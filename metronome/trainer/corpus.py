@@ -84,10 +84,11 @@ def build_corpus(
             min_length=cfg.min_length,
             max_length=cfg.max_length,
             max_total_points=cfg.max_total_points,
+            max_channels=cfg.max_channels,
         )
     except ValueError as e:
         raise CorpusError(f"generator_output_rejected: {e}") from e
-    total = int(sum(int(s.shape[0]) for s in series))
+    total = int(sum(int(s.size) for s in series))
     return CorpusResult(
         series=series,
         digest=corpus_digest(series),

@@ -59,16 +59,21 @@ def format_trained_pointer(repo: str, revision: str) -> str:
 def corpus_digest(series: Sequence[np.ndarray]) -> str:
     """Stable sha256 over a generated corpus.
 
-    Hashes the count, each series' length, and its raw float64 bytes in yield
-    order. Two trainers that draw the same corpus from the same pinned
-    generator + seed get the same digest, which is what makes a training run
-    auditable.
+    Each series is canonicalised to ``(C, L)`` (a 1-D ``(L,)`` array is promoted
+    to ``(1, L)``), and the hash covers the count, every series' full ``(C, L)``
+    shape, and its raw float64 bytes in yield order. Carrying the channel count
+    in the digest keeps it stable as the corpus moves from univariate ``(1, L)``
+    to multivariate ``(C, L)`` — a univariate and a single-channel-of-multivariate
+    corpus never collide. Two trainers that draw the same corpus from the same
+    pinned generator + seed get the same digest, which is what makes a training
+    run auditable.
     """
     h = hashlib.sha256()
     h.update(len(series).to_bytes(8, "big"))
     for arr in series:
-        a = np.ascontiguousarray(arr, dtype=np.float64)
-        h.update(a.shape[0].to_bytes(8, "big"))
+        a = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
+        h.update(a.shape[0].to_bytes(8, "big"))   # channels
+        h.update(a.shape[1].to_bytes(8, "big"))   # length
         h.update(a.tobytes())
     return h.hexdigest()
 

@@ -1,9 +1,15 @@
 # metronome submission interface (for miners)
 
 You submit a **data generator**, not a model. Your generator produces synthetic
-univariate time-series that the subnet owner's trainer uses to train a fixed
-forecasting model. You win when your data trains a better forecaster than the
-king's data.
+time-series that the subnet owner's trainer uses to train a **Toto2-4M forecaster
+from scratch** (random init — not a fine-tune). You win when your data trains a
+better forecaster than the king's data, scored on a private, rotating held-out
+set you never see.
+
+Series are univariate today (`max_channels = 1`), but the corpus carries a
+channel axis: `generate` may yield a 1-D `(L,)` array (treated as one channel) and
+the schema is ready for multivariate `(C, L)` priors the day the owner raises the
+cap — no interface change for you when that happens.
 
 ## Repo layout
 
@@ -32,8 +38,9 @@ class Generator(DataGenerator):
         ...
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-        # Yield EXACTLY n_series 1-D float arrays. Each length must fall in the
-        # configured [min_length, max_length] band; total points are capped.
+        # Yield EXACTLY n_series float arrays: 1-D (L,) today, or (C, L) once the
+        # owner raises max_channels. Each length L must fall in the configured
+        # [min_length, max_length] band; total emitted points (C*L) are capped.
         ...
 
     @property
@@ -71,9 +78,17 @@ metronome deploy <org>/<repo> --revision <40-char-sha> \
 
 ## What good data looks like
 
-You're optimising for **downstream forecast generalisation** of a fixed model on
-real held-out series (CRPS + MASE). Diversity of regimes (trend, multiple
-seasonalities, regime shifts, varied noise structure, realistic scales) tends to
-beat narrow or degenerate corpora. Memorising the eval set is not an option —
-you never see it, and the trainer only ever feeds the model *your generator's
-output*. See `scripts/example_generator/` for a runnable starting point.
+You're optimising for **downstream forecast generalisation** of a Toto2-4M trained
+**from scratch** on real held-out series (CRPS + MASE). Two consequences:
+
+* From random init the model learns forecasting *only* from your data, so
+  diversity of regimes (trend, multiple seasonalities, regime shifts, varied
+  noise structure, realistic scales) matters even more — a narrow or degenerate
+  corpus teaches a narrow forecaster, and a tiny one can't win by being memorised
+  (the budget is `train_tokens`, not a few epochs).
+* The eval set is **private and rotates every round**, so you cannot
+  distribution-match a public benchmark — you never see the windows, the slice
+  changes each round, and the trainer only ever feeds the model *your generator's
+  output*. Robust, general priors win; benchmark-shaped ones don't.
+
+See `scripts/example_generator/` for a runnable starting point.

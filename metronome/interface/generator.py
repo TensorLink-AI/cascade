@@ -59,12 +59,15 @@ class DataGenerator(ABC):
 
     @abstractmethod
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-        """Yield exactly ``n_series`` univariate training series.
+        """Yield exactly ``n_series`` training series.
 
-        Each yielded value is a 1-D ``float`` ``np.ndarray`` (finite, no NaN or
-        inf). Series lengths may vary but must fall within the configured
-        ``[min_length, max_length]`` band; the trainer validates every series
-        with :func:`check_series` and aborts the round if any fails.
+        Each yielded value is a ``float`` ``np.ndarray`` (finite, no NaN or
+        inf), either 1-D ``(L,)`` (univariate) or 2-D ``(C, L)`` (``C`` variates
+        of length ``L``). A 1-D series is treated as a single channel ``(1, L)``.
+        ``C`` must not exceed the configured ``max_channels`` (1 today), and the
+        length ``L`` must fall within ``[min_length, max_length]``; the trainer
+        validates every series with :func:`check_series` and aborts the round if
+        any fails.
 
         The sequence MUST be a deterministic function of the ``seed`` passed to
         ``__init__`` and of ``n_series`` only.
@@ -84,9 +87,14 @@ def check_series(
     *,
     min_length: int,
     max_length: int,
+    max_channels: int = 1,
     index: int | None = None,
 ) -> None:
     """Validate a single emitted series. Raises ``ValueError`` on any problem.
+
+    Accepts a 1-D ``(L,)`` series (univariate) or a 2-D ``(C, L)`` series
+    (``C`` variates of length ``L``); a 1-D series counts as one channel. The
+    length band applies to ``L`` and ``C`` must be in ``[1, max_channels]``.
 
     Used by the trainer while draining ``generate`` and by ``metronome verify``
     on the miner side so a miner sees the same failure locally. The trainer
@@ -99,11 +107,16 @@ def check_series(
         raise ValueError(
             f"generate must yield np.ndarray{where}; got {type(arr).__name__}"
         )
-    if arr.ndim != 1:
-        raise ValueError(f"series must be 1-D{where}; got shape {arr.shape}")
+    if arr.ndim not in (1, 2):
+        raise ValueError(f"series must be 1-D (L,) or 2-D (C, L){where}; got shape {arr.shape}")
     if not np.issubdtype(arr.dtype, np.floating):
         raise ValueError(f"series dtype must be floating{where}; got {arr.dtype}")
-    n = int(arr.shape[0])
+    channels = 1 if arr.ndim == 1 else int(arr.shape[0])
+    if channels < 1 or channels > max_channels:
+        raise ValueError(
+            f"series has {channels} channels outside [1, {max_channels}]{where}"
+        )
+    n = int(arr.shape[-1])
     if n < min_length or n > max_length:
         raise ValueError(
             f"series length {n} outside [{min_length}, {max_length}]{where}"
@@ -119,17 +132,21 @@ def drain_generator(
     min_length: int,
     max_length: int,
     max_total_points: int,
+    max_channels: int = 1,
 ) -> list[np.ndarray]:
     """Pull ``n_series`` series from ``gen``, validating each one.
 
-    Enforces the per-series length band and a global cap on total emitted
-    points (a memory / time guard against a generator that emits a few
-    enormous series). Raises ``ValueError`` if the generator yields the wrong
+    Enforces the per-series length band, the channel cap, and a global cap on
+    total emitted points (a memory / time guard against a generator that emits a
+    few enormous series). Raises ``ValueError`` if the generator yields the wrong
     count, a malformed series, or blows the point budget.
 
-    Returns the materialised list of series in yield order. The trainer hashes
-    this list (see :func:`metronome.shared.manifest.corpus_digest`) so the
-    corpus is reproducible and auditable.
+    Each series is canonicalised to a contiguous ``(C, L)`` float64 array (a 1-D
+    series becomes ``(1, L)``), so the corpus the base trainer consumes always
+    carries a channel axis. The point budget counts every emitted value
+    (``C * L``). Returns the list in yield order; the trainer hashes it (see
+    :func:`metronome.shared.manifest.corpus_digest`) so the corpus is
+    reproducible and auditable.
     """
     if n_series <= 0:
         raise ValueError(f"n_series must be positive; got {n_series}")
@@ -140,13 +157,17 @@ def drain_generator(
             raise ValueError(
                 f"generate yielded more than n_series={n_series} series"
             )
-        check_series(arr, min_length=min_length, max_length=max_length, index=i)
-        total += int(arr.shape[0])
+        check_series(
+            arr, min_length=min_length, max_length=max_length,
+            max_channels=max_channels, index=i,
+        )
+        canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
+        total += int(canon.size)
         if total > max_total_points:
             raise ValueError(
                 f"total emitted points {total} exceeds cap {max_total_points}"
             )
-        out.append(np.ascontiguousarray(arr, dtype=np.float64))
+        out.append(canon)
     if len(out) != n_series:
         raise ValueError(
             f"generate yielded {len(out)} series; expected exactly {n_series}"

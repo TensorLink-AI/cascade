@@ -29,10 +29,17 @@ ForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
 
 @dataclass(frozen=True)
 class WindowScore:
-    """One window's contribution to a model's aggregated metrics.
+    """One (window, channel) contribution to a model's aggregated metrics.
+
+    Univariate windows produce one score each (``channel == 0``); a multivariate
+    window produces one per channel. The scores are the unit the paired
+    bootstrap resamples, so a multivariate window's channels are independent
+    rows — king and challenger stay paired as long as they emit the same
+    (window, channel) order, which they do (same eval set, same scorer).
 
     Attributes:
         series_id: from the originating EvalWindow.
+        channel: variate index within the window (0 for univariate).
         mase: per-window Hyndman MASE (already a ratio; safe to average).
         qloss_per_q: shape ``(num_q,)`` — sum-over-horizon pinball loss per
             quantile, NOT divided yet; the bootstrap sums then divides once.
@@ -46,6 +53,7 @@ class WindowScore:
     qloss_per_q: np.ndarray
     abs_target: float
     quantile_levels: tuple[float, ...] = DEFAULT_QUANTILE_LEVELS
+    channel: int = 0
 
 
 def _resolve_seasonal_period(metadata: dict) -> int:
@@ -72,35 +80,42 @@ def score_forecaster_on_windows(
     out: list[WindowScore] = []
     q_tuple = tuple(float(q) for q in quantile_levels)
     for w in windows:
-        history = np.asarray(w.history, dtype=np.float64)
-        target = np.asarray(w.target, dtype=np.float64)
-        horizon = int(target.shape[0])
-        samples = forecast_fn(history, horizon, num_samples)
-        if samples.shape != (1, num_samples, horizon):
-            raise ValueError(
-                f"forecaster returned shape {samples.shape}; "
-                f"expected (1, {num_samples}, {horizon})"
-            )
-        if not np.isfinite(samples).all():
-            raise ValueError(
-                f"forecaster produced non-finite samples on window {w.series_id!r}"
-            )
-
-        qloss_per_q, abs_target = mwsql_components(
-            samples, target[None, :], quantile_levels=q_tuple
-        )
-        point = np.median(samples[0], axis=0)              # (H,)
+        history = np.asarray(w.history, dtype=np.float64)   # (C, L)
+        target = np.asarray(w.target, dtype=np.float64)     # (C, H)
+        horizon = int(target.shape[-1])
         period = _resolve_seasonal_period(w.metadata)
-        m = mase_one(point, target, history, period)
-        out.append(
-            WindowScore(
-                series_id=w.series_id,
-                mase=m,
-                qloss_per_q=qloss_per_q[0],
-                abs_target=float(abs_target[0]),
-                quantile_levels=q_tuple,
+        # Score each channel independently with the univariate forecaster
+        # contract. Univariate windows (C == 1) emit exactly one score.
+        for c in range(target.shape[0]):
+            hist_c = history[c]                              # (L,)
+            tgt_c = target[c]                                # (H,)
+            samples = forecast_fn(hist_c, horizon, num_samples)
+            if samples.shape != (1, num_samples, horizon):
+                raise ValueError(
+                    f"forecaster returned shape {samples.shape}; "
+                    f"expected (1, {num_samples}, {horizon})"
+                )
+            if not np.isfinite(samples).all():
+                raise ValueError(
+                    f"forecaster produced non-finite samples on window "
+                    f"{w.series_id!r} channel {c}"
+                )
+
+            qloss_per_q, abs_target = mwsql_components(
+                samples, tgt_c[None, :], quantile_levels=q_tuple
             )
-        )
+            point = np.median(samples[0], axis=0)           # (H,)
+            m = mase_one(point, tgt_c, hist_c, period)
+            out.append(
+                WindowScore(
+                    series_id=w.series_id,
+                    mase=m,
+                    qloss_per_q=qloss_per_q[0],
+                    abs_target=float(abs_target[0]),
+                    quantile_levels=q_tuple,
+                    channel=c,
+                )
+            )
     return out
 
 

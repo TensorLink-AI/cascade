@@ -53,8 +53,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.offline:
         seeds = RoundSeeds.derive(args.base_seed, cfg.training)
-        print(f"base_model:       {cfg.training.base_model}")
+        print(f"base_arch:        {cfg.training.base_arch} ({cfg.training.arch_preset})")
         print(f"base_arch_digest: {cfg.training.base_arch_digest}")
+        print(f"train_tokens:     {cfg.training.train_tokens:,} (from scratch)")
         print(f"contract_digest:  {contract_digest(cfg.training)}")
         print(f"generation_seed:  {seeds.generation_seed}")
         print(f"training_seed:    {seeds.training_seed}")

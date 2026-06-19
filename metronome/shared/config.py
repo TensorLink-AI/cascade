@@ -32,6 +32,12 @@ class GeneratorConfig:
     length in ``[min_length, max_length]`` and the run aborts if total emitted
     points exceed ``max_total_points`` or generation runs past
     ``max_generate_seconds``.
+
+    ``max_channels`` is the per-series variate cap. metronome trains a Toto2
+    backbone from scratch — a multivariate architecture — so the corpus schema
+    carries a channel axis. ``max_channels = 1`` keeps submissions univariate
+    for now (a generator may still yield 1-D series, promoted to ``(1, L)``);
+    raising it later turns on multivariate priors *without* a schema change.
     """
 
     corpus_n_series: int
@@ -40,6 +46,7 @@ class GeneratorConfig:
     max_total_points: int
     max_generate_seconds: int
     max_memory_mb: int
+    max_channels: int = 1
 
 
 @dataclass(frozen=True)
@@ -48,25 +55,80 @@ class TrainingContractConfig:
 
     The central invariant of metronome: the only thing that varies between the
     two trained models is the generator's data. Every field here is held
-    constant across the pair so the eval is a controlled measurement of data
-    quality. ``base_arch_digest`` pins the architecture + initialisation so a
-    trainer can't silently swap models between rounds.
+    constant across the pair (and folded into ``contract_digest``) so the eval
+    is a controlled measurement of data quality.
+
+    metronome trains a **Toto2 backbone from random initialisation** on each
+    generator's corpus — it does *not* fine-tune a released checkpoint. Training
+    from scratch is what makes the corpus the only source of learned signal: a
+    fine-tune would confound "good data" with "what the pretrained weights
+    already knew". Because the run starts from noise, the contract has to pin
+    the *entire* recipe — architecture, objective, masking, optimiser, and the
+    compute budget — not just three hyperparameters. ``base_arch_digest`` is the
+    sha256 of the frozen architecture + initialisation code; set it before
+    launch so a trainer can't silently swap models between rounds.
+
+    The architecture defaults below track Datadog's released ``Toto-2.0-4m``
+    (arch family fixes ``head_dim = 64``; Toto 2.0 uses ``patch_size = 32`` and
+    a 9-quantile pinball head). Pin the exact integers to that checkpoint's
+    ``config.json`` before launch, same convention as ``base_arch_digest``.
+
+    Budget is expressed in ``train_tokens`` (total point-passes), **not epochs**:
+    from scratch on a small corpus, epochs-over-a-tiny-set leaves the model in
+    the high-variance early regime where data-quality differences are dominated
+    by optimisation noise. A fixed token budget is the compute the king's and
+    challenger's data compete under, and the main signal/cost knob.
     """
 
-    base_model: str
+    # identity / architecture (pin to Datadog/Toto-2.0-4m config.json)
+    base_arch: str
+    arch_preset: str
     base_arch_digest: str
-    epochs: int
-    batch_size: int
-    learning_rate: float
+    d_model: int
+    num_layers: int
+    num_heads: int
+    head_dim: int
+    patch_size: int
+    mlp_expansion: int
+    num_quantiles: int
+    # objective / masking (Toto 2.0 Contiguous Patch Masking + quantile head)
+    masking: str
+    cpm_c_max: int
+    cpm_p_max: float
+    input_transform: str
+    # I/O lengths (must match [eval] so the trained model fits the eval windows)
     context_length: int
     horizon: int
+    # from-scratch budget — TOKENS, not epochs
+    train_tokens: int
+    warmup_tokens: int
+    batch_size: int
+    # optimiser (u-muP transfer: tune on a small proxy, pin the result here)
+    optimizer: str
+    base_lr: float
+    weight_decay: float
+    lr_schedule: str
+    umup_base_d_model: int
     train_seed_salt: int
     max_train_seconds: int
 
 
 @dataclass(frozen=True)
 class EvalConfig:
+    """Held-out eval windows scored each round (same set for king and challenger).
+
+    ``eval_dataset`` is the identifier the manifest carries and the validator
+    matches on. ``eval_source = "private-rotating"`` means the windows are drawn
+    from an owner-controlled private pool and the *slice rotates per round*
+    (seeded by the round's block hash) — TIME-style contamination resistance, so
+    a generator cannot distribution-match a fixed public benchmark. The concrete
+    pool loader (``window_pool``) is a boundary; the seeded rotation/selection
+    lives in ``metronome.validator.windows``.
+    """
+
     eval_dataset: str
+    eval_source: str
+    window_pool: str
     num_samples: int
     n_windows: int
     context_length: int
@@ -194,20 +256,40 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_total_points=int(g["max_total_points"]),
             max_generate_seconds=int(g["max_generate_seconds"]),
             max_memory_mb=int(g["max_memory_mb"]),
+            max_channels=int(g.get("max_channels", 1)),
         ),
         training=TrainingContractConfig(
-            base_model=str(t["base_model"]),
+            base_arch=str(t["base_arch"]),
+            arch_preset=str(t["arch_preset"]),
             base_arch_digest=str(t["base_arch_digest"]),
-            epochs=int(t["epochs"]),
-            batch_size=int(t["batch_size"]),
-            learning_rate=float(t["learning_rate"]),
+            d_model=int(t["d_model"]),
+            num_layers=int(t["num_layers"]),
+            num_heads=int(t["num_heads"]),
+            head_dim=int(t["head_dim"]),
+            patch_size=int(t["patch_size"]),
+            mlp_expansion=int(t["mlp_expansion"]),
+            num_quantiles=int(t["num_quantiles"]),
+            masking=str(t["masking"]),
+            cpm_c_max=int(t["cpm_c_max"]),
+            cpm_p_max=float(t["cpm_p_max"]),
+            input_transform=str(t["input_transform"]),
             context_length=int(t["context_length"]),
             horizon=int(t["horizon"]),
+            train_tokens=int(t["train_tokens"]),
+            warmup_tokens=int(t["warmup_tokens"]),
+            batch_size=int(t["batch_size"]),
+            optimizer=str(t["optimizer"]),
+            base_lr=float(t["base_lr"]),
+            weight_decay=float(t["weight_decay"]),
+            lr_schedule=str(t["lr_schedule"]),
+            umup_base_d_model=int(t["umup_base_d_model"]),
             train_seed_salt=int(t["train_seed_salt"]),
             max_train_seconds=int(t["max_train_seconds"]),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),
+            eval_source=str(e.get("eval_source", "private-rotating")),
+            window_pool=str(e.get("window_pool", "")),
             num_samples=int(e["num_samples"]),
             n_windows=int(e["n_windows"]),
             context_length=int(e["context_length"]),

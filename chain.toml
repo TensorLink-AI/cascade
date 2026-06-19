@@ -7,40 +7,76 @@ schema_version = 1
 [subnet]
 netuid = 0                       # placeholder; set per network (mainnet/testnet)
 name = "metronome"
-description = "Synthetic time-series training data, KOTH on CRPS + MASE of a fixed base model."
+description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Toto2-4M trained from scratch."
 
 [generator]
 # Bounds the trainer enforces on every generator's output. A generator that
 # violates any of these fails to qualify for the round (it can never affect the
-# king's run).
-corpus_n_series      = 4096      # series drawn from each generator per training run
+# king's run). From-scratch training wants more *unique* synthetic data than a
+# fine-tune does, so the corpus budget is larger here and is a real signal knob.
+corpus_n_series      = 16384     # series drawn from each generator per training run
 min_length           = 64        # per-series length band (timesteps)
 max_length           = 2048
-max_total_points     = 8_000_000 # global cap on emitted points (memory/time guard)
-max_generate_seconds = 600       # wall-clock budget for draining the generator
+max_total_points     = 64_000_000 # global cap on emitted points (memory/time guard)
+max_generate_seconds = 1800      # wall-clock budget for draining the generator
 max_memory_mb        = 4096      # rlimit for the generation sandbox
+max_channels         = 1         # per-series variates. 1 = univariate (generators may
+                                 # yield 1-D, promoted to (1, L)); raise to enable
+                                 # multivariate priors without a schema change.
 
 [training]
 # The FIXED training contract — identical for king and challenger. The only
 # thing that varies between the two trained models is the generator's data.
-# Set base_arch_digest to the sha256 of the frozen base architecture +
-# initialisation before launch.
-base_model         = "amazon/chronos-bolt-base"
-base_arch_digest   = "0000000000000000000000000000000000000000000000000000000000000000"  # placeholder
-epochs             = 3
-batch_size         = 256
-learning_rate      = 1e-4
+#
+# metronome trains a Toto2 backbone FROM RANDOM INIT on each corpus (it does not
+# fine-tune a released checkpoint): from scratch, the corpus is the only source
+# of learned signal. So the whole recipe is pinned here and folded into
+# contract_digest. Arch defaults track Datadog/Toto-2.0-4m — pin the exact
+# integers and base_arch_digest to that checkpoint's config.json before launch.
+base_arch          = "toto2"
+arch_preset        = "toto2-4m"
+base_arch_digest   = "0000000000000000000000000000000000000000000000000000000000000000"  # sha256 of frozen arch+init; set before launch
+# architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
+d_model            = 256
+num_layers         = 4
+num_heads          = 4
+head_dim           = 64
+patch_size         = 32
+mlp_expansion      = 2
+num_quantiles      = 9           # 9-level pinball head (0.1..0.9) — matches [eval]/scoring
+# objective / masking (Toto 2.0 Contiguous Patch Masking + quantile head)
+masking            = "contiguous_patch"
+cpm_c_max          = 16
+cpm_p_max          = 0.4
+input_transform    = "arcsinh_causal"
+# I/O lengths — must match [eval] so the trained model fits the eval windows
 context_length     = 512
 horizon            = 64
+# from-scratch budget — TOKENS (total point-passes), NOT epochs. This is the
+# compute the king's and challenger's data compete under; the main signal/cost
+# knob. Too small and the throne is decided by undertraining noise.
+train_tokens       = 2_000_000_000
+warmup_tokens      = 100_000_000
+batch_size         = 256
+# optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
+optimizer          = "normuon_adamw"
+base_lr            = 4e-3         # u-muP width-independent learning rate
+weight_decay       = 0.05
+lr_schedule        = "warmup_cosine"
+umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 7200        # per-model training budget
+max_train_seconds  = 21600       # per-model training budget (from-scratch is long)
 
 [eval]
-# Held-out real-world eval set. The SAME windows are scored for king and
-# challenger, which is what makes the comparison a controlled measurement.
-eval_dataset   = "gift-eval"     # identifier the validator's window source resolves
+# Held-out eval windows. The SAME windows are scored for king and challenger,
+# which is what makes the comparison a controlled measurement. The slice is
+# private and ROTATES per round (seeded by the block hash) so a generator cannot
+# distribution-match a fixed public benchmark — see metronome.validator.windows.
+eval_dataset   = "metronome-private-v1"  # identifier the validator matches on
+eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
+window_pool    = "tensorlink-ai/metronome-eval-private"  # owner-controlled pool (loader is a boundary)
 num_samples    = 100             # sample forecasts drawn per window
-n_windows      = 2000            # eval windows per round
+n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 512
 horizon        = 64
 
