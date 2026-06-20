@@ -50,7 +50,7 @@ cpm_c_max          = 16
 cpm_p_max          = 0.4
 input_transform    = "arcsinh_causal"
 # I/O lengths — must match [eval] so the trained model fits the eval windows
-context_length     = 512
+context_length     = 4096    # Toto 2.0 training context (Table 1); was 512
 horizon            = 64
 # from-scratch budget — train each model for ~target_train_hours of GPU on the
 # OWNER'S REFERENCE BOX. Enforced as a fixed token count (= hours × reference
@@ -83,7 +83,7 @@ eval_source    = "private-rotating"      # rotating private pool (vs a fixed pub
 window_pool    = "tensorlink-ai/metronome-eval-private"  # owner-controlled pool (loader is a boundary)
 num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
-context_length = 512
+context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
 [scoring]
