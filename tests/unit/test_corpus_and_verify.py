@@ -2,21 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from metronome.miner.verify import verify_repo
 from metronome.trainer.corpus import assert_corpus_reproducible, build_corpus
-
-
-@pytest.fixture()
-def small_cfg(cfg):
-    """Shrink the series count so the python AR(1) loop runs fast under test.
-    The length band is left at the chain.toml values the example generator's
-    own config.json (128..1024) fits inside."""
-    gen = replace(cfg.generator, corpus_n_series=6)
-    return replace(cfg, generator=gen)
 
 
 def test_example_generator_builds_corpus(small_cfg, example_generator_dir):
@@ -49,7 +38,11 @@ def test_verify_static_path_only(small_cfg, example_generator_dir):
 def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
     from metronome.trainer.corpus import build_round_corpus
 
-    res = build_round_corpus(example_generator_dir, 0, small_cfg.generator, "cache_reuse")
+    # use_sandbox=False keeps this a fast in-process unit test; the sandbox path
+    # is exercised in test_sandbox.py.
+    res = build_round_corpus(
+        example_generator_dir, 0, small_cfg.generator, "cache_reuse", use_sandbox=False
+    )
     assert res.n_series == 6
     assert len(res.digest) == 64
 

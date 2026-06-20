@@ -23,3 +23,14 @@ def cfg() -> ChainConfig:
 @pytest.fixture(scope="session")
 def example_generator_dir() -> Path:
     return REPO_ROOT / "scripts" / "example_generator"
+
+
+@pytest.fixture()
+def small_cfg(cfg):
+    """Shrink the series count so the example generator's python AR(1) loop runs
+    fast under test (the length band stays at the chain.toml values, which the
+    example generator's own config.json — 128..1024 — fits inside)."""
+    from dataclasses import replace
+
+    gen = replace(cfg.generator, corpus_n_series=6)
+    return replace(cfg, generator=gen)

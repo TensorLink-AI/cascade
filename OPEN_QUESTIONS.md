@@ -30,15 +30,20 @@ milestone that removes the single trusted trainer.
 execution be?
 
 **Default.** Two layers: a cheap AST static guard at submit time
-(`interface/static_guard.py`) and an intended network-isolated, rlimited
-subprocess at run time. The subprocess is a TODO —
-`trainer/corpus.py::run_in_sandbox` currently delegates to the in-process
-`build_corpus`, which is fine for trusted offline runs but **not** for
-adversarial mainnet use.
+(`interface/static_guard.py`) and a network-isolated, rlimited subprocess at run
+time (`trainer/sandbox.py::run_in_sandbox`). The subprocess pre-flights layout +
+size + static guard, runs the generator under POSIX rlimits (address space, CPU
+seconds, core, output size) with a scrubbed env (no trainer secrets) and a
+wall-clock timeout, wraps it in a `unshare --net` namespace when the host
+supports unprivileged user namespaces (probed, with fallback) plus Python-level
+socket blocking as defense-in-depth, and returns only `allow_pickle=False`
+float64 arrays whose digest the parent re-derives. The trainer selects it via
+`build_round_corpus(..., use_sandbox=True)` (the default; `TrainerRunner.use_sandbox`).
 
-**Flip point.** `metronome/trainer/corpus.py::run_in_sandbox`. Mirror horizon's
-`validator/scorer/sandbox.py` (network namespace, disk + rlimit, pipe the corpus
-back). Until then the trainer must only be pointed at trusted generators.
+**Remaining.** RLIMIT_AS caps *virtual* memory, so torch generators need a
+higher `max_repo_mb`/`max_memory_mb`; and `unshare` is unavailable on hardened
+hosts (no unprivileged userns), where isolation falls back to the socket guard —
+deploy the trainer in a no-egress container for hard network isolation there.
 
 ## 3. King identity across rounds
 

@@ -5,12 +5,11 @@ it with the round's generation seed, and drain exactly ``corpus_n_series``
 validated series. The result is a list of float64 arrays plus its digest — the
 auditable record of what the model was trained on.
 
-Isolation boundary: the generator is miner-controlled code. The static guard
-(:mod:`metronome.interface.static_guard`) is the cheap pre-check; running the
-generator MUST happen inside a network-isolated, rlimited sandbox subprocess in
-production. :func:`build_corpus` here runs in-process for tests and offline
-smoke; ``run_in_sandbox`` is the TODO boundary that wraps it for live use (see
-OPEN_QUESTIONS.md #2).
+Isolation boundary: the generator is miner-controlled code. :func:`build_corpus`
+runs it IN-PROCESS — fine for tests, ``metronome verify``, and trusted offline
+smoke. In production the trainer runs this same path inside the network-isolated,
+rlimited subprocess in :mod:`metronome.trainer.sandbox` (:func:`build_round_corpus`
+with ``use_sandbox=True``, the default).
 """
 
 from __future__ import annotations
@@ -111,6 +110,9 @@ def build_round_corpus(
     generation_seed: int,
     cfg: GeneratorConfig,
     mode: str,
+    *,
+    use_sandbox: bool = True,
+    blocked: tuple[str, ...] = (),
 ) -> CorpusResult:
     """Build a round's corpus according to the selected feed ``mode``.
 
@@ -124,9 +126,18 @@ def build_round_corpus(
       docs/ARCHITECTURE.md). Selecting one today raises so the choice fails
       loudly rather than silently falling back to reuse.
 
+    ``use_sandbox`` (default True) runs the generator in the network-isolated,
+    rlimited subprocess from :mod:`metronome.trainer.sandbox`; ``blocked`` is the
+    static-guard import blocklist enforced before the generator is imported. Pass
+    ``use_sandbox=False`` only for trusted offline / in-process test runs.
+
     Raises :class:`CorpusError` for an unwired or unknown mode.
     """
     if mode == "cache_reuse":
+        if use_sandbox:
+            from .sandbox import run_in_sandbox
+
+            return run_in_sandbox(repo_dir, generation_seed, cfg, blocked=tuple(blocked))
         return build_corpus(repo_dir, generation_seed, cfg)
     if mode in STREAMING_MODES:
         raise CorpusError(
@@ -155,18 +166,3 @@ def assert_corpus_reproducible(
             "different corpora (digests differ)"
         )
     return first.digest
-
-
-def run_in_sandbox(
-    repo_dir: Path | str,
-    generation_seed: int,
-    cfg: GeneratorConfig,
-) -> CorpusResult:
-    """TODO: spawn a network-isolated, rlimited subprocess that calls
-    :func:`build_corpus` and returns the corpus over a pipe.
-
-    Until the sandbox lands this delegates to the in-process path, which is
-    acceptable for trusted offline runs but NOT for adversarial mainnet use.
-    Mirrors horizon's ``validator/scorer/sandbox.py`` design.
-    """
-    return build_corpus(repo_dir, generation_seed, cfg)

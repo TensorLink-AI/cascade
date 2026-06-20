@@ -102,6 +102,7 @@ class TrainerRunner:
     trained_repo_prefix: str           # e.g. "tensorlink-ai/metro-trained"
     hf_token: str | None = None
     hf_cache_dir: Path | None = None
+    use_sandbox: bool = True           # run generators in the isolated subprocess
 
     def train_one(
         self,
@@ -124,6 +125,8 @@ class TrainerRunner:
         corpus = build_round_corpus(
             fetched.local_dir, seeds.generation_seed, self.cfg.generator,
             self.cfg.training.corpus_mode,
+            use_sandbox=self.use_sandbox,
+            blocked=self.cfg.static_guard.blocked,
         )
         log.info(
             "round=%s role=%s hotkey=%s corpus n=%d points=%d digest=%s",
