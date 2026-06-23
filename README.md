@@ -73,6 +73,52 @@ A challenger only takes the throne after winning **`dethrone_cp` consecutive
 rounds** by a confidence-bounded margin (paired bootstrap LCB clears the
 tenure-adjusted win margin). Weights are pure winner-takes-all.
 
+## Why Toto2-4M
+
+The fixed model is small *on purpose*. Toto 2.0 is the first time-series
+foundation family to **validate a clean scaling law** across its sizes
+(4M → 22M → 313M → 1B → 2.5B): by adopting u-μP (Maximal Update Parametrization),
+the learning dynamics are tuned **once on the 4M model** and those exact
+hyperparameters transfer to the 2.5B model, with predictive skill improving
+monotonically and without saturation as you climb the ladder
+([Datadog, Toto 2.0](https://www.datadoghq.com/blog/ai/toto-2/)). That makes the
+4M backbone the cheapest rung of a curve known to behave: it trains from scratch
+in hours, yet it sits on a scaling trajectory whose ordering is expected to hold
+as the subnet scales the fixed model up. It is also no toy — the 4M is already
+competitive with Toto 1.0 and Chronos-2 despite being ~30–40× smaller. A robust,
+predictable, inexpensive starting point is exactly what a per-round controlled
+experiment needs.
+
+## Why compete on data
+
+metronome's bet — that the *data distribution* is the dominant lever in a TSFM —
+is the consensus direction of the field. Recent models keep winning on benchmarks
+by competing on synthetic priors, not architecture:
+
+* **Chronos-2** (Amazon, 120M) reaches state-of-the-art zero-shot accuracy on
+  fev-bench, GIFT-Eval, and Chronos Benchmark II, trained heavily on
+  *large-scale synthetic* series (Gaussian-process curves, trend/seasonality/
+  irregularity mixtures, random temporal causal graphs)
+  ([arXiv 2510.15821](https://arxiv.org/abs/2510.15821)).
+* **FlowState** (IBM, 9.1M) is the smallest model in GIFT-Eval's top 10,
+  out-forecasting rivals 20×+ its size — pretrained in part on synthetic series
+  from the **CauKer** generator ([arXiv 2508.05287](https://arxiv.org/abs/2508.05287)).
+* **ForecastPFN** is a prior-data fitted network trained **purely on a synthetic
+  distribution**, and was the first zero-shot forecaster to beat the then-SOTA
+  with *no* real training data at all
+  ([arXiv 2311.01933](https://arxiv.org/abs/2311.01933)); **TempoPFN**
+  ([arXiv 2510.25502](https://arxiv.org/abs/2510.25502)) carries the
+  purely-synthetic pretraining recipe further.
+* **DynaMix** (NeurIPS 2025) is trained on nothing but synthetic chaotic
+  dynamical systems and, with **~0.1% of Chronos's parameters**, still beats
+  Chronos zero-shot on real-world traffic and weather it never saw — a small,
+  well-curated synthetic prior outperforming a far larger real-data model
+  ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
+
+The throughline: across the leaderboard, the synthetic data distribution is doing
+the heavy lifting. metronome turns that distribution into the competitive surface
+— hold the model fixed, and let miners compete the prior.
+
 ## Three roles
 
 | role | package | needs GPU | needs chain |
