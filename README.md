@@ -16,22 +16,45 @@ design into an open competition.
 
 ## How it works
 
+```mermaid
+flowchart TD
+    subgraph miner["Miner (no GPU)"]
+        gen["generator.py<br/>(DataGenerator)"]
+        commit["commit on-chain pointer<br/>metro-v1:gen:hf:repo@sha"]
+        gen --> commit
+    end
+
+    subgraph trainer["Trainer — owner-operated (the GPU boundary)"]
+        resolve["resolve commitments →<br/>pick king + challenger"]
+        seeds["derive one shared RoundSeeds<br/>from block hash<br/>(generation_seed + training_seed)"]
+        corpusK["draw corpus<br/>(king's generator)"]
+        corpusC["draw corpus<br/>(challenger's generator)"]
+        trainK["train Toto2-4M<br/>from random init"]
+        trainC["train Toto2-4M<br/>from random init"]
+        manifest["publish signed TrainingManifest<br/>(2 ckpts + corpus/contract digests)"]
+        resolve --> seeds
+        seeds --> corpusK --> trainK --> manifest
+        seeds --> corpusC --> trainC --> manifest
+    end
+
+    subgraph validator["Validator (eval GPU)"]
+        gate["verify signature +<br/>matching contract / base-arch digests<br/>(controlled-experiment gate)"]
+        eval["pull both ckpts → score on<br/>shared held-out windows<br/>(CRPS/MWSQL + MASE)"]
+        koth["paired-bootstrap LCB of<br/>geomean(CRPS, MASE),<br/>challenger vs king → KOTH verdict"]
+        weights["winner-take-all<br/>weights on king's UID"]
+        gate --> eval --> koth --> weights
+    end
+
+    commit -->|on-chain| resolve
+    manifest -->|manifest + HF ckpts| gate
+
+    classDef invariant fill:#fff3cd,stroke:#d39e00,color:#5c4400;
+    class seeds,gate invariant;
 ```
- miner          owner trainer                         validators
- ─────          ─────────────                         ──────────
- generator.py   ┌─ king's generator ─┐  train (fixed   ┌─ pull king ckpt ─┐
-   (no weights) │                    │  contract: same │                  │
-       │        │  challenger's gen ─┘  arch/seed/      └─ pull chal ckpt ─┘
-   commit ──────►   draw corpus → train Toto2-4M from scratch → push 2 ckpts → manifest
-   metro-v1:gen          │                                      │
-                         └──────────── manifest ────────────────► eval on shared
-                                                                  held-out windows
-                                                                       │
-                                                  paired bootstrap LCB of
-                                                  geomean(CRPS, MASE), king vs
-                                                  challenger → KOTH decision →
-                                                  winner-take-all weights
-```
+
+> The **highlighted boxes** are where the controlled experiment lives: the trainer
+> reuses one `RoundSeeds` for both runs, and the validator's digest gate rejects any
+> manifest where king and challenger didn't share that contract. Details below.
 
 The **central invariant**: in a round, the king's generator and the
 challenger's generator are trained into models under a *byte-identical* contract
