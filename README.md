@@ -1,8 +1,7 @@
 # metronome: synthetic time-series data subnet
 
 A Bittensor subnet where miners compete on the quality of **training data**, not
-models. It is the dual of [`horizon`](../horizon): horizon scores trained TSFMs
-that miners submit; metronome holds the *training process* fixed and scores the
+models. metronome holds the *training process* fixed and scores the
 **data generators** that feed it.
 
 The fixed process is **a Toto2-4M backbone trained from random initialisation**
