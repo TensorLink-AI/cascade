@@ -52,16 +52,22 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_chain_config(args.chain_toml)
 
     if args.offline:
+        from .contract import compute_base_arch_digest
+
         seeds = RoundSeeds.derive(args.base_seed, cfg.training)
-        print(f"base_arch:        {cfg.training.base_arch} ({cfg.training.arch_preset})")
-        print(f"base_arch_digest: {cfg.training.base_arch_digest}")
+        computed = compute_base_arch_digest(cfg.training)
+        print(f"base_arch:           {cfg.training.base_arch} ({cfg.training.arch_preset})")
+        print(f"base_arch_digest:    {cfg.training.base_arch_digest}  (in chain.toml)")
+        print(f"computed_arch_digest: {computed}")
+        if cfg.training.base_arch_digest != computed:
+            print("  ^ MISMATCH — pin [training] base_arch_digest to the computed value above")
         print(
-            f"budget:           {cfg.training.target_train_hours:g}h on ref GPU "
+            f"budget:              {cfg.training.target_train_hours:g}h on ref GPU "
             f"≈ {cfg.training.train_tokens:,} point-passes (from scratch)"
         )
-        print(f"contract_digest:  {contract_digest(cfg.training)}")
-        print(f"generation_seed:  {seeds.generation_seed}")
-        print(f"training_seed:    {seeds.training_seed}")
+        print(f"contract_digest:     {contract_digest(cfg.training)}")
+        print(f"generation_seed:     {seeds.generation_seed}")
+        print(f"training_seed:       {seeds.training_seed}")
         print("offline trainer smoke complete")
         return 0
 
@@ -70,6 +76,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.wallet_name is None or args.wallet_hotkey is None:
         print("--wallet-name and --wallet-hotkey are required for a live run", flush=True)
+        return 2
+
+    from ..shared.config import LaunchConfigError, assert_launch_ready
+
+    try:
+        assert_launch_ready(cfg, role="trainer")
+    except LaunchConfigError as e:
+        print(e, flush=True)
         return 2
 
     from ..shared.chain import ChainClient

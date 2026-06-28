@@ -38,7 +38,7 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # integers and base_arch_digest to that checkpoint's config.json before launch.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "0000000000000000000000000000000000000000000000000000000000000000"  # sha256 of frozen arch+init; set before launch
+base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `metronome-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -80,8 +80,10 @@ max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours s
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
 #                 the token budget. Byte-exact reproducible (rolling digest).
 #   stream_gpu  — live-stream from a GPU-resident generator (torch). High
-#                 throughput, but audit is tolerance/same-hardware, not byte-exact
-#                 (runtime not wired yet: needs torch on the allowlist + GPU sandbox).
+#                 throughput, but audit is tolerance/same-hardware, not byte-exact.
+#                 Wired: torch is on the [dependencies] allowlist and the sandbox
+#                 has a GPU profile (relaxed RLIMIT_AS + CUDA env). Run the trainer
+#                 in a no-egress container, since RLIMIT_AS no longer bounds it.
 #   cache_reuse — draw a fixed corpus once, then multi-pass it under the budget.
 #                 Byte-exact, but reuses data (some memorisation).
 corpus_mode = "stream_cpu"

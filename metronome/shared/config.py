@@ -270,6 +270,44 @@ class ChainConfig:
         )
 
 
+class LaunchConfigError(RuntimeError):
+    """chain.toml still carries launch placeholders that must be set."""
+
+
+_PLACEHOLDER_DIGEST = "0" * 64
+
+
+def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
+    """Refuse to start a live service while ``chain.toml`` holds placeholders.
+
+    ``role`` is ``"trainer"`` or ``"validator"``; each needs a slightly different
+    set. Raises :class:`LaunchConfigError` listing every unset value so the
+    operator fixes them in one pass rather than one failed launch at a time.
+    """
+    problems: list[str] = []
+    if cfg.netuid <= 0:
+        problems.append("[subnet] netuid is 0 (set the live netuid)")
+    if cfg.training.base_arch_digest in ("", _PLACEHOLDER_DIGEST) or len(cfg.training.base_arch_digest) != 64:
+        problems.append(
+            "[training] base_arch_digest is a placeholder "
+            "(run `metronome-trainer --offline` and paste the printed digest)"
+        )
+    if not cfg.manifest.trainer_hotkey:
+        problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
+    if role == "validator":
+        from .hippius import is_cid
+
+        if not is_cid(cfg.eval.window_pool):
+            problems.append(
+                "[eval] window_pool is not a Hippius registry CID "
+                "(upload the held-out pool and pin its CID)"
+            )
+    if problems:
+        raise LaunchConfigError(
+            "chain.toml is not launch-ready:\n  - " + "\n  - ".join(problems)
+        )
+
+
 def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     """Load and parse ``chain.toml``. Raises on a missing file or unsupported
     (too-old) schema; warns and proceeds on a newer schema."""

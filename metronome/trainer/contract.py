@@ -22,6 +22,7 @@ at round start), so a second honest trainer reproduces the exact run.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,37 @@ from ..shared.config import TrainingContractConfig
 # can stream per-step metrics (loss, lr, throughput, tokens) out to Hippius S3
 # for observability. ``None`` means "don't log" (offline / tests).
 TrainLogger = Callable[[dict], None]
+
+# The architecture fields folded into base_arch_digest. These pin the *shape* of
+# the frozen base model; together with the model source they fully determine the
+# from-scratch architecture + init that king and challenger must share.
+_ARCH_FIELDS = (
+    "base_arch", "arch_preset", "d_model", "num_layers", "num_heads", "head_dim",
+    "patch_size", "mlp_expansion", "num_quantiles", "masking", "cpm_c_max",
+    "cpm_p_max", "input_transform", "context_length", "horizon",
+)
+
+
+def compute_base_arch_digest(contract: TrainingContractConfig) -> str:
+    """Deterministic sha256 of the frozen base architecture + init code.
+
+    Hashes the architecture fields from the contract *and* the bytes of the
+    reference model source (``toto2_model.py``), so the digest changes if either
+    the integers or the model definition change. The operator computes this once
+    (``metronome-trainer --offline`` prints it) and pins the result in
+    ``chain.toml [training] base_arch_digest``; the validator's controlled-
+    experiment gate then asserts every manifest was trained under that exact arch.
+
+    Reads the model source as bytes (no torch import), so it runs in any
+    environment.
+    """
+    arch = {k: getattr(contract, k) for k in _ARCH_FIELDS}
+    model_src = (Path(__file__).with_name("toto2_model.py")).read_bytes()
+    h = hashlib.sha256()
+    h.update(json.dumps(arch, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    h.update(b"\x00arch_src\x00")
+    h.update(model_src)
+    return h.hexdigest()
 
 
 def _mix(base_seed: int, tag: str, salt: int = 0) -> int:

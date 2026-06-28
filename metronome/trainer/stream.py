@@ -8,6 +8,10 @@ the mode:
   model sees data again. Digest is the unique-corpus digest (``corpus_digest``).
 * ``stream_cpu`` — stream *fresh* series with no reuse, each hashed into a
   rolling digest as it passes. Digest covers exactly the consumed prefix.
+* ``stream_gpu`` — same fresh-series streaming, but from a CUDA/torch-resident
+  generator under the sandbox's GPU profile (relaxed address-space rlimit + CUDA
+  env passthrough). High throughput; audit is tolerance/same-hardware, so its
+  rolling digest reproduces only on equivalent hardware.
 
 Both stop at ``token_budget`` points. :func:`open_round_stream` is a context
 manager; after the trainer drains ``series()``, read ``digest`` / ``n_series`` /
@@ -133,13 +137,19 @@ class _CacheReuseStream(RoundStream):
         return self._consumed or self._corpus.total_points
 
 
-class _StreamCpuStream(RoundStream):
-    """Stream fresh series (no reuse) from the sandbox, rolling-digesting each."""
+class _FreshSeriesStream(RoundStream):
+    """Stream fresh series (no reuse) from the sandbox, rolling-digesting each.
+
+    Backs both ``stream_cpu`` and ``stream_gpu``; ``gpu=True`` selects the
+    sandbox's GPU profile (relaxed address-space rlimit + CUDA env passthrough)
+    for a torch-resident generator. The rolling digest is byte-exact for
+    ``stream_cpu`` and tolerance/same-hardware for ``stream_gpu``.
+    """
 
     def __init__(
         self, repo_dir: Path | str, generation_seed: int, cfg: GeneratorConfig,
         token_budget: int, *, use_sandbox: bool, blocked: tuple[str, ...],
-        allow_netns: bool = True,
+        allow_netns: bool = True, gpu: bool = False,
     ) -> None:
         self._repo = Path(repo_dir)
         self._seed = int(generation_seed)
@@ -148,6 +158,7 @@ class _StreamCpuStream(RoundStream):
         self._use_sandbox = use_sandbox
         self._allow_netns = allow_netns
         self._blocked = tuple(blocked)
+        self._gpu = gpu
         self._dig = _StreamDigest()
         self._n = 0
         self._points = 0
@@ -157,7 +168,7 @@ class _StreamCpuStream(RoundStream):
         if self._use_sandbox:
             self._cm = sandbox.stream_series(
                 self._repo, self._seed, self._cfg, self._budget,
-                blocked=self._blocked, allow_netns=self._allow_netns,
+                blocked=self._blocked, allow_netns=self._allow_netns, gpu=self._gpu,
             )
             return self._cm.__enter__()
         return _inprocess_stream(self._repo, self._seed, self._cfg, self._budget)
@@ -209,14 +220,10 @@ def open_round_stream(
             repo_dir, generation_seed, cfg, token_budget,
             use_sandbox=use_sandbox, blocked=tuple(blocked), allow_netns=allow_netns,
         )
-    if mode == "stream_cpu":
-        return _StreamCpuStream(
+    if mode in ("stream_cpu", "stream_gpu"):
+        return _FreshSeriesStream(
             repo_dir, generation_seed, cfg, token_budget,
             use_sandbox=use_sandbox, blocked=tuple(blocked), allow_netns=allow_netns,
-        )
-    if mode == "stream_gpu":
-        raise CorpusError(
-            "corpus_mode='stream_gpu' not yet wired: needs a GPU-resident generator "
-            "(torch) + relaxed audit. Use 'stream_cpu' or 'cache_reuse'."
+            gpu=(mode == "stream_gpu"),
         )
     raise CorpusError(f"unknown corpus_mode={mode!r}")

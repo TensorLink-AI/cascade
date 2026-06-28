@@ -53,6 +53,14 @@ def main(argv: list[str] | None = None) -> int:
         print("--wallet-name and --wallet-hotkey are required unless --offline", file=sys.stderr)
         return 2
 
+    from ..shared.config import LaunchConfigError, assert_launch_ready
+
+    try:
+        assert_launch_ready(runner.cfg, role="validator")
+    except LaunchConfigError as e:
+        print(e, file=sys.stderr)
+        return 2
+
     from ..shared.chain import ChainClient
     from .pool import load_pool
 
