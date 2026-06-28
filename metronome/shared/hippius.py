@@ -89,16 +89,23 @@ def pack_dir_to_tar(local_dir: Path | str) -> bytes:
 
 
 def unpack_tar_to_dir(tar_bytes: bytes, dest_dir: Path | str) -> Path:
-    """Inverse of :func:`pack_dir_to_tar`; extracts safely under ``dest_dir``."""
+    """Inverse of :func:`pack_dir_to_tar`; extracts safely under ``dest_dir``.
+
+    Generator tars are miner-controlled, so every member is vetted: only regular
+    files and directories are allowed (no symlinks/hardlinks/devices), and every
+    resolved path must stay strictly inside ``dest`` (a plain string-prefix check
+    is unsafe — ``/dest`` prefixes the sibling ``/dest-evil``).
+    """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest.resolve()
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
         for member in tar.getmembers():
-            # Refuse path traversal — extracted content is owner/trusted for
-            # checkpoints but miner-controlled for generators.
+            if member.issym() or member.islnk() or member.isdev():
+                raise StorageError(f"unsafe_tar_member (link/dev): {member.name}")
             target = (dest / member.name).resolve()
-            if not str(target).startswith(str(dest.resolve())):
-                raise StorageError(f"unsafe_tar_member: {member.name}")
+            if target != dest_resolved and dest_resolved not in target.parents:
+                raise StorageError(f"unsafe_tar_member (escapes dest): {member.name}")
         tar.extractall(dest)  # noqa: S202 — members vetted above
     return dest
 

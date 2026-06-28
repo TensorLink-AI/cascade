@@ -53,6 +53,34 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
+    """Yield ``(B, P*patch_size)`` float64 training batches from a series stream.
+
+    Pure numpy (no torch) so it is unit-testable. Each incoming ``(C, L)`` or
+    ``(L,)`` series is reduced to channel 0 and its last ``P`` patches are kept,
+    where ``P = min(L // patch_size, max_ctx_patches)``; series with fewer than 2
+    patches are skipped (a next-patch objective needs at least one input + one
+    target patch). Batches are **bucketed by ``P``** so all rows in a batch share
+    a length and stack without padding. Full buckets are emitted eagerly; partial
+    buckets are flushed when the stream ends. This is what lets the trainer learn
+    from realistic series whose length is below the full ``context_length``.
+    """
+    buckets: dict[int, list[np.ndarray]] = {}
+    for series in stream:
+        s = np.asarray(series, dtype=np.float64)
+        if s.ndim == 2:
+            s = s[0]
+        p = min(int(s.shape[0]) // patch_size, max_ctx_patches)
+        if p < 2:
+            continue
+        buckets.setdefault(p, []).append(s[-p * patch_size :])
+        if len(buckets[p]) >= batch_size:
+            yield np.stack(buckets.pop(p), axis=0)
+    for items in buckets.values():
+        if items:
+            yield np.stack(items, axis=0)
+
+
 def _zeropower_newtonschulz(G, steps: int = 5, eps: float = 1e-7):
     """Newton-Schulz orthogonalisation used by Muon (the 'norm' in NorMuon is the
     operator's refinement). ``G`` is a 2-D tensor."""
@@ -114,26 +142,28 @@ class Toto2Trainer:
         levels = QUANTILE_LEVELS[: cfg.num_quantiles] if cfg.num_quantiles <= len(QUANTILE_LEVELS) else QUANTILE_LEVELS
         optimizer = self._build_optimizer(model, contract)
 
-        n_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
-        window_len = n_ctx_patches * cfg.patch_size
+        max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
-        batch: list[np.ndarray] = []
         tokens = 0
         step = 0
         last_loss = float("nan")
         t0 = time.time()
+        deadline = t0 + contract.max_train_seconds
 
-        def _flush_batch() -> None:
-            nonlocal tokens, step, last_loss
-            if not batch:
-                return
-            arr = np.stack(batch, axis=0)  # (B, window_len)
-            x = torch.as_tensor(arr, device=self.device, dtype=self.dtype)
+        # Bucketed batching: series shorter than the full context still train (the
+        # generator's max_length can be < context_length). Each batch holds series
+        # of the same patch count P, so a single forward covers them; P caps at
+        # max_ctx_patches. Position p predicts patch p+1.
+        for arr in iter_training_batches(
+            stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
+            batch_size=contract.batch_size,
+        ):
+            x = torch.as_tensor(arr, device=self.device, dtype=self.dtype)  # (B, P*ps)
             z, _, _ = causal_standardize(x)
-            patches = z.view(z.shape[0], n_ctx_patches, cfg.patch_size)
+            num_patches = arr.shape[1] // cfg.patch_size
+            patches = z.view(x.shape[0], num_patches, cfg.patch_size)
             pred = model(patches)                       # (B, P, patch_size, num_q)
-            # position p predicts patch p+1; align preds[:-1] with targets[1:]
             pred_q = pred[:, :-1]                        # (B, P-1, patch_size, num_q)
             target = patches[:, 1:]                     # (B, P-1, patch_size)
             loss = pinball_loss(pred_q, target, tuple(levels))
@@ -147,7 +177,7 @@ class Toto2Trainer:
             optimizer.step()
 
             last_loss = float(loss.detach().cpu())
-            tokens += arr.shape[0] * window_len
+            tokens += arr.shape[0] * arr.shape[1]
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)
@@ -156,22 +186,8 @@ class Toto2Trainer:
                     "tokens": tokens, "tokens_frac": tokens / max(1, token_budget),
                     "throughput_tokens_per_s": tokens / elapsed,
                 })
-            batch.clear()
-
-        deadline = t0 + contract.max_train_seconds
-        for series in stream:
-            s = np.asarray(series, dtype=np.float64)
-            if s.ndim == 2:           # (C, L) — univariate today; train channel 0
-                s = s[0]
-            # carve non-overlapping windows; drop the short tail
-            n = (s.shape[0] // window_len)
-            for w in range(n):
-                batch.append(s[w * window_len : (w + 1) * window_len])
-                if len(batch) >= contract.batch_size:
-                    _flush_batch()
             if tokens >= token_budget or time.time() > deadline:
                 break
-        _flush_batch()  # train on the partial final batch
 
         train_seconds = time.time() - t0
         param_count = sum(p.numel() for p in model.parameters())

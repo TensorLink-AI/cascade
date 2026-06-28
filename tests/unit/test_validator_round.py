@@ -99,6 +99,21 @@ def test_dethrone_after_consecutive_wins(cfg):
     assert runner.state.king_hotkey == "chal_hk"
 
 
+def test_vote_prefers_manifest_king_without_dethrone(cfg):
+    runner = ValidatorRunner(cfg=cfg, evaluate_fn=lambda e, w: [], verify_signatures=False)
+    # No outcome (e.g. king-only round) ⇒ keep voting the manifest's king (uid 0).
+    assert runner._king_uid_to_vote(_manifest(cfg), None) == 0
+
+
+def test_vote_switches_to_new_king_on_dethrone(cfg):
+    import types
+
+    runner = ValidatorRunner(cfg=cfg, state=genesis("chal_hk", 1), evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    dethroned = types.SimpleNamespace(transition=types.SimpleNamespace(dethroned=True))
+    assert runner._king_uid_to_vote(_manifest(cfg), dethroned) == 1  # state's (new) king
+
+
 def test_trainer_pairing_logic():
     commits = [
         Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),

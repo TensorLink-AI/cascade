@@ -172,15 +172,36 @@ class ValidatorRunner:
                 manifest = load_manifest(read_latest_manifest(store))
                 if manifest.round_id != last_round:
                     base_seed = int(manifest.round_id)
-                    windows = window_source.windows_for_round(base_seed, self.cfg.eval.n_windows)
-                    outcome = self.process_round(manifest, windows, base_seed)
-                    if outcome is not None and self.state.king_uid is not None:
-                        client.set_winner_take_all_weights(self.state.king_uid, client.n_uids())
-                    self._persist_state()
-                    last_round = manifest.round_id
+                    # Gate first so a rejected manifest never moves weights.
+                    reason = self.check_manifest(manifest)
+                    if reason is not None:
+                        log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
+                        last_round = manifest.round_id
+                    else:
+                        windows = window_source.windows_for_round(base_seed, self.cfg.eval.n_windows)
+                        outcome = self.process_round(manifest, windows, base_seed)
+                        vote_uid = self._king_uid_to_vote(manifest, outcome)
+                        if vote_uid is not None:
+                            client.set_winner_take_all_weights(vote_uid, client.n_uids())
+                        self._persist_state()
+                        last_round = manifest.round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
             time.sleep(poll)
+
+    def _king_uid_to_vote(self, manifest: TrainingManifest, outcome: RoundOutcome | None) -> int | None:
+        """The UID to put winner-take-all weight on this round.
+
+        The reigning king is whoever the trainer trained as ``king`` — *unless*
+        this round dethroned them, in which case the challenger (now ``state``'s
+        king) takes the weight. Voting the manifest king every round (not only
+        after a dethrone) is what keeps the throne stable when there is a single
+        miner or before any streak completes.
+        """
+        if outcome is not None and outcome.transition.dethroned and self.state.king_uid is not None:
+            return self.state.king_uid
+        king_entry = manifest.entry_for_role("king")
+        return king_entry.miner_uid if king_entry is not None else None
 
     def _persist_state(self) -> None:  # pragma: no cover
         from . import state as state_mod
