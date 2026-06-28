@@ -7,8 +7,9 @@ may itself be a trained model). The subnet owner runs a deterministic
 reigning king's generator output and on a challenger's generator output under
 an *identical* training contract — same architecture, seed, epochs, budget —
 so the only thing that varies between the two trained models is the data.
-Both trained checkpoints are pushed to HuggingFace and recorded in a signed
-training manifest. Validators pull both checkpoints, evaluate them on a shared
+Both trained checkpoints are pushed to the Hippius registry (IPFS) and recorded
+in a signed training manifest (published to Hippius S3 alongside per-round
+training logs). Validators pull both checkpoints, evaluate them on a shared
 held-out real-world eval set, and the challenger dethrones the king only if its
 trained model beats the king's by a confidence-bounded margin (paired bootstrap
 LCB on geomean(CRPS, MASE)). Weights are pure winner-takes-all.

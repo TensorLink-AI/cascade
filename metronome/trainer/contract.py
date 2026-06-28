@@ -22,14 +22,19 @@ at round start), so a second honest trainer reproduces the exact run.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 
 from ..shared.config import TrainingContractConfig
+
+# A training logger: the trainer loop passes one in so a :class:`BaseTrainer`
+# can stream per-step metrics (loss, lr, throughput, tokens) out to Hippius S3
+# for observability. ``None`` means "don't log" (offline / tests).
+TrainLogger = Callable[[dict], None]
 
 
 def _mix(base_seed: int, tag: str, salt: int = 0) -> int:
@@ -60,11 +65,18 @@ class RoundSeeds:
 
 @dataclass(frozen=True)
 class TrainResult:
-    """What a :class:`BaseTrainer` returns after training one model."""
+    """What a :class:`BaseTrainer` returns after training one model.
+
+    ``metrics`` is a small summary of the run (e.g. ``final_loss``, ``steps``,
+    ``tokens_seen``, ``throughput_tokens_per_s``) — recorded into the training
+    log alongside the per-step records the trainer streamed via the
+    :data:`TrainLogger`. Keep it JSON-serialisable.
+    """
 
     local_dir: Path        # directory holding the trained checkpoint to upload
     param_count: int
     train_seconds: float
+    metrics: dict = field(default_factory=dict)
 
 
 class BaseTrainer(Protocol):
@@ -100,5 +112,6 @@ class BaseTrainer(Protocol):
         training_seed: int,
         token_budget: int,
         out_dir: Path,
+        logger: TrainLogger | None = None,
     ) -> TrainResult:
         ...

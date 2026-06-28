@@ -2,21 +2,21 @@
 
 The trainer is the one component that touches GPUs: it draws each generator's
 corpus, trains a fresh base model under the fixed contract, and pushes the
-resulting checkpoint to HuggingFace. Validators never train; they read this
-manifest to learn *which* trained checkpoint corresponds to *which* miner's
-generator at *which* revision, then pull and evaluate.
+resulting checkpoint to the Hippius registry (IPFS). Validators never train; they
+read this manifest to learn *which* trained checkpoint (CID) corresponds to
+*which* miner's generator (CID), then pull and evaluate.
 
-A manifest is a JSON document published to an owner-controlled HF dataset repo
-(``[manifest] hf_dataset_repo``). Each :class:`TrainedEntry` is a receipt:
-generator pointer in, trained-model pointer out, plus the digests that make the
+A manifest is a JSON document published to the owner-controlled Hippius S3
+manifest bucket (``[storage] manifest_bucket``). Each :class:`TrainedEntry` is a
+receipt: generator CID in, trained-model CID out, plus the digests that make the
 run auditable — a second honest trainer (or a suspicious validator) can re-draw
 the corpus from the pinned generator + seed and re-train to confirm the digests
 match.
 
 Trust model (v1): validators trust manifests signed by ``[manifest]
-trainer_hotkey`` only. Signature verification is a TODO boundary
-(:func:`verify_signature`); see OPEN_QUESTIONS.md #1 for the decentralisation
-path.
+trainer_hotkey`` only. :func:`sign_manifest` signs the canonical body with the
+trainer's bittensor hotkey and :func:`verify_signature` checks it against the
+configured ss58 address; see OPEN_QUESTIONS.md #1 for the decentralisation path.
 """
 
 from __future__ import annotations
@@ -30,27 +30,28 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 # The trainer's output pointer — distinct ``trained`` tag so it can never be
-# confused with a miner's ``gen`` submission.
-TRAINED_RE = re.compile(
-    r"^metro-v1:trained:hf:(?P<repo>[A-Za-z0-9][A-Za-z0-9._\-]*/[A-Za-z0-9][A-Za-z0-9._\-]*)"
-    r"@(?P<sha>[A-Fa-f0-9]{40})$"
-)
+# confused with a miner's ``gen`` submission. Trained checkpoints live on the
+# Hippius registry (IPFS), content-addressed by CID.
+TRAINED_RE = re.compile(r"^metro-v1:trained:hippius:(?P<cid>[A-Za-z0-9]+)$")
 
 MANIFEST_VERSION = 1
 VALID_ROLES = ("king", "challenger")
 
 
-def parse_trained_pointer(payload: str) -> tuple[str, str] | None:
-    """Return ``(repo, revision)`` for a trained-model pointer, else None."""
+def parse_trained_pointer(payload: str) -> str | None:
+    """Return the registry ``cid`` for a trained-model pointer, else None."""
+    from .hippius import is_cid
+
     m = TRAINED_RE.match(payload.strip())
     if not m:
         return None
-    return m.group("repo"), m.group("sha").lower()
+    cid = m.group("cid")
+    return cid if is_cid(cid) else None
 
 
-def format_trained_pointer(repo: str, revision: str) -> str:
-    """Build a trained-model pointer; raises if it would not round-trip."""
-    payload = f"metro-v1:trained:hf:{repo}@{revision.lower()}"
+def format_trained_pointer(cid: str) -> str:
+    """Build a trained-model pointer from a registry CID; raises if malformed."""
+    payload = f"metro-v1:trained:hippius:{cid.strip()}"
     if parse_trained_pointer(payload) is None:
         raise ValueError(f"refusing to emit malformed trained pointer: {payload!r}")
     return payload
@@ -96,16 +97,22 @@ def contract_digest(contract: object) -> str:
 
 @dataclass(frozen=True)
 class TrainedEntry:
-    """One miner's training receipt for a round."""
+    """One miner's training receipt for a round.
+
+    ``gen_cid`` is the miner's generator pointer on the Hippius registry;
+    ``trained_pointer`` is the trained checkpoint's registry pointer. ``tar_digest``
+    is the sha256 of the uploaded checkpoint tar — a CID-independent integrity
+    check the validator re-verifies after fetch.
+    """
 
     miner_hotkey: str
     miner_uid: int
     role: str                 # "king" | "challenger"
-    gen_repo: str
-    gen_revision: str
-    trained_pointer: str      # metro-v1:trained:hf:<repo>@<sha>
+    gen_cid: str              # miner's generator CID on the registry
+    trained_pointer: str      # metro-v1:trained:hippius:<cid>
     corpus_digest: str
     train_block: int
+    tar_digest: str = ""      # sha256 of the checkpoint tar (integrity)
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -173,11 +180,11 @@ def load_manifest(text: str) -> TrainingManifest:
             miner_hotkey=str(e["miner_hotkey"]),
             miner_uid=int(e["miner_uid"]),
             role=str(e["role"]),
-            gen_repo=str(e["gen_repo"]),
-            gen_revision=str(e["gen_revision"]),
+            gen_cid=str(e["gen_cid"]),
             trained_pointer=str(e["trained_pointer"]),
             corpus_digest=str(e["corpus_digest"]),
             train_block=int(e["train_block"]),
+            tar_digest=str(e.get("tar_digest", "")),
         )
         for e in obj["entries"]
     ]
@@ -193,14 +200,44 @@ def load_manifest(text: str) -> TrainingManifest:
     )
 
 
-def verify_signature(manifest: TrainingManifest, trainer_hotkey: str) -> bool:
-    """Verify the manifest was signed by ``trainer_hotkey``.
+def sign_manifest(manifest: TrainingManifest, wallet: object) -> TrainingManifest:
+    """Sign ``canonical_body()`` with the trainer's bittensor hotkey.
 
-    TODO: wire to ``bittensor`` keypair verification over
-    :meth:`TrainingManifest.canonical_body`. Until signing is implemented this
-    returns True when a signature is present and the trust model is "operator
-    controls the HF dataset repo write token" — see OPEN_QUESTIONS.md #1.
+    ``wallet`` is a ``bittensor.wallet`` (or anything exposing ``.hotkey`` with a
+    ``.sign(bytes) -> bytes``). The hex signature is stored on a copy of the
+    manifest. Validators verify it with :func:`verify_signature` against the
+    configured ``[manifest] trainer_hotkey`` ss58 address.
     """
-    # Placeholder: presence check only. Real ss58 signature verification is the
-    # decentralisation milestone.
-    return manifest.signature is not None
+    from dataclasses import replace
+
+    hotkey = getattr(wallet, "hotkey", wallet)
+    try:
+        sig = hotkey.sign(manifest.canonical_body())
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"manifest_signing_failed: {type(e).__name__}: {e}") from e
+    return replace(manifest, signature=sig.hex() if isinstance(sig, (bytes, bytearray)) else str(sig))
+
+
+def verify_signature(manifest: TrainingManifest, trainer_hotkey: str) -> bool:
+    """Verify the manifest was signed by ``trainer_hotkey`` (an ss58 address).
+
+    Recreates the signer's public key from the ss58 address and checks the hex
+    signature over :meth:`TrainingManifest.canonical_body`. Returns False on a
+    missing signature, an address/signature mismatch, or any verification error.
+    Requires ``bittensor`` (the trust check only runs in the validator, which
+    already depends on it); if it is unavailable this raises so the caller does
+    not silently accept an unverified manifest.
+    """
+    if not manifest.signature or not trainer_hotkey:
+        return False
+    try:
+        from bittensor import Keypair  # type: ignore
+    except ImportError as e:  # pragma: no cover - validator has bittensor
+        raise RuntimeError(
+            "bittensor required to verify manifest signatures; install the [chain] extra"
+        ) from e
+    try:
+        kp = Keypair(ss58_address=trainer_hotkey)
+        return bool(kp.verify(manifest.canonical_body(), bytes.fromhex(manifest.signature)))
+    except Exception:  # noqa: BLE001 — any malformed sig/address ⇒ untrusted
+        return False

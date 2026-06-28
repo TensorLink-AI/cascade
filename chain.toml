@@ -93,7 +93,9 @@ corpus_mode = "stream_cpu"
 # distribution-match a fixed public benchmark — see metronome.validator.windows.
 eval_dataset   = "metronome-private-v1"  # identifier the validator matches on
 eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
-window_pool    = "tensorlink-ai/metronome-eval-private"  # owner-controlled pool (loader is a boundary)
+window_pool    = ""                       # Hippius registry CID of the held-out pool (.npy/.npz
+                                          # series + optional metadata.json). Upload with
+                                          # upload_dir_to_registry and pin the CID here before launch.
 num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
@@ -152,11 +154,27 @@ blocked = [
     "metronome.shared.chain",
 ]
 
+[storage]
+# Hippius is metronome's storage layer. Two backends:
+#   registry (IPFS) — models/checkpoints/generators, content-addressed by CID.
+#                     Miners commit metro-v1:gen:hippius:<cid>; the trainer
+#                     publishes metro-v1:trained:hippius:<cid>.
+#   S3 (boto3)      — training manifests + per-round training logs/metrics.
+# Credentials are NEVER in this committed file — they come from the environment:
+#   registry: IPFS_NODE_URL (overrides ipfs_api_url), HIPPIUS_ENCRYPTION_KEY (opt)
+#   S3:       HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY
+ipfs_api_url     = "http://127.0.0.1:5001"          # operator's IPFS node (registry backend)
+ipfs_gateway     = "https://get.hippius.network"    # read gateway for CIDs
+registry_encrypt = false                            # models are public; keep readable
+s3_endpoint      = "https://s3.hippius.com"
+s3_region        = "decentralized"
+manifest_bucket  = "metronome-manifests"            # round-<id>.json + latest.json
+logs_bucket      = "metronome-logs"                 # logs/round-<id>/<role>.jsonl
+
 [manifest]
-# Where the trainer publishes training receipts and the validator reads them.
-# hf_dataset_repo is owner-controlled; trainer_hotkey is the only signer a
-# validator trusts (see OPEN_QUESTIONS.md #1).
-hf_dataset_repo = "tensorlink-ai/metronome-manifests"
+# The trainer publishes signed training receipts to the manifest S3 bucket
+# ([storage] manifest_bucket) and validators read them. trainer_hotkey is the
+# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
 trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
 poll_seconds    = 120
 

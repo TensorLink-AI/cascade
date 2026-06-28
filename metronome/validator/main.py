@@ -22,9 +22,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
-    p.add_argument("--hf-cache-dir", type=Path, default=None)
+    p.add_argument("--cache-dir", type=Path, default=None, help="Local cache for fetched pool/ckpts.")
     p.add_argument("--device", default="cpu")
-    p.add_argument("--offline", action="store_true", help="No chain/HF; print state and exit.")
+    p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runner = build_runner(
         chain_toml=args.chain_toml,
-        hf_cache_dir=args.hf_cache_dir,
+        cache_dir=args.cache_dir,
         device=args.device,
     )
 
@@ -44,6 +44,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"king:     {runner.state.king_hotkey}")
         print(f"tenure:   {runner.state.tenure_rounds}")
         print(f"dethrone_cp: {runner.cfg.scoring.dethrone_cp}")
+        print(f"manifest_bucket: {runner.cfg.storage.manifest_bucket}")
+        print(f"window_pool: {runner.cfg.eval.window_pool}")
         print("offline validator smoke complete")
         return 0
 
@@ -51,11 +53,19 @@ def main(argv: list[str] | None = None) -> int:
         print("--wallet-name and --wallet-hotkey are required unless --offline", file=sys.stderr)
         return 2
 
-    # TODO: live loop — poll the manifest repo on an interval, process_round on
-    # each new round, set winner-take-all weights on runner.state.king_uid, and
-    # persist state to [validator] state_db_path. Left as a boundary so the
-    # chain + HF integration is reviewed on its own.
-    print("live validator loop not yet wired; see TODO in metronome/validator/main.py")
+    from ..shared.chain import ChainClient
+    from .pool import load_pool
+
+    client = ChainClient.from_config(
+        runner.cfg, network=args.network,
+        wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
+    )
+    log = logging.getLogger("metronome.validator")
+    log.info("loading private eval pool %s …", runner.cfg.eval.window_pool)
+    window_source = load_pool(runner.cfg, cache_dir=args.cache_dir)
+    log.info("validator up: netuid=%s manifest_bucket=%s — polling for rounds",
+             runner.cfg.netuid, runner.cfg.storage.manifest_bucket)
+    runner.run_forever(client, window_source=window_source)
     return 0
 
 

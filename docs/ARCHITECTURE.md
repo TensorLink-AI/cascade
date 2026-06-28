@@ -21,18 +21,21 @@ synthetic prior is the lever, and metronome competes it.
 
 ### 1. Miner — submits a generator
 
-A miner writes `generator.py` exposing `Generator(DataGenerator)` and commits a
+A miner writes `generator.py` exposing `Generator(DataGenerator)`, uploads the
+repo to the **Hippius registry** (IPFS) with `metronome deploy`, and commits a
 single on-chain pointer:
 
 ```
-metro-v1:gen:hf:<org>/<repo>@<40-char-sha>
+metro-v1:gen:hippius:<cid>
 ```
 
-The git SHA pins the generator code, `config.json`, `requirements.txt`, and any
-model weights together. A generator may itself be a trained model (safetensors
-only, size-capped) — the distinction from horizon is not "no weights" but *what
-is scored*: metronome scores the **data** (via a fixed model trained on it),
-horizon scores the submitted model directly. See `docs/INTERFACE.md`.
+The registry CID content-addresses the generator code, `config.json`,
+`requirements.txt`, and any model weights together — it both locates and pins the
+submission (a CID *is* the content hash, so there is no separate git SHA). A
+generator may itself be a trained model (safetensors only, size-capped) — the
+distinction from horizon is not "no weights" but *what is scored*: metronome
+scores the **data** (via a fixed model trained on it), horizon scores the
+submitted model directly. See `docs/INTERFACE.md`.
 
 ### 2. Trainer — owner-operated, the GPU boundary
 
@@ -51,12 +54,15 @@ Once per round the trainer:
      way the trainer gets one budget-capped iterator (univariate `C = 1` today;
      the channel axis is carried so multivariate priors need no schema change),
    - trains a **fresh Toto2-4M from random init** via the owner's `BaseTrainer`
-     (`metronome.trainer.contract`) — it pulls series until the stream ends, for
-     the contract's budget (~3h on the reference GPU, enforced as a fixed
-     `train_tokens` count so king and challenger get identical compute),
-   - uploads the checkpoint to HF.
-5. Publishes a signed `TrainingManifest` listing both trained-model pointers and
-   the corpus/contract digests.
+     (`metronome.trainer.contract`; reference: `metronome.trainer.toto2_trainer`)
+     — it pulls series until the stream ends, for the contract's budget (~3h on
+     the reference GPU, enforced as a fixed `train_tokens` count so king and
+     challenger get identical compute), streaming per-step metrics (loss, lr,
+     throughput) to **Hippius S3**,
+   - uploads the checkpoint to the **Hippius registry** (IPFS) and records its CID.
+5. Signs a `TrainingManifest` (trainer hotkey) listing both trained-model CIDs and
+   the corpus/contract digests, and publishes it to the **Hippius S3** manifest
+   bucket (`round-<id>.json` + `latest.json`).
 
 `BaseTrainer` is a `Protocol` — the single GPU-dependent seam. Everything else
 in the trainer is numpy/CPU and unit-tested. A reference implementation (a
@@ -135,15 +141,21 @@ validators or a trainer quorum re-derive and challenge a manifest). See
 ## What's implemented vs. a boundary
 
 Implemented and tested (numpy/CPU): the generator contract + output checks (with
-the MV-ready `(C, L)` channel axis), the static guard, commit/pointer parsing,
-config (the full from-scratch Toto2 contract, digest-pinned), the manifest schema
-+ digests, the full scoring + KOTH math, the champion state machine, corpus
-building from a generator, the trainer's pairing logic, and the **rotating
-private window selection** (`metronome.validator.windows`).
+the MV-ready `(C, L)` channel axis), the static guard, commit/pointer parsing
+(Hippius CID scheme), config (the full from-scratch Toto2 contract, digest-pinned),
+the manifest schema + digests + **signing/verification**, the full scoring + KOTH
+math, the champion state machine, corpus building from a generator, the trainer's
+pairing logic, the **Hippius storage layer** (deterministic registry packing, S3
+manifest/log layout), the rotating private window selection *and* the **eval-pool
+loader** (`metronome.validator.pool`), and the trainer-round assembly + both
+**live service loops** (`trainer/main.py`, `validator/main.py`).
 
-Boundaries left for the integrator (clearly marked TODO): the **Toto2-4M
-from-scratch `BaseTrainer`** (the GPU seam), the corpus sandbox subprocess, the
-private eval-**pool loader** (the rotating *selection* is implemented; pulling and
-slicing the held-out corpus into the pool is the boundary), manifest
-signing/verification, and the two live service loops (`trainer/main.py`,
-`validator/main.py`).
+The **Toto2-4M from-scratch `BaseTrainer`** ships as a runnable reference
+(`metronome.trainer.toto2_trainer`) behind the `[train]` extra — a causal patch
+transformer with a 9-quantile pinball head, u-μP-style init, a Muon+AdamW
+optimiser split, and a token-budget LR schedule. It is the one piece that needs a
+**GPU to validate end-to-end** (no GPU in CI); run a real round on your reference
+box, then pin `base_arch_digest` / `ref_throughput_tokens_per_s`. Other operator
+inputs before launch: the Hippius `[storage]` credentials/endpoints and the
+held-out eval-pool CID (`[eval] window_pool`). The corpus sandbox subprocess
+caveats are unchanged (OPEN_QUESTIONS.md #2).

@@ -20,7 +20,8 @@ from metronome.trainer.loop import plan_round, resolve_commitments
 from metronome.validator.loop import ValidatorRunner
 from metronome.validator.state import genesis
 
-SHA = "abc123def456abc123def456abc123def456abcd"
+CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+CID2 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
 
 
 def _scores(scale, seed, n=300):
@@ -38,8 +39,8 @@ def _scores(scale, seed, n=300):
 
 def _manifest(cfg):
     entries = [
-        TrainedEntry("king_hk", 0, "king", "o/g", SHA, format_trained_pointer("o/king", SHA), "d", 10),
-        TrainedEntry("chal_hk", 1, "challenger", "o/g2", SHA, format_trained_pointer("o/chal", SHA), "d", 10),
+        TrainedEntry("king_hk", 0, "king", CID, format_trained_pointer(CID2), "d", 10),
+        TrainedEntry("chal_hk", 1, "challenger", CID, format_trained_pointer(CID2), "d", 10),
     ]
     return TrainingManifest(
         round_id="1",
@@ -59,7 +60,7 @@ def test_process_round_strong_challenger_wins(cfg):
     def fake_eval(entry, windows):
         return king_scores if entry.role == "king" else chal_scores
 
-    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval)
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval, verify_signatures=False)
     outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
     assert outcome is not None
     assert outcome.result.challenger_wins_round
@@ -78,7 +79,7 @@ def test_process_round_rejects_contract_mismatch(cfg):
         eval_dataset=m.eval_dataset,
         entries=m.entries,
     )
-    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=lambda e, w: [])
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=lambda e, w: [], verify_signatures=False)
     assert runner.process_round(bad, windows=[], base_seed=1) is None
 
 
@@ -89,7 +90,7 @@ def test_dethrone_after_consecutive_wins(cfg):
     def fake_eval(entry, windows):
         return king_scores if entry.role == "king" else chal_scores
 
-    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval)
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval, verify_signatures=False)
     dethroned = False
     for r in range(cfg.scoring.dethrone_cp):
         outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=r)
@@ -100,8 +101,8 @@ def test_dethrone_after_consecutive_wins(cfg):
 
 def test_trainer_pairing_logic():
     commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hf:o/a@{SHA}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hf:o/b@{SHA}", commit_block=6),
+        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
+        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID2}", commit_block=6),
         Commitment(uid=2, hotkey="c", coldkey=None, payload="garbage", commit_block=7),
     ]
     resolved = resolve_commitments(commits)
@@ -113,7 +114,7 @@ def test_trainer_pairing_logic():
 
 def test_trainer_pairing_promotes_interim_king_when_absent():
     commits = [
-        Commitment(uid=3, hotkey="x", coldkey=None, payload=f"metro-v1:gen:hf:o/x@{SHA}", commit_block=5),
+        Commitment(uid=3, hotkey="x", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
     ]
     plan = plan_round(resolve_commitments(commits), king_hotkey=None)
     assert plan.king.hotkey == "x"

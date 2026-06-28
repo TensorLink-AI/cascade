@@ -35,11 +35,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--trainer", default=None, help="BaseTrainer as 'module:Class'.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
-    p.add_argument("--trained-repo-prefix", default=None, help="HF repo prefix for checkpoints.")
     p.add_argument("--network", default="finney")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
-    p.add_argument("--hf-token", default=None)
+    p.add_argument("--wallet-path", default=None)
+    p.add_argument("--max-challengers", type=int, default=1)
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -68,30 +68,30 @@ def main(argv: list[str] | None = None) -> int:
     if not args.trainer:
         print("--trainer module:Class is required for a live run", flush=True)
         return 2
-    if not args.trained_repo_prefix:
-        print("--trained-repo-prefix is required for a live run", flush=True)
+    if args.wallet_name is None or args.wallet_hotkey is None:
+        print("--wallet-name and --wallet-hotkey are required for a live run", flush=True)
         return 2
 
     from ..shared.chain import ChainClient
     from .loop import TrainerRunner
 
     base_trainer = _load_trainer(args.trainer)
-    runner = TrainerRunner(  # noqa: F841 — constructed; run loop is the TODO below
+    client = ChainClient.from_config(
+        cfg, network=args.network,
+        wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey,
+        wallet_path=args.wallet_path,
+    )
+    runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
         work_root=args.work_root,
-        trained_repo_prefix=args.trained_repo_prefix,
-        hf_token=args.hf_token,
+        wallet=client.wallet(),
     )
-    client = ChainClient.from_config(  # noqa: F841
-        cfg, network=args.network,
-        wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey,
+    logging.getLogger("metronome.trainer").info(
+        "trainer up: netuid=%s manifest_bucket=%s registry=%s",
+        cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.ipfs_api_url,
     )
-    # TODO: the live poll→train→publish loop. Wiring: read the metagraph for the
-    # highest-incentive UID (reigning king), poll commitments, pick base_seed
-    # from the block hash, runner.run_round(...), runner.publish(...). Left as a
-    # boundary so the GPU/chain integration is reviewed on its own.
-    print("live trainer loop not yet wired; see TODO in metronome/trainer/main.py")
+    runner.run_forever(client, max_challengers=args.max_challengers)
     return 0
 
 

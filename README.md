@@ -19,8 +19,9 @@ design into an open competition.
 flowchart TD
     subgraph miner["Miner (no GPU)"]
         gen["generator.py<br/>(DataGenerator)"]
-        commit["commit on-chain pointer<br/>metro-v1:gen:hf:repo@sha"]
-        gen --> commit
+        upload["upload to Hippius registry<br/>(IPFS) → CID"]
+        commit["commit on-chain pointer<br/>metro-v1:gen:hippius:cid"]
+        gen --> upload --> commit
     end
 
     subgraph trainer["Trainer: owner-operated (the GPU boundary)"]
@@ -30,10 +31,11 @@ flowchart TD
         corpusC["draw corpus<br/>(challenger's generator)"]
         trainK["train Toto2-4M<br/>from random init"]
         trainC["train Toto2-4M<br/>from random init"]
-        manifest["publish signed TrainingManifest<br/>(2 ckpts + corpus/contract digests)"]
+        upK["upload ckpts → Hippius registry<br/>logs/metrics → Hippius S3"]
+        manifest["sign + publish TrainingManifest<br/>to Hippius S3 (2 ckpt CIDs + digests)"]
         resolve --> seeds
-        seeds --> corpusK --> trainK --> manifest
-        seeds --> corpusC --> trainC --> manifest
+        seeds --> corpusK --> trainK --> upK --> manifest
+        seeds --> corpusC --> trainC --> upK
     end
 
     subgraph validator["Validator (eval GPU)"]
@@ -45,7 +47,7 @@ flowchart TD
     end
 
     commit -->|on-chain| resolve
-    manifest -->|manifest + HF ckpts| gate
+    manifest -->|S3 manifest + registry ckpts| gate
 
     classDef invariant fill:#fff3cd,stroke:#d39e00,color:#5c4400;
     class seeds,gate invariant;
@@ -135,8 +137,8 @@ metronome/
   eval/        scoring math: CRPS (MWSQL), MASE, paired bootstrap, KOTH decision
   trainer/     owner GPU service: corpus build, fixed contract, train+upload, manifest
   validator/   manifest gate, checkpoint evaluator, KOTH state machine, weights
-  miner/       miner CLI: verify, deploy
-  shared/      config loader, HF fetch/upload, chain client, manifest schema
+  miner/       miner CLI: verify, deploy (upload to Hippius registry + commit)
+  shared/      config loader, Hippius registry/S3, chain client, manifest schema
 
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
@@ -152,14 +154,22 @@ After `uv sync` / `pip install -e .`:
 * `metronome verify <repo_dir>`: runs every check the trainer runs (layout,
   static guard, hash-locked deps, **and the determinism check**: your generator
   must produce a byte-identical corpus at a fixed seed).
-* `metronome deploy <hf_repo> --revision <40-char-sha> --wallet-name ... --wallet-hotkey ...`:
-  commits `metro-v1:gen:hf:<repo>@<sha>` on-chain.
-* `metronome-trainer`: the owner training service (`--offline` for a config/seed smoke).
+* `metronome deploy <repo_dir> --wallet-name ... --wallet-hotkey ...`: verifies
+  the local generator, uploads it to the **Hippius registry** (IPFS), and commits
+  `metro-v1:gen:hippius:<cid>` on-chain (the CID pins the content — no git SHA).
+* `metronome-trainer --trainer metronome.trainer.toto2_trainer:Toto2Trainer`:
+  the owner training service (`--offline` for a config/seed smoke); the reference
+  Toto2-4M backend lives in `metronome.trainer.toto2_trainer`.
 * `metronome-validator`: the validator loop (`--offline` for a state smoke).
 
+Storage is **Hippius**: models/checkpoints/generators on the registry (IPFS,
+content-addressed by CID), manifests + training logs on Hippius **S3**. Install
+the extra (`pip install -e '.[hippius]'`) and set the env credentials
+(`HIPPIUS_S3_ACCESS_KEY` / `HIPPIUS_S3_SECRET_KEY`, `IPFS_NODE_URL`).
+
 Before launching, set `chain.toml [subnet] netuid`, `[training] base_arch_digest`
-(sha256 of the frozen base architecture), `[manifest] trainer_hotkey`, and the
-repo identifiers.
+(sha256 of the frozen base architecture), `[manifest] trainer_hotkey`, `[eval]
+window_pool` (the held-out pool's registry CID), and `[storage]` endpoints.
 
 ## Quick start
 
@@ -169,9 +179,13 @@ pip install -e '.[dev]'          # + pytest/ruff
 python -m pytest tests/unit -q   # pure-numpy tests, no torch/HF/chain needed
 ```
 
-The Toto2-4M from-scratch training is the **owner's** to implement behind the
-`metronome.trainer.contract.BaseTrainer` protocol (the GPU boundary); see
-`docs/ARCHITECTURE.md`. Everything above that boundary is numpy/CPU and tested.
+The Toto2-4M from-scratch training sits behind the
+`metronome.trainer.contract.BaseTrainer` protocol (the GPU boundary). A runnable
+reference implementation ships in `metronome.trainer.toto2_trainer` (a causal
+patch transformer with a 9-quantile pinball head, trained from random init under
+the `chain.toml [training]` recipe); it needs a GPU to validate end-to-end, so
+run it on your reference box before pinning `base_arch_digest`. Everything above
+that boundary is numpy/CPU and tested. See `docs/ARCHITECTURE.md`.
 
 ## License
 

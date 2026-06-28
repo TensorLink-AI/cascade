@@ -197,12 +197,29 @@ class StaticGuardConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """Hippius storage endpoints (credentials come from the environment).
+
+    The **registry** (IPFS, ``ipfs_api_url``) stores models/checkpoints/
+    generators content-addressed by CID; **S3** (``s3_endpoint``) stores training
+    manifests (``manifest_bucket``) and per-round training logs (``logs_bucket``).
+    """
+
+    ipfs_api_url: str
+    ipfs_gateway: str
+    registry_encrypt: bool
+    s3_endpoint: str
+    s3_region: str
+    manifest_bucket: str
+    logs_bucket: str
+
+
+@dataclass(frozen=True)
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
-    them. ``hf_dataset_repo`` is an owner-controlled HF dataset repo;
+    them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
     ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts."""
 
-    hf_dataset_repo: str
     trainer_hotkey: str
     poll_seconds: int
 
@@ -225,6 +242,7 @@ class ChainConfig:
     scoring: ScoringConfig
     dependencies: DependencyConfig
     static_guard: StaticGuardConfig
+    storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
     raw: dict[str, Any] = field(default_factory=dict)
@@ -278,6 +296,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     s = raw["scoring"]
     d = raw["dependencies"]
     sg = raw["static_guard"]
+    st = raw.get("storage", {})
     m = raw["manifest"]
     v = raw["validator"]
 
@@ -353,8 +372,16 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         static_guard=StaticGuardConfig(
             blocked=tuple(str(x) for x in sg["blocked"]),
         ),
+        storage=StorageConfig(
+            ipfs_api_url=str(st.get("ipfs_api_url", "http://127.0.0.1:5001")),
+            ipfs_gateway=str(st.get("ipfs_gateway", "https://get.hippius.network")),
+            registry_encrypt=bool(st.get("registry_encrypt", False)),
+            s3_endpoint=str(st.get("s3_endpoint", "https://s3.hippius.com")),
+            s3_region=str(st.get("s3_region", "decentralized")),
+            manifest_bucket=str(st.get("manifest_bucket", "metronome-manifests")),
+            logs_bucket=str(st.get("logs_bucket", "metronome-logs")),
+        ),
         manifest=ManifestConfig(
-            hf_dataset_repo=str(m["hf_dataset_repo"]),
             trainer_hotkey=str(m["trainer_hotkey"]),
             poll_seconds=int(m["poll_seconds"]),
         ),

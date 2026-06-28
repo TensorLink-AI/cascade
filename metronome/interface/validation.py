@@ -158,40 +158,42 @@ def check_requirements_hash_locked(
 
 # ----- on-chain commit format --------------------------------------------------
 
-# Single pointer string: ``metro-v1:gen:hf:<org>/<repo>@<git_sha>``
-# git_sha is 40-char hex (full SHA-1). The ``gen`` tag distinguishes a miner's
-# generator submission from the trainer's ``trained`` pointers in the manifest.
-COMMIT_RE = re.compile(
-    r"^metro-v1:gen:hf:(?P<repo>[A-Za-z0-9][A-Za-z0-9._\-]*/[A-Za-z0-9][A-Za-z0-9._\-]*)"
-    r"@(?P<sha>[A-Fa-f0-9]{40})$"
-)
+# Single pointer string: ``metro-v1:gen:hippius:<cid>``. The generator repo
+# (code + config + any safetensors weights) is packed and stored on the Hippius
+# registry (IPFS); the CID content-addresses it, so it both *locates* and
+# *pins* the submission — no separate revision is needed (a CID is the content
+# hash). The ``gen`` tag distinguishes a miner's submission from the trainer's
+# ``trained`` pointers in the manifest.
+COMMIT_RE = re.compile(r"^metro-v1:gen:hippius:(?P<cid>[A-Za-z0-9]+)$")
 
 
 @dataclass(frozen=True)
 class ParsedCommit:
-    repo: str
-    revision: str
+    """A parsed generator pointer. ``cid`` is the Hippius registry CID."""
+
+    cid: str
 
 
 def parse_commit(payload: str) -> ParsedCommit | None:
     """Return None for malformed payloads. The trainer treats None as a
-    permanent rejection of the submission.
-
-    Mixed-case SHAs are accepted and normalised to lowercase so identity
-    checks downstream are case-stable.
+    permanent rejection of the submission. The CID is validated against the
+    IPFS CID grammar so a garbage payload never reaches a fetch.
     """
+    from ..shared.hippius import is_cid
+
     m = COMMIT_RE.match(payload.strip())
     if not m:
         return None
-    return ParsedCommit(repo=m.group("repo"), revision=m.group("sha").lower())
+    cid = m.group("cid")
+    if not is_cid(cid):
+        return None
+    return ParsedCommit(cid=cid)
 
 
-def format_commit(repo: str, revision: str) -> str:
-    """Build the on-chain payload. Raises if the inputs would not round-trip
-    through :func:`parse_commit`. The revision is lowercased so two callers
-    that differ only in SHA case produce identical payloads.
-    """
-    payload = f"metro-v1:gen:hf:{repo}@{revision.lower()}"
+def format_commit(cid: str) -> str:
+    """Build the on-chain payload from a registry CID. Raises if it would not
+    round-trip through :func:`parse_commit`."""
+    payload = f"metro-v1:gen:hippius:{cid.strip()}"
     if parse_commit(payload) is None:
         raise ValueError(f"refusing to emit malformed commit: {payload!r}")
     return payload
