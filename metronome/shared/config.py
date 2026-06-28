@@ -137,6 +137,11 @@ class TrainingContractConfig:
     max_train_seconds: int
     # corpus feed mode (one of CORPUS_MODES); identical for king & challenger
     corpus_mode: str = "stream_cpu"
+    # Pinned GPU model for byte-exact re-derivation. When non-empty, the validator
+    # asserts every trained entry's recorded gpu_name == this (king and challenger
+    # ran the same SKU); empty ⇒ require only that king and challenger match each
+    # other when both report a gpu_name. Folded into contract_digest.
+    expected_gpu: str = ""
 
     @property
     def train_tokens(self) -> int:
@@ -197,12 +202,29 @@ class StaticGuardConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """Hippius storage endpoints (credentials come from the environment).
+
+    The **registry** (IPFS, ``ipfs_api_url``) stores models/checkpoints/
+    generators content-addressed by CID; **S3** (``s3_endpoint``) stores training
+    manifests (``manifest_bucket``) and per-round training logs (``logs_bucket``).
+    """
+
+    ipfs_api_url: str
+    ipfs_gateway: str
+    registry_encrypt: bool
+    s3_endpoint: str
+    s3_region: str
+    manifest_bucket: str
+    logs_bucket: str
+
+
+@dataclass(frozen=True)
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
-    them. ``hf_dataset_repo`` is an owner-controlled HF dataset repo;
+    them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
     ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts."""
 
-    hf_dataset_repo: str
     trainer_hotkey: str
     poll_seconds: int
 
@@ -225,6 +247,7 @@ class ChainConfig:
     scoring: ScoringConfig
     dependencies: DependencyConfig
     static_guard: StaticGuardConfig
+    storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
     raw: dict[str, Any] = field(default_factory=dict)
@@ -249,6 +272,44 @@ class ChainConfig:
             bootstrap_B=self.scoring.bootstrap_B,
             bootstrap_alpha=self.scoring.bootstrap_alpha,
             dethrone_cp=self.scoring.dethrone_cp,
+        )
+
+
+class LaunchConfigError(RuntimeError):
+    """chain.toml still carries launch placeholders that must be set."""
+
+
+_PLACEHOLDER_DIGEST = "0" * 64
+
+
+def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
+    """Refuse to start a live service while ``chain.toml`` holds placeholders.
+
+    ``role`` is ``"trainer"`` or ``"validator"``; each needs a slightly different
+    set. Raises :class:`LaunchConfigError` listing every unset value so the
+    operator fixes them in one pass rather than one failed launch at a time.
+    """
+    problems: list[str] = []
+    if cfg.netuid <= 0:
+        problems.append("[subnet] netuid is 0 (set the live netuid)")
+    if cfg.training.base_arch_digest in ("", _PLACEHOLDER_DIGEST) or len(cfg.training.base_arch_digest) != 64:
+        problems.append(
+            "[training] base_arch_digest is a placeholder "
+            "(run `metronome-trainer --offline` and paste the printed digest)"
+        )
+    if not cfg.manifest.trainer_hotkey:
+        problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
+    if role == "validator":
+        from .hippius import is_cid
+
+        if not is_cid(cfg.eval.window_pool):
+            problems.append(
+                "[eval] window_pool is not a Hippius registry CID "
+                "(upload the held-out pool and pin its CID)"
+            )
+    if problems:
+        raise LaunchConfigError(
+            "chain.toml is not launch-ready:\n  - " + "\n  - ".join(problems)
         )
 
 
@@ -278,6 +339,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     s = raw["scoring"]
     d = raw["dependencies"]
     sg = raw["static_guard"]
+    st = raw.get("storage", {})
     m = raw["manifest"]
     v = raw["validator"]
 
@@ -327,6 +389,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             train_seed_salt=int(t["train_seed_salt"]),
             max_train_seconds=int(t["max_train_seconds"]),
             corpus_mode=validate_corpus_mode(str(t.get("corpus_mode", "stream_cpu"))),
+            expected_gpu=str(t.get("expected_gpu", "")),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),
@@ -353,8 +416,16 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         static_guard=StaticGuardConfig(
             blocked=tuple(str(x) for x in sg["blocked"]),
         ),
+        storage=StorageConfig(
+            ipfs_api_url=str(st.get("ipfs_api_url", "http://127.0.0.1:5001")),
+            ipfs_gateway=str(st.get("ipfs_gateway", "https://get.hippius.network")),
+            registry_encrypt=bool(st.get("registry_encrypt", False)),
+            s3_endpoint=str(st.get("s3_endpoint", "https://s3.hippius.com")),
+            s3_region=str(st.get("s3_region", "decentralized")),
+            manifest_bucket=str(st.get("manifest_bucket", "metronome-manifests")),
+            logs_bucket=str(st.get("logs_bucket", "metronome-logs")),
+        ),
         manifest=ManifestConfig(
-            hf_dataset_repo=str(m["hf_dataset_repo"]),
             trainer_hotkey=str(m["trainer_hotkey"]),
             poll_seconds=int(m["poll_seconds"]),
         ),

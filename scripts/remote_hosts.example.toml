@@ -1,0 +1,41 @@
+# Example remote-training host file for `metronome-trainer --remote-hosts`.
+#
+# This file is TRAINER-LOCAL — keep it out of git and OFF the public chain.toml.
+# It lists the SSH GPU pods (Lium, Targon, or any host you can SSH into) that the
+# trainer dispatches a round's king and challenger to, in parallel. The first
+# host trains the king, the second the challenger (more hosts → a round-robin
+# pool for multi-challenger rounds).
+#
+# Each pod must already have: metronome installed (`pip install -e '.[train,hippius]'`),
+# torch + a GPU, and registry/S3 access. The pod does NOT need the bittensor
+# wallet — signing/publishing stays on the orchestrator. Seed the pod's env once
+# when you rent it (IPFS_NODE_URL, HIPPIUS_S3_ACCESS_KEY, HIPPIUS_S3_SECRET_KEY,
+# HIPPIUS_ENCRYPTION_KEY) OR list them under forward_env to have the orchestrator
+# pass them over SSH.
+#
+# For BYTE-EXACT re-derivation, rent the SAME GPU SKU on both pods and pin it in
+# chain.toml [training] expected_gpu (the reference trainer runs deterministically;
+# the validator rejects any round whose two checkpoints weren't trained on it).
+
+[[host]]
+name          = "king-box"
+host          = "203.0.113.10"        # pod public IP / hostname
+port          = 22
+user          = "root"
+key_path      = "~/.ssh/lium_ed25519"
+remote_python = "/root/metronome/.venv/bin/python"
+workdir       = "/root/metronome"     # where metronome is installed on the pod
+cuda_device   = "0"                    # pins CUDA_VISIBLE_DEVICES on the pod
+# chain_toml  = "/root/metronome/chain.toml"   # only if non-default on the pod
+# forward_env = ["IPFS_NODE_URL", "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY"]
+# ssh_options = ["ServerAliveInterval=30", "ServerAliveCountMax=120"]
+
+[[host]]
+name          = "challenger-box"
+host          = "203.0.113.11"
+port          = 22
+user          = "root"
+key_path      = "~/.ssh/targon_ed25519"
+remote_python = "/root/metronome/.venv/bin/python"
+workdir       = "/root/metronome"
+cuda_device   = "0"

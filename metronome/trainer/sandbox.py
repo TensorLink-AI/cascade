@@ -59,6 +59,14 @@ log = logging.getLogger("metronome.trainer.sandbox")
 # stripped so untrusted generator code never sees the trainer's secrets.
 _SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 
+# Extra env a GPU-resident (torch) generator needs to reach CUDA. Passed through
+# only in the stream_gpu profile. None of these carry secrets; they select/locate
+# the GPU and its libraries.
+_GPU_ENV_KEYS = (
+    "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
+    "CUDA_HOME", "CUDA_DEVICE_ORDER", "LD_LIBRARY_PATH", "PYTORCH_CUDA_ALLOC_CONF",
+)
+
 _NETNS_PROBE: bool | None = None
 
 
@@ -81,24 +89,35 @@ def _netns_available() -> bool:
     return _NETNS_PROBE
 
 
-def _apply_rlimits(max_memory_mb: int, max_cpu_seconds: int, max_fsize_bytes: int) -> None:
-    """preexec_fn: cap the child's resources before it execs (best-effort)."""
+def _apply_rlimits(
+    max_memory_mb: int, max_cpu_seconds: int, max_fsize_bytes: int, *, set_as: bool = True
+) -> None:
+    """preexec_fn: cap the child's resources before it execs (best-effort).
+
+    ``set_as=False`` skips the address-space cap: a CUDA/torch generator reserves
+    far more *virtual* memory than it uses, so RLIMIT_AS would kill it spuriously.
+    The CPU-seconds, core, and file-size caps still apply, and the GPU profile is
+    documented as requiring a no-egress container for hard isolation.
+    """
     import resource
 
-    mem = int(max_memory_mb) * 1024 * 1024
-    for name, vals in (
-        (resource.RLIMIT_AS, (mem, mem)),
+    limits = [
         (resource.RLIMIT_CPU, (int(max_cpu_seconds), int(max_cpu_seconds) + 5)),
         (resource.RLIMIT_CORE, (0, 0)),
         (resource.RLIMIT_FSIZE, (int(max_fsize_bytes), int(max_fsize_bytes))),
-    ):
+    ]
+    if set_as:
+        mem = int(max_memory_mb) * 1024 * 1024
+        limits.insert(0, (resource.RLIMIT_AS, (mem, mem)))
+    for name, vals in limits:
         # not every limit is settable in every environment
         with contextlib.suppress(ValueError, OSError):
             resource.setrlimit(name, vals)
 
 
-def _child_env() -> dict[str, str]:
-    env = {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
+def _child_env(*, gpu: bool = False) -> dict[str, str]:
+    keys = _SAFE_ENV_KEYS + (_GPU_ENV_KEYS if gpu else ())
+    env = {k: os.environ[k] for k in keys if k in os.environ}
     # Ensure the child can import metronome even without an editable install.
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     return env
@@ -245,6 +264,7 @@ def stream_series(
     *,
     blocked: tuple[str, ...] = (),
     allow_netns: bool = True,
+    gpu: bool = False,
 ) -> Iterator[Iterator[np.ndarray]]:
     """Yield an iterator of fresh ``(C, L)`` series streamed from a sandboxed child.
 
@@ -254,6 +274,14 @@ def stream_series(
     once it has its budget. Same isolation as :func:`run_in_sandbox` (rlimits, env
     scrub, optional netns, Python-socket block, pre-flight). The child is always
     terminated on exit, including early stop.
+
+    ``gpu=True`` is the ``stream_gpu`` profile for a CUDA/torch-resident
+    generator: the address-space rlimit is dropped (torch over-reserves virtual
+    memory) and the CUDA selection/library env is passed through, while the
+    network namespace + socket block stay on. Run the trainer in a **no-egress
+    container** for hard isolation here, since RLIMIT_AS no longer bounds the
+    child and CUDA needs device access. Audit is tolerance/same-hardware, not
+    byte-exact (see ``chain.toml [training] corpus_mode``).
     """
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
@@ -268,11 +296,13 @@ def stream_series(
     preexec = None
     if os.name == "posix":
         def preexec() -> None:
-            _apply_rlimits(cfg.max_memory_mb, cfg.max_generate_seconds, 256 * 1024 * 1024)
+            _apply_rlimits(
+                cfg.max_memory_mb, cfg.max_generate_seconds, 256 * 1024 * 1024, set_as=not gpu
+            )
 
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env=_child_env(), preexec_fn=preexec, bufsize=0,
+        env=_child_env(gpu=gpu), preexec_fn=preexec, bufsize=0,
     )
     try:
         yield _frame_iter(proc, cfg.max_generate_seconds)

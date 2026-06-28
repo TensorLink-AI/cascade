@@ -32,6 +32,7 @@ from ..shared.manifest import (
     TrainingManifest,
     contract_digest,
     parse_trained_pointer,
+    verify_signature,
 )
 from . import state as state_mod
 from .state import ChampionState, StateTransition
@@ -52,21 +53,22 @@ class RoundOutcome:
 class ValidatorRunner:
     cfg: ChainConfig
     state: ChampionState = field(default_factory=ChampionState)
-    evaluate_fn: EvaluateFn | None = None     # injected in tests; defaults to HF+torch
-    hf_cache_dir: Path | None = None
-    hf_token: str | None = None
+    evaluate_fn: EvaluateFn | None = None     # injected in tests; defaults to registry+torch
+    cache_dir: Path | None = None
     device: str = "cpu"
+    verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
     def check_manifest(self, manifest: TrainingManifest) -> str | None:
         """Return a rejection reason string, or None if the manifest is usable.
 
-        Enforces the contract-digest match (king and challenger trained under
-        the same terms) and that the manifest targets our configured base
-        architecture and eval dataset. Signature verification is delegated to
-        :func:`metronome.shared.manifest.verify_signature` (TODO).
+        Enforces (1) the trainer-hotkey signature, (2) the contract-digest match
+        (king and challenger trained under the same terms), and (3) that the
+        manifest targets our configured base architecture and eval dataset.
         """
+        if self.verify_signatures and not verify_signature(manifest, self.cfg.manifest.trainer_hotkey):
+            return "signature_invalid"
         want_contract = contract_digest(self.cfg.training)
         if manifest.contract_digest != want_contract:
             return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
@@ -74,6 +76,27 @@ class ValidatorRunner:
             return "base_arch_digest_mismatch"
         if manifest.eval_dataset != self.cfg.eval.eval_dataset:
             return "eval_dataset_mismatch"
+        gpu_reason = self._check_gpu(manifest)
+        if gpu_reason is not None:
+            return gpu_reason
+        return None
+
+    def _check_gpu(self, manifest: TrainingManifest) -> str | None:
+        """Matched-hardware gate for byte-exact re-derivation.
+
+        If ``[training] expected_gpu`` is pinned, every entry must report that GPU.
+        Otherwise require only that king and challenger ran the same GPU (when both
+        report one) — equal compute is already guaranteed by the token budget, but
+        a byte-exact audit needs the comparison run on one SKU.
+        """
+        pinned = self.cfg.training.expected_gpu
+        gpus = {e.gpu_name for e in manifest.entries if e.gpu_name}
+        if pinned:
+            bad = sorted(g for g in gpus if g != pinned)
+            if bad or any(not e.gpu_name for e in manifest.entries):
+                return f"gpu_mismatch: expected {pinned!r}, manifest has {sorted(gpus)!r}"
+        elif len(gpus) > 1:
+            return f"gpu_mismatch: king/challenger on different GPUs {sorted(gpus)!r}"
         return None
 
     # ── per-round decision ──────────────────────────────────────────────────
@@ -81,17 +104,21 @@ class ValidatorRunner:
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
         if self.evaluate_fn is not None:
             return self.evaluate_fn(entry, windows)
-        # Default path: fetch the checkpoint and score it (HF + torch).
-        from ..shared.hf import fetch_revision
+        # Default path: fetch the checkpoint from the Hippius registry and score
+        # it (registry + torch). The tar digest is re-verified on fetch.
+        from ..shared.hippius import RegistryConfig, fetch_from_registry
         from .evaluator import evaluate_checkpoint
 
-        pointer = parse_trained_pointer(entry.trained_pointer)
-        if pointer is None:
+        cid = parse_trained_pointer(entry.trained_pointer)
+        if cid is None:
             raise ValueError(f"malformed trained_pointer: {entry.trained_pointer!r}")
-        repo, revision = pointer
-        fetched = fetch_revision(repo, revision, cache_dir=self.hf_cache_dir, token=self.hf_token)
+        reg = RegistryConfig.from_storage(self.cfg.storage)
+        dest = Path(self.cache_dir or "./_eval_ckpts") / cid
+        fetch_from_registry(
+            cid, dest, reg, expected_tar_digest=entry.tar_digest or None
+        )
         return evaluate_checkpoint(
-            fetched.local_dir, windows, num_samples=self.cfg.eval.num_samples, device=self.device
+            dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
         )
 
     def process_round(
@@ -143,15 +170,105 @@ class ValidatorRunner:
         return RoundOutcome(result=result, transition=transition)
 
 
+    # ── live loop ────────────────────────────────────────────────────────────
+
+    def run_forever(self, client: object, *, window_source: object) -> None:  # pragma: no cover
+        """Poll the manifest bucket → evaluate → set weights, once per round.
+
+        ``window_source`` is a :class:`metronome.validator.windows.WindowSource`
+        (the loaded private pool). Each new manifest's ``round_id`` is the base
+        seed; the same seed drives the rotating window slice so every validator
+        scores the identical set.
+        """
+        import time
+
+        from ..shared.hippius import S3Config, S3Store, read_latest_manifest
+        from ..shared.manifest import load_manifest
+
+        store = S3Store(S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket))
+        poll = self.cfg.manifest.poll_seconds
+        last_round: str | None = None
+        while True:
+            try:
+                manifest = load_manifest(read_latest_manifest(store))
+                if manifest.round_id != last_round:
+                    base_seed = int(manifest.round_id)
+                    # Gate first so a rejected manifest never moves weights.
+                    reason = self.check_manifest(manifest)
+                    if reason is not None:
+                        log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
+                        last_round = manifest.round_id
+                    else:
+                        windows = window_source.windows_for_round(base_seed, self.cfg.eval.n_windows)
+                        # process_round mutates the sticky KOTH state atomically (it
+                        # raises before any mutation on a transient eval/fetch error,
+                        # leaving state untouched for a clean retry). Mark the round
+                        # consumed as soon as it returns, so a later weight-set failure
+                        # can NEVER re-run it and double-count the streak/tenure.
+                        outcome = self.process_round(manifest, windows, base_seed)
+                        last_round = manifest.round_id
+                        self._persist_state()
+                        vote_uid = self._king_uid_to_vote(manifest, outcome)
+                        if vote_uid is not None:
+                            try:
+                                client.set_winner_take_all_weights(vote_uid, client.n_uids())
+                            except Exception as e:  # noqa: BLE001 — retried next round
+                                log.warning("weight set failed for round=%s (king holds, "
+                                            "retried next round): %s", manifest.round_id, e)
+            except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
+                log.exception("round processing failed; retrying after poll: %s", e)
+            time.sleep(poll)
+
+    def _king_uid_to_vote(self, manifest: TrainingManifest, outcome: RoundOutcome | None) -> int | None:
+        """The UID to put winner-take-all weight on this round.
+
+        The reigning king is whoever the trainer trained as ``king`` — *unless*
+        this round dethroned them, in which case the challenger (now ``state``'s
+        king) takes the weight. Voting the manifest king every round (not only
+        after a dethrone) is what keeps the throne stable when there is a single
+        miner or before any streak completes.
+        """
+        if outcome is not None and outcome.transition.dethroned and self.state.king_uid is not None:
+            return self.state.king_uid
+        king_entry = manifest.entry_for_role("king")
+        return king_entry.miner_uid if king_entry is not None else None
+
+    def _persist_state(self) -> None:  # pragma: no cover
+        from . import state as state_mod
+
+        try:
+            Path(self.cfg.validator.state_db_path).write_text(
+                state_mod.dumps(self.state), encoding="utf-8"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("failed to persist validator state: %s", e)
+
+
+def _load_state(path: str) -> ChampionState:
+    """Load persisted champion state from ``state_db_path`` (JSON), or a fresh
+    state if the file is absent/unreadable."""
+    p = Path(path)
+    if not p.is_file():
+        return ChampionState()
+    try:
+        return state_mod.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not load validator state from %s (%s); starting fresh", path, e)
+        return ChampionState()
+
+
 def build_runner(
     *,
     chain_toml: Path | None = None,
-    hf_cache_dir: Path | None = None,
+    cache_dir: Path | None = None,
     device: str = "cpu",
 ) -> ValidatorRunner:
-    """Construct a runner from ``chain.toml``. Wallet/chain wiring for live
-    weight-setting is attached by ``metronome-validator`` (see main.py)."""
+    """Construct a runner from ``chain.toml``, restoring persisted champion
+    state. Wallet/chain wiring for live weight-setting is attached by
+    ``metronome-validator`` (see main.py)."""
     from ..shared.config import load_chain_config
 
     cfg = load_chain_config(chain_toml)
-    return ValidatorRunner(cfg=cfg, hf_cache_dir=hf_cache_dir, device=device)
+    return ValidatorRunner(
+        cfg=cfg, state=_load_state(cfg.validator.state_db_path), cache_dir=cache_dir, device=device
+    )

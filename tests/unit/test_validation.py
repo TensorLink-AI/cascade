@@ -12,31 +12,33 @@ from metronome.interface.validation import (
     parse_commit,
 )
 
-GOOD_SHA = "abc123def456abc123def456abc123def456abcd"
+# A valid CIDv0 (base58btc) and CIDv1 (base32) for the Hippius registry pointer.
+CID_V0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+CID_V1 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
 
 
 def test_parse_commit_round_trip():
-    payload = f"metro-v1:gen:hf:foo-org/some_repo@{GOOD_SHA}"
+    payload = f"metro-v1:gen:hippius:{CID_V0}"
     parsed = parse_commit(payload)
     assert parsed is not None
-    assert parsed.repo == "foo-org/some_repo"
-    assert parsed.revision == GOOD_SHA
-    assert format_commit("foo-org/some_repo", GOOD_SHA) == payload
+    assert parsed.cid == CID_V0
+    assert format_commit(CID_V0) == payload
+    # CIDv1 too
+    assert parse_commit(f"metro-v1:gen:hippius:{CID_V1}").cid == CID_V1
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         "",
-        "metro-v0:gen:hf:foo/bar@" + GOOD_SHA,
-        "metro-v1:trained:hf:foo/bar@" + GOOD_SHA,  # trained tag is not a gen commit
-        "metro-v1:gen:gcs:foo/bar@" + GOOD_SHA,
-        "metro-v1:gen:hf:foo@" + GOOD_SHA,
-        "metro-v1:gen:hf:foo/bar",
-        "metro-v1:gen:hf:foo/bar@deadbeef",
-        f"metro-v1:gen:hf:foo/bar@{GOOD_SHA}extra",
-        f"metro-v1:gen:hf: foo/bar@{GOOD_SHA}",
-        "metro-v1:gen:hf:/bar@" + GOOD_SHA,
+        f"metro-v0:gen:hippius:{CID_V0}",
+        f"metro-v1:trained:hippius:{CID_V0}",        # trained tag is not a gen commit
+        f"metro-v1:gen:hf:{CID_V0}",                  # old backend tag is gone
+        "metro-v1:gen:hippius:not-a-cid",
+        "metro-v1:gen:hippius:Qmtooshort",
+        f"metro-v1:gen:hippius: {CID_V0}",
+        f"metro-v1:gen:hippius:{CID_V0}extra!",
+        "metro-v1:gen:hippius:",
     ],
 )
 def test_parse_commit_rejects_malformed(payload):
@@ -45,15 +47,9 @@ def test_parse_commit_rejects_malformed(payload):
 
 def test_format_commit_refuses_invalid_inputs():
     with pytest.raises(ValueError):
-        format_commit("no_slash_in_repo", GOOD_SHA)
+        format_commit("not-a-cid")
     with pytest.raises(ValueError):
-        format_commit("foo/bar", "not-a-sha")
-
-
-def test_parse_commit_normalises_uppercase_sha():
-    parsed = parse_commit(f"metro-v1:gen:hf:foo/bar@{GOOD_SHA.upper()}")
-    assert parsed is not None
-    assert parsed.revision == GOOD_SHA
+        format_commit("Qmshort")
 
 
 def _write(tmp_path, name, content):

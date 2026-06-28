@@ -19,8 +19,9 @@ auditability and is rejected by the determinism check in
 ``metronome verify``.
 
 The on-chain submission is a single pointer string
-``metro-v1:gen:hf:<repo>@<sha>``; the git SHA pins the full HF tree — generator
-code, ``config.json``, ``requirements.txt``, and any model weights — together.
+``metro-v1:gen:hippius:<cid>``; the Hippius registry CID content-addresses the
+full repo tree — generator code, ``config.json``, ``requirements.txt``, and any
+model weights — together (the CID *is* the content hash, so it pins them).
 A generator MAY itself be a trained model (e.g. a PFN or an ensemble) behind the
 ``generate`` endpoint: ship weights as ``safetensors`` only (pickle checkpoints
 are rejected), within the ``max_repo_mb`` size cap. Determinism still applies —

@@ -38,7 +38,7 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # integers and base_arch_digest to that checkpoint's config.json before launch.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "0000000000000000000000000000000000000000000000000000000000000000"  # sha256 of frozen arch+init; set before launch
+base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `metronome-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -80,11 +80,21 @@ max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours s
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
 #                 the token budget. Byte-exact reproducible (rolling digest).
 #   stream_gpu  — live-stream from a GPU-resident generator (torch). High
-#                 throughput, but audit is tolerance/same-hardware, not byte-exact
-#                 (runtime not wired yet: needs torch on the allowlist + GPU sandbox).
+#                 throughput, but audit is tolerance/same-hardware, not byte-exact.
+#                 Wired: torch is on the [dependencies] allowlist and the sandbox
+#                 has a GPU profile (relaxed RLIMIT_AS + CUDA env). Run the trainer
+#                 in a no-egress container, since RLIMIT_AS no longer bounds it.
 #   cache_reuse — draw a fixed corpus once, then multi-pass it under the budget.
 #                 Byte-exact, but reuses data (some memorisation).
 corpus_mode = "stream_cpu"
+# Pin the GPU model for BYTE-EXACT re-derivation. The reference trainer runs
+# deterministically (deterministic cuBLAS/cuDNN, math attention, seeded RNG), so
+# on a fixed GPU SKU king/challenger and any audit re-run reproduce the exact
+# checkpoint. Set this to the exact torch device name of the SKU you rent on both
+# pods (e.g. "NVIDIA H100 80GB HBM3" — check with torch.cuda.get_device_name(0));
+# the validator then rejects any manifest whose entries weren't trained on it.
+# Empty = only require king and challenger to match each other.
+expected_gpu = ""
 
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,
@@ -93,7 +103,9 @@ corpus_mode = "stream_cpu"
 # distribution-match a fixed public benchmark — see metronome.validator.windows.
 eval_dataset   = "metronome-private-v1"  # identifier the validator matches on
 eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
-window_pool    = "tensorlink-ai/metronome-eval-private"  # owner-controlled pool (loader is a boundary)
+window_pool    = ""                       # Hippius registry CID of the held-out pool (.npy/.npz
+                                          # series + optional metadata.json). Upload with
+                                          # upload_dir_to_registry and pin the CID here before launch.
 num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
@@ -152,11 +164,27 @@ blocked = [
     "metronome.shared.chain",
 ]
 
+[storage]
+# Hippius is metronome's storage layer. Two backends:
+#   registry (IPFS) — models/checkpoints/generators, content-addressed by CID.
+#                     Miners commit metro-v1:gen:hippius:<cid>; the trainer
+#                     publishes metro-v1:trained:hippius:<cid>.
+#   S3 (boto3)      — training manifests + per-round training logs/metrics.
+# Credentials are NEVER in this committed file — they come from the environment:
+#   registry: IPFS_NODE_URL (overrides ipfs_api_url), HIPPIUS_ENCRYPTION_KEY (opt)
+#   S3:       HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY
+ipfs_api_url     = "http://127.0.0.1:5001"          # operator's IPFS node (registry backend)
+ipfs_gateway     = "https://get.hippius.network"    # read gateway for CIDs
+registry_encrypt = false                            # models are public; keep readable
+s3_endpoint      = "https://s3.hippius.com"
+s3_region        = "decentralized"
+manifest_bucket  = "metronome-manifests"            # round-<id>.json + latest.json
+logs_bucket      = "metronome-logs"                 # logs/round-<id>/<role>.jsonl
+
 [manifest]
-# Where the trainer publishes training receipts and the validator reads them.
-# hf_dataset_repo is owner-controlled; trainer_hotkey is the only signer a
-# validator trusts (see OPEN_QUESTIONS.md #1).
-hf_dataset_repo = "tensorlink-ai/metronome-manifests"
+# The trainer publishes signed training receipts to the manifest S3 bucket
+# ([storage] manifest_bucket) and validators read them. trainer_hotkey is the
+# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
 trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
 poll_seconds    = 120
 

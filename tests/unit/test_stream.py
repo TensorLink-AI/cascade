@@ -59,8 +59,19 @@ def test_cache_reuse_digest_is_unique_corpus(small_cfg, example_generator_dir):
     assert total >= BUDGET
 
 
-def test_stream_gpu_not_wired(small_cfg, example_generator_dir):
+def test_stream_gpu_is_wired(small_cfg, example_generator_dir):
+    # stream_gpu shares the fresh-series path; on a CPU (numpy) generator under
+    # the GPU sandbox profile it streams just like stream_cpu (the profile only
+    # relaxes the address-space rlimit + passes CUDA env, both no-ops here).
+    digest, n, total, points = _drain(
+        "stream_gpu", example_generator_dir, small_cfg.generator, use_sandbox=False
+    )
+    assert points == total >= BUDGET
+    assert n >= 1 and len(digest) == 64
+
+
+def test_unknown_corpus_mode_rejected(small_cfg, example_generator_dir):
     with pytest.raises(CorpusError):
         open_round_stream(
-            "stream_gpu", example_generator_dir, 0, small_cfg.generator, token_budget=BUDGET
+            "stream_tpu", example_generator_dir, 0, small_cfg.generator, token_budget=BUDGET
         )

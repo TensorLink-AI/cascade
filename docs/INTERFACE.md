@@ -14,7 +14,8 @@ cap — no interface change for you when that happens.
 
 ## Repo layout
 
-Your HuggingFace repo must contain at least:
+Your generator repo (a local directory `deploy` uploads to the Hippius registry)
+must contain at least:
 
 ```
 generator.py        # exposes `class Generator(DataGenerator)`
@@ -75,12 +76,15 @@ class Generator(DataGenerator):
 
 ```bash
 metronome verify ./my-generator-repo            # runs every trainer-side check
-metronome deploy <org>/<repo> --revision <40-char-sha> \
-    --wallet-name <coldkey> --wallet-hotkey <hotkey> --verify-dir ./my-generator-repo
+metronome deploy ./my-generator-repo \
+    --wallet-name <coldkey> --wallet-hotkey <hotkey>
 ```
 
-`deploy` writes `metro-v1:gen:hf:<org>/<repo>@<sha>` on-chain via
-`set_reveal_commitment`. The SHA pins the exact tree the trainer will fetch.
+`deploy` verifies the repo locally, uploads it to the **Hippius registry** (IPFS),
+and writes `metro-v1:gen:hippius:<cid>` on-chain via `set_reveal_commitment`. The
+CID content-addresses (and so pins) the exact tree the trainer will fetch — needs
+the `[hippius]` extra and an IPFS node (`IPFS_NODE_URL`). Already uploaded? Pass
+`--cid <cid>` to skip the upload and just commit.
 
 ## What good data looks like
 

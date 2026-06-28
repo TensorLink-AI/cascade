@@ -11,18 +11,21 @@ which miner's generator. Who produces that mapping, and why should a validator
 trust it?
 
 **Default.** A single owner-operated trainer publishes a signed
-`TrainingManifest` to an owner-controlled HF dataset repo (`[manifest]
-hf_dataset_repo`); validators trust manifests signed by `[manifest]
-trainer_hotkey` only. Training is centralised in v1 because it makes the
-controlled-experiment invariant trivially enforceable.
+`TrainingManifest` to the owner-controlled Hippius S3 manifest bucket (`[storage]
+manifest_bucket`, `round-<id>.json` + `latest.json`); validators trust manifests
+signed by `[manifest] trainer_hotkey` only. Signing is **wired**:
+`sign_manifest` signs `canonical_body()` with the trainer's bittensor hotkey and
+`verify_signature` checks it against the configured ss58 address (the validator
+gates every round on it; `ValidatorRunner.verify_signatures`). Training is
+centralised in v1 because it makes the controlled-experiment invariant trivially
+enforceable.
 
-**Flip point.** `metronome/shared/manifest.py::verify_signature` (currently a
-presence check — wire to bittensor keypair verification over
-`canonical_body()`). The decentralisation path: every corpus carries a
-`corpus_digest` and every run a `contract_digest`, so a validator or a trainer
-quorum can re-derive the corpus from the pinned generator + seed and re-train to
-challenge a manifest. Moving to a re-derivation challenge protocol is the
-milestone that removes the single trusted trainer.
+**Flip point.** The decentralisation path: every corpus carries a `corpus_digest`
+and every run a `contract_digest`, and every checkpoint a content-addressed CID,
+so a validator or a trainer quorum can re-derive the corpus from the pinned
+generator + seed, re-train, and compare CIDs/digests to challenge a manifest.
+Moving to a re-derivation challenge protocol is the milestone that removes the
+single trusted trainer.
 
 ## 2. Generation sandbox
 
@@ -108,11 +111,14 @@ scaffold; it was moved to private+rotating to close the benchmark-matching
 exploit (a named public benchmark is the easiest thing for a generator to overfit
 without producing generally-good data).
 
-**Flip point.** The seeded *selection/rotation* is implemented and tested; the
-**pool loader** (pull `window_pool`, slice into `EvalWindow`s via
-`build_windows_from_series`) is the remaining boundary, wired into the live
-validator loop (TODO in `validator/main.py`). Keep the pool genuinely held-out
-and refresh it periodically so it stays contamination-resistant.
+**Flip point.** Both halves are now **wired**: the seeded selection/rotation
+(`metronome.validator.windows`) and the **pool loader**
+(`metronome.validator.pool::load_pool`), which fetches the `window_pool` **Hippius
+registry CID**, loads its `.npy`/`.npz` series (+ optional `metadata.json`), and
+slices them with `build_windows_from_series`. The live validator loop calls it on
+startup. Operator inputs: upload the held-out pool to the registry with
+`upload_dir_to_registry`, pin its CID in `[eval] window_pool`, keep it genuinely
+held-out, and refresh it periodically so it stays contamination-resistant.
 
 ## 7. From-scratch budget and model size
 

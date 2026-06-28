@@ -10,7 +10,6 @@ authors = [{ name = "tensorlink-ai" }]
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
-    "huggingface-hub>=0.23",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +19,13 @@ train = [
     "transformers>=4.40",
     "safetensors>=0.4",
     "accelerate>=0.30",
+]
+# Hippius storage: registry (IPFS, hippius_sdk) for models/checkpoints/generators
+# + S3 (boto3) for manifests and training logs. The trainer, validator, and the
+# miner `deploy` need this; the core stays installable without it.
+hippius = [
+    "hippius>=0.2.60",
+    "boto3>=1.34",
 ]
 dev = [
     "pytest>=8.0",
@@ -34,6 +40,7 @@ chain = [
 [project.scripts]
 metronome = "metronome.miner.cli:main"
 metronome-trainer = "metronome.trainer.main:main"
+metronome-train-worker = "metronome.trainer.worker:main"
 metronome-validator = "metronome.validator.main:main"
 
 [build-system]
