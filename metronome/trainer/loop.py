@@ -115,6 +115,13 @@ class TrainerRunner:
     work_root: Path
     wallet: object | None = None       # bittensor wallet for signing (live)
     use_sandbox: bool = True           # run generators in the isolated subprocess
+    # Remote (two-device) training: when ``remote_hosts`` is set, each round's
+    # king and challenger train on separate SSH GPU pods in parallel (see
+    # metronome.trainer.remote). ``trainer_spec`` is the BaseTrainer 'module:Class'
+    # the pods run. None ⇒ local sequential training on this box.
+    remote_hosts: list | None = None
+    trainer_spec: str | None = None
+    remote_timeout_seconds: int = 6 * 3600
     _registry: RegistryConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -226,20 +233,27 @@ class TrainerRunner:
         max_challengers: int = 1,
     ) -> TrainingManifest:
         """Train the king and up to ``max_challengers`` challengers, returning
-        the assembled (unsigned) manifest. Does not publish; see
-        :meth:`publish`."""
+        the assembled (unsigned) manifest. Does not publish; see :meth:`publish`.
+
+        Trains locally (sequential) by default, or across ``remote_hosts`` (king
+        and challenger in parallel on separate GPU pods) when configured.
+        """
         resolved = resolve_commitments(commitments)
         plan = plan_round(resolved, king_hotkey)
         if plan.king is None:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
-        entries: list[TrainedEntry] = [self.train_one(plan.king, "king", seeds, block)]
-        for chal in plan.challengers[:max_challengers]:
-            try:
-                entries.append(self.train_one(chal, "challenger", seeds, block))
-            except Exception as e:  # noqa: BLE001
-                log.warning("challenger %s failed to train: %s", chal.hotkey, e)
+        jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
+        jobs += [(c, "challenger") for c in plan.challengers[:max_challengers]]
+
+        entries = (
+            self._train_remote(jobs, seeds, block)
+            if self.remote_hosts
+            else self._train_local(jobs, seeds, block)
+        )
+        if not entries or entries[0].role != "king":
+            raise RuntimeError("king training produced no entry; aborting round")
 
         return TrainingManifest(
             round_id=str(base_seed),
@@ -249,6 +263,60 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
         )
+
+    def _train_local(
+        self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
+    ) -> list[TrainedEntry]:
+        """Sequential training on this box: king first (its failure aborts the
+        round), then each challenger (a failure just drops that challenger)."""
+        entries: list[TrainedEntry] = []
+        for gen, role in jobs:
+            try:
+                entries.append(self.train_one(gen, role, seeds, block))
+            except Exception as e:  # noqa: BLE001
+                if role == "king":
+                    raise
+                log.warning("challenger %s failed to train: %s", gen.hotkey, e)
+        return entries
+
+    def _train_remote(
+        self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
+    ) -> list[TrainedEntry]:
+        """Parallel training across ``remote_hosts`` (e.g. king→pod A, challenger→
+        pod B over SSH). Equal compute is preserved (fixed token budget); audit is
+        tolerance-based on rented hardware. King failure aborts the round; a
+        challenger failure drops only that challenger."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from .remote import RemoteDispatcher
+
+        if not self.trainer_spec:
+            raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
+        hosts = self.remote_hosts
+        disp = RemoteDispatcher(
+            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
+        )
+
+        def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+            host = hosts[i % len(hosts)]
+            return disp.dispatch(
+                host, gen_cid=gen.cid, uid=gen.uid, hotkey=gen.hotkey,
+                role=role, base_seed=seeds.base_seed, block=block,
+            )
+
+        results: list[TrainedEntry | None] = [None] * len(jobs)
+        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
+            futs = {ex.submit(_run, i, gen, role): (i, gen, role)
+                    for i, (gen, role) in enumerate(jobs)}
+            for fut in as_completed(futs):
+                i, gen, role = futs[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    if role == "king":
+                        raise RuntimeError(f"king training failed on remote: {e}") from e
+                    log.warning("challenger %s failed on remote: %s", gen.hotkey, e)
+        return [r for r in results if r is not None]
 
     def publish(self, manifest: TrainingManifest) -> None:
         """Sign the manifest with the trainer hotkey and write it to the Hippius

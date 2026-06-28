@@ -40,6 +40,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
     p.add_argument("--max-challengers", type=int, default=1)
+    p.add_argument(
+        "--remote-hosts", type=Path, default=None,
+        help="Trainer-local TOML of SSH GPU pods ([[host]] tables). When set, king "
+             "and challenger train in parallel on separate pods (see trainer/remote.py).",
+    )
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -95,15 +100,29 @@ def main(argv: list[str] | None = None) -> int:
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey,
         wallet_path=args.wallet_path,
     )
+
+    remote_hosts = None
+    if args.remote_hosts is not None:
+        from .remote import load_hosts
+
+        remote_hosts = load_hosts(args.remote_hosts)
+        logging.getLogger("metronome.trainer").info(
+            "remote training across %d pod(s): %s",
+            len(remote_hosts), ", ".join(h.name for h in remote_hosts),
+        )
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
         work_root=args.work_root,
         wallet=client.wallet(),
+        remote_hosts=remote_hosts,
+        trainer_spec=args.trainer,
     )
     logging.getLogger("metronome.trainer").info(
-        "trainer up: netuid=%s manifest_bucket=%s registry=%s",
+        "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s",
         cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.ipfs_api_url,
+        "remote" if remote_hosts else "local",
     )
     runner.run_forever(client, max_challengers=args.max_challengers)
     return 0

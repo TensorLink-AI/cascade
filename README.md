@@ -159,7 +159,11 @@ After `uv sync` / `pip install -e .`:
   `metro-v1:gen:hippius:<cid>` on-chain (the CID pins the content — no git SHA).
 * `metronome-trainer --trainer metronome.trainer.toto2_trainer:Toto2Trainer`:
   the owner training service (`--offline` for a config/seed smoke); the reference
-  Toto2-4M backend lives in `metronome.trainer.toto2_trainer`.
+  Toto2-4M backend lives in `metronome.trainer.toto2_trainer`. Add
+  `--remote-hosts hosts.toml` to train the king and challenger **in parallel on
+  separate SSH GPU pods** (Lium/Targon); see `scripts/remote_hosts.example.toml`.
+* `metronome-train-worker`: the per-pod worker the remote dispatch runs (trains
+  one role, uploads its checkpoint, prints a receipt — no wallet on the pod).
 * `metronome-validator`: the validator loop (`--offline` for a state smoke).
 
 Storage is **Hippius**: models/checkpoints/generators on the registry (IPFS,

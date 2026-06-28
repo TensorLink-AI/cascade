@@ -40,6 +40,7 @@ chain = [
 [project.scripts]
 metronome = "metronome.miner.cli:main"
 metronome-trainer = "metronome.trainer.main:main"
+metronome-train-worker = "metronome.trainer.worker:main"
 metronome-validator = "metronome.validator.main:main"
 
 [build-system]

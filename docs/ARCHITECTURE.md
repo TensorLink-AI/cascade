@@ -72,6 +72,28 @@ NorMuon+AdamW split) is the operator's to provide; it must be **stateless across
 the king and challenger calls** so no information leaks between the two training
 runs (shared `training_seed` ⇒ identical random init for both).
 
+#### Two-device (remote) training
+
+By default the king and challenger train sequentially on the trainer's own GPU.
+For faster rounds the trainer can dispatch them **in parallel to separate
+SSH-reachable GPU pods** (e.g. rented Lium/Targon boxes) via `--remote-hosts`
+(`metronome.trainer.remote`). The remote unit is a **round-worker**
+(`metronome.trainer.worker`), not a remote `BaseTrainer`: each pod pulls its
+generator from the registry by CID, builds the corpus in its own sandbox, trains,
+uploads the checkpoint, and returns a `TrainedEntry` receipt over SSH. The
+orchestrator collects the receipts and signs + publishes the manifest, so **the
+trainer hotkey never lands on a rented box**; pods need registry/S3 access, not
+the wallet. The host list is a trainer-local file (`scripts/remote_hosts.example.toml`),
+never `chain.toml`.
+
+This preserves the controlled experiment: the budget is a fixed `train_tokens`
+count, so king and challenger get **identical compute** regardless of which (or
+how fast a) device runs them. The trade-off is auditability — from-scratch
+training only bit-reproduces on matched hardware, so on rented marketplace GPUs
+the re-derivation audit is **tolerance/same-hardware**, like `stream_gpu` (pin a
+single GPU SKU if you need byte-exact). King failure aborts the round; a
+challenger failure just drops that challenger.
+
 ### 3. Validator — reads the manifest, decides the throne
 
 The validator never trains. Each round it:
