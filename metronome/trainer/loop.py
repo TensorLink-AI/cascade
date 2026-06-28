@@ -221,6 +221,7 @@ class TrainerRunner:
             corpus_digest=corpus_digest,
             train_block=block,
             tar_digest=up.tar_digest,
+            gpu_name=str(result.metrics.get("gpu_name", "")),
         )
 
     def run_round(

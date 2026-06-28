@@ -137,6 +137,11 @@ class TrainingContractConfig:
     max_train_seconds: int
     # corpus feed mode (one of CORPUS_MODES); identical for king & challenger
     corpus_mode: str = "stream_cpu"
+    # Pinned GPU model for byte-exact re-derivation. When non-empty, the validator
+    # asserts every trained entry's recorded gpu_name == this (king and challenger
+    # ran the same SKU); empty ⇒ require only that king and challenger match each
+    # other when both report a gpu_name. Folded into contract_digest.
+    expected_gpu: str = ""
 
     @property
     def train_tokens(self) -> int:
@@ -384,6 +389,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             train_seed_salt=int(t["train_seed_salt"]),
             max_train_seconds=int(t["max_train_seconds"]),
             corpus_mode=validate_corpus_mode(str(t.get("corpus_mode", "stream_cpu"))),
+            expected_gpu=str(t.get("expected_gpu", "")),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),

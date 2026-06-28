@@ -113,6 +113,7 @@ class TrainedEntry:
     corpus_digest: str
     train_block: int
     tar_digest: str = ""      # sha256 of the checkpoint tar (integrity)
+    gpu_name: str = ""        # GPU model the run used; gated for matched-hardware audit
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -185,6 +186,7 @@ def load_manifest(text: str) -> TrainingManifest:
             corpus_digest=str(e["corpus_digest"]),
             train_block=int(e["train_block"]),
             tar_digest=str(e.get("tar_digest", "")),
+            gpu_name=str(e.get("gpu_name", "")),
         )
         for e in obj["entries"]
     ]

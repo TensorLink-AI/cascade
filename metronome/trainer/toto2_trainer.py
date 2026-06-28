@@ -25,6 +25,7 @@ versions before freezing the arch digest if you need bit-fidelity.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -103,13 +104,49 @@ def _zeropower_newtonschulz(G, steps: int = 5, eps: float = 1e-7):
 class Toto2Trainer:
     """Owner GPU backend. Stateless across king/challenger calls (a fresh model
     is built per :meth:`train`), so the shared ``training_seed`` gives both the
-    identical random init the controlled experiment requires."""
+    identical random init the controlled experiment requires.
 
-    def __init__(self, *, device: str | None = None, dtype: str = "float32"):
+    With ``deterministic=True`` (the default) the run is **byte-reproducible on a
+    fixed GPU model**: deterministic cuBLAS/cuDNN, the math (not flash) attention
+    kernel, and all RNGs seeded from ``training_seed``. Combined with running king
+    and challenger on the **same pinned GPU SKU** (enforced at the validator gate
+    via the recorded ``gpu_name``), a re-derived audit run reproduces the exact
+    checkpoint. Pinning the SKU is the operator's job; this class makes the run
+    deterministic given it.
+    """
+
+    def __init__(self, *, device: str | None = None, dtype: str = "float32",
+                 deterministic: bool = True):
+        import os
+
+        self.deterministic = deterministic
+        if deterministic:
+            # Must be set before the first cuBLAS handle is created for
+            # deterministic GEMMs; setdefault so an operator override wins.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         import torch
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = getattr(torch, dtype)
+
+    def _enable_determinism(self, torch, seed: int) -> None:
+        """Force byte-reproducible kernels + seed every RNG (best-effort across
+        torch versions)."""
+        if not self.deterministic:
+            return
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        with contextlib.suppress(Exception):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        # Flash / mem-efficient attention are nondeterministic; force math SDPA.
+        for fn, arg in (("enable_flash_sdp", False),
+                        ("enable_mem_efficient_sdp", False),
+                        ("enable_math_sdp", True)):
+            with contextlib.suppress(Exception):
+                getattr(torch.backends.cuda, fn)(arg)
 
     # ── training ──────────────────────────────────────────────────────────────
 
@@ -135,6 +172,7 @@ class Toto2Trainer:
 
         torch.manual_seed(training_seed)
         np.random.seed(training_seed % (2**32 - 1))
+        self._enable_determinism(torch, training_seed)
 
         cfg = Toto2Config.from_contract(contract)
         model = Toto2Model(cfg).to(self.device, self.dtype)
@@ -191,10 +229,16 @@ class Toto2Trainer:
 
         train_seconds = time.time() - t0
         param_count = sum(p.numel() for p in model.parameters())
+        gpu_name = (
+            torch.cuda.get_device_name(0)
+            if self.device.startswith("cuda") and torch.cuda.is_available()
+            else "cpu"
+        )
         metrics = {
             "final_loss": last_loss, "steps": step, "tokens_seen": tokens,
             "param_count": param_count,
             "throughput_tokens_per_s": tokens / max(1e-6, train_seconds),
+            "gpu_name": gpu_name, "deterministic": self.deterministic,
         }
         if logger is not None:
             logger({"event": "done", **metrics})

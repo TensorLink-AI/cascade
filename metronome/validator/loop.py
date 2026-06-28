@@ -76,6 +76,27 @@ class ValidatorRunner:
             return "base_arch_digest_mismatch"
         if manifest.eval_dataset != self.cfg.eval.eval_dataset:
             return "eval_dataset_mismatch"
+        gpu_reason = self._check_gpu(manifest)
+        if gpu_reason is not None:
+            return gpu_reason
+        return None
+
+    def _check_gpu(self, manifest: TrainingManifest) -> str | None:
+        """Matched-hardware gate for byte-exact re-derivation.
+
+        If ``[training] expected_gpu`` is pinned, every entry must report that GPU.
+        Otherwise require only that king and challenger ran the same GPU (when both
+        report one) — equal compute is already guaranteed by the token budget, but
+        a byte-exact audit needs the comparison run on one SKU.
+        """
+        pinned = self.cfg.training.expected_gpu
+        gpus = {e.gpu_name for e in manifest.entries if e.gpu_name}
+        if pinned:
+            bad = sorted(g for g in gpus if g != pinned)
+            if bad or any(not e.gpu_name for e in manifest.entries):
+                return f"gpu_mismatch: expected {pinned!r}, manifest has {sorted(gpus)!r}"
+        elif len(gpus) > 1:
+            return f"gpu_mismatch: king/challenger on different GPUs {sorted(gpus)!r}"
         return None
 
     # ── per-round decision ──────────────────────────────────────────────────

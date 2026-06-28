@@ -87,6 +87,14 @@ max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours s
 #   cache_reuse — draw a fixed corpus once, then multi-pass it under the budget.
 #                 Byte-exact, but reuses data (some memorisation).
 corpus_mode = "stream_cpu"
+# Pin the GPU model for BYTE-EXACT re-derivation. The reference trainer runs
+# deterministically (deterministic cuBLAS/cuDNN, math attention, seeded RNG), so
+# on a fixed GPU SKU king/challenger and any audit re-run reproduce the exact
+# checkpoint. Set this to the exact torch device name of the SKU you rent on both
+# pods (e.g. "NVIDIA H100 80GB HBM3" — check with torch.cuda.get_device_name(0));
+# the validator then rejects any manifest whose entries weren't trained on it.
+# Empty = only require king and challenger to match each other.
+expected_gpu = ""
 
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,

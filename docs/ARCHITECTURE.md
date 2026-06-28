@@ -88,11 +88,19 @@ never `chain.toml`.
 
 This preserves the controlled experiment: the budget is a fixed `train_tokens`
 count, so king and challenger get **identical compute** regardless of which (or
-how fast a) device runs them. The trade-off is auditability — from-scratch
-training only bit-reproduces on matched hardware, so on rented marketplace GPUs
-the re-derivation audit is **tolerance/same-hardware**, like `stream_gpu` (pin a
-single GPU SKU if you need byte-exact). King failure aborts the round; a
-challenger failure just drops that challenger.
+how fast a) device runs them. King failure aborts the round; a challenger failure
+just drops that challenger.
+
+**Byte-exact audit (pinned GPU).** The reference trainer runs deterministically
+(deterministic cuBLAS/cuDNN, the math attention kernel, all RNGs seeded from
+`training_seed`), so on a **fixed GPU SKU** a re-derived run reproduces the exact
+checkpoint. Each run records its `torch.cuda.get_device_name(...)` into the
+manifest entry's `gpu_name`, and the validator's gate enforces matched hardware:
+with `[training] expected_gpu` set, every entry must report that SKU; otherwise
+king and challenger must at least match each other. So pin one SKU on both pods
+(e.g. both an H100) and the round is byte-reproducible end-to-end; leave
+`expected_gpu` empty and you only lose the cross-round SKU pin, not the
+king-vs-challenger guarantee.
 
 ### 3. Validator — reads the manifest, decides the throne
 
