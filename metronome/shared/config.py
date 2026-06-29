@@ -211,14 +211,14 @@ class StaticGuardConfig:
 class StorageConfig:
     """Hippius storage endpoints (credentials come from the environment).
 
-    The **registry** (IPFS, ``ipfs_api_url``) stores models/checkpoints/
-    generators content-addressed by CID; **S3** (``s3_endpoint``) stores training
-    manifests (``manifest_bucket``) and per-round training logs (``logs_bucket``).
+    The **registry** (Hippius Hub OCI, ``hub_registry_url``) stores models/
+    checkpoints/generators pinned by ``repo@digest``; **S3** (``s3_endpoint``)
+    stores training manifests (``manifest_bucket``) and per-round training logs
+    (``logs_bucket``).
     """
 
-    ipfs_api_url: str
-    ipfs_gateway: str
-    registry_encrypt: bool
+    hub_registry_url: str
+    hub_namespace: str
     s3_endpoint: str
     s3_region: str
     manifest_bucket: str
@@ -333,13 +333,13 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     if not cfg.manifest.trainer_hotkey:
         problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
     if role == "validator":
-        from .hippius import is_cid
+        from .hippius import is_hub_ref
 
-        # Either a daily-published pool bucket OR a static window_pool CID.
-        if not cfg.storage.pool_bucket and not is_cid(cfg.eval.window_pool):
+        # Either a daily-published pool bucket OR a static window_pool ref.
+        if not cfg.storage.pool_bucket and not is_hub_ref(cfg.eval.window_pool):
             problems.append(
                 "no eval pool configured: set [storage] pool_bucket (daily snapshots, "
-                "recommended) or pin a [eval] window_pool Hippius registry CID"
+                "recommended) or pin a [eval] window_pool Hippius Hub ref (repo@digest)"
             )
     if problems:
         raise LaunchConfigError(
@@ -454,9 +454,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             blocked=tuple(str(x) for x in sg["blocked"]),
         ),
         storage=StorageConfig(
-            ipfs_api_url=str(st.get("ipfs_api_url", "http://127.0.0.1:5001")),
-            ipfs_gateway=str(st.get("ipfs_gateway", "https://get.hippius.network")),
-            registry_encrypt=bool(st.get("registry_encrypt", False)),
+            hub_registry_url=str(st.get("hub_registry_url", "https://registry.hippius.com")),
+            hub_namespace=str(st.get("hub_namespace", "metronome")),
             s3_endpoint=str(st.get("s3_endpoint", "https://s3.hippius.com")),
             s3_region=str(st.get("s3_region", "decentralized")),
             manifest_bucket=str(st.get("manifest_bucket", "metronome-manifests")),

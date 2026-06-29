@@ -14,7 +14,7 @@ cap — no interface change for you when that happens.
 
 ## Repo layout
 
-Your generator repo (a local directory `deploy` uploads to the Hippius registry)
+Your generator repo (a local directory `deploy` pushes to the Hippius Hub registry)
 must contain at least:
 
 ```
@@ -76,15 +76,16 @@ class Generator(DataGenerator):
 
 ```bash
 metronome verify ./my-generator-repo            # runs every trainer-side check
-metronome deploy ./my-generator-repo \
+metronome deploy ./my-generator-repo --hub-repo <namespace/name> \
     --wallet-name <coldkey> --wallet-hotkey <hotkey>
 ```
 
-`deploy` verifies the repo locally, uploads it to the **Hippius registry** (IPFS),
-and writes `metro-v1:gen:hippius:<cid>` on-chain via `set_reveal_commitment`. The
-CID content-addresses (and so pins) the exact tree the trainer will fetch — needs
-the `[hippius]` extra and an IPFS node (`IPFS_NODE_URL`). Already uploaded? Pass
-`--cid <cid>` to skip the upload and just commit.
+`deploy` verifies the repo locally, pushes it to your **Hippius Hub** repo (OCI),
+and writes `metro-v1:gen:hippius:<repo>@<digest>` on-chain via
+`set_reveal_commitment`. The OCI digest content-addresses (and so pins) the exact
+tree the trainer will fetch — needs the `[hippius]` extra and Hub credentials
+(`HIPPIUS_HUB_TOKEN`, or `HIPPIUS_HUB_USERNAME` + `HIPPIUS_HUB_PASSWORD`). Already
+pushed? Pass `--ref <repo@digest>` to skip the upload and just commit.
 
 ## What good data looks like
 

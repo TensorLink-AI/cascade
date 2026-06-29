@@ -10,8 +10,8 @@ from metronome.shared.manifest import (
     verify_signature,
 )
 
-CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-CID_T = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+REF = "alice/metro-gen@sha256:" + "a" * 64
+REF_T = "metronome/ckpt-r1-king@sha256:" + "c" * 64
 
 
 def _manifest(sig=None):
@@ -21,7 +21,7 @@ def _manifest(sig=None):
         contract_digest="c" * 64,
         base_arch_digest="a" * 64,
         eval_dataset="metronome-private-v1",
-        entries=[TrainedEntry("hk", 0, "king", CID, f"metro-v1:trained:hippius:{CID_T}", "d", 1)],
+        entries=[TrainedEntry("hk", 0, "king", REF, f"metro-v1:trained:hippius:{REF_T}", "d", 1)],
         signature=sig,
     )
 

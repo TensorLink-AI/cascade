@@ -21,17 +21,17 @@ synthetic prior is the lever, and metronome competes it.
 
 ### 1. Miner — submits a generator
 
-A miner writes `generator.py` exposing `Generator(DataGenerator)`, uploads the
-repo to the **Hippius registry** (IPFS) with `metronome deploy`, and commits a
+A miner writes `generator.py` exposing `Generator(DataGenerator)`, pushes the
+repo to the **Hippius Hub registry** (OCI) with `metronome deploy`, and commits a
 single on-chain pointer:
 
 ```
-metro-v1:gen:hippius:<cid>
+metro-v1:gen:hippius:<repo>@<digest>
 ```
 
-The registry CID content-addresses the generator code, `config.json`,
+The Hub `repo@digest` content-addresses the generator code, `config.json`,
 `requirements.txt`, and any model weights together — it both locates and pins the
-submission (a CID *is* the content hash, so there is no separate git SHA). A
+submission (the OCI digest *is* the content hash, so there is no separate git SHA). A
 generator may itself be a trained model (safetensors only, size-capped) — the
 distinction from horizon is not "no weights" but *what is scored*: metronome
 scores the **data** (via a fixed model trained on it), horizon scores the
@@ -59,8 +59,8 @@ Once per round the trainer:
      the reference GPU, enforced as a fixed `train_tokens` count so king and
      challenger get identical compute), streaming per-step metrics (loss, lr,
      throughput) to **Hippius S3**,
-   - uploads the checkpoint to the **Hippius registry** (IPFS) and records its CID.
-5. Signs a `TrainingManifest` (trainer hotkey) listing both trained-model CIDs and
+   - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its ref.
+5. Signs a `TrainingManifest` (trainer hotkey) listing both trained-model refs and
    the corpus/contract digests, and publishes it to the **Hippius S3** manifest
    bucket (`round-<id>.json` + `latest.json`).
 
@@ -79,7 +79,7 @@ For faster rounds the trainer can dispatch them **in parallel to separate
 SSH-reachable GPU pods** (e.g. rented Lium/Targon boxes) via `--remote-hosts`
 (`metronome.trainer.remote`). The remote unit is a **round-worker**
 (`metronome.trainer.worker`), not a remote `BaseTrainer`: each pod pulls its
-generator from the registry by CID, builds the corpus in its own sandbox, trains,
+generator from the registry by ref, builds the corpus in its own sandbox, trains,
 uploads the checkpoint, and returns a `TrainedEntry` receipt over SSH. The
 orchestrator collects the receipts and signs + publishes the manifest, so **the
 trainer hotkey never lands on a rented box**; pods need registry/S3 access, not
@@ -178,11 +178,11 @@ validators or a trainer quorum re-derive and challenge a manifest). See
 
 Implemented and tested (numpy/CPU): the generator contract + output checks (with
 the MV-ready `(C, L)` channel axis), the static guard, commit/pointer parsing
-(Hippius CID scheme), config (the full from-scratch Toto2 contract, digest-pinned),
+(Hippius Hub `repo@digest` scheme), config (the full from-scratch Toto2 contract, digest-pinned),
 the manifest schema + digests + **signing/verification**, the full scoring + KOTH
 math, the champion state machine, corpus building from a generator, the trainer's
-pairing logic, the **Hippius storage layer** (deterministic registry packing, S3
-manifest/log layout), the rotating private window selection *and* the **eval-pool
+pairing logic, the **Hippius storage layer** (Hub ref grammar + S3
+manifest/log/pool-snapshot layout), the rotating private window selection *and* the **eval-pool
 loader** (`metronome.validator.pool`), and the trainer-round assembly + both
 **live service loops** (`trainer/main.py`, `validator/main.py`).
 
@@ -193,5 +193,5 @@ optimiser split, and a token-budget LR schedule. It is the one piece that needs 
 **GPU to validate end-to-end** (no GPU in CI); run a real round on your reference
 box, then pin `base_arch_digest` / `ref_throughput_tokens_per_s`. Other operator
 inputs before launch: the Hippius `[storage]` credentials/endpoints and the
-held-out eval-pool CID (`[eval] window_pool`). The corpus sandbox subprocess
+held-out eval-pool ref (`[eval] window_pool`). The corpus sandbox subprocess
 caveats are unchanged (OPEN_QUESTIONS.md #2).

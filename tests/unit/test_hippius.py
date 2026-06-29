@@ -1,5 +1,6 @@
-"""Hippius storage helpers — pure parts (tar packing, CID grammar, S3 manifest +
-log layout over a fake S3 client). No real IPFS node / boto3 endpoint needed."""
+"""Hippius storage helpers — pure parts (Hub ref grammar, tar packing for S3
+pool snapshots, S3 manifest + log layout over a fake S3 client). No real Hub /
+boto3 endpoint needed."""
 
 from __future__ import annotations
 
@@ -8,11 +9,24 @@ import pytest
 from metronome.shared import hippius
 
 
-def test_is_cid_accepts_v0_and_v1_rejects_garbage():
-    assert hippius.is_cid("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
-    assert hippius.is_cid("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
-    for bad in ("", "Qmshort", "not-a-cid", "QmYwAP!Jzv5", "metro-v1:gen"):
-        assert not hippius.is_cid(bad)
+def test_hub_ref_parses_and_rejects_garbage():
+    ref = hippius.HubRef.parse("alice/metro-gen@sha256:" + "a" * 64)
+    assert ref.repo == "alice/metro-gen"
+    assert ref.digest == "sha256:" + "a" * 64
+    assert ref.immutable_ref == "alice/metro-gen@sha256:" + "a" * 64
+    # hf: digests are accepted too (a genesis/eval artefact mirrored on HF).
+    assert hippius.is_hub_ref("ns/name@hf:" + "b" * 40)
+    for bad in (
+        "",
+        "not-a-ref",                              # no @digest
+        "alice/gen@sha256:short",                 # truncated digest
+        "alice/gen@deadbeef",                     # missing sha256: prefix
+        "@sha256:" + "a" * 64,                    # empty repo
+        "Alice Gen/x@sha256:" + "a" * 64,         # space in repo
+    ):
+        assert not hippius.is_hub_ref(bad)
+    with pytest.raises(hippius.StorageError):
+        hippius.HubRef.parse("no-at-sign")
 
 
 def test_pack_dir_is_deterministic_and_round_trips(tmp_path):

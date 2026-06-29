@@ -158,42 +158,42 @@ def check_requirements_hash_locked(
 
 # ----- on-chain commit format --------------------------------------------------
 
-# Single pointer string: ``metro-v1:gen:hippius:<cid>``. The generator repo
-# (code + config + any safetensors weights) is packed and stored on the Hippius
-# registry (IPFS); the CID content-addresses it, so it both *locates* and
-# *pins* the submission — no separate revision is needed (a CID is the content
-# hash). The ``gen`` tag distinguishes a miner's submission from the trainer's
-# ``trained`` pointers in the manifest.
-COMMIT_RE = re.compile(r"^metro-v1:gen:hippius:(?P<cid>[A-Za-z0-9]+)$")
+# Single pointer string: ``metro-v1:gen:hippius:<repo>@<digest>``. The generator
+# repo (code + config + any safetensors weights) is pushed to the Hippius Hub OCI
+# registry; the immutable ``repo@digest`` reference both *locates* and *pins* the
+# submission — the OCI manifest digest is the content hash, so no separate
+# revision is needed. The ``gen`` tag distinguishes a miner's submission from the
+# trainer's ``trained`` pointers in the manifest.
+COMMIT_RE = re.compile(r"^metro-v1:gen:hippius:(?P<ref>.+)$")
 
 
 @dataclass(frozen=True)
 class ParsedCommit:
-    """A parsed generator pointer. ``cid`` is the Hippius registry CID."""
+    """A parsed generator pointer. ``ref`` is the Hippius Hub ``repo@digest``."""
 
-    cid: str
+    ref: str
 
 
 def parse_commit(payload: str) -> ParsedCommit | None:
     """Return None for malformed payloads. The trainer treats None as a
-    permanent rejection of the submission. The CID is validated against the
-    IPFS CID grammar so a garbage payload never reaches a fetch.
+    permanent rejection of the submission. The reference is validated against the
+    Hub ``repo@digest`` grammar so a garbage payload never reaches a fetch.
     """
-    from ..shared.hippius import is_cid
+    from ..shared.hippius import is_hub_ref
 
     m = COMMIT_RE.match(payload.strip())
     if not m:
         return None
-    cid = m.group("cid")
-    if not is_cid(cid):
+    ref = m.group("ref").strip()
+    if not is_hub_ref(ref):
         return None
-    return ParsedCommit(cid=cid)
+    return ParsedCommit(ref=ref)
 
 
-def format_commit(cid: str) -> str:
-    """Build the on-chain payload from a registry CID. Raises if it would not
-    round-trip through :func:`parse_commit`."""
-    payload = f"metro-v1:gen:hippius:{cid.strip()}"
+def format_commit(ref: str) -> str:
+    """Build the on-chain payload from a Hub ``repo@digest`` reference. Raises if
+    it would not round-trip through :func:`parse_commit`."""
+    payload = f"metro-v1:gen:hippius:{ref.strip()}"
     if parse_commit(payload) is None:
         raise ValueError(f"refusing to emit malformed commit: {payload!r}")
     return payload

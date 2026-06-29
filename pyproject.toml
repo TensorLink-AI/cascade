@@ -20,11 +20,13 @@ train = [
     "safetensors>=0.4",
     "accelerate>=0.30",
 ]
-# Hippius storage: registry (IPFS, hippius_sdk) for models/checkpoints/generators
-# + S3 (boto3) for manifests and training logs. The trainer, validator, and the
-# miner `deploy` need this; the core stays installable without it.
+# Hippius storage: registry (Hippius Hub OCI, hippius_hub) for models/
+# checkpoints/generators + S3 (boto3) for manifests and training logs. The
+# trainer, validator, and the miner `deploy` need this; the core stays
+# installable without it.
 hippius = [
-    "hippius>=0.2.60",
+    "hippius-hub",
+    "huggingface_hub>=0.23",   # for hf:-pinned genesis/eval refs in fetch_from_hub
     "boto3>=1.34",
 ]
 dev = [

@@ -2,13 +2,14 @@
 
 The trainer is the one component that touches GPUs: it draws each generator's
 corpus, trains a fresh base model under the fixed contract, and pushes the
-resulting checkpoint to the Hippius registry (IPFS). Validators never train; they
-read this manifest to learn *which* trained checkpoint (CID) corresponds to
-*which* miner's generator (CID), then pull and evaluate.
+resulting checkpoint to the Hippius Hub registry. Validators never train; they
+read this manifest to learn *which* trained checkpoint (``repo@digest``)
+corresponds to *which* miner's generator (``repo@digest``), then pull and
+evaluate.
 
 A manifest is a JSON document published to the owner-controlled Hippius S3
 manifest bucket (``[storage] manifest_bucket``). Each :class:`TrainedEntry` is a
-receipt: generator CID in, trained-model CID out, plus the digests that make the
+receipt: generator ref in, trained-model ref out, plus the digests that make the
 run auditable — a second honest trainer (or a suspicious validator) can re-draw
 the corpus from the pinned generator + seed and re-train to confirm the digests
 match.
@@ -31,27 +32,27 @@ import numpy as np
 
 # The trainer's output pointer — distinct ``trained`` tag so it can never be
 # confused with a miner's ``gen`` submission. Trained checkpoints live on the
-# Hippius registry (IPFS), content-addressed by CID.
-TRAINED_RE = re.compile(r"^metro-v1:trained:hippius:(?P<cid>[A-Za-z0-9]+)$")
+# Hippius Hub registry, pinned by ``repo@digest``.
+TRAINED_RE = re.compile(r"^metro-v1:trained:hippius:(?P<ref>.+)$")
 
 MANIFEST_VERSION = 1
 VALID_ROLES = ("king", "challenger")
 
 
 def parse_trained_pointer(payload: str) -> str | None:
-    """Return the registry ``cid`` for a trained-model pointer, else None."""
-    from .hippius import is_cid
+    """Return the registry ``repo@digest`` for a trained-model pointer, else None."""
+    from .hippius import is_hub_ref
 
     m = TRAINED_RE.match(payload.strip())
     if not m:
         return None
-    cid = m.group("cid")
-    return cid if is_cid(cid) else None
+    ref = m.group("ref").strip()
+    return ref if is_hub_ref(ref) else None
 
 
-def format_trained_pointer(cid: str) -> str:
-    """Build a trained-model pointer from a registry CID; raises if malformed."""
-    payload = f"metro-v1:trained:hippius:{cid.strip()}"
+def format_trained_pointer(ref: str) -> str:
+    """Build a trained-model pointer from a Hub ``repo@digest``; raises if malformed."""
+    payload = f"metro-v1:trained:hippius:{ref.strip()}"
     if parse_trained_pointer(payload) is None:
         raise ValueError(f"refusing to emit malformed trained pointer: {payload!r}")
     return payload
@@ -99,20 +100,20 @@ def contract_digest(contract: object) -> str:
 class TrainedEntry:
     """One miner's training receipt for a round.
 
-    ``gen_cid`` is the miner's generator pointer on the Hippius registry;
-    ``trained_pointer`` is the trained checkpoint's registry pointer. ``tar_digest``
-    is the sha256 of the uploaded checkpoint tar — a CID-independent integrity
-    check the validator re-verifies after fetch.
+    ``gen_ref`` is the miner's generator pointer on the Hippius Hub
+    (``repo@digest``); ``trained_pointer`` is the trained checkpoint's registry
+    pointer. The OCI digest inside each ``repo@digest`` is itself the integrity
+    hash — the fetch verifies the layer blobs against it — so no separate tar
+    digest is carried.
     """
 
     miner_hotkey: str
     miner_uid: int
     role: str                 # "king" | "challenger"
-    gen_cid: str              # miner's generator CID on the registry
-    trained_pointer: str      # metro-v1:trained:hippius:<cid>
+    gen_ref: str              # miner's generator repo@digest on the registry
+    trained_pointer: str      # metro-v1:trained:hippius:<repo>@<digest>
     corpus_digest: str
     train_block: int
-    tar_digest: str = ""      # sha256 of the checkpoint tar (integrity)
     gpu_name: str = ""        # GPU model the run used; gated for matched-hardware audit
 
     def __post_init__(self) -> None:
@@ -181,11 +182,10 @@ def load_manifest(text: str) -> TrainingManifest:
             miner_hotkey=str(e["miner_hotkey"]),
             miner_uid=int(e["miner_uid"]),
             role=str(e["role"]),
-            gen_cid=str(e["gen_cid"]),
+            gen_ref=str(e["gen_ref"]),
             trained_pointer=str(e["trained_pointer"]),
             corpus_digest=str(e["corpus_digest"]),
             train_block=int(e["train_block"]),
-            tar_digest=str(e.get("tar_digest", "")),
             gpu_name=str(e.get("gpu_name", "")),
         )
         for e in obj["entries"]

@@ -9,7 +9,7 @@ import pytest
 from metronome.shared.config import LaunchConfigError, assert_launch_ready
 from metronome.trainer.contract import compute_base_arch_digest
 
-CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+REF = "metronome/eval-pool@sha256:" + "a" * 64
 
 
 def test_arch_digest_deterministic_and_arch_sensitive(cfg):
@@ -26,7 +26,7 @@ def _launch_ready(cfg):
     training = replace(cfg.training, base_arch_digest=digest)
     subnet = replace(cfg.subnet, netuid=42)
     manifest = replace(cfg.manifest, trainer_hotkey="5Fhotkeyaddress")
-    eval_ = replace(cfg.eval, window_pool=CID)
+    eval_ = replace(cfg.eval, window_pool=REF)
     return replace(cfg, subnet=subnet, training=training, manifest=manifest, eval=eval_)
 
 
@@ -50,10 +50,10 @@ def test_assert_launch_ready_flags_zero_digest(cfg):
 def test_assert_launch_ready_passes_when_set(cfg):
     ready = _launch_ready(cfg)
     assert_launch_ready(ready, role="trainer")        # no raise
-    assert_launch_ready(ready, role="validator")      # window_pool CID set too
+    assert_launch_ready(ready, role="validator")      # window_pool ref set too
 
 
-def test_validator_requires_window_pool_cid(cfg):
+def test_validator_requires_window_pool_ref(cfg):
     ready = _launch_ready(cfg)
     no_pool = replace(ready, eval=replace(ready.eval, window_pool=""))
     with pytest.raises(LaunchConfigError) as ei:

@@ -19,8 +19,8 @@ design into an open competition.
 flowchart TD
     subgraph miner["Miner (no GPU)"]
         gen["generator.py<br/>(DataGenerator)"]
-        upload["upload to Hippius registry<br/>(IPFS) → CID"]
-        commit["commit on-chain pointer<br/>metro-v1:gen:hippius:cid"]
+        upload["push to Hippius Hub registry<br/>(OCI) → repo@digest"]
+        commit["commit on-chain pointer<br/>metro-v1:gen:hippius:repo@digest"]
         gen --> upload --> commit
     end
 
@@ -31,8 +31,8 @@ flowchart TD
         corpusC["draw corpus<br/>(challenger's generator)"]
         trainK["train Toto2-4M<br/>from random init"]
         trainC["train Toto2-4M<br/>from random init"]
-        upK["upload ckpts → Hippius registry<br/>logs/metrics → Hippius S3"]
-        manifest["sign + publish TrainingManifest<br/>to Hippius S3 (2 ckpt CIDs + digests)"]
+        upK["push ckpts → Hippius Hub registry<br/>logs/metrics → Hippius S3"]
+        manifest["sign + publish TrainingManifest<br/>to Hippius S3 (2 ckpt refs + digests)"]
         resolve --> seeds
         seeds --> corpusK --> trainK --> upK --> manifest
         seeds --> corpusC --> trainC --> upK
@@ -143,8 +143,8 @@ metronome/
   eval/        scoring math: CRPS (MWSQL), MASE, paired bootstrap, KOTH decision
   trainer/     owner GPU service: corpus build, fixed contract, train+upload, manifest
   validator/   manifest gate, checkpoint evaluator, KOTH state machine, weights
-  miner/       miner CLI: verify, deploy (upload to Hippius registry + commit)
-  shared/      config loader, Hippius registry/S3, chain client, manifest schema
+  miner/       miner CLI: verify, deploy (push to Hippius Hub registry + commit)
+  shared/      config loader, Hippius Hub registry/S3, chain client, manifest schema
 
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
@@ -160,9 +160,10 @@ After `uv sync` / `pip install -e .`:
 * `metronome verify <repo_dir>`: runs every check the trainer runs (layout,
   static guard, hash-locked deps, **and the determinism check**: your generator
   must produce a byte-identical corpus at a fixed seed).
-* `metronome deploy <repo_dir> --wallet-name ... --wallet-hotkey ...`: verifies
-  the local generator, uploads it to the **Hippius registry** (IPFS), and commits
-  `metro-v1:gen:hippius:<cid>` on-chain (the CID pins the content — no git SHA).
+* `metronome deploy <repo_dir> --hub-repo <ns/name> --wallet-name ... --wallet-hotkey ...`:
+  verifies the local generator, pushes it to the **Hippius Hub registry** (OCI),
+  and commits `metro-v1:gen:hippius:<repo>@<digest>` on-chain (the OCI digest pins
+  the content — no git SHA).
 * `metronome-trainer --trainer metronome.trainer.toto2_trainer:Toto2Trainer`:
   the owner training service (`--offline` for a config/seed smoke); the reference
   Toto2-4M backend lives in `metronome.trainer.toto2_trainer`. Add
@@ -172,14 +173,15 @@ After `uv sync` / `pip install -e .`:
   one role, uploads its checkpoint, prints a receipt — no wallet on the pod).
 * `metronome-validator`: the validator loop (`--offline` for a state smoke).
 
-Storage is **Hippius**: models/checkpoints/generators on the registry (IPFS,
-content-addressed by CID), manifests + training logs on Hippius **S3**. Install
-the extra (`pip install -e '.[hippius]'`) and set the env credentials
-(`HIPPIUS_S3_ACCESS_KEY` / `HIPPIUS_S3_SECRET_KEY`, `IPFS_NODE_URL`).
+Storage is **Hippius**: models/checkpoints/generators on the **Hippius Hub**
+registry (OCI, pinned by `repo@digest`), manifests + training logs on Hippius
+**S3**. Install the extra (`pip install -e '.[hippius]'`) and set the env
+credentials (`HIPPIUS_S3_ACCESS_KEY` / `HIPPIUS_S3_SECRET_KEY`, and a Hub token
+`HIPPIUS_HUB_TOKEN` or `HIPPIUS_HUB_USERNAME` + `HIPPIUS_HUB_PASSWORD`).
 
 Before launching, set `chain.toml [subnet] netuid`, `[training] base_arch_digest`
 (sha256 of the frozen base architecture), `[manifest] trainer_hotkey`, `[eval]
-window_pool` (the held-out pool's registry CID), and `[storage]` endpoints.
+window_pool` (the held-out pool's Hub `repo@digest`), and `[storage]` endpoints.
 
 ## Quick start
 

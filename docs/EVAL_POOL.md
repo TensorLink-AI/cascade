@@ -1,10 +1,10 @@
 # Building the held-out eval pool
 
 Validators score the king's and challenger's trained models on a **private,
-rotating pool of real-world series** (`[eval] window_pool`, a Hippius registry
-CID). This doc covers the **producer** side — turning real data into that pool —
-with `metronome.pool` and the `metronome-pool` CLI. The consumer side (fetch CID
-→ slice into windows) lives in `metronome.validator.pool` / `.windows`.
+rotating pool of real-world series** (`[eval] window_pool`, a Hippius Hub
+`repo@digest`). This doc covers the **producer** side — turning real data into
+that pool — with `metronome.pool` and the `metronome-pool` CLI. The consumer side
+(fetch ref → slice into windows) lives in `metronome.validator.pool` / `.windows`.
 
 ## Why this design is hard to game
 
@@ -30,12 +30,12 @@ time-series foundation models pretrain on.
    `metronome-pool publish` on a cron; validators pull the current snapshot from
    `[storage] pool_bucket` with **no `chain.toml` edit**. This is how the pool
    *rotates in time* — see "Daily rotation & consensus" below.
-2. **Static CID.** `metronome-pool build --upload` pins one snapshot's CID in
-   `[eval] window_pool`. Simple, but refreshing the data means editing
-   `chain.toml` + redeploying. Use it for a fixed pool or local testing.
+2. **Static ref.** `metronome-pool build --upload` pins one snapshot's Hub
+   `repo@digest` in `[eval] window_pool`. Simple, but refreshing the data means
+   editing `chain.toml` + redeploying. Use it for a fixed pool or local testing.
 
 If `[storage] pool_bucket` is set, the validator uses the bucket; otherwise it
-falls back to the static CID.
+falls back to the static ref.
 
 ## Quick start
 
@@ -43,9 +43,9 @@ falls back to the static CID.
 # Offline smoke test (no network): synthetic series through the full build path.
 metronome-pool build --out ./pool --sources synthetic --overwrite
 
-# One-off static pool: build + pin a CID.
-metronome-pool build --out ./pool --upload
-# → prints  window_pool = "bafy…"   ← paste into [eval] in chain.toml
+# One-off static pool: build + pin a Hub ref.
+metronome-pool build --out ./pool --upload --hub-repo metronome/eval-pool
+# → prints  window_pool = "metronome/eval-pool@sha256:…"  ← paste into [eval] in chain.toml
 
 # Daily publish: build + push a snapshot to the pool bucket (no chain.toml edit).
 metronome-pool publish --effective-round auto
@@ -141,9 +141,9 @@ future-unknowable but near-random-walk, so use it as a minor domain only.
   `<series_id>.npy` per series (float32; loader upcasts), `metadata.json` keyed by
   `series_id` → `{freq, seasonal_period, domain}`, plus a `provenance.json` the
   loader ignores.
-- **Determinism**: same harvested inputs ⇒ byte-identical directory ⇒ identical
-  Hippius CID (the registry packs a sorted, zeroed-metadata tar). Re-build to
-  audit.
+- **Determinism**: same harvested inputs ⇒ byte-identical directory ⇒ the same
+  content pushed to the same Hub repo yields the same OCI `repo@digest`. Re-build
+  to audit.
 - **Cleaning**: gaps interpolated (series dropped above `--max-missing-frac`),
   truncated to the freshest `context_length + horizon` points, short/constant/
   multi-channel series dropped, exact duplicates de-duplicated.

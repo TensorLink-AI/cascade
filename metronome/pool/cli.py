@@ -4,7 +4,7 @@ eval pool.
 * ``metronome-pool build --out <dir> [--sources openmeteo,wikimedia]`` —
   harvest real-world series, clean/validate them, and write the pool directory
   in the layout :mod:`metronome.validator.pool` reads back. Add ``--upload`` to
-  pin a static CID in ``[eval] window_pool``.
+  pin a static Hub ref (``repo@digest``) in ``[eval] window_pool``.
 
 * ``metronome-pool publish --effective-round <N>`` — the **daily** path. Build
   the pool, pack it to a deterministic tar, upload it to the pool bucket
@@ -68,7 +68,12 @@ def _add_build(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--upload",
         action="store_true",
-        help="Upload the built pool to the Hippius registry and print the CID to pin.",
+        help="Push the built pool to the Hippius Hub registry and print the ref to pin.",
+    )
+    p.add_argument(
+        "--hub-repo",
+        default=None,
+        help="Hub repo id (namespace/name) to push the pool to (default: <namespace>/eval-pool).",
     )
     _add_build_args(p)
     p.set_defaults(func=_cmd_build)
@@ -156,7 +161,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
     _warn_if_small(summary, cfg)
 
     if args.upload:
-        return _upload_cid(args.out, cfg)
+        return _upload_pool_ref(args.out, cfg, getattr(args, "hub_repo", None))
     print("\nnext: pin the pool with `--upload`, or daily-publish with `metronome-pool publish`")
     return 0
 
@@ -231,18 +236,19 @@ def _resolve_effective_round(args: argparse.Namespace, cfg) -> int:
     return int(manifest.round_id) + max(0, args.round_buffer)
 
 
-def _upload_cid(out_dir: Path, cfg) -> int:
-    from ..shared.hippius import RegistryConfig, StorageError, upload_dir_to_registry
+def _upload_pool_ref(out_dir: Path, cfg, hub_repo: str | None) -> int:
+    from ..shared.hippius import HubConfig, StorageError, upload_dir_to_hub
 
     try:
-        reg = RegistryConfig.from_storage(cfg.storage)
-        up = upload_dir_to_registry(out_dir, reg)
+        hub = HubConfig.from_storage(cfg.storage)
+        repo = hub_repo or f"{hub.namespace}/eval-pool"
+        up = upload_dir_to_hub(out_dir, repo, hub)
     except StorageError as e:
         print(f"registry upload failed: {e}", file=sys.stderr)
         return 4
-    print(f"\nuploaded to Hippius registry: cid={up.cid} ({up.size_bytes:,} bytes)")
+    print(f"\npushed to Hippius Hub: {up.ref.immutable_ref} ({up.size_bytes:,} bytes)")
     print("pin this in chain.toml:")
-    print(f'    [eval]\n    window_pool = "{up.cid}"')
+    print(f'    [eval]\n    window_pool = "{up.ref.immutable_ref}"')
     return 0
 
 

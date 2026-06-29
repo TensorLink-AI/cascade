@@ -2,11 +2,11 @@
 
 Each round the trainer:
 
-1. Resolves on-chain generator commitments to ``(hotkey, uid, cid)``.
+1. Resolves on-chain generator commitments to ``(hotkey, uid, ref)``.
 2. Identifies the reigning king (the highest-incentive UID on the metagraph in
    live mode; a caller-supplied hotkey offline) and selects challengers.
 3. For the king and each challenger, under one shared :class:`RoundSeeds`:
-   fetches the generator from the Hippius registry by CID, builds the corpus,
+   fetches the generator from the Hippius Hub registry by ref, builds the corpus,
    trains a fresh base model via the owner's :class:`BaseTrainer` (streaming
    per-step metrics to Hippius S3), and uploads the checkpoint to the registry.
 4. Assembles a :class:`TrainingManifest`, signs it with the trainer hotkey, and
@@ -29,13 +29,13 @@ from ..interface.validation import parse_commit
 from ..shared.chain import Commitment
 from ..shared.config import ChainConfig
 from ..shared.hippius import (
+    HubConfig,
     LogSink,
-    RegistryConfig,
     S3Config,
     S3Store,
-    fetch_from_registry,
+    fetch_from_hub,
     publish_manifest,
-    upload_dir_to_registry,
+    upload_dir_to_hub,
 )
 from ..shared.manifest import (
     TrainedEntry,
@@ -58,7 +58,7 @@ log = logging.getLogger("metronome.trainer")
 class ResolvedGenerator:
     hotkey: str
     uid: int
-    cid: str           # generator's Hippius registry CID
+    ref: str           # generator's Hippius Hub reference (repo@digest)
 
 
 @dataclass(frozen=True)
@@ -71,14 +71,14 @@ def resolve_commitments(commitments: list[Commitment]) -> list[ResolvedGenerator
     """Parse each commitment's generator pointer, dropping malformed ones.
 
     A later commit from the same hotkey wins (miners re-deploy by committing a
-    new CID), so we keep the highest ``commit_block`` per hotkey.
+    new ref), so we keep the highest ``commit_block`` per hotkey.
     """
     best: dict[str, tuple[int, ResolvedGenerator]] = {}
     for c in commitments:
         parsed = parse_commit(c.payload)
         if parsed is None:
             continue
-        rg = ResolvedGenerator(hotkey=c.hotkey, uid=c.uid, cid=parsed.cid)
+        rg = ResolvedGenerator(hotkey=c.hotkey, uid=c.uid, ref=parsed.ref)
         prev = best.get(c.hotkey)
         if prev is None or c.commit_block >= prev[0]:
             best[c.hotkey] = (c.commit_block, rg)
@@ -99,12 +99,13 @@ def plan_round(
     Two cheap anti-duplicate filters run here, before any generator is fetched or
     trained (a round is ~3h of GPU per generator):
 
-    * **duplicate-of-king** — a challenger whose generator CID equals the king's
-      is byte-identical to the king (the CID is the content hash). It can only
-      tie the king, never clear the win margin, so it is dropped rather than
-      handed a wasted round. This is the metronome analogue of teutonic's
-      ``check_model_copy`` "same repo + same digest → instant reject".
-    * **same-CID dedup** — if two hotkeys committed the *same* generator CID,
+    * **duplicate-of-king** — a challenger whose generator ref equals the king's
+      (same ``repo@digest``) is byte-identical to the king (the OCI digest is the
+      content hash). It can only tie the king, never clear the win margin, so it
+      is dropped rather than handed a wasted round. This is the metronome
+      analogue of teutonic's ``check_model_copy`` "same repo + same digest →
+      instant reject".
+    * **same-ref dedup** — if two hotkeys committed the *same* generator ref,
       only the first (lowest UID) is kept; the others would be identical runs.
     """
     by_hotkey = {rg.hotkey: rg for rg in resolved}
@@ -112,20 +113,20 @@ def plan_round(
     field_ = sorted(resolved, key=lambda r: r.uid)
     if king is None:
         king = field_[0] if field_ else None
-    king_cid = king.cid if king is not None else None
+    king_ref = king.ref if king is not None else None
 
     challengers: list[ResolvedGenerator] = []
-    seen_cids: set[str] = set()
+    seen_refs: set[str] = set()
     for rg in field_:
         if king is not None and rg.hotkey == king.hotkey:
             continue
-        if king_cid is not None and rg.cid == king_cid:
-            log.info("dropping challenger %s: generator CID is identical to the king", rg.hotkey)
+        if king_ref is not None and rg.ref == king_ref:
+            log.info("dropping challenger %s: generator ref is identical to the king", rg.hotkey)
             continue
-        if rg.cid in seen_cids:
-            log.info("dropping challenger %s: duplicate of an already-planned CID", rg.hotkey)
+        if rg.ref in seen_refs:
+            log.info("dropping challenger %s: duplicate of an already-planned ref", rg.hotkey)
             continue
-        seen_cids.add(rg.cid)
+        seen_refs.add(rg.ref)
         challengers.append(rg)
     return RoundPlan(king=king, challengers=challengers)
 
@@ -134,8 +135,8 @@ def plan_round(
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
 
-    Storage is Hippius: generators + checkpoints on the registry (IPFS, by CID),
-    training logs + the manifest on S3.
+    Storage is Hippius: generators + checkpoints on the Hub registry (by
+    ``repo@digest``), training logs + the manifest on S3.
     """
 
     cfg: ChainConfig
@@ -150,16 +151,16 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
-    _registry: RegistryConfig | None = field(default=None, repr=False)
+    _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
-    def registry(self) -> RegistryConfig:
-        if self._registry is None:
-            self._registry = RegistryConfig.from_storage(self.cfg.storage)
-        return self._registry
+    def hub(self) -> HubConfig:
+        if self._hub is None:
+            self._hub = HubConfig.from_storage(self.cfg.storage)
+        return self._hub
 
     def manifest_store(self) -> S3Store:
         if self._manifest_store is None:
@@ -192,7 +193,7 @@ class TrainerRunner:
         does — there's nothing to defend against).
         """
         gen_dir = self.work_root / f"{seeds.base_seed}" / role / "generator"
-        fetch_from_registry(gen.cid, gen_dir, self.registry())
+        fetch_from_hub(gen.ref, gen_dir, self.hub())
 
         out_dir = self.work_root / f"{seeds.base_seed}" / role / "checkpoint"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -239,16 +240,16 @@ class TrainerRunner:
             n_series, total_points, corpus_digest[:12],
         )
 
-        up = upload_dir_to_registry(result.local_dir, self.registry())
+        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}"
+        up = upload_dir_to_hub(result.local_dir, ckpt_repo, self.hub())
         return TrainedEntry(
             miner_hotkey=gen.hotkey,
             miner_uid=gen.uid,
             role=role,
-            gen_cid=gen.cid,
-            trained_pointer=format_trained_pointer(up.cid),
+            gen_ref=gen.ref,
+            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
             corpus_digest=corpus_digest,
             train_block=block,
-            tar_digest=up.tar_digest,
             gpu_name=str(result.metrics.get("gpu_name", "")),
         )
 
@@ -270,7 +271,7 @@ class TrainerRunner:
 
         When a ``queue`` is supplied, challengers are drawn from the persistent
         FIFO backlog (oldest-first, deduplicated against the king and against
-        CIDs already trained this reign) instead of straight from this round's
+        refs already trained this reign) instead of straight from this round's
         field; the queue is mutated in place (entries enqueued, selected ones
         marked trained), so the caller persists it after the round.
         """
@@ -294,7 +295,7 @@ class TrainerRunner:
             # An attempt (win, loss, or a generator that failed to train) consumes
             # the challenger's shot for this reign so it is not re-run every round.
             for c in challengers:
-                queue.mark_trained(c.cid)
+                queue.mark_trained(c.ref)
         if not entries or entries[0].role != "king":
             raise RuntimeError("king training produced no entry; aborting round")
 
@@ -317,30 +318,30 @@ class TrainerRunner:
         """Pick this round's challengers — straight off the planned field when
         there is no queue, otherwise from the FIFO backlog.
 
-        ``plan.challengers`` has already had the duplicate-of-king and same-CID
+        ``plan.challengers`` has already had the duplicate-of-king and same-ref
         filters applied (:func:`plan_round`). With a queue, those survivors are
         the current on-chain field: the backlog is pruned to it (dropping
-        re-deployed/deregistered CIDs), the field is enqueued (cheap dedup), and
+        re-deployed/deregistered refs), the field is enqueued (cheap dedup), and
         the front ``max_challengers`` still-eligible entries are returned.
         """
         if queue is None:
             return plan.challengers[:max_challengers]
 
-        king_cid = plan.king.cid if plan.king is not None else None
-        if queue.note_king(king_cid):
-            log.info("new reign (king CID %s…); cleared per-reign trained cache", str(king_cid)[:12])
+        king_ref = plan.king.ref if plan.king is not None else None
+        if queue.note_king(king_ref):
+            log.info("new reign (king ref %s…); cleared per-reign trained cache", str(king_ref)[:24])
 
-        by_cid = {c.cid: c for c in plan.challengers}
-        for dropped in queue.prune_to_field(set(by_cid) | ({king_cid} if king_cid else set())):
-            log.info("pruning queued %s: CID no longer in the on-chain field", dropped.hotkey)
+        by_ref = {c.ref: c for c in plan.challengers}
+        for dropped in queue.prune_to_field(set(by_ref) | ({king_ref} if king_ref else set())):
+            log.info("pruning queued %s: ref no longer in the on-chain field", dropped.hotkey)
         for c in plan.challengers:
-            reason = queue.enqueue(QueuedSubmission(c.hotkey, c.uid, c.cid, block))
+            reason = queue.enqueue(QueuedSubmission(c.hotkey, c.uid, c.ref, block))
             if reason is not None:
-                log.info("skip enqueue %s (CID %s…): %s", c.hotkey, c.cid[:12], reason)
+                log.info("skip enqueue %s (ref %s…): %s", c.hotkey, c.ref[:24], reason)
 
         selected = queue.select(max_challengers)
         # Map the queued picks back to the resolved generators for this round.
-        return [by_cid[s.cid] for s in selected if s.cid in by_cid]
+        return [by_ref[s.ref] for s in selected if s.ref in by_ref]
 
     def _load_queue(self) -> SubmissionQueue:
         """Load the persistent submission backlog from ``[queue] state_db_path``
@@ -398,7 +399,7 @@ class TrainerRunner:
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
             host = hosts[i % len(hosts)]
             return disp.dispatch(
-                host, gen_cid=gen.cid, uid=gen.uid, hotkey=gen.hotkey,
+                host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
             )
 
@@ -445,7 +446,7 @@ class TrainerRunner:
         last_round: str | None = None
         queue = self._load_queue()
         log.info("submission queue loaded: %d pending, %d trained this reign",
-                 len(queue.pending), len(queue.trained_cids))
+                 len(queue.pending), len(queue.trained_refs))
         while True:
             try:
                 block = client.current_block()

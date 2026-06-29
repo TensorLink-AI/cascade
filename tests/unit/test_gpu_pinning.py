@@ -15,13 +15,13 @@ from metronome.shared.manifest import (
 )
 from metronome.validator.loop import ValidatorRunner
 
-CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-CID_T = "QmPChd2hVbrJ6bfo3WBcTW4iZnpHm8TEzWkLHmLpXhF68A"
+REF = "alice/metro-gen@sha256:" + "a" * 64
+REF_T = "metronome/ckpt-r1-king@sha256:" + "b" * 64
 
 
 def _entry(role, uid, gpu):
-    return TrainedEntry(f"hk{uid}", uid, role, CID, format_trained_pointer(CID_T),
-                        "d", 10, tar_digest="t", gpu_name=gpu)
+    return TrainedEntry(f"hk{uid}", uid, role, REF, format_trained_pointer(REF_T),
+                        "d", 10, gpu_name=gpu)
 
 
 def _manifest(cfg, king_gpu, chal_gpu):

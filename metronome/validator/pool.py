@@ -5,11 +5,11 @@ OPEN_QUESTIONS.md #6, now wired to Hippius.
 *selection and rotation* of windows; this module owns the other half: pulling the
 owner-controlled, held-out series pool and slicing it into :class:`EvalWindow` s.
 
-The pool is referenced by ``[eval] window_pool`` as a Hippius registry **CID**
-(the owner uploads the held-out corpus to the registry with ``upload_dir_to_registry``
-and pins the CID here). It is private (not a public benchmark) and refreshed
-periodically so it stays contamination-resistant. The directory behind the CID
-holds one or more array files:
+The pool is referenced by ``[eval] window_pool`` as a Hippius Hub **ref**
+(``repo@digest``) — the owner uploads the held-out corpus to the registry with
+``upload_dir_to_hub`` and pins the ref here. It is private (not a public
+benchmark) and refreshed periodically so it stays contamination-resistant. The
+directory behind the ref holds one or more array files:
 
 * ``*.npy``            — a single ``(L,)`` or ``(C, L)`` series each.
 * ``*.npz``            — many arrays under arbitrary keys, each a series.
@@ -19,7 +19,7 @@ holds one or more array files:
 Every series contributes one window (last ``horizon`` steps = target, up to
 ``context_length`` before = history) via the pure cutter
 :func:`metronome.validator.windows.build_windows_from_series`, so the resulting
-pool is byte-identical for every validator that fetches the same CID.
+pool is byte-identical for every validator that fetches the same ref.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from ..shared.config import ChainConfig
-from ..shared.hippius import RegistryConfig, fetch_from_registry, is_cid
+from ..shared.hippius import HubConfig, HubRef, fetch_from_hub, is_hub_ref
 from .windows import RotatingWindowSource, build_windows_from_series
 
 log = logging.getLogger("metronome.validator")
@@ -65,29 +65,29 @@ def load_pool(
     cfg: ChainConfig,
     *,
     cache_dir: Path | str | None = None,
-    registry: RegistryConfig | None = None,
+    hub: HubConfig | None = None,
 ) -> RotatingWindowSource:
-    """Fetch the private pool CID from the Hippius registry and build the window
-    source. Raises :class:`PoolError` on a missing/empty/malformed pool.
+    """Fetch the private pool ref from the Hippius Hub registry and build the
+    window source. Raises :class:`PoolError` on a missing/empty/malformed pool.
 
     Window geometry comes from ``[eval]`` (``context_length`` / ``horizon``),
     which the config pins equal to ``[training]`` so trained models fit the
     windows.
     """
-    cid = cfg.eval.window_pool
-    if not cid or not is_cid(cid):
+    ref = cfg.eval.window_pool
+    if not ref or not is_hub_ref(ref):
         raise PoolError(
-            f"[eval] window_pool must be a Hippius registry CID; got {cid!r}. "
-            "Upload the held-out pool with upload_dir_to_registry and pin its CID."
+            f"[eval] window_pool must be a Hippius Hub ref (repo@digest); got {ref!r}. "
+            "Upload the held-out pool with upload_dir_to_hub and pin its ref."
         )
-    reg = registry or RegistryConfig.from_storage(cfg.storage)
-    dest = Path(cache_dir or "./_eval_pool") / cid
+    hub = hub or HubConfig.from_storage(cfg.storage)
+    dest = Path(cache_dir or "./_eval_pool") / HubRef.parse(ref).digest.replace(":", "-")
     try:
-        fetch_from_registry(cid, dest, reg)
+        fetch_from_hub(ref, dest, hub)
     except Exception as e:  # noqa: BLE001
         raise PoolError(f"pool_fetch_failed: {e}") from e
 
-    return window_source_from_dir(dest, cfg, label=f"cid={cid}")
+    return window_source_from_dir(dest, cfg, label=f"ref={ref}")
 
 
 def window_source_from_dir(dest: Path, cfg: ChainConfig, *, label: str) -> RotatingWindowSource:

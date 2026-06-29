@@ -12,32 +12,33 @@ from metronome.interface.validation import (
     parse_commit,
 )
 
-# A valid CIDv0 (base58btc) and CIDv1 (base32) for the Hippius registry pointer.
-CID_V0 = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-CID_V1 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+# Two valid Hippius Hub references (repo@digest): one sha256 OCI digest, one
+# hf: commit SHA (a genesis/eval artefact mirrored on HF).
+REF_SHA = "alice/metro-gen@sha256:" + "a" * 64
+REF_HF = "datadog/toto-genesis@hf:" + "b" * 40
 
 
 def test_parse_commit_round_trip():
-    payload = f"metro-v1:gen:hippius:{CID_V0}"
+    payload = f"metro-v1:gen:hippius:{REF_SHA}"
     parsed = parse_commit(payload)
     assert parsed is not None
-    assert parsed.cid == CID_V0
-    assert format_commit(CID_V0) == payload
-    # CIDv1 too
-    assert parse_commit(f"metro-v1:gen:hippius:{CID_V1}").cid == CID_V1
+    assert parsed.ref == REF_SHA
+    assert format_commit(REF_SHA) == payload
+    # hf:-pinned ref too
+    assert parse_commit(f"metro-v1:gen:hippius:{REF_HF}").ref == REF_HF
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         "",
-        f"metro-v0:gen:hippius:{CID_V0}",
-        f"metro-v1:trained:hippius:{CID_V0}",        # trained tag is not a gen commit
-        f"metro-v1:gen:hf:{CID_V0}",                  # old backend tag is gone
-        "metro-v1:gen:hippius:not-a-cid",
-        "metro-v1:gen:hippius:Qmtooshort",
-        f"metro-v1:gen:hippius: {CID_V0}",
-        f"metro-v1:gen:hippius:{CID_V0}extra!",
+        f"metro-v0:gen:hippius:{REF_SHA}",
+        f"metro-v1:trained:hippius:{REF_SHA}",       # trained tag is not a gen commit
+        f"metro-v1:gen:hf:{REF_SHA}",                 # old backend tag is gone
+        "metro-v1:gen:hippius:not-a-ref",             # no @digest
+        "metro-v1:gen:hippius:alice/gen@sha256:short",  # truncated digest
+        "metro-v1:gen:hippius:alice/gen@deadbeef",    # digest missing sha256: prefix
+        f"metro-v1:gen:hippius:{REF_SHA}extra!",      # trailing junk in the digest
         "metro-v1:gen:hippius:",
     ],
 )
@@ -47,9 +48,9 @@ def test_parse_commit_rejects_malformed(payload):
 
 def test_format_commit_refuses_invalid_inputs():
     with pytest.raises(ValueError):
-        format_commit("not-a-cid")
+        format_commit("not-a-ref")
     with pytest.raises(ValueError):
-        format_commit("Qmshort")
+        format_commit("alice/gen@sha256:short")
 
 
 def _write(tmp_path, name, content):

@@ -16,17 +16,16 @@ from metronome.shared.manifest import (
     parse_trained_pointer,
 )
 
-SHA = "abc123def456abc123def456abc123def456abcd"
-CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-CID_T = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+REF = "alice/metro-gen@sha256:" + "a" * 64
+REF_T = "metronome/ckpt-r42-king@sha256:" + "b" * 64
 
 
 def test_trained_pointer_round_trip():
-    p = format_trained_pointer(CID_T)
-    assert p == f"metro-v1:trained:hippius:{CID_T}"
-    assert parse_trained_pointer(p) == CID_T
-    assert parse_trained_pointer(f"metro-v1:gen:hippius:{CID_T}") is None
-    assert parse_trained_pointer("metro-v1:trained:hippius:not-a-cid") is None
+    p = format_trained_pointer(REF_T)
+    assert p == f"metro-v1:trained:hippius:{REF_T}"
+    assert parse_trained_pointer(p) == REF_T
+    assert parse_trained_pointer(f"metro-v1:gen:hippius:{REF_T}") is None
+    assert parse_trained_pointer("metro-v1:trained:hippius:not-a-ref") is None
 
 
 def test_corpus_digest_is_order_and_value_sensitive():
@@ -49,19 +48,18 @@ def _entry(role, uid):
         miner_hotkey=f"hk{uid}",
         miner_uid=uid,
         role=role,
-        gen_cid=CID,
-        trained_pointer=format_trained_pointer(CID_T),
+        gen_ref=REF,
+        trained_pointer=format_trained_pointer(REF_T),
         corpus_digest="deadbeef",
         train_block=100,
-        tar_digest="cafe",
     )
 
 
 def test_entry_rejects_bad_role_and_pointer():
     with pytest.raises(ValueError):
-        TrainedEntry("hk", 0, "emperor", CID, format_trained_pointer(CID_T), "d", 1)
+        TrainedEntry("hk", 0, "emperor", REF, format_trained_pointer(REF_T), "d", 1)
     with pytest.raises(ValueError):
-        TrainedEntry("hk", 0, "king", CID, "not-a-pointer", "d", 1)
+        TrainedEntry("hk", 0, "king", REF, "not-a-pointer", "d", 1)
 
 
 def test_manifest_round_trip_and_role_lookup():

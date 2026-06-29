@@ -21,8 +21,8 @@ from metronome.trainer.loop import plan_round, resolve_commitments
 from metronome.validator.loop import ValidatorRunner
 from metronome.validator.state import genesis
 
-CID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
-CID2 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+CID = "alice/gen@sha256:" + "a" * 64
+CID2 = "metronome/ckpt@sha256:" + "b" * 64
 
 
 def _scores(scale, seed, n=300):

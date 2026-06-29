@@ -2,13 +2,15 @@
 
 metronome stores three kinds of artefact on Hippius:
 
-* **Models / checkpoints / generators → the Hippius *registry*** (the
-  ``hippius_sdk`` IPFS layer). Content-addressed by **CID**: a directory is
-  packed into a deterministic tar, uploaded, and referenced everywhere by the
-  returned CID. A CID *is* the content hash, so it doubles as the integrity
-  digest — there is no separate ``@sha`` the way a HuggingFace ``repo@revision``
-  pointer needed one. Miners commit ``metro-v1:gen:hippius:<cid>``; the trainer
-  publishes ``metro-v1:trained:hippius:<cid>`` checkpoints.
+* **Models / checkpoints / generators → the Hippius *registry* (Hippius Hub)** —
+  the OCI model registry documented at https://docs.hippius.com/registry (the
+  same backend teutonic uses, via ``hippius_hub``). An artefact lives in a Hub
+  **repo** and is pinned by an immutable OCI manifest **digest** (``sha256:…``).
+  It is referenced everywhere by ``repo@digest``: the digest *is* the content
+  hash, so it both locates the artefact and doubles as the integrity digest —
+  ``snapshot_download`` verifies the layer blobs against it on fetch. Miners
+  commit ``metro-v1:gen:hippius:<repo>@<digest>``; the trainer publishes
+  ``metro-v1:trained:hippius:<repo>@<digest>`` checkpoints.
 * **Training manifests → Hippius S3** (a standard boto3 endpoint). Small JSON
   the validator polls; the trainer writes ``round-<id>.json`` and updates a
   ``latest.json`` pointer.
@@ -17,58 +19,97 @@ metronome stores three kinds of artefact on Hippius:
   observability.
 
 Both backends are behind **lazy imports** so the core package stays installable
-without ``hippius_sdk`` / ``boto3`` (unit tests, the miner's static path). The
-``hippius_sdk`` client is async; the sync wrappers here run it on a private event
-loop so the rest of metronome stays synchronous.
+without ``hippius-hub`` / ``boto3`` (unit tests, the miner's static path). The
+``hippius_hub`` push/pull helpers are synchronous, so no event loop is needed.
 
 Credentials are read from the environment, never from ``chain.toml`` (which is a
 public, committed file):
 
-* registry  — ``IPFS_NODE_URL`` (or the configured ``ipfs_api_url``),
-  ``HIPPIUS_ENCRYPTION_KEY`` (optional; models are stored unencrypted by default
-  so validators can read them).
+* registry  — a Hub token (``HIPPIUS_HUB_TOKEN`` / ``HIPPIUS_TOKEN``) or a
+  username/password pair (``HIPPIUS_HUB_USERNAME`` + ``HIPPIUS_HUB_PASSWORD``);
+  ``HF_TOKEN`` for any ``hf:``-pinned artefact.
 * S3        — ``HIPPIUS_S3_ACCESS_KEY`` / ``HIPPIUS_S3_SECRET_KEY``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import json
 import os
-
-# CID grammar: CIDv0 (base58btc, ``Qm…46 chars``) or CIDv1 (multibase-prefixed,
-# lowercase base32 is the common ``bafy…`` form). Kept permissive but bounded so
-# a malformed on-chain payload is rejected, not fetched.
 import re
+import shutil
 import tarfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-
-CIDV0_RE = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
-CIDV1_RE = re.compile(r"^b[a-z2-7]{20,}$")
-
-
-def is_cid(value: str) -> bool:
-    """True if ``value`` looks like an IPFS CID (v0 or v1)."""
-    v = value.strip()
-    return bool(CIDV0_RE.match(v) or CIDV1_RE.match(v))
 
 
 class StorageError(RuntimeError):
     """Any Hippius registry or S3 operation failed."""
 
 
-# ───────────────────────────── deterministic tar ────────────────────────────
+# A Hippius Hub model reference is ``<repo>@<digest>``: a repo id plus an
+# immutable OCI manifest digest. Two digest shapes are accepted — ``sha256:``
+# (the canonical Hub OCI digest a push returns) and ``hf:`` (a vanilla
+# HuggingFace commit SHA, for a genesis/eval artefact mirrored on HF without a
+# Hub copy), mirroring teutonic's ``ModelRef``.
+REPO_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
+DIGEST_RE = re.compile(r"^(sha256:[0-9a-f]{64}|hf:[0-9a-f]{40})$")
+
+
+@dataclass(frozen=True)
+class HubRef:
+    """An immutable Hippius Hub reference: ``repo@digest``."""
+
+    repo: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        repo = (self.repo or "").strip()
+        digest = (self.digest or "").strip()
+        if not REPO_RE.match(repo):
+            raise StorageError(f"invalid Hippius Hub repo id: {self.repo!r}")
+        if not DIGEST_RE.match(digest):
+            raise StorageError(f"invalid Hippius Hub OCI digest: {self.digest!r}")
+        object.__setattr__(self, "repo", repo)
+        object.__setattr__(self, "digest", digest)
+
+    @property
+    def immutable_ref(self) -> str:
+        return f"{self.repo}@{self.digest}"
+
+    @classmethod
+    def parse(cls, ref: str) -> HubRef:
+        """Parse a ``repo@digest`` string; raise StorageError if malformed."""
+        repo, sep, digest = (ref or "").strip().partition("@")
+        if not sep:
+            raise StorageError(f"not a Hippius Hub ref (expected repo@digest): {ref!r}")
+        return cls(repo, digest)
+
+
+def is_hub_ref(value: str) -> bool:
+    """True if ``value`` parses as a ``repo@digest`` Hippius Hub reference."""
+    try:
+        HubRef.parse(value)
+        return True
+    except StorageError:
+        return False
+
+
+# ──────────────── deterministic tar (S3 eval-pool snapshots) ─────────────────
+#
+# Models/checkpoints/generators go to the Hub registry (above); these helpers
+# pack the daily eval-pool snapshot into a reproducible tar stored on S3
+# (``publish_pool_snapshot`` / ``fetch_pool_snapshot``), where the sha256 of the
+# tar is the integrity check (S3 has no content-addressing of its own).
 
 
 def pack_dir_to_tar(local_dir: Path | str) -> bytes:
     """Pack a directory into a reproducible (sorted, zeroed-metadata) tar blob.
 
     Two callers packing the same file tree get byte-identical tar bytes — so the
-    registry CID is stable across machines, which is what makes a stored
-    checkpoint / generator auditable (re-pack ⇒ same CID).
+    snapshot's sha256 is stable across machines, which is what lets every
+    validator verify it fetched the same eval-pool bytes (re-pack ⇒ same sha256).
     """
     d = Path(local_dir)
     if not d.is_dir():
@@ -92,10 +133,10 @@ def pack_dir_to_tar(local_dir: Path | str) -> bytes:
 def unpack_tar_to_dir(tar_bytes: bytes, dest_dir: Path | str) -> Path:
     """Inverse of :func:`pack_dir_to_tar`; extracts safely under ``dest_dir``.
 
-    Generator tars are miner-controlled, so every member is vetted: only regular
-    files and directories are allowed (no symlinks/hardlinks/devices), and every
-    resolved path must stay strictly inside ``dest`` (a plain string-prefix check
-    is unsafe — ``/dest`` prefixes the sibling ``/dest-evil``).
+    Every member is vetted: only regular files and directories are allowed (no
+    symlinks/hardlinks/devices), and every resolved path must stay strictly
+    inside ``dest`` (a plain string-prefix check is unsafe — ``/dest`` prefixes
+    the sibling ``/dest-evil``).
     """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -112,133 +153,171 @@ def unpack_tar_to_dir(tar_bytes: bytes, dest_dir: Path | str) -> Path:
 
 
 def tar_cid_digest(tar_bytes: bytes) -> str:
-    """sha256 of the packed tar — a backend-independent integrity digest that
-    travels next to the CID (a sanity check the fetched bytes match)."""
+    """sha256 of the packed tar — the integrity digest stored in the eval-pool
+    snapshot index so a validator can verify the bytes it fetched from S3."""
     return hashlib.sha256(tar_bytes).hexdigest()
 
 
-# ───────────────────────────── registry (IPFS) ──────────────────────────────
+# ───────────────────────────── registry (Hippius Hub) ───────────────────────
+#
+# Models, checkpoints, and generators live on the Hippius Hub OCI registry
+# (https://docs.hippius.com/registry — the same backend teutonic uses). A push
+# returns an immutable ``sha256:`` manifest digest; ``repo@digest`` both locates
+# and pins the artefact, so the digest doubles as the integrity hash (the fetch
+# verifies layer blobs against it). Auth is read from the environment.
+
+HUB_TOKEN_ENV_NAMES = ("HIPPIUS_HUB_TOKEN", "HIPPIUS_TOKEN", "METRONOME_HIPPIUS_TOKEN")
+HUB_USERNAME_ENV_NAMES = ("HIPPIUS_HUB_USERNAME", "HIPPIUS_REGISTRY_USERNAME")
+HUB_PASSWORD_ENV_NAMES = ("HIPPIUS_HUB_PASSWORD", "HIPPIUS_REGISTRY_PASSWORD")
+HUB_TOKEN_PATH = Path("~/.cache/hippius/hub/token").expanduser()
+
+# Files materialised from a fetched snapshot. Generators ship code + config +
+# optional safetensors weights; checkpoints ship safetensors + config; eval
+# pools ship .npy/.npz + metadata.json. Pickle weights are rejected later by
+# metronome.interface.validation (loading them runs arbitrary code).
+ALLOW_PATTERNS = [
+    "*.py", "*.json", "*.txt", "*.md",
+    "*.safetensors", "*.model", "tokenizer*", "special_tokens*",
+    "*.npy", "*.npz",
+]
+
+
+class HubAuthError(StorageError):
+    """Hippius Hub auth is unavailable or clearly misconfigured."""
+
+
+def _get_first_env(names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _read_cached_hub_token() -> str | None:
+    if HUB_TOKEN_PATH.exists():
+        cached = HUB_TOKEN_PATH.read_text().strip()
+        if cached:
+            return cached
+    return None
+
+
+def _resolve_hub_token(action: str) -> str:
+    """A Hub bearer token from an env token, the cached token, or a login.
+
+    Raises :class:`HubAuthError` (a StorageError) if no usable credential is set,
+    so a missing credential surfaces as a clear, non-retryable error.
+    """
+    token = _get_first_env(HUB_TOKEN_ENV_NAMES) or _read_cached_hub_token()
+    if token:
+        return token
+    username = _get_first_env(HUB_USERNAME_ENV_NAMES)
+    password = _get_first_env(HUB_PASSWORD_ENV_NAMES)
+    if username and password:
+        from hippius_hub import login as hub_login
+
+        hub_login(username=username, password=password)
+        cached = _read_cached_hub_token()
+        if cached:
+            return cached
+    raise HubAuthError(
+        f"{action} requires Hippius Hub auth: set a token "
+        f"({', '.join(HUB_TOKEN_ENV_NAMES)}) or username+password "
+        f"({HUB_USERNAME_ENV_NAMES[0]} + {HUB_PASSWORD_ENV_NAMES[0]})."
+    )
 
 
 @dataclass(frozen=True)
-class RegistryConfig:
-    """How to reach the Hippius registry (IPFS) backend."""
+class HubConfig:
+    """How to reach the Hippius Hub OCI registry (credentials come from env).
 
-    ipfs_api_url: str
-    ipfs_gateway: str = "https://get.hippius.network"
-    encrypt: bool = False  # models/generators are public; keep them readable
+    ``registry_url`` is informational — ``hippius_hub`` targets its own default
+    endpoint and is not redirected by this value. ``namespace`` *is* used: it is
+    the repo prefix the trainer/owner push under.
+    """
+
+    registry_url: str = "https://registry.hippius.com"
+    namespace: str = "metronome"
 
     @classmethod
-    def from_storage(cls, storage: object) -> RegistryConfig:
-        """Build from a :class:`metronome.shared.config.StorageConfig`, letting
-        ``IPFS_NODE_URL`` override the committed default."""
-        api = os.environ.get("IPFS_NODE_URL") or getattr(storage, "ipfs_api_url", "")
-        if not api:
-            raise StorageError(
-                "no IPFS node configured: set IPFS_NODE_URL or [storage] ipfs_api_url"
-            )
+    def from_storage(cls, storage: object) -> HubConfig:
+        """Build from a :class:`metronome.shared.config.StorageConfig`."""
         return cls(
-            ipfs_api_url=api,
-            ipfs_gateway=getattr(storage, "ipfs_gateway", "https://get.hippius.network"),
-            encrypt=bool(getattr(storage, "registry_encrypt", False)),
+            registry_url=getattr(storage, "hub_registry_url", "https://registry.hippius.com"),
+            namespace=getattr(storage, "hub_namespace", "metronome"),
         )
 
 
-def _run(coro):
-    """Run an async coroutine to completion on a fresh event loop (the rest of
-    metronome is synchronous)."""
-    try:
-        return asyncio.run(coro)
-    except RuntimeError as e:  # pragma: no cover - only if called inside a loop
-        raise StorageError(f"event_loop_error: {e}") from e
-
-
-def _registry_client(reg: RegistryConfig):
-    try:
-        from hippius_sdk import HippiusClient  # type: ignore
-    except ImportError as e:
-        raise StorageError(
-            "hippius_sdk not installed; install the [hippius] extra to use the registry"
-        ) from e
-    key = os.environ.get("HIPPIUS_ENCRYPTION_KEY")
-    kwargs: dict = {"ipfs_api_url": reg.ipfs_api_url, "ipfs_gateway": reg.ipfs_gateway}
-    if key:
-        import base64
-
-        kwargs["encryption_key"] = base64.b64decode(key)
-    return HippiusClient(**kwargs)
-
-
 @dataclass(frozen=True)
-class RegistryUpload:
-    cid: str
-    tar_digest: str
+class HubUpload:
+    ref: HubRef
     size_bytes: int
 
 
-def upload_dir_to_registry(local_dir: Path | str, reg: RegistryConfig) -> RegistryUpload:
-    """Pack ``local_dir`` to a deterministic tar and upload it to the registry.
+def _dir_size_bytes(local_dir: Path | str) -> int:
+    return sum(p.stat().st_size for p in Path(local_dir).rglob("*") if p.is_file())
 
-    Returns the IPFS CID (the pointer used everywhere) plus the tar's sha256 and
-    size. The CID is content-addressed, so re-uploading identical content yields
-    the same CID — the audit hook for re-derived runs.
+
+def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = None) -> HubUpload:
+    """Upload a folder to a Hippius Hub ``repo`` and return its immutable ref.
+
+    The push returns an OCI ``sha256:`` manifest digest; re-uploading identical
+    content to the same repo yields the same digest — the audit hook for
+    re-derived runs. ``hub`` is accepted for symmetry but the Hub endpoint is a
+    package/server default; auth comes from the environment.
     """
-    tar_bytes = pack_dir_to_tar(local_dir)
-    digest = tar_cid_digest(tar_bytes)
-    client = _registry_client(reg)
-
-    async def _go() -> str:
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as fh:
-            fh.write(tar_bytes)
-            tmp = fh.name
-        try:
-            result = await client.upload_file(tmp, encrypt=reg.encrypt)
-        finally:
-            os.unlink(tmp)
-        cid = result.get("cid") if isinstance(result, dict) else getattr(result, "cid", None)
-        if not cid:
-            raise StorageError(f"registry upload returned no cid: {result!r}")
-        return str(cid)
-
-    cid = _run(_go())
-    return RegistryUpload(cid=cid, tar_digest=digest, size_bytes=len(tar_bytes))
+    d = Path(local_dir)
+    if not d.is_dir():
+        raise StorageError(f"not_a_directory: {d}")
+    try:
+        from hippius_hub import upload_folder
+    except ImportError as e:
+        raise StorageError(
+            "hippius-hub not installed; install the [hippius] extra to use the registry"
+        ) from e
+    token = _resolve_hub_token(f"Uploading {d} to {repo}")
+    result = upload_folder(
+        repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
+    )
+    digest = str(getattr(result, "oid", "") or "")
+    if not DIGEST_RE.match(digest):
+        raise StorageError(f"hub upload returned no usable sha256 digest: {result!r}")
+    return HubUpload(ref=HubRef(str(repo), digest), size_bytes=_dir_size_bytes(d))
 
 
-def fetch_from_registry(
-    cid: str,
-    dest_dir: Path | str,
-    reg: RegistryConfig,
-    *,
-    expected_tar_digest: str | None = None,
-) -> Path:
-    """Download ``cid`` from the registry and extract it into ``dest_dir``.
+def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None) -> Path:
+    """Download an immutable Hub (or ``hf:``) snapshot into ``dest_dir``.
 
-    If ``expected_tar_digest`` is given, the fetched tar's sha256 must match
-    (defence against a backend serving the wrong bytes for a CID).
+    ``ref`` may be a :class:`HubRef` or a ``repo@digest`` string. The OCI digest
+    pins the content, so no separate integrity check is needed on fetch — a Hub
+    that served the wrong bytes for a digest would fail the layer verification.
     """
-    if not is_cid(cid):
-        raise StorageError(f"not_a_cid: {cid!r}")
-    client = _registry_client(reg)
+    ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
+    dest = Path(dest_dir)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if ref.digest.startswith("hf:"):
+        from huggingface_hub import snapshot_download as hf_snapshot_download
 
-    async def _go() -> bytes:
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as fh:
-            tmp = fh.name
+        path = hf_snapshot_download(
+            repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(dest),
+            allow_patterns=ALLOW_PATTERNS,
+            token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"),
+        )
+    else:
         try:
-            await client.download_file(cid, tmp, decrypt=reg.encrypt)
-            return Path(tmp).read_bytes()
-        finally:
-            os.unlink(tmp)
-
-    tar_bytes = _run(_go())
-    if expected_tar_digest is not None:
-        got = tar_cid_digest(tar_bytes)
-        if got != expected_tar_digest:
-            raise StorageError(f"tar_digest_mismatch: {got} != {expected_tar_digest}")
-    return unpack_tar_to_dir(tar_bytes, dest_dir)
+            from hippius_hub import snapshot_download
+        except ImportError as e:
+            raise StorageError(
+                "hippius-hub not installed; install the [hippius] extra to use the registry"
+            ) from e
+        path = snapshot_download(
+            repo_id=ref.repo, revision=ref.digest, local_dir=str(dest),
+            allow_patterns=ALLOW_PATTERNS,
+            token=_resolve_hub_token(f"Downloading {ref.immutable_ref}"),
+        )
+    return Path(path)
 
 
 # ─────────────────────────────────── S3 ─────────────────────────────────────

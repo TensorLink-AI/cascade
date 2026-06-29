@@ -9,25 +9,25 @@ the metronome analogue of teutonic's validator queue (FIFO drain + copy gate),
 adapted to metronome's content-addressed submissions.
 
 The headline check is **duplicate-of-king**: because a generator is pinned by its
-content CID, a challenger whose generator is byte-identical to the reigning
-king's has the *same CID*. Training it would burn a full controlled-experiment
-round on a generator that can only tie the king (a challenger must clear the win
-margin to dethrone — an identical run never will), so it is dropped for free with
-a CID equality test, never fetched, never run.
+immutable Hub ``repo@digest``, a challenger whose generator is byte-identical to
+the reigning king's (same ref) would burn a full controlled-experiment round on a
+generator that can only tie the king (a challenger must clear the win margin to
+dethrone — an identical run never will), so it is dropped for free with a ref
+equality test, never fetched, never run.
 
 Three more cheap checks ride along at :meth:`SubmissionQueue.enqueue`:
 
-* **already-queued** — the same CID is already waiting (idempotent re-discovery
+* **already-queued** — the same ref is already waiting (idempotent re-discovery
   of an unchanged commitment across polls).
-* **already-trained** — the CID was already trained *this reign*. The cache
+* **already-trained** — the ref was already trained *this reign*. The cache
   resets when the king changes (:meth:`note_king`), mirroring teutonic's
   per-cycle ``evaluated_repos``: under single-round dethroning (the shipped
   ``[scoring] dethrone_cp = 1``) a challenger that has had its one fair shot
   against the current king should not be re-trained every round until the throne
   turns over.
-* **latest-commit-wins** — a new CID from a hotkey already in the queue
+* **latest-commit-wins** — a new ref from a hotkey already in the queue
   supersedes that hotkey's older queued entry (miners re-deploy by committing a
-  new CID), matching :func:`metronome.trainer.loop.resolve_commitments`.
+  new ref), matching :func:`metronome.trainer.loop.resolve_commitments`.
 
 The queue is a small JSON-serialisable record so the trainer can persist it to
 ``[queue] state_db_path`` and keep the backlog (and per-reign dedup) across
@@ -44,14 +44,15 @@ from dataclasses import dataclass, field
 class QueuedSubmission:
     """One challenger generator waiting for a training round.
 
-    ``cid`` is the generator's Hippius registry CID (content hash); it is the key
-    every dedup check turns on. ``commit_block`` is the chain block the miner
-    revealed the commitment at (FIFO ordering uses arrival into the queue, not
-    this block, so a late re-deploy does not jump the line)."""
+    ``ref`` is the generator's Hippius Hub ``repo@digest`` (the OCI digest is the
+    content hash); it is the key every dedup check turns on. ``commit_block`` is
+    the chain block the miner revealed the commitment at (FIFO ordering uses
+    arrival into the queue, not this block, so a late re-deploy does not jump the
+    line)."""
 
     hotkey: str
     uid: int
-    cid: str
+    ref: str
     commit_block: int
 
 
@@ -71,36 +72,36 @@ class SubmissionQueue:
 
     Attributes:
         pending: challengers awaiting training, oldest-first (FIFO).
-        king_cid: the reigning king's generator CID the ``trained_cids`` cache is
-            scoped to. When :meth:`note_king` sees a different CID the cache is
+        king_ref: the reigning king's generator ref the ``trained_refs`` cache is
+            scoped to. When :meth:`note_king` sees a different ref the cache is
             cleared (a new reign — every challenger deserves a fresh shot).
-        trained_cids: CIDs already trained during the current reign, most-recent
+        trained_refs: refs already trained during the current reign, most-recent
             last, capped at ``max_trained_cache`` (a ring buffer).
-        max_trained_cache: cap on ``trained_cids`` (``[queue] trained_cache_size``).
+        max_trained_cache: cap on ``trained_refs`` (``[queue] trained_cache_size``).
     """
 
     pending: list[QueuedSubmission] = field(default_factory=list)
-    king_cid: str | None = None
-    trained_cids: list[str] = field(default_factory=list)
+    king_ref: str | None = None
+    trained_refs: list[str] = field(default_factory=list)
     max_trained_cache: int = 256
 
     # ── reign tracking ───────────────────────────────────────────────────────
 
-    def note_king(self, king_cid: str | None) -> bool:
-        """Record the reigning king's CID; reset the per-reign dedup on a change.
+    def note_king(self, king_ref: str | None) -> bool:
+        """Record the reigning king's ref; reset the per-reign dedup on a change.
 
-        Returns True if the reign turned over (the king CID changed), so a caller
+        Returns True if the reign turned over (the king ref changed), so a caller
         can log it. Also drops any pending entry that now *is* the king (a queued
         challenger that won the throne, or a copy of the new king). The cache is
-        only reset on a genuine change to a non-None CID, so a transient missing
+        only reset on a genuine change to a non-None ref, so a transient missing
         king does not wipe the dedup mid-reign.
         """
-        changed = king_cid is not None and king_cid != self.king_cid
+        changed = king_ref is not None and king_ref != self.king_ref
         if changed:
-            self.king_cid = king_cid
-            self.trained_cids = []
-        if king_cid is not None:
-            self.pending = [q for q in self.pending if q.cid != king_cid]
+            self.king_ref = king_ref
+            self.trained_refs = []
+        if king_ref is not None:
+            self.pending = [q for q in self.pending if q.ref != king_ref]
         return changed
 
     # ── intake ───────────────────────────────────────────────────────────────
@@ -109,30 +110,30 @@ class SubmissionQueue:
         """Add a challenger to the backlog, or return why it was skipped.
 
         Returns None when the submission was accepted (now pending), otherwise one
-        of the ``SKIP_*`` reason strings. Cheap by construction: a CID equality
+        of the ``SKIP_*`` reason strings. Cheap by construction: a ref equality
         test against the king, a membership test against the per-reign trained
         cache, and a linear scan of ``pending`` (which holds at most one entry per
         hotkey).
         """
-        if self.king_cid is not None and sub.cid == self.king_cid:
+        if self.king_ref is not None and sub.ref == self.king_ref:
             return SKIP_DUPLICATE_OF_KING
-        if sub.cid in self.trained_cids:
+        if sub.ref in self.trained_refs:
             return SKIP_ALREADY_TRAINED
-        if any(q.cid == sub.cid for q in self.pending):
+        if any(q.ref == sub.ref for q in self.pending):
             return SKIP_ALREADY_QUEUED
-        # latest-commit-wins: a fresh CID from a hotkey already in the queue
+        # latest-commit-wins: a fresh ref from a hotkey already in the queue
         # supersedes that hotkey's older entry (the miner re-deployed).
         self.pending = [q for q in self.pending if q.hotkey != sub.hotkey]
         self.pending.append(sub)
         return None
 
-    def prune_to_field(self, field_cids: set[str]) -> list[QueuedSubmission]:
-        """Drop pending entries whose CID is no longer in the resolved on-chain
-        field (the miner re-deployed to a new CID, or deregistered). Returns the
+    def prune_to_field(self, field_refs: set[str]) -> list[QueuedSubmission]:
+        """Drop pending entries whose ref is no longer in the resolved on-chain
+        field (the miner re-deployed to a new ref, or deregistered). Returns the
         removed entries so a caller can log them."""
         keep, drop = [], []
         for q in self.pending:
-            (keep if q.cid in field_cids else drop).append(q)
+            (keep if q.ref in field_refs else drop).append(q)
         self.pending = keep
         return drop
 
@@ -152,37 +153,37 @@ class SubmissionQueue:
         for q in self.pending:
             if len(out) >= n:
                 break
-            if self.king_cid is not None and q.cid == self.king_cid:
+            if self.king_ref is not None and q.ref == self.king_ref:
                 continue
-            if q.cid in self.trained_cids:
+            if q.ref in self.trained_refs:
                 continue
             out.append(q)
         return out
 
-    def mark_trained(self, cid: str) -> None:
-        """Record a CID as trained this reign and remove it from the backlog.
+    def mark_trained(self, ref: str) -> None:
+        """Record a ref as trained this reign and remove it from the backlog.
 
         Called once per challenger the trainer *attempted* this round (win, loss,
         or a generator that failed to train) — an attempt consumes the challenger's
         shot for this reign, so a broken or losing generator is not re-run every
         round. The cache is a bounded ring buffer."""
-        self.pending = [q for q in self.pending if q.cid != cid]
-        if cid in self.trained_cids:
+        self.pending = [q for q in self.pending if q.ref != ref]
+        if ref in self.trained_refs:
             return
-        self.trained_cids.append(cid)
-        if len(self.trained_cids) > self.max_trained_cache:
-            self.trained_cids = self.trained_cids[-self.max_trained_cache :]
+        self.trained_refs.append(ref)
+        if len(self.trained_refs) > self.max_trained_cache:
+            self.trained_refs = self.trained_refs[-self.max_trained_cache :]
 
 
 def dumps(queue: SubmissionQueue) -> str:
     return json.dumps(
         {
             "pending": [
-                {"hotkey": q.hotkey, "uid": q.uid, "cid": q.cid, "commit_block": q.commit_block}
+                {"hotkey": q.hotkey, "uid": q.uid, "ref": q.ref, "commit_block": q.commit_block}
                 for q in queue.pending
             ],
-            "king_cid": queue.king_cid,
-            "trained_cids": list(queue.trained_cids),
+            "king_ref": queue.king_ref,
+            "trained_refs": list(queue.trained_refs),
             "max_trained_cache": queue.max_trained_cache,
         },
         sort_keys=True,
@@ -196,12 +197,12 @@ def loads(text: str) -> SubmissionQueue:
             QueuedSubmission(
                 hotkey=str(p["hotkey"]),
                 uid=int(p["uid"]),
-                cid=str(p["cid"]),
+                ref=str(p["ref"]),
                 commit_block=int(p.get("commit_block", 0)),
             )
             for p in (obj.get("pending") or [])
         ],
-        king_cid=obj.get("king_cid"),
-        trained_cids=[str(c) for c in (obj.get("trained_cids") or [])],
+        king_ref=obj.get("king_ref"),
+        trained_refs=[str(c) for c in (obj.get("trained_refs") or [])],
         max_trained_cache=int(obj.get("max_trained_cache", 256)),
     )

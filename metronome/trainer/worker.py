@@ -2,7 +2,7 @@
 
 This is what the orchestrator runs over SSH on each GPU pod (see
 :mod:`metronome.trainer.remote`). It does exactly one role's work — fetch the
-generator from the Hippius registry by CID, build the corpus in the sandbox,
+generator from the Hippius Hub registry by ref, build the corpus in the sandbox,
 train a fresh model under the fixed contract, upload the checkpoint to the
 registry, and print a :class:`TrainedEntry` receipt — and **never touches the
 wallet or the manifest**. The orchestrator collects receipts from king and
@@ -36,7 +36,7 @@ from .remote import RECEIPT_SENTINEL
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="metronome-train-worker",
                                 description="Train one generator for one round (remote worker).")
-    p.add_argument("--gen-cid", required=True, help="Generator's Hippius registry CID.")
+    p.add_argument("--gen-ref", required=True, help="Generator's Hippius Hub ref (repo@digest).")
     p.add_argument("--uid", type=int, required=True, help="Miner UID.")
     p.add_argument("--hotkey", required=True, help="Miner hotkey.")
     p.add_argument("--role", required=True, choices=["king", "challenger"])
@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = TrainerRunner(cfg=cfg, base_trainer=base_trainer, work_root=args.work_root)
 
     seeds = RoundSeeds.derive(args.base_seed, cfg.training)
-    gen = ResolvedGenerator(hotkey=args.hotkey, uid=args.uid, cid=args.gen_cid)
+    gen = ResolvedGenerator(hotkey=args.hotkey, uid=args.uid, ref=args.gen_ref)
     try:
         entry = runner.train_one(gen, args.role, seeds, args.block)
     except Exception as e:  # noqa: BLE001 — report failure on stderr, nonzero exit

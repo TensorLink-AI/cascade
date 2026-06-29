@@ -107,19 +107,18 @@ class ValidatorRunner:
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
         if self.evaluate_fn is not None:
             return self.evaluate_fn(entry, windows)
-        # Default path: fetch the checkpoint from the Hippius registry and score
-        # it (registry + torch). The tar digest is re-verified on fetch.
-        from ..shared.hippius import RegistryConfig, fetch_from_registry
+        # Default path: fetch the checkpoint from the Hippius Hub registry and
+        # score it (registry + torch). The OCI digest in the ref pins the bytes,
+        # so the fetch is self-verifying.
+        from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
         from .evaluator import evaluate_checkpoint
 
-        cid = parse_trained_pointer(entry.trained_pointer)
-        if cid is None:
+        ref = parse_trained_pointer(entry.trained_pointer)
+        if ref is None:
             raise ValueError(f"malformed trained_pointer: {entry.trained_pointer!r}")
-        reg = RegistryConfig.from_storage(self.cfg.storage)
-        dest = Path(self.cache_dir or "./_eval_ckpts") / cid
-        fetch_from_registry(
-            cid, dest, reg, expected_tar_digest=entry.tar_digest or None
-        )
+        hub = HubConfig.from_storage(self.cfg.storage)
+        dest = Path(self.cache_dir or "./_eval_ckpts") / HubRef.parse(ref).digest.replace(":", "-")
+        fetch_from_hub(ref, dest, hub)
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
         )

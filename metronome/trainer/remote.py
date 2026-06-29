@@ -8,7 +8,7 @@ challenger on *identical compute*; only byte-exact re-derivation relaxes to
 tolerance — rented marketplace hardware varies (see ``chain.toml`` corpus_mode).
 
 Design: the remote unit is a **round-worker**, not a remote ``BaseTrainer``. Each
-pod pulls its generator from the Hippius registry by CID, builds the corpus in
+pod pulls its generator from the Hippius Hub registry by ref, builds the corpus in
 its own sandbox, trains, uploads the checkpoint to the registry, and prints a
 ``TrainedEntry`` receipt (``metronome.trainer.worker``). The orchestrator (which
 holds the wallet) collects the receipts and signs + publishes the manifest
@@ -82,7 +82,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         remote_python = "/root/metronome/.venv/bin/python"
         workdir = "/root/metronome"
         cuda_device = "0"
-        forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "IPFS_NODE_URL"]
+        forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_HUB_TOKEN"]
     """
     p = Path(path)
     if not p.is_file():
@@ -114,7 +114,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
 def worker_argv(
     host: RemoteHost,
     *,
-    gen_cid: str,
+    gen_ref: str,
     uid: int,
     hotkey: str,
     role: str,
@@ -125,7 +125,7 @@ def worker_argv(
     """The ``metronome.trainer.worker`` argv to run on the pod (no env/cd)."""
     argv = [
         host.remote_python, "-m", "metronome.trainer.worker",
-        "--gen-cid", gen_cid,
+        "--gen-ref", gen_ref,
         "--uid", str(int(uid)),
         "--hotkey", hotkey,
         "--role", role,
@@ -189,11 +189,11 @@ def receipt_to_entry(receipt: dict) -> TrainedEntry:
             miner_hotkey=str(receipt["miner_hotkey"]),
             miner_uid=int(receipt["miner_uid"]),
             role=str(receipt["role"]),
-            gen_cid=str(receipt["gen_cid"]),
+            gen_ref=str(receipt["gen_ref"]),
             trained_pointer=str(receipt["trained_pointer"]),
             corpus_digest=str(receipt["corpus_digest"]),
             train_block=int(receipt["train_block"]),
-            tar_digest=str(receipt.get("tar_digest", "")),
+            gpu_name=str(receipt.get("gpu_name", "")),
         )
     except (KeyError, ValueError) as e:
         raise RemoteDispatchError(f"receipt is not a valid TrainedEntry: {e}") from e
@@ -211,7 +211,7 @@ class RemoteDispatcher:
         self,
         host: RemoteHost,
         *,
-        gen_cid: str,
+        gen_ref: str,
         uid: int,
         hotkey: str,
         role: str,
@@ -221,7 +221,7 @@ class RemoteDispatcher:
         import os
 
         argv = worker_argv(
-            host, gen_cid=gen_cid, uid=uid, hotkey=hotkey, role=role,
+            host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
         )
         env = {k: os.environ[k] for k in host.forward_env if k in os.environ}

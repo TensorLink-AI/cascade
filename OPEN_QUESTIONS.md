@@ -21,9 +21,10 @@ centralised in v1 because it makes the controlled-experiment invariant trivially
 enforceable.
 
 **Flip point.** The decentralisation path: every corpus carries a `corpus_digest`
-and every run a `contract_digest`, and every checkpoint a content-addressed CID,
-so a validator or a trainer quorum can re-derive the corpus from the pinned
-generator + seed, re-train, and compare CIDs/digests to challenge a manifest.
+and every run a `contract_digest`, and every checkpoint a content-addressed Hub
+`repo@digest`, so a validator or a trainer quorum can re-derive the corpus from
+the pinned generator + seed, re-train, and compare refs/digests to challenge a
+manifest.
 Moving to a re-derivation challenge protocol is the milestone that removes the
 single trusted trainer.
 
@@ -114,14 +115,14 @@ without producing generally-good data).
 **Flip point.** Both halves are now **wired**: the seeded selection/rotation
 (`metronome.validator.windows`) and the **pool loader**
 (`metronome.validator.pool::load_pool`), which fetches the `window_pool` **Hippius
-registry CID**, loads its `.npy`/`.npz` series (+ optional `metadata.json`), and
-slices them with `build_windows_from_series`. The live validator loop calls it on
-startup. The **producer** side is also wired: `metronome.pool` (the
+Hub `repo@digest`**, loads its `.npy`/`.npz` series (+ optional `metadata.json`),
+and slices them with `build_windows_from_series`. The live validator loop calls it
+on startup. The **producer** side is also wired: `metronome.pool` (the
 `metronome-pool build` CLI) harvests recent real-world series from pluggable
 sources (Open-Meteo weather, Wikimedia pageviews; extensible), cleans/validates
-them, and writes exactly that loader layout — `--upload` pins the CID. Operator
-inputs: run `metronome-pool build --out ./pool --upload`, set the printed CID in
-`[eval] window_pool`, keep it genuinely held-out, and re-build periodically (a
+them, and writes exactly that loader layout — `--upload` pins the ref. Operator
+inputs: run `metronome-pool build --out ./pool --upload --hub-repo metronome/eval-pool`,
+set the printed ref in `[eval] window_pool`, keep it genuinely held-out, and re-build periodically (a
 fresh `as_of`) so the pool rotates in time and stays contamination-resistant. See
 `docs/EVAL_POOL.md`.
 

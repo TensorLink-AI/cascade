@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     logging.getLogger("metronome.trainer").info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s",
-        cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.ipfs_api_url,
+        cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.hub_registry_url,
         "remote" if remote_hosts else "local",
     )
     runner.run_forever(client, max_challengers=args.max_challengers)

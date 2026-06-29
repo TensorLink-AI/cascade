@@ -4,11 +4,12 @@
   trains on your generator, including the determinism check. Returns non-zero
   if anything would reject. ``--skip-runtime`` runs the static checks only.
 
-* ``metronome deploy <repo_dir>`` — verify the local generator, upload it to the
-  Hippius registry (IPFS), and commit ``metro-v1:gen:hippius:<cid>`` via
-  ``set_reveal_commitment``. The CID content-addresses your submission, so it
-  both locates and pins it (no separate git SHA). Requires the ``[chain]`` extra
-  (bittensor) + a wallet, and the ``[hippius]`` extra + an IPFS node.
+* ``metronome deploy <repo_dir> --hub-repo <namespace/name>`` — verify the local
+  generator, push it to your Hippius Hub repo, and commit
+  ``metro-v1:gen:hippius:<repo>@<digest>`` via ``set_reveal_commitment``. The OCI
+  digest content-addresses your submission, so ``repo@digest`` both locates and
+  pins it (no separate git SHA). Requires the ``[chain]`` extra (bittensor) + a
+  wallet, and the ``[hippius]`` extra + Hub credentials in the environment.
 
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload failure.
@@ -48,9 +49,14 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--blocks-until-reveal", type=int, default=1)
     p.add_argument("--skip-verify", action="store_true", help="Skip the local verify before upload.")
     p.add_argument(
-        "--cid",
+        "--hub-repo",
         default=None,
-        help="Skip the upload and commit this already-uploaded registry CID directly.",
+        help="Your Hippius Hub repo id (namespace/name) to push the generator to.",
+    )
+    p.add_argument(
+        "--ref",
+        default=None,
+        help="Skip the upload and commit this already-uploaded Hub ref (repo@digest) directly.",
     )
     p.set_defaults(func=_cmd_deploy)
 
@@ -65,8 +71,11 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 def _cmd_deploy(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
 
-    cid = args.cid
-    if cid is None:
+    ref = args.ref
+    if ref is None:
+        if not args.hub_repo:
+            print("error: --hub-repo (namespace/name) is required to upload.", file=sys.stderr)
+            return 2
         # Verify locally (cheaper than burning a chain commit), then upload.
         if not args.skip_verify:
             report = verify_repo(args.repo_dir, cfg, skip_runtime=False)
@@ -74,19 +83,19 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
                 print("local verify failed — refusing to deploy:", file=sys.stderr)
                 print(report.render(), file=sys.stderr)
                 return 1
-        from ..shared.hippius import RegistryConfig, StorageError, upload_dir_to_registry
+        from ..shared.hippius import HubConfig, StorageError, upload_dir_to_hub
 
         try:
-            reg = RegistryConfig.from_storage(cfg.storage)
-            up = upload_dir_to_registry(args.repo_dir, reg)
-            cid = up.cid
+            hub = HubConfig.from_storage(cfg.storage)
+            up = upload_dir_to_hub(args.repo_dir, args.hub_repo, hub)
+            ref = up.ref.immutable_ref
         except StorageError as e:
             print(f"registry upload failed: {e}", file=sys.stderr)
             return 4
-        print(f"uploaded to Hippius registry: cid={cid} ({up.size_bytes} bytes)")
+        print(f"pushed to Hippius Hub: {ref} ({up.size_bytes} bytes)")
 
     try:
-        payload = format_commit(cid)
+        payload = format_commit(ref)
     except ValueError as e:
         print(f"refusing to deploy: {e}", file=sys.stderr)
         return 2
