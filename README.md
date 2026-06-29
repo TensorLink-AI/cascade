@@ -17,7 +17,11 @@ benchmarks by competing on synthetic priors, not architecture.
   fev-bench, GIFT-Eval, and Chronos Benchmark II, trained heavily on
   *large-scale synthetic* series (Gaussian-process curves, trend/seasonality/
   irregularity mixtures, random temporal causal graphs)
-  ([arXiv 2510.15821](https://arxiv.org/abs/2510.15821)).
+  ([arXiv 2510.15821](https://arxiv.org/abs/2510.15821)). Their ablation
+  trained *purely on synthetic data*, Chronos-2-Synth, stays within ~1 skill
+  point of the full model on GIFT-Eval (50.4 vs 51.4) and Chronos Benchmark II
+  (46.4 vs 46.6) — the authors note this suggests real data "may not even be
+  required for effective pretraining."
 * FlowState (IBM, 9.1M) is the smallest model in GIFT-Eval's top 10,
   out-forecasting rivals 20x+ its size, pretrained in part on synthetic series
   from the CauKer generator ([arXiv 2508.05287](https://arxiv.org/abs/2508.05287)).
