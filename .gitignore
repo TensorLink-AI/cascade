@@ -15,8 +15,8 @@ validator_state.db
 *.db
 .DS_Store
 
-# Local per-network configs (carry live netuid/hotkeys/eval-pool refs) and pool caches
-chain.testnet.toml
+# Local-only config overrides (carry live eval-pool refs / secrets) and pool caches.
+# chain.testnet.toml IS tracked; the eval-pool ref is set out-of-band, not committed.
 chain.*.local.toml
 _pool_real/
 _eval_pool/
