@@ -6,6 +6,39 @@ model byte-identical so the only variable is data quality, and scores the data
 generators that feed it — better synthetic data, better forecasters. The full
 sequence is in the [technical roadmap](#technical-roadmap).
 
+## Why compete on data
+
+Synthetic data isn't cascade's *only* lever, but we believe high-quality
+synthetic data is critical to training a time-series foundation model. That view
+tracks the consensus direction of the field: recent models keep winning on
+benchmarks by competing on synthetic priors, not architecture.
+
+* Chronos-2 (Amazon, 120M) reaches state-of-the-art zero-shot accuracy on
+  fev-bench, GIFT-Eval, and Chronos Benchmark II, trained heavily on
+  *large-scale synthetic* series (Gaussian-process curves, trend/seasonality/
+  irregularity mixtures, random temporal causal graphs)
+  ([arXiv 2510.15821](https://arxiv.org/abs/2510.15821)).
+* FlowState (IBM, 9.1M) is the smallest model in GIFT-Eval's top 10,
+  out-forecasting rivals 20x+ its size, pretrained in part on synthetic series
+  from the CauKer generator ([arXiv 2508.05287](https://arxiv.org/abs/2508.05287)).
+* ForecastPFN is a prior-data fitted network trained purely on a synthetic
+  distribution, and was the first zero-shot forecaster to beat the then-SOTA
+  with *no* real training data at all
+  ([arXiv 2311.01933](https://arxiv.org/abs/2311.01933)); TempoPFN
+  ([arXiv 2510.25502](https://arxiv.org/abs/2510.25502)) carries the
+  purely-synthetic pretraining recipe further.
+* DynaMix (NeurIPS 2025) is trained on nothing but a narrow synthetic corpus
+  of 34 chaotic dynamical systems and, with ~0.1% of Chronos's parameters
+  (~10k in total), still beats Chronos zero-shot on real-world traffic and
+  weather it never saw: a small, well-curated synthetic prior outperforming a far
+  larger real-data model ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
+
+The throughline: across the leaderboard, the synthetic data distribution is doing
+the heavy lifting. cascade turns that distribution into the competitive surface,
+holding the model fixed so miners compete the prior.
+
+## How it works
+
 The fixed process is a Toto2-4M backbone trained from random initialisation
 ([Datadog/Toto-2.0-4m](https://huggingface.co/Datadog/Toto-2.0-4m), arXiv
 2605.20119), *not* a fine-tune of released weights. Training from scratch is the
@@ -14,8 +47,6 @@ forecast skill measures the *data*, not what some pretrained checkpoint already
 knew. Toto 2.0 itself is 57.5% synthetic data with zero public series in
 pretraining and still tops GIFT-Eval, and cascade turns that synthetic-prior
 design into an open competition.
-
-## How it works
 
 ```mermaid
 flowchart TD
@@ -97,37 +128,6 @@ as the subnet scales the fixed model up. It is also no toy: the 4M is already
 competitive with Toto 1.0 and Chronos-2 despite being ~30-40x smaller. A robust,
 predictable, inexpensive starting point is exactly what a per-round controlled
 experiment needs.
-
-## Why compete on data
-
-Synthetic data isn't cascade's *only* lever, but we believe high-quality
-synthetic data is critical to training a time-series foundation model. That view
-tracks the consensus direction of the field: recent models keep winning on
-benchmarks by competing on synthetic priors, not architecture.
-
-* Chronos-2 (Amazon, 120M) reaches state-of-the-art zero-shot accuracy on
-  fev-bench, GIFT-Eval, and Chronos Benchmark II, trained heavily on
-  *large-scale synthetic* series (Gaussian-process curves, trend/seasonality/
-  irregularity mixtures, random temporal causal graphs)
-  ([arXiv 2510.15821](https://arxiv.org/abs/2510.15821)).
-* FlowState (IBM, 9.1M) is the smallest model in GIFT-Eval's top 10,
-  out-forecasting rivals 20x+ its size, pretrained in part on synthetic series
-  from the CauKer generator ([arXiv 2508.05287](https://arxiv.org/abs/2508.05287)).
-* ForecastPFN is a prior-data fitted network trained purely on a synthetic
-  distribution, and was the first zero-shot forecaster to beat the then-SOTA
-  with *no* real training data at all
-  ([arXiv 2311.01933](https://arxiv.org/abs/2311.01933)); TempoPFN
-  ([arXiv 2510.25502](https://arxiv.org/abs/2510.25502)) carries the
-  purely-synthetic pretraining recipe further.
-* DynaMix (NeurIPS 2025) is trained on nothing but a narrow synthetic corpus
-  of 34 chaotic dynamical systems and, with ~0.1% of Chronos's parameters
-  (~10k in total), still beats Chronos zero-shot on real-world traffic and
-  weather it never saw: a small, well-curated synthetic prior outperforming a far
-  larger real-data model ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
-
-The throughline: across the leaderboard, the synthetic data distribution is doing
-the heavy lifting. cascade turns that distribution into the competitive surface,
-holding the model fixed so miners compete the prior.
 
 ## Technical roadmap
 
