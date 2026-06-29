@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.shared import hippius
+from cascade.shared import hippius
 
 
 def test_hub_ref_parses_and_rejects_garbage():

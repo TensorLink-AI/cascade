@@ -1,10 +1,10 @@
-"""Diversity sanity check for the metronome base generator (acceptance #5).
+"""Diversity sanity check for the cascade base generator (acceptance #5).
 
 Prints summary statistics (mean, std, dominant spectral period, trend slope,
 lag-1 autocorrelation) across a sample of the mixed corpus, plus a per-family
 breakdown, to confirm multiple regimes appear rather than one degenerate shape.
 
-    PYTHONPATH=/path/to/metronome python base_generator/tests/diversity_check.py
+    PYTHONPATH=/path/to/cascade python base_generator/tests/diversity_check.py
 """
 
 from __future__ import annotations

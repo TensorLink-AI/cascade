@@ -4,13 +4,13 @@
 # and state DBs. This file is gitignored (carries the testnet eval-pool ref).
 #
 # Single source of truth for active subnet configuration. Miners, the trainer,
-# and validators all read this file via metronome.shared.config. Schema is versioned.
+# and validators all read this file via cascade.shared.config. Schema is versioned.
 
 schema_version = 1
 
 [subnet]
-netuid = 259                     # testnet: metronome subnet (owner-registered)
-name = "metronome"
+netuid = 259                     # testnet: cascade subnet (owner-registered)
+name = "cascade"
 description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Toto2-4M trained from scratch."
 
 [generator]
@@ -35,14 +35,14 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # The FIXED training contract — identical for king and challenger. The only
 # thing that varies between the two trained models is the generator's data.
 #
-# metronome trains a Toto2 backbone FROM RANDOM INIT on each corpus (it does not
+# cascade trains a Toto2 backbone FROM RANDOM INIT on each corpus (it does not
 # fine-tune a released checkpoint): from scratch, the corpus is the only source
 # of learned signal. So the whole recipe is pinned here and folded into
 # contract_digest. Arch defaults track Datadog/Toto-2.0-4m — pin the exact
 # integers and base_arch_digest to that checkpoint's config.json before launch.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `metronome-trainer --offline` if you change either
+base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -104,15 +104,15 @@ expected_gpu = ""
 # Held-out eval windows. The SAME windows are scored for king and challenger,
 # which is what makes the comparison a controlled measurement. The slice is
 # private and ROTATES per round (seeded by the block hash) so a generator cannot
-# distribution-match a fixed public benchmark — see metronome.validator.windows.
-eval_dataset   = "metronome-private-v1"  # identifier the validator matches on
+# distribution-match a fixed public benchmark — see cascade.validator.windows.
+eval_dataset   = "cascade-private-v1"  # identifier the validator matches on
 eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
 window_pool    = ""                       # set out-of-band (not committed): the testnet eval-pool
-                                          # Hub/hf ref. Build with `metronome-pool build` (see docs/EVAL_POOL.md).
+                                          # Hub/hf ref. Build with `cascade-pool build` (see docs/EVAL_POOL.md).
                                           # (.npy/.npz series + optional metadata.json). Build,
                                           # push, and get the ref to pin here with:
-                                          #   metronome-pool build --out ./pool --upload
-                                          # (see docs/EVAL_POOL.md and metronome.pool).
+                                          #   cascade-pool build --out ./pool --upload
+                                          # (see docs/EVAL_POOL.md and cascade.pool).
 num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
@@ -185,13 +185,13 @@ blocked = [
     "shelve",
     "multiprocessing",
     "asyncio.subprocess",
-    "metronome.trainer",
-    "metronome.validator",
-    "metronome.shared.chain",
+    "cascade.trainer",
+    "cascade.validator",
+    "cascade.shared.chain",
 ]
 
 [storage]
-# Hippius is metronome's storage layer. Two backends:
+# Hippius is cascade's storage layer. Two backends:
 #   registry (Hippius Hub OCI, https://docs.hippius.com/registry) —
 #                     models/checkpoints/generators, pinned by repo@digest.
 #                     Miners commit metro-v1:gen:hippius:<repo>@<digest>; the
@@ -203,18 +203,18 @@ blocked = [
 hub_registry_url = "https://registry.hippius.com"   # informational: the hippius_hub
                                                     # client targets its own default
                                                     # endpoint; recorded here for ops
-hub_namespace    = "metronome-testnet"              # TESTNET namespace, kept distinct from
-                                                    # mainnet "metronome" so checkpoints/pools
+hub_namespace    = "cascade-testnet"              # TESTNET namespace, kept distinct from
+                                                    # mainnet "cascade" so checkpoints/pools
                                                     # never share a namespace across networks
 s3_endpoint      = "https://s3.hippius.com"
 s3_region        = "decentralized"
-manifest_bucket  = "metronome-testnet-manifests"    # TESTNET bucket (mainnet: metronome-manifests)
-logs_bucket      = "metronome-testnet-logs"         # TESTNET bucket (mainnet: metronome-logs)
+manifest_bucket  = "cascade-testnet-manifests"    # TESTNET bucket (mainnet: cascade-manifests)
+logs_bucket      = "cascade-testnet-logs"         # TESTNET bucket (mainnet: cascade-logs)
 # Eval-pool bucket: daily snapshots + pool/index.json. When set, validators pull
 # the rotating pool from here (deterministic per-round snapshot selection) instead
 # of a static [eval] window_pool ref — the owner publishes daily with
-# `metronome-pool publish`. Leave empty to use the static ref path.
-pool_bucket      = ""                               # e.g. "metronome-eval-pool"
+# `cascade-pool publish`. Leave empty to use the static ref path.
+pool_bucket      = ""                               # e.g. "cascade-eval-pool"
 # Point these at Cloudflare R2 (+ POOL_S3_ACCESS_KEY / POOL_S3_SECRET_KEY) to
 # publish/pull the pool there; empty = reuse the Hippius S3 endpoint above.
 pool_s3_endpoint = ""
@@ -234,14 +234,14 @@ hf_cache_seconds           = 1800
 state_db_path              = "validator_state.testnet.db"
 
 [queue]
-# Trainer-side submission queue (see metronome.trainer.queue). Challenger
+# Trainer-side submission queue (see cascade.trainer.queue). Challenger
 # generators discovered on-chain are enqueued FIFO and trained in arrival order,
 # at most --max-challengers per round. Cheap anti-duplicate checks run before any
 # generator is fetched or trained (a round is ~3h of GPU per generator):
 #   * duplicate-of-king — a challenger whose generator CID equals the reigning
 #     king's is an exact copy of the king (the CID is the content hash); it can
 #     only tie, never clear the win margin, so it is skipped instead of burning a
-#     round. This is the metronome analogue of teutonic's check_model_copy.
+#     round. This is the cascade analogue of teutonic's check_model_copy.
 #   * already-trained   — a CID already trained THIS REIGN is skipped; the cache
 #     resets when the king changes (teutonic-style per-cycle dedup). This fits the
 #     shipped single-round dethroning (dethrone_cp = 1): a challenger gets one

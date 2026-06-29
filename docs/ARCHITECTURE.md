@@ -1,9 +1,9 @@
-# metronome architecture
+# cascade architecture
 
 ## The thesis
 
 A time-series foundation model is only as good as the data it was trained on.
-metronome makes **synthetic training data** the competitive resource: miners
+cascade makes **synthetic training data** the competitive resource: miners
 write data generators, the subnet owner trains **a Toto2-4M backbone from random
 initialisation** on each, and the generator whose data yields the best forecaster
 wins. By holding the model architecture and the entire training process constant,
@@ -15,14 +15,14 @@ that attribution clean: a fine-tune confounds data quality with what the
 pretrained weights already encode, whereas from random init the corpus is the
 *only* source of learned signal. This mirrors Toto 2.0 itself, whose pretraining
 mix is 57.5% synthetic and 0% public time series yet still tops GIFT-Eval — the
-synthetic prior is the lever, and metronome competes it.
+synthetic prior is the lever, and cascade competes it.
 
 ## Roles and data flow
 
 ### 1. Miner — submits a generator
 
 A miner writes `generator.py` exposing `Generator(DataGenerator)`, pushes the
-repo to the **Hippius Hub registry** (OCI) with `metronome deploy`, and commits a
+repo to the **Hippius Hub registry** (OCI) with `cascade deploy`, and commits a
 single on-chain pointer:
 
 ```
@@ -33,7 +33,7 @@ The Hub `repo@digest` content-addresses the generator code, `config.json`,
 `requirements.txt`, and any model weights together — it both locates and pins the
 submission (the OCI digest *is* the content hash, so there is no separate git SHA). A
 generator may itself be a trained model (safetensors only, size-capped) — the
-distinction from horizon is not "no weights" but *what is scored*: metronome
+distinction from horizon is not "no weights" but *what is scored*: cascade
 scores the **data** (via a fixed model trained on it), horizon scores the
 submitted model directly. See `docs/INTERFACE.md`.
 
@@ -47,14 +47,14 @@ Once per round the trainer:
 3. Derives one `RoundSeeds` from the round's base seed (the chain block hash):
    a shared `generation_seed` and a shared `training_seed`.
 4. For the king and each challenger, **under that one shared seed pair**:
-   - opens the round's corpus stream (`metronome.trainer.stream.open_round_stream`,
+   - opens the round's corpus stream (`cascade.trainer.stream.open_round_stream`,
      selected by `[training] corpus_mode`): `stream_cpu` streams *fresh* `(C, L)`
      series from a sandboxed generator with no reuse (rolling byte-exact digest);
      `cache_reuse` draws a fixed corpus once (also sandboxed) and cycles it. Either
      way the trainer gets one budget-capped iterator (univariate `C = 1` today;
      the channel axis is carried so multivariate priors need no schema change),
    - trains a **fresh Toto2-4M from random init** via the owner's `BaseTrainer`
-     (`metronome.trainer.contract`; reference: `metronome.trainer.toto2_trainer`)
+     (`cascade.trainer.contract`; reference: `cascade.trainer.toto2_trainer`)
      — it pulls series until the stream ends, for the contract's budget (~3h on
      the reference GPU, enforced as a fixed `train_tokens` count so king and
      challenger get identical compute), streaming per-step metrics (loss, lr,
@@ -77,8 +77,8 @@ runs (shared `training_seed` ⇒ identical random init for both).
 By default the king and challenger train sequentially on the trainer's own GPU.
 For faster rounds the trainer can dispatch them **in parallel to separate
 SSH-reachable GPU pods** (e.g. rented Lium/Targon boxes) via `--remote-hosts`
-(`metronome.trainer.remote`). The remote unit is a **round-worker**
-(`metronome.trainer.worker`), not a remote `BaseTrainer`: each pod pulls its
+(`cascade.trainer.remote`). The remote unit is a **round-worker**
+(`cascade.trainer.worker`), not a remote `BaseTrainer`: each pod pulls its
 generator from the registry by ref, builds the corpus in its own sandbox, trains,
 uploads the checkpoint, and returns a `TrainedEntry` receipt over SSH. The
 orchestrator collects the receipts and signs + publishes the manifest, so **the
@@ -110,8 +110,8 @@ The validator never trains. Each round it:
    challenger share the **contract digest** and **base-arch digest** (the
    controlled-experiment gate — `ValidatorRunner.check_manifest`).
 2. Pulls both trained checkpoints and scores them on the **same** held-out
-   real-world eval windows (`metronome.validator.evaluator`).
-3. Runs the paired-bootstrap KOTH verdict (`metronome.eval.koth.evaluate_round`)
+   real-world eval windows (`cascade.validator.evaluator`).
+3. Runs the paired-bootstrap KOTH verdict (`cascade.eval.koth.evaluate_round`)
    and folds it into the champion state.
 4. Sets weights: an equal share across the current king plus up to
    `[scoring] reward_prior_kings` registered prior kings (`reward_prior_kings = 0`
@@ -120,7 +120,7 @@ The validator never trains. Each round it:
 ## The controlled-experiment invariant
 
 For a round to be a fair measurement of data quality, the king's model and the
-challenger's model must differ in **exactly one** thing: the corpus. metronome
+challenger's model must differ in **exactly one** thing: the corpus. cascade
 enforces this on three sides:
 
 * **Trainer:** one `RoundSeeds` instance is reused for both — identical *random*
@@ -141,7 +141,7 @@ Per window, per channel, per model: MASE (Hyndman seasonal-naive denominator) an
 the gluonts `MeanWeightedSumQuantileLoss` components `(qloss_per_q, abs_target)`
 over the 9-level grid `0.1…0.9`. That grid is *exactly* Toto 2.0's training
 objective — its quantile head predicts those nine levels under pinball loss — so
-metronome's **score objective equals the model's train objective**, which
+cascade's **score objective equals the model's train objective**, which
 collapses the metric-layer gap between what's trained and what's measured.
 Univariate windows produce one score each (`channel = 0`); a multivariate window
 contributes one row per channel.
@@ -151,7 +151,7 @@ The KOTH decision is a **paired bootstrap LCB** on the relative improvement of
 per bag and aggregating MWSQL numerator/denominator before dividing (robust to
 near-zero-mean windows). The challenger wins a round iff that LCB clears the
 win margin on at least `min_windows` common windows. The windows
-are a **rotating private slice** (`metronome.validator.windows`): seeded by the
+are a **rotating private slice** (`cascade.validator.windows`): seeded by the
 round's block hash so every validator scores the identical set and the king/
 challenger comparison is paired, but rotated each round so no fixed eval set can
 be distribution-matched.
@@ -183,11 +183,11 @@ the manifest schema + digests + **signing/verification**, the full scoring + KOT
 math, the champion state machine, corpus building from a generator, the trainer's
 pairing logic, the **Hippius storage layer** (Hub ref grammar + S3
 manifest/log/pool-snapshot layout), the rotating private window selection *and* the **eval-pool
-loader** (`metronome.validator.pool`), and the trainer-round assembly + both
+loader** (`cascade.validator.pool`), and the trainer-round assembly + both
 **live service loops** (`trainer/main.py`, `validator/main.py`).
 
 The **Toto2-4M from-scratch `BaseTrainer`** ships as a runnable reference
-(`metronome.trainer.toto2_trainer`) behind the `[train]` extra — a causal patch
+(`cascade.trainer.toto2_trainer`) behind the `[train]` extra — a causal patch
 transformer with a 9-quantile pinball head, u-μP-style init, a Muon+AdamW
 optimiser split, and a token-budget LR schedule. It is the one piece that needs a
 **GPU to validate end-to-end** (no GPU in CI); run a real round on your reference

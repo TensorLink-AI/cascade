@@ -1,4 +1,4 @@
-# Open questions — metronome scaffold
+# Open questions — cascade scaffold
 
 Substantive design calls the initial spec left ambiguous. Each is implemented
 with a clear default; the listed location is where to change it if a different
@@ -62,7 +62,7 @@ authority for dethroning and set weights accordingly. On a vacant throne
 (genesis or king deregistered) the lowest-UID resolvable generator is promoted
 to interim king so there is always something to defend.
 
-**Flip point.** `metronome/trainer/loop.py::plan_round` (interim-king choice) and
+**Flip point.** `cascade/trainer/loop.py::plan_round` (interim-king choice) and
 the live loop's king lookup (TODO in `trainer/main.py`). An alternative is an
 authoritative owner-maintained king pointer alongside the manifest; that
 re-centralises the decision and is not the default.
@@ -77,7 +77,7 @@ per round, the lowest-UID non-king resolvable generator. Simple and cheap (two
 trainings per round). Rotating fairly through the field, or batching multiple
 challengers into one manifest, is a straightforward extension.
 
-**Flip point.** `metronome/trainer/loop.py::plan_round` /
+**Flip point.** `cascade/trainer/loop.py::plan_round` /
 `TrainerRunner.run_round`, and `validator/loop.py::process_round` (which today
 reads the single `king`/`challenger` pair from the manifest).
 
@@ -92,7 +92,7 @@ identical weight init and data-order RNG (the controlled experiment); shared
 `generation_seed` means neither generator draws a "luckier" data seed. Both
 derive deterministically from the chain block hash.
 
-**Flip point.** `metronome/trainer/contract.py::RoundSeeds.derive`. If you want
+**Flip point.** `cascade/trainer/contract.py::RoundSeeds.derive`. If you want
 per-miner generation seeds (so a generator can't tune to one fixed seed), give
 each its own `generation_seed` while keeping `training_seed` shared — but note
 that weakens reproducibility unless the per-miner seed is also chain-derived.
@@ -103,7 +103,7 @@ that weakens reproducibility unless the per-miner seed is also chain-derived.
 
 **Default.** A **private, rotating** pool. `chain.toml [eval] eval_source =
 "private-rotating"` and `window_pool` names an owner-controlled held-out corpus.
-`metronome/validator/windows.py` implements the selection: `RotatingWindowSource`
+`cascade/validator/windows.py` implements the selection: `RotatingWindowSource`
 draws a slice seeded by the round's block hash, so every validator scores the
 **same** windows for the king and challenger (paired, consensus-stable) while the
 slice **rotates each round** so no fixed set can be distribution-matched
@@ -113,22 +113,22 @@ exploit (a named public benchmark is the easiest thing for a generator to overfi
 without producing generally-good data).
 
 **Flip point.** Both halves are now **wired**: the seeded selection/rotation
-(`metronome.validator.windows`) and the **pool loader**
-(`metronome.validator.pool::load_pool`), which fetches the `window_pool` **Hippius
+(`cascade.validator.windows`) and the **pool loader**
+(`cascade.validator.pool::load_pool`), which fetches the `window_pool` **Hippius
 Hub `repo@digest`**, loads its `.npy`/`.npz` series (+ optional `metadata.json`),
 and slices them with `build_windows_from_series`. The live validator loop calls it
-on startup. The **producer** side is also wired: `metronome.pool` (the
-`metronome-pool build` CLI) harvests recent real-world series from pluggable
+on startup. The **producer** side is also wired: `cascade.pool` (the
+`cascade-pool build` CLI) harvests recent real-world series from pluggable
 sources (Open-Meteo weather, Wikimedia pageviews; extensible), cleans/validates
 them, and writes exactly that loader layout — `--upload` pins the ref. Operator
-inputs: run `metronome-pool build --out ./pool --upload --hub-repo metronome/eval-pool`,
+inputs: run `cascade-pool build --out ./pool --upload --hub-repo cascade/eval-pool`,
 set the printed ref in `[eval] window_pool`, keep it genuinely held-out, and re-build periodically (a
 fresh `as_of`) so the pool rotates in time and stays contamination-resistant. See
 `docs/EVAL_POOL.md`.
 
 ## 7. From-scratch budget and model size
 
-**Question.** metronome trains a Toto2 backbone from random init, twice per round.
+**Question.** cascade trains a Toto2 backbone from random init, twice per round.
 How big a model, and how much compute, so data-quality differences clear the
 undertraining-noise floor without making rounds unaffordable?
 

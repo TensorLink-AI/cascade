@@ -1,7 +1,7 @@
-# metronome: synthetic time-series data subnet
+# cascade: synthetic time-series data subnet
 
 A Bittensor subnet where miners compete on the quality of **training data**, not
-models. metronome holds the *training process* fixed and scores the
+models. cascade holds the *training process* fixed and scores the
 **data generators** that feed it.
 
 The fixed process is **a Toto2-4M backbone trained from random initialisation**
@@ -10,7 +10,7 @@ The fixed process is **a Toto2-4M backbone trained from random initialisation**
 point: the corpus is then the only source of learned signal, so the downstream
 forecast skill measures the *data*, not what some pretrained checkpoint already
 knew. Toto 2.0 itself is 57.5% synthetic data with zero public series in
-pretraining and still tops GIFT-Eval, and metronome turns that synthetic-prior
+pretraining and still tops GIFT-Eval, and cascade turns that synthetic-prior
 design into an open competition.
 
 ## How it works
@@ -98,7 +98,7 @@ experiment needs.
 
 ## Why compete on data
 
-Synthetic data isn't metronome's *only* lever, but we believe **high-quality
+Synthetic data isn't cascade's *only* lever, but we believe **high-quality
 synthetic data is critical** to training a time-series foundation model. That view
 tracks the consensus direction of the field: recent models keep winning on
 benchmarks by competing on synthetic priors, not architecture.
@@ -124,21 +124,21 @@ benchmarks by competing on synthetic priors, not architecture.
   larger real-data model ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
 
 The throughline: across the leaderboard, the synthetic data distribution is doing
-the heavy lifting. metronome turns that distribution into the competitive surface,
+the heavy lifting. cascade turns that distribution into the competitive surface,
 holding the model fixed so miners compete the prior.
 
 ## Three roles
 
 | role | package | needs GPU | needs chain |
 |------|---------|-----------|-------------|
-| **miner** | `metronome.miner` | no | to deploy |
-| **trainer** (owner) | `metronome.trainer` | yes | to read king / sign manifest |
-| **validator** | `metronome.validator` | yes (eval) | to set weights |
+| **miner** | `cascade.miner` | no | to deploy |
+| **trainer** (owner) | `cascade.trainer` | yes | to read king / sign manifest |
+| **validator** | `cascade.validator` | yes (eval) | to set weights |
 
 ## Layout
 
 ```
-metronome/
+cascade/
   interface/   miner-facing contract (DataGenerator ABC, output checks, static guard)
   eval/        scoring math: CRPS (MWSQL), MASE, paired bootstrap, KOTH decision
   trainer/     owner GPU service: corpus build, fixed contract, train+upload, manifest
@@ -157,21 +157,21 @@ scripts/
 
 After `uv sync` / `pip install -e .`:
 
-* `metronome verify <repo_dir>`: runs every check the trainer runs (layout,
+* `cascade verify <repo_dir>`: runs every check the trainer runs (layout,
   static guard, hash-locked deps, **and the determinism check**: your generator
   must produce a byte-identical corpus at a fixed seed).
-* `metronome deploy <repo_dir> --hub-repo <ns/name> --wallet-name ... --wallet-hotkey ...`:
+* `cascade deploy <repo_dir> --hub-repo <ns/name> --wallet-name ... --wallet-hotkey ...`:
   verifies the local generator, pushes it to the **Hippius Hub registry** (OCI),
   and commits `metro-v1:gen:hippius:<repo>@<digest>` on-chain (the OCI digest pins
   the content — no git SHA).
-* `metronome-trainer --trainer metronome.trainer.toto2_trainer:Toto2Trainer`:
+* `cascade-trainer --trainer cascade.trainer.toto2_trainer:Toto2Trainer`:
   the owner training service (`--offline` for a config/seed smoke); the reference
-  Toto2-4M backend lives in `metronome.trainer.toto2_trainer`. Add
+  Toto2-4M backend lives in `cascade.trainer.toto2_trainer`. Add
   `--remote-hosts hosts.toml` to train the king and challenger **in parallel on
   separate SSH GPU pods** (Lium/Targon); see `scripts/remote_hosts.example.toml`.
-* `metronome-train-worker`: the per-pod worker the remote dispatch runs (trains
+* `cascade-train-worker`: the per-pod worker the remote dispatch runs (trains
   one role, uploads its checkpoint, prints a receipt — no wallet on the pod).
-* `metronome-validator`: the validator loop (`--offline` for a state smoke).
+* `cascade-validator`: the validator loop (`--offline` for a state smoke).
 
 Storage is **Hippius**: models/checkpoints/generators on the **Hippius Hub**
 registry (OCI, pinned by `repo@digest`), manifests + training logs on Hippius
@@ -192,8 +192,8 @@ python -m pytest tests/unit -q   # pure-numpy tests, no torch/HF/chain needed
 ```
 
 The Toto2-4M from-scratch training sits behind the
-`metronome.trainer.contract.BaseTrainer` protocol (the GPU boundary). A runnable
-reference implementation ships in `metronome.trainer.toto2_trainer` (a causal
+`cascade.trainer.contract.BaseTrainer` protocol (the GPU boundary). A runnable
+reference implementation ships in `cascade.trainer.toto2_trainer` (a causal
 patch transformer with a 9-quantile pinball head, trained from random init under
 the `chain.toml [training]` recipe); it needs a GPU to validate end-to-end, so
 run it on your reference box before pinning `base_arch_digest`. Everything above

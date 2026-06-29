@@ -1,4 +1,4 @@
-# Example remote-training host file for `metronome-trainer --remote-hosts`.
+# Example remote-training host file for `cascade-trainer --remote-hosts`.
 #
 # This file is TRAINER-LOCAL — keep it out of git and OFF the public chain.toml.
 # It lists the SSH GPU pods (Lium, Targon, or any host you can SSH into) that the
@@ -6,7 +6,7 @@
 # host trains the king, the second the challenger (more hosts → a round-robin
 # pool for multi-challenger rounds).
 #
-# Each pod must already have: metronome installed (`pip install -e '.[train,hippius]'`),
+# Each pod must already have: cascade installed (`pip install -e '.[train,hippius]'`),
 # torch + a GPU, and registry/S3 access. The pod does NOT need the bittensor
 # wallet — signing/publishing stays on the orchestrator. Seed the pod's env once
 # when you rent it (HIPPIUS_HUB_TOKEN, HIPPIUS_S3_ACCESS_KEY,
@@ -23,10 +23,10 @@ host          = "203.0.113.10"        # pod public IP / hostname
 port          = 22
 user          = "root"
 key_path      = "~/.ssh/lium_ed25519"
-remote_python = "/root/metronome/.venv/bin/python"
-workdir       = "/root/metronome"     # where metronome is installed on the pod
+remote_python = "/root/cascade/.venv/bin/python"
+workdir       = "/root/cascade"     # where cascade is installed on the pod
 cuda_device   = "0"                    # pins CUDA_VISIBLE_DEVICES on the pod
-# chain_toml  = "/root/metronome/chain.toml"   # only if non-default on the pod
+# chain_toml  = "/root/cascade/chain.toml"   # only if non-default on the pod
 # forward_env = ["HIPPIUS_HUB_TOKEN", "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY"]
 # ssh_options = ["ServerAliveInterval=30", "ServerAliveCountMax=120"]
 
@@ -36,6 +36,6 @@ host          = "203.0.113.11"
 port          = 22
 user          = "root"
 key_path      = "~/.ssh/targon_ed25519"
-remote_python = "/root/metronome/.venv/bin/python"
-workdir       = "/root/metronome"
+remote_python = "/root/cascade/.venv/bin/python"
+workdir       = "/root/cascade"
 cuda_device   = "0"

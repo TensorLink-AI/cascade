@@ -7,10 +7,10 @@ import datetime as dt
 
 import numpy as np
 
-from metronome.pool.source import HarvestContext
-from metronome.pool.sources.openmeteo import OpenMeteoSource
-from metronome.pool.sources.synthetic import SyntheticSource
-from metronome.pool.sources.wikimedia import WikimediaSource
+from cascade.pool.source import HarvestContext
+from cascade.pool.sources.openmeteo import OpenMeteoSource
+from cascade.pool.sources.synthetic import SyntheticSource
+from cascade.pool.sources.wikimedia import WikimediaSource
 
 CTX = HarvestContext(as_of=dt.date(2026, 6, 1), context_length=512, horizon=16, max_series=1000)
 
@@ -88,8 +88,8 @@ def test_wikimedia_skips_sparse_articles():
 
 
 def test_default_sources_can_supply_2000_windows():
-    from metronome.pool.sources.openmeteo import OpenMeteoSource, global_grid
-    from metronome.pool.sources.wikimedia import WikimediaSource
+    from cascade.pool.sources.openmeteo import OpenMeteoSource, global_grid
+    from cascade.pool.sources.wikimedia import WikimediaSource
 
     grid = global_grid()
     assert len(grid) > 200
@@ -101,7 +101,7 @@ def test_default_sources_can_supply_2000_windows():
 
 
 def test_global_grid_denser_with_smaller_steps():
-    from metronome.pool.sources.openmeteo import global_grid
+    from cascade.pool.sources.openmeteo import global_grid
 
     assert len(global_grid(lat_step=6, lon_step=8)) > len(global_grid())
 

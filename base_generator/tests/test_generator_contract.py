@@ -1,11 +1,11 @@
-"""Contract tests for the metronome base generator.
+"""Contract tests for the cascade base generator.
 
-Adapted from metronome's ``tests/unit/test_generator_contract.py`` pattern, but
+Adapted from cascade's ``tests/unit/test_generator_contract.py`` pattern, but
 pointed at THIS repo's ``Generator``. Run from the repo root with:
 
-    PYTHONPATH=/path/to/metronome pytest base_generator/tests -q
+    PYTHONPATH=/path/to/cascade pytest base_generator/tests -q
 
-(``metronome`` must be importable; the generator's own deps — numpy/scipy/pandas/
+(``cascade`` must be importable; the generator's own deps — numpy/scipy/pandas/
 torch — must be installed.)
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from metronome.interface.generator import check_series, drain_generator
+from cascade.interface.generator import check_series, drain_generator
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 
@@ -50,7 +50,7 @@ def _drain(Generator, n, seed=0):
 
 
 def test_subclasses_datagenerator(Generator):
-    from metronome.interface import DataGenerator
+    from cascade.interface import DataGenerator
 
     gen = Generator(str(REPO_DIR), seed=0)
     assert isinstance(gen, DataGenerator)

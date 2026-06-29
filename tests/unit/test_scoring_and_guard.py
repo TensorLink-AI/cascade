@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from metronome.eval.scoring import global_geomean, score_forecaster_on_windows
-from metronome.eval.window import EvalWindow
-from metronome.interface.static_guard import scan_source
+from cascade.eval.scoring import global_geomean, score_forecaster_on_windows
+from cascade.eval.window import EvalWindow
+from cascade.interface.static_guard import scan_source
 
-BLOCKED = ("socket", "subprocess", "metronome.shared.chain")
+BLOCKED = ("socket", "subprocess", "cascade.shared.chain")
 
 
 def _windows(n=10, h=12, seed=0):
@@ -65,7 +65,7 @@ def test_static_guard_flags_blocked_imports():
     assert scan_source("import numpy\n", BLOCKED).ok
     assert not scan_source("import socket\n", BLOCKED).ok
     assert not scan_source("from subprocess import run\n", BLOCKED).ok
-    assert not scan_source("import metronome.shared.chain as c\n", BLOCKED).ok
+    assert not scan_source("import cascade.shared.chain as c\n", BLOCKED).ok
     assert not scan_source("__import__('socket')\n", BLOCKED).ok
 
 

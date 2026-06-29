@@ -5,16 +5,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from metronome.shared.chain import Commitment
-from metronome.shared.hippius import HubRef, HubUpload
-from metronome.trainer import loop as loop_mod
-from metronome.trainer.contract import TrainResult
-from metronome.trainer.loop import TrainerRunner
-from metronome.trainer.queue import SubmissionQueue
+from cascade.shared.chain import Commitment
+from cascade.shared.hippius import HubRef, HubUpload
+from cascade.trainer import loop as loop_mod
+from cascade.trainer.contract import TrainResult
+from cascade.trainer.loop import TrainerRunner
+from cascade.trainer.queue import SubmissionQueue
 
 REF_A = "alice/gen-a@sha256:" + "a" * 64
 REF_B = "bob/gen-b@sha256:" + "b" * 64
-REF_OUT = "metronome/ckpt-out@sha256:" + "c" * 64
+REF_OUT = "cascade/ckpt-out@sha256:" + "c" * 64
 
 
 class _FakeStream:

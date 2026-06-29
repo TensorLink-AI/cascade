@@ -1,6 +1,6 @@
-"""metronome genesis "base generator".
+"""cascade genesis "base generator".
 
-A single :class:`Generator` (``metronome.interface.DataGenerator``) that adapts a
+A single :class:`Generator` (``cascade.interface.DataGenerator``) that adapts a
 curated subset of TempoPFN's procedural time-series priors into one deterministic
 corpus source. Ten families are mixed by configurable weights:
 
@@ -10,7 +10,7 @@ corpus source. Ten families are mixed by configurable weights:
 Everything is vendored under ``tempo_gen/`` (import-rewritten from TempoPFN's
 ``src/``). The GP-prior (gpytorch), KernelSynth (scikit-learn) and CauKer
 (networkx + scikit-learn) families were added in v2: their dependencies are now
-on metronome's allowlist (see ``chain.toml [dependencies]``). The TempoPFN
+on cascade's allowlist (see ``chain.toml [dependencies]``). The TempoPFN
 ablation shows this GP/kernel family carries a large share of the downstream
 signal, which is why it was the priority add. The pyo-backed *audio* generators
 remain excluded — pyo runs a real-time audio server and seeds via ``hash()``,
@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
-from metronome.interface import DataGenerator
+from cascade.interface import DataGenerator
 
 # The trainer imports this file by path (importlib.spec_from_file_location), so the
 # vendored ``tempo_gen`` package next to it is not on sys.path by default. Add this

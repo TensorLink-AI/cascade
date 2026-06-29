@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from metronome.trainer.toto2_trainer import iter_training_batches
+from cascade.trainer.toto2_trainer import iter_training_batches
 
 
 def test_short_series_still_produce_batches():

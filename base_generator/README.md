@@ -1,9 +1,9 @@
-# metronome base generator (genesis "base" king)
+# cascade base generator (genesis "base" king)
 
-A self-contained metronome data generator that adapts a curated subset of
+A self-contained cascade data generator that adapts a curated subset of
 [TempoPFN](https://github.com/automl/TempoPFN)'s procedural synthetic time-series
 priors into a single deterministic `Generator(DataGenerator)`. Intended as the
-launch/genesis king for the metronome subnet.
+launch/genesis king for the cascade subnet.
 
 ## What's inside
 
@@ -25,7 +25,7 @@ drawn at `generate_length` (2048) and deterministically random-cropped into the
 
 The GP/kernel family — **GP-prior** (gpytorch), **KernelSynth** (scikit-learn)
 and **CauKer** (networkx + scikit-learn) — was added in v2: those deps are now
-on metronome's allowlist (`chain.toml [dependencies]`). The TempoPFN ablation
+on cascade's allowlist (`chain.toml [dependencies]`). The TempoPFN ablation
 shows this family carries a large share of the downstream signal. CauKer is
 multivariate (an SCM DAG of GP-prior nodes); each channel is flattened into its
 own univariate series so the emitted corpus stays 1-D. Its upstream GPU
@@ -49,8 +49,8 @@ offset — salted per process by `PYTHONHASHSEED` — was replaced with a stable
 ## Verify / test
 
 ```bash
-# from the metronome repo root, with deps installed and metronome importable
-metronome verify ./base_generator                       # full trainer-side checks
+# from the cascade repo root, with deps installed and cascade importable
+cascade verify ./base_generator                       # full trainer-side checks
 PYTHONPATH=$PWD pytest base_generator/tests -q           # contract tests
 PYTHONPATH=$PWD python base_generator/tests/diversity_check.py
 ```

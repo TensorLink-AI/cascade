@@ -8,11 +8,11 @@ import types
 
 import pytest
 
-from metronome.shared.chain import Commitment
-from metronome.shared.manifest import format_trained_pointer
-from metronome.trainer import remote as remote_mod
-from metronome.trainer.loop import TrainerRunner
-from metronome.trainer.remote import (
+from cascade.shared.chain import Commitment
+from cascade.shared.manifest import format_trained_pointer
+from cascade.trainer import remote as remote_mod
+from cascade.trainer.loop import TrainerRunner
+from cascade.trainer.remote import (
     RECEIPT_SENTINEL,
     RemoteDispatcher,
     RemoteDispatchError,
@@ -26,7 +26,7 @@ from metronome.trainer.remote import (
 
 REF_A = "alice/gen-a@sha256:" + "a" * 64
 REF_B = "bob/gen-b@sha256:" + "b" * 64
-REF_T = "metronome/ckpt-r1-king@sha256:" + "c" * 64
+REF_T = "cascade/ckpt-r1-king@sha256:" + "c" * 64
 
 
 def _host(name="king-box", **kw):
@@ -50,7 +50,7 @@ def test_worker_argv_has_required_flags():
         gen_ref=REF_A, uid=3, hotkey="hkX", role="challenger",
         base_seed=99, block=12, trainer_spec="m:C",
     )
-    assert argv[0] == "/venv/python" and argv[1:3] == ["-m", "metronome.trainer.worker"]
+    assert argv[0] == "/venv/python" and argv[1:3] == ["-m", "cascade.trainer.worker"]
     for flag, val in [("--gen-ref", REF_A), ("--uid", "3"), ("--hotkey", "hkX"),
                       ("--role", "challenger"), ("--base-seed", "99"), ("--block", "12"),
                       ("--trainer", "m:C"), ("--chain-toml", "/r/chain.toml")]:

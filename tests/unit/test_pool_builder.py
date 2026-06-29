@@ -9,17 +9,17 @@ import json
 import numpy as np
 import pytest
 
-from metronome.eval.window import EvalWindow
-from metronome.pool.builder import (
+from cascade.eval.window import EvalWindow
+from cascade.pool.builder import (
     PoolBuildConfig,
     build_pool,
     collect_records,
     prepare_series,
     write_pool,
 )
-from metronome.pool.source import HarvestContext, HarvestedSeries
-from metronome.validator.pool import _load_series_dir
-from metronome.validator.windows import build_windows_from_series
+from cascade.pool.source import HarvestContext, HarvestedSeries
+from cascade.validator.pool import _load_series_dir
+from cascade.validator.windows import build_windows_from_series
 
 CFG = PoolBuildConfig(context_length=512, horizon=16, min_context=64)
 CTX = HarvestContext(as_of=dt.date(2026, 6, 1), context_length=512, horizon=16, max_series=1000)
@@ -124,7 +124,7 @@ def test_build_pool_round_trips_through_validator_loader(tmp_path):
     summary = build_pool([_ListSource(items)], out, CTX, CFG, fetch=None)
     assert summary.n_series == 6
 
-    # The exact path metronome.validator.pool.load_pool runs after fetching a CID:
+    # The exact path cascade.validator.pool.load_pool runs after fetching a CID:
     series, ids = _load_series_dir(out)
     assert len(series) == 6
     md_map = json.loads((out / "metadata.json").read_text())

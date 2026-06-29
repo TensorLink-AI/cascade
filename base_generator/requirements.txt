@@ -1,4 +1,4 @@
-# metronome base generator — runtime dependencies.
+# cascade base generator — runtime dependencies.
 # Allowlisted (chain.toml [dependencies]): numpy, scipy, pandas, torch,
 # scikit-learn, gpytorch, networkx.
 # Hash-locked to the cp311 linux x86_64 (or py3-none-any) wheels these were

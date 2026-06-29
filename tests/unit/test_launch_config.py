@@ -6,10 +6,10 @@ from dataclasses import replace
 
 import pytest
 
-from metronome.shared.config import LaunchConfigError, assert_launch_ready
-from metronome.trainer.contract import compute_base_arch_digest
+from cascade.shared.config import LaunchConfigError, assert_launch_ready
+from cascade.trainer.contract import compute_base_arch_digest
 
-REF = "metronome/eval-pool@sha256:" + "a" * 64
+REF = "cascade/eval-pool@sha256:" + "a" * 64
 
 
 def test_arch_digest_deterministic_and_arch_sensitive(cfg):

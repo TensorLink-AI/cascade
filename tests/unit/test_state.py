@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from metronome.eval.koth import RoundResult
-from metronome.validator.state import apply_round, dumps, genesis, loads
+from cascade.eval.koth import RoundResult
+from cascade.validator.state import apply_round, dumps, genesis, loads
 
 
 def _win() -> RoundResult:

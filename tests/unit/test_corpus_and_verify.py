@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.miner.verify import verify_repo
-from metronome.trainer.corpus import assert_corpus_reproducible, build_corpus
+from cascade.miner.verify import verify_repo
+from cascade.trainer.corpus import assert_corpus_reproducible, build_corpus
 
 
 def test_example_generator_builds_corpus(small_cfg, example_generator_dir):
@@ -36,7 +36,7 @@ def test_verify_static_path_only(small_cfg, example_generator_dir):
 
 
 def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
-    from metronome.trainer.corpus import build_round_corpus
+    from cascade.trainer.corpus import build_round_corpus
 
     # use_sandbox=False keeps this a fast in-process unit test; the sandbox path
     # is exercised in test_sandbox.py.
@@ -50,7 +50,7 @@ def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
 def test_build_round_corpus_rejects_stream_modes(small_cfg, example_generator_dir):
     # build_round_corpus is the materialised helper; streaming goes through
     # stream.open_round_stream. It rejects stream modes so a miswired caller fails.
-    from metronome.trainer.corpus import CorpusError, build_round_corpus
+    from cascade.trainer.corpus import CorpusError, build_round_corpus
 
     for mode in ("stream_cpu", "stream_gpu"):
         with pytest.raises(CorpusError):

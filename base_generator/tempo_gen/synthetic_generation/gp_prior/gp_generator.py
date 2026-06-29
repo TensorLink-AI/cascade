@@ -1,6 +1,6 @@
 # Vendored from TempoPFN (Apache-2.0). See repo-root NOTICE and LICENSE.
 #
-# Modifications (metronome): import paths rewritten ``src.* -> tempo_gen.*``; the
+# Modifications (cascade): import paths rewritten ``src.* -> tempo_gen.*``; the
 # upstream ``print()`` diagnostics in the GP-sampling fallback path were removed
 # (the vendored generators must keep a clean, side-effect-free hot path).
 import functools

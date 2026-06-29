@@ -1,4 +1,4 @@
-# metronome submission interface (for miners)
+# cascade submission interface (for miners)
 
 You submit a **data generator** — *any* process behind the `generate()` endpoint:
 an algorithm, a neural sampler (a PFN or ensemble), or a hybrid, and it may ship
@@ -33,7 +33,7 @@ whole repo (code + weights) must be `<= max_repo_mb`.
 ```python
 from collections.abc import Iterator
 import numpy as np
-from metronome.interface import DataGenerator
+from cascade.interface import DataGenerator
 
 class Generator(DataGenerator):
     def __init__(self, config_dir: str, *, seed: int) -> None:
@@ -57,7 +57,7 @@ class Generator(DataGenerator):
 * **Determinism.** Two runs at the same `seed` must produce a byte-identical
   corpus. No wall-clock, no `os.urandom`, no un-seeded global RNG. If your
   generator uses torch, seed it too (`torch.manual_seed(seed)` +
-  `torch.use_deterministic_algorithms(True)`, on CPU). `metronome verify` runs
+  `torch.use_deterministic_algorithms(True)`, on CPU). `cascade verify` runs
   your generator twice and rejects it if the digests differ — non-negotiable,
   because the trainer and validators rely on it to audit runs.
 * **Bounds.** Each series is finite (no NaN/inf), 1-D, floating dtype, with
@@ -65,7 +65,7 @@ class Generator(DataGenerator):
   capped at `generator.max_total_points`.
 * **Count.** `generate(n)` yields exactly `n` series.
 * **No network / no escape.** `generator.py` is AST-scanned for blocked imports
-  (sockets, subprocess, the metronome internals, etc.) and run in a
+  (sockets, subprocess, the cascade internals, etc.) and run in a
   network-isolated sandbox. See `chain.toml [static_guard]`.
 * **Dependencies & size.** `requirements.txt` lines must be
   `pkg==ver --hash=sha256:…`, drawn from `chain.toml [dependencies] allowed`
@@ -75,8 +75,8 @@ class Generator(DataGenerator):
 ## Deploy
 
 ```bash
-metronome verify ./my-generator-repo            # runs every trainer-side check
-metronome deploy ./my-generator-repo --hub-repo <namespace/name> \
+cascade verify ./my-generator-repo            # runs every trainer-side check
+cascade deploy ./my-generator-repo --hub-repo <namespace/name> \
     --wallet-name <coldkey> --wallet-hotkey <hotkey>
 ```
 

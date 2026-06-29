@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.trainer.corpus import CorpusError, build_corpus
-from metronome.trainer.sandbox import run_in_sandbox
+from cascade.trainer.corpus import CorpusError, build_corpus
+from cascade.trainer.sandbox import run_in_sandbox
 
 
 def test_sandbox_matches_in_process_digest(small_cfg, example_generator_dir):
@@ -44,7 +44,7 @@ def test_sandbox_reports_generator_runtime_error(tmp_path, small_cfg):
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "requirements.txt").write_text("")
     (tmp_path / "generator.py").write_text(
-        "from metronome.interface import DataGenerator\n"
+        "from cascade.interface import DataGenerator\n"
         "class Generator(DataGenerator):\n"
         "    def __init__(self, config_dir, *, seed): pass\n"
         "    @property\n"

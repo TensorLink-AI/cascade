@@ -1,4 +1,4 @@
-metronome base generator (genesis "base" king)
+cascade base generator (genesis "base" king)
 ================================================
 
 This generator vendors and adapts a subset of the synthetic time-series
@@ -50,7 +50,7 @@ Modifications made to the vendored code
   per-generator seed offset from the builtin ``hash(class_name)``, which is
   salted per process by PYTHONHASHSEED and is therefore NOT reproducible across
   processes. It now uses ``zlib.crc32`` (a stable, process-independent
-  checksum). metronome audits determinism by re-running the generator in a
+  checksum). cascade audits determinism by re-running the generator in a
   separate process, so this fix is load-bearing.
 * ``data/containers.py`` trimmed to the numpy ``TimeSeriesContainer`` only
   (dropped the torch-dependent ``BatchTimeSeriesContainer``).
@@ -58,7 +58,7 @@ Modifications made to the vendored code
   ``print()`` diagnostics from the GP generator's sampling-fallback path.
 * CauKer DETERMINISM / CPU FIX: the upstream SCM root nodes were drawn from the
   GP prior on the GPU via ``cupy`` (``sample_from_gp_prior_efficient_gpu``).
-  The metronome generate path is CPU-only and must be reproducible, so the
+  The cascade generate path is CPU-only and must be reproducible, so the
   ``cupy`` dependency is dropped and the draw uses NumPy's seeded
   ``Generator.multivariate_normal`` (same ``method="eigh"`` factorisation).
 
@@ -67,7 +67,7 @@ What is intentionally EXCLUDED
 The pyo-backed audio generators (FinancialVolatility, MultiScaleFractal,
 StochasticRhythm, NetworkTopology). They render through a real-time ``pyo``
 audio server and derive per-series seeds with the builtin ``hash()`` — both
-incompatible with metronome's cross-process determinism contract (and ``pyo``
+incompatible with cascade's cross-process determinism contract (and ``pyo``
 is not on the allowlist, nor reliably installable headless).
 
 No model weights are shipped (these generators are purely procedural).

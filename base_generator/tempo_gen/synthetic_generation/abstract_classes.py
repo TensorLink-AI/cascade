@@ -1,9 +1,9 @@
 # Vendored from TempoPFN (Apache-2.0). See repo-root NOTICE.
 #
-# DETERMINISM FIX (metronome): the upstream ``_set_random_seeds`` derived a
+# DETERMINISM FIX (cascade): the upstream ``_set_random_seeds`` derived a
 # per-generator offset with the builtin ``hash(self.__class__.__name__)``, whose
 # value is randomised per process via PYTHONHASHSEED — so two audit runs in
-# separate processes produced DIFFERENT corpora. metronome requires the corpus to
+# separate processes produced DIFFERENT corpora. cascade requires the corpus to
 # be a pure function of (seed, n_series), audited across processes. We replace the
 # builtin hash with ``zlib.crc32`` (a stable, process-independent checksum).
 import zlib
@@ -79,7 +79,7 @@ class GeneratorWrapper:
         # Seed the global numpy (legacy) and torch RNGs too: a few vendored
         # generators (anomalies, spikes) and forecast_pfn's spike augmentation use
         # the global np.random.* stream, so it must be reseeded deterministically
-        # before every batch. torch is seeded per the metronome determinism rules.
+        # before every batch. torch is seeded per the cascade determinism rules.
         np.random.seed(int(seed) % 2**31)
         torch.manual_seed(int(seed))
 

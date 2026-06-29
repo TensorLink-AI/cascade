@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from metronome.shared.manifest import (
+from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
@@ -13,10 +13,10 @@ from metronome.shared.manifest import (
     format_trained_pointer,
     load_manifest,
 )
-from metronome.validator.loop import ValidatorRunner
+from cascade.validator.loop import ValidatorRunner
 
 REF = "alice/metro-gen@sha256:" + "a" * 64
-REF_T = "metronome/ckpt-r1-king@sha256:" + "b" * 64
+REF_T = "cascade/ckpt-r1-king@sha256:" + "b" * 64
 
 
 def _entry(role, uid, gpu):
