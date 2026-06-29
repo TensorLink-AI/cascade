@@ -104,8 +104,10 @@ expected_gpu = ""
 eval_dataset   = "metronome-private-v1"  # identifier the validator matches on
 eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
 window_pool    = ""                       # Hippius registry CID of the held-out pool (.npy/.npz
-                                          # series + optional metadata.json). Upload with
-                                          # upload_dir_to_registry and pin the CID here before launch.
+                                          # series + optional metadata.json). Build, upload, and get
+                                          # the CID to pin here with:
+                                          #   metronome-pool build --out ./pool --upload
+                                          # (see docs/EVAL_POOL.md and metronome.pool).
 num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
@@ -192,6 +194,15 @@ s3_endpoint      = "https://s3.hippius.com"
 s3_region        = "decentralized"
 manifest_bucket  = "metronome-manifests"            # round-<id>.json + latest.json
 logs_bucket      = "metronome-logs"                 # logs/round-<id>/<role>.jsonl
+# Eval-pool bucket: daily snapshots + pool/index.json. When set, validators pull
+# the rotating pool from here (deterministic per-round snapshot selection) instead
+# of a static [eval] window_pool CID — the owner publishes daily with
+# `metronome-pool publish`. Leave empty to use the static CID path.
+pool_bucket      = ""                               # e.g. "metronome-eval-pool"
+# Point these at Cloudflare R2 (+ POOL_S3_ACCESS_KEY / POOL_S3_SECRET_KEY) to
+# publish/pull the pool there; empty = reuse the Hippius S3 endpoint above.
+pool_s3_endpoint = ""
+pool_s3_region   = ""
 
 [manifest]
 # The trainer publishes signed training receipts to the manifest S3 bucket

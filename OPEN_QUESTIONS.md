@@ -116,9 +116,14 @@ without producing generally-good data).
 (`metronome.validator.pool::load_pool`), which fetches the `window_pool` **Hippius
 registry CID**, loads its `.npy`/`.npz` series (+ optional `metadata.json`), and
 slices them with `build_windows_from_series`. The live validator loop calls it on
-startup. Operator inputs: upload the held-out pool to the registry with
-`upload_dir_to_registry`, pin its CID in `[eval] window_pool`, keep it genuinely
-held-out, and refresh it periodically so it stays contamination-resistant.
+startup. The **producer** side is also wired: `metronome.pool` (the
+`metronome-pool build` CLI) harvests recent real-world series from pluggable
+sources (Open-Meteo weather, Wikimedia pageviews; extensible), cleans/validates
+them, and writes exactly that loader layout — `--upload` pins the CID. Operator
+inputs: run `metronome-pool build --out ./pool --upload`, set the printed CID in
+`[eval] window_pool`, keep it genuinely held-out, and re-build periodically (a
+fresh `as_of`) so the pool rotates in time and stays contamination-resistant. See
+`docs/EVAL_POOL.md`.
 
 ## 7. From-scratch budget and model size
 

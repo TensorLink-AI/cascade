@@ -42,6 +42,7 @@ metronome = "metronome.miner.cli:main"
 metronome-trainer = "metronome.trainer.main:main"
 metronome-train-worker = "metronome.trainer.worker:main"
 metronome-validator = "metronome.validator.main:main"
+metronome-pool = "metronome.pool.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.18"]

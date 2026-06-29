@@ -45,7 +45,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tenure:   {runner.state.tenure_rounds}")
         print(f"dethrone_cp: {runner.cfg.scoring.dethrone_cp}")
         print(f"manifest_bucket: {runner.cfg.storage.manifest_bucket}")
-        print(f"window_pool: {runner.cfg.eval.window_pool}")
+        pool_bucket = runner.cfg.storage.pool_bucket
+        if pool_bucket:
+            print(f"eval pool: bucket={pool_bucket} (daily snapshots)")
+        else:
+            print(f"eval pool: static window_pool={runner.cfg.eval.window_pool!r}")
         print("offline validator smoke complete")
         return 0
 
@@ -62,15 +66,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     from ..shared.chain import ChainClient
-    from .pool import load_pool
 
     client = ChainClient.from_config(
         runner.cfg, network=args.network,
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
     )
     log = logging.getLogger("metronome.validator")
-    log.info("loading private eval pool %s …", runner.cfg.eval.window_pool)
-    window_source = load_pool(runner.cfg, cache_dir=args.cache_dir)
+    if runner.cfg.storage.pool_bucket:
+        from .pool import load_bucket_pool
+
+        log.info("loading daily eval pool from bucket %s …", runner.cfg.storage.pool_bucket)
+        window_source = load_bucket_pool(runner.cfg, cache_dir=args.cache_dir)
+    else:
+        from .pool import load_pool
+
+        log.info("loading static eval pool %s …", runner.cfg.eval.window_pool)
+        window_source = load_pool(runner.cfg, cache_dir=args.cache_dir)
     log.info("validator up: netuid=%s manifest_bucket=%s — polling for rounds",
              runner.cfg.netuid, runner.cfg.storage.manifest_bucket)
     runner.run_forever(client, window_source=window_source)
