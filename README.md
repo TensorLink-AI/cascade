@@ -243,10 +243,15 @@ window_pool` (the held-out pool's Hub `repo@digest`), and `[storage]` endpoints.
 ## Quick start
 
 ```bash
-pip install -e .                 # core (numpy/scipy/huggingface-hub)
-pip install -e '.[dev]'          # + pytest/ruff
-python -m pytest tests/unit -q   # pure-numpy tests, no torch/HF/chain needed
+pip install -e .                 # core: numpy + scipy only
+pip install -e '.[dev]'          # + pytest/ruff/hypothesis
+python -m pytest tests/unit -q   # CPU tests, no torch/HF/chain needed
 ```
+
+The heavy stacks are optional extras, pulled in only where needed:
+`.[train]` (torch/transformers for the trainer + validator evaluator),
+`.[hippius]` (Hippius Hub registry + S3 + `huggingface_hub`), and `.[chain]`
+(bittensor).
 
 The Toto2-4M from-scratch training sits behind the
 `cascade.trainer.contract.BaseTrainer` protocol (the GPU boundary). A runnable
