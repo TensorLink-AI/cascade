@@ -58,12 +58,17 @@ horizon            = 64
 # from-scratch budget — train each model for ~target_train_hours of GPU on the
 # OWNER'S REFERENCE BOX. Enforced as a fixed token count (= hours × reference
 # throughput, the train_tokens property) so king and challenger see identical
-# compute regardless of data-dependent throughput — a raw 3h timer would let a
+# compute regardless of data-dependent throughput — a raw timer would let a
 # generator win by emitting cheap-to-step data instead of better data, and would
 # not reproduce on a re-derived audit run. max_train_seconds is the hard guard.
-target_train_hours          = 3.0
+#
+# TESTNET: 0.75h (45 min) per model — the short "screening" round that ranks the
+# field fast on a daily cadence (see OPEN_QUESTIONS.md #9). The full ~3h
+# king-defence run is a separate, less-frequent budget; raise this back to 3.0
+# for mainnet-scale rounds.
+target_train_hours          = 0.75
 ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes the budget
-                                        # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
+                                        # (0.75h × 3600 × 185000 ≈ 0.5B point-passes)
 warmup_fraction             = 0.05
 batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was 256
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
@@ -73,8 +78,9 @@ weight_decay       = 0.05
 lr_schedule        = "warmup_cosine"
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours so the
-                                  # token budget completes; kills a pathologically slow run)
+max_train_seconds  = 3600        # hard wall-clock guard (> target_train_hours so the
+                                  # token budget completes; kills a pathologically slow run).
+                                  # 1h for the 0.75h testnet screen; raise with target_train_hours.
 # corpus feed mode — how generator data reaches the trainer. Identical for king
 # and challenger (folded into contract_digest). Three modes to A/B for now:
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until

@@ -149,6 +149,7 @@ metronome/
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
   INTERFACE.md      the DataGenerator submission contract for miners
+  TESTNET.md        two-VM testnet deploy (cheap validator + expensive orchestrator)
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
 ```
