@@ -1,8 +1,15 @@
-# cascade: synthetic time-series data subnet
+# cascade: a subnet for SOTA time-series foundation models
 
-A Bittensor subnet where miners compete on the quality of **training data**, not
-models. cascade holds the *training process* fixed and scores the
-**data generators** that feed it.
+**Build state-of-the-art time-series foundation models (TSFM) on Bittensor by
+making _data_ the thing miners compete on first.** Hold the model byte-identical
+so the only variable is data quality, prove that better synthetic data produces
+better forecasters, prove the advantage survives scaling — and only then open the
+network to training the models themselves. North star: **multimodal time series
+(TS ↔ language ↔ vision)**.
+
+cascade is the first phase of that program: a Bittensor subnet where miners
+compete on the quality of **training data**, not models. It holds the *training
+process* fixed and scores the **data generators** that feed it.
 
 The fixed process is **a Toto2-4M backbone trained from random initialisation**
 ([Datadog/Toto-2.0-4m](https://huggingface.co/Datadog/Toto-2.0-4m), arXiv
@@ -126,6 +133,57 @@ benchmarks by competing on synthetic priors, not architecture.
 The throughline: across the leaderboard, the synthetic data distribution is doing
 the heavy lifting. cascade turns that distribution into the competitive surface,
 holding the model fixed so miners compete the prior.
+
+## Technical roadmap
+
+cascade ships the first phase of a longer program. The sequence is deliberate:
+prove data quality is *measurable and competable* before handing miners the much
+larger, noisier surface of training the models themselves.
+
+* **Phase 1 — Compete on data (now).** The model is byte-identical; the only
+  variable is the synthetic data generator. This is the subnet shipping today —
+  everything else in this README describes it. The bet: better synthetic data
+  produces better forecasters, and we can measure that cleanly per round.
+* **Phase 2 — Prove it scales.** Show the data advantage *survives model scale*.
+  µP lets hyperparameters tuned once at the 4M rung transfer up the ladder, and
+  optimal data mixtures are roughly size-independent — so we rank the recipe
+  cheaply at the small model and predict large-model skill before paying for it.
+* **Phase 3 — Open model training.** Once data quality is a solved, measurable
+  axis, widen the contract so miners compete on the models too.
+* **North star — multimodal.** Forecasting that reads and writes across
+  modalities: time series ↔ language ↔ vision.
+
+### What we optimize for
+
+The active research informing this roadmap, distilled:
+
+1. **Data first.** A TSFM is only as good as what it learned from, and synthetic
+   data is the cheapest way to improve that — Toto 2.0 topped GIFT-Eval on a
+   corpus that was ~57% synthetic and 0% public series. Build the data pipeline
+   first (causal + kernel-composition generators, plus a *filtered* real subset);
+   treat model training as the thing that measures data quality, not the thing you
+   compete on.
+2. **Diversity over volume.** The goal is coverage of distinct underlying
+   processes, not raw size. Reward coverage and informativeness, penalize
+   redundancy, and cover the hard cases — driven, stochastic, regime-switching
+   dynamical systems — where benchmarks live and most generators are thin. The
+   real prize is a generator whose edge *survives* as the model scales.
+3. **Inductive biases that fit the job.** Probabilistic, multi-step quantile
+   heads (not point forecasts); state-tracking backbones (xLSTM / SSM / Mamba) for
+   long horizons, where decoder-only transformers aren't automatically the answer
+   and encoder-only models can generalize better OOD; external drivers as
+   first-class inputs; a dynamical-systems objective worth testing for long-term
+   fidelity.
+4. **Scale the cheap axis.** Context length and test-time compute may matter more
+   than parameter count — staying deliberately small (sub-200M) is a real option.
+   µP makes scaling a config change rather than a re-tune, which is what makes
+   "does the advantage hold at scale?" affordable to even ask.
+5. **Non-leaked evals.** The field has an evaluation crisis: leakage and
+   saturated benchmarks flatter models. Score on provably-fresh data with a
+   dynamic eval that can't be memorized; always include strong-but-dumb baselines
+   (context-parroting, DLinear) and run an overlap audit before trusting any
+   zero-shot number; report bootstrapped win rates with confidence intervals
+   across many tasks, not single headline scores.
 
 ## Three roles
 
