@@ -244,6 +244,24 @@ class ValidatorConfig:
 
 
 @dataclass(frozen=True)
+class QueueConfig:
+    """Trainer-side submission queue (see :mod:`metronome.trainer.queue`).
+
+    The trainer enqueues challenger generators discovered on-chain and trains
+    them FIFO, skipping any whose generator CID equals the reigning king's (an
+    exact copy of the king) or that was already trained this reign.
+
+    Attributes:
+        state_db_path: where the backlog + per-reign trained cache is persisted
+            so it survives trainer restarts.
+        trained_cache_size: ring-buffer cap on already-trained CIDs per reign.
+    """
+
+    state_db_path: str
+    trained_cache_size: int
+
+
+@dataclass(frozen=True)
 class ChainConfig:
     schema_version: int
     subnet: SubnetConfig
@@ -256,6 +274,7 @@ class ChainConfig:
     storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
+    queue: QueueConfig
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -348,6 +367,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     st = raw.get("storage", {})
     m = raw["manifest"]
     v = raw["validator"]
+    q = raw.get("queue", {})
 
     return ChainConfig(
         schema_version=schema,
@@ -442,6 +462,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             poll_seconds=int(v["poll_seconds"]),
             hf_cache_seconds=int(v["hf_cache_seconds"]),
             state_db_path=str(v["state_db_path"]),
+        ),
+        queue=QueueConfig(
+            state_db_path=str(q.get("state_db_path", "trainer_queue.db")),
+            trained_cache_size=int(q.get("trained_cache_size", 256)),
         ),
         raw=raw,
     )
