@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
 
 # CID grammar: CIDv0 (base58btc, ``Qm…46 chars``) or CIDv1 (multibase-prefixed,
@@ -42,7 +43,7 @@ import os
 # a malformed on-chain payload is rejected, not fetched.
 import re
 import tarfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 CIDV0_RE = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
@@ -245,11 +246,18 @@ def fetch_from_registry(
 
 @dataclass(frozen=True)
 class S3Config:
-    """Hippius S3 endpoint + bucket. Credentials come from the environment."""
+    """An S3-compatible endpoint + bucket. Credentials come from the environment
+    (named by ``access_key_env`` / ``secret_key_env``, never stored here).
+
+    Defaults target Hippius S3; the env-name fields let a second store (e.g. the
+    eval-pool bucket on Cloudflare R2) read different credentials without
+    touching the manifest store."""
 
     endpoint: str
     region: str
     bucket: str
+    access_key_env: str = "HIPPIUS_S3_ACCESS_KEY"
+    secret_key_env: str = "HIPPIUS_S3_SECRET_KEY"
 
     @classmethod
     def from_storage(cls, storage: object, *, bucket: str) -> S3Config:
@@ -268,11 +276,11 @@ def _s3_client(s3cfg: S3Config):
         raise StorageError(
             "boto3 not installed; install the [hippius] extra to use Hippius S3"
         ) from e
-    access = os.environ.get("HIPPIUS_S3_ACCESS_KEY")
-    secret = os.environ.get("HIPPIUS_S3_SECRET_KEY")
+    access = os.environ.get(s3cfg.access_key_env)
+    secret = os.environ.get(s3cfg.secret_key_env)
     if not access or not secret:
         raise StorageError(
-            "missing Hippius S3 credentials: set HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY"
+            f"missing S3 credentials: set {s3cfg.access_key_env} / {s3cfg.secret_key_env}"
         )
     return boto3.client(
         "s3",
@@ -387,3 +395,154 @@ class LogSink:
         key = log_key(self.round_id, self.role)
         self.store.put_text(key, "\n".join(self._records) + "\n", content_type="application/x-ndjson")
         return key
+
+
+# ───────────────────────── eval-pool snapshots over S3 ──────────────────────
+#
+# The eval pool refreshes daily without a chain.toml edit: the owner orchestrator
+# publishes a new snapshot (a deterministic tar of the pool directory) to the
+# pool bucket and appends it to ``pool/index.json``. Every validator reads the
+# same owner-controlled index and selects, for a round, the snapshot whose
+# ``effective_round`` is the greatest ``<= round_id`` — so all validators score
+# the identical pool for a given round REGARDLESS of when they polled (no
+# latest-wins divergence at the daily rollover). Integrity is the tar sha256.
+#
+# Invariant the publisher MUST hold: a new snapshot's ``effective_round`` is in
+# the FUTURE (greater than the current round). Never publish a snapshot that
+# becomes active for an already-processed round, or validators that already
+# scored it would disagree with those that re-select it.
+
+POOL_INDEX_KEY = "pool/index.json"
+POOL_INDEX_SCHEMA = 1
+
+
+def pool_snapshot_key(effective_round: int) -> str:
+    return f"pool/snapshots/{int(effective_round)}.tar"
+
+
+@dataclass(frozen=True)
+class PoolSnapshotMeta:
+    """One published eval-pool snapshot, listed in ``pool/index.json``."""
+
+    effective_round: int
+    key: str
+    sha256: str
+    size_bytes: int
+    as_of: str
+    n_series: int
+    context_length: int
+    horizon: int
+
+    @classmethod
+    def from_dict(cls, d: dict) -> PoolSnapshotMeta:
+        return cls(
+            effective_round=int(d["effective_round"]),
+            key=str(d["key"]),
+            sha256=str(d["sha256"]),
+            size_bytes=int(d.get("size_bytes", 0)),
+            as_of=str(d.get("as_of", "")),
+            n_series=int(d.get("n_series", 0)),
+            context_length=int(d.get("context_length", 0)),
+            horizon=int(d.get("horizon", 0)),
+        )
+
+
+def read_pool_index(store: S3Store) -> list[PoolSnapshotMeta]:
+    """Read the snapshot index, sorted by ``effective_round``. Empty if absent."""
+    try:
+        text = store.get_text(POOL_INDEX_KEY)
+    except StorageError:
+        return []
+    doc = json.loads(text)
+    snaps = [PoolSnapshotMeta.from_dict(s) for s in doc.get("snapshots", [])]
+    return sorted(snaps, key=lambda s: s.effective_round)
+
+
+def select_snapshot(index: list[PoolSnapshotMeta], round_id: int) -> PoolSnapshotMeta | None:
+    """The snapshot active for ``round_id``: greatest ``effective_round <= round_id``.
+
+    Falls back to the earliest snapshot when ``round_id`` precedes them all (so a
+    validator always has a pool); returns ``None`` only for an empty index. The
+    rule is deterministic, so every validator selects the same snapshot.
+    """
+    if not index:
+        return None
+    eligible = [s for s in index if s.effective_round <= round_id]
+    if eligible:
+        return max(eligible, key=lambda s: s.effective_round)
+    return min(index, key=lambda s: s.effective_round)
+
+
+def publish_pool_snapshot(
+    store: S3Store,
+    tar_bytes: bytes,
+    *,
+    effective_round: int,
+    as_of: str,
+    n_series: int,
+    context_length: int,
+    horizon: int,
+    max_keep: int = 14,
+) -> PoolSnapshotMeta:
+    """Upload a pool snapshot tar and register it in ``pool/index.json``.
+
+    Idempotent per ``effective_round`` (re-publishing replaces that entry). Keeps
+    the most recent ``max_keep`` entries in the index (old tars are left in the
+    bucket for any validator still resolving an older round; prune out-of-band).
+    """
+    sha = tar_cid_digest(tar_bytes)
+    key = pool_snapshot_key(effective_round)
+    store.put_bytes(key, tar_bytes, content_type="application/x-tar")
+
+    meta = PoolSnapshotMeta(
+        effective_round=int(effective_round),
+        key=key,
+        sha256=sha,
+        size_bytes=len(tar_bytes),
+        as_of=as_of,
+        n_series=n_series,
+        context_length=context_length,
+        horizon=horizon,
+    )
+    index = [s for s in read_pool_index(store) if s.effective_round != meta.effective_round]
+    index.append(meta)
+    index.sort(key=lambda s: s.effective_round)
+    index = index[-max_keep:]
+    doc = {"schema": POOL_INDEX_SCHEMA, "snapshots": [asdict(s) for s in index]}
+    store.put_text(POOL_INDEX_KEY, json.dumps(doc, indent=2, sort_keys=True),
+                   content_type="application/json")
+    return meta
+
+
+def fetch_pool_snapshot(store: S3Store, meta: PoolSnapshotMeta, dest_dir: Path | str) -> Path:
+    """Download a snapshot tar, verify its sha256 against the index, and unpack."""
+    data = store.get_bytes(meta.key)
+    got = tar_cid_digest(data)
+    if got != meta.sha256:
+        raise StorageError(f"pool_snapshot_digest_mismatch: {got} != {meta.sha256}")
+    return unpack_tar_to_dir(data, dest_dir)
+
+
+def pool_s3_store(storage: object, *, bucket: str | None = None) -> S3Store:
+    """Build an :class:`S3Store` for the eval-pool bucket.
+
+    Backend-agnostic: defaults to the Hippius S3 endpoint/credentials, but a
+    ``[storage] pool_s3_endpoint`` / ``pool_s3_region`` (e.g. Cloudflare R2) and
+    ``POOL_S3_ACCESS_KEY`` / ``POOL_S3_SECRET_KEY`` env override it. When the
+    POOL_* env is unset it falls back to the HIPPIUS_S3_* credentials, so a
+    Hippius-only operator needs no extra config.
+    """
+    bkt = bucket or getattr(storage, "pool_bucket", "") or "metronome-eval-pool"
+    use_pool_env = bool(os.environ.get("POOL_S3_ACCESS_KEY"))
+    endpoint = getattr(storage, "pool_s3_endpoint", "") or getattr(
+        storage, "s3_endpoint", "https://s3.hippius.com"
+    )
+    region = getattr(storage, "pool_s3_region", "") or getattr(storage, "s3_region", "decentralized")
+    cfg = S3Config(
+        endpoint=endpoint,
+        region=region,
+        bucket=bkt,
+        access_key_env="POOL_S3_ACCESS_KEY" if use_pool_env else "HIPPIUS_S3_ACCESS_KEY",
+        secret_key_env="POOL_S3_SECRET_KEY" if use_pool_env else "HIPPIUS_S3_SECRET_KEY",
+    )
+    return S3Store(cfg)

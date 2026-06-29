@@ -217,6 +217,14 @@ class StorageConfig:
     s3_region: str
     manifest_bucket: str
     logs_bucket: str
+    # Eval-pool bucket (daily snapshots + pool/index.json). When ``pool_bucket``
+    # is set the validator pulls the rotating pool from here instead of a static
+    # ``[eval] window_pool`` CID. ``pool_s3_endpoint`` / ``pool_s3_region`` default
+    # to the Hippius S3 endpoint above; point them at Cloudflare R2 (with
+    # ``POOL_S3_ACCESS_KEY`` / ``POOL_S3_SECRET_KEY``) to publish there instead.
+    pool_bucket: str = ""
+    pool_s3_endpoint: str = ""
+    pool_s3_region: str = ""
 
 
 @dataclass(frozen=True)
@@ -302,10 +310,11 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     if role == "validator":
         from .hippius import is_cid
 
-        if not is_cid(cfg.eval.window_pool):
+        # Either a daily-published pool bucket OR a static window_pool CID.
+        if not cfg.storage.pool_bucket and not is_cid(cfg.eval.window_pool):
             problems.append(
-                "[eval] window_pool is not a Hippius registry CID "
-                "(upload the held-out pool and pin its CID)"
+                "no eval pool configured: set [storage] pool_bucket (daily snapshots, "
+                "recommended) or pin a [eval] window_pool Hippius registry CID"
             )
     if problems:
         raise LaunchConfigError(
@@ -424,6 +433,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             s3_region=str(st.get("s3_region", "decentralized")),
             manifest_bucket=str(st.get("manifest_bucket", "metronome-manifests")),
             logs_bucket=str(st.get("logs_bucket", "metronome-logs")),
+            pool_bucket=str(st.get("pool_bucket", "")),
+            pool_s3_endpoint=str(st.get("pool_s3_endpoint", "")),
+            pool_s3_region=str(st.get("pool_s3_region", "")),
         ),
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),

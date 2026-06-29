@@ -87,9 +87,15 @@ def load_pool(
     except Exception as e:  # noqa: BLE001
         raise PoolError(f"pool_fetch_failed: {e}") from e
 
+    return window_source_from_dir(dest, cfg, label=f"cid={cid}")
+
+
+def window_source_from_dir(dest: Path, cfg: ChainConfig, *, label: str) -> RotatingWindowSource:
+    """Load a pool directory (``.npy``/``.npz`` + optional ``metadata.json``) into
+    a :class:`RotatingWindowSource`. Shared by the static-CID and bucket loaders."""
     series, ids = _load_series_dir(dest)
     if not series:
-        raise PoolError(f"pool {cid} contained no .npy/.npz series under {dest}")
+        raise PoolError(f"pool {label} contained no .npy/.npz series under {dest}")
 
     metadata_p = dest / "metadata.json"
     md_map: dict = {}
@@ -109,8 +115,81 @@ def load_pool(
     )
     if not windows:
         raise PoolError(
-            f"pool {cid} had {len(series)} series but none were long enough for "
+            f"pool {label} had {len(series)} series but none were long enough for "
             f"horizon={cfg.eval.horizon}+context (need >= horizon+1 steps)"
         )
-    log.info("loaded eval pool cid=%s series=%d windows=%d", cid, len(series), len(windows))
+    log.info("loaded eval pool %s series=%d windows=%d", label, len(series), len(windows))
     return RotatingWindowSource(pool=tuple(windows))
+
+
+# ───────────────────────── daily bucket-published pool ──────────────────────
+
+
+class BucketWindowSource:
+    """A :class:`~metronome.validator.windows.WindowSource` backed by the daily
+    snapshot bucket (``[storage] pool_bucket`` + ``pool/index.json``).
+
+    Per round it (re-)reads the owner-controlled index and selects the snapshot
+    whose ``effective_round`` is the greatest ``<= round_id`` — the **same**
+    deterministic choice on every validator, so async polling cannot diverge.
+    The chosen snapshot is fetched once (sha256-verified), cached, and reused;
+    its :class:`RotatingWindowSource` then draws the rotating slice for the round.
+
+    ``round_seed`` carries the round id (the live loop passes ``int(round_id)``),
+    which is both the snapshot selector and the rotation seed.
+    """
+
+    def __init__(self, cfg: ChainConfig, store: object, *, cache_dir: Path | str | None = None,
+                 max_cached: int = 3) -> None:
+        self.cfg = cfg
+        self.store = store
+        self.cache_dir = Path(cache_dir or "./_eval_pool")
+        self.max_cached = max_cached
+        self._cache: dict[str, RotatingWindowSource] = {}
+
+    def _ensure_snapshot(self, meta) -> RotatingWindowSource:
+        src = self._cache.get(meta.sha256)
+        if src is not None:
+            return src
+        from ..shared.hippius import fetch_pool_snapshot
+
+        dest = self.cache_dir / f"snapshot-{meta.effective_round}-{meta.sha256[:12]}"
+        try:
+            fetch_pool_snapshot(self.store, meta, dest)
+        except Exception as e:  # noqa: BLE001
+            raise PoolError(f"snapshot_fetch_failed (round>={meta.effective_round}): {e}") from e
+        src = window_source_from_dir(dest, self.cfg, label=f"snapshot@{meta.effective_round}")
+        if len(self._cache) >= self.max_cached:
+            self._cache.pop(next(iter(self._cache)))  # evict oldest inserted
+        self._cache[meta.sha256] = src
+        return src
+
+    def windows_for_round(self, round_seed, n_windows):
+        from ..shared.hippius import read_pool_index, select_snapshot
+
+        try:
+            round_id = int(round_seed)
+        except (TypeError, ValueError) as e:
+            raise PoolError(f"bucket pool needs an integer round id; got {round_seed!r}") from e
+
+        index = read_pool_index(self.store)
+        meta = select_snapshot(index, round_id)
+        if meta is None:
+            raise PoolError(
+                f"no eval-pool snapshot published in {self.cfg.storage.pool_bucket}; "
+                "run `metronome-pool publish` from the owner orchestrator"
+            )
+        return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows)
+
+
+def load_bucket_pool(
+    cfg: ChainConfig, *, cache_dir: Path | str | None = None, store: object | None = None
+) -> BucketWindowSource:
+    """Build a :class:`BucketWindowSource` for ``[storage] pool_bucket``."""
+    if not cfg.storage.pool_bucket:
+        raise PoolError("[storage] pool_bucket is empty; cannot load a bucket pool")
+    if store is None:
+        from ..shared.hippius import pool_s3_store
+
+        store = pool_s3_store(cfg.storage)
+    return BucketWindowSource(cfg, store, cache_dir=cache_dir)

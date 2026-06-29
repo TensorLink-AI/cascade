@@ -24,22 +24,82 @@ Do **not** point the pool at a fixed public benchmark (GIFT-Eval, Monash, …):
 those are the easiest thing for a generator to overfit, and they overlap what
 time-series foundation models pretrain on.
 
+## Two ways to ship the pool
+
+1. **Daily publish to a bucket (recommended).** The owner orchestrator runs
+   `metronome-pool publish` on a cron; validators pull the current snapshot from
+   `[storage] pool_bucket` with **no `chain.toml` edit**. This is how the pool
+   *rotates in time* — see "Daily rotation & consensus" below.
+2. **Static CID.** `metronome-pool build --upload` pins one snapshot's CID in
+   `[eval] window_pool`. Simple, but refreshing the data means editing
+   `chain.toml` + redeploying. Use it for a fixed pool or local testing.
+
+If `[storage] pool_bucket` is set, the validator uses the bucket; otherwise it
+falls back to the static CID.
+
 ## Quick start
 
 ```bash
-# Offline smoke test (no network): synthetic series through the full path.
+# Offline smoke test (no network): synthetic series through the full build path.
 metronome-pool build --out ./pool --sources synthetic --overwrite
 
-# Real pool from the default sources (weather + web traffic), then pin it.
+# One-off static pool: build + pin a CID.
 metronome-pool build --out ./pool --upload
-# → prints:  [eval]
-#            window_pool = "bafy…"     ← paste into chain.toml
+# → prints  window_pool = "bafy…"   ← paste into [eval] in chain.toml
+
+# Daily publish: build + push a snapshot to the pool bucket (no chain.toml edit).
+metronome-pool publish --effective-round auto
 
 metronome-pool sources   # list registered sources
 ```
 
 Window geometry (`context_length` / `horizon`) defaults to `[eval]` in
 `chain.toml`, so the pool matches what the validator expects.
+
+## Daily rotation & consensus
+
+`metronome-pool publish` builds a fresh pool, packs it to a deterministic tar,
+uploads it to the pool bucket, and appends it to `pool/index.json` stamped with
+an **`effective_round`**. Each validator, for a round at `round_id`, selects the
+snapshot with the greatest `effective_round ≤ round_id` — the **same**
+deterministic choice on every validator, so two validators that polled at
+different times around the daily rollover still score the *identical* pool for a
+given round (no latest-wins divergence). Integrity is the tar's sha256, verified
+on fetch.
+
+**Invariant the publisher must hold:** a new snapshot's `effective_round` is in
+the *future* (greater than the current round). `--effective-round auto` enforces
+this by reading the manifest `latest.json` round_id and adding `--round-buffer`
+(default 1). Never publish a snapshot that becomes active for an already-scored
+round, or validators would disagree.
+
+Example daily cron on the orchestrator:
+
+```bash
+# 03:00 UTC daily — fresh windows, active from the next round onward.
+0 3 * * *  metronome-pool publish --as-of "$(date -u +\%F)" --effective-round auto
+```
+
+Validators pick up new snapshots automatically (they re-read the index each
+round and fetch a snapshot once, cached by digest). No restart, no `chain.toml`
+change.
+
+### Backend: Hippius S3 or Cloudflare R2
+
+The publisher and validators talk to one S3-compatible bucket. Defaults use the
+Hippius S3 endpoint + `HIPPIUS_S3_*` credentials. To use R2 instead, set in
+`chain.toml`:
+
+```toml
+[storage]
+pool_bucket      = "metronome-eval-pool"
+pool_s3_endpoint = "https://<account>.r2.cloudflarestorage.com"
+pool_s3_region   = "auto"
+```
+
+and provide `POOL_S3_ACCESS_KEY` / `POOL_S3_SECRET_KEY` (an R2 token). When the
+`POOL_S3_*` env is unset, the pool store falls back to the `HIPPIUS_S3_*`
+credentials, so a Hippius-only operator needs nothing extra.
 
 ## Sources (shipped)
 
