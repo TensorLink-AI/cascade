@@ -89,6 +89,41 @@ def test_win_below_cp_only_increments_streak(cfg):
     assert runner.state.streaks.get("chal_hk") == 1
 
 
+def _nan_scores(n=300):
+    s = _scores(1.0, 0, n=n)
+    s[0] = WindowScore(s[0].series_id, float("nan"), s[0].qloss_per_q, s[0].abs_target)
+    return s
+
+
+def test_validity_gate_rejects_broken_challenger(cfg):
+    # Challenger's trained model produces NaN forecasts ⇒ conclusive loss, king
+    # holds, no dethrone — even though dethrone_cp = 1.
+    king_scores = _scores(1.0, 0)
+    chal_scores = _nan_scores()
+
+    def fake_eval(entry, windows):
+        return king_scores if entry.role == "king" else chal_scores
+
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval, verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome is not None
+    assert not outcome.transition.dethroned
+    assert runner.state.king_hotkey == "king_hk"
+    assert runner.state.streaks.get("chal_hk", 0) == 0
+
+
+def test_validity_gate_aborts_round_on_broken_king(cfg):
+    # King's trained model is broken ⇒ the round is unjudgeable; abort with no
+    # state change (throne held, challenger neither rewarded nor penalised).
+    def fake_eval(entry, windows):
+        return _nan_scores() if entry.role == "king" else _scores(0.5, 1)
+
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval, verify_signatures=False)
+    before = runner.state
+    assert runner.process_round(_manifest(cfg), windows=[], base_seed=7) is None
+    assert runner.state is before
+
+
 def test_process_round_rejects_contract_mismatch(cfg):
     m = _manifest(cfg)
     bad = TrainingManifest(

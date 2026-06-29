@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..eval.gate import check_scores_valid
 from ..eval.koth import RoundResult, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
@@ -133,8 +134,11 @@ class ValidatorRunner:
         """Evaluate one manifest against the eval windows and update state.
 
         Returns None (king holds, no state change) when the manifest carries no
-        challenger or fails the contract gate. Otherwise returns the round
-        outcome with the (already-applied) state transition.
+        challenger, fails the contract gate, or the *king's* trained checkpoint
+        fails the validity gate (an unjudgeable round). A challenger that fails
+        the validity gate is a conclusive loss (king holds, streak reset).
+        Otherwise returns the round outcome with the (already-applied) state
+        transition.
         """
         reason = self.check_manifest(manifest)
         if reason is not None:
@@ -150,13 +154,37 @@ class ValidatorRunner:
         king_scores = self._evaluate(king_entry, windows)
         chal_scores = self._evaluate(chal_entry, windows)
 
-        result = evaluate_round(
-            king_scores,
-            chal_scores,
-            self.cfg.koth_params(),
-            seed=base_seed,
-            king_tenure_rounds=self.state.tenure_rounds,
-        )
+        # Pass/fail validity gate (teutonic-style pre-duel screen): reject a
+        # numerically broken trained model before it can win a round or corrupt
+        # the bootstrap. A broken king can't be fairly judged ⇒ abort the round
+        # (throne unchanged); a broken challenger is a conclusive loss ⇒ the king
+        # holds and the challenger's streak resets.
+        king_bad = check_scores_valid(king_scores)
+        if king_bad is not None:
+            log.error("round=%s king checkpoint failed validity gate (%s); "
+                      "aborting round, king holds", manifest.round_id, king_bad)
+            return None
+        chal_bad = check_scores_valid(chal_scores)
+        if chal_bad is not None:
+            log.warning("round=%s challenger failed validity gate (%s); "
+                        "rejecting, king holds", manifest.round_id, chal_bad)
+            result = RoundResult(
+                challenger_wins_round=False,
+                lcb=float("nan"),
+                margin=float("nan"),
+                n_windows=len(chal_scores),
+                king_geomean=float("nan"),
+                chal_geomean=float("nan"),
+                inconclusive=False,
+            )
+        else:
+            result = evaluate_round(
+                king_scores,
+                chal_scores,
+                self.cfg.koth_params(),
+                seed=base_seed,
+                king_tenure_rounds=self.state.tenure_rounds,
+            )
         transition = state_mod.apply_round(
             self.state,
             challenger_hotkey=chal_entry.miner_hotkey,
