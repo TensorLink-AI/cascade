@@ -10,6 +10,7 @@ from metronome.shared.hippius import RegistryUpload
 from metronome.trainer import loop as loop_mod
 from metronome.trainer.contract import TrainResult
 from metronome.trainer.loop import TrainerRunner
+from metronome.trainer.queue import SubmissionQueue
 
 CID_A = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
 CID_B = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
@@ -70,3 +71,49 @@ def test_run_round_assembles_signed_ready_manifest(cfg, tmp_path, monkeypatch):
     assert king.corpus_digest == "corpusdigest"
     # contract/base-arch digests recorded once for the controlled-experiment gate
     assert manifest.contract_digest and manifest.base_arch_digest == cfg.training.base_arch_digest
+
+
+def _patch_train_boundaries(monkeypatch):
+    monkeypatch.setattr(loop_mod, "fetch_from_registry", lambda cid, dest, reg, **k: dest)
+    monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(
+        loop_mod, "upload_dir_to_registry",
+        lambda local_dir, reg: RegistryUpload(cid=CID_OUT, tar_digest="deadbeef", size_bytes=1),
+    )
+
+
+def test_run_round_skips_challenger_that_copies_the_king(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    # 'b' committed the king's exact generator CID — a copy. The round must train
+    # only the king, with no challenger entry (the copy is filtered for free).
+    commits = [
+        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID_A}", commit_block=5),
+        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID_A}", commit_block=6),
+    ]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10, max_challengers=1)
+    assert manifest.entry_for_role("king").gen_cid == CID_A
+    assert manifest.entry_for_role("challenger") is None
+
+
+def test_run_round_with_queue_trains_then_dedups_next_round(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    queue = SubmissionQueue()
+    commits = [
+        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID_A}", commit_block=5),
+        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID_B}", commit_block=6),
+    ]
+    # Round 1: challenger B is enqueued, selected, trained, and marked done.
+    m1 = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10,
+                          max_challengers=1, queue=queue)
+    assert m1.entry_for_role("challenger").gen_cid == CID_B
+    assert CID_B in queue.trained_cids
+
+    # Round 2 (same reign): B already trained this reign ⇒ no challenger this time.
+    m2 = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20,
+                          max_challengers=1, queue=queue)
+    assert m2.entry_for_role("king").gen_cid == CID_A
+    assert m2.entry_for_role("challenger") is None

@@ -46,6 +46,9 @@ from ..shared.manifest import (
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds
+from .queue import QueuedSubmission, SubmissionQueue
+from .queue import dumps as dump_queue
+from .queue import loads as load_queue
 from .stream import open_round_stream
 
 log = logging.getLogger("metronome.trainer")
@@ -92,13 +95,38 @@ def plan_round(
     the field (genesis, or the king deregistered), the lowest-UID resolved
     generator is promoted to interim king so there is always something to compare
     against. Challengers are returned in a stable order (by UID).
+
+    Two cheap anti-duplicate filters run here, before any generator is fetched or
+    trained (a round is ~3h of GPU per generator):
+
+    * **duplicate-of-king** — a challenger whose generator CID equals the king's
+      is byte-identical to the king (the CID is the content hash). It can only
+      tie the king, never clear the win margin, so it is dropped rather than
+      handed a wasted round. This is the metronome analogue of teutonic's
+      ``check_model_copy`` "same repo + same digest → instant reject".
+    * **same-CID dedup** — if two hotkeys committed the *same* generator CID,
+      only the first (lowest UID) is kept; the others would be identical runs.
     """
     by_hotkey = {rg.hotkey: rg for rg in resolved}
     king = by_hotkey.get(king_hotkey) if king_hotkey else None
     field_ = sorted(resolved, key=lambda r: r.uid)
     if king is None:
         king = field_[0] if field_ else None
-    challengers = [rg for rg in field_ if king is None or rg.hotkey != king.hotkey]
+    king_cid = king.cid if king is not None else None
+
+    challengers: list[ResolvedGenerator] = []
+    seen_cids: set[str] = set()
+    for rg in field_:
+        if king is not None and rg.hotkey == king.hotkey:
+            continue
+        if king_cid is not None and rg.cid == king_cid:
+            log.info("dropping challenger %s: generator CID is identical to the king", rg.hotkey)
+            continue
+        if rg.cid in seen_cids:
+            log.info("dropping challenger %s: duplicate of an already-planned CID", rg.hotkey)
+            continue
+        seen_cids.add(rg.cid)
+        challengers.append(rg)
     return RoundPlan(king=king, challengers=challengers)
 
 
@@ -232,27 +260,41 @@ class TrainerRunner:
         block: int,
         *,
         max_challengers: int = 1,
+        queue: SubmissionQueue | None = None,
     ) -> TrainingManifest:
         """Train the king and up to ``max_challengers`` challengers, returning
         the assembled (unsigned) manifest. Does not publish; see :meth:`publish`.
 
         Trains locally (sequential) by default, or across ``remote_hosts`` (king
         and challenger in parallel on separate GPU pods) when configured.
+
+        When a ``queue`` is supplied, challengers are drawn from the persistent
+        FIFO backlog (oldest-first, deduplicated against the king and against
+        CIDs already trained this reign) instead of straight from this round's
+        field; the queue is mutated in place (entries enqueued, selected ones
+        marked trained), so the caller persists it after the round.
         """
         resolved = resolve_commitments(commitments)
         plan = plan_round(resolved, king_hotkey)
         if plan.king is None:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
+        challengers = self._select_challengers(plan, block, max_challengers, queue)
+
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
-        jobs += [(c, "challenger") for c in plan.challengers[:max_challengers]]
+        jobs += [(c, "challenger") for c in challengers]
 
         entries = (
             self._train_remote(jobs, seeds, block)
             if self.remote_hosts
             else self._train_local(jobs, seeds, block)
         )
+        if queue is not None:
+            # An attempt (win, loss, or a generator that failed to train) consumes
+            # the challenger's shot for this reign so it is not re-run every round.
+            for c in challengers:
+                queue.mark_trained(c.cid)
         if not entries or entries[0].role != "king":
             raise RuntimeError("king training produced no entry; aborting round")
 
@@ -264,6 +306,61 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
         )
+
+    def _select_challengers(
+        self,
+        plan: RoundPlan,
+        block: int,
+        max_challengers: int,
+        queue: SubmissionQueue | None,
+    ) -> list[ResolvedGenerator]:
+        """Pick this round's challengers — straight off the planned field when
+        there is no queue, otherwise from the FIFO backlog.
+
+        ``plan.challengers`` has already had the duplicate-of-king and same-CID
+        filters applied (:func:`plan_round`). With a queue, those survivors are
+        the current on-chain field: the backlog is pruned to it (dropping
+        re-deployed/deregistered CIDs), the field is enqueued (cheap dedup), and
+        the front ``max_challengers`` still-eligible entries are returned.
+        """
+        if queue is None:
+            return plan.challengers[:max_challengers]
+
+        king_cid = plan.king.cid if plan.king is not None else None
+        if queue.note_king(king_cid):
+            log.info("new reign (king CID %s…); cleared per-reign trained cache", str(king_cid)[:12])
+
+        by_cid = {c.cid: c for c in plan.challengers}
+        for dropped in queue.prune_to_field(set(by_cid) | ({king_cid} if king_cid else set())):
+            log.info("pruning queued %s: CID no longer in the on-chain field", dropped.hotkey)
+        for c in plan.challengers:
+            reason = queue.enqueue(QueuedSubmission(c.hotkey, c.uid, c.cid, block))
+            if reason is not None:
+                log.info("skip enqueue %s (CID %s…): %s", c.hotkey, c.cid[:12], reason)
+
+        selected = queue.select(max_challengers)
+        # Map the queued picks back to the resolved generators for this round.
+        return [by_cid[s.cid] for s in selected if s.cid in by_cid]
+
+    def _load_queue(self) -> SubmissionQueue:
+        """Load the persistent submission backlog from ``[queue] state_db_path``
+        (a fresh, empty queue when the file is absent or unreadable)."""
+        path = Path(self.cfg.queue.state_db_path)
+        try:
+            return load_queue(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return SubmissionQueue(max_trained_cache=self.cfg.queue.trained_cache_size)
+        except Exception as e:  # noqa: BLE001 — a corrupt backlog must not wedge the trainer
+            log.warning("submission queue unreadable (%s); starting from empty", e)
+            return SubmissionQueue(max_trained_cache=self.cfg.queue.trained_cache_size)
+
+    def _save_queue(self, queue: SubmissionQueue) -> None:
+        path = Path(self.cfg.queue.state_db_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(dump_queue(queue), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            log.warning("failed to persist submission queue to %s: %s", path, e)
 
     def _train_local(
         self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
@@ -346,6 +443,9 @@ class TrainerRunner:
         """
         poll = self.cfg.manifest.poll_seconds
         last_round: str | None = None
+        queue = self._load_queue()
+        log.info("submission queue loaded: %d pending, %d trained this reign",
+                 len(queue.pending), len(queue.trained_cids))
         while True:
             try:
                 block = client.current_block()
@@ -356,11 +456,13 @@ class TrainerRunner:
                     continue
                 commitments = client.poll_commitments()
                 king_hotkey = client.highest_incentive_hotkey()
-                log.info("starting round=%s block=%d king=%s field=%d",
-                         round_id, block, king_hotkey, len(commitments))
+                log.info("starting round=%s block=%d king=%s field=%d queued=%d",
+                         round_id, block, king_hotkey, len(commitments), len(queue.pending))
                 manifest = self.run_round(
-                    commitments, king_hotkey, base_seed, block, max_challengers=max_challengers
+                    commitments, king_hotkey, base_seed, block,
+                    max_challengers=max_challengers, queue=queue,
                 )
+                self._save_queue(queue)
                 self.publish(manifest)
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
