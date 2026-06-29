@@ -142,7 +142,7 @@ burn_uid             = 0         # weight sink when no rewarded king is register
 # safetensors only — pickle checkpoints (.pt/.bin/.pth/.ckpt) are rejected by
 # the repo-layout check (loading them executes arbitrary code). Still
 # hash-locked and capped at max_packages.
-max_packages = 10
+max_packages = 16
 allowed = [
     "numpy",
     "scipy",
@@ -151,6 +151,13 @@ allowed = [
     "numba",
     "torch",
     "safetensors",
+    # GP/kernel-family priors (TempoPFN GP-prior, KernelSynth, CauKer). The base
+    # generator draws from Gaussian-process priors with composite kernels and
+    # SCM-DAG causal structure; these supply the GP/kernel/graph primitives.
+    # CPU-only on the generate path — no GPU (cupy) dependency.
+    "scikit-learn",
+    "gpytorch",
+    "networkx",
 ]
 
 [static_guard]

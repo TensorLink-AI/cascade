@@ -11,23 +11,30 @@ launch/genesis king for the metronome subnet.
 |------|---------|
 | `generator.py` | `class Generator(DataGenerator)` — the entrypoint |
 | `config.json` | length band, per-family mixing weights, sanitisation knobs |
-| `requirements.txt` | hash-locked, allowlisted deps (`numpy, scipy, pandas, torch`) |
+| `requirements.txt` | hash-locked, allowlisted deps (`numpy, scipy, pandas, torch, scikit-learn, gpytorch, networkx`) |
 | `tempo_gen/` | vendored, import-rewritten TempoPFN subset (Apache-2.0) |
 | `NOTICE`, `LICENSE` | TempoPFN attribution + Apache-2.0 text |
 | `tests/` | contract tests + a diversity sanity check |
 
-## Generator families (v1)
+## Generator families
 
-Seven families whose transitive imports are clean against metronome's dependency
-allowlist are mixed by weight: **ForecastPFN, SineWave, SawTooth, Step, Anomaly,
-Spikes, OrnsteinUhlenbeck**. Each is drawn at `generate_length` (2048) and
-deterministically random-cropped into the `[min_length, max_length]` band for
-length diversity.
+Ten families are mixed by weight: **ForecastPFN, SineWave, SawTooth, Step,
+Anomaly, Spikes, OrnsteinUhlenbeck, GP-prior, KernelSynth, CauKer**. Each is
+drawn at `generate_length` (2048) and deterministically random-cropped into the
+`[min_length, max_length]` band for length diversity.
 
-KernelSynth (sklearn), the GP prior (gpytorch), CauKer (networkx+sklearn) and the
-audio generators (pyo) are **excluded** from v1 because they pull non-allowlisted
-deps. See the `TODO(v2)` note in `generator.py` for the planned numpy/scipy
-reimplementation of the GP/kernel family.
+The GP/kernel family — **GP-prior** (gpytorch), **KernelSynth** (scikit-learn)
+and **CauKer** (networkx + scikit-learn) — was added in v2: those deps are now
+on metronome's allowlist (`chain.toml [dependencies]`). The TempoPFN ablation
+shows this family carries a large share of the downstream signal. CauKer is
+multivariate (an SCM DAG of GP-prior nodes); each channel is flattened into its
+own univariate series so the emitted corpus stays 1-D. Its upstream GPU
+(`cupy`) draw was replaced with NumPy's seeded `multivariate_normal` to keep the
+generate path CPU-only and reproducible.
+
+The pyo-backed **audio** generators remain **excluded**: pyo runs a real-time
+audio server and seeds via `hash()`, both of which break the cross-process
+determinism contract below (and pyo is not on the allowlist).
 
 ## Determinism
 

@@ -1,7 +1,14 @@
 # metronome base generator — runtime dependencies.
-# Allowlisted (chain.toml [dependencies]): numpy, scipy, pandas, torch.
-# Hash-locked to the cp311 linux x86_64 wheels these were verified against.
+# Allowlisted (chain.toml [dependencies]): numpy, scipy, pandas, torch,
+# scikit-learn, gpytorch, networkx.
+# Hash-locked to the cp311 linux x86_64 (or py3-none-any) wheels these were
+# verified against.
 numpy==2.4.6 --hash=sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93
 scipy==1.17.1 --hash=sha256:43af8d1f3bea642559019edfe64e9b11192a8978efbd1539d7bc2aaa23d92de4
 pandas==3.0.4 --hash=sha256:c423500b3f0118c2d02b5a76ade4c57f3a13b9c9cecf04599bf983ba247cebaa
 torch==2.12.1 --hash=sha256:6e29e7e74d05bda7d955c75e99459f878ebd970ef851b4057edbd3b34a5eb4a3
+# GP/kernel family: GP-prior (gpytorch), KernelSynth (scikit-learn),
+# CauKer (networkx + scikit-learn).
+scikit-learn==1.9.0 --hash=sha256:f7e254636164090da847715a27f8e5478feb98c40a9e0ee90cbd277de9e5ceb8
+gpytorch==1.15.2 --hash=sha256:2112fdc7c0c0bf56a7f2444663cfc80fdfc3e19724399d6303a83d8efdd71e9e
+networkx==3.6.1 --hash=sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762

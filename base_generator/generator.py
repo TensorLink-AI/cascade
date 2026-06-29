@@ -2,14 +2,19 @@
 
 A single :class:`Generator` (``metronome.interface.DataGenerator``) that adapts a
 curated subset of TempoPFN's procedural time-series priors into one deterministic
-corpus source. Seven allowlist-clean families are mixed by configurable weights:
+corpus source. Ten families are mixed by configurable weights:
 
-    ForecastPFN, SineWave, SawTooth, Step, Anomaly, Spikes, OrnsteinUhlenbeck
+    ForecastPFN, SineWave, SawTooth, Step, Anomaly, Spikes, OrnsteinUhlenbeck,
+    GP-prior, KernelSynth, CauKer
 
 Everything is vendored under ``tempo_gen/`` (import-rewritten from TempoPFN's
-``src/``). The GP-prior and KernelSynth families are intentionally excluded from
-v1 because their transitive imports pull non-allowlisted dependencies
-(gpytorch / scikit-learn / networkx). See the TODO(v2) note below.
+``src/``). The GP-prior (gpytorch), KernelSynth (scikit-learn) and CauKer
+(networkx + scikit-learn) families were added in v2: their dependencies are now
+on metronome's allowlist (see ``chain.toml [dependencies]``). The TempoPFN
+ablation shows this GP/kernel family carries a large share of the downstream
+signal, which is why it was the priority add. The pyo-backed *audio* generators
+remain excluded — pyo runs a real-time audio server and seeds via ``hash()``,
+both of which break the cross-process determinism contract below.
 
 Determinism is the load-bearing property: the emitted corpus is a pure function
 of ``(seed, n_series)`` only. We seed NumPy, torch and Python ``random`` from
@@ -17,14 +22,9 @@ of ``(seed, n_series)`` only. We seed NumPy, torch and Python ``random`` from
 per-generator and per-series sub-seed deterministically, and use a separate
 seeded RNG for length-band cropping. The upstream ``hash()``-based seed offset
 (PYTHONHASHSEED-salted, not reproducible across processes) is replaced with a
-stable ``zlib.crc32`` in the vendored ``abstract_classes.py``.
-
-# TODO(v2): reintroduce the GP-prior and KernelSynth families WITHOUT their
-# non-allowlisted deps — reimplement in numpy/scipy. A stationary-kernel GP
-# sample is an O(L log L) circulant/FFT embedding (or scipy.linalg.cholesky for
-# the general O(L^3) case); KernelSynth is a random additive/multiplicative
-# composition of such kernels. The TempoPFN ablation shows the GP/kernel family
-# carries a large share of the downstream signal, so this is the priority add.
+stable ``zlib.crc32`` in the vendored ``abstract_classes.py``. CauKer's upstream
+GP draw used ``cupy`` on the GPU; the vendored copy draws with NumPy's seeded
+``multivariate_normal`` instead, keeping the path CPU-only and reproducible.
 """
 
 from __future__ import annotations
@@ -50,17 +50,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tempo_gen.synthetic_generation.anomalies.anomaly_generator_wrapper import (
     AnomalyGeneratorWrapper,
 )
+from tempo_gen.synthetic_generation.cauker.cauker_generator_wrapper import (
+    CauKerGeneratorWrapper,
+)
 from tempo_gen.synthetic_generation.forecast_pfn_prior.forecast_pfn_generator_wrapper import (
     ForecastPFNGeneratorWrapper,
 )
 from tempo_gen.synthetic_generation.generator_params import (
     AnomalyGeneratorParams,
+    CauKerGeneratorParams,
     ForecastPFNGeneratorParams,
+    GPGeneratorParams,
+    KernelGeneratorParams,
     OrnsteinUhlenbeckProcessGeneratorParams,
     SawToothGeneratorParams,
     SineWaveGeneratorParams,
     SpikesGeneratorParams,
     StepGeneratorParams,
+)
+from tempo_gen.synthetic_generation.gp_prior.gp_generator_wrapper import (
+    GPGeneratorWrapper,
+)
+from tempo_gen.synthetic_generation.kernel_synth.kernel_generator_wrapper import (
+    KernelGeneratorWrapper,
 )
 from tempo_gen.synthetic_generation.ornstein_uhlenbeck_process.ou_generator_wrapper import (
     OrnsteinUhlenbeckProcessGeneratorWrapper,
@@ -79,25 +91,33 @@ from tempo_gen.synthetic_generation.steps.step_generator_wrapper import (
 )
 
 # Default mixing weights (need not sum to 1; they are normalised). Bias rationale:
-# ForecastPFN (rich trend × multi-seasonal × Weibull-noise families) and the
-# regime-switching OU process (stochastic volatility + trends + seasonality)
-# carry the most diverse downstream signal, so they get a slight bump despite
-# being the two most expensive to draw; the cheap periodic / step / spike / anomaly
-# families round out regime coverage at near-zero cost.
+# ForecastPFN (rich trend × multi-seasonal × Weibull-noise families), the
+# regime-switching OU process (stochastic volatility + trends + seasonality) and
+# the GP/kernel family (GP-prior, KernelSynth, CauKer) carry the most diverse
+# downstream signal, so they get the bulk of the mass despite being the most
+# expensive to draw (the GP families do an O(L^3) covariance factorisation per
+# series); the cheap periodic / step / spike / anomaly families round out regime
+# coverage at near-zero cost.
 _DEFAULT_WEIGHTS: dict[str, float] = {
-    "forecast_pfn": 0.20,
-    "ornstein_uhlenbeck": 0.15,
-    "sine_waves": 0.15,
-    "steps": 0.13,
-    "sawtooth": 0.13,
-    "anomalies": 0.12,
-    "spikes": 0.12,
+    "forecast_pfn": 0.16,
+    "ornstein_uhlenbeck": 0.12,
+    "gp": 0.12,
+    "kernel_synth": 0.12,
+    "cauker": 0.08,
+    "sine_waves": 0.10,
+    "steps": 0.08,
+    "sawtooth": 0.08,
+    "anomalies": 0.07,
+    "spikes": 0.07,
 }
 
 # (wrapper class, params class) per family key.
 _FAMILIES: dict[str, tuple[type, type]] = {
     "forecast_pfn": (ForecastPFNGeneratorWrapper, ForecastPFNGeneratorParams),
     "ornstein_uhlenbeck": (OrnsteinUhlenbeckProcessGeneratorWrapper, OrnsteinUhlenbeckProcessGeneratorParams),
+    "gp": (GPGeneratorWrapper, GPGeneratorParams),
+    "kernel_synth": (KernelGeneratorWrapper, KernelGeneratorParams),
+    "cauker": (CauKerGeneratorWrapper, CauKerGeneratorParams),
     "sine_waves": (SineWaveGeneratorWrapper, SineWaveGeneratorParams),
     "steps": (StepGeneratorWrapper, StepGeneratorParams),
     "sawtooth": (SawToothGeneratorWrapper, SawToothGeneratorParams),
@@ -204,6 +224,11 @@ class Generator(DataGenerator):
             values = np.asarray(batch.values)
             if values.ndim == 1:
                 values = values[None, :]
+            elif values.ndim == 3:
+                # Multivariate families (CauKer) emit [batch, seq_len, channels].
+                # Flatten each channel into its own univariate series so the
+                # emitted corpus stays 1-D like every other family.
+                values = np.moveaxis(values, 2, 1).reshape(-1, values.shape[1])
             for row in values:
                 yield np.ascontiguousarray(row)
             # Advance past this batch's per-series seeds (wrapper uses seed + i).

@@ -4,13 +4,16 @@
   "generate_length": 2048,
   "batch_size": 256,
   "weights": {
-    "forecast_pfn": 0.20,
-    "ornstein_uhlenbeck": 0.15,
-    "sine_waves": 0.15,
-    "steps": 0.13,
-    "sawtooth": 0.13,
-    "anomalies": 0.12,
-    "spikes": 0.12
+    "forecast_pfn": 0.16,
+    "ornstein_uhlenbeck": 0.12,
+    "gp": 0.12,
+    "kernel_synth": 0.12,
+    "cauker": 0.08,
+    "sine_waves": 0.10,
+    "steps": 0.08,
+    "sawtooth": 0.08,
+    "anomalies": 0.07,
+    "spikes": 0.07
   },
   "standardize": false,
   "clip_sigma": 0.0,
