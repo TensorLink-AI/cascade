@@ -1,16 +1,20 @@
-"""BOOM runner — DataDog's observability benchmark (2,807 real prod series).
+"""BOOM runner — DataDog's observability benchmark (2,807 series, real prod).
 
-BOOM is scored through gift-eval's ``Dataset`` (DataDog adapted gift-eval), but
-its dataset manifest is *not* part of the installed gift-eval package — the
-2,807 configs (``ds-<n>-<freq>``) and, crucially, each config's fixed ``term``
-live in DataDog's ``boom_properties.json``. We vendor that file
-(``data/boom_properties.json``, from DataDog/toto, Apache-2.0) and iterate it,
-constructing one ``Dataset`` per config with its designated term.
+BOOM is scored through gift-eval's ``Dataset`` (DataDog adapted gift-eval) and
+aggregated with the *same* official method as GIFT-Eval — the Seasonal-Naive
+normalized shifted geometric mean (``cascade_benchmark.aggregate``), including
+BOOM's zero-inflated split and ``LOW_VARIANCE_DATASETS`` exclusion, all ported
+from DataDog's ``boom/utils/leaderboard.py``.
+
+We drive the run off the vendored official Seasonal-Naive results keys
+(``<config>/<freq>/<term>``): each key gives the ``(name, term)`` to evaluate and
+the baseline to normalize against, so alignment is exact by construction. The
+baseline (``boom_seasonal_naive.json``) and the ``LOW_VARIANCE_DATASETS`` set
+(``boom_low_variance.json``) are vendored under ``data/`` (from DataDog/toto,
+Apache-2.0).
 
 Setup:
-* ``BOOM`` (or ``CASCADE_BENCH_BOOM_PATH``) → the downloaded BOOM data dir
-  (gift-eval layout). Required.
-* ``CASCADE_BENCH_BOOM_PROPERTIES`` → override the vendored manifest path.
+* ``BOOM`` (or ``CASCADE_BENCH_BOOM_PATH``) → the downloaded BOOM data dir. Required.
 * ``CASCADE_BENCH_BOOM_DATASETS`` → comma-separated config names to restrict to.
 
 BOOM is large (350M obs); use ``--max-series`` for anything but a full run.
@@ -18,39 +22,31 @@ BOOM is large (350M obs); use ``--max-series`` for anything but a full run.
 
 from __future__ import annotations
 
-import json
 import os
 import traceback
-from pathlib import Path
 
+from ..aggregate import official_aggregate
+from ..resources import load_json
 from ..results import SuiteResult
-from ._common import build_dataset, evaluate_datasets
-
-_VENDORED_PROPERTIES = Path(__file__).resolve().parent.parent / "data" / "boom_properties.json"
+from ._common import build_dataset, score_dataset
 
 
-def _load_properties() -> dict:
-    path = Path(os.environ.get("CASCADE_BENCH_BOOM_PROPERTIES") or _VENDORED_PROPERTIES)
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _iter_datasets(max_tasks: int | None):
-    props = _load_properties()
-    override = os.environ.get("CASCADE_BENCH_BOOM_DATASETS", "").strip()
-    if override:
-        wanted = [c.strip() for c in override.split(",") if c.strip()]
-    else:
-        wanted = list(props.keys())
-
+def _baseline_items(max_tasks: int | None):
+    """Yield ``(full_key, name, term)`` from the official baseline, optionally
+    restricted by ``CASCADE_BENCH_BOOM_DATASETS`` and capped for a smoke run."""
+    baseline = load_json("boom_seasonal_naive.json")
+    restrict = {
+        c.strip()
+        for c in os.environ.get("CASCADE_BENCH_BOOM_DATASETS", "").split(",")
+        if c.strip()
+    }
     n = 0
-    for cfg in wanted:
-        # Each BOOM config has ONE designated term in the manifest (not the
-        # short/medium/long sweep gift-eval uses); fall back to "short".
-        term = props.get(cfg, {}).get("term", "short")
-        ds = build_dataset(cfg, term, storage_env_var="BOOM")
-        if ds is None:
+    for full in baseline:
+        parts = full.split("/")
+        name, term = parts[0], parts[-1]
+        if restrict and name not in restrict:
             continue
-        yield ds
+        yield full, name, term
         n += 1
         if max_tasks and n >= max_tasks:
             return
@@ -72,17 +68,26 @@ def run(
         )
     os.environ.setdefault("BOOM", boom_path)
     try:
-        metrics, n = evaluate_datasets(
-            _iter_datasets(max_series),
-            checkpoint_dir,
-            num_samples=num_samples,
-            device=device,
-        )
-        if not n:
+        baseline = load_json("boom_seasonal_naive.json")
+        low_variance = frozenset(load_json("boom_low_variance.json"))
+        rows = []
+        for full, name, term in _baseline_items(max_series):
+            ds = build_dataset(name, term, storage_env_var="BOOM")
+            if ds is None:
+                continue
+            try:
+                m = score_dataset(ds, checkpoint_dir, num_samples=num_samples, device=device)
+            except Exception:  # noqa: BLE001 — one config must not abort the sweep
+                continue
+            rows.append({"full": full, **m})
+
+        if not rows:
             return SuiteResult(suite="boom", status="error", detail="no BOOM configs scored")
-        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=n)
+        agg = official_aggregate(rows, baseline, low_variance=low_variance)
+        metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
+        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"])
     except FileNotFoundError as e:
-        return SuiteResult(suite="boom", status="skipped", detail=f"BOOM manifest missing: {e}")
+        return SuiteResult(suite="boom", status="skipped", detail=f"BOOM data file missing: {e}")
     except ImportError as e:
         return SuiteResult(suite="boom", status="skipped", detail=f"gift-eval not importable: {e}")
     except Exception as e:  # noqa: BLE001

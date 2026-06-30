@@ -94,13 +94,35 @@ fabricated number.
 Both `GIFT_EVAL` and `BOOM` env vars must point at the respective downloaded
 benchmark data (gift-eval layout); each suite `skip`s cleanly when unset.
 
+### Aggregation (the headline number)
+
+GIFT-Eval and BOOM are **not** a plain mean of per-dataset metrics. The headline
+is the official one (`aggregate.py`, a faithful port of DataDog's
+`boom/utils/leaderboard.py`, the same methodology GIFT-Eval uses):
+
+> shifted geometric mean, across datasets, of each metric **normalized by the
+> Seasonal-Naive baseline** — with the zero-inflated split (datasets where the
+> baseline MASE is 0 use MAE instead) and BOOM's `LOW_VARIANCE_DATASETS`
+> exclusion.
+
+We normalize against the **vendored official Seasonal-Naive results** (`data/`,
+from the upstream repos), keyed `name/freq/term`. GIFT-Eval keys are constructed
+to match all 97 official baseline keys exactly; BOOM is driven directly off the
+baseline keys. So `metrics.crps` / `metrics.mase` are leaderboard-comparable
+(values near 1.0 ≈ Seasonal-Naive; lower is better). `crps_zero` / `mae_zero`
+report the zero-inflated pool.
+
 ## Status
 
-The GIFT-Eval, BOOM, and TIME runners are written against the upstream APIs as
-verified from their source at the pinned commits (gift-eval `naive.ipynb` +
-`data.py`; DataDog `boom_properties.json`; TIME `chronos2.py` + `saver.py`).
-They have **not been executed end to end here** (the env isn't installed and the
-benchmarks pull GB-scale data), so **smoke-test each with `--max-series 1`**
-after `uv sync --project benchmarks`. The most likely thing to need a refresh is
-the embedded GIFT-Eval list / vendored BOOM manifest if you bump the pinned
-commits.
+Data loading, per-config metrics, and aggregation are all written against — and
+verified from — upstream source at the pinned commits (gift-eval `naive.ipynb` +
+`data.py`; DataDog `boom/utils/leaderboard.py` + vendored Seasonal-Naive
+results; TIME `chronos2.py` + `saver.py`). The aggregation math and GIFT-Eval/
+BOOM key-alignment are unit-tested (`tests/test_aggregate.py`; 97/97 GIFT-Eval
+keys match the baseline, model==baseline normalizes to 1.0).
+
+What is **not** yet exercised: the actual model inference path
+(`CheckpointPredictor` → gluonts `evaluate_model`), because that needs the
+installed env + GB-scale data. **Smoke-test with `--max-series 1`** after
+`uv sync --project benchmarks`. Refresh the embedded GIFT-Eval list / vendored
+baselines if you bump the pinned commits.
