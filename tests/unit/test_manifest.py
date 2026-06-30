@@ -78,3 +78,40 @@ def test_manifest_round_trip_and_role_lookup():
     assert again.entry_for_role("challenger").miner_uid == 1
     # canonical body excludes the signature and is stable.
     assert again.canonical_body() == m.canonical_body()
+
+
+def _sized_entry(role, uid, size):
+    return TrainedEntry(
+        miner_hotkey=f"hk{uid}", miner_uid=uid, role=role, gen_ref=REF,
+        trained_pointer=format_trained_pointer(REF_T), corpus_digest="d",
+        train_block=100, size=size,
+    )
+
+
+def test_multi_size_entries_round_trip_and_group_by_size():
+    # A round with two sizes: a (king, challenger) pair per size, each size-tagged.
+    m = TrainingManifest(
+        round_id="7", created_block=1, contract_digest=contract_digest({"x": 1}),
+        base_arch_digest="a" * 64, eval_dataset="cascade-private-v1",
+        entries=[
+            _sized_entry("king", 0, "toto2-4m"), _sized_entry("challenger", 1, "toto2-4m"),
+            _sized_entry("king", 0, "toto2-22m"), _sized_entry("challenger", 1, "toto2-22m"),
+        ],
+    )
+    again = load_manifest(dump_manifest(m))
+    assert again.sizes() == ["toto2-4m", "toto2-22m"]
+    assert [e.size for e in again.entries_for_role("king")] == ["toto2-4m", "toto2-22m"]
+    assert [e.size for e in again.entries_for_role("challenger")] == ["toto2-4m", "toto2-22m"]
+    # size is folded into the signed body (tampering with a size would break the sig)
+    assert again.canonical_body() == m.canonical_body()
+    assert b"toto2-22m" in m.canonical_body()
+
+
+def test_legacy_single_size_entry_defaults_to_empty_size():
+    e = _entry("king", 0)
+    assert e.size == ""
+    m = TrainingManifest(
+        round_id="1", created_block=1, contract_digest="d", base_arch_digest="a" * 64,
+        eval_dataset="x", entries=[e],
+    )
+    assert m.sizes() == [""]

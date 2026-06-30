@@ -72,14 +72,24 @@ re-centralises the decision and is not the default.
 **Question.** How many challengers does the trainer train and the validator
 judge per round?
 
-**Default.** `TrainerRunner.run_round(..., max_challengers=1)` — one challenger
-per round, the lowest-UID non-king resolvable generator. Simple and cheap (two
-trainings per round). Rotating fairly through the field, or batching multiple
-challengers into one manifest, is a straightforward extension.
+**Default.** A round is one ~24h epoch and screens the whole eligible field down
+to one finalist via a cheap heat: every eligible challenger is trained for
+`[round] heat_train_hours` on the primary size, the owner scores them on the
+held-out pool, and the top `[round] finalists` (default 1) advance to the full
+final against the king. So the validator still judges a single king-vs-challenger
+contest (now combined across sizes), but the challenger is the heat winner rather
+than the lowest-UID generator. Raising `[round] finalists` promotes more than one
+challenger to the final; `validator/loop.py::process_round` selects the
+best-scoring challenger per size before the verdict.
 
-**Flip point.** `cascade/trainer/loop.py::plan_round` /
-`TrainerRunner.run_round`, and `validator/loop.py::process_round` (which today
-reads the single `king`/`challenger` pair from the manifest).
+This replaced the earlier FIFO submission queue with its **1-hotkey-1-eval
+lifetime burn** (`cascade/trainer/queue.py`, now removed): under the daily
+cadence a miner re-submits each round and competes whenever its latest pre-cutoff
+commitment is the heat winner, so a permanent per-hotkey burn no longer fits.
+
+**Flip point.** `cascade/trainer/loop.py::_run_heat` / `TrainerRunner.run_round`
+(heat budget, finalist count), and `validator/loop.py::process_round` (per-size
+pairing + combined verdict).
 
 ## 5. Shared training + generation seed
 
@@ -128,16 +138,21 @@ fresh `as_of`) so the pool rotates in time and stays contamination-resistant. Se
 
 ## 7. From-scratch budget and model size
 
-**Question.** cascade trains a Toto2 backbone from random init, twice per round.
-How big a model, and how much compute, so data-quality differences clear the
-undertraining-noise floor without making rounds unaffordable?
+**Question.** cascade trains a Toto2 backbone from random init in each round's
+final. How big a model, and how much compute, so data-quality differences clear
+the undertraining-noise floor without making rounds unaffordable?
 
-**Default.** The smallest released size, **Toto2-4M**, trained for a fixed
-**wall-clock budget — `target_train_hours` (3h) on the owner's reference GPU**.
-The intent is operational ("each model gets ~3h of GPU"), but the *enforced*
-budget is a fixed token count derived as `target_train_hours × 3600 ×
-ref_throughput_tokens_per_s`. Going through a pinned token count rather than a raw
-3h timer is deliberate and matters twice over:
+**Default.** The final trains at **more than one size** — the primary
+**Toto2-4M** plus each `[[training.sizes]]` (e.g. **Toto2-22M**) — and the throne
+is decided on the *combined* score across sizes (a scaling-aware KOTH; u-μP makes
+the 4M-tuned recipe transfer up the ladder). The cheap heat screens on the
+primary size only. Each final model trains for a fixed **wall-clock budget —
+`target_train_hours` (3h) on the owner's reference GPU**, per size. The intent is
+operational ("each model gets ~3h of GPU"), but the *enforced* budget is a fixed
+token count derived per size as `target_train_hours × 3600 ×
+ref_throughput_tokens_per_s` (each size measures its own throughput). Going
+through a pinned token count rather than a raw 3h timer is deliberate and matters
+twice over:
 
 * **Fairness / no throughput exploit.** A raw timer gives whichever corpus has
   higher train-throughput (e.g. shorter series ⇒ more steps/sec) *more* gradient
@@ -149,11 +164,12 @@ ref_throughput_tokens_per_s`. Going through a pinned token count rather than a r
 
 Budgeting by compute (not epochs) also stops a tiny corpus winning by being
 memorised in a few passes. `max_train_seconds` is the hard guard above the 3h
-target. The hours, throughput, and `[generator]` corpus size are the signal/cost
-knobs.
+target. The hours, throughput, per-size set, and `[generator]` corpus size are
+the signal/cost knobs.
 
-**Flip point.** `chain.toml [training]` (`target_train_hours`,
-`ref_throughput_tokens_per_s`, architecture) and the owner's `BaseTrainer`.
+**Flip point.** `chain.toml [training]` + `[[training.sizes]]`
+(`target_train_hours`, per-size `ref_throughput_tokens_per_s`, architecture),
+`[round]` (cadence + heat budget), and the owner's `BaseTrainer`.
 Measure `ref_throughput_tokens_per_s` once on the reference GPU; tune the recipe
 on a small u-μP proxy width and pin the result here (u-μP transfers it across
 width). Raising the hours or corpus size tightens the signal at linear GPU cost;

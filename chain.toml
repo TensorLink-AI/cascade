@@ -98,6 +98,50 @@ corpus_mode = "stream_cpu"
 # Empty = only require king and challenger to match each other.
 expected_gpu = ""
 
+# Extra final-stage model sizes. The [training] block above is the PRIMARY size
+# (the small rung the cheap heat screens on); each [[training.sizes]] below is
+# trained alongside it in the final, and the throne is decided on the COMBINED
+# score across all sizes (one king, scaling-aware). Each size overrides only the
+# width/depth fields plus its own frozen-arch digest and reference throughput;
+# everything else (head_dim, patch_size, objective, optimiser, budget hours) is
+# inherited from [training], so a size cannot diverge on anything but its shape.
+# With NO [[training.sizes]] block, rounds are single-size (the 4M primary only).
+#
+# === 20M (Toto2-22M) is DISABLED at launch ===
+# Uncomment the block below to add the 20M size to the final — the trainer then
+# trains king + finalist at both sizes and the validator decides ONE throne on
+# the combined 4M+20M score. Before enabling: pin d_model/num_layers/num_heads to
+# the released Datadog/Toto-2.0-22m config.json, measure its throughput, and
+# recompute base_arch_digest with `cascade-trainer --offline`.
+# [[training.sizes]]
+# arch_preset                 = "toto2-22m"
+# base_arch_digest            = "c7ecca53ed939eabfc34ccdb8a698d69101526c24f299efa21c0c0c288c96792"  # sha256 of this size's frozen arch+init; recompute with `cascade-trainer --offline`
+# d_model                     = 512
+# num_layers                  = 8
+# num_heads                   = 8       # head_dim stays 64 across the family ⇒ d_model = num_heads × 64
+# mlp_expansion               = 2
+# ref_throughput_tokens_per_s = 90000   # MEASURE on the reference GPU for THIS size (larger ⇒ slower)
+
+[round]
+# Daily round cadence + two-stage (heat → final) selection.
+# One round per epoch (~24h). The base seed is the chain block hash at the epoch
+# boundary, so the whole day shares one RoundSeeds (identical random init for
+# every heat and final training). Only commitments revealed strictly BEFORE the
+# boundary are eligible — commit late and you compete in the next round.
+epoch_blocks     = 7200   # ≈24h at a 12s block time (set to your network's block time)
+round_hours      = 24.0   # informational: wall-clock span of an epoch
+heat_train_hours = 0.5    # cheap screening budget per competitor (on screen_size)
+heat_n_windows   = 256    # eval windows the heat screens on (cheaper than the final's n_windows)
+finalists        = 1      # challengers promoted from the heat to the 3h final (top-N)
+# Scaling seam: which size the heat screens at, and which size(s) the final trains
+# + the throne is judged on. Both are arch_preset names from the size registry
+# ([training] primary + any [[training.sizes]]). At launch both are the 4M primary
+# (single-size rounds). To promote a rung later, just point these at a bigger size
+# — e.g. screen_size = "toto2-4m", throne_sizes = ["toto2-22m"] — no code change.
+# throne_sizes with >1 entry = combined-score throne pooled across those sizes.
+screen_size  = "toto2-4m"
+throne_sizes = ["toto2-4m"]
+
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,
 # which is what makes the comparison a controlled measurement. The slice is
@@ -242,21 +286,3 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.db"
-
-[queue]
-# Trainer-side submission queue (see cascade.trainer.queue). Challenger
-# generators discovered on-chain are enqueued FIFO and trained in arrival order,
-# at most --max-challengers per round. Cheap anti-duplicate checks run before any
-# generator is fetched or trained (a round is ~3h of GPU per generator):
-#   * duplicate-of-king — a challenger whose generator CID equals the reigning
-#     king's is an exact copy of the king (the CID is the content hash); it can
-#     only tie, never clear the win margin, so it is skipped instead of burning a
-#     round. This is the cascade analogue of teutonic's check_model_copy.
-#   * already-trained   — a CID already trained THIS REIGN is skipped; the cache
-#     resets when the king changes (teutonic-style per-cycle dedup). This fits the
-#     shipped single-round dethroning (dethrone_cp = 1): a challenger gets one
-#     fair shot per reign. If you raise dethrone_cp so a challenger must win
-#     several CONSECUTIVE rounds, raise trained_cache_size's reign scope
-#     accordingly or it will block the needed re-evaluations.
-state_db_path      = "trainer_queue.db"   # backlog + per-reign trained cache (survives restarts)
-trained_cache_size = 256                  # ring-buffer cap on already-trained CIDs per reign

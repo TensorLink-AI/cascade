@@ -12,6 +12,7 @@ level. Call it once in a service ``main`` before entering the run loop.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 
@@ -39,10 +40,8 @@ def restore_cascade_logging(level_name: str = "INFO") -> None:
     # Force bittensor's logging machine to initialise now (it silences other
     # loggers on first import); doing it here means our restore below is the
     # last word. Best-effort: if bittensor isn't installed there's nothing to undo.
-    try:
+    with contextlib.suppress(Exception):
         import bittensor  # noqa: F401
-    except Exception:  # noqa: BLE001
-        pass
 
     level = getattr(logging, str(level_name).upper(), logging.INFO)
     logging.getLogger("cascade").setLevel(level)

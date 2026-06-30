@@ -54,6 +54,90 @@ def test_training_contract_digest_covers_recipe(cfg):
     assert base != contract_digest(replace(cfg.training, d_model=cfg.training.d_model * 2))
 
 
+def test_round_cadence_loads(cfg):
+    # Daily-style cadence + two-stage selection knobs.
+    assert cfg.round.epoch_blocks > 0
+    assert cfg.round.heat_train_hours > 0
+    assert cfg.round.heat_train_hours < cfg.training.target_train_hours  # heat is the cheap screen
+    assert cfg.round.finalists >= 1
+    assert cfg.round.heat_n_windows <= cfg.eval.n_windows
+
+
+def test_shipped_config_is_single_size_at_launch(cfg):
+    # 20M is disabled in the committed chain.toml at launch — rounds run the 4M
+    # primary only. Uncomment [[training.sizes]] + repoint throne_sizes to promote.
+    assert cfg.training.extra_sizes == ()
+    assert [s.arch_preset for s in cfg.training.all_sizes()] == [cfg.training.arch_preset]
+    # screen and throne both resolve to the primary at launch.
+    assert cfg.screen_contract().arch_preset == cfg.training.arch_preset
+    assert [t.arch_preset for t in cfg.throne_contracts()] == [cfg.training.arch_preset]
+
+
+def test_all_sizes_primary_plus_extra(two_size_cfg):
+    cfg = two_size_cfg
+    sizes = cfg.training.all_sizes()
+    assert len(sizes) == 1 + len(cfg.training.extra_sizes) == 2
+    assert sizes[0].arch_preset == cfg.training.arch_preset      # primary first
+    assert sizes[0].extra_sizes == ()                            # each is a single concrete size
+    presets = [s.arch_preset for s in sizes]
+    assert len(presets) == len(set(presets))                     # distinct sizes
+
+
+def test_screen_and_throne_pointers_resolve_against_registry(two_size_cfg):
+    from dataclasses import replace
+
+    # Sliding window: screen at the small primary, throne at the bigger size only.
+    cfg = replace(two_size_cfg, round=replace(two_size_cfg.round,
+                  screen_size=two_size_cfg.training.arch_preset,
+                  throne_sizes=("toto2-test-xl",)))
+    assert cfg.screen_contract().arch_preset == cfg.training.arch_preset
+    assert [t.arch_preset for t in cfg.throne_contracts()] == ["toto2-test-xl"]
+    # screen budget uses the screen size's throughput; throne is the bigger size.
+    assert cfg.screen_contract().d_model == cfg.training.d_model
+    assert cfg.throne_contracts()[0].d_model == 512
+
+
+def test_contract_for_unknown_size_raises(cfg):
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown size"):
+        cfg.training.contract_for("toto2-does-not-exist")
+
+
+def test_for_size_overrides_only_shape_and_keeps_family_invariants(two_size_cfg):
+    cfg = two_size_cfg
+    spec = cfg.training.extra_sizes[0]
+    sized = cfg.training.for_size(spec)
+    # width/depth + digest + throughput come from the spec …
+    assert sized.d_model == spec.d_model and sized.num_layers == spec.num_layers
+    assert sized.base_arch_digest == spec.base_arch_digest
+    assert sized.ref_throughput_tokens_per_s == spec.ref_throughput_tokens_per_s
+    # … the family invariants and the budget hours are inherited from [training].
+    assert sized.head_dim == cfg.training.head_dim == 64
+    assert sized.patch_size == cfg.training.patch_size
+    assert sized.target_train_hours == cfg.training.target_train_hours
+
+
+def test_extra_sizes_change_contract_digest(two_size_cfg):
+    # Every size is folded into the one manifest-level contract digest, so the
+    # validator's contract gate covers all sizes at once.
+    from dataclasses import replace
+
+    from cascade.shared.manifest import contract_digest
+
+    base = contract_digest(two_size_cfg.training)
+    assert base != contract_digest(replace(two_size_cfg.training, extra_sizes=()))
+
+
+def test_tokens_for_hours_uses_per_size_throughput(two_size_cfg):
+    cfg = two_size_cfg
+    spec = cfg.training.extra_sizes[0]
+    sized = cfg.training.for_size(spec)
+    assert sized.tokens_for_hours(cfg.round.heat_train_hours) == round(
+        cfg.round.heat_train_hours * 3600 * spec.ref_throughput_tokens_per_s
+    )
+
+
 def test_koth_params_builds_from_scoring(cfg):
     params = cfg.koth_params()
     assert isinstance(params, KothParams)

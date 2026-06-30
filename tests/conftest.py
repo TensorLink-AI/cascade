@@ -26,6 +26,25 @@ def example_generator_dir() -> Path:
 
 
 @pytest.fixture()
+def two_size_cfg(cfg):
+    """A config with a second (synthetic) size in the registry AND a combined
+    throne over both sizes, so the multi-size final + combined-throne path stays
+    under test even though the shipped chain.toml runs 4M-only at launch."""
+    from dataclasses import replace
+
+    from cascade.shared.config import SizeSpec
+
+    spec = SizeSpec(
+        arch_preset="toto2-test-xl", base_arch_digest="f" * 64,
+        d_model=512, num_layers=8, num_heads=8, mlp_expansion=2,
+        ref_throughput_tokens_per_s=90_000,
+    )
+    training = replace(cfg.training, extra_sizes=(spec,))
+    rnd = replace(cfg.round, throne_sizes=(cfg.training.arch_preset, "toto2-test-xl"))
+    return replace(cfg, training=training, round=rnd)
+
+
+@pytest.fixture()
 def small_cfg(cfg):
     """Shrink the series count so the example generator's python AR(1) loop runs
     fast under test (the length band stays at the chain.toml values, which the

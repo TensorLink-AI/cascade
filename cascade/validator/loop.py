@@ -177,23 +177,38 @@ class ValidatorRunner:
     ) -> RoundOutcome | None:
         """Evaluate one manifest against the eval windows and update state.
 
+        A round carries one (king, challenger) pair PER trained size (the primary
+        plus any ``[[training.sizes]]``). Each size's pair is scored on the SAME
+        windows, then the per-size scores are POOLED — king's across sizes vs
+        challenger's across sizes, in identical order — and a single paired
+        bootstrap decides ONE throne on the combined score (scaling-aware KOTH).
+        Pooling preserves pairing because each size's king and challenger share
+        the window ``abs_target``.
+
         Returns None (king holds, no state change) when the manifest carries no
-        challenger or fails the contract gate. Otherwise returns the round
-        outcome with the (already-applied) state transition.
+        size with both a king and a challenger, or fails the contract gate.
+        Otherwise returns the round outcome with the (already-applied) transition.
         """
         reason = self.check_manifest(manifest)
         if reason is not None:
             log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
             return None
 
-        king_entry = manifest.entry_for_role("king")
-        chal_entry = manifest.entry_for_role("challenger")
-        if king_entry is None or chal_entry is None:
+        king_by_size = {e.size: e for e in manifest.entries_for_role("king")}
+        chal_by_size = {e.size: e for e in manifest.entries_for_role("challenger")}
+        paired_sizes = [s for s in manifest.sizes() if s in king_by_size and s in chal_by_size]
+        if not paired_sizes:
             log.info("manifest round=%s has no king/challenger pair; king holds", manifest.round_id)
             return None
 
-        king_scores = self._evaluate(king_entry, windows)
-        chal_scores = self._evaluate(chal_entry, windows)
+        king_scores: list[WindowScore] = []
+        chal_scores: list[WindowScore] = []
+        for size in paired_sizes:
+            king_scores += self._evaluate(king_by_size[size], windows)
+            chal_scores += self._evaluate(chal_by_size[size], windows)
+        # One challenger generator competes at every size, so any size's entry
+        # carries its identity for the KOTH state machine.
+        chal_entry = chal_by_size[paired_sizes[0]]
 
         result = evaluate_round(
             king_scores,

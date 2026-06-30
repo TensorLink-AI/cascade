@@ -62,23 +62,19 @@ flowchart TD
     end
 
     subgraph trainer["Trainer: owner-operated (the GPU boundary)"]
-        resolve["resolve commitments →<br/>pick king + challenger"]
-        seeds["derive one shared RoundSeeds<br/>from block hash<br/>(generation_seed + training_seed)"]
-        corpusK["draw corpus<br/>(king's generator)"]
-        corpusC["draw corpus<br/>(challenger's generator)"]
-        trainK["train Toto2-4M<br/>from random init"]
-        trainC["train Toto2-4M<br/>from random init"]
+        resolve["resolve commitments before the<br/>24h epoch cutoff → king + field"]
+        seeds["derive one shared RoundSeeds<br/>from epoch-boundary block hash<br/>(generation_seed + training_seed)"]
+        heat["HEAT: train every challenger<br/>~30min (primary size) → screen<br/>→ top finalist"]
+        trainK["FINAL: train king + finalist<br/>from random init at EVERY size<br/>(Toto2-4M, Toto2-22M)"]
         upK["push ckpts → Hippius Hub registry<br/>logs/metrics → Hippius S3"]
-        manifest["sign + publish TrainingManifest<br/>to Hippius S3 (2 ckpt refs + digests)"]
-        resolve --> seeds
-        seeds --> corpusK --> trainK --> upK --> manifest
-        seeds --> corpusC --> trainC --> upK
+        manifest["sign + publish TrainingManifest<br/>to Hippius S3 (size-tagged ckpt refs + digests)"]
+        resolve --> seeds --> heat --> trainK --> upK --> manifest
     end
 
     subgraph validator["Validator (eval GPU)"]
         gate["verify signature +<br/>matching contract / base-arch digests<br/>(controlled-experiment gate)"]
-        eval["pull both ckpts → score on<br/>shared held-out windows<br/>(CRPS/MWSQL + MASE)"]
-        koth["paired-bootstrap LCB of<br/>geomean(CRPS, MASE),<br/>challenger vs king → KOTH verdict"]
+        eval["pull king + finalist ckpts per size →<br/>score on shared held-out windows<br/>(CRPS/MWSQL + MASE)"]
+        koth["paired-bootstrap LCB of<br/>geomean(CRPS, MASE) POOLED across sizes,<br/>finalist vs king → one KOTH verdict"]
         weights["equal-share weights<br/>(king + recent kings)"]
         gate --> eval --> koth --> weights
     end
@@ -91,23 +87,38 @@ flowchart TD
 ```
 
 > The highlighted boxes are where the controlled experiment lives: the trainer
-> reuses one `RoundSeeds` for both runs, and the validator's digest gate rejects any
-> manifest where king and challenger didn't share that contract. Details below.
+> reuses one `RoundSeeds` for every run in the round, and the validator's digest gate
+> rejects any manifest where king and challenger didn't share that contract. Details below.
+
+**The round cadence.** A round is one ~24h epoch (`[round] epoch_blocks`): the
+trainer runs exactly one round per day, so the king is trained once per day and
+the whole day's trainings share one `RoundSeeds` (identical random init). Only
+generators committed on-chain *before* the epoch boundary compete in that round —
+commit late and you're in the next one. Each round has two stages: a cheap
+**heat** trains every eligible challenger for `[round] heat_train_hours` (~30min,
+primary size) and the owner screens them down to the top `[round] finalists`; the
+**final** then trains the king and the surviving finalist to the full
+`[training] target_train_hours` (~3h) at *every* configured size (the 4M primary
+plus each `[[training.sizes]]`, e.g. 22M).
 
 The central invariant: in a round, the king's generator and the
-challenger's generator are trained into models under a *byte-identical* contract:
-the same Toto2 architecture and random initialisation, same compute budget,
-optimiser, generation seed, and training seed. The only thing that differs is the
-generator code. So the downstream eval is a controlled measurement of data
-quality, not a confound of data + luck + hyperparameters. Because the run
-starts from noise, the contract pins the *whole* recipe (see `chain.toml
-[training]`). Each model trains for a fixed wall-clock budget (~3h on the
-owner's reference GPU), enforced as a fixed token count (`hours × reference
-throughput`) so king and challenger get identical compute. A raw timer would
-let a generator win by emitting cheap-to-step data rather than better data, and
-wouldn't reproduce on a re-derived audit run.
+challenger's generator are trained into models under a *byte-identical* contract
+*at each size*: the same Toto2 architecture and random initialisation, same
+compute budget, optimiser, generation seed, and training seed. The only thing
+that differs is the generator code. So the downstream eval is a controlled
+measurement of data quality, not a confound of data + luck + hyperparameters.
+Because the run starts from noise, the contract pins the *whole* recipe (see
+`chain.toml [training]`, with per-size overrides in `[[training.sizes]]`). Each
+model trains for a fixed wall-clock budget (~3h on the owner's reference GPU),
+enforced as a fixed token count (`hours × reference throughput`) so king and
+challenger get identical compute. A raw timer would let a generator win by
+emitting cheap-to-step data rather than better data, and wouldn't reproduce on a
+re-derived audit run.
 
-A challenger takes the throne by winning `dethrone_cp` round(s) by a
+The throne is decided on the **combined** score across sizes: the validator pools
+the king-vs-finalist per-window scores from every size into one paired bootstrap,
+so there is a single king judged on both the 4M and 22M models (a scaling-aware
+KOTH, not a per-size leaderboard). A challenger takes the throne by winning `dethrone_cp` round(s) by a
 confidence-bounded margin (paired bootstrap LCB clears the win margin). The
 shipped `chain.toml` sets `dethrone_cp = 1` with a flat, no-tenure margin
 (`win_margin_start == win_margin_end`, `margin_warmup_rounds = 0`), so a single

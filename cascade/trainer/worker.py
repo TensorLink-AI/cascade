@@ -43,6 +43,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-seed", type=int, required=True, help="Round base seed (block-hash int).")
     p.add_argument("--block", type=int, required=True, help="Round block height.")
     p.add_argument("--trainer", required=True, help="BaseTrainer as 'module:Class'.")
+    p.add_argument("--arch-preset", default=None,
+                   help="Size to train (primary if omitted, or a [[training.sizes]] arch_preset).")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -65,8 +67,21 @@ def main(argv: list[str] | None = None) -> int:
 
     seeds = RoundSeeds.derive(args.base_seed, cfg.training)
     gen = ResolvedGenerator(hotkey=args.hotkey, uid=args.uid, ref=args.gen_ref)
+
+    # Resolve the size this worker trains: the primary contract, or the matching
+    # [[training.sizes]] entry. Same per-size contract the local trainer uses, so
+    # remote and local runs are the identical code path at identical compute.
+    contract = cfg.training.primary_size
+    if args.arch_preset and args.arch_preset != contract.arch_preset:
+        match = next((s for s in cfg.training.extra_sizes if s.arch_preset == args.arch_preset), None)
+        if match is None:
+            log.error("unknown --arch-preset %r (not in [[training.sizes]])", args.arch_preset)
+            return 2
+        contract = cfg.training.for_size(match)
+
     try:
-        entry = runner.train_one(gen, args.role, seeds, args.block)
+        entry = runner.train_one(gen, args.role, seeds, args.block,
+                                 contract=contract, token_budget=contract.train_tokens)
     except Exception as e:  # noqa: BLE001 — report failure on stderr, nonzero exit
         log.exception("worker training failed: %s", e)
         return 1
