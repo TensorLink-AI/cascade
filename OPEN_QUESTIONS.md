@@ -193,30 +193,34 @@ warm-start from a persisted checkpoint, and if so, *which* checkpoint?
 the existing sticky paired KOTH on the private, rotating eval windows
 (`eval/koth.py`, `validator/state.py`); nothing here touches who is king or how
 rewards/weights are set. The change is narrow and lives in the *training
-contract*: when the reigning king's tenure exceeds `warm_start_after_days`
-(`0` = disabled; ships off), the round swaps random init for a persisted **base
-checkpoint**, and **both** the king's and the challenger's generators train from
-that *same* checkpoint. Shared init is preserved (now the checkpoint instead of
-random weights), shared `training_seed`/`generation_seed` and the fixed token
-budget are unchanged, so the controlled-experiment invariant — only the corpus
-differs — still holds; the contest now measures whose data best *continues to
-improve* the current base.
+contract*: there is a single persisted **base checkpoint** that is the
+warm-start anchor. Once a base exists, every round **both** the king's and the
+challenger's generators train from that *same* checkpoint instead of random
+init; before any base exists (genesis), training is from scratch as today.
+Shared init is preserved (now the checkpoint instead of random weights), shared
+`training_seed`/`generation_seed` and the fixed token budget are unchanged, so
+the controlled-experiment invariant — only the corpus differs — still holds; the
+contest now measures whose data best *continues to improve* the current base.
 
-The persisted base is the king's **best checkpoint by industry-standard
-benchmark score** (e.g. GIFT-Eval / Monash). Each round the king holds, the
-trainer scores its freshly-trained checkpoint on the pinned public benchmark
-suite and, if it beats the currently-persisted base's score, advances a single
-pointer to it. Checkpoints are immutable content-addressed `repo@digest`
-artifacts on the Hub, so "store the best, overwrite if beaten" is a *pointer*
-move — the old digests persist for audit, nothing is destroyed. A **public**
-benchmark is used here *on purpose*: unlike the throne eval (#6, private+rotating
-to resist overfit), base selection only chooses which of the king's *own*
-snapshots to warm-start from — it sets no reward — so an absolute, recognised,
+The base is **persistent and monotonically advancing — it is never reset.** It is
+refreshed only on a **staleness** trigger: when the reigning king has held the
+throne **undethroned for `warm_start_after_days`** (`0` = warm-start disabled,
+always from scratch; ships off), counted since the base was last set, the trainer
+promotes that king's **best checkpoint by industry-standard benchmark score**
+(e.g. GIFT-Eval / Monash) to be the new base — advancing a single pointer, and
+only if it beats the current base so the anchor never regresses. A **dethrone
+does not reset the base**; it resets only the countdown to the next promotion
+(continuous tenure is what earns one). So the base just keeps going between
+promotions, and slowly advances to capture the field's current best each time
+*some* king proves durable. Checkpoints are immutable content-addressed
+`repo@digest` artifacts on the Hub, so "set a new checkpoint" is a *pointer*
+move — old digests persist for audit, nothing is destroyed.
+
+A **public** benchmark is used for promotion *on purpose*: unlike the throne eval
+(#6, private+rotating to resist overfit), base selection only chooses which
+snapshot to warm-start from — it sets no reward — so an absolute, recognised,
 comparable yardstick is exactly right, and the weak indirect overfit pressure is
-acceptable because the throne is still decided by the rotating private pool. On
-dethrone the base resets: a fresh king trains from scratch again until it
-re-establishes `warm_start_after_days` of tenure, then its own best-by-benchmark
-snapshot becomes the new base.
+acceptable because the throne is still decided by the rotating private pool.
 
 **Wiring.** `BaseTrainer.train` gains `init_from: Path | None` (`None` = today's
 random init). `TrainingManifest` gains a signed `base_checkpoint: str | None` —
@@ -232,10 +236,11 @@ steal the throne, it only yields a weaker warm start that the rotating-window
 KOTH would expose. Tenure is read from the same bookkeeping that drives the
 margin warmup (`koth.py::margin_for_tenure`, `validator/state.py`).
 
-**Flip point.** `chain.toml [training] warm_start_after_days` (trigger; `0`
-keeps pure from-scratch) and `[eval] checkpoint_benchmark` (which industry-std
-suite ranks the king's snapshots). Days-vs-rounds for the trigger mirrors #7's
-hours-vs-tokens trade: days is the operator-facing intent, enforced via a round
-count for reproducibility. Choosing "advance to the king's latest checkpoint"
-instead of "best by benchmark" would drop the benchmark dependency but lose the
-non-regression guarantee on the base.
+**Flip point.** `chain.toml [training] warm_start_after_days` (the staleness
+threshold: continuous undethroned tenure a king must accrue to promote a new
+base; `0` disables warm-start, always from scratch) and `[eval]
+checkpoint_benchmark` (which industry-std suite ranks the king's snapshots).
+Days-vs-rounds for the trigger mirrors #7's hours-vs-tokens trade: days is the
+operator-facing intent, enforced via a round count for reproducibility. Choosing
+"advance to the king's latest checkpoint" instead of "best by benchmark" would
+drop the benchmark dependency but lose the non-regression guarantee on the base.
