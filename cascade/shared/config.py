@@ -340,6 +340,41 @@ class StaticGuardConfig:
 
 
 @dataclass(frozen=True)
+class JudgeConfig:
+    """LLM-as-a-judge screen run after the deterministic checks (static guard +
+    determinism) and, trainer-side, before the heat.
+
+    Off by default — the deterministic checks stand alone, and judging needs an
+    OpenRouter API key (``api_key_env``) in the environment. When ``enabled`` and
+    a key is present, :func:`cascade.screen.judge.build_judge` constructs the
+    client; otherwise the screen no-ops. ``model`` defaults to GLM (z-ai) on
+    OpenRouter.
+
+    ``fail_closed`` decides a judge *transport* error (not a verdict): reject the
+    submission (default — safe for a security screen) or pass it with a warning.
+
+    The copy-of-king thresholds are the cascade analogue of tau's copy
+    thresholds: at/above ``copy_reject_similarity`` a challenger is rejected
+    mechanically (no LLM); the band ``[copy_review_similarity,
+    copy_reject_similarity)`` is escalated to the LLM. The whole copy check only
+    runs when ``publish_king`` is set (it is moot in a private-only deployment).
+    """
+
+    enabled: bool = False
+    provider: str = "openrouter"
+    model: str = "z-ai/glm-5.2"
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    api_key: str = ""               # usually empty; prefer the env var
+    timeout_seconds: int = 60
+    max_tokens: int = 1024
+    fail_closed: bool = True
+    publish_king: bool = False
+    copy_reject_similarity: float = 0.90
+    copy_review_similarity: float = 0.70
+
+
+@dataclass(frozen=True)
 class StorageConfig:
     """Hippius storage endpoints (credentials come from the environment).
 
@@ -394,6 +429,7 @@ class ChainConfig:
     scoring: ScoringConfig
     dependencies: DependencyConfig
     static_guard: StaticGuardConfig
+    judge: JudgeConfig
     storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
@@ -515,6 +551,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     s = raw["scoring"]
     d = raw["dependencies"]
     sg = raw["static_guard"]
+    j = raw.get("judge", {})
     st = raw.get("storage", {})
     m = raw["manifest"]
     v = raw["validator"]
@@ -624,6 +661,20 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         ),
         static_guard=StaticGuardConfig(
             blocked=tuple(str(x) for x in sg["blocked"]),
+        ),
+        judge=JudgeConfig(
+            enabled=bool(j.get("enabled", False)),
+            provider=str(j.get("provider", "openrouter")),
+            model=str(j.get("model", "z-ai/glm-5.2")),
+            base_url=str(j.get("base_url", "https://openrouter.ai/api/v1")),
+            api_key_env=str(j.get("api_key_env", "OPENROUTER_API_KEY")),
+            api_key=str(j.get("api_key", "")),
+            timeout_seconds=int(j.get("timeout_seconds", 60)),
+            max_tokens=int(j.get("max_tokens", 1024)),
+            fail_closed=bool(j.get("fail_closed", True)),
+            publish_king=bool(j.get("publish_king", False)),
+            copy_reject_similarity=float(j.get("copy_reject_similarity", 0.90)),
+            copy_review_similarity=float(j.get("copy_review_similarity", 0.70)),
         ),
         storage=StorageConfig(
             hub_registry_url=str(st.get("hub_registry_url", "https://registry.hippius.com")),

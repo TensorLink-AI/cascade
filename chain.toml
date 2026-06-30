@@ -245,6 +245,46 @@ blocked = [
     "cascade.shared.chain",
 ]
 
+[judge]
+# LLM-as-a-judge screen, run AFTER the deterministic checks (static guard +
+# determinism) and, trainer-side, before the heat. It is a second opinion on the
+# things a parser can't decide, never a replacement for them:
+#   - distillation       — is this sampling a prior, or replaying fitted weights?
+#                          (fed generator.py + config + requirements + the
+#                          code-only rule, plus mechanical literal-density
+#                          evidence — total bytes & byte-entropy of numeric
+#                          literals). HARD-FAIL.
+#   - benchmark-targeting — general prior, or shaped to a specific distribution?
+#                          (the eval is private and rotating). HARD-FAIL if
+#                          blatant, WARN otherwise — the rotating eval handles
+#                          the rest. Folded into the SAME judge call.
+#   - copy-of-king       — mechanical source similarity to the published king
+#                          (canonicalised, comments/whitespace stripped). High
+#                          similarity rejects with NO LLM; only the middle band
+#                          is escalated to the LLM, fed both generators. Runs
+#                          only when publish_king = true.
+#
+# OFF by default: the deterministic checks stand alone, and judging needs an
+# OpenRouter API key in the environment ($OPENROUTER_API_KEY). Set enabled = true
+# and provide the key to turn it on; with no key the screen silently no-ops.
+enabled       = false
+provider      = "openrouter"
+model         = "z-ai/glm-5.2"                 # GLM (z-ai) on OpenRouter
+base_url      = "https://openrouter.ai/api/v1"
+api_key_env   = "OPENROUTER_API_KEY"           # key is read from the environment, never committed
+timeout_seconds = 60
+max_tokens    = 1024
+# Transport error policy (a failed/unreachable judge, NOT a verdict):
+#   true  = reject the submission (safe default for a security screen)
+#   false = pass it through with a warning (don't let a flaky API nuke the field)
+fail_closed   = true
+# Copy-of-king (the cascade analogue of tau's copy thresholds). Only meaningful
+# when the king's generator source is PUBLISHED — leave publish_king = false for
+# a private-only deployment and the copy check is skipped entirely.
+publish_king          = false
+copy_reject_similarity = 0.90   # >= this canonical-source similarity → mechanical reject (no LLM)
+copy_review_similarity = 0.70   # [review, reject) → escalate to the LLM (similar-but-restructured)
+
 [storage]
 # Hippius is cascade's storage layer. Two backends:
 #   registry (Hippius Hub OCI, https://docs.hippius.com/registry) —

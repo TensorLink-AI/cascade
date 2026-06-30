@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..interface.validation import parse_commit
 from ..shared.chain import Commitment
@@ -48,6 +49,9 @@ from ..shared.manifest import (
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult
 from .stream import open_round_stream
+
+if TYPE_CHECKING:
+    from ..screen.judge import JudgeClient
 
 # Screens one heat checkpoint: given the trained heat-model directory, the
 # generator that produced its corpus, and the round's base seed (so the screening
@@ -172,6 +176,11 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
+    # LLM-judge submission screen, run before the heat (after the deterministic
+    # checks). None ⇒ no screen (the deterministic checks still run in the
+    # sandbox preflight). Wired in trainer.main from [judge]; a hard-fail drops
+    # the challenger before any heat compute is spent.
+    judge: JudgeClient | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -352,7 +361,8 @@ class TrainerRunner:
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
 
-        finalists = self._run_heat(plan.challengers, seeds, block)
+        challengers = self._screen_field(plan.challengers, plan.king)
+        finalists = self._run_heat(challengers, seeds, block)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
@@ -368,6 +378,65 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
         )
+
+    def _screen_field(
+        self, challengers: list[ResolvedGenerator], king: ResolvedGenerator
+    ) -> list[ResolvedGenerator]:
+        """LLM-judge screen each challenger BEFORE the heat (after the
+        deterministic sandbox preflight). Drops hard-fails (distillation,
+        benchmark-targeting blatant, copy-of-king) so no heat compute is spent on
+        them; ``warn`` findings are logged but kept. No-ops when no ``judge`` is
+        wired or ``[judge]`` is disabled. A king is never screened — it already
+        reigns. A screen error is resolved by ``[judge] fail_closed``."""
+        if self.judge is None or not self.cfg.judge.enabled or not challengers:
+            return challengers
+
+        king_source = self._king_source(king) if self.cfg.judge.publish_king else None
+        kept: list[ResolvedGenerator] = []
+        for c in challengers:
+            try:
+                report = self._screen_one(c, king_source)
+            except Exception as e:  # noqa: BLE001 — screen transport/fetch failure
+                if self.cfg.judge.fail_closed:
+                    log.warning("screen: dropping challenger %s (judge unavailable, "
+                                "fail-closed): %s", c.hotkey, e)
+                    continue
+                log.warning("screen: challenger %s judge unavailable (fail-open, kept): %s",
+                            c.hotkey, e)
+                kept.append(c)
+                continue
+            if not report.ok:
+                reasons = "; ".join(f"{f.name}: {f.reason}" for f in report.failures)
+                log.warning("screen: REJECTING challenger %s — %s", c.hotkey, reasons)
+                continue
+            for w in report.warnings:
+                log.info("screen: challenger %s warning [%s]: %s", c.hotkey, w.name, w.reason)
+            kept.append(c)
+
+        if len(kept) != len(challengers):
+            log.info("screen: %d/%d challengers cleared the judge", len(kept), len(challengers))
+        return kept
+
+    def _screen_one(self, gen: ResolvedGenerator, king_source: str | None):
+        """Fetch a challenger's repo to a temp dir and run the screen on it."""
+        import tempfile
+
+        from ..screen import screen_repo
+
+        with tempfile.TemporaryDirectory(prefix="cascade-screen-") as td:
+            gen_dir = Path(td)
+            fetch_from_hub(gen.ref, gen_dir, self.hub())
+            return screen_repo(gen_dir, self.cfg, self.judge, king_source=king_source)
+
+    def _king_source(self, king: ResolvedGenerator) -> str | None:
+        """Fetch the king's ``generator.py`` source for the copy-of-king check."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="cascade-king-") as td:
+            king_dir = Path(td)
+            fetch_from_hub(king.ref, king_dir, self.hub())
+            p = king_dir / "generator.py"
+            return p.read_text(encoding="utf-8") if p.is_file() else None
 
     def _run_heat(
         self, challengers: list[ResolvedGenerator], seeds: RoundSeeds, block: int

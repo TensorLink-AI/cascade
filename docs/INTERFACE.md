@@ -79,6 +79,32 @@ class Generator(DataGenerator):
   but no shipped weights), at most `max_packages`. The fetched repo (code only)
   must be `<= max_repo_mb`.
 
+### LLM-judge screen (optional, owner-enabled)
+
+When the owner turns on `chain.toml [judge]`, a second opinion from an LLM
+(OpenRouter, GLM by default) runs *after* the deterministic checks above and
+again trainer-side before the heat. It is never a replacement for the
+deterministic gates — only a backstop for what a parser can't decide:
+
+* **Distillation (hard-fail).** Is your generator *sampling a prior* or
+  *replaying fitted weights*? The judge sees `generator.py`, `config.json`,
+  `requirements.txt`, the code-only rule, and two mechanical signals computed
+  from your source — the **total bytes of numeric literals** and their **byte
+  entropy**. Honest priors are mostly logic; distilled weights are mostly
+  numbers. Big literal arrays, base64/compressed blobs decoded at runtime, or
+  libraries used only to load a pretrained model get rejected.
+* **Benchmark-targeting (hard-fail if blatant, warn otherwise).** The held-out
+  eval is private and rotates every round. A general prior is fine; one with
+  hardcoded periods/scales/lengths shaped to a specific public benchmark is not.
+* **Copy-of-king (only if the king's source is published).** Your generator is
+  canonicalised (comments/whitespace stripped, AST-normalised) and compared to
+  the reigning king's source; too-similar is rejected mechanically (no LLM), and
+  only the similar-but-restructured middle band is sent to the judge.
+
+`cascade verify` runs the screen too when you set `OPENROUTER_API_KEY` and
+`[judge] enabled = true` locally (use `--skip-judge` to force the offline static
+path).
+
 ## Deploy
 
 ```bash

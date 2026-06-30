@@ -116,6 +116,43 @@ def test_sliding_window_screen_small_throne_big(two_size_cfg, tmp_path, monkeypa
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"  # heat winner promoted
 
 
+def test_run_round_judge_screen_drops_distilled_challenger(cfg, tmp_path, monkeypatch):
+    # With [judge] enabled, a challenger the judge fails for distillation is
+    # dropped BEFORE the heat — only the clean challenger reaches the final.
+    import json
+    from dataclasses import replace
+
+    _patch_train_boundaries(monkeypatch)
+    # fetch writes a per-ref generator.py so the screen has source to read.
+    sources = {REF_B: "x = 1\n", REF_C: "W = [0.1, 0.2]  # zzdistilledblob\n"}
+
+    def _fake_fetch(ref, dest, hub=None):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "generator.py").write_text(sources.get(ref, "x = 1\n"), encoding="utf-8")
+        (dest / "config.json").write_text("{}", encoding="utf-8")
+        (dest / "requirements.txt").write_text("", encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr(loop_mod, "fetch_from_hub", _fake_fetch)
+
+    class FakeJudge:
+        def complete(self, system, user):
+            blatant = "zzdistilledblob" in user
+            return json.dumps({
+                "distillation": "fail" if blatant else "pass",
+                "distillation_reason": "replays fitted weights",
+                "benchmark_targeting": "pass",
+            })
+
+    jcfg = replace(cfg, judge=replace(cfg.judge, enabled=True))
+    runner = TrainerRunner(cfg=jcfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, judge=FakeJudge())
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6), _commit(2, "c", REF_C, 7)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    # 'c' (distilled) screened out; 'b' is the only challenger trained.
+    assert manifest.entry_for_role("challenger").miner_hotkey == "b"
+
+
 def test_run_round_skips_challenger_that_copies_the_king(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,

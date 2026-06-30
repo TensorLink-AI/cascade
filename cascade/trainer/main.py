@@ -119,6 +119,16 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("cascade.trainer")
     screen_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
 
+    from ..screen.judge import build_judge
+
+    judge = build_judge(cfg)
+    if cfg.judge.enabled and judge is None:
+        log.warning("[judge] enabled but no API key in $%s — LLM-judge screen is OFF",
+                    cfg.judge.api_key_env)
+    elif judge is not None:
+        log.info("LLM-judge screen ON (model=%s, fail_closed=%s, publish_king=%s)",
+                 cfg.judge.model, cfg.judge.fail_closed, cfg.judge.publish_king)
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
@@ -127,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_hosts=remote_hosts,
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
+        judge=judge,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",

@@ -227,6 +227,26 @@ blocked = [
     "cascade.shared.chain",
 ]
 
+[judge]
+# LLM-as-a-judge screen, run AFTER the deterministic checks (static guard +
+# determinism) and, trainer-side, before the heat. A second opinion on what a
+# parser can't decide — distillation (replaying fitted weights), benchmark-
+# targeting (shaped to a distribution), and copy-of-king (restructured copy of a
+# published king) — never a replacement for the deterministic checks. OFF by
+# default; needs an OpenRouter API key ($OPENROUTER_API_KEY) to run. See the
+# fully-commented [judge] block in chain.toml for every field.
+enabled       = false
+provider      = "openrouter"
+model         = "z-ai/glm-5.2"                 # GLM (z-ai) on OpenRouter
+base_url      = "https://openrouter.ai/api/v1"
+api_key_env   = "OPENROUTER_API_KEY"
+timeout_seconds = 60
+max_tokens    = 1024
+fail_closed   = true
+publish_king          = false
+copy_reject_similarity = 0.90
+copy_review_similarity = 0.70
+
 [storage]
 # Hippius is cascade's storage layer. Two backends:
 #   registry (Hippius Hub OCI, https://docs.hippius.com/registry) —

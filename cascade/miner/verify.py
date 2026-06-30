@@ -13,6 +13,12 @@ Sequence:
    fixed seed, and assert identical digests. This is the load-bearing extra
    check cascade has that horizon doesn't: a non-deterministic generator
    breaks auditability and is rejected.
+6. (optional) LLM-judge screen — after the deterministic checks, a second
+   opinion on what a parser can't decide: distillation (replaying fitted
+   weights), benchmark-targeting (shaped to a distribution), and copy-of-king
+   (restructured copy of a published king). Runs only when a ``judge`` client is
+   passed and ``[judge] enabled``; ``fail`` rejects, ``warn`` is recorded. See
+   :mod:`cascade.screen`.
 
 Step 5 requires numpy and the generator's runtime deps importable in the
 current interpreter; ``--skip-runtime`` runs the static path only.
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..interface.static_guard import scan_file
 from ..interface.validation import (
@@ -33,6 +40,9 @@ from ..interface.validation import (
 )
 from ..shared.config import ChainConfig
 
+if TYPE_CHECKING:
+    from ..screen.judge import JudgeClient
+
 
 @dataclass(frozen=True)
 class VerifyReport:
@@ -42,6 +52,9 @@ class VerifyReport:
     failures: list[tuple[str, ValidationResult]] = field(default_factory=list)
     runtime_skipped: bool = False
     corpus_digest: str | None = None
+    # Non-blocking screen findings (e.g. a benchmark-targeting "warn"): recorded,
+    # not rejected. ``(check_name, reason)``.
+    warnings: list[tuple[str, str]] = field(default_factory=list)
 
     def render(self) -> str:
         lines = []
@@ -55,6 +68,8 @@ class VerifyReport:
             lines.append("  (determinism check skipped: --skip-runtime)")
         elif self.corpus_digest is not None:
             lines.append(f"  corpus_digest (seed=0): {self.corpus_digest[:16]}…  [deterministic]")
+        for name, reason in self.warnings:
+            lines.append(f"  warning [{name}] {reason}")
         return "\n".join(lines)
 
 
@@ -63,8 +78,15 @@ def verify_repo(
     cfg: ChainConfig,
     *,
     skip_runtime: bool = False,
+    judge: JudgeClient | None = None,
+    king_source: str | None = None,
 ) -> VerifyReport:
-    """Run every check the trainer runs before training on a generator."""
+    """Run every check the trainer runs before training on a generator.
+
+    When ``judge`` is supplied and ``[judge] enabled``, the LLM-judge screen
+    (distillation / benchmark-targeting / copy-of-king) runs after the
+    deterministic checks; ``king_source`` enables the copy-of-king comparison.
+    """
     d = Path(repo_dir)
     failures: list[tuple[str, ValidationResult]] = []
 
@@ -100,15 +122,46 @@ def verify_repo(
     if not reqs.ok:
         failures.append(("requirements", reqs))
 
-    if failures or skip_runtime:
-        return VerifyReport(ok=not failures, failures=failures, runtime_skipped=skip_runtime)
+    if failures:
+        return VerifyReport(ok=False, failures=failures, runtime_skipped=skip_runtime)
 
-    digest, runtime_err = _determinism_check(d, cfg)
-    if runtime_err is not None:
-        failures.append(("determinism", runtime_err))
-        return VerifyReport(ok=False, failures=failures)
+    digest: str | None = None
+    if not skip_runtime:
+        digest, runtime_err = _determinism_check(d, cfg)
+        if runtime_err is not None:
+            failures.append(("determinism", runtime_err))
+            return VerifyReport(ok=False, failures=failures)
 
-    return VerifyReport(ok=True, failures=[], runtime_skipped=False, corpus_digest=digest)
+    # LLM-judge screen — only with a wired client and [judge] enabled. The
+    # mechanical pieces (literal-density evidence, source similarity) are pure;
+    # only the adjudication touches the network.
+    warnings: list[tuple[str, str]] = []
+    if judge is not None and cfg.judge.enabled:
+        judge_fails, warnings = _judge_screen(d, cfg, judge, king_source)
+        failures.extend(judge_fails)
+
+    return VerifyReport(
+        ok=not failures,
+        failures=failures,
+        runtime_skipped=skip_runtime,
+        corpus_digest=digest,
+        warnings=warnings,
+    )
+
+
+def _judge_screen(
+    repo_dir: Path,
+    cfg: ChainConfig,
+    judge: JudgeClient,
+    king_source: str | None,
+) -> tuple[list[tuple[str, ValidationResult]], list[tuple[str, str]]]:
+    """Run the screen and split it into hard failures and recorded warnings."""
+    from ..screen import screen_repo
+
+    report = screen_repo(repo_dir, cfg, judge, king_source=king_source)
+    fails = [(c.name, ValidationResult.fail(c.reason)) for c in report.failures]
+    warns = [(c.name, c.reason) for c in report.warnings]
+    return fails, warns
 
 
 def _determinism_check(

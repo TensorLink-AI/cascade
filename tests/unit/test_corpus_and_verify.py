@@ -35,6 +35,49 @@ def test_verify_static_path_only(small_cfg, example_generator_dir):
     assert report.runtime_skipped
 
 
+def test_verify_ignores_judge_when_disabled(small_cfg, example_generator_dir):
+    # [judge] enabled = false in the shipped config ⇒ the client is never called
+    # even if one is passed.
+    class BoomJudge:
+        def complete(self, system, user):
+            raise AssertionError("judge must not run when [judge] is disabled")
+
+    report = verify_repo(example_generator_dir, small_cfg, skip_runtime=True, judge=BoomJudge())
+    assert report.ok
+
+
+def test_verify_runs_judge_when_enabled(small_cfg, example_generator_dir):
+    import json
+    from dataclasses import replace
+
+    class FakeJudge:
+        def complete(self, system, user):
+            return json.dumps({"distillation": "pass", "benchmark_targeting": "warn",
+                               "benchmark_targeting_reason": "weekly period"})
+
+    cfg = replace(small_cfg, judge=replace(small_cfg.judge, enabled=True))
+    report = verify_repo(example_generator_dir, cfg, skip_runtime=True, judge=FakeJudge())
+    assert report.ok                                   # a warn does not reject
+    assert ("benchmark_targeting", "weekly period") in report.warnings
+    assert "warning [benchmark_targeting]" in report.render()
+
+
+def test_verify_judge_distillation_fail_rejects(small_cfg, example_generator_dir):
+    import json
+    from dataclasses import replace
+
+    class FakeJudge:
+        def complete(self, system, user):
+            return json.dumps({"distillation": "fail",
+                               "distillation_reason": "replays fitted weights",
+                               "benchmark_targeting": "pass"})
+
+    cfg = replace(small_cfg, judge=replace(small_cfg.judge, enabled=True))
+    report = verify_repo(example_generator_dir, cfg, skip_runtime=True, judge=FakeJudge())
+    assert not report.ok
+    assert any(step == "distillation" for step, _ in report.failures)
+
+
 def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
     from cascade.trainer.corpus import build_round_corpus
 

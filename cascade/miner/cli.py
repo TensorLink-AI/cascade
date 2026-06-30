@@ -35,6 +35,11 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Skip the determinism (corpus build) check; static checks only.",
     )
+    p.add_argument(
+        "--skip-judge",
+        action="store_true",
+        help="Skip the LLM-judge screen even if [judge] is enabled (offline static run).",
+    )
     p.set_defaults(func=_cmd_verify)
 
 
@@ -63,7 +68,12 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
-    report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
+    judge = None
+    if not args.skip_judge:
+        from ..screen.judge import build_judge
+
+        judge = build_judge(cfg)
+    report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime, judge=judge)
     print(report.render())
     return 0 if report.ok else 1
 
