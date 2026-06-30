@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import tomllib  # py311+
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,30 @@ def validate_corpus_mode(mode: str) -> str:
     if mode not in CORPUS_MODES:
         raise ValueError(f"corpus_mode={mode!r} invalid; expected one of {CORPUS_MODES}")
     return mode
+
+
+@dataclass(frozen=True)
+class SizeSpec:
+    """One additional model size trained in the round's final stage.
+
+    cascade's final stage trains the king and the surviving challenger at more
+    than one Toto2 size so the throne is decided on a *combined* score across
+    sizes (a scaling check, not just the cheapest rung). Each spec overrides only
+    the width/depth fields that change with size, plus the per-size frozen-arch
+    digest and reference throughput; the fields fixed across the Toto2 family
+    (``head_dim``, ``patch_size``, the objective, the optimiser recipe) are
+    inherited from the base :class:`TrainingContractConfig` via
+    :meth:`TrainingContractConfig.for_size`, so a size cannot silently diverge on
+    anything but its shape.
+    """
+
+    arch_preset: str
+    base_arch_digest: str          # sha256 of THIS size's frozen arch+init
+    d_model: int
+    num_layers: int
+    num_heads: int
+    mlp_expansion: int
+    ref_throughput_tokens_per_s: int   # measured on the reference GPU for this size
 
 
 @dataclass(frozen=True)
@@ -142,19 +166,88 @@ class TrainingContractConfig:
     # ran the same SKU); empty ⇒ require only that king and challenger match each
     # other when both report a gpu_name. Folded into contract_digest.
     expected_gpu: str = ""
+    # Extra model sizes trained alongside the base (primary) size in the final
+    # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
+    # contract_digest, so a validator's contract gate covers every size at once.
+    extra_sizes: tuple[SizeSpec, ...] = ()
+
+    def tokens_for_hours(self, hours: float) -> int:
+        """Point-pass budget for ``hours`` on the reference GPU at this size's
+        throughput. Used for both the full final budget and the cheaper heat
+        budget; going through a token count (not a raw timer) keeps king and
+        challenger on identical compute and keeps a re-derived run reproducible."""
+        return int(round(hours * 3600.0 * self.ref_throughput_tokens_per_s))
 
     @property
     def train_tokens(self) -> int:
-        """Enforced training budget in point-passes: ``target_train_hours`` of the
-        reference GPU at ``ref_throughput_tokens_per_s``. King and challenger both
-        train to this exact count — fair (equal compute, not equal wall-clock,
-        which data-dependent throughput could skew) and reproducible (a re-derived
-        run matches)."""
-        return int(round(self.target_train_hours * 3600.0 * self.ref_throughput_tokens_per_s))
+        """Enforced final-stage budget in point-passes: ``target_train_hours`` of
+        the reference GPU at ``ref_throughput_tokens_per_s``. King and challenger
+        both train to this exact count — fair (equal compute, not equal
+        wall-clock, which data-dependent throughput could skew) and reproducible
+        (a re-derived run matches)."""
+        return self.tokens_for_hours(self.target_train_hours)
 
     @property
     def warmup_tokens(self) -> int:
         return int(round(self.train_tokens * self.warmup_fraction))
+
+    def for_size(self, spec: SizeSpec) -> TrainingContractConfig:
+        """A per-size training contract: this base recipe with the width/depth,
+        frozen-arch digest, and throughput swapped for ``spec``. The result has
+        no nested ``extra_sizes`` (it IS a single concrete size), so its
+        ``contract_digest`` is the stable identity of that one size."""
+        return replace(
+            self,
+            arch_preset=spec.arch_preset,
+            base_arch_digest=spec.base_arch_digest,
+            d_model=spec.d_model,
+            num_layers=spec.num_layers,
+            num_heads=spec.num_heads,
+            mlp_expansion=spec.mlp_expansion,
+            ref_throughput_tokens_per_s=spec.ref_throughput_tokens_per_s,
+            extra_sizes=(),
+        )
+
+    @property
+    def primary_size(self) -> TrainingContractConfig:
+        """The base (primary) size as a standalone single-size contract — the
+        rung the cheap heat screens on, and the first size of the final."""
+        return replace(self, extra_sizes=())
+
+    def final_sizes(self) -> list[TrainingContractConfig]:
+        """Per-size contracts trained in the final stage: the primary size first,
+        then each :class:`SizeSpec` in ``extra_sizes``. A single element when no
+        extra sizes are configured (legacy single-size rounds)."""
+        return [self.primary_size, *(self.for_size(s) for s in self.extra_sizes)]
+
+
+@dataclass(frozen=True)
+class RoundConfig:
+    """Round cadence and the two-stage (heat → final) selection.
+
+    A round spans ``epoch_blocks`` (≈24h at a 12s block time): the trainer runs
+    exactly one round per epoch, so the king is trained once per day. The round's
+    base seed is the chain block hash at the *epoch boundary*, so the whole day
+    shares one :class:`~cascade.trainer.contract.RoundSeeds` — every heat and
+    final training in the round uses identical random init and data-order RNG.
+
+    Only commitments revealed STRICTLY BEFORE the epoch boundary are eligible:
+    commit late and you compete in the next round, not this one. That boundary is
+    the submission deadline, and it is deterministic so every honest party
+    re-derives the same field.
+
+    The field is first screened cheaply — every eligible challenger is trained for
+    ``heat_train_hours`` on the primary (smallest) size and scored internally by
+    the trainer; the top ``finalists`` then advance to the full
+    ``[training] target_train_hours`` final against the king, trained at every
+    configured size.
+    """
+
+    epoch_blocks: int = 7200       # ≈24h at 12s blocks; one round per epoch
+    round_hours: float = 24.0      # informational: wall-clock span of an epoch
+    heat_train_hours: float = 0.5  # cheap screening budget per competitor
+    heat_n_windows: int = 256      # eval windows the heat screens on (≤ [eval] n_windows)
+    finalists: int = 1             # challengers promoted from the heat to the final
 
 
 @dataclass(frozen=True)
@@ -252,29 +345,12 @@ class ValidatorConfig:
 
 
 @dataclass(frozen=True)
-class QueueConfig:
-    """Trainer-side submission queue (see :mod:`cascade.trainer.queue`).
-
-    The trainer enqueues challenger generators discovered on-chain and trains
-    them FIFO, skipping any whose generator CID equals the reigning king's (an
-    exact copy of the king) or that was already trained this reign.
-
-    Attributes:
-        state_db_path: where the backlog + per-reign trained cache is persisted
-            so it survives trainer restarts.
-        trained_cache_size: ring-buffer cap on already-trained CIDs per reign.
-    """
-
-    state_db_path: str
-    trained_cache_size: int
-
-
-@dataclass(frozen=True)
 class ChainConfig:
     schema_version: int
     subnet: SubnetConfig
     generator: GeneratorConfig
     training: TrainingContractConfig
+    round: RoundConfig
     eval: EvalConfig
     scoring: ScoringConfig
     dependencies: DependencyConfig
@@ -282,7 +358,6 @@ class ChainConfig:
     storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
-    queue: QueueConfig
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -330,6 +405,12 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             "[training] base_arch_digest is a placeholder "
             "(run `cascade-trainer --offline` and paste the printed digest)"
         )
+    for spec in cfg.training.extra_sizes:
+        if spec.base_arch_digest in ("", _PLACEHOLDER_DIGEST) or len(spec.base_arch_digest) != 64:
+            problems.append(
+                f"[[training.sizes]] base_arch_digest for {spec.arch_preset!r} is a "
+                "placeholder (run `cascade-trainer --offline` and paste the printed digest)"
+            )
     if not cfg.manifest.trainer_hotkey:
         problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
     if role == "validator":
@@ -376,7 +457,22 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     st = raw.get("storage", {})
     m = raw["manifest"]
     v = raw["validator"]
-    q = raw.get("queue", {})
+    r = raw.get("round", {})
+
+    # Extra final-stage sizes ([[training.sizes]] array of tables). The base
+    # [training] block is always the primary size; these are trained alongside it.
+    extra_sizes = tuple(
+        SizeSpec(
+            arch_preset=str(z["arch_preset"]),
+            base_arch_digest=str(z["base_arch_digest"]),
+            d_model=int(z["d_model"]),
+            num_layers=int(z["num_layers"]),
+            num_heads=int(z["num_heads"]),
+            mlp_expansion=int(z["mlp_expansion"]),
+            ref_throughput_tokens_per_s=int(z["ref_throughput_tokens_per_s"]),
+        )
+        for z in t.get("sizes", [])
+    )
 
     return ChainConfig(
         schema_version=schema,
@@ -425,6 +521,14 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_train_seconds=int(t["max_train_seconds"]),
             corpus_mode=validate_corpus_mode(str(t.get("corpus_mode", "stream_cpu"))),
             expected_gpu=str(t.get("expected_gpu", "")),
+            extra_sizes=extra_sizes,
+        ),
+        round=RoundConfig(
+            epoch_blocks=int(r.get("epoch_blocks", 7200)),
+            round_hours=float(r.get("round_hours", 24.0)),
+            heat_train_hours=float(r.get("heat_train_hours", 0.5)),
+            heat_n_windows=int(r.get("heat_n_windows", 256)),
+            finalists=int(r.get("finalists", 1)),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),
@@ -473,10 +577,6 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             poll_seconds=int(v["poll_seconds"]),
             hf_cache_seconds=int(v["hf_cache_seconds"]),
             state_db_path=str(v["state_db_path"]),
-        ),
-        queue=QueueConfig(
-            state_db_path=str(q.get("state_db_path", "trainer_queue.db")),
-            trained_cache_size=int(q.get("trained_cache_size", 256)),
         ),
         raw=raw,
     )

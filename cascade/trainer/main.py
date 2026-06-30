@@ -39,7 +39,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
-    p.add_argument("--max-challengers", type=int, default=1)
     p.add_argument(
         "--remote-hosts", type=Path, default=None,
         help="Trainer-local TOML of SSH GPU pods ([[host]] tables). When set, king "
@@ -60,16 +59,19 @@ def main(argv: list[str] | None = None) -> int:
         from .contract import compute_base_arch_digest
 
         seeds = RoundSeeds.derive(args.base_seed, cfg.training)
-        computed = compute_base_arch_digest(cfg.training)
-        print(f"base_arch:           {cfg.training.base_arch} ({cfg.training.arch_preset})")
-        print(f"base_arch_digest:    {cfg.training.base_arch_digest}  (in chain.toml)")
-        print(f"computed_arch_digest: {computed}")
-        if cfg.training.base_arch_digest != computed:
-            print("  ^ MISMATCH — pin [training] base_arch_digest to the computed value above")
-        print(
-            f"budget:              {cfg.training.target_train_hours:g}h on ref GPU "
-            f"≈ {cfg.training.train_tokens:,} point-passes (from scratch)"
-        )
+        sizes = cfg.training.final_sizes()
+        print(f"base_arch:           {cfg.training.base_arch}")
+        print(f"round cadence:       1 round / {cfg.round.epoch_blocks} blocks "
+              f"(~{cfg.round.round_hours:g}h); heat {cfg.round.heat_train_hours:g}h, "
+              f"finalists {cfg.round.finalists}")
+        print(f"final sizes:         {', '.join(s.arch_preset for s in sizes)}")
+        for sc in sizes:
+            computed = compute_base_arch_digest(sc)
+            flag = "" if sc.base_arch_digest == computed else "  ← MISMATCH, pin this digest"
+            print(f"  [{sc.arch_preset}] base_arch_digest: {computed}{flag}")
+            print(f"  [{sc.arch_preset}] final budget:     "
+                  f"{cfg.training.target_train_hours:g}h ≈ {sc.train_tokens:,} point-passes; "
+                  f"heat ≈ {sc.tokens_for_hours(cfg.round.heat_train_hours):,}")
         print(f"contract_digest:     {contract_digest(cfg.training)}")
         print(f"generation_seed:     {seeds.generation_seed}")
         print(f"training_seed:       {seeds.training_seed}")
@@ -111,6 +113,9 @@ def main(argv: list[str] | None = None) -> int:
             len(remote_hosts), ", ".join(h.name for h in remote_hosts),
         )
 
+    log = logging.getLogger("cascade.trainer")
+    screen_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
@@ -118,14 +123,48 @@ def main(argv: list[str] | None = None) -> int:
         wallet=client.wallet(),
         remote_hosts=remote_hosts,
         trainer_spec=args.trainer,
+        screen_fn=screen_fn,
     )
-    logging.getLogger("cascade.trainer").info(
-        "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s",
+    log.info(
+        "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s sizes=%s",
         cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.hub_registry_url,
         "remote" if remote_hosts else "local",
+        ",".join(s.arch_preset for s in cfg.training.final_sizes()),
     )
-    runner.run_forever(client, max_challengers=args.max_challengers)
+    runner.run_forever(client)
     return 0
+
+
+def _build_screen_fn(cfg, *, cache_dir: Path | None):
+    """The heat screener: train cheap → score on the held-out pool → geomean.
+
+    Loads the same private eval pool the validators use (owner-controlled) and
+    scores each heat checkpoint on a per-round-rotated slice, returning
+    geomean(CRPS, MASE) (lower is better) so the trainer can rank the field down
+    to ``[round] finalists`` before the expensive final. Imports torch/pool lazily
+    so the offline smoke and unit tests never pull the heavy stacks."""
+    from ..eval.scoring import global_geomean
+    from ..validator.evaluator import evaluate_checkpoint
+
+    if cfg.storage.pool_bucket:
+        from ..validator.pool import load_bucket_pool
+
+        window_source = load_bucket_pool(cfg, cache_dir=cache_dir)
+    else:
+        from ..validator.pool import load_pool
+
+        window_source = load_pool(cfg, cache_dir=cache_dir)
+
+    n = min(cfg.round.heat_n_windows, cfg.eval.n_windows)
+
+    def screen(ckpt_dir: Path, gen, base_seed: int) -> float:
+        windows = window_source.windows_for_round(base_seed, n)
+        scores = evaluate_checkpoint(
+            ckpt_dir, windows, num_samples=cfg.eval.num_samples, device="cpu"
+        )
+        return global_geomean(scores)
+
+    return screen
 
 
 if __name__ == "__main__":

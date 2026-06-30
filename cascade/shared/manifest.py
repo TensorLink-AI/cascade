@@ -35,7 +35,7 @@ import numpy as np
 # Hippius Hub registry, pinned by ``repo@digest``.
 TRAINED_RE = re.compile(r"^metro-v1:trained:hippius:(?P<ref>.+)$")
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 VALID_ROLES = ("king", "challenger")
 
 
@@ -115,6 +115,8 @@ class TrainedEntry:
     corpus_digest: str
     train_block: int
     gpu_name: str = ""        # GPU model the run used; gated for matched-hardware audit
+    size: str = ""            # arch_preset this entry was trained at ("" = primary/legacy).
+                              # A round carries one (king, challenger) pair PER size.
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -145,6 +147,21 @@ class TrainingManifest:
             if e.role == role:
                 return e
         return None
+
+    def entries_for_role(self, role: str) -> list[TrainedEntry]:
+        """All entries for ``role`` — one per trained size (the primary plus any
+        ``[[training.sizes]]``). Order follows the manifest's entry order, which
+        the trainer emits size-by-size."""
+        return [e for e in self.entries if e.role == role]
+
+    def sizes(self) -> list[str]:
+        """Distinct size tags present, in first-seen order (e.g. the king's
+        sizes). ``[""]`` for a legacy single-size manifest."""
+        seen: list[str] = []
+        for e in self.entries:
+            if e.size not in seen:
+                seen.append(e.size)
+        return seen
 
     def canonical_body(self) -> bytes:
         """Deterministic byte serialisation of everything except the signature.
@@ -187,6 +204,7 @@ def load_manifest(text: str) -> TrainingManifest:
             corpus_digest=str(e["corpus_digest"]),
             train_block=int(e["train_block"]),
             gpu_name=str(e.get("gpu_name", "")),
+            size=str(e.get("size", "")),
         )
         for e in obj["entries"]
     ]

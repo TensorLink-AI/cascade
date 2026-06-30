@@ -148,7 +148,7 @@ class _RecordingDispatcher:
     def __init__(self, *a, **k):
         pass
 
-    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block):
+    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block, arch_preset=None):
         _RecordingDispatcher.calls.append((host.name, role, gen_ref))
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 
@@ -166,7 +166,7 @@ def test_run_round_remote_assigns_king_and_challenger_to_separate_hosts(cfg, tmp
         Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5),
         Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_B}", commit_block=6),
     ]
-    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10, max_challengers=1)
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
     assert manifest.entry_for_role("king") is not None
     assert manifest.entry_for_role("challenger") is not None

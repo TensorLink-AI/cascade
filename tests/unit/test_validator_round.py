@@ -53,6 +53,72 @@ def _manifest(cfg):
     )
 
 
+def _multi_manifest(cfg, sizes=("toto2-4m", "toto2-22m"), roles=("king", "challenger")):
+    entries = []
+    for size in sizes:
+        if "king" in roles:
+            entries.append(TrainedEntry("king_hk", 0, "king", CID, format_trained_pointer(CID2),
+                                        "d", 10, size=size))
+        if "challenger" in roles:
+            entries.append(TrainedEntry("chal_hk", 1, "challenger", CID, format_trained_pointer(CID2),
+                                        "d", 10, size=size))
+    return TrainingManifest(
+        round_id="1", created_block=10,
+        contract_digest=contract_digest(cfg.training),
+        base_arch_digest=cfg.training.base_arch_digest,
+        eval_dataset=cfg.eval.eval_dataset, entries=entries,
+    )
+
+
+def test_combined_score_pools_sizes_into_one_throne(cfg):
+    # Two sizes; challenger is 0.6x the king on the same windows at each size. The
+    # validator pools both sizes into ONE paired bootstrap → a single dethrone.
+    king_scores = _scores(1.0, 0)
+    chal_scores = [WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6, s.abs_target)
+                   for s in king_scores]
+
+    def fake_eval(entry, windows):
+        return king_scores if entry.role == "king" else chal_scores
+
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval,
+                             verify_signatures=False)
+    outcome = runner.process_round(_multi_manifest(cfg), windows=[], base_seed=7)
+    assert outcome is not None
+    # Pooled across two sizes ⇒ the decision sees both sizes' windows.
+    assert outcome.result.n_windows == 2 * len(king_scores)
+    assert outcome.result.challenger_wins_round
+    assert outcome.transition.dethroned
+    assert runner.state.king_hotkey == "chal_hk"
+
+
+def test_combined_score_skips_size_missing_a_challenger(cfg):
+    # 22m has a king but no challenger (e.g. it failed to train); only the paired
+    # 4m size contributes, and the round is still decided on it.
+    king_scores = _scores(1.0, 0)
+    chal_scores = [WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6, s.abs_target)
+                   for s in king_scores]
+
+    def fake_eval(entry, windows):
+        return king_scores if entry.role == "king" else chal_scores
+
+    m = _multi_manifest(cfg)
+    m.entries.remove(m.entries_for_role("challenger")[-1])  # drop the 22m challenger
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=fake_eval,
+                             verify_signatures=False)
+    outcome = runner.process_round(m, windows=[], base_seed=7)
+    assert outcome is not None
+    assert outcome.result.n_windows == len(king_scores)  # only the paired size counted
+    assert outcome.result.challenger_wins_round
+
+
+def test_no_paired_size_means_king_holds(cfg):
+    # A king-only manifest (no challenger at any size) ⇒ no decision, king holds.
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    m = _multi_manifest(cfg, roles=("king",))
+    assert runner.process_round(m, windows=[], base_seed=1) is None
+
+
 def test_process_round_strong_challenger_wins(cfg):
     # Challenger scores share the king's windows (paired abs_target) at 0.6x.
     king_scores = _scores(1.0, 0)

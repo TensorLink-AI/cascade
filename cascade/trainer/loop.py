@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..interface.validation import parse_commit
 from ..shared.chain import Commitment
-from ..shared.config import ChainConfig
+from ..shared.config import ChainConfig, TrainingContractConfig
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -45,11 +46,16 @@ from ..shared.manifest import (
     format_trained_pointer,
     sign_manifest,
 )
-from .contract import BaseTrainer, RoundSeeds
-from .queue import QueuedSubmission, SubmissionQueue
-from .queue import dumps as dump_queue
-from .queue import loads as load_queue
+from .contract import BaseTrainer, RoundSeeds, TrainResult
 from .stream import open_round_stream
+
+# Screens one heat checkpoint: given the trained heat-model directory, the
+# generator that produced its corpus, and the round's base seed (so the screening
+# window slice can rotate per round), return a heat score (LOWER is better, e.g.
+# geomean(CRPS, MASE) on the held-out windows). Injected so the trainer's
+# screening stays a testable boundary — the default wiring (torch evaluator +
+# eval pool) is attached in cascade.trainer.main.
+ScreenFn = Callable[[Path, "ResolvedGenerator", int], float]
 
 log = logging.getLogger("cascade.trainer")
 
@@ -67,14 +73,25 @@ class RoundPlan:
     challengers: list[ResolvedGenerator]
 
 
-def resolve_commitments(commitments: list[Commitment]) -> list[ResolvedGenerator]:
+def resolve_commitments(
+    commitments: list[Commitment], cutoff_block: int | None = None
+) -> list[ResolvedGenerator]:
     """Parse each commitment's generator pointer, dropping malformed ones.
 
     A later commit from the same hotkey wins (miners re-deploy by committing a
     new ref), so we keep the highest ``commit_block`` per hotkey.
+
+    When ``cutoff_block`` is given (the round's epoch boundary), only commits
+    revealed STRICTLY BEFORE it are eligible — this is the daily submission
+    deadline. A miner who commits at or after the boundary competes in the next
+    round, not this one, and because the boundary is deterministic every honest
+    party re-derives the identical field. The latest-commit-wins rule applies only
+    among a hotkey's eligible (pre-cutoff) commits.
     """
     best: dict[str, tuple[int, ResolvedGenerator]] = {}
     for c in commitments:
+        if cutoff_block is not None and c.commit_block >= cutoff_block:
+            continue
         parsed = parse_commit(c.payload)
         if parsed is None:
             continue
@@ -144,6 +161,10 @@ class TrainerRunner:
     work_root: Path
     wallet: object | None = None       # bittensor wallet for signing (live)
     use_sandbox: bool = True           # run generators in the isolated subprocess
+    # Heat screener: scores a trained heat checkpoint (lower better) to rank the
+    # field down to [round] finalists before the expensive final. None ⇒ no
+    # internal screen (the field's natural order is taken). Wired in trainer.main.
+    screen_fn: ScreenFn | None = None
     # Remote (two-device) training: when ``remote_hosts`` is set, each round's
     # king and challenger train on separate SSH GPU pods in parallel (see
     # cascade.trainer.remote). ``trainer_spec`` is the BaseTrainer 'module:Class'
@@ -178,38 +199,41 @@ class TrainerRunner:
 
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
-    def train_one(
+    def _train_checkpoint(
         self,
         gen: ResolvedGenerator,
-        role: str,
         seeds: RoundSeeds,
-        block: int,
-    ) -> TrainedEntry:
-        """Fetch generator (registry) → build corpus → train (logging to S3) →
-        upload checkpoint (registry) → receipt for one generator.
+        contract: TrainingContractConfig,
+        token_budget: int,
+        out_dir: Path,
+        *,
+        log_role: str,
+    ) -> tuple[TrainResult, str, int, int]:
+        """Fetch generator (registry) → build corpus → train into ``out_dir``,
+        streaming per-step metrics to S3. No upload — the caller decides whether
+        the checkpoint is uploaded (final) or thrown away after screening (heat).
 
-        Raises on any failure; the caller decides whether a failed challenger
-        simply doesn't qualify (it does) or a failed king aborts the round (it
-        does — there's nothing to defend against).
+        ``contract`` is the per-size training contract (the base recipe with this
+        size's width/depth/digest/throughput); ``token_budget`` is its compute
+        budget for this stage. Returns ``(result, corpus_digest, n_series,
+        total_points)``. Raises on any failure.
         """
-        gen_dir = self.work_root / f"{seeds.base_seed}" / role / "generator"
+        gen_dir = out_dir.parent / "generator"
         fetch_from_hub(gen.ref, gen_dir, self.hub())
-
-        out_dir = self.work_root / f"{seeds.base_seed}" / role / "checkpoint"
         out_dir.mkdir(parents=True, exist_ok=True)
-        token_budget = self.cfg.training.train_tokens
 
         # Stream per-step metrics to S3 (best-effort: logging must never abort a
-        # training run).
+        # training run). ``log_role`` carries the size/heat tag so each run's log
+        # lands at a distinct key (king-toto2-4m, challenger-toto2-22m, heat-<hk>).
         sink: LogSink | None = None
         try:
-            sink = LogSink(self.logs_store(), round_id=str(seeds.base_seed), role=role)
+            sink = LogSink(self.logs_store(), round_id=str(seeds.base_seed), role=log_role)
         except Exception as e:  # noqa: BLE001
             log.warning("log sink unavailable (continuing without S3 logs): %s", e)
         logger = sink.emit if sink is not None else None
 
         with open_round_stream(
-            self.cfg.training.corpus_mode,
+            contract.corpus_mode,
             gen_dir, seeds.generation_seed, self.cfg.generator,
             token_budget=token_budget,
             use_sandbox=self.use_sandbox,
@@ -217,7 +241,7 @@ class TrainerRunner:
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),
-                self.cfg.training,
+                contract,
                 training_seed=seeds.training_seed,
                 token_budget=token_budget,
                 out_dir=out_dir,
@@ -226,7 +250,7 @@ class TrainerRunner:
             corpus_digest, n_series, total_points = rs.digest, rs.n_series, rs.total_points
 
         if sink is not None:
-            sink.emit({"event": "summary", "role": role, "corpus_digest": corpus_digest,
+            sink.emit({"event": "summary", "role": log_role, "corpus_digest": corpus_digest,
                        "n_series": n_series, "total_points": total_points,
                        "train_seconds": result.train_seconds, **result.metrics})
             try:
@@ -235,12 +259,44 @@ class TrainerRunner:
                 log.warning("failed to flush S3 training logs: %s", e)
 
         log.info(
-            "round=%s role=%s hotkey=%s mode=%s n=%d points=%d digest=%s",
-            seeds.base_seed, role, gen.hotkey, self.cfg.training.corpus_mode,
+            "round=%s run=%s hotkey=%s mode=%s n=%d points=%d digest=%s",
+            seeds.base_seed, log_role, gen.hotkey, contract.corpus_mode,
             n_series, total_points, corpus_digest[:12],
         )
+        return result, corpus_digest, n_series, total_points
 
-        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}"
+    def train_one(
+        self,
+        gen: ResolvedGenerator,
+        role: str,
+        seeds: RoundSeeds,
+        block: int,
+        *,
+        contract: TrainingContractConfig | None = None,
+        token_budget: int | None = None,
+    ) -> TrainedEntry:
+        """Train one generator at one size for the FINAL stage, upload its
+        checkpoint, and return the receipt.
+
+        ``contract`` defaults to the primary (smallest) size; ``token_budget`` to
+        that size's full ``train_tokens``. The checkpoint is uploaded to a
+        size-tagged registry repo (``ckpt-r<seed>-<role>-<size>``) and the entry
+        carries the ``size`` tag so the validator can pair king and challenger
+        per size before combining their scores.
+
+        Raises on any failure; the caller decides whether a failed challenger
+        simply doesn't qualify (it does) or a failed king aborts the round (it
+        does — there's nothing to defend against).
+        """
+        contract = contract if contract is not None else self.cfg.training.primary_size
+        token_budget = token_budget if token_budget is not None else contract.train_tokens
+        size = contract.arch_preset
+        out_dir = self.work_root / f"{seeds.base_seed}" / size / role / "checkpoint"
+        result, corpus_digest, _, _ = self._train_checkpoint(
+            gen, seeds, contract, token_budget, out_dir, log_role=f"{role}-{size}",
+        )
+
+        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}"
         up = upload_dir_to_hub(result.local_dir, ckpt_repo, self.hub())
         return TrainedEntry(
             miner_hotkey=gen.hotkey,
@@ -251,6 +307,7 @@ class TrainerRunner:
             corpus_digest=corpus_digest,
             train_block=block,
             gpu_name=str(result.metrics.get("gpu_name", "")),
+            size=size,
         )
 
     def run_round(
@@ -260,43 +317,41 @@ class TrainerRunner:
         base_seed: int,
         block: int,
         *,
-        max_challengers: int = 1,
-        queue: SubmissionQueue | None = None,
+        cutoff_block: int | None = None,
     ) -> TrainingManifest:
-        """Train the king and up to ``max_challengers`` challengers, returning
-        the assembled (unsigned) manifest. Does not publish; see :meth:`publish`.
+        """Run one daily round and return the assembled (unsigned) manifest.
 
-        Trains locally (sequential) by default, or across ``remote_hosts`` (king
-        and challenger in parallel on separate GPU pods) when configured.
+        Two stages, both under one shared :class:`RoundSeeds` (identical random
+        init for the whole round):
 
-        When a ``queue`` is supplied, challengers are drawn from the persistent
-        FIFO backlog (oldest-first, deduplicated against the king and against
-        refs already trained this reign) instead of straight from this round's
-        field; the queue is mutated in place (entries enqueued, selected ones
-        marked trained), so the caller persists it after the round.
+        1. **Heat** — every eligible challenger is trained cheaply
+           (``[round] heat_train_hours`` on the primary size) and screened; the
+           top ``[round] finalists`` advance.
+        2. **Final** — the king and the surviving finalists are trained to the
+           full ``[training] target_train_hours`` at EVERY configured size
+           (primary + ``[[training.sizes]]``). Each (king, challenger) pair is
+           tagged with its size so the validator can combine scores across sizes
+           into one throne.
+
+        ``cutoff_block`` (the epoch boundary) is the submission deadline: only
+        commitments revealed before it are eligible (see
+        :func:`resolve_commitments`). Does not publish; see :meth:`publish`.
+        Trains locally (sequential) by default, or across ``remote_hosts`` when
+        configured. A king failure at any size aborts the round.
         """
-        resolved = resolve_commitments(commitments)
+        resolved = resolve_commitments(commitments, cutoff_block=cutoff_block)
         plan = plan_round(resolved, king_hotkey)
         if plan.king is None:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
-        challengers = self._select_challengers(plan, block, max_challengers, queue)
-
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
-        jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
-        jobs += [(c, "challenger") for c in challengers]
 
-        entries = (
-            self._train_remote(jobs, seeds, block)
-            if self.remote_hosts
-            else self._train_local(jobs, seeds, block)
-        )
-        if queue is not None:
-            # An attempt (win, loss, or a generator that failed to train) consumes
-            # the challenger's shot for this reign so it is not re-run every round.
-            for c in challengers:
-                queue.mark_trained(c.ref)
-        if not entries or entries[0].role != "king":
+        finalists = self._run_heat(plan.challengers, seeds, block)
+        jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
+        jobs += [(c, "challenger") for c in finalists]
+
+        entries = self._train_final(jobs, seeds, block)
+        if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
 
         return TrainingManifest(
@@ -308,91 +363,103 @@ class TrainerRunner:
             entries=entries,
         )
 
-    def _select_challengers(
-        self,
-        plan: RoundPlan,
-        block: int,
-        max_challengers: int,
-        queue: SubmissionQueue | None,
+    def _run_heat(
+        self, challengers: list[ResolvedGenerator], seeds: RoundSeeds, block: int
     ) -> list[ResolvedGenerator]:
-        """Pick this round's challengers — straight off the planned field when
-        there is no queue, otherwise from the FIFO backlog.
+        """Screen the field down to ``[round] finalists`` for the final stage.
 
-        ``plan.challengers`` has already had the duplicate-of-king and same-ref
-        filters applied (:func:`plan_round`). With a queue, those survivors are
-        the current on-chain field: the backlog is pruned to it (dropping
-        re-deployed/deregistered refs), the field is enqueued (cheap dedup), and
-        the front ``max_challengers`` still-eligible entries are returned.
+        Each challenger is trained for ``[round] heat_train_hours`` on the primary
+        (smallest) size and scored by the injected ``screen_fn`` (lower is
+        better); the cheapest ``finalists`` advance, UID breaking ties for
+        determinism. When the field already fits within ``finalists``, or no
+        ``screen_fn`` is wired, the field's natural order (lowest UID first) is
+        taken without spending heat compute. A challenger that fails to train or
+        screen is dropped (it simply doesn't qualify).
         """
-        if queue is None:
-            return plan.challengers[:max_challengers]
+        n = max(0, self.cfg.round.finalists)
+        if not challengers or n == 0:
+            return []
+        if self.screen_fn is None or len(challengers) <= n:
+            if self.screen_fn is None and len(challengers) > n:
+                log.warning("no screen_fn wired; taking %d of %d challengers by UID order",
+                            n, len(challengers))
+            return list(challengers[:n])
 
-        king_ref = plan.king.ref if plan.king is not None else None
-        if queue.note_king(king_ref):
-            log.info("new reign (king ref %s…); cleared per-reign trained cache", str(king_ref)[:24])
-
-        by_ref = {c.ref: c for c in plan.challengers}
-        for dropped in queue.prune_to_field(set(by_ref) | ({king_ref} if king_ref else set())):
-            log.info("pruning queued %s: ref no longer in the on-chain field", dropped.hotkey)
-        for c in plan.challengers:
-            # 1-hotkey-1-eval: skip already-burned hotkeys before enqueue. The
-            # enqueue gate is the source of truth (and rejects them anyway); this
-            # belt-and-suspenders filter at the on-chain intake layer just keeps
-            # logs clean of repeated enqueue-rejections each round, matching
-            # teutonic's scan_reveals filtering by ``seen`` before enqueue.
-            if c.hotkey in queue.seen_hotkeys:
-                log.info("skipping %s: already used its 1-eval slot, must re-register", c.hotkey)
+        heat_contract = self.cfg.training.primary_size
+        heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
+        scored: list[tuple[float, int, ResolvedGenerator]] = []
+        for c in challengers:
+            out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
+            try:
+                result, *_ = self._train_checkpoint(
+                    c, seeds, heat_contract, heat_tokens, out_dir, log_role=f"heat-{c.hotkey}",
+                )
+                score = float(self.screen_fn(result.local_dir, c, seeds.base_seed))
+            except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
+                log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
-            reason = queue.enqueue(QueuedSubmission(c.hotkey, c.uid, c.ref, block))
-            if reason is not None:
-                log.info("skip enqueue %s (ref %s…): %s", c.hotkey, c.ref[:24], reason)
+            log.info("heat: challenger %s score=%.5f", c.hotkey, score)
+            scored.append((score, c.uid, c))
 
-        selected = queue.select(max_challengers)
-        # Map the queued picks back to the resolved generators for this round.
-        return [by_ref[s.ref] for s in selected if s.ref in by_ref]
+        scored.sort(key=lambda t: (t[0], t[1]))  # lower score better; UID tiebreak
+        winners = [c for _, _, c in scored[:n]]
+        log.info("heat: %d/%d advance to the final: %s",
+                 len(winners), len(challengers), [c.hotkey for c in winners])
+        return winners
 
-    def _load_queue(self) -> SubmissionQueue:
-        """Load the persistent submission backlog from ``[queue] state_db_path``
-        (a fresh, empty queue when the file is absent or unreadable)."""
-        path = Path(self.cfg.queue.state_db_path)
-        try:
-            return load_queue(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return SubmissionQueue(max_trained_cache=self.cfg.queue.trained_cache_size)
-        except Exception as e:  # noqa: BLE001 — a corrupt backlog must not wedge the trainer
-            log.warning("submission queue unreadable (%s); starting from empty", e)
-            return SubmissionQueue(max_trained_cache=self.cfg.queue.trained_cache_size)
-
-    def _save_queue(self, queue: SubmissionQueue) -> None:
-        path = Path(self.cfg.queue.state_db_path)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(dump_queue(queue), encoding="utf-8")
-        except Exception as e:  # noqa: BLE001 — persistence is best-effort
-            log.warning("failed to persist submission queue to %s: %s", path, e)
-
-    def _train_local(
+    def _train_final(
         self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
     ) -> list[TrainedEntry]:
-        """Sequential training on this box: king first (its failure aborts the
-        round), then each challenger (a failure just drops that challenger)."""
+        """Train the final jobs at every configured size, returning all receipts.
+
+        One (king + finalists) pass per size in ``cfg.training.final_sizes()``;
+        a king failure at any size aborts the round, a challenger failure drops
+        only that challenger from that size."""
+        entries: list[TrainedEntry] = []
+        for contract in self.cfg.training.final_sizes():
+            token_budget = contract.train_tokens
+            if self.remote_hosts:
+                entries += self._train_remote(jobs, seeds, block, contract, token_budget)
+            else:
+                entries += self._train_local(jobs, seeds, block, contract, token_budget)
+        return entries
+
+    def _train_local(
+        self,
+        jobs: list[tuple[ResolvedGenerator, str]],
+        seeds: RoundSeeds,
+        block: int,
+        contract: TrainingContractConfig,
+        token_budget: int,
+    ) -> list[TrainedEntry]:
+        """Sequential training on this box for one size: king first (its failure
+        aborts the round), then each challenger (a failure just drops it)."""
         entries: list[TrainedEntry] = []
         for gen, role in jobs:
             try:
-                entries.append(self.train_one(gen, role, seeds, block))
+                entries.append(
+                    self.train_one(gen, role, seeds, block,
+                                   contract=contract, token_budget=token_budget)
+                )
             except Exception as e:  # noqa: BLE001
                 if role == "king":
                     raise
-                log.warning("challenger %s failed to train: %s", gen.hotkey, e)
+                log.warning("challenger %s failed to train (%s): %s",
+                            gen.hotkey, contract.arch_preset, e)
         return entries
 
     def _train_remote(
-        self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
+        self,
+        jobs: list[tuple[ResolvedGenerator, str]],
+        seeds: RoundSeeds,
+        block: int,
+        contract: TrainingContractConfig,
+        token_budget: int,  # noqa: ARG002 — budget travels via chain.toml on the pod
     ) -> list[TrainedEntry]:
-        """Parallel training across ``remote_hosts`` (e.g. king→pod A, challenger→
-        pod B over SSH). Equal compute is preserved (fixed token budget); audit is
-        tolerance-based on rented hardware. King failure aborts the round; a
-        challenger failure drops only that challenger."""
+        """Parallel training across ``remote_hosts`` for one size (king→pod A,
+        challenger→pod B over SSH). Equal compute is preserved (fixed token
+        budget); audit is tolerance-based on rented hardware. King failure aborts
+        the round; a challenger failure drops only that challenger."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from .remote import RemoteDispatcher
@@ -409,6 +476,7 @@ class TrainerRunner:
             return disp.dispatch(
                 host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
+                arch_preset=contract.arch_preset,
             )
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
@@ -422,7 +490,8 @@ class TrainerRunner:
                 except Exception as e:  # noqa: BLE001
                     if role == "king":
                         raise RuntimeError(f"king training failed on remote: {e}") from e
-                    log.warning("challenger %s failed on remote: %s", gen.hotkey, e)
+                    log.warning("challenger %s failed on remote (%s): %s",
+                                gen.hotkey, contract.arch_preset, e)
         return [r for r in results if r is not None]
 
     def publish(self, manifest: TrainingManifest) -> None:
@@ -441,37 +510,37 @@ class TrainerRunner:
 
     # ── live loop ────────────────────────────────────────────────────────────
 
-    def run_forever(self, client: object, *, max_challengers: int = 1) -> None:  # pragma: no cover
-        """Poll → train → publish, once per new round.
+    def run_forever(self, client: object) -> None:  # pragma: no cover
+        """Poll → train → publish, once per daily round (epoch).
 
-        A *round* is keyed by the chain block hash at the time the trainer wakes
-        and finds a fresh king/field; the block hash is the shared base seed (so
-        every honest party re-derives the same seeds). The reigning king is the
-        highest-incentive UID on the metagraph (validators own the dethrone
-        decision; the trainer just reads their weights).
+        A *round* is one ``[round] epoch_blocks`` window (~24h). It is keyed by
+        the chain block hash at the EPOCH BOUNDARY (``epoch_start = block //
+        epoch_blocks × epoch_blocks``), which is the shared base seed — so the
+        whole day's heat and final trainings share one :class:`RoundSeeds`, and
+        every honest party re-derives the same seeds and the same eligible field.
+        The reigning king is the highest-incentive UID on the metagraph
+        (validators own the dethrone decision; the trainer just reads weights).
         """
         poll = self.cfg.manifest.poll_seconds
+        epoch_blocks = max(1, self.cfg.round.epoch_blocks)
         last_round: str | None = None
-        queue = self._load_queue()
-        log.info("submission queue loaded: %d pending, %d trained this reign",
-                 len(queue.pending), len(queue.trained_refs))
         while True:
             try:
                 block = client.current_block()
-                base_seed = client.block_seed(block)
+                epoch = block // epoch_blocks
+                epoch_start = epoch * epoch_blocks
+                base_seed = client.block_seed(epoch_start)
                 round_id = str(base_seed)
                 if round_id == last_round:
                     time.sleep(poll)
                     continue
                 commitments = client.poll_commitments()
                 king_hotkey = client.highest_incentive_hotkey()
-                log.info("starting round=%s block=%d king=%s field=%d queued=%d",
-                         round_id, block, king_hotkey, len(commitments), len(queue.pending))
+                log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
+                         round_id, epoch, epoch_start, king_hotkey, len(commitments))
                 manifest = self.run_round(
-                    commitments, king_hotkey, base_seed, block,
-                    max_challengers=max_challengers, queue=queue,
+                    commitments, king_hotkey, base_seed, block, cutoff_block=epoch_start,
                 )
-                self._save_queue(queue)
                 self.publish(manifest)
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round

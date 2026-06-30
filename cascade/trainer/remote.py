@@ -121,8 +121,13 @@ def worker_argv(
     base_seed: int,
     block: int,
     trainer_spec: str,
+    arch_preset: str | None = None,
 ) -> list[str]:
-    """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd)."""
+    """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
+
+    ``arch_preset`` pins which configured size the pod trains (the primary size
+    or one of ``[[training.sizes]]``); omitted ⇒ the worker trains the primary
+    size, preserving single-size behaviour."""
     argv = [
         host.remote_python, "-m", "cascade.trainer.worker",
         "--gen-ref", gen_ref,
@@ -133,6 +138,8 @@ def worker_argv(
         "--block", str(int(block)),
         "--trainer", trainer_spec,
     ]
+    if arch_preset:
+        argv += ["--arch-preset", arch_preset]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -194,6 +201,7 @@ def receipt_to_entry(receipt: dict) -> TrainedEntry:
             corpus_digest=str(receipt["corpus_digest"]),
             train_block=int(receipt["train_block"]),
             gpu_name=str(receipt.get("gpu_name", "")),
+            size=str(receipt.get("size", "")),
         )
     except (KeyError, ValueError) as e:
         raise RemoteDispatchError(f"receipt is not a valid TrainedEntry: {e}") from e
@@ -217,12 +225,14 @@ class RemoteDispatcher:
         role: str,
         base_seed: int,
         block: int,
+        arch_preset: str | None = None,
     ) -> TrainedEntry:
         import os
 
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
+            arch_preset=arch_preset,
         )
         env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
         remote_cmd = build_remote_command(host, argv, env)

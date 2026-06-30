@@ -100,6 +100,31 @@ corpus_mode = "stream_cpu"
 # Empty = only require king and challenger to match each other.
 expected_gpu = ""
 
+# Extra final-stage sizes (see chain.toml for the full explanation). The throne
+# is decided on the COMBINED score across all sizes. TESTNET: a small second size
+# for fast iteration; pin width/depth + base_arch_digest to the released
+# Datadog/Toto-2.0-22m before any real testnet launch (recompute with
+# `cascade-trainer --offline --chain-toml chain.testnet.toml`).
+[[training.sizes]]
+arch_preset                 = "toto2-22m"
+base_arch_digest            = "c7ecca53ed939eabfc34ccdb8a698d69101526c24f299efa21c0c0c288c96792"  # sha256 of this size's frozen arch+init; recompute with `cascade-trainer --offline`
+d_model                     = 512
+num_layers                  = 8
+num_heads                   = 8
+mlp_expansion               = 2
+ref_throughput_tokens_per_s = 90000
+
+[round]
+# Daily-style cadence + two-stage (heat → final) selection. TESTNET uses a SHORT
+# epoch so rounds turn over quickly for iteration; mainnet template = 7200 (~24h).
+# The base seed is the block hash at the epoch boundary, so the whole epoch shares
+# one RoundSeeds; only commits before the boundary are eligible (the deadline).
+epoch_blocks     = 300    # ~1h at 12s blocks (mainnet template = 7200 ≈ 24h)
+round_hours      = 1.0    # informational
+heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
+heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
+finalists        = 1      # challengers promoted from the heat to the final
+
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,
 # which is what makes the comparison a controlled measurement. The slice is
@@ -232,21 +257,3 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.testnet.db"
-
-[queue]
-# Trainer-side submission queue (see cascade.trainer.queue). Challenger
-# generators discovered on-chain are enqueued FIFO and trained in arrival order,
-# at most --max-challengers per round. Cheap anti-duplicate checks run before any
-# generator is fetched or trained (a round is ~3h of GPU per generator):
-#   * duplicate-of-king — a challenger whose generator CID equals the reigning
-#     king's is an exact copy of the king (the CID is the content hash); it can
-#     only tie, never clear the win margin, so it is skipped instead of burning a
-#     round. This is the cascade analogue of teutonic's check_model_copy.
-#   * already-trained   — a CID already trained THIS REIGN is skipped; the cache
-#     resets when the king changes (teutonic-style per-cycle dedup). This fits the
-#     shipped single-round dethroning (dethrone_cp = 1): a challenger gets one
-#     fair shot per reign. If you raise dethrone_cp so a challenger must win
-#     several CONSECUTIVE rounds, raise trained_cache_size's reign scope
-#     accordingly or it will block the needed re-evaluations.
-state_db_path      = "trainer_queue.testnet.db"   # backlog + per-reign trained cache (survives restarts)
-trained_cache_size = 256                  # ring-buffer cap on already-trained CIDs per reign

@@ -39,29 +39,43 @@ submitted model directly. See `docs/INTERFACE.md`.
 
 ### 2. Trainer — owner-operated, the GPU boundary
 
-Once per round the trainer:
+A round is one ~24h epoch (`[round] epoch_blocks`); the trainer runs one round
+per epoch (so the king is trained once per day). Each round:
 
-1. Resolves on-chain commitments to `(hotkey, uid, repo, revision)`.
+1. Resolves on-chain commitments to `(hotkey, uid, repo, revision)`, keeping only
+   those revealed **before the epoch boundary** (`resolve_commitments(...,
+   cutoff_block=epoch_start)`) — that boundary is the submission deadline.
 2. Identifies the reigning **king** (highest-incentive UID on the metagraph) and
-   selects **challenger(s)**.
-3. Derives one `RoundSeeds` from the round's base seed (the chain block hash):
-   a shared `generation_seed` and a shared `training_seed`.
-4. For the king and each challenger, **under that one shared seed pair**:
+   the eligible **challenger field**.
+3. Derives one `RoundSeeds` from the round's base seed (the block hash **at the
+   epoch boundary**): a shared `generation_seed` and a shared `training_seed`,
+   used by every training in the round — heat and final, all sizes — so the whole
+   day shares one random init.
+4. **Heat (screen).** Trains every eligible challenger cheaply
+   (`[round] heat_train_hours`, ~30min, on the primary/smallest size), scores each
+   on the held-out pool (geomean of CRPS/MASE), and keeps the top
+   `[round] finalists` (default 1). A challenger that fails to train or score just
+   doesn't qualify.
+5. **Final.** For the king and each surviving finalist, at **every configured
+   size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
+   **under that one shared seed pair**:
    - opens the round's corpus stream (`cascade.trainer.stream.open_round_stream`,
      selected by `[training] corpus_mode`): `stream_cpu` streams *fresh* `(C, L)`
      series from a sandboxed generator with no reuse (rolling byte-exact digest);
      `cache_reuse` draws a fixed corpus once (also sandboxed) and cycles it. Either
      way the trainer gets one budget-capped iterator (univariate `C = 1` today;
      the channel axis is carried so multivariate priors need no schema change),
-   - trains a **fresh Toto2-4M from random init** via the owner's `BaseTrainer`
-     (`cascade.trainer.contract`; reference: `cascade.trainer.toto2_trainer`)
-     — it pulls series until the stream ends, for the contract's budget (~3h on
-     the reference GPU, enforced as a fixed `train_tokens` count so king and
-     challenger get identical compute), streaming per-step metrics (loss, lr,
-     throughput) to **Hippius S3**,
-   - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its ref.
-5. Signs a `TrainingManifest` (trainer hotkey) listing both trained-model refs and
-   the corpus/contract digests, and publishes it to the **Hippius S3** manifest
+   - trains a **fresh Toto2 model from random init** at that size via the owner's
+     `BaseTrainer` (`cascade.trainer.contract`; reference:
+     `cascade.trainer.toto2_trainer`) — it pulls series until the stream ends, for
+     the per-size budget (~3h on the reference GPU, enforced as a fixed
+     `train_tokens` count so king and challenger get identical compute), streaming
+     per-step metrics (loss, lr, throughput) to **Hippius S3**,
+   - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
+     size-tagged ref.
+6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref
+   (one king + finalist pair per size, each tagged with its `size`) and the
+   corpus/contract digests, and publishes it to the **Hippius S3** manifest
    bucket (`round-<id>.json` + `latest.json`).
 
 `BaseTrainer` is a `Protocol` — the single GPU-dependent seam. Everything else
@@ -108,26 +122,34 @@ The validator never trains. Each round it:
 
 1. Reads the current manifest, verifies its signature and that king and
    challenger share the **contract digest** and **base-arch digest** (the
-   controlled-experiment gate — `ValidatorRunner.check_manifest`).
-2. Pulls both trained checkpoints and scores them on the **same** held-out
-   real-world eval windows (`cascade.validator.evaluator`).
-3. Runs the paired-bootstrap KOTH verdict (`cascade.eval.koth.evaluate_round`)
-   and folds it into the champion state.
+   controlled-experiment gate — `ValidatorRunner.check_manifest`). The contract
+   digest covers every size at once (`[[training.sizes]]` is folded into it).
+2. For each trained **size**, pulls the king's and finalist's checkpoints and
+   scores them on the **same** held-out real-world eval windows
+   (`cascade.validator.evaluator`), then **pools** the per-window scores across
+   sizes (king-vs-finalist), preserving pairing because each size shares the
+   window `abs_target`.
+3. Runs ONE paired-bootstrap KOTH verdict on the pooled scores
+   (`cascade.eval.koth.evaluate_round`) — a single throne decided on the combined
+   4M+22M skill — and folds it into the champion state.
 4. Sets weights: an equal share across the current king plus up to
    `[scoring] reward_prior_kings` registered prior kings (`reward_prior_kings = 0`
    ⇒ winner-take-all on the king; burns to `burn_uid` if none are registered).
 
 ## The controlled-experiment invariant
 
-For a round to be a fair measurement of data quality, the king's model and the
-challenger's model must differ in **exactly one** thing: the corpus. cascade
-enforces this on three sides:
+For a round to be a fair measurement of data quality, at **each size** the king's
+model and the challenger's model must differ in **exactly one** thing: the corpus.
+cascade enforces this on three sides:
 
-* **Trainer:** one `RoundSeeds` instance is reused for both — identical *random*
-  weight initialisation (`training_seed`, the from-scratch init) and identical
-  generation seed.
-* **Manifest:** `contract_digest` (sha256 of the `TrainingContractConfig`) and
-  `base_arch_digest` are recorded once and asserted equal for both entries.
+* **Trainer:** one `RoundSeeds` instance is reused for every run in the round —
+  heat and final, king and challenger, all sizes — so weight initialisation
+  (`training_seed`, the from-scratch init) and the generation seed are identical;
+  only the per-size width/depth changes between sizes, never between king and
+  challenger of the same size.
+* **Manifest:** `contract_digest` (sha256 of the `TrainingContractConfig`,
+  including every `[[training.sizes]]`) and `base_arch_digest` are recorded once;
+  each size's frozen-arch digest is folded into the contract digest.
 * **Validator:** rejects any manifest whose digests don't match its own
   `chain.toml`, so a tampered or mismatched training run can't score.
 
