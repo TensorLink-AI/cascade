@@ -84,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         window_source = load_pool(runner.cfg, cache_dir=args.cache_dir)
     log.info("validator up: netuid=%s manifest_bucket=%s — polling for rounds",
              runner.cfg.netuid, runner.cfg.storage.manifest_bucket)
+    # bittensor's logging machine silences all other loggers on import; restore
+    # cascade.* levels so the run-loop's progress logs stay visible.
+    from ..shared.logging_util import restore_cascade_logging
+
+    restore_cascade_logging(args.log_level)
     runner.run_forever(client, window_source=window_source)
     return 0
 

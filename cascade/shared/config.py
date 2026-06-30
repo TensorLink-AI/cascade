@@ -46,7 +46,7 @@ class GeneratorConfig:
     max_total_points: int
     max_generate_seconds: int
     max_memory_mb: int
-    max_repo_mb: int = 2048  # cap on fetched submission bytes (code + safetensors weights)
+    max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
 
 
@@ -298,6 +298,17 @@ class EvalConfig:
     n_windows: int
     context_length: int
     horizon: int
+    # ── Public-benchmark logging (log-only; never feeds scoring/weights) ──────
+    # Off by default. When on, the validator runs the out-of-process sidecar
+    # (``benchmarks/``) on a dethroned challenger and logs GIFT-Eval/BOOM/TIME
+    # numbers. ``benchmark_suites = ()`` runs all three; ``benchmark_num_samples
+    # = 0`` reuses ``num_samples``; ``benchmark_max_series = 0`` runs the full
+    # benchmark (use a small cap for a smoke run). Defaults keep old toml loading.
+    run_benchmarks: bool = False
+    benchmark_project_dir: str = "benchmarks"
+    benchmark_suites: tuple[str, ...] = ()
+    benchmark_num_samples: int = 0
+    benchmark_max_series: int = 0
 
 
 @dataclass(frozen=True)
@@ -590,6 +601,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             n_windows=int(e["n_windows"]),
             context_length=int(e["context_length"]),
             horizon=int(e["horizon"]),
+            run_benchmarks=bool(e.get("run_benchmarks", False)),
+            benchmark_project_dir=str(e.get("benchmark_project_dir", "benchmarks")),
+            benchmark_suites=tuple(str(s) for s in e.get("benchmark_suites", ())),
+            benchmark_num_samples=int(e.get("benchmark_num_samples", 0)),
+            benchmark_max_series=int(e.get("benchmark_max_series", 0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),

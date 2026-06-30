@@ -129,7 +129,10 @@ class ChainClient:
             kwargs: dict[str, Any] = {"name": self.wallet_name, "hotkey": self.wallet_hotkey}
             if self.wallet_path is not None:
                 kwargs["path"] = self.wallet_path
-            self._wallet = bt.wallet(**kwargs)
+            # bittensor <9 exposed a lowercase ``wallet`` factory; 9+/10 only ship
+            # the ``Wallet`` class. Support both (matches the subtensor shim above).
+            wallet_factory = getattr(bt, "wallet", None) or bt.Wallet
+            self._wallet = wallet_factory(**kwargs)
         return self._wallet
 
     def current_block(self) -> int:
@@ -163,7 +166,7 @@ class ChainClient:
         metagraph (validators set this via weights). None on an empty metagraph."""
         sub = self.subtensor()
         try:
-            meta = sub.metagraph(netuid=self.netuid)
+            meta = sub.metagraph(netuid=self.netuid, lite=True)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
         n = int(meta.n)
@@ -179,7 +182,7 @@ class ChainClient:
         """Number of UIDs registered on the netuid (for the weight vector)."""
         sub = self.subtensor()
         try:
-            return int(sub.metagraph(netuid=self.netuid).n)
+            return int(sub.metagraph(netuid=self.netuid, lite=True).n)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
 
@@ -187,7 +190,7 @@ class ChainClient:
         """Resolve a hotkey to its UID on the netuid, or None if absent."""
         sub = self.subtensor()
         try:
-            meta = sub.metagraph(netuid=self.netuid)
+            meta = sub.metagraph(netuid=self.netuid, lite=True)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
         for uid in range(int(meta.n)):
@@ -197,17 +200,54 @@ class ChainClient:
 
     def poll_commitments(self) -> list[Commitment]:
         """Return the revealed generator pointer for every UID on the netuid.
-        UIDs without a commitment are omitted."""
+        UIDs without a commitment are omitted.
+
+        Miners write via ``set_reveal_commitment`` (timelock commit-reveal), so the
+        payload lands in the *revealed*-commitment store — NOT the plain commitment
+        store that ``get_commitment`` reads. We therefore read
+        ``get_all_revealed_commitments`` (one call for the whole netuid) and map
+        each hotkey back to its UID, taking the latest reveal per hotkey. Falls
+        back to the per-UID ``get_commitment`` path on older bittensor builds.
+        """
         sub = self.subtensor()
         try:
-            meta = sub.metagraph(netuid=self.netuid)
+            meta = sub.metagraph(netuid=self.netuid, lite=True)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
 
+        uid_by_hotkey = {str(meta.hotkeys[u]): u for u in range(int(meta.n))}
+        coldkeys = list(meta.coldkeys) if hasattr(meta, "coldkeys") else None
+
+        get_revealed = getattr(sub, "get_all_revealed_commitments", None)
         out: list[Commitment] = []
+        if get_revealed is not None:
+            try:
+                revealed = get_revealed(self.netuid) or {}
+            except Exception as e:  # noqa: BLE001
+                raise ChainError(f"get_all_revealed_commitments_failed: {e}") from e
+            for hotkey, reveals in revealed.items():
+                uid = uid_by_hotkey.get(str(hotkey))
+                if uid is None or not reveals:
+                    continue
+                # ``reveals`` is a sequence of (block, payload); take the latest.
+                block, payload = max(reveals, key=lambda r: int(r[0]))
+                if not isinstance(payload, str) or not payload:
+                    continue
+                out.append(
+                    Commitment(
+                        uid=uid,
+                        hotkey=str(hotkey),
+                        coldkey=str(coldkeys[uid]) if coldkeys else None,
+                        payload=payload,
+                        commit_block=int(block),
+                    )
+                )
+            return out
+
+        # Fallback: plain per-UID commitment store (older bittensor).
         for uid in range(int(meta.n)):
             hotkey = str(meta.hotkeys[uid])
-            coldkey = str(meta.coldkeys[uid]) if hasattr(meta, "coldkeys") else None
+            coldkey = str(coldkeys[uid]) if coldkeys else None
             try:
                 rec = sub.get_commitment(netuid=self.netuid, uid=uid)
             except Exception:  # noqa: BLE001

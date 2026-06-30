@@ -3,8 +3,9 @@ fetch time so a miner sees the same failure messages locally.
 
 Sequence:
 
-1. Repo layout + size — required files present, no pickle weight files
-   (safetensors OK), and total bytes <= max_repo_mb.
+1. Repo layout + size — required files present, no shipped weight files of any
+   kind (pickle checkpoints or code-free containers like safetensors), and total
+   bytes <= max_repo_mb.
 2. Config — ``config.json`` parses as an object.
 3. Static guard on ``generator.py`` — AST scan for blocked imports.
 4. Requirements — hash-locked, allowlisted, <= max_packages.

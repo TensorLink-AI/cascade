@@ -221,6 +221,12 @@ class TrainerRunner:
         gen_dir = out_dir.parent / "generator"
         fetch_from_hub(gen.ref, gen_dir, self.hub())
         out_dir.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "round=%s run=%s: fetched generator %s — building corpus + training "
+            "(mode=%s, budget=%s point-passes) …",
+            seeds.base_seed, log_role, gen.ref[:48],
+            contract.corpus_mode, f"{token_budget:,}",
+        )
 
         # Stream per-step metrics to S3 (best-effort: logging must never abort a
         # training run). ``log_role`` carries the size/heat tag so each run's log

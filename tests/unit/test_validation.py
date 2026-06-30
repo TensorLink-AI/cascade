@@ -66,21 +66,36 @@ def test_repo_layout_accepts_generator_repo(tmp_path):
     assert check_repo_layout(tmp_path).ok
 
 
-def test_repo_layout_accepts_safetensors_weights(tmp_path):
-    # A generator may BE a model: safetensors weights are allowed.
+def test_repo_layout_rejects_safetensors_weights(tmp_path):
+    # Generators are code-only: even code-free weight containers are rejected,
+    # so a miner can't distill a pretrained model into the "generator".
     _write(tmp_path, "config.json", "{}")
     _write(tmp_path, "generator.py", "x = 1\n")
     _write(tmp_path, "requirements.txt", "")
     _write(tmp_path, "model.safetensors", "binary")
-    assert check_repo_layout(tmp_path).ok
+    r = check_repo_layout(tmp_path)
+    assert not r.ok
+    assert r.reason == "weight_files_forbidden"
 
 
-def test_repo_layout_rejects_pickle_weights(tmp_path):
-    # Pickle checkpoints execute code on load — rejected (ship safetensors).
+@pytest.mark.parametrize("fname", ["weights.npz", "weights.npy", "model.onnx", "model.h5"])
+def test_repo_layout_rejects_weight_containers(tmp_path, fname):
     _write(tmp_path, "config.json", "{}")
     _write(tmp_path, "generator.py", "x = 1\n")
     _write(tmp_path, "requirements.txt", "")
-    _write(tmp_path, "model.pt", "binary")
+    _write(tmp_path, fname, "binary")
+    r = check_repo_layout(tmp_path)
+    assert not r.ok
+    assert r.reason == "weight_files_forbidden"
+
+
+@pytest.mark.parametrize("fname", ["model.pt", "model.bin", "ckpt.pth", "x.ckpt", "s.pkl", "s.joblib"])
+def test_repo_layout_rejects_pickle_weights(tmp_path, fname):
+    # Pickle checkpoints execute code on load — rejected outright.
+    _write(tmp_path, "config.json", "{}")
+    _write(tmp_path, "generator.py", "x = 1\n")
+    _write(tmp_path, "requirements.txt", "")
+    _write(tmp_path, fname, "binary")
     r = check_repo_layout(tmp_path)
     assert not r.ok
     assert r.reason == "pickle_weights_forbidden"

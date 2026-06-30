@@ -29,13 +29,13 @@ single on-chain pointer:
 metro-v1:gen:hippius:<repo>@<digest>
 ```
 
-The Hub `repo@digest` content-addresses the generator code, `config.json`,
-`requirements.txt`, and any model weights together — it both locates and pins the
-submission (the OCI digest *is* the content hash, so there is no separate git SHA). A
-generator may itself be a trained model (safetensors only, size-capped) — the
-distinction from horizon is not "no weights" but *what is scored*: cascade
-scores the **data** (via a fixed model trained on it), horizon scores the
-submitted model directly. See `docs/INTERFACE.md`.
+The Hub `repo@digest` content-addresses the generator code, `config.json`, and
+`requirements.txt` together — it both locates and pins the submission (the OCI
+digest *is* the content hash, so there is no separate git SHA). A generator is
+code-only (purely algorithmic): no shipped weights of any kind, so a miner cannot
+distill a pretrained forecaster into the "generator". The distinction from horizon
+is *what is scored*: cascade scores the **data** (via a fixed model trained on it),
+horizon scores the submitted model directly. See `docs/INTERFACE.md`.
 
 ### 2. Trainer — owner-operated, the GPU boundary
 

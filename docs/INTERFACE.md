@@ -1,11 +1,14 @@
 # cascade submission interface (for miners)
 
-You submit a **data generator** — *any* process behind the `generate()` endpoint:
-an algorithm, a neural sampler (a PFN or ensemble), or a hybrid, and it may ship
-its own weights. Whatever it is, it produces synthetic time-series that the subnet
-owner's trainer uses to train a **Toto2-4M forecaster from scratch** (random init
-— not a fine-tune). You win when your data trains a better forecaster than the
-king's data, scored on a private, rotating held-out set you never see.
+You submit a **data generator** — a *purely algorithmic* process behind the
+`generate()` endpoint: a sampler built from priors (GP/kernel families, causal
+DAGs, parametric trend/seasonality/noise, …). It is **code-only — no shipped
+weights** (see the contract below), so you compete on the data-generating prior,
+not on a large pretrained forecaster distilled into a "generator". Whatever it is,
+it produces synthetic time-series that the subnet owner's trainer uses to train a
+**Toto2-4M forecaster from scratch** (random init — not a fine-tune). You win when
+your data trains a better forecaster than the king's data, scored on a private,
+rotating held-out set you never see.
 
 Series are univariate today (`max_channels = 1`), but the corpus carries a
 channel axis: `generate` may yield a 1-D `(L,)` array (treated as one channel) and
@@ -23,10 +26,13 @@ config.json         # any JSON object; your generator may read it
 requirements.txt    # hash-locked, allowlisted, <= max_packages
 ```
 
-**Weights are allowed — as `safetensors` only.** If your generator is a model,
-ship its weights as `*.safetensors`. Pickle checkpoints (`*.bin`, `*.pt`,
-`*.pth`, `*.ckpt`) are rejected because loading them runs arbitrary code. The
-whole repo (code + weights) must be `<= max_repo_mb`.
+**No shipped weights — generators are code-only.** Weight files of any kind are
+rejected: pickle checkpoints (`*.bin`, `*.pt`, `*.pth`, `*.ckpt`, `*.pkl`, …)
+because loading them runs arbitrary code, *and* code-free containers
+(`*.safetensors`, `*.npy`, `*.npz`, `*.onnx`, …) because they'd let you distill a
+pretrained model into the generator. `torch`/`gpytorch` stay available as compute
+libraries for GP/kernel priors — just don't ship parameters. The whole repo must
+be `<= max_repo_mb` (small, since it's source + config).
 
 ## The contract
 
@@ -69,8 +75,9 @@ class Generator(DataGenerator):
   network-isolated sandbox. See `chain.toml [static_guard]`.
 * **Dependencies & size.** `requirements.txt` lines must be
   `pkg==ver --hash=sha256:…`, drawn from `chain.toml [dependencies] allowed`
-  (which includes `torch` + `safetensors` for model generators), at most
-  `max_packages`. The fetched repo (code + weights) must be `<= max_repo_mb`.
+  (which includes `torch`/`gpytorch` as compute libraries for GP/kernel priors —
+  but no shipped weights), at most `max_packages`. The fetched repo (code only)
+  must be `<= max_repo_mb`.
 
 ## Deploy
 

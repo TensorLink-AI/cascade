@@ -26,3 +26,10 @@ chain.*.local.toml
 _pool_real/
 _eval_pool/
 _vpool_cache/
+
+# Trainer-local remote-host file (pod IPs / key paths) — keep off git/chain.
+hosts.toml
+# Service logs
+orchestrator.log
+validator.log
+worker_manual.log

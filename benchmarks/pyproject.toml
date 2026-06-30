@@ -1,0 +1,43 @@
+[project]
+name = "cascade-benchmark"
+version = "0.0.1"
+description = "Isolated sidecar that scores a cascade checkpoint on public TS benchmarks (GIFT-Eval, BOOM, TIME) and emits leaderboard-comparable numbers as JSON. Kept in its OWN locked environment so gift-eval's hard pins never touch the cascade core."
+readme = "README.md"
+# gift-eval pins pandas==2.0.0 (no cp312 wheels on some arches) → stay on 3.11.
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+
+# These are the pins that make co-installing gift-eval into the cascade env
+# impossible (numpy~=1.26, scipy~=1.11, datasets~=2.17, gluonts~=0.15). Here they
+# live in a resolver universe of their own, so they cannot collide with the main
+# repo's torch>=2.2 / transformers>=4.40 / bittensor / hippius stack.
+dependencies = [
+    # gift-eval IS the harness for both GIFT-Eval and BOOM (BOOM's loader is
+    # built on it). Pinned to the exact commit DataDog/toto's BOOM runner uses
+    # so our BOOM numbers match the published leaderboard. Bump deliberately.
+    "gift-eval @ git+https://github.com/SalesforceAIResearch/gift-eval@1527c41589189ad1bc3883ed4d3d97b3e5a3b47c",
+    "gluonts~=0.15.1",
+    "datasets~=2.17.1",
+    "pandas==2.0.0",
+    "numpy~=1.26.0",
+    "scipy~=1.11.3",
+    "orjson",
+    # Loading a cascade checkpoint needs the same inference stack the trainer
+    # produced it with. These are unconstrained by gift-eval, so they resolve
+    # against the pins above (torch ~2.2 is numpy-1.26 compatible).
+    "torch>=2.2",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "accelerate>=0.30",
+    "huggingface_hub>=0.23",
+]
+
+[project.scripts]
+cascade-benchmark = "cascade_benchmark.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cascade_benchmark"]

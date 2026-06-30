@@ -66,7 +66,7 @@ def test_sandbox_rejects_oversize_repo(tmp_path, small_cfg):
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "requirements.txt").write_text("")
     (tmp_path / "generator.py").write_text("x = 1\n")
-    (tmp_path / "weights.safetensors").write_bytes(b"z" * 4096)
+    (tmp_path / "big.dat").write_bytes(b"z" * 4096)  # bulk, not a weight file
     tiny = replace(small_cfg.generator, max_repo_mb=0)  # nothing fits
     with pytest.raises(CorpusError):
         run_in_sandbox(tmp_path, 0, tiny, blocked=small_cfg.static_guard.blocked, allow_netns=False)

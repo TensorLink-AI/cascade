@@ -135,6 +135,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.screen_contract().arch_preset,
         ",".join(t.arch_preset for t in cfg.throne_contracts()),
     )
+    # bittensor's logging machine silences all other loggers on import; restore
+    # cascade.* levels so the run-loop's progress logs stay visible.
+    from ..shared.logging_util import restore_cascade_logging
+
+    restore_cascade_logging(args.log_level)
     runner.run_forever(client)
     return 0
 
