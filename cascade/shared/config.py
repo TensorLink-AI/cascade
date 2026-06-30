@@ -210,15 +210,33 @@ class TrainingContractConfig:
 
     @property
     def primary_size(self) -> TrainingContractConfig:
-        """The base (primary) size as a standalone single-size contract — the
-        rung the cheap heat screens on, and the first size of the final."""
+        """The base (primary) size as a standalone single-size contract."""
         return replace(self, extra_sizes=())
 
-    def final_sizes(self) -> list[TrainingContractConfig]:
-        """Per-size contracts trained in the final stage: the primary size first,
-        then each :class:`SizeSpec` in ``extra_sizes``. A single element when no
-        extra sizes are configured (legacy single-size rounds)."""
+    def all_sizes(self) -> list[TrainingContractConfig]:
+        """Every configured size as a standalone single-size contract: the primary
+        first, then each :class:`SizeSpec` in ``extra_sizes``. This is the size
+        *registry* the round's screen/throne pointers select from — not (in
+        general) what a round trains; see :meth:`ChainConfig.throne_contracts`."""
         return [self.primary_size, *(self.for_size(s) for s in self.extra_sizes)]
+
+    @property
+    def size_registry(self) -> dict[str, TrainingContractConfig]:
+        """``arch_preset`` → single-size contract, over the primary + extra sizes."""
+        return {c.arch_preset: c for c in self.all_sizes()}
+
+    def contract_for(self, preset: str) -> TrainingContractConfig:
+        """Resolve a size by ``arch_preset`` to its single-size contract.
+
+        Raises ``ValueError`` listing the available presets if ``preset`` is not
+        configured (typo, or a `[[training.sizes]]` block still commented out)."""
+        registry = self.size_registry
+        if preset not in registry:
+            raise ValueError(
+                f"unknown size {preset!r}; configured sizes are {sorted(registry)} "
+                "(add a [[training.sizes]] block or fix the [round] screen/throne size)"
+            )
+        return registry[preset]
 
 
 @dataclass(frozen=True)
@@ -237,17 +255,27 @@ class RoundConfig:
     re-derives the same field.
 
     The field is first screened cheaply — every eligible challenger is trained for
-    ``heat_train_hours`` on the primary (smallest) size and scored internally by
-    the trainer; the top ``finalists`` then advance to the full
-    ``[training] target_train_hours`` final against the king, trained at every
-    configured size.
+    ``heat_train_hours`` on the ``screen_size`` and scored internally by the
+    trainer; the top ``finalists`` then advance to the full
+    ``[training] target_train_hours`` final against the king, trained at each of
+    ``throne_sizes``.
+
+    ``screen_size`` and ``throne_sizes`` are ``arch_preset`` names selecting from
+    the size registry (``[training]`` primary + each ``[[training.sizes]]``).
+    Empty ⇒ both default to the primary size (single-size rounds, today's
+    behaviour). This is the scaling seam: promoting a rung is just pointing these
+    at a bigger size (e.g. ``screen_size = "toto2-4m"``, ``throne_sizes =
+    ["toto2-22m"]``) — no code change. The screen size is independent of the
+    throne size, so a cheap small screen can feed a larger throne.
     """
 
-    epoch_blocks: int = 7200       # ≈24h at 12s blocks; one round per epoch
-    round_hours: float = 24.0      # informational: wall-clock span of an epoch
-    heat_train_hours: float = 0.5  # cheap screening budget per competitor
-    heat_n_windows: int = 256      # eval windows the heat screens on (≤ [eval] n_windows)
-    finalists: int = 1             # challengers promoted from the heat to the final
+    epoch_blocks: int = 7200          # ≈24h at 12s blocks; one round per epoch
+    round_hours: float = 24.0         # informational: wall-clock span of an epoch
+    heat_train_hours: float = 0.5     # cheap screening budget per competitor
+    heat_n_windows: int = 256         # eval windows the heat screens on (≤ [eval] n_windows)
+    finalists: int = 1                # challengers promoted from the heat to the final
+    screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
+    throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
 
 
 @dataclass(frozen=True)
@@ -364,6 +392,20 @@ class ChainConfig:
     def netuid(self) -> int:
         return self.subnet.netuid
 
+    def screen_contract(self) -> TrainingContractConfig:
+        """The single-size contract the heat screens at — ``[round] screen_size``
+        resolved against the size registry, defaulting to the primary size."""
+        name = self.round.screen_size or self.training.arch_preset
+        return self.training.contract_for(name)
+
+    def throne_contracts(self) -> list[TrainingContractConfig]:
+        """The single-size contracts the final trains + the throne is judged at —
+        ``[round] throne_sizes`` resolved against the registry, defaulting to just
+        the primary size. One element ⇒ a single-size throne; several ⇒ the
+        combined-score throne pools across them."""
+        names = self.round.throne_sizes or (self.training.arch_preset,)
+        return [self.training.contract_for(n) for n in names]
+
     def koth_params(self) -> Any:
         """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``.
 
@@ -413,6 +455,14 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             )
     if not cfg.manifest.trainer_hotkey:
         problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
+    # The round's screen/throne size pointers must name configured sizes.
+    registry = cfg.training.size_registry
+    for label, name in [("screen_size", cfg.round.screen_size), *(("throne_sizes", n) for n in cfg.round.throne_sizes)]:
+        if name and name not in registry:
+            problems.append(
+                f"[round] {label} = {name!r} is not a configured size {sorted(registry)} "
+                "(add the [[training.sizes]] block or fix the name)"
+            )
     if role == "validator":
         from .hippius import is_hub_ref
 
@@ -529,6 +579,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             heat_train_hours=float(r.get("heat_train_hours", 0.5)),
             heat_n_windows=int(r.get("heat_n_windows", 256)),
             finalists=int(r.get("finalists", 1)),
+            screen_size=str(r.get("screen_size", "")),
+            throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),

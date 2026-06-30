@@ -70,9 +70,9 @@ def test_run_round_trains_king_and_challenger_at_every_size(two_size_cfg, tmp_pa
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
     assert manifest.round_id == "1"
-    sizes = sorted(s.arch_preset for s in cfg.training.final_sizes())
-    assert len(sizes) == 2  # primary + the extra size
-    # One (king, challenger) pair per configured size, each tagged with its size.
+    sizes = sorted(t.arch_preset for t in cfg.throne_contracts())
+    assert len(sizes) == 2  # combined throne over both sizes
+    # One (king, challenger) pair per throne size, each tagged with its size.
     assert sorted(e.size for e in manifest.entries_for_role("king")) == sizes
     assert sorted(e.size for e in manifest.entries_for_role("challenger")) == sizes
     assert manifest.entry_for_role("king").gen_ref == REF_A
@@ -91,6 +91,29 @@ def test_run_round_single_size_at_launch(cfg, tmp_path, monkeypatch):
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
     assert [e.size for e in manifest.entries_for_role("king")] == [cfg.training.arch_preset]
     assert [e.size for e in manifest.entries_for_role("challenger")] == [cfg.training.arch_preset]
+
+
+def test_sliding_window_screen_small_throne_big(two_size_cfg, tmp_path, monkeypatch):
+    # The seam: screen at the small primary, train + judge the throne at the
+    # bigger size ONLY (4M never appears in the manifest — it's just the screen).
+    from dataclasses import replace
+
+    _patch_train_boundaries(monkeypatch)
+    cfg = replace(two_size_cfg, round=replace(two_size_cfg.round,
+                  screen_size=two_size_cfg.training.arch_preset,
+                  throne_sizes=("toto2-test-xl",)))
+    # screen only matters when it has to choose; give it 3 challengers + a screener.
+    def screen(ckpt_dir, gen, base_seed):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    # throne entries are the big size only — the 4M screen is internal, never published.
+    assert {e.size for e in manifest.entries} == {"toto2-test-xl"}
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"  # heat winner promoted
 
 
 def test_run_round_skips_challenger_that_copies_the_king(cfg, tmp_path, monkeypatch):
@@ -124,8 +147,8 @@ def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     assert sorted(seen) == ["b", "c", "d"]  # every challenger got a heat run
     chal = manifest.entry_for_role("challenger")
     assert chal.miner_hotkey == "c"          # lowest geomean advances
-    # the single finalist is trained at every size in the final
-    sizes = sorted(s.arch_preset for s in cfg.training.final_sizes())
+    # the single finalist is trained at every throne size
+    sizes = sorted(t.arch_preset for t in cfg.throne_contracts())
     assert sorted(e.size for e in manifest.entries_for_role("challenger")) == sizes
 
 

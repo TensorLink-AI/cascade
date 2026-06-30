@@ -385,7 +385,7 @@ class TrainerRunner:
                             n, len(challengers))
             return list(challengers[:n])
 
-        heat_contract = self.cfg.training.primary_size
+        heat_contract = self.cfg.screen_contract()
         heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
         scored: list[tuple[float, int, ResolvedGenerator]] = []
         for c in challengers:
@@ -410,13 +410,13 @@ class TrainerRunner:
     def _train_final(
         self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
     ) -> list[TrainedEntry]:
-        """Train the final jobs at every configured size, returning all receipts.
+        """Train the final jobs at each throne size, returning all receipts.
 
-        One (king + finalists) pass per size in ``cfg.training.final_sizes()``;
-        a king failure at any size aborts the round, a challenger failure drops
-        only that challenger from that size."""
+        One (king + finalists) pass per size in ``cfg.throne_contracts()`` (the
+        ``[round] throne_sizes``); a king failure at any size aborts the round, a
+        challenger failure drops only that challenger from that size."""
         entries: list[TrainedEntry] = []
-        for contract in self.cfg.training.final_sizes():
+        for contract in self.cfg.throne_contracts():
             token_budget = contract.train_tokens
             if self.remote_hosts:
                 entries += self._train_remote(jobs, seeds, block, contract, token_budget)

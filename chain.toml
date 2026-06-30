@@ -128,9 +128,17 @@ expected_gpu = ""
 # boundary are eligible — commit late and you compete in the next round.
 epoch_blocks     = 7200   # ≈24h at a 12s block time (set to your network's block time)
 round_hours      = 24.0   # informational: wall-clock span of an epoch
-heat_train_hours = 0.5    # cheap screening budget per competitor (primary size only)
+heat_train_hours = 0.5    # cheap screening budget per competitor (on screen_size)
 heat_n_windows   = 256    # eval windows the heat screens on (cheaper than the final's n_windows)
 finalists        = 1      # challengers promoted from the heat to the 3h final (top-N)
+# Scaling seam: which size the heat screens at, and which size(s) the final trains
+# + the throne is judged on. Both are arch_preset names from the size registry
+# ([training] primary + any [[training.sizes]]). At launch both are the 4M primary
+# (single-size rounds). To promote a rung later, just point these at a bigger size
+# — e.g. screen_size = "toto2-4m", throne_sizes = ["toto2-22m"] — no code change.
+# throne_sizes with >1 entry = combined-score throne pooled across those sizes.
+screen_size  = "toto2-4m"
+throne_sizes = ["toto2-4m"]
 
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,

@@ -59,19 +59,22 @@ def main(argv: list[str] | None = None) -> int:
         from .contract import compute_base_arch_digest
 
         seeds = RoundSeeds.derive(args.base_seed, cfg.training)
-        sizes = cfg.training.final_sizes()
+        screen = cfg.screen_contract()
+        thrones = cfg.throne_contracts()
         print(f"base_arch:           {cfg.training.base_arch}")
         print(f"round cadence:       1 round / {cfg.round.epoch_blocks} blocks "
-              f"(~{cfg.round.round_hours:g}h); heat {cfg.round.heat_train_hours:g}h, "
-              f"finalists {cfg.round.finalists}")
-        print(f"final sizes:         {', '.join(s.arch_preset for s in sizes)}")
-        for sc in sizes:
+              f"(~{cfg.round.round_hours:g}h); finalists {cfg.round.finalists}")
+        print(f"screen size:         {screen.arch_preset} "
+              f"(heat {cfg.round.heat_train_hours:g}h ≈ "
+              f"{screen.tokens_for_hours(cfg.round.heat_train_hours):,} point-passes)")
+        print(f"throne sizes:        {', '.join(t.arch_preset for t in thrones)}")
+        print(f"available sizes:     {', '.join(cfg.training.size_registry)}")
+        for sc in cfg.training.all_sizes():
             computed = compute_base_arch_digest(sc)
             flag = "" if sc.base_arch_digest == computed else "  ← MISMATCH, pin this digest"
             print(f"  [{sc.arch_preset}] base_arch_digest: {computed}{flag}")
             print(f"  [{sc.arch_preset}] final budget:     "
-                  f"{cfg.training.target_train_hours:g}h ≈ {sc.train_tokens:,} point-passes; "
-                  f"heat ≈ {sc.tokens_for_hours(cfg.round.heat_train_hours):,}")
+                  f"{cfg.training.target_train_hours:g}h ≈ {sc.train_tokens:,} point-passes")
         print(f"contract_digest:     {contract_digest(cfg.training)}")
         print(f"generation_seed:     {seeds.generation_seed}")
         print(f"training_seed:       {seeds.training_seed}")
@@ -126,10 +129,11 @@ def main(argv: list[str] | None = None) -> int:
         screen_fn=screen_fn,
     )
     log.info(
-        "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s sizes=%s",
+        "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",
         cfg.netuid, cfg.storage.manifest_bucket, cfg.storage.hub_registry_url,
         "remote" if remote_hosts else "local",
-        ",".join(s.arch_preset for s in cfg.training.final_sizes()),
+        cfg.screen_contract().arch_preset,
+        ",".join(t.arch_preset for t in cfg.throne_contracts()),
     )
     runner.run_forever(client)
     return 0

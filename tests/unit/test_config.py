@@ -65,19 +65,43 @@ def test_round_cadence_loads(cfg):
 
 def test_shipped_config_is_single_size_at_launch(cfg):
     # 20M is disabled in the committed chain.toml at launch — rounds run the 4M
-    # primary only. Uncomment [[training.sizes]] to bring the 20M size online.
+    # primary only. Uncomment [[training.sizes]] + repoint throne_sizes to promote.
     assert cfg.training.extra_sizes == ()
-    assert [s.arch_preset for s in cfg.training.final_sizes()] == [cfg.training.arch_preset]
+    assert [s.arch_preset for s in cfg.training.all_sizes()] == [cfg.training.arch_preset]
+    # screen and throne both resolve to the primary at launch.
+    assert cfg.screen_contract().arch_preset == cfg.training.arch_preset
+    assert [t.arch_preset for t in cfg.throne_contracts()] == [cfg.training.arch_preset]
 
 
-def test_final_sizes_primary_plus_extra(two_size_cfg):
+def test_all_sizes_primary_plus_extra(two_size_cfg):
     cfg = two_size_cfg
-    sizes = cfg.training.final_sizes()
+    sizes = cfg.training.all_sizes()
     assert len(sizes) == 1 + len(cfg.training.extra_sizes) == 2
     assert sizes[0].arch_preset == cfg.training.arch_preset      # primary first
     assert sizes[0].extra_sizes == ()                            # each is a single concrete size
     presets = [s.arch_preset for s in sizes]
     assert len(presets) == len(set(presets))                     # distinct sizes
+
+
+def test_screen_and_throne_pointers_resolve_against_registry(two_size_cfg):
+    from dataclasses import replace
+
+    # Sliding window: screen at the small primary, throne at the bigger size only.
+    cfg = replace(two_size_cfg, round=replace(two_size_cfg.round,
+                  screen_size=two_size_cfg.training.arch_preset,
+                  throne_sizes=("toto2-test-xl",)))
+    assert cfg.screen_contract().arch_preset == cfg.training.arch_preset
+    assert [t.arch_preset for t in cfg.throne_contracts()] == ["toto2-test-xl"]
+    # screen budget uses the screen size's throughput; throne is the bigger size.
+    assert cfg.screen_contract().d_model == cfg.training.d_model
+    assert cfg.throne_contracts()[0].d_model == 512
+
+
+def test_contract_for_unknown_size_raises(cfg):
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown size"):
+        cfg.training.contract_for("toto2-does-not-exist")
 
 
 def test_for_size_overrides_only_shape_and_keeps_family_invariants(two_size_cfg):

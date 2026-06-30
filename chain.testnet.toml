@@ -127,6 +127,12 @@ round_hours      = 1.0    # informational
 heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
 finalists        = 1      # challengers promoted from the heat to the final
+# Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
+# throne_sizes. Both default to the 4M primary; point them at a bigger size to
+# promote a rung. To test the sliding window on testnet, uncomment the 22M size
+# above and set e.g. screen_size = "toto2-4m", throne_sizes = ["toto2-22m"].
+screen_size  = "toto2-4m"
+throne_sizes = ["toto2-4m"]
 
 [eval]
 # Held-out eval windows. The SAME windows are scored for king and challenger,
