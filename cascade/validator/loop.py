@@ -104,14 +104,12 @@ class ValidatorRunner:
 
     # ── per-round decision ──────────────────────────────────────────────────
 
-    def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
-        if self.evaluate_fn is not None:
-            return self.evaluate_fn(entry, windows)
-        # Default path: fetch the checkpoint from the Hippius Hub registry and
-        # score it (registry + torch). The OCI digest in the ref pins the bytes,
-        # so the fetch is self-verifying.
+    def _fetch_checkpoint_dir(self, entry: TrainedEntry) -> Path:
+        """Fetch a trained checkpoint from the Hippius Hub registry to a local
+        dir and return it. The OCI digest in the ref pins the bytes, so the
+        fetch is self-verifying; repeated fetches of the same ref land in the
+        same digest-named dir (cheap to reuse)."""
         from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
-        from .evaluator import evaluate_checkpoint
 
         ref = parse_trained_pointer(entry.trained_pointer)
         if ref is None:
@@ -119,9 +117,57 @@ class ValidatorRunner:
         hub = HubConfig.from_storage(self.cfg.storage)
         dest = Path(self.cache_dir or "./_eval_ckpts") / HubRef.parse(ref).digest.replace(":", "-")
         fetch_from_hub(ref, dest, hub)
+        return dest
+
+    def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
+        if self.evaluate_fn is not None:
+            return self.evaluate_fn(entry, windows)
+        # Default path: fetch the checkpoint from the Hippius Hub registry and
+        # score it (registry + torch).
+        from .evaluator import evaluate_checkpoint
+
+        dest = self._fetch_checkpoint_dir(entry)
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
         )
+
+    def _maybe_run_benchmarks(
+        self, manifest: TrainingManifest, outcome: RoundOutcome | None
+    ) -> None:  # pragma: no cover — exercised only in the live loop
+        """Log public-benchmark numbers for a newly crowned king (log-only).
+
+        Best-effort and strictly off the consensus path: it runs only when a
+        challenger just dethroned the king, scores that new king's checkpoint via
+        the isolated sidecar, and logs whatever comes back. Any failure is
+        swallowed — a benchmark hiccup must never disturb weights or KOTH state.
+        """
+        ec = self.cfg.eval
+        if not ec.run_benchmarks:
+            return
+        if outcome is None or not outcome.transition.dethroned:
+            return
+        new_king = manifest.entry_for_role("challenger")
+        if new_king is None:
+            return
+        try:
+            from ..eval.benchmarks import format_report, run_benchmarks
+
+            ckpt = self._fetch_checkpoint_dir(new_king)
+            report = run_benchmarks(
+                ckpt,
+                project_dir=ec.benchmark_project_dir,
+                suites=ec.benchmark_suites or ("gift-eval", "boom", "time"),
+                num_samples=ec.benchmark_num_samples or ec.num_samples,
+                max_series=ec.benchmark_max_series,
+                device=self.device,
+            )
+            if report is not None:
+                log.info(
+                    "benchmarks round=%s king=%s %s",
+                    manifest.round_id, self.state.king_hotkey, format_report(report),
+                )
+        except Exception as e:  # noqa: BLE001 — log-only, never fatal
+            log.warning("benchmark hook failed for round=%s: %s", manifest.round_id, e)
 
     def process_round(
         self,
@@ -223,6 +269,9 @@ class ValidatorRunner:
                         except Exception as e:  # noqa: BLE001 — retried next round
                             log.warning("weight set failed for round=%s (king holds, "
                                         "retried next round): %s", manifest.round_id, e)
+                        # Log-only public benchmarks for a freshly crowned king.
+                        # Strictly after weights are decided; never affects them.
+                        self._maybe_run_benchmarks(manifest, outcome)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
             time.sleep(poll)

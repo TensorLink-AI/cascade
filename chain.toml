@@ -113,6 +113,20 @@ n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
+# ── Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH) ──────
+# When a challenger dethrones the king, the validator optionally scores the new
+# king's checkpoint on public benchmarks (GIFT-Eval, BOOM, TIME) and LOGS the
+# numbers — purely diagnostic, to track the network's best model against
+# published leaderboards. These run OUT OF PROCESS via the `benchmarks/` sidecar
+# (its gift-eval pins conflict with the cascade env), are best-effort, and a
+# failure is logged and ignored. Requires `uv` and a synced sidecar env
+# (`uv sync --project benchmarks`); see benchmarks/README.md.
+run_benchmarks        = false     # off by default — opt in per validator
+benchmark_project_dir = "benchmarks"  # path to the sidecar project (relative to cwd or absolute)
+benchmark_suites      = []        # subset of ["gift-eval","boom","time"]; [] = all three
+benchmark_num_samples = 0         # samples per benchmark forecast; 0 reuses num_samples above
+benchmark_max_series  = 0         # cap series/dataset for a fast smoke run; 0 = full benchmark
+
 [scoring]
 # King-of-the-hill — single-round, flat-margin dethroning (teutonic-style).
 # A challenger takes the throne the moment ONE round clears the win margin, and
