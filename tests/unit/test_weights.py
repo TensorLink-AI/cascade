@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.shared.chain import ChainError, equal_share_vector
+from cascade.shared.chain import ChainError, equal_share_vector
 
 
 def test_winner_take_all_single_uid():

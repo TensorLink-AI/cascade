@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from metronome.eval.koth import KothParams, evaluate_round, margin_for_tenure
-from metronome.eval.scoring import WindowScore
+from cascade.eval.koth import KothParams, evaluate_round, margin_for_tenure
+from cascade.eval.scoring import WindowScore
 
 PARAMS = KothParams(
     win_margin_start=0.02,

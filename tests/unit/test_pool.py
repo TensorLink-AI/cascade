@@ -8,10 +8,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from metronome.validator import pool as pool_mod
-from metronome.validator.pool import PoolError, load_pool
+from cascade.validator import pool as pool_mod
+from cascade.validator.pool import PoolError, load_pool
 
-REF = "metronome/eval-pool@sha256:" + "a" * 64
+REF = "cascade/eval-pool@sha256:" + "a" * 64
 
 
 def _cfg_with_pool(cfg, window_pool):

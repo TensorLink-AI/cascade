@@ -1,7 +1,7 @@
 # Vendored and trimmed from TempoPFN (Apache-2.0). See repo-root NOTICE.
 #
 # Original carried a torch-based BatchTimeSeriesContainer used by the training
-# pipeline; the metronome base generator only needs the numpy TimeSeriesContainer
+# pipeline; the cascade base generator only needs the numpy TimeSeriesContainer
 # emitted by generate_batch(), so the torch dependency and the batch/history
 # container are dropped here to keep the vendored surface minimal.
 from dataclasses import dataclass

@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from metronome.eval.window import EvalWindow
-from metronome.validator.windows import (
+from cascade.eval.window import EvalWindow
+from cascade.validator.windows import (
     RotatingWindowSource,
     build_windows_from_series,
 )

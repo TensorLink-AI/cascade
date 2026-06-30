@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from metronome.eval.crps import DEFAULT_QUANTILE_LEVELS
-from metronome.eval.koth import KothParams
+from cascade.eval.crps import DEFAULT_QUANTILE_LEVELS
+from cascade.eval.koth import KothParams
 
 
 def test_config_loads(cfg):
     assert cfg.schema_version == 1
-    assert cfg.subnet.name == "metronome"
+    assert cfg.subnet.name == "cascade"
     assert cfg.generator.corpus_n_series > 0
     assert cfg.generator.min_length < cfg.generator.max_length
     assert cfg.generator.max_channels >= 1
@@ -44,7 +44,7 @@ def test_training_contract_digest_covers_recipe(cfg):
     # terms". This is the controlled-experiment pin for from-scratch training.
     from dataclasses import replace
 
-    from metronome.shared.manifest import contract_digest
+    from cascade.shared.manifest import contract_digest
 
     base = contract_digest(cfg.training)
     # Budget is pinned via the hours × throughput fields (train_tokens is derived).
@@ -63,8 +63,8 @@ def test_koth_params_builds_from_scoring(cfg):
 
 def test_static_guard_blocks_internal_modules(cfg):
     blocked = cfg.static_guard.blocked
-    assert "metronome.trainer" in blocked
-    assert "metronome.shared.chain" in blocked
+    assert "cascade.trainer" in blocked
+    assert "cascade.shared.chain" in blocked
     assert "socket" in blocked
 
 
@@ -77,7 +77,7 @@ def test_generator_allowlist_includes_torch_for_model_generators(cfg):
 
 
 def test_corpus_mode_is_a_known_mode(cfg):
-    from metronome.shared.config import CORPUS_MODES
+    from cascade.shared.config import CORPUS_MODES
 
     assert cfg.training.corpus_mode in CORPUS_MODES
 
@@ -87,7 +87,7 @@ def test_corpus_mode_folded_into_contract_digest(cfg):
     # use the same one — so changing it must change the digest.
     from dataclasses import replace
 
-    from metronome.shared.manifest import contract_digest
+    from cascade.shared.manifest import contract_digest
 
     base = contract_digest(cfg.training)
     alt = "cache_reuse" if cfg.training.corpus_mode != "cache_reuse" else "stream_cpu"
@@ -97,7 +97,7 @@ def test_corpus_mode_folded_into_contract_digest(cfg):
 def test_validate_corpus_mode_rejects_unknown():
     import pytest
 
-    from metronome.shared.config import validate_corpus_mode
+    from cascade.shared.config import validate_corpus_mode
 
     with pytest.raises(ValueError):
         validate_corpus_mode("turbo")

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from metronome.shared.manifest import (
+from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
@@ -17,7 +17,7 @@ from metronome.shared.manifest import (
 )
 
 REF = "alice/metro-gen@sha256:" + "a" * 64
-REF_T = "metronome/ckpt-r42-king@sha256:" + "b" * 64
+REF_T = "cascade/ckpt-r42-king@sha256:" + "b" * 64
 
 
 def test_trained_pointer_round_trip():

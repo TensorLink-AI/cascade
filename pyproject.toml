@@ -1,5 +1,5 @@
 [project]
-name = "metronome"
+name = "cascade"
 version = "0.0.1"
 description = "Bittensor subnet for synthetic time-series training data, evaluated king-of-the-hill by training a fixed base model on each generator and scoring CRPS + MASE."
 readme = "README.md"
@@ -40,18 +40,18 @@ chain = [
 ]
 
 [project.scripts]
-metronome = "metronome.miner.cli:main"
-metronome-trainer = "metronome.trainer.main:main"
-metronome-train-worker = "metronome.trainer.worker:main"
-metronome-validator = "metronome.validator.main:main"
-metronome-pool = "metronome.pool.cli:main"
+cascade = "cascade.miner.cli:main"
+cascade-trainer = "cascade.trainer.main:main"
+cascade-train-worker = "cascade.trainer.worker:main"
+cascade-validator = "cascade.validator.main:main"
+cascade-pool = "cascade.pool.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["metronome"]
+packages = ["cascade"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

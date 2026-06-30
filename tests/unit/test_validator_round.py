@@ -9,20 +9,20 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from metronome.eval.scoring import WindowScore
-from metronome.shared.chain import Commitment
-from metronome.shared.manifest import (
+from cascade.eval.scoring import WindowScore
+from cascade.shared.chain import Commitment
+from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
     format_trained_pointer,
 )
-from metronome.trainer.loop import plan_round, resolve_commitments
-from metronome.validator.loop import ValidatorRunner
-from metronome.validator.state import genesis
+from cascade.trainer.loop import plan_round, resolve_commitments
+from cascade.validator.loop import ValidatorRunner
+from cascade.validator.state import genesis
 
 CID = "alice/gen@sha256:" + "a" * 64
-CID2 = "metronome/ckpt@sha256:" + "b" * 64
+CID2 = "cascade/ckpt@sha256:" + "b" * 64
 
 
 def _scores(scale, seed, n=300):
@@ -137,7 +137,7 @@ def test_process_round_is_atomic_on_eval_failure(cfg):
 def test_reward_uids_include_registered_former_kings(cfg):
     import types
 
-    from metronome.validator.state import ChampionState
+    from cascade.validator.state import ChampionState
 
     # Current king is uid 0 (manifest king); former court = ["fk1", "fk2"], but
     # only fk1 is still registered (fk2 deregistered ⇒ dropped).

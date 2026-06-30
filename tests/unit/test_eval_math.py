@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from metronome.eval.bootstrap import paired_bootstrap_lcb, paired_bootstrap_lcb_aggregated
-from metronome.eval.crps import mwsql_components, mwsql_from_components
-from metronome.eval.mase import in_sample_naive_mae, mase
+from cascade.eval.bootstrap import paired_bootstrap_lcb, paired_bootstrap_lcb_aggregated
+from cascade.eval.crps import mwsql_components, mwsql_from_components
+from cascade.eval.mase import in_sample_naive_mae, mase
 
 
 def test_mwsql_perfect_forecast_is_zero():

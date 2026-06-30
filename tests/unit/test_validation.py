@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.interface.validation import (
+from cascade.interface.validation import (
     check_repo_layout,
     check_repo_size,
     check_requirements_hash_locked,

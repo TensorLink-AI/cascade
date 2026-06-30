@@ -3,7 +3,7 @@ and the no-signature / no-hotkey rejections (real ss58 verify needs bittensor)."
 
 from __future__ import annotations
 
-from metronome.shared.manifest import (
+from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     sign_manifest,
@@ -11,7 +11,7 @@ from metronome.shared.manifest import (
 )
 
 REF = "alice/metro-gen@sha256:" + "a" * 64
-REF_T = "metronome/ckpt-r1-king@sha256:" + "c" * 64
+REF_T = "cascade/ckpt-r1-king@sha256:" + "c" * 64
 
 
 def _manifest(sig=None):
@@ -20,7 +20,7 @@ def _manifest(sig=None):
         created_block=10,
         contract_digest="c" * 64,
         base_arch_digest="a" * 64,
-        eval_dataset="metronome-private-v1",
+        eval_dataset="cascade-private-v1",
         entries=[TrainedEntry("hk", 0, "king", REF, f"metro-v1:trained:hippius:{REF_T}", "d", 1)],
         signature=sig,
     )

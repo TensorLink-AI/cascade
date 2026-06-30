@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from metronome.trainer.corpus import CorpusError, build_corpus
-from metronome.trainer.stream import open_round_stream
+from cascade.trainer.corpus import CorpusError, build_corpus
+from cascade.trainer.stream import open_round_stream
 
 BUDGET = 3000
 

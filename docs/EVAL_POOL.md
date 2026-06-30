@@ -3,8 +3,8 @@
 Validators score the king's and challenger's trained models on a **private,
 rotating pool of real-world series** (`[eval] window_pool`, a Hippius Hub
 `repo@digest`). This doc covers the **producer** side — turning real data into
-that pool — with `metronome.pool` and the `metronome-pool` CLI. The consumer side
-(fetch ref → slice into windows) lives in `metronome.validator.pool` / `.windows`.
+that pool — with `cascade.pool` and the `cascade-pool` CLI. The consumer side
+(fetch ref → slice into windows) lives in `cascade.validator.pool` / `.windows`.
 
 ## Why this design is hard to game
 
@@ -27,10 +27,10 @@ time-series foundation models pretrain on.
 ## Two ways to ship the pool
 
 1. **Daily publish to a bucket (recommended).** The owner orchestrator runs
-   `metronome-pool publish` on a cron; validators pull the current snapshot from
+   `cascade-pool publish` on a cron; validators pull the current snapshot from
    `[storage] pool_bucket` with **no `chain.toml` edit**. This is how the pool
    *rotates in time* — see "Daily rotation & consensus" below.
-2. **Static ref.** `metronome-pool build --upload` pins one snapshot's Hub
+2. **Static ref.** `cascade-pool build --upload` pins one snapshot's Hub
    `repo@digest` in `[eval] window_pool`. Simple, but refreshing the data means
    editing `chain.toml` + redeploying. Use it for a fixed pool or local testing.
 
@@ -41,16 +41,16 @@ falls back to the static ref.
 
 ```bash
 # Offline smoke test (no network): synthetic series through the full build path.
-metronome-pool build --out ./pool --sources synthetic --overwrite
+cascade-pool build --out ./pool --sources synthetic --overwrite
 
 # One-off static pool: build + pin a Hub ref.
-metronome-pool build --out ./pool --upload --hub-repo metronome/eval-pool
-# → prints  window_pool = "metronome/eval-pool@sha256:…"  ← paste into [eval] in chain.toml
+cascade-pool build --out ./pool --upload --hub-repo cascade/eval-pool
+# → prints  window_pool = "cascade/eval-pool@sha256:…"  ← paste into [eval] in chain.toml
 
 # Daily publish: build + push a snapshot to the pool bucket (no chain.toml edit).
-metronome-pool publish --effective-round auto
+cascade-pool publish --effective-round auto
 
-metronome-pool sources   # list registered sources
+cascade-pool sources   # list registered sources
 ```
 
 Window geometry (`context_length` / `horizon`) defaults to `[eval]` in
@@ -58,7 +58,7 @@ Window geometry (`context_length` / `horizon`) defaults to `[eval]` in
 
 ## Daily rotation & consensus
 
-`metronome-pool publish` builds a fresh pool, packs it to a deterministic tar,
+`cascade-pool publish` builds a fresh pool, packs it to a deterministic tar,
 uploads it to the pool bucket, and appends it to `pool/index.json` stamped with
 an **`effective_round`**. Each validator, for a round at `round_id`, selects the
 snapshot with the greatest `effective_round ≤ round_id` — the **same**
@@ -77,7 +77,7 @@ Example daily cron on the orchestrator:
 
 ```bash
 # 03:00 UTC daily — fresh windows, active from the next round onward.
-0 3 * * *  metronome-pool publish --as-of "$(date -u +\%F)" --effective-round auto
+0 3 * * *  cascade-pool publish --as-of "$(date -u +\%F)" --effective-round auto
 ```
 
 Validators pick up new snapshots automatically (they re-read the index each
@@ -92,7 +92,7 @@ Hippius S3 endpoint + `HIPPIUS_S3_*` credentials. To use R2 instead, set in
 
 ```toml
 [storage]
-pool_bucket      = "metronome-eval-pool"
+pool_bucket      = "cascade-eval-pool"
 pool_s3_endpoint = "https://<account>.r2.cloudflarestorage.com"
 pool_s3_region   = "auto"
 ```
@@ -123,9 +123,9 @@ Wikimedia per daily build — well within the keyless free tiers.)
 
 ## Adding a source
 
-Implement the `DataSource` protocol (`metronome/pool/source.py`) — a `name` and
+Implement the `DataSource` protocol (`cascade/pool/source.py`) — a `name` and
 `harvest(fetch, ctx) -> Iterable[HarvestedSeries]` — and register it in
-`metronome/pool/sources/__init__.py`. Do **all** network I/O through the injected
+`cascade/pool/sources/__init__.py`. Do **all** network I/O through the injected
 `fetch` callable so the source is unit-testable against canned JSON (see
 `tests/unit/test_pool_sources.py`). Yield raw series with a pandas-style `freq`;
 the builder handles cleaning, gap-fill, length normalisation, degeneracy/dup
@@ -137,7 +137,7 @@ future-unknowable but near-random-walk, so use it as a minor domain only.
 
 ## What the builder guarantees
 
-- **On-disk format** matches `metronome.validator.pool` exactly: one
+- **On-disk format** matches `cascade.validator.pool` exactly: one
   `<series_id>.npy` per series (float32; loader upcasts), `metadata.json` keyed by
   `series_id` → `{freq, seasonal_period, domain}`, plus a `provenance.json` the
   loader ignores.

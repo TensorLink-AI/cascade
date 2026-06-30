@@ -1,10 +1,10 @@
 # Vendored from TempoPFN (Apache-2.0). See repo-root NOTICE and LICENSE.
 #
-# Modifications (metronome):
+# Modifications (cascade):
 # * Import paths rewritten ``src.* -> tempo_gen.*``.
 # * DETERMINISM / CPU FIX: the upstream GP-prior sampler drew the multivariate
 #   normal on the GPU via ``cupy`` (``sample_from_gp_prior_efficient_gpu``). The
-#   metronome generate path is CPU-only and must be a pure function of the seed,
+#   cascade generate path is CPU-only and must be a pure function of the seed,
 #   so the ``cupy`` dependency is dropped and the draw is done with NumPy's
 #   seeded ``Generator.multivariate_normal`` (same ``method="eigh"`` factorisation).
 import functools

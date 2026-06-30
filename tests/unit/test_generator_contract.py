@@ -7,7 +7,7 @@ from collections.abc import Iterator
 import numpy as np
 import pytest
 
-from metronome.interface.generator import DataGenerator, check_series, drain_generator
+from cascade.interface.generator import DataGenerator, check_series, drain_generator
 
 
 class _Good(DataGenerator):

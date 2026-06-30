@@ -11,11 +11,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from metronome.pool.builder import PoolBuildConfig, build_pool
-from metronome.pool.source import HarvestContext, HarvestedSeries
-from metronome.shared import hippius
-from metronome.shared.config import load_chain_config
-from metronome.shared.hippius import (
+from cascade.pool.builder import PoolBuildConfig, build_pool
+from cascade.pool.source import HarvestContext, HarvestedSeries
+from cascade.shared import hippius
+from cascade.shared.config import load_chain_config
+from cascade.shared.hippius import (
     StorageError,
     fetch_pool_snapshot,
     pack_dir_to_tar,
@@ -24,7 +24,7 @@ from metronome.shared.hippius import (
     read_pool_index,
     select_snapshot,
 )
-from metronome.validator.pool import BucketWindowSource
+from cascade.validator.pool import BucketWindowSource
 
 CTX = HarvestContext(as_of=dt.date(2026, 6, 1), context_length=128, horizon=16, max_series=1000)
 CFG = PoolBuildConfig(context_length=128, horizon=16, min_context=32)
@@ -190,11 +190,11 @@ def test_bucket_source_raises_when_no_snapshot(tmp_path):
 def test_pool_s3_store_defaults_to_hippius(monkeypatch):
     monkeypatch.delenv("POOL_S3_ACCESS_KEY", raising=False)
     storage = SimpleNamespace(
-        pool_bucket="metronome-eval-pool", pool_s3_endpoint="", pool_s3_region="",
+        pool_bucket="cascade-eval-pool", pool_s3_endpoint="", pool_s3_region="",
         s3_endpoint="https://s3.hippius.com", s3_region="decentralized",
     )
     store = pool_s3_store(storage)
-    assert store.cfg.bucket == "metronome-eval-pool"
+    assert store.cfg.bucket == "cascade-eval-pool"
     assert store.cfg.endpoint == "https://s3.hippius.com"
     assert store.cfg.access_key_env == "HIPPIUS_S3_ACCESS_KEY"
 
@@ -212,12 +212,12 @@ def test_pool_s3_store_uses_r2_when_configured(monkeypatch):
 
 
 def test_publish_cli_end_to_end(tmp_path, monkeypatch):
-    from metronome.pool import cli
+    from cascade.pool import cli
 
     store = _FakeS3Store()
     cfg = dataclasses.replace(
         _cfg_small(),
-        storage=dataclasses.replace(load_chain_config().storage, pool_bucket="metronome-eval-pool"),
+        storage=dataclasses.replace(load_chain_config().storage, pool_bucket="cascade-eval-pool"),
     )
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)

@@ -1,15 +1,15 @@
 """Submission queue + cheap anti-duplicate checks (pure, no GPU/chain/Hippius).
 
-Covers the standalone :mod:`metronome.trainer.queue` (FIFO, dup-of-king,
+Covers the standalone :mod:`cascade.trainer.queue` (FIFO, dup-of-king,
 already-queued, already-trained, per-reign reset, persistence) and the
 duplicate-of-king / same-ref filters baked into
-:func:`metronome.trainer.loop.plan_round`.
+:func:`cascade.trainer.loop.plan_round`.
 """
 
 from __future__ import annotations
 
-from metronome.trainer.loop import ResolvedGenerator, plan_round
-from metronome.trainer.queue import (
+from cascade.trainer.loop import ResolvedGenerator, plan_round
+from cascade.trainer.queue import (
     SKIP_ALREADY_QUEUED,
     SKIP_ALREADY_TRAINED,
     SKIP_DUPLICATE_OF_KING,
@@ -17,8 +17,8 @@ from metronome.trainer.queue import (
     QueuedSubmission,
     SubmissionQueue,
 )
-from metronome.trainer.queue import dumps as dump_queue
-from metronome.trainer.queue import loads as load_queue
+from cascade.trainer.queue import dumps as dump_queue
+from cascade.trainer.queue import loads as load_queue
 
 # Opaque Hub refs (repo@digest) — the queue/plan only compare them as strings.
 KING = "ns/king@sha256:" + "0" * 64

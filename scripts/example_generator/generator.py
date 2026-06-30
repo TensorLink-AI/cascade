@@ -1,4 +1,4 @@
-"""Reference metronome generator — a template miners can fork.
+"""Reference cascade generator — a template miners can fork.
 
 Emits deterministic synthetic univariate series: a mix of trend, multi-seasonal
 sinusoids, AR(1) noise, and occasional level shifts. Everything is driven by the
@@ -6,8 +6,8 @@ single ``seed`` passed in, so two runs at the same seed produce byte-identical
 corpora — the determinism the trainer audits.
 
 The submitted class MUST be named ``Generator`` and subclass
-``metronome.interface.DataGenerator``. In a real submission you only need the
-``metronome`` package importable to subclass it; the heavy lifting is your data
+``cascade.interface.DataGenerator``. In a real submission you only need the
+``cascade`` package importable to subclass it; the heavy lifting is your data
 process.
 """
 
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from metronome.interface import DataGenerator
+from cascade.interface import DataGenerator
 
 
 class Generator(DataGenerator):
