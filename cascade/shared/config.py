@@ -46,7 +46,7 @@ class GeneratorConfig:
     max_total_points: int
     max_generate_seconds: int
     max_memory_mb: int
-    max_repo_mb: int = 2048  # cap on fetched submission bytes (code + safetensors weights)
+    max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
 
 

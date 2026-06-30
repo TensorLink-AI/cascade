@@ -20,13 +20,14 @@ auditability and is rejected by the determinism check in
 
 The on-chain submission is a single pointer string
 ``metro-v1:gen:hippius:<repo>@<digest>``; the Hippius Hub ``repo@digest``
-references the full repo tree — generator code, ``config.json``,
-``requirements.txt``, and any model weights — together (the OCI digest *is* the
-content hash, so it pins them).
-A generator MAY itself be a trained model (e.g. a PFN or an ensemble) behind the
-``generate`` endpoint: ship weights as ``safetensors`` only (pickle checkpoints
-are rejected), within the ``max_repo_mb`` size cap. Determinism still applies —
-seed every framework RNG (NumPy and, if used, ``torch.manual_seed`` +
+references the full repo tree — generator code, ``config.json``, and
+``requirements.txt`` — together (the OCI digest *is* the content hash, so it
+pins them).
+A generator is **code-only** (purely algorithmic): it must NOT ship learned
+weights of any kind, so the competition is on the data-generating prior, not on
+a large pretrained forecaster distilled into a "generator". ``torch``/``gpytorch``
+are available as compute libraries for GP/kernel priors. Determinism still
+applies — seed every framework RNG (NumPy and, if used, ``torch.manual_seed`` +
 ``torch.use_deterministic_algorithms(True)``) so the corpus stays reproducible.
 """
 

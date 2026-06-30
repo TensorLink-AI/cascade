@@ -24,9 +24,11 @@ max_length           = 2048
 max_total_points     = 2_000_000_000 # raised off 64M; real corpus size is set by corpus_n_series + memory/streaming (see notes)
 max_generate_seconds = 1800      # wall-clock budget for draining the generator
 max_memory_mb        = 4096      # rlimit for the generation sandbox
-max_repo_mb          = 2048      # cap on the fetched submission (code + safetensors
-                                 # weights). A generator may BE a model up to this size;
-                                 # max_memory_mb / max_generate_seconds bound it at runtime.
+max_repo_mb          = 128       # cap on the fetched submission. Generators are code-only
+                                 # (purely algorithmic) — no shipped weights — so a repo is
+                                 # source + config, a few MB; this is the wall that actually
+                                 # makes a distilled model impossible. max_memory_mb /
+                                 # max_generate_seconds bound it at runtime.
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
@@ -143,11 +145,12 @@ burn_uid             = 0         # weight sink when no rewarded king is register
 
 [dependencies]
 # Allowlist for a generator's requirements.txt — supply-chain restriction.
-# A generator may BE a trained model (e.g. a PFN / ensemble) behind the
-# generate() endpoint, so torch + safetensors are allowed. Weights ship as
-# safetensors only — pickle checkpoints (.pt/.bin/.pth/.ckpt) are rejected by
-# the repo-layout check (loading them executes arbitrary code). Still
-# hash-locked and capped at max_packages.
+# Generators are PURELY ALGORITHMIC: they compete on the data-generating prior,
+# not on shipped learned weights, so NO weight files of any kind are accepted
+# (the repo-layout check rejects pickle checkpoints AND code-free containers like
+# safetensors — see cascade.interface.validation). torch stays allowed as a
+# COMPUTE library for GP/kernel priors (gpytorch builds on it), not as a way to
+# ship a distilled model. Still hash-locked and capped at max_packages.
 max_packages = 16
 allowed = [
     "numpy",
@@ -156,7 +159,6 @@ allowed = [
     "statsmodels",
     "numba",
     "torch",
-    "safetensors",
     # GP/kernel-family priors (TempoPFN GP-prior, KernelSynth, CauKer). The base
     # generator draws from Gaussian-process priors with composite kernels and
     # SCM-DAG causal structure; these supply the GP/kernel/graph primitives.

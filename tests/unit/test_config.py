@@ -68,12 +68,13 @@ def test_static_guard_blocks_internal_modules(cfg):
     assert "socket" in blocked
 
 
-def test_generator_allowlist_includes_torch_for_model_generators(cfg):
-    # A generator may itself be a trained model behind generate(), so torch and
-    # safetensors are allowlisted (weights ship as safetensors only).
+def test_generator_allowlist_has_torch_as_compute_lib_but_no_weights_format(cfg):
+    # torch/gpytorch are allowlisted as COMPUTE libraries for GP/kernel priors,
+    # but generators are code-only — safetensors (a weights container) is not
+    # allowlisted, and shipped weight files are rejected at repo-layout time.
     allowed = {a.lower() for a in cfg.dependencies.allowed}
     assert "torch" in allowed
-    assert "safetensors" in allowed
+    assert "safetensors" not in allowed
 
 
 def test_corpus_mode_is_a_known_mode(cfg):

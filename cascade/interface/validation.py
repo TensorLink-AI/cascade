@@ -1,10 +1,14 @@
 """Schema + runtime checks for a submitted generator repo.
 
 Used by the miner CLI (``cascade verify``) and by the trainer before it
-imports and runs a generator in the sandbox. A submission MAY carry model
-weights (the generator can be a trained model behind ``generate()``), but only
-as **safetensors** — pickle-based checkpoints are rejected because loading them
-executes arbitrary code. The whole submission is size-capped (``max_repo_mb``).
+imports and runs a generator in the sandbox. Generators are **code-only**
+(purely algorithmic): a submission must NOT ship learned weights of any kind —
+neither pickle checkpoints (which execute arbitrary code on load) nor code-free
+containers like safetensors. This keeps the competition on the data-generating
+prior rather than on a large pretrained forecaster distilled into a "generator".
+``torch``/``gpytorch`` remain on the dependency allowlist as compute libraries
+for GP/kernel priors; only shipped weight *blobs* are rejected. The whole
+submission is size-capped (``max_repo_mb``).
 """
 
 from __future__ import annotations
@@ -14,18 +18,49 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# A generator HF repo must contain at least these files; it MAY additionally
-# ship safetensors weights (the generator can be a trained model).
+# A generator repo must contain at least these files. No weight files of any kind
+# may be shipped — generators are code-only (see the FORBIDDEN_* globs below).
 REQUIRED_FILES: tuple[str, ...] = (
     "config.json",
     "generator.py",
     "requirements.txt",
 )
 
-# Pickle-based weight globs that must NOT appear: loading them (torch.load et al.)
-# unpickles — i.e. runs arbitrary code from untrusted miner data. Ship weights as
-# ``*.safetensors`` instead, a safe code-free tensor container.
-FORBIDDEN_PICKLE_GLOBS: tuple[str, ...] = ("*.bin", "*.pt", "*.pth", "*.ckpt")
+# Two independently-justified blocklists, kept separate on purpose.
+#
+# 1. Pickle / code-execution formats. Loading these (``torch.load``,
+#    ``pickle.load``, ``numpy.load(allow_pickle=True)``, ``joblib.load``)
+#    UNPICKLES — i.e. runs arbitrary code from untrusted miner data. Forbidden
+#    forever, independent of the weights policy below: if shipped weights were
+#    ever re-allowed, these would still have to be rejected.
+FORBIDDEN_PICKLE_GLOBS: tuple[str, ...] = (
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.pkl",
+    "*.pickle",
+    "*.joblib",
+    "*.dill",
+)
+
+# 2. Code-free tensor / model containers. Forbidden under the code-only generator
+#    policy: cascade generators are PURELY ALGORITHMIC and compete on the
+#    data-generating prior, not on shipped learned weights (which would let a
+#    miner distill a large pretrained forecaster into the "generator"). Drop this
+#    set if shipped weights are ever re-allowed — the pickle set above must stay.
+#    ``.npy``/``.npz`` are here both as a weight-smuggling path and because
+#    ``numpy.load(allow_pickle=True)`` is itself a code-execution vector. The real
+#    backstop is ``max_repo_mb`` — extensions are enumerable-by-hand; the size cap
+#    is the wall.
+FORBIDDEN_WEIGHT_GLOBS: tuple[str, ...] = (
+    "*.safetensors",
+    "*.gguf",
+    "*.onnx",
+    "*.h5",
+    "*.npz",
+    "*.npy",
+)
 
 # requirements.txt line: ``pkg==1.2.3 --hash=sha256:abc...`` (one or more hash flags).
 _REQ_LINE = re.compile(
@@ -57,10 +92,11 @@ class ValidationResult:
 
 
 def check_repo_layout(repo_dir: Path | str) -> ValidationResult:
-    """Required files present and no pickle-based weight files.
+    """Required files present and no shipped weight files.
 
-    safetensors weights are allowed (a generator may be a trained model); only
-    pickle checkpoints are rejected. The size cap is :func:`check_repo_size`.
+    Generators are code-only (purely algorithmic): both pickle checkpoints and
+    code-free weight containers (safetensors, npy/npz, …) are rejected. The size
+    cap is :func:`check_repo_size`.
     """
     d = Path(repo_dir)
     if not d.is_dir():
@@ -71,6 +107,9 @@ def check_repo_layout(repo_dir: Path | str) -> ValidationResult:
     pickled = sorted({p.name for g in FORBIDDEN_PICKLE_GLOBS for p in d.rglob(g)})
     if pickled:
         return ValidationResult.fail("pickle_weights_forbidden", files=pickled)
+    weights = sorted({p.name for g in FORBIDDEN_WEIGHT_GLOBS for p in d.rglob(g)})
+    if weights:
+        return ValidationResult.fail("weight_files_forbidden", files=weights)
     return ValidationResult.pass_()
 
 
