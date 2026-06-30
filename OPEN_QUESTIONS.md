@@ -179,3 +179,63 @@ and digests stay valid.
 windows in the pool and a `BaseTrainer` that exercises Toto2's variate-axis
 attention. Until then the variate axis trains on `C = 1` (degenerate) and is
 effectively dormant.
+
+## 9. Warm-start base for entrenched kings
+
+**Question.** cascade trains both models from random init every round (#7),
+which is the controlled-experiment baseline. But once a king has defended the
+throne for a long stretch, re-deriving it from scratch each round is wasteful,
+and the contest keeps re-measuring "best from zero" instead of "whose data best
+improves the field's current best model." Should a long-reigning king's training
+warm-start from a persisted checkpoint, and if so, *which* checkpoint?
+
+**Default.** Throne logic is **unchanged** — king identity and dethroning remain
+the existing sticky paired KOTH on the private, rotating eval windows
+(`eval/koth.py`, `validator/state.py`); nothing here touches who is king or how
+rewards/weights are set. The change is narrow and lives in the *training
+contract*: when the reigning king's tenure exceeds `warm_start_after_days`
+(`0` = disabled; ships off), the round swaps random init for a persisted **base
+checkpoint**, and **both** the king's and the challenger's generators train from
+that *same* checkpoint. Shared init is preserved (now the checkpoint instead of
+random weights), shared `training_seed`/`generation_seed` and the fixed token
+budget are unchanged, so the controlled-experiment invariant — only the corpus
+differs — still holds; the contest now measures whose data best *continues to
+improve* the current base.
+
+The persisted base is the king's **best checkpoint by industry-standard
+benchmark score** (e.g. GIFT-Eval / Monash). Each round the king holds, the
+trainer scores its freshly-trained checkpoint on the pinned public benchmark
+suite and, if it beats the currently-persisted base's score, advances a single
+pointer to it. Checkpoints are immutable content-addressed `repo@digest`
+artifacts on the Hub, so "store the best, overwrite if beaten" is a *pointer*
+move — the old digests persist for audit, nothing is destroyed. A **public**
+benchmark is used here *on purpose*: unlike the throne eval (#6, private+rotating
+to resist overfit), base selection only chooses which of the king's *own*
+snapshots to warm-start from — it sets no reward — so an absolute, recognised,
+comparable yardstick is exactly right, and the weak indirect overfit pressure is
+acceptable because the throne is still decided by the rotating private pool. On
+dethrone the base resets: a fresh king trains from scratch again until it
+re-establishes `warm_start_after_days` of tenure, then its own best-by-benchmark
+snapshot becomes the new base.
+
+**Wiring.** `BaseTrainer.train` gains `init_from: Path | None` (`None` = today's
+random init). `TrainingManifest` gains a signed `base_checkpoint: str | None` —
+the trained pointer both entries were warmed from (`None` on cold rounds) —
+folded into `canonical_body()` and asserted equal for the king and challenger
+entries in the controlled-experiment gate alongside
+`contract_digest`/`base_arch_digest`. The trainer (the GPU component) scores
+checkpoints on the benchmark and maintains the persisted base pointer alongside
+`latest.json` in the manifest bucket; validators re-derive the score from the
+pinned checkpoint + public benchmark, so selection stays auditable under the
+existing signed-manifest trust model (#1) — and even a mis-selected base cannot
+steal the throne, it only yields a weaker warm start that the rotating-window
+KOTH would expose. Tenure is read from the same bookkeeping that drives the
+margin warmup (`koth.py::margin_for_tenure`, `validator/state.py`).
+
+**Flip point.** `chain.toml [training] warm_start_after_days` (trigger; `0`
+keeps pure from-scratch) and `[eval] checkpoint_benchmark` (which industry-std
+suite ranks the king's snapshots). Days-vs-rounds for the trigger mirrors #7's
+hours-vs-tokens trade: days is the operator-facing intent, enforced via a round
+count for reproducibility. Choosing "advance to the king's latest checkpoint"
+instead of "best by benchmark" would drop the benchmark dependency but lose the
+non-regression guarantee on the base.
