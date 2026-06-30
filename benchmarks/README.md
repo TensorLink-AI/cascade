@@ -48,10 +48,11 @@ uv run --project benchmarks cascade-benchmark CKPT out.json --suites gift-eval -
   override the full GIFT-Eval config list.
 - `BOOM` / `CASCADE_BENCH_BOOM_PATH` — path/HF repo for the `Datadog/BOOM`
   dataset; `CASCADE_BENCH_BOOM_DATASETS` to override its config list.
-- `CASCADE_BENCH_TIME_DATASETS` — **required to enable TIME.** The TIME harness
-  (arXiv:2602.12147) isn't pinned here yet, so the `time` suite reports
-  `skipped` until you add its loader and set this — see
-  `cascade_benchmark/suites/time_bench.py`.
+- `CASCADE_BENCH_TIME_DATASET` (or `TIME_DATASET`) — **required to enable TIME.**
+  Path to the [`Real-TSF/TIME`](https://huggingface.co/datasets/Real-TSF/TIME)
+  data. `CASCADE_BENCH_TIME_DATASETS` optionally restricts the `name/freq`
+  configs (default: all of TIME's bundled config). Without it the `time` suite
+  reports `skipped`.
 
 ## Output shape
 
@@ -70,10 +71,26 @@ uv run --project benchmarks cascade-benchmark CKPT out.json --suites gift-eval -
 the others, and a skipped/errored suite is logged as such rather than emitting a
 fabricated number.
 
+## How each suite plugs in
+
+- **GIFT-Eval / BOOM** — gluonts-interface, scored via gift-eval's `Dataset` +
+  `gluonts.model.evaluate_model` (shared loop in `suites/_common.py`). Both wrap
+  the checkpoint as a gluonts predictor (`predictor.py`).
+- **TIME** — *not* gluonts; mirrors TIME's own `experiments/chronos2.py`: build
+  `timebench.evaluation.data.Dataset`, feed quantile arrays (sample paths from
+  the wrapper reduced to TIME's 9-level grid) to `save_window_predictions`, and
+  read the resulting `metrics.npz` — TIME's own metric code, so numbers match the
+  [leaderboard](https://huggingface.co/spaces/Real-TSF/TIME-leaderboard).
+
 ## Status / TODO
 
-- GIFT-Eval & BOOM runners follow gift-eval's documented `Dataset` +
-  `gluonts.model.evaluate_model` interface. **Smoke-test once the env is built**
-  (`--max-series`) and adjust the dataset-list symbols (`ALL_DATASETS`,
-  `BOOM_DATASETS`) if the pinned gift-eval commit names them differently.
-- TIME is a clearly-marked stub pending confirmation of its public loader.
+**Smoke-test each suite once the env is built** (`--max-series 1`) — these
+runners are written against the upstream APIs but have not been executed end to
+end here. Likely adjustment points:
+
+- GIFT-Eval / BOOM: the dataset-list symbols (`ALL_DATASETS`, `BOOM_DATASETS`)
+  and metric column names in `_common.py` may differ in the pinned gift-eval
+  commit — pass explicit `CASCADE_BENCH_*_DATASETS` to sidestep enumeration.
+- TIME: confirm the `metrics.npz` keys land under expected metric names (the
+  runner averages *every* array it finds, so it's robust to naming) and that
+  `Dataset(...).test_data.input` matches the installed `timebench` version.

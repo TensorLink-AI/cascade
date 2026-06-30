@@ -39,6 +39,8 @@ def _iter_datasets(max_series: int | None):
 
         specs = list(BOOM_DATASETS)
 
+    if max_series:
+        specs = specs[:max_series]  # smoke-run cap on number of configs
     for spec in specs:
         name, _, term = spec.partition("/")
         kwargs = {"name": name, "to_univariate": False, "storage_env_var": "BOOM"}

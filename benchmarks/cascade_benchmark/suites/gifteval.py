@@ -29,6 +29,8 @@ def _iter_datasets(max_series: int | None):
 
         specs = list(ALL_DATASETS)
 
+    if max_series:
+        specs = specs[:max_series]  # smoke-run cap on number of configs
     for spec in specs:
         name, _, term = spec.partition("/")
         kwargs = {"name": name, "to_univariate": False}

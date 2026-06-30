@@ -37,7 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-series",
         type=int,
         default=0,
-        help="cap series per dataset for a fast smoke run (0 = full benchmark)",
+        help="cap the number of datasets/tasks evaluated, for a fast smoke run "
+        "(0 = full benchmark)",
     )
     p.add_argument("--device", default="cpu")
     args = p.parse_args(argv)
