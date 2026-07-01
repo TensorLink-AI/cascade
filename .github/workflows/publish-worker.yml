@@ -1,0 +1,86 @@
+name: Publish cascade-worker image
+
+# Builds the trainer-worker data-plane image (deploy/Dockerfile) and publishes it
+# to GHCR under this repo's org: ghcr.io/<owner>/cascade-worker.
+#
+# The image is pinned by DIGEST downstream (deploy/provision.py --image
+# ...@sha256:...) — the digest is part of the reproducibility contract alongside
+# [training] expected_gpu, so the job prints it to the run summary.
+#
+# Trigger by pushing a tag like `worker-v0.1.0`, or run manually.
+
+on:
+  push:
+    tags:
+      - "worker-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra image tag to apply (e.g. v0.1.0). The immutable sha- tag is always applied."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write        # required to push to GHCR with GITHUB_TOKEN
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the image name, so a mixed-case org
+          # (e.g. TensorLink-AI) still yields a valid ghcr.io reference.
+          images: ghcr.io/${{ github.repository_owner }}/cascade-worker
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+
+      - name: Build & push (linux/amd64 — GPU pods are amd64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false        # single-arch manifest → a clean, pinnable digest
+
+      - name: Report digest
+        run: |
+          {
+            echo "### cascade-worker published to GHCR"
+            echo ""
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Pin pods to the digest (not a tag):"
+            echo '```'
+            echo "python deploy/provision.py \\"
+            echo "  --image ghcr.io/${{ github.repository_owner }}/cascade-worker@${{ steps.build.outputs.digest }} \\"
+            echo "  --ssh-pubkey ~/.ssh/orchestrator.pub --sku L40S --count 2"
+            echo '```'
+            echo ""
+            echo "Tags pushed:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
