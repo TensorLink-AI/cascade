@@ -270,3 +270,15 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.testnet.db"
+
+[wandb]
+# Optional LIVE training dashboards (Weights & Biases). Observability only — the
+# numbers here NEVER feed scoring or weights, and held-out eval scores are not
+# sent. When enabled, the trainer mirrors its per-step S3 log into a wandb run
+# (one per round/competitor/size, tagged with the miner hotkey) so miners can
+# watch their generator train as it occurs. Requires the [wandb] extra; the
+# WANDB_API_KEY comes from the environment, never this committed file.
+enabled = true                  # testnet: on so miners can watch live
+project = "cascade-testnet"     # PUBLIC wandb project for miners to view
+entity  = ""                    # wandb team/user (empty = the API key's default)
+mode    = "online"              # online | offline | disabled

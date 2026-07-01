@@ -366,6 +366,27 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class WandbConfig:
+    """Optional Weights & Biases logging for the reference trainer.
+
+    Observability only — wandb numbers never feed scoring or weights. When
+    ``enabled`` (and the ``wandb`` package + ``WANDB_API_KEY`` are present, for
+    ``mode = "online"``), the trainer mirrors the same per-step records it streams
+    to the Hippius S3 log into a **live** wandb run, one run per ``(round,
+    competitor, size)`` tagged with the miner hotkey/uid. Point
+    ``project``/``entity`` at a PUBLIC wandb project so miners can watch their
+    generator train as it occurs. Credentials come from the environment
+    (``WANDB_API_KEY``), never this committed file. Defaults keep old toml
+    loading (the whole ``[wandb]`` section is optional).
+    """
+
+    enabled: bool = False
+    project: str = "cascade"
+    entity: str = ""
+    mode: str = "online"   # online | offline | disabled
+
+
+@dataclass(frozen=True)
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
     them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
@@ -397,6 +418,7 @@ class ChainConfig:
     storage: StorageConfig
     manifest: ManifestConfig
     validator: ValidatorConfig
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -519,6 +541,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     m = raw["manifest"]
     v = raw["validator"]
     r = raw.get("round", {})
+    wb = raw.get("wandb", {})
 
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
@@ -645,6 +668,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             poll_seconds=int(v["poll_seconds"]),
             hf_cache_seconds=int(v["hf_cache_seconds"]),
             state_db_path=str(v["state_db_path"]),
+        ),
+        wandb=WandbConfig(
+            enabled=bool(wb.get("enabled", False)),
+            project=str(wb.get("project", "cascade")),
+            entity=str(wb.get("entity", "")),
+            mode=str(wb.get("mode", "online")),
         ),
         raw=raw,
     )

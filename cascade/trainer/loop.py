@@ -48,6 +48,7 @@ from ..shared.manifest import (
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult
 from .stream import open_round_stream
+from .wandb_sink import open_wandb_run
 
 # Screens one heat checkpoint: given the trained heat-model directory, the
 # generator that produced its corpus, and the round's base seed (so the screening
@@ -236,7 +237,18 @@ class TrainerRunner:
             sink = LogSink(self.logs_store(), round_id=str(seeds.base_seed), role=log_role)
         except Exception as e:  # noqa: BLE001
             log.warning("log sink unavailable (continuing without S3 logs): %s", e)
-        logger = sink.emit if sink is not None else None
+        # Optional live wandb mirror (observability only — the same per-step
+        # records, so miners can watch this run train as it occurs). Best-effort:
+        # disabled/unavailable ⇒ None, and every wandb call swallows its errors.
+        wandb_sink = open_wandb_run(
+            self.cfg.wandb,
+            round_id=str(seeds.base_seed), role=log_role,
+            hotkey=gen.hotkey, uid=gen.uid, size=contract.arch_preset,
+            config={"corpus_mode": contract.corpus_mode, "token_budget": token_budget,
+                    "contract_digest": contract_digest(contract)},
+        )
+        emitters = [s for s in (sink, wandb_sink) if s is not None]
+        logger = (lambda record: [s.emit(record) for s in emitters]) if emitters else None
 
         with open_round_stream(
             contract.corpus_mode,
@@ -255,14 +267,18 @@ class TrainerRunner:
             )
             corpus_digest, n_series, total_points = rs.digest, rs.n_series, rs.total_points
 
+        summary = {"event": "summary", "role": log_role, "corpus_digest": corpus_digest,
+                   "n_series": n_series, "total_points": total_points,
+                   "train_seconds": result.train_seconds, **result.metrics}
+        for s in emitters:
+            s.emit(summary)
         if sink is not None:
-            sink.emit({"event": "summary", "role": log_role, "corpus_digest": corpus_digest,
-                       "n_series": n_series, "total_points": total_points,
-                       "train_seconds": result.train_seconds, **result.metrics})
             try:
                 sink.flush()
             except Exception as e:  # noqa: BLE001
                 log.warning("failed to flush S3 training logs: %s", e)
+        if wandb_sink is not None:
+            wandb_sink.finish()
 
         log.info(
             "round=%s run=%s hotkey=%s mode=%s n=%d points=%d digest=%s",

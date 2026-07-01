@@ -34,6 +34,12 @@ dev = [
     "hypothesis>=6.100",
     "ruff>=0.5",
 ]
+# Optional live training dashboards (Weights & Biases). Observability only —
+# the trainer mirrors its per-step S3 log into a wandb run so miners can watch
+# training as it occurs. Off unless [wandb] enabled = true in chain.toml.
+wandb = [
+    "wandb>=0.17",
+]
 chain = [
     # Bittensor stack pulled in only where needed (validator, trainer, miner CLI).
     "bittensor>=8.0",

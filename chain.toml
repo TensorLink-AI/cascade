@@ -286,3 +286,18 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.db"
+
+[wandb]
+# Optional LIVE training dashboards (Weights & Biases). Observability only — the
+# numbers here NEVER feed scoring or weights, and the held-out eval scores are
+# deliberately not sent (that stays the validator's private, rotating concern).
+# When enabled, the trainer mirrors the same per-step records it streams to the
+# S3 log ([storage] logs_bucket) into a wandb run — one run per (round,
+# competitor, size), tagged with the miner hotkey/uid — so a miner can watch
+# their generator train AS IT OCCURS by filtering the (public) project to their
+# hotkey. Requires the [wandb] extra (pip install cascade[wandb]). Credentials
+# come from the environment (WANDB_API_KEY), never this committed file.
+enabled = false                 # set true to turn on live wandb logging
+project = "cascade"             # wandb project; make it PUBLIC for miners to view
+entity  = ""                    # wandb team/user (empty = the API key's default)
+mode    = "online"              # online | offline | disabled

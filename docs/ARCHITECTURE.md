@@ -70,7 +70,10 @@ per epoch (so the king is trained once per day). Each round:
      `cascade.trainer.toto2_trainer`) — it pulls series until the stream ends, for
      the per-size budget (~3h on the reference GPU, enforced as a fixed
      `train_tokens` count so king and challenger get identical compute), streaming
-     per-step metrics (loss, lr, throughput) to **Hippius S3**,
+     per-step metrics (loss, lr, throughput) to **Hippius S3** (and, when
+     `[wandb] enabled`, mirroring the *same* records into a live wandb run — one
+     per round/competitor/size, tagged with the miner hotkey — so miners can watch
+     their generator train as it occurs; observability only, never fed to scoring),
    - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
      size-tagged ref.
 6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref
