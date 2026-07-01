@@ -44,7 +44,7 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # integers and base_arch_digest to that checkpoint's config.json before launch.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
+base_arch_digest   = "5789406f068d685426569ed9ac09937899e518ebd136243c3506acdbd1b5d1b7"  # recomputed for the new arch code (`cascade-trainer --offline`)
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -67,7 +67,7 @@ horizon            = 64
 # compute regardless of data-dependent throughput — a raw 3h timer would let a
 # generator win by emitting cheap-to-step data instead of better data, and would
 # not reproduce on a re-derived audit run. max_train_seconds is the hard guard.
-target_train_hours          = 0.5      # TESTNET: 30-min budget per model (mainnet template = 3.0)
+target_train_hours          = 0.25     # TESTNET: 15-min final budget per model (shorter; mainnet template = 3.0)
 ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes the budget
                                         # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
 warmup_fraction             = 0.05
@@ -125,11 +125,12 @@ expected_gpu = ""
 # epoch so rounds turn over quickly for iteration; mainnet template = 7200 (~24h).
 # The base seed is the block hash at the epoch boundary, so the whole epoch shares
 # one RoundSeeds; only commits before the boundary are eligible (the deadline).
-epoch_blocks     = 300    # ~1h at 12s blocks (mainnet template = 7200 ≈ 24h)
-round_hours      = 1.0    # informational
+epoch_blocks     = 900    # ~3h at 12s blocks (mainnet template = 7200 ≈ 24h)
+round_hours      = 3.0    # informational
 heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
 finalists        = 1      # challengers promoted from the heat to the final
+one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 # Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
 # throne_sizes. Both default to the 4M primary; point them at a bigger size to
 # promote a rung. To test the sliding window on testnet, uncomment the 22M size
@@ -145,13 +146,10 @@ throne_sizes = ["toto2-4m"]
 eval_dataset   = "cascade-private-v1"  # identifier the validator matches on
 eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
 window_pool    = ""                       # set out-of-band (not committed): the testnet eval-pool
-                                          # Hub/hf ref. Build with `cascade-pool build` (see docs/EVAL_POOL.md).
-                                          # (.npy/.npz series + optional metadata.json). Build,
-                                          # push, and get the ref to pin here with:
-                                          #   cascade-pool build --out ./pool --upload
-                                          # (see docs/EVAL_POOL.md and cascade.pool).
-num_samples    = 100             # sample forecasts drawn per window
-n_windows      = 2000            # eval windows drawn per round from the pool
+                                          # Hub/hf ref (also lets the trainer heat-screener load).
+                                          # Build with `cascade-pool build` (see docs/EVAL_POOL.md).
+num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
+n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
