@@ -208,3 +208,51 @@ def test_one_submission_per_hotkey_off_recompetes(cfg, tmp_path, monkeypatch):
     m1 = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
     m2 = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
     assert m1.entries_for_role("challenger") and m2.entries_for_role("challenger")  # re-competes
+
+
+def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
+    # With remote_hosts set, the HEAT trains on the pod (dispatch) — not locally —
+    # at the cheap heat budget + a per-challenger repo, then screens the fetched
+    # checkpoints. Proves the wallet-safe split can run the heat on remote GPUs.
+    from dataclasses import replace
+
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+    import cascade.trainer.remote as remote_mod
+
+    _patch_train_boundaries(monkeypatch)  # patches fetch_from_hub → returns dest
+    dispatched = []
+
+    class _FakeDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            dispatched.append({"hotkey": hotkey, "role": role, "arch_preset": arch_preset,
+                               "train_hours": train_hours, "repo_suffix": repo_suffix})
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]  # 'c' is best
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[object()], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    # the 3 challengers were heat-trained on the pod at the cheap budget + unique repos
+    heat = [d for d in dispatched if d["train_hours"] is not None]
+    assert len(heat) == 3
+    assert all(d["train_hours"] == cfg.round.heat_train_hours for d in heat)
+    assert sorted(d["repo_suffix"] for d in heat) == ["-heat-u1", "-heat-u2", "-heat-u3"]
+    # heat winner ('c') promoted; the final dispatch carries no heat overrides
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+    assert any(d["role"] == "king" and d["train_hours"] is None for d in dispatched)

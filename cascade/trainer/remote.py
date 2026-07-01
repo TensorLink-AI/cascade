@@ -122,12 +122,16 @@ def worker_argv(
     block: int,
     trainer_spec: str,
     arch_preset: str | None = None,
+    train_hours: float | None = None,
+    repo_suffix: str = "",
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
     ``arch_preset`` pins which configured size the pod trains (the primary size
     or one of ``[[training.sizes]]``); omitted ⇒ the worker trains the primary
-    size, preserving single-size behaviour."""
+    size, preserving single-size behaviour. ``train_hours`` overrides the compute
+    budget (a cheap heat screen); ``repo_suffix`` disambiguates the checkpoint
+    repo so parallel same-size runs (heat challengers) don't collide."""
     argv = [
         host.remote_python, "-m", "cascade.trainer.worker",
         "--gen-ref", gen_ref,
@@ -140,6 +144,12 @@ def worker_argv(
     ]
     if arch_preset:
         argv += ["--arch-preset", arch_preset]
+    if train_hours is not None:
+        argv += ["--train-hours", repr(float(train_hours))]
+    if repo_suffix:
+        # `=` form: the suffix starts with '-' (e.g. -heat-u3), which argparse
+        # would otherwise mistake for a flag.
+        argv.append(f"--repo-suffix={repo_suffix}")
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -226,13 +236,15 @@ class RemoteDispatcher:
         base_seed: int,
         block: int,
         arch_preset: str | None = None,
+        train_hours: float | None = None,
+        repo_suffix: str = "",
     ) -> TrainedEntry:
         import os
 
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
-            arch_preset=arch_preset,
+            arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
         )
         env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
         remote_cmd = build_remote_command(host, argv, env)

@@ -55,6 +55,23 @@ def test_worker_argv_has_required_flags():
                       ("--role", "challenger"), ("--base-seed", "99"), ("--block", "12"),
                       ("--trainer", "m:C"), ("--chain-toml", "/r/chain.toml")]:
         assert val == argv[argv.index(flag) + 1]
+    # no heat overrides by default (final training uses the full config budget/repo)
+    assert "--train-hours" not in argv and "--repo-suffix" not in argv
+
+
+def test_worker_argv_heat_overrides_budget_and_repo():
+    # A heat dispatch pins the cheap budget + a per-challenger repo suffix so
+    # concurrent same-size heat runs don't overwrite each other's checkpoint.
+    argv = worker_argv(
+        _host(remote_python="/venv/python"),
+        gen_ref=REF_A, uid=5, hotkey="hkX", role="challenger",
+        base_seed=99, block=12, trainer_spec="m:C",
+        arch_preset="toto2-4m", train_hours=0.02, repo_suffix="-heat-u5",
+    )
+    assert float(argv[argv.index("--train-hours") + 1]) == 0.02
+    # `=` form so the leading-dash suffix isn't parsed as a flag
+    assert "--repo-suffix=-heat-u5" in argv
+    assert argv[argv.index("--arch-preset") + 1] == "toto2-4m"
 
 
 def test_build_remote_command_sets_cd_cuda_and_env():

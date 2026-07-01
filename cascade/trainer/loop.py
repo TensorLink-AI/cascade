@@ -45,6 +45,7 @@ from ..shared.manifest import (
     contract_digest,
     dump_manifest,
     format_trained_pointer,
+    parse_trained_pointer,
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult
@@ -349,15 +350,18 @@ class TrainerRunner:
         *,
         contract: TrainingContractConfig | None = None,
         token_budget: int | None = None,
+        repo_suffix: str = "",
     ) -> TrainedEntry:
-        """Train one generator at one size for the FINAL stage, upload its
-        checkpoint, and return the receipt.
+        """Train one generator at one size, upload its checkpoint, return the receipt.
 
         ``contract`` defaults to the primary (smallest) size; ``token_budget`` to
-        that size's full ``train_tokens``. The checkpoint is uploaded to a
-        size-tagged registry repo (``ckpt-r<seed>-<role>-<size>``) and the entry
-        carries the ``size`` tag so the validator can pair king and challenger
-        per size before combining their scores.
+        that size's full ``train_tokens`` (pass a cheaper budget for a heat screen).
+        The checkpoint is uploaded to a size-tagged registry repo
+        (``ckpt-r<seed>-<role>-<size><repo_suffix>``) and the entry carries the
+        ``size`` tag so the validator can pair king and challenger per size before
+        combining their scores. ``repo_suffix`` disambiguates otherwise-identical
+        repos (same seed/role/size) so parallel runs — several heat challengers, or
+        finalists>1 at one size — never overwrite each other's checkpoint.
 
         Raises on any failure; the caller decides whether a failed challenger
         simply doesn't qualify (it does) or a failed king aborts the round (it
@@ -366,12 +370,12 @@ class TrainerRunner:
         contract = contract if contract is not None else self.cfg.training.primary_size
         token_budget = token_budget if token_budget is not None else contract.train_tokens
         size = contract.arch_preset
-        out_dir = self.work_root / f"{seeds.base_seed}" / size / role / "checkpoint"
+        out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
         result, corpus_digest, _, _ = self._train_checkpoint(
             gen, seeds, contract, token_budget, out_dir, log_role=f"{role}-{size}",
         )
 
-        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}"
+        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
         up = upload_dir_to_hub(result.local_dir, ckpt_repo, self.hub())
         return TrainedEntry(
             miner_hotkey=gen.hotkey,
@@ -463,14 +467,11 @@ class TrainerRunner:
 
         heat_contract = self.cfg.screen_contract()
         heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
+        trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
         scored: list[tuple[float, int, ResolvedGenerator]] = []
-        for c in challengers:
-            out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
+        for c, ckpt_dir in trained:
             try:
-                result, *_ = self._train_checkpoint(
-                    c, seeds, heat_contract, heat_tokens, out_dir, log_role=f"heat-{c.hotkey}",
-                )
-                score = float(self.screen_fn(result.local_dir, c, seeds.base_seed))
+                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed))
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
@@ -482,6 +483,86 @@ class TrainerRunner:
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
         return winners
+
+    def _heat_train(
+        self,
+        challengers: list[ResolvedGenerator],
+        seeds: RoundSeeds,
+        block: int,
+        heat_contract: TrainingContractConfig,
+        heat_tokens: int,
+    ) -> list[tuple[ResolvedGenerator, Path]]:
+        """Train each heat challenger, returning ``[(challenger, local_ckpt_dir)]``
+        for the ones that trained. Dispatches to ``remote_hosts`` (GPU pods) when
+        configured — the pod trains at the cheap heat budget and the checkpoint is
+        fetched back for local screening, so the orchestrator (with the wallet)
+        never needs a GPU — else trains locally. A failed train drops that
+        challenger (it just doesn't qualify)."""
+        if self.remote_hosts:
+            return self._heat_train_remote(challengers, seeds, block, heat_contract)
+        out: list[tuple[ResolvedGenerator, Path]] = []
+        for c in challengers:
+            out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
+            try:
+                result, *_ = self._train_checkpoint(
+                    c, seeds, heat_contract, heat_tokens, out_dir, log_role=f"heat-{c.hotkey}",
+                )
+                out.append((c, result.local_dir))
+            except Exception as e:  # noqa: BLE001
+                log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
+        return out
+
+    def _heat_train_remote(
+        self,
+        challengers: list[ResolvedGenerator],
+        seeds: RoundSeeds,
+        block: int,
+        heat_contract: TrainingContractConfig,
+    ) -> list[tuple[ResolvedGenerator, Path]]:
+        """Screen-train the field on the GPU pods: dispatch each challenger to a
+        host (round-robin across ``remote_hosts``, in parallel), training at the
+        cheap ``[round] heat_train_hours`` on the screen size, then fetch each
+        checkpoint back for local screening. Each pushes to a per-challenger repo
+        so concurrent heat runs never collide. A challenger that fails to train or
+        fetch is dropped."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from .remote import RemoteDispatcher
+
+        if not self.trainer_spec:
+            raise RuntimeError("remote heat requires trainer_spec (BaseTrainer 'module:Class')")
+        hosts = self.remote_hosts
+        hub = self.hub()  # pre-init (thread-safe) before the pool
+        disp = RemoteDispatcher(
+            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
+        )
+
+        def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path]:
+            host = hosts[i % len(hosts)]
+            entry = disp.dispatch(
+                host, gen_ref=c.ref, uid=c.uid, hotkey=c.hotkey, role="challenger",
+                base_seed=seeds.base_seed, block=block,
+                arch_preset=heat_contract.arch_preset,
+                train_hours=self.cfg.round.heat_train_hours,
+                repo_suffix=f"-heat-u{c.uid}",
+            )
+            ref = parse_trained_pointer(entry.trained_pointer)
+            if ref is None:
+                raise RuntimeError(f"malformed trained_pointer: {entry.trained_pointer!r}")
+            out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
+            fetch_from_hub(ref, out_dir, hub)
+            return c, out_dir
+
+        out: list[tuple[ResolvedGenerator, Path]] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
+            futs = {ex.submit(_run, i, c): c for i, c in enumerate(challengers)}
+            for fut in as_completed(futs):
+                c = futs[fut]
+                try:
+                    out.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
+        return out
 
     def _train_final(
         self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int

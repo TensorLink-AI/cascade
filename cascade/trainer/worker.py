@@ -45,6 +45,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trainer", required=True, help="BaseTrainer as 'module:Class'.")
     p.add_argument("--arch-preset", default=None,
                    help="Size to train (primary if omitted, or a [[training.sizes]] arch_preset).")
+    p.add_argument("--train-hours", type=float, default=None,
+                   help="Override the training budget in hours (e.g. a cheap heat screen at "
+                        "[round] heat_train_hours). Omitted ⇒ the size's full [training] budget.")
+    p.add_argument("--repo-suffix", default="",
+                   help="Suffix on the checkpoint repo (ckpt-r<seed>-<role>-<size><suffix>) so "
+                        "parallel runs at one size — heat challengers, finalists>1 — don't collide.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -79,9 +85,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         contract = cfg.training.for_size(match)
 
+    token_budget = (
+        contract.tokens_for_hours(args.train_hours)
+        if args.train_hours is not None else contract.train_tokens
+    )
     try:
         entry = runner.train_one(gen, args.role, seeds, args.block,
-                                 contract=contract, token_budget=contract.train_tokens)
+                                 contract=contract, token_budget=token_budget,
+                                 repo_suffix=args.repo_suffix)
     except Exception as e:  # noqa: BLE001 — report failure on stderr, nonzero exit
         log.exception("worker training failed: %s", e)
         return 1
