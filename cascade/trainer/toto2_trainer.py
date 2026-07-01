@@ -358,6 +358,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -367,6 +368,10 @@ import torch
 def _load_model_module(d: Path):
     spec = importlib.util.spec_from_file_location("cascade_ckpt_model", d / "model.py")
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec: model.py defines an @dataclass, and the dataclass
+    # machinery does sys.modules.get(cls.__module__).__dict__ during class
+    # creation — which is None (AttributeError) unless the module is registered.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
