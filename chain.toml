@@ -133,6 +133,12 @@ round_hours      = 24.0   # informational: wall-clock span of an epoch
 heat_train_hours = 0.5    # cheap screening budget per competitor (on screen_size)
 heat_n_windows   = 256    # eval windows the heat screens on (cheaper than the final's n_windows)
 finalists        = 1      # challengers promoted from the heat to the 3h final (top-N)
+# Anti-spam: 1 hotkey = 1 submission for the lifetime of the trainer state. A
+# challenger hotkey that has entered a heat is burned (persisted); it must
+# re-register (new UID, paying the cost) to resubmit — so a miner can't cheaply
+# re-roll a generator against the throne. Set false only on a throwaway testnet.
+one_submission_per_hotkey = true
+# submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Scaling seam: which size the heat screens at, and which size(s) the final trains
 # + the throne is judged on. Both are arch_preset names from the size registry
 # ([training] primary + any [[training.sizes]]). At launch both are the 4M primary

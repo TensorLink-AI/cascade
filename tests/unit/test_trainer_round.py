@@ -181,3 +181,30 @@ def test_resolve_commitments_cutoff_is_strict_and_latest_eligible_wins():
     assert resolved == {"a": REF_A, "b": REF_B}  # late re-deploy ignored; pre-cutoff ref kept
     # exactly-at-boundary is excluded (strict <)
     assert all(r.hotkey != "x" for r in resolve_commitments([_commit(9, "x", REF_D, 50)], cutoff_block=50))
+
+
+def test_one_submission_per_hotkey_burns_challenger(cfg, tmp_path, monkeypatch):
+    # chain.toml ships one_submission_per_hotkey = true: a challenger that competes
+    # in one round is burned (persisted under work_root) and skipped in the next.
+    _patch_train_boundaries(monkeypatch)
+    assert cfg.round.one_submission_per_hotkey is True
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    m1 = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert m1.entries_for_role("challenger")  # 'b' competed this round
+    # Same field next epoch ⇒ 'b' already used its one submission ⇒ king-only round.
+    m2 = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
+    assert m2.entries_for_role("challenger") == []
+
+
+def test_one_submission_per_hotkey_off_recompetes(cfg, tmp_path, monkeypatch):
+    from dataclasses import replace
+    _patch_train_boundaries(monkeypatch)
+    cfg = replace(cfg, round=replace(cfg.round, one_submission_per_hotkey=False))
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    m1 = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    m2 = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
+    assert m1.entries_for_role("challenger") and m2.entries_for_role("challenger")  # re-competes

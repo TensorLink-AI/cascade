@@ -20,6 +20,7 @@ Hippius; the GPU / registry / S3 / chain calls are isolated in
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -59,6 +60,26 @@ from .wandb_sink import open_wandb_run
 ScreenFn = Callable[[Path, "ResolvedGenerator", int], float]
 
 log = logging.getLogger("cascade.trainer")
+
+
+def _load_seen_hotkeys(path: Path) -> set[str]:
+    """Load the persisted 1-hotkey-1-submission burn set (best-effort)."""
+    try:
+        return {str(h) for h in json.loads(path.read_text(encoding="utf-8"))}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:  # noqa: BLE001
+        log.warning("submissions db %s unreadable (%s); starting from empty", path, e)
+        return set()
+
+
+def _save_seen_hotkeys(path: Path, seen: set[str]) -> None:
+    """Persist the burn set (best-effort — anti-spam must never abort a round)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist submissions db to %s: %s", path, e)
 
 
 @dataclass(frozen=True)
@@ -197,6 +218,38 @@ class TrainerRunner:
                 S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.logs_bucket)
             )
         return self._logs_store
+
+    # ── anti-spam: 1 hotkey = 1 submission (lifetime) ────────────────────────
+
+    def _submissions_path(self) -> Path:
+        """Where the burn set is persisted. A relative ``submissions_db_path`` is
+        resolved under ``work_root`` (a stable per-deployment dir; per-test tmp)."""
+        p = Path(self.cfg.round.submissions_db_path)
+        return p if p.is_absolute() else (self.work_root / p)
+
+    def _burn_and_filter_challengers(
+        self, challengers: list[ResolvedGenerator]
+    ) -> list[ResolvedGenerator]:
+        """Drop challengers whose hotkey already used its one submission, and burn
+        the survivors so they can never be screened again without re-registering.
+
+        No-op when ``[round] one_submission_per_hotkey`` is False (testnet). The
+        burn happens at heat entry (mirroring the old queue's enqueue-time burn):
+        a hotkey gets exactly one shot at the throne per registration. The king is
+        never here (``plan_round`` separates it), so the incumbent is exempt.
+        """
+        if not self.cfg.round.one_submission_per_hotkey:
+            return challengers
+        path = self._submissions_path()
+        seen = _load_seen_hotkeys(path)
+        fresh = [c for c in challengers if c.hotkey not in seen]
+        for c in challengers:
+            if c.hotkey in seen:
+                log.info("skipping challenger %s: hotkey already used its 1 submission "
+                         "(re-register to resubmit)", c.hotkey)
+        if fresh:
+            _save_seen_hotkeys(path, seen | {c.hotkey for c in fresh})
+        return fresh
 
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
@@ -368,7 +421,8 @@ class TrainerRunner:
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
 
-        finalists = self._run_heat(plan.challengers, seeds, block)
+        eligible = self._burn_and_filter_challengers(plan.challengers)
+        finalists = self._run_heat(eligible, seeds, block)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 

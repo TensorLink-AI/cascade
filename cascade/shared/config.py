@@ -276,6 +276,15 @@ class RoundConfig:
     finalists: int = 1                # challengers promoted from the heat to the final
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
+    # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
+    # already entered a round's heat is never screened again — it must re-register
+    # (a new UID, paying the registration cost) to resubmit, so a miner cannot
+    # cheaply re-roll a generator against the throne. The trainer enforces it and
+    # persists the burn set at ``submissions_db_path`` (resolved under the
+    # trainer's ``work_root`` when relative). Off ⇒ a hotkey re-competes every
+    # epoch — handy for testnet iteration; keep ON for mainnet.
+    one_submission_per_hotkey: bool = True
+    submissions_db_path: str = "trainer_submissions.json"
 
 
 @dataclass(frozen=True)
@@ -615,6 +624,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             finalists=int(r.get("finalists", 1)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
+            one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
+            submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),
