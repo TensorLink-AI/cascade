@@ -34,6 +34,11 @@ dev = [
     "hypothesis>=6.100",
     "ruff>=0.5",
 ]
+# Ephemeral GPU-pod provisioner (deploy/provision.py). Shells out to the `lium`
+# CLI (installed separately) and calls the Shadeform REST API via requests.
+deploy = [
+    "requests>=2.31",
+]
 # Optional live training dashboards (Weights & Biases). Observability only —
 # the trainer mirrors its per-step S3 log into a wandb run so miners can watch
 # training as it occurs. Off unless [wandb] enabled = true in chain.toml.

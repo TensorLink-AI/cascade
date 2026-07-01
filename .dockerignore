@@ -1,0 +1,33 @@
+# Build-context excludes for deploy/Dockerfile (COPY . /root/cascade).
+# Keep the image lean AND keep secrets out — the worker image bakes NO secrets.
+
+# VCS / CI
+.git
+.github
+
+# Python environments & caches (rebuilt in-image via uv)
+.venv
+venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Secrets — MUST never land in the image
+.env
+*.env
+!*.env.example
+
+# Generated pools / caches / work dirs (large, not needed by the worker)
+_pool_real/
+_vpool_cache/
+_eval_pool/
+_train_work/
+
+# Local state, scratch, logs
+*.db
+*.log
+
+# Editor / OS
+.DS_Store
