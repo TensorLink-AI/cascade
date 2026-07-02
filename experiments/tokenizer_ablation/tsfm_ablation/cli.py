@@ -30,6 +30,25 @@ def _add_storage_args(p):
                    help="GIFT-Eval dataset cache (default: $TSFM_GIFT_DIR or ./gifteval_data)")
 
 
+def _load_run(arm, seed, ckpt_dir):
+    """Load a finished run's final checkpoint. Returns (model, cfg)."""
+    import os
+
+    import torch
+
+    from .device import DEVICE
+    from .model import MiniTSFM2
+    from .train import run_dir
+    cfg = make_arm(arm, seed)
+    latest = os.path.join(run_dir(cfg, ckpt_dir), "latest.pt")
+    if not os.path.exists(latest):
+        raise SystemExit(f"no checkpoint at {latest} — train this arm/seed first")
+    model = MiniTSFM2(cfg).to(DEVICE)
+    model.load_state_dict(torch.load(latest, map_location=DEVICE,
+                                     weights_only=False)["model"])
+    return model, cfg
+
+
 def _apply_overrides(cfg, args):
     for attr in ("steps", "batch", "n_variates"):
         val = getattr(args, attr, None)
@@ -84,6 +103,19 @@ def build_parser():
     _add_storage_args(p)
     p.add_argument("--arm", required=True, choices=ARMS)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--full", action="store_true",
+                   help="run the full 97-config leaderboard (default: 14-task dev subset)")
+
+    # -- time --------------------------------------------------------------
+    p = sub.add_parser("time", help="TIME-benchmark a finished run's final checkpoint")
+    _add_storage_args(p)
+    p.add_argument("--arm", required=True, choices=ARMS)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--time-dir", default=None,
+                   help="Real-TSF/TIME dataset path (default: $TSFM_TIME_DIR)")
+    p.add_argument("--datasets", nargs="+", default=None,
+                   help="restrict to these name or name/term specs (default: all)")
+    p.add_argument("--max-tasks", type=int, default=None, help="cap tasks for a smoke run")
 
     # -- aggregate ---------------------------------------------------------
     p = sub.add_parser("aggregate", help="print the cross-run aggregate table")
@@ -132,22 +164,17 @@ def main(argv=None):
         return
 
     if args.cmd == "eval":
-        import os
+        from .gift_eval import eval_gift_dev, eval_gift_full
+        model, cfg = _load_run(args.arm, args.seed, ckpt_dir)
+        run = eval_gift_full if args.full else eval_gift_dev
+        run(model, gift_dir, tag=f"{cfg.run_name}@final")
+        return
 
-        import torch
-
-        from .device import DEVICE
-        from .gift_eval import eval_gift_dev
-        from .model import MiniTSFM2
-        from .train import run_dir
-        cfg = make_arm(args.arm, args.seed)
-        latest = os.path.join(run_dir(cfg, ckpt_dir), "latest.pt")
-        if not os.path.exists(latest):
-            raise SystemExit(f"no checkpoint at {latest} — train this arm/seed first")
-        model = MiniTSFM2(cfg).to(DEVICE)
-        model.load_state_dict(torch.load(latest, map_location=DEVICE,
-                                         weights_only=False)["model"])
-        eval_gift_dev(model, gift_dir, tag=f"{cfg.run_name}@final")
+    if args.cmd == "time":
+        from .time_eval import eval_time
+        model, cfg = _load_run(args.arm, args.seed, ckpt_dir)
+        eval_time(model, time_dir=args.time_dir, datasets=args.datasets,
+                  max_tasks=args.max_tasks)
         return
 
     if args.cmd == "aggregate":

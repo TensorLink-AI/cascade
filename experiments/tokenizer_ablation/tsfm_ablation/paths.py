@@ -7,6 +7,8 @@ runs on a GPU pod, a /data mount, or a laptop:
   mount if present, else ./tsfm_ckpts).
 * ``TSFM_GIFT_DIR`` — GIFT-Eval dataset cache (default: /data mount if present,
   else ./gifteval_data).
+* ``TSFM_TIME_DIR`` — Real-TSF/TIME dataset path (read directly by ``time_eval``;
+  aliases the ``TIME_DATASET`` env var that ``timebench`` expects).
 """
 from __future__ import annotations
 

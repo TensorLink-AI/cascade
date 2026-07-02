@@ -36,6 +36,7 @@ this isolated means those pins never touch the main repo.
 # from the repo root — isolated from the main env
 uv sync --project experiments/tokenizer_ablation                 # core: train + infer
 uv sync --project experiments/tokenizer_ablation --extra gift    # + GIFT-Eval harness
+uv sync --project experiments/tokenizer_ablation --extra time    # + TIME benchmark harness
 uv sync --project experiments/tokenizer_ablation --extra hub --extra wandb --extra viz
 ```
 
@@ -43,7 +44,7 @@ Or with pip in a fresh 3.11 venv:
 
 ```bash
 pip install -e experiments/tokenizer_ablation           # core
-pip install -e 'experiments/tokenizer_ablation[gift,hub,wandb,viz]'
+pip install -e 'experiments/tokenizer_ablation[gift,time,hub,wandb,viz]'
 ```
 
 ## Layout
@@ -57,7 +58,9 @@ tsfm_ablation/
   model.py        MiniTSFM2 backbone + CPM mask sampler
   optim.py        NorMuon + AdamW split, WSD schedule
   train.py        per-run training loop + synthetic val CRPS
-  gift_eval.py    GIFT-Eval dev-subset harness (+ wiring pre-flight)
+  infer.py        shared eval inference core (batched ragged quantile forecasts)
+  gift_eval.py    GIFT-Eval harness — 14-task dev subset + full 97-config leaderboard
+  time_eval.py    TIME benchmark harness (contamination-resistant; via timebench)
   probes.py       long-horizon stability probe + aggregate table + tripwires
   hub.py          Hugging Face Hub artifact/card uploads
   runner.py       run_matrix orchestration + LR sweep
@@ -78,6 +81,7 @@ Colab Drive mount):
   mount if present, else `./tsfm_ckpts`).
 * `TSFM_GIFT_DIR` — GIFT-Eval dataset cache (default: `/data` mount, else
   `./gifteval_data`).
+* `TSFM_TIME_DIR` — Real-TSF/TIME dataset path (aliases `TIME_DATASET`).
 * `HF_TOKEN` — WRITE token for the gated GIFT-Eval download **and** Hub pushes.
 
 ## CLI
@@ -89,13 +93,45 @@ tsfm-ablation train --arm T0 --seed 0  # train one arm/seed
 tsfm-ablation matrix                   # full 4-arm x 3-seed matrix (~1 A100-day)
 tsfm-ablation matrix --arms T0 T2 --seeds 0 1 --hf-push --wandb
 tsfm-ablation lr-sweep                 # 3-point LR calibration on T0
-tsfm-ablation eval --arm T0 --seed 0   # GIFT-Eval a finished run
+tsfm-ablation eval --arm T0 --seed 0   # GIFT-Eval (14-task dev subset)
+tsfm-ablation eval --arm T0 --seed 0 --full     # full 97-config GIFT leaderboard
+tsfm-ablation time --arm T0 --seed 0            # TIME benchmark
 tsfm-ablation aggregate                # cross-run table + tripwires
 tsfm-ablation quick-test               # GIFT-Eval wiring pre-flight
 ```
 
 The matrix is fully resumable: rerun after any disconnect and it continues where
 it stopped (a run whose `results.json` exists is skipped).
+
+## Evaluation — what you can score off
+
+Two tangible, leaderboard-shaped harnesses run any trained `MiniTSFM2`
+checkpoint through one shared inference core (`infer.batched_quantiles` —
+ragged/NaN-safe, block-rollout for horizons past the trained tail):
+
+* **GIFT-Eval** (`gift_eval.py`, `.[gift]`). Salesforce's 97-config general
+  benchmark. CRPS == the leaderboard's `mean_weighted_sum_quantile_loss`; also
+  reports MASE. Two modes:
+  * **dev subset** (14 fixed tasks) — for *iterating* on tokenizers. Fast,
+    stratified across frequency. Don't grow it, or you Goodhart the choice.
+  * **full** (`--full`, all 97 configs) — held out for the promoted winner.
+* **TIME** (`time_eval.py`, `.[time]`). The contamination-resistant *It's TIME*
+  benchmark (arXiv:2602.12147), a Toto 2.0 headline benchmark of "fresh"
+  datasets. The model hands quantile arrays directly to `timebench`, which
+  computes the leaderboard metrics itself — so numbers are comparable. Point
+  `TSFM_TIME_DIR` at the [Real-TSF/TIME](https://huggingface.co/datasets/Real-TSF/TIME)
+  data.
+
+```python
+from tsfm_ablation import make_arm, MiniTSFM2, eval_gift_full, eval_time
+# ... load a trained model (see run_dir / latest.pt) ...
+gift = eval_gift_full(model, gift_dir, tag="T0@final")   # {per_dataset, gm_crps, ...}
+time = eval_time(model, time_dir="/data/TIME")           # {per_task, mean, n_tasks}
+```
+
+Both numbers are **ablation-internal** on this ~3.6M recipe-clone — not directly
+comparable to published Toto 2.0 GIFT/TIME scores (see the fidelity notes in
+this file's caveats and the PR discussion).
 
 ## Library use
 

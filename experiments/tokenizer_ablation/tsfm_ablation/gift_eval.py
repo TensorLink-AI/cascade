@@ -13,19 +13,20 @@ package stays importable without the (numpy<2-pinned) eval stack installed.
 """
 from __future__ import annotations
 
-import math
 import os
 
 import numpy as np
-import torch
 
-from .device import AMP_DTYPE, DEVICE
+from .infer import batched_quantiles
 
 QL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 # (name, term) — stratified across frequency; the 10T/15T/H entries form the
 # "long-seasonality" slice where the iso-token pyramid (T2) should show its
-# advantage if the long-history hypothesis is real.
+# advantage if the long-history hypothesis is real. This is the FIXED design
+# subset for iterating on tokenizers — do NOT grow it, or you Goodhart the
+# choice; the full 97-config leaderboard (GIFT_ALL) stays held out for the
+# promoted winner.
 DEV_SETS = [
     ("m4_weekly", "short"), ("m4_daily", "short"), ("m4_hourly", "short"),
     ("m4_monthly", "short"),
@@ -36,6 +37,46 @@ DEV_SETS = [
     ("us_births/D", "short"), ("covid_deaths", "short"), ("hospital", "short"),
 ]
 LONG_SEASONALITY_FREQS = {"10T", "15T", "H", "h", "10min", "15min"}
+
+# The full GIFT-Eval enumeration (97 configs), verbatim from gift-eval's
+# reference runner (notebooks/naive.ipynb): SHORT terms for every dataset, plus
+# medium + long terms for the subset with long-enough series. Used by the
+# `gift_all_specs()` full-leaderboard eval; the horizon-past-tail configs are
+# handled by the block rollout in infer.batched_quantiles.
+_SHORT_DATASETS = (
+    "m4_yearly m4_quarterly m4_monthly m4_weekly m4_daily m4_hourly "
+    "electricity/15T electricity/H electricity/D electricity/W "
+    "solar/10T solar/H solar/D solar/W hospital covid_deaths "
+    "us_births/D us_births/M us_births/W saugeenday/D saugeenday/M saugeenday/W "
+    "temperature_rain_with_missing kdd_cup_2018_with_missing/H "
+    "kdd_cup_2018_with_missing/D car_parts_with_missing restaurant "
+    "hierarchical_sales/D hierarchical_sales/W LOOP_SEATTLE/5T LOOP_SEATTLE/H "
+    "LOOP_SEATTLE/D SZ_TAXI/15T SZ_TAXI/H M_DENSE/H M_DENSE/D "
+    "ett1/15T ett1/H ett1/D ett1/W ett2/15T ett2/H ett2/D ett2/W "
+    "jena_weather/10T jena_weather/H jena_weather/D "
+    "bitbrains_fast_storage/5T bitbrains_fast_storage/H bitbrains_rnd/5T "
+    "bitbrains_rnd/H bizitobs_application bizitobs_service "
+    "bizitobs_l2c/5T bizitobs_l2c/H"
+)
+_MED_LONG_DATASETS = (
+    "electricity/15T electricity/H solar/10T solar/H "
+    "kdd_cup_2018_with_missing/H LOOP_SEATTLE/5T LOOP_SEATTLE/H SZ_TAXI/15T "
+    "M_DENSE/H ett1/15T ett1/H ett2/15T ett2/H jena_weather/10T jena_weather/H "
+    "bitbrains_fast_storage/5T bitbrains_rnd/5T bizitobs_application "
+    "bizitobs_service bizitobs_l2c/5T bizitobs_l2c/H"
+)
+
+
+def gift_all_specs():
+    """The full 97-config GIFT-Eval task list as ``(name, term)`` pairs."""
+    med_long = set(_MED_LONG_DATASETS.split())
+    specs = []
+    for name in _SHORT_DATASETS.split():
+        for term in ("short", "medium", "long"):
+            if term in ("medium", "long") and name not in med_long:
+                continue
+            specs.append((name, term))
+    return specs
 
 
 def _download_dev_sets(gift_eval_dir, dev_sets=DEV_SETS):
@@ -48,61 +89,24 @@ def _download_dev_sets(gift_eval_dir, dev_sets=DEV_SETS):
 
 
 class TSFMPredictor:
-    """gluonts RepresentablePredictor around MiniTSFM2.predict (batched,
-    ragged-aware via the valid mask; NaNs forward-filled)."""
+    """gluonts predictor around MiniTSFM2: forecasts each series' quantiles via
+    the shared ``infer.batched_quantiles`` core (ragged-aware, block-rollout for
+    horizons past the trained tail)."""
 
     def __init__(self, model, H, batch_size=256):
         self.model, self.H, self.bs = model, H, batch_size
         self.prediction_length = H
-        P = model.cfg.patch
-        self.k = math.ceil(H / P)
 
     def predict(self, dataset, **kwargs):
         from gluonts.model.forecast import QuantileForecast
         entries = list(dataset)
-        for i in range(0, len(entries), self.bs):
-            chunk = entries[i:i + self.bs]
-            Cmax = min(self.model.cfg.ctx_span,
-                       max(len(np.atleast_1d(e["target"])) for e in chunk))
-            Cmax = max(Cmax, self.model.cfg.patch)
-            ctx = np.zeros((len(chunk), 1, Cmax), np.float32)
-            val = np.zeros((len(chunk), 1, Cmax), np.float32)
-            for j, e in enumerate(chunk):
-                y = np.asarray(e["target"], np.float32).reshape(-1)
-                # forward-fill NaNs, then zero any leading NaNs
-                idx = np.where(~np.isnan(y), np.arange(len(y)), 0)
-                np.maximum.accumulate(idx, out=idx)
-                y = np.nan_to_num(y[idx], nan=0.0)
-                y = y[-Cmax:]
-                ctx[j, 0, -len(y):] = y
-                val[j, 0, -len(y):] = 1.0
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=(DEVICE == "cuda" and AMP_DTYPE is not None)):
-                if self.k <= self.model.cfg.train_kmax:
-                    q = self.model.predict(torch.from_numpy(ctx).to(DEVICE), self.k,
-                                           valid=torch.from_numpy(val).to(DEVICE))
-                else:  # horizon beyond trained tail: block rollout, per-block quantiles
-                    q = self._rollout_quantiles(torch.from_numpy(ctx).to(DEVICE),
-                                                torch.from_numpy(val).to(DEVICE))
-            q = q.float().cpu().numpy()[:, 0, :self.H, :]      # [n, H, 9]
-            for j, e in enumerate(chunk):
-                yield QuantileForecast(
-                    forecast_arrays=q[j].T, forecast_keys=[str(p) for p in QL],
-                    start_date=e["start"] + len(np.atleast_1d(e["target"])),
-                    item_id=e.get("item_id"))
-
-    def _rollout_quantiles(self, ctx, val):
-        m, k_max = self.model, self.model.cfg.train_kmax
-        outs, cur, cv, k_left = [], ctx, val, self.k
-        while k_left > 0:
-            kb = min(k_left, k_max)
-            q = m.predict(cur, kb, valid=cv)                  # [B,1,kb*P,9]
-            outs.append(q)
-            med = q[..., q.shape[-1] // 2]
-            cur = torch.cat([cur, med], dim=-1)[..., -m.cfg.ctx_span:]
-            cv = torch.cat([cv, torch.ones_like(med)], dim=-1)[..., -m.cfg.ctx_span:]
-            k_left -= kb
-        return torch.cat(outs, dim=2)
+        targets = [np.asarray(e["target"], np.float32).reshape(-1) for e in entries]
+        q = batched_quantiles(self.model, targets, self.H, self.bs)   # [N, H, Q]
+        for j, e in enumerate(entries):
+            yield QuantileForecast(
+                forecast_arrays=q[j].T, forecast_keys=[str(p) for p in QL],
+                start_date=e["start"] + len(np.atleast_1d(e["target"])),
+                item_id=e.get("item_id"))
 
 
 def eval_gift_dev(model, gift_eval_dir, dev_sets=DEV_SETS, tag=""):
@@ -141,6 +145,12 @@ def eval_gift_dev(model, gift_eval_dir, dev_sets=DEV_SETS, tag=""):
     print(f"{tag} GM-CRPS={out['gm_crps']:.4f}  long-season={out['gm_crps_long_season']:.4f} "
           f" other={out['gm_crps_other']:.4f}  ({len(rows)}/{len(dev_sets)} datasets)")
     return out
+
+
+def eval_gift_full(model, gift_eval_dir, tag=""):
+    """Full 97-config GIFT-Eval leaderboard sweep. Same scoring as the dev
+    subset, over every task; downloads the full benchmark on first run."""
+    return eval_gift_dev(model, gift_eval_dir, dev_sets=gift_all_specs(), tag=tag)
 
 
 def quick_wiring_test(gift_eval_dir, name="m4_weekly", term="short"):

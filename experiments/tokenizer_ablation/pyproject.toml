@@ -28,6 +28,13 @@ gift = [
     "orjson",
     "pandas>=2.0,<2.1",
 ]
+# TIME benchmark (arXiv:2602.12147). Its `timebench` package is gift-eval-
+# adapted and py3.11/gluonts-compatible; it takes quantile arrays directly and
+# computes its own metrics. Compose with `gift` for a full eval env.
+time = [
+    "timebench @ git+https://github.com/zqiao11/TIME",
+    "gluonts~=0.15",
+]
 # Hub uploads of run artifacts + the experiment card.
 hub = [
     "huggingface_hub>=0.23",

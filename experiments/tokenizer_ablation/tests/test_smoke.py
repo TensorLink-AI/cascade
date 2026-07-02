@@ -106,7 +106,42 @@ def test_train_one_and_probe(tmp_path):
 
 
 def test_optional_eval_modules_import():
-    # These import lazily and must not require the pinned gift stack to import.
+    # These import lazily and must not require the pinned gift/time stacks to import.
     import tsfm_ablation.gift_eval  # noqa: F401
     import tsfm_ablation.hub  # noqa: F401
+    import tsfm_ablation.infer  # noqa: F401
     import tsfm_ablation.runner  # noqa: F401
+    import tsfm_ablation.time_eval  # noqa: F401
+
+
+def test_batched_quantiles_shapes_and_ragged():
+    """The shared eval inference core: ragged/NaN-safe, correct shape, sorted,
+    and handling horizons past the trained tail via block rollout."""
+    import numpy as np
+
+    from tsfm_ablation.infer import batched_quantiles
+    from tsfm_ablation.model import MiniTSFM2
+    model = MiniTSFM2(_tiny_cfg())
+    P = model.cfg.patch
+    rng = np.random.default_rng(0)
+    series = [
+        rng.standard_normal(300).astype(np.float32),          # longer than ctx_span
+        rng.standard_normal(40).astype(np.float32),           # shorter than ctx_span
+        np.concatenate([[np.nan] * 5, rng.standard_normal(60).astype(np.float32)]),  # leading NaNs
+    ]
+    # horizon past the trained tail (train_kmax=2 patches) -> exercises rollout
+    H = (model.cfg.train_kmax + 2) * P
+    q = batched_quantiles(model, series, H, batch_size=2)
+    assert q.shape == (3, H, 9)
+    assert np.isfinite(q).all()
+    assert (q[..., 1:] >= q[..., :-1] - 1e-3).all()           # quantiles sorted
+
+
+def test_gift_all_enumeration():
+    from tsfm_ablation.gift_eval import DEV_SETS, gift_all_specs
+    specs = gift_all_specs()
+    assert len(specs) == 97                                    # official GIFT-Eval config count
+    assert all(t in ("short", "medium", "long") for _, t in specs)
+    assert ("m4_weekly", "short") in specs
+    # the dev subset is a strict, short-only slice of the full leaderboard
+    assert all(term == "short" for _, term in DEV_SETS)
