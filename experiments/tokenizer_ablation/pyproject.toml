@@ -1,0 +1,79 @@
+[project]
+name = "tsfm-tokenizer-ablation"
+version = "0.1.0"
+description = "Toto-2-4m-recipe context-tokenizer ablation (fixed / pyramid / adaptive) trained from scratch on a TempoPFN-style synthetic prior ensemble and scored on a GIFT-Eval dev subset. Split out of the v10 experiment notebook into reusable components."
+readme = "README.md"
+# gift-eval pins pandas==2.0.0 / gluonts~=0.15 / numpy<2 → stay on 3.11, and
+# keep this in its OWN locked env so those caps never touch the cascade core.
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+authors = [{ name = "tensorlink-ai" }]
+
+# Core training + inference stack. numpy<2 because the GIFT-Eval extra pins it,
+# and pinning it here keeps `train`-only installs ABI-compatible with the eval
+# extra when both are present.
+dependencies = [
+    "numpy>=1.26,<2",
+    "scipy>=1.11",
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+# GIFT-Eval harness. Hard-pins (gluonts~=0.15, pandas==2.0.0, numpy<2) that
+# cannot coexist with the main cascade env — hence this separate subproject,
+# mirroring benchmarks/. Install only when you need to score on GIFT.
+gift = [
+    "gift-eval @ git+https://github.com/SalesforceAIResearch/gift-eval.git",
+    "gluonts~=0.15",
+    "orjson",
+    "pandas>=2.0,<2.1",
+]
+# Hub uploads of run artifacts + the experiment card.
+hub = [
+    "huggingface_hub>=0.23",
+]
+# Optional live training telemetry.
+wandb = [
+    "wandb>=0.17",
+]
+# Aggregate table + plots.
+viz = [
+    "pandas>=2.0,<2.1",
+    "matplotlib>=3.7",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+tsfm-ablation = "tsfm_ablation.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# the `gift` extra pins gift-eval by git ref (no PyPI release)
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["tsfm_ablation"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# the reference notebook is kept as an artifact, not linted as source
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# This package is a faithful port of a dense, math-heavy research notebook.
+# The compact one-statement-per-line idiom (E701/E702) and canonical single
+# letters (E741: `O` = the Muon-orthogonalized update; `l` = layer index) are
+# intentional and kept for line-by-line comparability with the notebook.
+ignore = ["E501", "E701", "E702", "E741", "B905", "SIM108"]

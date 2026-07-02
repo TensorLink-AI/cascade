@@ -1,0 +1,11 @@
+# local storage (checkpoints, corpus, GIFT cache, results)
+tsfm_ckpts/
+gifteval_data/
+*.pt
+*.npy
+# env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+wandb/
