@@ -42,6 +42,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--device", default="cpu")
     p.add_argument(
+        "--gifteval-datasets",
+        default=None,
+        help="comma/space-separated gift-eval config subset (e.g. the pinned "
+        "consensus-gate subset); sets CASCADE_BENCH_GIFTEVAL_DATASETS. Omit to "
+        "run the full 97-config battery.",
+    )
+    p.add_argument(
         "--batch-size",
         type=int,
         default=64,
@@ -77,9 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.download and not args.data_dir:
         print("error: --download requires --data-dir", file=sys.stderr)
         return 2
-    if args.data_dir:
-        from .datasets import DATASETS, apply_env, ensure_datasets
 
+    import os
+
+    if args.gifteval_datasets:
+        os.environ["CASCADE_BENCH_GIFTEVAL_DATASETS"] = args.gifteval_datasets
+
+    from .datasets import DATASETS, apply_env, ensure_datasets, recorded_revision
+
+    if args.data_dir:
         env = ensure_datasets(requested, args.data_dir, download=args.download)
         apply_env(env)
         for name in requested:
@@ -88,13 +101,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{name}] no data under {args.data_dir}/{name} "
                       "(use --download to fetch it) — will skip", file=sys.stderr)
 
-    from .datasets import DATASETS as _DATASETS
+    def _actual_revision(name: str) -> str | None:
+        """Provenance of the data this suite will actually read: the download
+        marker of the wired dir, or 'unknown' for marker-less (hand-managed /
+        bare-env-var) data. None when the suite has no data at all."""
+        spec = DATASETS.get(name)
+        if spec is None:
+            return None
+        path = os.environ.get(spec.env_var)
+        if not path:
+            return None
+        return recorded_revision(path) or "unknown"
 
     max_series = args.max_series or None
     report = BenchmarkReport(
         checkpoint=str(ckpt),
         data_revisions={
-            name: _DATASETS[name].revision for name in requested if name in _DATASETS
+            name: rev for name in requested if (rev := _actual_revision(name)) is not None
         },
     )
     for name in requested:

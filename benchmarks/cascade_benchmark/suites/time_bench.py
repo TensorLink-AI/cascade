@@ -152,10 +152,13 @@ def _score_one(
     # average each over windows (TIME's own leaderboard aggregation).
     metrics_npz = Path(out_dir) / ds_config / "metrics.npz"
     if not metrics_npz.is_file():
-        hits = list(Path(out_dir).rglob("metrics.npz"))
+        # Tolerate a deeper timebench layout, but never search outside this
+        # task's own subtree: out_dir is shared across tasks, so a wider glob
+        # could silently attribute a previous task's metrics to this one.
+        hits = sorted((Path(out_dir) / ds_config).rglob("metrics.npz"))
         if not hits:
             raise FileNotFoundError(f"metrics.npz not written for {ds_config}")
-        metrics_npz = hits[-1]
+        metrics_npz = hits[0]
     with np.load(metrics_npz) as data:
         return {k: float(np.nanmean(data[k])) for k in data.files}
 

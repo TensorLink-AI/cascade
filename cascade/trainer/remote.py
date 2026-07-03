@@ -160,8 +160,11 @@ def worker_argv(
 # can never contend a worker toward its max_train_seconds guard. The pattern is
 # anchored to the venv entrypoint path (how the running scorer's cmdline reads)
 # with the bracket trick, so it matches neither this dispatch command's own
-# shell nor the benchmark *launch* command's shell — only the live scorer.
-PREEMPT_BENCHMARKS = "pkill -f 'bin/cascade[-]benchmark' 2>/dev/null; "
+# shell nor the benchmark *launch* command's shell — only the live scorer. The
+# trailing `( |$)` keeps it off the scorer's siblings: without it the substring
+# also matches `bin/cascade-benchmark-download`, and every dispatch would kill
+# an in-progress (multi-hour) benchmark-data pull on the pod.
+PREEMPT_BENCHMARKS = "pkill -f 'bin/cascade[-]benchmark( |$)' 2>/dev/null; "
 
 
 def build_remote_command(host: RemoteHost, argv: list[str], env: dict[str, str]) -> str:
@@ -262,7 +265,7 @@ class RemoteDispatcher:
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
                  host.cuda_device)
         try:
-            proc = (self._runner or _run_ssh)(ssh_argv, self.timeout_seconds)
+            proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds)
         except subprocess.TimeoutExpired as e:
             raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
         if proc.returncode != 0:
@@ -276,6 +279,6 @@ class RemoteDispatcher:
         return entry
 
 
-def _run_ssh(ssh_argv: list[str], timeout: int):
+def run_ssh(ssh_argv: list[str], timeout: int):
     """Run the ssh command, returning the CompletedProcess (text mode)."""
     return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout)

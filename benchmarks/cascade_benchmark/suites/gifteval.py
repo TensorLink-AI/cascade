@@ -70,6 +70,42 @@ def _baseline_key(ds_name: str, term: str, properties: dict) -> str:
     return f"{key}/{freq}/{term}"
 
 
+def _safe_ratio(num: float | None, den: float | None) -> float | None:
+    """model ÷ Seasonal-Naive, or None when it is undefined (missing/zero
+    denominator) — the consensus gate's cleaner treats None as an invalid value
+    and fills it with the column mean, matching ``official_aggregate``."""
+    if num is None or den is None or den == 0:
+        return None
+    return float(num) / float(den)
+
+
+def _ratio_rows(rows: list[dict], baseline: dict[str, dict]) -> list[dict]:
+    """Per-config Seasonal-Naive-normalized ratio rows for the consensus gate.
+
+    Mirrors ``official_aggregate``'s zero-inflated split: the MASE ratio uses
+    MASE where the baseline MASE is non-zero, else substitutes the MAE ratio
+    (the config is in the zero pool), so a single ``mase_ratio`` column is
+    leaderboard-faithful across both pools. CRPS is normalized in both.
+    """
+    out: list[dict] = []
+    for r in rows:
+        b = baseline.get(r["full"])
+        if b is None:
+            continue
+        naive_mase = b.get("MASE")
+        if naive_mase in (None, 0):  # zero pool → MAE stands in for MASE
+            mase_ratio = _safe_ratio(r.get("MAE"), b.get("MAE"))
+        else:
+            mase_ratio = _safe_ratio(r.get("MASE"), naive_mase)
+        out.append({
+            "full": r["full"],
+            "MASE": r.get("MASE"), "MAE": r.get("MAE"), "CRPS": r.get("CRPS"),
+            "crps_ratio": _safe_ratio(r.get("CRPS"), b.get("CRPS")),
+            "mase_ratio": mase_ratio,
+        })
+    return out
+
+
 def _name_term_pairs(max_tasks: int | None):
     override = os.environ.get("CASCADE_BENCH_GIFTEVAL_DATASETS", "").strip()
     names = override.replace(",", " ").split() if override else SHORT_DATASETS.split()
@@ -120,7 +156,10 @@ def run(
             return SuiteResult(suite="gift-eval", status="error", detail="no datasets scored")
         agg = official_aggregate(rows, baseline)
         metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
-        return SuiteResult(suite="gift-eval", status="ok", metrics=metrics, n_series=agg["n_scored"])
+        return SuiteResult(
+            suite="gift-eval", status="ok", metrics=metrics, n_series=agg["n_scored"],
+            rows=_ratio_rows(rows, baseline),
+        )
     except ImportError as e:
         return SuiteResult(suite="gift-eval", status="skipped", detail=f"gift-eval not importable: {e}")
     except Exception as e:  # noqa: BLE001

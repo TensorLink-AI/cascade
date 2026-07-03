@@ -197,3 +197,56 @@ attention. The variate-axis layers now exist in `toto2_model.py` (one closes
 each group of 4, matching the Toto-2.0-4m release) and `Toto2Model.forward`
 accepts `(B, C, P, patch_size)` — but the trainer still feeds `C = 1`, so they
 train degenerate/dormant until multivariate corpora flip on.
+
+## 9. Public-benchmark no-regression gate
+
+**Question.** The throne is decided purely on the private rotating pool (§6).
+Should broad public performance (GIFT-Eval) also constrain a dethrone, so a
+challenger that overfits the pool's domains but is narrow on the wider world
+can't take the crown?
+
+**Default.** **Present but OFF (`[scoring] gift_gate_mode = "off"`).** When
+enabled, a second condition is AND-ed onto a dethrone: on a private-pool *win*,
+both king and challenger are scored on GIFT-Eval (the isolated `benchmarks/`
+sidecar, quantile-head — minutes, not hours) and a **paired no-regression
+bootstrap** (`cascade.eval.gift_gate`) checks the challenger is not
+*statistically meaningfully worse* on broad public data: it passes when
+`lcb >= -gift_gate_tolerance`. The gate is deliberately **not winnable** — it can
+only block a dethrone the private LCB already granted, never cause one — so a
+generator that games the public benchmark still has to beat the private pool,
+while one that regresses on the broad battery is held back. The statistic
+mirrors the KOTH decision (relative `geomean(CRPS, MASE)` improvement, block-
+bootstrapped over the shared configs, seeded by the block hash for
+cross-validator consensus). It is a **no-regression bound, not a "beat the king"
+check**, on purpose: at parity a raw `chal < king` comparison is a coin flip
+that, AND-ed with `dethrone_cp` consecutive wins, would entrench kings on noise;
+the bound tolerates noise-level deficits and only fires on a real regression.
+
+**Why the bootstrap, not a raw binary.** Discussed at length: GIFT-Eval is a
+*named public* benchmark, and §6 moved eval to a private rotating pool precisely
+because a public target is the easiest thing to overfit. A hard `chal < king`
+binary would be (a) gameable by a contaminating generator and (b) a
+parity-noise veto against honest challengers. Gating on the LCB with a tolerance
+keeps the legitimate job — block a genuine broad-public regression — without the
+coin flip.
+
+**Failure policy.** Uncomputable (sidecar unavailable, gift-eval skipped, too
+few shared configs, or **king/challenger scored against different pinned data
+revisions**) ⇒ the round is **inconclusive** (king holds, streak untouched) —
+never a silent pass or fail. Rollout is three-way: `shadow` computes and logs
+the verdict every qualifying round *without enforcing it*, so an operator can
+calibrate `gift_gate_tolerance` against observed round-to-round noise on testnet
+before flipping to `enforce`.
+
+**Ops.** An *enforcing* validator adds consensus-critical infrastructure: the
+GIFT-Eval data must be pinned locally (`cascade-benchmark-download`,
+`[eval] gift_gate_data_dir`) and the sidecar env synced. Cross-machine float
+variance is absorbed by the statistical bound except exactly at the threshold —
+the same exposure the private-pool eval already carries. v1 gates on the
+**primary size's** checkpoint pair only (the pooled KOTH decision spans sizes;
+the gate screens on one, matching the heat's screening philosophy).
+
+**Flip point.** `[scoring] gift_gate_mode`/`gift_gate_tolerance`/
+`gift_gate_min_configs` and `[eval] gift_gate_datasets`/`gift_gate_num_samples`/
+`gift_gate_data_dir`; the decision combiner is `cascade.eval.koth.apply_gift_gate`
+and the wiring is `cascade.validator.loop.ValidatorRunner._run_gift_gate`.

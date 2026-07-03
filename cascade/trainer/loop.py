@@ -704,13 +704,21 @@ class TrainerRunner:
                 )
                 self.publish(manifest)
                 if self.bench_plan is not None and self.remote_hosts:
-                    from .bench_hook import launch_post_round_benchmark
+                    # Guarded separately: the round is already published, so a
+                    # telemetry failure here must not fall through to the round
+                    # handler and re-run (re-train + re-publish) it next poll.
+                    try:
+                        from .bench_hook import launch_post_round_benchmark
 
-                    launch_post_round_benchmark(
-                        self.remote_hosts[0], round_id,
-                        self.cfg.training.arch_preset, self.bench_plan,
-                        work_root=self.work_root,
-                    )
+                        # The final trains king checkpoints for the throne
+                        # sizes, which need not include the primary preset.
+                        launch_post_round_benchmark(
+                            self.remote_hosts[0], round_id,
+                            self.cfg.throne_contracts()[0].arch_preset, self.bench_plan,
+                            work_root=self.work_root,
+                        )
+                    except Exception as e:  # noqa: BLE001 — telemetry only
+                        log.warning("post-round benchmark launch failed (ignored): %s", e)
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)

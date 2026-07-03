@@ -78,11 +78,33 @@ def test_build_remote_command_sets_cd_cuda_and_env():
     host = _host(workdir="/root/metro", cuda_device="1")
     cmd = build_remote_command(host, ["python", "-m", "x"], {"HIPPIUS_S3_ACCESS_KEY": "ak"})
     # training preempts any straggling log-only benchmark sweep before cd'ing in
-    assert cmd.startswith("pkill -f 'bin/cascade[-]benchmark'")
+    from cascade.trainer.remote import PREEMPT_BENCHMARKS
+
+    assert cmd.startswith(PREEMPT_BENCHMARKS)
     assert "cd /root/metro && " in cmd
     assert "CUDA_VISIBLE_DEVICES=1" in cmd
     assert "HIPPIUS_S3_ACCESS_KEY=ak" in cmd
     assert cmd.rstrip().endswith("python -m x")
+
+
+def test_preempt_pattern_matches_only_the_live_scorer():
+    """The pkill regex must hit a running cascade-benchmark and nothing else —
+    in particular NOT cascade-benchmark-download (a multi-hour data pull that
+    every dispatch would otherwise kill), the launch shell, or itself."""
+    import re
+
+    from cascade.trainer.remote import PREEMPT_BENCHMARKS
+
+    pattern = PREEMPT_BENCHMARKS.split("'")[1]
+    scorer = "/root/x/.venv/bin/cascade-benchmark /ckpt /out.json --suites gift-eval"
+    scorer_py = "/root/x/.venv/bin/python /root/x/.venv/bin/cascade-benchmark /ckpt /out"
+    downloader = "/root/x/.venv/bin/cascade-benchmark-download --data-dir /root/bench_data"
+    launch_shell = "uv run --project /root/x/benchmarks cascade-benchmark /ckpt /out"
+    assert re.search(pattern, scorer)
+    assert re.search(pattern, scorer_py)
+    assert not re.search(pattern, downloader)
+    assert not re.search(pattern, launch_shell)
+    assert not re.search(pattern, PREEMPT_BENCHMARKS)  # bracket trick: no self-match
 
 
 def test_build_ssh_argv_includes_key_port_dest():

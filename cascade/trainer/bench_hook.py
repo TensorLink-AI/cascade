@@ -25,22 +25,17 @@ from __future__ import annotations
 import json
 import logging
 import shlex
-import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .remote import RemoteHost, build_ssh_argv
+# PREEMPT_BENCHMARKS also serves as this hook's kill-any-previous-sweep prefix
+# (never let a stale sweep pile up behind fast rounds) — one pattern, one
+# place, see remote.py for the anchoring rationale.
+from ..eval.benchmarks import format_report
+from .remote import PREEMPT_BENCHMARKS, RemoteHost, build_ssh_argv, run_ssh
 
 log = logging.getLogger("cascade.trainer.bench")
-
-# Kill any previous benchmark before starting a new one (and never let a
-# stale sweep pile up behind fast rounds). The pattern is anchored to the venv
-# entrypoint path (`…/.venv/bin/cascade-benchmark`, how the running scorer's
-# cmdline reads) with the bracket trick — so it can match neither this launch
-# command's own shell (which says `… benchmarks cascade-benchmark …`, no
-# `bin/`) nor the pkill text itself. pkill exits 1 on no match, hence the `;`.
-_KILL_PREVIOUS = "pkill -f 'bin/cascade[-]benchmark' 2>/dev/null; "
 
 
 @dataclass(frozen=True)
@@ -90,7 +85,7 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     if host.cuda_device is not None:
         prefix = f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
     cmd = (
-        _KILL_PREVIOUS
+        PREEMPT_BENCHMARKS
         + prefix
         + f"{plan.uv_bin} run --project {shlex.quote(f'{host.workdir}/benchmarks')} "
         + quoted
@@ -109,8 +104,7 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
     try:
         remote_cmd, report_path = build_bench_remote_command(host, round_id, arch_preset, plan)
         ssh = build_ssh_argv(host, remote_cmd)
-        run = runner or (lambda argv, timeout: subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout))
+        run = runner or run_ssh
         proc = run(ssh, plan.timeout_seconds)
         if proc.returncode != 0:
             log.warning("post-round benchmark failed on %s (exit %s): %s",
@@ -126,10 +120,7 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
             local = Path(work_root) / round_id / arch_preset / "king-benchmark_report.json"
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        for s in report.get("suites", []):
-            metrics = " ".join(f"{k}={v:.4f}" for k, v in (s.get("metrics") or {}).items())
-            log.info("bench round=%s %s %s %s n=%s",
-                     round_id, s.get("suite"), s.get("status"), metrics, s.get("n_series"))
+        log.info("bench round=%s %s", round_id, format_report(report))
         return report
     except Exception as e:  # noqa: BLE001 — log-only telemetry must never raise
         log.warning("post-round benchmark errored (ignored): %s", e)

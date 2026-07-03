@@ -325,6 +325,17 @@ class EvalConfig:
     benchmark_suites: tuple[str, ...] = ()
     benchmark_num_samples: int = 0
     benchmark_max_series: int = 0
+    # ── Public-benchmark no-regression gate (CONSENSUS; see gift_gate) ────────
+    # Consumed only when ``[scoring] gift_gate_mode`` != "off". Runs the
+    # gift-eval sidecar on the primary king/challenger checkpoints on a
+    # private-pool win. ``gift_gate_datasets`` pins the config subset
+    # ("" = full 97 configs); ``gift_gate_num_samples = 0`` reuses
+    # ``num_samples``; ``gift_gate_data_dir`` points at pinned benchmark data on
+    # the validator ("" = the suite's own env vars). Defaults keep old toml.
+    gift_gate_datasets: str = ""
+    gift_gate_num_samples: int = 0
+    gift_gate_data_dir: str = ""
+    gift_gate_timeout_s: int = 3600
 
 
 @dataclass(frozen=True)
@@ -342,6 +353,15 @@ class ScoringConfig:
     # reproduces pure winner-take-all. Defaults keep older chain.toml loadable.
     reward_prior_kings: int = 0
     burn_uid: int = 0
+    # Public-benchmark no-regression gate (see cascade.eval.koth / .gift_gate):
+    # "off" (default) | "shadow" (compute + log, verdict unchanged) | "enforce"
+    # (AND into the dethrone decision). ``gift_gate_tolerance`` is the relative
+    # slack the challenger may be worse by on gift-eval; ``gift_gate_min_configs``
+    # is the shared-config floor below which the gate is uncomputable
+    # (→ inconclusive). Reuses ``bootstrap_B``/``bootstrap_alpha``.
+    gift_gate_mode: str = "off"
+    gift_gate_tolerance: float = 0.03
+    gift_gate_min_configs: int = 15
 
 
 @dataclass(frozen=True)
@@ -471,6 +491,9 @@ class ChainConfig:
             bootstrap_B=self.scoring.bootstrap_B,
             bootstrap_alpha=self.scoring.bootstrap_alpha,
             dethrone_cp=self.scoring.dethrone_cp,
+            gift_gate_mode=self.scoring.gift_gate_mode,
+            gift_gate_tolerance=self.scoring.gift_gate_tolerance,
+            gift_gate_min_configs=self.scoring.gift_gate_min_configs,
         )
 
 
@@ -525,6 +548,20 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
         raise LaunchConfigError(
             "chain.toml is not launch-ready:\n  - " + "\n  - ".join(problems)
         )
+
+
+_GIFT_GATE_MODES = ("off", "shadow", "enforce")
+
+
+def _gift_gate_mode(value: object) -> str:
+    """Validate ``[scoring] gift_gate_mode`` at load time so a typo fails fast
+    rather than silently disabling the consensus gate."""
+    mode = str(value)
+    if mode not in _GIFT_GATE_MODES:
+        raise ValueError(
+            f"[scoring] gift_gate_mode={mode!r} invalid; one of {_GIFT_GATE_MODES}"
+        )
+    return mode
 
 
 def load_chain_config(path: Path | str | None = None) -> ChainConfig:
@@ -649,6 +686,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             benchmark_suites=tuple(str(s) for s in e.get("benchmark_suites", ())),
             benchmark_num_samples=int(e.get("benchmark_num_samples", 0)),
             benchmark_max_series=int(e.get("benchmark_max_series", 0)),
+            gift_gate_datasets=str(e.get("gift_gate_datasets", "")),
+            gift_gate_num_samples=int(e.get("gift_gate_num_samples", 0)),
+            gift_gate_data_dir=str(e.get("gift_gate_data_dir", "")),
+            gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),
@@ -660,6 +701,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dethrone_cp=int(s["dethrone_cp"]),
             reward_prior_kings=int(s.get("reward_prior_kings", 0)),
             burn_uid=int(s.get("burn_uid", 0)),
+            gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
+            gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
+            gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

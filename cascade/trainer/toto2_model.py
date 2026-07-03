@@ -138,11 +138,20 @@ def causal_standardize(
     """
     B, L = x.shape
     keep = torch.ones_like(x) if mask is None else 1.0 - mask.to(x.dtype)
-    xk = x * keep
-    n = keep.cumsum(dim=-1)
+    # The cumulative E[x²]−E[x]² form cancels catastrophically once
+    # mean²/var exceeds the dtype's precision (~1e7 in float32 — routine for
+    # counter/gauge-style series at large levels with small fluctuations),
+    # collapsing scale to eps. Accumulate in float64 and shift each row to its
+    # first observation so the moments stay small regardless of series level.
+    x64 = x.double()
+    k64 = keep.double()
+    ref = x64.gather(-1, (k64 > 0).to(torch.int64).argmax(dim=-1, keepdim=True))
+    xk = (x64 - ref) * k64
+    n = k64.cumsum(dim=-1)
     cnt = n.clamp_min(1.0)
     loc = xk.cumsum(dim=-1) / cnt
     var = (xk * xk).cumsum(dim=-1) / cnt - loc * loc
+    loc = loc + ref
     scale = var.clamp_min(0.0).sqrt().clamp_min(eps)
     ok = n >= float(min_obs)
     has = ok.any(dim=-1)
@@ -151,8 +160,8 @@ def causal_standardize(
     )[:, None]
     loc = torch.where(ok, loc, loc.gather(-1, first))
     scale = torch.where(ok, scale, scale.gather(-1, first))
-    z = torch.asinh((x - loc) / scale)
-    return z, loc, scale
+    z = torch.asinh((x64 - loc) / scale)
+    return z.to(x.dtype), loc.to(x.dtype), scale.to(x.dtype)
 
 
 def patch_anchors(loc: torch.Tensor, scale: torch.Tensor, patch_size: int) -> tuple[torch.Tensor, torch.Tensor]:

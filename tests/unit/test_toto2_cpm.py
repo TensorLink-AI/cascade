@@ -123,6 +123,39 @@ def test_causal_scaler_backfills_leading_steps():
     assert (scale > 0).all()
 
 
+def test_causal_scaler_survives_large_offsets():
+    """Regression: the cumulative E[x²]−E[x]² form used to cancel catastrophically
+    in float32, collapsing scale to the eps floor for any series whose mean ≫ std
+    (counter/gauge-style benchmark data at 1e7+ levels) and unscaling forecasts by
+    up to 7 orders of magnitude."""
+    rng = np.random.default_rng(0)
+    series = 1e7 + rng.normal(0.0, 100.0, size=2048)
+    for dtype in (torch.float32, torch.float64):
+        x = torch.as_tensor(series[None, :], dtype=dtype)
+        _, _, scale = causal_standardize(x)
+        tail = scale[0, 64:]
+        assert (tail > 50.0).all() and (tail < 200.0).all(), f"scale broken for {dtype}"
+
+
+def test_normuon_restores_orthogonalized_norm():
+    """Regression: the per-row second-moment normalization must redistribute the
+    orthogonalized update, not rescale it — without the norm restore, the
+    zero-init EMA inflated step 1 by ~1/sqrt(1-β₂) and steady-state elements to
+    RMS 1 instead of the ~1/sqrt(cols) the Muon-convention base_lr assumes."""
+    from cascade.trainer.toto2_trainer import _MuonAdamW, _polar_express
+
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.zeros(48, 64))
+    p.grad = torch.randn(48, 64)
+    opt = _MuonAdamW([p], [], lr=1.0, weight_decay=0.0)
+    expected = _polar_express(p.grad * (1.0 + opt.momentum))  # Nesterov, step 1
+    before = p.data.clone()
+    opt.step()
+    # lr=1 and scale=max(1, sqrt(48/64))=1 → |Δp|_F must equal |orthogonalized|_F
+    step_norm = (p.data - before).norm()
+    assert torch.isclose(step_norm, expected.norm(), rtol=0.05)
+
+
 def test_patch_anchors_pick_patch_ends():
     loc = torch.arange(16, dtype=torch.float32)[None, :]
     scale = loc + 100
@@ -282,6 +315,48 @@ def test_wrapper_forecast_tracks_context_level(tiny_checkpoint: Path):
     assert (out >= q[:, 0] - 1e-4).all() and (out <= q[:, -1] + 1e-4).all()
     # and nowhere near the 1..8 index range for a level-500 series
     assert abs(np.median(out) - 500.0) < 100.0
+
+
+def test_wrapper_block_decode_advances_anchor(tiny_checkpoint: Path):
+    """Regression: blocks ≥ 2 must be unscaled with causal stats advanced
+    through the committed medians (training semantics: stats move through every
+    observed patch), not the pre-horizon anchor. A stub model that always emits
+    z = 1 decodes every value to ``sinh(1)·scale + loc`` at the *current*
+    anchor — so block 2's output must use the stats recomputed after
+    committing block 1 (which its above-the-mean commits have moved)."""
+    w = _load_wrapper(tiny_checkpoint)
+
+    class _OneModel:
+        def __call__(self, patches, mask=None):
+            B, P, ps = patches.shape
+            return torch.ones(B, P, ps, len(QUANTILE_LEVELS))
+
+    w.model = _OneModel()
+    hist = np.linspace(0.0, 100.0, 40)
+    # max_patches=10, ps=4 → stable span is 8 patches (32 steps); horizon 40 → 2 blocks
+    q = w.forecast_quantiles_batch([hist], horizon=40)[0]     # (40, nq)
+    b1, b2 = q[:32, 4], q[32:, 4]
+    assert np.allclose(b1, b1[0])                             # one anchor per block
+    ctx = w._prep([hist])[0].cpu().numpy()
+    x2 = torch.as_tensor(np.concatenate([ctx, b1]), dtype=torch.float64)[None]
+    _, loc2, scale2 = w.m.causal_standardize(x2)
+    expected = np.sinh(1.0) * float(scale2[0, -1]) + float(loc2[0, -1])
+    assert np.allclose(b2, expected, atol=1e-9)               # advanced anchor
+    assert not np.isclose(b2[0], b1[0])                       # …and it moved
+
+
+def test_wrapper_quantiles_survive_large_offset_level(tiny_checkpoint: Path):
+    """Regression (end-to-end for the scaler fix): at a 1e7 level with std 100,
+    decoded quantiles must sit at the context level with a non-degenerate
+    spread — the float32 collapse pinned scale to 1e-5, flattening every
+    quantile onto loc."""
+    w = _load_wrapper(tiny_checkpoint)
+    rng = np.random.default_rng(0)
+    hist = 1e7 + rng.normal(0.0, 100.0, size=64)
+    q = w.forecast_quantiles_batch([hist], horizon=8)[0]      # (8, nq)
+    assert abs(np.median(q) - 1e7) < 1e6
+    spread = q[:, -1] - q[:, 0]
+    assert (spread > 1.0).all()                               # not collapsed onto loc
 
 
 def test_trainer_end_to_end_tiny_run(tmp_path: Path):

@@ -19,6 +19,11 @@ class SuiteResult:
     metrics: dict = field(default_factory=dict)  # e.g. {"crps": .., "mase": ..}
     n_series: int = 0
     detail: str = ""  # error message or skip reason
+    # Per-config rows the consensus gate consumes: one dict per scored config,
+    # ``{"full": name/freq/term, "MASE", "MAE", "CRPS", "crps_ratio",
+    # "mase_ratio"}`` where the ratios are model ÷ vendored Seasonal-Naive
+    # baseline. Only ``gift-eval`` populates this; other suites leave it empty.
+    rows: list = field(default_factory=list)
 
 
 @dataclass

@@ -61,9 +61,37 @@ DATASETS: dict[str, DatasetSpec] = {
 }
 
 
+# Written into each suite's data dir by a *completed* download_suite call, so
+# provenance reflects what actually landed rather than what the code pins. An
+# interrupted pull leaves no (or a stale) marker and is re-downloaded — cheap,
+# since huggingface_hub resumes by skipping files already present.
+_MARKER = "_cascade_revision.json"
+
+
 def _looks_populated(path: Path) -> bool:
     """True if ``path`` already holds downloaded data (any dataset arrow file)."""
     return path.is_dir() and any(path.rglob("*.arrow"))
+
+
+def _read_marker(path: Path) -> dict | None:
+    import json
+
+    try:
+        return json.loads((Path(path) / _MARKER).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — absent/corrupt marker means "unknown"
+        return None
+
+
+def recorded_revision(path: str | Path) -> str | None:
+    """The revision a data dir was downloaded at, per its marker — ``None`` when
+    the dir carries no marker (hand-managed, env-var-wired, or pre-marker data).
+    Partial (``allow_patterns``) pulls are flagged so a subset can't masquerade
+    as the full benchmark."""
+    marker = _read_marker(Path(path))
+    if not marker or "revision" not in marker:
+        return None
+    rev = str(marker["revision"])
+    return f"{rev} (partial)" if marker.get("patterns") else rev
 
 
 def download_suite(
@@ -75,20 +103,32 @@ def download_suite(
     """Download one benchmark's HF dataset repo into ``dest`` and return the path.
 
     ``allow_patterns`` restricts the pull (e.g. ``["ds-0-T/*"]`` for a quick
-    subset); omit it to fetch the entire benchmark.
+    subset); omit it to fetch the entire benchmark. On completion a marker file
+    records the repo/revision/patterns actually pulled.
     """
     if suite not in DATASETS:
         raise KeyError(f"unknown benchmark {suite!r}; known: {', '.join(DATASETS)}")
+    import json
+
     from huggingface_hub import snapshot_download
 
+    spec = DATASETS[suite]
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     snapshot_download(
-        repo_id=DATASETS[suite].hf_repo,
+        repo_id=spec.hf_repo,
         repo_type="dataset",
-        revision=DATASETS[suite].revision,
+        revision=spec.revision,
         local_dir=str(dest),
         allow_patterns=list(allow_patterns) if allow_patterns else None,
+    )
+    (dest / _MARKER).write_text(
+        json.dumps({
+            "repo": spec.hf_repo,
+            "revision": spec.revision,
+            "patterns": list(allow_patterns) if allow_patterns else None,
+        }, indent=2),
+        encoding="utf-8",
     )
     return dest
 
@@ -102,11 +142,19 @@ def ensure_datasets(
 ) -> dict[str, str]:
     """Ensure each suite's data is under ``data_root/<suite>`` and map env → path.
 
-    With ``download=True`` (default) missing data is fetched; with ``download=False``
-    only already-present dirs are wired up (missing ones are skipped, so the suite
-    reports ``skipped`` rather than erroring). Returns ``{env_var: path}`` for the
-    suites whose data is available — assign these into ``os.environ`` before running.
+    With ``download=True`` (default) the (resumable) download runs unless the
+    dir's marker already matches the pinned revision and requested patterns —
+    a mere "some arrow files exist" is NOT enough, so an interrupted pull is
+    resumed and a stale-pin dir is re-synced rather than silently scored. If a
+    download fails but usable data is present, it is wired up with a warning
+    (its true revision comes from the marker, or ``unknown``). With
+    ``download=False`` only already-present dirs are wired up (missing ones
+    are skipped, so the suite reports ``skipped`` rather than erroring).
+    Returns ``{env_var: path}`` for the suites whose data is available —
+    assign these into ``os.environ`` before running.
     """
+    import sys
+
     data_root = Path(data_root)
     env: dict[str, str] = {}
     for suite in suites:
@@ -114,8 +162,20 @@ def ensure_datasets(
         if spec is None:  # e.g. a suite with no downloadable dataset
             continue
         dest = data_root / suite
-        if download and not _looks_populated(dest):
-            download_suite(suite, dest, allow_patterns=allow_patterns)
+        if download:
+            marker = _read_marker(dest)
+            in_sync = (
+                marker is not None
+                and marker.get("revision") == spec.revision
+                and marker.get("patterns") == (list(allow_patterns) if allow_patterns else None)
+            )
+            if not in_sync:
+                try:
+                    download_suite(suite, dest, allow_patterns=allow_patterns)
+                except Exception as e:  # noqa: BLE001 — offline with usable data
+                    print(f"[{suite}] download failed ({e}); "
+                          f"{'using existing data as-is' if _looks_populated(dest) else 'no data available'}",
+                          file=sys.stderr)
         if _looks_populated(dest):
             env[spec.env_var] = str(dest)
     return env

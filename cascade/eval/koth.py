@@ -15,10 +15,18 @@ holds no state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .bootstrap import paired_bootstrap_lcb_aggregated
+from .gift_gate import GiftGateResult
 from .scoring import WindowScore, global_geomean, stack_components
+
+# The public-benchmark gate rollout modes (``[scoring] gift_gate_mode``):
+#   "off"     — gate never runs (default; pure private-pool KOTH).
+#   "shadow"  — gate is computed and logged on a private-pool win, but the
+#               verdict is NOT changed (calibrate tolerance against real noise).
+#   "enforce" — gate is AND-ed into the dethrone decision.
+GIFT_GATE_MODES = ("off", "shadow", "enforce")
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,14 @@ class KothParams:
     bootstrap_B: int
     bootstrap_alpha: float
     dethrone_cp: int
+    # Public-benchmark no-regression gate (see :mod:`.gift_gate`). Off by
+    # default; ``gift_gate_tolerance`` is the relative slack the challenger may
+    # be worse by on GIFT-Eval, ``gift_gate_min_configs`` the floor of shared
+    # configs below which the gate is uncomputable (→ inconclusive). The gate
+    # reuses ``bootstrap_B``/``bootstrap_alpha``. Defaults keep it inert.
+    gift_gate_mode: str = "off"
+    gift_gate_tolerance: float = 0.03
+    gift_gate_min_configs: int = 15
 
 
 def margin_for_tenure(params: KothParams, king_tenure_rounds: int) -> float:
@@ -75,6 +91,11 @@ class RoundResult:
             logging.
         inconclusive: True when ``n_windows < min_windows`` — the king holds
             and the win counter does not advance.
+        gift_lcb: public-benchmark gate LCB, when the gate ran this round
+            (``None`` = gate off / not reached / uncomputable). Diagnostic only.
+        gift_gate_passed: whether the gate passed, when it ran (``None``
+            otherwise). Under ``enforce`` a False here has already been folded
+            into ``challenger_wins_round``; under ``shadow`` it is logged only.
     """
 
     challenger_wins_round: bool
@@ -84,6 +105,8 @@ class RoundResult:
     king_geomean: float
     chal_geomean: float
     inconclusive: bool
+    gift_lcb: float | None = None
+    gift_gate_passed: bool | None = None
 
 
 def evaluate_round(
@@ -133,3 +156,37 @@ def evaluate_round(
         chal_geomean=global_geomean(chal_scores),
         inconclusive=False,
     )
+
+
+def apply_gift_gate(
+    result: RoundResult, gate: GiftGateResult, *, mode: str
+) -> RoundResult:
+    """Fold the public-benchmark gate into a round result. Pure — returns a new
+    :class:`RoundResult`; the private-pool decision in ``result`` is untouched
+    except where ``enforce`` blocks a win.
+
+    Truth table (the gate only matters on a private-pool *win*):
+
+    * win × pass                → win (unchanged)
+    * win × fail   (enforce)    → not a win, streak resets (a public regression)
+    * win × uncomputable        → inconclusive (king holds, streak untouched)
+    * win, mode = shadow        → win (unchanged); gate recorded for logging
+    * loss / inconclusive       → unchanged (gate is never consulted)
+
+    ``gift_lcb``/``gift_gate_passed`` are always recorded for observability, so
+    a shadow run logs exactly what an enforce run would have decided.
+    """
+    diagnostic = replace(
+        result,
+        gift_lcb=(gate.lcb if gate.computed else None),
+        gift_gate_passed=(gate.passed if gate.computed else None),
+    )
+    if mode != "enforce" or not result.challenger_wins_round:
+        return diagnostic
+    if not gate.computed:
+        # Uncomputable gate on an otherwise-winning round: make no decision
+        # rather than pass or fail silently — the king holds, streak untouched.
+        return replace(diagnostic, challenger_wins_round=False, inconclusive=True)
+    if not gate.passed:
+        return replace(diagnostic, challenger_wins_round=False)
+    return diagnostic

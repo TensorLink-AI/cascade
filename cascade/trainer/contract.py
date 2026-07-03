@@ -42,7 +42,7 @@ TrainLogger = Callable[[dict], None]
 # from-scratch architecture + init that king and challenger must share.
 _ARCH_FIELDS = (
     "base_arch", "arch_preset", "d_model", "num_layers", "num_heads", "head_dim",
-    "patch_size", "mlp_expansion", "num_quantiles", "masking", "cpm_c_max",
+    "patch_size", "mlp_expansion", "d_ff", "num_quantiles", "masking", "cpm_c_max",
     "cpm_p_max", "input_transform", "context_length", "horizon",
 )
 

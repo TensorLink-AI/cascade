@@ -42,7 +42,7 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # per_dim_scale=true, layer_group_size=4 with one trailing variate layer.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "7c16aedfbc624683b7e06b8aa8b882baab09e61b23a71dd1bf1cb72d1bd4abf5"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
+base_arch_digest   = "95a8141d1909e38fd1369c22968e8881f3801fb9915321534b36a8cc9d977747"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -181,6 +181,13 @@ benchmark_project_dir = "benchmarks"  # path to the sidecar project (relative to
 benchmark_suites      = []        # subset of ["gift-eval","boom","time"]; [] = all three
 benchmark_num_samples = 0         # samples per benchmark forecast; 0 reuses num_samples above
 benchmark_max_series  = 0         # cap number of datasets/tasks for a fast smoke run; 0 = full benchmark
+# Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
+# gift_gate_mode != "off"). Every enforcing validator must have the gift-eval
+# data pinned locally (see benchmarks/, `cascade-benchmark-download`).
+gift_gate_datasets    = ""        # gift-eval config subset for the gate ("" = full 97 configs)
+gift_gate_num_samples = 0         # samples for the gate's gift-eval run; 0 reuses num_samples
+gift_gate_data_dir    = ""        # pinned benchmark data dir on the validator ("" = suite env vars)
+gift_gate_timeout_s   = 3600      # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
 # King-of-the-hill — single-round, flat-margin dethroning (teutonic-style).
@@ -203,6 +210,14 @@ dethrone_cp          = 1         # consecutive round wins to take the throne (1 
 # Set reward_prior_kings = 0 for pure winner-take-all on the current king.
 reward_prior_kings   = 4         # prior distinct kings that share weight with the current king
 burn_uid             = 0         # weight sink when no rewarded king is registered (owner burn slot)
+# Public-benchmark no-regression gate (see cascade.eval.gift_gate). AND-ed with
+# the private-pool decision on a win: it can BLOCK a dethrone if the challenger
+# regressed on broad public data (GIFT-Eval), but can never grant one. Start on
+# "shadow" to log what it WOULD decide and calibrate the tolerance against real
+# round-to-round noise before flipping to "enforce".
+gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
+gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
+gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
 
 [dependencies]
 # Allowlist for a generator's requirements.txt — supply-chain restriction.

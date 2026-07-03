@@ -100,6 +100,38 @@ def test_quantile_wrapper_multivariate_stacks_variates(tmp_path: Path):
     assert f.start_date == pd.Period("2020-01-01", freq="D") + 12  # time, not variates
 
 
+MISMATCHED_GRID_STUB = textwrap.dedent(
+    """
+    import numpy as np
+
+    class Wrapper:
+        quantile_levels = [0.1, 0.3, 0.5, 0.7, 0.9]  # not the metric grid
+
+        def __init__(self, checkpoint_dir, device="cpu"):
+            pass
+
+        def forecast_quantiles_batch(self, histories, horizon):
+            raise AssertionError("quantile path must not be used on a mismatched grid")
+
+        def forecast(self, history, horizon, num_samples):
+            h = np.asarray(history, dtype=np.float64).reshape(-1)
+            return np.full((1, num_samples, horizon), h[-1])
+    """
+)
+
+
+def test_mismatched_quantile_grid_falls_back_to_samples(tmp_path: Path):
+    """A wrapper whose quantile grid differs from the one the metrics request
+    must take the sample path: QuantileForecast would silently interpolate or
+    tail-extrapolate the missing levels, making numbers non-comparable with
+    same-grid checkpoints, while samples can serve any level correctly."""
+    ckpt = _ckpt(tmp_path, MISMATCHED_GRID_STUB)
+    predictor = CheckpointPredictor(ckpt, prediction_length=4, num_samples=7)
+    (f,) = predictor.predict([_entry(np.arange(10), "a")])
+    assert isinstance(f, SampleForecast)
+    assert f.samples.shape == (7, 4)
+
+
 def test_legacy_sample_wrapper_falls_back_to_sample_forecasts(tmp_path: Path):
     ckpt = _ckpt(tmp_path, SAMPLE_STUB)
     predictor = CheckpointPredictor(ckpt, prediction_length=5, num_samples=11)

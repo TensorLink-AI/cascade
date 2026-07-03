@@ -246,7 +246,11 @@ class Toto2Trainer:
             stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
         ):
-            x = torch.as_tensor(arr, device=self.device, dtype=self.dtype)  # (B, P*ps)
+            # Standardize from float64: downcasting the raw series first would
+            # quantize away small fluctuations at large levels (float32 has ~7
+            # digits) before the scaler ever sees them. Only the O(1)-scale z
+            # and targets drop to the model dtype.
+            x = torch.as_tensor(arr, device=self.device, dtype=torch.float64)  # (B, P*ps)
             num_patches = arr.shape[1] // cfg.patch_size
             cpm = sample_cpm_masks(
                 arr.shape[0], num_patches,
@@ -255,12 +259,12 @@ class Toto2Trainer:
             mask = torch.as_tensor(cpm, device=self.device)                 # (B, P)
             step_mask = (
                 mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
-            ).to(self.dtype)
+            ).to(x.dtype)
             # Per-step causal stats over unmasked entries only — masked spans
             # carry the last observed stats forward, exactly like the horizon
             # mask patches at inference.
             z, loc, scale = causal_standardize(x, mask=step_mask)
-            patches = z.view(x.shape[0], num_patches, cfg.patch_size)
+            patches = z.to(self.dtype).view(x.shape[0], num_patches, cfg.patch_size)
             pred = model(patches, mask=mask)            # (B, P, patch_size, num_q)
             pred_q = pred[:, :-1]                        # (B, P-1, patch_size, num_q)
             # Target patch p+1 is scaled at the anchor closing patch p — the
@@ -270,7 +274,7 @@ class Toto2Trainer:
             raw = x.view(x.shape[0], num_patches, cfg.patch_size)
             target = torch.asinh(
                 (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
-            )
+            ).to(self.dtype)
             loss = pinball_loss(pred_q, target, tuple(levels))
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
@@ -417,7 +421,14 @@ class _MuonAdamW:
             v.mul_(self.beta2).add_(
                 (update * update).mean(dim=1, keepdim=True), alpha=1.0 - self.beta2
             )
-            update = update / (v.sqrt() + self.eps)
+            # Row-normalise, then restore the orthogonalized update's Frobenius
+            # norm (NorMuon alg. 1 step 10): the per-row rebalancing must
+            # redistribute the step, not inflate it — without the restore, the
+            # zero-init EMA scales the first steps by ~1/sqrt(1-β₂) and
+            # steady-state elements to RMS 1 instead of the ~1/sqrt(cols) the
+            # Muon-convention base_lr is calibrated for.
+            normed = update / (v.sqrt() + self.eps)
+            update = normed * (update.norm() / normed.norm().clamp_min(self.eps))
             scale = max(1.0, (p.shape[0] / p.shape[1]) ** 0.5)
             if self.weight_decay:
                 # cautious weight decay: only where decay agrees with the update
@@ -497,11 +508,9 @@ class Wrapper:
 
     def _prep(self, histories):
         """Left-pad (with the first value) or truncate each 1-D history to the
-        context window, then apply the causal scaler. Returns
-        ``(z, loc, scale, lo, hi)``: the causally normalized context
-        ``(B, window_len)``, the end-of-context anchor stats ``(B, 1)`` the
-        forecast is unscaled with, and the real-space clamp bounds ``(B, 1)``
-        (context min/max, each extended by 1e4x the anchor scale)."""
+        context window. Returns the real-space context ``(B, window_len)`` in
+        float64 — standardization happens per decode block, from full
+        precision, so large-level series keep their fluctuations."""
         ps = self.cfg.patch_size
         n_ctx = max(2, self.cfg.context_length // ps)
         window_len = n_ctx * ps
@@ -514,59 +523,71 @@ class Wrapper:
             else:
                 h = h[-window_len:]
             rows.append(h)
-        x = torch.as_tensor(np.stack(rows), dtype=torch.float32, device=self.device)
-        z, loc_t, scale_t = self.m.causal_standardize(x)
-        loc = loc_t[:, -1:]
-        scale = scale_t[:, -1:]
-        lo = x.min(dim=-1, keepdim=True).values - 1e4 * scale
-        hi = x.max(dim=-1, keepdim=True).values + 1e4 * scale
-        return z, loc, scale, lo, hi
+        return torch.as_tensor(np.stack(rows), dtype=torch.float64, device=self.device)
 
     @torch.no_grad()
-    def _decode_z(self, z, k_patches: int):
-        """Append masked horizon patches and read every horizon patch's
-        quantiles from one forward pass; past the stable span, block-decode
-        (commit the median and continue). ``z``: ``(B, L)`` normalized context
-        → z-space quantiles ``(B, k_patches*patch_size, num_q)``."""
+    def _decode_block_z(self, z, block: int):
+        """One CPM forward pass: append ``block`` masked patches to the
+        normalized context ``(B, L)`` and read their z-space quantiles
+        ``(B, block*patch_size, num_q)``."""
+        ps = self.cfg.patch_size
+        # keep as much context as the positional table allows
+        ctx_p = min(z.shape[1] // ps, self.cfg.max_patches - block)
+        ctx = z[:, -ctx_p * ps :].view(z.shape[0], ctx_p, ps)
+        filler = torch.zeros(z.shape[0], block, ps, dtype=ctx.dtype, device=self.device)
+        mask = torch.zeros(z.shape[0], ctx_p + block, dtype=ctx.dtype, device=self.device)
+        mask[:, ctx_p:] = 1.0
+        pred = self.model(torch.cat([ctx, filler], dim=1), mask=mask)
+        # position i predicts patch i+1 → the horizon patches come from
+        # positions ctx_p-1 .. ctx_p+block-2.
+        q = pred[:, ctx_p - 1 : ctx_p + block - 1]          # (B, block, ps, nq)
+        q, _ = torch.sort(q, dim=-1)                        # prevent quantile crossing
+        return q.reshape(z.shape[0], block * ps, -1)
+
+    @torch.no_grad()
+    def _decode_quantiles(self, x, horizon: int):
+        """Block-decode real-space quantiles ``(B, horizon, num_q)`` from the
+        real-space context ``x`` ``(B, L)``.
+
+        Each block re-runs the causal scaler over history + committed medians
+        and unscales with the resulting end-of-context anchor. Committed
+        patches are *observed* context for later blocks, and in training the
+        causal stats advance through every observed patch — so the anchor must
+        advance with them; reusing the pre-horizon anchor would feed blocks ≥ 2
+        a scale/location regime the model never sees in training. Clamp bounds
+        are fixed from the original context (min/max ± 1e4x anchor scale, per
+        the report) so committed medians can't widen them.
+        """
         ps = self.cfg.patch_size
         stable = max(1, min(STABLE_DECODE_STEPS // ps, self.cfg.max_patches - 2))
+        remaining = -(-int(horizon) // ps)
+        lo = hi = None
         out = []
-        remaining = k_patches
         while remaining > 0:
             block = min(remaining, stable)
-            # keep as much context as the positional table allows
-            ctx_p = min(z.shape[1] // ps, self.cfg.max_patches - block)
-            ctx = z[:, -ctx_p * ps :].view(z.shape[0], ctx_p, ps)
-            filler = torch.zeros(z.shape[0], block, ps, dtype=ctx.dtype, device=self.device)
-            mask = torch.zeros(z.shape[0], ctx_p + block, dtype=ctx.dtype, device=self.device)
-            mask[:, ctx_p:] = 1.0
-            pred = self.model(torch.cat([ctx, filler], dim=1), mask=mask)
-            # position i predicts patch i+1 → the horizon patches come from
-            # positions ctx_p-1 .. ctx_p+block-2.
-            q = pred[:, ctx_p - 1 : ctx_p + block - 1]      # (B, block, ps, nq)
-            q, _ = torch.sort(q, dim=-1)                    # prevent quantile crossing
-            out.append(q.reshape(z.shape[0], block * ps, -1))
+            z, loc_t, scale_t = self.m.causal_standardize(x)
+            loc = loc_t[:, -1:].double().unsqueeze(-1)      # (B, 1, 1)
+            scale = scale_t[:, -1:].double().unsqueeze(-1)
+            if lo is None:
+                lo = x.min(dim=-1, keepdim=True).values.unsqueeze(-1) - 1e4 * scale
+                hi = x.max(dim=-1, keepdim=True).values.unsqueeze(-1) + 1e4 * scale
+            qz = self._decode_block_z(z.to(torch.float32), block)
+            q = torch.sinh(qz.double()) * scale + loc       # (B, block*ps, nq)
+            q = torch.clamp(q, min=lo, max=hi)
+            out.append(q)
             remaining -= block
             if remaining > 0:
-                median = q[..., q.shape[-1] // 2].reshape(z.shape[0], block * ps)
-                z = torch.cat([z, median], dim=1)
-        return torch.cat(out, dim=1)
+                x = torch.cat([x, q[..., q.shape[-1] // 2]], dim=1)
+        return torch.cat(out, dim=1)[:, : int(horizon)]
 
     # ── quantile head (benchmark path) ────────────────────────────────────────
 
     @torch.no_grad()
     def forecast_quantiles_batch(self, histories, horizon: int) -> np.ndarray:
         """Decode ``len(histories)`` series in one batch → real-space quantiles
-        ``(B, horizon, num_q)`` at ``self.quantile_levels``."""
-        histories = list(histories)
-        z, loc, scale, lo, hi = self._prep(histories)
-        k = -(-int(horizon) // self.cfg.patch_size)
-        qz = self._decode_z(z, k)[:, : int(horizon)]        # (B, h, nq)
-        # arcsinh + affine are monotone increasing, so quantiles map pointwise;
-        # decoded patches sit in the end-of-context anchor space (mask patches
-        # add no observations, so the causal stats stay at the anchor).
-        q = torch.sinh(qz) * scale.unsqueeze(-1) + loc.unsqueeze(-1)
-        q = torch.clamp(q, min=lo.unsqueeze(-1), max=hi.unsqueeze(-1))
+        ``(B, horizon, num_q)`` at ``self.quantile_levels``. arcsinh + affine
+        are monotone increasing, so quantiles map pointwise."""
+        q = self._decode_quantiles(self._prep(list(histories)), horizon)
         return q.detach().cpu().numpy().astype(np.float64)
 
     def forecast_quantiles(self, history, horizon: int) -> np.ndarray:
@@ -585,27 +606,22 @@ class Wrapper:
         generator = torch.Generator(device=self.device)
         generator.manual_seed(seed)
 
-        z, loc, scale, lo, hi = self._prep([hist])
-        k = -(-int(horizon) // self.cfg.patch_size)
-        qz = self._decode_z(z, k)[0, : int(horizon)]        # (h, nq) — z-space
+        q = self._decode_quantiles(self._prep([hist]), horizon)[0]  # (h, nq) real-space
         # One draw per step per path via the piecewise-linear inverse CDF of the
-        # decoded quantiles. Quantiles decode once; samples never feed back.
-        nq = qz.shape[-1]
+        # decoded quantiles (already clamped and monotone in the level).
+        # Quantiles decode once; samples never feed back.
+        nq = q.shape[-1]
         levels = self.levels
         u = torch.rand(int(num_samples), int(horizon), device=self.device, generator=generator)
         idx = torch.searchsorted(levels, u.clamp(levels[0].item(), levels[-1].item()))
         idx = idx.clamp(1, nq - 1)
-        # i_lo/i_hi are quantile INDICES — distinct names so they can't shadow
-        # the real-space clamp bounds ``lo``/``hi`` from _prep.
         i_lo = idx - 1
         i_hi = idx
-        qe = qz.unsqueeze(0).expand(u.shape[0], -1, -1)     # (ns, h, nq)
+        qe = q.unsqueeze(0).expand(u.shape[0], -1, -1)      # (ns, h, nq)
         vl = torch.gather(qe, -1, i_lo.unsqueeze(-1)).squeeze(-1)
         vh = torch.gather(qe, -1, i_hi.unsqueeze(-1)).squeeze(-1)
-        ql = levels[i_lo]; qh = levels[i_hi]
-        frac = ((u - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
-        zs = vl + frac * (vh - vl)                          # (ns, h)
-        out = torch.sinh(zs) * scale[0] + loc[0]
-        out = torch.clamp(out, min=lo[0], max=hi[0])
+        ql = levels[i_lo].double(); qh = levels[i_hi].double()
+        frac = ((u.double() - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
+        out = vl + frac * (vh - vl)                         # (ns, h)
         return out.detach().cpu().numpy().reshape(1, int(num_samples), int(horizon))
 '''

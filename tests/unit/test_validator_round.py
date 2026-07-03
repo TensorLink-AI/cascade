@@ -245,6 +245,112 @@ def test_vote_switches_to_new_king_on_dethrone(cfg):
     assert runner._king_uid_to_vote(_manifest(cfg), dethroned) == 1  # state's (new) king
 
 
+# ── public-benchmark gate wiring ───────────────────────────────────────────────
+
+
+def _strong_eval():
+    """Challenger clearly beats the king on the private pool (0.6x) ⇒ a win the
+    gate can then act on."""
+    king_scores = _scores(1.0, 0)
+    chal_scores = [WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6, s.abs_target)
+                   for s in king_scores]
+    return lambda entry, windows: king_scores if entry.role == "king" else chal_scores
+
+
+def _gift_fn(king_mult, chal_mult, *, king_rev="r1", chal_rev="r1",
+            status="ok", calls=None):
+    def fn(entry):
+        if calls is not None:
+            calls.append(entry.role)
+        mult, rev = (king_mult, king_rev) if entry.role == "king" else (chal_mult, chal_rev)
+        rows = [{"full": f"ds/{i}", "crps_ratio": mult, "mase_ratio": mult} for i in range(20)]
+        return {"status": status, "rows": rows, "revision": rev}
+    return fn
+
+
+def _with_gate(cfg, mode):
+    from dataclasses import replace
+
+    return replace(cfg, scoring=replace(cfg.scoring, gift_gate_mode=mode))
+
+
+def test_enforce_gate_pass_allows_dethrone(cfg):
+    cfg = _with_gate(cfg, "enforce")
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=_gift_fn(1.0, 1.0), verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome.result.challenger_wins_round and outcome.transition.dethroned
+    assert outcome.result.gift_gate_passed is True
+    assert runner.state.king_hotkey == "chal_hk"
+
+
+def test_enforce_gate_fail_blocks_dethrone(cfg):
+    cfg = _with_gate(cfg, "enforce")
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=_gift_fn(1.0, 1.5), verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert not outcome.result.challenger_wins_round and not outcome.result.inconclusive
+    assert outcome.result.gift_gate_passed is False
+    assert not outcome.transition.dethroned
+    assert runner.state.king_hotkey == "king_hk"  # king holds
+
+
+def test_enforce_gate_uncomputable_holds_round(cfg):
+    cfg = _with_gate(cfg, "enforce")
+    # sidecar produced nothing for the challenger ⇒ uncomputable ⇒ inconclusive
+    def gift_fn(entry):
+        return None if entry.role == "challenger" else _gift_fn(1.0, 1.0)(entry)
+
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=gift_fn, verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome.result.inconclusive and not outcome.transition.dethroned
+    assert runner.state.king_hotkey == "king_hk"
+
+
+def test_enforce_gate_data_revision_mismatch_holds_round(cfg):
+    cfg = _with_gate(cfg, "enforce")
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=_gift_fn(1.0, 1.0, king_rev="r1", chal_rev="r2"),
+                             verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome.result.inconclusive and not outcome.transition.dethroned
+
+
+def test_shadow_gate_logs_but_never_blocks(cfg):
+    cfg = _with_gate(cfg, "shadow")
+    # gate would FAIL, but shadow must not change the dethrone
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=_gift_fn(1.0, 1.5), verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome.transition.dethroned                     # verdict unchanged
+    assert outcome.result.gift_gate_passed is False         # but recorded
+
+
+def test_gate_not_consulted_on_a_loss(cfg):
+    cfg = _with_gate(cfg, "enforce")
+    king_scores = _scores(1.0, 0)
+    weak = [WindowScore(s.series_id, s.mase * 2.0, s.qloss_per_q * 2.0, s.abs_target)
+            for s in king_scores]  # challenger worse ⇒ no win
+    calls: list[str] = []
+    runner = ValidatorRunner(
+        cfg=cfg, state=genesis("king_hk", 0),
+        evaluate_fn=lambda e, w: king_scores if e.role == "king" else weak,
+        gift_rows_fn=_gift_fn(1.0, 1.0, calls=calls), verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert not outcome.result.challenger_wins_round
+    assert calls == []  # gate never ran on a non-winning round
+
+
+def test_off_mode_skips_gate_entirely(cfg):
+    calls: list[str] = []
+    runner = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=_strong_eval(),
+                             gift_rows_fn=_gift_fn(1.0, 1.5, calls=calls), verify_signatures=False)
+    outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
+    assert outcome.transition.dethroned  # default cfg ships gift_gate_mode = "off"
+    assert calls == []
+
+
 def test_trainer_pairing_logic():
     commits = [
         Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),

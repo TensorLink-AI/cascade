@@ -190,6 +190,19 @@ is still available: set `dethrone_cp > 1` (a challenger must then win that many
 and let `win_margin_end > win_margin_start` ramp over `margin_warmup_rounds` of
 tenure so an entrenched king must be beaten more decisively.
 
+**Public-benchmark no-regression gate (optional, off by default).** With
+`[scoring] gift_gate_mode = "enforce"`, a dethrone additionally requires that the
+challenger has not *statistically meaningfully regressed* on broad public data
+(GIFT-Eval). On a private-pool win, both models are scored via the isolated
+`benchmarks/` sidecar and a **paired no-regression bootstrap**
+(`cascade.eval.gift_gate`) checks `lcb >= -gift_gate_tolerance` on the shared
+configs. The gate is **not winnable** — it can only block a dethrone the private
+LCB already granted — and an uncomputable gate (sidecar down, too few configs,
+or king/challenger on different pinned data revisions) makes the round
+inconclusive rather than silently passing or failing. `gift_gate_mode = "shadow"`
+computes and logs the verdict without enforcing it, to calibrate the tolerance
+against real noise first. Rationale and ops notes: `OPEN_QUESTIONS.md` §9.
+
 ## Trust model (v1) and the path to decentralisation
 
 v1 centralises training in the owner's trainer and trust in `[manifest]

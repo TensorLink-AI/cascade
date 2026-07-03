@@ -38,6 +38,11 @@ from gluonts.model.forecast import Forecast, QuantileForecast, SampleForecast
 from gluonts.model.predictor import Predictor
 
 
+# The grid the gluonts metrics are configured with (suites/_common.py's
+# QUANTILE_LEVELS — kept local because the suites import this module).
+_METRIC_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+
 def _load_wrapper(checkpoint_dir: Path, device: str):
     """Import ``forecast_wrapper.Wrapper`` from the checkpoint and instantiate it.
 
@@ -77,8 +82,16 @@ class CheckpointPredictor(Predictor):
         self.batch_size = max(1, int(batch_size))
         self._wrapper = _load_wrapper(Path(checkpoint_dir), device)
         levels = getattr(self._wrapper, "quantile_levels", None)
+        # The quantile path requires the wrapper's grid to be exactly the one
+        # the gluonts metrics request (mirrors time_bench's check): on any
+        # other grid, QuantileForecast would silently interpolate/extrapolate
+        # the missing levels — numbers not comparable across checkpoints —
+        # whereas the sample path can serve any level correctly.
         self._use_quantiles = (
-            hasattr(self._wrapper, "forecast_quantiles_batch") and levels is not None
+            hasattr(self._wrapper, "forecast_quantiles_batch")
+            and levels is not None
+            and len(levels) == len(_METRIC_QUANTILE_LEVELS)
+            and np.allclose([float(v) for v in levels], _METRIC_QUANTILE_LEVELS)
         )
         if self._use_quantiles:
             self._forecast_keys = [f"{float(v):g}" for v in levels]

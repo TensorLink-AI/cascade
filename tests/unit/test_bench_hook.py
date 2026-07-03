@@ -14,7 +14,7 @@ from cascade.trainer.bench_hook import (
     launch_post_round_benchmark,
     run_post_round_benchmark,
 )
-from cascade.trainer.remote import RemoteHost
+from cascade.trainer.remote import PREEMPT_BENCHMARKS, RemoteHost
 
 HOST = RemoteHost(name="pod", host="1.2.3.4", workdir="/root/cascade", cuda_device="0")
 
@@ -28,7 +28,7 @@ def test_king_paths_match_worker_layout():
 def test_build_bench_remote_command():
     cmd, report = build_bench_remote_command(HOST, "42", "toto2-4m", BenchPlan())
     # bracketed pattern: kills previous benchmarks without self-matching this shell
-    assert cmd.startswith("pkill -f 'bin/cascade[-]benchmark'")
+    assert cmd.startswith(PREEMPT_BENCHMARKS)
     assert "CUDA_VISIBLE_DEVICES=0" in cmd
     assert "--project /root/cascade/benchmarks" in cmd
     assert "--suites gift-eval,boom,time" in cmd and "--device cuda" in cmd
@@ -72,7 +72,7 @@ def test_training_dispatch_preempts_benchmarks():
     from cascade.trainer.remote import build_remote_command
 
     cmd = build_remote_command(HOST, ["python", "-m", "cascade.trainer.worker"], {})
-    assert cmd.startswith("pkill -f 'bin/cascade[-]benchmark'")  # training always wins
+    assert cmd.startswith(PREEMPT_BENCHMARKS)  # training always wins
     assert "cd /root/cascade &&" in cmd
 
 

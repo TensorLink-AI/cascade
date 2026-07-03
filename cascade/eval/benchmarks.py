@@ -30,23 +30,18 @@ log = logging.getLogger("cascade.validator.benchmarks")
 DEFAULT_TIMEOUT_S = 6 * 60 * 60
 
 
-def run_benchmarks(
+def _invoke_sidecar(
     checkpoint_dir: str | Path,
-    *,
     project_dir: str | Path,
-    suites: tuple[str, ...] | list[str] = ("gift-eval", "boom", "time"),
-    num_samples: int = 100,
-    max_series: int = 0,
-    device: str = "cpu",
-    timeout_s: int = DEFAULT_TIMEOUT_S,
-    uv_bin: str | None = None,
+    tail_args: list[str],
+    *,
+    timeout_s: int,
+    uv_bin: str | None,
 ) -> dict | None:
-    """Run the benchmark sidecar on ``checkpoint_dir`` and return its report dict.
-
-    Returns the parsed report (``{"checkpoint": ..., "suites": [...]}``) on
-    success, or ``None`` on any failure — never raises. ``project_dir`` is the
-    ``benchmarks/`` sidecar project; ``uv`` resolves its locked env in isolation.
-    """
+    """Run ``cascade-benchmark <ckpt> <out.json> <tail_args…>`` in the sidecar's
+    locked env and return the parsed report dict, or ``None`` on any failure
+    (never raises). Shared by :func:`run_benchmarks` and :func:`run_gift_rows`
+    so the local uv invocation lives in exactly one place."""
     ckpt = Path(checkpoint_dir)
     project = Path(project_dir)
     if not (ckpt / "forecast_wrapper.py").is_file():
@@ -60,16 +55,11 @@ def run_benchmarks(
         log.warning("benchmarks: `uv` not on PATH; cannot run sidecar; skipping")
         return None
 
-    suites_arg = ",".join(suites)
     with tempfile.TemporaryDirectory(prefix="cascade-bench-") as tmp:
         out_json = Path(tmp) / "results.json"
         cmd = [
             uv, "run", "--project", str(project), "cascade-benchmark",
-            str(ckpt), str(out_json),
-            "--suites", suites_arg,
-            "--num-samples", str(num_samples),
-            "--max-series", str(max_series),
-            "--device", device,
+            str(ckpt), str(out_json), *tail_args,
         ]
         try:
             proc = subprocess.run(
@@ -93,6 +83,82 @@ def run_benchmarks(
         except Exception as e:  # noqa: BLE001
             log.warning("benchmarks: could not read sidecar output: %s", e)
             return None
+
+
+def run_benchmarks(
+    checkpoint_dir: str | Path,
+    *,
+    project_dir: str | Path,
+    suites: tuple[str, ...] | list[str] = ("gift-eval", "boom", "time"),
+    num_samples: int = 100,
+    max_series: int = 0,
+    device: str = "cpu",
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    uv_bin: str | None = None,
+) -> dict | None:
+    """Run the benchmark sidecar on ``checkpoint_dir`` and return its report dict.
+
+    Returns the parsed report (``{"checkpoint": ..., "suites": [...]}``) on
+    success, or ``None`` on any failure — never raises. ``project_dir`` is the
+    ``benchmarks/`` sidecar project; ``uv`` resolves its locked env in isolation.
+    """
+    return _invoke_sidecar(
+        checkpoint_dir, project_dir,
+        [
+            "--suites", ",".join(suites),
+            "--num-samples", str(num_samples),
+            "--max-series", str(max_series),
+            "--device", device,
+        ],
+        timeout_s=timeout_s, uv_bin=uv_bin,
+    )
+
+
+def run_gift_rows(
+    checkpoint_dir: str | Path,
+    *,
+    project_dir: str | Path,
+    datasets: str = "",
+    num_samples: int = 100,
+    batch_size: int = 512,
+    device: str = "cpu",
+    data_dir: str | None = None,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    uv_bin: str | None = None,
+) -> dict | None:
+    """Run ONLY the ``gift-eval`` suite and return the per-config ratio rows the
+    consensus gate consumes, with the data revision they were scored against::
+
+        {"status": "ok", "rows": [{"full", "crps_ratio", "mase_ratio", …}, …],
+         "revision": "<hf-commit>" | None}
+
+    Unlike :func:`run_benchmarks` this is on the *consensus* path, so the caller
+    (not this function) decides the failure policy: ``None`` means the sidecar
+    could not produce a report at all, and a returned ``status`` other than
+    ``"ok"`` means gift-eval was skipped/errored — either way the caller treats
+    the gate as uncomputable. ``datasets`` pins the config subset (sets
+    ``--gifteval-datasets``); ``data_dir`` points at the pinned benchmark data.
+    """
+    tail = [
+        "--suites", "gift-eval",
+        "--num-samples", str(num_samples),
+        "--device", device,
+        "--batch-size", str(batch_size),
+    ]
+    if datasets:
+        tail += ["--gifteval-datasets", datasets]
+    if data_dir:
+        tail += ["--data-dir", data_dir]
+    report = _invoke_sidecar(
+        checkpoint_dir, project_dir, tail, timeout_s=timeout_s, uv_bin=uv_bin
+    )
+    if report is None:
+        return None
+    revision = (report.get("data_revisions") or {}).get("gift-eval")
+    for s in report.get("suites", []):
+        if s.get("suite") == "gift-eval":
+            return {"status": s.get("status"), "rows": s.get("rows") or [], "revision": revision}
+    return None
 
 
 def format_report(report: dict) -> str:

@@ -44,6 +44,10 @@ log = logging.getLogger("cascade.validator")
 
 # Resolve a trained entry to its per-window scores on the eval set.
 EvaluateFn = Callable[[TrainedEntry, list[EvalWindow]], list[WindowScore]]
+# Resolve a trained entry to its gift-eval ratio rows for the public-benchmark
+# gate: ``{"status", "rows", "revision"}`` (see ``eval.benchmarks.run_gift_rows``)
+# or ``None`` when the sidecar produced nothing.
+GiftRowsFn = Callable[[TrainedEntry], dict | None]
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class ValidatorRunner:
     cfg: ChainConfig
     state: ChampionState = field(default_factory=ChampionState)
     evaluate_fn: EvaluateFn | None = None     # injected in tests; defaults to registry+torch
+    gift_rows_fn: GiftRowsFn | None = None    # injected in tests; defaults to the sidecar bridge
     cache_dir: Path | None = None
     device: str = "cpu"
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
@@ -130,6 +135,82 @@ class ValidatorRunner:
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
         )
+
+    # ── public-benchmark no-regression gate ─────────────────────────────────
+
+    def _gift_rows(self, entry: TrainedEntry) -> dict | None:
+        """Gift-eval ratio rows for one entry — injected in tests, else the
+        sidecar bridge on the fetched checkpoint dir."""
+        if self.gift_rows_fn is not None:
+            return self.gift_rows_fn(entry)
+        from ..eval.benchmarks import run_gift_rows
+
+        ec = self.cfg.eval
+        dest = self._fetch_checkpoint_dir(entry)
+        return run_gift_rows(
+            dest,
+            project_dir=ec.benchmark_project_dir,
+            datasets=ec.gift_gate_datasets,
+            num_samples=ec.gift_gate_num_samples or ec.num_samples,
+            device=self.device,
+            data_dir=(ec.gift_gate_data_dir or None),
+            timeout_s=ec.gift_gate_timeout_s,
+        )
+
+    def _run_gift_gate(
+        self,
+        result: RoundResult,
+        king_entry: TrainedEntry,
+        chal_entry: TrainedEntry,
+        *,
+        seed: int | str,
+        round_id: str,
+    ) -> RoundResult:
+        """Fold the public-benchmark gate into a *winning* round result.
+
+        Scores both sides on gift-eval (via the sidecar bridge) and runs the
+        paired no-regression bootstrap. The gate is uncomputable — and the
+        round therefore inconclusive under ``enforce`` — when either sidecar run
+        fails, gift-eval was skipped/errored, or the two runs scored against
+        different pinned data revisions (a consensus-safety check: king and
+        challenger must be judged on identical public data).
+        """
+        from ..eval.gift_gate import evaluate_gift_gate, uncomputable_gate
+        from ..eval.koth import apply_gift_gate
+
+        p = self.cfg.koth_params()
+        mode = p.gift_gate_mode
+        king_run = self._gift_rows(king_entry)
+        chal_run = self._gift_rows(chal_entry)
+        if (
+            king_run is None or chal_run is None
+            or king_run.get("status") != "ok" or chal_run.get("status") != "ok"
+        ):
+            gate = uncomputable_gate(p.gift_gate_tolerance, "gift-eval sidecar unavailable/errored")
+        elif king_run.get("revision") != chal_run.get("revision"):
+            gate = uncomputable_gate(
+                p.gift_gate_tolerance,
+                f"data-revision mismatch: king {king_run.get('revision')} != "
+                f"chal {chal_run.get('revision')}",
+            )
+        else:
+            gate = evaluate_gift_gate(
+                king_run["rows"], chal_run["rows"],
+                tolerance=p.gift_gate_tolerance,
+                alpha=p.bootstrap_alpha,
+                B=p.bootstrap_B,
+                seed=seed,
+                min_configs=p.gift_gate_min_configs,
+            )
+        log.info(
+            "gift-gate round=%s mode=%s computed=%s passed=%s lcb=%s tol=%.4f "
+            "n_configs=%d king_agg=%.5f chal_agg=%.5f%s",
+            round_id, mode, gate.computed, gate.passed,
+            f"{gate.lcb:.5f}" if gate.computed else "n/a", gate.tolerance,
+            gate.n_configs, gate.king_agg, gate.chal_agg,
+            "" if gate.computed else f" reason={gate.reason!r}",
+        )
+        return apply_gift_gate(result, gate, mode=mode)
 
     def _maybe_run_benchmarks(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None
@@ -217,6 +298,21 @@ class ValidatorRunner:
             seed=base_seed,
             king_tenure_rounds=self.state.tenure_rounds,
         )
+        # Public-benchmark no-regression gate: only on a private-pool win, and
+        # only when enabled. It can block a dethrone (or, uncomputable, hold the
+        # round) but never grant one. Gated on the primary size's checkpoint
+        # pair (the pooled decision spans sizes; the gate screens on one).
+        if self.cfg.scoring.gift_gate_mode != "off" and result.challenger_wins_round:
+            gate_size = (
+                self.cfg.training.arch_preset
+                if self.cfg.training.arch_preset in king_by_size and
+                self.cfg.training.arch_preset in chal_by_size
+                else paired_sizes[0]
+            )
+            result = self._run_gift_gate(
+                result, king_by_size[gate_size], chal_by_size[gate_size],
+                seed=base_seed, round_id=manifest.round_id,
+            )
         transition = state_mod.apply_round(
             self.state,
             challenger_hotkey=chal_entry.miner_hotkey,
