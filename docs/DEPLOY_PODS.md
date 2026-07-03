@@ -29,7 +29,19 @@ docker inspect --format='{{index .RepoDigests 0}}' <registry>/cascade-worker:<ta
 
 Pinning by digest (`...@sha256:...`) makes the numeric stack identical on every
 pod and every audit re-run. Treat the digest as part of the reproducibility
-contract, alongside `[training] expected_gpu`.
+contract, alongside `[training] expected_gpu` — and pin it **on-chain-visibly**
+in `chain.toml`:
+
+```toml
+[training]
+train_image_digest = "<registry>/cascade-worker@sha256:<digest>"
+```
+
+Then inject the same digest into every pod at launch as
+`CASCADE_TRAIN_IMAGE_DIGEST` (a container cannot introspect its own OCI
+digest). With the pin set, `cascade-train-worker` **refuses a final run** whose
+runtime doesn't report the pinned digest, and `cascade-audit` Tier 2 uses the
+match to decide when a byte-exact checkpoint comparison applies.
 
 ## 2. Pick ONE GPU SKU and stick to it
 
@@ -127,6 +139,79 @@ launch pods (provider API)  →  poll SSH-ready, collect IPs
 Only these GPU-hours are the variable cost; the orchestrator stays up cheaply on
 CPU between rounds.
 
+## 7. Lock down generator execution (no-egress + sandbox)
+
+Pods run **miner-controlled generator code** when they build the corpus. Two
+layers of the sandbox are configured in `chain.toml [generator]`; harden the
+deployment around them.
+
+**Pick a sandbox mode.** On any production pod, one of:
+
+```toml
+[generator]
+# EITHER: subprocess sandbox that REFUSES to run when the host cannot provide
+# a network namespace (instead of silently degrading to the Python-level
+# socket guard alone). Needs unprivileged user namespaces on the pod
+# (`unshare --user --map-root-user --net true` must succeed).
+sandbox_strict = true
+
+# OR: kernel-enforced container sandbox — docker/podman with --network=none,
+# --cap-drop=ALL, no-new-privileges, read-only rootfs, tmpfs workdir, and
+# memory/pids/cpu limits, with the rlimited subprocess kept inside as defense
+# in depth. Needs a container runtime on the pod and docker.sock access.
+sandbox_mode   = "container"
+sandbox_image  = "<registry>/cascade-worker@sha256:<digest>"   # digest-pinned
+sandbox_python = "/root/cascade/.venv/bin/python"
+```
+
+Don't ship the permissive default (`sandbox_mode = "subprocess"`,
+`sandbox_strict = false`) to mainnet: on a hardened host without unprivileged
+userns it silently leaves only the in-process socket guard between miner code
+and your network.
+
+**No-egress pods.** The worker only ever needs to reach the Hippius registry
+and S3 endpoints (plus the orchestrator's inbound SSH). Deny everything else at
+the pod boundary so even a full sandbox escape has nowhere to call home:
+
+```bash
+# On the pod (or bake into the provider's firewall / security-group config):
+# resolve the storage endpoints once, then default-drop outbound.
+for host in registry.hippius.com s3.hippius.com; do
+  for ip in $(getent ahostsv4 "$host" | awk '{print $1}' | sort -u); do
+    iptables -A OUTPUT -d "$ip" -p tcp --dport 443 -j ACCEPT
+  done
+done
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT  # SSH replies
+iptables -P OUTPUT DROP
+```
+
+Providers with security groups (Shadeform et al.): express the same policy
+there instead — allow 22/tcp inbound from the orchestrator's IP, outbound only
+to the storage endpoints.
+
+**Write-only-prefix S3 credentials.** The `HIPPIUS_S3_*` pair a pod receives
+via `forward_env` should not be the owner's root credentials. Issue each pod a
+scoped key that can only write where a worker legitimately writes — per-round
+logs — and read nothing it doesn't need:
+
+```json
+{
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:PutObject"],
+     "Resource": "arn:aws:s3:::cascade-logs/logs/*"},
+    {"Effect": "Deny", "Action": ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
+     "Resource": "arn:aws:s3:::cascade-manifests/*"}
+  ]
+}
+```
+
+The manifest and receipt buckets stay writable **only** by the orchestrator's
+credentials (the wallet box): a compromised pod then cannot overwrite
+`manifests/latest.json` or `receipts/latest.json`, only append noise to its own
+log prefix. Checkpoint uploads go through the Hub token — scope it to the
+`ckpt-*` repos if the registry supports it, and rotate both after any incident.
+
 ## Security recap
 
 - **Wallet never leaves the orchestrator.** Pods can't sign; a bad pod can only
@@ -134,3 +219,7 @@ CPU between rounds.
 - **No secrets in the image.** `SSH_PUBKEY` at launch; Hippius creds via
   `forward_env` (preferred) or launch env.
 - **Key-only SSH.** The image disables password auth and bakes no host keys.
+- **Miner code is caged.** Container sandbox or strict-netns subprocess (step
+  7); no-egress firewall behind it; write-only-prefix S3 creds behind that.
+- **The runtime is pinned.** `train_image_digest` + `CASCADE_TRAIN_IMAGE_DIGEST`
+  make a final run refuse an off-contract stack (step 1).

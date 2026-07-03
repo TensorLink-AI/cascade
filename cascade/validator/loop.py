@@ -37,6 +37,15 @@ from ..shared.manifest import (
     parse_trained_pointer,
     verify_signature,
 )
+from ..shared.receipt import (
+    EntryScores,
+    EvalContext,
+    Participant,
+    RoundReceipt,
+    VerdictRecord,
+    WindowScoreRecord,
+    build_receipt,
+)
 from . import state as state_mod
 from .state import ChampionState, StateTransition
 
@@ -50,10 +59,43 @@ EvaluateFn = Callable[[TrainedEntry, list[EvalWindow]], list[WindowScore]]
 GiftRowsFn = Callable[[TrainedEntry], dict | None]
 
 
+def participants_from_commitments(commitments: list, cutoff_block: int) -> tuple[Participant, ...]:
+    """The round's eligible participant set, for the public receipt.
+
+    Mirrors the trainer's eligibility rule (``trainer.loop.resolve_commitments``):
+    parseable generator pointers revealed STRICTLY BEFORE the epoch boundary,
+    latest commit per hotkey among the eligible ones — but keeps ``commit_block``
+    so an auditor can re-check every entrant against the cutoff. Sorted by UID
+    for a deterministic receipt body.
+    """
+    from ..interface.validation import parse_commit
+
+    best: dict[str, Participant] = {}
+    for c in commitments:
+        if c.commit_block >= cutoff_block:
+            continue
+        parsed = parse_commit(c.payload)
+        if parsed is None:
+            continue
+        prev = best.get(c.hotkey)
+        if prev is None or c.commit_block >= prev.commit_block:
+            best[c.hotkey] = Participant(
+                hotkey=c.hotkey, uid=c.uid, gen_ref=parsed.ref, commit_block=c.commit_block
+            )
+    return tuple(sorted(best.values(), key=lambda p: p.uid))
+
+
 @dataclass(frozen=True)
 class RoundOutcome:
     result: RoundResult
     transition: StateTransition
+    # Every per-window score that fed the verdict, one record per evaluated
+    # (role, size) entry in evaluation order — threaded out so the live loop can
+    # publish them in the round's signed public receipt (cascade.shared.receipt).
+    entry_scores: tuple[EntryScores, ...] = ()
+    # The king's tenure AT decision time (it set the margin); recorded in the
+    # receipt so an auditor can recompute margin_for_tenure without validator state.
+    king_tenure_rounds: int = 0
 
 
 @dataclass
@@ -284,19 +326,29 @@ class ValidatorRunner:
 
         king_scores: list[WindowScore] = []
         chal_scores: list[WindowScore] = []
+        score_records: list[EntryScores] = []
         for size in paired_sizes:
-            king_scores += self._evaluate(king_by_size[size], windows)
-            chal_scores += self._evaluate(chal_by_size[size], windows)
+            ks = self._evaluate(king_by_size[size], windows)
+            cs = self._evaluate(chal_by_size[size], windows)
+            king_scores += ks
+            chal_scores += cs
+            for entry, scores in ((king_by_size[size], ks), (chal_by_size[size], cs)):
+                score_records.append(EntryScores(
+                    role=entry.role, size=size,
+                    hotkey=entry.miner_hotkey, uid=entry.miner_uid,
+                    scores=tuple(WindowScoreRecord.from_score(s) for s in scores),
+                ))
         # One challenger generator competes at every size, so any size's entry
         # carries its identity for the KOTH state machine.
         chal_entry = chal_by_size[paired_sizes[0]]
 
+        tenure_at_decision = self.state.tenure_rounds
         result = evaluate_round(
             king_scores,
             chal_scores,
             self.cfg.koth_params(),
             seed=base_seed,
-            king_tenure_rounds=self.state.tenure_rounds,
+            king_tenure_rounds=tenure_at_decision,
         )
         # Public-benchmark no-regression gate: only on a private-pool win, and
         # only when enabled. It can block a dethrone (or, uncomputable, hold the
@@ -327,8 +379,147 @@ class ValidatorRunner:
             manifest.round_id, result.lcb, result.margin, result.challenger_wins_round,
             transition.note, self.state.king_hotkey, self.state.tenure_rounds,
         )
-        return RoundOutcome(result=result, transition=transition)
+        return RoundOutcome(
+            result=result, transition=transition, entry_scores=tuple(score_records),
+            king_tenure_rounds=tenure_at_decision,
+        )
 
+    # ── public round receipts ────────────────────────────────────────────────
+
+    def build_round_receipt(
+        self,
+        manifest: TrainingManifest,
+        *,
+        base_seed: int,
+        epoch_start_block: int,
+        epoch_block_hash: str,
+        outcome: RoundOutcome | None = None,
+        windows: list[EvalWindow] | None = None,
+        reject_reason: str | None = None,
+        participants: tuple[Participant, ...] = (),
+        pool_provenance: tuple[str, str] = ("", ""),
+        reward_uids: tuple[int, ...] = (),
+        weights: tuple[float, ...] = (),
+        validator_hotkey: str = "",
+    ) -> RoundReceipt:
+        """Assemble the round's public receipt (pure — no I/O, no signing).
+
+        A gated-out manifest — or one with no (king, challenger) pair to score —
+        yields a ``rejected`` receipt carrying the reason; a scored round yields
+        the full record: chain context, embedded manifest, participant set, the
+        eval slice, every per-window score, the verdict, and the weight vector.
+        """
+        from ..trainer.contract import RoundSeeds
+
+        seeds = RoundSeeds.derive(base_seed, self.cfg.training)
+        if reject_reason is not None:
+            return build_receipt(
+                round_id=manifest.round_id, status="rejected",
+                epoch_start_block=epoch_start_block, epoch_block_hash=epoch_block_hash,
+                base_seed=base_seed, seeds=seeds, manifest=manifest,
+                participants=participants, reject_reason=reject_reason,
+                reward_uids=reward_uids, weights=weights,
+                validator_hotkey=validator_hotkey,
+            )
+        if outcome is None or windows is None:
+            raise ValueError("a scored receipt needs both outcome and windows")
+        eval_context = EvalContext(
+            pool_ref=pool_provenance[0],
+            pool_digest=pool_provenance[1],
+            window_ids=tuple(w.series_id for w in windows),
+            n_windows=len(windows),
+            num_samples=self.cfg.eval.num_samples,
+        )
+        verdict = VerdictRecord.from_round(
+            outcome.result, outcome.transition,
+            params=self.cfg.koth_params(), bootstrap_seed=base_seed,
+            king_tenure_rounds=outcome.king_tenure_rounds,
+        )
+        return build_receipt(
+            round_id=manifest.round_id, status="scored",
+            epoch_start_block=epoch_start_block, epoch_block_hash=epoch_block_hash,
+            base_seed=base_seed, seeds=seeds, manifest=manifest,
+            participants=participants, eval_context=eval_context,
+            entry_scores=outcome.entry_scores, verdict=verdict,
+            reward_uids=reward_uids, weights=weights,
+            validator_hotkey=validator_hotkey,
+        )
+
+    def _publish_round_receipt(
+        self,
+        client: object,
+        manifest: TrainingManifest,
+        base_seed: int,
+        *,
+        outcome: RoundOutcome | None = None,
+        windows: list[EvalWindow] | None = None,
+        reject_reason: str | None = None,
+        window_source: object = None,
+        reward_uids: tuple[int, ...] = (),
+        weights: tuple[float, ...] = (),
+    ) -> None:  # pragma: no cover — live-loop glue; assembly is unit-tested
+        """Gather chain context, sign, and publish the round receipt.
+
+        Best-effort by design: a receipt failure must never disturb weights or
+        KOTH state (they are already committed), so every chain lookup degrades
+        to an empty field and any publish error is logged and swallowed. The
+        audit CLI treats missing context as WARN, not PASS.
+        """
+        from ..shared.hippius import S3Config, S3Store, publish_receipt
+        from ..shared.receipt import dump_receipt, sign_receipt
+
+        try:
+            epoch_blocks = max(1, self.cfg.round.epoch_blocks)
+            epoch_start = (manifest.created_block // epoch_blocks) * epoch_blocks
+            epoch_hash = ""
+            participants: tuple[Participant, ...] = ()
+            try:
+                epoch_hash = client.block_hash(epoch_start)
+                participants = participants_from_commitments(
+                    client.poll_commitments(), cutoff_block=epoch_start
+                )
+            except Exception as e:  # noqa: BLE001 — chain context is best-effort
+                log.warning("receipt chain context unavailable for round=%s: %s",
+                            manifest.round_id, e)
+            provenance = ("", "")
+            prov_fn = getattr(window_source, "provenance_for_round", None)
+            if prov_fn is not None:
+                try:
+                    provenance = tuple(prov_fn(base_seed))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("pool provenance unavailable for round=%s: %s",
+                                manifest.round_id, e)
+            wallet = getattr(client, "wallet", lambda: None)()
+            hotkey_ss58 = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", "") or "")
+
+            receipt = self.build_round_receipt(
+                manifest,
+                base_seed=base_seed,
+                epoch_start_block=epoch_start,
+                epoch_block_hash=str(epoch_hash),
+                outcome=outcome,
+                windows=windows,
+                reject_reason=reject_reason,
+                participants=participants,
+                pool_provenance=(provenance[0], provenance[1]),
+                reward_uids=reward_uids,
+                weights=weights,
+                validator_hotkey=hotkey_ss58,
+            )
+            if wallet is not None:
+                receipt = sign_receipt(receipt, wallet)
+            else:
+                log.warning("publishing an UNSIGNED receipt (no wallet) for round=%s",
+                            manifest.round_id)
+            store = S3Store(
+                S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket)
+            )
+            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id)
+            log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
+                     receipt.status, manifest.round_id, receipt.signature is not None,
+                     self.cfg.storage.manifest_bucket, key)
+        except Exception as e:  # noqa: BLE001 — receipts must never disturb the round
+            log.warning("receipt publication failed for round=%s: %s", manifest.round_id, e)
 
     # ── live loop ────────────────────────────────────────────────────────────
 
@@ -363,6 +554,12 @@ class ValidatorRunner:
                     if reason is not None:
                         log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
                         last_round = manifest.round_id
+                        # A rejected round still gets a public receipt carrying
+                        # the gate's reason — visible, not silently absent.
+                        self._publish_round_receipt(
+                            client, manifest, base_seed,
+                            reject_reason=reason, window_source=window_source,
+                        )
                     else:
                         windows = window_source.windows_for_round(base_seed, self.cfg.eval.n_windows)
                         # process_round mutates the sticky KOTH state atomically (it
@@ -374,15 +571,21 @@ class ValidatorRunner:
                         last_round = manifest.round_id
                         self._persist_state()
                         reward_uids = self._reward_uids(manifest, outcome, client)
+                        weights_vec: tuple[float, ...] = ()
                         try:
                             # Always set weights — when no king/court is registered
                             # the empty set burns to burn_uid (teutonic-style) so
                             # emission still leaves the network rather than reverting.
+                            from ..shared.chain import equal_share_vector
+
                             n_uids = client.n_uids()
                             client.set_equal_share_weights(
                                 reward_uids, n_uids,
                                 burn_uid=self.cfg.scoring.burn_uid,
                             )
+                            weights_vec = tuple(equal_share_vector(
+                                reward_uids, n_uids, burn_uid=self.cfg.scoring.burn_uid,
+                            ))
                             log.info(
                                 "round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
                                 manifest.round_id, reward_uids or [self.cfg.scoring.burn_uid],
@@ -391,6 +594,25 @@ class ValidatorRunner:
                         except Exception as e:  # noqa: BLE001 — retried next round
                             log.warning("weight set failed for round=%s (king holds, "
                                         "retried next round): %s", manifest.round_id, e)
+                        # The public receipt — strictly after weights, so it
+                        # records what was actually set (empty vector = the
+                        # weight extrinsic failed this round).
+                        if outcome is not None:
+                            self._publish_round_receipt(
+                                client, manifest, base_seed,
+                                outcome=outcome, windows=windows,
+                                window_source=window_source,
+                                reward_uids=tuple(reward_uids), weights=weights_vec,
+                            )
+                        else:
+                            # Gated in but nothing to score (no king/challenger
+                            # pair at any size): a public record still exists.
+                            self._publish_round_receipt(
+                                client, manifest, base_seed,
+                                reject_reason="no_king_challenger_pair",
+                                window_source=window_source,
+                                reward_uids=tuple(reward_uids), weights=weights_vec,
+                            )
                         # Log-only public benchmarks for a freshly crowned king.
                         # Strictly after weights are decided; never affects them.
                         self._maybe_run_benchmarks(manifest, outcome)

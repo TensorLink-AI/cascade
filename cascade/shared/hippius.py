@@ -393,17 +393,28 @@ class S3Store:
             except Exception as e:  # noqa: BLE001
                 raise StorageError(f"bucket_unavailable: {self.cfg.bucket}: {e}") from e
 
-    def put_bytes(self, key: str, data: bytes, *, content_type: str = "application/octet-stream") -> None:
+    def put_bytes(
+        self, key: str, data: bytes, *,
+        content_type: str = "application/octet-stream", acl: str | None = None,
+    ) -> None:
+        """Write one object. ``acl`` sets a canned object ACL (e.g.
+        ``"public-read"`` for the audit-facing receipts); None keeps the
+        bucket default (private)."""
         self._ensure_bucket()
+        kwargs = {"Bucket": self.cfg.bucket, "Key": key, "Body": data,
+                  "ContentType": content_type}
+        if acl:
+            kwargs["ACL"] = acl
         try:
-            self.client().put_object(
-                Bucket=self.cfg.bucket, Key=key, Body=data, ContentType=content_type
-            )
+            self.client().put_object(**kwargs)
         except Exception as e:  # noqa: BLE001
             raise StorageError(f"s3_put_failed: {key}: {e}") from e
 
-    def put_text(self, key: str, text: str, *, content_type: str = "text/plain") -> None:
-        self.put_bytes(key, text.encode("utf-8"), content_type=content_type)
+    def put_text(
+        self, key: str, text: str, *,
+        content_type: str = "text/plain", acl: str | None = None,
+    ) -> None:
+        self.put_bytes(key, text.encode("utf-8"), content_type=content_type, acl=acl)
 
     def get_bytes(self, key: str) -> bytes:
         try:
@@ -439,6 +450,50 @@ def publish_manifest(store: S3Store, manifest_text: str, round_id: str) -> str:
 def read_latest_manifest(store: S3Store) -> str:
     """Read the current manifest JSON from ``latest.json``."""
     return store.get_text(MANIFEST_LATEST_KEY)
+
+
+RECEIPT_LATEST_KEY = "receipts/latest.json"
+
+
+def receipt_round_key(round_id: str) -> str:
+    return f"receipts/round-{round_id}.json"
+
+
+def publish_receipt(store: S3Store, receipt_text: str, round_id: str) -> str:
+    """Write the round receipt and update the ``receipts/latest.json`` pointer.
+
+    Mirrors :func:`publish_manifest` — the validator publishes its signed
+    :class:`cascade.shared.receipt.RoundReceipt` here after weights are set, and
+    auditors read :data:`RECEIPT_LATEST_KEY` (or a specific round's key).
+    Returns the per-round key.
+
+    Receipts are the audit-facing artefact, so each object is written with a
+    ``public-read`` ACL: third parties can then GET it (and run
+    ``cascade-audit``) with zero credentials while the bucket — manifests,
+    logs — stays private. On a backend that rejects object ACLs the write is
+    retried private (the audit's anonymous fetch then falls back to
+    credentials, as documented in docs/AUDIT.md).
+    """
+    key = receipt_round_key(round_id)
+    try:
+        store.put_text(key, receipt_text, content_type="application/json", acl="public-read")
+        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json",
+                       acl="public-read")
+    except StorageError:
+        # ACL unsupported on this backend: publish private rather than not at all.
+        store.put_text(key, receipt_text, content_type="application/json")
+        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json")
+    return key
+
+
+def read_receipt(store: S3Store, round_id: str) -> str:
+    """Read one round's receipt JSON by round id."""
+    return store.get_text(receipt_round_key(round_id))
+
+
+def read_latest_receipt(store: S3Store) -> str:
+    """Read the current receipt JSON from ``receipts/latest.json``."""
+    return store.get_text(RECEIPT_LATEST_KEY)
 
 
 def log_key(round_id: str, role: str) -> str:

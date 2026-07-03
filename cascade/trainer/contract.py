@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +69,59 @@ def compute_base_arch_digest(contract: TrainingContractConfig) -> str:
     h.update(b"\x00arch_src\x00")
     h.update(model_src)
     return h.hexdigest()
+
+
+# How a running trainer/worker learns which container image it is executing in:
+# the operator injects the image digest at launch (pods can't introspect their
+# own OCI digest). deploy/provision.py already requires a digest-pinned image
+# ref, so the value to inject is known at provision time.
+TRAIN_IMAGE_DIGEST_ENV = "CASCADE_TRAIN_IMAGE_DIGEST"
+
+_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+class TrainImageMismatch(RuntimeError):
+    """The runtime image does not satisfy ``[training] train_image_digest``."""
+
+
+def _image_sha256(value: str) -> str | None:
+    """Extract the ``sha256:<64hex>`` from an image pin — accepts a bare digest
+    or a full digest-pinned ref (``…@sha256:…``). None if there is none."""
+    m = _SHA256_RE.search((value or "").strip().lower())
+    return m.group(0) if m else None
+
+
+def assert_train_image(contract: TrainingContractConfig) -> None:
+    """Refuse a FINAL run whose runtime image doesn't match the contract pin.
+
+    ``[training] train_image_digest`` pins the container image (the torch/CUDA/
+    cuDNN stack) every final run must execute in — part of the byte-exact
+    re-derivation contract alongside ``expected_gpu``. The runtime reports its
+    image via :data:`TRAIN_IMAGE_DIGEST_ENV` (injected at pod/trainer launch).
+    Raises :class:`TrainImageMismatch` loudly on a missing or mismatched
+    runtime digest; a pinned contract must never train on an unknown stack.
+    No-op when the contract leaves the pin empty.
+    """
+    pinned = _image_sha256(contract.train_image_digest)
+    if not contract.train_image_digest:
+        return
+    if pinned is None:
+        raise TrainImageMismatch(
+            f"[training] train_image_digest={contract.train_image_digest!r} carries no "
+            "sha256:<64hex> digest; pin the deployed image by digest (…@sha256:…)"
+        )
+    runtime = _image_sha256(os.environ.get(TRAIN_IMAGE_DIGEST_ENV, ""))
+    if runtime is None:
+        raise TrainImageMismatch(
+            f"refusing FINAL run: [training] train_image_digest pins {pinned} but "
+            f"{TRAIN_IMAGE_DIGEST_ENV} is unset/malformed in this runtime — inject the "
+            "deployed image digest at launch (see chain.toml [training])"
+        )
+    if runtime != pinned:
+        raise TrainImageMismatch(
+            f"refusing FINAL run: runtime image {runtime} != pinned train_image_digest "
+            f"{pinned} — this runtime is not the contracted training image"
+        )
 
 
 def _mix(base_seed: int, tag: str, salt: int = 0) -> int:

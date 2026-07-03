@@ -87,12 +87,17 @@ def load_pool(
     except Exception as e:  # noqa: BLE001
         raise PoolError(f"pool_fetch_failed: {e}") from e
 
-    return window_source_from_dir(dest, cfg, label=f"ref={ref}")
+    return window_source_from_dir(
+        dest, cfg, label=f"ref={ref}", provenance=(ref, HubRef.parse(ref).digest)
+    )
 
 
-def window_source_from_dir(dest: Path, cfg: ChainConfig, *, label: str) -> RotatingWindowSource:
+def window_source_from_dir(
+    dest: Path, cfg: ChainConfig, *, label: str, provenance: tuple[str, str] = ("", "")
+) -> RotatingWindowSource:
     """Load a pool directory (``.npy``/``.npz`` + optional ``metadata.json``) into
-    a :class:`RotatingWindowSource`. Shared by the static-CID and bucket loaders."""
+    a :class:`RotatingWindowSource`. Shared by the static-CID and bucket loaders.
+    ``provenance`` is the ``(ref, digest)`` recorded in round receipts."""
     series, ids = _load_series_dir(dest)
     if not series:
         raise PoolError(f"pool {label} contained no .npy/.npz series under {dest}")
@@ -119,7 +124,7 @@ def window_source_from_dir(dest: Path, cfg: ChainConfig, *, label: str) -> Rotat
             f"horizon={cfg.eval.horizon}+context (need >= horizon+1 steps)"
         )
     log.info("loaded eval pool %s series=%d windows=%d", label, len(series), len(windows))
-    return RotatingWindowSource(pool=tuple(windows))
+    return RotatingWindowSource(pool=tuple(windows), provenance=provenance)
 
 
 # ───────────────────────── daily bucket-published pool ──────────────────────
@@ -158,7 +163,10 @@ class BucketWindowSource:
             fetch_pool_snapshot(self.store, meta, dest)
         except Exception as e:  # noqa: BLE001
             raise PoolError(f"snapshot_fetch_failed (round>={meta.effective_round}): {e}") from e
-        src = window_source_from_dir(dest, self.cfg, label=f"snapshot@{meta.effective_round}")
+        src = window_source_from_dir(
+            dest, self.cfg, label=f"snapshot@{meta.effective_round}",
+            provenance=(meta.key, meta.sha256),
+        )
         if len(self._cache) >= self.max_cached:
             self._cache.pop(next(iter(self._cache)))  # evict oldest inserted
         self._cache[meta.sha256] = src
@@ -180,6 +188,18 @@ class BucketWindowSource:
                 "run `cascade-pool publish` from the owner orchestrator"
             )
         return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows)
+
+    def provenance_for_round(self, round_seed) -> tuple[str, str]:
+        """``(snapshot_key, tar_sha256)`` of the snapshot active for the round —
+        the pool provenance recorded in the round receipt. ("", "") when the
+        index is unreadable or empty (the receipt then carries no pool pin)."""
+        from ..shared.hippius import read_pool_index, select_snapshot
+
+        try:
+            meta = select_snapshot(read_pool_index(self.store), int(round_seed))
+        except Exception:  # noqa: BLE001 — provenance is best-effort metadata
+            return ("", "")
+        return (meta.key, meta.sha256) if meta is not None else ("", "")
 
 
 def load_bucket_pool(

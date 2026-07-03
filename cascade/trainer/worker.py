@@ -89,6 +89,17 @@ def main(argv: list[str] | None = None) -> int:
         contract.tokens_for_hours(args.train_hours)
         if args.train_hours is not None else contract.train_tokens
     )
+    if args.train_hours is None:
+        # Full-budget run ⇒ this is a FINAL: this pod is the runtime, so the
+        # contract's train_image_digest pin (if set) must match the image digest
+        # injected at pod launch. Refuse loudly rather than train off-contract.
+        from .contract import TrainImageMismatch, assert_train_image
+
+        try:
+            assert_train_image(cfg.training)
+        except TrainImageMismatch as e:
+            log.error("%s", e)
+            return 2
     try:
         entry = runner.train_one(gen, args.role, seeds, args.block,
                                  contract=contract, token_budget=token_budget,

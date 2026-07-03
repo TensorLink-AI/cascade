@@ -66,10 +66,19 @@ class RotatingWindowSource:
     """
 
     pool: tuple[EvalWindow, ...]
+    # Where the pool came from, for the public round receipt: ``(ref, digest)``
+    # — the Hub ``repo@digest`` and its OCI digest for a static pool. ("", "")
+    # for an injected/test pool.
+    provenance: tuple[str, str] = ("", "")
 
     def __post_init__(self) -> None:
         if not self.pool:
             raise ValueError("RotatingWindowSource pool is empty")
+
+    def provenance_for_round(self, round_seed: int | str) -> tuple[str, str]:
+        """``(pool_ref, pool_digest)`` recorded in the round receipt. A static
+        pool's provenance is round-independent."""
+        return self.provenance
 
     def windows_for_round(self, round_seed: int | str, n_windows: int) -> list[EvalWindow]:
         if n_windows <= 0:

@@ -43,3 +43,51 @@ def test_burn_uid_out_of_range_raises():
 def test_nonpositive_n_uids_raises():
     with pytest.raises(ChainError):
         equal_share_vector([0], 0)
+
+
+# ── ChainClient.weights_for_hotkey (the audit's on-chain cross-check) ─────────
+
+
+class _FakeMeta:
+    n = 3
+    hotkeys = ["hk0", "hk1", "hk2"]
+    W = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]]
+
+
+class _FakeSubtensor:
+    def metagraph(self, netuid, lite=True):
+        assert lite is False  # the weight matrix needs the full metagraph
+        return _FakeMeta()
+
+
+def _client():
+    from cascade.shared.chain import ChainClient
+
+    c = ChainClient(netuid=1)
+    c._subtensor = _FakeSubtensor()
+    return c
+
+
+def test_weights_for_hotkey_returns_row():
+    assert _client().weights_for_hotkey("hk1") == [0.0, 0.0, 1.0]
+
+
+def test_weights_for_hotkey_none_when_unregistered():
+    assert _client().weights_for_hotkey("ghost") is None
+
+
+def test_weights_for_hotkey_falls_back_to_weights_attr():
+    class _NoW:
+        n = 2
+        hotkeys = ["a", "b"]
+        weights = [[1.0, 0.0], [0.5, 0.5]]
+
+    class _Sub:
+        def metagraph(self, netuid, lite=True):
+            return _NoW()
+
+    from cascade.shared.chain import ChainClient
+
+    c = ChainClient(netuid=1)
+    c._subtensor = _Sub()
+    assert c.weights_for_hotkey("b") == [0.5, 0.5]

@@ -48,7 +48,7 @@ from ..shared.manifest import (
     parse_trained_pointer,
     sign_manifest,
 )
-from .contract import BaseTrainer, RoundSeeds, TrainResult
+from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -576,6 +576,10 @@ class TrainerRunner:
         One (king + finalists) pass per size in ``cfg.throne_contracts()`` (the
         ``[round] throne_sizes``); a king failure at any size aborts the round, a
         challenger failure drops only that challenger from that size."""
+        if not self.remote_hosts:
+            # This box is the runtime for a local final; with remote hosts the
+            # check runs on each pod (cascade-train-worker), which is the runtime.
+            assert_train_image(self.cfg.training)
         entries: list[TrainedEntry] = []
         for contract in self.cfg.throne_contracts():
             token_budget = contract.train_tokens

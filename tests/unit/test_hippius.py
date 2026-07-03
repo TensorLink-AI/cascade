@@ -67,7 +67,7 @@ class _FakeS3Store:
     def __init__(self):
         self.objects: dict[str, str] = {}
 
-    def put_text(self, key, text, *, content_type="text/plain"):
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
         self.objects[key] = text
 
     def get_text(self, key):

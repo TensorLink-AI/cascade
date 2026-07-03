@@ -185,6 +185,7 @@ cascade/
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
   INTERFACE.md      the DataGenerator submission contract for miners
+  AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
 ```
@@ -208,12 +209,36 @@ After `uv sync` / `pip install -e .`:
 * `cascade-train-worker`: the per-pod worker the remote dispatch runs (trains
   one role, uploads its checkpoint, prints a receipt — no wallet on the pod).
 * `cascade-validator`: the validator loop (`--offline` for a state smoke).
+* `cascade-audit latest` / `cascade-audit round <id>`: third-party verification
+  of a published round receipt — re-derives seeds, digests, the KOTH verdict,
+  and (at `--tier 1`) each generator's corpus, with a nonzero exit on any
+  mismatch (CI-usable). No wallet or GPU needed for tiers 0–1; see
+  `docs/AUDIT.md`.
 
 Storage is Hippius: models/checkpoints/generators on the Hippius Hub
 registry (OCI, pinned by `repo@digest`), manifests + training logs on Hippius
 S3. Install the extra (`pip install -e '.[hippius]'`) and set the env
 credentials (`HIPPIUS_S3_ACCESS_KEY` / `HIPPIUS_S3_SECRET_KEY`, and a Hub token
 `HIPPIUS_HUB_TOKEN` or `HIPPIUS_HUB_USERNAME` + `HIPPIUS_HUB_PASSWORD`).
+
+**Public round receipts.** After each round's weights are set, the validator
+publishes a signed `RoundReceipt` to the manifest bucket — the full public
+record of the round (chain context, the trainer's manifest verbatim, the
+participant set, every per-window score, the KOTH verdict, and the weight
+vector), so a third party can re-derive the owner's work without trusting it.
+The layout mirrors the manifests:
+
+```
+s3://<manifest_bucket>/manifests/round-<id>.json   the trainer's signed manifest
+s3://<manifest_bucket>/manifests/latest.json       pointer to the newest manifest
+s3://<manifest_bucket>/receipts/round-<id>.json    the validator's signed receipt
+s3://<manifest_bucket>/receipts/latest.json        pointer to the newest receipt
+```
+
+`<id>` is the round id (the base seed derived from the epoch-boundary block
+hash). A round the validator *rejected* still gets a receipt
+(`"status": "rejected"`) carrying the gate's reason. Verify one with
+`cascade-audit latest` — see `docs/AUDIT.md`.
 
 Before launching, set `chain.toml [subnet] netuid`, `[training] base_arch_digest`
 (sha256 of the frozen base architecture), `[manifest] trainer_hotkey`, `[eval]

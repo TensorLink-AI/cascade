@@ -28,6 +28,31 @@ manifest.
 Moving to a re-derivation challenge protocol is the milestone that removes the
 single trusted trainer.
 
+## 1b. Receipt audit — trust anchors and data availability
+
+**Question.** The public round receipts (`cascade.shared.receipt`, audited by
+`cascade-audit`; see `docs/AUDIT.md`) let a third party re-derive a round. Who
+signs the receipt, and what storage/chain access can an auditor assume?
+
+**Default.** The validator signs receipts with its hotkey; the auditor's trust
+anchor is `[manifest] validator_hotkey` in chain.toml. Left empty (the shipped
+default while the owner runs the only validator), the audit verifies against
+the receipt's self-declared signer and WARNs that the signer is unpinned.
+Storage: the audit fetches receipts with an **unsigned S3 request first**
+(assuming the manifest bucket is public-read; Hippius S3 permissioning is the
+open bit) and falls back to `HIPPIUS_S3_*` credentials or `--receipt <file>`;
+Tier 1 pulls generators with the authenticated Hub client, falling back to an
+anonymous `snapshot_download`. Chain: any check needing history a lite node
+can't serve (the epoch-boundary block hash of an old round, past commitment
+state) degrades to an explicit WARN, never a silent pass — an auditor wanting
+zero WARNs points `--network` at an archive node.
+
+**Flip point.** `cascade/audit/main.py::fetch_receipt_text` (storage access),
+`chain.toml [manifest] validator_hotkey` (signer pinning; with multiple
+validators, either pin one designated receipt publisher or extend the audit to
+accept any hotkey with validator permit on the metagraph),
+`cascade/audit/checks.py` (WARN policy per check).
+
 ## 2. Generation sandbox
 
 **Question.** Generators are miner-controlled code. How isolated must their
@@ -45,9 +70,16 @@ float64 arrays whose digest the parent re-derives. The trainer selects it via
 `build_round_corpus(..., use_sandbox=True)` (the default; `TrainerRunner.use_sandbox`).
 
 **Remaining.** RLIMIT_AS caps *virtual* memory, so torch generators need a
-higher `max_repo_mb`/`max_memory_mb`; and `unshare` is unavailable on hardened
-hosts (no unprivileged userns), where isolation falls back to the socket guard —
-deploy the trainer in a no-egress container for hard network isolation there.
+higher `max_repo_mb`/`max_memory_mb`. The no-userns fallback is now policy, not
+silence: with `[generator] sandbox_strict = true` the subprocess sandbox
+REFUSES to run when `unshare` netns is unavailable (default: a loud warning),
+and `[generator] sandbox_mode = "container"` runs the same rlimited child
+inside a locked-down docker/podman container (`--network=none`,
+`--cap-drop=ALL`, no-new-privileges, read-only rootfs, tmpfs workdir,
+memory/pids/cpu limits — `trainer/sandbox_container.py`) for kernel-enforced
+isolation regardless of userns support. Production deployment guidance
+(no-egress firewall, write-only-prefix S3 creds) lives in
+`docs/DEPLOY_PODS.md` §7.
 
 ## 3. King identity across rounds
 

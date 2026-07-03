@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{sc.arch_preset}] final budget:     "
                   f"{cfg.training.target_train_hours:g}h ≈ {sc.train_tokens:,} point-passes")
         print(f"contract_digest:     {contract_digest(cfg.training)}")
+        print(f"train_image_digest:  {cfg.training.train_image_digest or '(unpinned)'}")
         print(f"generation_seed:     {seeds.generation_seed}")
         print(f"training_seed:       {seeds.training_seed}")
         print("offline trainer smoke complete")

@@ -28,6 +28,24 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
+# Generation sandbox (trainer-side; never folded into contract_digest).
+#   subprocess — rlimited child in a network namespace (unshare) with a
+#                Python-level socket guard; the default, no container runtime
+#                needed. With sandbox_strict = true it REFUSES to run when the
+#                host can't provide the namespace (no unprivileged userns)
+#                instead of silently downgrading to the socket guard alone —
+#                set true on any production trainer.
+#   container  — the same rlimited child inside docker/podman with
+#                --network=none, --cap-drop=ALL, no-new-privileges, read-only
+#                rootfs, tmpfs /tmp, memory/pids/cpu limits (defense in depth;
+#                see cascade/trainer/sandbox_container.py). Set sandbox_image
+#                to a DIGEST-PINNED image carrying numpy + the generator deps
+#                (the worker image works) and sandbox_python to the interpreter
+#                inside it (worker image: /root/cascade/.venv/bin/python).
+sandbox_mode   = "subprocess"
+sandbox_image  = ""              # e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>"
+sandbox_python = "python3"       # python inside sandbox_image
+sandbox_strict = false           # true on production: no netns => refuse, don't degrade
 
 [training]
 # The FIXED training contract — identical for king and challenger. The only
@@ -100,6 +118,15 @@ corpus_mode = "stream_cpu"
 # the validator then rejects any manifest whose entries weren't trained on it.
 # Empty = only require king and challenger to match each other.
 expected_gpu = ""
+# Pin the training-runtime IMAGE for byte-exact re-derivation. The worker image
+# (deploy/Dockerfile) fixes the torch/CUDA/cuDNN stack; this pins WHICH build of
+# it every FINAL run must execute in. Set it to the digest-pinned ref you deploy
+# (e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>", or the bare
+# "sha256:<64hex>") and inject the same digest into each pod/trainer env as
+# CASCADE_TRAIN_IMAGE_DIGEST at launch — the trainer/worker then REFUSES a final
+# run whose runtime doesn't match. Folded into contract_digest, so re-pinning
+# the image starts a new contract. Empty = unpinned (no runtime check).
+train_image_digest = ""
 
 # Extra final-stage model sizes. The [training] block above is the PRIMARY size
 # (the small rung the cheap heat screens on); each [[training.sizes]] below is
@@ -304,6 +331,11 @@ pool_s3_region   = ""
 # only signer a validator trusts (see OPEN_QUESTIONS.md #1).
 trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
 poll_seconds    = 120
+# Trust anchor for the PUBLIC round receipts (receipts/round-<id>.json): the
+# validator hotkey whose signature `cascade-audit` requires on a receipt. Empty
+# = the audit verifies against the receipt's self-declared signer and WARNs
+# that the signer is unpinned (fine while the owner runs the only validator).
+validator_hotkey = ""
 
 [validator]
 weight_set_interval_blocks = 180

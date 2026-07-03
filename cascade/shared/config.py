@@ -38,6 +38,17 @@ class GeneratorConfig:
     carries a channel axis. ``max_channels = 1`` keeps submissions univariate
     for now (a generator may still yield 1-D series, promoted to ``(1, L)``);
     raising it later turns on multivariate priors *without* a schema change.
+
+    Sandbox selection (trainer-side; never part of ``contract_digest``):
+    ``sandbox_mode = "subprocess"`` is the rlimited, netns-wrapped child
+    (:mod:`cascade.trainer.sandbox`); ``"container"`` runs that same child
+    inside a locked-down docker/podman container (``--network=none``,
+    ``--cap-drop=ALL``, read-only rootfs — :mod:`cascade.trainer.
+    sandbox_container`), using ``sandbox_image`` (digest-pin it in production)
+    and ``sandbox_python`` (the interpreter inside the image). With
+    ``sandbox_strict = true``, subprocess mode REFUSES to run when the host
+    cannot provide a network namespace instead of silently downgrading to the
+    Python-level socket guard — set it on any production trainer.
     """
 
     corpus_n_series: int
@@ -48,6 +59,20 @@ class GeneratorConfig:
     max_memory_mb: int
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
+    sandbox_mode: str = "subprocess"   # "subprocess" | "container"
+    sandbox_image: str = ""            # container image for sandbox_mode="container"
+    sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
+    sandbox_strict: bool = False       # refuse to run without hard network isolation
+
+
+SANDBOX_MODES = ("subprocess", "container")
+
+
+def validate_sandbox_mode(mode: str) -> str:
+    """Return ``mode`` if it is a known sandbox mode, else raise ValueError."""
+    if mode not in SANDBOX_MODES:
+        raise ValueError(f"sandbox_mode={mode!r} invalid; expected one of {SANDBOX_MODES}")
+    return mode
 
 
 # Corpus feed modes — how a generator's data reaches the trainer. Identical for
@@ -172,6 +197,14 @@ class TrainingContractConfig:
     # ran the same SKU); empty ⇒ require only that king and challenger match each
     # other when both report a gpu_name. Folded into contract_digest.
     expected_gpu: str = ""
+    # Pinned training-runtime image for byte-exact re-derivation: the digest of
+    # the container image (torch/CUDA/cuDNN stack) every FINAL run must execute
+    # in. Accepts a full digest-pinned ref (``…@sha256:<64hex>``) or a bare
+    # ``sha256:<64hex>``. When non-empty, the trainer/worker refuses a final run
+    # unless its runtime reports the same digest (CASCADE_TRAIN_IMAGE_DIGEST,
+    # injected at pod launch). Folded into contract_digest, so re-pinning the
+    # image is a new contract. Empty ⇒ unpinned (no check).
+    train_image_digest: str = ""
     # Extra model sizes trained alongside the base (primary) size in the final
     # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
     # contract_digest, so a validator's contract gate covers every size at once.
@@ -426,10 +459,17 @@ class WandbConfig:
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
     them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
-    ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts."""
+    ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts.
+
+    ``validator_hotkey`` is the trust anchor for public *round receipts*
+    (``cascade.shared.receipt``): when set, ``cascade-audit`` requires receipts
+    to be signed by exactly this ss58; empty ⇒ the audit verifies against the
+    receipt's self-declared signer and WARNs that the signer is unpinned.
+    """
 
     trainer_hotkey: str
     poll_seconds: int
+    validator_hotkey: str = ""
 
 
 @dataclass(frozen=True)
@@ -628,6 +668,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_memory_mb=int(g["max_memory_mb"]),
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
+            sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
+            sandbox_image=str(g.get("sandbox_image", "")),
+            sandbox_python=str(g.get("sandbox_python", "python3")),
+            sandbox_strict=bool(g.get("sandbox_strict", False)),
         ),
         training=TrainingContractConfig(
             base_arch=str(t["base_arch"]),
@@ -660,6 +704,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_train_seconds=int(t["max_train_seconds"]),
             corpus_mode=validate_corpus_mode(str(t.get("corpus_mode", "stream_cpu"))),
             expected_gpu=str(t.get("expected_gpu", "")),
+            train_image_digest=str(t.get("train_image_digest", "")),
             extra_sizes=extra_sizes,
         ),
         round=RoundConfig(
@@ -726,6 +771,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),
             poll_seconds=int(m["poll_seconds"]),
+            validator_hotkey=str(m.get("validator_hotkey", "")),
         ),
         validator=ValidatorConfig(
             weight_set_interval_blocks=int(v["weight_set_interval_blocks"]),
