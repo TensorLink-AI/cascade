@@ -212,6 +212,34 @@ class ChainClient:
                 return uid
         return None
 
+    def weights_for_hotkey(self, hotkey: str) -> list[float] | None:
+        """The weight row a validator hotkey currently has on chain, or None.
+
+        Reads the full (non-lite) metagraph and returns ``hotkey``'s row of the
+        weight matrix as floats (chain-normalised; callers comparing against a
+        receipt should compare the *support* — which UIDs carry weight — not
+        magnitudes). None when the hotkey is not registered. Used by
+        ``cascade-audit`` to cross-check a receipt's recorded weight vector.
+        """
+        sub = self.subtensor()
+        try:
+            meta = sub.metagraph(netuid=self.netuid, lite=False)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        uid = next(
+            (u for u in range(int(meta.n)) if str(meta.hotkeys[u]) == hotkey), None
+        )
+        if uid is None:
+            return None
+        # bittensor 9/10 expose the weight matrix as ``W`` (property) with the
+        # raw attribute ``weights``; accept either for version tolerance.
+        matrix = getattr(meta, "W", None)
+        if matrix is None:
+            matrix = getattr(meta, "weights", None)
+        if matrix is None:
+            raise ChainError("metagraph carries no weight matrix (lite node?)")
+        return [float(w) for w in matrix[uid]]
+
     def poll_commitments(self) -> list[Commitment]:
         """Return the revealed generator pointer for every UID on the netuid.
         UIDs without a commitment are omitted.
