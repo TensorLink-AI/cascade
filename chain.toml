@@ -36,11 +36,13 @@ max_channels         = 1         # per-series variates. 1 = univariate (generato
 # cascade trains a Toto2 backbone FROM RANDOM INIT on each corpus (it does not
 # fine-tune a released checkpoint): from scratch, the corpus is the only source
 # of learned signal. So the whole recipe is pinned here and folded into
-# contract_digest. Arch defaults track Datadog/Toto-2.0-4m — pin the exact
-# integers and base_arch_digest to that checkpoint's config.json before launch.
+# contract_digest. Arch integers VERIFIED against Datadog/Toto-2.0-4m
+# config.json (2026-07-02): d_model=256, num_layers=4, num_heads=4,
+# qk/v_dim=64, patch_size=32, d_ff=688, attn_bias=true, mlp_bias=false,
+# per_dim_scale=true, layer_group_size=4 with one trailing variate layer.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "e2435bcdff9f00540dea47b2c5446327c3ae5477572619603aa0840d8eb39d83"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
+base_arch_digest   = "7c16aedfbc624683b7e06b8aa8b882baab09e61b23a71dd1bf1cb72d1bd4abf5"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -48,6 +50,7 @@ num_heads          = 4
 head_dim           = 64
 patch_size         = 32
 mlp_expansion      = 2
+d_ff               = 688         # exact FFN hidden width from the released config.json
 num_quantiles      = 9           # 9-level pinball head (0.1..0.9) — matches [eval]/scoring
 # objective / masking (Toto 2.0 Contiguous Patch Masking + quantile head)
 masking            = "contiguous_patch"

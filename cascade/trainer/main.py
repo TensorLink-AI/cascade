@@ -46,6 +46,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
+    p.add_argument(
+        "--post-round-benchmarks", action="store_true",
+        help="After each round's manifest publishes, benchmark the round's KING "
+             "checkpoint (GIFT-Eval/BOOM/TIME) on the idle GPU pod. LOG-ONLY "
+             "telemetry — validators still score exclusively on the private eval "
+             "pool; this never feeds weights or the throne. Requires --remote-hosts "
+             "and pinned benchmark data on the pod (see benchmarks/README).",
+    )
+    p.add_argument("--bench-suites", default="gift-eval,boom,time",
+                   help="Suites for --post-round-benchmarks (size to round cadence: "
+                        "the full battery is ~1h on a 4090).")
+    p.add_argument("--bench-max-series", type=int, default=0,
+                   help="Cap datasets per suite for --post-round-benchmarks (0 = full).")
+    p.add_argument("--bench-data-dir", default="/root/bench_data",
+                   help="Benchmark data dir on the pod.")
+    p.add_argument("--bench-interval", type=int, default=0,
+                   help="Minimum seconds between benchmark launches (0 = every round). "
+                        "Set this above the sweep duration when rounds are tighter than "
+                        "the sweep — telemetry then samples every Nth king instead of "
+                        "being preempted by every round's training.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
@@ -119,6 +139,20 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("cascade.trainer")
     screen_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
 
+    bench_plan = None
+    if args.post_round_benchmarks:
+        if not remote_hosts:
+            log.warning("--post-round-benchmarks needs --remote-hosts; disabling")
+        else:
+            from .bench_hook import BenchPlan
+
+            bench_plan = BenchPlan(
+                suites=args.bench_suites,
+                max_series=args.bench_max_series,
+                data_dir=args.bench_data_dir,
+                min_interval_seconds=args.bench_interval,
+            )
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
@@ -127,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_hosts=remote_hosts,
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
+        bench_plan=bench_plan,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",

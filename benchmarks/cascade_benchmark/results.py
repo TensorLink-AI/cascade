@@ -25,6 +25,13 @@ class SuiteResult:
 class BenchmarkReport:
     checkpoint: str
     suites: list[SuiteResult] = field(default_factory=list)
+    # suite → pinned HF dataset revision the numbers were computed against
+    # (see ``datasets.DATASETS``) — keeps historical reports traceable.
+    data_revisions: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {"checkpoint": self.checkpoint, "suites": [asdict(s) for s in self.suites]}
+        return {
+            "checkpoint": self.checkpoint,
+            "suites": [asdict(s) for s in self.suites],
+            "data_revisions": dict(self.data_revisions),
+        }

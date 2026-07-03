@@ -36,14 +36,29 @@ from ..results import SuiteResult
 QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
-def _instance_quantiles(wrapper, target, horizon: int, num_samples: int) -> np.ndarray:
-    """Sample paths from the wrapper, reduced to ``(num_q, num_variates, H)``.
+def _wrapper_quantile_grid_matches(wrapper) -> bool:
+    """True when the wrapper exposes the quantile head on TIME's exact grid."""
+    levels = getattr(wrapper, "quantile_levels", None)
+    return (
+        hasattr(wrapper, "forecast_quantiles_batch")
+        and levels is not None
+        and len(levels) == len(QUANTILE_LEVELS)
+        and np.allclose([float(v) for v in levels], QUANTILE_LEVELS)
+    )
 
-    ``target`` is one TIME eval instance's context: ``(variates, time)`` or
-    ``(time,)``. Each variate is forecast independently (cascade's per-channel
-    convention) and the sample paths are collapsed to the TIME quantile grid.
+
+def _instance_quantiles(wrapper, target, horizon: int, num_samples: int) -> np.ndarray:
+    """One TIME eval instance's forecast, shaped ``(num_q, num_variates, H)``.
+
+    ``target`` is the instance's context: ``(variates, time)`` or ``(time,)``.
+    Each variate is forecast independently (cascade's per-channel convention).
+    CPM checkpoints hand back the quantile head directly on TIME's grid; older
+    checkpoints draw sample paths and collapse them to the grid.
     """
     t = np.atleast_2d(np.asarray(target, dtype=np.float64))  # (V, L)
+    if _wrapper_quantile_grid_matches(wrapper):
+        q = np.asarray(wrapper.forecast_quantiles_batch(list(t), horizon))  # (V, H, num_q)
+        return np.transpose(q, (2, 0, 1))  # (num_q, V, H)
     per_variate = []
     for v in range(t.shape[0]):
         samples = np.asarray(wrapper.forecast(t[v], horizon, num_samples))[0]  # (S, H)
@@ -57,10 +72,10 @@ def _tasks(config, max_tasks: int | None):
 
     override = os.environ.get("CASCADE_BENCH_TIME_DATASETS", "").strip()
     if override:
-        names_terms = []
-        for spec in (s.strip() for s in override.split(",") if s.strip()):
-            name, _, term = spec.partition("/")
-            names_terms.append((name, [term] if term else None))
+        # Each entry is a full dataset key (e.g. "WUI_Global/Q") — the config keys
+        # themselves contain a "/", so the spec must NOT be split on it. Terms are
+        # then resolved from the config (its defined short/medium/long).
+        names_terms = [(spec.strip(), None) for spec in override.split(",") if spec.strip()]
     else:
         names_terms = [(name, None) for name in config.get("datasets", {})]
 
@@ -73,7 +88,10 @@ def _tasks(config, max_tasks: int | None):
                 return
 
 
-def _score_one(wrapper, name: str, term: str, config, out_dir: str, num_samples: int) -> dict:
+def _score_one(
+    wrapper, name: str, term: str, config, out_dir: str, num_samples: int,
+    batch_size: int = 64,
+) -> dict:
     """Run one TIME task and return ``{metric_name: mean_value}`` from metrics.npz."""
     from gluonts.time_feature import get_seasonality
     from timebench.evaluation.data import Dataset, get_dataset_settings
@@ -92,10 +110,31 @@ def _score_one(wrapper, name: str, term: str, config, out_dir: str, num_samples:
     season = get_seasonality(dataset.freq)
 
     eval_inputs = list(dataset.test_data.input)
-    fc = [
-        _instance_quantiles(wrapper, d["target"], pred_len, num_samples)[np.newaxis, ...]
-        for d in eval_inputs
-    ]
+    if _wrapper_quantile_grid_matches(wrapper):
+        # Quantile head, batched across instances *and* variates: flatten every
+        # (instance, variate) context into one job list, chunk it through
+        # forecast_quantiles_batch, and reassemble TIME's (N, num_q, V, H).
+        jobs: list[np.ndarray] = []
+        counts: list[int] = []
+        for d in eval_inputs:
+            t = np.atleast_2d(np.asarray(d["target"], dtype=np.float64))
+            jobs.extend(t)
+            counts.append(t.shape[0])
+        chunks = [
+            np.asarray(wrapper.forecast_quantiles_batch(jobs[i : i + batch_size], pred_len))
+            for i in range(0, len(jobs), batch_size)
+        ]
+        q = np.concatenate(chunks, axis=0)  # (sum_V, H, num_q)
+        fc, i = [], 0
+        for n_var in counts:
+            per = q[i : i + n_var]
+            i += n_var
+            fc.append(np.transpose(per, (2, 0, 1))[np.newaxis, ...])  # (1, num_q, V, H)
+    else:
+        fc = [
+            _instance_quantiles(wrapper, d["target"], pred_len, num_samples)[np.newaxis, ...]
+            for d in eval_inputs
+        ]
     fc_quantiles = np.concatenate(fc, axis=0)  # (N, num_q, V, H)
 
     ds_config = f"{name}/{term}"
@@ -127,6 +166,7 @@ def run(
     num_samples: int = 100,
     max_series: int | None = None,
     device: str = "cpu",
+    batch_size: int = 64,
 ) -> SuiteResult:
     # TIME needs the dataset location; mirror TIME's TIME_DATASET env var.
     ds_path = os.environ.get("CASCADE_BENCH_TIME_DATASET") or os.environ.get("TIME_DATASET")
@@ -152,7 +192,9 @@ def run(
         with tempfile.TemporaryDirectory(prefix="cascade-time-") as out_dir:
             for name, term in _tasks(config, max_series):
                 try:
-                    task_metrics = _score_one(wrapper, name, term, config, out_dir, num_samples)
+                    task_metrics = _score_one(
+                        wrapper, name, term, config, out_dir, num_samples, batch_size
+                    )
                 except Exception:  # noqa: BLE001 — one task must not abort the sweep
                     continue
                 for k, v in task_metrics.items():

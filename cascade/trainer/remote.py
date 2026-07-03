@@ -155,8 +155,18 @@ def worker_argv(
     return argv
 
 
+# Training always wins the GPU: every dispatch first kills any still-running
+# post-round benchmark sweep (log-only telemetry, see bench_hook) so a straggler
+# can never contend a worker toward its max_train_seconds guard. The pattern is
+# anchored to the venv entrypoint path (how the running scorer's cmdline reads)
+# with the bracket trick, so it matches neither this dispatch command's own
+# shell nor the benchmark *launch* command's shell — only the live scorer.
+PREEMPT_BENCHMARKS = "pkill -f 'bin/cascade[-]benchmark' 2>/dev/null; "
+
+
 def build_remote_command(host: RemoteHost, argv: list[str], env: dict[str, str]) -> str:
-    """The single shell string ssh runs on the pod: ``cd workdir && ENV… argv``.
+    """The single shell string ssh runs on the pod: benchmark preemption, then
+    ``cd workdir && ENV… argv``.
 
     Everything is ``shlex.quote``d so credentials/paths with spaces or shell
     metacharacters can't break out.
@@ -167,7 +177,7 @@ def build_remote_command(host: RemoteHost, argv: list[str], env: dict[str, str])
         full_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
     if full_env:
         prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(full_env.items())) + " "
-    return f"cd {shlex.quote(host.workdir)} && {prefix}{shlex.join(argv)}"
+    return f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {prefix}{shlex.join(argv)}"
 
 
 def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:

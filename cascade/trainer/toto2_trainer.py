@@ -18,9 +18,10 @@ Validation status: this is a faithful, runnable reference, not a byte-exact
 clone of Datadog's released 4M. It needs a GPU to train end-to-end (no GPU in
 CI) — validate a real run on your reference box, then pin ``[training]
 base_arch_digest`` and ``ref_throughput_tokens_per_s`` to what you launch with.
-The u-μP init multipliers and the NorMuon optimiser are approximated (u-μP-style
-fan-in init + Muon-orthogonalised matrices + AdamW for the rest); swap in exact
-versions before freezing the arch digest if you need bit-fidelity.
+Remaining approximation vs the Toto 2.0 report: the u-μP init multipliers and
+LR width-scaling rules are fan-in-flavoured (not real unit scaling — the
+residual scheme, xPos, and Polar Express are now exact); swap in the full
+unit-scaling rules before freezing the arch digest if you need bit-fidelity.
 """
 
 from __future__ import annotations
@@ -54,6 +55,29 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, rng) -> np.ndarray:
+    """Sample per-row contiguous-patch-masking masks: ``(n_rows, n_patches)``
+    bool, True = masked (unobserved).
+
+    Mirrors Toto 2.0 §2.1: per row, draw a masked fraction ``p ~ U(0, p_max)``,
+    then place random contiguous spans of length ``c ~ U{1..c_max}`` until
+    ``~p·P`` patches are masked. Pure numpy (no torch) so it is unit-testable;
+    the trainer expands the patch-level mask to the model's per-entry channel.
+    """
+    masks = np.zeros((n_rows, n_patches), dtype=bool)
+    if n_patches <= 1 or c_max < 1 or p_max <= 0:
+        return masks
+    for r in range(n_rows):
+        target = rng.uniform(0.0, p_max) * n_patches
+        placed = 0
+        while masks[r].sum() < target and placed < 4 * n_patches:
+            c = int(rng.integers(1, c_max + 1))
+            start = int(rng.integers(0, n_patches))
+            masks[r, start : start + c] = True
+            placed += 1
+    return masks
+
+
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
     """Yield ``(B, P*patch_size)`` float64 training batches from a series stream.
 
@@ -82,22 +106,40 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batc
             yield np.stack(items, axis=0)
 
 
-def _zeropower_newtonschulz(G, steps: int = 5, eps: float = 1e-7):
-    """Newton-Schulz orthogonalisation used by Muon (the 'norm' in NorMuon is the
-    operator's refinement). ``G`` is a 2-D tensor."""
+# Polar Express (arXiv 2505.16932, Implementation 1): the minimax-optimal
+# degree-5 polynomial composition for polar(M) that Toto 2.0 uses to
+# orthogonalize NorMuon updates. Coefficients are the paper's precomputed
+# optimal composition for ℓ = 1e-3, with its 1.01 numerical safety factor
+# folded in. We run the first 6 iterations in float32 (the paper uses bfloat16
+# for speed; float32 preserves cascade's byte-reproducible-on-a-pinned-SKU
+# training guarantee).
+_POLAR_COEFFS = [
+    (a / 1.01, b / 1.01**3, c / 1.01**5)
+    for a, b, c in [
+        (8.28721201814563, -23.595886519098837, 17.300387312530933),
+        (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+        (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+        (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+        (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+        (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    ]
+]
 
-    a, b, c = 3.4445, -4.7750, 2.0315
+
+def _polar_express(G):
+    """Approximate ``polar(G)`` via the Polar Express polynomial iteration.
+    ``G`` is a 2-D tensor; only matmuls, so GPU-friendly and deterministic."""
     X = G.float()
-    X = X / (X.norm() + eps)
     transposed = X.size(0) > X.size(1)
     if transposed:
-        X = X.t()
-    for _ in range(steps):
-        A = X @ X.t()
+        X = X.mT
+    X = X / (X.norm() * 1.01 + 1e-7)
+    for a, b, c in _POLAR_COEFFS:
+        A = X @ X.mT
         B = b * A + c * (A @ A)
-        X = a * X + B @ X
+        X = a * X + B @ X  # X ← aX + bX³ + cX⁵
     if transposed:
-        X = X.t()
+        X = X.mT
     return X.to(G.dtype)
 
 
@@ -167,6 +209,7 @@ class Toto2Trainer:
             Toto2Config,
             Toto2Model,
             causal_standardize,
+            patch_anchors,
             pinball_loss,
         )
 
@@ -189,21 +232,45 @@ class Toto2Trainer:
         t0 = time.time()
         deadline = t0 + contract.max_train_seconds
 
+        # CPM masks are drawn per batch from a dedicated generator so the run
+        # stays byte-reproducible under the shared training_seed.
+        mask_rng = np.random.default_rng(training_seed % (2**63))
+
         # Bucketed batching: series shorter than the full context still train (the
         # generator's max_length can be < context_length). Each batch holds series
         # of the same patch count P, so a single forward covers them; P caps at
-        # max_ctx_patches. Position p predicts patch p+1.
+        # max_ctx_patches. Position p predicts patch p+1; CPM zeroes contiguous
+        # input spans (mask channel = 1) so the model learns to fill multiple
+        # future patches from one forward pass — targets stay unmasked.
         for arr in iter_training_batches(
             stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
         ):
             x = torch.as_tensor(arr, device=self.device, dtype=self.dtype)  # (B, P*ps)
-            z, _, _ = causal_standardize(x)
             num_patches = arr.shape[1] // cfg.patch_size
+            cpm = sample_cpm_masks(
+                arr.shape[0], num_patches,
+                c_max=cfg.cpm_c_max, p_max=cfg.cpm_p_max, rng=mask_rng,
+            )
+            mask = torch.as_tensor(cpm, device=self.device)                 # (B, P)
+            step_mask = (
+                mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
+            ).to(self.dtype)
+            # Per-step causal stats over unmasked entries only — masked spans
+            # carry the last observed stats forward, exactly like the horizon
+            # mask patches at inference.
+            z, loc, scale = causal_standardize(x, mask=step_mask)
             patches = z.view(x.shape[0], num_patches, cfg.patch_size)
-            pred = model(patches)                       # (B, P, patch_size, num_q)
+            pred = model(patches, mask=mask)            # (B, P, patch_size, num_q)
             pred_q = pred[:, :-1]                        # (B, P-1, patch_size, num_q)
-            target = patches[:, 1:]                     # (B, P-1, patch_size)
+            # Target patch p+1 is scaled at the anchor closing patch p — the
+            # stats known when that patch is forecast, so a target never leaks
+            # into its own scaling.
+            a_loc, a_scale = patch_anchors(loc, scale, cfg.patch_size)
+            raw = x.view(x.shape[0], num_patches, cfg.patch_size)
+            target = torch.asinh(
+                (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
+            )
             loss = pinball_loss(pred_q, target, tuple(levels))
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
@@ -297,23 +364,26 @@ class Toto2Trainer:
 
 
 class _MuonAdamW:
-    """Minimal NorMuon-style optimiser: Muon (momentum + Newton-Schulz orthogonal
-    update) for hidden weight matrices, AdamW for embeddings/heads/biases.
-
-    A reference, not a tuned implementation — the per-neuron second-moment
-    normalisation that distinguishes NorMuon from Muon is left to the operator.
+    """NorMuon optimiser (Toto 2.0 §2.3): Nesterov momentum + Polar Express
+    orthogonalisation with per-neuron (row) second-moment normalisation — the
+    "Nor" — and cautious weight decay for hidden weight matrices; AdamW for
+    embeddings/heads/biases, with no weight decay there (μP++ convention).
     """
 
     def __init__(self, muon_params, adamw_params, *, lr: float, weight_decay: float,
-                 momentum: float = 0.95):
+                 momentum: float = 0.95, beta2: float = 0.95, eps: float = 1e-8):
         import torch
 
         self._torch = torch
         self.momentum = momentum
         self.weight_decay = weight_decay
+        self.beta2 = beta2
+        self.eps = eps
         self._bufs: dict = {}
+        self._row_v: dict = {}  # per-row second-moment EMA (NorMuon eq. 5)
         self.muon_params = list(muon_params)
-        self.adamw = torch.optim.AdamW(adamw_params, lr=lr, weight_decay=weight_decay) if adamw_params else None
+        # μP++: no weight decay on biases, norms, or input/output projections.
+        self.adamw = torch.optim.AdamW(adamw_params, lr=lr, weight_decay=0.0) if adamw_params else None
         # param_groups so the trainer's LR scheduler can set lr uniformly.
         self.param_groups = [{"params": self.muon_params, "lr": lr, "lr_scale": 1.0}]
         if self.adamw is not None:
@@ -336,9 +406,23 @@ class _MuonAdamW:
                 buf = self._torch.zeros_like(g)
                 self._bufs[p] = buf
             buf.mul_(self.momentum).add_(g)
-            update = _zeropower_newtonschulz(buf)
+            update = _polar_express(g.add(buf, alpha=self.momentum))  # Nesterov
+            # NorMuon: normalise each row against an EMA of its own squared
+            # magnitude, so no handful of neurons dominates the update — and
+            # the β₂ variance mechanism pinball training relies on is restored.
+            v = self._row_v.get(p)
+            if v is None:
+                v = self._torch.zeros(p.shape[0], 1, device=p.device, dtype=update.dtype)
+                self._row_v[p] = v
+            v.mul_(self.beta2).add_(
+                (update * update).mean(dim=1, keepdim=True), alpha=1.0 - self.beta2
+            )
+            update = update / (v.sqrt() + self.eps)
             scale = max(1.0, (p.shape[0] / p.shape[1]) ** 0.5)
-            p.data.mul_(1.0 - lr * self.weight_decay)
+            if self.weight_decay:
+                # cautious weight decay: only where decay agrees with the update
+                cautious = ((update * p.data) > 0).to(p.dtype)
+                p.data.mul_(1.0 - lr * self.weight_decay * cautious)
             p.data.add_(update, alpha=-lr * scale)
         if self.adamw is not None:
             self.adamw.step()
@@ -346,12 +430,27 @@ class _MuonAdamW:
 
 # ── the loader written into every checkpoint ─────────────────────────────────
 # Self-contained: imports the sibling model.py by file path, rebuilds the arch,
-# loads weights, and autoregressively samples forecast paths from the predicted
-# quantiles. Matches the contract cascade.validator.evaluator expects:
+# loads weights, and decodes forecasts via contiguous patch masking — the whole
+# horizon in ONE forward pass (masked horizon patches), no autoregressive
+# sampling. Matches the contract cascade.validator.evaluator expects:
 #   Wrapper(checkpoint_dir, device=...).forecast(history_1d, horizon, num_samples)
 #       -> ndarray (1, num_samples, horizon)
+# and additionally exposes the quantile head directly (what benchmark CRPS
+# consumes), batched across series:
+#   forecast_quantiles(history, horizon)          -> (1, horizon, num_q)
+#   forecast_quantiles_batch(histories, horizon)  -> (B, horizon, num_q)
 _FORECAST_WRAPPER_PY = '''"""Auto-generated by cascade Toto2Trainer. Loads the trained checkpoint and
-forecasts by sampling the model's predicted quantiles autoregressively."""
+decodes the full horizon in one forward pass via contiguous patch masking
+(CPM) — no autoregressive sampling. Exposes:
+
+  forecast(history, horizon, num_samples) -> (1, num_samples, horizon)
+      the cascade validator contract — sample paths drawn once from the
+      decoded quantiles (seeded per window for validator consensus).
+  forecast_quantiles(history, horizon) -> (1, horizon, num_q)
+  forecast_quantiles_batch(histories, horizon) -> (B, horizon, num_q)
+      the quantile head directly — what benchmark CRPS consumes; batched
+      across series so eval sweeps amortize the forward passes.
+"""
 
 from __future__ import annotations
 
@@ -363,6 +462,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# Single-pass CPM decoding is stable to ~768 steps (Toto 2.0 tech report);
+# longer horizons block-decode: commit the median per block, then continue.
+STABLE_DECODE_STEPS = 768
 
 
 def _load_model_module(d: Path):
@@ -383,30 +486,93 @@ class Wrapper:
         cfg_obj = json.loads((d / "config.json").read_text())
         self.m = _load_model_module(d)
         self.cfg = self.m.Toto2Config(**cfg_obj["toto2"])
-        self.levels = torch.tensor(cfg_obj["quantile_levels"], dtype=torch.float32, device=device)
+        self.quantile_levels = [float(v) for v in cfg_obj["quantile_levels"]]
+        self.levels = torch.tensor(self.quantile_levels, dtype=torch.float32, device=device)
         self.model = self.m.Toto2Model(self.cfg).to(device).eval()
         from safetensors.torch import load_file
         state = load_file(str(d / "weights.safetensors"))
         self.model.load_state_dict(state)
 
-    def _quantiles_to_samples(self, q_vals, num_samples, generator):
-        # q_vals: (num_samples, patch_size, num_q) — sample one value per step via
-        # the piecewise-linear inverse CDF of the predicted quantiles. ``generator``
-        # is seeded per window so every validator draws identical samples (consensus)
-        # and king/challenger share uniforms (paired Monte-Carlo, lower variance).
-        ns, ps, nq = q_vals.shape
-        q_vals, _ = torch.sort(q_vals, dim=-1)  # enforce monotone quantiles
-        u = torch.rand(ns, ps, device=q_vals.device, generator=generator)
-        levels = self.levels
-        idx = torch.searchsorted(levels, u.clamp(levels[0].item(), levels[-1].item()))
-        idx = idx.clamp(1, nq - 1)
-        lo = (idx - 1)
-        hi = idx
-        ql = levels[lo]; qh = levels[hi]
-        vl = torch.gather(q_vals, -1, lo.unsqueeze(-1)).squeeze(-1)
-        vh = torch.gather(q_vals, -1, hi.unsqueeze(-1)).squeeze(-1)
-        frac = ((u - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
-        return vl + frac * (vh - vl)
+    # ── CPM decoding ──────────────────────────────────────────────────────────
+
+    def _prep(self, histories):
+        """Left-pad (with the first value) or truncate each 1-D history to the
+        context window, then apply the causal scaler. Returns
+        ``(z, loc, scale, lo, hi)``: the causally normalized context
+        ``(B, window_len)``, the end-of-context anchor stats ``(B, 1)`` the
+        forecast is unscaled with, and the real-space clamp bounds ``(B, 1)``
+        (context min/max, each extended by 1e4x the anchor scale)."""
+        ps = self.cfg.patch_size
+        n_ctx = max(2, self.cfg.context_length // ps)
+        window_len = n_ctx * ps
+        rows = []
+        for h in histories:
+            h = np.asarray(h, dtype=np.float64).reshape(-1)
+            if h.shape[0] < window_len:
+                pad = np.full(window_len - h.shape[0], h[0] if h.size else 0.0)
+                h = np.concatenate([pad, h])
+            else:
+                h = h[-window_len:]
+            rows.append(h)
+        x = torch.as_tensor(np.stack(rows), dtype=torch.float32, device=self.device)
+        z, loc_t, scale_t = self.m.causal_standardize(x)
+        loc = loc_t[:, -1:]
+        scale = scale_t[:, -1:]
+        lo = x.min(dim=-1, keepdim=True).values - 1e4 * scale
+        hi = x.max(dim=-1, keepdim=True).values + 1e4 * scale
+        return z, loc, scale, lo, hi
+
+    @torch.no_grad()
+    def _decode_z(self, z, k_patches: int):
+        """Append masked horizon patches and read every horizon patch's
+        quantiles from one forward pass; past the stable span, block-decode
+        (commit the median and continue). ``z``: ``(B, L)`` normalized context
+        → z-space quantiles ``(B, k_patches*patch_size, num_q)``."""
+        ps = self.cfg.patch_size
+        stable = max(1, min(STABLE_DECODE_STEPS // ps, self.cfg.max_patches - 2))
+        out = []
+        remaining = k_patches
+        while remaining > 0:
+            block = min(remaining, stable)
+            # keep as much context as the positional table allows
+            ctx_p = min(z.shape[1] // ps, self.cfg.max_patches - block)
+            ctx = z[:, -ctx_p * ps :].view(z.shape[0], ctx_p, ps)
+            filler = torch.zeros(z.shape[0], block, ps, dtype=ctx.dtype, device=self.device)
+            mask = torch.zeros(z.shape[0], ctx_p + block, dtype=ctx.dtype, device=self.device)
+            mask[:, ctx_p:] = 1.0
+            pred = self.model(torch.cat([ctx, filler], dim=1), mask=mask)
+            # position i predicts patch i+1 → the horizon patches come from
+            # positions ctx_p-1 .. ctx_p+block-2.
+            q = pred[:, ctx_p - 1 : ctx_p + block - 1]      # (B, block, ps, nq)
+            q, _ = torch.sort(q, dim=-1)                    # prevent quantile crossing
+            out.append(q.reshape(z.shape[0], block * ps, -1))
+            remaining -= block
+            if remaining > 0:
+                median = q[..., q.shape[-1] // 2].reshape(z.shape[0], block * ps)
+                z = torch.cat([z, median], dim=1)
+        return torch.cat(out, dim=1)
+
+    # ── quantile head (benchmark path) ────────────────────────────────────────
+
+    @torch.no_grad()
+    def forecast_quantiles_batch(self, histories, horizon: int) -> np.ndarray:
+        """Decode ``len(histories)`` series in one batch → real-space quantiles
+        ``(B, horizon, num_q)`` at ``self.quantile_levels``."""
+        histories = list(histories)
+        z, loc, scale, lo, hi = self._prep(histories)
+        k = -(-int(horizon) // self.cfg.patch_size)
+        qz = self._decode_z(z, k)[:, : int(horizon)]        # (B, h, nq)
+        # arcsinh + affine are monotone increasing, so quantiles map pointwise;
+        # decoded patches sit in the end-of-context anchor space (mask patches
+        # add no observations, so the causal stats stay at the anchor).
+        q = torch.sinh(qz) * scale.unsqueeze(-1) + loc.unsqueeze(-1)
+        q = torch.clamp(q, min=lo.unsqueeze(-1), max=hi.unsqueeze(-1))
+        return q.detach().cpu().numpy().astype(np.float64)
+
+    def forecast_quantiles(self, history, horizon: int) -> np.ndarray:
+        return self.forecast_quantiles_batch([history], horizon)
+
+    # ── validator contract (sample paths) ─────────────────────────────────────
 
     @torch.no_grad()
     def forecast(self, history, horizon: int, num_samples: int) -> np.ndarray:
@@ -418,31 +584,28 @@ class Wrapper:
         seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:8], "big") & ((1 << 63) - 1)
         generator = torch.Generator(device=self.device)
         generator.manual_seed(seed)
-        ps = self.cfg.patch_size
-        n_ctx = max(2, self.cfg.context_length // ps)
-        window_len = n_ctx * ps
-        # left-pad (with the first value) or truncate to window_len
-        if hist.shape[0] < window_len:
-            pad = np.full(window_len - hist.shape[0], hist[0] if hist.size else 0.0)
-            hist = np.concatenate([pad, hist])
-        else:
-            hist = hist[-window_len:]
-        x = torch.as_tensor(hist, dtype=torch.float32, device=self.device)[None, :]  # (1, L)
-        loc = x.mean(dim=-1, keepdim=True)
-        scale = x.std(dim=-1, keepdim=True).clamp_min(1e-5)
-        z = torch.asinh((x - loc) / scale).repeat(num_samples, 1)  # (ns, L)
 
-        generated = []
-        steps_needed = horizon
-        while sum(g.shape[1] for g in generated) < steps_needed:
-            ctx = z[:, -window_len:]
-            patches = ctx.view(num_samples, n_ctx, ps)
-            pred = self.model(patches)            # (ns, P, ps, num_q)
-            next_q = pred[:, -1]                  # (ns, ps, num_q) — next patch
-            nxt = self._quantiles_to_samples(next_q, num_samples, generator)  # (ns, ps)
-            z = torch.cat([z, nxt], dim=1)
-            generated.append(nxt)
-        gen = torch.cat(generated, dim=1)[:, :horizon]  # (ns, horizon)
-        out = torch.sinh(gen) * scale + loc             # inverse transform
-        return out.detach().cpu().numpy().reshape(1, num_samples, horizon)
+        z, loc, scale, lo, hi = self._prep([hist])
+        k = -(-int(horizon) // self.cfg.patch_size)
+        qz = self._decode_z(z, k)[0, : int(horizon)]        # (h, nq) — z-space
+        # One draw per step per path via the piecewise-linear inverse CDF of the
+        # decoded quantiles. Quantiles decode once; samples never feed back.
+        nq = qz.shape[-1]
+        levels = self.levels
+        u = torch.rand(int(num_samples), int(horizon), device=self.device, generator=generator)
+        idx = torch.searchsorted(levels, u.clamp(levels[0].item(), levels[-1].item()))
+        idx = idx.clamp(1, nq - 1)
+        # i_lo/i_hi are quantile INDICES — distinct names so they can't shadow
+        # the real-space clamp bounds ``lo``/``hi`` from _prep.
+        i_lo = idx - 1
+        i_hi = idx
+        qe = qz.unsqueeze(0).expand(u.shape[0], -1, -1)     # (ns, h, nq)
+        vl = torch.gather(qe, -1, i_lo.unsqueeze(-1)).squeeze(-1)
+        vh = torch.gather(qe, -1, i_hi.unsqueeze(-1)).squeeze(-1)
+        ql = levels[i_lo]; qh = levels[i_hi]
+        frac = ((u - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
+        zs = vl + frac * (vh - vl)                          # (ns, h)
+        out = torch.sinh(zs) * scale[0] + loc[0]
+        out = torch.clamp(out, min=lo[0], max=hi[0])
+        return out.detach().cpu().numpy().reshape(1, int(num_samples), int(horizon))
 '''

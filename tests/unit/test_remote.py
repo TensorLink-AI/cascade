@@ -77,7 +77,9 @@ def test_worker_argv_heat_overrides_budget_and_repo():
 def test_build_remote_command_sets_cd_cuda_and_env():
     host = _host(workdir="/root/metro", cuda_device="1")
     cmd = build_remote_command(host, ["python", "-m", "x"], {"HIPPIUS_S3_ACCESS_KEY": "ak"})
-    assert cmd.startswith("cd /root/metro && ")
+    # training preempts any straggling log-only benchmark sweep before cd'ing in
+    assert cmd.startswith("pkill -f 'bin/cascade[-]benchmark'")
+    assert "cd /root/metro && " in cmd
     assert "CUDA_VISIBLE_DEVICES=1" in cmd
     assert "HIPPIUS_S3_ACCESS_KEY=ak" in cmd
     assert cmd.rstrip().endswith("python -m x")

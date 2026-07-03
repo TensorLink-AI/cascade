@@ -91,6 +91,7 @@ def run(
     num_samples: int = 100,
     max_series: int | None = None,
     device: str = "cpu",
+    batch_size: int = 64,
 ) -> SuiteResult:
     if not (os.environ.get("GIFT_EVAL") or os.environ.get("CASCADE_BENCH_GIFTEVAL_DATASETS")):
         return SuiteResult(
@@ -107,7 +108,10 @@ def run(
             if ds is None:
                 continue
             try:
-                m = score_dataset(ds, checkpoint_dir, num_samples=num_samples, device=device)
+                m = score_dataset(
+                    ds, checkpoint_dir,
+                    num_samples=num_samples, device=device, batch_size=batch_size,
+                )
             except Exception:  # noqa: BLE001 — one dataset must not abort the sweep
                 continue
             rows.append({"full": _baseline_key(ds_name, term, properties), **m})

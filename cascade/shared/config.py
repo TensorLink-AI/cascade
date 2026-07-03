@@ -88,6 +88,9 @@ class SizeSpec:
     num_heads: int
     mlp_expansion: int
     ref_throughput_tokens_per_s: int   # measured on the reference GPU for this size
+    # Exact FFN hidden width from the released config.json (0 ⇒ derive as
+    # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
+    d_ff: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,9 @@ class TrainingContractConfig:
     max_train_seconds: int
     # corpus feed mode (one of CORPUS_MODES); identical for king & challenger
     corpus_mode: str = "stream_cpu"
+    # Exact FFN hidden width from the released config.json (0 ⇒ derive as
+    # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
+    d_ff: int = 0
     # Pinned GPU model for byte-exact re-derivation. When non-empty, the validator
     # asserts every trained entry's recorded gpu_name == this (king and challenger
     # ran the same SKU); empty ⇒ require only that king and challenger match each
@@ -204,6 +210,7 @@ class TrainingContractConfig:
             num_layers=spec.num_layers,
             num_heads=spec.num_heads,
             mlp_expansion=spec.mlp_expansion,
+            d_ff=spec.d_ff,
             ref_throughput_tokens_per_s=spec.ref_throughput_tokens_per_s,
             extra_sizes=(),
         )
@@ -563,6 +570,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             num_heads=int(z["num_heads"]),
             mlp_expansion=int(z["mlp_expansion"]),
             ref_throughput_tokens_per_s=int(z["ref_throughput_tokens_per_s"]),
+            d_ff=int(z.get("d_ff", 0)),
         )
         for z in t.get("sizes", [])
     )
@@ -594,6 +602,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             head_dim=int(t["head_dim"]),
             patch_size=int(t["patch_size"]),
             mlp_expansion=int(t["mlp_expansion"]),
+            d_ff=int(t.get("d_ff", 0)),
             num_quantiles=int(t["num_quantiles"]),
             masking=str(t["masking"]),
             cpm_c_max=int(t["cpm_c_max"]),

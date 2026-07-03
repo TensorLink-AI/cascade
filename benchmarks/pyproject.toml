@@ -15,15 +15,10 @@ dependencies = [
     # gift-eval IS the harness for both GIFT-Eval and BOOM (BOOM's loader is
     # built on it). Pinned to the exact commit DataDog/toto's BOOM runner uses
     # so our BOOM numbers match the published leaderboard. Bump deliberately.
-    "gift-eval @ git+https://github.com/SalesforceAIResearch/gift-eval@1527c41589189ad1bc3883ed4d3d97b3e5a3b47c",
+    "salesforce-gift-eval @ git+https://github.com/SalesforceAIResearch/gift-eval@1527c41589189ad1bc3883ed4d3d97b3e5a3b47c",
     "gluonts~=0.15.1",
     "datasets~=2.17.1",
     "pandas==2.0.0",
-    # TIME benchmark (arXiv:2602.12147). Its `timebench` package is gift-eval-
-    # adapted and py3.11/gluonts-compatible, so it slots into this same env. It
-    # takes quantile arrays directly (no gluonts predictor) and computes its own
-    # metrics — see suites/time_bench.py.
-    "timebench @ git+https://github.com/zqiao11/TIME",
     "python-dotenv",
     "numpy~=1.26.0",
     "scipy~=1.11.3",
@@ -38,12 +33,38 @@ dependencies = [
     "huggingface_hub>=0.23",
 ]
 
+# TIME benchmark (arXiv:2602.12147) is OPTIONAL: its upstream `timebench` wheel
+# currently fails to build (duplicate force-include of config/datasets.yaml), and
+# a broken TIME build must not block GIFT-Eval + BOOM. The `time` suite lazy-
+# imports timebench and reports `skipped` when it's absent (suites/time_bench.py),
+# so the core env installs cleanly. Install this extra to enable TIME:
+#   uv sync --project benchmarks --extra time
+[project.optional-dependencies]
+time = [
+    "timebench @ git+https://github.com/zqiao11/TIME",
+]
+
+[tool.uv]
+# timebench's upstream wheel force-includes config/datasets.yaml, which is also
+# picked up via packages=["src/timebench"] — newer hatchling rejects the
+# duplicate ("a second file … at the same path"). Its build-system only requires
+# hatchling>=1.18.0 (unpinned), so uv otherwise grabs a strict newer one. Pin the
+# BUILD backend (build-time only; does not affect runtime) to a version that
+# tolerates it, so `--extra time` builds reproducibly.
+build-constraint-dependencies = ["hatchling==1.18.0"]
+
 [project.scripts]
 cascade-benchmark = "cascade_benchmark.cli:main"
+cascade-benchmark-download = "cascade_benchmark.cli:download_main"
 
 [build-system]
 requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
+
+# gift-eval / timebench are git (direct-reference) dependencies; hatchling
+# refuses to build metadata with those unless this is explicitly allowed.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["cascade_benchmark"]

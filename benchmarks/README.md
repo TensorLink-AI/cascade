@@ -20,6 +20,33 @@ cascade checkpoint already ships `forecast_wrapper.py` (the same trusted
 inference path the validator scores on), which we wrap as a gluonts predictor —
 so this is model-agnostic and consistent with in-protocol scores.
 
+CPM-era checkpoints expose their quantile head
+(`forecast_quantiles_batch(histories, horizon)`), so the scorer emits gluonts
+`QuantileForecast`s straight from one batched forward pass per `--batch-size`
+series — no Monte-Carlo sampling. Older checkpoints that only implement the
+sampling contract still work via the original per-series `SampleForecast` path
+(slow; expect the historical hours-long runtimes for those).
+
+## Docker (recommended): env + frozen data as one artifact
+
+`benchmarks/Dockerfile` bakes the locked env **and** the three datasets at the
+revisions pinned in `cascade_benchmark/datasets.py`, so any host with docker
+(and optionally a GPU) scores checkpoints with zero setup and comparable
+numbers:
+
+```bash
+# build (from benchmarks/); the data layer only rebuilds when revisions bump
+docker build -t cascade-bench:<tag> .
+
+# score a checkpoint (data is baked at /data; env vars pre-wired)
+docker run --rm --gpus all \
+    -v /path/to/checkpoint:/ckpt:ro -v /path/to/out:/out \
+    cascade-bench:<tag> /ckpt /out/report.json --device cuda --batch-size 512
+```
+
+Every report records `data_revisions`, so historical numbers stay traceable to
+the exact data they were computed against.
+
 ## Setup (uv)
 
 ```bash
@@ -41,6 +68,26 @@ Fast smoke run on a subset (avoids downloading/scoring the full benchmarks):
 CASCADE_BENCH_GIFTEVAL_DATASETS="electricity/short" \
 uv run --project benchmarks cascade-benchmark CKPT out.json --suites gift-eval --max-series 50
 ```
+
+### Getting the data (auto-download)
+
+The three benchmarks live in HuggingFace dataset repos (`Salesforce/GiftEval`,
+`Datadog/BOOM`, `Real-TSF/TIME`). Fetch them all — or run the scorer with
+`--data-dir` and let it download what's missing:
+
+```bash
+# download the full datasets once (set HF_TOKEN if a repo is gated)
+uv run --project benchmarks cascade-benchmark-download --data-dir ./bench_data
+
+# ...or fetch-and-score in one shot (each suite reads <data-dir>/<suite>)
+uv run --project benchmarks cascade-benchmark CKPT out.json \
+    --suites gift-eval,boom,time --data-dir ./bench_data --download
+```
+
+`--data-dir` (without `--download`) just wires `GIFT_EVAL` / `BOOM` /
+`CASCADE_BENCH_TIME_DATASET` to `<data-dir>/<suite>` for data already present.
+Downloads are resumable. BOOM is ~350M obs / large — expect a big pull for a full
+run. The manual env vars below still work if you manage the data yourself.
 
 ### Datasets / env vars
 
@@ -86,8 +133,9 @@ fabricated number.
   `boom_properties.json` (`data/`, Apache-2.0) and iterate it, one `Dataset` per
   config with its designated term.
 - **TIME** — *not* gluonts; mirrors TIME's own `experiments/chronos2.py`: build
-  `timebench.evaluation.data.Dataset`, feed quantile arrays (sample paths from
-  the wrapper reduced to TIME's 9-level grid) to `save_window_predictions`, and
+  `timebench.evaluation.data.Dataset`, feed quantile arrays (the wrapper's
+  quantile head on TIME's 9-level grid; legacy checkpoints fall back to sample
+  paths reduced to that grid) to `save_window_predictions`, and
   read the resulting `metrics.npz` — TIME's own metric code, so numbers match the
   [leaderboard](https://huggingface.co/spaces/Real-TSF/TIME-leaderboard).
 

@@ -32,13 +32,16 @@ def build_dataset(name: str, term: str, *, storage_env_var: str = "GIFT_EVAL"):
         return None
 
 
-def score_dataset(ds, checkpoint_dir: str, *, num_samples: int, device: str) -> dict:
+def score_dataset(
+    ds, checkpoint_dir: str, *, num_samples: int, device: str, batch_size: int = 64
+) -> dict:
     """Score the checkpoint on one ``Dataset`` and return ``{MASE, MAE, CRPS}``.
 
     The ``evaluate_model`` call mirrors gift-eval's reference runner exactly
     (kwargs + seasonality), so the per-config numbers are leaderboard-faithful.
     Column names ``MASE[0.5]`` / ``MAE[0.5]`` / ``mean_weighted_sum_quantile_loss``
-    are verified against ``naive.ipynb``.
+    are verified against ``naive.ipynb``. ``batch_size`` is the number of series
+    the predictor forwards through the checkpoint at once (quantile-head path).
     """
     from gluonts.ev.metrics import MAE, MASE, MeanWeightedSumQuantileLoss
     from gluonts.model import evaluate_model
@@ -52,6 +55,7 @@ def score_dataset(ds, checkpoint_dir: str, *, num_samples: int, device: str) -> 
         prediction_length=ds.prediction_length,
         num_samples=num_samples,
         device=device,
+        batch_size=batch_size,
     )
     res = evaluate_model(
         predictor,

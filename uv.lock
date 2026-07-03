@@ -366,6 +366,9 @@ dependencies = [
 chain = [
     { name = "bittensor" },
 ]
+deploy = [
+    { name = "requests" },
+]
 dev = [
     { name = "hypothesis" },
     { name = "pytest" },
@@ -396,6 +399,7 @@ requires-dist = [
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "requests", marker = "extra == 'deploy'", specifier = ">=2.31" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "safetensors", marker = "extra == 'train'", specifier = ">=0.4" },
     { name = "scipy", specifier = ">=1.11" },
@@ -403,7 +407,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'train'", specifier = ">=4.40" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.17" },
 ]
-provides-extras = ["train", "hippius", "dev", "wandb", "chain"]
+provides-extras = ["train", "hippius", "dev", "deploy", "wandb", "chain"]
 
 [[package]]
 name = "certifi"

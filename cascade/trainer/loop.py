@@ -195,6 +195,10 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
+    # Post-round public-benchmark telemetry (GIFT-Eval/BOOM/TIME) of the round's
+    # king on the idle pod. LOG-ONLY: validators score rounds exclusively on the
+    # private eval pool; this never feeds weights or the throne (see bench_hook).
+    bench_plan: object | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -699,6 +703,14 @@ class TrainerRunner:
                     commitments, king_hotkey, base_seed, block, cutoff_block=epoch_start,
                 )
                 self.publish(manifest)
+                if self.bench_plan is not None and self.remote_hosts:
+                    from .bench_hook import launch_post_round_benchmark
+
+                    launch_post_round_benchmark(
+                        self.remote_hosts[0], round_id,
+                        self.cfg.training.arch_preset, self.bench_plan,
+                        work_root=self.work_root,
+                    )
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)

@@ -193,5 +193,7 @@ and digests stay valid.
 
 **Flip point.** `chain.toml [generator] max_channels`; provide multivariate eval
 windows in the pool and a `BaseTrainer` that exercises Toto2's variate-axis
-attention. Until then the variate axis trains on `C = 1` (degenerate) and is
-effectively dormant.
+attention. The variate-axis layers now exist in `toto2_model.py` (one closes
+each group of 4, matching the Toto-2.0-4m release) and `Toto2Model.forward`
+accepts `(B, C, P, patch_size)` — but the trainer still feeds `C = 1`, so they
+train degenerate/dormant until multivariate corpora flip on.

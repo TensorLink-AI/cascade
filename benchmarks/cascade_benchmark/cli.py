@@ -41,6 +41,26 @@ def main(argv: list[str] | None = None) -> int:
         "(0 = full benchmark)",
     )
     p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="series forwarded through the checkpoint per batch (quantile-head "
+        "wrappers only; legacy sample wrappers run one series at a time)",
+    )
+    p.add_argument(
+        "--data-dir",
+        default=None,
+        help="root dir for benchmark datasets (each suite reads <data-dir>/<suite>). "
+        "Wires GIFT_EVAL/BOOM/CASCADE_BENCH_TIME_DATASET automatically; with "
+        "--download, fetches any missing dataset first. Overrides those env vars.",
+    )
+    p.add_argument(
+        "--download",
+        action="store_true",
+        help="download each requested suite's FULL dataset into --data-dir before "
+        "scoring (requires --data-dir; skips data already present).",
+    )
     args = p.parse_args(argv)
 
     ckpt = Path(args.checkpoint_dir)
@@ -54,14 +74,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: unknown suite(s): {unknown}; known: {list(SUITES)}", file=sys.stderr)
         return 2
 
+    if args.download and not args.data_dir:
+        print("error: --download requires --data-dir", file=sys.stderr)
+        return 2
+    if args.data_dir:
+        from .datasets import DATASETS, apply_env, ensure_datasets
+
+        env = ensure_datasets(requested, args.data_dir, download=args.download)
+        apply_env(env)
+        for name in requested:
+            spec = DATASETS.get(name)
+            if spec and spec.env_var not in env:
+                print(f"[{name}] no data under {args.data_dir}/{name} "
+                      "(use --download to fetch it) — will skip", file=sys.stderr)
+
+    from .datasets import DATASETS as _DATASETS
+
     max_series = args.max_series or None
-    report = BenchmarkReport(checkpoint=str(ckpt))
+    report = BenchmarkReport(
+        checkpoint=str(ckpt),
+        data_revisions={
+            name: _DATASETS[name].revision for name in requested if name in _DATASETS
+        },
+    )
     for name in requested:
         result = SUITES[name](
             str(ckpt),
             num_samples=args.num_samples,
             max_series=max_series,
             device=args.device,
+            batch_size=args.batch_size,
         )
         report.suites.append(result)
         print(f"[{name}] {result.status} {result.metrics or result.detail}", file=sys.stderr)
@@ -70,6 +112,47 @@ def main(argv: list[str] | None = None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
     print(f"wrote {out}", file=sys.stderr)
+    return 0
+
+
+def download_main(argv: list[str] | None = None) -> int:
+    """``cascade-benchmark-download`` — fetch the full benchmark datasets.
+
+        cascade-benchmark-download --data-dir ./bench_data [--suites gift-eval,boom,time]
+
+    Pulls each benchmark's HuggingFace dataset repo into ``<data-dir>/<suite>`` and
+    prints the env vars to export (or just pass the same ``--data-dir`` to
+    ``cascade-benchmark``). Set ``HF_TOKEN`` for gated repos.
+    """
+    from .datasets import DATASETS, download_suite
+
+    p = argparse.ArgumentParser(
+        prog="cascade-benchmark-download",
+        description="Download the full GIFT-Eval / BOOM / TIME datasets for the scorer.",
+    )
+    p.add_argument("--data-dir", required=True, help="root dir to download into (<data-dir>/<suite>)")
+    p.add_argument(
+        "--suites",
+        default=",".join(DATASETS),
+        help="comma-separated subset of: " + ", ".join(DATASETS),
+    )
+    args = p.parse_args(argv)
+
+    suites = [s.strip() for s in args.suites.split(",") if s.strip()]
+    unknown = [s for s in suites if s not in DATASETS]
+    if unknown:
+        print(f"error: unknown suite(s): {unknown}; known: {list(DATASETS)}", file=sys.stderr)
+        return 2
+
+    for s in suites:
+        dest = Path(args.data_dir) / s
+        print(f"downloading {DATASETS[s].hf_repo} → {dest} …", file=sys.stderr)
+        download_suite(s, dest)
+        print(f"  {DATASETS[s].env_var}={dest}", file=sys.stderr)
+    print(
+        f"done — run: cascade-benchmark CKPT out.json --data-dir {args.data_dir}",
+        file=sys.stderr,
+    )
     return 0
 
 
