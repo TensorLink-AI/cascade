@@ -142,14 +142,16 @@ class EvalContext:
 class VerdictRecord:
     """The KOTH decision and the state transition it caused.
 
-    ``params`` is the full ``KothParams`` (asdict) and ``bootstrap_seed`` the
-    seed fed to ``evaluate_round`` — together with the recorded scores they make
-    the verdict a pure recomputation. ``lcb`` is None when the round was
-    inconclusive (NaN has no strict-JSON form).
+    ``params`` is the full ``KothParams`` (asdict), ``bootstrap_seed`` the seed
+    fed to ``evaluate_round``, and ``king_tenure_rounds`` the king's tenure at
+    decision time (it sets the margin under a warmup schedule) — together with
+    the recorded scores they make the verdict a pure recomputation. ``lcb`` is
+    None when the round was inconclusive (NaN has no strict-JSON form).
     """
 
     params: dict
     bootstrap_seed: str
+    king_tenure_rounds: int
     lcb: float | None
     margin: float
     challenger_wins_round: bool
@@ -165,11 +167,14 @@ class VerdictRecord:
     king_uid: int | None
 
     @classmethod
-    def from_round(cls, result, transition, *, params, bootstrap_seed) -> VerdictRecord:
+    def from_round(
+        cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0
+    ) -> VerdictRecord:
         """From an ``eval.koth.RoundResult`` + ``validator.state.StateTransition``."""
         return cls(
             params=dict(asdict(params)),
             bootstrap_seed=str(bootstrap_seed),
+            king_tenure_rounds=int(king_tenure_rounds),
             lcb=_none_for_nan(result.lcb),
             margin=float(result.margin),
             challenger_wins_round=bool(result.challenger_wins_round),
@@ -368,6 +373,7 @@ def load_receipt(text: str) -> RoundReceipt:
         verdict=VerdictRecord(
             params=dict(verdict["params"]),
             bootstrap_seed=str(verdict["bootstrap_seed"]),
+            king_tenure_rounds=int(verdict["king_tenure_rounds"]),
             lcb=(None if verdict["lcb"] is None else float(verdict["lcb"])),
             margin=float(verdict["margin"]),
             challenger_wins_round=bool(verdict["challenger_wins_round"]),

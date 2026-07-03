@@ -434,10 +434,17 @@ class WandbConfig:
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
     them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
-    ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts."""
+    ``trainer_hotkey`` is the only hotkey whose manifest a validator trusts.
+
+    ``validator_hotkey`` is the trust anchor for public *round receipts*
+    (``cascade.shared.receipt``): when set, ``cascade-audit`` requires receipts
+    to be signed by exactly this ss58; empty ⇒ the audit verifies against the
+    receipt's self-declared signer and WARNs that the signer is unpinned.
+    """
 
     trainer_hotkey: str
     poll_seconds: int
+    validator_hotkey: str = ""
 
 
 @dataclass(frozen=True)
@@ -735,6 +742,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),
             poll_seconds=int(m["poll_seconds"]),
+            validator_hotkey=str(m.get("validator_hotkey", "")),
         ),
         validator=ValidatorConfig(
             weight_set_interval_blocks=int(v["weight_set_interval_blocks"]),

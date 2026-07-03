@@ -313,6 +313,11 @@ pool_s3_region   = ""
 # only signer a validator trusts (see OPEN_QUESTIONS.md #1).
 trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
 poll_seconds    = 120
+# Trust anchor for the PUBLIC round receipts (receipts/round-<id>.json): the
+# validator hotkey whose signature `cascade-audit` requires on a receipt. Empty
+# = the audit verifies against the receipt's self-declared signer and WARNs
+# that the signer is unpinned (fine while the owner runs the only validator).
+validator_hotkey = ""
 
 [validator]
 weight_set_interval_blocks = 180

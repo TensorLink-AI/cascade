@@ -14689,6 +14689,7 @@
     "inconclusive": false,
     "king_geomean": 0.37982557515837456,
     "king_hotkey": "chal_hk",
+    "king_tenure_rounds": 0,
     "king_uid": 1,
     "lcb": 0.3999999999999999,
     "margin": 0.02,

@@ -68,7 +68,8 @@ def make_scores(scale: float, seed: int, n: int = 256) -> list[WindowScore]:
     ]
 
 
-def make_manifest(cfg=None, *, base_seed: int, size: str = "") -> TrainingManifest:
+def make_manifest(cfg=None, *, base_seed: int, size: str = "",
+                  trainer_wallet=None) -> TrainingManifest:
     if cfg is not None:
         cdigest = contract_digest(cfg.training)
         adigest = cfg.training.base_arch_digest
@@ -83,7 +84,7 @@ def make_manifest(cfg=None, *, base_seed: int, size: str = "") -> TrainingManife
         TrainedEntry("chal_hk", 1, "challenger", GEN_REF_CHAL, CKPT_CHAL, "4" * 64,
                      CREATED_BLOCK, size=size),
     ]
-    return TrainingManifest(
+    manifest = TrainingManifest(
         round_id=str(base_seed),
         created_block=CREATED_BLOCK,
         contract_digest=cdigest,
@@ -92,9 +93,14 @@ def make_manifest(cfg=None, *, base_seed: int, size: str = "") -> TrainingManife
         entries=entries,
         signature="00ff" * 16,  # placeholder; audit signature checks use real signing
     )
+    if trainer_wallet is not None:
+        from cascade.shared.manifest import sign_manifest
+
+        manifest = sign_manifest(manifest, trainer_wallet)
+    return manifest
 
 
-def make_scored_receipt(cfg=None, *, validator_hotkey: str = ""):
+def make_scored_receipt(cfg=None, *, validator_hotkey: str = "", trainer_wallet=None):
     """A scored receipt whose every derived field genuinely derives.
 
     Returns ``(receipt, king_scores, chal_scores)`` so tests can re-feed the
@@ -116,7 +122,8 @@ def make_scored_receipt(cfg=None, *, validator_hotkey: str = ""):
         num_samples = 100
         size = "toto2-4m"
 
-    manifest = make_manifest(cfg, base_seed=base_seed, size=size)
+    manifest = make_manifest(cfg, base_seed=base_seed, size=size,
+                             trainer_wallet=trainer_wallet)
     king_scores = make_scores(1.0, 0)
     chal_scores = [
         WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6, s.abs_target)
@@ -158,8 +165,8 @@ def make_scored_receipt(cfg=None, *, validator_hotkey: str = ""):
             EntryScores("challenger", size, "chal_hk", 1,
                         tuple(WindowScoreRecord.from_score(s) for s in chal_scores)),
         ),
-        verdict=VerdictRecord.from_round(result, transition,
-                                         params=params, bootstrap_seed=base_seed),
+        verdict=VerdictRecord.from_round(result, transition, params=params,
+                                         bootstrap_seed=base_seed, king_tenure_rounds=0),
         reward_uids=reward_uids,
         weights=weights,
     )

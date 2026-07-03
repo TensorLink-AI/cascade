@@ -93,6 +93,9 @@ class RoundOutcome:
     # (role, size) entry in evaluation order — threaded out so the live loop can
     # publish them in the round's signed public receipt (cascade.shared.receipt).
     entry_scores: tuple[EntryScores, ...] = ()
+    # The king's tenure AT decision time (it set the margin); recorded in the
+    # receipt so an auditor can recompute margin_for_tenure without validator state.
+    king_tenure_rounds: int = 0
 
 
 @dataclass
@@ -339,12 +342,13 @@ class ValidatorRunner:
         # carries its identity for the KOTH state machine.
         chal_entry = chal_by_size[paired_sizes[0]]
 
+        tenure_at_decision = self.state.tenure_rounds
         result = evaluate_round(
             king_scores,
             chal_scores,
             self.cfg.koth_params(),
             seed=base_seed,
-            king_tenure_rounds=self.state.tenure_rounds,
+            king_tenure_rounds=tenure_at_decision,
         )
         # Public-benchmark no-regression gate: only on a private-pool win, and
         # only when enabled. It can block a dethrone (or, uncomputable, hold the
@@ -376,7 +380,8 @@ class ValidatorRunner:
             transition.note, self.state.king_hotkey, self.state.tenure_rounds,
         )
         return RoundOutcome(
-            result=result, transition=transition, entry_scores=tuple(score_records)
+            result=result, transition=transition, entry_scores=tuple(score_records),
+            king_tenure_rounds=tenure_at_decision,
         )
 
     # ── public round receipts ────────────────────────────────────────────────
@@ -428,6 +433,7 @@ class ValidatorRunner:
         verdict = VerdictRecord.from_round(
             outcome.result, outcome.transition,
             params=self.cfg.koth_params(), bootstrap_seed=base_seed,
+            king_tenure_rounds=outcome.king_tenure_rounds,
         )
         return build_receipt(
             round_id=manifest.round_id, status="scored",

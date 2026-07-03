@@ -185,6 +185,7 @@ cascade/
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
   INTERFACE.md      the DataGenerator submission contract for miners
+  AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
 ```
@@ -208,6 +209,11 @@ After `uv sync` / `pip install -e .`:
 * `cascade-train-worker`: the per-pod worker the remote dispatch runs (trains
   one role, uploads its checkpoint, prints a receipt — no wallet on the pod).
 * `cascade-validator`: the validator loop (`--offline` for a state smoke).
+* `cascade-audit latest` / `cascade-audit round <id>`: third-party verification
+  of a published round receipt — re-derives seeds, digests, the KOTH verdict,
+  and (at `--tier 1`) each generator's corpus, with a nonzero exit on any
+  mismatch (CI-usable). No wallet or GPU needed for tiers 0–1; see
+  `docs/AUDIT.md`.
 
 Storage is Hippius: models/checkpoints/generators on the Hippius Hub
 registry (OCI, pinned by `repo@digest`), manifests + training logs on Hippius
