@@ -28,6 +28,24 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
+# Generation sandbox (trainer-side; never folded into contract_digest).
+#   subprocess — rlimited child in a network namespace (unshare) with a
+#                Python-level socket guard; the default, no container runtime
+#                needed. With sandbox_strict = true it REFUSES to run when the
+#                host can't provide the namespace (no unprivileged userns)
+#                instead of silently downgrading to the socket guard alone —
+#                set true on any production trainer.
+#   container  — the same rlimited child inside docker/podman with
+#                --network=none, --cap-drop=ALL, no-new-privileges, read-only
+#                rootfs, tmpfs /tmp, memory/pids/cpu limits (defense in depth;
+#                see cascade/trainer/sandbox_container.py). Set sandbox_image
+#                to a DIGEST-PINNED image carrying numpy + the generator deps
+#                (the worker image works) and sandbox_python to the interpreter
+#                inside it (worker image: /root/cascade/.venv/bin/python).
+sandbox_mode   = "subprocess"
+sandbox_image  = ""              # e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>"
+sandbox_python = "python3"       # python inside sandbox_image
+sandbox_strict = false           # true on production: no netns => refuse, don't degrade
 
 [training]
 # The FIXED training contract — identical for king and challenger. The only

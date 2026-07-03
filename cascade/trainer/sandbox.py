@@ -144,6 +144,34 @@ def _load_series(path: Path, n: int) -> list[np.ndarray]:
         return [np.ascontiguousarray(z[f"s{i}"]) for i in range(n)]
 
 
+def _assert_isolation(cfg: GeneratorConfig, *, allow_netns: bool) -> bool:
+    """Whether to wrap the child in a netns — refusing or warning LOUDLY when
+    the host can't provide one.
+
+    ``allow_netns=False`` is an explicit caller opt-out (tests / trusted local
+    smoke) and skips the policy. Otherwise, a host without unprivileged network
+    namespaces leaves only the Python-level socket guard between miner code and
+    the network: with ``[generator] sandbox_strict = true`` (production) that
+    refuses to run; the default logs a loud warning instead of silently
+    downgrading.
+    """
+    if not allow_netns:
+        return False
+    if _netns_available():
+        return True
+    msg = ("network namespaces unavailable on this host (no unprivileged userns): "
+           "generator network isolation degrades to the Python-level socket guard only")
+    if cfg.sandbox_strict:
+        raise CorpusError(
+            f"sandbox_isolation_unavailable: {msg}. [generator] sandbox_strict = true "
+            "refuses to run in this state — use sandbox_mode = 'container' or a "
+            "userns-enabled host."
+        )
+    log.warning("sandbox: %s — set [generator] sandbox_strict = true to refuse instead, "
+                "or sandbox_mode = 'container' for kernel-enforced isolation", msg)
+    return False
+
+
 def run_in_sandbox(
     repo_dir: Path | str,
     generation_seed: int,
@@ -158,9 +186,18 @@ def run_in_sandbox(
     enforced before the generator is imported. ``allow_netns=False`` skips the
     network-namespace wrapper (used in tests; Python-level networking is still
     disabled in the child). Raises :class:`CorpusError` on any failure.
+
+    ``[generator] sandbox_mode = "container"`` reroutes to the docker/podman
+    sandbox (:mod:`cascade.trainer.sandbox_container`) with this rlimited child
+    kept inside as defense in depth.
     """
+    if cfg.sandbox_mode == "container":
+        from .sandbox_container import run_in_container
+
+        return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked)
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
 
     with tempfile.TemporaryDirectory(prefix="metro-sbx-") as td:
         out_dir = Path(td)
@@ -168,7 +205,7 @@ def run_in_sandbox(
             sys.executable, "-m", "cascade.trainer.sandbox",
             str(repo), str(int(generation_seed)), json.dumps(asdict(cfg)), str(out_dir),
         ]
-        if allow_netns and _netns_available():
+        if use_netns:
             argv = ["unshare", "--user", "--map-root-user", "--net", *argv]
             log.debug("sandbox: running generator inside a network namespace")
 
@@ -282,15 +319,28 @@ def stream_series(
     container** for hard isolation here, since RLIMIT_AS no longer bounds the
     child and CUDA needs device access. Audit is tolerance/same-hardware, not
     byte-exact (see ``chain.toml [training] corpus_mode``).
+
+    ``[generator] sandbox_mode = "container"`` reroutes to the docker/podman
+    sandbox (:mod:`cascade.trainer.sandbox_container`), the rlimited child kept
+    inside as defense in depth.
     """
+    if cfg.sandbox_mode == "container":
+        from .sandbox_container import stream_series_container
+
+        with stream_series_container(
+            repo_dir, generation_seed, cfg, token_budget, blocked=blocked, gpu=gpu,
+        ) as frames:
+            yield frames
+        return
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     argv = [
         sys.executable, "-m", "cascade.trainer.sandbox", "--stream",
         str(repo), str(int(generation_seed)), json.dumps(asdict(cfg)), str(n_upper),
     ]
-    if allow_netns and _netns_available():
+    if use_netns:
         argv = ["unshare", "--user", "--map-root-user", "--net", *argv]
 
     preexec = None
@@ -336,6 +386,25 @@ def _disable_network() -> None:
         os.environ.pop(var, None)
 
 
+def _maybe_self_rlimit(cfg: GeneratorConfig) -> None:
+    """Container mode: the child applies its own POSIX rlimits.
+
+    In subprocess mode the parent's ``preexec_fn`` sets them pre-exec; inside a
+    container there is no cascade parent, so :mod:`.sandbox_container` sets
+    ``CASCADE_SANDBOX_SELF_RLIMIT=1`` and the child self-limits here — the
+    container's cgroup ceilings and this are independent layers (defense in
+    depth). ``CASCADE_SANDBOX_GPU=1`` skips only the address-space cap (torch
+    over-reserves virtual memory), matching the subprocess GPU profile.
+    """
+    if os.environ.get("CASCADE_SANDBOX_SELF_RLIMIT") != "1":
+        return
+    max_fsize = int(cfg.max_total_points) * 8 * 2 + 64 * 1024 * 1024
+    _apply_rlimits(
+        cfg.max_memory_mb, cfg.max_generate_seconds, max_fsize,
+        set_as=os.environ.get("CASCADE_SANDBOX_GPU") != "1",
+    )
+
+
 def _save_series(path: Path, series: list[np.ndarray]) -> None:
     np.savez(path, **{f"s{i}": a for i, a in enumerate(series)})
 
@@ -352,6 +421,7 @@ def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int
     out = Path(out_dir)
     try:
         cfg = GeneratorConfig(**json.loads(cfg_json))
+        _maybe_self_rlimit(cfg)
         res = build_corpus(repo, int(seed), cfg)
         _save_series(out / "corpus.npz", res.series)
         meta = {
@@ -374,6 +444,7 @@ def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
     out = sys.stdout.buffer
     try:
         cfg = GeneratorConfig(**json.loads(cfg_json))
+        _maybe_self_rlimit(cfg)
         gen = _load_generator(Path(repo), int(seed))
         for i, arr in enumerate(gen.generate(int(n_upper))):
             check_series(

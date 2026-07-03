@@ -32,6 +32,13 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
+# Generation sandbox (see chain.toml for the full explanation). Testnet keeps
+# the permissive defaults; on mainnet either set sandbox_strict = true or run
+# sandbox_mode = "container" with a digest-pinned sandbox_image.
+sandbox_mode   = "subprocess"
+sandbox_image  = ""
+sandbox_python = "python3"
+sandbox_strict = false
 
 [training]
 # The FIXED training contract — identical for king and challenger. The only

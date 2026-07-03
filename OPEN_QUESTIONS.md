@@ -70,9 +70,16 @@ float64 arrays whose digest the parent re-derives. The trainer selects it via
 `build_round_corpus(..., use_sandbox=True)` (the default; `TrainerRunner.use_sandbox`).
 
 **Remaining.** RLIMIT_AS caps *virtual* memory, so torch generators need a
-higher `max_repo_mb`/`max_memory_mb`; and `unshare` is unavailable on hardened
-hosts (no unprivileged userns), where isolation falls back to the socket guard —
-deploy the trainer in a no-egress container for hard network isolation there.
+higher `max_repo_mb`/`max_memory_mb`. The no-userns fallback is now policy, not
+silence: with `[generator] sandbox_strict = true` the subprocess sandbox
+REFUSES to run when `unshare` netns is unavailable (default: a loud warning),
+and `[generator] sandbox_mode = "container"` runs the same rlimited child
+inside a locked-down docker/podman container (`--network=none`,
+`--cap-drop=ALL`, no-new-privileges, read-only rootfs, tmpfs workdir,
+memory/pids/cpu limits — `trainer/sandbox_container.py`) for kernel-enforced
+isolation regardless of userns support. Production deployment guidance
+(no-egress firewall, write-only-prefix S3 creds) lives in
+`docs/DEPLOY_PODS.md` §7.
 
 ## 3. King identity across rounds
 

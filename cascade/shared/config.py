@@ -38,6 +38,17 @@ class GeneratorConfig:
     carries a channel axis. ``max_channels = 1`` keeps submissions univariate
     for now (a generator may still yield 1-D series, promoted to ``(1, L)``);
     raising it later turns on multivariate priors *without* a schema change.
+
+    Sandbox selection (trainer-side; never part of ``contract_digest``):
+    ``sandbox_mode = "subprocess"`` is the rlimited, netns-wrapped child
+    (:mod:`cascade.trainer.sandbox`); ``"container"`` runs that same child
+    inside a locked-down docker/podman container (``--network=none``,
+    ``--cap-drop=ALL``, read-only rootfs — :mod:`cascade.trainer.
+    sandbox_container`), using ``sandbox_image`` (digest-pin it in production)
+    and ``sandbox_python`` (the interpreter inside the image). With
+    ``sandbox_strict = true``, subprocess mode REFUSES to run when the host
+    cannot provide a network namespace instead of silently downgrading to the
+    Python-level socket guard — set it on any production trainer.
     """
 
     corpus_n_series: int
@@ -48,6 +59,20 @@ class GeneratorConfig:
     max_memory_mb: int
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
+    sandbox_mode: str = "subprocess"   # "subprocess" | "container"
+    sandbox_image: str = ""            # container image for sandbox_mode="container"
+    sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
+    sandbox_strict: bool = False       # refuse to run without hard network isolation
+
+
+SANDBOX_MODES = ("subprocess", "container")
+
+
+def validate_sandbox_mode(mode: str) -> str:
+    """Return ``mode`` if it is a known sandbox mode, else raise ValueError."""
+    if mode not in SANDBOX_MODES:
+        raise ValueError(f"sandbox_mode={mode!r} invalid; expected one of {SANDBOX_MODES}")
+    return mode
 
 
 # Corpus feed modes — how a generator's data reaches the trainer. Identical for
@@ -643,6 +668,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_memory_mb=int(g["max_memory_mb"]),
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
+            sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
+            sandbox_image=str(g.get("sandbox_image", "")),
+            sandbox_python=str(g.get("sandbox_python", "python3")),
+            sandbox_strict=bool(g.get("sandbox_strict", False)),
         ),
         training=TrainingContractConfig(
             base_arch=str(t["base_arch"]),
