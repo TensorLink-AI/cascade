@@ -999,7 +999,15 @@ th.num { text-align: right; }
 <script>
 // ── config ──────────────────────────────────────────────────────────────
 var BUCKET = "cascade-manifests";
+// Same-origin FIRST: the directory the page is served from. This makes the
+// page CORS-free wherever the receipts sit under the same host as index.html —
+// served from the bucket (…/<BUCKET>/index.html reads …/<BUCKET>/receipts/…),
+// or behind a proxy/CDN that maps /receipts/* to the bucket (Vercel/Cloudflare
+// rewrite → index.html at the domain root reads /receipts/…). The absolute
+// Hippius endpoints stay as a fallback (those DO need bucket CORS to succeed).
+var SAME_ORIGIN = location.pathname.replace(/\/[^/]*$/, "").replace(/\/$/, "");
 var ENDPOINTS = [
+  SAME_ORIGIN,
   "https://s3.hippius.com/" + BUCKET,
   "https://us-east-1.hippius.com/" + BUCKET,
   "https://eu-central-1.hippius.com/" + BUCKET
