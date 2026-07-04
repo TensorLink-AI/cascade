@@ -1,0 +1,130 @@
+"""The dashboard-facing receipts index: the compact per-round summary and the
+public-read ``receipts/index.json`` rolling window the notebook reads.
+
+Presentational only (no signing, no chain, no boto3) — exercised on the
+self-consistent receipt fixture and a fake S3 store.
+"""
+
+from __future__ import annotations
+
+import json
+
+import cascade.shared.hippius as hippius
+from cascade.shared.receipt import summarize_receipt
+
+from .receipt_fixture import (
+    GEN_REF_CHAL,
+    GEN_REF_KING,
+    make_rejected_receipt,
+    make_scored_receipt,
+)
+
+
+class _FakeS3Store:
+    def __init__(self):
+        self.objects: dict[str, str] = {}
+        self.acls: dict[str, str | None] = {}
+
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
+        self.objects[key] = text
+        self.acls[key] = acl
+
+    def get_text(self, key):
+        # Mirror the real S3Store: a missing object is a StorageError, not KeyError.
+        if key not in self.objects:
+            raise hippius.StorageError(f"s3_get_failed: {key}: missing")
+        return self.objects[key]
+
+
+# ── summarize_receipt ────────────────────────────────────────────────────────
+
+
+def test_summarize_scored_receipt_pulls_identities_and_verdict():
+    receipt, _king, _chal = make_scored_receipt()
+    s = summarize_receipt(receipt)
+
+    assert s["round_id"] == receipt.round_id
+    assert s["status"] == "scored"
+    assert s["king_hotkey"] == "king_hk" and s["king_uid"] == 0
+    assert s["chal_hotkey"] == "chal_hk" and s["chal_uid"] == 1
+    assert s["king_gen_ref"] == GEN_REF_KING
+    assert s["chal_gen_ref"] == GEN_REF_CHAL
+    assert s["n_participants"] == 2
+    assert s["n_windows"] == receipt.eval_context.n_windows
+    # the fixture's challenger is strictly better ⇒ finite geomeans, a decision
+    assert s["king_geomean"] is not None and s["chal_geomean"] is not None
+    assert s["chal_geomean"] < s["king_geomean"]
+    assert s["challenger_wins_round"] is True
+    assert s["reject_reason"] is None
+    # every value must be JSON-round-trippable (no numpy/NaN leaking through)
+    assert json.loads(json.dumps(s)) == s
+
+
+def test_summarize_rejected_receipt_has_reason_and_empty_verdict():
+    receipt = make_rejected_receipt(reason="signature_invalid")
+    s = summarize_receipt(receipt)
+
+    assert s["status"] == "rejected"
+    assert s["reject_reason"] == "signature_invalid"
+    # a rejected round carries no scores/verdict
+    assert s["king_geomean"] is None and s["chal_geomean"] is None
+    assert s["challenger_wins_round"] is None and s["dethroned"] is None
+    assert s["n_windows"] is None
+    # generator refs still come from the embedded (gated) manifest
+    assert s["king_gen_ref"] == GEN_REF_KING and s["chal_gen_ref"] == GEN_REF_CHAL
+
+
+# ── update_receipt_index ─────────────────────────────────────────────────────
+
+
+def test_update_receipt_index_writes_public_read_with_header():
+    store = _FakeS3Store()
+    receipt, _, _ = make_scored_receipt()
+    entry = hippius.update_receipt_index(
+        store, summarize_receipt(receipt),
+        updated_at="2026-07-03T00:00:00+00:00",
+        subnet={"netuid": 7, "name": "cascade"},
+    )
+
+    assert entry["receipt_key"] == f"receipts/round-{receipt.round_id}.json"
+    assert entry["published_at"] == "2026-07-03T00:00:00+00:00"
+    assert store.acls[hippius.RECEIPT_INDEX_KEY] == "public-read"
+
+    doc = json.loads(store.objects[hippius.RECEIPT_INDEX_KEY])
+    assert doc["schema"] == hippius.RECEIPT_INDEX_SCHEMA
+    assert doc["subnet"] == {"netuid": 7, "name": "cascade"}
+    assert doc["updated_at"] == "2026-07-03T00:00:00+00:00"
+    assert [r["round_id"] for r in doc["rounds"]] == [receipt.round_id]
+
+
+def test_update_receipt_index_idempotent_per_round():
+    store = _FakeS3Store()
+    receipt, _, _ = make_scored_receipt()
+    summary = summarize_receipt(receipt)
+    hippius.update_receipt_index(store, summary)
+    hippius.update_receipt_index(store, summary)  # same round again
+
+    doc = json.loads(store.objects[hippius.RECEIPT_INDEX_KEY])
+    assert len(doc["rounds"]) == 1  # replaced, not duplicated
+
+
+def test_update_receipt_index_sorts_by_epoch_and_caps():
+    store = _FakeS3Store()
+    # synthetic summaries across epochs, inserted out of order
+    for blk in (300, 100, 200):
+        hippius.update_receipt_index(
+            store, {"round_id": f"r{blk}", "epoch_start_block": blk, "status": "scored"},
+            max_keep=2,
+        )
+    doc = json.loads(store.objects[hippius.RECEIPT_INDEX_KEY])
+    # sorted ascending by epoch, then capped to the 2 most-recent
+    assert [r["round_id"] for r in doc["rounds"]] == ["r200", "r300"]
+
+
+def test_read_receipt_index_empty_when_absent_or_malformed():
+    store = _FakeS3Store()
+    assert hippius.read_receipt_index(store) == {"schema": hippius.RECEIPT_INDEX_SCHEMA, "rounds": []}
+    store.objects[hippius.RECEIPT_INDEX_KEY] = "{not json"
+    assert hippius.read_receipt_index(store)["rounds"] == []
+    store.objects[hippius.RECEIPT_INDEX_KEY] = json.dumps({"schema": 1})  # no rounds list
+    assert hippius.read_receipt_index(store)["rounds"] == []

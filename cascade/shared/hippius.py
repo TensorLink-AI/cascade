@@ -496,6 +496,98 @@ def read_latest_receipt(store: S3Store) -> str:
     return store.get_text(RECEIPT_LATEST_KEY)
 
 
+# ── receipts index (dashboard-facing) ───────────────────────────────────────
+#
+# The per-round receipts are the audit source of truth, but a static dashboard
+# can't *list* a bucket to discover them. So the validator also maintains one
+# small public-read ``receipts/index.json`` — a rolling window of compact
+# per-round summaries (see :func:`cascade.shared.receipt.summarize_receipt`) with
+# a ``receipt_key`` pointer back to each signed receipt. Presentational only:
+# nothing here is signed or part of the audit contract, and a stale/absent index
+# never affects weights (the update is best-effort, like receipt publication).
+
+RECEIPT_INDEX_KEY = "receipts/index.json"
+RECEIPT_INDEX_SCHEMA = 1
+RECEIPT_INDEX_MAX_KEEP = 400
+
+
+def read_receipt_index(store: S3Store) -> dict:
+    """Read ``receipts/index.json``; return an empty index if absent/malformed."""
+    empty = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": []}
+    try:
+        text = store.get_text(RECEIPT_INDEX_KEY)
+    except StorageError:
+        return empty
+    try:
+        doc = json.loads(text)
+    except (ValueError, TypeError):
+        return empty
+    if not isinstance(doc, dict) or not isinstance(doc.get("rounds"), list):
+        return empty
+    return doc
+
+
+def update_receipt_index(
+    store: S3Store,
+    summary: dict,
+    *,
+    updated_at: str = "",
+    subnet: dict | None = None,
+    max_keep: int = RECEIPT_INDEX_MAX_KEEP,
+) -> dict:
+    """Append/replace one round in ``receipts/index.json`` and write it public-read.
+
+    Idempotent per ``round_id`` (a re-published round replaces its entry), sorted
+    by ``epoch_start_block`` then ``round_id`` (chronological — round ids are
+    block-hash seeds, not monotonic), and capped at ``max_keep`` most-recent
+    rounds. ``updated_at`` (an ISO stamp) and ``subnet`` (``{"netuid", "name"}``)
+    are optional header fields the dashboard shows. Returns the stored entry.
+    """
+    entry = dict(summary)
+    entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")))
+    if updated_at:
+        entry["published_at"] = updated_at
+
+    doc = read_receipt_index(store)
+    rid = str(entry.get("round_id"))
+    rounds = [r for r in doc.get("rounds", []) if str(r.get("round_id")) != rid]
+    rounds.append(entry)
+    rounds.sort(key=lambda r: (int(r.get("epoch_start_block", 0)), str(r.get("round_id", ""))))
+    rounds = rounds[-max_keep:]
+
+    out: dict = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": rounds}
+    if updated_at:
+        out["updated_at"] = updated_at
+    if subnet:
+        out["subnet"] = subnet
+
+    text = json.dumps(out, indent=2, sort_keys=True)
+    try:
+        store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json", acl="public-read")
+    except StorageError:
+        # ACL unsupported on this backend: publish private rather than not at all.
+        store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json")
+    return entry
+
+
+# ── static dashboard site ────────────────────────────────────────────────────
+#
+# The "notebook" — a single self-contained ``index.html`` — is served straight
+# from the manifest bucket (public-read), reading the public receipts + index
+# above. Mirrors teutonic, whose validator re-uploads its dashboard on restart.
+
+WEBSITE_INDEX_KEY = "index.html"
+
+
+def publish_website(store: S3Store, html: str, *, key: str = WEBSITE_INDEX_KEY) -> str:
+    """Upload the dashboard HTML to the bucket root, public-read. Returns the key."""
+    try:
+        store.put_text(key, html, content_type="text/html; charset=utf-8", acl="public-read")
+    except StorageError:
+        store.put_text(key, html, content_type="text/html; charset=utf-8")
+    return key
+
+
 def log_key(round_id: str, role: str) -> str:
     return f"logs/round-{round_id}/{role}.jsonl"
 

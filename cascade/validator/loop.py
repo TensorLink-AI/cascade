@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 
 from ..eval.koth import RoundResult, evaluate_round
@@ -465,8 +466,15 @@ class ValidatorRunner:
         to an empty field and any publish error is logged and swallowed. The
         audit CLI treats missing context as WARN, not PASS.
         """
-        from ..shared.hippius import S3Config, S3Store, publish_receipt
-        from ..shared.receipt import dump_receipt, sign_receipt
+        from datetime import datetime
+
+        from ..shared.hippius import (
+            S3Config,
+            S3Store,
+            publish_receipt,
+            update_receipt_index,
+        )
+        from ..shared.receipt import dump_receipt, sign_receipt, summarize_receipt
 
         try:
             epoch_blocks = max(1, self.cfg.round.epoch_blocks)
@@ -518,6 +526,17 @@ class ValidatorRunner:
             log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
                      receipt.status, manifest.round_id, receipt.signature is not None,
                      self.cfg.storage.manifest_bucket, key)
+            # Refresh the dashboard-facing rolling index (best-effort, and inside
+            # the outer guard: a listing convenience must never disturb a round).
+            try:
+                update_receipt_index(
+                    store, summarize_receipt(receipt),
+                    updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    subnet={"netuid": self.cfg.subnet.netuid, "name": self.cfg.subnet.name},
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("receipt index update failed for round=%s: %s",
+                            manifest.round_id, e)
         except Exception as e:  # noqa: BLE001 — receipts must never disturb the round
             log.warning("receipt publication failed for round=%s: %s", manifest.round_id, e)
 

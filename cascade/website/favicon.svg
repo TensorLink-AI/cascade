@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" rx="7" fill="#E5DBC9"/>
+  <!-- cascade wordmark motif: stacked descending step-lines -->
+  <polyline points="5,20 12,15 19,19 26,14" fill="none" stroke="#7E9B7E" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <polyline points="5,15 12,10 19,14 26,9"  fill="none" stroke="#33404E" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="26" cy="9" r="2.4" fill="#BF5B3D"/>
+</svg>

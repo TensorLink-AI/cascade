@@ -181,6 +181,7 @@ cascade/
   validator/   manifest gate, checkpoint evaluator, KOTH state machine, weights
   miner/       miner CLI: verify, deploy (push to Hippius Hub registry + commit)
   shared/      config loader, Hippius Hub registry/S3, chain client, manifest schema
+  website/     the public dashboard ("notebook"): a self-contained index.html
 
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
@@ -188,6 +189,7 @@ docs/
   AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
+  publish_website.py   upload the dashboard to the manifest bucket (public-read)
 ```
 
 ## Console scripts
@@ -233,7 +235,22 @@ s3://<manifest_bucket>/manifests/round-<id>.json   the trainer's signed manifest
 s3://<manifest_bucket>/manifests/latest.json       pointer to the newest manifest
 s3://<manifest_bucket>/receipts/round-<id>.json    the validator's signed receipt
 s3://<manifest_bucket>/receipts/latest.json        pointer to the newest receipt
+s3://<manifest_bucket>/receipts/index.json         rolling round summary (dashboard)
 ```
+
+**The dashboard ("notebook").** A single self-contained
+[`cascade/website/index.html`](cascade/website/index.html) renders the live
+king-of-the-hill state — the reigning king generator, the reign chain, the
+per-round KOTH verdicts, and geomean(CRPS·MASE) skill over time — in a
+paper-notebook style. It is a static page that reads only the public-read
+receipts above: `receipts/latest.json` for the current round's detail and
+`receipts/index.json` for history. The validator maintains that index (a
+rolling window of compact per-round summaries with a pointer back to each
+signed receipt) alongside every receipt it publishes — presentational only, so
+a stale index never affects weights, and audit trust still flows through the
+signed per-round receipts. Serve the page from the same bucket with
+`python scripts/publish_website.py` (needs the `HIPPIUS_S3_*` credentials); it
+then lives at `<s3_endpoint>/<manifest_bucket>/index.html`.
 
 `<id>` is the round id (the base seed derived from the epoch-boundary block
 hash). A round the validator *rejected* still gets a receipt

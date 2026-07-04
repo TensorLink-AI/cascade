@@ -399,6 +399,78 @@ def load_receipt(text: str) -> RoundReceipt:
     )
 
 
+def summarize_receipt(receipt: RoundReceipt) -> dict:
+    """A compact, presentational summary of one receipt for ``receipts/index.json``.
+
+    Pure (stdlib only), so it stays importable without the eval/chain stacks. It
+    pulls the king/challenger identities from the signed ``entry_scores``
+    (role → hotkey/uid), their generator refs from the embedded manifest, and the
+    KOTH headline numbers from the verdict — everything the dashboard needs to
+    render the reigns/rounds tables *without* fetching every per-round receipt.
+
+    This is a *view*, not part of the audit trail: the signed per-round receipt
+    remains the source of truth, and the index carries a ``receipt_key`` pointer
+    back to it (added by :func:`cascade.shared.hippius.update_receipt_index`).
+    """
+    entries = receipt.manifest.get("entries", []) if isinstance(receipt.manifest, dict) else []
+
+    def _gen_ref(role: str) -> str | None:
+        for e in entries:
+            if isinstance(e, dict) and e.get("role") == role:
+                return e.get("gen_ref")
+        return None
+
+    def _scorer(role: str):
+        for es in receipt.entry_scores:
+            if es.role == role:
+                return es
+        return None
+
+    king_es = _scorer("king")
+    chal_es = _scorer("challenger")
+    v = receipt.verdict
+
+    sizes: list[str] = []
+    for e in entries:
+        if isinstance(e, dict):
+            s = e.get("size", "")
+            if s not in sizes:
+                sizes.append(s)
+
+    return {
+        "round_id": receipt.round_id,
+        "status": receipt.status,
+        "epoch_start_block": receipt.epoch_start_block,
+        # king/challenger of THIS round (from the signed per-entry scores)
+        "king_hotkey": king_es.hotkey if king_es else None,
+        "king_uid": king_es.uid if king_es else None,
+        "king_gen_ref": _gen_ref("king"),
+        "chal_hotkey": chal_es.hotkey if chal_es else None,
+        "chal_uid": chal_es.uid if chal_es else None,
+        "chal_gen_ref": _gen_ref("challenger"),
+        "sizes": sizes,
+        "n_participants": len(receipt.participants),
+        # verdict headline
+        "n_windows": (receipt.eval_context.n_windows if receipt.eval_context
+                      else (v.n_windows if v else None)),
+        "king_geomean": v.king_geomean if v else None,
+        "chal_geomean": v.chal_geomean if v else None,
+        "lcb": v.lcb if v else None,
+        "margin": v.margin if v else None,
+        "challenger_wins_round": v.challenger_wins_round if v else None,
+        "inconclusive": v.inconclusive if v else None,
+        "dethroned": v.dethroned if v else None,
+        "gift_gate_passed": v.gift_gate_passed if v else None,
+        # the throne AFTER this round (winner), and the payout set
+        "post_round_king_hotkey": v.king_hotkey if v else None,
+        "post_round_king_uid": v.king_uid if v else None,
+        "reward_uids": list(receipt.reward_uids),
+        "n_rewarded": len(receipt.reward_uids),
+        "reject_reason": receipt.reject_reason,
+        "validator_hotkey": receipt.validator_hotkey or None,
+    }
+
+
 def sign_receipt(receipt: RoundReceipt, wallet: object) -> RoundReceipt:
     """Sign ``canonical_body()`` with the validator's bittensor hotkey.
 
