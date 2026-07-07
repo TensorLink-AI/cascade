@@ -998,7 +998,14 @@ th.num { text-align: right; }
 
 <script>
 // ── config ──────────────────────────────────────────────────────────────
-var BUCKET = "cascade-manifests";
+// Network is selected by hostname: any host containing "testnet" (e.g.
+// testnet.casdesub.net) reads the testnet bucket; everything else
+// (dashboard.casdesub.net, local previews) reads mainnet. This keeps a single
+// identical index.html correct on both subdomains — including the absolute
+// Hippius fallbacks below, which would otherwise always point at mainnet.
+var BUCKET = /testnet/.test(location.hostname)
+  ? "cascade-testnet-manifests"
+  : "cascade-manifests";
 // Same-origin FIRST: the directory the page is served from. This makes the
 // page CORS-free wherever the receipts sit under the same host as index.html —
 // served from the bucket (…/<BUCKET>/index.html reads …/<BUCKET>/receipts/…),
