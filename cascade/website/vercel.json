@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/receipts/:path*",
-      "destination": "https://s3.hippius.com/cascade-manifests/receipts/:path*"
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/receipts/:path*"
     }
   ],
   "headers": [
