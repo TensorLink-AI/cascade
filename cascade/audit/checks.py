@@ -446,8 +446,15 @@ def check_transition(receipt: RoundReceipt) -> CheckResult:
     if not v.dethroned and king is not None and v.king_hotkey not in (
         king.miner_hotkey, None
     ):
-        return _fail(name, f"no dethrone, but resulting king {v.king_hotkey!r} is not the "
-                           f"manifest king {king.miner_hotkey!r}")
+        # Legitimate steady state, not a contradiction: the trainer reads its
+        # king from on-chain incentive while the validator's state tracks its
+        # own throne (OPEN_QUESTIONS #3) — they can diverge (e.g. after a
+        # service outage or an interim-king promotion). The vote still goes to
+        # the manifest king, which check_weights verifies. Surface it, don't
+        # fail it — a receipt-chain audit is what would confirm the lineage.
+        return _warn(name, f"validator-state king {v.king_hotkey!r} differs from the "
+                           f"manifest king {king.miner_hotkey!r} (trainer reads incentive; "
+                           "state tracks its own throne — see OPEN_QUESTIONS #3)")
     if cp > 1:
         return _warn(name, f"dethrone_cp={cp}: streak state spans rounds; verify the "
                            "receipt chain for full confirmation")
@@ -471,16 +478,29 @@ def check_weights(
     if [float(w) for w in receipt.weights] != want:
         return _fail(name, f"recorded weights {list(receipt.weights)} != "
                            f"equal_share_vector({list(receipt.reward_uids)}) = {want}")
+    # The round's vote mirrors the validator's _king_uid_to_vote: the MANIFEST
+    # king holds the throne vote unless this round dethroned, in which case the
+    # new (state) king takes it. The state king can legitimately differ from
+    # the manifest king on a no-dethrone round (see check_transition).
     v = receipt.verdict
-    if v is not None and v.king_uid is not None and v.king_uid not in receipt.reward_uids:
-        return _fail(name, f"resulting king uid {v.king_uid} is not among reward_uids "
-                           f"{list(receipt.reward_uids)}")
+    if v is not None:
+        if v.dethroned:
+            voted = v.king_uid
+        else:
+            try:
+                king = receipt.load_embedded_manifest().entry_for_role("king")
+            except (ValueError, KeyError):
+                king = None
+            voted = king.miner_uid if king is not None else v.king_uid
+        if voted is not None and voted not in receipt.reward_uids:
+            return _fail(name, f"the round's king vote (uid {voted}) is not among "
+                               f"reward_uids {list(receipt.reward_uids)}")
     if client is None:
         return _warn(name, "vector recomputes; on-chain weights not compared "
                            "(no chain connection)")
     note = _weights_chain_note(receipt, client)
-    if note.startswith("FAIL:"):
-        return _fail(name, note[5:])
+    if note.startswith("WARN:"):
+        return _warn(name, f"vector recomputes, but {note[5:]}")
     return _ok(name, f"equal-share vector over uids {list(receipt.reward_uids)}{note}")
 
 
@@ -489,7 +509,11 @@ def _weights_chain_note(receipt: RoundReceipt, client: object) -> str:
 
     Weights are u16-normalised on chain and overwritten by later rounds, so
     only the *support* (which UIDs carry weight) is compared, and only when the
-    signer's row is addressable; anything else is noted, not failed.
+    signer's row is addressable. A mismatch is a WARN, never a FAIL: the chain
+    is stale in both directions — a freshly set row lags inclusion (the
+    extrinsic is async; commit-reveal delays it further) and a newer round
+    overwrites older receipts' rows. The falsifying weight checks are the pure
+    recomputations above.
     """
     try:
         row = client.weights_for_hotkey(receipt.validator_hotkey)  # may not exist
@@ -502,9 +526,9 @@ def _weights_chain_note(receipt: RoundReceipt, client: object) -> str:
     got_support = {i for i, w in enumerate(row) if w > 0}
     want_support = {i for i, w in enumerate(receipt.weights) if w > 0}
     if got_support != want_support:
-        return (f"FAIL:on-chain weight support {sorted(got_support)} != receipt "
-                f"{sorted(want_support)} (a later round may have moved weights — "
-                "check the newest receipt first)")
+        return (f"WARN:on-chain weight support {sorted(got_support)} != receipt "
+                f"{sorted(want_support)} — inclusion lag or a later round moved "
+                "weights; compare the newest receipt")
     return "; on-chain weight support matches"
 
 

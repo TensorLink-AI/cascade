@@ -306,12 +306,13 @@ def test_chain_payload_contradiction_fails_cutoff(signed_receipt):
     assert r.status == C.FAIL and "chain shows" in r.detail
 
 
-def test_onchain_weight_support_mismatch_fails(audit_cfg, signed_receipt):
+def test_onchain_weight_support_mismatch_warns(audit_cfg, signed_receipt):
+    # A differing on-chain row is inclusion lag or a later round's overwrite —
+    # never falsifying on its own (the pure recomputations are), so WARN.
     client = _FakeChain(signed_receipt)
     client.weights_for_hotkey = lambda hk: [1.0] + [0.0] * (len(signed_receipt.weights) - 1)
     r = C.check_weights(signed_receipt, audit_cfg, client)
-    # fixture rewards uids (1, 0); a 1.0-on-uid-0 row is a different support
-    assert r.status == C.FAIL
+    assert r.status == C.WARN and "inclusion lag" in r.detail
 
 
 # ── Tier 1: corpus re-derivation against the example generator ───────────────
@@ -447,3 +448,61 @@ def test_fetch_receipt_falls_back_to_credentialed(cfg, monkeypatch):
 
     monkeypatch.setattr(hippius, "S3Store", lambda s3cfg: _Store(s3cfg))
     assert fetch_receipt_text(cfg, "9") == '{"ok": 1}'
+
+
+# ── trainer-king vs validator-state-king divergence (seen live 2026-07-07) ────
+# After a service outage the trainer's king-read (on-chain incentive) pointed at
+# a different hotkey than the validator's persisted state king. That is a
+# legitimate steady state (OPEN_QUESTIONS #3): the vote goes to the MANIFEST
+# king; the state king only moves on a dethrone. The audit must surface it as
+# WARN, not fail the receipt.
+
+
+def _diverged_receipt(audit_cfg):
+    from cascade.shared.chain import equal_share_vector
+
+    receipt, _, _ = make_scored_receipt(
+        audit_cfg, validator_hotkey=VALIDATOR_KP.ss58_address, trainer_wallet=TRAINER_KP
+    )
+    v = replace(
+        receipt.verdict,
+        challenger_wins_round=False, dethroned=False, note="loss",
+        king_hotkey="old_state_king_hk", king_uid=7,   # ≠ manifest king (uid 0)
+    )
+    return replace(
+        receipt, verdict=v,
+        reward_uids=(0,),                              # vote = manifest king uid
+        weights=tuple(equal_share_vector([0], 4, burn_uid=0)),
+    )
+
+
+def test_king_divergence_warns_transition_not_fails(audit_cfg):
+    r = C.check_transition(_diverged_receipt(audit_cfg))
+    assert r.status == C.WARN and "differs from the manifest king" in r.detail
+
+
+def test_king_divergence_weights_vote_manifest_king(audit_cfg):
+    # no-dethrone vote goes to the manifest king (uid 0): recomputes, no FAIL
+    r = C.check_weights(_diverged_receipt(audit_cfg), audit_cfg)
+    assert r.status != C.FAIL
+
+
+def test_no_dethrone_vote_elsewhere_fails_weights(audit_cfg):
+    from cascade.shared.chain import equal_share_vector
+
+    receipt = _diverged_receipt(audit_cfg)
+    tampered = replace(receipt, reward_uids=(5,),
+                       weights=tuple(equal_share_vector([5], 8, burn_uid=0)))
+    r = C.check_weights(tampered, audit_cfg)
+    assert r.status == C.FAIL and "king vote" in r.detail
+
+
+def test_dethrone_vote_goes_to_new_king(audit_cfg, signed_receipt):
+    # the dethroned fixture votes the new (state) king — uid 1 — so a reward
+    # set that omits it fails even when the vector itself recomputes
+    from cascade.shared.chain import equal_share_vector
+
+    tampered = replace(signed_receipt, reward_uids=(0,),
+                       weights=tuple(equal_share_vector([0], 4, burn_uid=0)))
+    r = C.check_weights(tampered, audit_cfg)
+    assert r.status == C.FAIL and "king vote" in r.detail
