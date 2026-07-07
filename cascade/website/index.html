@@ -840,6 +840,9 @@ a { color: var(--chal); text-decoration: none; }
 }
 #top-bar b { color: var(--ink); font-weight: 600; }
 .tb-group { display: flex; gap: 26px; align-items: center; }
+.net-badge { font-weight: 700; letter-spacing: 0.08em; padding: 3px 9px; border: 1px solid currentColor; border-radius: 2px; }
+.net-badge.net-mainnet { color: var(--king, #7E9B7E); }
+.net-badge.net-testnet { color: #BF5B3D; background: rgba(191,91,61,0.10); }
 #theme-toggle {
   background: none; border: var(--line); color: var(--ink);
   font: 600 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; padding: 5px 11px; cursor: pointer;
@@ -930,6 +933,7 @@ th.num { text-align: right; }
 
   <div id="top-bar">
     <div class="tb-group">
+      <span id="net-badge" class="net-badge net-mainnet">MAINNET</span>
       <span>SUBNET <b id="tb-netuid">--</b></span>
       <span>ROUNDS <b id="tb-rounds">--</b></span>
       <span>UPDATED <b id="tb-updated">--</b></span>
@@ -1003,9 +1007,18 @@ th.num { text-align: right; }
 // (dashboard.casdesub.net, local previews) reads mainnet. This keeps a single
 // identical index.html correct on both subdomains — including the absolute
 // Hippius fallbacks below, which would otherwise always point at mainnet.
-var BUCKET = /testnet/.test(location.hostname)
-  ? "cascade-testnet-manifests"
-  : "cascade-manifests";
+var IS_TESTNET = /testnet/.test(location.hostname);
+var BUCKET = IS_TESTNET ? "cascade-testnet-manifests" : "cascade-manifests";
+// Visible network label so the two identical dashboards can't be confused.
+(function markNetwork(){
+  var el = document.getElementById("net-badge");
+  if (el) {
+    el.textContent = IS_TESTNET ? "TESTNET" : "MAINNET";
+    el.className = "net-badge " + (IS_TESTNET ? "net-testnet" : "net-mainnet");
+    el.title = IS_TESTNET ? "Reading testnet manifests" : "Reading mainnet manifests";
+  }
+  if (IS_TESTNET) document.title = "testnet · " + document.title;
+})();
 // Same-origin FIRST: the directory the page is served from. This makes the
 // page CORS-free wherever the receipts sit under the same host as index.html —
 // served from the bucket (…/<BUCKET>/index.html reads …/<BUCKET>/receipts/…),
