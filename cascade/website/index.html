@@ -1041,7 +1041,7 @@ var _now = Date.now();
 function iso(minAgo){ return new Date(_now - minAgo*60000).toISOString(); }
 function gr(repo, dig){ return repo + "@sha256:" + dig; }
 var SEED_INDEX = {
-  subnet: { netuid: 91, name: "cascade" },
+  subnet: { netuid: IS_TESTNET ? 259 : 91, name: "cascade" },
   updated_at: iso(1),
   rounds: [
     { round_id:"rnd_0af31c92", status:"scored", king_hotkey:"5Ck2rQ9aWdF0zx", king_uid:3, king_gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), chal_hotkey:"5CqW4bJr7xTa1p", chal_uid:57, chal_gen_ref:gr("helix/synth-v1","3d9e01ab7c"), dethroned:false, challenger_wins_round:false, inconclusive:false, king_geomean:0.921, chal_geomean:0.948, lcb:-0.011, margin:0.010, n_windows:960, n_participants:9, gift_gate_passed:true, n_rewarded:6, sizes:["4M","22M"], epoch_start_block:4818020, published_at:iso(2880) },
