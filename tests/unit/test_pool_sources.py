@@ -217,3 +217,57 @@ def test_tsbench_forge_respects_max_series(tmp_path):
     ctx = HarvestContext(as_of=as_of, context_length=512, horizon=16, max_series=1)
     out = list(TsbenchForgeSource(root).harvest(lambda u, p: None, ctx))
     assert len(out) == 1
+
+
+def test_resolve_frequency_derivation_matches_the_pinned_table():
+    """The generic ISO-duration path must reproduce every canonical entry, so a
+    catalog cadence dropping out of FREQ_MAP can never change behaviour."""
+    from cascade.pool.sources.tsbench_forge import FREQ_MAP, _iso_duration_seconds
+
+    for iso, (_, period) in FREQ_MAP.items():
+        sec = int(_iso_duration_seconds(iso))
+        if sec == 86_400:
+            assert period == 7
+        elif sec >= 300:
+            assert period == max(2, round(86_400 / sec)), iso
+        else:
+            assert period == max(2, round(3_600 / sec)), iso
+
+
+def test_resolve_frequency_handles_future_cadences():
+    from cascade.pool.sources.tsbench_forge import resolve_frequency
+
+    assert resolve_frequency("PT20M") == ("1200S", 72)     # new sub-daily feed
+    assert resolve_frequency("PT2M") == ("120S", 30)       # faster than 5min → hourly cycle
+    assert resolve_frequency("PT4H") == ("14400S", 6)
+    assert resolve_frequency("PT1H30M") == ("5400S", 16)   # compound duration
+    assert resolve_frequency("P1W") is None                # weekly+ still skipped
+    assert resolve_frequency("P1M") is None
+    assert resolve_frequency("fortnightly") is None        # unparseable
+    assert resolve_frequency("PT1H") == ("H", 24)          # table stays canonical
+
+
+def test_tsbench_forge_picks_up_a_new_cadence_source(tmp_path):
+    """A catalog entry at a cadence FREQ_MAP has never seen must still be
+    harvested — the future-proofing contract for a growing catalog."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    yaml = pytest.importorskip("yaml")
+    from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
+
+    as_of = dt.date(2026, 6, 1)
+    root = tmp_path / "forge"
+    (root / "data" / "new_feed").mkdir(parents=True)
+    (root / "sources.yaml").write_text(yaml.safe_dump([
+        {"id": "new_feed", "domain": "transport", "frequency": "PT20M"},
+    ]), encoding="utf-8")
+    ts = pd.date_range("2026-05-25", periods=500, freq="20min", tz="UTC")
+    pd.DataFrame({"timestamp": ts.astype(str),
+                  "count": [float(i % 72) for i in range(500)]}).to_parquet(
+        root / "data" / "new_feed" / f"{as_of}.parquet")
+
+    ctx = HarvestContext(as_of=as_of, context_length=512, horizon=16, max_series=10)
+    out = list(TsbenchForgeSource(root).harvest(lambda u, p: None, ctx))
+    assert len(out) == 1
+    assert out[0].freq == "1200S" and out[0].seasonal_period == 72
+    assert out[0].source == "new_feed"

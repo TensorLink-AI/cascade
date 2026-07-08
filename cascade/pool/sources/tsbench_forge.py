@@ -32,13 +32,17 @@ Design notes:
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
+import re
 from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 
 from ..source import FetchJson, HarvestContext, HarvestedSeries, HarvestError
+
+log = logging.getLogger("cascade.pool")
 
 # Directory holding `sources.yaml` + `data/` (the synced forge mirror).
 ENV_FORGE_DIR = "TSFORGE_DIR"
@@ -51,6 +55,11 @@ DEFAULT_FORGE_DIR = "./tsforge"
 # minute-and-faster uses the hourly cycle so the period stays well inside even
 # short (min_context) histories. Weekly-and-slower catalog entries are skipped:
 # they cannot reach the builder's min_length at their cadence.
+#
+# This table pins today's catalog; cadences NOT listed here are handled by
+# :func:`resolve_frequency`, which derives the same convention from the parsed
+# ISO duration — so a source added to the forge catalog at a brand-new cadence
+# is picked up without a cascade change (the catalog grows on its own schedule).
 FREQ_MAP: dict[str, tuple[str, int]] = {
     "PT30S": ("30S", 120),
     "PT1M": ("min", 60),
@@ -64,6 +73,56 @@ FREQ_MAP: dict[str, tuple[str, int]] = {
     "PT8H": ("8H", 3),
     "P1D": ("D", 7),
 }
+
+_ISO_DURATION = re.compile(
+    r"^P(?:(?P<years>\d+)Y)?(?:(?P<months>\d+)M)?(?:(?P<weeks>\d+)W)?(?:(?P<days>\d+)D)?"
+    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$"
+)
+
+
+def _iso_duration_seconds(freq: str) -> float | None:
+    """Nominal seconds of an ISO-8601 duration, or ``None`` if unparseable.
+    Months/years use nominal lengths — only coarse skip decisions need them."""
+    m = _ISO_DURATION.match(freq.strip())
+    if not m or not any(m.groups()):
+        return None
+    g = {k: int(v) for k, v in m.groupdict().items() if v}
+    return (
+        g.get("years", 0) * 31_557_600
+        + g.get("months", 0) * 2_629_800
+        + g.get("weeks", 0) * 604_800
+        + g.get("days", 0) * 86_400
+        + g.get("hours", 0) * 3_600
+        + g.get("minutes", 0) * 60
+        + g.get("seconds", 0)
+    ) or None
+
+
+def resolve_frequency(freq: str) -> tuple[str, int] | None:
+    """``(pandas freq, seasonal period)`` for a catalog frequency, or ``None``
+    when the cadence can't fill an eval window (slower than daily, or
+    unparseable).
+
+    Unknown-but-parseable cadences derive the FREQ_MAP convention: daily data
+    gets the weekly cycle; 5-minute-and-slower sub-daily gets its daily cycle;
+    faster-than-5-minute gets its hourly cycle (the daily one would not fit a
+    short ``min_context`` history). The derivation reproduces every FREQ_MAP
+    entry exactly (pinned by test), so the table is a readability/canonical
+    layer, not divergent behaviour.
+    """
+    known = FREQ_MAP.get(freq)
+    if known is not None:
+        return known
+    sec = _iso_duration_seconds(str(freq))
+    if sec is None or sec > 86_400:
+        return None
+    sec = int(sec)
+    pandas_freq = f"{sec}S"
+    if sec == 86_400:
+        return "D", 7
+    cycle = 86_400 if sec >= 300 else 3_600
+    period = max(2, round(cycle / sec))
+    return pandas_freq, period
 
 # A window straddling a scrape gap is a fake level shift; segment at gaps
 # larger than this multiple of the median sampling interval (mirrors the
@@ -130,9 +189,16 @@ class TsbenchForgeSource:
             sid = entry.get("id")
             if not sid or entry.get("disabled"):
                 continue
-            mapped = FREQ_MAP.get(str(entry.get("frequency", "")))
+            mapped = resolve_frequency(str(entry.get("frequency", "")))
             if mapped is None:
-                continue  # weekly-and-slower (or unknown) can't fill a window
+                # Weekly-and-slower can't fill a window (expected); anything
+                # unparseable is a catalog-schema surprise worth surfacing.
+                if _iso_duration_seconds(str(entry.get("frequency", ""))) is None:
+                    log.warning(
+                        "tsbench_forge: skipping %s — unparseable frequency %r",
+                        sid, entry.get("frequency"),
+                    )
+                continue
             freq, seasonal_period = mapped
 
             files = self._snapshot_files(data_dir / sid, as_of=ctx.as_of)
@@ -150,6 +216,12 @@ class TsbenchForgeSource:
             dgp_class = str(entry.get("dgp_class", ""))
             for panel_key, values in self._iter_panel_series(pd, df, ctx):
                 if emitted >= ctx.max_series:
+                    log.warning(
+                        "tsbench_forge: max_series=%d reached at catalog entry %s; "
+                        "later catalog entries are dropped (catalog-order bias) — "
+                        "raise HarvestContext.max_series to cover the full catalog",
+                        ctx.max_series, sid,
+                    )
                     return
                 suffix = "__".join(f"{k}_{v}" for k, v in panel_key.items())
                 series_id = f"tsforge__{sid}" + (f"__{suffix}" if suffix else "")
