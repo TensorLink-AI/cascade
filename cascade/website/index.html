@@ -1032,7 +1032,10 @@ var ENDPOINTS = [
   "https://us-east-1.hippius.com/" + BUCKET,
   "https://eu-central-1.hippius.com/" + BUCKET
 ];
-var HUB_BASE = "https://hub.hippius.com/models/";
+// Hippius Hub is a HuggingFace-style browse UI: a model repo lives at the bare
+// repo path (hub.hippius.com/<owner>/<name>), not under a /models/ prefix — the
+// old /models/ segment 404'd for every generator link.
+var HUB_BASE = "https://hub.hippius.com/";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _chartMode = "geomean", _smooth = 0;
 
