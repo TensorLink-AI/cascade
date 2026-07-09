@@ -48,7 +48,7 @@ cascade-pool build --out ./pool --upload --hub-repo cascade/eval-pool
 # → prints  window_pool = "cascade/eval-pool@sha256:…"  ← paste into [eval] in chain.toml
 
 # Daily publish: build + push a snapshot to the pool bucket (no chain.toml edit).
-cascade-pool publish --effective-round auto
+cascade-pool publish --effective-block auto
 
 cascade-pool sources   # list registered sources
 ```
@@ -60,24 +60,37 @@ Window geometry (`context_length` / `horizon`) defaults to `[eval]` in
 
 `cascade-pool publish` builds a fresh pool, packs it to a deterministic tar,
 uploads it to the pool bucket, and appends it to `pool/index.json` stamped with
-an **`effective_round`**. Each validator, for a round at `round_id`, selects the
-snapshot with the greatest `effective_round ≤ round_id` — the **same**
+an **`effective_block`** — the epoch-boundary block from which the snapshot is
+active. Each validator, for a round, computes that round's epoch-boundary block
+(`created_block` floored to the epoch grid, from the shared manifest) and selects
+the snapshot with the greatest `effective_block ≤ that block` — the **same**
 deterministic choice on every validator, so two validators that polled at
 different times around the daily rollover still score the *identical* pool for a
 given round (no latest-wins divergence). Integrity is the tar's sha256, verified
 on fetch.
 
-**Invariant the publisher must hold:** a new snapshot's `effective_round` is in
-the *future* (greater than the current round). `--effective-round auto` enforces
-this by reading the manifest `latest.json` round_id and adding `--round-buffer`
-(default 1). Never publish a snapshot that becomes active for an already-scored
-round, or validators would disagree.
+> **Why the block, not the round id.** A round id is the epoch-boundary block
+> *hash* folded to a 64-bit seed (`ChainClient.block_seed`) — deliberately
+> unpredictable, hence non-monotonic. Ordering snapshots by "greatest
+> `effective_round ≤ round_id`" over random seeds is meaningless. The epoch
+> block *number* is monotonic and every validator derives the same value from
+> the manifest's `created_block`, so it is the correct consensus key. (Pool
+> index schema v2 made this switch; a v1 index keyed by `effective_round` still
+> parses — a redeploy republishes under `effective_block`.)
+
+**Invariant the publisher must hold:** a new snapshot's `effective_block` is in
+a *future* epoch (later than the current round). `--effective-block auto` enforces
+this by reading the manifest `latest.json` `created_block`, flooring it to the
+epoch grid, and adding `--round-buffer` epochs (default 1). Never publish a
+snapshot that becomes active for an already-scored round, or validators would
+disagree. (`--effective-round` remains as a deprecated alias; its value is now a
+block.)
 
 Example daily cron on the orchestrator:
 
 ```bash
 # 03:00 UTC daily — fresh windows, active from the next round onward.
-0 3 * * *  cascade-pool publish --as-of "$(date -u +\%F)" --effective-round auto
+0 3 * * *  cascade-pool publish --as-of "$(date -u +\%F)" --effective-block auto
 ```
 
 Validators pick up new snapshots automatically (they re-read the index each
@@ -121,7 +134,7 @@ cascade never imports forge code. The deployment is a two-bucket relay:
 ```
 forge scrape host                owner orchestrator                    validators
 scraper cron ─► raw-data bucket ─► cascade-pool publish ─► pool bucket ─► fetch by
-                (parquet+catalog)  (sync, build, validate)  (tar+index)   effective_round
+                (parquet+catalog)  (sync, build, validate)  (tar+index)   effective_block
 ```
 
 1. The forge cron ends with `scripts/publish_data_bucket.sh` (in the forge
@@ -131,12 +144,12 @@ scraper cron ─► raw-data bucket ─► cascade-pool publish ─► pool buck
 
 ```bash
 aws s3 sync "s3://$TSFORGE_BUCKET" ./tsforge --exact-timestamps
-TSFORGE_DIR=./tsforge cascade-pool publish --sources tsbench_forge --effective-round auto
+TSFORGE_DIR=./tsforge cascade-pool publish --sources tsbench_forge --effective-block auto
 ```
 
 Install the producer extra first: `pip install "cascade[pool-forge]"` (pyarrow
 + pyyaml + pandas; validators never need it — they consume the built `.npy`
-pool). Everything downstream — deterministic tar, `effective_round` consensus,
+pool). Everything downstream — deterministic tar, `effective_block` consensus,
 validator fetch — is unchanged.
 
 Properties worth knowing:

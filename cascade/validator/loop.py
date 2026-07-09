@@ -395,6 +395,15 @@ class ValidatorRunner:
             king_tenure_rounds=tenure_at_decision,
         )
 
+    def _epoch_start_block(self, manifest: TrainingManifest) -> int:
+        """The round's epoch-boundary block: ``created_block`` floored to the
+        epoch grid. Monotonic and identical for every validator (from the shared
+        manifest), so it is the consensus key for daily eval-pool snapshot
+        selection — unlike the round id, which is a block *hash* (non-monotonic).
+        """
+        epoch_blocks = max(1, self.cfg.round.epoch_blocks)
+        return (manifest.created_block // epoch_blocks) * epoch_blocks
+
     # ── public round receipts ────────────────────────────────────────────────
 
     def build_round_receipt(
@@ -487,8 +496,7 @@ class ValidatorRunner:
         from ..shared.receipt import dump_receipt, sign_receipt, summarize_receipt
 
         try:
-            epoch_blocks = max(1, self.cfg.round.epoch_blocks)
-            epoch_start = (manifest.created_block // epoch_blocks) * epoch_blocks
+            epoch_start = self._epoch_start_block(manifest)
             epoch_hash = ""
             participants: tuple[Participant, ...] = ()
             try:
@@ -503,7 +511,9 @@ class ValidatorRunner:
             prov_fn = getattr(window_source, "provenance_for_round", None)
             if prov_fn is not None:
                 try:
-                    provenance = tuple(prov_fn(base_seed))
+                    # Same epoch block that selected the round's windows, so the
+                    # recorded provenance is the pool actually scored.
+                    provenance = tuple(prov_fn(base_seed, block=epoch_start))
                 except Exception as e:  # noqa: BLE001
                     log.warning("pool provenance unavailable for round=%s: %s",
                                 manifest.round_id, e)
@@ -590,7 +600,12 @@ class ValidatorRunner:
                             reject_reason=reason, window_source=window_source,
                         )
                     else:
-                        windows = window_source.windows_for_round(base_seed, self.cfg.eval.n_windows)
+                        # The epoch block selects the daily snapshot; base_seed
+                        # rotates the window slice within it.
+                        windows = window_source.windows_for_round(
+                            base_seed, self.cfg.eval.n_windows,
+                            block=self._epoch_start_block(manifest),
+                        )
                         # process_round mutates the sticky KOTH state atomically (it
                         # raises before any mutation on a transient eval/fetch error,
                         # leaving state untouched for a clean retry). Mark the round

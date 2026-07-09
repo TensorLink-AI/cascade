@@ -104,33 +104,67 @@ class HttpFetcher:
     Stdlib-only (no ``requests`` dependency) and synchronous. Honours the
     standard ``HTTP(S)_PROXY`` environment (``urllib`` reads ``getproxies()``),
     so it works behind an operator proxy without extra config. Retries on
-    transient transport errors and 5xx with exponential backoff; 4xx fails fast.
+    transient transport errors and 5xx with exponential backoff; other 4xx fail
+    fast.
+
+    Rate limiting (HTTP 429) gets its own, more patient budget: many-call
+    sources (Open-Meteo's global grid is ~250 requests) trip per-window limits,
+    and a 1-2s backoff just re-trips them. On 429 the fetcher honours a
+    ``Retry-After`` header when present, else backs off geometrically up to
+    ``max_backoff``, for up to ``rate_limit_retries`` attempts — separate from
+    the ``retries`` budget so a 429 storm doesn't exhaust the transient-error
+    allowance in a couple of seconds.
     """
 
     timeout: float = 30.0
     retries: int = 3
     backoff: float = 1.5
+    rate_limit_retries: int = 6
+    rate_limit_backoff: float = 2.0
+    max_backoff: float = 60.0
     user_agent: str = "cascade-pool/1 (+https://github.com/TensorLink-AI/cascade)"
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+
+    @staticmethod
+    def _retry_after(e: urllib.error.HTTPError) -> float | None:
+        """Seconds from a ``Retry-After`` header (integer form only), or None."""
+        raw = e.headers.get("Retry-After") if e.headers else None
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None  # HTTP-date form: fall back to geometric backoff
 
     def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
         if params:
             url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         last: Exception | None = None
-        for attempt in range(self.retries):
+        attempt = 0          # transient (5xx / transport) budget
+        rl_attempt = 0       # rate-limit (429) budget, separate
+        while True:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 — fixed https hosts
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
                 last = e
-                # 429 (rate limit) is transient; other 4xx won't improve on retry.
-                if e.code < 500 and e.code != 429:
+                if e.code == 429:
+                    if rl_attempt >= self.rate_limit_retries:
+                        break
+                    wait = self._retry_after(e)
+                    if wait is None:
+                        wait = min(self.max_backoff, self.rate_limit_backoff ** rl_attempt)
+                    rl_attempt += 1
+                    self._sleep(min(wait, self.max_backoff))
+                    continue
+                # Any other 4xx won't improve on retry.
+                if e.code < 500:
                     raise HarvestError(f"http_{e.code} for {url}") from e
             except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
                 last = e
-            if attempt < self.retries - 1:
-                self._sleep(self.backoff ** attempt)
+            attempt += 1
+            if attempt >= self.retries:
+                break
+            self._sleep(self.backoff ** attempt)
         raise HarvestError(f"fetch_failed after {self.retries} tries: {url}: {last}")
 
 

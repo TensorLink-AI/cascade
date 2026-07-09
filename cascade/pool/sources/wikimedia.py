@@ -29,6 +29,14 @@ REST_BASE = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
 PROJECT = "en.wikipedia"
 HISTORY_DAYS = 1500  # ~4 years of daily points
 
+# Pageviews are aggregated with a lag: the most recent 1-2 days are not yet
+# published, and the REST endpoint returns **404 for the whole range** (not a
+# partial series) if the requested end date is past the last available day. So
+# request only up to ``as_of - PAGEVIEW_LAG_DAYS``. This keeps the build
+# deterministic in ``as_of`` (the requested window is a pure function of it)
+# while never asking for data that doesn't exist yet.
+PAGEVIEW_LAG_DAYS = 2
+
 # Stable, high-traffic articles across topics (countries, science, companies,
 # culture) so the set is reliably populated and topically diverse.
 ARTICLES: tuple[str, ...] = (
@@ -60,7 +68,9 @@ class WikimediaSource:
         self.project = project
 
     def harvest(self, fetch: FetchJson, ctx: HarvestContext) -> Iterable[HarvestedSeries]:
-        end = ctx.as_of
+        # Cap the end at the last day pageviews are actually published for
+        # (as_of − lag), or the endpoint 404s the whole range.
+        end = ctx.as_of - dt.timedelta(days=PAGEVIEW_LAG_DAYS)
         start = end - dt.timedelta(days=HISTORY_DAYS)
         start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
         emitted = 0

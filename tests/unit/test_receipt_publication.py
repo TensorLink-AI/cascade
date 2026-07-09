@@ -212,7 +212,7 @@ def test_published_receipt_matches_round_outcome(cfg, monkeypatch):
     outcome = runner.process_round(manifest, windows, base_seed)
 
     window_source = types.SimpleNamespace(
-        provenance_for_round=lambda seed: ("pool@ref", "sha256:" + "e" * 64)
+        provenance_for_round=lambda seed, *, block=None: ("pool@ref", "sha256:" + "e" * 64)
     )
     runner._publish_round_receipt(
         _FakeClient(), manifest, base_seed,

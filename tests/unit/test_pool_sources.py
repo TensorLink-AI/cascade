@@ -87,6 +87,120 @@ def test_wikimedia_skips_sparse_articles():
     assert list(src.harvest(lambda u, p: {"items": [{"views": 1}]}, CTX)) == []
 
 
+def test_wikimedia_end_date_lags_as_of():
+    # Pageviews lag ~2 days; requesting up to as_of 404s the whole range. The
+    # requested end must be as_of - PAGEVIEW_LAG_DAYS.
+    from cascade.pool.sources.wikimedia import PAGEVIEW_LAG_DAYS
+
+    captured = {}
+
+    def fake_fetch(url, params):
+        captured["url"] = url
+        return {"items": [{"views": 1}, {"views": 2}, {"views": 3}]}
+
+    ctx = HarvestContext(as_of=dt.date(2026, 7, 9), context_length=512, horizon=16, max_series=10)
+    list(WikimediaSource(articles=("Physics",)).harvest(fake_fetch, ctx))
+    end = (dt.date(2026, 7, 9) - dt.timedelta(days=PAGEVIEW_LAG_DAYS)).strftime("%Y%m%d")
+    assert captured["url"].rstrip("/").endswith(end)
+    assert "20260709" not in captured["url"]  # never requests today
+
+
+# ── HttpFetcher rate-limit (429) handling ──────────────────────────────────────
+
+
+def _fetcher_with_responses(responses, sleeps):
+    """An HttpFetcher whose urlopen yields ``responses`` in order (an int status
+    raises that HTTPError; a dict is returned as JSON), recording sleeps."""
+    import io
+    import json as _json
+    import urllib.error
+
+    from cascade.pool.source import HttpFetcher
+
+    seq = iter(responses)
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): self.close()
+
+    def fake_urlopen(req, timeout=None):
+        item = next(seq)
+        if isinstance(item, tuple):  # (code, headers)
+            code, headers = item
+            raise urllib.error.HTTPError(req.full_url, code, "err", headers, None)
+        return _Resp(_json.dumps(item).encode())
+
+    import cascade.pool.source as src_mod
+    orig = src_mod.urllib.request.urlopen
+    src_mod.urllib.request.urlopen = fake_urlopen
+    f = HttpFetcher(_sleep=lambda s: sleeps.append(s))
+    return f, (lambda: setattr(src_mod.urllib.request, "urlopen", orig))
+
+
+def test_fetcher_retries_429_with_own_budget():
+    from email.message import Message
+
+    sleeps = []
+    hdr = Message()  # no Retry-After → geometric backoff
+    f, restore = _fetcher_with_responses(
+        [(429, hdr), (429, hdr), {"ok": 1}], sleeps)
+    try:
+        assert f("https://x/y") == {"ok": 1}
+    finally:
+        restore()
+    # two 429s → two backoff sleeps (rate_limit_backoff ** 0, ** 1) = 1.0, 2.0
+    assert sleeps == [1.0, 2.0]
+
+
+def test_fetcher_honors_retry_after_header():
+    from email.message import Message
+
+    sleeps = []
+    hdr = Message()
+    hdr["Retry-After"] = "5"
+    f, restore = _fetcher_with_responses([(429, hdr), {"ok": 2}], sleeps)
+    try:
+        assert f("https://x/y") == {"ok": 2}
+    finally:
+        restore()
+    assert sleeps == [5.0]   # slept exactly the header value
+
+
+def test_fetcher_429_exhausts_and_raises():
+    from email.message import Message
+
+    from cascade.pool.source import HarvestError
+
+    sleeps = []
+    hdr = Message()
+    f, restore = _fetcher_with_responses([(429, hdr)] * 10, sleeps)
+    f.rate_limit_retries = 3
+    try:
+        import pytest
+        with pytest.raises(HarvestError, match="fetch_failed"):
+            f("https://x/y")
+    finally:
+        restore()
+    assert len(sleeps) == 3   # rate_limit_retries attempts, then give up
+
+
+def test_fetcher_4xx_fails_fast_no_retry():
+    from email.message import Message
+
+    from cascade.pool.source import HarvestError
+
+    sleeps = []
+    hdr = Message()
+    f, restore = _fetcher_with_responses([(404, hdr), {"never": 1}], sleeps)
+    try:
+        import pytest
+        with pytest.raises(HarvestError, match="http_404"):
+            f("https://x/y")
+    finally:
+        restore()
+    assert sleeps == []   # 404 is terminal, no backoff
+
+
 def test_default_sources_can_supply_2000_windows():
     from cascade.pool.sources.openmeteo import OpenMeteoSource, global_grid
     from cascade.pool.sources.wikimedia import WikimediaSource
