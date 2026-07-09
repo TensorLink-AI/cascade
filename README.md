@@ -185,6 +185,8 @@ cascade/
 
 docs/
   ARCHITECTURE.md   end-to-end flow, trust model, the controlled-experiment invariant
+  MINER.md          run a miner end to end: fork → verify → register → deploy
+  VALIDATOR.md      run a validator end to end: register → configure → score → set weights
   INTERFACE.md      the DataGenerator submission contract for miners
   AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
 scripts/
