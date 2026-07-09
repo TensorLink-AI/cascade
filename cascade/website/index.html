@@ -1032,10 +1032,10 @@ var ENDPOINTS = [
   "https://us-east-1.hippius.com/" + BUCKET,
   "https://eu-central-1.hippius.com/" + BUCKET
 ];
-// Hippius Hub is a HuggingFace-style browse UI: a model repo lives at the bare
-// repo path (hub.hippius.com/<owner>/<name>), not under a /models/ prefix — the
-// old /models/ segment 404'd for every generator link.
-var HUB_BASE = "https://hub.hippius.com/";
+// A Hippius Hub model page lives at hub.hippius.com/models/<owner>/<name>/<ref>.
+// hubUrl() appends the "/main" default ref: without a ref the page 404s.
+var HUB_BASE = "https://hub.hippius.com/models/";
+var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _chartMode = "geomean", _smooth = 0;
 
@@ -1079,7 +1079,7 @@ var SEED_LATEST = {
 })();
 function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 function splitRef(ref){ if(!ref) return {repo:"",digest:""}; var i=ref.indexOf("@"); return i<0?{repo:ref,digest:""}:{repo:ref.slice(0,i),digest:ref.slice(i+1)}; }
-function hubUrl(repo){ return repo ? HUB_BASE+repo : "#"; }
+function hubUrl(repo){ return repo ? HUB_BASE+repo+"/"+HUB_REF : "#"; }
 function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?p.repo+"@"+d:p.repo; }
 function refLink(ref,k){ var p=splitRef(ref); if(!p.repo) return '<span class="muted">--</span>'; return '<a class="'+(k||"")+'" href="'+hubUrl(p.repo)+'" target="_blank" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
 function shortHk(hk){ return hk?hk.slice(0,8)+"\u2026"+hk.slice(-4):"--"; }
