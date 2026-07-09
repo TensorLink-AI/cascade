@@ -135,13 +135,17 @@ class BucketWindowSource:
     snapshot bucket (``[storage] pool_bucket`` + ``pool/index.json``).
 
     Per round it (re-)reads the owner-controlled index and selects the snapshot
-    whose ``effective_round`` is the greatest ``<= round_id`` — the **same**
-    deterministic choice on every validator, so async polling cannot diverge.
-    The chosen snapshot is fetched once (sha256-verified), cached, and reused;
-    its :class:`RotatingWindowSource` then draws the rotating slice for the round.
+    whose ``effective_block`` is the greatest ``<=`` the round's epoch-boundary
+    block — the **same** deterministic choice on every validator, so async
+    polling cannot diverge. The chosen snapshot is fetched once (sha256-verified),
+    cached, and reused; its :class:`RotatingWindowSource` then draws the rotating
+    slice for the round.
 
-    ``round_seed`` carries the round id (the live loop passes ``int(round_id)``),
-    which is both the snapshot selector and the rotation seed.
+    Two keys, two jobs: the ``block`` (epoch-boundary block number, monotonic)
+    selects *which daily snapshot*; ``round_seed`` (the block-hash round id,
+    random) seeds *which windows* within it rotate in. The live loop passes both.
+    ``block=None`` (a caller that can't supply it) falls back to the newest
+    snapshot rather than the retired, broken round-id comparison.
     """
 
     def __init__(self, cfg: ChainConfig, store: object, *, cache_dir: Path | str | None = None,
@@ -158,13 +162,13 @@ class BucketWindowSource:
             return src
         from ..shared.hippius import fetch_pool_snapshot
 
-        dest = self.cache_dir / f"snapshot-{meta.effective_round}-{meta.sha256[:12]}"
+        dest = self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
         try:
             fetch_pool_snapshot(self.store, meta, dest)
         except Exception as e:  # noqa: BLE001
-            raise PoolError(f"snapshot_fetch_failed (round>={meta.effective_round}): {e}") from e
+            raise PoolError(f"snapshot_fetch_failed (block>={meta.effective_block}): {e}") from e
         src = window_source_from_dir(
-            dest, self.cfg, label=f"snapshot@{meta.effective_round}",
+            dest, self.cfg, label=f"snapshot@block-{meta.effective_block}",
             provenance=(meta.key, meta.sha256),
         )
         if len(self._cache) >= self.max_cached:
@@ -172,16 +176,21 @@ class BucketWindowSource:
         self._cache[meta.sha256] = src
         return src
 
-    def windows_for_round(self, round_seed, n_windows):
+    def _select(self, block):
+        """The snapshot active for a round at epoch ``block`` (None → newest)."""
         from ..shared.hippius import read_pool_index, select_snapshot
 
-        try:
-            round_id = int(round_seed)
-        except (TypeError, ValueError) as e:
-            raise PoolError(f"bucket pool needs an integer round id; got {round_seed!r}") from e
-
         index = read_pool_index(self.store)
-        meta = select_snapshot(index, round_id)
+        if not index:
+            return None
+        if block is None:
+            # No epoch block supplied: the newest snapshot is the only safe,
+            # deterministic choice (never the retired round-id comparison).
+            return max(index, key=lambda s: s.effective_block)
+        return select_snapshot(index, int(block))
+
+    def windows_for_round(self, round_seed, n_windows, *, block=None):
+        meta = self._select(block)
         if meta is None:
             raise PoolError(
                 f"no eval-pool snapshot published in {self.cfg.storage.pool_bucket}; "
@@ -189,14 +198,12 @@ class BucketWindowSource:
             )
         return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows)
 
-    def provenance_for_round(self, round_seed) -> tuple[str, str]:
+    def provenance_for_round(self, round_seed, *, block=None) -> tuple[str, str]:
         """``(snapshot_key, tar_sha256)`` of the snapshot active for the round —
         the pool provenance recorded in the round receipt. ("", "") when the
         index is unreadable or empty (the receipt then carries no pool pin)."""
-        from ..shared.hippius import read_pool_index, select_snapshot
-
         try:
-            meta = select_snapshot(read_pool_index(self.store), int(round_seed))
+            meta = self._select(block)
         except Exception:  # noqa: BLE001 — provenance is best-effort metadata
             return ("", "")
         return (meta.key, meta.sha256) if meta is not None else ("", "")

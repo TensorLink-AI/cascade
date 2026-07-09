@@ -47,9 +47,17 @@ def _seed_to_int(seed: int | str) -> int:
 
 @runtime_checkable
 class WindowSource(Protocol):
-    """Produces the eval windows for one round, deterministic in ``round_seed``."""
+    """Produces the eval windows for one round, deterministic in ``round_seed``.
 
-    def windows_for_round(self, round_seed: int | str, n_windows: int) -> list[EvalWindow]:
+    ``block`` (the round's epoch-boundary block number) is an optional selector
+    for sources that rotate a daily snapshot (the bucket pool); a static pool
+    ignores it. Keeping it keyword-only + defaulted preserves the simple
+    ``windows_for_round(seed, n)`` call for static sources.
+    """
+
+    def windows_for_round(
+        self, round_seed: int | str, n_windows: int, *, block: int | None = None
+    ) -> list[EvalWindow]:
         ...
 
 
@@ -75,12 +83,16 @@ class RotatingWindowSource:
         if not self.pool:
             raise ValueError("RotatingWindowSource pool is empty")
 
-    def provenance_for_round(self, round_seed: int | str) -> tuple[str, str]:
+    def provenance_for_round(self, round_seed: int | str, *, block: int | None = None) -> tuple[str, str]:
         """``(pool_ref, pool_digest)`` recorded in the round receipt. A static
-        pool's provenance is round-independent."""
+        pool's provenance is round-independent (``block`` ignored)."""
         return self.provenance
 
-    def windows_for_round(self, round_seed: int | str, n_windows: int) -> list[EvalWindow]:
+    def windows_for_round(
+        self, round_seed: int | str, n_windows: int, *, block: int | None = None
+    ) -> list[EvalWindow]:
+        # ``block`` is only meaningful for a rotating daily snapshot (bucket
+        # pool); a static pool draws its slice from ``round_seed`` alone.
         if n_windows <= 0:
             raise ValueError(f"n_windows must be positive; got {n_windows}")
         rng = np.random.default_rng(_seed_to_int(round_seed))

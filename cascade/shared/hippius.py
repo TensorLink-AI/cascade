@@ -629,28 +629,41 @@ class LogSink:
 # publishes a new snapshot (a deterministic tar of the pool directory) to the
 # pool bucket and appends it to ``pool/index.json``. Every validator reads the
 # same owner-controlled index and selects, for a round, the snapshot whose
-# ``effective_round`` is the greatest ``<= round_id`` — so all validators score
-# the identical pool for a given round REGARDLESS of when they polled (no
-# latest-wins divergence at the daily rollover). Integrity is the tar sha256.
+# ``effective_block`` is the greatest ``<= the round's epoch-boundary block`` —
+# so all validators score the identical pool for a given round REGARDLESS of
+# when they polled (no latest-wins divergence at the daily rollover). Integrity
+# is the tar sha256.
 #
-# Invariant the publisher MUST hold: a new snapshot's ``effective_round`` is in
-# the FUTURE (greater than the current round). Never publish a snapshot that
-# becomes active for an already-processed round, or validators that already
+# Why the EPOCH BLOCK, not the round id: a round id is the epoch-boundary block
+# HASH folded to a 64-bit seed (``ChainClient.block_seed``) — deliberately
+# unpredictable and therefore NON-monotonic. Selecting "greatest effective_round
+# <= round_id" over random seeds is meaningless. The epoch-boundary block NUMBER
+# (``created_block // epoch_blocks * epoch_blocks``) is monotonic and derivable
+# by every validator from the manifest's ``created_block``, so it is the correct
+# ordering key for "which daily snapshot is active for this round".
+#
+# Invariant the publisher MUST hold: a new snapshot's ``effective_block`` is in
+# the FUTURE (a later epoch than the current round). Never publish a snapshot
+# that becomes active for an already-processed round, or validators that already
 # scored it would disagree with those that re-select it.
 
 POOL_INDEX_KEY = "pool/index.json"
-POOL_INDEX_SCHEMA = 1
+POOL_INDEX_SCHEMA = 2   # v1 keyed snapshots by round_id (non-monotonic; broken)
 
 
-def pool_snapshot_key(effective_round: int) -> str:
-    return f"pool/snapshots/{int(effective_round)}.tar"
+def pool_snapshot_key(effective_block: int) -> str:
+    return f"pool/snapshots/block-{int(effective_block)}.tar"
 
 
 @dataclass(frozen=True)
 class PoolSnapshotMeta:
-    """One published eval-pool snapshot, listed in ``pool/index.json``."""
+    """One published eval-pool snapshot, listed in ``pool/index.json``.
 
-    effective_round: int
+    ``effective_block`` is the epoch-boundary block from which this snapshot is
+    active; validators select by it (greatest ``<=`` the round's epoch block).
+    """
+
+    effective_block: int
     key: str
     sha256: str
     size_bytes: int
@@ -661,8 +674,11 @@ class PoolSnapshotMeta:
 
     @classmethod
     def from_dict(cls, d: dict) -> PoolSnapshotMeta:
+        # ``effective_round`` is the retired v1 key; read it as a fallback so an
+        # old index still parses (a redeploy republishes with ``effective_block``).
+        block = d.get("effective_block", d.get("effective_round"))
         return cls(
-            effective_round=int(d["effective_round"]),
+            effective_block=int(block),
             key=str(d["key"]),
             sha256=str(d["sha256"]),
             size_bytes=int(d.get("size_bytes", 0)),
@@ -674,36 +690,38 @@ class PoolSnapshotMeta:
 
 
 def read_pool_index(store: S3Store) -> list[PoolSnapshotMeta]:
-    """Read the snapshot index, sorted by ``effective_round``. Empty if absent."""
+    """Read the snapshot index, sorted by ``effective_block``. Empty if absent."""
     try:
         text = store.get_text(POOL_INDEX_KEY)
     except StorageError:
         return []
     doc = json.loads(text)
     snaps = [PoolSnapshotMeta.from_dict(s) for s in doc.get("snapshots", [])]
-    return sorted(snaps, key=lambda s: s.effective_round)
+    return sorted(snaps, key=lambda s: s.effective_block)
 
 
-def select_snapshot(index: list[PoolSnapshotMeta], round_id: int) -> PoolSnapshotMeta | None:
-    """The snapshot active for ``round_id``: greatest ``effective_round <= round_id``.
+def select_snapshot(index: list[PoolSnapshotMeta], epoch_block: int) -> PoolSnapshotMeta | None:
+    """The snapshot active for a round at ``epoch_block`` (its epoch-boundary block
+    number): greatest ``effective_block <= epoch_block``.
 
-    Falls back to the earliest snapshot when ``round_id`` precedes them all (so a
-    validator always has a pool); returns ``None`` only for an empty index. The
-    rule is deterministic, so every validator selects the same snapshot.
+    Falls back to the earliest snapshot when ``epoch_block`` precedes them all (so
+    a validator always has a pool); returns ``None`` only for an empty index. The
+    rule is deterministic over a monotonic key, so every validator selects the
+    same snapshot for the same round regardless of when it polled.
     """
     if not index:
         return None
-    eligible = [s for s in index if s.effective_round <= round_id]
+    eligible = [s for s in index if s.effective_block <= epoch_block]
     if eligible:
-        return max(eligible, key=lambda s: s.effective_round)
-    return min(index, key=lambda s: s.effective_round)
+        return max(eligible, key=lambda s: s.effective_block)
+    return min(index, key=lambda s: s.effective_block)
 
 
 def publish_pool_snapshot(
     store: S3Store,
     tar_bytes: bytes,
     *,
-    effective_round: int,
+    effective_block: int,
     as_of: str,
     n_series: int,
     context_length: int,
@@ -712,16 +730,16 @@ def publish_pool_snapshot(
 ) -> PoolSnapshotMeta:
     """Upload a pool snapshot tar and register it in ``pool/index.json``.
 
-    Idempotent per ``effective_round`` (re-publishing replaces that entry). Keeps
+    Idempotent per ``effective_block`` (re-publishing replaces that entry). Keeps
     the most recent ``max_keep`` entries in the index (old tars are left in the
     bucket for any validator still resolving an older round; prune out-of-band).
     """
     sha = tar_cid_digest(tar_bytes)
-    key = pool_snapshot_key(effective_round)
+    key = pool_snapshot_key(effective_block)
     store.put_bytes(key, tar_bytes, content_type="application/x-tar")
 
     meta = PoolSnapshotMeta(
-        effective_round=int(effective_round),
+        effective_block=int(effective_block),
         key=key,
         sha256=sha,
         size_bytes=len(tar_bytes),
@@ -730,9 +748,9 @@ def publish_pool_snapshot(
         context_length=context_length,
         horizon=horizon,
     )
-    index = [s for s in read_pool_index(store) if s.effective_round != meta.effective_round]
+    index = [s for s in read_pool_index(store) if s.effective_block != meta.effective_block]
     index.append(meta)
-    index.sort(key=lambda s: s.effective_round)
+    index.sort(key=lambda s: s.effective_block)
     index = index[-max_keep:]
     doc = {"schema": POOL_INDEX_SCHEMA, "snapshots": [asdict(s) for s in index]}
     store.put_text(POOL_INDEX_KEY, json.dumps(doc, indent=2, sort_keys=True),

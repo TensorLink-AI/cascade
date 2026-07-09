@@ -436,6 +436,16 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
     chal_es = _scorer("challenger")
     v = receipt.verdict
 
+    # Distinct eval-window clusters (upstream feeds) behind the verdict —
+    # derived from the SIGNED per-window ``source`` keys, so it is trustworthy
+    # (an auditor recomputes the same value) without bloating the signed body.
+    # This is the breadth the cluster bootstrap actually resampled; the raw
+    # window count overstates the evidence when many windows share a feed.
+    n_clusters = None
+    if king_es is not None:
+        keys = {s.series_id if s.source in (None, "") else s.source for s in king_es.scores}
+        n_clusters = len(keys) if king_es.scores else 0
+
     sizes: list[str] = []
     for e in entries:
         if isinstance(e, dict):
@@ -459,6 +469,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         # verdict headline
         "n_windows": (receipt.eval_context.n_windows if receipt.eval_context
                       else (v.n_windows if v else None)),
+        "n_clusters": n_clusters,
         "king_geomean": v.king_geomean if v else None,
         "chal_geomean": v.chal_geomean if v else None,
         "lcb": v.lcb if v else None,

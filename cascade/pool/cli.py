@@ -85,17 +85,19 @@ def _add_publish(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--out", type=Path, default=Path("./_pool_stage"), help="Local staging dir.")
     p.add_argument(
-        "--effective-round",
+        "--effective-block", "--effective-round",
+        dest="effective_block",
         default="auto",
-        help="Round id from which this snapshot is active (int), or 'auto' to read the "
-        "manifest latest.json round_id and use round_id + --round-buffer. MUST be a future "
-        "round, never one already scored.",
+        help="Epoch-boundary block from which this snapshot is active (int), or 'auto' "
+        "to read the manifest latest.json created_block, floor it to the epoch grid, and "
+        "add --round-buffer epochs. MUST be a FUTURE epoch, never one already scored. "
+        "(--effective-round is a deprecated alias.)",
     )
     p.add_argument(
         "--round-buffer",
         type=int,
         default=1,
-        help="With --effective-round auto, how many rounds ahead to activate (default 1).",
+        help="With --effective-block auto, how many epochs ahead to activate (default 1).",
     )
     p.add_argument("--max-keep", type=int, default=14, help="Snapshots to retain in the index.")
     _add_build_args(p)
@@ -179,11 +181,11 @@ def _cmd_publish(args: argparse.Namespace) -> int:
         publish_pool_snapshot,
     )
 
-    # Resolve effective_round before the (slow) build so a bad value fails fast.
+    # Resolve effective_block before the (slow) build so a bad value fails fast.
     try:
-        effective_round = _resolve_effective_round(args, cfg)
+        effective_block = _resolve_effective_block(args, cfg)
     except (StorageError, ValueError) as e:
-        print(f"error: could not resolve --effective-round: {e}", file=sys.stderr)
+        print(f"error: could not resolve --effective-block: {e}", file=sys.stderr)
         return 2
 
     try:
@@ -204,7 +206,7 @@ def _cmd_publish(args: argparse.Namespace) -> int:
         meta = publish_pool_snapshot(
             store,
             tar_bytes,
-            effective_round=effective_round,
+            effective_block=effective_block,
             as_of=summary.as_of,
             n_series=summary.n_series,
             context_length=summary.context_length,
@@ -217,23 +219,33 @@ def _cmd_publish(args: argparse.Namespace) -> int:
 
     print(
         f"\npublished snapshot to {cfg.storage.pool_bucket}: {meta.key}\n"
-        f"  effective_round={meta.effective_round} sha256={meta.sha256[:16]}… "
+        f"  effective_block={meta.effective_block} sha256={meta.sha256[:16]}… "
         f"size={meta.size_bytes:,} series={meta.n_series}"
     )
-    print("validators will score this pool for rounds >= effective_round (no chain.toml edit).")
+    print("validators score this pool for rounds whose epoch block >= effective_block "
+          "(no chain.toml edit).")
     return 0
 
 
-def _resolve_effective_round(args: argparse.Namespace, cfg) -> int:
-    if args.effective_round != "auto":
-        return int(args.effective_round)
-    # Derive from the manifest bucket's latest.json round_id + buffer.
+def _resolve_effective_block(args: argparse.Namespace, cfg) -> int:
+    """The epoch-boundary block from which the new snapshot is active.
+
+    Explicit ``--effective-block N`` is used verbatim. ``auto`` reads the
+    manifest bucket's ``latest.json`` ``created_block``, floors it to the epoch
+    grid, and adds ``--round-buffer`` epochs — so the snapshot activates for a
+    FUTURE round, never one already scored (the publisher invariant). Keyed on
+    the block NUMBER, which is monotonic; the round *id* is a block hash and
+    must never be used for ordering."""
+    if args.effective_block != "auto":
+        return int(args.effective_block)
     from ..shared.hippius import S3Config, S3Store, read_latest_manifest
     from ..shared.manifest import load_manifest
 
     store = S3Store(S3Config.from_storage(cfg.storage, bucket=cfg.storage.manifest_bucket))
     manifest = load_manifest(read_latest_manifest(store))
-    return int(manifest.round_id) + max(0, args.round_buffer)
+    epoch_blocks = max(1, cfg.round.epoch_blocks)
+    epoch_start = (int(manifest.created_block) // epoch_blocks) * epoch_blocks
+    return epoch_start + max(1, args.round_buffer) * epoch_blocks
 
 
 def _upload_pool_ref(out_dir: Path, cfg, hub_repo: str | None) -> int:

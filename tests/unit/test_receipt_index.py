@@ -51,6 +51,8 @@ def test_summarize_scored_receipt_pulls_identities_and_verdict():
     assert s["chal_gen_ref"] == GEN_REF_CHAL
     assert s["n_participants"] == 2
     assert s["n_windows"] == receipt.eval_context.n_windows
+    # unlabeled windows ⇒ each is its own cluster ⇒ n_clusters == n_windows
+    assert s["n_clusters"] == len(receipt.entry_scores[0].scores)
     # the fixture's challenger is strictly better ⇒ finite geomeans, a decision
     assert s["king_geomean"] is not None and s["chal_geomean"] is not None
     assert s["chal_geomean"] < s["king_geomean"]
@@ -72,6 +74,27 @@ def test_summarize_rejected_receipt_has_reason_and_empty_verdict():
     assert s["n_windows"] is None
     # generator refs still come from the embedded (gated) manifest
     assert s["king_gen_ref"] == GEN_REF_KING and s["chal_gen_ref"] == GEN_REF_CHAL
+    assert s["n_clusters"] is None   # no scores ⇒ no cluster count
+
+
+def test_summarize_counts_distinct_clusters_from_sources():
+    # When windows carry upstream-feed ``source`` labels, n_clusters collapses
+    # to the distinct feeds (what the cluster bootstrap actually resampled),
+    # derived from the SIGNED per-window keys — not the raw window count.
+    from dataclasses import replace
+
+    receipt, _k, _c = make_scored_receipt()
+    king = receipt.entry_scores[0]
+    labelled = tuple(
+        replace(sc, source=f"feed{i % 4}") for i, sc in enumerate(king.scores)
+    )
+    receipt = replace(
+        receipt,
+        entry_scores=(replace(king, scores=labelled), *receipt.entry_scores[1:]),
+    )
+    s = summarize_receipt(receipt)
+    assert s["n_clusters"] == 4                       # 4 distinct feeds
+    assert s["n_windows"] == len(labelled) and s["n_windows"] > 4
 
 
 # ── update_receipt_index ─────────────────────────────────────────────────────
