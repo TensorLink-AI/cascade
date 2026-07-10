@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from cascade.eval.koth import RoundResult
-from cascade.validator.state import apply_round, dumps, genesis, loads
+from cascade.validator.state import (
+    ChampionState,
+    apply_round,
+    demote_to_trained,
+    dumps,
+    genesis,
+    loads,
+)
 
 
 def _win() -> RoundResult:
@@ -119,3 +126,39 @@ def test_former_kings_survive_json_round_trip():
     again = loads(dumps(st))
     assert again == st
     assert again.former_kings == ("k0",)
+
+
+# ── king-resync safety valve ───────────────────────────────────────────────────
+
+
+def test_demote_to_trained_crowns_trained_king_fresh():
+    # A stuck champion (uid 1) with tenure/streaks/court/holds is abandoned; the
+    # trainer's trained king (uid 9) is crowned fresh with everything reset.
+    st = ChampionState(
+        king_hotkey="stuck", king_uid=1, tenure_rounds=7,
+        streaks={"c": 2}, rounds_seen=42, former_kings=("old",), resync_holds=5,
+    )
+    out = demote_to_trained(st, trained_hotkey="trained", trained_uid=9)
+    assert out.king_hotkey == "trained"
+    assert out.king_uid == 9
+    assert out.tenure_rounds == 0
+    assert out.streaks == {}
+    assert out.resync_holds == 0
+    assert out.rounds_seen == 43            # a round was processed
+    # The abandoned champion is dropped, NOT rolled into the rewarded court.
+    assert out.former_kings == ()
+    assert "stuck" not in out.former_kings
+
+
+def test_resync_holds_survive_json_round_trip():
+    st = ChampionState(king_hotkey="k", king_uid=0, resync_holds=3)
+    again = loads(dumps(st))
+    assert again == st
+    assert again.resync_holds == 3
+
+
+def test_resync_holds_defaults_to_zero_for_legacy_state():
+    # State written before the safety valve existed has no resync_holds key.
+    again = loads('{"king_hotkey": "k", "king_uid": 0, "tenure_rounds": 1}')
+    assert again.resync_holds == 0
+    assert again.king_hotkey == "k"

@@ -42,6 +42,14 @@ class ChampionState:
     streaks: dict[str, int] = field(default_factory=dict)
     rounds_seen: int = 0
     former_kings: tuple[str, ...] = ()
+    # Consecutive rounds the validator has held the throne for a champion whose
+    # *trained* king disagrees (the trainer's incentive lags a dethrone — see the
+    # validator loop's king-resync branch). Reset to 0 on any normally-scored
+    # round. When it reaches ``[scoring] king_resync_max_rounds`` the safety valve
+    # gives up and adopts the trained king (:func:`demote_to_trained`), so a
+    # champion that can never be trained as king (e.g. no usable commitment) does
+    # not wedge the subnet forever. Persisted so the cap survives restarts.
+    resync_holds: int = 0
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,32 @@ def apply_round(
     )
 
 
+def demote_to_trained(
+    state: ChampionState, *, trained_hotkey: str, trained_uid: int
+) -> ChampionState:
+    """Abandon a stuck champion and crown the trainer's trained king.
+
+    The validator's king-resync safety valve: when the crowned champion has
+    stayed out of sync with the trainer for ``king_resync_max_rounds`` consecutive
+    rounds — it can never become the king the trainer trains (e.g. it has no
+    usable on-chain commitment) — holding the throne for it starves the subnet.
+    This resynchronises the validator to ground truth (the incentive-driven king
+    the trainer actually trained) by crowning it fresh: tenure and streaks reset
+    and the resync counter clears. The abandoned champion is **not** rolled into
+    ``former_kings`` — it is being dropped, not honourably retired, so it must not
+    keep drawing reward. ``rounds_seen`` still advances (a round was processed).
+    """
+    return ChampionState(
+        king_hotkey=trained_hotkey,
+        king_uid=trained_uid,
+        tenure_rounds=0,
+        streaks={},
+        rounds_seen=state.rounds_seen + 1,
+        former_kings=(),
+        resync_holds=0,
+    )
+
+
 def dumps(state: ChampionState) -> str:
     return json.dumps(
         {
@@ -153,6 +187,7 @@ def dumps(state: ChampionState) -> str:
             "streaks": state.streaks,
             "rounds_seen": state.rounds_seen,
             "former_kings": list(state.former_kings),
+            "resync_holds": state.resync_holds,
         },
         sort_keys=True,
     )
@@ -167,4 +202,5 @@ def loads(text: str) -> ChampionState:
         streaks={str(k): int(v) for k, v in (obj.get("streaks") or {}).items()},
         rounds_seen=int(obj.get("rounds_seen", 0)),
         former_kings=tuple(str(k) for k in (obj.get("former_kings") or ())),
+        resync_holds=int(obj.get("resync_holds", 0)),
     )

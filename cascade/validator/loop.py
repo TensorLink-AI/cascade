@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
 
@@ -598,21 +598,18 @@ class ValidatorRunner:
                         )
                     elif not self.king_synced(manifest):
                         # The trainer trained the OLD king (incentive lags a
-                        # dethrone). Don't judge the champion on a round it didn't
-                        # fight: hold the KOTH state and keep voting the champion so
-                        # incentive migrates to it and the trainer re-syncs next
-                        # round. A public receipt records why, not a silent skip.
-                        champ = self.state.king_hotkey
-                        trained = self._manifest_king_hotkey(manifest)
-                        log.warning("round=%s trainer king %s != champion %s; voting champion "
-                                    "to re-sync incentive, KOTH state held",
-                                    manifest.round_id, (trained or "?")[:12], (champ or "?")[:12])
+                        # dethrone). Hold the KOTH state and keep voting the champion
+                        # so incentive migrates and the trainer re-syncs — bounded by
+                        # the safety valve (see _resync_step). A public receipt
+                        # records why, not a silent skip.
                         last_round = manifest.round_id
+                        self.state, reject_reason = self._resync_step(manifest)
+                        self._persist_state()
                         reward_uids = self._reward_uids(manifest, None, client)
                         weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
                         self._publish_round_receipt(
                             client, manifest, base_seed,
-                            reject_reason=f"king_resyncing: champion {champ} != trained king {trained}",
+                            reject_reason=reject_reason,
                             window_source=window_source,
                             reward_uids=tuple(reward_uids), weights=weights_vec,
                         )
@@ -629,6 +626,10 @@ class ValidatorRunner:
                         # consumed as soon as it returns, so a later weight-set failure
                         # can NEVER re-run it and double-count the streak/tenure.
                         outcome = self.process_round(manifest, windows, base_seed)
+                        # Back in sync — clear any accumulated resync holds so a
+                        # future desync starts the safety-valve count from zero.
+                        if self.state.resync_holds:
+                            self.state = replace(self.state, resync_holds=0)
                         last_round = manifest.round_id
                         self._persist_state()
                         reward_uids = self._reward_uids(manifest, outcome, client)
@@ -664,6 +665,11 @@ class ValidatorRunner:
         e = manifest.entry_for_role("king")
         return e.miner_hotkey if e is not None else None
 
+    @staticmethod
+    def _manifest_king_uid(manifest: TrainingManifest) -> int | None:
+        e = manifest.entry_for_role("king")
+        return e.miner_uid if e is not None else None
+
     def king_synced(self, manifest: TrainingManifest) -> bool:
         """Whether the round's *trained* king matches the validator's champion.
 
@@ -678,6 +684,50 @@ class ValidatorRunner:
         if self.state.king_hotkey is None:
             return True
         return self._manifest_king_hotkey(manifest) == self.state.king_hotkey
+
+    def _resync_step(self, manifest: TrainingManifest) -> tuple[ChampionState, str]:
+        """Next champion state + receipt reason for a king-resync round.
+
+        Called when the trained king != champion (``king_synced`` is False). By
+        default it holds the throne, bumping the consecutive-hold counter, and the
+        caller keeps voting the champion so incentive migrates and the trainer
+        re-syncs. SAFETY VALVE: once the champion has stayed un-synced for
+        ``scoring.king_resync_max_rounds`` consecutive rounds it can never be the
+        king the trainer trains (e.g. it has no usable commitment), so holding
+        forever would wedge the subnet — the valve abandons it and adopts the
+        trainer's trained king (:func:`state.demote_to_trained`), and normal
+        scoring resumes next round. ``king_resync_max_rounds <= 0`` disables the
+        valve (hold indefinitely). Pure: returns the new state; the caller
+        persists, votes, and publishes.
+        """
+        champ = self.state.king_hotkey
+        trained = self._manifest_king_hotkey(manifest)
+        holds = self.state.resync_holds + 1
+        cap = self.cfg.scoring.king_resync_max_rounds
+        if 0 < cap <= holds and trained is not None:
+            log.warning(
+                "round=%s king_resync SAFETY VALVE: champion %s un-synced %d rounds "
+                "(cap=%d) — demoting to trained king %s, resuming normal scoring next round",
+                manifest.round_id, (champ or "?")[:12], holds, cap, (trained or "?")[:12],
+            )
+            return (
+                state_mod.demote_to_trained(
+                    self.state, trained_hotkey=trained,
+                    trained_uid=self._manifest_king_uid(manifest),
+                ),
+                f"king_resync_demoted: champion {champ} un-synced {holds} rounds "
+                f"(cap={cap}); adopted trained king {trained}",
+            )
+        log.warning(
+            "round=%s trainer king %s != champion %s; voting champion to re-sync "
+            "incentive, KOTH state held (%d/%s)",
+            manifest.round_id, (trained or "?")[:12], (champ or "?")[:12],
+            holds, cap if cap > 0 else "∞",
+        )
+        return (
+            replace(self.state, resync_holds=holds),
+            f"king_resyncing: champion {champ} != trained king {trained}",
+        )
 
     def _king_uid_to_vote(self, manifest: TrainingManifest, *, client: object | None = None) -> int | None:
         """The UID to put the king's weight on this round.

@@ -265,6 +265,53 @@ def test_king_synced_detects_trainer_lag(cfg):
     assert diverged.king_synced(_manifest(cfg)) is False
 
 
+def test_resync_step_holds_and_bumps_counter(cfg):
+    # champion chal_hk (uid 1) != trained king king_hk (uid 0): hold the throne,
+    # bump the consecutive-hold counter, keep voting the champion.
+    runner = ValidatorRunner(cfg=cfg, state=genesis("chal_hk", 1), evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    new_state, reason = runner._resync_step(_manifest(cfg))
+    assert new_state.king_hotkey == "chal_hk"          # champion held
+    assert new_state.resync_holds == 1                 # counter bumped
+    assert reason.startswith("king_resyncing")
+
+
+def test_resync_step_safety_valve_demotes_at_cap(cfg):
+    from dataclasses import replace
+
+    from cascade.validator.state import ChampionState
+
+    cfg = replace(cfg, scoring=replace(cfg.scoring, king_resync_max_rounds=5))
+    # One hold short of the cap; the next resync round trips the valve.
+    state = ChampionState(king_hotkey="chal_hk", king_uid=1, tenure_rounds=3, resync_holds=4)
+    runner = ValidatorRunner(cfg=cfg, state=state, evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    new_state, reason = runner._resync_step(_manifest(cfg))
+    # Abandoned the stuck champion; adopted the trainer's trained king (uid 0).
+    assert new_state.king_hotkey == "king_hk"
+    assert new_state.king_uid == 0
+    assert new_state.tenure_rounds == 0
+    assert new_state.resync_holds == 0
+    assert new_state.former_kings == ()                # stuck champion not retired
+    assert reason.startswith("king_resync_demoted")
+
+
+def test_resync_valve_disabled_holds_indefinitely(cfg):
+    from dataclasses import replace
+
+    from cascade.validator.state import ChampionState
+
+    # king_resync_max_rounds <= 0 disables the valve: hold forever, never demote.
+    cfg = replace(cfg, scoring=replace(cfg.scoring, king_resync_max_rounds=0))
+    state = ChampionState(king_hotkey="chal_hk", king_uid=1, resync_holds=99)
+    runner = ValidatorRunner(cfg=cfg, state=state, evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    new_state, reason = runner._resync_step(_manifest(cfg))
+    assert new_state.king_hotkey == "chal_hk"          # still the champion
+    assert new_state.resync_holds == 100
+    assert reason.startswith("king_resyncing")
+
+
 def test_reward_uids_vote_champion_over_manifest_king(cfg):
     import types
 

@@ -399,6 +399,15 @@ class ScoringConfig:
     # ties it with prior kings). E.g. 0.5 gives a 4-king court shares
     # ≈ 0.53/0.27/0.13/0.07.
     king_decay: float = 1.0
+    # King-resync safety valve: max consecutive rounds the validator holds the
+    # throne for a champion whose trained king disagrees (incentive lag). Past
+    # this many holds it abandons the stuck champion and adopts the trainer's
+    # trained king (see cascade.validator.state.demote_to_trained). A champion
+    # with no usable commitment can never re-sync, so an unbounded hold would
+    # wedge the subnet; this bounds recovery. ``<= 0`` disables the valve (hold
+    # indefinitely — the pre-safety-valve behaviour). Normal resync is 1 round,
+    # so the default leaves generous slack before tripping.
+    king_resync_max_rounds: int = 5
     # Public-benchmark no-regression gate (see cascade.eval.koth / .gift_gate):
     # "off" (default) | "shadow" (compute + log, verdict unchanged) | "enforce"
     # (AND into the dethrone decision). ``gift_gate_tolerance`` is the relative
@@ -767,6 +776,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             reward_prior_kings=int(s.get("reward_prior_kings", 0)),
             burn_uid=int(s.get("burn_uid", 0)),
             king_decay=float(s.get("king_decay", 1.0)),
+            king_resync_max_rounds=int(s.get("king_resync_max_rounds", 5)),
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
