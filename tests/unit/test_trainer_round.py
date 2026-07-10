@@ -50,14 +50,14 @@ class _FakeBaseTrainer:
                            metrics={"final_loss": 0.1})
 
 
-def _fake_upload(local_dir, repo, hub=None):
+def _fake_upload(local_dir, repo, hub=None, *, hf_repo=None, hf_token=None):
     return HubUpload(ref=HubRef.parse(REF_OUT), size_bytes=1)
 
 
 def _patch_train_boundaries(monkeypatch):
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
     monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
-    monkeypatch.setattr(loop_mod, "upload_dir_to_hub", _fake_upload)
+    monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 
 def _commit(uid, hotkey, ref, block):

@@ -37,7 +37,7 @@ from ..shared.hippius import (
     S3Store,
     fetch_from_hub,
     publish_manifest,
-    upload_dir_to_hub,
+    upload_dir_to_hub_or_hf,
 )
 from ..shared.manifest import (
     HeatEntrant,
@@ -226,6 +226,21 @@ class TrainerRunner:
             self._hub = HubConfig.from_storage(self.cfg.storage)
         return self._hub
 
+    def _hf_ckpt_repo(self, ckpt_repo: str) -> str | None:
+        """The HuggingFace **model** repo to mirror a checkpoint to when the Hub is
+        down, or ``None`` when no HF fallback is configured (Hub-only).
+
+        Reuses the HF account from ``[storage] hf_backup_repo`` — the same mirror
+        the manifest/receipt store already falls back to; its namespace owns the
+        model repos too — and keeps the Hub repo's basename, so a fallback ref
+        reads ``<hf_ns>/ckpt-r…``. Empty/namespaceless ``hf_backup_repo`` ⇒ no
+        checkpoint fallback, matching the manifest store's own gating."""
+        backup = self.cfg.storage.hf_backup_repo
+        if not backup or "/" not in backup:
+            return None
+        ns = backup.split("/", 1)[0]
+        return f"{ns}/{ckpt_repo.rsplit('/', 1)[-1]}"
+
     def manifest_store(self):
         # HF-backed when [storage] hf_backup_repo is set, else plain S3 — so the
         # trainer's manifest write survives a Hippius S3 outage (writes to HF).
@@ -398,7 +413,12 @@ class TrainerRunner:
         )
 
         ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
-        up = upload_dir_to_hub(result.local_dir, ckpt_repo, self.hub())
+        # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
+        # alive through a Hub outage instead of failing the checkpoint upload).
+        up = upload_dir_to_hub_or_hf(
+            result.local_dir, ckpt_repo, self.hub(),
+            hf_repo=self._hf_ckpt_repo(ckpt_repo),
+        )
         return TrainedEntry(
             miner_hotkey=gen.hotkey,
             miner_uid=gen.uid,

@@ -403,6 +403,45 @@ def upload_dir_to_hf(local_dir: Path | str, repo: str, *, token: str | None = No
     return HubUpload(ref=HubRef(str(repo), f"hf:{oid}"), size_bytes=_dir_size_bytes(d))
 
 
+def upload_dir_to_hub_or_hf(
+    local_dir: Path | str,
+    repo: str,
+    hub: HubConfig | None = None,
+    *,
+    hf_repo: str | None = None,
+    hf_token: str | None = None,
+) -> HubUpload:
+    """Push a folder to the Hippius Hub, mirroring to a HuggingFace **model** repo
+    when the Hub is unreachable — the training path's counterpart to the miner's
+    ``cascade deploy --hf-repo`` escape hatch.
+
+    The Hub is priority-one: its ``sha256:`` OCI digest is content-addressed and
+    is the audit re-derivation anchor, so it is always tried first (with the usual
+    retry/backoff in :func:`upload_dir_to_hub`). Only if that ultimately raises a
+    :class:`StorageError` — a Hub outage, the ``_ensure_config_blob_uploaded``
+    class of failure that otherwise aborts a round — *and* ``hf_repo`` is set do we
+    fall back to :func:`upload_dir_to_hf` and return its ``repo@hf:<sha>`` ref,
+    which the whole downstream (``fetch_from_hub``, ``parse_commit``) already
+    handles. The trade: an ``hf:`` ref pins an immutable revision but is a git
+    commit sha, not a content hash, so a fallback round stays auditable by
+    corpus/contract digest but not by a re-derived checkpoint digest. With no
+    ``hf_repo`` the Hub error propagates unchanged (the prior, Hub-only behaviour),
+    so callers that must not silently mirror off-Hub are unaffected.
+    """
+    try:
+        return upload_dir_to_hub(local_dir, repo, hub)
+    except StorageError as hub_exc:
+        if not hf_repo:
+            raise
+        import logging
+
+        logging.getLogger("cascade.storage").warning(
+            "Hub upload of %s to %s failed (%s); mirroring to HuggingFace %s",
+            local_dir, repo, hub_exc, hf_repo,
+        )
+        return upload_dir_to_hf(local_dir, hf_repo, token=hf_token)
+
+
 def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None) -> Path:
     """Download an immutable Hub (or ``hf:``) snapshot into ``dest_dir``.
 
