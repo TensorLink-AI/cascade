@@ -488,8 +488,7 @@ class ValidatorRunner:
         from datetime import datetime
 
         from ..shared.hippius import (
-            S3Config,
-            S3Store,
+            open_manifest_store,
             publish_receipt,
             update_receipt_index,
         )
@@ -539,9 +538,7 @@ class ValidatorRunner:
             else:
                 log.warning("publishing an UNSIGNED receipt (no wallet) for round=%s",
                             manifest.round_id)
-            store = S3Store(
-                S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket)
-            )
+            store = open_manifest_store(self.cfg.storage)
             key = publish_receipt(store, dump_receipt(receipt), manifest.round_id)
             log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
                      receipt.status, manifest.round_id, receipt.signature is not None,
@@ -572,10 +569,10 @@ class ValidatorRunner:
         """
         import time
 
-        from ..shared.hippius import S3Config, S3Store, read_latest_manifest
+        from ..shared.hippius import open_manifest_store, read_latest_manifest
         from ..shared.manifest import load_manifest
 
-        store = S3Store(S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket))
+        store = open_manifest_store(self.cfg.storage)
         poll = self.cfg.manifest.poll_seconds
         last_round: str | None = None
         while True:

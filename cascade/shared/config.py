@@ -445,6 +445,11 @@ class StorageConfig:
     pool_bucket: str = ""
     pool_s3_endpoint: str = ""
     pool_s3_region: str = ""
+    # HuggingFace-Hub dataset repo used as a manifest/receipt fallback ONLY when
+    # Hippius S3 is down (see cascade.shared.hippius.HFFallbackStore). Empty ⇒
+    # no fallback (plain S3). Make it a PUBLIC dataset so receipts stay auditable
+    # during an outage; auth via HF_TOKEN.
+    hf_backup_repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -783,6 +788,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             pool_bucket=str(st.get("pool_bucket", "")),
             pool_s3_endpoint=str(st.get("pool_s3_endpoint", "")),
             pool_s3_region=str(st.get("pool_s3_region", "")),
+            hf_backup_repo=str(st.get("hf_backup_repo", "")),
         ),
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),

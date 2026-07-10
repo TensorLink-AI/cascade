@@ -334,6 +334,13 @@ pool_bucket      = ""                               # e.g. "cascade-eval-pool"
 # publish/pull the pool there; empty = reuse the Hippius S3 endpoint above.
 pool_s3_endpoint = ""
 pool_s3_region   = ""
+# HuggingFace-Hub dataset used as a manifest/receipt FALLBACK, engaged ONLY when
+# Hippius S3 is unavailable (see cascade.shared.hippius.HFFallbackStore). On the
+# happy path there is zero HF traffic; during a Hippius S3 outage the trainer's
+# manifest write and the validator's read (+ receipt publish) transparently ride
+# the HF mirror so rounds keep completing. Make it a PUBLIC dataset so receipts
+# stay auditable during an outage; auth via HF_TOKEN. Empty = no fallback.
+hf_backup_repo   = ""                               # e.g. "yourorg/cascade-manifests-mirror"
 
 [manifest]
 # The trainer publishes signed training receipts to the manifest S3 bucket

@@ -33,6 +33,7 @@ public, committed file):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -494,6 +495,114 @@ class S3Store:
 
     def get_text(self, key: str) -> str:
         return self.get_bytes(key).decode("utf-8")
+
+
+@dataclass
+class HFFallbackStore:
+    """Hippius S3 primary + a HuggingFace-Hub dataset fallback that engages ONLY
+    when S3 is unavailable.
+
+    Hippius S3 has had degraded windows that 500 the manifest/receipt objects and
+    stall the whole round loop. This wrapper keeps the loop running through such
+    an outage without changing the happy path:
+
+    * **reads** try S3 first, then the HF mirror;
+    * **writes** go to S3 first and, only if S3 fails, land on HF so the object is
+      not lost.
+
+    So when Hippius is healthy there is **zero HF traffic** (no commit spam, no
+    latency), and during a Hippius outage the trainer's manifest write and the
+    validator's read (and receipt publish) both transparently ride the HF mirror
+    — the round completes end-to-end. Duck-types :class:`S3Store` (same
+    ``put_text``/``get_text``/``put_bytes``/``get_bytes``), so it drops into every
+    manifest/receipt call site. Uses a HF **dataset** repo (``hf_backup_repo``);
+    make it public so receipts stay auditable during an outage. Auth: ``HF_TOKEN``.
+    """
+
+    primary: S3Store
+    hf_repo: str
+    _api: object = None
+    _ensured: bool = False
+
+    def _token(self) -> str | None:
+        return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
+
+    def _hf(self):
+        if self._api is None:
+            from huggingface_hub import HfApi
+
+            self._api = HfApi(token=self._token())
+            if not self._ensured:
+                # may already exist / caller lacks create perm — the upload will
+                # surface the real error if the repo is genuinely unusable.
+                with contextlib.suppress(Exception):
+                    self._api.create_repo(self.hf_repo, repo_type="dataset",
+                                          private=False, exist_ok=True)
+                self._ensured = True
+        return self._api
+
+    def _hf_put(self, key: str, data: bytes) -> None:
+        import io
+
+        self._hf().upload_file(
+            path_or_fileobj=io.BytesIO(data), path_in_repo=key,
+            repo_id=self.hf_repo, repo_type="dataset",
+            commit_message=f"cascade S3-fallback: {key}",
+        )
+
+    def _hf_get(self, key: str) -> bytes:
+        from huggingface_hub import hf_hub_download
+
+        # force_download: latest.json changes every round, so never serve a
+        # cached (stale) revision from a prior fetch.
+        path = hf_hub_download(
+            repo_id=self.hf_repo, filename=key, repo_type="dataset",
+            force_download=True, token=self._token(),
+        )
+        return Path(path).read_bytes()
+
+    def put_bytes(self, key: str, data: bytes, *,
+                  content_type: str = "application/octet-stream", acl: str | None = None) -> None:
+        try:
+            self.primary.put_bytes(key, data, content_type=content_type, acl=acl)
+            return
+        except StorageError as e:
+            import logging
+            logging.getLogger("cascade.storage").warning(
+                "S3 put failed for %s (%s); writing HF fallback %s", key, e, self.hf_repo)
+        try:
+            self._hf_put(key, data)
+        except Exception as e:  # noqa: BLE001
+            raise StorageError(f"both S3 and HF put failed for {key}: {e}") from e
+
+    def put_text(self, key: str, text: str, *,
+                 content_type: str = "text/plain", acl: str | None = None) -> None:
+        self.put_bytes(key, text.encode("utf-8"), content_type=content_type, acl=acl)
+
+    def get_bytes(self, key: str) -> bytes:
+        try:
+            return self.primary.get_bytes(key)
+        except StorageError as e:
+            import logging
+            logging.getLogger("cascade.storage").warning(
+                "S3 get failed for %s (%s); reading HF fallback %s", key, e, self.hf_repo)
+        try:
+            return self._hf_get(key)
+        except Exception as e:  # noqa: BLE001
+            raise StorageError(f"both S3 and HF get failed for {key}: {e}") from e
+
+    def get_text(self, key: str) -> str:
+        return self.get_bytes(key).decode("utf-8")
+
+
+def open_manifest_store(storage: object) -> S3Store | HFFallbackStore:
+    """The manifest/receipt bucket store, HF-backed when ``[storage]
+    hf_backup_repo`` is set (else a plain :class:`S3Store` — no behaviour
+    change). Every manifest/receipt call site builds its store through here."""
+    bucket = getattr(storage, "manifest_bucket", "cascade-manifests")
+    s3 = S3Store(S3Config.from_storage(storage, bucket=bucket))
+    repo = getattr(storage, "hf_backup_repo", "") or ""
+    return HFFallbackStore(s3, repo) if repo else s3
 
 
 # ───────────────────────── manifests + logs over S3 ─────────────────────────
