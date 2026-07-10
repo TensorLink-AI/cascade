@@ -148,6 +148,12 @@ class BucketWindowSource:
     snapshot rather than the retired, broken round-id comparison.
     """
 
+    # A snapshot dir carrying this marker was fetched AND sha256-verified in
+    # full on a prior round; its presence licenses offline reuse (below). tar
+    # extraction is not atomic, so an unmarked dir may be a partial unpack and
+    # is never trusted — it is re-fetched.
+    _SNAP_MARKER = ".cascade_snapshot_ok"
+
     def __init__(self, cfg: ChainConfig, store: object, *, cache_dir: Path | str | None = None,
                  max_cached: int = 3) -> None:
         self.cfg = cfg
@@ -155,32 +161,101 @@ class BucketWindowSource:
         self.cache_dir = Path(cache_dir or "./_eval_pool")
         self.max_cached = max_cached
         self._cache: dict[str, RotatingWindowSource] = {}
+        self._index_path = self.cache_dir / "pool-index.json"
 
     def _ensure_snapshot(self, meta) -> RotatingWindowSource:
         src = self._cache.get(meta.sha256)
         if src is not None:
             return src
-        from ..shared.hippius import fetch_pool_snapshot
 
         dest = self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
-        try:
-            fetch_pool_snapshot(self.store, meta, dest)
-        except Exception as e:  # noqa: BLE001
-            raise PoolError(f"snapshot_fetch_failed (block>={meta.effective_block}): {e}") from e
-        src = window_source_from_dir(
-            dest, self.cfg, label=f"snapshot@block-{meta.effective_block}",
-            provenance=(meta.key, meta.sha256),
-        )
+        marker = dest / self._SNAP_MARKER
+        if marker.is_file():
+            # Verified copy already on disk — reuse it without touching S3, so a
+            # restart or a Hippius outage doesn't force a re-download. Selection
+            # is by the index's sha256, so a reused dir is byte-identical to what
+            # a re-fetch would produce: consensus-safe.
+            src = window_source_from_dir(
+                dest, self.cfg, label=f"snapshot@block-{meta.effective_block} (cached)",
+                provenance=(meta.key, meta.sha256),
+            )
+        else:
+            from ..shared.hippius import fetch_pool_snapshot
+
+            try:
+                fetch_pool_snapshot(self.store, meta, dest)
+            except Exception as e:  # noqa: BLE001
+                raise PoolError(
+                    f"snapshot_fetch_failed (block>={meta.effective_block}): {e}"
+                ) from e
+            src = window_source_from_dir(
+                dest, self.cfg, label=f"snapshot@block-{meta.effective_block}",
+                provenance=(meta.key, meta.sha256),
+            )
+            try:  # mark complete only after a full fetch + successful load
+                marker.write_text("ok\n", encoding="utf-8")
+            except OSError as e:
+                log.debug("could not write snapshot marker %s: %s", marker, e)
+
         if len(self._cache) >= self.max_cached:
             self._cache.pop(next(iter(self._cache)))  # evict oldest inserted
         self._cache[meta.sha256] = src
         return src
 
-    def _select(self, block):
-        """The snapshot active for a round at epoch ``block`` (None → newest)."""
-        from ..shared.hippius import read_pool_index, select_snapshot
+    def _persist_index(self, index) -> None:
+        """Mirror the last-good index to disk. When S3 is unreachable, a round can
+        still select the right snapshot from this mirror (the tar itself is served
+        from the on-disk snapshot cache), so an outage doesn't halt scoring."""
+        from dataclasses import asdict
+
+        from ..shared.hippius import POOL_INDEX_SCHEMA
+
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            doc = {"schema": POOL_INDEX_SCHEMA, "snapshots": [asdict(s) for s in index]}
+            self._index_path.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+        except OSError as e:
+            log.debug("could not cache pool index to %s: %s", self._index_path, e)
+
+    def _cached_index(self):
+        from ..shared.hippius import PoolSnapshotMeta
+
+        try:
+            doc = json.loads(self._index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        snaps = [PoolSnapshotMeta.from_dict(s) for s in doc.get("snapshots", [])]
+        return sorted(snaps, key=lambda s: s.effective_block)
+
+    def _read_index(self):
+        """The snapshot index: from S3 when reachable (and mirrored to disk for
+        next time), otherwise the last-good on-disk mirror. ``read_pool_index``
+        already collapses a read failure to an empty list, so an empty result
+        means *either* a genuinely unpublished index *or* an S3 outage — both are
+        handled by falling back to the mirror (empty if there's nothing to reuse).
+        """
+        from ..shared.hippius import read_pool_index
 
         index = read_pool_index(self.store)
+        if index:
+            self._persist_index(index)
+            return index
+        cached = self._cached_index()
+        if cached:
+            log.warning(
+                "S3 pool index unavailable; reusing on-disk cache %s "
+                "(%d snapshot(s), newest effective_block=%d) — rounds continue on "
+                "the last-published pool until S3 recovers",
+                self._index_path, len(cached),
+                max(s.effective_block for s in cached),
+            )
+        return cached
+
+    def _select(self, block):
+        """The snapshot active for a round at epoch ``block`` (None → newest)."""
+        from ..shared.hippius import select_snapshot
+
+        index = self._read_index()
         if not index:
             return None
         if block is None:

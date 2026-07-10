@@ -229,6 +229,78 @@ def test_bucket_source_raises_when_no_snapshot(tmp_path):
         src.windows_for_round(1, 50, block=7200)
 
 
+# ── outage resilience (Hippius S3 down → reuse the on-disk pool cache) ────────
+
+
+class _OutageS3(_FakeS3Store):
+    """A fake store whose reads/writes can be flipped to raise, standing in for
+    a Hippius S3 outage. Publishing happens while ``up``; then ``up=False``."""
+
+    up = True
+
+    def get_bytes(self, key):
+        if not self.up:
+            raise StorageError(f"s3_get_failed: {key}: 500")
+        return super().get_bytes(key)
+
+
+def test_bucket_source_reuses_cache_when_s3_drops_midflight(tmp_path):
+    # A round warms the index + snapshot caches; S3 then goes down. The next
+    # round for the same epoch must still serve windows entirely from disk.
+    store = _OutageS3()
+    publish_pool_snapshot(store, _make_pool_tar(tmp_path, "v1", n=6), effective_block=7200,
+                          as_of="d", n_series=6, context_length=128, horizon=16)
+    src = BucketWindowSource(_cfg_small(), store, cache_dir=tmp_path / "cache")
+    assert len(src.windows_for_round(1, 50, block=8000)) == 6      # warms caches
+
+    store.up = False            # Hippius S3 outage: every GET now 500s
+    src._cache.clear()          # drop in-memory cache to force the disk path
+    assert len(src.windows_for_round(2, 50, block=8000)) == 6      # served from disk
+
+
+def test_bucket_source_survives_restart_during_outage(tmp_path):
+    # A fresh BucketWindowSource (process restart) sharing the same cache_dir
+    # reuses the last-good index + verified snapshot dir while S3 is down.
+    cache = tmp_path / "cache"
+    store = _OutageS3()
+    publish_pool_snapshot(store, _make_pool_tar(tmp_path, "v1", n=7), effective_block=7200,
+                          as_of="d", n_series=7, context_length=128, horizon=16)
+    warm = BucketWindowSource(_cfg_small(), store, cache_dir=cache)
+    warm.windows_for_round(1, 50, block=8000)                     # persist to disk
+
+    store.up = False
+    fresh = BucketWindowSource(_cfg_small(), store, cache_dir=cache)   # simulate restart
+    assert len(fresh.windows_for_round(2, 50, block=8000)) == 7   # all from disk, no S3
+
+
+def test_bucket_source_does_not_trust_unmarked_snapshot_dir(tmp_path):
+    # An unmarked snapshot dir may be a partial/interrupted unpack, so it is
+    # never reused offline — with S3 down and no marker it re-fetches (and fails
+    # loudly) rather than serving a possibly-truncated pool.
+    cache = tmp_path / "cache"
+    store = _OutageS3()
+    meta = publish_pool_snapshot(store, _make_pool_tar(tmp_path, "v1", n=6), effective_block=7200,
+                                 as_of="d", n_series=6, context_length=128, horizon=16)
+    # hand-place the index cache but a marker-less snapshot dir
+    src = BucketWindowSource(_cfg_small(), store, cache_dir=cache)
+    src._persist_index(read_pool_index(store))
+    fetch_pool_snapshot(store, meta, cache / f"snapshot-7200-{meta.sha256[:12]}")
+
+    store.up = False
+    with pytest.raises(Exception, match="snapshot_fetch_failed"):
+        src.windows_for_round(3, 50, block=8000)
+
+
+def test_bucket_source_persists_index_to_disk(tmp_path):
+    store = _OutageS3()
+    publish_pool_snapshot(store, _make_pool_tar(tmp_path, "v1", n=5), effective_block=7200,
+                          as_of="d", n_series=5, context_length=128, horizon=16)
+    src = BucketWindowSource(_cfg_small(), store, cache_dir=tmp_path / "cache")
+    src.windows_for_round(1, 50, block=8000)
+    doc = json.loads((tmp_path / "cache" / "pool-index.json").read_text())
+    assert [s["effective_block"] for s in doc["snapshots"]] == [7200]
+
+
 # ── credential / backend resolution ─────────────────────────────────────────
 
 
