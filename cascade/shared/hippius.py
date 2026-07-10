@@ -286,6 +286,60 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
     return HubUpload(ref=HubRef(str(repo), digest), size_bytes=_dir_size_bytes(d))
 
 
+def upload_dir_to_hf(local_dir: Path | str, repo: str, *, token: str | None = None) -> HubUpload:
+    """Mirror a generator folder to a HuggingFace **model** repo and return its
+    immutable ``repo@hf:<commit_sha>`` ref — a miner's escape hatch for submitting
+    when the Hippius Hub OCI registry is down.
+
+    The whole downstream path already understands ``hf:`` refs: ``fetch_from_hub``
+    snapshot-downloads that exact revision (also a **model** repo, no repo_type),
+    and ``parse_commit`` accepts the ``hf:[0-9a-f]{40}`` digest grammar — so an
+    HF-mirrored submission is trained and audited exactly like a Hub one. Only
+    files matching :data:`ALLOW_PATTERNS` are pushed (the same allow-list the Hub
+    path uses), so the fetched content matches byte-for-byte.
+
+    Caveat vs the Hub: the Hub's ``sha256:`` OCI digest is a *content* hash
+    (identical content ⇒ same digest, the audit re-derivation anchor), whereas an
+    HF ``oid`` is a git commit SHA — it pins an immutable revision but is not
+    content-addressed, so re-uploading identical content yields a *new* ref. It
+    still locates + pins the submission, which is all the chain commit needs.
+    Auth: ``HF_TOKEN`` / ``HUGGINGFACE_API_KEY``.
+    """
+    d = Path(local_dir)
+    if not d.is_dir():
+        raise StorageError(f"not_a_directory: {d}")
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as e:
+        raise StorageError(
+            "huggingface_hub not installed; install the [hippius] extra to mirror to HF"
+        ) from e
+    tok = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
+    if not tok:
+        raise HubAuthError(
+            f"mirroring {d} to HF repo {repo} requires an HF token: set HF_TOKEN "
+            "(or HUGGINGFACE_API_KEY)."
+        )
+    api = HfApi(token=tok)
+    with contextlib.suppress(Exception):  # may already exist / no create perm
+        api.create_repo(str(repo), repo_type="model", private=False, exist_ok=True)
+    info = api.upload_folder(
+        repo_id=str(repo), folder_path=str(d), repo_type="model",
+        allow_patterns=ALLOW_PATTERNS,
+        commit_message=f"cascade generator submission: {d.name}",
+    )
+    oid = str(getattr(info, "oid", "") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        # A short oid / tag won't satisfy DIGEST_RE — resolve main's full sha so
+        # the ref pins an immutable revision the trainer can fetch.
+        with contextlib.suppress(Exception):
+            refs = api.list_repo_refs(str(repo), repo_type="model")
+            oid = next((b.target_commit for b in refs.branches if b.name == "main"), oid)
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise StorageError(f"HF upload returned no usable commit sha: {info!r}")
+    return HubUpload(ref=HubRef(str(repo), f"hf:{oid}"), size_bytes=_dir_size_bytes(d))
+
+
 def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None) -> Path:
     """Download an immutable Hub (or ``hf:``) snapshot into ``dest_dir``.
 
