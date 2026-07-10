@@ -961,7 +961,7 @@ th.num { text-align: right; }
 
   <div>
     <div class="section-label">
-      <span id="chart-label">Skill over rounds — geomean(CRPS · MASE), lower is better</span>
+      <span id="chart-label">Model error over rounds — geomean(CRPS · MASE), lower is better</span>
       <span class="controls">
         <label>Smooth<input type="range" id="smooth" min="0" max="1" step="0.05" value="0"></label>
         <button class="btn" id="chart-mode">Geomean</button>
@@ -994,7 +994,7 @@ th.num { text-align: right; }
   <div>
     <div class="section-label"><span>Rounds</span></div>
     <div class="scroll-box scroll-hist">
-      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King skill</th><th class="num">Chal skill</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
+      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
     </div>
   </div>
 
@@ -1138,8 +1138,8 @@ function renderVerdict(){
   if(r.status==="rejected"){
     cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans)">'+esc(r.reject_reason||"--")+'</span>'));
   } else {
-    cells.push(stat("King skill",fmt(r.king_geomean)));
-    cells.push(stat("Challenger skill",'<span class="'+(r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
+    cells.push(stat("King error (lower better)",fmt(r.king_geomean)));
+    cells.push(stat("Challenger error (lower better)",'<span class="'+(r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
     cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>'));
     cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
     cells.push(stat("Field",(r.n_participants!=null?r.n_participants:"--")+' <span class="sub">entrants</span>'));
@@ -1246,7 +1246,7 @@ document.getElementById("theme-toggle").addEventListener("click",function(){
 document.getElementById("chart-mode").addEventListener("click",function(){
   _chartMode=_chartMode==="geomean"?"lcb":"geomean";
   this.textContent=_chartMode==="geomean"?"Geomean":"LCB/Margin";
-  document.getElementById("chart-label").textContent=_chartMode==="geomean"?"Skill over rounds — geomean(CRPS · MASE), lower is better":"Decision margin over rounds — bootstrap LCB vs win margin";
+  document.getElementById("chart-label").textContent=_chartMode==="geomean"?"Model error over rounds — geomean(CRPS · MASE), lower is better":"Decision margin over rounds — bootstrap LCB vs win margin";
   document.querySelector(".legend").style.visibility=_chartMode==="geomean"?"visible":"hidden";
   renderChart();
 });
