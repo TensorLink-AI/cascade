@@ -95,6 +95,13 @@ export HIPPIUS_HUB_PASSWORD=...
 
 You do **not** need S3 credentials — those are the trainer/validator's.
 
+Optionally, set a HuggingFace token if you want the outage fallback in
+[§5a](#5a-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
+
+```bash
+export HF_TOKEN=hf_...               # only needed for `--hf-repo`
+```
+
 ## 5. Deploy
 
 `cascade deploy` re-verifies locally, pushes the generator to the registry
@@ -112,6 +119,40 @@ cascade deploy ./my-generator \
 
 Re-deploy any time to submit a new version — the latest pre-cutoff commit per
 hotkey is the one that competes.
+
+### 5a. If the Hippius Hub is down
+
+Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
+service from Hippius **S3** (which only the trainer/validator use). If the Hub is
+having an outage, the upload fails with `registry upload failed: …` (exit 4). Pass
+`--hf-repo` to mirror your generator to HuggingFace instead so you can still
+submit:
+
+```bash
+cascade deploy ./my-generator \
+  --chain-toml chain.testnet.toml --network test \
+  --wallet-name my-miner --wallet-hotkey gen1 \
+  --hub-repo my-namespace/my-generator \
+  --hf-repo  my-hf-namespace/my-generator      # fallback, needs HF_TOKEN
+# → Hippius Hub upload failed (…); falling back to HuggingFace mirror …
+#   mirrored to HuggingFace: my-hf-namespace/my-generator@hf:<sha>
+#   committed: metro-v1:gen:hippius:my-hf-namespace/my-generator@hf:<sha>
+```
+
+How it works, and what to know:
+
+- **Hippius is priority one.** The Hub is *always* tried first; HF engages **only**
+  if that push fails. `--hub-repo` is required — you cannot submit straight to HF
+  while the Hub is healthy. (`--hf-repo` alone is refused.)
+- **It's a real submission.** The chain commit records `repo@hf:<sha>`, and the
+  trainer/validators/auditors fetch, train, and score it exactly like a Hub one —
+  the `hf:` ref just tells them to fetch from HuggingFace.
+- **Keep the HF repo public and don't delete it** while that commit is your active
+  submission — the trainer fetches it anonymously, so a private/deleted repo means
+  it can't be evaluated. (A newly-created repo is public by default.)
+- **The commit stays on HF until you replace it.** When the Hub recovers it does
+  *not* auto-migrate — re-deploy with just `--hub-repo` to move your submission back
+  onto the content-addressed Hub (the preferred, audit-anchored form).
 
 ## 6. Confirm it's competing
 
@@ -166,5 +207,6 @@ needed, just Hub read credentials.
 | `blocked_import` | a banned import (`socket`, `subprocess`, `pickle`, …); see `chain.toml [static_guard]` |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
+| `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
 | committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round; or it failed to train (heat drops it) |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape |

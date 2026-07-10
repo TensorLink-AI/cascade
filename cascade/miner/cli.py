@@ -10,9 +10,9 @@
   digest content-addresses your submission, so ``repo@digest`` both locates and
   pins it (no separate git SHA). Requires the ``[chain]`` extra (bittensor) + a
   wallet, and the ``[hippius]`` extra + Hub credentials in the environment.
-  ``--hf-repo <namespace/name>`` mirrors to HuggingFace (``repo@hf:<sha>``) so you
-  can still submit when the Hub is down — passed alongside ``--hub-repo`` it is the
-  automatic fallback; alone it uploads straight to HF. The chain commit and the
+  ``--hf-repo <namespace/name>`` is a HuggingFace fallback (``repo@hf:<sha>``) used
+  ONLY if the Hub push fails — the Hub is always tried first, so a healthy Hippius
+  always wins (you cannot bypass it while it's up). The chain commit and the
   trainer's fetch/audit treat an ``hf:`` ref exactly like a Hub one.
 
 * ``cascade fetch king`` (or a uid / hotkey / ``repo@digest``) — download a
@@ -67,11 +67,10 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--hf-repo",
         default=None,
-        help="A HuggingFace model repo (namespace/name) to mirror to when the Hippius "
-        "Hub is down. If both --hub-repo and --hf-repo are given, the Hub is tried "
-        "first and HF is the automatic fallback; --hf-repo alone uploads straight to "
-        "HF. Needs HF_TOKEN. The resulting repo@hf:<sha> ref trains + audits like a "
-        "Hub one.",
+        help="A HuggingFace model repo (namespace/name) used ONLY as a fallback if the "
+        "Hippius Hub push fails — the Hub is always tried first, so a healthy Hippius "
+        "always wins. Requires --hub-repo. Needs HF_TOKEN. The resulting repo@hf:<sha> "
+        "ref trains + audits like a Hub one.",
     )
     p.add_argument(
         "--ref",
@@ -186,10 +185,11 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _upload_generator(args: argparse.Namespace, cfg) -> tuple[int, str | None]:
-    """Upload the generator and return ``(exit_code, ref)``. Tries the Hippius Hub
-    first (if ``--hub-repo``); on failure, falls back to a HuggingFace mirror (if
-    ``--hf-repo``) so a miner can still submit while the Hub is down. ``--hf-repo``
-    alone uploads straight to HF. Returns ``(0, ref)`` on success, else ``(4, None)``."""
+    """Upload the generator and return ``(exit_code, ref)``. Hippius is priority one:
+    the Hub (``--hub-repo``, required) is ALWAYS tried first, so a healthy Hippius
+    always wins. Only if the Hub push fails does it fall back to a HuggingFace mirror
+    (``--hf-repo``), so a miner can still submit through a Hub outage. Returns
+    ``(0, ref)`` on success, else ``(4, None)``."""
     from ..shared.hippius import (
         HubConfig,
         StorageError,
@@ -197,26 +197,23 @@ def _upload_generator(args: argparse.Namespace, cfg) -> tuple[int, str | None]:
         upload_dir_to_hub,
     )
 
-    hub_err: Exception | None = None
-    if args.hub_repo:
-        try:
-            up = upload_dir_to_hub(args.repo_dir, args.hub_repo, HubConfig.from_storage(cfg.storage))
-            print(f"pushed to Hippius Hub: {up.ref.immutable_ref} ({up.size_bytes} bytes)")
-            return 0, up.ref.immutable_ref
-        except StorageError as e:
-            hub_err = e
-            if not args.hf_repo:
-                print(f"registry upload failed: {e}", file=sys.stderr)
-                return 4, None
-            print(f"Hippius Hub upload failed ({e});\n"
-                  f"  falling back to HuggingFace mirror {args.hf_repo}", file=sys.stderr)
+    try:
+        up = upload_dir_to_hub(args.repo_dir, args.hub_repo, HubConfig.from_storage(cfg.storage))
+        print(f"pushed to Hippius Hub: {up.ref.immutable_ref} ({up.size_bytes} bytes)")
+        return 0, up.ref.immutable_ref
+    except StorageError as e:
+        hub_err = str(e)  # bind now — the `as` name is cleared at except-block exit
+        if not args.hf_repo:
+            print(f"registry upload failed: {e}", file=sys.stderr)
+            return 4, None
+        print(f"Hippius Hub upload failed ({e});\n"
+              f"  falling back to HuggingFace mirror {args.hf_repo}", file=sys.stderr)
 
-    # --hf-repo path (chosen directly, or as the Hub fallback above)
     try:
         up = upload_dir_to_hf(args.repo_dir, args.hf_repo)
     except StorageError as e:
-        extra = f" (Hub also failed: {hub_err})" if hub_err else ""
-        print(f"HuggingFace mirror upload failed: {e}{extra}", file=sys.stderr)
+        print(f"HuggingFace mirror upload failed: {e} (Hub also failed: {hub_err})",
+              file=sys.stderr)
         return 4, None
     print(f"mirrored to HuggingFace: {up.ref.immutable_ref} ({up.size_bytes} bytes)")
     return 0, up.ref.immutable_ref
@@ -227,10 +224,11 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 
     ref = args.ref
     if ref is None:
-        if not args.hub_repo and not args.hf_repo:
-            print("error: pass --hub-repo (Hippius Hub) and/or --hf-repo (HuggingFace "
-                  "mirror, for when the Hub is down) to upload — or --ref to commit an "
-                  "already-uploaded ref.", file=sys.stderr)
+        if not args.hub_repo:
+            print("error: --hub-repo (Hippius Hub) is required to upload — it is always "
+                  "tried first. --hf-repo is only a fallback for when the Hub push fails; "
+                  "pass it alongside --hub-repo. Or use --ref to commit an already-"
+                  "uploaded ref.", file=sys.stderr)
             return 2
         # Verify locally (cheaper than burning a chain commit), then upload.
         if not args.skip_verify:

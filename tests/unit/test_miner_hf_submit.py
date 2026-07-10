@@ -163,13 +163,11 @@ def test_dispatch_hub_fail_without_hf_errors(monkeypatch, cfg):
     assert rc == 4 and ref is None
 
 
-def test_dispatch_hf_only_bypasses_hub(monkeypatch, cfg):
-    import cascade.shared.hippius as hip
-
-    def _boom_hub(*a, **k):
-        raise AssertionError("Hub must not be touched when only --hf-repo is given")
-
-    monkeypatch.setattr(hip, "upload_dir_to_hub", _boom_hub)
-    monkeypatch.setattr(hip, "upload_dir_to_hf", lambda rd, repo: _hf_up(repo, sha="cc"))
-    rc, ref = cli._upload_generator(_args(hf_repo="me/hf"), cfg)
-    assert rc == 0 and ref == "me/hf@hf:" + "cc" * 20
+def test_deploy_rejects_hf_only_hippius_is_priority_one(monkeypatch, cfg, capsys):
+    # Hippius priority one: a miner CANNOT submit straight to HF. --hub-repo is
+    # required (always tried first); --hf-repo alone is refused before any upload.
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    args = types.SimpleNamespace(ref=None, hub_repo=None, hf_repo="me/hf", chain_toml=None)
+    rc = cli._cmd_deploy(args)
+    assert rc == 2
+    assert "--hub-repo" in capsys.readouterr().err
