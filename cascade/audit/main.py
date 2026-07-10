@@ -84,8 +84,7 @@ def fetch_receipt_text(cfg, round_id: str | None) -> str:
     """The receipt JSON for ``round_id`` (None ⇒ latest), anonymous-first."""
     from ..shared.hippius import (
         RECEIPT_LATEST_KEY,
-        S3Config,
-        S3Store,
+        open_manifest_store,
         receipt_round_key,
     )
 
@@ -97,7 +96,9 @@ def fetch_receipt_text(cfg, round_id: str | None) -> str:
             f"boto3 unavailable ({e}); install the [hippius] extra or pass --receipt FILE"
         ) from e
     except Exception as anon_err:  # noqa: BLE001 — fall back to credentials if present
-        store = S3Store(S3Config.from_storage(cfg.storage, bucket=cfg.storage.manifest_bucket))
+        # HF-backed store when [storage] hf_backup_repo is set, so an auditor can
+        # still fetch the receipt during a Hippius S3 outage.
+        store = open_manifest_store(cfg.storage)
         try:
             return store.get_text(key)
         except Exception as cred_err:  # noqa: BLE001

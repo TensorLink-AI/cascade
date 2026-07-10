@@ -238,10 +238,9 @@ def _resolve_effective_block(args: argparse.Namespace, cfg) -> int:
     must never be used for ordering."""
     if args.effective_block != "auto":
         return int(args.effective_block)
-    from ..shared.hippius import S3Config, S3Store, read_latest_manifest
+    from ..shared.hippius import open_manifest_store, read_latest_manifest
     from ..shared.manifest import load_manifest
-
-    store = S3Store(S3Config.from_storage(cfg.storage, bucket=cfg.storage.manifest_bucket))
+    store = open_manifest_store(cfg.storage)
     manifest = load_manifest(read_latest_manifest(store))
     epoch_blocks = max(1, cfg.round.epoch_blocks)
     epoch_start = (int(manifest.created_block) // epoch_blocks) * epoch_blocks

@@ -210,11 +210,13 @@ class TrainerRunner:
             self._hub = HubConfig.from_storage(self.cfg.storage)
         return self._hub
 
-    def manifest_store(self) -> S3Store:
+    def manifest_store(self):
+        # HF-backed when [storage] hf_backup_repo is set, else plain S3 — so the
+        # trainer's manifest write survives a Hippius S3 outage (writes to HF).
         if self._manifest_store is None:
-            self._manifest_store = S3Store(
-                S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket)
-            )
+            from ..shared.hippius import open_manifest_store
+
+            self._manifest_store = open_manifest_store(self.cfg.storage)
         return self._manifest_store
 
     def logs_store(self) -> S3Store:
