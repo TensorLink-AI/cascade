@@ -242,6 +242,11 @@ dethrone_cp          = 1         # consecutive round wins to take the throne (1 
 # Set reward_prior_kings = 0 for pure winner-take-all on the current king.
 reward_prior_kings   = 4         # prior distinct kings that share weight with the current king
 burn_uid             = 0         # weight sink when no rewarded king is registered (owner burn slot)
+king_decay           = 1.0       # geometric decay of reward across [king, prior kings]:
+                                 # king ∝ 1, next ∝ king_decay, next ∝ king_decay², … (normalised).
+                                 # 1.0 = flat equal split; <1 skews to the current king so it is
+                                 # unambiguously highest-incentive (a flat split ties it with prior
+                                 # kings, which the trainer cannot then distinguish). e.g. 0.5.
 # Public-benchmark no-regression gate (see cascade.eval.gift_gate). AND-ed with
 # the private-pool decision on a win: it can BLOCK a dethrone if the challenger
 # regressed on broad public data (GIFT-Eval), but can never grant one. Start on

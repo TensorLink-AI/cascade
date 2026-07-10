@@ -732,14 +732,16 @@ class ValidatorRunner:
         an empty ``reward_uids`` burns to ``burn_uid`` so emission still leaves the
         network. A failed extrinsic is logged and retried next round (the empty
         vector is recorded truthfully in the receipt)."""
-        from ..shared.chain import equal_share_vector
+        from ..shared.chain import decayed_share_vector
 
+        decay = self.cfg.scoring.king_decay
         try:
             n_uids = client.n_uids()  # type: ignore[attr-defined]
             client.set_equal_share_weights(  # type: ignore[attr-defined]
-                reward_uids, n_uids, burn_uid=self.cfg.scoring.burn_uid,
+                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid,
             )
-            vec = tuple(equal_share_vector(reward_uids, n_uids, burn_uid=self.cfg.scoring.burn_uid))
+            vec = tuple(decayed_share_vector(
+                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid))
             log.info("round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
                      round_id, reward_uids or [self.cfg.scoring.burn_uid], n_uids,
                      self.cfg.scoring.burn_uid)
