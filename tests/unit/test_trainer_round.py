@@ -174,6 +174,33 @@ def test_run_round_cutoff_excludes_late_commits(cfg, tmp_path, monkeypatch):
     assert manifest.entries_for_role("challenger") == []
 
 
+def test_run_round_king_is_cutoff_exempt(cfg, tmp_path, monkeypatch):
+    # The reigning king 'a' re-committed at block 100 (AT/AFTER the epoch boundary
+    # 50); challenger 'b' is pre-cutoff. The king is exempt from the submission
+    # cutoff — it must still be trained AS king, never silently replaced by the
+    # challenger (which would make the validator reject the round king_resyncing).
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 100), _commit(1, "b", REF_B, 5)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=110, cutoff_block=50)
+    assert manifest.entry_for_role("king").gen_ref == REF_A          # king kept, not swapped
+    assert [e.gen_ref for e in manifest.entries_for_role("challenger")] == [REF_B]
+
+
+def test_plan_round_never_silently_swaps_a_named_champion():
+    from cascade.trainer.loop import ResolvedGenerator, plan_round
+
+    field = [ResolvedGenerator(hotkey="b", uid=1, ref=REF_B)]
+    # champion 'a' named + resolved cutoff-exempt, absent from the challenger field
+    king_a = ResolvedGenerator(hotkey="a", uid=0, ref=REF_A)
+    plan = plan_round(field, "a", king=king_a)
+    assert plan.king.hotkey == "a"                       # champion wins
+    assert [c.hotkey for c in plan.challengers] == ["b"]
+    # genesis (no champion named) still promotes the lowest-UID interim king
+    assert plan_round(field, None).king.hotkey == "b"
+
+
 def test_resolve_commitments_cutoff_is_strict_and_latest_eligible_wins():
     # b re-deploys: REF_B at block 5 (eligible) then REF_C at block 60 (late).
     commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 5), _commit(1, "b", REF_C, 60)]
