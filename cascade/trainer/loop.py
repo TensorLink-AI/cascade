@@ -128,13 +128,19 @@ def resolve_commitments(
 def plan_round(
     resolved: list[ResolvedGenerator],
     king_hotkey: str | None,
+    *,
+    king: ResolvedGenerator | None = None,
 ) -> RoundPlan:
     """Split the field into the king and the challengers.
 
-    ``king_hotkey`` is the reigning champion. When it is None or not present in
-    the field (genesis, or the king deregistered), the lowest-UID resolved
-    generator is promoted to interim king so there is always something to compare
-    against. Challengers are returned in a stable order (by UID).
+    ``king_hotkey`` is the reigning champion. ``king`` is its pre-resolved
+    generator (resolved cutoff-exempt by the caller, since the reigning king is
+    not a fresh submission); when omitted it is looked up in ``resolved`` by
+    hotkey. Only when there is **no champion at all** (genesis) is the lowest-UID
+    generator promoted to interim king. A champion that is named but has no
+    resolvable commitment is a loud warning, not a silent swap — silently training
+    a different king would make the validator reject every round `king_resyncing`.
+    Challengers are returned in a stable order (by UID).
 
     Two cheap anti-duplicate filters run here, before any generator is fetched or
     trained (a round is ~3h of GPU per generator):
@@ -149,9 +155,17 @@ def plan_round(
       only the first (lowest UID) is kept; the others would be identical runs.
     """
     by_hotkey = {rg.hotkey: rg for rg in resolved}
-    king = by_hotkey.get(king_hotkey) if king_hotkey else None
+    if king is None and king_hotkey:
+        king = by_hotkey.get(king_hotkey)
     field_ = sorted(resolved, key=lambda r: r.uid)
     if king is None:
+        if king_hotkey:
+            # A champion exists but we couldn't resolve its generator — never
+            # silently crown a challenger in its place (that orphans the throne
+            # and the validator rejects the round). Genesis (no champion) is the
+            # only case where promoting the lowest UID is correct.
+            log.warning("reigning king %s has no resolvable commitment; "
+                        "falling back to interim king (validator may hold)", king_hotkey[:12])
         king = field_[0] if field_ else None
     king_ref = king.ref if king is not None else None
 
@@ -425,7 +439,19 @@ class TrainerRunner:
         configured. A king failure at any size aborts the round.
         """
         resolved = resolve_commitments(commitments, cutoff_block=cutoff_block)
-        plan = plan_round(resolved, king_hotkey)
+        # The reigning king is NOT a new submission — it already holds the throne,
+        # so it is exempt from the challenger submission cutoff. Resolve it from the
+        # FULL commitment set: a champion that (re-)committed at/after the epoch
+        # boundary must still be trained AS king, not silently replaced by a
+        # challenger. Training the wrong king makes the validator (whose champion
+        # this is) reject the round `king_resyncing` until they re-converge.
+        king_rg = None
+        if king_hotkey is not None:
+            king_rg = next(
+                (rg for rg in resolve_commitments(commitments) if rg.hotkey == king_hotkey),
+                None,
+            )
+        plan = plan_round(resolved, king_hotkey, king=king_rg)
         if plan.king is None:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
