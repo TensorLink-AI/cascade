@@ -21,10 +21,13 @@ reach it.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from .config import ChainConfig
+
+log = logging.getLogger("cascade.chain")
 
 
 class ChainError(RuntimeError):
@@ -295,7 +298,14 @@ class ChainClient:
             try:
                 revealed = get_revealed(self.netuid) or {}
             except Exception as e:  # noqa: BLE001
-                raise ChainError(f"get_all_revealed_commitments_failed: {e}") from e
+                # One miner's malformed (non-hex) revealed commitment makes
+                # bittensor's BATCH decoder raise for the WHOLE netuid — which
+                # would blind the trainer to every other miner's submission (a
+                # field-wide DoS from a single bad commit). Fall back to a
+                # per-UID decode that skips only the undecodable entry.
+                log.warning("bulk revealed-commitment decode failed (%s); "
+                            "falling back to per-UID decode", e)
+                return self._revealed_per_uid(sub, meta, coldkeys)
             for hotkey, reveals in revealed.items():
                 uid = uid_by_hotkey.get(str(hotkey))
                 if uid is None or not reveals:
@@ -315,10 +325,36 @@ class ChainClient:
                 )
             return out
 
-        # Fallback: plain per-UID commitment store (older bittensor).
+        # No bulk API (older bittensor): decode per-UID.
+        return self._revealed_per_uid(sub, meta, coldkeys)
+
+    def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None) -> list[Commitment]:
+        """Decode each UID's revealed commitment individually — robust to a single
+        malformed entry that would poison bittensor's batch decoder.
+
+        Prefers the per-UID *revealed* store (``get_revealed_commitment``, the
+        timelock reveal path miners actually write to); falls back to the plain
+        commitment store (``get_commitment``) on older builds. An entry that won't
+        decode is skipped with a warning, never fatal — so one garbage commitment
+        costs exactly that one UID, not the whole field."""
+        per_uid = getattr(sub, "get_revealed_commitment", None)
+        out: list[Commitment] = []
         for uid in range(int(meta.n)):
             hotkey = str(meta.hotkeys[uid])
             coldkey = str(coldkeys[uid]) if coldkeys else None
+            if per_uid is not None:
+                try:
+                    reveals = per_uid(self.netuid, uid)
+                except Exception as e:  # noqa: BLE001 — skip only this bad entry
+                    log.warning("skipping uid %d: revealed-commitment decode failed: %s", uid, e)
+                    continue
+                if reveals:
+                    block, payload = max(reveals, key=lambda r: int(r[0]))
+                    if isinstance(payload, str) and payload:
+                        out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
+                                              payload=payload, commit_block=int(block)))
+                    continue
+            # Last resort: the plain commitment store (older bittensor).
             try:
                 rec = sub.get_commitment(netuid=self.netuid, uid=uid)
             except Exception:  # noqa: BLE001
@@ -328,15 +364,8 @@ class ChainClient:
             payload, commit_block = _split_commitment(rec)
             if payload is None:
                 continue
-            out.append(
-                Commitment(
-                    uid=uid,
-                    hotkey=hotkey,
-                    coldkey=coldkey,
-                    payload=payload,
-                    commit_block=int(commit_block),
-                )
-            )
+            out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
+                                  payload=payload, commit_block=int(commit_block)))
         return out
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
