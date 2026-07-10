@@ -129,6 +129,65 @@ def test_retry_hub_op_passes_auth_error_through_unretried():
     assert calls["n"] == 1
 
 
+def test_hub_op_timeout_env_overrides_and_disables(monkeypatch):
+    monkeypatch.delenv(hippius.HUB_OP_TIMEOUT_ENV, raising=False)
+    assert hippius._hub_op_timeout() == hippius.HUB_OP_TIMEOUT_DEFAULT_S  # unset ⇒ default
+    monkeypatch.setenv(hippius.HUB_OP_TIMEOUT_ENV, "30")
+    assert hippius._hub_op_timeout() == 30.0
+    monkeypatch.setenv(hippius.HUB_OP_TIMEOUT_ENV, "0")
+    assert hippius._hub_op_timeout() is None  # <= 0 disables the watchdog
+    monkeypatch.setenv(hippius.HUB_OP_TIMEOUT_ENV, "-5")
+    assert hippius._hub_op_timeout() is None
+    monkeypatch.setenv(hippius.HUB_OP_TIMEOUT_ENV, "not-a-number")
+    assert hippius._hub_op_timeout() == hippius.HUB_OP_TIMEOUT_DEFAULT_S  # malformed ⇒ default
+
+
+def test_run_with_timeout_returns_value_and_runs_inline_when_unbounded():
+    assert hippius._run_with_timeout(lambda: 42, 5.0) == 42
+    assert hippius._run_with_timeout(lambda: 7, None) == 7  # None ⇒ inline, no watchdog
+
+
+def test_run_with_timeout_propagates_op_error():
+    def boom():
+        raise RuntimeError("kaboom")
+
+    with pytest.raises(RuntimeError, match="kaboom"):
+        hippius._run_with_timeout(boom, 5.0)
+
+
+def test_run_with_timeout_abandons_a_hung_op():
+    import threading
+
+    never = threading.Event()  # never set ⇒ the op blocks until the watchdog fires
+    try:
+        with pytest.raises(TimeoutError, match="never responded"):
+            hippius._run_with_timeout(never.wait, 0.05)
+    finally:
+        never.set()  # release the daemon worker so it can exit cleanly
+
+
+def test_retry_hub_op_retries_a_hung_op_then_gives_up():
+    # The exact production symptom: the Hub op never returns AND never raises.
+    # The watchdog converts each hang into a retryable TimeoutError, so the loop
+    # retries `attempts` times and then surfaces a StorageError (rather than
+    # blocking forever, which would strand `cascade deploy`'s HF fallback).
+    import threading
+
+    never = threading.Event()
+    slept: list[float] = []
+    try:
+        with pytest.raises(hippius.StorageError) as ei:
+            hippius._retry_hub_op(
+                never.wait, "upload of ./gen to alice/gen",
+                attempts=2, sleep=slept.append, op_timeout=0.05,
+            )
+    finally:
+        never.set()
+    assert "after 2 attempt(s)" in str(ei.value)
+    assert "exceeded" in str(ei.value).lower()  # the TimeoutError text is carried through
+    assert slept == [2.0]  # one exponential backoff between the two bounded attempts
+
+
 class _FakeS3Store:
     """In-memory stand-in for S3Store (same put_text/get_text surface)."""
 

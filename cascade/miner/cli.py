@@ -73,9 +73,11 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
         "--hf-repo",
         default=None,
         help="A HuggingFace model repo (namespace/name) used ONLY as a fallback if the "
-        "Hippius Hub push fails — the Hub is always tried first, so a healthy Hippius "
-        "always wins. Requires --hub-repo. Needs HF_TOKEN. The resulting repo@hf:<sha> "
-        "ref trains + audits like a Hub one.",
+        "Hippius Hub push fails or hangs — the Hub is always tried first, so a healthy "
+        "Hippius always wins. A Hub op that stalls indefinitely is bounded by a "
+        "wall-clock timeout (HIPPIUS_HUB_TIMEOUT_S, default 600s) so it fails over "
+        "instead of wedging. Requires --hub-repo. Needs HF_TOKEN. The resulting "
+        "repo@hf:<sha> ref trains + audits like a Hub one.",
     )
     p.add_argument(
         "--ref",

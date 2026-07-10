@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import tarfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -269,6 +270,73 @@ def _dir_size_bytes(local_dir: Path | str) -> int:
 HUB_MAX_ATTEMPTS = 4
 HUB_BACKOFF_BASE_S = 2.0
 
+# A worse failure than a *raised* timeout is a Hub op that hangs FOREVER: the
+# server accepts the request (TLS completes, the body is sent) and then never
+# answers — observed in the wild on the blob-upload-initiate POST
+# (``POST /v2/<repo>/blobs/uploads/``). ``hippius_hub``'s compiled client can sit
+# in that read past any library deadline, so ``op()`` never returns and never
+# raises: the retry loop below never sees an exception (so it never retries) and
+# ``cascade deploy``'s ``--hf-repo`` fallback never engages (it triggers on a
+# raised StorageError). The miner is wedged indefinitely. Bound each attempt with
+# a wall-clock watchdog so an indefinite hang becomes a retryable ``TimeoutError``
+# — retries kick in and, once exhausted, the caller's fallback path runs. The
+# default is generous (a legit push of a code+weights generator finishes well
+# within it); override with ``HIPPIUS_HUB_TIMEOUT_S``, or set it <= 0 to disable
+# (e.g. a very large upload on a slow link).
+HUB_OP_TIMEOUT_ENV = "HIPPIUS_HUB_TIMEOUT_S"
+HUB_OP_TIMEOUT_DEFAULT_S = 600.0
+
+
+def _hub_op_timeout() -> float | None:
+    """The per-attempt Hub wall-clock bound in seconds, or ``None`` if disabled.
+
+    Reads ``HIPPIUS_HUB_TIMEOUT_S`` (a malformed value falls back to the default);
+    a value <= 0 disables the watchdog and runs the op inline, unbounded.
+    """
+    raw = (os.environ.get(HUB_OP_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return HUB_OP_TIMEOUT_DEFAULT_S
+    try:
+        val = float(raw)
+    except ValueError:
+        return HUB_OP_TIMEOUT_DEFAULT_S
+    return val if val > 0 else None
+
+
+def _run_with_timeout(op, timeout_s: float | None):
+    """Run blocking ``op`` under a wall-clock watchdog, raising ``TimeoutError`` if
+    it does not finish within ``timeout_s``. ``None`` runs ``op`` inline (unbounded).
+
+    ``hippius_hub`` is a compiled extension whose network read can hang past any
+    library-level deadline, so a Python-side watchdog is the only backend-agnostic
+    way to bound it. The op runs in a daemon thread; on timeout that thread is
+    abandoned (a daemon never blocks process exit) — acceptable because the caller
+    is about to retry or fall back and then exit. ``op``'s own exception is
+    re-raised on the calling thread unchanged.
+    """
+    if timeout_s is None:
+        return op()
+    box: dict = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            box["value"] = op()
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the caller thread
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_runner, name="hippius-hub-op", daemon=True).start()
+    if not done.wait(timeout_s):
+        raise TimeoutError(
+            f"Hippius Hub operation exceeded {timeout_s:.0f}s and was abandoned "
+            "(server accepted the request but never responded)"
+        )
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
 # Substrings (lower-cased) that mark a Hub error as a transient network blip
 # worth retrying. reqwest/requests timeouts surface as "read operation timed
 # out" / "read timed out"; 5xx are the registry itself being briefly unhappy.
@@ -298,17 +366,22 @@ def _is_retryable_hub_error(exc: BaseException) -> bool:
 
 
 def _retry_hub_op(op, what: str, *, attempts: int = HUB_MAX_ATTEMPTS,
-                  base_delay: float = HUB_BACKOFF_BASE_S, sleep=time.sleep):
+                  base_delay: float = HUB_BACKOFF_BASE_S, sleep=time.sleep,
+                  op_timeout: float | None = None):
     """Run ``op`` (a Hub upload/download), retrying transient network failures.
 
     Backs off exponentially (``base_delay`` × 2ⁿ) between attempts. A
     non-retryable error (auth, bad ref) is re-raised immediately; exhausting the
     retries raises a :class:`StorageError` that names ``what`` and the last cause.
+
+    ``op_timeout`` (seconds) bounds each attempt via :func:`_run_with_timeout`, so
+    a Hub op that hangs indefinitely surfaces as a retryable ``TimeoutError``
+    rather than blocking forever; ``None`` runs each attempt unbounded.
     """
     last_exc: BaseException | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return op()
+            return _run_with_timeout(op, op_timeout)
         except StorageError:
             raise  # our own validation errors (auth, bad digest) are deterministic
         except Exception as exc:  # noqa: BLE001 — classify below, re-raise if permanent
@@ -342,6 +415,7 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
             repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
         ),
         f"upload of {d} to {repo}",
+        op_timeout=_hub_op_timeout(),
     )
     digest = str(getattr(result, "oid", "") or "")
     if not DIGEST_RE.match(digest):
@@ -440,6 +514,7 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
                 allow_patterns=ALLOW_PATTERNS, token=hub_token,
             ),
             f"fetch of {ref.immutable_ref}",
+            op_timeout=_hub_op_timeout(),
         )
     return Path(path)
 
