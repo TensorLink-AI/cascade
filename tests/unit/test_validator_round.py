@@ -230,19 +230,53 @@ def test_reward_uids_empty_when_no_king(cfg):
     assert runner._reward_uids(empty, None, client) == []
 
 
-def test_vote_prefers_manifest_king_without_dethrone(cfg):
+def test_vote_bootstraps_from_manifest_king_without_champion(cfg):
+    # No champion yet (fresh validator) ⇒ bootstrap on the manifest king (uid 0).
     runner = ValidatorRunner(cfg=cfg, evaluate_fn=lambda e, w: [], verify_signatures=False)
-    # No outcome (e.g. king-only round) ⇒ keep voting the manifest's king (uid 0).
-    assert runner._king_uid_to_vote(_manifest(cfg), None) == 0
+    assert runner.state.king_hotkey is None
+    assert runner._king_uid_to_vote(_manifest(cfg)) == 0
 
 
-def test_vote_switches_to_new_king_on_dethrone(cfg):
+def test_vote_is_the_champion_not_the_manifest_king(cfg):
+    # THE FIX: the validator votes its champion state king, NOT the (possibly
+    # lagging) king the trainer trained — so a dethrone sticks.
     import types
 
+    # champion is chal_hk (uid 1); the manifest king is king_hk (uid 0)
     runner = ValidatorRunner(cfg=cfg, state=genesis("chal_hk", 1), evaluate_fn=lambda e, w: [],
                              verify_signatures=False)
-    dethroned = types.SimpleNamespace(transition=types.SimpleNamespace(dethroned=True))
-    assert runner._king_uid_to_vote(_manifest(cfg), dethroned) == 1  # state's (new) king
+    assert runner._king_uid_to_vote(_manifest(cfg)) == 1              # champion, not uid 0
+    # champion hotkey is resolved to its CURRENT uid via the metagraph
+    client = types.SimpleNamespace(uid_for_hotkey=lambda hk: {"chal_hk": 7}.get(hk))
+    assert runner._king_uid_to_vote(_manifest(cfg), client=client) == 7
+
+
+def test_king_synced_detects_trainer_lag(cfg):
+    # fresh validator (no champion) is trivially synced (bootstrap)
+    fresh = ValidatorRunner(cfg=cfg, evaluate_fn=lambda e, w: [], verify_signatures=False)
+    assert fresh.king_synced(_manifest(cfg)) is True
+    # champion == trained king ⇒ synced
+    synced = ValidatorRunner(cfg=cfg, state=genesis("king_hk", 0), evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    assert synced.king_synced(_manifest(cfg)) is True
+    # champion != trained king (the divergence bug) ⇒ NOT synced
+    diverged = ValidatorRunner(cfg=cfg, state=genesis("chal_hk", 1), evaluate_fn=lambda e, w: [],
+                               verify_signatures=False)
+    assert diverged.king_synced(_manifest(cfg)) is False
+
+
+def test_reward_uids_vote_champion_over_manifest_king(cfg):
+    import types
+
+    from cascade.validator.state import ChampionState
+
+    # champion chal_hk (dethroned uid 1) while the trainer still trains king_hk
+    # (uid 0); the reward must go to the champion, not the manifest king.
+    state = ChampionState(king_hotkey="chal_hk", king_uid=1)
+    runner = ValidatorRunner(cfg=cfg, state=state, evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    client = types.SimpleNamespace(uid_for_hotkey=lambda hk: {"chal_hk": 1}.get(hk))
+    assert runner._reward_uids(_manifest(cfg), None, client) == [1]   # not [0]
 
 
 # ── public-benchmark gate wiring ───────────────────────────────────────────────

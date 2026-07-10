@@ -391,6 +391,14 @@ class ScoringConfig:
     # reproduces pure winner-take-all. Defaults keep older chain.toml loadable.
     reward_prior_kings: int = 0
     burn_uid: int = 0
+    # Geometric decay of the reward across [current king, prior kings by recency]:
+    # the king gets a share ∝ 1, the next ∝ king_decay, the next ∝ king_decay²,
+    # … normalised. ``king_decay = 1.0`` is the flat equal split (back-compat);
+    # ``< 1`` skews to the current king so it is unambiguously the highest-
+    # incentive UID (which is how the trainer identifies the king — a flat split
+    # ties it with prior kings). E.g. 0.5 gives a 4-king court shares
+    # ≈ 0.53/0.27/0.13/0.07.
+    king_decay: float = 1.0
     # Public-benchmark no-regression gate (see cascade.eval.koth / .gift_gate):
     # "off" (default) | "shadow" (compute + log, verdict unchanged) | "enforce"
     # (AND into the dethrone decision). ``gift_gate_tolerance`` is the relative
@@ -753,6 +761,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             min_clusters=int(s.get("min_clusters", 0)),
             reward_prior_kings=int(s.get("reward_prior_kings", 0)),
             burn_uid=int(s.get("burn_uid", 0)),
+            king_decay=float(s.get("king_decay", 1.0)),
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),

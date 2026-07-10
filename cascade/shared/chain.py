@@ -31,26 +31,55 @@ class ChainError(RuntimeError):
     """Wraps any bittensor exception so callers don't import bittensor."""
 
 
-def equal_share_vector(
-    reward_uids: list[int], n_uids: int, *, burn_uid: int = 0
+def decayed_share_vector(
+    reward_uids: list[int], n_uids: int, *, decay: float = 1.0, burn_uid: int = 0
 ) -> list[float]:
-    """Build a length-``n_uids`` weight vector that splits 1.0 equally across the
-    distinct, in-range ``reward_uids``. With no valid reward UID, all weight goes
-    to ``burn_uid``. Pure (no chain I/O) so the routing math is unit-testable.
+    """Length-``n_uids`` weight vector with **geometric decay** across
+    ``reward_uids`` in order.
+
+    ``reward_uids`` is ordered *current king first, then former kings by
+    recency*. Share is ``decay**i`` for the i-th entry, normalised to sum 1: the
+    king gets the largest slice, each older king progressively less. ``decay =
+    1.0`` reproduces the equal split; ``0 < decay < 1`` skews toward the current
+    king (so it is unambiguously the highest-incentive UID, which is how the
+    trainer identifies the king). With no valid reward UID all weight burns to
+    ``burn_uid``.
+
+    Order is preserved (unlike a set): the first occurrence of each in-range UID
+    wins its slot, so the current king keeps the top share even if it also
+    appears later as a former king. Pure (no chain I/O) — unit-testable.
     """
     if n_uids <= 0:
         raise ChainError(f"n_uids must be positive, got {n_uids}")
-    uniq = sorted({u for u in reward_uids if 0 <= u < n_uids})
+    if not (0.0 < decay <= 1.0):
+        raise ChainError(f"decay must be in (0, 1], got {decay}")
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for u in reward_uids:
+        if 0 <= u < n_uids and u not in seen:
+            seen.add(u)
+            ordered.append(u)
     weights = [0.0] * n_uids
-    if uniq:
-        share = 1.0 / len(uniq)
-        for u in uniq:
-            weights[u] = share
-    else:
+    if not ordered:
         if not (0 <= burn_uid < n_uids):
             raise ChainError(f"burn_uid {burn_uid} out of range [0,{n_uids})")
         weights[burn_uid] = 1.0
+        return weights
+    raw = [decay ** i for i in range(len(ordered))]
+    total = sum(raw)
+    for u, w in zip(ordered, raw, strict=True):
+        weights[u] = w / total
     return weights
+
+
+def equal_share_vector(
+    reward_uids: list[int], n_uids: int, *, burn_uid: int = 0
+) -> list[float]:
+    """Equal split across the distinct, in-range ``reward_uids`` (burns to
+    ``burn_uid`` if none). The ``decay = 1.0`` case of
+    :func:`decayed_share_vector`, kept as a named helper for the winner-take-all
+    path and back-compat."""
+    return decayed_share_vector(reward_uids, n_uids, decay=1.0, burn_uid=burn_uid)
 
 
 def seed_from_block_hash(block_hash: str) -> int:
@@ -331,17 +360,18 @@ class ChainClient:
         self._set_weights(equal_share_vector([champion_uid], n_uids))
 
     def set_equal_share_weights(
-        self, reward_uids: list[int], n_uids: int, *, burn_uid: int = 0
+        self, reward_uids: list[int], n_uids: int, *, decay: float = 1.0, burn_uid: int = 0
     ) -> None:
-        """Push an equal-share weight vector across ``reward_uids``.
+        """Push a (geometrically decayed) share vector across ``reward_uids``.
 
-        ``reward_uids`` is the current king plus any registered prior kings.
-        Duplicates and out-of-range UIDs are dropped; each survivor gets
-        ``1/k``. When none survive, all weight burns to ``burn_uid`` so emission
-        still leaves the network rather than reverting. Mirrors teutonic's
-        equal-share-across-recent-kings payout.
+        ``reward_uids`` is the current king first, then any registered prior
+        kings by recency. With ``decay < 1`` the king gets the largest slice and
+        each older king progressively less (so the king is unambiguously the
+        highest-incentive UID); ``decay = 1.0`` is the flat equal split.
+        Duplicates and out-of-range UIDs are dropped; when none survive, all
+        weight burns to ``burn_uid`` so emission still leaves the network.
         """
-        self._set_weights(equal_share_vector(reward_uids, n_uids, burn_uid=burn_uid))
+        self._set_weights(decayed_share_vector(reward_uids, n_uids, decay=decay, burn_uid=burn_uid))
 
     def _set_weights(self, weights: list[float]) -> None:
         sub = self.subtensor()

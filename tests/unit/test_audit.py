@@ -233,7 +233,7 @@ def test_tamper_weights_fails(audit_cfg, signed_receipt):
     w[0], w[1] = 0.9, 0.1
     tampered = replace(signed_receipt, weights=tuple(w))
     r = C.check_weights(tampered, audit_cfg)
-    assert r.status == C.FAIL and "equal_share_vector" in r.detail
+    assert r.status == C.FAIL and "decayed_share_vector" in r.detail
 
 
 def test_tamper_reward_uids_fails_weights(audit_cfg, signed_receipt):

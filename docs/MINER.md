@@ -170,6 +170,27 @@ your `gen_ref`. If it wins the heat it advances to the full final against the
 king. Verify any round independently with `cascade-audit latest` (see
 [`AUDIT.md`](AUDIT.md)).
 
+## Study the competition
+
+Every committed generator is content-addressed and **public** — that's what
+makes the eval re-derivable, and it makes the current best openly studyable.
+Pull the reigning king (or any competitor) and read its code:
+
+```bash
+cascade fetch king --network test --chain-toml chain.testnet.toml
+# → fetched king-uid3: cascade/testnet-smoothgp@sha256:…
+#   inspect it, or fork + improve it:  cascade verify ./fetched-king-uid3
+
+cascade fetch 13 --out ./chal13      # a specific UID
+cascade fetch 5Haf…                  # a specific hotkey (ss58)
+cascade fetch namespace/repo@sha256:…  --verify   # a raw ref; --verify runs the checks
+```
+
+This is the game: the best generator is visible, and you win by **improving**
+on it, not hiding — a byte-identical copy of the king is dropped before it
+trains (it can only tie), so you have to genuinely beat it. Read-only; no wallet
+needed, just Hub read credentials.
+
 ## Common failures
 
 | symptom | cause |

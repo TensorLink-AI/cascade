@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import tarfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -258,6 +259,65 @@ def _dir_size_bytes(local_dir: Path | str) -> int:
     return sum(p.stat().st_size for p in Path(local_dir).rglob("*") if p.is_file())
 
 
+# A Hub push/pull is one HTTP round-trip to an IPFS-backed OCI registry, so a
+# single chunk can silently stall ("The read operation timed out") even when the
+# operation would sail through on a fresh attempt — a miner's whole `cascade
+# deploy` should not die on one flaky chunk after it already passed verify.
+# Retry transient network failures with exponential backoff; a HubAuthError, an
+# invalid ref, or a genuine "not found" is deterministic and surfaces at once.
+HUB_MAX_ATTEMPTS = 4
+HUB_BACKOFF_BASE_S = 2.0
+
+# Substrings (lower-cased) that mark a Hub error as a transient network blip
+# worth retrying. reqwest/requests timeouts surface as "read operation timed
+# out" / "read timed out"; 5xx are the registry itself being briefly unhappy.
+_RETRYABLE_HUB_ERROR_SUBSTRINGS = (
+    "timed out", "timeout", "read operation",
+    "connection reset", "connection aborted", "connection error",
+    "broken pipe", "temporarily unavailable", "try again",
+    " 500 ", " 502 ", " 503 ", " 504 ",
+    "500 server error", "502 server error", "503 server error", "504 server error",
+)
+
+
+def _is_retryable_hub_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a transient network failure, not a permanent one.
+
+    Auth failures (:class:`HubAuthError`) are deterministic and never retried.
+    Timeouts and connection resets are — whether they arrive as a stdlib
+    ``TimeoutError``/``ConnectionError`` or, more commonly, wrapped in a library
+    HTTP error whose *message* carries the timeout text.
+    """
+    if isinstance(exc, HubAuthError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(sub in text for sub in _RETRYABLE_HUB_ERROR_SUBSTRINGS)
+
+
+def _retry_hub_op(op, what: str, *, attempts: int = HUB_MAX_ATTEMPTS,
+                  base_delay: float = HUB_BACKOFF_BASE_S, sleep=time.sleep):
+    """Run ``op`` (a Hub upload/download), retrying transient network failures.
+
+    Backs off exponentially (``base_delay`` × 2ⁿ) between attempts. A
+    non-retryable error (auth, bad ref) is re-raised immediately; exhausting the
+    retries raises a :class:`StorageError` that names ``what`` and the last cause.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return op()
+        except StorageError:
+            raise  # our own validation errors (auth, bad digest) are deterministic
+        except Exception as exc:  # noqa: BLE001 — classify below, re-raise if permanent
+            last_exc = exc
+            if attempt >= attempts or not _is_retryable_hub_error(exc):
+                break
+            sleep(base_delay * (2 ** (attempt - 1)))
+    raise StorageError(f"{what} failed after {attempt} attempt(s): {last_exc}") from last_exc
+
+
 def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = None) -> HubUpload:
     """Upload a folder to a Hippius Hub ``repo`` and return its immutable ref.
 
@@ -276,8 +336,11 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
             "hippius-hub not installed; install the [hippius] extra to use the registry"
         ) from e
     token = _resolve_hub_token(f"Uploading {d} to {repo}")
-    result = upload_folder(
-        repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
+    result = _retry_hub_op(
+        lambda: upload_folder(
+            repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
+        ),
+        f"upload of {d} to {repo}",
     )
     digest = str(getattr(result, "oid", "") or "")
     if not DIGEST_RE.match(digest):
@@ -300,10 +363,13 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
     if ref.digest.startswith("hf:"):
         from huggingface_hub import snapshot_download as hf_snapshot_download
 
-        path = hf_snapshot_download(
-            repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(dest),
-            allow_patterns=ALLOW_PATTERNS,
-            token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"),
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
+        path = _retry_hub_op(
+            lambda: hf_snapshot_download(
+                repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(dest),
+                allow_patterns=ALLOW_PATTERNS, token=hf_token,
+            ),
+            f"fetch of {ref.immutable_ref}",
         )
     else:
         try:
@@ -312,10 +378,13 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
             raise StorageError(
                 "hippius-hub not installed; install the [hippius] extra to use the registry"
             ) from e
-        path = snapshot_download(
-            repo_id=ref.repo, revision=ref.digest, local_dir=str(dest),
-            allow_patterns=ALLOW_PATTERNS,
-            token=_resolve_hub_token(f"Downloading {ref.immutable_ref}"),
+        hub_token = _resolve_hub_token(f"Downloading {ref.immutable_ref}")
+        path = _retry_hub_op(
+            lambda: snapshot_download(
+                repo_id=ref.repo, revision=ref.digest, local_dir=str(dest),
+                allow_patterns=ALLOW_PATTERNS, token=hub_token,
+            ),
+            f"fetch of {ref.immutable_ref}",
         )
     return Path(path)
 

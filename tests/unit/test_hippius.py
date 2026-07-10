@@ -61,6 +61,74 @@ def test_unpack_rejects_path_traversal(tmp_path):
         hippius.unpack_tar_to_dir(buf.getvalue(), tmp_path / "dest")
 
 
+def test_is_retryable_hub_error_classifies_transient_vs_permanent():
+    # The exact message from the failing miner upload is a transient read stall.
+    assert hippius._is_retryable_hub_error(RuntimeError("The read operation timed out"))
+    assert hippius._is_retryable_hub_error(TimeoutError())
+    assert hippius._is_retryable_hub_error(ConnectionError("connection reset by peer"))
+    assert hippius._is_retryable_hub_error(RuntimeError("503 Server Error: Service Unavailable"))
+    # Deterministic failures must not be retried.
+    assert not hippius._is_retryable_hub_error(hippius.HubAuthError("no token"))
+    assert not hippius._is_retryable_hub_error(RuntimeError("404 repo not found"))
+
+
+def test_retry_hub_op_recovers_after_transient_timeouts():
+    calls = {"n": 0}
+    slept: list[float] = []
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("The read operation timed out")
+        return "sha256:" + "a" * 64
+
+    out = hippius._retry_hub_op(flaky, "upload of ./gen to alice/gen", sleep=slept.append)
+    assert out == "sha256:" + "a" * 64
+    assert calls["n"] == 3
+    # Exponential backoff between the two failed attempts: 2s then 4s.
+    assert slept == [2.0, 4.0]
+
+
+def test_retry_hub_op_gives_up_after_max_attempts():
+    calls = {"n": 0}
+
+    def always_times_out():
+        calls["n"] += 1
+        raise RuntimeError("The read operation timed out")
+
+    with pytest.raises(hippius.StorageError) as ei:
+        hippius._retry_hub_op(always_times_out, "upload of ./gen to alice/gen",
+                              attempts=3, sleep=lambda _: None)
+    assert calls["n"] == 3  # tried exactly `attempts` times, no more
+    assert "after 3 attempt(s)" in str(ei.value)
+    assert "read operation timed out" in str(ei.value).lower()
+
+
+def test_retry_hub_op_does_not_retry_permanent_errors():
+    calls = {"n": 0}
+
+    def not_found():
+        calls["n"] += 1
+        raise RuntimeError("404 Client Error: repo not found")
+
+    with pytest.raises(hippius.StorageError):
+        hippius._retry_hub_op(not_found, "fetch of alice/gen@sha256:...", sleep=lambda _: None)
+    assert calls["n"] == 1  # permanent error surfaces on the first attempt
+
+
+def test_retry_hub_op_passes_auth_error_through_unretried():
+    calls = {"n": 0}
+
+    def auth_fails():
+        calls["n"] += 1
+        raise hippius.HubAuthError("set HIPPIUS_HUB_TOKEN")
+
+    # HubAuthError is a StorageError, so it propagates unchanged (not re-wrapped).
+    with pytest.raises(hippius.HubAuthError):
+        hippius._retry_hub_op(auth_fails, "upload of ./gen to alice/gen", sleep=lambda _: None)
+    assert calls["n"] == 1
+
+
 class _FakeS3Store:
     """In-memory stand-in for S3Store (same put_text/get_text surface)."""
 

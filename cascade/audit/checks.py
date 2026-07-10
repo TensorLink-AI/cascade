@@ -18,7 +18,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from ..shared.chain import equal_share_vector, seed_from_block_hash
+from ..shared.chain import decayed_share_vector, seed_from_block_hash
 from ..shared.config import ChainConfig
 from ..shared.manifest import TrainingManifest, contract_digest
 from ..shared.receipt import RoundReceipt
@@ -464,20 +464,23 @@ def check_transition(receipt: RoundReceipt) -> CheckResult:
 def check_weights(
     receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None
 ) -> CheckResult:
-    """The recorded weight vector is exactly ``equal_share_vector`` of the
-    recorded reward UIDs; compared against on-chain weights when reachable."""
+    """The recorded weight vector is exactly the geometrically-decayed share of
+    the recorded reward UIDs (``[scoring] king_decay``); compared against
+    on-chain weights when reachable."""
     name = "weights"
     if receipt.status == "rejected":
         return _skip(name, "rejected round; no weights expected")
     if not receipt.weights:
         return _warn(name, "no weight vector recorded (the weight extrinsic failed that "
                            "round and is retried the next)")
-    want = equal_share_vector(
-        list(receipt.reward_uids), len(receipt.weights), burn_uid=cfg.scoring.burn_uid
+    want = decayed_share_vector(
+        list(receipt.reward_uids), len(receipt.weights),
+        decay=cfg.scoring.king_decay, burn_uid=cfg.scoring.burn_uid,
     )
     if [float(w) for w in receipt.weights] != want:
         return _fail(name, f"recorded weights {list(receipt.weights)} != "
-                           f"equal_share_vector({list(receipt.reward_uids)}) = {want}")
+                           f"decayed_share_vector({list(receipt.reward_uids)}, "
+                           f"decay={cfg.scoring.king_decay}) = {want}")
     # The round's vote mirrors the validator's _king_uid_to_vote: the MANIFEST
     # king holds the throne vote unless this round dethroned, in which case the
     # new (state) king takes it. The state king can legitimately differ from

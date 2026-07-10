@@ -599,6 +599,26 @@ class ValidatorRunner:
                             client, manifest, base_seed,
                             reject_reason=reason, window_source=window_source,
                         )
+                    elif not self.king_synced(manifest):
+                        # The trainer trained the OLD king (incentive lags a
+                        # dethrone). Don't judge the champion on a round it didn't
+                        # fight: hold the KOTH state and keep voting the champion so
+                        # incentive migrates to it and the trainer re-syncs next
+                        # round. A public receipt records why, not a silent skip.
+                        champ = self.state.king_hotkey
+                        trained = self._manifest_king_hotkey(manifest)
+                        log.warning("round=%s trainer king %s != champion %s; voting champion "
+                                    "to re-sync incentive, KOTH state held",
+                                    manifest.round_id, (trained or "?")[:12], (champ or "?")[:12])
+                        last_round = manifest.round_id
+                        reward_uids = self._reward_uids(manifest, None, client)
+                        weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
+                        self._publish_round_receipt(
+                            client, manifest, base_seed,
+                            reject_reason=f"king_resyncing: champion {champ} != trained king {trained}",
+                            window_source=window_source,
+                            reward_uids=tuple(reward_uids), weights=weights_vec,
+                        )
                     else:
                         # The epoch block selects the daily snapshot; base_seed
                         # rotates the window slice within it.
@@ -615,29 +635,7 @@ class ValidatorRunner:
                         last_round = manifest.round_id
                         self._persist_state()
                         reward_uids = self._reward_uids(manifest, outcome, client)
-                        weights_vec: tuple[float, ...] = ()
-                        try:
-                            # Always set weights — when no king/court is registered
-                            # the empty set burns to burn_uid (teutonic-style) so
-                            # emission still leaves the network rather than reverting.
-                            from ..shared.chain import equal_share_vector
-
-                            n_uids = client.n_uids()
-                            client.set_equal_share_weights(
-                                reward_uids, n_uids,
-                                burn_uid=self.cfg.scoring.burn_uid,
-                            )
-                            weights_vec = tuple(equal_share_vector(
-                                reward_uids, n_uids, burn_uid=self.cfg.scoring.burn_uid,
-                            ))
-                            log.info(
-                                "round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
-                                manifest.round_id, reward_uids or [self.cfg.scoring.burn_uid],
-                                n_uids, self.cfg.scoring.burn_uid,
-                            )
-                        except Exception as e:  # noqa: BLE001 — retried next round
-                            log.warning("weight set failed for round=%s (king holds, "
-                                        "retried next round): %s", manifest.round_id, e)
+                        weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
                         # The public receipt — strictly after weights, so it
                         # records what was actually set (empty vector = the
                         # weight extrinsic failed this round).
@@ -664,16 +662,44 @@ class ValidatorRunner:
                 log.exception("round processing failed; retrying after poll: %s", e)
             time.sleep(poll)
 
-    def _king_uid_to_vote(self, manifest: TrainingManifest, outcome: RoundOutcome | None) -> int | None:
-        """The UID to put winner-take-all weight on this round.
+    @staticmethod
+    def _manifest_king_hotkey(manifest: TrainingManifest) -> str | None:
+        e = manifest.entry_for_role("king")
+        return e.miner_hotkey if e is not None else None
 
-        The reigning king is whoever the trainer trained as ``king`` — *unless*
-        this round dethroned them, in which case the challenger (now ``state``'s
-        king) takes the weight. Voting the manifest king every round (not only
-        after a dethrone) is what keeps the throne stable when there is a single
-        miner or before any streak completes.
+    def king_synced(self, manifest: TrainingManifest) -> bool:
+        """Whether the round's *trained* king matches the validator's champion.
+
+        The trainer picks the king it trains from on-chain incentive, which lags
+        the validator's dethrone verdicts (OPEN_QUESTIONS #3). Until the champion
+        the validator crowned actually becomes the highest-incentive UID — and so
+        the king the trainer trains — the two disagree, and a round trained
+        against the *old* king must not have its verdict applied to the *new*
+        champion. Synced when the champion is unset (bootstrap) or the trained
+        king is the champion.
         """
-        if outcome is not None and outcome.transition.dethroned and self.state.king_uid is not None:
+        if self.state.king_hotkey is None:
+            return True
+        return self._manifest_king_hotkey(manifest) == self.state.king_hotkey
+
+    def _king_uid_to_vote(self, manifest: TrainingManifest, *, client: object | None = None) -> int | None:
+        """The UID to put the king's weight on this round.
+
+        The **validator's champion state** is the authority on who holds the
+        throne, so vote *that* king every round — not the (lagging) king the
+        trainer happened to train. This is what makes a dethrone STICK: the new
+        champion keeps the weight, incentive migrates to it, and next round the
+        trainer trains it as king (they re-sync). Voting the trained/manifest
+        king instead — the old behaviour — reverted a dethrone the moment the
+        trainer lagged one round, orphaning the champion. The champion hotkey is
+        resolved to its current UID via the metagraph (robust to re-registration);
+        the manifest king is used only to bootstrap when there is no champion yet.
+        """
+        if self.state.king_hotkey is not None:
+            if client is not None:
+                resolved = client.uid_for_hotkey(self.state.king_hotkey)  # type: ignore[attr-defined]
+                if resolved is not None:
+                    return resolved
             return self.state.king_uid
         king_entry = manifest.entry_for_role("king")
         return king_entry.miner_uid if king_entry is not None else None
@@ -685,12 +711,12 @@ class ValidatorRunner:
         ``former_kings`` still registered (teutonic-style equal-share payout).
 
         Returns an empty list when there is no king to vote for at all (no
-        manifest king and no recorded throne); the loop hands that to
+        champion and no manifest king); the loop hands that to
         ``set_equal_share_weights``, which burns to ``burn_uid`` rather than
         reverting. The list is otherwise deduped/range-checked there too.
         """
         uids: list[int] = []
-        king_uid = self._king_uid_to_vote(manifest, outcome)
+        king_uid = self._king_uid_to_vote(manifest, client=client)
         if king_uid is not None:
             uids.append(king_uid)
         for hk in self.state.former_kings:
@@ -698,6 +724,32 @@ class ValidatorRunner:
             if uid is not None:
                 uids.append(uid)
         return uids
+
+    def _apply_weights(self, client: object, round_id: str, reward_uids: list[int]) -> tuple[float, ...]:
+        """Set the equal-share weight vector on chain; return it (empty on failure).
+
+        Shared by the scored path and the king-resync path. Always sets weights —
+        an empty ``reward_uids`` burns to ``burn_uid`` so emission still leaves the
+        network. A failed extrinsic is logged and retried next round (the empty
+        vector is recorded truthfully in the receipt)."""
+        from ..shared.chain import decayed_share_vector
+
+        decay = self.cfg.scoring.king_decay
+        try:
+            n_uids = client.n_uids()  # type: ignore[attr-defined]
+            client.set_equal_share_weights(  # type: ignore[attr-defined]
+                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid,
+            )
+            vec = tuple(decayed_share_vector(
+                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid))
+            log.info("round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
+                     round_id, reward_uids or [self.cfg.scoring.burn_uid], n_uids,
+                     self.cfg.scoring.burn_uid)
+            return vec
+        except Exception as e:  # noqa: BLE001 — retried next round
+            log.warning("weight set failed for round=%s (king holds, retried next round): %s",
+                        round_id, e)
+            return ()
 
     def _persist_state(self) -> None:  # pragma: no cover
         from . import state as state_mod
