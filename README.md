@@ -201,6 +201,9 @@ After `uv sync` / `pip install -e .`:
 * `cascade verify <repo_dir>`: runs every check the trainer runs (layout,
   static guard, hash-locked deps, and the determinism check: your generator
   must produce a byte-identical corpus at a fixed seed).
+* `cascade score <repo_dir> --pool-dir <held-out>`: train the fixed model on your
+  generator at the cheap heat budget and score it locally, offline (no chain, no
+  wait) — the fast iteration loop. Needs the `.[train]` extra.
 * `cascade deploy <repo_dir> --hub-repo <ns/name> --wallet-name ... --wallet-hotkey ...`:
   verifies the local generator, pushes it to the Hippius Hub registry (OCI),
   and commits `metro-v1:gen:hippius:<repo>@<digest>` on-chain (the OCI digest pins

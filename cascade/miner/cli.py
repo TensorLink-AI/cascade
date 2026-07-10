@@ -1,8 +1,13 @@
-"""``cascade`` console-script: ``verify`` and ``deploy``.
+"""``cascade`` console-script: ``verify``, ``deploy``, and ``score``.
 
 * ``cascade verify <repo_dir>`` — run every check the trainer runs before it
   trains on your generator, including the determinism check. Returns non-zero
   if anything would reject. ``--skip-runtime`` runs the static checks only.
+
+* ``cascade score <repo_dir>`` — train the fixed model on your generator's data
+  at the cheap heat budget and score it on a local/sample pool, entirely offline
+  (no chain, no TAO, no ~30-min round). The fast iteration loop; needs the
+  ``[train]`` extra. See ``cascade/miner/score.py``.
 
 * ``cascade deploy <repo_dir> --hub-repo <namespace/name>`` — verify the local
   generator, push it to your Hippius Hub repo, and commit
@@ -59,6 +64,67 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
         help="Skip the upload and commit this already-uploaded Hub ref (repo@digest) directly.",
     )
     p.set_defaults(func=_cmd_deploy)
+
+
+def _add_score(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "score",
+        help="Train the fixed model on your generator at the heat budget and score it "
+        "locally (offline, minutes) — the fast iteration loop.",
+    )
+    p.add_argument("repo_dir", type=Path, help="Path to your generator repo.")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--pool-dir", type=Path, default=None,
+                   help="Local dir of .npy/.npz held-out series to score on (recommended: your "
+                        "own real data). Falls back to --pool, then an offline synthetic sample.")
+    p.add_argument("--pool", default="", dest="pool_ref",
+                   help="A Hippius Hub pool ref (repo@digest) to score on instead of --pool-dir.")
+    p.add_argument("--train-hours", type=float, default=None,
+                   help="Training budget (default: [round] heat_train_hours — the cheap screen).")
+    p.add_argument("--n-windows", type=int, default=None,
+                   help="Eval windows to score on (default: [round] heat_n_windows).")
+    p.add_argument("--device", default="cpu", help="Torch device (cuda recommended).")
+    p.add_argument("--seed", type=int, default=0, help="Round seed (fixes generation + training).")
+    p.add_argument("--skip-verify", action="store_true",
+                   help="Skip the pre-score determinism/guard check.")
+    p.set_defaults(func=_cmd_score)
+
+
+def _cmd_score(args: argparse.Namespace) -> int:
+    cfg = load_chain_config(args.chain_toml)
+    if not args.skip_verify:
+        report = verify_repo(args.repo_dir, cfg, skip_runtime=False)
+        if not report.ok:
+            print("verify failed — fix before scoring:", file=sys.stderr)
+            print(report.render(), file=sys.stderr)
+            return 1
+    try:
+        r = _run_score(args, cfg)
+    except ImportError as e:
+        print(f"error: `cascade score` needs the [train] extra (torch): {e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 — surface any train/eval failure cleanly
+        print(f"scoring failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"\nscore: geomean={r.geomean:.5f}  (lower is better)\n"
+        f"  pool:    {r.pool_label}  ({r.n_windows} windows)\n"
+        f"  corpus:  {r.n_series} series, digest {r.corpus_digest[:12]}…\n"
+        f"  trained: {r.train_seconds:.0f}s\n"
+        f"\ncompare against the king:  cascade fetch king --out ./king && "
+        f"cascade score ./king --pool-dir <same pool>"
+    )
+    return 0
+
+
+def _run_score(args: argparse.Namespace, cfg):
+    from .score import score_generator
+
+    return score_generator(
+        args.repo_dir, cfg, pool_dir=args.pool_dir, pool_ref=args.pool_ref,
+        train_hours=args.train_hours, n_windows=args.n_windows, device=args.device,
+        seed=args.seed,
+    )
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -125,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_verify(sub)
     _add_deploy(sub)
+    _add_score(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

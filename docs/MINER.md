@@ -64,6 +64,39 @@ cascade verify ./my-generator --chain-toml chain.testnet.toml
 
 A green `[deterministic]` line means the trainer will accept it.
 
+## 2b. Score it locally (the fast iteration loop)
+
+`verify` proves your generator is *valid*; `cascade score` tells you if it's
+*good* — without deploying, spending TAO, or waiting ~30 min for a round. It
+trains the fixed model on your data at the cheap **heat** budget and scores it
+on a pool you control, entirely offline (needs the `[train]` extra + ideally a
+GPU):
+
+```bash
+cascade score ./my-generator --pool-dir ./my-heldout --device cuda
+# → score: geomean=0.412  (lower is better)
+#     pool:    dir:./my-heldout  (256 windows)
+#     corpus:  1024 series, digest c29ae1caa6b3…
+#     trained: 92s
+```
+
+The tight loop for a human or an agent:
+
+```bash
+cascade fetch king --out ./king                          # pull the current best
+cascade score ./king   --pool-dir ./my-heldout           # baseline to beat
+cascade score ./my-gen --pool-dir ./my-heldout           # your candidate
+# keep editing my-gen until it beats the king's number, THEN deploy
+```
+
+Two caveats worth internalising:
+- **Directional, not the verdict.** You score on *your* pool; the validator
+  scores on its private, rotating pool. Use the local number to hill-climb, not
+  as truth — and use real held-out data (`--pool-dir`), since the default
+  offline synthetic sample is only a smoke signal.
+- **Don't overfit your pool.** A generator tuned to ace one fixed local set is
+  exactly what the private rotating eval punishes. Rotate/expand your pool.
+
 ## 3. Make a wallet and register
 
 You need a bittensor wallet (a coldkey + a hotkey) and a UID on the subnet.
