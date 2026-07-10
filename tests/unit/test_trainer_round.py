@@ -3,10 +3,14 @@ assembly, with the GPU and Hippius boundaries faked (no torch, no Hub, no S3).""
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pytest
 
 from cascade.shared.chain import Commitment
 from cascade.shared.hippius import HubRef, HubUpload
+from cascade.shared.manifest import dump_manifest, load_manifest
 from cascade.trainer import loop as loop_mod
 from cascade.trainer.contract import TrainResult
 from cascade.trainer.loop import TrainerRunner, resolve_commitments
@@ -150,6 +154,48 @@ def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     # the single finalist is trained at every throne size
     sizes = sorted(t.arch_preset for t in cfg.throne_contracts())
     assert sorted(e.size for e in manifest.entries_for_role("challenger")) == sizes
+
+
+def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    # Same field as above: cheapest (c) advances, everyone else is screened.
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+
+    def screen(ckpt_dir, gen, base_seed):
+        return scores[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = manifest.heat
+    assert heat is not None
+    assert heat.finalists == 1
+    by_hk = {e.hotkey: e for e in heat.entrants}
+    assert set(by_hk) == {"b", "c", "d"}
+    # ranked cheapest-first; relative to the best (c), never the raw scores
+    assert by_hk["c"].rank == 1 and by_hk["c"].status == "advanced"
+    assert by_hk["c"].rel_score == 1.0
+    assert by_hk["d"].rank == 2 and by_hk["d"].status == "screened"
+    assert by_hk["d"].rel_score == pytest.approx(2.5)     # 0.5 / 0.2
+    assert by_hk["b"].rank == 3 and by_hk["b"].status == "screened"
+    assert by_hk["b"].rel_score == pytest.approx(4.5)     # 0.9 / 0.2
+    # survives serialisation to the wire (rides the manifest, unsigned)
+    assert load_manifest(dump_manifest(manifest)).heat == heat
+
+
+def test_heat_none_when_no_screen_runs(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    # One challenger, finalists = 1 ⇒ it fits without a screen; no standings to show.
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=lambda *a: 0.0)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.heat is None
+    # a heat-less manifest carries no "heat" key at all (byte-compatible wire)
+    assert "heat" not in json.loads(dump_manifest(manifest))
 
 
 def test_no_screen_fn_takes_lowest_uid_when_field_exceeds_finalists(cfg, tmp_path, monkeypatch):

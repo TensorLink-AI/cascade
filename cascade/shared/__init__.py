@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from .config import ChainConfig, load_chain_config
 from .manifest import (
+    HeatEntrant,
+    HeatResult,
     TrainedEntry,
     TrainingManifest,
     contract_digest,
@@ -18,6 +20,8 @@ from .manifest import (
 __all__ = [
     "ChainConfig",
     "load_chain_config",
+    "HeatEntrant",
+    "HeatResult",
     "TrainedEntry",
     "TrainingManifest",
     "contract_digest",

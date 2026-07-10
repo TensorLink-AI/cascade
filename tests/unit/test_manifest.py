@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from cascade.shared.manifest import (
+    HeatEntrant,
+    HeatResult,
     TrainedEntry,
     TrainingManifest,
     contract_digest,
@@ -78,6 +82,35 @@ def test_manifest_round_trip_and_role_lookup():
     assert again.entry_for_role("challenger").miner_uid == 1
     # canonical body excludes the signature and is stable.
     assert again.canonical_body() == m.canonical_body()
+
+
+def test_heat_is_unsigned_and_round_trips():
+    base = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval", entries=[_entry("king", 0), _entry("challenger", 1)],
+        signature="sig",
+    )
+    heat = HeatResult(
+        screen_size="toto2-4m", finalists=1,
+        entrants=(
+            HeatEntrant(uid=1, hotkey="hk1", gen_ref=REF, status="advanced",
+                        rank=1, rel_score=1.0),
+            HeatEntrant(uid=2, hotkey="hk2", gen_ref=REF, status="screened",
+                        rank=2, rel_score=1.08),
+            HeatEntrant(uid=3, hotkey="hk3", gen_ref=REF, status="failed_train"),
+        ),
+    )
+    m = replace(base, heat=heat)
+    again = load_manifest(dump_manifest(m))
+    assert again.heat == heat
+    # heat is informational: it must NOT change what the trainer signs.
+    assert m.canonical_body() == base.canonical_body()
+
+
+def test_heat_rejects_unknown_status():
+    with pytest.raises(ValueError):
+        HeatEntrant(uid=1, hotkey="hk", gen_ref=REF, status="promoted")
 
 
 def _sized_entry(role, uid, size):

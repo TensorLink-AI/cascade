@@ -453,6 +453,21 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
             if s not in sizes:
                 sizes.append(s)
 
+    # Heat screen summary (informational; rides in the embedded manifest). Just
+    # the counts the rounds table needs — the full per-entrant standings live on
+    # the round receipt (receipts/latest.json) that the dashboard reads directly.
+    heat = receipt.manifest.get("heat") if isinstance(receipt.manifest, dict) else None
+    heat_summary = None
+    if isinstance(heat, dict):
+        ents = heat.get("entrants") or []
+        heat_summary = {
+            "screen_size": heat.get("screen_size", ""),
+            "finalists": heat.get("finalists"),
+            "n_entrants": len(ents),
+            "n_advanced": sum(1 for e in ents if isinstance(e, dict)
+                              and e.get("status") == "advanced"),
+        }
+
     return {
         "round_id": receipt.round_id,
         "status": receipt.status,
@@ -483,6 +498,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "post_round_king_uid": v.king_uid if v else None,
         "reward_uids": list(receipt.reward_uids),
         "n_rewarded": len(receipt.reward_uids),
+        "heat": heat_summary,
         "reject_reason": receipt.reject_reason,
         "validator_hotkey": receipt.validator_hotkey or None,
     }

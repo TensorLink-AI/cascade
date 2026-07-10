@@ -211,6 +211,13 @@ your `gen_ref`. If it wins the heat it advances to the full final against the
 king. Verify any round independently with `cascade-audit latest` (see
 [`AUDIT.md`](AUDIT.md)).
 
+The dashboard's **Heat** panel shows where every entrant placed in the screen —
+your rank, your score *relative to the best entrant* (not the raw numbers; the
+eval pool rotates privately), and whether you advanced, were screened out, or
+failed to train. It's the fastest read on how close a non-winning submission
+was. The standings ride the latest receipt's embedded manifest as an
+informational (unsigned) block, so they never affect the signed verdict.
+
 ## Study the competition
 
 Every committed generator is content-addressed and **public** — that's what

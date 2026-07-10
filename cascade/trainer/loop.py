@@ -40,6 +40,8 @@ from ..shared.hippius import (
     upload_dir_to_hub,
 )
 from ..shared.manifest import (
+    HeatEntrant,
+    HeatResult,
     TrainedEntry,
     TrainingManifest,
     contract_digest,
@@ -432,7 +434,7 @@ class TrainerRunner:
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
 
         eligible = self._burn_and_filter_challengers(plan.challengers)
-        finalists = self._run_heat(eligible, seeds, block)
+        finalists, heat = self._run_heat(eligible, seeds, block)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
@@ -447,11 +449,12 @@ class TrainerRunner:
             base_arch_digest=self.cfg.training.base_arch_digest,
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
+            heat=heat,
         )
 
     def _run_heat(
         self, challengers: list[ResolvedGenerator], seeds: RoundSeeds, block: int
-    ) -> list[ResolvedGenerator]:
+    ) -> tuple[list[ResolvedGenerator], HeatResult | None]:
         """Screen the field down to ``[round] finalists`` for the final stage.
 
         Each challenger is trained for ``[round] heat_train_hours`` on the primary
@@ -461,19 +464,24 @@ class TrainerRunner:
         ``screen_fn`` is wired, the field's natural order (lowest UID first) is
         taken without spending heat compute. A challenger that fails to train or
         screen is dropped (it simply doesn't qualify).
+
+        Returns ``(finalists, heat)`` where ``heat`` is the informational
+        standings the dashboard shows every entrant (:class:`HeatResult`), or
+        ``None`` when no screen actually ran (no compute was spent to rank).
         """
         n = max(0, self.cfg.round.finalists)
         if not challengers or n == 0:
-            return []
+            return [], None
         if self.screen_fn is None or len(challengers) <= n:
             if self.screen_fn is None and len(challengers) > n:
                 log.warning("no screen_fn wired; taking %d of %d challengers by UID order",
                             n, len(challengers))
-            return list(challengers[:n])
+            return list(challengers[:n]), None
 
         heat_contract = self.cfg.screen_contract()
         heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
         trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
+        trained_hotkeys = {c.hotkey for c, _ in trained}
         scored: list[tuple[float, int, ResolvedGenerator]] = []
         for c, ckpt_dir in trained:
             try:
@@ -488,7 +496,48 @@ class TrainerRunner:
         winners = [c for _, _, c in scored[:n]]
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
-        return winners
+        heat = self._heat_result(
+            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n
+        )
+        return winners, heat
+
+    def _heat_result(
+        self,
+        challengers: list[ResolvedGenerator],
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        winners: list[ResolvedGenerator],
+        trained_hotkeys: set[str],
+        screen_size: str,
+        finalists: int,
+    ) -> HeatResult:
+        """Assemble the informational standings from a completed heat.
+
+        Scores are recorded only *relative to the best entrant* (``score / best``)
+        — the raw numbers stay off the public record so the private, per-round
+        rotated eval pool can't be reverse-engineered from the heat. Entrants that
+        never produced a score are carried too, tagged by how they dropped out:
+        ``failed_train`` (crashed the screen budget) or ``failed_screen`` (trained
+        but the scorer raised).
+        """
+        advanced = {c.hotkey for c in winners}
+        scored_hotkeys = {c.hotkey for _, _, c in scored}
+        best = scored[0][0] if scored else None
+        entrants: list[HeatEntrant] = []
+        for rank, (score, _uid, c) in enumerate(scored, start=1):
+            rel = (score / best) if (best is not None and best > 0) else None
+            entrants.append(HeatEntrant(
+                uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
+                status="advanced" if c.hotkey in advanced else "screened",
+                rank=rank, rel_score=rel,
+            ))
+        for c in challengers:
+            if c.hotkey in scored_hotkeys:
+                continue
+            status = "failed_screen" if c.hotkey in trained_hotkeys else "failed_train"
+            entrants.append(HeatEntrant(
+                uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref, status=status,
+            ))
+        return HeatResult(screen_size=screen_size, finalists=finalists, entrants=tuple(entrants))
 
     def _heat_train(
         self,

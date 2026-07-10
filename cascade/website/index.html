@@ -921,6 +921,22 @@ th.num { text-align: right; }
 .empty { color: var(--muted); text-transform: uppercase; padding: 12px 0; text-align: center; }
 .crown { font-weight: 700; color: var(--chal); }
 
+/* heat screen — informational standings for every entrant */
+.heat-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-bottom: 9px; max-width: 84ch; line-height: 1.55; }
+.heat-bar-cell { display: flex; align-items: center; gap: 8px; min-width: 130px; }
+.heat-bar { flex: 1; height: 6px; background: var(--surface); border: var(--line-faint); border-radius: 3px; overflow: hidden; min-width: 56px; }
+.heat-bar > i { display: block; height: 100%; }
+.heat-rel { font-family: var(--font-mono); font-size: 11px; color: var(--muted); min-width: 46px; text-align: right; }
+.heat-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.heat-pill.adv { color: var(--good); }
+.heat-pill.screened { color: var(--muted); }
+.heat-pill.nofit { color: #BF5B3D; }
+tbody tr:hover td .heat-pill { color: var(--bone-light); }
+.heat-empty { border: var(--line); background: var(--surface); padding: 26px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.heat-empty .he-glyph { font-family: var(--font-mono); font-size: 18px; color: var(--muted); letter-spacing: 0.3em; }
+.heat-empty .he-head { font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+.heat-empty p { font-size: 12px; color: var(--muted); max-width: 58ch; margin: 0; }
+
 @media (max-width: 720px) {
   .page { padding: 16px; gap: 16px; }
   .header .wordmark { font-size: 34px; }
@@ -994,6 +1010,11 @@ th.num { text-align: right; }
     <div class="scroll-box scroll-field">
       <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th></tr></thead><tbody id="field"></tbody></table>
     </div>
+  </div>
+
+  <div>
+    <div class="section-label"><span>Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
+    <div id="heat-panel"></div>
   </div>
 
   <div>
@@ -1073,7 +1094,18 @@ var SEED_LATEST = {
     { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), commit_block:4822120 },
     { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), commit_block:4822150 },
     { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"), commit_block:4822171 }
-  ]
+  ],
+  // the receipt embeds the trainer's manifest verbatim; heat rides there (unsigned)
+  manifest: { heat: {
+    screen_size: "toto2-4m", finalists: 1,
+    entrants: [
+      { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), status:"advanced",     rank:1, rel_score:1.000 },
+      { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), status:"screened",     rank:2, rel_score:1.031 },
+      { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"),   status:"screened",     rank:3, rel_score:1.074 },
+      { uid:88,  hotkey:"5Dk82mLpQ2vHse", gen_ref:gr("aurora/tsgen","7a2c55e910"),   status:"screened",     rank:4, rel_score:1.120 },
+      { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), status:"failed_train", rank:null, rel_score:null }
+    ]
+  } }
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -1225,6 +1257,57 @@ function renderField(){
       '<td>'+refLink(p.gen_ref)+'</td><td class="num">'+p.commit_block+'</td></tr>';
   }).join("");
 }
+// Heat = the cheap screen that ranks every eligible challenger; only the top
+// `finalists` advance to the final vs the king. The trainer otherwise throws
+// these scores away, so this panel is a non-finalist miner's only feedback.
+// Standings ride the latest receipt's embedded manifest (_latest.manifest.heat).
+function heatStatusMeta(s){
+  if(s==="advanced") return {cls:"adv",label:"▲ Advanced"};
+  if(s==="screened") return {cls:"screened",label:"Screened"};
+  if(s==="failed_train") return {cls:"nofit",label:"Did not train"};
+  if(s==="failed_screen") return {cls:"nofit",label:"Screen error"};
+  return {cls:"screened",label:s||"--"};
+}
+function renderHeat(){
+  var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when");
+  var heat=_latest&&_latest.manifest&&_latest.manifest.heat;
+  var ents=(heat&&heat.entrants)||[];
+  if(!heat||!ents.length){
+    when.textContent="";
+    panel.innerHTML='<div class="heat-empty">'+
+      '<div class="he-glyph">· · ·</div>'+
+      '<div class="he-head">No heat screening this round</div>'+
+      '<p>The field advanced without a screen — either a single eligible challenger, or a round that predates heat reporting. The verdict and final scores are unaffected.</p>'+
+      '</div>';
+    return;
+  }
+  var nf=heat.finalists;
+  when.textContent=ents.length+" entrants · "+(nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
+    (heat.screen_size?" · screened at "+esc(heat.screen_size):"");
+  var rows=ents.slice().sort(function(a,b){
+    var ra=a.rank==null?1e9:a.rank, rb=b.rank==null?1e9:b.rank;
+    return (ra-rb)||((a.uid||0)-(b.uid||0));
+  });
+  var body=rows.map(function(e){
+    var m=heatStatusMeta(e.status), rel=e.rel_score;
+    var hasScore=rel!=null&&isFinite(rel)&&rel>0;
+    var width=hasScore?Math.max(6,100/rel):0;
+    var label=!hasScore?"—":(e.rank===1?"best":"+"+((rel-1)*100).toFixed(1)+"%");
+    var fill=e.status==="advanced"?"var(--good)":"var(--chal)";
+    return '<tr>'+
+      '<td class="num'+(e.rank===1?' good':'')+'">'+(e.rank!=null?e.rank:"—")+'</td>'+
+      '<td class="num">'+(e.uid!=null?e.uid:"--")+'</td>'+
+      '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+'</td>'+
+      '<td>'+refLink(e.gen_ref)+'</td>'+
+      '<td class="heat-bar-cell"><span class="heat-bar"><i style="width:'+width.toFixed(0)+'%;background:'+fill+'"></i></span><span class="heat-rel">'+label+'</span></td>'+
+      '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
+  }).join("");
+  panel.innerHTML='<div class="heat-note">Ranked by heat score (lower is better); the top '+
+    (nf!=null?nf:"N")+' advance to the final. Scores are shown relative to the best entrant — the raw per-window numbers stay off the dashboard so the rotating private eval pool can’t be reverse-engineered.</div>'+
+    '<div class="scroll-box scroll-field"><table><thead><tr>'+
+    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th>Standing</th>'+
+    '</tr></thead><tbody>'+body+'</tbody></table></div>';
+}
 function renderRounds(){
   var rs=(_index&&_index.rounds||[]).slice().reverse(), tb=document.getElementById("rounds");
   if(!rs.length){ tb.innerHTML='<tr><td colspan="10" class="empty">No rounds published yet</td></tr>'; return; }
@@ -1255,7 +1338,7 @@ function renderStatus(){
     ? "⚠ Live results unavailable — could not reach the validator receipts. The figures below are SAMPLE data, not live subnet state."
     : "Loading live results…";
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderRounds(); }
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1280,7 +1363,7 @@ _index=SEED_INDEX; _latest=SEED_LATEST; _dataState="loading"; renderAll();
 function poll(){
   fetchJSON("receipts/index.json").then(function(d){ _index=d; _dataState="live"; renderAll(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
-  fetchJSON("receipts/latest.json").then(function(d){ _latest=d; renderField(); }).catch(function(){});
+  fetchJSON("receipts/latest.json").then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
 }
 poll();
 setInterval(poll, POLL_MS);

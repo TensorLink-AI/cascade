@@ -125,12 +125,92 @@ class TrainedEntry:
             raise ValueError(f"malformed trained_pointer: {self.trained_pointer!r}")
 
 
+HEAT_STATUSES = ("advanced", "screened", "failed_train", "failed_screen")
+
+
+@dataclass(frozen=True)
+class HeatEntrant:
+    """One challenger's standing in the heat screen — an *informational* record.
+
+    The heat trains every eligible challenger cheaply and ranks them; only the
+    top ``finalists`` advance. Those scores are otherwise thrown away (the heat
+    checkpoints are discarded), so this is the miner's only window into how a
+    non-finalist submission fared. It is deliberately coarse: a ``rank`` and a
+    ``rel_score`` *relative to the best entrant* (``heat_score / best``, ≥ 1.0,
+    where 1.0 is the best), never the raw per-window numbers — the eval pool
+    rotates privately and exposing absolute scores would hand a miner a gradient
+    to distribution-match it. ``rank``/``rel_score`` are None for an entrant that
+    never produced a score (``failed_train`` / ``failed_screen``).
+    """
+
+    uid: int
+    hotkey: str
+    gen_ref: str
+    status: str                    # one of HEAT_STATUSES
+    rank: int | None = None        # 1-based placement among scored entrants
+    rel_score: float | None = None  # heat_score / best_heat_score (≥ 1.0; 1.0 = best)
+
+    def __post_init__(self) -> None:
+        if self.status not in HEAT_STATUSES:
+            raise ValueError(f"status must be one of {HEAT_STATUSES}; got {self.status!r}")
+
+
+@dataclass(frozen=True)
+class HeatResult:
+    """The round's heat screen, as a presentational (unsigned) block.
+
+    Rides in the manifest but is excluded from :meth:`TrainingManifest.canonical_body`
+    — it is a *view* for the dashboard, not part of the signed/audited claim (an
+    auditor cannot cheaply reproduce a discarded heat checkpoint). ``None`` on a
+    manifest means no screen ran: the field fit within ``finalists``, or the
+    round had a single eligible challenger.
+    """
+
+    screen_size: str               # arch_preset the heat screened at
+    finalists: int                 # how many advanced to the final
+    entrants: tuple[HeatEntrant, ...] = ()
+
+
+def _heat_to_json(heat: HeatResult | None) -> dict | None:
+    if heat is None:
+        return None
+    return {
+        "screen_size": heat.screen_size,
+        "finalists": heat.finalists,
+        "entrants": [asdict(e) for e in heat.entrants],
+    }
+
+
+def _heat_from_json(obj: object) -> HeatResult | None:
+    if not isinstance(obj, dict):
+        return None
+    return HeatResult(
+        screen_size=str(obj.get("screen_size", "")),
+        finalists=int(obj.get("finalists", 0)),
+        entrants=tuple(
+            HeatEntrant(
+                uid=int(e["uid"]),
+                hotkey=str(e["hotkey"]),
+                gen_ref=str(e["gen_ref"]),
+                status=str(e["status"]),
+                rank=(None if e.get("rank") is None else int(e["rank"])),
+                rel_score=(None if e.get("rel_score") is None else float(e["rel_score"])),
+            )
+            for e in obj.get("entrants", ())
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class TrainingManifest:
     """A round's worth of training receipts plus the shared contract context.
 
     ``contract_digest`` and ``base_arch_digest`` are recorded once and asserted
     equal for every entry's training run — the controlled-experiment guarantee.
+
+    ``heat`` is an *informational* screening summary (unsigned; see
+    :class:`HeatResult`): it is serialised alongside the manifest but never enters
+    :meth:`canonical_body`, so adding it leaves every existing signature valid.
     """
 
     round_id: str
@@ -140,6 +220,7 @@ class TrainingManifest:
     eval_dataset: str
     entries: list[TrainedEntry] = field(default_factory=list)
     manifest_version: int = MANIFEST_VERSION
+    heat: HeatResult | None = None
     signature: str | None = None  # trainer_hotkey signature over the canonical body; TODO
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -182,9 +263,19 @@ class TrainingManifest:
 
 
 def dump_manifest(manifest: TrainingManifest) -> str:
-    """Serialise a manifest (including signature) to a JSON string."""
+    """Serialise a manifest (including signature) to a JSON string.
+
+    ``heat`` is attached outside the signed :meth:`~TrainingManifest.canonical_body`
+    — it travels with the manifest for the dashboard but is not part of what the
+    trainer signs.
+    """
     body = json.loads(manifest.canonical_body().decode("utf-8"))
     body["signature"] = manifest.signature
+    # Only present when a screen actually ran, so a heat-less manifest (the common
+    # single-finalist round, and every manifest predating this field) serialises
+    # byte-for-byte as before — no wire-format break, no version bump.
+    if manifest.heat is not None:
+        body["heat"] = _heat_to_json(manifest.heat)
     return json.dumps(body, indent=2, sort_keys=True)
 
 
@@ -216,6 +307,7 @@ def load_manifest(text: str) -> TrainingManifest:
         eval_dataset=str(obj["eval_dataset"]),
         entries=entries,
         manifest_version=version,
+        heat=_heat_from_json(obj.get("heat")),
         signature=obj.get("signature"),
     )
 
