@@ -205,6 +205,10 @@ After `uv sync` / `pip install -e .`:
   verifies the local generator, pushes it to the Hippius Hub registry (OCI),
   and commits `metro-v1:gen:hippius:<repo>@<digest>` on-chain (the OCI digest pins
   the content — no git SHA).
+* `cascade fetch king` (or a `<uid>` / `<hotkey>` / `<repo>@<digest>`): downloads
+  a competitor's on-chain generator to a local dir to inspect or fork. Generators
+  are public by design — you win by improving on the visible best. Read-only, no
+  wallet.
 * `cascade-trainer --trainer cascade.trainer.toto2_trainer:Toto2Trainer`:
   the owner training service (`--offline` for a config/seed smoke); the reference
   Toto2-4M backend lives in `cascade.trainer.toto2_trainer`. Add

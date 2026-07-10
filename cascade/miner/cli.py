@@ -1,4 +1,4 @@
-"""``cascade`` console-script: ``verify`` and ``deploy``.
+"""``cascade`` console-script: ``verify``, ``deploy``, and ``fetch``.
 
 * ``cascade verify <repo_dir>`` — run every check the trainer runs before it
   trains on your generator, including the determinism check. Returns non-zero
@@ -11,8 +11,15 @@
   pins it (no separate git SHA). Requires the ``[chain]`` extra (bittensor) + a
   wallet, and the ``[hippius]`` extra + Hub credentials in the environment.
 
+* ``cascade fetch king`` (or a uid / hotkey / ``repo@digest``) — download a
+  competitor's on-chain generator to a local dir so you can inspect or fork it.
+  Generators are content-addressed and public by design (the whole eval is
+  re-derivable), so the reigning king's data process is open to study — that is
+  the competition: beat the visible best, don't hide. Read-only; no wallet
+  needed, only the ``[chain]``/``[hippius]`` extras + Hub credentials.
+
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
-chain/network failure, 4 = registry upload failure.
+chain/network failure, 4 = registry upload/fetch failure.
 """
 
 from __future__ import annotations
@@ -59,6 +66,103 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
         help="Skip the upload and commit this already-uploaded Hub ref (repo@digest) directly.",
     )
     p.set_defaults(func=_cmd_deploy)
+
+
+def _add_fetch(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "fetch",
+        help="Download a competitor's on-chain generator (king / uid / hotkey / repo@digest).",
+    )
+    p.add_argument(
+        "target",
+        help="'king' (the highest-incentive UID), a miner UID (int), a hotkey (ss58), "
+        "or a raw Hippius ref (repo@digest, which skips the chain lookup).",
+    )
+    p.add_argument("--out", type=Path, default=None,
+                   help="Directory to download into (default: ./fetched-<name>).")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
+    p.add_argument("--verify", action="store_true",
+                   help="Run `cascade verify` on the fetched generator after downloading.")
+    p.set_defaults(func=_cmd_fetch)
+
+
+def _resolve_fetch_ref(target: str, cfg, network: str) -> tuple[str, str]:
+    """Resolve a fetch target to ``(ref, label)``.
+
+    A ``repo@digest`` is returned as-is (no chain needed). Otherwise the chain is
+    queried: ``king`` → the highest-incentive UID; an integer → that UID; anything
+    else → a hotkey (ss58). Raises ``ValueError`` if the target can't be resolved
+    to a committed generator.
+    """
+    from ..shared.hippius import is_hub_ref
+
+    if is_hub_ref(target):
+        return target, target.split("@")[0].replace("/", "-")
+
+    from ..shared.chain import ChainClient
+
+    client = ChainClient.from_config(cfg, network=network)
+    commitments = client.poll_commitments()
+    by_uid = {c.uid: c for c in commitments}
+    by_hotkey = {c.hotkey: c for c in commitments}
+
+    if target.lower() == "king":
+        king_hk = client.highest_incentive_hotkey()
+        if king_hk is None:
+            raise ValueError("no king on the metagraph (vacant throne / empty subnet)")
+        commit = by_hotkey.get(king_hk)
+        if commit is None:
+            raise ValueError(f"king {king_hk[:12]}… has no committed generator this round")
+        label = f"king-uid{commit.uid}"
+    elif target.isdigit():
+        commit = by_uid.get(int(target))
+        if commit is None:
+            raise ValueError(f"uid {target} has no committed generator")
+        label = f"uid{target}"
+    else:
+        commit = by_hotkey.get(target)
+        if commit is None:
+            raise ValueError(f"hotkey {target} has no committed generator")
+        label = f"{target[:10]}"
+
+    ref = commit.payload.split("hippius:")[-1].strip()
+    if not is_hub_ref(ref):
+        raise ValueError(f"commitment for {label} is not a valid generator ref: {commit.payload!r}")
+    return ref, label
+
+
+def _cmd_fetch(args: argparse.Namespace) -> int:
+    cfg = load_chain_config(args.chain_toml)
+    from ..shared.chain import ChainError
+
+    try:
+        ref, label = _resolve_fetch_ref(args.target, cfg, args.network)
+    except ChainError as e:
+        print(f"chain error: {e}", file=sys.stderr)
+        return 3
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    out = args.out or Path(f"./fetched-{label}")
+    print(f"fetching {ref}\n  → {out}")
+    from ..shared.hippius import HubConfig, StorageError, fetch_from_hub
+
+    try:
+        dest = fetch_from_hub(ref, out, HubConfig.from_storage(cfg.storage))
+    except StorageError as e:
+        print(f"registry fetch failed: {e}", file=sys.stderr)
+        return 4
+    files = sorted(p.name for p in dest.iterdir()) if dest.is_dir() else []
+    print(f"fetched {label}: {ref}\n  {len(files)} top-level entries: {', '.join(files[:12])}")
+
+    if args.verify:
+        report = verify_repo(dest, cfg, skip_runtime=False)
+        print(report.render())
+        return 0 if report.ok else 1
+    print(f"\ninspect it, or fork + improve it:  cascade verify {out}")
+    return 0
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -125,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_verify(sub)
     _add_deploy(sub)
+    _add_fetch(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 
