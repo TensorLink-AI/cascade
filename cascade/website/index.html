@@ -1245,16 +1245,35 @@ function renderReigns(){
       '<td class="num">'+(r.block!=null?r.block:"--")+'</td></tr>';
   }).join("");
 }
+// The receipt's participant set is a BEST-EFFORT chain snapshot the validator
+// takes when it builds the receipt; if the chain is unreachable that round it
+// publishes an EMPTY set (verdict still valid), and the field would blank out.
+// The manifest, though, records who competed independent of the chain poll —
+// king + finalists in `entries`, every screened challenger in `heat.entrants` —
+// so we can rebuild the field from it. No commit_block travels there (the chain
+// snapshot is what carries it), so those show "—".
+function fieldFromManifest(){
+  var m=_latest&&_latest.manifest; if(!m) return [];
+  var by={};
+  function add(uid,hotkey,gen_ref){
+    if(hotkey&&by[hotkey]==null) by[hotkey]={uid:uid,hotkey:hotkey,gen_ref:gen_ref,commit_block:null};
+  }
+  (m.entries||[]).forEach(function(e){ if(e) add(e.miner_uid,e.miner_hotkey,e.gen_ref); });
+  ((m.heat&&m.heat.entrants)||[]).forEach(function(e){ if(e) add(e.uid,e.hotkey,e.gen_ref); });
+  return Object.keys(by).map(function(k){ return by[k]; });
+}
 function renderField(){
   var tb=document.getElementById("field"), when=document.getElementById("field-when");
-  var parts=(_latest&&_latest.participants)||[];
-  when.textContent=_latest?("round "+shortRoundId(_latest.round_id)):"";
+  var parts=(_latest&&_latest.participants)||[], reconstructed=false;
+  if(!parts.length){ var fb=fieldFromManifest(); if(fb.length){ parts=fb; reconstructed=true; } }
+  when.textContent=_latest?("round "+shortRoundId(_latest.round_id)+
+    (reconstructed?" · from manifest — chain snapshot unavailable":"")):"";
   if(!parts.length){ tb.innerHTML='<tr><td colspan="4" class="empty">No participant set on the latest receipt</td></tr>'; return; }
   var kingHk=_latest&&_latest.verdict&&_latest.verdict.king_hotkey;
-  tb.innerHTML=parts.slice().sort(function(a,b){ return a.uid-b.uid; }).map(function(p){
+  tb.innerHTML=parts.slice().sort(function(a,b){ return (a.uid||0)-(b.uid||0); }).map(function(p){
     var crown=p.hotkey&&p.hotkey===kingHk?'<span class="crown">&#9819;</span> ':'';
-    return '<tr><td class="num">'+p.uid+'</td><td title="'+esc(p.hotkey)+'">'+crown+esc(shortHk(p.hotkey))+'</td>'+
-      '<td>'+refLink(p.gen_ref)+'</td><td class="num">'+p.commit_block+'</td></tr>';
+    return '<tr><td class="num">'+(p.uid!=null?p.uid:"--")+'</td><td title="'+esc(p.hotkey)+'">'+crown+esc(shortHk(p.hotkey))+'</td>'+
+      '<td>'+refLink(p.gen_ref)+'</td><td class="num">'+(p.commit_block!=null?p.commit_block:"—")+'</td></tr>';
   }).join("");
 }
 // Heat = the cheap screen that ranks every eligible challenger; only the top
