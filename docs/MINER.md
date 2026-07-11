@@ -191,6 +191,22 @@ same generator ref, the **earliest reveal** keeps the slot (the copy is dropped
 before any training), and a challenger byte-identical to the king is discarded
 outright.
 
+Two empirical assumptions behind this scheme can (and should) be re-checked
+against the live network:
+
+```bash
+# is the margin big enough? (needs a throwaway testnet hotkey; ~minutes)
+python scripts/measure_reveal_jitter.py --chain-toml chain.testnet.toml \
+    --network test --wallet-name probe --wallet-hotkey probe1
+
+# is content behind a random repo name actually undiscoverable? (~seconds)
+python scripts/probe_hub_enumeration.py
+```
+
+If the registry turns out to be enumerable, random repo names don't hide
+content and the fallback is *sealed submissions* (upload ciphertext; the
+decryption key + plaintext digest ride in the timelocked payload).
+
 ### 5b. If the Hippius Hub is down
 
 Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
