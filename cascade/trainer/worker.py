@@ -58,6 +58,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     args = _build_parser().parse_args(argv)
     # Logs to stderr so stdout carries only the receipt.
     logging.basicConfig(

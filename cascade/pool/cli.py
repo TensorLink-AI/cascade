@@ -264,6 +264,8 @@ def _upload_pool_ref(out_dir: Path, cfg, hub_repo: str | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     parser = argparse.ArgumentParser(
         prog="cascade-pool", description="Build the held-out eval pool for cascade validators."
     )

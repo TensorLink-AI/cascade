@@ -335,6 +335,8 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     parser = argparse.ArgumentParser(prog="cascade", description="cascade subnet miner CLI.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_verify(sub)

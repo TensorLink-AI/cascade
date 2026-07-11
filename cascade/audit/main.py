@@ -174,6 +174,8 @@ def audit_receipt(
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
