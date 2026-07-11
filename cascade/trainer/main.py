@@ -61,6 +61,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Cap datasets per suite for --post-round-benchmarks (0 = full).")
     p.add_argument("--bench-data-dir", default="/root/bench_data",
                    help="Benchmark data dir on the pod.")
+    p.add_argument("--bench-device", default="cpu",
+                   help="Device for the Cascade king bench eval ([scoring] cascade_enabled): "
+                        "'cuda' when the trainer box has a GPU, else 'cpu'.")
     p.add_argument("--bench-interval", type=int, default=0,
                    help="Minimum seconds between benchmark launches (0 = every round). "
                         "Set this above the sweep duration when rounds are tighter than "
@@ -154,6 +157,15 @@ def main(argv: list[str] | None = None) -> int:
                 min_interval_seconds=args.bench_interval,
             )
 
+    # Cascade: score the king's checkpoint on GIFT-Eval/BOOM/TIME and stamp the
+    # numbers onto its signed manifest entry so validators promote off one
+    # authoritative set. Only wired when [scoring] cascade_enabled.
+    bench_eval_fn = None
+    if cfg.scoring.cascade_enabled:
+        from .loop import make_bench_eval_fn
+
+        bench_eval_fn = make_bench_eval_fn(cfg, device=args.bench_device)
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
@@ -163,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
         bench_plan=bench_plan,
+        bench_eval_fn=bench_eval_fn,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",

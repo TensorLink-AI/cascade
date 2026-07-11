@@ -256,13 +256,13 @@ gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
 gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
 # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
-# Master switch: off ⇒ pure KOTH (no reign clock, no per-round GIFT-Eval/TIME
-# scoring, no warm-start promotion). When on, and the reigning king holds the
-# throne cascade_reign_days CONSECUTIVE WALL-CLOCK DAYS undethroned, the reign's
-# best checkpoint (lowest geomean of GIFT-Eval + TIME CRPS/MASE) is installed as
-# the warm-start init and the throne is vacated so the whole field re-competes
-# from it. The reign clock is wall-clock driven and persisted, so it survives
-# validator restarts.
+# Master switch: off ⇒ pure KOTH (no reign clock, no public-benchmark scoring, no
+# warm-start promotion). When on, and the reigning king holds the throne
+# cascade_reign_days CONSECUTIVE WALL-CLOCK DAYS undethroned, the reign's best
+# checkpoint (lowest geomean of the six GIFT-Eval / BOOM / TIME CRPS/MASE numbers
+# the trainer stamps onto the signed manifest) is installed as the warm-start init
+# and the throne is vacated so the whole field re-competes from it. The reign
+# clock is wall-clock driven and persisted, so it survives validator restarts.
 cascade_enabled      = false     # master on/off for warm-start promotion
 cascade_reign_days   = 7         # consecutive undethroned days before a Cascade fires
 

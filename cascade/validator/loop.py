@@ -322,55 +322,60 @@ class ValidatorRunner:
         primary = self.cfg.throne_contracts()[0].arch_preset
         return next((e for e in matches if e.size == primary), matches[0])
 
-    def _gift_time_metrics(self, entry: TrainedEntry) -> dict | None:  # pragma: no cover — sidecar glue
-        """Score one checkpoint on GIFT-Eval and TIME, returning the four numbers
-        Cascade records, or ``None`` when either suite is missing/errored. Runs the
-        out-of-process benchmark sidecar (best-effort, like the log-only hook)."""
-        from ..eval.benchmarks import run_benchmarks
+    @staticmethod
+    def _bench_scores_dict(entry: TrainedEntry) -> dict | None:
+        """The six Cascade numbers off a manifest entry's trainer-signed
+        ``bench_scores`` (GIFT-Eval / BOOM / TIME CRPS+MASE), or ``None`` when the
+        entry carries none. This is the authoritative, consensus-safe source: every
+        validator reads the identical signed numbers."""
+        bs = entry.bench_scores
+        if bs is None:
+            return None
+        return {
+            "gifteval_crps": bs.gifteval_crps, "gifteval_mase": bs.gifteval_mase,
+            "boom_crps": bs.boom_crps, "boom_mase": bs.boom_mase,
+            "time_crps": bs.time_crps, "time_mase": bs.time_mase,
+        }
+
+    def _bench_metrics_via_sidecar(self, entry: TrainedEntry) -> dict | None:  # pragma: no cover — sidecar glue
+        """Fallback: score one checkpoint on GIFT-Eval, BOOM, and TIME via the
+        out-of-process sidecar, returning the six numbers or ``None`` when any suite
+        is missing/errored. Used only when the manifest carries no ``bench_scores``
+        (e.g. a trainer that predates the Cascade hook). NOTE: independently-run GPU
+        sweeps are not bit-reproducible, so this path is not consensus-safe across
+        validators — prefer the trainer-signed numbers."""
+        from ..eval.benchmarks import extract_bench_scores, run_benchmarks
 
         ec = self.cfg.eval
         ckpt = self._fetch_checkpoint_dir(entry)
         report = run_benchmarks(
             ckpt,
             project_dir=ec.benchmark_project_dir,
-            suites=("gift-eval", "time"),
+            suites=("gift-eval", "boom", "time"),
             num_samples=ec.benchmark_num_samples or ec.num_samples,
             max_series=ec.benchmark_max_series,
             device=self.device,
         )
-        if report is None:
-            return None
-        got: dict[str, float] = {}
-        for s in report.get("suites", []):
-            if s.get("status") != "ok":
-                continue
-            m = s.get("metrics") or {}
-            if "crps" not in m or "mase" not in m:
-                continue
-            if s.get("suite") == "gift-eval":
-                got["gifteval_crps"], got["gifteval_mase"] = float(m["crps"]), float(m["mase"])
-            elif s.get("suite") == "time":
-                got["time_crps"], got["time_mase"] = float(m["crps"]), float(m["mase"])
-        needed = ("gifteval_crps", "gifteval_mase", "time_crps", "time_mase")
-        if not all(k in got for k in needed):
-            log.warning("cascade: incomplete GIFT-Eval/TIME metrics for king checkpoint %s "
-                        "(have %s); not recording this round", entry.trained_pointer, sorted(got))
-            return None
-        return got
+        metrics = extract_bench_scores(report)
+        if metrics is None:
+            log.warning("cascade: incomplete GIFT-Eval/BOOM/TIME metrics for king checkpoint %s; "
+                        "not recording this round", entry.trained_pointer)
+        return metrics
 
     def _record_king_checkpoint(
         self, manifest: TrainingManifest, now: float
     ) -> None:  # pragma: no cover — sidecar glue
-        """Score the reigning king's checkpoint this round and add it to the reign
-        log so a later Cascade selection is a lookup, not a re-eval. Best-effort: a
-        sidecar failure just means this round's checkpoint isn't a promotion
-        candidate — it never disturbs the round."""
+        """Add the reigning king's checkpoint to the reign log so a later Cascade
+        selection is a lookup, not a re-eval. Prefers the trainer's signed
+        ``bench_scores`` on the manifest (consensus-safe); falls back to scoring via
+        the local sidecar only when the manifest carries none. Best-effort: a miss
+        just means this round's checkpoint isn't a promotion candidate."""
         if self.cascade is None or self.state.king_hotkey is None:
             return
         entry = self._current_king_entry(manifest)
         if entry is None:
             return
-        metrics = self._gift_time_metrics(entry)
+        metrics = self._bench_scores_dict(entry) or self._bench_metrics_via_sidecar(entry)
         if metrics is None:
             return
         self.cascade.record_checkpoint(entry.trained_pointer, now=now, **metrics)

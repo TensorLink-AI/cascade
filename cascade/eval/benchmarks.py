@@ -161,6 +161,32 @@ def run_gift_rows(
     return None
 
 
+# Sidecar suite name → the prefix Cascade uses for that suite's two numbers.
+_CASCADE_SUITE_KEY = {"gift-eval": "gifteval", "boom": "boom", "time": "time"}
+_CASCADE_KEYS = (
+    "gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase", "time_crps", "time_mase",
+)
+
+
+def extract_bench_scores(report: dict | None) -> dict | None:
+    """Pull Cascade's six numbers — GIFT-Eval / BOOM / TIME CRPS+MASE — from a
+    :func:`run_benchmarks` report, or ``None`` when any of the three suites is
+    missing, skipped, errored, or lacks a crps/mase. Shared by the trainer (which
+    stamps them onto the king's manifest entry) and the validator's fallback so the
+    extraction convention lives in one place."""
+    if not report:
+        return None
+    got: dict[str, float] = {}
+    for s in report.get("suites", []):
+        key = _CASCADE_SUITE_KEY.get(s.get("suite"))
+        if key is None or s.get("status") != "ok":
+            continue
+        m = s.get("metrics") or {}
+        if "crps" in m and "mase" in m:
+            got[f"{key}_crps"], got[f"{key}_mase"] = float(m["crps"]), float(m["mase"])
+    return got if all(k in got for k in _CASCADE_KEYS) else None
+
+
 def format_report(report: dict) -> str:
     """One-line-per-suite summary for logging, e.g.
     ``gift-eval ok crps=0.4200 mase=0.8100 n=97 | boom ok ... | time skipped``."""

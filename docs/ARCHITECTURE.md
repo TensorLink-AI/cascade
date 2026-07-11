@@ -146,15 +146,28 @@ wall-clock ratchet that periodically raises the floor the whole field trains up
 from. A **reign clock** counts days since the current king last took the throne;
 every dethrone re-crowns and resets it (Cascade reuses the KOTH dethrone signal —
 it never re-implements dethroning). During a reign every checkpoint the king
-produces is scored on **GIFT-Eval and TIME** — `score =
-geomean(gifteval_crps, gifteval_mase, time_crps, time_mase)`, lower better — and
-kept in a per-reign log. When a king holds the throne `[scoring]
-cascade_reign_days` (default 7) consecutive days undethroned, a **Cascade** fires:
-the reign's lowest-score checkpoint (a lookup, not a re-eval) is installed **as-is**
-as the warm-start init for all subsequent rounds, then the throne is vacated — the
-king is cleared, the competition re-opens from the new init, and the clock resets.
-The reign clock and checkpoint log persist next to the champion state, so Cascade
-survives validator restarts.
+produces is scored on the three public suites — **GIFT-Eval, BOOM, and TIME** —
+`score = geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps,
+time_mase)`, lower better — and kept in a per-reign log. When a king holds the
+throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned, a
+**Cascade** fires: the reign's lowest-score checkpoint (a lookup, not a re-eval)
+is installed **as-is** as the warm-start init for all subsequent rounds, then the
+throne is vacated — the king is cleared, the competition re-opens from the new
+init, and the clock resets. The reign clock and checkpoint log persist next to the
+champion state, so Cascade survives validator restarts.
+
+Those six numbers are **authoritative from the trainer, not recomputed per
+validator**. The trainer (owner-operated, already the manifest trust anchor) runs
+the benchmark sidecar once on the king's checkpoint and stamps the numbers onto
+that entry in the *signed* manifest (`manifest.BenchScores`), so every validator
+records the identical values — Cascade selection is deterministic across
+validators rather than each re-running a non-bit-reproducible GPU sweep. A
+validator falls back to scoring the checkpoint itself only when the manifest
+carries no scores (e.g. a trainer predating the hook). The dethrone verdict itself
+stays entirely on the private eval pool; these public-benchmark numbers drive only
+Cascade's warm-start promotion. Cascade is opt-in — `[scoring] cascade_enabled`
+(off by default) — and when off the trainer skips the eval and validators run pure
+KOTH.
 
 ## The controlled-experiment invariant
 

@@ -97,6 +97,28 @@ def contract_digest(contract: object) -> str:
 
 
 @dataclass(frozen=True)
+class BenchScores:
+    """Public-benchmark scores for one trained checkpoint, stamped by the trainer.
+
+    The CRPS and MASE the checkpoint scored on each of the three public suites —
+    GIFT-Eval, BOOM, and TIME — run once by the (trusted, owner-operated) trainer
+    via the benchmark sidecar and published on the king's :class:`TrainedEntry`.
+    Cascade (:mod:`cascade.validator.cascade`) consumes these: every validator
+    reads the *same signed numbers* instead of re-running a non-bit-reproducible
+    GPU sweep, so the reign checkpoint log — and the promotion it drives — is
+    deterministic across validators. These feed ONLY Cascade's warm-start
+    promotion; the round's dethrone verdict stays on the private eval pool.
+    """
+
+    gifteval_crps: float
+    gifteval_mase: float
+    boom_crps: float
+    boom_mase: float
+    time_crps: float
+    time_mase: float
+
+
+@dataclass(frozen=True)
 class TrainedEntry:
     """One miner's training receipt for a round.
 
@@ -105,6 +127,12 @@ class TrainedEntry:
     pointer. The OCI digest inside each ``repo@digest`` is itself the integrity
     hash — the fetch verifies the layer blobs against it — so no separate tar
     digest is carried.
+
+    ``bench_scores`` is the trainer's signed public-benchmark scoring of this
+    checkpoint (GIFT-Eval / BOOM / TIME), carried on the king entry when Cascade
+    is enabled and ``None`` otherwise. It is folded into ``canonical_body`` only
+    when present, so a manifest without it serialises byte-for-byte as before (no
+    wire-format break, no version bump) and old signatures stay valid.
     """
 
     miner_hotkey: str
@@ -117,6 +145,7 @@ class TrainedEntry:
     gpu_name: str = ""        # GPU model the run used; gated for matched-hardware audit
     size: str = ""            # arch_preset this entry was trained at ("" = primary/legacy).
                               # A round carries one (king, challenger) pair PER size.
+    bench_scores: BenchScores | None = None  # trainer-signed public-benchmark scores (king only)
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -169,6 +198,29 @@ class HeatResult:
     screen_size: str               # arch_preset the heat screened at
     finalists: int                 # how many advanced to the final
     entrants: tuple[HeatEntrant, ...] = ()
+
+
+def _entry_body(e: TrainedEntry) -> dict:
+    """One entry's canonical dict. ``bench_scores`` is omitted when ``None`` so a
+    manifest without it is byte-identical to a pre-``bench_scores`` manifest — the
+    signed payload only grows for entries that actually carry the scores."""
+    d = asdict(e)
+    if d.get("bench_scores") is None:
+        d.pop("bench_scores", None)
+    return d
+
+
+def _bench_from_json(obj: object) -> BenchScores | None:
+    if not isinstance(obj, dict):
+        return None
+    return BenchScores(
+        gifteval_crps=float(obj["gifteval_crps"]),
+        gifteval_mase=float(obj["gifteval_mase"]),
+        boom_crps=float(obj["boom_crps"]),
+        boom_mase=float(obj["boom_mase"]),
+        time_crps=float(obj["time_crps"]),
+        time_mase=float(obj["time_mase"]),
+    )
 
 
 def _heat_to_json(heat: HeatResult | None) -> dict | None:
@@ -248,7 +300,10 @@ class TrainingManifest:
         """Deterministic byte serialisation of everything except the signature.
 
         The signed payload. Stable key ordering so the trainer and every
-        validator hash the identical bytes.
+        validator hash the identical bytes. ``bench_scores`` is dropped from an
+        entry when ``None`` (see :func:`_entry_body`), so a manifest without it
+        hashes exactly as it did before the field existed — old signatures stay
+        valid without a version bump.
         """
         body = {
             "manifest_version": self.manifest_version,
@@ -257,7 +312,7 @@ class TrainingManifest:
             "contract_digest": self.contract_digest,
             "base_arch_digest": self.base_arch_digest,
             "eval_dataset": self.eval_dataset,
-            "entries": [asdict(e) for e in self.entries],
+            "entries": [_entry_body(e) for e in self.entries],
         }
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -296,6 +351,7 @@ def load_manifest(text: str) -> TrainingManifest:
             train_block=int(e["train_block"]),
             gpu_name=str(e.get("gpu_name", "")),
             size=str(e.get("size", "")),
+            bench_scores=_bench_from_json(e.get("bench_scores")),
         )
         for e in obj["entries"]
     ]

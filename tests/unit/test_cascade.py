@@ -3,7 +3,8 @@
 The wall-clock reign clock, per-reign checkpoint log, lowest-score selection, and
 the vacate-throne action are exercised here on the pure controller (no I/O beyond
 an optional temp state file). Time is passed explicitly as ``now`` so nothing
-depends on the wall clock.
+depends on the wall clock. Checkpoints are scored on six public-benchmark numbers
+(GIFT-Eval / BOOM / TIME CRPS+MASE).
 """
 
 from __future__ import annotations
@@ -16,9 +17,10 @@ from cascade.validator.cascade import (
     CascadeController,
     CascadeState,
     CheckpointRecord,
+    cascade_score,
     crown,
     dumps,
-    geomean4,
+    geomean,
     load_state,
     loads,
     reign_days,
@@ -30,31 +32,46 @@ from cascade.validator.cascade import (
 DAY = 86_400.0
 
 
-def _ckpt(cid: str, gc: float, gm: float, tc: float, tm: float, ts: float) -> CheckpointRecord:
+def _ckpt(cid, gc, gm, tc, tm, ts, *, bc=1.0, bm=1.0) -> CheckpointRecord:
+    """A scored checkpoint. BOOM defaults to 1.0 so tests that only vary GIFT-Eval
+    and TIME keep BOOM out of the comparison."""
     return CheckpointRecord.scored(
-        cid, gifteval_crps=gc, gifteval_mase=gm, time_crps=tc, time_mase=tm, timestamp=ts
+        cid, gifteval_crps=gc, gifteval_mase=gm, boom_crps=bc, boom_mase=bm,
+        time_crps=tc, time_mase=tm, timestamp=ts,
+    )
+
+
+def _record(ctl, cid, *, gc, gm, tc, tm, now, bc=1.0, bm=1.0):
+    return ctl.record_checkpoint(
+        cid, gifteval_crps=gc, gifteval_mase=gm, boom_crps=bc, boom_mase=bm,
+        time_crps=tc, time_mase=tm, now=now,
     )
 
 
 # ── the geomean score ────────────────────────────────────────────────────────
 
 
-def test_geomean4_is_fourth_root_of_product():
-    assert geomean4(1.0, 1.0, 1.0, 1.0) == 1.0
-    assert math.isclose(geomean4(2.0, 2.0, 2.0, 2.0), 2.0)
-    assert math.isclose(geomean4(0.5, 0.8, 0.4, 0.9), (0.5 * 0.8 * 0.4 * 0.9) ** 0.25)
+def test_geomean_is_nth_root_of_product():
+    assert geomean(1.0, 1.0, 1.0) == 1.0
+    assert math.isclose(geomean(2.0, 2.0, 2.0, 2.0), 2.0)
+    assert math.isclose(geomean(0.5, 0.8, 0.4, 0.9), (0.5 * 0.8 * 0.4 * 0.9) ** 0.25)
 
 
-def test_geomean4_clamps_zero_and_negative():
+def test_cascade_score_is_geomean_of_six():
+    vals = (0.5, 0.8, 0.6, 0.7, 0.4, 0.9)
+    assert math.isclose(cascade_score(*vals), math.prod(vals) ** (1.0 / 6))
+
+
+def test_geomean_clamps_zero_and_negative():
     # A zero (or spurious negative) eval must not zero-out or NaN the product.
-    v = geomean4(0.0, 1.0, 1.0, 1.0)
+    v = geomean(0.0, 1.0, 1.0)
     assert v > 0.0 and math.isfinite(v)
-    assert math.isfinite(geomean4(-1.0, 1.0, 1.0, 1.0))
+    assert math.isfinite(geomean(-1.0, 1.0, 1.0))
 
 
-def test_record_score_matches_geomean():
-    r = _ckpt("c", 0.5, 0.8, 0.4, 0.9, 0.0)
-    assert math.isclose(r.score, geomean4(0.5, 0.8, 0.4, 0.9))
+def test_record_score_matches_cascade_score():
+    r = _ckpt("c", 0.5, 0.8, 0.4, 0.9, 0.0, bc=0.6, bm=0.7)
+    assert math.isclose(r.score, cascade_score(0.5, 0.8, 0.6, 0.7, 0.4, 0.9))
 
 
 # ── trigger: the wall-clock reign clock ──────────────────────────────────────
@@ -73,7 +90,7 @@ def test_reign_clock_is_none_when_throne_vacant():
 def test_dethrone_resets_the_clock():
     ctl = CascadeController(reign_days=7)
     ctl.note_dethrone("kingA", now=0.0)
-    ctl.record_checkpoint("a", gifteval_crps=1, gifteval_mase=1, time_crps=1, time_mase=1, now=DAY)
+    _record(ctl, "a", gc=1, gm=1, tc=1, tm=1, now=DAY)
     # 6 days in, not ripe.
     assert ctl.cascade_check(now=6 * DAY) is None
     # A new king dethrones on day 6 → clock resets; the old reign's log is cleared.
@@ -87,7 +104,7 @@ def test_should_cascade_requires_clock_and_a_checkpoint():
     st = crown(CascadeState(), king_hotkey="k", now=0.0)
     # Ripe clock but empty log → not a cascade (nothing to promote).
     assert not should_cascade(st, now=10 * DAY, reign_days_threshold=7)
-    st = st.__class__(king_hotkey="k", reign_start=0.0, checkpoints=(_ckpt("a", 1, 1, 1, 1, 0.0),))
+    st = CascadeState(king_hotkey="k", reign_start=0.0, checkpoints=(_ckpt("a", 1, 1, 1, 1, 0.0),))
     assert not should_cascade(st, now=6 * DAY, reign_days_threshold=7)  # too soon
     assert should_cascade(st, now=7 * DAY, reign_days_threshold=7)      # ripe + a checkpoint
 
@@ -106,6 +123,19 @@ def test_select_winner_picks_lowest_score():
         ),
     )
     assert select_winner(st).checkpoint_id == "lo"
+
+
+def test_boom_can_flip_the_winner():
+    # Two checkpoints identical on GIFT-Eval and TIME; BOOM decides.
+    st = CascadeState(
+        king_hotkey="k",
+        reign_start=0.0,
+        checkpoints=(
+            _ckpt("boom-bad", 0.5, 0.5, 0.5, 0.5, 1.0, bc=0.9, bm=0.9),
+            _ckpt("boom-good", 0.5, 0.5, 0.5, 0.5, 2.0, bc=0.2, bm=0.2),
+        ),
+    )
+    assert select_winner(st).checkpoint_id == "boom-good"
 
 
 def test_select_winner_breaks_ties_by_earliest():
@@ -131,8 +161,8 @@ def test_cascade_fires_at_threshold_and_selects_best():
     installed: list[CheckpointRecord] = []
     ctl = CascadeController(reign_days=7, install_fn=installed.append)
     ctl.note_dethrone("kingA", now=0.0)
-    ctl.record_checkpoint("worse", gifteval_crps=0.6, gifteval_mase=0.9, time_crps=0.5, time_mase=1.0, now=DAY)
-    ctl.record_checkpoint("best", gifteval_crps=0.4, gifteval_mase=0.7, time_crps=0.3, time_mase=0.8, now=2 * DAY)
+    _record(ctl, "worse", gc=0.6, gm=0.9, tc=0.5, tm=1.0, now=DAY)
+    _record(ctl, "best", gc=0.4, gm=0.7, tc=0.3, tm=0.8, now=2 * DAY)
 
     assert ctl.cascade_check(now=6.99 * DAY) is None      # clock not ripe
     event = ctl.cascade_check(now=7 * DAY)
@@ -147,7 +177,7 @@ def test_cascade_fires_at_threshold_and_selects_best():
 def test_cascade_vacates_throne_and_resets_clock():
     ctl = CascadeController(reign_days=7)
     ctl.note_dethrone("kingA", now=0.0)
-    ctl.record_checkpoint("c", gifteval_crps=1, gifteval_mase=1, time_crps=1, time_mase=1, now=DAY)
+    _record(ctl, "c", gc=1, gm=1, tc=1, tm=1, now=DAY)
     ctl.cascade_check(now=7 * DAY)
     # Throne vacated: no king, clock stopped, reign log cleared.
     assert ctl.state == CascadeState()
@@ -167,7 +197,7 @@ def test_cascade_holds_when_clock_ripe_but_no_checkpoint():
 def test_record_checkpoint_ignored_when_throne_vacant():
     ctl = CascadeController(reign_days=7)
     # No king crowned yet.
-    assert ctl.record_checkpoint("c", gifteval_crps=1, gifteval_mase=1, time_crps=1, time_mase=1, now=0.0) is None
+    assert _record(ctl, "c", gc=1, gm=1, tc=1, tm=1, now=0.0) is None
     assert ctl.state.checkpoints == ()
 
 
@@ -177,7 +207,7 @@ def test_install_failure_leaves_reign_intact_for_retry():
 
     ctl = CascadeController(reign_days=7, install_fn=_boom)
     ctl.note_dethrone("kingA", now=0.0)
-    ctl.record_checkpoint("c", gifteval_crps=1, gifteval_mase=1, time_crps=1, time_mase=1, now=DAY)
+    _record(ctl, "c", gc=1, gm=1, tc=1, tm=1, now=DAY)
     with pytest.raises(RuntimeError):
         ctl.cascade_check(now=7 * DAY)
     # The throne was NOT vacated — a failed install is retried next round.
@@ -188,11 +218,11 @@ def test_install_failure_leaves_reign_intact_for_retry():
 def test_new_reign_after_cascade_can_fire_again():
     ctl = CascadeController(reign_days=7)
     ctl.note_dethrone("kingA", now=0.0)
-    ctl.record_checkpoint("a", gifteval_crps=1, gifteval_mase=1, time_crps=1, time_mase=1, now=DAY)
+    _record(ctl, "a", gc=1, gm=1, tc=1, tm=1, now=DAY)
     ctl.cascade_check(now=7 * DAY)          # fires, throne vacated
     # A fresh king is crowned; its own reign clock starts from the crown instant.
     ctl.note_dethrone("kingB", now=8 * DAY)
-    ctl.record_checkpoint("b", gifteval_crps=0.5, gifteval_mase=0.5, time_crps=0.5, time_mase=0.5, now=9 * DAY)
+    _record(ctl, "b", gc=0.5, gm=0.5, tc=0.5, tm=0.5, now=9 * DAY)
     assert ctl.cascade_check(now=8 * DAY + 6 * DAY) is None
     ev = ctl.cascade_check(now=8 * DAY + 7 * DAY)
     assert ev is not None and ev.old_king == "kingB" and ev.winner.checkpoint_id == "b"
@@ -206,8 +236,8 @@ def test_state_round_trips_through_json():
         king_hotkey="k",
         reign_start=1234.5,
         checkpoints=(
-            _ckpt("a", 0.5, 0.8, 0.4, 0.9, 10.0),
-            _ckpt("b", 0.4, 0.7, 0.3, 0.8, 20.0),
+            _ckpt("a", 0.5, 0.8, 0.4, 0.9, 10.0, bc=0.6, bm=0.7),
+            _ckpt("b", 0.4, 0.7, 0.3, 0.8, 20.0, bc=0.5, bm=0.6),
         ),
     )
     assert loads(dumps(st)) == st
@@ -221,7 +251,7 @@ def test_controller_persists_and_reloads(tmp_path):
     path = tmp_path / "cascade_state.json"
     ctl = CascadeController(reign_days=7, state_path=path)
     ctl.note_dethrone("kingA", now=1000.0)
-    ctl.record_checkpoint("a", gifteval_crps=0.4, gifteval_mase=0.7, time_crps=0.3, time_mase=0.8, now=1000.0 + DAY)
+    _record(ctl, "a", gc=0.4, gm=0.7, tc=0.3, tm=0.8, now=1000.0 + DAY)
     # Simulate a restart: rebuild the controller from the persisted file.
     reloaded = CascadeController(reign_days=7, state=load_state(path), state_path=path)
     assert reloaded.state.king_hotkey == "kingA"

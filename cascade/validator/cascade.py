@@ -16,11 +16,19 @@ The mechanism has three moving parts:
   consecutive days undethroned, Cascade fires.
 
 * **Checkpoint selection.** Every checkpoint the king produces during its reign is
-  evaluated on the current eval on both GIFT-Eval and TIME, each yielding a CRPS
-  and a MASE. The checkpoint is scored ``geomean(gifteval_crps, gifteval_mase,
-  time_crps, time_mase)`` (lower is better) and the four numbers + score are kept
-  in a per-reign log (:class:`CheckpointRecord`). On a Cascade event the reign's
-  lowest-score checkpoint is selected — a lookup over the log, never a re-eval.
+  evaluated on the three public suites — GIFT-Eval, BOOM, and TIME — each yielding
+  a CRPS and a MASE. The checkpoint is scored ``geomean(gifteval_crps,
+  gifteval_mase, boom_crps, boom_mase, time_crps, time_mase)`` (lower is better)
+  and the six numbers + score are kept in a per-reign log
+  (:class:`CheckpointRecord`). On a Cascade event the reign's lowest-score
+  checkpoint is selected — a lookup over the log, never a re-eval.
+
+  The six numbers are produced once by the (trusted, owner-operated) trainer via
+  the benchmark sidecar and published on the king's manifest entry
+  (:class:`cascade.shared.manifest.BenchScores`), so every validator records the
+  *same signed numbers* — Cascade is deterministic across validators rather than
+  each re-running a non-bit-reproducible GPU sweep. The validator can still score
+  a checkpoint itself as a fallback when the manifest lacks the numbers.
 
 * **Action.** The selected checkpoint is installed as the warm-start init for all
   subsequent rounds (promoted **as-is** — never retrained or fine-tuned). Then the
@@ -55,14 +63,29 @@ SECONDS_PER_DAY = 86_400.0
 _EPS = 1e-12
 
 
-def geomean4(gifteval_crps: float, gifteval_mase: float, time_crps: float, time_mase: float) -> float:
-    """``geomean`` of the four eval numbers — GIFT-Eval CRPS/MASE and TIME
-    CRPS/MASE — lower is better. Each is clamped to a tiny positive floor so a
-    single zero (or a spurious negative) can't zero out or NaN the product."""
+def geomean(*values: float) -> float:
+    """Geometric mean of its arguments — lower is better for the eval metrics
+    Cascade scores on. Each value is clamped to a tiny positive floor so a single
+    zero (or a spurious negative) can't zero out or NaN the product."""
+    if not values:
+        return float("nan")
     prod = 1.0
-    for v in (gifteval_crps, gifteval_mase, time_crps, time_mase):
+    for v in values:
         prod *= max(float(v), _EPS)
-    return float(prod ** 0.25)
+    return float(prod ** (1.0 / len(values)))
+
+
+def cascade_score(
+    gifteval_crps: float,
+    gifteval_mase: float,
+    boom_crps: float,
+    boom_mase: float,
+    time_crps: float,
+    time_mase: float,
+) -> float:
+    """The Cascade checkpoint score: geomean of the six public-benchmark numbers
+    (GIFT-Eval / BOOM / TIME CRPS+MASE). Lower is better."""
+    return geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps, time_mase)
 
 
 @dataclass(frozen=True)
@@ -70,15 +93,17 @@ class CheckpointRecord:
     """One checkpoint the king produced during its reign, scored for Cascade.
 
     ``checkpoint_id`` identifies the artifact to promote (the trained-pointer /
-    registry ref). The four eval numbers are the CRPS and MASE the checkpoint
-    scored on GIFT-Eval and on TIME against the current eval; ``score`` is their
-    :func:`geomean4` (lower is better); ``timestamp`` is wall-clock epoch seconds
-    when it was recorded (the selection tiebreak, and reign observability).
+    registry ref). The six eval numbers are the CRPS and MASE the checkpoint
+    scored on GIFT-Eval, BOOM, and TIME; ``score`` is their :func:`cascade_score`
+    (geomean, lower is better); ``timestamp`` is wall-clock epoch seconds when it
+    was recorded (the selection tiebreak, and reign observability).
     """
 
     checkpoint_id: str
     gifteval_crps: float
     gifteval_mase: float
+    boom_crps: float
+    boom_mase: float
     time_crps: float
     time_mase: float
     score: float
@@ -91,19 +116,23 @@ class CheckpointRecord:
         *,
         gifteval_crps: float,
         gifteval_mase: float,
+        boom_crps: float,
+        boom_mase: float,
         time_crps: float,
         time_mase: float,
         timestamp: float,
     ) -> CheckpointRecord:
-        """Build a record, computing ``score`` from the four eval numbers so the
+        """Build a record, computing ``score`` from the six eval numbers so the
         geomean convention lives in exactly one place."""
         return cls(
             checkpoint_id=checkpoint_id,
             gifteval_crps=float(gifteval_crps),
             gifteval_mase=float(gifteval_mase),
+            boom_crps=float(boom_crps),
+            boom_mase=float(boom_mase),
             time_crps=float(time_crps),
             time_mase=float(time_mase),
-            score=geomean4(gifteval_crps, gifteval_mase, time_crps, time_mase),
+            score=cascade_score(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps, time_mase),
             timestamp=float(timestamp),
         )
 
@@ -214,6 +243,8 @@ def dumps(state: CascadeState) -> str:
                     "checkpoint_id": r.checkpoint_id,
                     "gifteval_crps": r.gifteval_crps,
                     "gifteval_mase": r.gifteval_mase,
+                    "boom_crps": r.boom_crps,
+                    "boom_mase": r.boom_mase,
                     "time_crps": r.time_crps,
                     "time_mase": r.time_mase,
                     "score": r.score,
@@ -233,6 +264,8 @@ def loads(text: str) -> CascadeState:
             checkpoint_id=str(c["checkpoint_id"]),
             gifteval_crps=float(c["gifteval_crps"]),
             gifteval_mase=float(c["gifteval_mase"]),
+            boom_crps=float(c["boom_crps"]),
+            boom_mase=float(c["boom_mase"]),
             time_crps=float(c["time_crps"]),
             time_mase=float(c["time_mase"]),
             score=float(c["score"]),
@@ -286,6 +319,8 @@ class CascadeController:
         *,
         gifteval_crps: float,
         gifteval_mase: float,
+        boom_crps: float,
+        boom_mase: float,
         time_crps: float,
         time_mase: float,
         now: float,
@@ -299,6 +334,8 @@ class CascadeController:
             checkpoint_id,
             gifteval_crps=gifteval_crps,
             gifteval_mase=gifteval_mase,
+            boom_crps=boom_crps,
+            boom_mase=boom_mase,
             time_crps=time_crps,
             time_mase=time_mase,
             timestamp=now,
@@ -307,9 +344,9 @@ class CascadeController:
         self._persist()
         log.info(
             "cascade: recorded checkpoint %s score=%.5f (gift crps=%.5f mase=%.5f, "
-            "time crps=%.5f mase=%.5f); %d checkpoint(s) this reign",
+            "boom crps=%.5f mase=%.5f, time crps=%.5f mase=%.5f); %d checkpoint(s) this reign",
             rec.checkpoint_id, rec.score, rec.gifteval_crps, rec.gifteval_mase,
-            rec.time_crps, rec.time_mase, len(self.state.checkpoints),
+            rec.boom_crps, rec.boom_mase, rec.time_crps, rec.time_mase, len(self.state.checkpoints),
         )
         return rec
 
@@ -350,11 +387,11 @@ class CascadeController:
         self._persist()
         log.info(
             "CASCADE fired: old_king=%s reign=%.2fd winner=%s score=%.5f "
-            "(gift crps=%.5f mase=%.5f, time crps=%.5f mase=%.5f); "
+            "(gift crps=%.5f mase=%.5f, boom crps=%.5f mase=%.5f, time crps=%.5f mase=%.5f); "
             "installed as warm-start init, throne vacated, competition re-opened",
             (event.old_king or "?")[:12], event.reign_days, winner.checkpoint_id,
             winner.score, winner.gifteval_crps, winner.gifteval_mase,
-            winner.time_crps, winner.time_mase,
+            winner.boom_crps, winner.boom_mase, winner.time_crps, winner.time_mase,
         )
         return event
 

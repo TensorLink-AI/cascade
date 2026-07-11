@@ -24,7 +24,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..interface.validation import parse_commit
@@ -40,6 +40,7 @@ from ..shared.hippius import (
     upload_dir_to_hub,
 )
 from ..shared.manifest import (
+    BenchScores,
     HeatEntrant,
     HeatResult,
     TrainedEntry,
@@ -61,6 +62,15 @@ from .wandb_sink import open_wandb_run
 # screening stays a testable boundary — the default wiring (torch evaluator +
 # eval pool) is attached in cascade.trainer.main.
 ScreenFn = Callable[[Path, "ResolvedGenerator", int], float]
+
+# Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
+# TIME) for Cascade, given its local checkpoint dir. Returns the six-number
+# BenchScores the trainer stamps onto the king's manifest entry, or None when the
+# sidecar could not produce a complete set (best-effort — a miss just leaves the
+# king entry without bench_scores). Injected so the trainer's Cascade eval stays a
+# testable boundary; the default wiring (fetch + benchmark sidecar) is attached in
+# cascade.trainer.main.
+BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
 
@@ -96,6 +106,31 @@ class ResolvedGenerator:
 class RoundPlan:
     king: ResolvedGenerator | None
     challengers: list[ResolvedGenerator]
+
+
+def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
+    """Default Cascade bench evaluator: run the sidecar on a checkpoint dir over
+    GIFT-Eval / BOOM / TIME and return the six-number :class:`BenchScores`, or
+    ``None`` when the sidecar can't produce a complete set. Wired in trainer.main
+    when ``[scoring] cascade_enabled``; the checkpoint fetch is the caller's job
+    (``TrainerRunner._stamp_king_bench_scores``)."""
+
+    def _eval(ckpt_dir: Path) -> BenchScores | None:
+        from ..eval.benchmarks import extract_bench_scores, run_benchmarks
+
+        ec = cfg.eval
+        report = run_benchmarks(
+            ckpt_dir,
+            project_dir=ec.benchmark_project_dir,
+            suites=("gift-eval", "boom", "time"),
+            num_samples=ec.benchmark_num_samples or ec.num_samples,
+            max_series=ec.benchmark_max_series,
+            device=device,
+        )
+        scores = extract_bench_scores(report)
+        return BenchScores(**scores) if scores is not None else None
+
+    return _eval
 
 
 def resolve_commitments(
@@ -204,6 +239,12 @@ class TrainerRunner:
     # field down to [round] finalists before the expensive final. None ⇒ no
     # internal screen (the field's natural order is taken). Wired in trainer.main.
     screen_fn: ScreenFn | None = None
+    # Cascade: scores the king's checkpoint on GIFT-Eval / BOOM / TIME and stamps
+    # the numbers onto its manifest entry (so validators read one authoritative,
+    # signed set — consensus-safe promotion). Runs only when [scoring]
+    # cascade_enabled. None ⇒ no stamping (the king entry carries no bench_scores
+    # and validators fall back to scoring it themselves). Wired in trainer.main.
+    bench_eval_fn: BenchEvalFn | None = None
     # Remote (two-device) training: when ``remote_hosts`` is set, each round's
     # king and challenger train on separate SSH GPU pods in parallel (see
     # cascade.trainer.remote). ``trainer_spec`` is the BaseTrainer 'module:Class'
@@ -411,6 +452,56 @@ class TrainerRunner:
             size=size,
         )
 
+    def _fetch_checkpoint_dir(self, trained_pointer: str) -> Path:
+        """Fetch a just-trained checkpoint from the registry to a local dir (the
+        OCI digest self-verifies the bytes). Uniform for local and remote training,
+        since every final checkpoint is uploaded to the registry."""
+        ref = parse_trained_pointer(trained_pointer)
+        if ref is None:
+            raise ValueError(f"malformed trained_pointer: {trained_pointer!r}")
+        from ..shared.hippius import HubRef
+
+        dest = self.work_root / "_bench_ckpts" / HubRef.parse(ref).digest.replace(":", "-")
+        fetch_from_hub(ref, dest, self.hub())
+        return dest
+
+    def _stamp_king_bench_scores(
+        self, entries: list[TrainedEntry], seeds: RoundSeeds
+    ) -> list[TrainedEntry]:
+        """Score the king's checkpoint on GIFT-Eval / BOOM / TIME and return the
+        entries with those numbers stamped onto the king's (primary throne size)
+        entry. Best-effort: any failure logs and returns the entries unchanged, so
+        a benchmark hiccup never fails a round — validators then fall back to
+        scoring the checkpoint themselves."""
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        king_idx = next(
+            (i for i, e in enumerate(entries)
+             if e.role == "king" and (e.size == primary or e.size == "")),
+            next((i for i, e in enumerate(entries) if e.role == "king"), None),
+        )
+        if king_idx is None:
+            return entries
+        king = entries[king_idx]
+        try:
+            ckpt = self._fetch_checkpoint_dir(king.trained_pointer)
+            scores = self.bench_eval_fn(ckpt) if self.bench_eval_fn is not None else None
+        except Exception as e:  # noqa: BLE001 — Cascade telemetry must never fail a round
+            log.warning("round=%s: king bench eval failed (%s); manifest omits bench_scores",
+                        seeds.base_seed, e)
+            return entries
+        if scores is None:
+            log.warning("round=%s: king bench eval produced no complete score set; "
+                        "manifest omits bench_scores", seeds.base_seed)
+            return entries
+        log.info(
+            "round=%s: stamped king bench_scores gift(crps=%.5f mase=%.5f) "
+            "boom(crps=%.5f mase=%.5f) time(crps=%.5f mase=%.5f)",
+            seeds.base_seed, scores.gifteval_crps, scores.gifteval_mase,
+            scores.boom_crps, scores.boom_mase, scores.time_crps, scores.time_mase,
+        )
+        entries[king_idx] = replace(king, bench_scores=scores)
+        return entries
+
     def run_round(
         self,
         commitments: list[Commitment],
@@ -467,6 +558,13 @@ class TrainerRunner:
         entries = self._train_final(jobs, seeds, block)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
+
+        # Cascade: score the king's checkpoint on the public suites and stamp the
+        # numbers onto its manifest entry, so every validator promotes off one
+        # signed set (see cascade.validator.cascade). Best-effort and gated on
+        # [scoring] cascade_enabled; a failure just leaves bench_scores unset.
+        if self.cfg.scoring.cascade_enabled and self.bench_eval_fn is not None:
+            entries = self._stamp_king_bench_scores(entries, seeds)
 
         return TrainingManifest(
             round_id=str(base_seed),
