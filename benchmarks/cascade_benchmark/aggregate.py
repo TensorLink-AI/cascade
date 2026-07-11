@@ -57,6 +57,65 @@ def _scaled_gmean(pool: list[tuple[dict, dict]], metric: str) -> float:
     return shifted_gmean(ratio) if ratio is not None else float("nan")
 
 
+# Metric-name aliases (case-insensitive) → the canonical Cascade key. TIME's
+# timebench writes its own metric names into metrics.npz; GIFT-Eval/BOOM already
+# emit lowercase crps/mase. Matching case-insensitively over these aliases makes
+# the three suites agree on one pair of numbers regardless of upstream casing.
+_CRPS_ALIASES = ("crps", "wql", "mean_weighted_sum_quantile_loss")
+_MASE_ALIASES = ("mase",)
+
+
+def _ci_get(d: dict, aliases: tuple[str, ...]):
+    """Case-insensitive lookup of the first matching alias in ``d`` (else None)."""
+    low = {str(k).lower(): v for k, v in d.items()}
+    for a in aliases:
+        if a in low:
+            return low[a]
+    return None
+
+
+def seasonal_naive_quantiles(
+    target, horizon: int, season: int, n_quantiles: int
+) -> np.ndarray:
+    """Seasonal-Naive forecast as a degenerate ``(n_quantiles, V, H)`` quantile
+    array: the point forecast ``y[L - s + (h mod s)]`` repeated across every
+    quantile level. This is the standard Seasonal-Naive reference the leaderboards
+    (GIFT-Eval, BOOM, and TIME) normalize against, expressed on the caller's
+    quantile grid — a point forecast, so all quantile levels coincide (its
+    weighted quantile loss reduces to weighted MAE). ``target`` is one instance's
+    context, ``(V, L)`` or ``(L,)``; ``season`` the seasonal period."""
+    t = np.atleast_2d(np.asarray(target, dtype=np.float64))  # (V, L)
+    length = t.shape[1]
+    s = max(1, int(season))
+    idx = np.array(
+        [min(max((length - s) + (h % s), 0), length - 1) for h in range(int(horizon))],
+        dtype=int,
+    )
+    point = t[:, idx]  # (V, H)
+    return np.repeat(point[np.newaxis, :, :], int(n_quantiles), axis=0)  # (num_q, V, H)
+
+
+def normalize_time(model_rows: list[dict], baseline_rows: list[dict]) -> dict:
+    """TIME aggregation, made to match GIFT-Eval/BOOM: the per-task ratio of the
+    model metric to the Seasonal-Naive metric, then the **shifted geometric mean**
+    across tasks — instead of a plain mean of raw metrics. ``model_rows[i]`` and
+    ``baseline_rows[i]`` are the per-task metric dicts (timebench's own keys) for
+    the same task, in the same order. Returns ``{"crps": .., "mase": ..}`` in the
+    canonical lowercase keys the other suites use, skipping a metric whose baseline
+    is unusable. Reuses ``_scaled_gmean`` so the invalid-value / div-0 handling is
+    byte-identical to the official aggregate."""
+    out: dict = {}
+    for canon, aliases in (("crps", _CRPS_ALIASES), ("mase", _MASE_ALIASES)):
+        pool = [
+            ({canon: _ci_get(mr, aliases)}, {canon: _ci_get(br, aliases)})
+            for mr, br in zip(model_rows, baseline_rows, strict=False)
+        ]
+        val = _scaled_gmean(pool, canon)
+        if np.isfinite(val):
+            out[canon] = val
+    return out
+
+
 def official_aggregate(
     rows: list[dict],
     baseline: dict[str, dict],

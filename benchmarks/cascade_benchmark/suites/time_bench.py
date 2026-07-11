@@ -23,6 +23,7 @@ Real-TSF/TIME data. ``CASCADE_BENCH_TIME_DATASETS`` optionally restricts the
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import traceback
 from pathlib import Path
@@ -88,14 +89,48 @@ def _tasks(config, max_tasks: int | None):
                 return
 
 
+def _metrics_from_quantiles(dataset, fc_quantiles, ds_config, output_base_dir, season, model):
+    """Write a quantile forecast through TIME's own saver and read back the
+    per-window metrics it computes, averaged over windows. ``output_base_dir`` is
+    unique per role (model vs Seasonal-Naive baseline) so their metrics.npz files
+    never collide under a shared task dir."""
+    from timebench.evaluation.saver import save_window_predictions
+
+    save_window_predictions(
+        dataset=dataset,
+        fc_quantiles=fc_quantiles,
+        ds_config=ds_config,
+        output_base_dir=str(output_base_dir),
+        seasonality=season,
+        model_hyperparams={"model": model},
+        quantile_levels=QUANTILE_LEVELS,
+    )
+    metrics_npz = Path(output_base_dir) / ds_config / "metrics.npz"
+    if not metrics_npz.is_file():
+        # Tolerate a deeper timebench layout, but never search outside this
+        # role's own subtree — a wider glob could misattribute another task's
+        # (or the other role's) metrics.
+        hits = sorted((Path(output_base_dir) / ds_config).rglob("metrics.npz"))
+        if not hits:
+            raise FileNotFoundError(f"metrics.npz not written for {ds_config}")
+        metrics_npz = hits[0]
+    with np.load(metrics_npz) as data:
+        return {k: float(np.nanmean(data[k])) for k in data.files}
+
+
 def _score_one(
     wrapper, name: str, term: str, config, out_dir: str, num_samples: int,
     batch_size: int = 64,
-) -> dict:
-    """Run one TIME task and return ``{metric_name: mean_value}`` from metrics.npz."""
+) -> tuple[dict, dict]:
+    """Run one TIME task and return ``(model_metrics, seasonal_naive_metrics)``,
+    each ``{metric_name: mean_value}`` computed by TIME's own metric code. The
+    Seasonal-Naive baseline is scored through the identical saver+metric path, so
+    the caller can normalize the model metric by the baseline metric per task (the
+    ratio-then-geomean the GIFT-Eval / BOOM leaderboards — and TIME's own — use)."""
     from gluonts.time_feature import get_seasonality
     from timebench.evaluation.data import Dataset, get_dataset_settings
-    from timebench.evaluation.saver import save_window_predictions
+
+    from ..aggregate import seasonal_naive_quantiles
 
     settings = get_dataset_settings(name, term, config)
     pred_len = settings.get("prediction_length")
@@ -137,30 +172,24 @@ def _score_one(
         ]
     fc_quantiles = np.concatenate(fc, axis=0)  # (N, num_q, V, H)
 
-    ds_config = f"{name}/{term}"
-    save_window_predictions(
-        dataset=dataset,
-        fc_quantiles=fc_quantiles,
-        ds_config=ds_config,
-        output_base_dir=out_dir,
-        seasonality=season,
-        model_hyperparams={"model": "cascade"},
-        quantile_levels=QUANTILE_LEVELS,
+    # Seasonal-Naive baseline on the SAME instances/grid, scored the SAME way — so
+    # dividing model by baseline per task is apples-to-apples.
+    snaive = np.concatenate(
+        [
+            seasonal_naive_quantiles(d["target"], pred_len, season, len(QUANTILE_LEVELS))[np.newaxis, ...]
+            for d in eval_inputs
+        ],
+        axis=0,
     )
 
-    # TIME writes per-window metric arrays to {out_dir}/{ds_config}/metrics.npz;
-    # average each over windows (TIME's own leaderboard aggregation).
-    metrics_npz = Path(out_dir) / ds_config / "metrics.npz"
-    if not metrics_npz.is_file():
-        # Tolerate a deeper timebench layout, but never search outside this
-        # task's own subtree: out_dir is shared across tasks, so a wider glob
-        # could silently attribute a previous task's metrics to this one.
-        hits = sorted((Path(out_dir) / ds_config).rglob("metrics.npz"))
-        if not hits:
-            raise FileNotFoundError(f"metrics.npz not written for {ds_config}")
-        metrics_npz = hits[0]
-    with np.load(metrics_npz) as data:
-        return {k: float(np.nanmean(data[k])) for k in data.files}
+    ds_config = f"{name}/{term}"
+    model_metrics = _metrics_from_quantiles(
+        dataset, fc_quantiles, ds_config, Path(out_dir) / "model", season, "cascade",
+    )
+    snaive_metrics = _metrics_from_quantiles(
+        dataset, snaive, ds_config, Path(out_dir) / "snaive", season, "seasonal_naive",
+    )
+    return model_metrics, snaive_metrics
 
 
 def run(
@@ -187,28 +216,51 @@ def run(
     try:
         from timebench.evaluation.data import load_dataset_config
 
+        from ..aggregate import normalize_time
+
         config = load_dataset_config(None)
         wrapper = _load_wrapper(Path(checkpoint_dir), device)
 
-        per_metric: dict[str, list[float]] = {}
-        n_tasks = 0
+        model_rows: list[dict] = []
+        snaive_rows: list[dict] = []
         with tempfile.TemporaryDirectory(prefix="cascade-time-") as out_dir:
-            for name, term in _tasks(config, max_series):
+            for j, (name, term) in enumerate(_tasks(config, max_series)):
                 try:
-                    task_metrics = _score_one(
-                        wrapper, name, term, config, out_dir, num_samples, batch_size
+                    # Per-task subdir keeps every task's (and role's) metrics.npz
+                    # isolated under the shared temp root.
+                    model_m, snaive_m = _score_one(
+                        wrapper, name, term, config, str(Path(out_dir) / str(j)),
+                        num_samples, batch_size,
                     )
                 except Exception:  # noqa: BLE001 — one task must not abort the sweep
                     continue
-                for k, v in task_metrics.items():
-                    if np.isfinite(v):
-                        per_metric.setdefault(k, []).append(v)
-                n_tasks += 1
+                model_rows.append(model_m)
+                snaive_rows.append(snaive_m)
 
-        if not n_tasks:
+        if not model_rows:
             return SuiteResult(suite="time", status="error", detail="no TIME tasks scored")
-        metrics = {k: float(np.mean(vs)) for k, vs in per_metric.items() if vs}
-        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=n_tasks)
+
+        # Parity with GIFT-Eval/BOOM (and TIME's own leaderboard): per-task ratio to
+        # the Seasonal-Naive baseline, aggregated by the shifted geometric mean.
+        # ``CASCADE_BENCH_TIME_RAW=1`` forces the legacy raw arithmetic mean.
+        raw_mode = os.environ.get("CASCADE_BENCH_TIME_RAW", "").strip() in ("1", "true", "yes")
+        metrics: dict = {}
+        if not raw_mode:
+            metrics = normalize_time(model_rows, snaive_rows)
+        if not metrics:
+            # Normalization unavailable (no usable baseline, or forced raw): fall
+            # back to the raw mean so the suite still yields crps/mase — but this is
+            # NOT Seasonal-Naive-normalized, so it is not comparable to the others.
+            per_metric: dict[str, list[float]] = {}
+            for row in model_rows:
+                for k, v in row.items():
+                    if np.isfinite(v):
+                        per_metric.setdefault(k.lower(), []).append(v)
+            metrics = {k: float(np.mean(vs)) for k, vs in per_metric.items() if vs}
+            if not raw_mode:
+                print("time: Seasonal-Naive normalization produced nothing; reporting raw "
+                      "means (NOT comparable to gift-eval/boom)", file=sys.stderr)
+        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=len(model_rows))
     except ImportError as e:
         return SuiteResult(suite="time", status="skipped", detail=f"timebench not importable: {e}")
     except Exception as e:  # noqa: BLE001

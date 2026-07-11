@@ -166,6 +166,21 @@ _CASCADE_SUITE_KEY = {"gift-eval": "gifteval", "boom": "boom", "time": "time"}
 _CASCADE_KEYS = (
     "gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase", "time_crps", "time_mase",
 )
+# Metric-name aliases, matched case-insensitively. GIFT-Eval/BOOM emit lowercase
+# ``crps``/``mase``; TIME rides in on timebench's own naming (which may be
+# upper-case, and CRPS may surface as a weighted-quantile-loss name), so accept
+# the known synonyms rather than silently dropping a suite.
+_CRPS_ALIASES = ("crps", "wql", "mean_weighted_sum_quantile_loss")
+_MASE_ALIASES = ("mase",)
+
+
+def _pick_metric(metrics: dict, aliases: tuple[str, ...]) -> float | None:
+    low = {str(k).lower(): v for k, v in metrics.items()}
+    for a in aliases:
+        v = low.get(a)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
 
 
 def extract_bench_scores(report: dict | None) -> dict | None:
@@ -173,18 +188,37 @@ def extract_bench_scores(report: dict | None) -> dict | None:
     :func:`run_benchmarks` report, or ``None`` when any of the three suites is
     missing, skipped, errored, or lacks a crps/mase. Shared by the trainer (which
     stamps them onto the king's manifest entry) and the validator's fallback so the
-    extraction convention lives in one place."""
+    extraction convention lives in one place.
+
+    Matches metric names case-insensitively over ``_CRPS_ALIASES`` / ``_MASE_ALIASES``
+    so a suite whose upstream uses different casing (TIME) isn't silently dropped,
+    and logs exactly which suites were missing/failed when it returns ``None`` —
+    an incomplete set is a visible warning, not a silent Cascade stall."""
     if not report:
+        log.warning("extract_bench_scores: empty report; no Cascade scores")
         return None
     got: dict[str, float] = {}
-    for s in report.get("suites", []):
-        key = _CASCADE_SUITE_KEY.get(s.get("suite"))
-        if key is None or s.get("status") != "ok":
+    problems: list[str] = []
+    by_suite = {s.get("suite"): s for s in report.get("suites", [])}
+    for suite, key in _CASCADE_SUITE_KEY.items():
+        s = by_suite.get(suite)
+        if s is None:
+            problems.append(f"{suite}:absent")
+            continue
+        if s.get("status") != "ok":
+            problems.append(f"{suite}:{s.get('status')}")
             continue
         m = s.get("metrics") or {}
-        if "crps" in m and "mase" in m:
-            got[f"{key}_crps"], got[f"{key}_mase"] = float(m["crps"]), float(m["mase"])
-    return got if all(k in got for k in _CASCADE_KEYS) else None
+        crps, mase = _pick_metric(m, _CRPS_ALIASES), _pick_metric(m, _MASE_ALIASES)
+        if crps is None or mase is None:
+            problems.append(f"{suite}:missing_metric(keys={sorted(m)})")
+            continue
+        got[f"{key}_crps"], got[f"{key}_mase"] = crps, mase
+    if all(k in got for k in _CASCADE_KEYS):
+        return got
+    log.warning("extract_bench_scores: incomplete Cascade metric set (need all of "
+                "GIFT-Eval/BOOM/TIME crps+mase); problems: %s", "; ".join(problems) or "none")
+    return None
 
 
 def format_report(report: dict) -> str:

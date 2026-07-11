@@ -135,18 +135,24 @@ fabricated number.
 - **TIME** — *not* gluonts; mirrors TIME's own `experiments/chronos2.py`: build
   `timebench.evaluation.data.Dataset`, feed quantile arrays (the wrapper's
   quantile head on TIME's 9-level grid; legacy checkpoints fall back to sample
-  paths reduced to that grid) to `save_window_predictions`, and
-  read the resulting `metrics.npz` — TIME's own metric code, so numbers match the
-  [leaderboard](https://huggingface.co/spaces/Real-TSF/TIME-leaderboard).
+  paths reduced to that grid) to `save_window_predictions`, and read the resulting
+  `metrics.npz` — TIME's own metric code, so the per-task numbers match the
+  [leaderboard](https://huggingface.co/spaces/Real-TSF/TIME-leaderboard). Unlike
+  GIFT-Eval/BOOM, no Seasonal-Naive baseline is *vendored* for TIME, so we score a
+  point Seasonal-Naive forecast through the **same** saver+metric path per task and
+  normalize the model metric by it — the ratio→shifted-geomean below — so TIME's
+  headline `crps`/`mase` are on the same footing as the other two suites (this is
+  also TIME's own leaderboard aggregation). `CASCADE_BENCH_TIME_RAW=1` forces the
+  legacy raw arithmetic mean (not baseline-normalized, so **not** comparable).
 
 Both `GIFT_EVAL` and `BOOM` env vars must point at the respective downloaded
 benchmark data (gift-eval layout); each suite `skip`s cleanly when unset.
 
 ### Aggregation (the headline number)
 
-GIFT-Eval and BOOM are **not** a plain mean of per-dataset metrics. The headline
+All three suites are **not** a plain mean of per-dataset metrics. The headline
 is the official one (`aggregate.py`, a faithful port of DataDog's
-`boom/utils/leaderboard.py`, the same methodology GIFT-Eval uses):
+`boom/utils/leaderboard.py`, the same methodology GIFT-Eval and TIME use):
 
 > shifted geometric mean, across datasets, of each metric **normalized by the
 > Seasonal-Naive baseline** — with the zero-inflated split (datasets where the

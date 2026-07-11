@@ -148,7 +148,10 @@ every dethrone re-crowns and resets it (Cascade reuses the KOTH dethrone signal 
 it never re-implements dethroning). During a reign every checkpoint the king
 produces is scored on the three public suites — **GIFT-Eval, BOOM, and TIME** —
 `score = geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps,
-time_mase)`, lower better — and kept in a per-reign log. When a king holds the
+time_mase)`, lower better — and kept in a per-reign log. All three suites report
+CRPS/MASE the same way — the shifted geometric mean, across tasks, of each metric
+**normalized by the Seasonal-Naive baseline** (≈1.0 = baseline parity) — so the
+six numbers are the same kind of quantity before they enter the geomean. When a king holds the
 throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned, a
 **Cascade** fires: the reign's lowest-score checkpoint (a lookup, not a re-eval)
 is installed **as-is** as the warm-start init for all subsequent rounds, then the
