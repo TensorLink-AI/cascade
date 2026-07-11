@@ -4,6 +4,7 @@ assembly, with the GPU and Hippius boundaries faked (no torch, no Hub, no S3).""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,9 +24,11 @@ REF_OUT = "cascade/ckpt-out@sha256:" + "e" * 64
 
 
 class _FakeStream:
-    digest = "corpusdigest"
     n_series = 3
     total_points = 192
+
+    def __init__(self, digest="corpusdigest"):
+        self.digest = digest
 
     def __enter__(self):
         return self
@@ -56,7 +59,11 @@ def _fake_upload(local_dir, repo, hub=None, *, hf_repo=None, hf_token=None):
 
 def _patch_train_boundaries(monkeypatch):
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
-    monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
+    # A real corpus digest is content-derived; the pre-heat fingerprint fetches
+    # each generator into ``…/fingerprint/<hotkey>``, so key the fake digest on the
+    # gen dir's leaf → distinct generators get distinct fingerprints (no false dedup).
+    monkeypatch.setattr(loop_mod, "open_round_stream",
+                        lambda *a, **k: _FakeStream(digest=f"c-{Path(a[1]).name}"))
     monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 
@@ -156,6 +163,57 @@ def test_run_round_first_submitter_of_a_ref_beats_a_later_copier(cfg, tmp_path, 
                _commit(1, "copy", REF_B, 9)]
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
     assert manifest.entry_for_role("challenger").miner_hotkey == "orig"
+
+
+def test_run_round_drops_reuploaded_clone_with_a_different_ref(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    # 'orig' and 'copy2' committed DIFFERENT refs (the copy was re-uploaded under a
+    # new repo, so ref dedup can't see it) but their generators produce the SAME
+    # corpus. Content dedup drops the later copy and keeps the first submitter.
+    fp = {"a": "king-corpus", "orig": "shared-corpus", "copy2": "shared-corpus"}
+    monkeypatch.setattr(runner, "_corpus_fingerprint", lambda gen, seeds: fp[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(2, "orig", REF_B, 5),
+               _commit(1, "copy2", REF_C, 9)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entry_for_role("challenger").miner_hotkey == "orig"
+
+
+def test_run_round_drops_challenger_that_reuploads_the_king(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    # 'b' committed a different ref from the king but its generator produces the
+    # king's exact corpus — a re-uploaded copy of the king. The ref duplicate-of-king
+    # check misses it (different repo@digest); the corpus check catches and drops it.
+    fp = {"a": "king-corpus", "b": "king-corpus"}
+    monkeypatch.setattr(runner, "_corpus_fingerprint", lambda gen, seeds: fp[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entry_for_role("king").gen_ref == REF_A
+    assert manifest.entries_for_role("challenger") == []
+
+
+def test_dedup_by_corpus_first_submitter_wins_and_unbuildable_survives(cfg, tmp_path, monkeypatch):
+    from cascade.trainer.contract import RoundSeeds
+    from cascade.trainer.loop import ResolvedGenerator
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    seeds = RoundSeeds.derive(1, cfg.training)
+    king = ResolvedGenerator(hotkey="k", uid=0, ref=REF_A, commit_block=1)
+    # orig (earlier) and copy (later, LOWER uid) share a corpus → copy dropped;
+    # solo has its own corpus → kept; broken can't be fingerprinted (None) → kept,
+    # never silently dropped. Survivors keep the input order.
+    orig = ResolvedGenerator(hotkey="orig", uid=5, ref=REF_B, commit_block=10)
+    copy = ResolvedGenerator(hotkey="copy", uid=1, ref=REF_C, commit_block=20)
+    solo = ResolvedGenerator(hotkey="solo", uid=3, ref=REF_D, commit_block=15)
+    broken = ResolvedGenerator(hotkey="broken", uid=2, ref=REF_OUT, commit_block=12)
+    fp = {"k": "kc", "orig": "shared", "copy": "shared", "solo": "solo-c", "broken": None}
+    monkeypatch.setattr(runner, "_corpus_fingerprint", lambda gen, s: fp[gen.hotkey])
+    kept = runner._dedup_by_corpus(king, [orig, copy, solo, broken], seeds)
+    assert [c.hotkey for c in kept] == ["orig", "solo", "broken"]
 
 
 def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):

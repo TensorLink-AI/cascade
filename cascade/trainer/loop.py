@@ -62,6 +62,13 @@ from .wandb_sink import open_wandb_run
 # eval pool) is attached in cascade.trainer.main.
 ScreenFn = Callable[[Path, "ResolvedGenerator", int], float]
 
+# Point-pass budget for the cheap pre-heat corpus fingerprint (see
+# ``TrainerRunner._corpus_fingerprint``). Small on purpose — a copy is detectable
+# from a short deterministic sample, and this generation runs for every entrant
+# before any GPU is spent. Raising it only costs more CPU generation time; it does
+# not change what counts as a duplicate.
+_FINGERPRINT_TOKENS = 100_000
+
 log = logging.getLogger("cascade.trainer")
 
 
@@ -311,6 +318,78 @@ class TrainerRunner:
             _save_seen_hotkeys(path, seen | {c.hotkey for c in fresh})
         return fresh
 
+    # ── anti-copy: content-identity dedup (catches re-uploaded clones) ───────
+
+    def _corpus_fingerprint(self, gen: ResolvedGenerator, seeds: RoundSeeds) -> str | None:
+        """A content identity for a generator: the digest of a small deterministic
+        corpus it produces at the round's generation seed.
+
+        Two byte-identical generators — including a clone re-uploaded under a
+        *different* Hub repo, which the ``repo@digest`` ref dedup in
+        :func:`plan_round` cannot see — produce the same sample and so the same
+        fingerprint; a generator that actually changed its output does not. Runs in
+        the same sandbox as training, at a cheap :data:`_FINGERPRINT_TOKENS` budget.
+        Returns None if the generator can't be fetched or built — such an entrant is
+        left in the field (heat will train and screen it), never silently dropped.
+        """
+        try:
+            gen_dir = self.work_root / f"{seeds.base_seed}" / "fingerprint" / gen.hotkey
+            fetch_from_hub(gen.ref, gen_dir, self.hub())
+            contract = self.cfg.screen_contract()
+            with open_round_stream(
+                contract.corpus_mode,
+                gen_dir, seeds.generation_seed, self.cfg.generator,
+                token_budget=_FINGERPRINT_TOKENS,
+                use_sandbox=self.use_sandbox,
+                blocked=self.cfg.static_guard.blocked,
+            ) as rs:
+                for _ in rs.series():
+                    pass
+                return str(rs.digest)
+        except Exception as e:  # noqa: BLE001 — a fingerprint failure must not drop a miner
+            log.warning("corpus fingerprint failed for %s (%s); leaving it in the field",
+                        gen.hotkey, e)
+            return None
+
+    def _dedup_by_corpus(
+        self, king: ResolvedGenerator, challengers: list[ResolvedGenerator], seeds: RoundSeeds
+    ) -> list[ResolvedGenerator]:
+        """Drop challengers whose generator PRODUCES the same corpus as the king or
+        as an earlier challenger — the content-level analogue of the ref dedups in
+        :func:`plan_round`, so a clone re-uploaded under a new repo (a different
+        ``repo@digest``) is caught too.
+
+        First submitter of each corpus keeps the slot: challengers are considered in
+        reveal-block order (UID breaking exact ties), mirroring the ref rule, so a
+        later copy never displaces the original. Best-effort: a challenger whose
+        fingerprint can't be built is kept (heat will handle it), and if the king's
+        own fingerprint can't be built the king comparison is skipped rather than
+        dropping the whole field. Survivors are returned in the input order.
+        """
+        if not challengers:
+            return challengers
+        king_fp = self._corpus_fingerprint(king, seeds)
+        seen: dict[str, ResolvedGenerator] = {}
+        keep: set[str] = set()
+        for c in sorted(challengers, key=lambda r: (r.commit_block, r.uid)):
+            fp = self._corpus_fingerprint(c, seeds)
+            if fp is None:
+                keep.add(c.hotkey)
+                continue
+            if king_fp is not None and fp == king_fp:
+                log.info("dropping challenger %s: generator output identical to the king "
+                         "(corpus %s) — a re-uploaded copy of the king", c.hotkey, fp[:12])
+                continue
+            prior = seen.get(fp)
+            if prior is not None:
+                log.info("dropping challenger %s: same generator output as earlier submitter "
+                         "%s (corpus %s, reveal block %d <= %d) — first submitter keeps the slot",
+                         c.hotkey, prior.hotkey, fp[:12], prior.commit_block, c.commit_block)
+                continue
+            seen[fp] = c
+            keep.add(c.hotkey)
+        return [c for c in challengers if c.hotkey in keep]
+
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
     def _train_checkpoint(
@@ -501,7 +580,12 @@ class TrainerRunner:
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
 
-        eligible = self._burn_and_filter_challengers(plan.challengers)
+        # Content-identity dedup BEFORE the burn/heat spend any compute: ref dedup
+        # (plan_round) only catches an identical ``repo@digest``; this catches a
+        # clone re-uploaded under a new repo by comparing the corpus each generator
+        # actually produces. First submitter of a corpus keeps the slot.
+        deduped = self._dedup_by_corpus(plan.king, plan.challengers, seeds)
+        eligible = self._burn_and_filter_challengers(deduped)
         finalists, heat = self._run_heat(eligible, seeds, block)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
