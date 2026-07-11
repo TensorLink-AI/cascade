@@ -132,6 +132,32 @@ def test_run_round_skips_challenger_that_copies_the_king(cfg, tmp_path, monkeypa
     assert manifest.entries_for_role("challenger") == []
 
 
+def test_plan_round_same_ref_earliest_submitter_wins_over_lower_uid():
+    from cascade.trainer.loop import ResolvedGenerator, plan_round
+
+    # A copier holding a LOWER uid fetches the original's public ref and re-commits
+    # it at a later reveal block. First-submitter-wins keeps the original (earlier
+    # reveal), not the lower UID — a copier can't steal an original's slot.
+    king = ResolvedGenerator(hotkey="k", uid=0, ref=REF_A, commit_block=1)
+    original = ResolvedGenerator(hotkey="orig", uid=5, ref=REF_B, commit_block=10)
+    copier = ResolvedGenerator(hotkey="copy", uid=1, ref=REF_B, commit_block=20)
+    plan = plan_round([copier, original], "k", king=king)
+    assert [c.hotkey for c in plan.challengers] == ["orig"]
+
+
+def test_run_round_first_submitter_of_a_ref_beats_a_later_copier(cfg, tmp_path, monkeypatch):
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    # 'orig' (uid 2) reveals REF_B at block 5; 'copy' (uid 1, LOWER uid) re-commits
+    # the SAME ref at block 9 — a copy. The trained challenger is 'orig', not the
+    # lower-UID copier: the first submitter of a ref keeps its round.
+    commits = [_commit(0, "a", REF_A, 5), _commit(2, "orig", REF_B, 5),
+               _commit(1, "copy", REF_B, 9)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entry_for_role("challenger").miner_hotkey == "orig"
+
+
 def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     # Three challengers, finalists = 1 (chain.toml). The cheapest heat score wins.

@@ -90,6 +90,11 @@ class ResolvedGenerator:
     hotkey: str
     uid: int
     ref: str           # generator's Hippius Hub reference (repo@digest)
+    # The on-chain reveal block of this hotkey's winning commit (0 when unknown).
+    # Used by ``plan_round`` to give a shared ref to its FIRST submitter: a ref is
+    # content-addressed and only becomes public when it reveals, so a copier's
+    # reveal is necessarily later — earliest reveal is always the original.
+    commit_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,7 +125,8 @@ def resolve_commitments(
         parsed = parse_commit(c.payload)
         if parsed is None:
             continue
-        rg = ResolvedGenerator(hotkey=c.hotkey, uid=c.uid, ref=parsed.ref)
+        rg = ResolvedGenerator(hotkey=c.hotkey, uid=c.uid, ref=parsed.ref,
+                               commit_block=c.commit_block)
         prev = best.get(c.hotkey)
         if prev is None or c.commit_block >= prev[0]:
             best[c.hotkey] = (c.commit_block, rg)
@@ -153,8 +159,14 @@ def plan_round(
       is dropped rather than handed a wasted round. This is the cascade
       analogue of teutonic's ``check_model_copy`` "same repo + same digest →
       instant reject".
-    * **same-ref dedup** — if two hotkeys committed the *same* generator ref,
-      only the first (lowest UID) is kept; the others would be identical runs.
+    * **same-ref dedup, first submitter wins** — if several hotkeys committed the
+      *same* generator ref, only the **earliest submitter** is kept (by reveal
+      block, UID breaking exact ties); the rest are identical runs and dropped.
+      This is the anti-copy rule: a ref is content-addressed and only becomes
+      public when it reveals, so a copier who fetched a rival's public ref and
+      re-committed it necessarily reveals *later* than the original — the original
+      keeps its slot even if the copier holds a lower UID. (The prior rule kept the
+      lowest UID, which let a low-UID copier displace the original in its own round.)
     """
     by_hotkey = {rg.hotkey: rg for rg in resolved}
     if king is None and king_hotkey:
@@ -171,18 +183,28 @@ def plan_round(
         king = field_[0] if field_ else None
     king_ref = king.ref if king is not None else None
 
+    # First submitter of each ref wins it: earliest reveal block, UID breaking
+    # exact ties. Computed over the whole resolved field so the winner is fixed
+    # before we walk it in UID order below.
+    first_by_ref: dict[str, ResolvedGenerator] = {}
+    for rg in resolved:
+        cur = first_by_ref.get(rg.ref)
+        if cur is None or (rg.commit_block, rg.uid) < (cur.commit_block, cur.uid):
+            first_by_ref[rg.ref] = rg
+
     challengers: list[ResolvedGenerator] = []
-    seen_refs: set[str] = set()
     for rg in field_:
         if king is not None and rg.hotkey == king.hotkey:
             continue
         if king_ref is not None and rg.ref == king_ref:
             log.info("dropping challenger %s: generator ref is identical to the king", rg.hotkey)
             continue
-        if rg.ref in seen_refs:
-            log.info("dropping challenger %s: duplicate of an already-planned ref", rg.hotkey)
+        winner = first_by_ref[rg.ref]
+        if winner.hotkey != rg.hotkey:
+            log.info("dropping challenger %s: same generator ref as earlier submitter %s "
+                     "(reveal block %d <= %d) — first submitter keeps the slot",
+                     rg.hotkey, winner.hotkey, winner.commit_block, rg.commit_block)
             continue
-        seen_refs.add(rg.ref)
         challengers.append(rg)
     return RoundPlan(king=king, challengers=challengers)
 
