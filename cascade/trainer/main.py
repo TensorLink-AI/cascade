@@ -61,11 +61,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Cap datasets per suite for --post-round-benchmarks (0 = full).")
     p.add_argument("--bench-data-dir", default="/root/bench_data",
                    help="Benchmark data dir on the pod.")
-    p.add_argument("--bench-device", default="cpu",
+    p.add_argument("--bench-device", default="auto",
                    help="Device for the Cascade king bench eval ([scoring] cascade_enabled). "
-                        "Use 'cuda' on a GPU training box — the full GIFT-Eval + BOOM + TIME "
-                        "battery is only practical on a GPU (BOOM full ≈ 26 min on an RTX 5090); "
-                        "'cpu' is for tests/smoke only.")
+                        "'auto' (default) uses the trainer's GPU when one is present, else cpu — "
+                        "the eval runs after training finishes, on the same now-idle GPU. Force "
+                        "with 'cuda'/'cpu'. The full GIFT-Eval + BOOM + TIME battery is only "
+                        "practical on a GPU (BOOM full ≈ 26 min on an RTX 5090).")
     p.add_argument("--bench-interval", type=int, default=0,
                    help="Minimum seconds between benchmark launches (0 = every round). "
                         "Set this above the sweep duration when rounds are tighter than "
@@ -166,7 +167,18 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.scoring.cascade_enabled:
         from .loop import make_bench_eval_fn
 
-        bench_eval_fn = make_bench_eval_fn(cfg, device=args.bench_device)
+        bench_device = args.bench_device
+        if bench_device == "auto":
+            # Reuse the trainer's GPU when present — the eval runs after training,
+            # so that GPU is idle. Falls back to cpu on a GPU-less box.
+            try:
+                import torch
+
+                bench_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:  # noqa: BLE001 — torch missing/broken ⇒ cpu
+                bench_device = "cpu"
+        log.info("cascade king bench eval enabled on device=%s", bench_device)
+        bench_eval_fn = make_bench_eval_fn(cfg, device=bench_device)
 
     runner = TrainerRunner(
         cfg=cfg,
