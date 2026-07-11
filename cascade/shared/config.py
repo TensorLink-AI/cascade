@@ -59,6 +59,16 @@ class GeneratorConfig:
     max_memory_mb: int
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
+    # Cheap data-quality gates on generator output (see cascade.interface.generator).
+    #   max_abs_value       — reject a series whose peak |value| exceeds this; 0.0
+    #                         means "cast-safe default" (the float32 ceiling), which
+    #                         is always applied since an over-max value is untrainable.
+    #   reject_constant     — reject any flat (zero-range) series.
+    #   max_dup_fraction    — cap the fraction of exact byte-duplicate series in a
+    #                         materialised (cache_reuse) corpus; 1.0 disables it.
+    max_abs_value: float = 0.0
+    reject_constant: bool = False
+    max_dup_fraction: float = 1.0
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -687,6 +697,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_memory_mb=int(g["max_memory_mb"]),
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
+            max_abs_value=float(g.get("max_abs_value", 0.0)),
+            reject_constant=bool(g.get("reject_constant", False)),
+            max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),

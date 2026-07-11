@@ -32,6 +32,10 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
+# Cheap data-quality gates on generator output (see chain.toml for the rationale).
+max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.
+reject_constant      = false     # reject flat (zero-range) series (off pending calibration).
+max_dup_fraction     = 1.0       # cache_reuse only: cap exact byte-duplicate series (1.0 = off).
 # Generation sandbox (see chain.toml for the full explanation). Testnet keeps
 # the permissive defaults; on mainnet either set sandbox_strict = true or run
 # sandbox_mode = "container" with a digest-pinned sandbox_image.

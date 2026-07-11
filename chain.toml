@@ -28,6 +28,25 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
 max_channels         = 1         # per-series variates. 1 = univariate (generators may
                                  # yield 1-D, promoted to (1, L)); raise to enable
                                  # multivariate priors without a schema change.
+# Cheap data-quality gates on generator output — reject data that would break or
+# waste a training round before the GPU spends on it. They gate structure only,
+# NOT "how good" the data is (that stays the scoring surface). Enforced by the
+# trainer AND surfaced locally by `cascade verify`.
+max_abs_value        = 0.0       # reject a series whose peak |value| exceeds this.
+                                 # 0.0 = cast-safe float32 ceiling (~3.4e38). The trainer
+                                 # standardizes in float64; this bound keeps the scaler's
+                                 # (x-loc)/scale ratio clear of the asinh→inf→NaN path.
+                                 # Conservative — real series top out ~1e13. Always applied.
+reject_constant      = false     # reject any flat (zero-range) series: the robust
+                                 # scaler clamps its scale to eps, so it carries no
+                                 # gradient signal — a corpus of them trains nothing.
+                                 # Off pending a one-time check that the base generator
+                                 # emits no fully-constant series; flip to true then.
+max_dup_fraction     = 1.0       # cache_reuse only: reject if >this fraction of series
+                                 # are exact byte-copies of an earlier one ("emit one
+                                 # series N times" gaming). 1.0 disables. Set e.g. 0.5
+                                 # (lenient) once real-corpus telemetry confirms honest
+                                 # generators sit near zero.
 # Generation sandbox (trainer-side; never folded into contract_digest).
 #   subprocess — rlimited child in a network namespace (unshare) with a
 #                Python-level socket guard; the default, no container runtime
