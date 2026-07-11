@@ -33,6 +33,7 @@ applies — seed every framework RNG (NumPy and, if used, ``torch.manual_seed`` 
 
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
@@ -169,27 +170,16 @@ def check_series(
         raise ValueError(f"series is constant (zero range){where}")
 
 
-def _duplicate_fraction(series: list[np.ndarray]) -> tuple[float, int]:
-    """Fraction of series that are exact byte-copies of an earlier one.
+def _series_key(canon: np.ndarray) -> bytes:
+    """16-byte content digest of a canonical ``(C, L)`` float64 array.
 
-    Hashes each canonical ``(C, L)`` float64 array (storing only a 16-byte
-    digest, not the bytes, so memory stays flat even for a large corpus). O(total
-    points) — the same order as the corpus digest the trainer already computes.
-    Returns ``(fraction, n_duplicates)``.
+    Storing the digest (not the bytes) keeps the dedup set flat regardless of
+    corpus size; the channel count is folded in so a univariate and a
+    single-channel-of-multivariate series never collide.
     """
-    import hashlib
-
-    seen: set[bytes] = set()
-    dups = 0
-    for a in series:
-        key = hashlib.blake2b(
-            a.shape[0].to_bytes(4, "big") + a.tobytes(), digest_size=16
-        ).digest()
-        if key in seen:
-            dups += 1
-        else:
-            seen.add(key)
-    return (dups / len(series) if series else 0.0), dups
+    return hashlib.blake2b(
+        canon.shape[0].to_bytes(4, "big") + canon.tobytes(), digest_size=16
+    ).digest()
 
 
 def drain_generator(
@@ -213,10 +203,15 @@ def drain_generator(
 
     ``max_abs`` and ``reject_constant`` are forwarded to :func:`check_series` as
     per-series data-quality gates (see there). ``max_dup_fraction`` is a
-    corpus-level gate: after draining, reject if the fraction of series that are
-    exact byte-copies of an earlier one exceeds it (defence against "emit one
-    series N times"). ``1.0`` disables it. All three default to no-op so existing
-    callers are unchanged; the trainer sets them from ``chain.toml [generator]``.
+    corpus-level gate: reject if the fraction of series that are exact byte-copies
+    of an earlier one exceeds it (defence against "emit one series N times"
+    spam). It is accumulated *during* the drain — one digest per series, no second
+    pass — and ``1.0`` disables it. Byte-exact matching is deliberately the
+    zero-false-positive choice: honest seeded continuous-parameter generators
+    never byte-collide, so a loose cap only trips lazy duplication (a determined
+    adversary can still evade it with 1e-15 jitter — that's a v1 floor, not an
+    anti-adversary defence). All three gates default to no-op so existing callers
+    are unchanged; the trainer sets them from ``chain.toml [generator]``.
 
     Each series is canonicalised to a contiguous ``(C, L)`` float64 array (a 1-D
     series becomes ``(1, L)``), so the corpus the base trainer consumes always
@@ -227,6 +222,9 @@ def drain_generator(
     """
     if n_series <= 0:
         raise ValueError(f"n_series must be positive; got {n_series}")
+    dedup = max_dup_fraction < 1.0
+    seen: set[bytes] = set()
+    dups = 0
     out: list[np.ndarray] = []
     total = 0
     for i, arr in enumerate(gen.generate(n_series)):
@@ -245,13 +243,19 @@ def drain_generator(
             raise ValueError(
                 f"total emitted points {total} exceeds cap {max_total_points}"
             )
+        if dedup:
+            key = _series_key(canon)
+            if key in seen:
+                dups += 1
+            else:
+                seen.add(key)
         out.append(canon)
     if len(out) != n_series:
         raise ValueError(
             f"generate yielded {len(out)} series; expected exactly {n_series}"
         )
-    if max_dup_fraction < 1.0:
-        frac, dups = _duplicate_fraction(out)
+    if dedup:
+        frac = dups / len(out)
         if frac > max_dup_fraction:
             raise ValueError(
                 f"duplicate-series fraction {frac:.3f} exceeds cap "

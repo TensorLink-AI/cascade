@@ -42,11 +42,13 @@ reject_constant      = false     # reject any flat (zero-range) series: the robu
                                  # gradient signal — a corpus of them trains nothing.
                                  # Off pending a one-time check that the base generator
                                  # emits no fully-constant series; flip to true then.
-max_dup_fraction     = 1.0       # cache_reuse only: reject if >this fraction of series
+max_dup_fraction     = 0.05      # cache_reuse only: reject if >this fraction of series
                                  # are exact byte-copies of an earlier one ("emit one
-                                 # series N times" gaming). 1.0 disables. Set e.g. 0.5
-                                 # (lenient) once real-corpus telemetry confirms honest
-                                 # generators sit near zero.
+                                 # series N times" spam). Honest seeded continuous-parameter
+                                 # generators never byte-collide (0%), so this loose
+                                 # few-percent cap has no false positives. It's a v1 floor
+                                 # — evadable with 1e-15 jitter, not an anti-adversary
+                                 # defence. 1.0 disables. Accumulated during the drain.
 # Generation sandbox (trainer-side; never folded into contract_digest).
 #   subprocess — rlimited child in a network namespace (unshare) with a
 #                Python-level socket guard; the default, no container runtime
