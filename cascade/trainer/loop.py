@@ -90,6 +90,7 @@ class ResolvedGenerator:
     hotkey: str
     uid: int
     ref: str           # generator's Hippius Hub reference (repo@digest)
+    reveal_block: int = 0  # block the pointer became publicly readable at
 
 
 @dataclass(frozen=True)
@@ -103,27 +104,31 @@ def resolve_commitments(
 ) -> list[ResolvedGenerator]:
     """Parse each commitment's generator pointer, dropping malformed ones.
 
-    A later commit from the same hotkey wins (miners re-deploy by committing a
-    new ref), so we keep the highest ``commit_block`` per hotkey.
+    A later reveal from the same hotkey wins (miners re-deploy by committing a
+    new ref), so we keep the highest ``reveal_block`` per hotkey.
 
     When ``cutoff_block`` is given (the round's epoch boundary), only commits
-    revealed STRICTLY BEFORE it are eligible — this is the daily submission
-    deadline. A miner who commits at or after the boundary competes in the next
-    round, not this one, and because the boundary is deterministic every honest
-    party re-derives the identical field. The latest-commit-wins rule applies only
-    among a hotkey's eligible (pre-cutoff) commits.
+    REVEALED STRICTLY BEFORE it are eligible — this is the daily submission
+    deadline, and it gates on the reveal block (the chain's revealed store does
+    not carry the original commit block). A timelock reveal landing at/after
+    the boundary competes in the next round, not this one; because the boundary
+    is deterministic every honest party re-derives the identical field. The
+    latest-reveal-wins rule applies only among a hotkey's eligible (pre-cutoff)
+    reveals.
     """
     best: dict[str, tuple[int, ResolvedGenerator]] = {}
     for c in commitments:
-        if cutoff_block is not None and c.commit_block >= cutoff_block:
+        if cutoff_block is not None and c.reveal_block >= cutoff_block:
             continue
         parsed = parse_commit(c.payload)
         if parsed is None:
             continue
-        rg = ResolvedGenerator(hotkey=c.hotkey, uid=c.uid, ref=parsed.ref)
+        rg = ResolvedGenerator(
+            hotkey=c.hotkey, uid=c.uid, ref=parsed.ref, reveal_block=c.reveal_block
+        )
         prev = best.get(c.hotkey)
-        if prev is None or c.commit_block >= prev[0]:
-            best[c.hotkey] = (c.commit_block, rg)
+        if prev is None or c.reveal_block >= prev[0]:
+            best[c.hotkey] = (c.reveal_block, rg)
     return [rg for _, rg in best.values()]
 
 
@@ -154,7 +159,10 @@ def plan_round(
       analogue of teutonic's ``check_model_copy`` "same repo + same digest →
       instant reject".
     * **same-ref dedup** — if two hotkeys committed the *same* generator ref,
-      only the first (lowest UID) is kept; the others would be identical runs.
+      only the EARLIEST REVEAL is kept (UID breaking ties); the others would be
+      identical runs. First-to-publish wins so committing a competitor's
+      visible ref (which needs no upload — the ref string is enough) can never
+      steal their slot, whatever the copier's UID.
     """
     by_hotkey = {rg.hotkey: rg for rg in resolved}
     if king is None and king_hotkey:
@@ -171,18 +179,25 @@ def plan_round(
         king = field_[0] if field_ else None
     king_ref = king.ref if king is not None else None
 
+    # Earliest reveal (UID tiebreak) owns each duplicated ref — never the
+    # lowest UID, which would let a low-UID copier take the original's slot.
+    ref_owner: dict[str, ResolvedGenerator] = {}
+    for rg in field_:
+        cur = ref_owner.get(rg.ref)
+        if cur is None or (rg.reveal_block, rg.uid) < (cur.reveal_block, cur.uid):
+            ref_owner[rg.ref] = rg
+
     challengers: list[ResolvedGenerator] = []
-    seen_refs: set[str] = set()
     for rg in field_:
         if king is not None and rg.hotkey == king.hotkey:
             continue
         if king_ref is not None and rg.ref == king_ref:
             log.info("dropping challenger %s: generator ref is identical to the king", rg.hotkey)
             continue
-        if rg.ref in seen_refs:
-            log.info("dropping challenger %s: duplicate of an already-planned ref", rg.hotkey)
+        if ref_owner[rg.ref].hotkey != rg.hotkey:
+            log.info("dropping challenger %s: duplicate of a ref revealed earlier by %s",
+                     rg.hotkey, ref_owner[rg.ref].hotkey)
             continue
-        seen_refs.add(rg.ref)
         challengers.append(rg)
     return RoundPlan(king=king, challengers=challengers)
 

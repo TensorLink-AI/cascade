@@ -62,7 +62,7 @@ def _client(sub):
 def test_bulk_success_decodes_whole_field():
     out = _client(_Sub()).poll_commitments()
     assert sorted(c.uid for c in out) == [0, 1, 3]
-    assert {c.uid: c.commit_block for c in out} == {0: 100, 1: 110, 3: 130}
+    assert {c.uid: c.reveal_block for c in out} == {0: 100, 1: 110, 3: 130}
 
 
 def test_malformed_batch_falls_back_and_skips_only_bad_uid():

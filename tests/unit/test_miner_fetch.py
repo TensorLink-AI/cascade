@@ -27,9 +27,9 @@ class _FakeClient:
 def _commits():
     return [
         Commitment(uid=3, hotkey="5King", coldkey=None,
-                   payload=f"metro-v1:gen:hippius:{GEN}", commit_block=100),
+                   payload=f"metro-v1:gen:hippius:{GEN}", reveal_block=100),
         Commitment(uid=13, hotkey="5Chal", coldkey=None,
-                   payload=f"metro-v1:gen:hippius:{CHAL}", commit_block=110),
+                   payload=f"metro-v1:gen:hippius:{CHAL}", reveal_block=110),
     ]
 
 

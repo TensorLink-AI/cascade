@@ -204,8 +204,8 @@ def test_run_round_remote_assigns_king_and_challenger_to_separate_hosts(cfg, tmp
                            remote_hosts=hosts, trainer_spec="m:C")
 
     commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_B}", commit_block=6),
+        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_A}", reveal_block=5),
+        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_B}", reveal_block=6),
     ]
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
@@ -226,6 +226,6 @@ def test_run_round_remote_aborts_when_king_fails(cfg, tmp_path, monkeypatch):
     runner = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
                            remote_hosts=[_host(name="h0")], trainer_spec="m:C")
     commits = [Commitment(uid=0, hotkey="a", coldkey=None,
-                          payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5)]
+                          payload=f"metro-v1:gen:hippius:{REF_A}", reveal_block=5)]
     with pytest.raises(RuntimeError):
         runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)

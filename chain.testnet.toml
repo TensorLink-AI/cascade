@@ -145,6 +145,7 @@ heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
 finalists        = 1      # challengers promoted from the heat to the final
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
+reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin (see chain.toml)
 # Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
 # throne_sizes. Both default to the 4M primary; point them at a bigger size to
 # promote a rung. To test the sliding window on testnet, uncomment the 22M size

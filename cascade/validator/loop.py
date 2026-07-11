@@ -65,23 +65,24 @@ def participants_from_commitments(commitments: list, cutoff_block: int) -> tuple
 
     Mirrors the trainer's eligibility rule (``trainer.loop.resolve_commitments``):
     parseable generator pointers revealed STRICTLY BEFORE the epoch boundary,
-    latest commit per hotkey among the eligible ones — but keeps ``commit_block``
-    so an auditor can re-check every entrant against the cutoff. Sorted by UID
-    for a deterministic receipt body.
+    latest reveal per hotkey among the eligible ones — and records the reveal
+    block (the receipt's ``commit_block`` wire field, kept for receipt
+    compatibility) so an auditor can re-check every entrant against the cutoff.
+    Sorted by UID for a deterministic receipt body.
     """
     from ..interface.validation import parse_commit
 
     best: dict[str, Participant] = {}
     for c in commitments:
-        if c.commit_block >= cutoff_block:
+        if c.reveal_block >= cutoff_block:
             continue
         parsed = parse_commit(c.payload)
         if parsed is None:
             continue
         prev = best.get(c.hotkey)
-        if prev is None or c.commit_block >= prev.commit_block:
+        if prev is None or c.reveal_block >= prev.commit_block:
             best[c.hotkey] = Participant(
-                hotkey=c.hotkey, uid=c.uid, gen_ref=parsed.ref, commit_block=c.commit_block
+                hotkey=c.hotkey, uid=c.uid, gen_ref=parsed.ref, commit_block=c.reveal_block
             )
     return tuple(sorted(best.values(), key=lambda p: p.uid))
 

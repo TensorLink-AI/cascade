@@ -62,7 +62,7 @@ def _patch_train_boundaries(monkeypatch):
 
 def _commit(uid, hotkey, ref, block):
     return Commitment(uid=uid, hotkey=hotkey, coldkey=None,
-                      payload=f"metro-v1:gen:hippius:{ref}", commit_block=block)
+                      payload=f"metro-v1:gen:hippius:{ref}", reveal_block=block)
 
 
 def test_run_round_trains_king_and_challenger_at_every_size(two_size_cfg, tmp_path, monkeypatch):

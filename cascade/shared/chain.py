@@ -85,6 +85,48 @@ def equal_share_vector(
     return decayed_share_vector(reward_uids, n_uids, decay=1.0, burn_uid=burn_uid)
 
 
+def blocks_until_boundary_reveal(
+    current_block: int,
+    epoch_blocks: int,
+    margin_blocks: int,
+    *,
+    next_epoch: bool = False,
+    min_blocks: int = 1,
+) -> int:
+    """The ``blocks_until_reveal`` delay that lands a timelock reveal just
+    before the next epoch boundary.
+
+    Eligibility gates on the REVEAL block strictly before the boundary
+    (:func:`cascade.trainer.loop.resolve_commitments`), so a reveal that lands
+    at/after the boundary silently costs the miner the round. The target is
+    therefore ``boundary − margin_blocks``: hidden for (almost) the whole
+    submission window, public only for the last ``margin_blocks`` — long enough
+    to absorb commit-inclusion and drand reveal jitter, short enough that a
+    copier cannot fetch + re-commit + land their own reveal before the same
+    boundary.
+
+    When the current block is already inside the margin, floors to
+    ``min_blocks`` (reveal now): the residual exposure is below the margin
+    anyway, and revealing beats silently slipping past the deadline and losing
+    a full epoch. Pass ``next_epoch=True`` to target the following boundary
+    instead (for miners who prefer a guaranteed-hidden window over entering the
+    imminent round). Pure — unit-testable without a chain.
+    """
+    if epoch_blocks < 1:
+        raise ValueError(f"epoch_blocks must be >= 1, got {epoch_blocks}")
+    if not (0 <= margin_blocks < epoch_blocks):
+        raise ValueError(
+            f"margin_blocks must be in [0, epoch_blocks={epoch_blocks}), got {margin_blocks}"
+        )
+    if min_blocks < 1:
+        raise ValueError(f"min_blocks must be >= 1, got {min_blocks}")
+    boundary = (current_block // epoch_blocks + 1) * epoch_blocks
+    if next_epoch:
+        boundary += epoch_blocks
+    delay = boundary - margin_blocks - current_block
+    return max(delay, min_blocks)
+
+
 def seed_from_block_hash(block_hash: str) -> int:
     """A round base seed from a chain block hash: blake2b of the hex digest as a
     64-bit int. Pure — the audit CLI recomputes a receipt's ``base_seed`` from
@@ -113,13 +155,20 @@ def _import_bittensor():
 
 @dataclass(frozen=True)
 class Commitment:
-    """One miner's revealed generator pointer string."""
+    """One miner's revealed generator pointer string.
+
+    ``reveal_block`` is the block the timelock payload became publicly
+    readable at — what bittensor's ``RevealedCommitments`` store records — NOT
+    the block the encrypted commit landed. Round eligibility gates on it
+    (reveal strictly before the epoch boundary), so a timed reveal must target
+    the boundary minus a safety margin (:func:`blocks_until_boundary_reveal`).
+    """
 
     uid: int
     hotkey: str
     coldkey: str | None
     payload: str
-    commit_block: int
+    reveal_block: int
 
 
 @dataclass
@@ -320,7 +369,7 @@ class ChainClient:
                         hotkey=str(hotkey),
                         coldkey=str(coldkeys[uid]) if coldkeys else None,
                         payload=payload,
-                        commit_block=int(block),
+                        reveal_block=int(block),
                     )
                 )
             return out
@@ -352,7 +401,7 @@ class ChainClient:
                     block, payload = max(reveals, key=lambda r: int(r[0]))
                     if isinstance(payload, str) and payload:
                         out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                              payload=payload, commit_block=int(block)))
+                                              payload=payload, reveal_block=int(block)))
                     continue
             # Last resort: the plain commitment store (older bittensor).
             try:
@@ -361,11 +410,11 @@ class ChainClient:
                 rec = None
             if not rec:
                 continue
-            payload, commit_block = _split_commitment(rec)
+            payload, reveal_block = _split_commitment(rec)
             if payload is None:
                 continue
             out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                  payload=payload, commit_block=int(commit_block)))
+                                  payload=payload, reveal_block=int(reveal_block)))
         return out
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
@@ -420,7 +469,7 @@ class ChainClient:
 
 
 def _split_commitment(rec: Any) -> tuple[str | None, int]:
-    """Best-effort extraction of ``(payload, commit_block)`` across bittensor
+    """Best-effort extraction of ``(payload, reveal_block)`` across bittensor
     versions: a plain string, a 2-tuple, a dict, or an object with attrs."""
     if rec is None:
         return None, 0

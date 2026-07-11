@@ -434,9 +434,9 @@ def test_off_mode_skips_gate_entirely(cfg):
 
 def test_trainer_pairing_logic():
     commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID2}", commit_block=6),
-        Commitment(uid=2, hotkey="c", coldkey=None, payload="garbage", commit_block=7),
+        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", reveal_block=5),
+        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID2}", reveal_block=6),
+        Commitment(uid=2, hotkey="c", coldkey=None, payload="garbage", reveal_block=7),
     ]
     resolved = resolve_commitments(commits)
     assert len(resolved) == 2  # garbage dropped
@@ -447,7 +447,7 @@ def test_trainer_pairing_logic():
 
 def test_trainer_pairing_promotes_interim_king_when_absent():
     commits = [
-        Commitment(uid=3, hotkey="x", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
+        Commitment(uid=3, hotkey="x", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", reveal_block=5),
     ]
     plan = plan_round(resolve_commitments(commits), king_hotkey=None)
     assert plan.king.hotkey == "x"

@@ -296,7 +296,7 @@ def _cutoff_chain_note(receipt: RoundReceipt, client: object) -> str:
             unverifiable += 1  # deregistered / lite node without the reveal
             continue
         parsed = parse_commit(c.payload)
-        if c.commit_block == p.commit_block:
+        if c.reveal_block == p.commit_block:
             if parsed is None or parsed.ref != p.gen_ref:
                 return (f"FAIL:participant {p.hotkey} recorded gen_ref {p.gen_ref[:32]}… "
                         f"but chain shows {getattr(parsed, 'ref', c.payload)[:32]}… "

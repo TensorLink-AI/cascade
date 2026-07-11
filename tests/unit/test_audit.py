@@ -298,7 +298,7 @@ def test_chain_payload_contradiction_fails_cutoff(signed_receipt):
 
         commits[0] = Commitment(c.uid, c.hotkey, None,
                                 "metro-v1:gen:hippius:mallory/gen@sha256:" + "f" * 64,
-                                c.commit_block)
+                                c.reveal_block)
         return commits
 
     client.poll_commitments = lie

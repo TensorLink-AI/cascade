@@ -129,7 +129,7 @@ export HIPPIUS_HUB_PASSWORD=...
 You do **not** need S3 credentials — those are the trainer/validator's.
 
 Optionally, set a HuggingFace token if you want the outage fallback in
-[§5a](#5a-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
+[§5b](#5b-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
 
 ```bash
 export HF_TOKEN=hf_...               # only needed for `--hf-repo`
@@ -147,13 +147,51 @@ cascade deploy ./my-generator \
   --wallet-name my-miner --wallet-hotkey gen1 \
   --hub-repo my-namespace/my-generator
 # → pushed to Hippius Hub: my-namespace/my-generator@sha256:…
+#   timed reveal: payload decrypts ~block 48575 (4820 blocks from now, 25 blocks
+#   before the epoch boundary at 48600) — hidden until the field locks.
 #   committed: metro-v1:gen:hippius:my-namespace/my-generator@sha256:…
 ```
 
-Re-deploy any time to submit a new version — the latest pre-cutoff commit per
+Re-deploy any time to submit a new version — the latest pre-cutoff reveal per
 hotkey is the one that competes.
 
-### 5a. If the Hippius Hub is down
+### 5a. Protecting your submission (timed reveal)
+
+**Threat model.** Everything on cascade is public *after* a round locks — that's
+what makes every round independently re-derivable, and studying (or forking) the
+reigning king is the intended game. What should **not** be possible is a
+competitor copying your *fresh* submission into the **same round**, free-riding
+on work that hasn't even been evaluated yet. Two things could leak it early:
+
+1. **The on-chain pointer.** Deploy defaults to a **timed reveal**: the
+   timelock-encrypted commit decrypts `[round] reveal_margin_blocks` (~5 min)
+   before the epoch boundary. Your pointer is hidden for its whole submission
+   window; by the time it's readable, a copier can no longer land their own
+   reveal before the cutoff (eligibility requires the *reveal* — not the commit —
+   to be strictly before the boundary). Flags:
+   - `--reveal-now` — reveal immediately (the old behaviour). Your ref is public
+     and copyable for the rest of the window; committing someone's exact ref
+     needs no upload at all.
+   - `--next-epoch` — target the *following* boundary when you'd rather sit out
+     the imminent round than deploy inside the margin.
+   - `--blocks-until-reveal N` — full manual control.
+   Don't try to out-tune the margin by hand: reveal timing jitters by a few
+   blocks, and a reveal landing at/after the boundary misses the round entirely.
+2. **The generator content itself.** The upload to your Hub repo happens at
+   deploy time, *before* the reveal — and a predictable repo name (or a public
+   HuggingFace mirror, which lists your whole account) lets a competitor watch
+   your namespace and copy the content without ever reading the chain. Use
+   `--hub-namespace my-namespace` instead of `--hub-repo`: each deploy then goes
+   to a fresh, non-guessable `my-namespace/gen-<random>` repo, so the content is
+   only discoverable through the (still-hidden) on-chain ref. Avoid the
+   `--hf-repo` fallback for competitive submissions; it exists for Hub outages.
+
+Same-ref copying is also unrewarding by construction: if two hotkeys commit the
+same generator ref, the **earliest reveal** keeps the slot (the copy is dropped
+before any training), and a challenger byte-identical to the king is discarded
+outright.
+
+### 5b. If the Hippius Hub is down
 
 Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
 service from Hippius **S3** (which only the trainer/validator use). If the Hub is
@@ -204,7 +242,7 @@ for cm in c.poll_commitments():
 PY
 ```
 
-Then watch the **public round receipts** (or the dashboard): committed *before*
+Then watch the **public round receipts** (or the dashboard): revealed *before*
 the epoch boundary, your generator enters the next round's **heat**, gets
 trained and scored, and appears in that round's receipt participant set with
 your `gen_ref`. If it wins the heat it advances to the full final against the
