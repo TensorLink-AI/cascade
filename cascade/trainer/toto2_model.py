@@ -117,6 +117,17 @@ class Toto2Config:
 
 # ── robust causal scaler ──────────────────────────────────────────────────────
 
+# Saturation bound on the standardized representation z = asinh((x-loc)/scale).
+# Realistic data lives at |z| of a few (even a 1000σ event is asinh(1000)≈7.6), so
+# this bound is never reached by honest corpora — clamp is the identity there. It
+# exists purely as a backstop: it guarantees a finite, bounded z (and asinh target,
+# clamped identically in the trainer) even for a pathological jump after an
+# eps-clamped prefix, so the loss can never NaN or spike the shared training step.
+# 64 leaves ~25 orders of asinh dynamic range above anything real; do NOT tighten
+# it toward single digits without intent — that would start compressing legitimate
+# heavy tails and change the scoring surface, not just add safety.
+Z_CLAMP = 64.0
+
 
 def causal_standardize(
     x: torch.Tensor,
@@ -160,7 +171,7 @@ def causal_standardize(
     )[:, None]
     loc = torch.where(ok, loc, loc.gather(-1, first))
     scale = torch.where(ok, scale, scale.gather(-1, first))
-    z = torch.asinh((x64 - loc) / scale)
+    z = torch.asinh((x64 - loc) / scale).clamp_(-Z_CLAMP, Z_CLAMP)
     return z.to(x.dtype), loc.to(x.dtype), scale.to(x.dtype)
 
 

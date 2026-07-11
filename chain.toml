@@ -81,7 +81,7 @@ sandbox_strict = false           # true on production: no netns => refuse, don't
 # per_dim_scale=true, layer_group_size=4 with one trailing variate layer.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "95a8141d1909e38fd1369c22968e8881f3801fb9915321534b36a8cc9d977747"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
+base_arch_digest   = "953e40d292e037ea07ffea25ae1fdf2e8b7dc8990276c081fa67fb4371396147"  # sha256 of frozen arch+init (toto2_model.py + arch fields); recompute with `cascade-trainer --offline` if you change either
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4

@@ -206,6 +206,7 @@ class Toto2Trainer:
 
         from .toto2_model import (
             QUANTILE_LEVELS,
+            Z_CLAMP,
             Toto2Config,
             Toto2Model,
             causal_standardize,
@@ -272,9 +273,13 @@ class Toto2Trainer:
             # into its own scaling.
             a_loc, a_scale = patch_anchors(loc, scale, cfg.patch_size)
             raw = x.view(x.shape[0], num_patches, cfg.patch_size)
+            # Clamp the target to the same bound as z (toto2_model.Z_CLAMP): the
+            # model input and the loss target must share one range, and this is the
+            # backstop that keeps a pathological jump from producing an inf/huge
+            # target that NaNs or destabilizes the shared training step.
             target = torch.asinh(
                 (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
-            ).to(self.dtype)
+            ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
             loss = pinball_loss(pred_q, target, tuple(levels))
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
