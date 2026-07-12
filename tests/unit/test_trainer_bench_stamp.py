@@ -46,7 +46,7 @@ class _FakeBaseTrainer:
         return TrainResult(local_dir=out_dir, param_count=4_000_000, train_seconds=1.0, metrics={})
 
 
-def _fake_upload(local_dir, repo, hub=None):
+def _fake_upload(local_dir, repo, hub=None, **kw):
     from cascade.shared.hippius import HubRef, HubUpload
 
     return HubUpload(ref=HubRef.parse(REF_OUT), size_bytes=1)
@@ -71,7 +71,7 @@ def cascade_cfg(cfg):
 def _patch(monkeypatch):
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
     monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
-    monkeypatch.setattr(loop_mod, "upload_dir_to_hub", _fake_upload)
+    monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 
 def test_run_round_stamps_king_bench_scores_when_enabled(cascade_cfg, tmp_path, monkeypatch):
@@ -120,3 +120,37 @@ def test_bench_eval_failure_leaves_manifest_unstamped(cascade_cfg, tmp_path, mon
     manifest = runner.run_round([_commit(0, "a", REF_A, 1)], king_hotkey="a", base_seed=1, block=10)
     assert manifest.entry_for_role("king") is not None
     assert manifest.entry_for_role("king").bench_scores is None
+
+
+class _StubHost:
+    name = "worker"
+    workdir = "/root/cascade"
+
+
+def test_remote_king_bench_dispatches_to_worker_not_local(cascade_cfg, tmp_path, monkeypatch):
+    # When a cascade_bench_plan + remote_hosts are set, the king bench runs on the
+    # pod (reusing the post-round-benchmark path), NOT the local bench_eval_fn.
+    import cascade.eval.benchmarks as bench_mod
+    import cascade.trainer.bench_hook as hook_mod
+
+    calls: dict = {}
+
+    def _fake_run(host, round_id, arch_preset, plan, *, work_root=None, runner=None):
+        calls["dispatch"] = (host.name, round_id, arch_preset)
+        return {"suites": ["stub"]}
+
+    monkeypatch.setattr(hook_mod, "run_post_round_benchmark", _fake_run)
+    monkeypatch.setattr(bench_mod, "extract_bench_scores", lambda r: {
+        "gifteval_crps": 0.42, "gifteval_mase": 0.81, "boom_crps": 0.55,
+        "boom_mase": 0.90, "time_crps": 0.38, "time_mase": 0.77,
+    })
+    local_called: list = []
+    runner = TrainerRunner(
+        cfg=cascade_cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path, use_sandbox=False,
+        bench_eval_fn=lambda d: local_called.append(d) or _BENCH,
+        remote_hosts=[_StubHost()], cascade_bench_plan=object(),
+    )
+    scores = runner._remote_king_bench_scores("12345", "toto2-4m")
+    assert scores == _BENCH                          # parsed the six signed numbers
+    assert calls["dispatch"] == ("worker", "12345", "toto2-4m")  # ran on the pod
+    assert local_called == []                        # local CPU path untouched

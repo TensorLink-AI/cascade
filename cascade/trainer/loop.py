@@ -256,6 +256,12 @@ class TrainerRunner:
     # king on the idle pod. LOG-ONLY: validators score rounds exclusively on the
     # private eval pool; this never feeds weights or the throne (see bench_hook).
     bench_plan: object | None = None
+    # Cascade king bench eval on the REMOTE worker: when set (cascade_enabled +
+    # remote_hosts), the king's GIFT-Eval/BOOM/TIME scoring runs on the pod that
+    # just trained it — GPU, checkpoint already local — instead of a local-CPU
+    # subprocess. The six numbers still go on the signed manifest. Falls back to
+    # the local ``bench_eval_fn`` when there is no remote host.
+    cascade_bench_plan: object | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -502,9 +508,17 @@ class TrainerRunner:
         if king_idx is None:
             return entries
         king = entries[king_idx]
+        arch_preset = king.size or primary
         try:
-            ckpt = self._fetch_checkpoint_dir(king.trained_pointer)
-            scores = self.bench_eval_fn(ckpt) if self.bench_eval_fn is not None else None
+            if self.cascade_bench_plan is not None and self.remote_hosts:
+                # Bench on the pod that just trained the king: GPU, and the
+                # checkpoint is already at its _train_work path (no local fetch).
+                scores = self._remote_king_bench_scores(str(seeds.base_seed), arch_preset)
+            elif self.bench_eval_fn is not None:
+                ckpt = self._fetch_checkpoint_dir(king.trained_pointer)
+                scores = self.bench_eval_fn(ckpt)
+            else:
+                scores = None
         except Exception as e:  # noqa: BLE001 — Cascade telemetry must never fail a round
             log.warning("round=%s: king bench eval failed (%s); manifest omits bench_scores",
                         seeds.base_seed, e)
@@ -521,6 +535,21 @@ class TrainerRunner:
         )
         entries[king_idx] = replace(king, bench_scores=scores)
         return entries
+
+    def _remote_king_bench_scores(self, round_id: str, arch_preset: str) -> BenchScores | None:
+        """Score the round's king on GIFT-Eval/BOOM/TIME on the pod that trained it
+        (GPU; the checkpoint is already at its ``_train_work`` path) and parse the
+        six signed numbers. Reuses the post-round-benchmark remote path; best-effort
+        — returns None on any miss, so the manifest simply omits ``bench_scores``."""
+        from ..eval.benchmarks import extract_bench_scores
+        from .bench_hook import run_post_round_benchmark
+
+        host = self.remote_hosts[0]  # the king trains on the first pod (single-worker today)
+        report = run_post_round_benchmark(
+            host, round_id, arch_preset, self.cascade_bench_plan, work_root=self.work_root,
+        )
+        scores = extract_bench_scores(report) if report is not None else None
+        return BenchScores(**scores) if scores is not None else None
 
     def run_round(
         self,

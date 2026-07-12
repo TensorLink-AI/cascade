@@ -166,21 +166,41 @@ def main(argv: list[str] | None = None) -> int:
     # numbers onto its signed manifest entry so validators promote off one
     # authoritative set. Only wired when [scoring] cascade_enabled.
     bench_eval_fn = None
+    cascade_bench_plan = None
     if cfg.scoring.cascade_enabled:
-        from .loop import make_bench_eval_fn
+        if remote_hosts:
+            # Preferred: bench the king on the pod that just trained it — GPU, and
+            # the checkpoint is already at its _train_work path. Reuses the
+            # post-round-benchmark remote path; the six numbers still land on the
+            # signed manifest via TrainerRunner._stamp_king_bench_scores.
+            from .bench_hook import BenchPlan
 
-        bench_device = args.bench_device
-        if bench_device == "auto":
-            # Reuse the trainer's GPU when present — the eval runs after training,
-            # so that GPU is idle. Falls back to cpu on a GPU-less box.
-            try:
-                import torch
+            wd = remote_hosts[0].workdir
+            cascade_bench_plan = BenchPlan(
+                suites=args.bench_suites,
+                max_series=cfg.eval.cascade_bench_max_series,
+                device="cuda",
+                data_dir=f"{wd}/bench_data",
+                timeout_seconds=1800,  # guard: a capped battery is ~minutes on an L40
+            )
+            log.info("cascade king bench eval enabled on worker %s (device=cuda, max_series=%s)",
+                     remote_hosts[0].name, cfg.eval.cascade_bench_max_series)
+        else:
+            from .loop import make_bench_eval_fn
 
-                bench_device = "cuda" if torch.cuda.is_available() else "cpu"
-            except Exception:  # noqa: BLE001 — torch missing/broken ⇒ cpu
-                bench_device = "cpu"
-        log.info("cascade king bench eval enabled on device=%s", bench_device)
-        bench_eval_fn = make_bench_eval_fn(cfg, device=bench_device)
+            bench_device = args.bench_device
+            if bench_device == "auto":
+                # Reuse the trainer's GPU when present — the eval runs after training,
+                # so that GPU is idle. Falls back to cpu on a GPU-less box.
+                try:
+                    import torch
+
+                    bench_device = "cuda" if torch.cuda.is_available() else "cpu"
+                except Exception:  # noqa: BLE001 — torch missing/broken ⇒ cpu
+                    bench_device = "cpu"
+            log.info("cascade king bench eval enabled on device=%s (local, no remote host)",
+                     bench_device)
+            bench_eval_fn = make_bench_eval_fn(cfg, device=bench_device)
 
     runner = TrainerRunner(
         cfg=cfg,
@@ -192,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         screen_fn=screen_fn,
         bench_plan=bench_plan,
         bench_eval_fn=bench_eval_fn,
+        cascade_bench_plan=cascade_bench_plan,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",
