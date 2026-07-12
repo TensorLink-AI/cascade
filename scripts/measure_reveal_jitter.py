@@ -67,6 +67,27 @@ def summarize(records: list[tuple[int, int]], margin: int) -> str:
     return "\n".join(lines)
 
 
+def _dump_pending_commitment(client: ChainClient, netuid: int, hotkey: str, when: str) -> None:
+    """Print what the PENDING commitment store (``Commitments.CommitmentOf``)
+    exposes for ``hotkey`` right now — best-effort, read-only.
+
+    This settles the commit-age-floor feasibility question empirically: the
+    floor ("a commitment must predate ``boundary − margin`` to enter the
+    round") is implementable iff the commit block is readable here while the
+    commitment is pending, and re-derivable by auditors via archive state at a
+    past block. Run this before AND after a probe's reveal to learn whether the
+    record (and its ``block`` field) survives the reveal or is cleaned up."""
+    try:
+        substrate = client.subtensor().substrate
+        rec = substrate.query(
+            module="Commitments", storage_function="CommitmentOf", params=[netuid, hotkey]
+        )
+        value = getattr(rec, "value", rec)
+        print(f"pending-store [{when}]: {value!r}"[:600])
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never abort the probe
+        print(f"pending-store [{when}]: unreadable ({type(e).__name__}: {e})")
+
+
 def _await_reveal(client: ChainClient, hotkey: str, after_block: int, timeout_s: int) -> int | None:
     """Poll until ``hotkey`` shows a reveal at/after ``after_block``; its block."""
     deadline = time.monotonic() + timeout_s
@@ -89,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="Comma-separated blocks_until_reveal values to probe.")
     ap.add_argument("--timeout-s", type=int, default=1800,
                     help="Max seconds to wait for each probe's reveal.")
+    ap.add_argument("--inspect-pending", action="store_true",
+                    help="Also dump the raw Commitments.CommitmentOf record before and "
+                    "after each reveal — answers whether the COMMIT block is readable "
+                    "on chain (pending and/or post-reveal), i.e. whether a commit-age "
+                    "eligibility floor is implementable.")
     args = ap.parse_args(argv)
 
     cfg = load_chain_config(args.chain_toml)
@@ -107,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         client.commit_submission(payload, blocks_until_reveal=d)
         print(f"probe {i}: committed at block {submit_block}, target reveal {submit_block + d} "
               f"(delay {d}) — waiting…")
+        if args.inspect_pending:
+            _dump_pending_commitment(client, cfg.netuid, hotkey, f"probe {i}, pre-reveal")
         revealed = _await_reveal(client, hotkey, submit_block, args.timeout_s)
         if revealed is None:
             print(f"probe {i}: NOT revealed within {args.timeout_s}s — treat as a "
@@ -114,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         late = revealed - (submit_block + d)
         print(f"probe {i}: revealed at {revealed} (lateness {late:+d} block(s))")
+        if args.inspect_pending:
+            _dump_pending_commitment(client, cfg.netuid, hotkey, f"probe {i}, post-reveal")
         records.append((d, late))
 
     print()
