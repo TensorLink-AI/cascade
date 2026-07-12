@@ -202,6 +202,50 @@ def plan_round(
     return RoundPlan(king=king, challengers=challengers)
 
 
+def _drop_final_content_clones(
+    entries: list[TrainedEntry], jobs: list[tuple[ResolvedGenerator, str]]
+) -> list[TrainedEntry]:
+    """Drop final-stage challenger entries whose corpus is byte-identical to
+    another entry's under the round's shared seed.
+
+    The ref-level filters in :func:`plan_round` cannot see a re-upload of
+    someone else's generator (same bytes, different repo ⇒ different ref); the
+    corpus digest can — identical content under one :class:`RoundSeeds` yields
+    an identical corpus. Per size: a challenger matching the KING's digest is
+    dropped (it can only tie, never clear the win margin — the content-level
+    analogue of plan_round's duplicate-of-king rule), and among challengers
+    sharing a digest only the EARLIEST REVEAL survives (UID tiebreak), so a
+    margin-window clone cannot ride a copied corpus into the throne decision.
+    """
+    order = {rg.hotkey: (rg.reveal_block, rg.uid) for rg, _ in jobs}
+    king_digest: dict[str, str] = {e.size: e.corpus_digest for e in entries if e.role == "king"}
+    best: dict[tuple[str, str], TrainedEntry] = {}
+    for e in entries:
+        if e.role != "challenger":
+            continue
+        cur = best.get((e.size, e.corpus_digest))
+        if cur is None or order.get(e.miner_hotkey, (1 << 62, 1 << 62)) < order.get(
+            cur.miner_hotkey, (1 << 62, 1 << 62)
+        ):
+            best[(e.size, e.corpus_digest)] = e
+
+    kept: list[TrainedEntry] = []
+    for e in entries:
+        if e.role != "challenger":
+            kept.append(e)
+            continue
+        if e.corpus_digest == king_digest.get(e.size):
+            log.info("final: challenger %s (%s) dropped: corpus identical to the king's",
+                     e.miner_hotkey, e.size)
+            continue
+        if best[(e.size, e.corpus_digest)].miner_hotkey != e.miner_hotkey:
+            log.info("final: challenger %s (%s) dropped: corpus identical to an "
+                     "earlier-revealed challenger's", e.miner_hotkey, e.size)
+            continue
+        kept.append(e)
+    return kept
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -500,6 +544,7 @@ class TrainerRunner:
         jobs += [(c, "challenger") for c in finalists]
 
         entries = self._train_final(jobs, seeds, block)
+        entries = _drop_final_content_clones(entries, jobs)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
 
@@ -542,9 +587,27 @@ class TrainerRunner:
         heat_contract = self.cfg.screen_contract()
         heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
         trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
-        trained_hotkeys = {c.hotkey for c, _ in trained}
+        trained_hotkeys = {c.hotkey for c, _, _ in trained}
+        # Content-level first-submitter rule: two challengers whose corpora share
+        # a digest under this round's shared seed submitted the same generator
+        # CONTENT (a re-upload of someone else's repo escapes the ref-level dedup
+        # in plan_round but cannot escape this). Only the earliest reveal is
+        # screened; clones would otherwise tie it exactly and could steal its
+        # finalist slot on the UID tiebreak.
+        by_digest: dict[str, ResolvedGenerator] = {}
+        for c, _, digest in trained:
+            cur = by_digest.get(digest)
+            if cur is None or (c.reveal_block, c.uid) < (cur.reveal_block, cur.uid):
+                by_digest[digest] = c
+        duplicates = {c.hotkey for c, _, digest in trained if by_digest[digest].hotkey != c.hotkey}
+        for hk in duplicates:
+            log.info("heat: challenger %s dropped: corpus is byte-identical to an "
+                     "earlier-revealed submission", hk)
+
         scored: list[tuple[float, int, ResolvedGenerator]] = []
-        for c, ckpt_dir in trained:
+        for c, ckpt_dir, _ in trained:
+            if c.hotkey in duplicates:
+                continue
             try:
                 score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed))
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
@@ -558,7 +621,8 @@ class TrainerRunner:
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
         heat = self._heat_result(
-            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n
+            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
+            duplicates=duplicates,
         )
         return winners, heat
 
@@ -570,6 +634,8 @@ class TrainerRunner:
         trained_hotkeys: set[str],
         screen_size: str,
         finalists: int,
+        *,
+        duplicates: set[str] = frozenset(),
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
@@ -577,8 +643,9 @@ class TrainerRunner:
         — the raw numbers stay off the public record so the private, per-round
         rotated eval pool can't be reverse-engineered from the heat. Entrants that
         never produced a score are carried too, tagged by how they dropped out:
-        ``failed_train`` (crashed the screen budget) or ``failed_screen`` (trained
-        but the scorer raised).
+        ``duplicate`` (corpus byte-identical to an earlier reveal), ``failed_train``
+        (crashed the screen budget) or ``failed_screen`` (trained but the scorer
+        raised).
         """
         advanced = {c.hotkey for c in winners}
         scored_hotkeys = {c.hotkey for _, _, c in scored}
@@ -594,7 +661,10 @@ class TrainerRunner:
         for c in challengers:
             if c.hotkey in scored_hotkeys:
                 continue
-            status = "failed_screen" if c.hotkey in trained_hotkeys else "failed_train"
+            if c.hotkey in duplicates:
+                status = "duplicate"
+            else:
+                status = "failed_screen" if c.hotkey in trained_hotkeys else "failed_train"
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref, status=status,
             ))
@@ -607,23 +677,24 @@ class TrainerRunner:
         block: int,
         heat_contract: TrainingContractConfig,
         heat_tokens: int,
-    ) -> list[tuple[ResolvedGenerator, Path]]:
-        """Train each heat challenger, returning ``[(challenger, local_ckpt_dir)]``
-        for the ones that trained. Dispatches to ``remote_hosts`` (GPU pods) when
-        configured — the pod trains at the cheap heat budget and the checkpoint is
-        fetched back for local screening, so the orchestrator (with the wallet)
-        never needs a GPU — else trains locally. A failed train drops that
-        challenger (it just doesn't qualify)."""
+    ) -> list[tuple[ResolvedGenerator, Path, str]]:
+        """Train each heat challenger, returning ``[(challenger, local_ckpt_dir,
+        corpus_digest)]`` for the ones that trained — the digest feeds the
+        content-level duplicate drop in :meth:`_run_heat`. Dispatches to
+        ``remote_hosts`` (GPU pods) when configured — the pod trains at the cheap
+        heat budget and the checkpoint is fetched back for local screening, so the
+        orchestrator (with the wallet) never needs a GPU — else trains locally. A
+        failed train drops that challenger (it just doesn't qualify)."""
         if self.remote_hosts:
             return self._heat_train_remote(challengers, seeds, block, heat_contract)
-        out: list[tuple[ResolvedGenerator, Path]] = []
+        out: list[tuple[ResolvedGenerator, Path, str]] = []
         for c in challengers:
             out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
             try:
-                result, *_ = self._train_checkpoint(
+                result, digest, _, _ = self._train_checkpoint(
                     c, seeds, heat_contract, heat_tokens, out_dir, log_role=f"heat-{c.hotkey}",
                 )
-                out.append((c, result.local_dir))
+                out.append((c, result.local_dir, digest))
             except Exception as e:  # noqa: BLE001
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
         return out
@@ -634,13 +705,14 @@ class TrainerRunner:
         seeds: RoundSeeds,
         block: int,
         heat_contract: TrainingContractConfig,
-    ) -> list[tuple[ResolvedGenerator, Path]]:
+    ) -> list[tuple[ResolvedGenerator, Path, str]]:
         """Screen-train the field on the GPU pods: dispatch each challenger to a
         host (round-robin across ``remote_hosts``, in parallel), training at the
         cheap ``[round] heat_train_hours`` on the screen size, then fetch each
         checkpoint back for local screening. Each pushes to a per-challenger repo
         so concurrent heat runs never collide. A challenger that fails to train or
-        fetch is dropped."""
+        fetch is dropped. The pod's receipt carries the corpus digest, threaded
+        through for the content-level duplicate drop."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from .remote import RemoteDispatcher
@@ -653,7 +725,7 @@ class TrainerRunner:
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
         )
 
-        def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path]:
+        def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path, str]:
             host = hosts[i % len(hosts)]
             entry = disp.dispatch(
                 host, gen_ref=c.ref, uid=c.uid, hotkey=c.hotkey, role="challenger",
@@ -667,9 +739,9 @@ class TrainerRunner:
                 raise RuntimeError(f"malformed trained_pointer: {entry.trained_pointer!r}")
             out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
             fetch_from_hub(ref, out_dir, hub)
-            return c, out_dir
+            return c, out_dir, entry.corpus_digest
 
-        out: list[tuple[ResolvedGenerator, Path]] = []
+        out: list[tuple[ResolvedGenerator, Path, str]] = []
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
             futs = {ex.submit(_run, i, c): c for i, c in enumerate(challengers)}
             for fut in as_completed(futs):

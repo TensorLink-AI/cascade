@@ -34,9 +34,11 @@ def _host(name="king-box", **kw):
 
 
 def _receipt_dict(role="king", uid=0, hotkey="hk"):
+    # distinct generators produce distinct corpora — a shared digest would (rightly)
+    # trip the trainer's content-clone drop, which is not what these tests probe
     return {
         "miner_hotkey": hotkey, "miner_uid": uid, "role": role, "gen_ref": REF_A,
-        "trained_pointer": format_trained_pointer(REF_T), "corpus_digest": "d",
+        "trained_pointer": format_trained_pointer(REF_T), "corpus_digest": f"d-{hotkey}",
         "train_block": 10,
     }
 

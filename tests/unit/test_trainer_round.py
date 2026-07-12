@@ -23,9 +23,11 @@ REF_OUT = "cascade/ckpt-out@sha256:" + "e" * 64
 
 
 class _FakeStream:
-    digest = "corpusdigest"
     n_series = 3
     total_points = 192
+
+    def __init__(self, digest="corpusdigest"):
+        self.digest = digest
 
     def __enter__(self):
         return self
@@ -54,9 +56,17 @@ def _fake_upload(local_dir, repo, hub=None, *, hf_repo=None, hf_token=None):
     return HubUpload(ref=HubRef.parse(REF_OUT), size_bytes=1)
 
 
-def _patch_train_boundaries(monkeypatch):
+def _patch_train_boundaries(monkeypatch, digest_fn=None):
+    """Fake the GPU/registry boundaries. Real corpus digests hash generator
+    CONTENT (distinct miners ⇒ distinct digests; byte-identical clones collide),
+    so the default derives a per-miner digest from the fetched generator dir.
+    Pass a collapsing ``digest_fn(gen_dir) -> str`` to simulate content clones."""
+    fn = digest_fn or (lambda gen_dir: f"digest-{gen_dir}")
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
-    monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(
+        loop_mod, "open_round_stream",
+        lambda mode, gen_dir, *a, **k: _FakeStream(digest=fn(gen_dir)),
+    )
     monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 
@@ -305,7 +315,9 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
                                "train_hours": train_hours, "repo_suffix": repo_suffix})
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                # per-miner digest: distinct generators ⇒ distinct corpora (a shared
+                # one would rightly trip the content-clone drop, not probed here)
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
@@ -329,3 +341,76 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
     # heat winner ('c') promoted; the final dispatch carries no heat overrides
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"
     assert any(d["role"] == "king" and d["train_hours"] is None for d in dispatched)
+
+
+def test_heat_drops_content_clone_keeping_earliest_reveal(cfg, tmp_path, monkeypatch):
+    # 'c' re-uploaded 'b''s generator content under its own repo (different ref,
+    # so plan_round's ref dedup can't see it) and revealed later. The heat's
+    # corpus-digest dedup drops 'c' before screening — a clone must never tie
+    # its original and steal the finalist slot on the UID tiebreak.
+    def collapse(gen_dir):
+        s = str(gen_dir)
+        return "cloned-corpus" if ("/heat/b/" in s or "/heat/c/" in s) else s
+
+    _patch_train_boundaries(monkeypatch, digest_fn=collapse)
+    scores = {"b": 0.9, "d": 0.5}
+    seen: list[str] = []
+
+    def screen(ckpt_dir, gen, base_seed):
+        seen.append(gen.hotkey)
+        return scores[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert "c" not in seen  # the clone is never even screened
+    assert manifest.entry_for_role("challenger").miner_hotkey == "d"
+    status = {e.hotkey: e.status for e in manifest.heat.entrants}
+    assert status["c"] == "duplicate"
+    assert status["b"] == "screened" and status["d"] == "advanced"
+
+
+def test_final_drops_challenger_whose_corpus_matches_the_king(cfg, tmp_path, monkeypatch):
+    # 'b' re-uploaded the KING's generator content under a fresh repo — a
+    # different ref, so the ref-level duplicate-of-king filter misses it. The
+    # corpus digest cannot: identical content under the round's shared seed
+    # yields an identical corpus, and the final drops the clone entry.
+    _patch_train_boundaries(monkeypatch, digest_fn=lambda gen_dir: "same-content")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entry_for_role("king").gen_ref == REF_A
+    assert manifest.entries_for_role("challenger") == []
+
+
+def test_drop_final_content_clones_prefers_earliest_reveal():
+    # Pure check of the challenger-vs-challenger rule: same corpus digest at the
+    # same size → only the earliest reveal survives, whatever the UID order.
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+    from cascade.trainer.loop import ResolvedGenerator, _drop_final_content_clones
+
+    tp = format_trained_pointer(REF_OUT)
+
+    def entry(hotkey, uid, digest, role="challenger", size="s1"):
+        return TrainedEntry(miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=REF_B,
+                            trained_pointer=tp, corpus_digest=digest, train_block=10,
+                            size=size)
+
+    jobs = [
+        (ResolvedGenerator("king", 0, REF_A, reveal_block=1), "king"),
+        (ResolvedGenerator("orig", 9, REF_B, reveal_block=100), "challenger"),
+        (ResolvedGenerator("copier", 1, REF_C, reveal_block=200), "challenger"),
+    ]
+    entries = [
+        entry("king", 0, "king-digest", role="king"),
+        entry("orig", 9, "shared"),
+        entry("copier", 1, "shared"),      # lower UID, later reveal — must lose
+        entry("copier", 1, "unique", size="s2"),  # different corpus at s2 — kept
+    ]
+    kept = _drop_final_content_clones(entries, jobs)
+    assert [(e.miner_hotkey, e.size) for e in kept] == [
+        ("king", "s1"), ("orig", "s1"), ("copier", "s2")]

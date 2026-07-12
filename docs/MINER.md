@@ -186,10 +186,53 @@ on work that hasn't even been evaluated yet. Two things could leak it early:
    only discoverable through the (still-hidden) on-chain ref. Avoid the
    `--hf-repo` fallback for competitive submissions; it exists for Hub outages.
 
-Same-ref copying is also unrewarding by construction: if two hotkeys commit the
-same generator ref, the **earliest reveal** keeps the slot (the copy is dropped
-before any training), and a challenger byte-identical to the king is discarded
-outright.
+Copying is also unrewarding by construction, at both levels the trainer can see:
+
+- **Same ref** (someone commits your exact `repo@digest` string — needs no
+  upload): the **earliest reveal** keeps the slot; the copy is dropped before
+  any training.
+- **Same content** (someone re-uploads your generator bytes under their own
+  repo — a different ref): under the round's shared seed an identical generator
+  produces an identical **corpus digest**, and the trainer drops the clone —
+  before screening in the heat (`duplicate` in the standings), and from the
+  final's entries — again keeping the earliest reveal. A clone can therefore
+  never tie you and steal your slot on a tiebreak; a challenger whose corpus is
+  byte-identical to the king's is discarded outright.
+
+What remains possible inside the ~5-minute margin is a *modified* fork — which
+is just the ordinary (allowed) forking game played with almost no time to
+actually improve anything.
+
+#### After you deploy: confirm the reveal, and what a miss means
+
+Reveal timing jitters by a few blocks, so don't assume — confirm. `deploy`
+prints the exact command:
+
+```bash
+cascade reveal-status <your-hotkey-ss58> --network test \
+    --expect-boundary <printed-boundary> --watch
+# → revealed at block 48577 — eligible for the round locking at block 48600 …
+# or, loudly:
+# → ⚠ MISSED the targeted boundary 48600: the reveal landed 3 block(s) at/after it.
+```
+
+If the reveal **misses** its boundary:
+
+- The submission **auto-rolls into the next round** — no re-commit needed
+  (eligibility is just "revealed before that round's boundary").
+- It has **not** consumed your one-submission budget: the burn happens only
+  when a submission actually enters a round's heat, and a missed reveal never
+  entered.
+- The cost is secrecy, not eligibility: the ref is public until the next
+  boundary. The same-ref and same-content rules above still keep your slot
+  yours; if you'd rather enter *fresh, improved* content hidden, just
+  re-deploy — the **latest reveal per hotkey** is the one that competes.
+
+**Fat-fingered a deploy?** Same mechanism: re-deploy the corrected generator
+before the boundary. Both commitments will eventually reveal; the later reveal
+wins. Two timed deploys in one window may target the same reveal block — if you
+need the replacement to be unambiguous, give it `--next-epoch` (or a later
+explicit `--blocks-until-reveal`) so its reveal strictly follows the original's.
 
 Two empirical assumptions behind this scheme can (and should) be re-checked
 against the live network:

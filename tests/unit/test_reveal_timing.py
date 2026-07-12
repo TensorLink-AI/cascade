@@ -143,3 +143,44 @@ def test_duplicated_ref_ties_break_by_uid():
 
 def test_config_carries_the_reveal_margin(cfg):
     assert cfg.round.reveal_margin_blocks == 25
+
+
+# ── reveal-status verdicts ───────────────────────────────────────────────────
+
+
+def test_reveal_verdict_on_time_is_eligible_and_quiet():
+    from cascade.miner.cli import _reveal_verdict
+
+    # revealed exactly at boundary − margin, boundary not yet passed
+    missed, report = _reveal_verdict(
+        reveal_block=EPOCH - MARGIN, current_block=EPOCH - 10,
+        epoch_blocks=EPOCH, margin_blocks=MARGIN, expect_boundary=EPOCH,
+    )
+    assert not missed
+    assert f"locking at block {EPOCH}" in report
+    assert "MISSED" not in report and "exceeds" not in report
+
+
+def test_reveal_verdict_flags_a_missed_boundary_loudly():
+    from cascade.miner.cli import _reveal_verdict
+
+    # targeted the boundary at EPOCH but the reveal jittered past it
+    missed, report = _reveal_verdict(
+        reveal_block=EPOCH + 2, current_block=EPOCH + 40,
+        epoch_blocks=EPOCH, margin_blocks=MARGIN, expect_boundary=EPOCH,
+    )
+    assert missed
+    assert "MISSED" in report
+    assert f"locking at block {2 * EPOCH}" in report      # auto-rolls to next round
+    assert "one-submission budget" in report               # miss ≠ burned submission
+
+
+def test_reveal_verdict_notes_exposure_beyond_the_margin():
+    from cascade.miner.cli import _reveal_verdict
+
+    # a --reveal-now style early reveal: public far longer than the margin
+    missed, report = _reveal_verdict(
+        reveal_block=100, current_block=200,
+        epoch_blocks=EPOCH, margin_blocks=MARGIN,
+    )
+    assert not missed and "exceeds" in report
