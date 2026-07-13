@@ -227,6 +227,13 @@ each. Those numbers reach your validator one of two ways:
 Either way, these public-benchmark numbers drive **only** Cascade's warm-start
 promotion. The dethrone verdict itself stays entirely on the private eval pool.
 
+And to be explicit: **the validator never runs the warm start.** A Cascade
+firing is pure bookkeeping on the validator — it looks up the reign's
+best-scored checkpoint (no re-eval), promotes it **as-is** (no retrain, no
+fine-tune), and vacates the throne. Training from that warm-start init is the
+owner-trainer's job in the following rounds. The validator's GPU is only ever
+used for inference — scoring and benchmarks — never training.
+
 ## What can go wrong
 
 | symptom | cause |
