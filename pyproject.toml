@@ -15,8 +15,14 @@ dependencies = [
 
 [project.optional-dependencies]
 # Heavy ML stack — only the trainer (and the validator's evaluator) need torch.
+# torch is PINNED EXACTLY (not a range) + sourced from a fixed CUDA index below:
+# a KOTH duel compares king vs challenger, so every pod MUST run bit-identical
+# numerics. An unpinned `torch>=2.2` let fresh `uv sync`s resolve to whatever was
+# latest (2.4.1 on old pods, 2.12.1 on new) and auto-pick the CUDA build per host
+# (cu124 vs cu130) — silent drift that invalidates the comparison. See also
+# .python-version (pins the interpreter, else uv grabs the newest available).
 train = [
-    "torch>=2.2",
+    "torch==2.4.1",
     "transformers>=4.40",
     "safetensors>=0.4",
     "accelerate>=0.30",
@@ -66,6 +72,18 @@ cascade-train-worker = "cascade.trainer.worker:main"
 cascade-validator = "cascade.validator.main:main"
 cascade-pool = "cascade.pool.cli:main"
 cascade-audit = "cascade.audit.main:main"
+
+# Pin torch to a single CUDA build (cu124) so every worker/validator resolves the
+# SAME wheel regardless of the host's CUDA version — uv would otherwise auto-select
+# the backend per machine (cu124 on one pod, cu130 on another). cu124 wheels run
+# on newer CUDA runtimes (backward-compatible), so this is safe across SKUs.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
 
 [build-system]
 requires = ["hatchling>=1.18"]
