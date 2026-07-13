@@ -223,3 +223,52 @@ log prefix. Checkpoint uploads go through the Hub token — scope it to the
   7); no-egress firewall behind it; write-only-prefix S3 creds behind that.
 - **The runtime is pinned.** `train_image_digest` + `CASCADE_TRAIN_IMAGE_DIGEST`
   make a final run refuse an off-contract stack (step 1).
+
+## The trainer ↔ provisioner contract (`cascade-provisioner`)
+
+Everything above provisions pods **by hand**. `cascade-provisioner` (see
+`cascade/provision/`, config in `scripts/provision.example.toml`, unit in
+`deploy/cascade-provisioner.service`) automates it **per round**: rent shortly
+before the epoch boundary, health-gate, publish, tear down per stage. The two
+services never call each other — they meet only through files and stores, and
+each side degrades safely without the other:
+
+- **`hosts.toml`** (the trainer's `--remote-hosts`). The provisioner writes it
+  atomically with heat- and final-tagged `[[host]]` entries — one entry **per
+  GPU** (a 2×L40S final pod becomes two entries with `cuda_device = "0"/"1"`,
+  so king and finalist train on the same physical box and trivially satisfy
+  the validator's `expected_gpu` pairing). The trainer re-reads the file at
+  every round start (`--hosts-wait-seconds` covers pod boot time after the
+  boundary).
+- **Empty `hosts.toml` = local fallback.** When no provider has capacity, the
+  fleet fails its health gate, or the budget breaker refuses the round, the
+  provisioner publishes an *empty* file. `load_hosts` raises on zero entries
+  and the trainer trains that round locally — degraded, never lost.
+- **`cascade-trainer --plan-only`** is the sizing input: the provisioner runs
+  it inside the trigger margin (timed reveals have landed, so the eligible
+  field is countable) and sizes the heat fleet off `eligible_challengers`,
+  slot-based for multi-GPU pods.
+- **The shared work-root** carries the mid-round teardown signal: the trainer
+  drops `work_root/<round_id>/heat_complete.json` when the heat settles
+  (field screened, hotkeys burned, finalists chosen — no heat dispatch can
+  occur afterwards). The provisioner then kills the heat fleet **while the
+  final still runs** and re-renders `hosts.toml` final-only. The provisioner
+  keys rounds by boundary block and can't know `round_id` (= base_seed, the
+  boundary block's *hash*) in advance, so any marker newer than its rent time
+  is accepted — only one round runs at a time.
+- **The round manifest** (`manifests/round-<id>.json` / a `latest.json`
+  round-id change) ends the round: final pods die when it publishes.
+- **TTL backstop.** Every pod dies one epoch after rent no matter what — a
+  crashed trainer, an unreachable store, or a lost ledger can cost at most
+  the round's worst-case projection, which `max_spend_per_round` caps before
+  anything is rented. Orphan reconcile (live `cascade-*`-tagged pods not in
+  the provisioner's ledger) runs every cycle.
+
+**Security split.** The wallet never leaves the trainer/orchestrator box, and
+the provisioner never needs it: it holds only the marketplace API keys
+(`SHADEFORM_API_KEY`, `LIUM_API_KEY`), read credentials for the manifest store
+(reachability probe + round-end watch), and the orchestrator SSH keypair. A
+compromised provisioner can spend your provider balance (bounded by the budget
+breaker) but cannot sign a manifest, and the systemd unit deliberately has no
+dependency on any trainer unit — either service restarts freely without the
+other.

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from deploy.provision import (
+from cascade.provision import (
     DEFAULT_FORWARD_ENV,
     LaunchSpec,
     LiumProvider,
@@ -34,6 +34,7 @@ from deploy.provision import (
     shadeform_pod_address,
     validate_digest_pinned,
 )
+from cascade.provision.core import filter_tagged_names, shadeform_offer_price_usd_hr
 
 IMG = "reg.example/cascade-worker@sha256:" + "a" * 64
 
@@ -349,6 +350,48 @@ def test_shadeform_pod_address_reads_ip():
     assert shadeform_pod_address({"ip": "198.51.100.7", "status": "active"}) == \
         PodAddress("198.51.100.7", 22)
     assert shadeform_pod_address({"status": "pending"}) is None
+
+
+def test_shadeform_offer_price_converts_cents_to_usd():
+    # hourly_price is in CENTS; the budget breaker works in USD — a mixup would
+    # 100× (or 1/100×) every projection.
+    assert shadeform_offer_price_usd_hr(_types(price=120), "L40S") == pytest.approx(1.20)
+    assert shadeform_offer_price_usd_hr(_types(available=False), "L40S") is None
+    assert shadeform_offer_price_usd_hr(_types(gpu="H100"), "L40S") is None
+
+
+def test_shadeform_offer_price_picks_cheapest():
+    cheap = _types(price=90)["instance_types"][0]
+    dear = _types(price=200)["instance_types"][0]
+    assert shadeform_offer_price_usd_hr({"instance_types": [dear, cheap]}, "L40S") == \
+        pytest.approx(0.90)
+
+
+# ── tagged-pod listing (the reconcile primitive) ─────────────────────────────
+
+
+def test_filter_tagged_names_by_prefix():
+    pods = [
+        {"name": "cascade-900-heat-0", "id": "i-1"},
+        {"name": "cascade-900-final-0", "id": "i-2"},
+        {"name": "someone-elses-box", "id": "i-3"},
+        {"id": "i-4"},                                   # nameless: never ours
+    ]
+    assert filter_tagged_names(pods, "cascade-", id_key="name") == \
+        ["cascade-900-heat-0", "cascade-900-final-0"]
+    # Shadeform terminates by opaque id, so the id is the returned handle.
+    assert filter_tagged_names(pods, "cascade-", id_key="id") == ["i-1", "i-2"]
+
+
+def test_lium_list_tagged_uses_ps_names():
+    def _run(argv):
+        import types
+        out = ('[{"name": "cascade-900-heat-0", "status": "RUNNING"},'
+               ' {"name": "other", "status": "RUNNING"}]') if "ps" in argv else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    assert LiumProvider(bin="lium", _run=_run).list_tagged("cascade-") == \
+        ["cascade-900-heat-0"]
 
 
 # ── launch + GUARANTEED teardown control flow ────────────────────────────────

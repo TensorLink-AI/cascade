@@ -68,6 +68,7 @@ chain = [
 [project.scripts]
 cascade = "cascade.miner.cli:main"
 cascade-trainer = "cascade.trainer.main:main"
+cascade-provisioner = "cascade.provision.main:main"
 cascade-train-worker = "cascade.trainer.worker:main"
 cascade-validator = "cascade.validator.main:main"
 cascade-pool = "cascade.pool.cli:main"

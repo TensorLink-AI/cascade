@@ -365,6 +365,37 @@ class TrainerRunner:
         seen = _load_seen_hotkeys(path)
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
+    def _mark_heat_complete(
+        self,
+        base_seed: int,
+        screened: list[ResolvedGenerator],
+        finalists: list[ResolvedGenerator],
+    ) -> None:
+        """Drop ``work_root/<round_id>/heat_complete.json`` when the heat settles.
+
+        The teardown signal for an external provisioner: once the field is
+        screened, burned, and the finalists chosen, no heat-stage dispatch can
+        occur for the rest of the round, so heat-tagged pods are safe to
+        terminate while the final still runs (see docs/DEPLOY_PODS.md). Written
+        atomically (tmp + rename) so a watcher never reads a torn file; the
+        round_id equals the round's base_seed (the work-root subdir key).
+        Best-effort: a write failure must never sink a round.
+        """
+        payload = {
+            "round_id": str(base_seed),
+            "screened": len(screened),
+            "finalists": [c.hotkey for c in finalists],
+        }
+        try:
+            out_dir = self.work_root / f"{base_seed}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out_dir / "heat_complete.json.tmp"
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            tmp.replace(out_dir / "heat_complete.json")
+        except OSError as e:
+            log.warning("could not write heat_complete marker for round=%s: %s",
+                        base_seed, e)
+
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
     def _train_checkpoint(
@@ -647,6 +678,9 @@ class TrainerRunner:
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
         # submission is consumed by a round that never judged it.
         self._burn_hotkeys(eligible)
+        # Heat settled (screened + burned + finalists chosen): signal external
+        # watchers (the provisioner) that heat-stage pods are now safe to release.
+        self._mark_heat_complete(base_seed, eligible, finalists)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
