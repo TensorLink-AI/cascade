@@ -176,6 +176,7 @@ def render_hosts_toml(
     ssh_options: Sequence[str] = DEFAULT_SSH_OPTIONS,
     name_prefix: str = "cascade-pod",
     provider: str = "",
+    stage: str = "any",
 ) -> str:
     """Render a trainer ``hosts.toml`` (schema: ``remote_hosts.example.toml``).
 
@@ -183,6 +184,12 @@ def render_hosts_toml(
     ``"0"``. ``forward_env`` lists the credential env vars the orchestrator
     forwards inline per dispatch (they are NOT seeded onto the pod). The array
     literals are emitted as TOML/JSON-style ``["a", "b"]``.
+
+    ``stage`` ("any" | "heat" | "final") tags which round stage these pods serve
+    (see ``cascade.trainer.remote.RemoteHost``): a homogeneous batch is one stage,
+    so provision a cheap heat fleet (``--stage heat``) and a single-SKU final pair
+    (``--stage final``) as separate runs, then concatenate the ``[[host]]`` blocks.
+    ``"any"`` is omitted (it is the schema default).
     """
     if not addrs:
         raise ProvisionError("cannot render hosts.toml with zero pods")
@@ -209,6 +216,8 @@ def render_hosts_toml(
             f'workdir       = "{workdir}"',
             'cuda_device   = "0"',
         ]
+        if stage != "any":
+            lines.append(f'stage         = "{stage}"')
         if chain_toml:
             lines.append(f'chain_toml    = "{chain_toml}"')
         lines += [
@@ -626,6 +635,7 @@ class RenderOpts:
     remote_python: str = DEFAULT_REMOTE_PYTHON
     workdir: str = DEFAULT_WORKDIR
     chain_toml: str | None = None
+    stage: str = "any"
 
 
 def _sidecar_path(hosts_path: Path) -> Path:
@@ -690,6 +700,7 @@ def provision_and_run(
             chain_toml=render_opts.chain_toml,
             name_prefix=spec.name_prefix,
             provider=provider.name,
+            stage=render_opts.stage,
         )
         _write(hosts_path, hosts_toml)
         log.info("wrote %s (%d host(s))", hosts_path, len(addrs))
@@ -756,6 +767,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--count", type=int, default=DEFAULT_POD_COUNT,
                    help=f"Number of pods, all the same SKU (default {DEFAULT_POD_COUNT}).")
     p.add_argument("--image", help="Digest-pinned worker image (…@sha256:<64hex>).")
+    p.add_argument("--stage", default="any", choices=("any", "heat", "final"),
+                   help="Round stage these pods serve (default any). Heats can be a cheap "
+                        "SKU; finals must be a single SKU (validator gpu_name gate). Provision "
+                        "each stage as a separate run and concatenate the hosts.toml blocks.")
+    p.add_argument("--name-prefix", default="cascade-pod",
+                   help="hosts.toml [[host]] name prefix (default cascade-pod); e.g. "
+                        "'cascade-heat' / 'cascade-final' to tell the fleets apart.")
     p.add_argument("--ssh-pubkey",
                    help="Orchestrator SSH public key: inline 'ssh-…' or a path to a .pub file.")
     p.add_argument("--ssh-key-path", default=None,
@@ -826,11 +844,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec = LaunchSpec(
             sku=args.sku, count=args.count, image=args.image,
             ssh_pubkey=pubkey, ssh_port=args.ssh_port,
+            name_prefix=args.name_prefix,
         )
         render_opts = RenderOpts(
             key_path=key_path, forward_env=forward_env,
             remote_python=args.remote_python, workdir=args.workdir,
-            chain_toml=args.chain_toml,
+            chain_toml=args.chain_toml, stage=args.stage,
         )
 
         providers = build_providers(priority)
