@@ -59,6 +59,16 @@ class GeneratorConfig:
     max_memory_mb: int
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
+    # Cheap data-quality gates on generator output (see cascade.interface.generator).
+    #   max_abs_value       — reject a series whose peak |value| exceeds this; 0.0
+    #                         means "cast-safe default" (the float32 ceiling), which
+    #                         is always applied since an over-max value is untrainable.
+    #   reject_constant     — reject any flat (zero-range) series.
+    #   max_dup_fraction    — cap the fraction of exact byte-duplicate series in a
+    #                         materialised (cache_reuse) corpus; 1.0 disables it.
+    max_abs_value: float = 0.0
+    reject_constant: bool = False
+    max_dup_fraction: float = 1.0
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -116,6 +126,23 @@ class SizeSpec:
     # Exact FFN hidden width from the released config.json (0 ⇒ derive as
     # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
     d_ff: int = 0
+
+
+# Screen-stage wall-clock guard (see TrainingContractConfig.for_hours): a heat
+# run's hard deadline derives from its own cheap hours budget instead of
+# inheriting the final's ``max_train_seconds``. Defaults implement the owner
+# policy "the budget hours ARE the wall-clock cap" (factor 1.0): a run stops at
+# the token budget or the nominal time, whichever comes first, and a time stop
+# is flagged ``deadline_hit`` rather than run long. Raise the factor (via
+# ``[round] heat_guard_factor``) when heat pods are a slower SKU than the
+# reference-throughput box — at 1.0 a slower SKU turns every heat into a
+# time-truncated run, which makes the screen partially reward fast-to-generate
+# data over good data. The floor absorbs fixed overheads (sandbox boot, first
+# batch) that don't shrink with tiny budgets. Overridable per deployment from
+# ``[round]``; the derived heat contract stays trainer-internal (screened,
+# discarded, never digest-gated).
+HEAT_GUARD_FACTOR = 1.0
+HEAT_GUARD_FLOOR_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -217,6 +244,40 @@ class TrainingContractConfig:
         challenger on identical compute and keeps a re-derived run reproducible."""
         return int(round(hours * 3600.0 * self.ref_throughput_tokens_per_s))
 
+    def for_hours(
+        self,
+        hours: float,
+        *,
+        guard_factor: float = HEAT_GUARD_FACTOR,
+        guard_floor_seconds: int = HEAT_GUARD_FLOOR_SECONDS,
+    ) -> TrainingContractConfig:
+        """This size's contract at a reduced ``hours`` budget — a heat/screen run.
+
+        Scales BOTH knobs together: ``train_tokens`` (via ``target_train_hours``)
+        and the hard wall-clock guard, ``max(guard_factor × hours,
+        guard_floor_seconds)`` capped at the pinned ``max_train_seconds``. The
+        run stops at the token budget or that deadline, whichever comes first —
+        without this a screen run inherits the final's guard, and one
+        pathologically slow (or adversarially trickling) corpus can hold a heat
+        slot for the final-scale hours at a ~30-min budget. At the default
+        ``guard_factor = 1.0`` the budget hours ARE the cap (owner policy): a
+        run that can't sustain reference throughput truncates and is flagged
+        ``deadline_hit``. Callers wire the knobs from ``[round]``
+        (``heat_guard_factor`` / ``heat_guard_floor_seconds``); raise the factor
+        when heat pods are a slower SKU than the reference box. Final runs never
+        come through here; their guard stays the contract value."""
+        if hours <= 0:
+            raise ValueError(f"hours must be positive; got {hours}")
+        if guard_factor <= 0:
+            raise ValueError(f"guard_factor must be positive; got {guard_factor}")
+        guard = max(int(round(guard_factor * hours * 3600.0)), int(guard_floor_seconds))
+        return replace(
+            self,
+            target_train_hours=float(hours),
+            max_train_seconds=min(guard, self.max_train_seconds),
+            extra_sizes=(),
+        )
+
     @property
     def train_tokens(self) -> int:
         """Enforced final-stage budget in point-passes: ``target_train_hours`` of
@@ -313,6 +374,20 @@ class RoundConfig:
     round_hours: float = 24.0         # informational: wall-clock span of an epoch
     heat_train_hours: float = 0.5     # cheap screening budget per competitor
     heat_n_windows: int = 256         # eval windows the heat screens on (≤ [eval] n_windows)
+    # Sample forecasts per window in the heat screen. The heat only RANKS the
+    # field, and CRPS rankings are stable at far fewer samples than the final
+    # verdict needs — the screen eval runs sequentially on the orchestrator's
+    # CPU, so this is the knob that keeps a large field's screening from
+    # rivalling its training time. 0 ⇒ reuse [eval] num_samples.
+    heat_num_samples: int = 0
+    # Heat wall-clock cap = max(heat_guard_factor × heat_train_hours,
+    # heat_guard_floor_seconds), never above [training] max_train_seconds. The
+    # run stops at the token budget or this deadline, whichever first; a time
+    # stop is flagged deadline_hit. 1.0 = the budget hours ARE the cap; raise it
+    # when heat pods are a slower SKU than the reference-throughput box, or the
+    # screen starts rewarding fast-to-generate data over good data.
+    heat_guard_factor: float = 1.0
+    heat_guard_floor_seconds: int = 900
     finalists: int = 1                # challengers promoted from the heat to the final
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
@@ -377,6 +452,13 @@ class EvalConfig:
     gift_gate_num_samples: int = 0
     gift_gate_data_dir: str = ""
     gift_gate_timeout_s: int = 3600
+    # Cascade king-eval coverage (see cascade.validator.cascade). Cap on datasets
+    # per suite when the trainer scores the king's checkpoint on GIFT-Eval / BOOM /
+    # TIME. ``0`` = the FULL battery (all configs) — the default, since Cascade's
+    # promotion should see the whole eval. Kept separate from the log-only
+    # ``benchmark_max_series`` so tightening telemetry never quietly shrinks the
+    # Cascade decision. Set a positive cap only to speed up testnet iteration.
+    cascade_bench_max_series: int = 0
 
 
 @dataclass(frozen=True)
@@ -425,6 +507,17 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
+    # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
+    # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
+    # and the reigning king holds the throne ``cascade_reign_days`` CONSECUTIVE
+    # WALL-CLOCK DAYS undethroned, the reign's best checkpoint (lowest geomean of
+    # the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the trainer stamps onto the
+    # signed manifest) is installed as the warm-start init and the throne is
+    # vacated to re-open the competition from it. The reign clock is wall-clock, so
+    # it is persisted and survives restarts.
+    cascade_enabled: bool = False
+    cascade_reign_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -467,6 +560,16 @@ class StorageConfig:
     # no fallback (plain S3). Make it a PUBLIC dataset so receipts stay auditable
     # during an outage; auth via HF_TOKEN.
     hf_backup_repo: str = ""
+    # Cloudflare R2 (or any S3-compatible) backup of the manifest/receipt bucket.
+    # When ``backup_s3_endpoint`` is set every manifest/receipt write is mirrored
+    # here (dual-write) and reads fall back here when Hippius S3 is unavailable —
+    # a full off-Hippius backup, not just an outage failover (see
+    # cascade.shared.hippius.S3MirrorStore). ``backup_bucket`` defaults to the
+    # primary ``manifest_bucket`` name; ``backup_s3_region`` defaults to R2's
+    # ``"auto"``. Credentials via BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.
+    backup_bucket: str = ""
+    backup_s3_endpoint: str = ""
+    backup_s3_region: str = ""
 
 
 @dataclass(frozen=True)
@@ -513,6 +616,13 @@ class ValidatorConfig:
     poll_seconds: int
     hf_cache_seconds: int
     state_db_path: str
+    # Cascade persistence (see cascade.validator.cascade). ``cascade_state_db_path``
+    # holds the reign clock + reign checkpoint log (JSON) so Cascade survives
+    # restarts; ``warm_start_init_path`` is where a fired Cascade writes the
+    # promoted checkpoint pointer for the trainer to warm-start every subsequent
+    # round from. Defaults keep older chain.toml loadable.
+    cascade_state_db_path: str = "cascade_state.json"
+    warm_start_init_path: str = "warm_start_init.json"
 
 
 @dataclass(frozen=True)
@@ -704,6 +814,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_memory_mb=int(g["max_memory_mb"]),
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
+            max_abs_value=float(g.get("max_abs_value", 0.0)),
+            reject_constant=bool(g.get("reject_constant", False)),
+            max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),
@@ -748,6 +861,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             round_hours=float(r.get("round_hours", 24.0)),
             heat_train_hours=float(r.get("heat_train_hours", 0.5)),
             heat_n_windows=int(r.get("heat_n_windows", 256)),
+            heat_num_samples=int(r.get("heat_num_samples", 0)),
+            heat_guard_factor=float(r.get("heat_guard_factor", 1.0)),
+            heat_guard_floor_seconds=int(r.get("heat_guard_floor_seconds", 900)),
             finalists=int(r.get("finalists", 1)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
@@ -772,6 +888,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_num_samples=int(e.get("gift_gate_num_samples", 0)),
             gift_gate_data_dir=str(e.get("gift_gate_data_dir", "")),
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
+            cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),
@@ -789,6 +906,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            cascade_enabled=bool(s.get("cascade_enabled", False)),
+            cascade_reign_days=int(s.get("cascade_reign_days", 7)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
@@ -808,6 +927,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             pool_s3_endpoint=str(st.get("pool_s3_endpoint", "")),
             pool_s3_region=str(st.get("pool_s3_region", "")),
             hf_backup_repo=str(st.get("hf_backup_repo", "")),
+            backup_bucket=str(st.get("backup_bucket", "")),
+            backup_s3_endpoint=str(st.get("backup_s3_endpoint", "")),
+            backup_s3_region=str(st.get("backup_s3_region", "")),
         ),
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),
@@ -819,6 +941,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             poll_seconds=int(v["poll_seconds"]),
             hf_cache_seconds=int(v["hf_cache_seconds"]),
             state_db_path=str(v["state_db_path"]),
+            cascade_state_db_path=str(v.get("cascade_state_db_path", "cascade_state.json")),
+            warm_start_init_path=str(v.get("warm_start_init_path", "warm_start_init.json")),
         ),
         wandb=WandbConfig(
             enabled=bool(wb.get("enabled", False)),

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..interface.generator import DataGenerator, drain_generator
+from ..interface.generator import CAST_SAFE_MAX_FLOAT32, DataGenerator, drain_generator
 from ..interface.validation import check_repo_size
 from ..shared.config import GeneratorConfig
 from ..shared.manifest import corpus_digest
@@ -88,6 +88,9 @@ def build_corpus(
             max_length=cfg.max_length,
             max_total_points=cfg.max_total_points,
             max_channels=cfg.max_channels,
+            max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
+            reject_constant=cfg.reject_constant,
+            max_dup_fraction=cfg.max_dup_fraction,
         )
     except ValueError as e:
         raise CorpusError(f"generator_output_rejected: {e}") from e

@@ -84,6 +84,46 @@ def test_manifest_round_trip_and_role_lookup():
     assert again.canonical_body() == m.canonical_body()
 
 
+def _bench():
+    from cascade.shared.manifest import BenchScores
+
+    return BenchScores(
+        gifteval_crps=0.42, gifteval_mase=0.81, boom_crps=0.55,
+        boom_mase=0.90, time_crps=0.38, time_mase=0.77,
+    )
+
+
+def test_bench_scores_round_trip_and_are_signed():
+    m = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval",
+        entries=[replace(_entry("king", 0), bench_scores=_bench()), _entry("challenger", 1)],
+    )
+    again = load_manifest(dump_manifest(m))
+    assert again.entry_for_role("king").bench_scores == _bench()
+    assert again.entry_for_role("challenger").bench_scores is None
+    # bench_scores IS part of the signed body (unlike heat): it drives Cascade.
+    assert again.canonical_body() == m.canonical_body()
+    assert b"bench_scores" in m.canonical_body()
+
+
+def test_bench_scores_absent_is_byte_identical_to_before():
+    # A manifest with no bench_scores must canonicalise exactly as it did before
+    # the field existed — so old signatures stay valid without a version bump.
+    m = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval", entries=[_entry("king", 0), _entry("challenger", 1)],
+    )
+    assert b"bench_scores" not in m.canonical_body()
+    # Adding scores to the king grows the signed body only for that entry.
+    with_scores = replace(
+        m, entries=[replace(_entry("king", 0), bench_scores=_bench()), _entry("challenger", 1)]
+    )
+    assert with_scores.canonical_body() != m.canonical_body()
+
+
 def test_heat_is_unsigned_and_round_trips():
     base = TrainingManifest(
         round_id="42", created_block=1000,

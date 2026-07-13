@@ -117,7 +117,7 @@ def test_sliding_window_screen_small_throne_big(two_size_cfg, tmp_path, monkeypa
                   screen_size=two_size_cfg.training.arch_preset,
                   throne_sizes=("toto2-test-xl",)))
     # screen only matters when it has to choose; give it 3 challengers + a screener.
-    def screen(ckpt_dir, gen, base_seed):
+    def screen(ckpt_dir, gen, base_seed, block=None):
         return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
 
     runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
@@ -148,7 +148,7 @@ def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     scores = {"b": 0.9, "c": 0.2, "d": 0.5}
     seen: list[str] = []
 
-    def screen(ckpt_dir, gen, base_seed):
+    def screen(ckpt_dir, gen, base_seed, block=None):
         seen.append(gen.hotkey)
         return scores[gen.hotkey]
 
@@ -171,7 +171,7 @@ def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     # Same field as above: cheapest (c) advances, everyone else is screened.
     scores = {"b": 0.9, "c": 0.2, "d": 0.5}
 
-    def screen(ckpt_dir, gen, base_seed):
+    def screen(ckpt_dir, gen, base_seed, block=None):
         return scores[gen.hotkey]
 
     runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
@@ -297,10 +297,9 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
     # With remote_hosts set, the HEAT trains on the pod (dispatch) — not locally —
     # at the cheap heat budget + a per-challenger repo, then screens the fetched
     # checkpoints. Proves the wallet-safe split can run the heat on remote GPUs.
-    from dataclasses import replace
 
-    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
     import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
 
     _patch_train_boundaries(monkeypatch)  # patches fetch_from_hub → returns dest
     dispatched = []
@@ -315,15 +314,13 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
                                "train_hours": train_hours, "repo_suffix": repo_suffix})
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                # per-miner digest: distinct generators ⇒ distinct corpora (a shared
-                # one would rightly trip the content-clone drop, not probed here)
                 trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
     monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
 
-    def screen(ckpt_dir, gen, base_seed):
+    def screen(ckpt_dir, gen, base_seed, block=None):
         return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]  # 'c' is best
 
     runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
@@ -343,6 +340,307 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
     assert any(d["role"] == "king" and d["train_hours"] is None for d in dispatched)
 
 
+def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
+    # A round that dies MID-HEAT (pod fleet lost, trainer crash) must not consume
+    # anyone's one lifetime submission: the burn is persisted only after the heat
+    # stage completes. The retried round then re-admits the same field.
+    _patch_train_boundaries(monkeypatch)
+    assert cfg.round.one_submission_per_hotkey is True
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+
+    def _boom(*a, **k):
+        raise RuntimeError("fleet died mid-heat")
+
+    monkeypatch.setattr(runner, "_run_heat", _boom)
+    with pytest.raises(RuntimeError, match="mid-heat"):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / cfg.round.submissions_db_path).exists()  # nobody burned
+
+    monkeypatch.undo()
+    _patch_train_boundaries(monkeypatch)  # undo() dropped the boundary patches too
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
+    assert manifest.entries_for_role("challenger")  # 'b' still had its shot
+    assert (tmp_path / cfg.round.submissions_db_path).exists()  # …and is burned now
+
+
+def test_heat_and_final_contracts_use_scaled_guard(cfg, tmp_path, monkeypatch):
+    # The heat trains under for_hours(heat_train_hours): token budget AND the hard
+    # wall-clock guard scale to the cheap budget (a staller costs minutes, not the
+    # final's max_train_seconds). The final keeps the pinned contract guard.
+    _patch_train_boundaries(monkeypatch)
+    contracts = []
+
+    class _Recorder(_FakeBaseTrainer):
+        def train(self, stream, contract, **kw):
+            contracts.append(contract)
+            return super().train(stream, contract, **kw)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_Recorder(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = [c for c in contracts if c.target_train_hours == cfg.round.heat_train_hours]
+    final = [c for c in contracts if c.target_train_hours == cfg.training.target_train_hours]
+    assert len(heat) == 3 and len(final) == 2  # 3 screened; king + finalist finals
+    expected_guard = max(
+        int(round(cfg.round.heat_guard_factor * cfg.round.heat_train_hours * 3600)),
+        cfg.round.heat_guard_floor_seconds,
+    )
+    assert all(c.max_train_seconds == expected_guard for c in heat)
+    assert all(c.train_tokens == c.tokens_for_hours(cfg.round.heat_train_hours) for c in heat)
+    assert all(c.max_train_seconds == cfg.training.max_train_seconds for c in final)
+
+
+def test_screen_receives_epoch_boundary_block(cfg, tmp_path, monkeypatch):
+    # The screener gets the round's epoch-boundary block (cutoff_block), not the
+    # current height, so a daily-snapshot pool picks the validator's snapshot.
+    _patch_train_boundaries(monkeypatch)
+    seen_blocks = []
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        seen_blocks.append(block)
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=60, cutoff_block=50)
+    assert seen_blocks == [50, 50, 50]
+
+
+def test_remote_dispatch_retries_once_on_next_host(cfg, tmp_path, monkeypatch):
+    # Rented pods churn: every dispatch (heat AND final, king included) that fails
+    # once is retried on the next host instead of dropping the challenger's only
+    # slot or aborting the round. Two hosts ⇒ the retry lands on the other box.
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    host_a, host_b = object(), object()
+    calls: dict[tuple, list] = {}
+    failed_once: set[tuple] = set()
+
+    class _FlakyDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            key = (hotkey, role, train_hours is not None)
+            calls.setdefault(key, []).append(host)
+            if key not in failed_once:
+                failed_once.add(key)
+                raise RuntimeError("pod flake")
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FlakyDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[host_a, host_b], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    # every dispatch survived its first failure via a retry on the OTHER host
+    assert manifest.entry_for_role("king").gen_ref == REF_A
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+    for key, hosts_seen in calls.items():
+        assert len(hosts_seen) == 2, key
+        assert hosts_seen[0] is not hosts_seen[1], key
+
+
+def test_reload_remote_hosts_per_round(cfg, tmp_path):
+    # The elastic-fleet seam: hosts TOML re-read per round; missing/empty file ⇒
+    # local round; the provisioner writing the file brings the fleet up without a
+    # trainer restart, and emptying it tears the fleet down again.
+    hosts_path = tmp_path / "hosts.toml"
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts_path=hosts_path, hosts_wait_seconds=0)
+    runner._reload_remote_hosts()
+    assert runner.remote_hosts is None                      # no file yet ⇒ local
+
+    hosts_path.write_text('[[host]]\nname = "pod-a"\nhost = "1.2.3.4"\n', encoding="utf-8")
+    runner._reload_remote_hosts()
+    assert [h.name for h in runner.remote_hosts] == ["pod-a"]
+
+    hosts_path.write_text("", encoding="utf-8")             # fleet torn down
+    runner._reload_remote_hosts()
+    assert runner.remote_hosts is None
+
+
+def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
+    # --plan-only runs the round's own eligibility pipeline (dedup + burn filter),
+    # so the provisioner sizes pods off what the heat will actually train.
+    from cascade.trainer.main import _plan_payload
+
+    class _StubClient:
+        def current_block(self):
+            return 3 * cfg.round.epoch_blocks + 100
+
+        def poll_commitments(self):
+            return [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+                    _commit(2, "c", REF_A, 7)]   # 'c' copies the king's ref → deduped
+
+        def highest_incentive_hotkey(self):
+            return "a"
+
+    payload = _plan_payload(cfg, _StubClient(), tmp_path)
+    assert payload["king"] == "a"
+    assert payload["resolved"] == 3
+    assert payload["challengers"] == 1               # only 'b' survives dedup
+    assert payload["eligible_challengers"] == 1
+    assert payload["next_boundary_block"] == 4 * cfg.round.epoch_blocks
+    assert payload["blocks_to_boundary"] == cfg.round.epoch_blocks - 100
+
+    # burned hotkeys drop out of the eligible count
+    (tmp_path / cfg.round.submissions_db_path).write_text(json.dumps(["b"]), encoding="utf-8")
+    assert _plan_payload(cfg, _StubClient(), tmp_path)["eligible_challengers"] == 0
+
+
+def test_screen_block_derived_when_cutoff_omitted(cfg, tmp_path, monkeypatch):
+    # Direct callers may omit cutoff_block; the screener must still get the
+    # derived epoch boundary (never None, which a bucket pool reads as "newest").
+    _patch_train_boundaries(monkeypatch)
+    seen_blocks = []
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        seen_blocks.append(block)
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    block = 2 * cfg.round.epoch_blocks + 123
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=block)
+    assert seen_blocks == [2 * cfg.round.epoch_blocks] * 3
+
+
+def test_stage_tagged_hosts_split_heat_from_final(cfg, tmp_path, monkeypatch):
+    # The cheap-GPU seam: hosts tagged stage="heat" serve only the screen
+    # trainings (a cheaper SKU class), stage="final" only the king/finalist runs
+    # (the SKU the validator's gpu_name gate pairs). Untagged = both.
+    from types import SimpleNamespace
+
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    cheap_a = SimpleNamespace(name="a6000-1", stage="heat")
+    cheap_b = SimpleNamespace(name="a6000-2", stage="heat")
+    big = SimpleNamespace(name="l40-1", stage="final")
+    dispatched: list[tuple[str, str, bool]] = []
+
+    class _FakeDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            dispatched.append((host.name, role, train_hours is not None))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[cheap_a, cheap_b, big], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_hosts = {name for name, _, is_heat in dispatched if is_heat}
+    final_hosts = {name for name, _, is_heat in dispatched if not is_heat}
+    assert heat_hosts <= {"a6000-1", "a6000-2"}          # heats never on the L40
+    assert final_hosts == {"l40-1"}                      # final never on the A6000s
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+
+
+def test_stage_filter_falls_back_when_no_host_matches(cfg, tmp_path):
+    from types import SimpleNamespace
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts=[SimpleNamespace(name="l40", stage="final")])
+    assert [h.name for h in runner._hosts_for("final")] == ["l40"]
+    # nothing tagged for the heat ⇒ use the whole fleet rather than strand the stage
+    assert [h.name for h in runner._hosts_for("heat")] == ["l40"]
+    # legacy untagged host objects serve both stages
+    legacy = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts=[object(), object()])
+    assert len(legacy._hosts_for("heat")) == 2 and len(legacy._hosts_for("final")) == 2
+
+
+def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
+    # The outer SSH timeout is the only bound on a fully wedged pod; heats cap
+    # it at scaled-guard + 30min instead of the 6h final default.
+    from types import SimpleNamespace
+
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    timeouts: list[tuple[bool, int]] = []
+
+    class _FakeDisp:
+        def __init__(self, *, trainer_spec, timeout_seconds):
+            self.timeout_seconds = timeout_seconds
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            timeouts.append((train_hours is not None, self.timeout_seconds))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[SimpleNamespace(name="p", stage="any")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_guard = cfg.screen_contract().for_hours(
+        cfg.round.heat_train_hours,
+        guard_factor=cfg.round.heat_guard_factor,
+        guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+    ).max_train_seconds
+    heat_timeouts = {t for is_heat, t in timeouts if is_heat}
+    final_timeouts = {t for is_heat, t in timeouts if not is_heat}
+    assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml
+    assert final_timeouts == {runner.remote_timeout_seconds}
+
+
 def test_heat_drops_content_clone_keeping_earliest_reveal(cfg, tmp_path, monkeypatch):
     # 'c' re-uploaded 'b''s generator content under its own repo (different ref,
     # so plan_round's ref dedup can't see it) and revealed later. The heat's
@@ -356,7 +654,7 @@ def test_heat_drops_content_clone_keeping_earliest_reveal(cfg, tmp_path, monkeyp
     scores = {"b": 0.9, "d": 0.5}
     seen: list[str] = []
 
-    def screen(ckpt_dir, gen, base_seed):
+    def screen(ckpt_dir, gen, base_seed, block=None):
         seen.append(gen.hotkey)
         return scores[gen.hotkey]
 

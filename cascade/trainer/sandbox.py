@@ -438,7 +438,7 @@ def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int
 
 
 def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
-    from ..interface.generator import check_series
+    from ..interface.generator import CAST_SAFE_MAX_FLOAT32, check_series
     from .corpus import _load_generator
 
     out = sys.stdout.buffer
@@ -449,7 +449,9 @@ def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
         for i, arr in enumerate(gen.generate(int(n_upper))):
             check_series(
                 arr, min_length=cfg.min_length, max_length=cfg.max_length,
-                max_channels=cfg.max_channels, index=i,
+                max_channels=cfg.max_channels,
+                max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
+                reject_constant=cfg.reject_constant, index=i,
             )
             canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
             _write_frame(out, canon)

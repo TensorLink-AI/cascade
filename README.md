@@ -212,6 +212,10 @@ After `uv sync` / `pip install -e .`:
   a competitor's on-chain generator to a local dir to inspect or fork. Generators
   are public by design — you win by improving on the visible best. Read-only, no
   wallet.
+* `cascade round`: a live countdown dashboard to the next round — current block,
+  epoch progress, and the submission deadline (commit strictly before the epoch
+  boundary to enter that round). `--once` for a single snapshot. Read-only, no
+  wallet.
 * `cascade-trainer --trainer cascade.trainer.toto2_trainer:Toto2Trainer`:
   the owner training service (`--offline` for a config/seed smoke); the reference
   Toto2-4M backend lives in `cascade.trainer.toto2_trainer`. Add

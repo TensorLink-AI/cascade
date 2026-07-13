@@ -138,6 +138,59 @@ def _bag_geomeans(
     return np.sqrt(np.maximum(bag_mwsql, 1e-12) * np.maximum(bag_mase, 1e-12))
 
 
+def _rel_bootstrap_aggregated(
+    king_qloss: np.ndarray,
+    king_abs_target: np.ndarray,
+    king_mase: np.ndarray,
+    chal_qloss: np.ndarray,
+    chal_abs_target: np.ndarray,
+    chal_mase: np.ndarray,
+    *,
+    B: int,
+    seed: int | str,
+    clusters: list | np.ndarray | None,
+) -> np.ndarray:
+    """The ``(B,)`` paired-cluster bootstrap distribution of relative geomean
+    improvement ``(king − chal) / king``. Shared core of the decision LCB and the
+    diagnostic spread, so both read quantiles off the *same* draws and can never
+    disagree. Returns an empty array when there are no windows.
+    """
+    if king_qloss.shape != chal_qloss.shape:
+        raise ValueError(
+            f"qloss shape mismatch: king {king_qloss.shape} vs chal {chal_qloss.shape}"
+        )
+    if king_qloss.ndim != 2:
+        raise ValueError(f"qloss must be (N, num_q); got {king_qloss.shape}")
+    n = king_qloss.shape[0]
+    for name, arr in (
+        ("king_abs_target", king_abs_target),
+        ("chal_abs_target", chal_abs_target),
+        ("king_mase", king_mase),
+        ("chal_mase", chal_mase),
+    ):
+        if arr.shape != (n,):
+            raise ValueError(f"{name} shape {arr.shape}; expected ({n},)")
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    if not np.allclose(king_abs_target, chal_abs_target):
+        raise ValueError(
+            "king_abs_target and chal_abs_target must be elementwise equal; "
+            "windows are not paired correctly"
+        )
+
+    codes = cluster_codes(clusters, n)
+    g = int(codes.max()) + 1
+    king_c = _cluster_sums(king_qloss, king_abs_target, king_mase, codes, g)
+    chal_c = _cluster_sums(chal_qloss, chal_abs_target, chal_mase, codes, g)
+
+    rng = np.random.default_rng(_seed_to_int(seed))
+    idx = rng.integers(0, g, size=(B, g))
+    king_geo = _bag_geomeans(*king_c, idx)
+    chal_geo = _bag_geomeans(*chal_c, idx)
+    safe_king = np.where(np.abs(king_geo) < 1e-9, 1e-9, king_geo)
+    return (king_geo - chal_geo) / safe_king
+
+
 def paired_bootstrap_lcb_aggregated(
     king_qloss: np.ndarray,
     king_abs_target: np.ndarray,
@@ -168,38 +221,42 @@ def paired_bootstrap_lcb_aggregated(
     Returns the ``alpha``-quantile of the bag relative differences; positive
     means the challenger reliably beat the king.
     """
-    if king_qloss.shape != chal_qloss.shape:
-        raise ValueError(
-            f"qloss shape mismatch: king {king_qloss.shape} vs chal {chal_qloss.shape}"
-        )
-    if king_qloss.ndim != 2:
-        raise ValueError(f"qloss must be (N, num_q); got {king_qloss.shape}")
-    n = king_qloss.shape[0]
-    for name, arr in (
-        ("king_abs_target", king_abs_target),
-        ("chal_abs_target", chal_abs_target),
-        ("king_mase", king_mase),
-        ("chal_mase", chal_mase),
-    ):
-        if arr.shape != (n,):
-            raise ValueError(f"{name} shape {arr.shape}; expected ({n},)")
-    if n == 0:
+    rel = _rel_bootstrap_aggregated(
+        king_qloss, king_abs_target, king_mase,
+        chal_qloss, chal_abs_target, chal_mase,
+        B=B, seed=seed, clusters=clusters,
+    )
+    if rel.size == 0:
         return float("nan")
-    if not np.allclose(king_abs_target, chal_abs_target):
-        raise ValueError(
-            "king_abs_target and chal_abs_target must be elementwise equal; "
-            "windows are not paired correctly"
-        )
-
-    codes = cluster_codes(clusters, n)
-    g = int(codes.max()) + 1
-    king_c = _cluster_sums(king_qloss, king_abs_target, king_mase, codes, g)
-    chal_c = _cluster_sums(chal_qloss, chal_abs_target, chal_mase, codes, g)
-
-    rng = np.random.default_rng(_seed_to_int(seed))
-    idx = rng.integers(0, g, size=(B, g))
-    king_geo = _bag_geomeans(*king_c, idx)
-    chal_geo = _bag_geomeans(*chal_c, idx)
-    safe_king = np.where(np.abs(king_geo) < 1e-9, 1e-9, king_geo)
-    rel = (king_geo - chal_geo) / safe_king
     return float(np.quantile(rel, alpha))
+
+
+def paired_bootstrap_quantiles_aggregated(
+    king_qloss: np.ndarray,
+    king_abs_target: np.ndarray,
+    king_mase: np.ndarray,
+    chal_qloss: np.ndarray,
+    chal_abs_target: np.ndarray,
+    chal_mase: np.ndarray,
+    quantiles: tuple[float, ...] = (0.05, 0.5, 0.95),
+    B: int = 10_000,
+    seed: int | str = 42,
+    clusters: list | np.ndarray | None = None,
+) -> dict[float, float]:
+    """Diagnostic spread of the *same* bootstrap the LCB gates on.
+
+    Returns ``{q: value}`` for each requested quantile of the relative-improvement
+    distribution. With identical ``B``/``seed``/``clusters`` the ``alpha``-quantile
+    here equals :func:`paired_bootstrap_lcb_aggregated`'s LCB by construction, so
+    reporting ``p5 / p50 / p95`` shows how far the median improvement sits above a
+    negative LCB (a wide gap = the point estimate is carried by a fragile tail).
+    Never gates — display only. NaN per quantile when there are no windows.
+    """
+    rel = _rel_bootstrap_aggregated(
+        king_qloss, king_abs_target, king_mase,
+        chal_qloss, chal_abs_target, chal_mase,
+        B=B, seed=seed, clusters=clusters,
+    )
+    if rel.size == 0:
+        return {q: float("nan") for q in quantiles}
+    return {float(q): float(np.quantile(rel, q)) for q in quantiles}

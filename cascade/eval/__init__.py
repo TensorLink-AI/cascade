@@ -5,7 +5,11 @@ All numpy — no torch — so the statistics are unit-testable in a minimal env.
 
 from __future__ import annotations
 
-from .bootstrap import paired_bootstrap_lcb, paired_bootstrap_lcb_aggregated
+from .bootstrap import (
+    paired_bootstrap_lcb,
+    paired_bootstrap_lcb_aggregated,
+    paired_bootstrap_quantiles_aggregated,
+)
 from .crps import DEFAULT_QUANTILE_LEVELS, mwsql_components, mwsql_from_components
 from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
 from .mase import mase
@@ -20,6 +24,7 @@ from .window import EvalWindow
 __all__ = [
     "paired_bootstrap_lcb",
     "paired_bootstrap_lcb_aggregated",
+    "paired_bootstrap_quantiles_aggregated",
     "DEFAULT_QUANTILE_LEVELS",
     "mwsql_components",
     "mwsql_from_components",

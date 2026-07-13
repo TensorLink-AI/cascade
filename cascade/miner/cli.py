@@ -1,4 +1,4 @@
-"""``cascade`` console-script: ``verify``, ``deploy``, ``fetch``, and ``score``.
+"""``cascade`` console-script: ``verify``, ``deploy``, ``fetch``, ``score``, and ``round``.
 
 * ``cascade verify <repo_dir>`` — run every check the trainer runs before it
   trains on your generator, including the determinism check. Returns non-zero
@@ -38,6 +38,13 @@
   re-derivable), so the reigning king's data process is open to study — that is
   the competition: beat the visible best, don't hide. Read-only; no wallet
   needed, only the ``[chain]``/``[hippius]`` extras + Hub credentials.
+
+* ``cascade round`` — a live terminal dashboard counting down to the next
+  round: current block, epoch progress, and the submission deadline (the next
+  epoch boundary — commit strictly before it to enter that round). Ticks every
+  second, re-syncing to the chain every ``--refresh`` seconds; ``--once``
+  prints a single snapshot (also the automatic behaviour when piped).
+  Read-only; needs the ``[chain]`` extra, no wallet.
 
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
@@ -284,6 +291,35 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_round(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "round",
+        help="Live countdown dashboard to the next round (the submission deadline).",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
+    p.add_argument("--once", action="store_true",
+                   help="Print a single snapshot instead of the live countdown.")
+    p.add_argument("--refresh", type=float, default=30.0,
+                   help="Seconds between chain re-syncs in watch mode (default: 30).")
+    p.set_defaults(func=_cmd_round)
+
+
+def _cmd_round(args: argparse.Namespace) -> int:
+    cfg = load_chain_config(args.chain_toml)
+    from ..shared.chain import ChainClient, ChainError
+    from .dashboard import run_dashboard
+
+    try:
+        client = ChainClient.from_config(cfg, network=args.network)
+        return run_dashboard(
+            client, cfg.round, args.network, once=args.once, refresh=args.refresh,
+        )
+    except ChainError as e:
+        print(f"chain error: {e}", file=sys.stderr)
+        return 3
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
@@ -347,7 +383,8 @@ def _reveal_verdict(
                      "re-commit needed) but its ref is public until then — a copy can "
                      "only tie it, never take its slot (earliest reveal wins), yet a "
                      "derived/tweaked fork is now possible. It has NOT consumed the "
-                     "one-submission budget (that burns only at heat entry). To re-hide "
+                     "one-submission budget (that burns only after a heat screens it). "
+                     "To re-hide "
                      "improved content instead, re-deploy: the latest reveal per hotkey "
                      "wins.")
     return missed, "\n".join(lines)
@@ -554,6 +591,8 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     parser = argparse.ArgumentParser(prog="cascade", description="cascade subnet miner CLI.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_verify(sub)
@@ -561,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_fetch(sub)
     _add_score(sub)
     _add_reveal_status(sub)
+    _add_round(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

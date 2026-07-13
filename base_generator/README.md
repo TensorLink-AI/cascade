@@ -20,7 +20,7 @@ launch/genesis king for the cascade subnet.
 
 Ten families are mixed by weight: **ForecastPFN, SineWave, SawTooth, Step,
 Anomaly, Spikes, OrnsteinUhlenbeck, GP-prior, KernelSynth, CauKer**. Each is
-drawn at `generate_length` (2048) and deterministically random-cropped into the
+drawn at `generate_length` (4096) and deterministically random-cropped into the
 `[min_length, max_length]` band for length diversity.
 
 The GP/kernel family — **GP-prior** (gpytorch), **KernelSynth** (scikit-learn)
@@ -57,7 +57,7 @@ PYTHONPATH=$PWD python base_generator/tests/diversity_check.py
 
 ## Config knobs (`config.json`)
 
-- `min_length` / `max_length` — per-series length band (defaults 64 / 2048, matching `chain.toml`).
+- `min_length` / `max_length` — per-series length band (defaults 64 / 4096, matching `chain.toml` — and `[training] context_length`, so series can fill the model's context as Toto 2.0's do).
 - `generate_length` — length generators are drawn at before cropping (>= `max_length`).
 - `batch_size` — internal generation batch size (memory/throughput knob).
 - `weights` — per-family mixing weights (normalised; families with weight 0 or absent are skipped).

@@ -24,19 +24,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-path", default=None)
     p.add_argument("--cache-dir", type=Path, default=None, help="Local cache for fetched pool/ckpts.")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--eval-hosts", type=Path, default=None,
+                   help="hosts.toml with a GPU pod to offload the GIFT-Eval gate to "
+                        "(the first 'final'/'any'-stage host is used). Wallet + all "
+                        "consensus decisions stay on this box; only gift-eval runs on "
+                        "the pod. Omit to run the gate locally on --device.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    eval_host = None
+    if args.eval_hosts is not None:
+        from ..trainer.remote import load_hosts
+        candidates = [h for h in load_hosts(args.eval_hosts)
+                      if getattr(h, "stage", "any") in ("any", "final")]
+        if not candidates:
+            raise SystemExit(f"--eval-hosts {args.eval_hosts}: no 'final'/'any'-stage host found")
+        eval_host = candidates[0]
+        logging.getLogger("cascade.validator").info(
+            "GIFT-Eval gate offloaded to %s (%s); wallet + consensus stay local",
+            eval_host.name, eval_host.host)
 
     runner = build_runner(
         chain_toml=args.chain_toml,
         cache_dir=args.cache_dir,
         device=args.device,
+        eval_host=eval_host,
     )
 
     if args.offline:
@@ -44,6 +64,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"king:     {runner.state.king_hotkey}")
         print(f"tenure:   {runner.state.tenure_rounds}")
         print(f"dethrone_cp: {runner.cfg.scoring.dethrone_cp}")
+        print(f"cascade: {'on' if runner.cfg.scoring.cascade_enabled else 'off'} "
+              f"(reign_days={runner.cfg.scoring.cascade_reign_days})")
+        if runner.cascade is not None:
+            cs = runner.cascade.state
+            print(f"cascade king: {cs.king_hotkey} "
+                  f"(reign checkpoints logged: {len(cs.checkpoints)})")
         print(f"manifest_bucket: {runner.cfg.storage.manifest_bucket}")
         pool_bucket = runner.cfg.storage.pool_bucket
         if pool_bucket:

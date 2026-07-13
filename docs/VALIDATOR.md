@@ -82,6 +82,15 @@ export HIPPIUS_HUB_USERNAME=...     # (or HIPPIUS_HUB_TOKEN) to pull checkpoints
 export HIPPIUS_HUB_PASSWORD=...
 ```
 
+If `[storage] backup_s3_endpoint` is set (a Cloudflare R2 backup of the
+manifest/receipt bucket — every object is dual-written there, and reads fall back
+to it when Hippius S3 is down), also export the R2 token:
+
+```bash
+export BACKUP_S3_ACCESS_KEY=...     # R2 backup of manifests/receipts
+export BACKUP_S3_SECRET_KEY=...
+```
+
 Smoke-test the config with no chain/GPU I/O first:
 
 ```bash

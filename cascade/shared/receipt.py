@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass
 
 from .manifest import TrainingManifest, dump_manifest, load_manifest
 
-RECEIPT_VERSION = 2
+RECEIPT_VERSION = 3
 RECEIPT_STATUSES = ("scored", "rejected")
 
 
@@ -40,6 +40,20 @@ def _none_for_nan(x: float | None) -> float | None:
         return None
     x = float(x)
     return x if math.isfinite(x) else None
+
+
+def _clean_per_domain(pd: dict | None) -> dict | None:
+    """``{domain: (win_rate, n)}`` → strict-JSON ``{domain: [win_rate|None, n]}``.
+
+    Sorted, NaN-scrubbed, and list-valued so it round-trips byte-identically
+    through ``json`` (tuples serialise as lists anyway). ``None`` when empty."""
+    if not pd:
+        return None
+    out: dict[str, list] = {}
+    for dom in sorted(pd, key=str):
+        wr, n = pd[dom]
+        out[str(dom)] = [_none_for_nan(wr), int(n)]
+    return out
 
 
 @dataclass(frozen=True)
@@ -170,6 +184,19 @@ class VerdictRecord:
     note: str
     king_hotkey: str | None     # the throne AFTER this round
     king_uid: int | None
+    # Shadow diagnostics — recomputable from the signed ``entry_scores`` and
+    # NEVER part of the gate (the LCB decides). Persisted so the dashboard and
+    # ``cascade-audit`` can explain a verdict — e.g. a great geomean with a low
+    # ``win_rate`` is a rare-but-big-wins/losses signal — without recomputation.
+    n_clusters: int = 0
+    win_rate: float | None = None
+    wilcoxon_p: float | None = None
+    per_domain_win_rate: dict | None = None
+    # Bootstrap spread of the relative improvement: median (p50) and 95th pct.
+    # The LCB above is the same distribution's 5th pct; a big p50−lcb gap flags a
+    # fragile verdict (better point estimate riding a heavy tail). Display only.
+    boot_p50: float | None = None
+    boot_p95: float | None = None
 
     @classmethod
     def from_round(
@@ -193,6 +220,12 @@ class VerdictRecord:
             note=str(transition.note),
             king_hotkey=transition.state.king_hotkey,
             king_uid=transition.state.king_uid,
+            n_clusters=int(getattr(result, "n_clusters", 0) or 0),
+            win_rate=_none_for_nan(getattr(result, "win_rate", None)),
+            wilcoxon_p=_none_for_nan(getattr(result, "wilcoxon_p", None)),
+            per_domain_win_rate=_clean_per_domain(getattr(result, "per_domain_win_rate", None)),
+            boot_p50=_none_for_nan(getattr(result, "boot_p50", None)),
+            boot_p95=_none_for_nan(getattr(result, "boot_p95", None)),
         )
 
 
@@ -395,6 +428,13 @@ def load_receipt(text: str) -> RoundReceipt:
             note=str(verdict["note"]),
             king_hotkey=verdict.get("king_hotkey"),
             king_uid=(None if verdict.get("king_uid") is None else int(verdict["king_uid"])),
+            n_clusters=int(verdict.get("n_clusters", 0) or 0),
+            win_rate=(None if verdict.get("win_rate") is None else float(verdict["win_rate"])),
+            wilcoxon_p=(None if verdict.get("wilcoxon_p") is None
+                        else float(verdict["wilcoxon_p"])),
+            per_domain_win_rate=_clean_per_domain(verdict.get("per_domain_win_rate")),
+            boot_p50=(None if verdict.get("boot_p50") is None else float(verdict["boot_p50"])),
+            boot_p95=(None if verdict.get("boot_p95") is None else float(verdict["boot_p95"])),
         ) if verdict else None,
         reward_uids=tuple(int(u) for u in obj.get("reward_uids", ())),
         weights=tuple(float(w) for w in obj.get("weights", ())),
@@ -489,6 +529,13 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "chal_geomean": v.chal_geomean if v else None,
         "lcb": v.lcb if v else None,
         "margin": v.margin if v else None,
+        # shadow diagnostics that explain the LCB (see VerdictRecord) — the
+        # geomean-vs-winrate pairing is what exposes a rare-but-big-wins verdict
+        "win_rate": v.win_rate if v else None,
+        "wilcoxon_p": v.wilcoxon_p if v else None,
+        "per_domain_win_rate": v.per_domain_win_rate if v else None,
+        "boot_p50": v.boot_p50 if v else None,
+        "boot_p95": v.boot_p95 if v else None,
         "challenger_wins_round": v.challenger_wins_round if v else None,
         "inconclusive": v.inconclusive if v else None,
         "dethroned": v.dethroned if v else None,

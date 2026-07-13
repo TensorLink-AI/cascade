@@ -21,11 +21,13 @@ behind the defaults.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..eval.koth import RoundResult, evaluate_round
 from ..eval.scoring import WindowScore
@@ -49,6 +51,10 @@ from ..shared.receipt import (
 )
 from . import state as state_mod
 from .state import ChampionState, StateTransition
+
+if TYPE_CHECKING:
+    from ..trainer.remote import RemoteHost
+    from .cascade import CascadeController
 
 log = logging.getLogger("cascade.validator")
 
@@ -108,7 +114,18 @@ class ValidatorRunner:
     gift_rows_fn: GiftRowsFn | None = None    # injected in tests; defaults to the sidecar bridge
     cache_dir: Path | None = None
     device: str = "cpu"
+    # Optional GPU pod for the GIFT-Eval gate: when set, the (heavy, paired)
+    # gift-eval runs are offloaded to this pod (see cascade.validator.eval_offload)
+    # while the wallet and every consensus decision stay on this box. None ⇒ the
+    # gate runs on ``device`` locally. Never used for the private-pool duel.
+    eval_host: RemoteHost | None = None
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
+    # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
+    # the reign clock is reset on each dethrone, every reigning-king checkpoint is
+    # scored (GIFT-Eval + TIME) and logged, and once per round the clock is checked;
+    # a fired Cascade vacates the champion throne to re-open the competition from
+    # the promoted warm-start init. None ⇒ Cascade is disabled (pure KOTH).
+    cascade: CascadeController | None = None
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -187,15 +204,30 @@ class ValidatorRunner:
         sidecar bridge on the fetched checkpoint dir."""
         if self.gift_rows_fn is not None:
             return self.gift_rows_fn(entry)
-        from ..eval.benchmarks import run_gift_rows
 
         ec = self.cfg.eval
         dest = self._fetch_checkpoint_dir(entry)
+        num_samples = ec.gift_gate_num_samples or ec.num_samples
+        if self.eval_host is not None:
+            # Offload the (heavy, paired) gift-eval to the GPU pod; the paired
+            # bootstrap and every consensus decision stay on this box.
+            from .eval_offload import gift_rows_via_host
+
+            return gift_rows_via_host(
+                self.eval_host, dest,
+                datasets=ec.gift_gate_datasets,
+                num_samples=num_samples,
+                data_dir=(ec.gift_gate_data_dir or None),
+                device="cuda",
+                timeout_s=ec.gift_gate_timeout_s,
+            )
+        from ..eval.benchmarks import run_gift_rows
+
         return run_gift_rows(
             dest,
             project_dir=ec.benchmark_project_dir,
             datasets=ec.gift_gate_datasets,
-            num_samples=ec.gift_gate_num_samples or ec.num_samples,
+            num_samples=num_samples,
             device=self.device,
             data_dir=(ec.gift_gate_data_dir or None),
             timeout_s=ec.gift_gate_timeout_s,
@@ -294,6 +326,139 @@ class ValidatorRunner:
         except Exception as e:  # noqa: BLE001 — log-only, never fatal
             log.warning("benchmark hook failed for round=%s: %s", manifest.round_id, e)
 
+    # ── Cascade: king-reign promotion ────────────────────────────────────────
+
+    def _current_king_entry(self, manifest: TrainingManifest) -> TrainedEntry | None:
+        """The manifest checkpoint the reigning champion produced this round.
+
+        Cascade times the *validator's champion*, not the manifest's (lagging)
+        king role — so the checkpoint to score is the entry whose miner hotkey is
+        the champion. Prefers the primary throne size (what the benchmark sidecar
+        scores) and falls back to any size that hotkey trained."""
+        hk = self.state.king_hotkey
+        if hk is None:
+            return None
+        matches = [e for e in manifest.entries if e.miner_hotkey == hk]
+        if not matches:
+            return None
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        return next((e for e in matches if e.size == primary), matches[0])
+
+    @staticmethod
+    def _bench_scores_dict(entry: TrainedEntry) -> dict | None:
+        """The six Cascade numbers off a manifest entry's trainer-signed
+        ``bench_scores`` (GIFT-Eval / BOOM / TIME CRPS+MASE), or ``None`` when the
+        entry carries none. This is the authoritative, consensus-safe source: every
+        validator reads the identical signed numbers."""
+        bs = entry.bench_scores
+        if bs is None:
+            return None
+        return {
+            "gifteval_crps": bs.gifteval_crps, "gifteval_mase": bs.gifteval_mase,
+            "boom_crps": bs.boom_crps, "boom_mase": bs.boom_mase,
+            "time_crps": bs.time_crps, "time_mase": bs.time_mase,
+        }
+
+    def _bench_metrics_via_sidecar(self, entry: TrainedEntry) -> dict | None:  # pragma: no cover — sidecar glue
+        """Fallback: score one checkpoint on GIFT-Eval, BOOM, and TIME via the
+        out-of-process sidecar, returning the six numbers or ``None`` when any suite
+        is missing/errored. Used only when the manifest carries no ``bench_scores``
+        (e.g. a trainer that predates the Cascade hook). NOTE: independently-run GPU
+        sweeps are not bit-reproducible, so this path is not consensus-safe across
+        validators — prefer the trainer-signed numbers."""
+        from ..eval.benchmarks import extract_bench_scores, run_benchmarks
+
+        ec = self.cfg.eval
+        ckpt = self._fetch_checkpoint_dir(entry)
+        num_samples = ec.benchmark_num_samples or ec.num_samples
+        if self.eval_host is not None:
+            # Offload the cascade bench (GIFT-Eval+BOOM+TIME) to the GPU pod,
+            # same seam as the gift-eval gate; the wallet stays on this box.
+            from .eval_offload import bench_scores_via_host
+
+            metrics = bench_scores_via_host(
+                self.eval_host, ckpt,
+                num_samples=num_samples,
+                max_series=ec.cascade_bench_max_series,  # 0 = full battery
+                data_dir=(ec.gift_gate_data_dir or None),
+                device="cuda",
+                timeout_s=ec.gift_gate_timeout_s,
+            )
+        else:
+            report = run_benchmarks(
+                ckpt,
+                project_dir=ec.benchmark_project_dir,
+                suites=("gift-eval", "boom", "time"),
+                num_samples=num_samples,
+                max_series=ec.cascade_bench_max_series,  # 0 = full battery
+                device=self.device,
+            )
+            metrics = extract_bench_scores(report)
+        if metrics is None:
+            log.warning("cascade: incomplete GIFT-Eval/BOOM/TIME metrics for king checkpoint %s; "
+                        "not recording this round", entry.trained_pointer)
+        return metrics
+
+    def _record_king_checkpoint(
+        self, manifest: TrainingManifest, now: float
+    ) -> None:  # pragma: no cover — sidecar glue
+        """Add the reigning king's checkpoint to the reign log so a later Cascade
+        selection is a lookup, not a re-eval. Prefers the trainer's signed
+        ``bench_scores`` on the manifest (consensus-safe); falls back to scoring via
+        the local sidecar only when the manifest carries none. Best-effort: a miss
+        just means this round's checkpoint isn't a promotion candidate."""
+        if self.cascade is None or self.state.king_hotkey is None:
+            return
+        entry = self._current_king_entry(manifest)
+        if entry is None:
+            return
+        metrics = self._bench_scores_dict(entry) or self._bench_metrics_via_sidecar(entry)
+        if metrics is None:
+            return
+        self.cascade.record_checkpoint(entry.trained_pointer, now=now, **metrics)
+
+    def _cascade_round(
+        self, manifest: TrainingManifest, outcome: RoundOutcome | None
+    ) -> None:  # pragma: no cover — live-loop glue; the controller is unit-tested
+        """One Cascade step, run at the end of a round (after weights/receipts, so
+        the outgoing king still earns this round). Resets the reign clock on a
+        dethrone, records the reigning king's checkpoint, then checks the clock —
+        a fired Cascade vacates the champion throne so the field re-competes from
+        the promoted init next round. Fully guarded: Cascade never disturbs KOTH."""
+        if self.cascade is None:
+            return
+        import time
+
+        now = time.time()
+        try:
+            # Reuse KOTH's dethrone signal to reset the clock (never reimplement it);
+            # on genesis, crown the first champion so the reign clock starts ticking.
+            if outcome is not None and outcome.transition.dethroned and outcome.transition.new_king_hotkey:
+                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, now=now)
+            elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
+                self.cascade.note_dethrone(self.state.king_hotkey, now=now)
+            self._record_king_checkpoint(manifest, now)
+            event = self.cascade.cascade_check(now)
+            if event is not None:
+                self._apply_cascade(event)
+        except Exception as e:  # noqa: BLE001 — Cascade must never disturb a round
+            log.warning("cascade step failed for round=%s: %s", manifest.round_id, e)
+
+    def _apply_cascade(self, event: object) -> None:  # pragma: no cover — live-loop glue
+        """Vacate the champion throne after a Cascade so the competition re-opens:
+        clear the king (tenure/streaks reset) and persist. Next round crowns
+        whoever wins from the newly-installed warm-start init."""
+        winner = getattr(event, "winner", None)
+        old_king = getattr(event, "old_king", None)
+        self.state = ChampionState()
+        self._persist_state()
+        log.info(
+            "cascade: champion throne vacated (old king %s); field re-competes from "
+            "checkpoint %s next round",
+            (old_king or "?")[:12],
+            getattr(winner, "checkpoint_id", "?"),
+        )
+
     def process_round(
         self,
         manifest: TrainingManifest,
@@ -330,8 +495,20 @@ class ValidatorRunner:
         chal_scores: list[WindowScore] = []
         score_records: list[EntryScores] = []
         for size in paired_sizes:
+            import time as _time
+
+            _t0 = _time.perf_counter()
             ks = self._evaluate(king_by_size[size], windows)
+            _t_king = _time.perf_counter() - _t0
+            _t1 = _time.perf_counter()
             cs = self._evaluate(chal_by_size[size], windows)
+            _t_chal = _time.perf_counter() - _t1
+            log.info(
+                "round=%s eval-timing size=%s device=%s n_windows=%d num_samples=%d "
+                "king=%.1fs challenger=%.1fs total=%.1fs",
+                manifest.round_id, size, self.device, len(windows),
+                self.cfg.eval.num_samples, _t_king, _t_chal, _t_king + _t_chal,
+            )
             king_scores += ks
             chal_scores += cs
             for entry, scores in ((king_by_size[size], ks), (chal_by_size[size], cs)):
@@ -498,12 +675,16 @@ class ValidatorRunner:
         try:
             epoch_start = self._epoch_start_block(manifest)
             epoch_hash = ""
+            current_block: int | None = None
             participants: tuple[Participant, ...] = ()
             try:
                 epoch_hash = client.block_hash(epoch_start)
                 participants = participants_from_commitments(
                     client.poll_commitments(), cutoff_block=epoch_start
                 )
+                # Anchor for the dashboard's next-round countdown (best-effort;
+                # the client extrapolates block→wall-clock from this + as_of).
+                current_block = int(client.current_block())
             except Exception as e:  # noqa: BLE001 — chain context is best-effort
                 log.warning("receipt chain context unavailable for round=%s: %s",
                             manifest.round_id, e)
@@ -547,10 +728,24 @@ class ValidatorRunner:
             # Refresh the dashboard-facing rolling index (best-effort, and inside
             # the outer guard: a listing convenience must never disturb a round).
             try:
+                now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+                # Schedule anchor for the "time until next round" countdown. The
+                # next round begins at the next epoch boundary; the client turns
+                # blocks into wall-clock via block_time_s, extrapolating current_block
+                # from `as_of`. Bittensor blocks are ~12s regardless of epoch_blocks
+                # (testnet shortens epochs, not block time), so it is a constant.
+                chain = {
+                    "as_of": now_iso,
+                    "current_block": current_block,
+                    "epoch_start_block": epoch_start,
+                    "epoch_blocks": int(self.cfg.round.epoch_blocks),
+                    "block_time_s": 12.0,
+                }
                 update_receipt_index(
                     store, summarize_receipt(receipt),
-                    updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    updated_at=now_iso,
                     subnet={"netuid": self.cfg.subnet.netuid, "name": self.cfg.subnet.name},
+                    chain=chain,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("receipt index update failed for round=%s: %s",
@@ -657,6 +852,11 @@ class ValidatorRunner:
                         # Log-only public benchmarks for a freshly crowned king.
                         # Strictly after weights are decided; never affects them.
                         self._maybe_run_benchmarks(manifest, outcome)
+                        # Cascade step — strictly last, so this round's weights and
+                        # receipt already recorded the outgoing king. Resets the
+                        # reign clock on a dethrone, records the king's checkpoint,
+                        # and fires the promotion when the clock is ripe.
+                        self._cascade_round(manifest, outcome)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
             time.sleep(poll)
@@ -823,18 +1023,69 @@ def _load_state(path: str) -> ChampionState:
         return ChampionState()
 
 
+def _warm_start_installer(path: Path) -> Callable[[object], None]:
+    """The default Cascade installer: promote the winning checkpoint by writing its
+    pointer (and its eval numbers) to ``warm_start_init_path`` — the seam the
+    trainer reads to warm-start every subsequent round from. Promotes AS-IS; no
+    retrain/fine-tune."""
+
+    def _install(winner: object) -> None:  # pragma: no cover — file glue
+        import time
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "checkpoint_id": getattr(winner, "checkpoint_id", None),
+                    "score": getattr(winner, "score", None),
+                    "gifteval_crps": getattr(winner, "gifteval_crps", None),
+                    "gifteval_mase": getattr(winner, "gifteval_mase", None),
+                    "time_crps": getattr(winner, "time_crps", None),
+                    "time_mase": getattr(winner, "time_mase", None),
+                    "installed_at": time.time(),
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        log.info("cascade: warm-start init written to %s (checkpoint %s)",
+                 path, getattr(winner, "checkpoint_id", "?"))
+
+    return _install
+
+
+def _build_cascade(cfg: ChainConfig) -> CascadeController:
+    """Construct the Cascade controller from config, restoring the persisted reign
+    clock + checkpoint log so it resumes across restarts."""
+    from .cascade import CascadeController, load_state
+
+    state_path = Path(cfg.validator.cascade_state_db_path)
+    return CascadeController(
+        reign_days=cfg.scoring.cascade_reign_days,
+        state=load_state(state_path),
+        install_fn=_warm_start_installer(Path(cfg.validator.warm_start_init_path)),
+        state_path=state_path,
+    )
+
+
 def build_runner(
     *,
     chain_toml: Path | None = None,
     cache_dir: Path | None = None,
     device: str = "cpu",
+    eval_host: RemoteHost | None = None,
 ) -> ValidatorRunner:
     """Construct a runner from ``chain.toml``, restoring persisted champion
     state. Wallet/chain wiring for live weight-setting is attached by
-    ``cascade-validator`` (see main.py)."""
+    ``cascade-validator`` (see main.py). ``eval_host`` (optional) offloads the
+    GIFT-Eval gate to a GPU pod while the wallet stays on this box."""
     from ..shared.config import load_chain_config
 
     cfg = load_chain_config(chain_toml)
+    # Cascade is opt-in ([scoring] cascade_enabled); off ⇒ no controller is wired
+    # and the runner is pure KOTH.
+    cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
     return ValidatorRunner(
-        cfg=cfg, state=_load_state(cfg.validator.state_db_path), cache_dir=cache_dir, device=device
+        cfg=cfg, state=_load_state(cfg.validator.state_db_path),
+        cache_dir=cache_dir, device=device, cascade=cascade, eval_host=eval_host,
     )

@@ -19,7 +19,10 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .bootstrap import paired_bootstrap_lcb_aggregated
+from .bootstrap import (
+    paired_bootstrap_lcb_aggregated,
+    paired_bootstrap_quantiles_aggregated,
+)
 from .gift_gate import GiftGateResult
 from .scoring import WindowScore, global_geomean, stack_components
 
@@ -132,6 +135,12 @@ class RoundResult:
     win_rate: float | None = None
     wilcoxon_p: float | None = None
     per_domain_win_rate: dict | None = None
+    # Diagnostic spread of the same bootstrap the LCB gates on: the median and
+    # 95th pct of the relative-improvement distribution (the LCB is its 5th pct).
+    # A wide gap between a positive median and a negative LCB = a fragile verdict
+    # whose point estimate rides a heavy tail. Display only; never gates.
+    boot_p50: float | None = None
+    boot_p95: float | None = None
 
 
 def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
@@ -228,6 +237,17 @@ def evaluate_round(
         clusters=clusters,
     )
     win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
+    boot_p50 = boot_p95 = None
+    try:
+        # Same B/seed/clusters as the LCB above ⇒ the 5th-pct here == lcb; we keep
+        # the median and 95th pct for display. A diagnostic must never fail a round.
+        qs = paired_bootstrap_quantiles_aggregated(
+            k_qloss, k_abs, k_mase, c_qloss, c_abs, c_mase,
+            quantiles=(0.5, 0.95), B=params.bootstrap_B, seed=seed, clusters=clusters,
+        )
+        boot_p50, boot_p95 = qs.get(0.5), qs.get(0.95)
+    except Exception:  # noqa: BLE001 — spread is display-only
+        pass
     return RoundResult(
         challenger_wins_round=bool(lcb >= margin),
         lcb=lcb,
@@ -240,6 +260,8 @@ def evaluate_round(
         win_rate=win_rate,
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,
+        boot_p50=boot_p50,
+        boot_p95=boot_p95,
     )
 
 

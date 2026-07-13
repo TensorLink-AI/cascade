@@ -378,3 +378,33 @@ def test_trainer_end_to_end_tiny_run(tmp_path: Path):
     w = _load_wrapper(tmp_path / "ckpt")
     assert w.forecast(np.arange(20, dtype=float), 8, 4).shape == (1, 4, 8)
     assert w.forecast_quantiles_batch([np.arange(20, dtype=float)], 8).shape == (1, 8, 9)
+
+
+def test_first_reached_stops_and_deadline_hit_is_flagged(tmp_path: Path):
+    """First-reached-stops: the run ends on the token budget OR the wall-clock
+    deadline. A budget stop reports deadline_hit=False; a deadline stop (compute
+    under contract) must be flagged, never silent — in a final it means the
+    equal-compute pairing broke."""
+    def _contract(max_secs):
+        return SimpleNamespace(
+            context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
+            num_heads=1, head_dim=16, mlp_expansion=2, num_quantiles=9,
+            batch_size=4, max_train_seconds=max_secs, base_lr=1e-3, weight_decay=0.0,
+            optimizer="adamw", warmup_tokens=0, input_transform="arcsinh_causal",
+        )
+
+    def _stream():
+        rng = np.random.default_rng(0)
+        return (rng.normal(size=32).cumsum() for _ in range(16))
+
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    # Budget reached first (generous deadline): clean completion.
+    ok = trainer.train(_stream(), _contract(300), training_seed=1,
+                       token_budget=256, out_dir=tmp_path / "ok")
+    assert ok.metrics["tokens_seen"] >= 256
+    assert ok.metrics["deadline_hit"] is False
+    # Deadline reached first (already expired): stops after one step, flagged.
+    slow = trainer.train(_stream(), _contract(0), training_seed=1,
+                         token_budget=10**9, out_dir=tmp_path / "slow")
+    assert 0 < slow.metrics["tokens_seen"] < 10**9
+    assert slow.metrics["deadline_hit"] is True

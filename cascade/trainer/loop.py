@@ -24,7 +24,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..interface.validation import parse_commit
@@ -40,6 +40,7 @@ from ..shared.hippius import (
     upload_dir_to_hub_or_hf,
 )
 from ..shared.manifest import (
+    BenchScores,
     HeatEntrant,
     HeatResult,
     TrainedEntry,
@@ -55,12 +56,23 @@ from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
 # Screens one heat checkpoint: given the trained heat-model directory, the
-# generator that produced its corpus, and the round's base seed (so the screening
-# window slice can rotate per round), return a heat score (LOWER is better, e.g.
+# generator that produced its corpus, the round's base seed (so the screening
+# window slice can rotate per round), and the round's epoch-boundary block (so a
+# daily-snapshot pool selects the SAME snapshot the validator will judge the
+# final on — not whatever is newest), return a heat score (LOWER is better, e.g.
 # geomean(CRPS, MASE) on the held-out windows). Injected so the trainer's
 # screening stays a testable boundary — the default wiring (torch evaluator +
 # eval pool) is attached in cascade.trainer.main.
-ScreenFn = Callable[[Path, "ResolvedGenerator", int], float]
+ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
+
+# Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
+# TIME) for Cascade, given its local checkpoint dir. Returns the six-number
+# BenchScores the trainer stamps onto the king's manifest entry, or None when the
+# sidecar could not produce a complete set (best-effort — a miss just leaves the
+# king entry without bench_scores). Injected so the trainer's Cascade eval stays a
+# testable boundary; the default wiring (fetch + benchmark sidecar) is attached in
+# cascade.trainer.main.
+BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
 
@@ -97,6 +109,31 @@ class ResolvedGenerator:
 class RoundPlan:
     king: ResolvedGenerator | None
     challengers: list[ResolvedGenerator]
+
+
+def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
+    """Default Cascade bench evaluator: run the sidecar on a checkpoint dir over
+    GIFT-Eval / BOOM / TIME and return the six-number :class:`BenchScores`, or
+    ``None`` when the sidecar can't produce a complete set. Wired in trainer.main
+    when ``[scoring] cascade_enabled``; the checkpoint fetch is the caller's job
+    (``TrainerRunner._stamp_king_bench_scores``)."""
+
+    def _eval(ckpt_dir: Path) -> BenchScores | None:
+        from ..eval.benchmarks import extract_bench_scores, run_benchmarks
+
+        ec = cfg.eval
+        report = run_benchmarks(
+            ckpt_dir,
+            project_dir=ec.benchmark_project_dir,
+            suites=("gift-eval", "boom", "time"),
+            num_samples=ec.benchmark_num_samples or ec.num_samples,
+            max_series=ec.cascade_bench_max_series,  # 0 = full battery
+            device=device,
+        )
+        scores = extract_bench_scores(report)
+        return BenchScores(**scores) if scores is not None else None
+
+    return _eval
 
 
 def resolve_commitments(
@@ -263,6 +300,12 @@ class TrainerRunner:
     # field down to [round] finalists before the expensive final. None ⇒ no
     # internal screen (the field's natural order is taken). Wired in trainer.main.
     screen_fn: ScreenFn | None = None
+    # Cascade: scores the king's checkpoint on GIFT-Eval / BOOM / TIME and stamps
+    # the numbers onto its manifest entry (so validators read one authoritative,
+    # signed set — consensus-safe promotion). Runs only when [scoring]
+    # cascade_enabled. None ⇒ no stamping (the king entry carries no bench_scores
+    # and validators fall back to scoring it themselves). Wired in trainer.main.
+    bench_eval_fn: BenchEvalFn | None = None
     # Remote (two-device) training: when ``remote_hosts`` is set, each round's
     # king and challenger train on separate SSH GPU pods in parallel (see
     # cascade.trainer.remote). ``trainer_spec`` is the BaseTrainer 'module:Class'
@@ -270,10 +313,26 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
+    # Elastic fleet: when ``remote_hosts_path`` is set, run_forever RE-READS the
+    # hosts TOML at the start of every round, so a per-round provisioner (rent
+    # pods when the field is big, tear down after) changes the fleet without a
+    # trainer restart. A missing/empty file ⇒ this round trains locally.
+    # ``hosts_wait_seconds`` waits up to that long for the file to appear/fill
+    # before falling back — with timed reveals the field is only countable
+    # ~reveal_margin_blocks before the boundary, so pods finish booting after
+    # the round starts.
+    remote_hosts_path: Path | None = None
+    hosts_wait_seconds: int = 0
     # Post-round public-benchmark telemetry (GIFT-Eval/BOOM/TIME) of the round's
     # king on the idle pod. LOG-ONLY: validators score rounds exclusively on the
     # private eval pool; this never feeds weights or the throne (see bench_hook).
     bench_plan: object | None = None
+    # Cascade king bench eval on the REMOTE worker: when set (cascade_enabled +
+    # remote_hosts), the king's GIFT-Eval/BOOM/TIME scoring runs on the pod that
+    # just trained it — GPU, checkpoint already local — instead of a local-CPU
+    # subprocess. The six numbers still go on the signed manifest. Falls back to
+    # the local ``bench_eval_fn`` when there is no remote host.
+    cascade_bench_plan: object | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -324,29 +383,40 @@ class TrainerRunner:
         p = Path(self.cfg.round.submissions_db_path)
         return p if p.is_absolute() else (self.work_root / p)
 
-    def _burn_and_filter_challengers(
+    def _filter_burned_challengers(
         self, challengers: list[ResolvedGenerator]
     ) -> list[ResolvedGenerator]:
-        """Drop challengers whose hotkey already used its one submission, and burn
-        the survivors so they can never be screened again without re-registering.
+        """Drop challengers whose hotkey already used its one submission.
 
-        No-op when ``[round] one_submission_per_hotkey`` is False (testnet). The
-        burn happens at heat entry (mirroring the old queue's enqueue-time burn):
-        a hotkey gets exactly one shot at the throne per registration. The king is
-        never here (``plan_round`` separates it), so the incumbent is exempt.
+        Read-only: the survivors are burned by :meth:`_burn_hotkeys` only after
+        the heat stage completes. No-op when ``[round] one_submission_per_hotkey``
+        is False (testnet). The king is never here (``plan_round`` separates it),
+        so the incumbent is exempt.
         """
         if not self.cfg.round.one_submission_per_hotkey:
             return challengers
-        path = self._submissions_path()
-        seen = _load_seen_hotkeys(path)
-        fresh = [c for c in challengers if c.hotkey not in seen]
+        seen = _load_seen_hotkeys(self._submissions_path())
         for c in challengers:
             if c.hotkey in seen:
                 log.info("skipping challenger %s: hotkey already used its 1 submission "
                          "(re-register to resubmit)", c.hotkey)
-        if fresh:
-            _save_seen_hotkeys(path, seen | {c.hotkey for c in fresh})
-        return fresh
+        return [c for c in challengers if c.hotkey not in seen]
+
+    def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:
+        """Burn the challengers that got their shot: 1 hotkey = 1 submission.
+
+        Called AFTER the heat stage completes (not at entry): a round that
+        crashes or aborts mid-heat — a pod fleet dying, the trainer restarting —
+        must never consume a miner's single lifetime submission without having
+        actually screened it. Entrants whose own generator failed to train or
+        score DO burn (that was their shot); a round-level failure before this
+        point burns no one and the field simply re-enters the retried round.
+        """
+        if not self.cfg.round.one_submission_per_hotkey or not challengers:
+            return
+        path = self._submissions_path()
+        seen = _load_seen_hotkeys(path)
+        _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
@@ -490,6 +560,79 @@ class TrainerRunner:
             size=size,
         )
 
+    def _fetch_checkpoint_dir(self, trained_pointer: str) -> Path:
+        """Fetch a just-trained checkpoint from the registry to a local dir (the
+        OCI digest self-verifies the bytes). Uniform for local and remote training,
+        since every final checkpoint is uploaded to the registry."""
+        ref = parse_trained_pointer(trained_pointer)
+        if ref is None:
+            raise ValueError(f"malformed trained_pointer: {trained_pointer!r}")
+        from ..shared.hippius import HubRef
+
+        dest = self.work_root / "_bench_ckpts" / HubRef.parse(ref).digest.replace(":", "-")
+        fetch_from_hub(ref, dest, self.hub())
+        return dest
+
+    def _stamp_king_bench_scores(
+        self, entries: list[TrainedEntry], seeds: RoundSeeds
+    ) -> list[TrainedEntry]:
+        """Score the king's checkpoint on GIFT-Eval / BOOM / TIME and return the
+        entries with those numbers stamped onto the king's (primary throne size)
+        entry. Best-effort: any failure logs and returns the entries unchanged, so
+        a benchmark hiccup never fails a round — validators then fall back to
+        scoring the checkpoint themselves."""
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        king_idx = next(
+            (i for i, e in enumerate(entries)
+             if e.role == "king" and (e.size == primary or e.size == "")),
+            next((i for i, e in enumerate(entries) if e.role == "king"), None),
+        )
+        if king_idx is None:
+            return entries
+        king = entries[king_idx]
+        arch_preset = king.size or primary
+        try:
+            if self.cascade_bench_plan is not None and self.remote_hosts:
+                # Bench on the pod that just trained the king: GPU, and the
+                # checkpoint is already at its _train_work path (no local fetch).
+                scores = self._remote_king_bench_scores(str(seeds.base_seed), arch_preset)
+            elif self.bench_eval_fn is not None:
+                ckpt = self._fetch_checkpoint_dir(king.trained_pointer)
+                scores = self.bench_eval_fn(ckpt)
+            else:
+                scores = None
+        except Exception as e:  # noqa: BLE001 — Cascade telemetry must never fail a round
+            log.warning("round=%s: king bench eval failed (%s); manifest omits bench_scores",
+                        seeds.base_seed, e)
+            return entries
+        if scores is None:
+            log.warning("round=%s: king bench eval produced no complete score set; "
+                        "manifest omits bench_scores", seeds.base_seed)
+            return entries
+        log.info(
+            "round=%s: stamped king bench_scores gift(crps=%.5f mase=%.5f) "
+            "boom(crps=%.5f mase=%.5f) time(crps=%.5f mase=%.5f)",
+            seeds.base_seed, scores.gifteval_crps, scores.gifteval_mase,
+            scores.boom_crps, scores.boom_mase, scores.time_crps, scores.time_mase,
+        )
+        entries[king_idx] = replace(king, bench_scores=scores)
+        return entries
+
+    def _remote_king_bench_scores(self, round_id: str, arch_preset: str) -> BenchScores | None:
+        """Score the round's king on GIFT-Eval/BOOM/TIME on the pod that trained it
+        (GPU; the checkpoint is already at its ``_train_work`` path) and parse the
+        six signed numbers. Reuses the post-round-benchmark remote path; best-effort
+        — returns None on any miss, so the manifest simply omits ``bench_scores``."""
+        from ..eval.benchmarks import extract_bench_scores
+        from .bench_hook import run_post_round_benchmark
+
+        host = self.remote_hosts[0]  # the king trains on the first pod (single-worker today)
+        report = run_post_round_benchmark(
+            host, round_id, arch_preset, self.cascade_bench_plan, work_root=self.work_root,
+        )
+        scores = extract_bench_scores(report) if report is not None else None
+        return BenchScores(**scores) if scores is not None else None
+
     def run_round(
         self,
         commitments: list[Commitment],
@@ -538,8 +681,24 @@ class TrainerRunner:
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
 
-        eligible = self._burn_and_filter_challengers(plan.challengers)
-        finalists, heat = self._run_heat(eligible, seeds, block)
+        # The screener keys a daily-snapshot eval pool by the round's epoch
+        # boundary. The live loop supplies it as ``cutoff_block``; derive it for
+        # direct callers (scripts, operators) so a bucket-backed pool never
+        # silently screens on a NEWER snapshot than the validator will judge the
+        # final on (``None`` would mean "newest").
+        screen_block = cutoff_block
+        if screen_block is None:
+            epoch_blocks = max(1, self.cfg.round.epoch_blocks)
+            screen_block = (block // epoch_blocks) * epoch_blocks
+
+        eligible = self._filter_burned_challengers(plan.challengers)
+        finalists, heat = self._run_heat(eligible, seeds, block,
+                                         screen_block=screen_block)
+        # Burn only now, after the heat stage completed: every eligible entrant
+        # got its screening attempt (or its pass-through to the final). A crash
+        # mid-heat leaves the burn set untouched, so no miner's one lifetime
+        # submission is consumed by a round that never judged it.
+        self._burn_hotkeys(eligible)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
@@ -547,6 +706,15 @@ class TrainerRunner:
         entries = _drop_final_content_clones(entries, jobs)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
+
+        # Cascade: score the king's checkpoint on the public suites and stamp the
+        # numbers onto its manifest entry, so every validator promotes off one
+        # signed set (see cascade.validator.cascade). Best-effort and gated on
+        # [scoring] cascade_enabled; a failure just leaves bench_scores unset.
+        if self.cfg.scoring.cascade_enabled and (
+            self.bench_eval_fn is not None or self.cascade_bench_plan is not None
+        ):
+            entries = self._stamp_king_bench_scores(entries, seeds)
 
         return TrainingManifest(
             round_id=str(base_seed),
@@ -559,7 +727,12 @@ class TrainerRunner:
         )
 
     def _run_heat(
-        self, challengers: list[ResolvedGenerator], seeds: RoundSeeds, block: int
+        self,
+        challengers: list[ResolvedGenerator],
+        seeds: RoundSeeds,
+        block: int,
+        *,
+        screen_block: int | None = None,
     ) -> tuple[list[ResolvedGenerator], HeatResult | None]:
         """Screen the field down to ``[round] finalists`` for the final stage.
 
@@ -570,6 +743,11 @@ class TrainerRunner:
         ``screen_fn`` is wired, the field's natural order (lowest UID first) is
         taken without spending heat compute. A challenger that fails to train or
         screen is dropped (it simply doesn't qualify).
+
+        ``screen_block`` is the round's epoch-boundary block, handed to the
+        screener so a daily-snapshot eval pool selects the SAME snapshot the
+        validator will judge the final on (``block`` is the current height,
+        which could select a snapshot published after the boundary).
 
         Returns ``(finalists, heat)`` where ``heat`` is the informational
         standings the dashboard shows every entrant (:class:`HeatResult`), or
@@ -584,8 +762,17 @@ class TrainerRunner:
                             n, len(challengers))
             return list(challengers[:n]), None
 
-        heat_contract = self.cfg.screen_contract()
-        heat_tokens = heat_contract.tokens_for_hours(self.cfg.round.heat_train_hours)
+        # for_hours scales the token budget AND the hard wall-clock cap to the
+        # cheap heat budget — the run stops at whichever is reached first, so a
+        # stalling generator costs minutes of a heat slot, never the final-scale
+        # max_train_seconds.
+        rnd = self.cfg.round
+        heat_contract = self.cfg.screen_contract().for_hours(
+            rnd.heat_train_hours,
+            guard_factor=rnd.heat_guard_factor,
+            guard_floor_seconds=rnd.heat_guard_floor_seconds,
+        )
+        heat_tokens = heat_contract.train_tokens
         trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
         trained_hotkeys = {c.hotkey for c, _, _ in trained}
         # Content-level first-submitter rule: two challengers whose corpora share
@@ -609,7 +796,7 @@ class TrainerRunner:
             if c.hotkey in duplicates:
                 continue
             try:
-                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed))
+                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block))
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
@@ -699,6 +886,42 @@ class TrainerRunner:
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
         return out
 
+    def _hosts_for(self, stage: str) -> list:
+        """The pods serving ``stage`` ("heat" | "final"): hosts tagged with that
+        stage or ``"any"``. The cheap-GPU seam — heats can run on a cheaper SKU
+        class than the final, because heat checkpoints are trainer-internal
+        (screened, discarded, never validated) while the final's king and
+        challenger must satisfy the validator's gpu_name pairing. When no host
+        matches the stage (e.g. a fleet tagged all-final), every host is used
+        with a warning rather than stranding the stage: a heat on final-class
+        pods is just pricier, and a final on the remaining pods still pairs
+        king/challenger on one list."""
+        hosts = self.remote_hosts or []
+        matched = [h for h in hosts if getattr(h, "stage", "any") in ("any", stage)]
+        if hosts and not matched:
+            log.warning("no remote hosts tagged for stage %r; using all %d host(s)",
+                        stage, len(hosts))
+            return list(hosts)
+        return matched
+
+    @staticmethod
+    def _dispatch_with_retry(disp, hosts: list, i: int, *, describe: str, **kw):
+        """Dispatch to the round-robin host, retrying ONCE on the next host on
+        any failure. Rented pods churn — SSH flaps, reclaimed boxes, slow image
+        pulls — and one flaky box must cost a retry, not a challenger's only
+        heat slot or (for the king) the entire round. With a single host the
+        retry re-uses it, since the failure may be transient rather than the
+        box. A second failure propagates to the caller's policy (drop the
+        challenger / abort the round)."""
+        host = hosts[i % len(hosts)]
+        try:
+            return disp.dispatch(host, **kw)
+        except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
+            retry_host = hosts[(i + 1) % len(hosts)]
+            log.warning("%s failed on %s (%s); retrying on %s", describe,
+                        getattr(host, "name", host), e, getattr(retry_host, "name", retry_host))
+            return disp.dispatch(retry_host, **kw)
+
     def _heat_train_remote(
         self,
         challengers: list[ResolvedGenerator],
@@ -719,16 +942,20 @@ class TrainerRunner:
 
         if not self.trainer_spec:
             raise RuntimeError("remote heat requires trainer_spec (BaseTrainer 'module:Class')")
-        hosts = self.remote_hosts
+        hosts = self._hosts_for("heat")
         hub = self.hub()  # pre-init (thread-safe) before the pool
-        disp = RemoteDispatcher(
-            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
-        )
+        # Heat dispatches get a TIGHT SSH timeout: the pod-side guard already
+        # kills a slow run at the scaled max_train_seconds, so the only thing a
+        # long outer timeout buys is a wedged pod (kernel hang, dead network
+        # where SSH never returns) holding a heat slot for the full 6h default.
+        # Guard + 30min covers fetch/sandbox/upload overheads around training.
+        heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
+        disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout)
 
         def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path, str]:
-            host = hosts[i % len(hosts)]
-            entry = disp.dispatch(
-                host, gen_ref=c.ref, uid=c.uid, hotkey=c.hotkey, role="challenger",
+            entry = self._dispatch_with_retry(
+                disp, hosts, i, describe=f"heat challenger {c.hotkey}",
+                gen_ref=c.ref, uid=c.uid, hotkey=c.hotkey, role="challenger",
                 base_seed=seeds.base_seed, block=block,
                 arch_preset=heat_contract.arch_preset,
                 train_hours=self.cfg.round.heat_train_hours,
@@ -815,15 +1042,15 @@ class TrainerRunner:
 
         if not self.trainer_spec:
             raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
-        hosts = self.remote_hosts
+        hosts = self._hosts_for("final")
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
         )
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
-            host = hosts[i % len(hosts)]
-            return disp.dispatch(
-                host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+            return self._dispatch_with_retry(
+                disp, hosts, i, describe=f"final {role} {gen.hotkey}",
+                gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
             )
@@ -859,6 +1086,46 @@ class TrainerRunner:
 
     # ── live loop ────────────────────────────────────────────────────────────
 
+    def _reload_remote_hosts(self) -> None:
+        """Refresh ``remote_hosts`` from ``remote_hosts_path`` for this round.
+
+        The elastic-fleet seam: a per-round provisioner (sized off the revealed
+        field, e.g. ``cascade-trainer --plan-only``) rents pods, health-checks
+        them, and writes the hosts TOML; this re-read picks the fleet up without
+        a trainer restart. Waits up to ``hosts_wait_seconds`` for the file to
+        appear/fill — pods boot after the reveal-margin field count, so the
+        round can start before they are ready — then falls back to local
+        training rather than holding the round hostage. No-op when no
+        ``remote_hosts_path`` is configured (a static ``remote_hosts`` list, or
+        purely local training).
+        """
+        if self.remote_hosts_path is None:
+            return
+        from .remote import RemoteDispatchError, load_hosts
+
+        deadline = time.time() + max(0, self.hosts_wait_seconds)
+        while True:
+            try:
+                hosts = load_hosts(self.remote_hosts_path)
+            except RemoteDispatchError as e:
+                hosts, reason = None, str(e)
+            else:
+                reason = ""
+            if hosts:
+                if self.remote_hosts is None or [h.name for h in hosts] != [
+                    h.name for h in self.remote_hosts
+                ]:
+                    log.info("round fleet: %d pod(s): %s",
+                             len(hosts), ", ".join(h.name for h in hosts))
+                self.remote_hosts = hosts
+                return
+            if time.time() >= deadline:
+                log.warning("no remote hosts available (%s); training locally this round",
+                            reason or str(self.remote_hosts_path))
+                self.remote_hosts = None
+                return
+            time.sleep(min(15.0, max(1.0, deadline - time.time())))
+
     def run_forever(self, client: object) -> None:  # pragma: no cover
         """Poll → train → publish, once per daily round (epoch).
 
@@ -885,6 +1152,7 @@ class TrainerRunner:
                     continue
                 commitments = client.poll_commitments()
                 king_hotkey = client.highest_incentive_hotkey()
+                self._reload_remote_hosts()  # per-round elastic fleet pickup
                 log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
                          round_id, epoch, epoch_start, king_hotkey, len(commitments))
                 manifest = self.run_round(
@@ -900,8 +1168,10 @@ class TrainerRunner:
 
                         # The final trains king checkpoints for the throne
                         # sizes, which need not include the primary preset.
+                        # Prefer a final-class pod (the heat pods may be a
+                        # cheaper SKU the benchmark sweep wasn't sized for).
                         launch_post_round_benchmark(
-                            self.remote_hosts[0], round_id,
+                            self._hosts_for("final")[0], round_id,
                             self.cfg.throne_contracts()[0].arch_preset, self.bench_plan,
                             work_root=self.work_root,
                         )

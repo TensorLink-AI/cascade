@@ -26,7 +26,7 @@ from cascade.shared.receipt import (
 
 from .receipt_fixture import make_rejected_receipt, make_scored_receipt
 
-GOLDEN_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "round_receipt_v2.json"
+GOLDEN_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "round_receipt_v3.json"
 
 
 # ── round-trip ────────────────────────────────────────────────────────────────

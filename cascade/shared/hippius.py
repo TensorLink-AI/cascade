@@ -688,14 +688,131 @@ class HFFallbackStore:
         return self.get_bytes(key).decode("utf-8")
 
 
-def open_manifest_store(storage: object) -> S3Store | HFFallbackStore:
-    """The manifest/receipt bucket store, HF-backed when ``[storage]
-    hf_backup_repo`` is set (else a plain :class:`S3Store` — no behaviour
-    change). Every manifest/receipt call site builds its store through here."""
+@dataclass
+class S3MirrorStore:
+    """Hippius S3 primary + an S3-compatible (Cloudflare R2) mirror that receives
+    a copy of every write — a genuine off-Hippius **backup**, not just a failover.
+
+    Where :class:`HFFallbackStore` lands objects on HF *only while S3 is down* (so
+    the mirror holds just the outage-era writes), this **dual-writes** every put to
+    both stores, so the mirror always carries a complete, current copy of the
+    manifest/receipt namespace. It therefore survives not only a Hippius S3
+    *outage* but a Hippius S3 *data-loss* event — R2 keeps its own copy of every
+    object that was ever written, healthy or not.
+
+    * **writes** go to the primary first, then the mirror. A mirror-only failure
+      is logged and swallowed — the object is safely on the primary, and a backup
+      outage must never break the round loop. A primary failure still writes the
+      mirror so the object is not lost (exactly like :class:`HFFallbackStore`);
+      only if *both* fail does the put raise.
+    * **reads** try the primary first, then fall back to the mirror.
+
+    Duck-types :class:`S3Store` (``put_text``/``get_text``/``put_bytes``/
+    ``get_bytes``), so it drops into every manifest/receipt call site through
+    :func:`open_manifest_store`. The ``primary`` may itself be an
+    :class:`HFFallbackStore`, so R2 and the HF failover can be stacked. R2 does
+    not honour per-object canned ACLs, so a mirror write rejected for its ``acl``
+    is retried without one — the backed-up bytes matter more than the ACL on the
+    mirror copy (the primary keeps the public-read receipts).
+    """
+
+    primary: S3Store | HFFallbackStore
+    mirror: S3Store
+
+    @property
+    def _mirror_label(self) -> str:
+        return getattr(getattr(self.mirror, "cfg", None), "bucket", "r2-backup")
+
+    def _mirror_put(self, key: str, data: bytes, *, content_type: str, acl: str | None) -> None:
+        try:
+            self.mirror.put_bytes(key, data, content_type=content_type, acl=acl)
+        except StorageError:
+            if not acl:
+                raise
+            # R2 rejects canned object ACLs — retry without so the backup lands.
+            self.mirror.put_bytes(key, data, content_type=content_type)
+
+    def put_bytes(self, key: str, data: bytes, *,
+                  content_type: str = "application/octet-stream", acl: str | None = None) -> None:
+        import logging
+        log = logging.getLogger("cascade.storage")
+        primary_ok = True
+        try:
+            self.primary.put_bytes(key, data, content_type=content_type, acl=acl)
+        except StorageError as e:
+            primary_ok = False
+            log.warning("primary put failed for %s (%s); relying on R2 backup %s",
+                        key, e, self._mirror_label)
+        try:
+            self._mirror_put(key, data, content_type=content_type, acl=acl)
+        except Exception as e:  # noqa: BLE001 — a backup failure is not fatal on its own
+            if not primary_ok:
+                raise StorageError(f"both primary and R2 put failed for {key}: {e}") from e
+            log.warning("R2 backup put failed for %s (%s); primary copy is intact",
+                        key, e)
+
+    def put_text(self, key: str, text: str, *,
+                 content_type: str = "text/plain", acl: str | None = None) -> None:
+        self.put_bytes(key, text.encode("utf-8"), content_type=content_type, acl=acl)
+
+    def get_bytes(self, key: str) -> bytes:
+        try:
+            return self.primary.get_bytes(key)
+        except StorageError as e:
+            import logging
+            logging.getLogger("cascade.storage").warning(
+                "primary get failed for %s (%s); reading R2 backup %s",
+                key, e, self._mirror_label)
+        try:
+            return self.mirror.get_bytes(key)
+        except Exception as e:  # noqa: BLE001
+            raise StorageError(f"both primary and R2 get failed for {key}: {e}") from e
+
+    def get_text(self, key: str) -> str:
+        return self.get_bytes(key).decode("utf-8")
+
+
+def backup_s3_store(storage: object, *, bucket: str) -> S3Store | None:
+    """Build an :class:`S3Store` for the Cloudflare R2 (or any S3-compatible)
+    backup of the manifest/receipt bucket, or ``None`` when no backup is configured.
+
+    Enabled by ``[storage] backup_s3_endpoint`` (R2's
+    ``https://<account>.r2.cloudflarestorage.com``); the mirror bucket defaults to
+    ``[storage] backup_bucket`` and falls back to the same ``bucket`` name as the
+    primary. ``backup_s3_region`` defaults to ``"auto"`` (R2's region). Credentials
+    come from ``BACKUP_S3_ACCESS_KEY`` / ``BACKUP_S3_SECRET_KEY`` — a distinct pair
+    from the Hippius keys, since the backup lives on a different provider.
+    """
+    endpoint = getattr(storage, "backup_s3_endpoint", "") or ""
+    if not endpoint:
+        return None
+    region = getattr(storage, "backup_s3_region", "") or "auto"
+    bkt = getattr(storage, "backup_bucket", "") or bucket
+    cfg = S3Config(
+        endpoint=endpoint,
+        region=region,
+        bucket=bkt,
+        access_key_env="BACKUP_S3_ACCESS_KEY",
+        secret_key_env="BACKUP_S3_SECRET_KEY",
+    )
+    return S3Store(cfg)
+
+
+def open_manifest_store(storage: object) -> S3Store | HFFallbackStore | S3MirrorStore:
+    """The manifest/receipt bucket store, with optional backups layered on.
+
+    Base is a plain :class:`S3Store`; if ``[storage] hf_backup_repo`` is set it is
+    wrapped in an :class:`HFFallbackStore` (HF failover, unchanged), and if
+    ``[storage] backup_s3_endpoint`` is set the result is wrapped in an
+    :class:`S3MirrorStore` that dual-writes every object to a Cloudflare R2 backup.
+    With neither configured this is exactly a :class:`S3Store` — no behaviour
+    change. Every manifest/receipt call site builds its store through here."""
     bucket = getattr(storage, "manifest_bucket", "cascade-manifests")
     s3 = S3Store(S3Config.from_storage(storage, bucket=bucket))
     repo = getattr(storage, "hf_backup_repo", "") or ""
-    return HFFallbackStore(s3, repo) if repo else s3
+    base: S3Store | HFFallbackStore = HFFallbackStore(s3, repo) if repo else s3
+    mirror = backup_s3_store(storage, bucket=bucket)
+    return S3MirrorStore(base, mirror) if mirror else base
 
 
 # ───────────────────────── manifests + logs over S3 ─────────────────────────
@@ -804,6 +921,7 @@ def update_receipt_index(
     *,
     updated_at: str = "",
     subnet: dict | None = None,
+    chain: dict | None = None,
     max_keep: int = RECEIPT_INDEX_MAX_KEEP,
 ) -> dict:
     """Append/replace one round in ``receipts/index.json`` and write it public-read.
@@ -811,7 +929,9 @@ def update_receipt_index(
     Idempotent per ``round_id`` (a re-published round replaces its entry), sorted
     by ``epoch_start_block`` then ``round_id`` (chronological — round ids are
     block-hash seeds, not monotonic), and capped at ``max_keep`` most-recent
-    rounds. ``updated_at`` (an ISO stamp) and ``subnet`` (``{"netuid", "name"}``)
+    rounds. ``updated_at`` (an ISO stamp), ``subnet`` (``{"netuid", "name"}``),
+    and ``chain`` (schedule anchor for the next-round countdown:
+    ``{as_of, current_block, epoch_start_block, epoch_blocks, block_time_s}``)
     are optional header fields the dashboard shows. Returns the stored entry.
     """
     entry = dict(summary)
@@ -831,6 +951,8 @@ def update_receipt_index(
         out["updated_at"] = updated_at
     if subnet:
         out["subnet"] = subnet
+    if chain:
+        out["chain"] = chain
 
     text = json.dumps(out, indent=2, sort_keys=True)
     try:

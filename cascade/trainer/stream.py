@@ -59,7 +59,7 @@ def _inprocess_stream(
     repo: Path, seed: int, cfg: GeneratorConfig, token_budget: int
 ) -> Iterator[np.ndarray]:
     """In-process fresh-series stream (no sandbox) for offline / test runs."""
-    from ..interface.generator import check_series
+    from ..interface.generator import CAST_SAFE_MAX_FLOAT32, check_series
     from .corpus import _load_generator
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
@@ -67,7 +67,9 @@ def _inprocess_stream(
     for i, arr in enumerate(gen.generate(n_upper)):
         check_series(
             arr, min_length=cfg.min_length, max_length=cfg.max_length,
-            max_channels=cfg.max_channels, index=i,
+            max_channels=cfg.max_channels,
+            max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
+            reject_constant=cfg.reject_constant, index=i,
         )
         yield np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
 

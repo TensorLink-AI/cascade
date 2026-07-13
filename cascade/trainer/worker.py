@@ -58,6 +58,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.env import load_env_files
+    load_env_files()
     args = _build_parser().parse_args(argv)
     # Logs to stderr so stdout carries only the receipt.
     logging.basicConfig(
@@ -85,10 +87,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         contract = cfg.training.for_size(match)
 
-    token_budget = (
-        contract.tokens_for_hours(args.train_hours)
-        if args.train_hours is not None else contract.train_tokens
-    )
+    if args.train_hours is not None:
+        # Heat/screen run: scale the token budget AND the hard wall-clock cap
+        # to the cheap budget, so a stalling generator costs this pod minutes,
+        # never the final's full max_train_seconds (rented hours are billed).
+        # The guard knobs travel via the pod's chain.toml [round].
+        contract = contract.for_hours(
+            args.train_hours,
+            guard_factor=cfg.round.heat_guard_factor,
+            guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+        )
+    token_budget = contract.train_tokens
     if args.train_hours is None:
         # Full-budget run ⇒ this is a FINAL: this pod is the runtime, so the
         # contract's train_image_digest pin (if set) must match the image digest

@@ -15180,7 +15180,7 @@
       "uid": 1
     }
   ],
-  "receipt_version": 2,
+  "receipt_version": 3,
   "reject_reason": null,
   "reward_uids": [
     1,
@@ -15192,6 +15192,8 @@
   "training_seed": 15787885796686058747,
   "validator_hotkey": "",
   "verdict": {
+    "boot_p50": 0.4,
+    "boot_p95": 0.4000000000000002,
     "bootstrap_seed": "2269901645662351552",
     "chal_geomean": 0.2278953450950247,
     "challenger_wins_round": true,
@@ -15205,6 +15207,7 @@
     "king_uid": 1,
     "lcb": 0.3999999999999999,
     "margin": 0.02,
+    "n_clusters": 256,
     "n_windows": 256,
     "note": "dethroned after 1 consecutive win(s)",
     "params": {
@@ -15219,7 +15222,15 @@
       "min_windows": 200,
       "win_margin_end": 0.02,
       "win_margin_start": 0.02
-    }
+    },
+    "per_domain_win_rate": {
+      "unknown": [
+        1.0,
+        256
+      ]
+    },
+    "wilcoxon_p": 9.640418513895798e-44,
+    "win_rate": 1.0
   },
   "weights": [
     0.5,

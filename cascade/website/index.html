@@ -918,6 +918,7 @@ tbody tr:hover td a { color: var(--bone-light); }
 th.num { text-align: right; }
 .muted { color: var(--muted); }
 .good { color: var(--good); font-weight: 700; }
+.warn { color: var(--warning); font-weight: 700; }
 .empty { color: var(--muted); text-transform: uppercase; padding: 12px 0; text-align: center; }
 .crown { font-weight: 700; color: var(--chal); }
 
@@ -976,7 +977,7 @@ tbody tr:hover td .heat-pill { color: var(--bone-light); }
   </div>
 
   <div>
-    <div class="section-label"><span id="verdict-title">Latest round</span><span id="verdict-when" class="muted"></span></div>
+    <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
     <div class="verdict" id="verdict"></div>
   </div>
 
@@ -1020,7 +1021,7 @@ tbody tr:hover td .heat-pill { color: var(--bone-light); }
   <div>
     <div class="section-label"><span>Rounds</span></div>
     <div class="scroll-box scroll-hist">
-      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
+      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
     </div>
   </div>
 
@@ -1084,6 +1085,16 @@ var SEED_INDEX = {
   ]
 };
 SEED_INDEX.rounds[7].round_id = "rnd_7c88f3e0";
+// Demo diagnostics + schedule anchor (SAMPLE only; live index.json overwrites).
+SEED_INDEX.rounds.forEach(function(r){
+  if(r.status==="scored"){
+    var won=r.challenger_wins_round;
+    r.win_rate = won?0.56:0.34; r.wilcoxon_p = won?3e-4:6e-7; r.n_clusters=26;
+    r.boot_p50 = won?0.05:-0.03; r.boot_p95 = won?0.12:0.04;
+  }
+});
+SEED_INDEX.chain = { as_of: iso(1), current_block: 4822980,
+  epoch_start_block: 4822360, epoch_blocks: IS_TESTNET?900:7200, block_time_s: 12.0 };
 var SEED_LATEST = {
   round_id: "rnd_7c88f3e0",
   verdict: { king_hotkey: "5FhR9kQ2mLpQ4d" },
@@ -1124,6 +1135,8 @@ function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var d=p.di
 function refLink(ref,k){ var p=splitRef(ref); if(!p.repo) return '<span class="muted">--</span>'; return '<a class="'+(k||"")+'" href="'+genUrl(ref)+'" target="_blank" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
 function shortHk(hk){ return hk?hk.slice(0,8)+"\u2026"+hk.slice(-4):"--"; }
 function fmt(x,dp){ if(x==null||!isFinite(x)) return "--"; return Number(x).toFixed(dp==null?4:dp); }
+function pct(x){ if(x==null||!isFinite(x)) return "--"; return Math.round(Number(x)*100)+"%"; }
+function pval(x){ if(x==null||!isFinite(x)) return "--"; x=Number(x); return x<0.001?x.toExponential(1):x.toFixed(3); }
 function shortRoundId(id){ id=String(id||""); return id.length>12?id.slice(0,6)+"\u2026"+id.slice(-4):id; }
 function timeAgo(i){ if(!i) return "--"; var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0; if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago"; var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
 function ema(a,al){ if(al>=1||!a.length) return a.slice(); var o=[a[0]]; for(var i=1;i<a.length;i++)o.push(al*a[i]+(1-al)*o[i-1]); return o; }
@@ -1178,10 +1191,25 @@ function renderVerdict(){
   if(r.status==="rejected"){
     cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans)">'+esc(r.reject_reason||"--")+'</span>'));
   } else {
+    var betterV=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
     cells.push(stat("King error (lower better)",fmt(r.king_geomean)));
-    cells.push(stat("Challenger error (lower better)",'<span class="'+(r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
+    cells.push(stat("Challenger error (lower better)",'<span class="'+(betterV?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
+    if(r.win_rate!=null){
+      // Win rate next to the error tiles: a low win rate under a better geomean
+      // is the rare-but-big signal that the LCB (below) then prices as fragile.
+      var wcls=r.win_rate>=0.5?"good":(betterV?"warn":"");
+      var wnote=betterV&&r.win_rate<0.5?'<span class="sub">rare&#8209;but&#8209;big &mdash; geomean carried by few windows</span>':'<span class="sub">of windows</span>';
+      cells.push(stat("Win rate",'<span class="'+wcls+'">'+pct(r.win_rate)+'</span> '+wnote));
+    }
     cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>'));
+    if(r.boot_p50!=null){
+      // Bootstrap spread of the relative improvement; LCB is the 5th pct. A large
+      // gap between a positive median and a negative LCB = a fragile verdict.
+      cells.push(stat("Bootstrap spread",fmt(r.lcb,2)+' <span class="sub">p5</span> · <b>'+fmt(r.boot_p50,2)+'</b> <span class="sub">p50</span> · '+fmt(r.boot_p95,2)+' <span class="sub">p95</span>'));
+    }
     cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
+    if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">clusters (eff. n)</span>'));
+    if(r.wilcoxon_p!=null) cells.push(stat("Wilcoxon p",pval(r.wilcoxon_p)));
     cells.push(stat("Field",(r.n_participants!=null?r.n_participants:"--")+' <span class="sub">entrants</span>'));
     if(r.gift_gate_passed!=null) cells.push(stat("GIFT gate",r.gift_gate_passed?"pass":"fail"));
     cells.push(stat("Rewarded",r.n_rewarded!=null?r.n_rewarded:"--"));
@@ -1310,15 +1338,18 @@ function renderHeat(){
 }
 function renderRounds(){
   var rs=(_index&&_index.rounds||[]).slice().reverse(), tb=document.getElementById("rounds");
-  if(!rs.length){ tb.innerHTML='<tr><td colspan="10" class="empty">No rounds published yet</td></tr>'; return; }
+  if(!rs.length){ tb.innerHTML='<tr><td colspan="11" class="empty">No rounds published yet</td></tr>'; return; }
   tb.innerHTML=rs.map(function(r){
     var cls=verdictClass(r);
     var better=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
+    // amber win rate = geomean favours the challenger but it wins few windows
+    var wcls=r.win_rate==null?"":(r.win_rate>=0.5?"good":(better?"warn":""));
     return '<tr><td title="'+esc(r.round_id)+'">'+esc(shortRoundId(r.round_id))+'</td>'+
       '<td><span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span></td>'+
       '<td>'+refLink(r.king_gen_ref)+'</td><td>'+refLink(r.chal_gen_ref)+'</td>'+
       '<td class="num">'+fmt(r.king_geomean)+'</td>'+
       '<td class="num'+(better?' good':'')+'">'+fmt(r.chal_geomean)+'</td>'+
+      '<td class="num '+wcls+'">'+pct(r.win_rate)+'</td>'+
       '<td class="num">'+fmt(r.lcb,3)+'</td><td class="num">'+fmt(r.margin,3)+'</td>'+
       '<td class="num">'+(r.n_windows!=null?r.n_windows:"--")+'</td>'+
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
@@ -1338,7 +1369,27 @@ function renderStatus(){
     ? "⚠ Live results unavailable — could not reach the validator receipts. The figures below are SAMPLE data, not live subnet state."
     : "Loading live results…";
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); }
+function fmtDur(s){ if(s==null||!isFinite(s)) return "--"; s=Math.max(0,Math.round(s)); if(s<60) return s+"s"; var m=Math.floor(s/60); if(m<60) return m+"m "+(s%60)+"s"; var h=Math.floor(m/60); return h+"h "+(m%60)+"m"; }
+// Seconds until the next round (next epoch boundary), extrapolated from the
+// index's `chain` anchor: block-at-as_of + wall-clock elapsed / block_time.
+function nextRoundSecs(){
+  var c=_index&&_index.chain; if(!c||c.epoch_start_block==null||!c.epoch_blocks) return null;
+  var bt=c.block_time_s>0?c.block_time_s:12, eb=c.epoch_blocks, es=c.epoch_start_block;
+  var asOf=c.as_of?new Date(c.as_of).getTime():null;
+  var elapsed=asOf!=null?(Date.now()-asOf)/1000:0; if(elapsed<0) elapsed=0;
+  // current block now: from current_block at as_of; if unknown, assume the round
+  // scored at its epoch boundary (a lower bound → conservative, never-too-short ETA).
+  var base=c.current_block!=null?c.current_block:es;
+  var est=base+elapsed/bt;
+  var k=Math.floor((est-es)/eb)+1; if(k<1) k=1;   // next boundary strictly past est
+  return Math.max(0,(es+k*eb-est)*bt);
+}
+function renderCountdown(){
+  var el=document.getElementById("next-round"); if(!el) return;
+  var s=nextRoundSecs();
+  el.textContent = s==null ? "" : ("next round ~"+fmtDur(s)+" · ");
+}
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); renderCountdown(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1367,6 +1418,7 @@ function poll(){
 }
 poll();
 setInterval(poll, POLL_MS);
+setInterval(renderCountdown, 1000);  // tick the next-round ETA every second
 </script>
 
 

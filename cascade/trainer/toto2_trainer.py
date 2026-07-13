@@ -206,6 +206,7 @@ class Toto2Trainer:
 
         from .toto2_model import (
             QUANTILE_LEVELS,
+            Z_CLAMP,
             Toto2Config,
             Toto2Model,
             causal_standardize,
@@ -229,8 +230,14 @@ class Toto2Trainer:
         tokens = 0
         step = 0
         last_loss = float("nan")
-        t0 = time.time()
-        deadline = t0 + contract.max_train_seconds
+        # The wall-clock cap measures ACTUAL TRAINING TIME: the clock starts at
+        # the first training batch, so registry fetch, sandbox boot, and model
+        # init never eat the budget (material at testnet-scale budgets). Waits
+        # for data DURING training do count — that is the anti-trickler bound —
+        # and a first batch that never arrives is killed by the sandbox's
+        # max_generate_seconds inactivity timeout, not this deadline.
+        t0 = time.time()                     # provisional (re-anchored at first batch)
+        deadline: float | None = None
 
         # CPM masks are drawn per batch from a dedicated generator so the run
         # stays byte-reproducible under the shared training_seed.
@@ -246,6 +253,9 @@ class Toto2Trainer:
             stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
         ):
+            if deadline is None:             # first batch: training starts NOW
+                t0 = time.time()
+                deadline = t0 + contract.max_train_seconds
             # Standardize from float64: downcasting the raw series first would
             # quantize away small fluctuations at large levels (float32 has ~7
             # digits) before the scaler ever sees them. Only the O(1)-scale z
@@ -272,9 +282,13 @@ class Toto2Trainer:
             # into its own scaling.
             a_loc, a_scale = patch_anchors(loc, scale, cfg.patch_size)
             raw = x.view(x.shape[0], num_patches, cfg.patch_size)
+            # Clamp the target to the same bound as z (toto2_model.Z_CLAMP): the
+            # model input and the loss target must share one range, and this is the
+            # backstop that keeps a pathological jump from producing an inf/huge
+            # target that NaNs or destabilizes the shared training step.
             target = torch.asinh(
                 (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
-            ).to(self.dtype)
+            ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
             loss = pinball_loss(pred_q, target, tuple(levels))
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
@@ -298,7 +312,21 @@ class Toto2Trainer:
             if tokens >= token_budget or time.time() > deadline:
                 break
 
-        train_seconds = time.time() - t0
+        train_seconds = time.time() - t0     # actual training time (from first batch)
+        # First-reached-stops: the loop ends on the token budget OR the wall-clock
+        # deadline. A deadline stop leaves the model UNDER the contract's compute
+        # — self-penalizing in a heat, but in a final it silently breaks the
+        # equal-compute pairing, so it must be loud in the record, never implicit.
+        deadline_hit = (
+            deadline is not None and tokens < token_budget and time.time() > deadline
+        )
+        if deadline_hit:
+            log.warning(
+                "wall-clock deadline (%ds) hit at %d/%d tokens (%.0f%%): checkpoint is "
+                "under the contract budget — slow corpus or under-provisioned device",
+                contract.max_train_seconds, tokens, token_budget,
+                100.0 * tokens / max(1, token_budget),
+            )
         param_count = sum(p.numel() for p in model.parameters())
         gpu_name = (
             torch.cuda.get_device_name(0)
@@ -310,6 +338,7 @@ class Toto2Trainer:
             "param_count": param_count,
             "throughput_tokens_per_s": tokens / max(1e-6, train_seconds),
             "gpu_name": gpu_name, "deterministic": self.deterministic,
+            "deadline_hit": deadline_hit,
         }
         if logger is not None:
             logger({"event": "done", **metrics})

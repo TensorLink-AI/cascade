@@ -9,7 +9,55 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cascade.eval.benchmarks import format_report, run_benchmarks
+from cascade.eval.benchmarks import extract_bench_scores, format_report, run_benchmarks
+
+
+def _report(*suites):
+    return {"checkpoint": "/x", "suites": list(suites)}
+
+
+def _ok(suite, metrics):
+    return {"suite": suite, "status": "ok", "metrics": metrics, "n_series": 10}
+
+
+def test_extract_bench_scores_all_three_suites():
+    report = _report(
+        _ok("gift-eval", {"crps": 0.42, "mase": 0.81}),
+        _ok("boom", {"crps": 0.55, "mase": 0.93}),
+        _ok("time", {"crps": 0.38, "mase": 0.77}),
+    )
+    assert extract_bench_scores(report) == {
+        "gifteval_crps": 0.42, "gifteval_mase": 0.81,
+        "boom_crps": 0.55, "boom_mase": 0.93,
+        "time_crps": 0.38, "time_mase": 0.77,
+    }
+
+
+def test_extract_bench_scores_is_case_insensitive_and_alias_aware():
+    # TIME may surface upper-case keys, and CRPS may arrive as a WQL name.
+    report = _report(
+        _ok("gift-eval", {"crps": 0.4, "mase": 0.8}),
+        _ok("boom", {"crps": 0.5, "mase": 0.9}),
+        _ok("time", {"MASE": 0.7, "mean_weighted_sum_quantile_loss": 0.3}),
+    )
+    got = extract_bench_scores(report)
+    assert got["time_crps"] == 0.3 and got["time_mase"] == 0.7
+
+
+def test_extract_bench_scores_none_when_a_suite_is_missing_or_skipped():
+    # TIME skipped ⇒ incomplete set ⇒ None (and a loud warning, not a silent drop).
+    assert extract_bench_scores(_report(
+        _ok("gift-eval", {"crps": 0.4, "mase": 0.8}),
+        _ok("boom", {"crps": 0.5, "mase": 0.9}),
+        {"suite": "time", "status": "skipped", "metrics": {}},
+    )) is None
+    # A suite present but lacking a recognizable crps key ⇒ None.
+    assert extract_bench_scores(_report(
+        _ok("gift-eval", {"crps": 0.4, "mase": 0.8}),
+        _ok("boom", {"crps": 0.5, "mase": 0.9}),
+        _ok("time", {"mase": 0.7, "nd": 0.2}),
+    )) is None
+    assert extract_bench_scores(None) is None
 
 
 def test_run_benchmarks_missing_wrapper_returns_none(tmp_path: Path):

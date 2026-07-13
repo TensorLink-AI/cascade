@@ -218,6 +218,31 @@ def test_render_hosts_toml_chain_toml_optional():
     assert with_ct["host"][0]["chain_toml"] == "/root/cascade/chain.testnet.toml"
 
 
+def test_render_hosts_toml_stage_default_any_omits_line():
+    # "any" is the schema default (RemoteHost.stage) — don't emit a redundant line.
+    data = tomllib.loads(render_hosts_toml(
+        [PodAddress("10.0.0.1")], key_path="k", forward_env=()))
+    assert "stage" not in data["host"][0]
+
+
+def test_render_hosts_toml_stage_tagged_pods(tmp_path):
+    # A heat/final fleet is a homogeneous batch: every pod carries the stage tag,
+    # and it must parse back through the trainer's own hosts loader.
+    from cascade.trainer.remote import load_hosts
+
+    toml = render_hosts_toml(
+        [PodAddress("10.0.0.1", 22), PodAddress("10.0.0.2", 40060)],
+        key_path="k", forward_env=(), name_prefix="cascade-heat", stage="heat")
+    data = tomllib.loads(toml)
+    assert all(h["stage"] == "heat" for h in data["host"])
+
+    hosts_path = tmp_path / "hosts.toml"
+    hosts_path.write_text(toml, encoding="utf-8")
+    hosts = load_hosts(hosts_path)
+    assert [h.name for h in hosts] == ["cascade-heat-0", "cascade-heat-1"]
+    assert all(h.stage == "heat" for h in hosts)
+
+
 def test_render_hosts_toml_rejects_empty():
     with pytest.raises(ProvisionError):
         render_hosts_toml([], key_path="k", forward_env=())
