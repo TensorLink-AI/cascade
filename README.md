@@ -71,7 +71,7 @@ flowchart TD
         resolve --> seeds --> heat --> trainK --> upK --> manifest
     end
 
-    subgraph validator["Validator (eval GPU)"]
+    subgraph validator["Validator (GPU box or CPU + eval pod — see docs/VALIDATOR.md)"]
         gate["verify signature +<br/>matching contract / base-arch digests<br/>(controlled-experiment gate)"]
         eval["pull king + finalist ckpts per size →<br/>score on shared held-out windows<br/>(CRPS/MWSQL + MASE)"]
         koth["paired-bootstrap LCB of<br/>geomean(CRPS, MASE) POOLED across sizes,<br/>finalist vs king → one KOTH verdict"]

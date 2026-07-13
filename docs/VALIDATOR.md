@@ -4,25 +4,60 @@ A validator reads the owner-trainer's signed manifest each round, pulls the
 king's and challenger's trained checkpoints, scores them on the private rotating
 eval pool, runs the king-of-the-hill verdict, and sets weights on chain. It also
 publishes a signed public **receipt** for every round so anyone can verify your
-work. You need an **eval GPU** (to run the Toto2 forecaster on the eval windows)
-but you never train — that's the owner's trainer.
+work. You never train — that's the owner's trainer; your job is inference-only
+scoring, which is why the hardware bar is modest (see below).
 
 At a glance:
 
 ```
-install (GPU) → make a wallet → register + stake → configure chain.toml + creds
-   → cascade-validator → confirm weights set + receipts published → audit as health check
+pick a shape (GPU box / CPU box + eval pod) → install → make a wallet
+   → register + stake → configure chain.toml + creds → cascade-validator
+   → confirm weights set + receipts published → audit as health check
 ```
+
+## Hardware
+
+Two supported shapes:
+
+| shape | what runs where |
+|---|---|
+| **GPU box** (simplest) | everything — wallet, private-pool duel, and benchmark evals — on one CUDA machine; run with `--device cuda` |
+| **CPU orchestrator + eval pod** | wallet, private-pool duel, and **all consensus decisions** stay on a cheap CPU box; the GPU-heavy public benchmarks are offloaded over SSH with `--eval-hosts` (only a public checkpoint and a report cross to the pod — never keys) |
+
+Minimums (the GPU row applies to whichever box runs benchmarks — the GPU box
+itself, or the eval pod in the split shape):
+
+| resource | minimum | notes |
+|---|---|---|
+| GPU | 1× CUDA GPU, **24 GB VRAM** (e.g. RTX 3090/4090, A5000, L4, L40S) | the Toto2 checkpoints being scored are tiny (4M / 22M params) — 24 GB is headroom for the benchmark sweeps (batched forecasts, `batch_size` up to 512), not the model |
+| CPU / RAM | 8 cores / 32 GB | the private-pool duel and the paired bootstrap are CPU-tuned |
+| disk | 100 GB free | eval-pool snapshots, fetched checkpoints, benchmark data caches |
+| network | stable outbound HTTPS + SSH | Hippius S3/Hub and the chain endpoint; SSH to the pod in the split shape |
+
+What actually exercises the GPU depends on config:
+
+* **Pure KOTH (the shipped defaults** — `gift_gate_mode = "off"`,
+  `cascade_enabled = false`**)**: only the private-pool duel runs, and it is
+  CPU-tuned — a CPU-only box works. Keep a GPU (local or as an eval pod)
+  available anyway: the owner can turn the gates below on, and without one your
+  rounds go inconclusive/degraded.
+* **GIFT-Eval gate on** (`gift_gate_mode = "shadow"` / `"enforce"`): every
+  round scores *both* king and challenger on gift-eval — GPU, every round.
+* **Cascade on** (`cascade_enabled = true`): normally free for you (the trainer
+  ships the numbers in the signed manifest), but the fallback runs the full
+  three-suite battery on your GPU — see
+  [Bench scores](#bench-scores-trainer-stamped-validator-fallback).
 
 ## 0. Install
 
-The validator's evaluator needs torch; add the Hippius (fetch checkpoints/pool)
-and chain (metagraph + weights) extras:
+The evaluator needs torch; add the Hippius (fetch checkpoints/pool) and chain
+(metagraph + weights) extras:
 
 ```bash
 git clone https://github.com/TensorLink-AI/cascade && cd cascade
 pip install -e '.[train,hippius,chain]'
-python -c "import torch; print('cuda:', torch.cuda.is_available())"   # must be True
+# GPU-box shape only — on a CPU orchestrator this prints False and that's fine:
+python -c "import torch; print('cuda:', torch.cuda.is_available())"
 ```
 
 ## 1. Make a wallet, register, and stake
@@ -112,10 +147,24 @@ cascade-validator --offline --chain-toml chain.testnet.toml
 
 ## 4. Run
 
+**GPU box** — everything local:
+
 ```bash
 cascade-validator --chain-toml chain.testnet.toml --network test \
-  --wallet-name my-validator --wallet-hotkey default
+  --wallet-name my-validator --wallet-hotkey default --device cuda
 # mainnet: --network finney
+```
+
+**CPU orchestrator + eval pod** — `--device` stays at its `cpu` default and the
+benchmark evals go to the first `final`/`any`-stage host in a `hosts.toml`
+(same format as the trainer's `scripts/remote_hosts.example.toml`):
+
+```bash
+cascade-validator --chain-toml chain.testnet.toml --network test \
+  --wallet-name my-validator --wallet-hotkey default \
+  --eval-hosts hosts.toml
+# log line to expect:
+#   GIFT-Eval gate offloaded to <name> (<host>); wallet + consensus stay local
 ```
 
 On startup it loads the eval pool (`loaded eval pool snapshot@block-… series=…`)
@@ -151,6 +200,31 @@ Three signals:
    A FAIL here means your validator and the audit disagree — investigate before
    trusting the round. See [`AUDIT.md`](AUDIT.md).
 
+## Bench scores: trainer-stamped, validator fallback
+
+When Cascade (`[scoring] cascade_enabled`) is on, each reign's checkpoints are
+ranked on six public-benchmark numbers — GIFT-Eval, BOOM, and TIME, CRPS + MASE
+each. Those numbers reach your validator one of two ways:
+
+1. **Trainer-stamped (authoritative).** The owner-trainer runs the benchmark
+   sidecar once on the king's checkpoint and stamps the six numbers onto that
+   entry in the **signed** manifest (`bench_scores`). Every validator reads the
+   identical values, so Cascade's warm-start selection is deterministic across
+   validators — and it costs you zero GPU time. This is the normal path.
+2. **Validator sidecar fallback (degraded).** Only when a manifest entry
+   carries **no** `bench_scores` (e.g. a trainer predating the Cascade hook)
+   does your validator score the checkpoint itself: the full
+   GIFT-Eval + BOOM + TIME battery via the out-of-process `benchmarks/` sidecar,
+   on your local `--device` or offloaded to your `--eval-hosts` pod. Two
+   caveats: it's expensive (full BOOM alone ≈ 26 min on an RTX 5090 — this is
+   the load the 24 GB VRAM minimum is sized for), and independently-run GPU
+   sweeps are **not bit-reproducible**, so validators on the fallback can log
+   slightly different numbers. Prefer the trainer-stamped path; treat sustained
+   fallback as something to raise with the owner.
+
+Either way, these public-benchmark numbers drive **only** Cascade's warm-start
+promotion. The dethrone verdict itself stays entirely on the private eval pool.
+
 ## What can go wrong
 
 | symptom | cause |
@@ -159,7 +233,9 @@ Three signals:
 | `rejecting manifest … signature_invalid` | wrong `[manifest] trainer_hotkey`, or the trainer published unsigned |
 | `no eval-pool snapshot published` | `pool_bucket` set but the owner hasn't published a snapshot, or wrong bucket/creds |
 | weights never set | no validator permit (insufficient stake), or the weight extrinsic is failing — check `btcli` and the log's `weight set failed` line |
-| CUDA not available | the evaluator needs a GPU; `pip install -e '.[train]'` on a CUDA box |
+| `gift-eval sidecar unavailable/errored` | the gift gate needs a GPU: pass `--device cuda` on a GPU box, or point `--eval-hosts` at a pod (see [Hardware](#hardware)); under `enforce` this makes rounds inconclusive |
+| CUDA errors with `--device cuda` | torch can't see the GPU — reinstall with `pip install -e '.[train]'` on a CUDA box and re-check `torch.cuda.is_available()` |
+| `--eval-hosts …: no 'final'/'any'-stage host found` | every host in the file is tagged `stage = "heat"` — the validator only offloads to `final`/`any`-stage hosts |
 | audit WARNs on `block-hash-onchain` / `commit-cutoff` | you're on a lite node without the historical block/commitment; point `--network` at an archive node for zero WARNs |
 
 ## Rewards
