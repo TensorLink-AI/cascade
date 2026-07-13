@@ -156,6 +156,37 @@ def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     assert sorted(e.size for e in manifest.entries_for_role("challenger")) == sizes
 
 
+def test_heat_complete_marker_written_when_heat_settles(cfg, tmp_path, monkeypatch):
+    """The provisioner's heat-teardown signal: once the field is screened and
+    finalists chosen, ``work_root/<round_id>/heat_complete.json`` appears with
+    the settled field — heat pods are safe to release from that moment."""
+    _patch_train_boundaries(monkeypatch)
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "1", "screened": 3, "finalists": ["c"]}
+    assert not (tmp_path / "1" / "heat_complete.json.tmp").exists()  # atomic publish
+
+
+def test_heat_complete_marker_written_even_without_a_screen(cfg, tmp_path, monkeypatch):
+    """Field ≤ finalists ⇒ no screening runs, but the heat stage is still
+    settled (no heat dispatch can follow) — the marker must appear anyway."""
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    runner.run_round(commits, king_hotkey="a", base_seed=7, block=10)
+
+    marker = json.loads((tmp_path / "7" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "7", "screened": 1, "finalists": ["b"]}
+
+
 def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     # Same field as above: cheapest (c) advances, everyone else is screened.
