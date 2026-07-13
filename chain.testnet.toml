@@ -20,7 +20,8 @@ description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Tot
 # fine-tune does, so the corpus budget is larger here and is a real signal knob.
 corpus_n_series      = 16384     # series drawn from each generator per training run
 min_length           = 64        # per-series length band (timesteps)
-max_length           = 2048
+max_length           = 4096      # = [training] context_length (train on the full context,
+                                 # as Toto 2.0 does — see chain.toml); keep in lockstep
 max_total_points     = 2_000_000_000 # raised off 64M; real corpus size is set by corpus_n_series + memory/streaming (see notes)
 max_generate_seconds = 600       # TESTNET: generator stall window (streaming: max seconds
                                  # between series). 1800s dwarfed the ~6-min heat budget —

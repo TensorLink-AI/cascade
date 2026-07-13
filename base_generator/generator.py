@@ -139,7 +139,7 @@ class Generator(DataGenerator):
 
         self._seed = int(seed)
         self._min_len = int(cfg.get("min_length", 64))
-        self._max_len = int(cfg.get("max_length", 2048))
+        self._max_len = int(cfg.get("max_length", 4096))
         if not (1 <= self._min_len <= self._max_len):
             raise ValueError(f"invalid length band [{self._min_len}, {self._max_len}]")
         # Generators are drawn at this length, then random-cropped into the band.

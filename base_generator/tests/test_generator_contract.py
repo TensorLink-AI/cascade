@@ -23,7 +23,7 @@ REPO_DIR = Path(__file__).resolve().parents[1]
 
 # Mirror chain.toml [generator] bounds.
 MIN_LEN = 64
-MAX_LEN = 2048
+MAX_LEN = 4096
 MAX_TOTAL_POINTS = 2_000_000_000
 MAX_CHANNELS = 1
 
