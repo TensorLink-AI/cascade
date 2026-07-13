@@ -1,0 +1,251 @@
+"""Health gate + hosts publication — a pod proves itself before joining the fleet.
+
+Every check is a pure predicate over an injected ``run_ssh(argv)`` boundary
+(canned CompletedProcess-like results; no network, no GPU), and the rendered
+hosts.toml must round-trip through the trainer's real ``load_hosts``."""
+
+from __future__ import annotations
+
+import tomllib
+from types import SimpleNamespace
+
+from cascade.provision import DEFAULT_FORWARD_ENV, PodAddress, render_hosts_toml
+from cascade.provision.health import EXPECTED_TORCH, HealthGate
+from cascade.provision.hostsfile import clear_hosts, write_hosts
+
+# ── fake ssh boundary ────────────────────────────────────────────────────────
+
+
+def _proc(stdout="", rc=0, stderr=""):
+    return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
+
+
+GOOD_L40S = {
+    "echo": _proc("cascade-health-ok\n"),
+    "nvidia-smi": _proc("NVIDIA L40S\nNVIDIA L40S\n"),
+    "runtime": _proc("3.11 2.4.1+cu124\n"),
+    "worker": _proc(""),
+    "printenv": _proc("sha256:" + "a" * 64 + "\n"),
+    "df": _proc("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "/dev/vda1 524288000 104857600 419430400 20% /\n"),   # 400 GB free
+}
+
+
+def _run_ssh(overrides=None, calls=None):
+    """A canned run_ssh: routes each remote argv to its scripted result."""
+    table = {**GOOD_L40S, **(overrides or {})}
+
+    def run(argv):
+        if calls is not None:
+            calls.append(list(argv))
+        if argv[0] == "echo":
+            return table["echo"]
+        if argv[0] == "nvidia-smi":
+            return table["nvidia-smi"]
+        if argv[0] == "printenv":
+            return table["printenv"]
+        if argv[0] == "df":
+            return table["df"]
+        if "torch.__version__" in argv[-1]:
+            return table["runtime"]
+        if "import cascade.trainer.worker" in argv[-1]:
+            return table["worker"]
+        raise AssertionError(f"unexpected remote argv: {argv}")
+
+    return run
+
+
+def _gate(**kw):
+    kw.setdefault("sku", "NVIDIA L40S")
+    kw.setdefault("gpus", 2)
+    kw.setdefault("image_digest", "reg.example/worker@sha256:" + "a" * 64)
+    return HealthGate(**kw)
+
+
+# ── the gate: all seven checks ───────────────────────────────────────────────
+
+
+def test_healthy_pod_passes_all_checks():
+    report = _gate(hippius_probe=lambda: True).check(_run_ssh())
+    assert report.ok and report.failures == ()
+    assert [c.name for c in report.checks] == [
+        "ssh_echo", "gpu_sku", "runtime_pin", "worker_import",
+        "image_digest", "hippius", "disk",
+    ]
+
+
+def test_ssh_echo_failure():
+    report = _gate().check(_run_ssh({"echo": _proc(rc=255, stderr="auth denied")}))
+    assert not report.ok
+    assert report.failures[0].name == "ssh_echo"
+
+
+def test_gpu_sku_is_exact_l40_is_not_l40s():
+    # The classic marketplace bait: an L40 sold on an L40S listing.
+    report = _gate().check(_run_ssh({"nvidia-smi": _proc("NVIDIA L40\nNVIDIA L40\n")}))
+    failed = {c.name for c in report.failures}
+    assert "gpu_sku" in failed
+
+
+def test_gpu_sku_every_line_must_match():
+    # 7 good GPUs + 1 wrong one is a broken pod, not a 7/8 pod.
+    out = "\n".join(["NVIDIA L40S"] * 7 + ["NVIDIA L40"]) + "\n"
+    report = _gate(gpus=8).check(_run_ssh({"nvidia-smi": _proc(out)}))
+    assert "gpu_sku" in {c.name for c in report.failures}
+
+
+def test_gpu_count_must_cover_the_pod_shape():
+    # An "8x cluster" exposing 4 GPUs can't serve 8 hosts.toml slots.
+    report = _gate(gpus=8).check(_run_ssh())        # canned pod shows 2 GPUs
+    assert "gpu_sku" in {c.name for c in report.failures}
+
+
+def test_runtime_pin_rejects_torch_drift():
+    report = _gate().check(_run_ssh({"runtime": _proc("3.11 2.12.1+cu130\n")}))
+    fail = next(c for c in report.failures if c.name == "runtime_pin")
+    assert EXPECTED_TORCH in fail.detail            # detail names the pinned runtime
+
+
+def test_runtime_pin_rejects_python_drift():
+    report = _gate().check(_run_ssh({"runtime": _proc("3.12 2.4.1+cu124\n")}))
+    assert "runtime_pin" in {c.name for c in report.failures}
+
+
+def test_runtime_pin_is_configurable_for_a_repin():
+    gate = _gate(expected_python="3.12", expected_torch="2.5.0+cu124")
+    report = gate.check(_run_ssh({"runtime": _proc("3.12 2.5.0+cu124\n")}))
+    assert "runtime_pin" not in {c.name for c in report.failures}
+
+
+def test_worker_import_failure():
+    report = _gate().check(
+        _run_ssh({"worker": _proc(rc=1, stderr="ModuleNotFoundError: cascade")}))
+    assert "worker_import" in {c.name for c in report.failures}
+
+
+def test_image_digest_matches_pin_across_ref_forms():
+    # Pod env may carry the bare digest or the full ref — both normalise.
+    for env_val in ("sha256:" + "a" * 64, "reg.example/worker@sha256:" + "a" * 64):
+        report = _gate().check(_run_ssh({"printenv": _proc(env_val + "\n")}))
+        assert "image_digest" not in {c.name for c in report.failures}
+
+
+def test_image_digest_mismatch_and_unset_fail_when_pinned():
+    wrong = _gate().check(_run_ssh({"printenv": _proc("sha256:" + "b" * 64)}))
+    assert "image_digest" in {c.name for c in wrong.failures}
+    unset = _gate().check(_run_ssh({"printenv": _proc(rc=1)}))
+    assert "image_digest" in {c.name for c in unset.failures}
+
+
+def test_image_digest_skipped_when_unpinned():
+    # Mirrors assert_train_image: an empty pin means no check.
+    report = _gate(image_digest="").check(_run_ssh({"printenv": _proc(rc=1)}))
+    assert "image_digest" not in {c.name for c in report.failures}
+
+
+def test_hippius_probe_injected():
+    assert not _gate(hippius_probe=lambda: False).check(_run_ssh()).ok
+    assert _gate(hippius_probe=lambda: True).check(_run_ssh()).ok
+    assert _gate(hippius_probe=None).check(_run_ssh()).ok      # unconfigured ⇒ skipped
+
+
+def test_disk_headroom_gate():
+    thin = _proc("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                 "/dev/vda1 524288000 519045120 5242880 99% /\n")   # 5 GB free
+    report = _gate(min_disk_gb=20.0).check(_run_ssh({"df": thin}))
+    fail = next(c for c in report.failures if c.name == "disk")
+    assert "5.0 GB" in fail.detail
+    assert _gate(min_disk_gb=4.0).check(_run_ssh({"df": thin})).ok
+
+
+def test_transport_exception_fails_the_check_not_the_gate():
+    def exploding(argv):
+        raise TimeoutError("ssh hung")
+
+    report = _gate().check(exploding)
+    assert not report.ok
+    assert all(not c.ok for c in report.checks if c.name != "hippius")
+    assert "hippius" not in {c.name for c in report.failures}  # orchestrator-side, no ssh
+
+
+def test_report_summary_names_each_failure():
+    report = _gate().check(_run_ssh({"nvidia-smi": _proc("NVIDIA L40\nNVIDIA L40\n")}))
+    assert "gpu_sku=FAIL" in report.summary() and "ssh_echo=ok" in report.summary()
+
+
+# ── per-GPU fan-out + round trip through the trainer's own loader ────────────
+
+
+def _render(addrs, *, prefix, stage, gpus):
+    return render_hosts_toml(
+        addrs, key_path="~/.ssh/cascade_ed25519", forward_env=DEFAULT_FORWARD_ENV,
+        name_prefix=prefix, stage=stage, gpus_per_pod=gpus,
+    )
+
+
+def test_multi_gpu_pod_fans_out_one_entry_per_gpu():
+    data = tomllib.loads(_render([PodAddress("10.0.0.1", 40001)],
+                                 prefix="cascade-final", stage="final", gpus=2))
+    hosts = data["host"]
+    assert [h["name"] for h in hosts] == ["cascade-final-0-g0", "cascade-final-0-g1"]
+    assert [h["cuda_device"] for h in hosts] == ["0", "1"]
+    # Same physical box behind every entry — that's the expected_gpu win.
+    assert all(h["host"] == "10.0.0.1" and h["port"] == 40001 for h in hosts)
+
+
+def test_single_gpu_keeps_legacy_names():
+    data = tomllib.loads(_render([PodAddress("10.0.0.1")], prefix="cascade-pod",
+                                 stage="any", gpus=1))
+    assert [h["name"] for h in data["host"]] == ["cascade-pod-0"]
+    assert data["host"][0]["cuda_device"] == "0"
+
+
+def test_round_trip_through_trainer_load_hosts(tmp_path):
+    # THE contract test: a concatenated heat + final render must parse via the
+    # trainer's real loader with stages and cuda_device honoured, exactly as
+    # TrainerRunner._hosts_for will consume it.
+    from cascade.trainer.remote import load_hosts
+
+    heat = _render([PodAddress("10.0.0.1", 22), PodAddress("10.0.0.2", 40060)],
+                   prefix="cascade-900-heat", stage="heat", gpus=4)
+    final = _render([PodAddress("10.0.0.3", 40001)],
+                    prefix="cascade-900-final", stage="final", gpus=2)
+    path = tmp_path / "hosts.toml"
+    write_hosts(path, heat + final)
+
+    hosts = load_hosts(path)
+    assert len(hosts) == 2 * 4 + 2
+    heat_hosts = [h for h in hosts if h.stage == "heat"]
+    final_hosts = [h for h in hosts if h.stage == "final"]
+    assert len(heat_hosts) == 8 and len(final_hosts) == 2
+    assert [h.cuda_device for h in heat_hosts] == ["0", "1", "2", "3"] * 2
+    assert [h.name for h in final_hosts] == ["cascade-900-final-0-g0",
+                                             "cascade-900-final-0-g1"]
+    assert [h.cuda_device for h in final_hosts] == ["0", "1"]
+    assert all(h.host == "10.0.0.3" for h in final_hosts)
+
+
+# ── hosts publication (atomic write / clear) ─────────────────────────────────
+
+
+def test_write_hosts_is_atomic_and_creates_parent(tmp_path):
+    path = tmp_path / "run" / "hosts.toml"
+    write_hosts(path, _render([PodAddress("10.0.0.1")], prefix="p", stage="heat", gpus=1))
+    assert path.is_file()
+    assert not path.with_suffix(".toml.tmp").exists()          # tmp renamed away
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["host"]
+
+
+def test_clear_hosts_means_local_fallback(tmp_path):
+    # An empty hosts file is the trainer's "no fleet" signal: load_hosts raises
+    # and _reload_remote_hosts falls back to local training — round never lost.
+    import pytest
+
+    from cascade.trainer.remote import RemoteDispatchError, load_hosts
+
+    path = tmp_path / "hosts.toml"
+    write_hosts(path, _render([PodAddress("10.0.0.1")], prefix="p", stage="heat", gpus=1))
+    clear_hosts(path)
+    assert tomllib.loads(path.read_text(encoding="utf-8")) == {}  # valid, empty TOML
+    with pytest.raises(RemoteDispatchError):
+        load_hosts(path)

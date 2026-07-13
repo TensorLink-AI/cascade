@@ -177,13 +177,19 @@ def render_hosts_toml(
     name_prefix: str = "cascade-pod",
     provider: str = "",
     stage: str = "any",
+    gpus_per_pod: int = 1,
 ) -> str:
     """Render a trainer ``hosts.toml`` (schema: ``remote_hosts.example.toml``).
 
-    One ``[[host]]`` per pod; each pod is single-GPU so ``cuda_device`` is always
-    ``"0"``. ``forward_env`` lists the credential env vars the orchestrator
-    forwards inline per dispatch (they are NOT seeded onto the pod). The array
-    literals are emitted as TOML/JSON-style ``["a", "b"]``.
+    One ``[[host]]`` per GPU: a single-GPU pod (``gpus_per_pod=1``, the default)
+    is one entry named ``{prefix}-{i}`` with ``cuda_device = "0"``; a multi-GPU
+    pod fans out into ``gpus_per_pod`` entries named ``{prefix}-{i}-g{g}`` with
+    ``cuda_device`` ``"0"``…``"N-1"`` — same address, one training slot per GPU
+    (``RemoteHost.cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` per dispatch, so
+    the trainer's round-robin lands one job per GPU). ``forward_env`` lists the
+    credential env vars the orchestrator forwards inline per dispatch (they are
+    NOT seeded onto the pod). The array literals are emitted as TOML/JSON-style
+    ``["a", "b"]``.
 
     ``stage`` ("any" | "heat" | "final") tags which round stage these pods serve
     (see ``cascade.trainer.remote.RemoteHost``): a homogeneous batch is one stage,
@@ -193,6 +199,8 @@ def render_hosts_toml(
     """
     if not addrs:
         raise ProvisionError("cannot render hosts.toml with zero pods")
+    if gpus_per_pod < 1:
+        raise ProvisionError(f"gpus_per_pod must be >= 1; got {gpus_per_pod}")
 
     def _arr(items: Sequence[str]) -> str:
         return json.dumps(list(items))
@@ -204,26 +212,28 @@ def render_hosts_toml(
         "# Hippius creds are forwarded inline per dispatch (forward_env), never on the pod.",
     ]
     for i, addr in enumerate(addrs):
-        lines += [
-            "",
-            "[[host]]",
-            f'name          = "{name_prefix}-{i}"',
-            f'host          = "{addr.ip}"',
-            f"port          = {addr.ssh_port}",
-            f'user          = "{user}"',
-            f'key_path      = "{key_path}"',
-            f'remote_python = "{remote_python}"',
-            f'workdir       = "{workdir}"',
-            'cuda_device   = "0"',
-        ]
-        if stage != "any":
-            lines.append(f'stage         = "{stage}"')
-        if chain_toml:
-            lines.append(f'chain_toml    = "{chain_toml}"')
-        lines += [
-            f"forward_env   = {_arr(forward_env)}",
-            f"ssh_options   = {_arr(ssh_options)}",
-        ]
+        for g in range(gpus_per_pod):
+            name = f"{name_prefix}-{i}" if gpus_per_pod == 1 else f"{name_prefix}-{i}-g{g}"
+            lines += [
+                "",
+                "[[host]]",
+                f'name          = "{name}"',
+                f'host          = "{addr.ip}"',
+                f"port          = {addr.ssh_port}",
+                f'user          = "{user}"',
+                f'key_path      = "{key_path}"',
+                f'remote_python = "{remote_python}"',
+                f'workdir       = "{workdir}"',
+                f'cuda_device   = "{g}"',
+            ]
+            if stage != "any":
+                lines.append(f'stage         = "{stage}"')
+            if chain_toml:
+                lines.append(f'chain_toml    = "{chain_toml}"')
+            lines += [
+                f"forward_env   = {_arr(forward_env)}",
+                f"ssh_options   = {_arr(ssh_options)}",
+            ]
     return "\n".join(lines) + "\n"
 
 
