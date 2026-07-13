@@ -230,8 +230,14 @@ class Toto2Trainer:
         tokens = 0
         step = 0
         last_loss = float("nan")
-        t0 = time.time()
-        deadline = t0 + contract.max_train_seconds
+        # The wall-clock cap measures ACTUAL TRAINING TIME: the clock starts at
+        # the first training batch, so registry fetch, sandbox boot, and model
+        # init never eat the budget (material at testnet-scale budgets). Waits
+        # for data DURING training do count — that is the anti-trickler bound —
+        # and a first batch that never arrives is killed by the sandbox's
+        # max_generate_seconds inactivity timeout, not this deadline.
+        t0 = time.time()                     # provisional (re-anchored at first batch)
+        deadline: float | None = None
 
         # CPM masks are drawn per batch from a dedicated generator so the run
         # stays byte-reproducible under the shared training_seed.
@@ -247,6 +253,9 @@ class Toto2Trainer:
             stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
         ):
+            if deadline is None:             # first batch: training starts NOW
+                t0 = time.time()
+                deadline = t0 + contract.max_train_seconds
             # Standardize from float64: downcasting the raw series first would
             # quantize away small fluctuations at large levels (float32 has ~7
             # digits) before the scaler ever sees them. Only the O(1)-scale z
@@ -303,12 +312,14 @@ class Toto2Trainer:
             if tokens >= token_budget or time.time() > deadline:
                 break
 
-        train_seconds = time.time() - t0
+        train_seconds = time.time() - t0     # actual training time (from first batch)
         # First-reached-stops: the loop ends on the token budget OR the wall-clock
         # deadline. A deadline stop leaves the model UNDER the contract's compute
         # — self-penalizing in a heat, but in a final it silently breaks the
         # equal-compute pairing, so it must be loud in the record, never implicit.
-        deadline_hit = tokens < token_budget and time.time() > deadline
+        deadline_hit = (
+            deadline is not None and tokens < token_budget and time.time() > deadline
+        )
         if deadline_hit:
             log.warning(
                 "wall-clock deadline (%ds) hit at %d/%d tokens (%.0f%%): checkpoint is "

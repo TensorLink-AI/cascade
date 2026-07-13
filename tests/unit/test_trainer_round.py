@@ -379,7 +379,10 @@ def test_heat_and_final_contracts_use_scaled_guard(cfg, tmp_path, monkeypatch):
     heat = [c for c in contracts if c.target_train_hours == cfg.round.heat_train_hours]
     final = [c for c in contracts if c.target_train_hours == cfg.training.target_train_hours]
     assert len(heat) == 3 and len(final) == 2  # 3 screened; king + finalist finals
-    expected_guard = int(round(3.0 * cfg.round.heat_train_hours * 3600))
+    expected_guard = max(
+        int(round(cfg.round.heat_guard_factor * cfg.round.heat_train_hours * 3600)),
+        cfg.round.heat_guard_floor_seconds,
+    )
     assert all(c.max_train_seconds == expected_guard for c in heat)
     assert all(c.train_tokens == c.tokens_for_hours(cfg.round.heat_train_hours) for c in heat)
     assert all(c.max_train_seconds == cfg.training.max_train_seconds for c in final)
@@ -617,7 +620,11 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
                _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
     runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
-    heat_guard = cfg.screen_contract().for_hours(cfg.round.heat_train_hours).max_train_seconds
+    heat_guard = cfg.screen_contract().for_hours(
+        cfg.round.heat_train_hours,
+        guard_factor=cfg.round.heat_guard_factor,
+        guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+    ).max_train_seconds
     heat_timeouts = {t for is_heat, t in timeouts if is_heat}
     final_timeouts = {t for is_heat, t in timeouts if not is_heat}
     assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml

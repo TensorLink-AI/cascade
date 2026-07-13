@@ -117,8 +117,12 @@ weight_decay       = 0.05
 lr_schedule        = "warmup_cosine"
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours so the
-                                  # token budget completes; kills a pathologically slow run)
+max_train_seconds  = 10800       # hard wall-clock cap = the 3h budget itself (owner
+                                  # policy): a final stops at the token budget or 3h of
+                                  # wall-clock, whichever first. A time stop is flagged
+                                  # deadline_hit — it means the corpus couldn't sustain
+                                  # reference throughput (or the pod is slower than the
+                                  # reference box; raise this if renting slower SKUs).
 # corpus feed mode — how generator data reaches the trainer. Identical for king
 # and challenger (folded into contract_digest). Three modes to A/B for now:
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
@@ -188,6 +192,17 @@ heat_num_samples = 20     # sample forecasts per window in the heat screen (0 = 
                           # stable at ~20 samples — and the screen eval runs sequentially on
                           # the orchestrator CPU, so this keeps a large field's screening from
                           # rivalling its training time. The final verdict still uses [eval].
+# Heat wall-clock cap: max(heat_guard_factor × heat_train_hours, floor), never
+# above [training] max_train_seconds. Every run stops at its TOKEN budget or
+# this deadline, whichever is reached first; a deadline stop leaves the model
+# under the contract's compute and is flagged deadline_hit in the run metrics.
+# 1.0 = the budget hours ARE the cap (a 0.5h heat may run 0.5h of wall-clock).
+# RAISE THIS if heat pods are a slower SKU than the reference-throughput box —
+# at 1.0 a slower SKU time-truncates every heat, and a screen where entrants hit
+# the wall rewards fast-to-generate data over good data. The floor absorbs the
+# fixed overheads (sandbox boot, generator warmup) that don't shrink with budget.
+heat_guard_factor        = 1.0
+heat_guard_floor_seconds = 900
 finalists        = 1      # challengers promoted from the heat to the 3h final (top-N)
 # Anti-spam: 1 hotkey = 1 submission for the lifetime of the trainer state. A
 # challenger hotkey that has entered a heat is burned (persisted); it must

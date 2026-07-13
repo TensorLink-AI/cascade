@@ -95,8 +95,10 @@ weight_decay       = 0.05
 lr_schedule        = "warmup_cosine"
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours so the
-                                  # token budget completes; kills a pathologically slow run)
+max_train_seconds  = 900         # TESTNET: cap = the 15-min final budget itself, measured
+                                  # from the first training batch. Token budget or deadline —
+                                  # first reached stops; a time stop is flagged deadline_hit.
+                                  # (Was 14400 — longer than the whole 3h testnet epoch.)
 # corpus feed mode — how generator data reaches the trainer. Identical for king
 # and challenger (folded into contract_digest). Three modes to A/B for now:
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
@@ -153,6 +155,12 @@ heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
 heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [eval] num_samples);
                           # ranking-only, so small keeps the CPU screen quick on a 3h epoch
+# Heat wall-clock cap (see chain.toml): budget hours = the cap, measured from the
+# FIRST TRAINING BATCH (fetch/sandbox boot excluded), token budget or deadline —
+# first reached stops, deadline stop flagged deadline_hit. Testnet floor is low
+# so the ~6-min heat budget really is the cap.
+heat_guard_factor        = 1.0
+heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 # Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at

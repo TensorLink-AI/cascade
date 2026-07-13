@@ -671,10 +671,16 @@ class TrainerRunner:
                             n, len(challengers))
             return list(challengers[:n]), None
 
-        # for_hours scales the token budget AND the hard wall-clock guard to the
-        # cheap heat budget — a stalling generator costs minutes of a heat slot,
-        # never the final-scale max_train_seconds.
-        heat_contract = self.cfg.screen_contract().for_hours(self.cfg.round.heat_train_hours)
+        # for_hours scales the token budget AND the hard wall-clock cap to the
+        # cheap heat budget — the run stops at whichever is reached first, so a
+        # stalling generator costs minutes of a heat slot, never the final-scale
+        # max_train_seconds.
+        rnd = self.cfg.round
+        heat_contract = self.cfg.screen_contract().for_hours(
+            rnd.heat_train_hours,
+            guard_factor=rnd.heat_guard_factor,
+            guard_floor_seconds=rnd.heat_guard_floor_seconds,
+        )
         heat_tokens = heat_contract.train_tokens
         trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
         trained_hotkeys = {c.hotkey for c, _ in trained}

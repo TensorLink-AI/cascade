@@ -218,3 +218,15 @@ def test_heat_num_samples_knob(cfg):
     assert cfg.round.heat_num_samples == 20
     bare = replace(cfg.round, heat_num_samples=0)
     assert (bare.heat_num_samples or cfg.eval.num_samples) == cfg.eval.num_samples
+
+
+def test_for_hours_guard_knobs_override_defaults(cfg):
+    # [round] heat_guard_factor / heat_guard_floor_seconds feed straight through:
+    # 1.0 = the budget hours ARE the cap; a bigger factor buys slower-SKU headroom.
+    c = cfg.training.primary_size
+    assert c.for_hours(0.5).max_train_seconds == 1800                 # 1.0 default
+    assert c.for_hours(0.5, guard_factor=3.0).max_train_seconds == 5400
+    assert c.for_hours(0.1, guard_floor_seconds=300).max_train_seconds == 360
+    # chain.toml ships the owner policy: cap == budget, final cap == 3h budget
+    assert cfg.round.heat_guard_factor == 1.0
+    assert cfg.training.max_train_seconds == int(cfg.training.target_train_hours * 3600)

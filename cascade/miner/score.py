@@ -109,10 +109,15 @@ def score_generator(
 
     repo = Path(repo_dir)
     hours = train_hours if train_hours is not None else cfg.round.heat_train_hours
-    # for_hours scales the wall-clock guard down with the budget (same contract
-    # the heat screener trains under), so a bug that stalls your generator fails
-    # in minutes locally instead of hanging for the final's full guard.
-    contract = cfg.screen_contract().for_hours(hours)     # primary/screen size
+    # for_hours scales the wall-clock cap down with the budget (same contract +
+    # [round] guard knobs the heat screener trains under), so a bug that stalls
+    # your generator fails in minutes locally, and a slow generator shows the
+    # same deadline truncation here that it would suffer in the real heat.
+    contract = cfg.screen_contract().for_hours(           # primary/screen size
+        hours,
+        guard_factor=cfg.round.heat_guard_factor,
+        guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+    )
     token_budget = contract.train_tokens
     n_win = n_windows if n_windows is not None else min(cfg.round.heat_n_windows, cfg.eval.n_windows)
     seeds = RoundSeeds.derive(seed, cfg.training)
