@@ -303,13 +303,13 @@ class ProvisionerLoop:
                 log.warning("provider %r not configured; skipping", name)
                 continue
             try:
-                if not prov.available(sp.sku, count):
+                if not prov.available(sp.marketplace_sku, count):
                     log.info("provider %s: no capacity for %d×%s", name, count, sp.sku)
                     continue
             except Exception as e:  # noqa: BLE001
                 log.warning("provider %s availability probe failed (%s); skipping", name, e)
                 continue
-            price = self._offer_price(prov, sp.sku)
+            price = self._offer_price(prov, sp.marketplace_sku)
             if price is None:
                 # Unknown price ⇒ assume the stage cap: the budget breaker then
                 # projects at the worst price we were willing to pay.
@@ -338,7 +338,7 @@ class ProvisionerLoop:
     def _rent_stage(self, round_id: int, stage: str, prov: object,
                     fl: StageFleet) -> list[tuple[PodInstance, PodAddress]]:
         spec = LaunchSpec(
-            sku=_sku_for(self.policy, stage), count=fl.pods, image=self.render.image,
+            sku=_market_sku_for(self.policy, stage), count=fl.pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
             name_prefix=f"{POD_TAG}{round_id}-{stage}",
         )
@@ -643,6 +643,11 @@ class ProvisionerLoop:
 
 def _sku_for(policy: ProvisionPolicy, stage: str) -> str:
     return policy.heat.sku if stage == "heat" else policy.final.sku
+
+
+def _market_sku_for(policy: ProvisionPolicy, stage: str) -> str:
+    sp = policy.heat if stage == "heat" else policy.final
+    return sp.marketplace_sku
 
 
 def _gpus_for(policy: ProvisionPolicy, stage: str) -> int:

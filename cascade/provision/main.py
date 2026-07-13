@@ -67,7 +67,8 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     if overhead < 1.0:
         raise ProvisionError(f"[provisioner.{stage}] slot_overhead must be >= 1.0; got {overhead}")
     return StagePolicy(sku=sku, gpus_per_pod=gpus, max_pods=max_pods,
-                       providers=providers, max_price_hr=price, slot_overhead=overhead)
+                       providers=providers, max_price_hr=price, slot_overhead=overhead,
+                       market_sku=str(raw.get("market_sku", "")).strip())
 
 
 def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:

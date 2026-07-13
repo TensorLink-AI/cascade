@@ -64,6 +64,14 @@ class StagePolicy:
     providers: tuple[str, ...]
     max_price_hr: float
     slot_overhead: float = 1.3
+    # The marketplace's name for the same silicon when it differs from the
+    # nvidia-smi device string ("A6000" on lium vs "NVIDIA RTX A6000" on the
+    # pod). Empty = same as ``sku``. The health gate ALWAYS asserts ``sku``.
+    market_sku: str = ""
+
+    @property
+    def marketplace_sku(self) -> str:
+        return self.market_sku or self.sku
 
 
 @dataclass(frozen=True)
