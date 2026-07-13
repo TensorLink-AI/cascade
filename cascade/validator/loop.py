@@ -53,6 +53,7 @@ from . import state as state_mod
 from .state import ChampionState, StateTransition
 
 if TYPE_CHECKING:
+    from ..trainer.remote import RemoteHost
     from .cascade import CascadeController
 
 log = logging.getLogger("cascade.validator")
@@ -112,6 +113,11 @@ class ValidatorRunner:
     gift_rows_fn: GiftRowsFn | None = None    # injected in tests; defaults to the sidecar bridge
     cache_dir: Path | None = None
     device: str = "cpu"
+    # Optional GPU pod for the GIFT-Eval gate: when set, the (heavy, paired)
+    # gift-eval runs are offloaded to this pod (see cascade.validator.eval_offload)
+    # while the wallet and every consensus decision stay on this box. None ⇒ the
+    # gate runs on ``device`` locally. Never used for the private-pool duel.
+    eval_host: RemoteHost | None = None
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
     # the reign clock is reset on each dethrone, every reigning-king checkpoint is
@@ -197,15 +203,30 @@ class ValidatorRunner:
         sidecar bridge on the fetched checkpoint dir."""
         if self.gift_rows_fn is not None:
             return self.gift_rows_fn(entry)
-        from ..eval.benchmarks import run_gift_rows
 
         ec = self.cfg.eval
         dest = self._fetch_checkpoint_dir(entry)
+        num_samples = ec.gift_gate_num_samples or ec.num_samples
+        if self.eval_host is not None:
+            # Offload the (heavy, paired) gift-eval to the GPU pod; the paired
+            # bootstrap and every consensus decision stay on this box.
+            from .eval_offload import gift_rows_via_host
+
+            return gift_rows_via_host(
+                self.eval_host, dest,
+                datasets=ec.gift_gate_datasets,
+                num_samples=num_samples,
+                data_dir=(ec.gift_gate_data_dir or None),
+                device="cuda",
+                timeout_s=ec.gift_gate_timeout_s,
+            )
+        from ..eval.benchmarks import run_gift_rows
+
         return run_gift_rows(
             dest,
             project_dir=ec.benchmark_project_dir,
             datasets=ec.gift_gate_datasets,
-            num_samples=ec.gift_gate_num_samples or ec.num_samples,
+            num_samples=num_samples,
             device=self.device,
             data_dir=(ec.gift_gate_data_dir or None),
             timeout_s=ec.gift_gate_timeout_s,
@@ -458,8 +479,20 @@ class ValidatorRunner:
         chal_scores: list[WindowScore] = []
         score_records: list[EntryScores] = []
         for size in paired_sizes:
+            import time as _time
+
+            _t0 = _time.perf_counter()
             ks = self._evaluate(king_by_size[size], windows)
+            _t_king = _time.perf_counter() - _t0
+            _t1 = _time.perf_counter()
             cs = self._evaluate(chal_by_size[size], windows)
+            _t_chal = _time.perf_counter() - _t1
+            log.info(
+                "round=%s eval-timing size=%s device=%s n_windows=%d num_samples=%d "
+                "king=%.1fs challenger=%.1fs total=%.1fs",
+                manifest.round_id, size, self.device, len(windows),
+                self.cfg.eval.num_samples, _t_king, _t_chal, _t_king + _t_chal,
+            )
             king_scores += ks
             chal_scores += cs
             for entry, scores in ((king_by_size[size], ks), (chal_by_size[size], cs)):
@@ -1024,10 +1057,12 @@ def build_runner(
     chain_toml: Path | None = None,
     cache_dir: Path | None = None,
     device: str = "cpu",
+    eval_host: RemoteHost | None = None,
 ) -> ValidatorRunner:
     """Construct a runner from ``chain.toml``, restoring persisted champion
     state. Wallet/chain wiring for live weight-setting is attached by
-    ``cascade-validator`` (see main.py)."""
+    ``cascade-validator`` (see main.py). ``eval_host`` (optional) offloads the
+    GIFT-Eval gate to a GPU pod while the wallet stays on this box."""
     from ..shared.config import load_chain_config
 
     cfg = load_chain_config(chain_toml)
@@ -1036,5 +1071,5 @@ def build_runner(
     cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
     return ValidatorRunner(
         cfg=cfg, state=_load_state(cfg.validator.state_db_path),
-        cache_dir=cache_dir, device=device, cascade=cascade,
+        cache_dir=cache_dir, device=device, cascade=cascade, eval_host=eval_host,
     )

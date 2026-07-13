@@ -24,6 +24,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wallet-path", default=None)
     p.add_argument("--cache-dir", type=Path, default=None, help="Local cache for fetched pool/ckpts.")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--eval-hosts", type=Path, default=None,
+                   help="hosts.toml with a GPU pod to offload the GIFT-Eval gate to "
+                        "(the first 'final'/'any'-stage host is used). Wallet + all "
+                        "consensus decisions stay on this box; only gift-eval runs on "
+                        "the pod. Omit to run the gate locally on --device.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -35,10 +40,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    eval_host = None
+    if args.eval_hosts is not None:
+        from ..trainer.remote import load_hosts
+        candidates = [h for h in load_hosts(args.eval_hosts)
+                      if getattr(h, "stage", "any") in ("any", "final")]
+        if not candidates:
+            raise SystemExit(f"--eval-hosts {args.eval_hosts}: no 'final'/'any'-stage host found")
+        eval_host = candidates[0]
+        logging.getLogger("cascade.validator").info(
+            "GIFT-Eval gate offloaded to %s (%s); wallet + consensus stay local",
+            eval_host.name, eval_host.host)
+
     runner = build_runner(
         chain_toml=args.chain_toml,
         cache_dir=args.cache_dir,
         device=args.device,
+        eval_host=eval_host,
     )
 
     if args.offline:

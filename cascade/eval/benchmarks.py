@@ -152,6 +152,18 @@ def run_gift_rows(
     report = _invoke_sidecar(
         checkpoint_dir, project_dir, tail, timeout_s=timeout_s, uv_bin=uv_bin
     )
+    return gift_rows_from_report(report)
+
+
+def gift_rows_from_report(report: dict | None) -> dict | None:
+    """Parse the gift-eval per-config rows + data revision out of a sidecar
+    report — the exact shape the consensus gate consumes::
+
+        {"status": "ok", "rows": [...], "revision": "<hf-commit>" | None}
+
+    ``None`` when the report is missing or carries no gift-eval suite. Shared by
+    the local sidecar (:func:`run_gift_rows`) and the remote eval-offload
+    (``cascade.validator.eval_offload``) so both parse a report identically."""
     if report is None:
         return None
     revision = (report.get("data_revisions") or {}).get("gift-eval")
