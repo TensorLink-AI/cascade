@@ -1,0 +1,88 @@
+# Example config for `cascade-provisioner` — the per-round GPU pod renter.
+#
+#   cascade-provisioner --config provision.toml --chain-toml chain.toml \
+#       --work-root /root/cascade/_train_work [--dry-run] [--once]
+#
+# This file is OPERATOR-LOCAL: keep it out of git (it names your SSH key and
+# hosts file) and OFF the public chain.toml. Round shape (epoch cadence, final
+# training hours, the image-digest pin) is read from chain.toml — this file
+# only holds the RENTAL policy: what to rent, where, and how much to spend.
+#
+# The provisioner holds NO wallet — only provider API keys (env:
+# SHADEFORM_API_KEY / LIUM_API_KEY, see deploy/cascade-provisioner.service)
+# and the orchestrator's SSH keypair. Signing/publishing stays on the trainer.
+
+[provisioner]
+# Where the trainer's --remote-hosts points. The provisioner writes this file
+# atomically per round (heat + final entries), re-renders it final-only when
+# the heat settles, and EMPTIES it when it can't rent — an empty file is the
+# trainer's explicit "train locally this round" signal.
+hosts_path = "/root/cascade/hosts.toml"
+
+# Crash-safe rental ledger (default: <work-root>/provisioner_state.json).
+# Restarts resume teardown from here; delete it only if you have verified by
+# hand that no cascade-* pod is still running on any provider.
+state_path = "/root/cascade/_train_work/provisioner_state.json"
+
+# Digest-pinned worker image (see docs/DEPLOY_PODS.md §1). MUST be @sha256 —
+# a moving tag breaks the expected_gpu / train_image_digest contract.
+image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+# Orchestrator SSH keypair: the PUBLIC key is injected into each pod
+# ($SSH_PUBKEY); the PRIVATE key path is written into hosts.toml for the
+# trainer's dispatches (and used by the provisioner's own health checks).
+ssh_pubkey   = "~/.ssh/cascade_ed25519.pub"     # inline "ssh-…" also accepted
+ssh_key_path = "~/.ssh/cascade_ed25519"
+
+# Rent inside the last N blocks of the epoch (~12s each; 25 ≈ 5 min). Must sit
+# within the trainer's reveal margin — the field is only countable once timed
+# reveals have landed — and be < epoch_blocks. Pods finish booting AFTER the
+# round starts; the trainer's --hosts-wait-seconds covers that gap.
+trigger_margin_blocks = 25
+
+# HARD per-round spend ceiling in USD, projected at WORST case (every pod
+# billed for the full TTL). If the projection exceeds this, the round rents
+# NOTHING and the trainer trains locally — a runaway field can never surprise
+# you on the bill.
+max_spend_per_round = 25.0
+
+# Pod time-to-live in epochs — the no-cooperation teardown backstop. Even if
+# the heat marker, the manifest, and the ledger are ALL lost, every pod dies
+# this many epochs after rent.
+ttl_epochs = 1
+
+# Health-gate knobs (see cascade/provision/health.py for the full seven).
+min_disk_gb = 20.0
+
+# Pod-side layout (matches deploy/Dockerfile).
+remote_python = "/root/cascade/.venv/bin/python"
+workdir       = "/root/cascade"
+# chain_toml  = "/root/cascade/chain.testnet.toml"   # only if non-default on the pod
+poll_seconds  = 30
+
+# ── heat fleet: cheap SKU, sized off the revealed field ──────────────────────
+# Heat checkpoints are trainer-internal (screened and discarded, never
+# validated), so heats run on whatever is cheap — here 8×A6000 clusters. The
+# fleet is SLOT-sized: ceil(field × heat_hours × slot_overhead / window) GPU
+# slots, then ceil(slots / gpus_per_pod) pods, capped at max_pods. sku is the
+# EXACT `nvidia-smi --query-gpu=name` string — the health gate byte-compares
+# every GPU of every pod against it.
+[provisioner.heat]
+sku           = "NVIDIA RTX A6000"
+gpus_per_pod  = 8            # 8x cluster: one hosts.toml entry per GPU
+max_pods      = 4
+providers     = ["lium", "shadeform"]   # priority order; a stage never splits providers
+max_price_hr  = 4.0          # USD per POD-hour; dearer offers are skipped
+slot_overhead = 1.3          # pads for image pull / corpus build / one flaky retry
+
+# ── final fleet: the pinned SKU, king + finalists on ONE pod ─────────────────
+# Default shape is a single pod with gpus_per_pod >= 1 + [round] finalists:
+# every final run reports the same physical box's GPU, so the validator's
+# expected_gpu pairing holds by construction. One 2×L40S pod = king + 1
+# finalist. (gpus_per_pod = 1 falls back to one pod per run.)
+[provisioner.final]
+sku          = "NVIDIA L40S"
+gpus_per_pod = 2
+max_pods     = 2
+providers    = ["lium", "shadeform"]
+max_price_hr = 3.0
