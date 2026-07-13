@@ -612,7 +612,9 @@ class TrainerRunner:
         # numbers onto its manifest entry, so every validator promotes off one
         # signed set (see cascade.validator.cascade). Best-effort and gated on
         # [scoring] cascade_enabled; a failure just leaves bench_scores unset.
-        if self.cfg.scoring.cascade_enabled and self.bench_eval_fn is not None:
+        if self.cfg.scoring.cascade_enabled and (
+            self.bench_eval_fn is not None or self.cascade_bench_plan is not None
+        ):
             entries = self._stamp_king_bench_scores(entries, seeds)
 
         return TrainingManifest(
