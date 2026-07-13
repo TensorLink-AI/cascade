@@ -150,6 +150,40 @@ class ValidatorRunner:
             return gpu_reason
         return None
 
+    @staticmethod
+    def check_pool_pin(
+        manifest: TrainingManifest, window_source: object, *, block: int | None
+    ) -> str | None:
+        """Verify this round's eval pool against the trainer-signed pin.
+
+        A pinned manifest carries the ``(key, sha256)`` of the snapshot the
+        trainer screened on; the validator's own deterministic selection (same
+        epoch block, same rule) must resolve to the identical pair. The pin is
+        inside the signed body, so pool integrity descends from the trainer
+        signature rather than the unsigned ``pool/index.json`` — a poisoned
+        index or tampered tar surfaces here as a loud reject instead of scoring
+        on attacker-chosen data. Unpinned manifests (older trainers) keep the
+        legacy index-trust behaviour. Returns a reject reason or ``None``.
+        """
+        if not (manifest.eval_pool_key and manifest.eval_pool_sha256):
+            return None
+        prov_fn = getattr(window_source, "provenance_for_round", None)
+        if prov_fn is None:
+            return ("pool_pin_unverifiable: manifest pins the eval pool but this "
+                    "validator's pool source reports no provenance")
+        try:
+            key, sha = prov_fn(int(manifest.round_id), block=block)
+        except Exception as e:  # noqa: BLE001 — an unreadable pool must reject, not crash
+            return f"pool_pin_unverifiable: provenance lookup failed: {e}"
+        if not key or not sha:
+            return ("pool_pin_unverifiable: manifest pins the eval pool but this "
+                    "validator resolved no snapshot for the round")
+        if (key, sha) != (manifest.eval_pool_key, manifest.eval_pool_sha256):
+            return (f"pool_pin_mismatch: manifest signed {manifest.eval_pool_key}@"
+                    f"{manifest.eval_pool_sha256[:12]}…, this validator resolved "
+                    f"{key}@{sha[:12]}…")
+        return None
+
     def _check_gpu(self, manifest: TrainingManifest) -> str | None:
         """Matched-hardware gate for byte-exact re-derivation.
 
@@ -721,7 +755,8 @@ class ValidatorRunner:
                 log.warning("publishing an UNSIGNED receipt (no wallet) for round=%s",
                             manifest.round_id)
             store = open_manifest_store(self.cfg.storage)
-            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id)
+            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id,
+                                  validator_hotkey=hotkey_ss58)
             log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
                      receipt.status, manifest.round_id, receipt.signature is not None,
                      self.cfg.storage.manifest_bucket, key)
@@ -783,6 +818,13 @@ class ValidatorRunner:
                     )
                     # Gate first so a rejected manifest never moves weights.
                     reason = self.check_manifest(manifest)
+                    if reason is None:
+                        # Pool-pin gate: the signed snapshot pin must match this
+                        # validator's own deterministic selection for the round.
+                        reason = self.check_pool_pin(
+                            manifest, window_source,
+                            block=self._epoch_start_block(manifest),
+                        )
                     if reason is not None:
                         log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
                         last_round = manifest.round_id

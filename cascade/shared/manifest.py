@@ -273,7 +273,15 @@ class TrainingManifest:
     entries: list[TrainedEntry] = field(default_factory=list)
     manifest_version: int = MANIFEST_VERSION
     heat: HeatResult | None = None
-    signature: str | None = None  # trainer_hotkey signature over the canonical body; TODO
+    # Eval-pool pin: the exact snapshot (bucket key or pool ref + sha256) the
+    # trainer screened this round on. Signed (see canonical_body), so validators
+    # can verify their own deterministic snapshot selection against a digest that
+    # descends from the trainer signature they already trust — pool integrity
+    # then no longer rests on the unsigned pool/index.json (see docs/EVAL_POOL.md).
+    # Empty ⇒ unpinned (trainer predates the field, or no pool provenance).
+    eval_pool_key: str = ""
+    eval_pool_sha256: str = ""
+    signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
         for e in self.entries:
@@ -301,9 +309,11 @@ class TrainingManifest:
 
         The signed payload. Stable key ordering so the trainer and every
         validator hash the identical bytes. ``bench_scores`` is dropped from an
-        entry when ``None`` (see :func:`_entry_body`), so a manifest without it
-        hashes exactly as it did before the field existed — old signatures stay
-        valid without a version bump.
+        entry when ``None`` (see :func:`_entry_body`), and the eval-pool pin is
+        dropped when unset, so a manifest without them hashes exactly as it did
+        before the fields existed — old signatures stay valid without a version
+        bump. (Rollout note: once the trainer emits a pin, validators must run
+        code that knows the field, or their recomputed body won't verify.)
         """
         body = {
             "manifest_version": self.manifest_version,
@@ -314,6 +324,9 @@ class TrainingManifest:
             "eval_dataset": self.eval_dataset,
             "entries": [_entry_body(e) for e in self.entries],
         }
+        if self.eval_pool_key and self.eval_pool_sha256:
+            body["eval_pool_key"] = self.eval_pool_key
+            body["eval_pool_sha256"] = self.eval_pool_sha256
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -364,6 +377,8 @@ def load_manifest(text: str) -> TrainingManifest:
         entries=entries,
         manifest_version=version,
         heat=_heat_from_json(obj.get("heat")),
+        eval_pool_key=str(obj.get("eval_pool_key", "") or ""),
+        eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
         signature=obj.get("signature"),
     )
 

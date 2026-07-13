@@ -48,6 +48,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="chain.toml path (default: the repo's).")
         sp.add_argument("--receipt", type=Path, default=None,
                         help="Read the receipt from a local JSON file instead of S3.")
+        sp.add_argument("--validator", default="",
+                        help="Validator hotkey (ss58) whose receipt to fetch "
+                             "(receipts/<hotkey>/…). Default: the shared latest "
+                             "pointer, or index discovery for a round id.")
         sp.add_argument("--network", default="finney",
                         help="Bittensor network for the optional chain checks.")
         sp.add_argument("--no-chain", action="store_true",
@@ -80,15 +84,10 @@ def _unsigned_s3_text(cfg, key: str) -> str:
     return resp["Body"].read().decode("utf-8")
 
 
-def fetch_receipt_text(cfg, round_id: str | None) -> str:
-    """The receipt JSON for ``round_id`` (None ⇒ latest), anonymous-first."""
-    from ..shared.hippius import (
-        RECEIPT_LATEST_KEY,
-        open_manifest_store,
-        receipt_round_key,
-    )
+def _fetch_text(cfg, key: str) -> str:
+    """GET one bucket object, anonymous-first with a credentialed fallback."""
+    from ..shared.hippius import open_manifest_store
 
-    key = RECEIPT_LATEST_KEY if round_id is None else receipt_round_key(round_id)
     try:
         return _unsigned_s3_text(cfg, key)
     except ImportError as e:
@@ -102,11 +101,61 @@ def fetch_receipt_text(cfg, round_id: str | None) -> str:
         try:
             return store.get_text(key)
         except Exception as cred_err:  # noqa: BLE001
-            raise SystemExit(
-                f"could not fetch s3://{cfg.storage.manifest_bucket}/{key}: anonymous "
-                f"({anon_err}); credentialed ({cred_err}). Pass --receipt FILE to audit "
-                "a local copy."
-            ) from cred_err
+            raise RuntimeError(f"anonymous ({anon_err}); credentialed ({cred_err})") from cred_err
+
+
+def _resolve_via_index(cfg, round_id: str) -> str | None:
+    """Find a round's receipt through the public rolling index.
+
+    Receipts live under per-validator prefixes (``receipts/<hotkey>/round-…``),
+    which an S3 GET can't discover by round id alone. Each index entry carries
+    a ``receipt_key`` pointer back to its signed receipt; newest publication
+    first, first fetch that succeeds wins.
+    """
+    from ..shared.hippius import RECEIPT_INDEX_KEY
+
+    try:
+        doc = json.loads(_fetch_text(cfg, RECEIPT_INDEX_KEY))
+    except (RuntimeError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("rounds"), list):
+        return None
+    entries = [r for r in doc["rounds"]
+               if isinstance(r, dict) and str(r.get("round_id")) == round_id
+               and r.get("receipt_key")]
+    entries.sort(key=lambda r: str(r.get("published_at") or ""), reverse=True)
+    for r in entries:
+        try:
+            return _fetch_text(cfg, str(r["receipt_key"]))
+        except RuntimeError:
+            continue
+    return None
+
+
+def fetch_receipt_text(cfg, round_id: str | None, validator_hotkey: str = "") -> str:
+    """The receipt JSON for ``round_id`` (None ⇒ latest), anonymous-first.
+
+    ``validator_hotkey`` addresses one validator's receipts directly; without
+    it, ``latest`` reads the shared pointer and a round id falls back to
+    discovery through ``receipts/index.json`` (the legacy un-namespaced key is
+    tried first, so pre-namespacing rounds still resolve).
+    """
+    from ..shared.hippius import receipt_latest_key, receipt_round_key
+
+    key = (receipt_latest_key(validator_hotkey) if round_id is None
+           else receipt_round_key(round_id, validator_hotkey))
+    try:
+        return _fetch_text(cfg, key)
+    except RuntimeError as err:
+        if round_id is not None and not validator_hotkey:
+            text = _resolve_via_index(cfg, str(round_id))
+            if text is not None:
+                return text
+        raise SystemExit(
+            f"could not fetch s3://{cfg.storage.manifest_bucket}/{key}: {err}. "
+            "Pass --receipt FILE to audit a local copy, or --validator HOTKEY "
+            "to address one validator's receipts."
+        ) from err
 
 
 def _chain_client(cfg, network: str):
@@ -185,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.receipt is not None:
         text = args.receipt.read_text(encoding="utf-8")
     else:
-        text = fetch_receipt_text(cfg, round_id)
+        text = fetch_receipt_text(cfg, round_id, getattr(args, "validator", "") or "")
     try:
         receipt = load_receipt(text)
     except (ValueError, KeyError) as e:

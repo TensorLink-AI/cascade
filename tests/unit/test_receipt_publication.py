@@ -199,10 +199,13 @@ def test_published_receipt_matches_round_outcome(cfg, monkeypatch):
     """The A-workstream acceptance path: run a fake round, publish, and the
     receipt on 'S3' reproduces the outcome exactly."""
     published: dict[str, str] = {}
-    monkeypatch.setattr(
-        hippius, "publish_receipt",
-        lambda store, text, round_id: published.setdefault(round_id, text),
-    )
+    publish_kwargs: dict[str, str] = {}
+
+    def _capture(store, text, round_id, **kw):
+        publish_kwargs.update(kw)
+        return published.setdefault(round_id, text)
+
+    monkeypatch.setattr(hippius, "publish_receipt", _capture)
 
     base_seed = seed_from_block_hash(BLOCK_HASH)
     eval_fn, king, chal = _strong_eval()
@@ -221,6 +224,8 @@ def test_published_receipt_matches_round_outcome(cfg, monkeypatch):
     )
 
     assert manifest.round_id in published
+    # the receipt lands under the validator's own prefix — no cross-validator clobber
+    assert publish_kwargs.get("validator_hotkey") == "5FakeValidatorHotkey"
     receipt = load_receipt(published[manifest.round_id])
     assert receipt.status == "scored"
     assert receipt.epoch_start_block == EPOCH_START
@@ -240,7 +245,7 @@ def test_published_rejection_receipt(cfg, monkeypatch):
     published: dict[str, str] = {}
     monkeypatch.setattr(
         hippius, "publish_receipt",
-        lambda store, text, round_id: published.setdefault(round_id, text),
+        lambda store, text, round_id, **kw: published.setdefault(round_id, text),
     )
     base_seed = seed_from_block_hash(BLOCK_HASH)
     runner = _runner(cfg, lambda e, w: [])
@@ -263,7 +268,7 @@ def test_published_rejection_receipt(cfg, monkeypatch):
 
 def test_receipt_failure_never_raises(cfg, monkeypatch):
     """A receipt hiccup must never disturb the round (weights/state are done)."""
-    def boom(store, text, round_id):
+    def boom(store, text, round_id, **kw):
         raise RuntimeError("s3 down")
 
     monkeypatch.setattr(hippius, "publish_receipt", boom)
@@ -304,3 +309,25 @@ def test_publish_and_read_receipt_keys():
     hippius.publish_receipt(store, '{"round_id":"43"}', "43")
     assert hippius.read_latest_receipt(store) == '{"round_id":"43"}'
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
+
+
+def test_publish_receipt_namespaced_per_validator():
+    """Two validators publish the same round: each keeps its own signed copy
+    (single-writer prefixes), only the shared convenience pointer races."""
+    store = _FakeS3Store()
+    key_a = hippius.publish_receipt(store, '{"v":"A"}', "42", validator_hotkey="5ValA")
+    key_b = hippius.publish_receipt(store, '{"v":"B"}', "42", validator_hotkey="5ValB")
+    assert key_a == "receipts/5ValA/round-42.json"
+    assert key_b == "receipts/5ValB/round-42.json"
+    # no clobber: both per-validator receipts and latest pointers coexist
+    assert hippius.read_receipt(store, "42", "5ValA") == '{"v":"A"}'
+    assert hippius.read_receipt(store, "42", "5ValB") == '{"v":"B"}'
+    assert hippius.read_latest_receipt(store, "5ValA") == '{"v":"A"}'
+    assert hippius.read_latest_receipt(store, "5ValB") == '{"v":"B"}'
+    # the shared pointer is last-writer-wins by design
+    assert hippius.read_latest_receipt(store) == '{"v":"B"}'
+    # the legacy un-namespaced round key is never written by namespaced publishes
+    assert "receipts/round-42.json" not in store.objects
+    # everything audit-facing is world-readable
+    assert store.acls[key_a] == "public-read"
+    assert store.acls["receipts/5ValA/latest.json"] == "public-read"

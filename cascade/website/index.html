@@ -1409,10 +1409,27 @@ document.getElementById("chart-mode").addEventListener("click",function(){
 document.getElementById("smooth").addEventListener("input",function(){ _smooth=Number(this.value); renderChart(); });
 document.getElementById("theme-toggle").textContent=document.documentElement.dataset.theme==="dark"?"LIGHT":"DARK";
 
+// Multiple validators publish into the shared rolling index (entries keyed by
+// round_id + validator_hotkey). The notebook renders one row per round: keep
+// the newest entry per round_id by published_at — honest validators agree on
+// the verdict, so any one entry is representative.
+function collapseByRound(d){
+  if(!d || !Array.isArray(d.rounds)) return d;
+  var by={}, order=[];
+  d.rounds.forEach(function(r){
+    var id=String(r.round_id);
+    if(!(id in by)) order.push(id);
+    if(!by[id] || String(r.published_at||"") >= String(by[id].published_at||"")) by[id]=r;
+  });
+  var out={}; for(var k in d) out[k]=d[k];
+  out.rounds=order.map(function(id){ return by[id]; });
+  return out;
+}
+
 // seed immediately so it renders offline, then poll real endpoints (override on success)
 _index=SEED_INDEX; _latest=SEED_LATEST; _dataState="loading"; renderAll();
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=d; _dataState="live"; renderAll(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   fetchJSON("receipts/latest.json").then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
 }

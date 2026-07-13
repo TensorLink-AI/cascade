@@ -76,11 +76,23 @@ every (valid) manifest.
 Storage credentials come from the environment, never `chain.toml`:
 
 ```bash
-export HIPPIUS_S3_ACCESS_KEY=...    # read manifests/receipts + pool, write receipts
+export HIPPIUS_S3_ACCESS_KEY=...    # read manifests, write your receipts
 export HIPPIUS_S3_SECRET_KEY=...
+export POOL_S3_ACCESS_KEY=...       # read eval-pool snapshots (falls back to
+export POOL_S3_SECRET_KEY=...       #  HIPPIUS_S3_* when unset — see note below)
 export HIPPIUS_HUB_USERNAME=...     # (or HIPPIUS_HUB_TOKEN) to pull checkpoints from the registry
 export HIPPIUS_HUB_PASSWORD=...
 ```
+
+The Hub credential can be **your own** Hippius account — pulls are digest-pinned
+and namespace-independent, so the owner doesn't need to share theirs. The S3
+pairs come from the owner. Owners: hand out a *separate* key pair for the pool
+bucket (`POOL_S3_*`) rather than reusing the manifest-bucket pair — S3 keys
+aren't prefix-scoped, so any key that can write a bucket can overwrite
+everything in it, and the eval pool is the one store where an overwrite could
+touch scoring (the manifest's signed pool pin catches it, but least privilege
+beats detection). The same reasoning says never reuse the TSBench-Forge relay
+keys here, even though they read the same `HIPPIUS_S3_*` env names in that repo.
 
 If `[storage] backup_s3_endpoint` is set (a Cloudflare R2 backup of the
 manifest/receipt bucket — every object is dual-written there, and reads fall back
@@ -114,7 +126,7 @@ and set weights:
 new manifest round=… entries=2 (king:uid3,challenger:uid2); gating + scoring …
 round=… lcb=0.0000 margin=0.0200 win=False loss king=… tenure=…
 round=… weights set: reward_uids=[3] (n_uids=9, burn_uid=0)
-published scored receipt round=… signed=True → s3://…/receipts/round-….json
+published scored receipt round=… signed=True → s3://…/receipts/<hotkey>/round-….json
 ```
 
 Run it under a process manager (systemd, tmux, supervisor) so it survives
@@ -127,8 +139,8 @@ Three signals:
 
 1. **Weights on chain** — `round=… weights set …` in the log, and
    `btcli wallet overview` / the metagraph shows your hotkey emitting weight.
-2. **Receipts published** — a signed `receipts/round-<id>.json` per round in the
-   manifest bucket (the dashboard reads these).
+2. **Receipts published** — a signed `receipts/<your-hotkey>/round-<id>.json` per
+   round in the manifest bucket (the dashboard reads these via the shared index).
 3. **Audit as health check** — verify your own latest round end to end:
 
    ```bash

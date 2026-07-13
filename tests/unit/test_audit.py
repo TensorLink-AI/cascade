@@ -440,14 +440,69 @@ def test_fetch_receipt_falls_back_to_credentialed(cfg, monkeypatch):
         def __init__(self, s3cfg):
             pass
 
-        def get_text(self, key):
+        def get_bytes(self, key):
             assert key == "receipts/round-9.json"
-            return '{"ok": 1}'
+            return b'{"ok": 1}'
+
+        def get_text(self, key):
+            return self.get_bytes(key).decode("utf-8")
 
     import cascade.shared.hippius as hippius
 
     monkeypatch.setattr(hippius, "S3Store", lambda s3cfg: _Store(s3cfg))
     assert fetch_receipt_text(cfg, "9") == '{"ok": 1}'
+
+
+def _serve_objects(monkeypatch, objects: dict[str, str]):
+    """Anonymous S3 serves ``objects``; the credentialed fallback always 404s."""
+    import cascade.audit.main as audit_mod
+    import cascade.shared.hippius as hippius
+
+    def _anon(cfg_, key):
+        if key in objects:
+            return objects[key]
+        raise RuntimeError(f"404: {key}")
+
+    class _Store:
+        def __init__(self, s3cfg):
+            pass
+
+        def get_bytes(self, key):
+            raise RuntimeError(f"404: {key}")
+
+        def get_text(self, key):
+            raise RuntimeError(f"404: {key}")
+
+    monkeypatch.setattr(audit_mod, "_unsigned_s3_text", _anon)
+    monkeypatch.setattr(hippius, "S3Store", lambda s3cfg: _Store(s3cfg))
+
+
+def test_fetch_receipt_resolves_namespaced_round_via_index(cfg, monkeypatch):
+    # Post-namespacing, a round receipt lives under the validator's prefix;
+    # with no --validator the fetch discovers it through the public index.
+    _serve_objects(monkeypatch, {
+        "receipts/index.json": json.dumps({"schema": 2, "rounds": [
+            {"round_id": "9", "validator_hotkey": "5ValA", "published_at": "2026-07-01",
+             "receipt_key": "receipts/5ValA/round-9.json"},
+        ]}),
+        "receipts/5ValA/round-9.json": '{"ok": 1}',
+    })
+    assert fetch_receipt_text(cfg, "9") == '{"ok": 1}'
+
+
+def test_fetch_receipt_addresses_one_validator_directly(cfg, monkeypatch):
+    _serve_objects(monkeypatch, {
+        "receipts/5ValB/round-9.json": '{"ok": 2}',
+        "receipts/5ValB/latest.json": '{"ok": 3}',
+    })
+    assert fetch_receipt_text(cfg, "9", "5ValB") == '{"ok": 2}'
+    assert fetch_receipt_text(cfg, None, "5ValB") == '{"ok": 3}'
+
+
+def test_fetch_receipt_exits_cleanly_when_unresolvable(cfg, monkeypatch):
+    _serve_objects(monkeypatch, {})
+    with pytest.raises(SystemExit, match="receipts/round-9.json"):
+        fetch_receipt_text(cfg, "9")
 
 
 # ── trainer-king vs validator-state-king divergence (seen live 2026-07-07) ────

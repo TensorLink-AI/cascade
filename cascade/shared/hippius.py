@@ -843,17 +843,42 @@ def read_latest_manifest(store: S3Store) -> str:
 RECEIPT_LATEST_KEY = "receipts/latest.json"
 
 
-def receipt_round_key(round_id: str) -> str:
+def receipt_latest_key(validator_hotkey: str = "") -> str:
+    """The validator's own latest-receipt pointer; the shared legacy key when
+    no hotkey is given."""
+    if validator_hotkey:
+        return f"receipts/{validator_hotkey}/latest.json"
+    return RECEIPT_LATEST_KEY
+
+
+def receipt_round_key(round_id: str, validator_hotkey: str = "") -> str:
+    """Per-round receipt key, namespaced per validator.
+
+    With a hotkey the key is ``receipts/<hotkey>/round-<id>.json`` — every
+    validator owns its own prefix, so any number of validators can publish
+    receipts for the same round without overwriting each other. The bare
+    form is the legacy single-writer layout, kept so old rounds stay
+    readable and local/test paths without a wallet still work.
+    """
+    if validator_hotkey:
+        return f"receipts/{validator_hotkey}/round-{round_id}.json"
     return f"receipts/round-{round_id}.json"
 
 
-def publish_receipt(store: S3Store, receipt_text: str, round_id: str) -> str:
-    """Write the round receipt and update the ``receipts/latest.json`` pointer.
+def publish_receipt(
+    store: S3Store, receipt_text: str, round_id: str, *, validator_hotkey: str = ""
+) -> str:
+    """Write the round receipt under the validator's own prefix.
 
     Mirrors :func:`publish_manifest` — the validator publishes its signed
-    :class:`cascade.shared.receipt.RoundReceipt` here after weights are set, and
-    auditors read :data:`RECEIPT_LATEST_KEY` (or a specific round's key).
-    Returns the per-round key.
+    :class:`cascade.shared.receipt.RoundReceipt` here after weights are set.
+    Three objects are written: the validator's per-round receipt and
+    ``latest.json`` (both under ``receipts/<hotkey>/`` — single-writer keys,
+    so concurrent validators never clobber each other's audit trail), plus
+    the shared :data:`RECEIPT_LATEST_KEY` convenience pointer. That shared
+    pointer is last-writer-wins by design: honest validators agree on the
+    verdict, and each validator's authoritative copy lives under its own
+    prefix regardless. Returns the per-round key.
 
     Receipts are the audit-facing artefact, so each object is written with a
     ``public-read`` ACL: third parties can then GET it (and run
@@ -862,40 +887,48 @@ def publish_receipt(store: S3Store, receipt_text: str, round_id: str) -> str:
     retried private (the audit's anonymous fetch then falls back to
     credentials, as documented in docs/AUDIT.md).
     """
-    key = receipt_round_key(round_id)
+    keys = [receipt_round_key(round_id, validator_hotkey),
+            receipt_latest_key(validator_hotkey)]
+    if validator_hotkey:
+        keys.append(RECEIPT_LATEST_KEY)
     try:
-        store.put_text(key, receipt_text, content_type="application/json", acl="public-read")
-        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json",
-                       acl="public-read")
+        for key in keys:
+            store.put_text(key, receipt_text, content_type="application/json",
+                           acl="public-read")
     except StorageError:
         # ACL unsupported on this backend: publish private rather than not at all.
-        store.put_text(key, receipt_text, content_type="application/json")
-        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json")
-    return key
+        for key in keys:
+            store.put_text(key, receipt_text, content_type="application/json")
+    return keys[0]
 
 
-def read_receipt(store: S3Store, round_id: str) -> str:
-    """Read one round's receipt JSON by round id."""
-    return store.get_text(receipt_round_key(round_id))
+def read_receipt(store: S3Store, round_id: str, validator_hotkey: str = "") -> str:
+    """Read one round's receipt JSON by round id (a validator's, or legacy)."""
+    return store.get_text(receipt_round_key(round_id, validator_hotkey))
 
 
-def read_latest_receipt(store: S3Store) -> str:
-    """Read the current receipt JSON from ``receipts/latest.json``."""
-    return store.get_text(RECEIPT_LATEST_KEY)
+def read_latest_receipt(store: S3Store, validator_hotkey: str = "") -> str:
+    """Read the newest receipt — a specific validator's, or the shared pointer."""
+    return store.get_text(receipt_latest_key(validator_hotkey))
 
 
 # ── receipts index (dashboard-facing) ───────────────────────────────────────
 #
 # The per-round receipts are the audit source of truth, but a static dashboard
-# can't *list* a bucket to discover them. So the validator also maintains one
-# small public-read ``receipts/index.json`` — a rolling window of compact
+# can't *list* a bucket to discover them. So every validator also maintains one
+# shared public-read ``receipts/index.json`` — a rolling window of compact
 # per-round summaries (see :func:`cascade.shared.receipt.summarize_receipt`) with
-# a ``receipt_key`` pointer back to each signed receipt. Presentational only:
-# nothing here is signed or part of the audit contract, and a stale/absent index
-# never affects weights (the update is best-effort, like receipt publication).
+# a ``receipt_key`` pointer back to each signed receipt. Entries are keyed by
+# ``(round_id, validator_hotkey)`` so a validator's update preserves its peers'
+# entries; the read-modify-write itself is uncoordinated, so two validators
+# publishing in the same instant can still drop one entry until that
+# validator's next round. Acceptable because the index is presentational only:
+# nothing here is signed or part of the audit contract (the per-validator
+# receipts above are single-writer), and a stale/absent index never affects
+# weights (the update is best-effort, like receipt publication).
 
 RECEIPT_INDEX_KEY = "receipts/index.json"
-RECEIPT_INDEX_SCHEMA = 1
+RECEIPT_INDEX_SCHEMA = 2  # 2: entries keyed by (round_id, validator_hotkey)
 RECEIPT_INDEX_MAX_KEEP = 400
 
 
@@ -924,26 +957,33 @@ def update_receipt_index(
     chain: dict | None = None,
     max_keep: int = RECEIPT_INDEX_MAX_KEEP,
 ) -> dict:
-    """Append/replace one round in ``receipts/index.json`` and write it public-read.
+    """Append/replace one entry in ``receipts/index.json`` and write it public-read.
 
-    Idempotent per ``round_id`` (a re-published round replaces its entry), sorted
-    by ``epoch_start_block`` then ``round_id`` (chronological — round ids are
-    block-hash seeds, not monotonic), and capped at ``max_keep`` most-recent
-    rounds. ``updated_at`` (an ISO stamp), ``subnet`` (``{"netuid", "name"}``),
+    Idempotent per ``(round_id, validator_hotkey)`` — a re-published round
+    replaces the same validator's entry and leaves other validators' entries
+    for that round intact. Sorted by ``epoch_start_block`` then ``round_id``
+    then ``validator_hotkey`` (chronological — round ids are block-hash seeds,
+    not monotonic), and capped at ``max_keep`` most-recent entries.
+    ``updated_at`` (an ISO stamp), ``subnet`` (``{"netuid", "name"}``),
     and ``chain`` (schedule anchor for the next-round countdown:
     ``{as_of, current_block, epoch_start_block, epoch_blocks, block_time_s}``)
     are optional header fields the dashboard shows. Returns the stored entry.
     """
     entry = dict(summary)
-    entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")))
+    hotkey = str(entry.get("validator_hotkey") or "")
+    entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")), hotkey)
     if updated_at:
         entry["published_at"] = updated_at
 
     doc = read_receipt_index(store)
     rid = str(entry.get("round_id"))
-    rounds = [r for r in doc.get("rounds", []) if str(r.get("round_id")) != rid]
+    rounds = [r for r in doc.get("rounds", [])
+              if (str(r.get("round_id")), str(r.get("validator_hotkey") or ""))
+              != (rid, hotkey)]
     rounds.append(entry)
-    rounds.sort(key=lambda r: (int(r.get("epoch_start_block", 0)), str(r.get("round_id", ""))))
+    rounds.sort(key=lambda r: (int(r.get("epoch_start_block", 0)),
+                               str(r.get("round_id", "")),
+                               str(r.get("validator_hotkey") or "")))
     rounds = rounds[-max_keep:]
 
     out: dict = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": rounds}

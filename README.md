@@ -246,8 +246,9 @@ The layout mirrors the manifests:
 ```
 s3://<manifest_bucket>/manifests/round-<id>.json   the trainer's signed manifest
 s3://<manifest_bucket>/manifests/latest.json       pointer to the newest manifest
-s3://<manifest_bucket>/receipts/round-<id>.json    the validator's signed receipt
-s3://<manifest_bucket>/receipts/latest.json        pointer to the newest receipt
+s3://<manifest_bucket>/receipts/<hotkey>/round-<id>.json   a validator's signed receipt
+s3://<manifest_bucket>/receipts/<hotkey>/latest.json         that validator's newest receipt
+s3://<manifest_bucket>/receipts/latest.json        shared pointer to the newest receipt
 s3://<manifest_bucket>/receipts/index.json         rolling round summary (dashboard)
 ```
 
@@ -261,7 +262,9 @@ receipts above: `receipts/latest.json` for the current round's detail and
 rolling window of compact per-round summaries with a pointer back to each
 signed receipt) alongside every receipt it publishes — presentational only, so
 a stale index never affects weights, and audit trust still flows through the
-signed per-round receipts. Serve the page from the same bucket with
+signed per-round receipts. With several validators live, each writes only under
+its own `receipts/<hotkey>/` prefix (no clobbering); the shared index carries
+one entry per (round, validator) and the dashboard shows one row per round. Serve the page from the same bucket with
 `python scripts/publish_website.py` (needs the `HIPPIUS_S3_*` credentials); it
 then lives at `<s3_endpoint>/<manifest_bucket>/index.html`.
 

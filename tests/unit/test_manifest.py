@@ -124,6 +124,38 @@ def test_bench_scores_absent_is_byte_identical_to_before():
     assert with_scores.canonical_body() != m.canonical_body()
 
 
+def test_eval_pool_pin_round_trips_and_is_signed():
+    m = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval", entries=[_entry("king", 0)],
+        eval_pool_key="pool/snapshots/block-1000.tar", eval_pool_sha256="e" * 64,
+    )
+    again = load_manifest(dump_manifest(m))
+    assert again.eval_pool_key == "pool/snapshots/block-1000.tar"
+    assert again.eval_pool_sha256 == "e" * 64
+    # The pin IS part of the signed body: it anchors pool integrity.
+    assert again.canonical_body() == m.canonical_body()
+    assert b"eval_pool_key" in m.canonical_body()
+
+
+def test_eval_pool_pin_absent_is_byte_identical_to_before():
+    # An unpinned manifest must canonicalise exactly as it did before the
+    # fields existed — old signatures stay valid without a version bump.
+    m = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval", entries=[_entry("king", 0)],
+    )
+    assert b"eval_pool_key" not in m.canonical_body()
+    pinned = replace(m, eval_pool_key="pool/snapshots/block-1000.tar",
+                     eval_pool_sha256="e" * 64)
+    assert pinned.canonical_body() != m.canonical_body()
+    # A half-set pin (key without digest) stays out of the signed body.
+    half = replace(m, eval_pool_key="pool/snapshots/block-1000.tar")
+    assert half.canonical_body() == m.canonical_body()
+
+
 def test_heat_is_unsigned_and_round_trips():
     base = TrainingManifest(
         round_id="42", created_block=1000,

@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     log = logging.getLogger("cascade.trainer")
-    screen_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
+    screen_fn, pool_provenance_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
 
     bench_plan = None
     if args.post_round_benchmarks:
@@ -249,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts_wait_seconds=args.hosts_wait_seconds,
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
+        pool_provenance_fn=pool_provenance_fn,
         bench_plan=bench_plan,
         bench_eval_fn=bench_eval_fn,
         cascade_bench_plan=cascade_bench_plan,
@@ -304,7 +305,13 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
 
 
 def _build_screen_fn(cfg, *, cache_dir: Path | None):
-    """The heat screener: train cheap → score on the held-out pool → geomean.
+    """The heat screener plus the eval-pool pin, off one shared pool source.
+
+    Returns ``(screen_fn, pool_provenance_fn)``: the screener ranks heat
+    checkpoints on the held-out pool, and the provenance hook reports the
+    ``(key, sha256)`` of the snapshot a round screens on so the runner can
+    stamp it — signed — into the manifest (validators then verify their own
+    snapshot selection against it; see docs/EVAL_POOL.md).
 
     Loads the same private eval pool the validators use (owner-controlled) and
     scores each heat checkpoint on a per-round-rotated slice, returning
@@ -337,7 +344,11 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
         )
         return global_geomean(scores)
 
-    return screen
+    def pool_provenance(base_seed: int, block: int | None = None) -> tuple[str, str]:
+        key, sha = window_source.provenance_for_round(base_seed, block=block)
+        return (str(key or ""), str(sha or ""))
+
+    return screen, pool_provenance
 
 
 if __name__ == "__main__":

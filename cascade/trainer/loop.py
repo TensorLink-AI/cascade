@@ -300,6 +300,12 @@ class TrainerRunner:
     # field down to [round] finalists before the expensive final. None ⇒ no
     # internal screen (the field's natural order is taken). Wired in trainer.main.
     screen_fn: ScreenFn | None = None
+    # Eval-pool pin: ``(base_seed, block) -> (key, sha256)`` provenance of the
+    # pool snapshot this round screens on, stamped (and therefore signed) into
+    # the manifest so validators verify their own snapshot selection against it
+    # rather than trusting the unsigned pool index. None ⇒ manifests go out
+    # unpinned (legacy). Wired in trainer.main from the screen pool source.
+    pool_provenance_fn: object | None = None
     # Cascade: scores the king's checkpoint on GIFT-Eval / BOOM / TIME and stamps
     # the numbers onto its manifest entry (so validators read one authoritative,
     # signed set — consensus-safe promotion). Runs only when [scoring]
@@ -716,6 +722,17 @@ class TrainerRunner:
         ):
             entries = self._stamp_king_bench_scores(entries, seeds)
 
+        # Pin the round's eval pool: the provenance of the snapshot the heat
+        # screened on (selected at screen_block, same rule the validator uses),
+        # so the pin the trainer signs is the pool validators must judge on.
+        # Best-effort: a miss just publishes an unpinned (legacy) manifest.
+        pool_key, pool_sha = "", ""
+        if self.pool_provenance_fn is not None:
+            try:
+                pool_key, pool_sha = self.pool_provenance_fn(base_seed, screen_block)
+            except Exception as e:  # noqa: BLE001 — pinning must never sink a round
+                log.warning("eval-pool pin unavailable for round=%s: %s", base_seed, e)
+
         return TrainingManifest(
             round_id=str(base_seed),
             created_block=block,
@@ -724,6 +741,8 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
             heat=heat,
+            eval_pool_key=str(pool_key or ""),
+            eval_pool_sha256=str(pool_sha or ""),
         )
 
     def _run_heat(

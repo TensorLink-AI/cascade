@@ -15,8 +15,10 @@ instead of taking it on faith. Every round is a pure function of chain state:
 * the **weights** are `equal_share_vector` of the resulting court.
 
 After each round the validator publishes a signed
-[`RoundReceipt`](../cascade/shared/receipt.py) to the manifest bucket
-(`receipts/round-<id>.json` + `receipts/latest.json`) recording all of the
+[`RoundReceipt`](../cascade/shared/receipt.py) to the manifest bucket under its
+own prefix (`receipts/<hotkey>/round-<id>.json` + `receipts/<hotkey>/latest.json`,
+plus the shared `receipts/latest.json` pointer — per-validator prefixes mean
+concurrent validators never overwrite each other's audit trail) recording all of the
 above — including the trainer's manifest verbatim and every per-window score
 that fed the KOTH bootstrap. A round the validator *rejected* still gets a
 receipt (`"status": "rejected"`) carrying the gate's reason.
@@ -40,7 +42,13 @@ pip install -e '.[hippius]'        # boto3 for the receipt fetch
 cascade-audit latest               # tier 0 on the newest round
 cascade-audit round 2269901645662351552 --tier 1
 cascade-audit latest --json        # machine-readable; exit 1 on any FAIL
+cascade-audit round <id> --validator 5F…   # one validator's receipt specifically
 ```
+
+Without `--validator`, `latest` reads the shared pointer (the most recently
+published receipt, whichever validator wrote it) and `round <id>` discovers the
+receipt through the public `receipts/index.json` (legacy un-namespaced rounds
+are tried first).
 
 Exit status is nonzero **iff any check FAILs**, so it drops straight into CI:
 
