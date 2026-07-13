@@ -64,7 +64,16 @@ verdict independently, which is why weights need no coordination. Channels
 | Manifest bucket | read `manifests/…`, write `receipts/<own hotkey>/…` + index | `HIPPIUS_S3_*` |
 | Pool bucket (if split from manifest bucket) | read-only snapshots | `POOL_S3_*` (or same) |
 | Hippius Hub | read (pull checkpoints/generators) | `HIPPIUS_HUB_TOKEN` |
-| HF benchmark datasets (optional, cascade-promotion gate only) | public read | `HF_TOKEN` if gated |
+| HF benchmark datasets + bench sidecar (opt-in only, see below) | public read | `HF_TOKEN` if gated |
+
+The benchmark sidecar (`benchmarks/`, or an SSH eval pod via `--eval-hosts`) is
+**not** part of a stock validator. All three of its call sites default off:
+`[eval] run_benchmarks` (log-only numbers on a dethrone), `[scoring]
+gift_gate_mode` (the gift-eval gate — the only mode in which the sidecar is
+load-bearing, since `enforce` turns a sidecar failure into an inconclusive
+round), and `[scoring] cascade_enabled` (warm-start promotion, which prefers
+the trainer-signed `bench_scores` on the manifest and touches the sidecar only
+as a non-consensus-safe fallback for manifests that carry none).
 
 Deliberately **not** on the list: the TSBench-Forge raw-data bucket. Validators
 consume forge data only through the built pool snapshots (channel 5). The raw
