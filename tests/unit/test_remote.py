@@ -229,3 +229,19 @@ def test_run_round_remote_aborts_when_king_fails(cfg, tmp_path, monkeypatch):
                           payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5)]
     with pytest.raises(RuntimeError):
         runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+
+def test_load_hosts_parses_and_validates_stage(tmp_path):
+    p = tmp_path / "hosts.toml"
+    p.write_text(
+        '[[host]]\nname="cheap"\nhost="10.0.0.1"\nstage="heat"\n\n'
+        '[[host]]\nname="big"\nhost="10.0.0.2"\nstage="final"\n\n'
+        '[[host]]\nname="both"\nhost="10.0.0.3"\n',
+        encoding="utf-8",
+    )
+    hosts = load_hosts(p)
+    assert [h.stage for h in hosts] == ["heat", "final", "any"]
+
+    p.write_text('[[host]]\nname="x"\nhost="10.0.0.9"\nstage="warmup"\n', encoding="utf-8")
+    with pytest.raises(RemoteDispatchError, match="stage"):
+        load_hosts(p)

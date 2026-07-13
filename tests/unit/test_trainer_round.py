@@ -517,3 +517,64 @@ def test_screen_block_derived_when_cutoff_omitted(cfg, tmp_path, monkeypatch):
     block = 2 * cfg.round.epoch_blocks + 123
     runner.run_round(commits, king_hotkey="a", base_seed=1, block=block)
     assert seen_blocks == [2 * cfg.round.epoch_blocks] * 3
+
+
+def test_stage_tagged_hosts_split_heat_from_final(cfg, tmp_path, monkeypatch):
+    # The cheap-GPU seam: hosts tagged stage="heat" serve only the screen
+    # trainings (a cheaper SKU class), stage="final" only the king/finalist runs
+    # (the SKU the validator's gpu_name gate pairs). Untagged = both.
+    from types import SimpleNamespace
+
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    cheap_a = SimpleNamespace(name="a6000-1", stage="heat")
+    cheap_b = SimpleNamespace(name="a6000-2", stage="heat")
+    big = SimpleNamespace(name="l40-1", stage="final")
+    dispatched: list[tuple[str, str, bool]] = []
+
+    class _FakeDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            dispatched.append((host.name, role, train_hours is not None))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[cheap_a, cheap_b, big], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_hosts = {name for name, _, is_heat in dispatched if is_heat}
+    final_hosts = {name for name, _, is_heat in dispatched if not is_heat}
+    assert heat_hosts <= {"a6000-1", "a6000-2"}          # heats never on the L40
+    assert final_hosts == {"l40-1"}                      # final never on the A6000s
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+
+
+def test_stage_filter_falls_back_when_no_host_matches(cfg, tmp_path):
+    from types import SimpleNamespace
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts=[SimpleNamespace(name="l40", stage="final")])
+    assert [h.name for h in runner._hosts_for("final")] == ["l40"]
+    # nothing tagged for the heat ⇒ use the whole fleet rather than strand the stage
+    assert [h.name for h in runner._hosts_for("heat")] == ["l40"]
+    # legacy untagged host objects serve both stages
+    legacy = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts=[object(), object()])
+    assert len(legacy._hosts_for("heat")) == 2 and len(legacy._hosts_for("final")) == 2

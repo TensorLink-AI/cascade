@@ -763,6 +763,24 @@ class TrainerRunner:
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
         return out
 
+    def _hosts_for(self, stage: str) -> list:
+        """The pods serving ``stage`` ("heat" | "final"): hosts tagged with that
+        stage or ``"any"``. The cheap-GPU seam — heats can run on a cheaper SKU
+        class than the final, because heat checkpoints are trainer-internal
+        (screened, discarded, never validated) while the final's king and
+        challenger must satisfy the validator's gpu_name pairing. When no host
+        matches the stage (e.g. a fleet tagged all-final), every host is used
+        with a warning rather than stranding the stage: a heat on final-class
+        pods is just pricier, and a final on the remaining pods still pairs
+        king/challenger on one list."""
+        hosts = self.remote_hosts or []
+        matched = [h for h in hosts if getattr(h, "stage", "any") in ("any", stage)]
+        if hosts and not matched:
+            log.warning("no remote hosts tagged for stage %r; using all %d host(s)",
+                        stage, len(hosts))
+            return list(hosts)
+        return matched
+
     @staticmethod
     def _dispatch_with_retry(disp, hosts: list, i: int, *, describe: str, **kw):
         """Dispatch to the round-robin host, retrying ONCE on the next host on
@@ -800,7 +818,7 @@ class TrainerRunner:
 
         if not self.trainer_spec:
             raise RuntimeError("remote heat requires trainer_spec (BaseTrainer 'module:Class')")
-        hosts = self.remote_hosts
+        hosts = self._hosts_for("heat")
         hub = self.hub()  # pre-init (thread-safe) before the pool
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
@@ -896,7 +914,7 @@ class TrainerRunner:
 
         if not self.trainer_spec:
             raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
-        hosts = self.remote_hosts
+        hosts = self._hosts_for("final")
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
         )
@@ -1022,8 +1040,10 @@ class TrainerRunner:
 
                         # The final trains king checkpoints for the throne
                         # sizes, which need not include the primary preset.
+                        # Prefer a final-class pod (the heat pods may be a
+                        # cheaper SKU the benchmark sweep wasn't sized for).
                         launch_post_round_benchmark(
-                            self.remote_hosts[0], round_id,
+                            self._hosts_for("final")[0], round_id,
                             self.cfg.throne_contracts()[0].arch_preset, self.bench_plan,
                             work_root=self.work_root,
                         )
