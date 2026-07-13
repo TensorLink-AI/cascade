@@ -82,7 +82,7 @@ class _FakeProvider:
         self.launched: list[str] = []
         self.terminated: list[str] = []
 
-    def available(self, sku, count):
+    def available(self, sku, count, *, gpus=1):
         if self._avail_raises:
             raise self._avail_raises
         return self._available
@@ -480,3 +480,32 @@ def test_teardown_removes_sidecar_record(tmp_path):
         _run(prov, hosts_path=hp, removed=removed)
     # sidecar was recorded on launch and cleaned up during teardown
     assert removed == [hp.with_suffix(".toml.pods.json")]
+
+
+def test_pick_shadeform_offer_filters_pod_shape():
+    """The fleet plan fans one lane per GPU — a 1x machine against an 8-lane
+    plan strands lanes, so offers must match configuration.num_gpus exactly."""
+    types = {"instance_types": [
+        {"configuration": {"gpu_type": "A6000", "num_gpus": 1}, "hourly_price": 50,
+         "cloud": "hyperstack", "shade_instance_type": "A6000",
+         "availability": [{"region": "r1", "available": True}]},
+        {"configuration": {"gpu_type": "A6000", "num_gpus": 2}, "hourly_price": 100,
+         "cloud": "hyperstack", "shade_instance_type": "A6000x2",
+         "availability": [{"region": "r1", "available": True}]},
+    ]}
+    offer = pick_shadeform_offer(types, "A6000", gpus=2)
+    assert offer is not None and offer["shade_instance_type"] == "A6000x2"
+    assert pick_shadeform_offer(types, "A6000", gpus=8) is None  # no such shape
+
+
+def test_lium_executors_filtered_by_gpu_count(monkeypatch):
+    prov = LiumProvider()
+    canned = ('[{"id": "e1", "gpu_type": "A6000", "gpu_count": 1},'
+              ' {"id": "e8", "gpu_type": "A6000", "gpu_count": 8}]')
+
+    class _P:
+        stdout = canned
+    monkeypatch.setattr(prov, "_cli", lambda argv: _P())
+    assert [e["id"] for e in prov._list_executors("A6000", gpus=8)] == ["e8"]
+    assert prov.available("A6000", 1, gpus=8) is True
+    assert prov.available("A6000", 2, gpus=8) is False  # only one 8x machine

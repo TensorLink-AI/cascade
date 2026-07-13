@@ -39,7 +39,7 @@ class FakeProvider:
         self.launched: list[str] = []
         self.terminated: list[str] = []
 
-    def available(self, sku, count):
+    def available(self, sku, count, *, gpus=1):
         if self._avail_raises:
             raise self._avail_raises
         return self._available

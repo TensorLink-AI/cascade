@@ -303,7 +303,7 @@ class ProvisionerLoop:
                 log.warning("provider %r not configured; skipping", name)
                 continue
             try:
-                if not prov.available(sp.marketplace_sku, count):
+                if not prov.available(sp.marketplace_sku, count, gpus=sp.gpus_per_pod):
                     log.info("provider %s: no capacity for %d×%s", name, count, sp.sku)
                     continue
             except Exception as e:  # noqa: BLE001
@@ -340,7 +340,7 @@ class ProvisionerLoop:
         spec = LaunchSpec(
             sku=_market_sku_for(self.policy, stage), count=fl.pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
-            name_prefix=f"{POD_TAG}{round_id}-{stage}",
+            name_prefix=f"{POD_TAG}{round_id}-{stage}", gpus_per_pod=fl.gpus_per_pod,
         )
         try:
             pod_ids = prov.launch(spec)

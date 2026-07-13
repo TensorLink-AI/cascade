@@ -94,6 +94,11 @@ class LaunchSpec:
     ssh_pubkey: str                         # injected into the pod as $SSH_PUBKEY
     ssh_port: int = DEFAULT_SSH_PORT
     name_prefix: str = "cascade-pod"
+    # Pod shape: adapters must rent machines with EXACTLY this many GPUs of
+    # ``sku`` — the fleet plan fans one hosts.toml lane out per GPU, so a
+    # smaller machine strands lanes and a bigger one bills idle silicon. The
+    # health gate re-asserts the shape on the booted pod.
+    gpus_per_pod: int = 1
 
 
 @dataclass(frozen=True)
@@ -118,7 +123,7 @@ class Provider(Protocol):
 
     name: str
 
-    def available(self, sku: str, count: int) -> bool: ...
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool: ...
     def launch(self, spec: LaunchSpec) -> list[str]: ...        # → pod handles
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool: ...
     def get_ip(self, pod_id: str) -> PodAddress | None: ...
@@ -305,16 +310,19 @@ def lium_pod_address(pod: dict, *, container_ssh_port: int = DEFAULT_SSH_PORT) -
     return PodAddress(ip=str(ip), ssh_port=int(port))
 
 
-def pick_shadeform_offer(types_json: dict, sku: str) -> dict | None:
+def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1) -> dict | None:
     """Choose a ``(cloud, region, shade_instance_type)`` offer for ``sku``.
 
-    Filters ``GET /instances/types`` results to the requested ``gpu_type`` with
-    an available region, preferring the cheapest (``hourly_price``, in cents).
-    Returns ``None`` if nothing is available — the fall-through signal.
+    Filters ``GET /instances/types`` results to the requested ``gpu_type`` AND
+    the exact ``gpus`` pod shape (``configuration.num_gpus``) with an available
+    region, preferring the cheapest (``hourly_price``, in cents). Returns
+    ``None`` if nothing is available — the fall-through signal.
     """
     offers: list[tuple[int, dict]] = []
     for t in types_json.get("instance_types", []):
         if str(t.get("configuration", {}).get("gpu_type", "")).upper() != sku.upper():
+            continue
+        if int(t.get("configuration", {}).get("num_gpus", 1) or 1) != int(gpus):
             continue
         region = next(
             (a.get("region") for a in t.get("availability", []) if a.get("available")),
@@ -493,8 +501,14 @@ class LiumProvider:
             )
         return proc
 
-    def _list_executors(self, sku: str) -> list[dict]:
-        return parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+    def _list_executors(self, sku: str, *, gpus: int = 1) -> list[dict]:
+        """Marketplace executors of ``sku`` with EXACTLY ``gpus`` GPUs.
+
+        Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
+        a 1× machine rented against an 8-lane plan strands seven lanes (and the
+        health gate then kills the pod anyway — filter here, before renting)."""
+        execs = parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        return [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
 
     def _list_pods(self) -> list[dict]:
         return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
@@ -503,14 +517,15 @@ class LiumProvider:
         return next((p for p in self._list_pods()
                      if pod_id in (p.get("name"), p.get("huid"), p.get("id"))), None)
 
-    def available(self, sku: str, count: int) -> bool:
-        return len(self._list_executors(sku)) >= count
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
+        return len(self._list_executors(sku, gpus=gpus)) >= count
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        execs = self._list_executors(spec.sku)
+        execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
         if len(execs) < spec.count:
             raise ProvisionError(
-                f"lium: only {len(execs)} × {spec.sku} available, need {spec.count}"
+                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available, "
+                f"need {spec.count}"
             )
         spawn = self._spawn or _spawn_cli
         names: list[str] = []
@@ -603,17 +618,17 @@ class ShadeformProvider:
         r.raise_for_status()
         return r.json() if r.content else {}
 
-    def _offer(self, sku: str) -> dict | None:
+    def _offer(self, sku: str, *, gpus: int = 1) -> dict | None:
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
-        return pick_shadeform_offer(types, sku)
+        return pick_shadeform_offer(types, sku, gpus=gpus)
 
-    def available(self, sku: str, count: int) -> bool:
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         # Shadeform reports availability, not exact counts; an available offer
-        # means we can create the batch of `count`.
-        return self._offer(sku) is not None
+        # (in the requested pod shape) means we can create the batch of `count`.
+        return self._offer(sku, gpus=gpus) is not None
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        offer = self._offer(spec.sku)
+        offer = self._offer(spec.sku, gpus=spec.gpus_per_pod)
         if offer is None:
             raise ProvisionError(f"shadeform: no available {spec.sku} offer")
         ids: list[str] = []
