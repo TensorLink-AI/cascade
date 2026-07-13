@@ -347,6 +347,7 @@ def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="mid-heat"):
         runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
     assert not (tmp_path / cfg.round.submissions_db_path).exists()  # nobody burned
+    assert not (tmp_path / "1" / "heat_complete.json").exists()     # no teardown signal
 
     monkeypatch.undo()
     _patch_train_boundaries(monkeypatch)  # undo() dropped the boundary patches too
@@ -629,3 +630,22 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     final_timeouts = {t for is_heat, t in timeouts if not is_heat}
     assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml
     assert final_timeouts == {runner.remote_timeout_seconds}
+
+
+def test_heat_complete_marker_written_for_provisioner(cfg, tmp_path, monkeypatch):
+    # After the heat settles (screened + burned) the trainer writes the
+    # heat_complete.json marker — the provisioner's signal that stage="heat"
+    # pods can be torn down while the final runs on the final fleet.
+    _patch_train_boundaries(monkeypatch)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "1", "screened": 3, "finalists": ["c"]}

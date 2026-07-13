@@ -353,6 +353,38 @@ class TrainerRunner:
         seen = _load_seen_hotkeys(path)
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
+    def _mark_heat_complete(
+        self,
+        seeds: RoundSeeds,
+        eligible: list[ResolvedGenerator],
+        finalists: list[ResolvedGenerator],
+    ) -> None:
+        """Write the round's heat-complete marker
+        (``work_root/<round>/heat_complete.json``).
+
+        The pod provisioner's early-teardown signal: once the heat stage has
+        settled (screened, burned, finalists chosen) no further heat-stage
+        dispatch can occur, so ``stage="heat"`` pods can be torn down while the
+        final runs on the final fleet — instead of idling, billed, for the
+        final's hours. Mid-round teardown is safe because the final only
+        dispatches to final-stage hosts and the trainer reads the hosts file
+        once per round. Best-effort and local: a write failure never aborts a
+        round, and the trainer stays cloud-blind — the marker is just a file;
+        the provisioner owns what to do with it.
+        """
+        path = self.work_root / f"{seeds.base_seed}" / "heat_complete.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "round_id": str(seeds.base_seed),
+                "screened": len(eligible),
+                "finalists": [c.hotkey for c in finalists],
+            }), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not write heat-complete marker %s: %s", path, e)
+
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
     def _train_checkpoint(
@@ -611,6 +643,11 @@ class TrainerRunner:
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
         # submission is consumed by a round that never judged it.
         self._burn_hotkeys(eligible)
+        # Progress marker for the pod provisioner: from here on, no heat-stage
+        # dispatch can occur, so stage="heat" pods are safe to tear down while
+        # the final runs on the final-stage fleet (they idle for hours
+        # otherwise). Local file, best-effort — the trainer stays cloud-blind.
+        self._mark_heat_complete(seeds, eligible, finalists)
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
