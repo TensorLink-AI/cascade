@@ -22,6 +22,13 @@ rsync -a --delete-after \
   -e "ssh ${SSH_OPTS[*]}" \
   "$SRC_ROOT/" "$DEST:$POD_WORKDIR/"
 
+# The live deployment's chain toml can carry uncommitted testnet overrides
+# (window_pool, budget knobs) that fold into contract_digest — push the REAL
+# one when the operator points at it, or the pod would sign a different digest.
+if [[ -n "${CASCADE_CHAIN_TOML:-}" ]]; then
+  scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new     "$CASCADE_CHAIN_TOML" "$DEST:$POD_WORKDIR/$(basename "$CASCADE_CHAIN_TOML")"
+fi
+
 ssh "${SSH_OPTS[@]}" "$DEST" bash -s <<REMOTE
 set -euo pipefail
 cd "$POD_WORKDIR"
