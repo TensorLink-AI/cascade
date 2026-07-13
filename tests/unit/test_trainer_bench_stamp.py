@@ -154,3 +154,17 @@ def test_remote_king_bench_dispatches_to_worker_not_local(cascade_cfg, tmp_path,
     assert scores == _BENCH                          # parsed the six signed numbers
     assert calls["dispatch"] == ("worker", "12345", "toto2-4m")  # ran on the pod
     assert local_called == []                        # local CPU path untouched
+
+
+def test_run_round_calls_stamp_when_only_cascade_bench_plan_set(cascade_cfg, tmp_path, monkeypatch):
+    # Regression: the run_round guard must fire on cascade_bench_plan alone (the
+    # remote-worker path leaves bench_eval_fn=None). Previously it gated on
+    # bench_eval_fn, so the worker bench never ran and no scores were stamped.
+    _patch(monkeypatch)
+    called: list = []
+    runner = TrainerRunner(cfg=cascade_cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, bench_eval_fn=None, cascade_bench_plan=object())
+    monkeypatch.setattr(runner, "_stamp_king_bench_scores",
+                        lambda entries, seeds: called.append(True) or entries)
+    runner.run_round([_commit(0, "a", REF_A, 1)], king_hotkey="a", base_seed=1, block=10)
+    assert called == [True]   # guard let it through with bench_eval_fn=None
