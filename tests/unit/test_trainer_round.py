@@ -578,3 +578,47 @@ def test_stage_filter_falls_back_when_no_host_matches(cfg, tmp_path):
     legacy = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
                            remote_hosts=[object(), object()])
     assert len(legacy._hosts_for("heat")) == 2 and len(legacy._hosts_for("final")) == 2
+
+
+def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
+    # The outer SSH timeout is the only bound on a fully wedged pod; heats cap
+    # it at scaled-guard + 30min instead of the 6h final default.
+    from types import SimpleNamespace
+
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    timeouts: list[tuple[bool, int]] = []
+
+    class _FakeDisp:
+        def __init__(self, *, trainer_spec, timeout_seconds):
+            self.timeout_seconds = timeout_seconds
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix=""):
+            timeouts.append((train_hours is not None, self.timeout_seconds))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[SimpleNamespace(name="p", stage="any")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_guard = cfg.screen_contract().for_hours(cfg.round.heat_train_hours).max_train_seconds
+    heat_timeouts = {t for is_heat, t in timeouts if is_heat}
+    final_timeouts = {t for is_heat, t in timeouts if not is_heat}
+    assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml
+    assert final_timeouts == {runner.remote_timeout_seconds}

@@ -820,9 +820,13 @@ class TrainerRunner:
             raise RuntimeError("remote heat requires trainer_spec (BaseTrainer 'module:Class')")
         hosts = self._hosts_for("heat")
         hub = self.hub()  # pre-init (thread-safe) before the pool
-        disp = RemoteDispatcher(
-            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
-        )
+        # Heat dispatches get a TIGHT SSH timeout: the pod-side guard already
+        # kills a slow run at the scaled max_train_seconds, so the only thing a
+        # long outer timeout buys is a wedged pod (kernel hang, dead network
+        # where SSH never returns) holding a heat slot for the full 6h default.
+        # Guard + 30min covers fetch/sandbox/upload overheads around training.
+        heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
+        disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout)
 
         def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path]:
             entry = self._dispatch_with_retry(
