@@ -81,32 +81,47 @@ def _unsigned_s3_text(cfg, key: str) -> str:
 
 
 def fetch_receipt_text(cfg, round_id: str | None) -> str:
-    """The receipt JSON for ``round_id`` (None ⇒ latest), anonymous-first."""
+    """The receipt JSON for ``round_id`` (None ⇒ latest), anonymous-first.
+
+    When ``[manifest] validator_hotkey`` is pinned, that validator's
+    ``receipts/<hotkey>/…`` prefix is tried first, then the legacy shared
+    ``receipts/…`` keys (receipts published before per-validator prefixes).
+    """
     from ..shared.hippius import (
-        RECEIPT_LATEST_KEY,
         open_manifest_store,
+        receipt_latest_key,
         receipt_round_key,
     )
 
-    key = RECEIPT_LATEST_KEY if round_id is None else receipt_round_key(round_id)
-    try:
-        return _unsigned_s3_text(cfg, key)
-    except ImportError as e:
-        raise SystemExit(
-            f"boto3 unavailable ({e}); install the [hippius] extra or pass --receipt FILE"
-        ) from e
-    except Exception as anon_err:  # noqa: BLE001 — fall back to credentials if present
+    def _key(hotkey: str) -> str:
+        return (receipt_latest_key(hotkey) if round_id is None
+                else receipt_round_key(round_id, hotkey))
+
+    pinned = str(getattr(cfg.manifest, "validator_hotkey", "") or "")
+    keys = [_key(pinned), _key("")] if pinned else [_key("")]
+    store = None
+    errors: list[str] = []
+    for key in keys:
+        try:
+            return _unsigned_s3_text(cfg, key)
+        except ImportError as e:
+            raise SystemExit(
+                f"boto3 unavailable ({e}); install the [hippius] extra or pass --receipt FILE"
+            ) from e
+        except Exception as anon_err:  # noqa: BLE001 — fall back to credentials if present
+            errors.append(f"{key}: anonymous ({anon_err})")
         # HF-backed store when [storage] hf_backup_repo is set, so an auditor can
         # still fetch the receipt during a Hippius S3 outage.
-        store = open_manifest_store(cfg.storage)
+        if store is None:
+            store = open_manifest_store(cfg.storage)
         try:
             return store.get_text(key)
         except Exception as cred_err:  # noqa: BLE001
-            raise SystemExit(
-                f"could not fetch s3://{cfg.storage.manifest_bucket}/{key}: anonymous "
-                f"({anon_err}); credentialed ({cred_err}). Pass --receipt FILE to audit "
-                "a local copy."
-            ) from cred_err
+            errors.append(f"{key}: credentialed ({cred_err})")
+    raise SystemExit(
+        f"could not fetch a receipt from s3://{cfg.storage.manifest_bucket}: "
+        + "; ".join(errors) + ". Pass --receipt FILE to audit a local copy."
+    )
 
 
 def _chain_client(cfg, network: str):

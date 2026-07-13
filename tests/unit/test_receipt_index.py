@@ -151,3 +151,66 @@ def test_read_receipt_index_empty_when_absent_or_malformed():
     assert hippius.read_receipt_index(store)["rounds"] == []
     store.objects[hippius.RECEIPT_INDEX_KEY] = json.dumps({"schema": 1})  # no rounds list
     assert hippius.read_receipt_index(store)["rounds"] == []
+
+
+# ── per-validator prefixed index ─────────────────────────────────────────────
+
+HK = "5ValidatorHotkey"
+
+
+class _ScopedS3Store(_FakeS3Store):
+    """Writes allowed only under one validator's prefix — models the
+    owner-issued credential scoped to ``receipts/<hotkey>/*``."""
+
+    def __init__(self, allow_prefix: str):
+        super().__init__()
+        self.allow_prefix = allow_prefix
+
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
+        if not key.startswith(self.allow_prefix):
+            raise hippius.StorageError(f"s3_put_failed: {key}: AccessDenied")
+        super().put_text(key, text, content_type=content_type, acl=acl)
+
+
+def test_update_receipt_index_prefixed_mirrors_legacy():
+    store = _FakeS3Store()
+    receipt, _, _ = make_scored_receipt()
+    entry = hippius.update_receipt_index(
+        store, summarize_receipt(receipt), validator_hotkey=HK,
+    )
+
+    # the entry points at the validator's own per-round receipt
+    assert entry["receipt_key"] == f"receipts/{HK}/round-{receipt.round_id}.json"
+    prefixed = hippius.receipt_index_key(HK)
+    assert prefixed == f"receipts/{HK}/index.json"
+    assert store.acls[prefixed] == "public-read"
+    # broad (owner) credential ⇒ the legacy shared index stays fed for old readers
+    assert store.objects[hippius.RECEIPT_INDEX_KEY] == store.objects[prefixed]
+
+
+def test_update_receipt_index_scoped_key_skips_legacy_mirror():
+    store = _ScopedS3Store(f"receipts/{HK}/")
+    hippius.update_receipt_index(
+        store, {"round_id": "r1", "epoch_start_block": 1, "status": "scored"},
+        validator_hotkey=HK,
+    )
+    assert hippius.receipt_index_key(HK) in store.objects
+    # the denied legacy mirror is skipped, not fatal
+    assert hippius.RECEIPT_INDEX_KEY not in store.objects
+
+
+def test_read_receipt_index_seeds_from_legacy_history():
+    store = _FakeS3Store()
+    # pre-prefix history lives only in the shared index
+    hippius.update_receipt_index(
+        store, {"round_id": "r1", "epoch_start_block": 1, "status": "scored"},
+    )
+    doc = hippius.read_receipt_index(store, HK)   # no prefixed index yet
+    assert [r["round_id"] for r in doc["rounds"]] == ["r1"]
+    # the first prefixed update carries that history forward
+    hippius.update_receipt_index(
+        store, {"round_id": "r2", "epoch_start_block": 2, "status": "scored"},
+        validator_hotkey=HK,
+    )
+    doc = json.loads(store.objects[hippius.receipt_index_key(HK)])
+    assert [r["round_id"] for r in doc["rounds"]] == ["r1", "r2"]

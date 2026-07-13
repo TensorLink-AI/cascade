@@ -450,6 +450,50 @@ def test_fetch_receipt_falls_back_to_credentialed(cfg, monkeypatch):
     assert fetch_receipt_text(cfg, "9") == '{"ok": 1}'
 
 
+def test_fetch_receipt_prefers_pinned_validator_prefix(audit_cfg, monkeypatch):
+    """With [manifest] validator_hotkey pinned, the audit reads that validator's
+    receipts/<hotkey>/ prefix first — the authoritative copy under prefix-scoped
+    credentials."""
+    import cascade.audit.main as audit_mod
+
+    hk = VALIDATOR_KP.ss58_address
+    calls: list[str] = []
+
+    def anon(cfg_, key):
+        calls.append(key)
+        if key == f"receipts/{hk}/round-9.json":
+            return '{"ok": "prefixed"}'
+        raise RuntimeError("404")
+
+    monkeypatch.setattr(audit_mod, "_unsigned_s3_text", anon)
+    assert fetch_receipt_text(audit_cfg, "9") == '{"ok": "prefixed"}'
+    assert calls == [f"receipts/{hk}/round-9.json"]
+
+
+def test_fetch_receipt_falls_back_to_legacy_shared_key(audit_cfg, monkeypatch):
+    """A pre-prefix receipt that exists only at the legacy shared key is still
+    found when the pinned validator's prefixed copy is absent."""
+    import cascade.audit.main as audit_mod
+
+    def anon(cfg_, key):
+        if key == "receipts/round-9.json":
+            return '{"ok": "legacy"}'
+        raise RuntimeError("404")
+
+    class _NoStore:
+        def __init__(self, s3cfg):
+            pass
+
+        def get_text(self, key):
+            raise RuntimeError("no creds")
+
+    import cascade.shared.hippius as hippius
+
+    monkeypatch.setattr(audit_mod, "_unsigned_s3_text", anon)
+    monkeypatch.setattr(hippius, "S3Store", lambda s3cfg: _NoStore(s3cfg))
+    assert fetch_receipt_text(audit_cfg, "9") == '{"ok": "legacy"}'
+
+
 # ── trainer-king vs validator-state-king divergence (seen live 2026-07-07) ────
 # After a service outage the trainer's king-read (on-chain incentive) pointed at
 # a different hotkey than the validator's persisted state king. That is a

@@ -82,6 +82,35 @@ export HIPPIUS_HUB_USERNAME=...     # (or HIPPIUS_HUB_TOKEN) to pull checkpoints
 export HIPPIUS_HUB_PASSWORD=...
 ```
 
+**Where the S3 key comes from.** The manifest bucket is owner-controlled — ask
+the subnet owner for a key when you register. Your receipts are published under
+your own namespace, `receipts/<your-hotkey>/…`, so the owner issues you a key
+scoped to exactly that prefix: you can publish your own signed record but
+cannot touch manifests, the eval pool, or any other validator's receipts. (An
+S3 `PutObject` to an existing key is an *overwrite* — denying delete protects
+nothing; prefix scoping is what prevents clobbering.) The policy the owner
+issues per validator:
+
+```json
+{"Statement": [
+  {"Effect": "Allow", "Action": ["s3:GetObject"],
+   "Resource": ["arn:aws:s3:::cascade-testnet-manifests/manifests/*",
+                "arn:aws:s3:::cascade-testnet-manifests/receipts/*",
+                "arn:aws:s3:::cascade-testnet-eval-pool/*"]},
+  {"Effect": "Allow", "Action": ["s3:PutObject"],
+   "Resource": "arn:aws:s3:::cascade-testnet-manifests/receipts/<your-hotkey>/*"}
+]}
+```
+
+The validator also mirrors each receipt to the legacy shared `receipts/…` keys
+best-effort — with a prefix-scoped key that mirror is denied and silently
+skipped (expected; your prefixed copy is the authoritative one the audit
+reads). Owner-side management is simple: issue one key per validator hotkey at
+onboarding, revoke that key to cut off a validator, rotate after any incident —
+no other validator is affected. To verify a freshly issued key is scoped
+correctly, confirm a `PutObject` to `manifests/latest.json` is denied while one
+to `receipts/<your-hotkey>/test.json` succeeds.
+
 If `[storage] backup_s3_endpoint` is set (a Cloudflare R2 backup of the
 manifest/receipt bucket — every object is dual-written there, and reads fall back
 to it when Hippius S3 is down), also export the R2 token:
@@ -114,7 +143,7 @@ and set weights:
 new manifest round=… entries=2 (king:uid3,challenger:uid2); gating + scoring …
 round=… lcb=0.0000 margin=0.0200 win=False loss king=… tenure=…
 round=… weights set: reward_uids=[3] (n_uids=9, burn_uid=0)
-published scored receipt round=… signed=True → s3://…/receipts/round-….json
+published scored receipt round=… signed=True → s3://…/receipts/<your-hotkey>/round-….json
 ```
 
 Run it under a process manager (systemd, tmux, supervisor) so it survives
@@ -127,8 +156,8 @@ Three signals:
 
 1. **Weights on chain** — `round=… weights set …` in the log, and
    `btcli wallet overview` / the metagraph shows your hotkey emitting weight.
-2. **Receipts published** — a signed `receipts/round-<id>.json` per round in the
-   manifest bucket (the dashboard reads these).
+2. **Receipts published** — a signed `receipts/<your-hotkey>/round-<id>.json`
+   per round in the manifest bucket (the dashboard reads these).
 3. **Audit as health check** — verify your own latest round end to end:
 
    ```bash
@@ -147,6 +176,7 @@ Three signals:
 | `rejecting manifest … signature_invalid` | wrong `[manifest] trainer_hotkey`, or the trainer published unsigned |
 | `no eval-pool snapshot published` | `pool_bucket` set but the owner hasn't published a snapshot, or wrong bucket/creds |
 | weights never set | no validator permit (insufficient stake), or the weight extrinsic is failing — check `btcli` and the log's `weight set failed` line |
+| `receipt publication failed … AccessDenied` | your S3 key's write prefix doesn't match your wallet hotkey — ask the owner to re-issue the key for the ss58 you actually run with |
 | CUDA not available | the evaluator needs a GPU; `pip install -e '.[train]'` on a CUDA box |
 | audit WARNs on `block-hash-onchain` / `commit-cutoff` | you're on a lite node without the historical block/commitment; point `--network` at an archive node for zero WARNs |
 

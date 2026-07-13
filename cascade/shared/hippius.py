@@ -843,17 +843,52 @@ def read_latest_manifest(store: S3Store) -> str:
 RECEIPT_LATEST_KEY = "receipts/latest.json"
 
 
-def receipt_round_key(round_id: str) -> str:
-    return f"receipts/round-{round_id}.json"
+def receipt_prefix(validator_hotkey: str = "") -> str:
+    """Namespace for one validator's receipts.
+
+    With a hotkey, receipts live under ``receipts/<hotkey>/…`` so the owner can
+    issue that validator S3 credentials scoped to exactly this prefix — able to
+    publish its own signed record, unable to touch manifests, the pool, or any
+    other validator's receipts. (An S3 ``PutObject`` to an existing key is an
+    overwrite — denying ``DeleteObject`` protects nothing; only prefix scoping
+    prevents clobbering.) Empty ⇒ the legacy shared ``receipts/…`` namespace.
+    """
+    return f"receipts/{validator_hotkey}" if validator_hotkey else "receipts"
 
 
-def publish_receipt(store: S3Store, receipt_text: str, round_id: str) -> str:
-    """Write the round receipt and update the ``receipts/latest.json`` pointer.
+def receipt_round_key(round_id: str, validator_hotkey: str = "") -> str:
+    return f"{receipt_prefix(validator_hotkey)}/round-{round_id}.json"
+
+
+def receipt_latest_key(validator_hotkey: str = "") -> str:
+    return f"{receipt_prefix(validator_hotkey)}/latest.json"
+
+
+def _put_public_json(store: S3Store, key: str, text: str) -> None:
+    """public-read PUT (audit-facing), retried private where ACLs are rejected."""
+    try:
+        store.put_text(key, text, content_type="application/json", acl="public-read")
+    except StorageError:
+        # ACL unsupported on this backend: publish private rather than not at all.
+        store.put_text(key, text, content_type="application/json")
+
+
+def publish_receipt(
+    store: S3Store, receipt_text: str, round_id: str, *, validator_hotkey: str = "",
+) -> str:
+    """Write the round receipt and update the ``latest.json`` pointer.
 
     Mirrors :func:`publish_manifest` — the validator publishes its signed
     :class:`cascade.shared.receipt.RoundReceipt` here after weights are set, and
-    auditors read :data:`RECEIPT_LATEST_KEY` (or a specific round's key).
-    Returns the per-round key.
+    auditors read the latest (or a specific round's) key. Returns the per-round
+    key the authoritative copy landed on.
+
+    With ``validator_hotkey`` the authoritative copies live under this
+    validator's own ``receipts/<hotkey>/…`` prefix (see :func:`receipt_prefix`),
+    and the legacy shared ``receipts/…`` keys are then mirrored best-effort: a
+    prefix-scoped credential that is denied the shared keys still publishes
+    cleanly, while a broad (owner) credential keeps pre-prefix dashboards and
+    auditors fed.
 
     Receipts are the audit-facing artefact, so each object is written with a
     ``public-read`` ACL: third parties can then GET it (and run
@@ -862,25 +897,43 @@ def publish_receipt(store: S3Store, receipt_text: str, round_id: str) -> str:
     retried private (the audit's anonymous fetch then falls back to
     credentials, as documented in docs/AUDIT.md).
     """
-    key = receipt_round_key(round_id)
-    try:
-        store.put_text(key, receipt_text, content_type="application/json", acl="public-read")
-        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json",
-                       acl="public-read")
-    except StorageError:
-        # ACL unsupported on this backend: publish private rather than not at all.
-        store.put_text(key, receipt_text, content_type="application/json")
-        store.put_text(RECEIPT_LATEST_KEY, receipt_text, content_type="application/json")
+    key = receipt_round_key(round_id, validator_hotkey)
+    _put_public_json(store, key, receipt_text)
+    _put_public_json(store, receipt_latest_key(validator_hotkey), receipt_text)
+    if validator_hotkey:
+        try:
+            _put_public_json(store, receipt_round_key(round_id), receipt_text)
+            _put_public_json(store, RECEIPT_LATEST_KEY, receipt_text)
+        except StorageError as e:
+            import logging
+
+            logging.getLogger("cascade.storage").debug(
+                "legacy receipt mirror skipped for round=%s (scoped key?): %s", round_id, e)
     return key
 
 
-def read_receipt(store: S3Store, round_id: str) -> str:
-    """Read one round's receipt JSON by round id."""
+def read_receipt(store: S3Store, round_id: str, validator_hotkey: str = "") -> str:
+    """Read one round's receipt JSON by round id.
+
+    With ``validator_hotkey``, that validator's prefixed copy is preferred and
+    the legacy shared key is the fallback (receipts published before the
+    per-validator prefixes existed).
+    """
+    if validator_hotkey:
+        try:
+            return store.get_text(receipt_round_key(round_id, validator_hotkey))
+        except StorageError:
+            pass
     return store.get_text(receipt_round_key(round_id))
 
 
-def read_latest_receipt(store: S3Store) -> str:
-    """Read the current receipt JSON from ``receipts/latest.json``."""
+def read_latest_receipt(store: S3Store, validator_hotkey: str = "") -> str:
+    """Read the current receipt JSON from ``latest.json`` (prefixed-first)."""
+    if validator_hotkey:
+        try:
+            return store.get_text(receipt_latest_key(validator_hotkey))
+        except StorageError:
+            pass
     return store.get_text(RECEIPT_LATEST_KEY)
 
 
@@ -899,20 +952,37 @@ RECEIPT_INDEX_SCHEMA = 1
 RECEIPT_INDEX_MAX_KEEP = 400
 
 
-def read_receipt_index(store: S3Store) -> dict:
-    """Read ``receipts/index.json``; return an empty index if absent/malformed."""
-    empty = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": []}
+def receipt_index_key(validator_hotkey: str = "") -> str:
+    return f"{receipt_prefix(validator_hotkey)}/index.json"
+
+
+def _load_receipt_index(store: S3Store, key: str) -> dict | None:
+    """One index document, or None if absent/malformed."""
     try:
-        text = store.get_text(RECEIPT_INDEX_KEY)
+        text = store.get_text(key)
     except StorageError:
-        return empty
+        return None
     try:
         doc = json.loads(text)
     except (ValueError, TypeError):
-        return empty
+        return None
     if not isinstance(doc, dict) or not isinstance(doc.get("rounds"), list):
-        return empty
+        return None
     return doc
+
+
+def read_receipt_index(store: S3Store, validator_hotkey: str = "") -> dict:
+    """Read the receipts index; return an empty index if absent/malformed.
+
+    With ``validator_hotkey``, that validator's prefixed index is preferred and
+    the legacy shared ``receipts/index.json`` is the fallback — so the first
+    prefixed update seeds from the pre-prefix history instead of starting the
+    dashboard's rolling window from scratch.
+    """
+    doc = _load_receipt_index(store, receipt_index_key(validator_hotkey))
+    if doc is None and validator_hotkey:
+        doc = _load_receipt_index(store, RECEIPT_INDEX_KEY)
+    return doc if doc is not None else {"schema": RECEIPT_INDEX_SCHEMA, "rounds": []}
 
 
 def update_receipt_index(
@@ -923,8 +993,9 @@ def update_receipt_index(
     subnet: dict | None = None,
     chain: dict | None = None,
     max_keep: int = RECEIPT_INDEX_MAX_KEEP,
+    validator_hotkey: str = "",
 ) -> dict:
-    """Append/replace one round in ``receipts/index.json`` and write it public-read.
+    """Append/replace one round in the receipts index and write it public-read.
 
     Idempotent per ``round_id`` (a re-published round replaces its entry), sorted
     by ``epoch_start_block`` then ``round_id`` (chronological — round ids are
@@ -933,13 +1004,17 @@ def update_receipt_index(
     and ``chain`` (schedule anchor for the next-round countdown:
     ``{as_of, current_block, epoch_start_block, epoch_blocks, block_time_s}``)
     are optional header fields the dashboard shows. Returns the stored entry.
+
+    With ``validator_hotkey`` the authoritative index lives under the
+    validator's own prefix and the legacy shared ``receipts/index.json`` is
+    mirrored best-effort, exactly like :func:`publish_receipt`.
     """
     entry = dict(summary)
-    entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")))
+    entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")), validator_hotkey)
     if updated_at:
         entry["published_at"] = updated_at
 
-    doc = read_receipt_index(store)
+    doc = read_receipt_index(store, validator_hotkey)
     rid = str(entry.get("round_id"))
     rounds = [r for r in doc.get("rounds", []) if str(r.get("round_id")) != rid]
     rounds.append(entry)
@@ -955,11 +1030,15 @@ def update_receipt_index(
         out["chain"] = chain
 
     text = json.dumps(out, indent=2, sort_keys=True)
-    try:
-        store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json", acl="public-read")
-    except StorageError:
-        # ACL unsupported on this backend: publish private rather than not at all.
-        store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json")
+    _put_public_json(store, receipt_index_key(validator_hotkey), text)
+    if validator_hotkey:
+        try:
+            _put_public_json(store, RECEIPT_INDEX_KEY, text)
+        except StorageError as e:
+            import logging
+
+            logging.getLogger("cascade.storage").debug(
+                "legacy index mirror skipped for round=%s (scoped key?): %s", rid, e)
     return entry
 
 

@@ -11,10 +11,13 @@ third party needs to re-derive the round without trusting the owner — see
 ``docs/AUDIT.md`` and the ``cascade-audit`` CLI.
 
 Receipts are published to the owner-controlled Hippius S3 manifest bucket
-(``receipts/round-<id>.json`` + ``receipts/latest.json``; see
-:mod:`cascade.shared.hippius`). A round the validator *rejected* still gets a
-receipt (``status = "rejected"``) carrying the gate's reason, so a censored or
-malformed round is publicly visible rather than silently absent.
+under the validator's own prefix (``receipts/<hotkey>/round-<id>.json`` +
+``receipts/<hotkey>/latest.json``, mirrored best-effort to the legacy shared
+``receipts/…`` keys; see :mod:`cascade.shared.hippius`) — so the owner can
+issue each validator credentials scoped to its prefix, unable to overwrite
+manifests or another validator's receipts. A round the validator *rejected*
+still gets a receipt (``status = "rejected"``) carrying the gate's reason, so a
+censored or malformed round is publicly visible rather than silently absent.
 
 Conventions follow :mod:`cascade.shared.manifest` exactly: frozen dataclasses,
 an explicit ``receipt_version``, a canonical sorted-key JSON body, and

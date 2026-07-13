@@ -15,10 +15,14 @@ instead of taking it on faith. Every round is a pure function of chain state:
 * the **weights** are `equal_share_vector` of the resulting court.
 
 After each round the validator publishes a signed
-[`RoundReceipt`](../cascade/shared/receipt.py) to the manifest bucket
-(`receipts/round-<id>.json` + `receipts/latest.json`) recording all of the
-above — including the trainer's manifest verbatim and every per-window score
-that fed the KOTH bootstrap. A round the validator *rejected* still gets a
+[`RoundReceipt`](../cascade/shared/receipt.py) to the manifest bucket under its
+own prefix (`receipts/<validator-hotkey>/round-<id>.json` +
+`receipts/<validator-hotkey>/latest.json`, mirrored best-effort to the legacy
+shared `receipts/…` keys) recording all of the above — including the trainer's
+manifest verbatim and every per-window score that fed the KOTH bootstrap. When
+`[manifest] validator_hotkey` is pinned in `chain.toml`, the audit fetches from
+that prefix first and falls back to the shared keys (receipts published before
+per-validator prefixes existed). A round the validator *rejected* still gets a
 receipt (`"status": "rejected"`) carrying the gate's reason.
 
 `cascade-audit` re-derives a receipt at three tiers:

@@ -199,10 +199,13 @@ def test_published_receipt_matches_round_outcome(cfg, monkeypatch):
     """The A-workstream acceptance path: run a fake round, publish, and the
     receipt on 'S3' reproduces the outcome exactly."""
     published: dict[str, str] = {}
-    monkeypatch.setattr(
-        hippius, "publish_receipt",
-        lambda store, text, round_id: published.setdefault(round_id, text),
-    )
+    publish_hotkeys: list[str] = []
+
+    def fake_publish(store, text, round_id, *, validator_hotkey=""):
+        publish_hotkeys.append(validator_hotkey)
+        return published.setdefault(round_id, text)
+
+    monkeypatch.setattr(hippius, "publish_receipt", fake_publish)
 
     base_seed = seed_from_block_hash(BLOCK_HASH)
     eval_fn, king, chal = _strong_eval()
@@ -226,6 +229,8 @@ def test_published_receipt_matches_round_outcome(cfg, monkeypatch):
     assert receipt.epoch_start_block == EPOCH_START
     assert receipt.epoch_block_hash == BLOCK_HASH
     assert receipt.validator_hotkey == "5FakeValidatorHotkey"
+    # published under the validator's own receipts/<hotkey>/ prefix
+    assert publish_hotkeys == ["5FakeValidatorHotkey"]
     assert receipt.signature is not None  # signed with the (fake) wallet
     assert [p.hotkey for p in receipt.participants] == ["king_hk", "chal_hk"]
     assert receipt.eval_context.pool_ref == "pool@ref"
@@ -240,7 +245,7 @@ def test_published_rejection_receipt(cfg, monkeypatch):
     published: dict[str, str] = {}
     monkeypatch.setattr(
         hippius, "publish_receipt",
-        lambda store, text, round_id: published.setdefault(round_id, text),
+        lambda store, text, round_id, **kw: published.setdefault(round_id, text),
     )
     base_seed = seed_from_block_hash(BLOCK_HASH)
     runner = _runner(cfg, lambda e, w: [])
@@ -263,7 +268,7 @@ def test_published_rejection_receipt(cfg, monkeypatch):
 
 def test_receipt_failure_never_raises(cfg, monkeypatch):
     """A receipt hiccup must never disturb the round (weights/state are done)."""
-    def boom(store, text, round_id):
+    def boom(store, text, round_id, **kw):
         raise RuntimeError("s3 down")
 
     monkeypatch.setattr(hippius, "publish_receipt", boom)
@@ -288,7 +293,24 @@ class _FakeS3Store:
         self.acls[key] = acl
 
     def get_text(self, key):
+        # Mirror the real S3Store: a missing object is a StorageError, not KeyError.
+        if key not in self.objects:
+            raise hippius.StorageError(f"s3_get_failed: {key}: missing")
         return self.objects[key]
+
+
+class _ScopedS3Store(_FakeS3Store):
+    """Writes allowed only under one validator's prefix — models the
+    owner-issued credential scoped to ``receipts/<hotkey>/*``."""
+
+    def __init__(self, allow_prefix: str):
+        super().__init__()
+        self.allow_prefix = allow_prefix
+
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
+        if not key.startswith(self.allow_prefix):
+            raise hippius.StorageError(f"s3_put_failed: {key}: AccessDenied")
+        super().put_text(key, text, content_type=content_type, acl=acl)
 
 
 def test_publish_and_read_receipt_keys():
@@ -304,3 +326,39 @@ def test_publish_and_read_receipt_keys():
     hippius.publish_receipt(store, '{"round_id":"43"}', "43")
     assert hippius.read_latest_receipt(store) == '{"round_id":"43"}'
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
+
+
+HK = "5ValidatorHotkey"
+
+
+def test_publish_prefixed_mirrors_legacy_keys():
+    store = _FakeS3Store()
+    key = hippius.publish_receipt(store, '{"round_id":"42"}', "42", validator_hotkey=HK)
+    # authoritative copies under the validator's own prefix, world-readable
+    assert key == f"receipts/{HK}/round-42.json"
+    assert store.acls[key] == "public-read"
+    assert store.acls[f"receipts/{HK}/latest.json"] == "public-read"
+    # broad (owner) credential ⇒ the legacy shared keys stay fed for old readers
+    assert store.objects["receipts/round-42.json"] == '{"round_id":"42"}'
+    assert store.objects["receipts/latest.json"] == '{"round_id":"42"}'
+    assert hippius.read_receipt(store, "42", HK) == '{"round_id":"42"}'
+    assert hippius.read_latest_receipt(store, HK) == '{"round_id":"42"}'
+
+
+def test_publish_with_scoped_key_skips_legacy_mirror():
+    store = _ScopedS3Store(f"receipts/{HK}/")
+    key = hippius.publish_receipt(store, '{"round_id":"42"}', "42", validator_hotkey=HK)
+    # the prefix-scoped credential publishes cleanly under its own namespace…
+    assert key == f"receipts/{HK}/round-42.json"
+    assert key in store.objects and f"receipts/{HK}/latest.json" in store.objects
+    # …and the denied legacy mirror is skipped, not fatal
+    assert "receipts/round-42.json" not in store.objects
+    assert "receipts/latest.json" not in store.objects
+
+
+def test_read_receipt_falls_back_to_legacy_key():
+    store = _FakeS3Store()
+    # a pre-prefix receipt exists only at the legacy shared key
+    hippius.publish_receipt(store, '{"round_id":"41"}', "41")
+    assert hippius.read_receipt(store, "41", HK) == '{"round_id":"41"}'
+    assert hippius.read_latest_receipt(store, HK) == '{"round_id":"41"}'

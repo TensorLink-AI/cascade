@@ -672,7 +672,8 @@ class ValidatorRunner:
                 log.warning("publishing an UNSIGNED receipt (no wallet) for round=%s",
                             manifest.round_id)
             store = open_manifest_store(self.cfg.storage)
-            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id)
+            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id,
+                                  validator_hotkey=hotkey_ss58)
             log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
                      receipt.status, manifest.round_id, receipt.signature is not None,
                      self.cfg.storage.manifest_bucket, key)
@@ -697,6 +698,7 @@ class ValidatorRunner:
                     updated_at=now_iso,
                     subnet={"netuid": self.cfg.subnet.netuid, "name": self.cfg.subnet.name},
                     chain=chain,
+                    validator_hotkey=hotkey_ss58,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("receipt index update failed for round=%s: %s",
