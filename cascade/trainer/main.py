@@ -42,7 +42,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--remote-hosts", type=Path, default=None,
         help="Trainer-local TOML of SSH GPU pods ([[host]] tables). When set, king "
-             "and challenger train in parallel on separate pods (see trainer/remote.py).",
+             "and challenger train in parallel on separate pods (see trainer/remote.py). "
+             "RE-READ at the start of every round, so an elastic provisioner can "
+             "rewrite it (rent pods per round, tear down after) without a restart; "
+             "missing/empty at round start ⇒ that round trains locally.",
+    )
+    p.add_argument(
+        "--hosts-wait-seconds", type=int, default=0,
+        help="At round start, wait up to this long for --remote-hosts to appear/fill "
+             "before falling back to local training. With timed reveals the field is "
+             "only countable ~reveal_margin_blocks before the boundary, so per-round "
+             "pods finish booting after the round starts; size this to pod boot + "
+             "image pull (e.g. 900).",
+    )
+    p.add_argument(
+        "--plan-only", action="store_true",
+        help="Print the upcoming round's eligible field as JSON and exit (no wallet, "
+             "no trainer, no GPU) — the input the pod provisioner sizes the fleet "
+             "off. Counts only settle once timed reveals have landed (reveals target "
+             "boundary − reveal_margin_blocks), so run this at/after the reveal margin.",
     )
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
@@ -110,6 +128,15 @@ def main(argv: list[str] | None = None) -> int:
         print("offline trainer smoke complete")
         return 0
 
+    if args.plan_only:
+        import json
+
+        from ..shared.chain import ChainClient
+
+        client = ChainClient.from_config(cfg, network=args.network)
+        print(json.dumps(_plan_payload(cfg, client, args.work_root), sort_keys=True))
+        return 0
+
     if not args.trainer:
         print("--trainer module:Class is required for a live run", flush=True)
         return 2
@@ -137,20 +164,30 @@ def main(argv: list[str] | None = None) -> int:
 
     remote_hosts = None
     if args.remote_hosts is not None:
-        from .remote import load_hosts
+        from .remote import RemoteDispatchError, load_hosts
 
-        remote_hosts = load_hosts(args.remote_hosts)
-        logging.getLogger("cascade.trainer").info(
-            "remote training across %d pod(s): %s",
-            len(remote_hosts), ", ".join(h.name for h in remote_hosts),
-        )
+        # Best-effort at startup: with an elastic per-round provisioner the file
+        # may not exist yet — run_forever re-reads it at every round start.
+        try:
+            remote_hosts = load_hosts(args.remote_hosts)
+            logging.getLogger("cascade.trainer").info(
+                "remote training across %d pod(s): %s",
+                len(remote_hosts), ", ".join(h.name for h in remote_hosts),
+            )
+        except RemoteDispatchError as e:
+            logging.getLogger("cascade.trainer").warning(
+                "remote hosts not ready at startup (%s); re-checking each round", e,
+            )
 
     log = logging.getLogger("cascade.trainer")
     screen_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
 
     bench_plan = None
     if args.post_round_benchmarks:
-        if not remote_hosts:
+        # Key off the FLAG, not the startup-loaded list: with an elastic fleet
+        # the hosts file may be empty until a round's provisioner fills it, and
+        # run_forever guards each launch on the round's live fleet anyway.
+        if args.remote_hosts is None:
             log.warning("--post-round-benchmarks needs --remote-hosts; disabling")
         else:
             from .bench_hook import BenchPlan
@@ -208,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         work_root=args.work_root,
         wallet=client.wallet(),
         remote_hosts=remote_hosts,
+        remote_hosts_path=args.remote_hosts,
+        hosts_wait_seconds=args.hosts_wait_seconds,
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
         bench_plan=bench_plan,
@@ -230,14 +269,50 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _plan_payload(cfg, client, work_root: Path | str) -> dict:
+    """The upcoming round's eligible field, as one JSON-able dict.
+
+    This is the provisioner's sizing input (``--plan-only``): the same
+    eligibility pipeline the round itself will run — resolve reveals, split
+    king from challengers, dedup, drop burned hotkeys — so the count matches
+    what the heat will actually train, not raw commitments. Every reveal on
+    chain now lands strictly before the NEXT boundary, so no cutoff is applied;
+    with timed reveals the field only settles once reveals land
+    (~reveal_margin_blocks before the boundary).
+    """
+    from .loop import TrainerRunner, plan_round, resolve_commitments
+
+    block = int(client.current_block())
+    epoch_blocks = max(1, cfg.round.epoch_blocks)
+    next_boundary = (block // epoch_blocks + 1) * epoch_blocks
+    resolved = resolve_commitments(client.poll_commitments())
+    plan = plan_round(resolved, client.highest_incentive_hotkey())
+    probe = TrainerRunner(cfg=cfg, base_trainer=None, work_root=Path(work_root))
+    eligible = probe._filter_burned_challengers(plan.challengers)
+    return {
+        "block": block,
+        "epoch_blocks": epoch_blocks,
+        "next_boundary_block": next_boundary,
+        "blocks_to_boundary": next_boundary - block,
+        "king": plan.king.hotkey if plan.king is not None else None,
+        "resolved": len(resolved),
+        "challengers": len(plan.challengers),
+        "eligible_challengers": len(eligible),
+        "heat_train_hours": cfg.round.heat_train_hours,
+        "finalists": cfg.round.finalists,
+    }
+
+
 def _build_screen_fn(cfg, *, cache_dir: Path | None):
     """The heat screener: train cheap → score on the held-out pool → geomean.
 
     Loads the same private eval pool the validators use (owner-controlled) and
     scores each heat checkpoint on a per-round-rotated slice, returning
     geomean(CRPS, MASE) (lower is better) so the trainer can rank the field down
-    to ``[round] finalists`` before the expensive final. Imports torch/pool lazily
-    so the offline smoke and unit tests never pull the heavy stacks."""
+    to ``[round] finalists`` before the expensive final. ``block`` (the round's
+    epoch boundary) keys a daily-snapshot pool to the same snapshot the
+    validator will judge on. Imports torch/pool lazily so the offline smoke and
+    unit tests never pull the heavy stacks."""
     from ..eval.scoring import global_geomean
     from ..validator.evaluator import evaluate_checkpoint
 
@@ -251,11 +326,14 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
         window_source = load_pool(cfg, cache_dir=cache_dir)
 
     n = min(cfg.round.heat_n_windows, cfg.eval.n_windows)
+    # The heat only RANKS the field; far fewer samples than the final verdict
+    # keeps the sequential CPU screening from rivalling the heat training time.
+    num_samples = cfg.round.heat_num_samples or cfg.eval.num_samples
 
-    def screen(ckpt_dir: Path, gen, base_seed: int) -> float:
-        windows = window_source.windows_for_round(base_seed, n)
+    def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None) -> float:
+        windows = window_source.windows_for_round(base_seed, n, block=block)
         scores = evaluate_checkpoint(
-            ckpt_dir, windows, num_samples=cfg.eval.num_samples, device="cpu"
+            ckpt_dir, windows, num_samples=num_samples, device="cpu"
         )
         return global_geomean(scores)
 

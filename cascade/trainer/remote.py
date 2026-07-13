@@ -45,6 +45,9 @@ class RemoteDispatchError(RuntimeError):
     """An SSH dispatch or receipt parse failed."""
 
 
+HOST_STAGES = ("any", "heat", "final")
+
+
 @dataclass(frozen=True)
 class RemoteHost:
     """One SSH-reachable GPU pod that can run a training worker.
@@ -53,6 +56,14 @@ class RemoteHost:
     environment into the remote command (e.g. registry/S3 credentials) — use it
     only if you have not pre-seeded the pod's env; the bittensor wallet is never
     forwarded. ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
+
+    ``stage`` restricts which round stage the pod serves: ``"heat"`` (screen
+    trainings only), ``"final"`` (king/finalist trainings only), or ``"any"``
+    (both — the default, and the pre-stage behaviour). This is the cheap-GPU
+    seam: heats can run on a cheaper SKU class (e.g. A6000) because heat
+    checkpoints are trainer-internal — screened and discarded, never validated —
+    while the final MUST stay on one SKU (the validator's gpu_name gate pairs
+    king and challenger). Keep each stage's pods a single SKU.
     """
 
     name: str
@@ -66,6 +77,7 @@ class RemoteHost:
     chain_toml: str | None = None          # path to chain.toml on the pod (if non-default)
     forward_env: tuple[str, ...] = ()
     ssh_options: tuple[str, ...] = ()       # extra raw `-o Key=Value` style flags
+    stage: str = "any"                      # "any" | "heat" | "final"
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -83,6 +95,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         workdir = "/root/cascade"
         cuda_device = "0"
         forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_HUB_TOKEN"]
+        stage = "any"       # "heat" | "final" | "any" — which round stage this pod serves
     """
     p = Path(path)
     if not p.is_file():
@@ -93,6 +106,11 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         raise RemoteDispatchError(f"no [[host]] entries in {p}")
     hosts: list[RemoteHost] = []
     for h in entries:
+        stage = str(h.get("stage", "any"))
+        if stage not in HOST_STAGES:
+            raise RemoteDispatchError(
+                f"host {h.get('name', '?')!r}: stage={stage!r} invalid; expected one of {HOST_STAGES}"
+            )
         hosts.append(
             RemoteHost(
                 name=str(h["name"]),
@@ -106,6 +124,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 chain_toml=h.get("chain_toml"),
                 forward_env=tuple(str(x) for x in h.get("forward_env", ())),
                 ssh_options=tuple(str(x) for x in h.get("ssh_options", ())),
+                stage=stage,
             )
         )
     return hosts

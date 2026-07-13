@@ -16,6 +16,16 @@
 # For BYTE-EXACT re-derivation, rent the SAME GPU SKU on both pods and pin it in
 # chain.toml [training] expected_gpu (the reference trainer runs deterministically;
 # the validator rejects any round whose two checkpoints weren't trained on it).
+#
+# STAGE TAGS (optional, default "any"): stage = "heat" | "final" | "any" restricts
+# which round stage a pod serves. Heats can run on a CHEAPER SKU class (e.g.
+# A6000) than the final — heat checkpoints are trainer-internal (screened and
+# discarded, never validated), and the fixed token budget keeps every heat
+# entrant on identical compute regardless of SKU. Two rules:
+#   * keep each stage's pods a single SKU (heat entrants stay numerically
+#     comparable; the final's king/challenger must match for the validator gate),
+#   * only the FINAL pods need the expected_gpu SKU from chain.toml.
+# Untagged ("any") hosts serve both stages — the pre-stage behaviour.
 
 [[host]]
 name          = "king-box"

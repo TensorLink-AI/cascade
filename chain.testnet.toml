@@ -20,9 +20,14 @@ description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Tot
 # fine-tune does, so the corpus budget is larger here and is a real signal knob.
 corpus_n_series      = 16384     # series drawn from each generator per training run
 min_length           = 64        # per-series length band (timesteps)
-max_length           = 2048
+max_length           = 4096      # = [training] context_length (train on the full context,
+                                 # as Toto 2.0 does — see chain.toml); keep in lockstep
 max_total_points     = 2_000_000_000 # raised off 64M; real corpus size is set by corpus_n_series + memory/streaming (see notes)
-max_generate_seconds = 1800      # wall-clock budget for draining the generator
+max_generate_seconds = 600       # TESTNET: generator stall window (streaming: max seconds
+                                 # between series). 1800s dwarfed the ~6-min heat budget —
+                                 # one stalling generator could idle a heat slot for 30 min;
+                                 # 600s still absorbs sandbox boot + torch import for the
+                                 # first frame. (Mainnet template keeps 1800.)
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission. Generators are code-only
                                  # (purely algorithmic) — no shipped weights — so a repo is
@@ -91,8 +96,10 @@ weight_decay       = 0.05
 lr_schedule        = "warmup_cosine"
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 14400       # hard wall-clock guard (> target_train_hours so the
-                                  # token budget completes; kills a pathologically slow run)
+max_train_seconds  = 900         # TESTNET: cap = the 15-min final budget itself, measured
+                                  # from the first training batch. Token budget or deadline —
+                                  # first reached stops; a time stop is flagged deadline_hit.
+                                  # (Was 14400 — longer than the whole 3h testnet epoch.)
 # corpus feed mode — how generator data reaches the trainer. Identical for king
 # and challenger (folded into contract_digest). Three modes to A/B for now:
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
@@ -147,6 +154,14 @@ epoch_blocks     = 900    # ~3h at 12s blocks (mainnet template = 7200 ≈ 24h)
 round_hours      = 3.0    # informational
 heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
+heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [eval] num_samples);
+                          # ranking-only, so small keeps the CPU screen quick on a 3h epoch
+# Heat wall-clock cap (see chain.toml): budget hours = the cap, measured from the
+# FIRST TRAINING BATCH (fetch/sandbox boot excluded), token budget or deadline —
+# first reached stops, deadline stop flagged deadline_hit. Testnet floor is low
+# so the ~6-min heat budget really is the cap.
+heat_guard_factor        = 1.0
+heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 # Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
@@ -170,6 +185,12 @@ num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
 n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
+# TESTNET: cap datasets per suite for the Cascade king bench stamp. With
+# cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on the king EVERY
+# round, BEFORE the manifest publishes — uncapped (0 = full battery) that alone
+# can blow the 3h epoch, especially on a CPU orchestrator. (Mainnet ships
+# cascade_enabled = false, so its 0 stays the full battery.)
+cascade_bench_max_series = 3
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators must have gift-eval data pinned.
 gift_gate_datasets    = ""       # gift-eval config subset for the gate ("" = full 97 configs)
