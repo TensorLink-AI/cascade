@@ -187,6 +187,33 @@ How it works, and what to know:
   *not* auto-migrate — re-deploy with just `--hub-repo` to move your submission back
   onto the content-addressed Hub (the preferred, audit-anchored form).
 
+### 5b. Time your submission — `cascade round`
+
+Only commits revealed **strictly before** the epoch boundary enter the next
+round; commit at or after it and you wait a whole extra round (~24h). `cascade
+round` is a live countdown dashboard to that deadline — run it before you
+deploy so you don't commit into the wrong round:
+
+```bash
+cascade round --network test --chain-toml chain.testnet.toml
+# cascade round — network: test
+#   current block   4,321,004
+#   round (epoch)   600  ·  started at block 4,320,000
+#   next round      epoch 601 at block 4,327,200
+#   progress        [████░░░░░░░░░░░░░░░░░░░░░░░░]  13.9%  (1,004 / 7,200 blocks)
+#   countdown       20h 39m 12s until next round  (~12.0s/block)
+#   deadline        commit strictly before block 4,327,200 to enter epoch 601
+#   eta             2026-07-12 03:51 UTC (estimated)
+```
+
+It ticks every second, re-syncing to the real block height every `--refresh`
+seconds (default 30); Ctrl+C exits. `--once` prints a single snapshot instead
+(piped output does this automatically, with no escape codes), which is handy
+in scripts. The block numbers are on-chain-exact; the wall-clock countdown and
+ETA are estimates from the configured cadence (`[round] round_hours` over
+`epoch_blocks`, ~12s/block). Read-only — no wallet needed. Don't cut it to the
+last block: leave margin for the upload plus commit inclusion.
+
 ## 6. Confirm it's competing
 
 Your commit is now on chain. Verify it two ways:
@@ -248,5 +275,5 @@ needed, just Hub read credentials.
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
-| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round; or it failed to train (heat drops it) |
+| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5b](#5b-time-your-submission--cascade-round)); or it failed to train (heat drops it) |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape |
