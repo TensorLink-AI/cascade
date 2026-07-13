@@ -21,7 +21,7 @@ Two supported shapes:
 
 | shape | what runs where |
 |---|---|
-| **GPU box** (simplest) | everything — wallet, private-pool duel, and benchmark evals — on one CUDA machine; run with `--device cuda` |
+| **GPU box** (recommended) | everything — wallet, private-pool duel, and benchmark evals — on one CUDA machine; run with `--device cuda` |
 | **CPU orchestrator + eval pod** | wallet, private-pool duel, and **all consensus decisions** stay on a cheap CPU box; the GPU-heavy public benchmarks are offloaded over SSH with `--eval-hosts` (only a public checkpoint and a report cross to the pod — never keys) |
 
 Minimums (the GPU row applies to whichever box runs benchmarks — the GPU box
@@ -37,10 +37,12 @@ itself, or the eval pod in the split shape):
 What actually exercises the GPU depends on config:
 
 * **Pure KOTH (the shipped defaults** — `gift_gate_mode = "off"`,
-  `cascade_enabled = false`**)**: only the private-pool duel runs, and it is
-  CPU-tuned — a CPU-only box works. Keep a GPU (local or as an eval pod)
-  available anyway: the owner can turn the gates below on, and without one your
-  rounds go inconclusive/degraded.
+  `cascade_enabled = false`**)**: only the private-pool duel runs. It is
+  CPU-tuned, so a CPU-only box *works* — but run it on the GPU anyway
+  (`--device cuda`) when you have one: rounds finish faster and you're already
+  covered the moment the owner turns the gates below on. Treat CPU-only as the
+  floor for the split shape, not the default. Without any GPU (local or pod),
+  enabling those gates makes your rounds inconclusive/degraded.
 * **GIFT-Eval gate on** (`gift_gate_mode = "shadow"` / `"enforce"`): every
   round scores *both* king and challenger on gift-eval — GPU, every round.
 * **Cascade on** (`cascade_enabled = true`): normally free for you (the trainer
@@ -147,7 +149,7 @@ cascade-validator --offline --chain-toml chain.testnet.toml
 
 ## 4. Run
 
-**GPU box** — everything local:
+**GPU box** (recommended) — everything local, duel included, on the GPU:
 
 ```bash
 cascade-validator --chain-toml chain.testnet.toml --network test \
