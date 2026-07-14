@@ -199,7 +199,7 @@ s3_region        = "decentralized"
 manifest_bucket  = "cascade-testnet-manifests"      # TESTNET bucket (mainnet: cascade-manifests)
 logs_bucket      = "cascade-testnet-logs"           # TESTNET bucket (mainnet: cascade-logs)
 # Eval-pool bucket (see chain.toml). Empty = use the static [eval] window_pool ref.
-pool_bucket      = ""                               # e.g. "cascade-eval-pool"
+pool_bucket      = "cascade-testnet-eval-pool"      # daily snapshots from publish-pool.yml
 pool_s3_endpoint = ""                               # e.g. Cloudflare R2; empty = Hippius S3 above
 pool_s3_region   = ""
 # S3-compatible backup of the manifest/receipt bucket (see chain.toml).
