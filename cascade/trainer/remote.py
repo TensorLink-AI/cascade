@@ -322,6 +322,13 @@ class RemoteDispatcher:
             proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds)
         except subprocess.TimeoutExpired as e:
             raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
+        if proc.returncode == 3:
+            # Worker rc=3 = miner submission rejected (CorpusError): the last
+            # stderr line is the one-line reason — no traceback to relay.
+            reason = (proc.stderr or "").strip().splitlines()[-1:] or ["(no reason)"]
+            raise RemoteDispatchError(
+                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}"
+            )
         if proc.returncode != 0:
             tail = (proc.stderr or "")[-2000:]
             raise RemoteDispatchError(

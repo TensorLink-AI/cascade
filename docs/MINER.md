@@ -153,6 +153,20 @@ cascade deploy ./my-generator \
 Re-deploy any time to submit a new version — the latest pre-cutoff commit per
 hotkey is the one that competes.
 
+> **⚠️ Your Hippius project must be PUBLIC.** The trainer pulls your generator
+> anonymously; a private Harbor project returns `401 Unauthorized` and your
+> submission is rejected every round as `generator_artifact_unreachable`
+> (observed live for several miners). New Hippius Harbor projects can default
+> to private — after your first push, open the Hippius Hub UI and set the
+> project's visibility to public. Self-check (should print `200`):
+>
+> ```bash
+> REPO=my-namespace/my-generator DIGEST=sha256:...   # from `cascade deploy` output
+> TOK=$(curl -s "https://registry.hippius.com/service/token?service=harbor-registry&scope=repository:${REPO}:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+> curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOK" \
+>   "https://registry.hippius.com/v2/${REPO}/manifests/${DIGEST}"
+> ```
+
 > **⚠️ SDK version matters — use this repo's environment to commit.** The
 > on-chain pointer travels through bittensor's timelock commit-reveal, and the
 > reveal ENCODING differs across SDK lines: older `set_reveal_commitment`

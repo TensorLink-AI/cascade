@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ..shared.config import load_chain_config
 from .contract import RoundSeeds
+from .corpus import CorpusError
 from .loop import ResolvedGenerator, TrainerRunner
 from .main import _load_trainer
 from .remote import RECEIPT_SENTINEL
@@ -113,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
         entry = runner.train_one(gen, args.role, seeds, args.block,
                                  contract=contract, token_budget=token_budget,
                                  repo_suffix=args.repo_suffix)
+    except CorpusError as e:
+        # Miner fault (bad submission, private/missing artifact): one line and a
+        # distinct exit code, so the orchestrator logs it as a rejection rather
+        # than an infra traceback.
+        log.error("miner submission rejected: %s", e)
+        return 3
     except Exception as e:  # noqa: BLE001 — report failure on stderr, nonzero exit
         log.exception("worker training failed: %s", e)
         return 1

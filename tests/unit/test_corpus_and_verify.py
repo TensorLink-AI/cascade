@@ -6,6 +6,26 @@ import pytest
 
 from cascade.miner.verify import verify_repo
 from cascade.trainer.corpus import assert_corpus_reproducible, build_corpus
+from cascade.trainer.loop import _http_status_in_chain
+
+
+def test_http_status_in_chain_walks_causes():
+    """The 401-on-private-miner-repo classifier must find the HTTP status
+    anywhere in a StorageError's cause chain (hippius_hub wraps httpx)."""
+    import types
+
+    http_err = RuntimeError("client error")
+    http_err.response = types.SimpleNamespace(status_code=401)
+    mid = RuntimeError("fetch failed")
+    mid.__cause__ = http_err
+    outer = RuntimeError("wrapped")
+    outer.__cause__ = mid
+    assert _http_status_in_chain(outer) == 401
+    assert _http_status_in_chain(RuntimeError("no http anywhere")) is None
+    # Self-referential chains must not loop forever.
+    loopy = RuntimeError("a")
+    loopy.__context__ = loopy
+    assert _http_status_in_chain(loopy) is None
 
 
 def test_example_generator_builds_corpus(small_cfg, example_generator_dir):

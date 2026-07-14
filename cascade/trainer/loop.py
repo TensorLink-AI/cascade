@@ -35,6 +35,7 @@ from ..shared.hippius import (
     LogSink,
     S3Config,
     S3Store,
+    StorageError,
     fetch_from_hub,
     publish_manifest,
     upload_dir_to_hub_or_hf,
@@ -52,6 +53,7 @@ from ..shared.manifest import (
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
+from .corpus import CorpusError
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -75,6 +77,18 @@ ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+
+def _http_status_in_chain(exc: BaseException | None) -> int | None:
+    """First HTTP status code found walking an exception's cause chain."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        exc = exc.__cause__ or exc.__context__
+    return None
 
 
 def _pctl(vals: list[float], q: float) -> float:
@@ -472,7 +486,18 @@ class TrainerRunner:
         total_points)``. Raises on any failure.
         """
         gen_dir = out_dir.parent / "generator"
-        fetch_from_hub(gen.ref, gen_dir, self.hub())
+        try:
+            fetch_from_hub(gen.ref, gen_dir, self.hub())
+        except StorageError as e:
+            status = _http_status_in_chain(e)
+            if status in (401, 403, 404):
+                # The MINER's repo, not our infra: a private or missing artifact
+                # is the submitter's fault (Hippius Harbor projects must be
+                # public for the trainer to pull them — see docs/MINER.md).
+                raise CorpusError(
+                    f"generator_artifact_unreachable: HTTP {status} for {gen.ref}"
+                ) from e
+            raise
         out_dir.mkdir(parents=True, exist_ok=True)
         log.info(
             "round=%s run=%s: fetched generator %s — building corpus + training "
