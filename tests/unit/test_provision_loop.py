@@ -120,7 +120,8 @@ PLAN = {
 
 
 def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
-              clock=None, store=None, health=None, dry_run=False, plan_calls=None):
+              clock=None, store=None, health=None, dry_run=False, plan_calls=None,
+              eval_hosts=None, receipt_prefix=""):
     providers = providers if providers is not None else {"lium": FakeProvider("lium")}
     plan_calls = plan_calls if plan_calls is not None else []
 
@@ -141,6 +142,8 @@ def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
         epoch_blocks=900,                    # 3h epochs → ttl 3h at ttl_epochs=1
         final_hours=0.25,
         manifest_store=store,
+        eval_hosts_path=eval_hosts,
+        receipt_prefix=receipt_prefix,
         health_check=health,
         dry_run=dry_run,
         clock=clock or Clock(),
@@ -685,3 +688,198 @@ def test_raising_chain_client_rebuilds_once(tmp_path):
     loop.chain_client_factory = lambda: FakeChain(880)
     loop.run_once()
     assert plan_calls == [1]                    # rebuilt and proceeded same cycle
+
+# ── elastic eval pod (manifest-triggered; serves the validator) ──────────────
+
+
+def _eval_policy(**kw):
+    kw.setdefault("eval", StagePolicy(sku="NVIDIA L40S", gpus_per_pod=1, max_pods=1,
+                                      providers=("lium",), max_price_hr=1.2))
+    return _policy(**kw)
+
+
+def _eval_loop(tmp_path, *, store, prov=None, clock=None, dry_run=False,
+               receipt_prefix="receipts/5Val/", block=100):
+    """A loop far outside the boundary margin (block=100): only the
+    manifest-triggered eval machinery can act."""
+    prov = prov or FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=block, clock=clock,
+                        store=store, policy=_eval_policy(), dry_run=dry_run,
+                        eval_hosts=tmp_path / "eval_hosts.toml",
+                        receipt_prefix=receipt_prefix)
+    return loop, prov
+
+
+def test_new_manifest_rents_exactly_one_eval_pod_once(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store)
+    loop.run_once()
+    assert prov.launched == ["cascade-111-eval-0"]           # one pod, named for the round
+
+    # Round-trip through the trainer's REAL loader (the validator's parser).
+    hosts = load_hosts(tmp_path / "eval_hosts.toml")
+    assert [h.name for h in hosts] == ["cascade-111-eval-0"]
+    assert hosts[0].stage == "any"                           # matches the final/any filter
+    assert hosts[0].host == "10.0.0.1" and hosts[0].cuda_device == "0"
+    # …and through the validator's own lazy resolver.
+    from cascade.validator.eval_offload import make_eval_host_fn
+    resolved = make_eval_host_fn(tmp_path / "eval_hosts.toml")()
+    assert resolved is not None and resolved.name == "cascade-111-eval-0"
+
+    assert not (tmp_path / "hosts.toml").exists()            # trainer's file untouched
+    st = load_state(tmp_path / "state.json")
+    assert st.last_evaled_round == "111"                     # persisted rent-once latch
+    assert {(i.stage, i.instance_id) for i in st.instances} == {("eval", "cascade-111-eval-0")}
+
+    loop.run_once()                                          # same manifest: idempotent
+    loop.run_once()
+    assert prov.launched == ["cascade-111-eval-0"]
+
+
+def test_eval_latch_persists_across_restart(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop1, prov = _eval_loop(tmp_path, store=store)
+    loop1.run_once()
+    loop2, prov2 = _eval_loop(tmp_path, store=store, prov=prov)  # fresh process, same ledger
+    loop2.run_once()
+    assert prov.launched == ["cascade-111-eval-0"]           # no double rent
+    assert "cascade-111-eval-0" in prov.live                 # and the owned pod survives
+
+
+def test_receipt_tears_down_eval_pod_and_clears_hosts_file(tmp_path):
+    clock = Clock()
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store, clock=clock)
+    loop.run_once()
+    clock.t += 600.0
+    loop.run_once()
+    assert "cascade-111-eval-0" in prov.live                 # no receipt yet: pod stays
+    # The validator publishes the round's receipt under ITS OWN prefix.
+    store.texts["receipts/5Val/round-111.json"] = '{"round_id": "111"}'
+    clock.t += 600.0
+    loop.run_once()
+    assert prov.terminated == ["cascade-111-eval-0"] and prov.live == {}
+    with pytest.raises(RemoteDispatchError):
+        load_hosts(tmp_path / "eval_hosts.toml")             # cleared → validator falls local
+    st = load_state(tmp_path / "state.json")
+    assert st.instances == () and st.last_evaled_round == "111"
+    loop.run_once()                                          # receipted round never re-rents
+    assert prov.launched == ["cascade-111-eval-0"]
+
+
+def test_newer_manifest_replaces_the_eval_pod(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store)
+    loop.run_once()
+    store.texts["manifests/latest.json"] = '{"round_id": "222"}'
+    loop.run_once()
+    # Round 111's evals are moot: its pod dies and round 222 gets its own —
+    # teardown runs before the eval check, so the two never coexist.
+    assert prov.terminated == ["cascade-111-eval-0"]
+    assert prov.launched == ["cascade-111-eval-0", "cascade-222-eval-0"]
+    hosts = load_hosts(tmp_path / "eval_hosts.toml")
+    assert [h.name for h in hosts] == ["cascade-222-eval-0"]
+
+
+def test_eval_ttl_backstop_fires_without_receipt_or_newer_manifest(tmp_path):
+    clock = Clock()
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store, clock=clock)
+    loop.run_once()
+    clock.t += 3 * 3600.0 - 1                                # one second shy of 1 epoch
+    loop.run_once()
+    assert "cascade-111-eval-0" in prov.live
+    clock.t += 1.0
+    loop.run_once()
+    assert prov.live == {}                                   # TTL: silent validator ≠ bill
+    with pytest.raises(RemoteDispatchError):
+        load_hosts(tmp_path / "eval_hosts.toml")
+
+
+def test_fresh_start_skips_a_round_already_receipted(tmp_path):
+    # Restarted between rounds: the latest manifest is old news and its receipt
+    # is up — renting would just buy a pod for the teardown sweep to kill.
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}',
+                       "receipts/5Val/round-111.json": "{}"})
+    loop, prov = _eval_loop(tmp_path, store=store)
+    loop.run_once()
+    assert prov.launched == []
+    assert load_state(tmp_path / "state.json").last_evaled_round == "111"  # latched anyway
+
+
+def test_absent_eval_policy_rents_nothing(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100, store=store,
+                        eval_hosts=tmp_path / "eval_hosts.toml")   # policy has no eval
+    loop.run_once()
+    assert prov.launched == [] and not (tmp_path / "eval_hosts.toml").exists()
+
+
+def test_absent_eval_hosts_path_rents_nothing(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100, store=store,
+                        policy=_eval_policy())                     # nowhere to publish
+    loop.run_once()
+    assert prov.launched == []
+
+
+def test_eval_dry_run_rents_nothing_and_touches_no_files(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store, dry_run=True)
+    loop.run_once()
+    loop.run_once()                                          # in-memory latch: no hammering
+    assert prov.launched == []
+    assert not (tmp_path / "eval_hosts.toml").exists()
+    assert load_state(tmp_path / "state.json") is None       # dry-run writes no ledger
+
+
+def test_eval_no_capacity_degrades_and_latches(tmp_path):
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store, prov=FakeProvider("lium", available=False))
+    loop.run_once()
+    loop.run_once()                                          # latched: no 30s hammering
+    assert prov.launched == []                               # validator evals run local
+    assert load_state(tmp_path / "state.json").last_evaled_round == "111"
+
+
+def test_eval_and_trainer_stages_coexist_in_separate_files(tmp_path):
+    """A manifest lands while the boundary trigger fires: the eval pod goes to
+    eval_hosts.toml, the trainer fleet to hosts.toml — never cross-published."""
+    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
+    loop, prov = _eval_loop(tmp_path, store=store, block=880)
+    loop.run_once()
+    assert set(prov.launched) == {
+        "cascade-111-eval-0", "cascade-900-heat-0", "cascade-900-final-0"}
+    assert all(h.stage in ("heat", "final") for h in load_hosts(tmp_path / "hosts.toml"))
+    assert [h.name for h in load_hosts(tmp_path / "eval_hosts.toml")] == ["cascade-111-eval-0"]
+
+
+def test_reaper_accepts_eval_pods_as_self_named(tmp_path):
+    from cascade.provision.loop import is_provisioner_pod_name
+
+    assert is_provisioner_pod_name("cascade-900-eval-0")
+    assert is_provisioner_pod_name("cascade-900-eval-r0-0")     # replacement suffix
+    assert not is_provisioner_pod_name("cascade-eval-1")        # no round id ⇒ not ours
+    prov = FakeProvider("lium")
+    prov.live["cascade-900-eval-zombie"] = PodAddress("10.9.9.5", 22)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100)
+    loop.run_once()
+    assert prov.terminated == ["cascade-900-eval-zombie"]       # orphan eval pod reaped
+
+
+def test_build_policy_eval_table_is_optional():
+    p = build_policy(_raw_config(), epoch_blocks=900)
+    assert p.eval is None                                       # pre-eval configs unchanged
+    raw = _raw_config(eval={"sku": "NVIDIA L40S", "gpus_per_pod": 1, "max_pods": 1,
+                            "providers": ["lium"], "max_price_hr": 1.2})
+    p = build_policy(raw, epoch_blocks=900)
+    assert p.eval.sku == "NVIDIA L40S" and p.eval.max_pods == 1
+
+
+def test_build_policy_rejects_bad_eval_table():
+    raw = _raw_config(eval={"sku": "", "gpus_per_pod": 1, "max_pods": 1,
+                            "providers": ["lium"], "max_price_hr": 1.2})
+    with pytest.raises(ProvisionError):
+        build_policy(raw, epoch_blocks=900)

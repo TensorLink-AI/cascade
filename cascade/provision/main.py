@@ -47,7 +47,7 @@ log = logging.getLogger("cascade.provision.main")
 
 
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
-    """One ``[provisioner.heat|final]`` table → a validated :class:`StagePolicy`."""
+    """One ``[provisioner.heat|final|eval]`` table → a validated :class:`StagePolicy`."""
     sku = str(raw.get("sku", "")).strip()
     if not sku:
         raise ProvisionError(f"[provisioner.{stage}] sku must be non-empty (the exact "
@@ -96,6 +96,10 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     for stage in ("heat", "final"):
         if stage not in top:
             raise ProvisionError(f"provision config needs a [provisioner.{stage}] table")
+    # [provisioner.eval] is OPTIONAL — the elastic validator eval pod. Absent
+    # (or max_pods = 0) the stage does not exist: pre-eval configs keep their
+    # exact behaviour, which is why it is not in the required loop above.
+    eval_sp = build_stage_policy(top["eval"], "eval") if "eval" in top else None
     margin = int(top.get("trigger_margin_blocks", 25))
     if not 0 < margin < epoch_blocks:
         raise ProvisionError(
@@ -109,6 +113,7 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     return ProvisionPolicy(
         heat=build_stage_policy(top["heat"], "heat"),
         final=build_stage_policy(top["final"], "final"),
+        eval=eval_sp,
         trigger_margin_blocks=margin,
         max_spend_per_round=max_spend,
         ttl_epochs=ttl_epochs,
@@ -153,11 +158,13 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
     def check(addr, stage: str, provider: str = "", *,
               sku: str = "", gpus: int = 0) -> HealthReport:
         prof = render.profile_for(provider)
-        sp = policy.heat if stage == "heat" else policy.final
+        sp = {"heat": policy.heat, "final": policy.final, "eval": policy.eval}.get(stage)
         # The gate asserts what was ACTUALLY rented — with SKU fallback the
         # round's device can be any configured candidate, not just the primary.
-        gate_sku = sku or sp.sku
-        gate_gpus = gpus or sp.gpus_per_pod
+        # The loop always passes the rented candidate's sku/gpus, so the stage
+        # policy is only a fallback (and eval's may legitimately be None).
+        gate_sku = sku or (sp.sku if sp is not None else "")
+        gate_gpus = gpus or (sp.gpus_per_pod if sp is not None else 1)
         key = (stage, provider, gate_sku, gate_gpus)
         if key not in gates:
             gates[key] = HealthGate(
@@ -312,6 +319,18 @@ def _run(args) -> int:
     work_root = Path(args.work_root)
     state_path = Path(top.get("state_path", work_root / "provisioner_state.json"))
 
+    # Elastic validator eval pod: BOTH the [provisioner.eval] policy and
+    # eval_hosts_path must be present for the stage to exist. Half a config is
+    # an operator mistake — fail loudly now, not silently never-rent.
+    eval_hosts_path = Path(top["eval_hosts_path"]) if top.get("eval_hosts_path") else None
+    receipt_prefix = str(top.get("receipt_prefix", ""))
+    if policy.eval is not None and policy.eval.max_pods > 0 and eval_hosts_path is None:
+        raise ProvisionError("[provisioner.eval] is configured but eval_hosts_path is "
+                             "not set — the eval pod would have nowhere to publish")
+    if eval_hosts_path is not None and eval_hosts_path == hosts_path:
+        raise ProvisionError("eval_hosts_path must differ from hosts_path — the "
+                             "validator's eval file must never clobber the trainer's fleet")
+
     # Operator's static [[host]] entries (e.g. a long-lived final pod) — appended
     # verbatim to every hosts.toml publish so provisioner activity never drops them.
     static_hosts_text = ""
@@ -347,7 +366,10 @@ def _run(args) -> int:
     if profiles:
         render = replace(render, profiles=profiles)
 
-    provider_names = list(dict.fromkeys([*policy.heat.providers, *policy.final.providers]))
+    provider_names = list(dict.fromkeys([
+        *policy.heat.providers, *policy.final.providers,
+        *(policy.eval.providers if policy.eval is not None else ()),
+    ]))
     provider_opts: dict[str, dict] = {}
     if top.get("shadeform_ssh_key_id"):
         provider_opts["shadeform"] = {"ssh_key_id": str(top["shadeform_ssh_key_id"])}
@@ -376,6 +398,8 @@ def _run(args) -> int:
         epoch_blocks=cfg.round.epoch_blocks,
         final_hours=cfg.training.target_train_hours,
         manifest_store=manifest_store,
+        eval_hosts_path=eval_hosts_path,
+        receipt_prefix=receipt_prefix,
         health_check=make_health_check(
             policy, render,
             image_digest=cfg.training.train_image_digest,
@@ -388,11 +412,15 @@ def _run(args) -> int:
         poll_seconds=float(top.get("poll_seconds", 30.0)),
         dry_run=bool(args.dry_run),
     )
-    log.info("provisioner up: heat=%d×%s(%dx) final=%d×%s(%dx) margin=%d blocks "
+    eval_desc = ("off" if policy.eval is None or policy.eval.max_pods == 0
+                 or eval_hosts_path is None
+                 else f"{policy.eval.max_pods}×{policy.eval.sku}"
+                      f"({policy.eval.gpus_per_pod}x)→{eval_hosts_path}")
+    log.info("provisioner up: heat=%d×%s(%dx) final=%d×%s(%dx) eval=%s margin=%d blocks "
              "cap=$%.2f/round ttl=%d epoch(s)%s",
              policy.heat.max_pods, policy.heat.sku, policy.heat.gpus_per_pod,
              policy.final.max_pods, policy.final.sku, policy.final.gpus_per_pod,
-             policy.trigger_margin_blocks, policy.max_spend_per_round,
+             eval_desc, policy.trigger_margin_blocks, policy.max_spend_per_round,
              policy.ttl_epochs, " [DRY RUN]" if args.dry_run else "")
     if args.once:
         loop.run_once()

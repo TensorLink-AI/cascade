@@ -4,14 +4,17 @@ Only the gift-eval compute crosses to the pod (scp the fetched checkpoint →
 run ``cascade-benchmark --suites gift-eval`` → pull the report); the paired
 bootstrap and every consensus decision stay on the orchestrator. Failures
 return ``None`` (gate uncomputable), never raise.
+
+The pod itself is elastic (provisioner-rented per round manifest), so the
+host is re-resolved from the hosts file AT EACH offloaded eval — see the
+``make_eval_host_fn`` section.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
-
-import pytest
 
 from cascade.eval.benchmarks import gift_rows_from_report
 from cascade.trainer.remote import RemoteHost
@@ -20,7 +23,9 @@ from cascade.validator.eval_offload import (
     build_bench_remote_command,
     build_scp_argv,
     gift_rows_via_host,
+    make_eval_host_fn,
 )
+from cascade.validator.loop import ValidatorRunner
 
 
 def _host(cuda_device="0"):
@@ -188,3 +193,80 @@ def test_gift_rows_from_report_parses_and_handles_missing():
     assert gift_rows_from_report(_REPORT)["revision"] == "abc123"
     assert gift_rows_from_report(None) is None
     assert gift_rows_from_report({"suites": []}) is None  # no gift-eval suite
+
+
+# ── make_eval_host_fn: lazy per-eval host resolution (elastic pod) ───────────
+
+def _hosts_toml(name="cascade-900-eval-0", ip="9.9.9.9", stage=""):
+    stage_line = f'stage = "{stage}"\n' if stage else ""
+    return (f'[[host]]\nname = "{name}"\nhost = "{ip}"\nport = 40123\n'
+            f'key_path = "~/.ssh/k"\nworkdir = "/root/cascade"\n{stage_line}')
+
+
+def test_eval_host_fn_reresolves_per_call_across_pod_lifecycle(tmp_path):
+    """The elastic-pod lifecycle: no file → pod published → file cleared →
+    a NEW pod published. Every transition is picked up without a restart."""
+    path = tmp_path / "eval_hosts.toml"
+    fn = make_eval_host_fn(path)
+    assert fn() is None                                     # not rented yet ⇒ local
+    path.write_text(_hosts_toml(), encoding="utf-8")
+    host = fn()
+    assert host is not None and host.host == "9.9.9.9"      # pod appeared ⇒ offload resumes
+    path.write_text("# cascade-provisioner: no fleet\n", encoding="utf-8")
+    assert fn() is None                                     # torn down ⇒ local fallback
+    path.write_text(_hosts_toml(name="cascade-901-eval-0", ip="9.9.9.10"), encoding="utf-8")
+    assert fn().host == "9.9.9.10"                          # next round's pod
+
+
+def test_eval_host_fn_missing_file_after_delete_falls_back_local(tmp_path):
+    path = tmp_path / "eval_hosts.toml"
+    path.write_text(_hosts_toml(), encoding="utf-8")
+    fn = make_eval_host_fn(path)
+    assert fn() is not None
+    path.unlink()                                           # file disappears entirely
+    assert fn() is None
+
+
+def test_eval_host_fn_unparseable_file_warns_and_falls_back_local(tmp_path, caplog):
+    path = tmp_path / "eval_hosts.toml"
+    path.write_text("this is [not valid toml", encoding="utf-8")
+    fn = make_eval_host_fn(path)
+    with caplog.at_level(logging.WARNING, logger="cascade.validator.eval_offload"):
+        assert fn() is None                                 # degraded, never crashed
+    assert any("unreadable" in r.message for r in caplog.records)
+
+
+def test_eval_host_fn_ignores_heat_only_hosts(tmp_path):
+    path = tmp_path / "eval_hosts.toml"
+    path.write_text(_hosts_toml(stage="heat"), encoding="utf-8")
+    assert make_eval_host_fn(path)() is None                # no final/any host ⇒ local
+
+
+def test_eval_host_fn_logs_transitions_once_not_per_eval(tmp_path, caplog):
+    path = tmp_path / "eval_hosts.toml"
+    path.write_text(_hosts_toml(), encoding="utf-8")
+    fn = make_eval_host_fn(path)
+    with caplog.at_level(logging.INFO, logger="cascade.validator.eval_offload"):
+        for _ in range(3):                                  # static file: one 'now' log
+            fn()
+        path.unlink()
+        fn()
+        fn()                                                # one 'gone' log
+    infos = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert len([m for m in infos if "host now" in m]) == 1
+    assert len([m for m in infos if "host gone" in m]) == 1
+
+
+def test_runner_resolves_eval_host_freshly_per_eval(cfg):
+    """The runner asks the injected resolver at every eval — a host that
+    appears mid-run is used, one that disappears stops being used."""
+    answers = [None, _host(), None]
+    fn = lambda: answers.pop(0)  # noqa: E731
+    runner = ValidatorRunner(cfg=cfg, eval_host_fn=fn, verify_signatures=False)
+    assert runner._eval_host() is None                      # pod not rented yet
+    assert runner._eval_host().host == "9.9.9.9"            # rented: offload
+    assert runner._eval_host() is None                      # torn down: local again
+
+
+def test_runner_without_resolver_stays_local(cfg):
+    assert ValidatorRunner(cfg=cfg, verify_signatures=False)._eval_host() is None

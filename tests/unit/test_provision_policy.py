@@ -224,3 +224,37 @@ def test_teardown_rejects_unknown_stage():
     with pytest.raises(ValueError):
         teardown_due("any", heat_marker_seen=False, manifest_seen=False,
                      rented_at=0.0, now=0.0, ttl_hours=24.0)
+
+
+# ── the eval arm: receipt_seen | newer_manifest | ttl ────────────────────────
+
+
+def test_eval_pod_survives_the_manifest_that_rented_it():
+    # The manifest is the eval pod's RENT signal — the round publishing is
+    # when the validator starts needing GPU, so it must never also kill it.
+    assert not teardown_due("eval", heat_marker_seen=True, manifest_seen=True,
+                            rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+def test_eval_pod_dies_on_receipt():
+    assert teardown_due("eval", heat_marker_seen=False, manifest_seen=False,
+                        receipt_seen=True, rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+def test_eval_pod_dies_on_newer_manifest():
+    assert teardown_due("eval", heat_marker_seen=False, manifest_seen=False,
+                        newer_manifest=True, rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+def test_eval_ttl_backstop_fires_without_signals():
+    assert teardown_due("eval", heat_marker_seen=False, manifest_seen=False,
+                        rented_at=0.0, now=24 * 3600.0, ttl_hours=24.0)
+    assert not teardown_due("eval", heat_marker_seen=False, manifest_seen=False,
+                            rented_at=0.0, now=24 * 3600.0 - 1, ttl_hours=24.0)
+
+
+def test_eval_signals_never_kill_trainer_stages():
+    for stage in ("heat", "final"):
+        assert not teardown_due(stage, heat_marker_seen=False, manifest_seen=False,
+                                receipt_seen=True, newer_manifest=True,
+                                rented_at=0.0, now=100.0, ttl_hours=24.0)

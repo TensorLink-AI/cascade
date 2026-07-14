@@ -113,11 +113,14 @@ class ValidatorRunner:
     gift_rows_fn: GiftRowsFn | None = None    # injected in tests; defaults to the sidecar bridge
     cache_dir: Path | None = None
     device: str = "cpu"
-    # Optional GPU pod for the GIFT-Eval gate: when set, the (heavy, paired)
-    # gift-eval runs are offloaded to this pod (see cascade.validator.eval_offload)
-    # while the wallet and every consensus decision stay on this box. None ⇒ the
-    # gate runs on ``device`` locally. Never used for the private-pool duel.
-    eval_host: RemoteHost | None = None
+    # Optional resolver for the GPU eval-offload pod, called AT EACH offloaded
+    # eval (see cascade.validator.eval_offload.make_eval_host_fn): the pod is
+    # elastic — rented per round by the provisioner, torn down on the receipt —
+    # so it must be re-resolved lazily, not captured at startup. ``None`` (or a
+    # call returning ``None``) ⇒ that eval runs on ``device`` locally. The
+    # wallet and every consensus decision stay on this box either way; the pod
+    # is never used for the private-pool duel.
+    eval_host_fn: Callable[[], RemoteHost | None] | None = None
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
     # the reign clock is reset on each dethrone, every reigning-king checkpoint is
@@ -232,6 +235,12 @@ class ValidatorRunner:
 
     # ── public-benchmark no-regression gate ─────────────────────────────────
 
+    def _eval_host(self) -> RemoteHost | None:
+        """The offload pod for THIS eval — resolved fresh every time so an
+        elastic pod (rented per round manifest, torn down on the receipt)
+        appears and disappears without a validator restart."""
+        return self.eval_host_fn() if self.eval_host_fn is not None else None
+
     def _gift_rows(self, entry: TrainedEntry) -> dict | None:
         """Gift-eval ratio rows for one entry — injected in tests, else the
         sidecar bridge on the fetched checkpoint dir."""
@@ -241,13 +250,14 @@ class ValidatorRunner:
         ec = self.cfg.eval
         dest = self._fetch_checkpoint_dir(entry)
         num_samples = ec.gift_gate_num_samples or ec.num_samples
-        if self.eval_host is not None:
+        eval_host = self._eval_host()
+        if eval_host is not None:
             # Offload the (heavy, paired) gift-eval to the GPU pod; the paired
             # bootstrap and every consensus decision stay on this box.
             from .eval_offload import gift_rows_via_host
 
             return gift_rows_via_host(
-                self.eval_host, dest,
+                eval_host, dest,
                 datasets=ec.gift_gate_datasets,
                 num_samples=num_samples,
                 data_dir=(ec.gift_gate_data_dir or None),
@@ -404,13 +414,14 @@ class ValidatorRunner:
         ec = self.cfg.eval
         ckpt = self._fetch_checkpoint_dir(entry)
         num_samples = ec.benchmark_num_samples or ec.num_samples
-        if self.eval_host is not None:
+        eval_host = self._eval_host()
+        if eval_host is not None:
             # Offload the cascade bench (GIFT-Eval+BOOM+TIME) to the GPU pod,
             # same seam as the gift-eval gate; the wallet stays on this box.
             from .eval_offload import bench_scores_via_host
 
             metrics = bench_scores_via_host(
-                self.eval_host, ckpt,
+                eval_host, ckpt,
                 num_samples=num_samples,
                 max_series=ec.cascade_bench_max_series,  # 0 = full battery
                 data_dir=(ec.gift_gate_data_dir or None),
@@ -1114,12 +1125,13 @@ def build_runner(
     chain_toml: Path | None = None,
     cache_dir: Path | None = None,
     device: str = "cpu",
-    eval_host: RemoteHost | None = None,
+    eval_host_fn: Callable[[], RemoteHost | None] | None = None,
 ) -> ValidatorRunner:
     """Construct a runner from ``chain.toml``, restoring persisted champion
     state. Wallet/chain wiring for live weight-setting is attached by
-    ``cascade-validator`` (see main.py). ``eval_host`` (optional) offloads the
-    GIFT-Eval gate to a GPU pod while the wallet stays on this box."""
+    ``cascade-validator`` (see main.py). ``eval_host_fn`` (optional) resolves
+    the GPU pod to offload heavy evals to — re-invoked per eval, so an elastic
+    provisioner-rented pod is picked up lazily; the wallet stays on this box."""
     from ..shared.config import load_chain_config
 
     cfg = load_chain_config(chain_toml)
@@ -1128,5 +1140,5 @@ def build_runner(
     cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
     return ValidatorRunner(
         cfg=cfg, state=_load_state(cfg.validator.state_db_path),
-        cache_dir=cache_dir, device=device, cascade=cascade, eval_host=eval_host,
+        cache_dir=cache_dir, device=device, cascade=cascade, eval_host_fn=eval_host_fn,
     )

@@ -45,7 +45,7 @@ class PodInstance:
 
     provider: str
     instance_id: str
-    stage: str                       # "heat" | "final"
+    stage: str                       # "heat" | "final" | "eval"
     rented_at_iso: str
     # The candidate actually rented (SKU fallback makes this vary per round);
     # persisted so a mid-round restart republishes hosts with the RIGHT lane
@@ -64,11 +64,16 @@ class RoundState:
     base-seed round id, which is only knowable at the boundary).
     ``published`` records that ``hosts.toml`` was written for this fleet, so a
     restart mid-round knows whether the trainer may already be dispatching.
+    ``last_evaled_round`` is the eval stage's rent-once latch: the manifest
+    round id an eval pod was last rented for. Persisted so a restart while
+    that round is still live never rents a SECOND pod for the same manifest
+    (the crash-safety twin of the in-memory latch). ``""`` = never evaled.
     """
 
     round_id: str
     instances: tuple[PodInstance, ...] = field(default=())
     published: bool = False
+    last_evaled_round: str = ""
 
 
 # ── pure transforms (the loop composes these, then saves) ────────────────────
@@ -127,6 +132,7 @@ def save_state(path: Path | str, state: RoundState) -> None:
     payload = {
         "round_id": state.round_id,
         "published": state.published,
+        "last_evaled_round": state.last_evaled_round,
         "instances": [
             {
                 "provider": i.provider,
@@ -159,6 +165,7 @@ def load_state(path: Path | str) -> RoundState | None:
     return RoundState(
         round_id=str(raw["round_id"]),
         published=bool(raw.get("published", False)),
+        last_evaled_round=str(raw.get("last_evaled_round", "")),
         instances=tuple(
             PodInstance(
                 provider=str(i["provider"]),

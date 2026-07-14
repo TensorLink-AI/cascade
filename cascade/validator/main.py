@@ -26,9 +26,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--eval-hosts", type=Path, default=None,
                    help="hosts.toml with a GPU pod to offload the GIFT-Eval gate to "
-                        "(the first 'final'/'any'-stage host is used). Wallet + all "
-                        "consensus decisions stay on this box; only gift-eval runs on "
-                        "the pod. Omit to run the gate locally on --device.")
+                        "(the first 'final'/'any'-stage host is used). Re-read at "
+                        "EACH offloaded eval, so an elastic provisioner-rented pod "
+                        "is picked up/dropped without a restart; a missing/empty "
+                        "file just runs that eval locally on --device. Wallet + all "
+                        "consensus decisions stay on this box; only the heavy eval "
+                        "runs on the pod. Omit to always run locally.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -40,23 +43,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    eval_host = None
+    eval_host_fn = None
     if args.eval_hosts is not None:
-        from ..trainer.remote import load_hosts
-        candidates = [h for h in load_hosts(args.eval_hosts)
-                      if getattr(h, "stage", "any") in ("any", "final")]
-        if not candidates:
-            raise SystemExit(f"--eval-hosts {args.eval_hosts}: no 'final'/'any'-stage host found")
-        eval_host = candidates[0]
+        # Lazy on purpose: the eval pod is elastic (provisioner-rented per round
+        # manifest, torn down on the receipt), so the file is re-read at each
+        # offloaded eval rather than pinned at startup — a missing/empty file at
+        # eval time just means that eval runs locally on --device.
+        from .eval_offload import make_eval_host_fn
+        eval_host_fn = make_eval_host_fn(args.eval_hosts)
         logging.getLogger("cascade.validator").info(
-            "GIFT-Eval gate offloaded to %s (%s); wallet + consensus stay local",
-            eval_host.name, eval_host.host)
+            "eval offload configured from %s (re-resolved per eval; local fallback "
+            "on --device=%s); wallet + consensus stay local", args.eval_hosts, args.device)
 
     runner = build_runner(
         chain_toml=args.chain_toml,
         cache_dir=args.cache_dir,
         device=args.device,
-        eval_host=eval_host,
+        eval_host_fn=eval_host_fn,
     )
 
     if args.offline:

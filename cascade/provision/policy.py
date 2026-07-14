@@ -21,6 +21,14 @@ the provisioner rents two fleets —
 Both fleets are bounded by ``max_pods`` per stage and by a hard
 ``max_spend_per_round`` circuit breaker computed at worst case (every pod
 billed for the full TTL) — a runaway round can cost at most that number.
+
+A third, OPTIONAL stage rides a different clock: the **eval** pod (one box,
+usually one GPU) serves the VALIDATOR's heavy evals (GIFT-Eval gate, cascade
+bench). It is manifest-triggered — rented when a round's manifest publishes,
+which is exactly when the trainer fleet is being torn down — and dies when
+that round's receipt appears (or a newer manifest makes it moot, or the TTL).
+Absent config (``policy.eval is None`` / ``max_pods = 0``) the stage does not
+exist and validators eval locally, the pre-elastic behaviour.
 """
 
 from __future__ import annotations
@@ -131,6 +139,11 @@ class ProvisionPolicy:
     trigger_margin_blocks: int
     max_spend_per_round: float
     ttl_epochs: int = 1
+    # The validator's eval-offload pod (manifest-triggered lifecycle, see the
+    # module docstring). Optional and off by default: ``None`` (no
+    # [provisioner.eval] table) or ``max_pods = 0`` means no eval pod is ever
+    # rented — existing configs keep their exact behaviour.
+    eval: StagePolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -299,6 +312,8 @@ def teardown_due(
     rented_at: float,
     now: float,
     ttl_hours: float,
+    receipt_seen: bool = False,
+    newer_manifest: bool = False,
 ) -> bool:
     """Whether a pod of ``stage`` should be terminated NOW.
 
@@ -311,15 +326,26 @@ def teardown_due(
     A published manifest also kills any heat pod the marker missed — the round
     being over subsumes the heat being over.
 
-    The TTL is the hard backstop for BOTH stages: ``rented_at``/``now`` are
+    **eval** pods live on the opposite phase: the manifest is what RENTED them
+    (the validator's heavy evals start when a round publishes), so
+    ``manifest_seen`` must never kill one. They die when the round's receipt
+    appears (``receipt_seen`` — the validator has scored and published, no
+    more offloaded evals are coming) or when a NEWER manifest supersedes the
+    round they served (``newer_manifest`` — those evals are moot; the new
+    round gets its own pod).
+
+    The TTL is the hard backstop for EVERY stage: ``rented_at``/``now`` are
     seconds on the same (injected) clock, and once ``ttl_hours`` have elapsed
-    the pod dies regardless of signals — a crashed trainer or an unreadable
-    manifest store must never turn into an eternally-billing pod.
+    the pod dies regardless of signals — a crashed trainer, a silent
+    validator, or an unreadable manifest store must never turn into an
+    eternally-billing pod.
     """
-    if stage not in ("heat", "final"):
-        raise ValueError(f"stage must be 'heat' or 'final'; got {stage!r}")
+    if stage not in ("heat", "final", "eval"):
+        raise ValueError(f"stage must be 'heat', 'final', or 'eval'; got {stage!r}")
     if now - rented_at >= ttl_hours * 3600.0:
         return True
+    if stage == "eval":
+        return receipt_seen or newer_manifest
     if manifest_seen:
         return True
     return stage == "heat" and heat_marker_seen

@@ -91,6 +91,20 @@ def test_load_corrupt_raises_instead_of_silently_starting_fresh(tmp_path):
         load_state(p)
 
 
+def test_last_evaled_round_round_trips_and_defaults(tmp_path):
+    # The eval stage's rent-once latch must survive restarts (or a crash
+    # mid-eval-round rents a SECOND pod for the same manifest)…
+    p = tmp_path / "state.json"
+    save_state(p, RoundState(round_id="900", last_evaled_round="111",
+                             instances=(_inst("e0", stage="eval"),)))
+    st = load_state(p)
+    assert st.last_evaled_round == "111"
+    assert instances_for_stage(st, "eval")[0].instance_id == "e0"
+    # …while pre-eval ledgers (no key) keep loading with the default.
+    p.write_text(json.dumps({"round_id": "900"}), encoding="utf-8")
+    assert load_state(p).last_evaled_round == ""
+
+
 def test_saved_json_is_stable_and_human_readable(tmp_path):
     p = tmp_path / "state.json"
     save_state(p, RoundState(round_id="900", instances=(_inst("h0"),)))

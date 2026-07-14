@@ -47,6 +47,20 @@ image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:000000000000000000000000000
 # activity (teardown re-renders, no-capacity rounds, budget refusals).
 # static_hosts = "/root/cascade/static_hosts.toml"
 
+# ── elastic validator eval pod (optional; see [provisioner.eval] below) ──────
+# Where the VALIDATOR's --eval-hosts points — a SEPARATE file from hosts_path
+# (the two consumers have different lifecycles; the provisioner refuses equal
+# paths). Published when a round's manifest appears, cleared on teardown; the
+# validator re-reads it lazily at each offloaded eval, so clearing mid-round
+# is safe (its next eval just runs locally). Unset = eval stage off.
+# eval_hosts_path = "/root/cascade/eval_hosts.toml"
+# The eval pod's primary teardown signal: this deployment's validator
+# publishes round receipts at receipts/<validator_hotkey>/round-<id>.json —
+# when the served round's receipt appears the pod is torn down. A newer
+# manifest (round superseded) and the TTL below also end it. Unset = only
+# those two backstops apply.
+# receipt_prefix = "receipts/5ValidatorHotkey.../"
+
 # Orchestrator SSH keypair: the PUBLIC key is injected into each pod
 # ($SSH_PUBKEY); the PRIVATE key path is written into hosts.toml for the
 # trainer's dispatches (and used by the provisioner's own health checks).
@@ -134,6 +148,23 @@ gpus_per_pod = 2
 max_pods     = 2             # 0 = unmanaged: a static hand-rented pod serves finals
 providers    = ["lium", "shadeform"]
 max_price_hr = 3.0
+
+# ── eval pod: the validator's per-round offload box (OPTIONAL) ───────────────
+# Manifest-triggered, unlike heat/final: rented when a round's manifest
+# publishes (that is when the validator's GIFT-Eval gate + cascade bench need
+# GPU — exactly as the trainer fleet is torn down), torn down when the round's
+# receipt appears under receipt_prefix, a newer manifest supersedes it, or the
+# TTL fires. One pod (max_pods = 1), one GPU is plenty. Absent table (or
+# max_pods = 0, or eval_hosts_path unset) = feature off: validators eval
+# locally on their --device, the pre-elastic behaviour. [[provisioner.eval.
+# candidate]] SKU fallbacks work exactly like the heat's.
+# [provisioner.eval]
+# sku          = "NVIDIA L40S"
+# market_sku   = "L40S"
+# gpus_per_pod = 1
+# max_pods     = 1
+# providers    = ["lium", "shadeform"]
+# max_price_hr = 1.20
 
 # ── per-provider pod paths (bootstrap mode) ──────────────────────────────────
 # Providers boot different base users: lium pods are root, shadeform VMs land
