@@ -520,8 +520,14 @@ class ProvisionerLoop:
             # lemon-prone, but retrying forever would chase a bad batch all day.
             log.warning("round %s %s: pod %s failed boot/health; replacing once",
                         round_id, stage, pid)
+            # Exclude the lemon's machine from the replacement pick — offer
+            # listings are deterministic, so the same spec re-rents the same
+            # failed executor (observed: eval pod + replacement both dead on
+            # 63243c2c…, round 5052267627071284702).
+            lemon = getattr(prov, "machine_of", lambda _p: None)(pid)
             self._terminate_and_drop(prov, pid)
-            rspec = replace(spec, count=1, name_prefix=f"{POD_TAG}{round_id}-{stage}-r{i}")
+            rspec = replace(spec, count=1, name_prefix=f"{POD_TAG}{round_id}-{stage}-r{i}",
+                            exclude_ids=spec.exclude_ids + ((lemon,) if lemon else ()))
             try:
                 rid = prov.launch(rspec)[0]
             except Exception as e:  # noqa: BLE001

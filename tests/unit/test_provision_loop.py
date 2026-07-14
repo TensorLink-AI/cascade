@@ -297,6 +297,47 @@ def test_replacement_also_unhealthy_drops_the_slot(tmp_path):
     assert {i.instance_id for i in st.instances} == {"cascade-900-final-0"}
 
 
+def test_replacement_excludes_the_failed_pods_machine(tmp_path):
+    """Incident 2026-07-14 round 5052267627071284702: the eval pod failed its
+    boot gate and the replacement re-rented the SAME lium executor (offer
+    lists are deterministic), so it failed identically. The replacement spec
+    must exclude the lemon's machine."""
+
+    class MachineAwareProvider(FakeProvider):
+        machines = ("m-lemon", "m-good", "m-spare")
+
+        def __init__(self, name, **kw):
+            super().__init__(name, **kw)
+            self.machine_by_pod: dict[str, str] = {}
+            self.specs = []
+
+        def launch(self, spec):
+            self.specs.append(spec)
+            offers = [m for m in self.machines if m not in spec.exclude_ids]
+            ids = super().launch(spec)
+            for i, pid in enumerate(ids):                    # head-of-list pick, like lium
+                self.machine_by_pod[pid] = offers[i]
+            return ids
+
+        def machine_of(self, pod_id):
+            return self.machine_by_pod.get(pod_id)
+
+    prov = MachineAwareProvider("lium")
+
+    def health(addr, stage, provider="", **shape):
+        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
+        return _report(ok=not (stage == "heat" and prov.machine_by_pod[pid] == "m-lemon"))
+
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
+    loop.run_once()
+
+    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
+    assert rspec.exclude_ids == ("m-lemon",)                 # the fix
+    assert prov.machine_by_pod["cascade-900-heat-r0-0"] == "m-good"
+    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
+    assert heat and all(h.host == prov.live["cascade-900-heat-r0-0"].ip for h in heat)
+
+
 def test_every_pod_unhealthy_clears_hosts(tmp_path):
     prov = FakeProvider("lium")
     loop, _ = make_loop(tmp_path, providers={"lium": prov},

@@ -181,6 +181,26 @@ def test_lium_launch_injects_ssh_pubkey_env_and_port():
     assert up[up.index("--internal-ports") + 1] == "22"
 
 
+def test_lium_launch_excludes_lemons_and_remembers_machines():
+    """Replacement rents must skip the failed pod's executor (the offer list is
+    deterministic, so an unexcluded replacement re-rents the exact lemon —
+    observed live on round 5052267627071284702's eval slot)."""
+    spawned: list[list[str]] = []
+
+    def _run(argv):
+        import types
+        out = '[{"id": "exec-1"}, {"id": "exec-2"}]' if "ls" in argv else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    names = prov.launch(_spec(count=1, exclude_ids=("exec-1",)))
+    assert spawned[0][:3] == ["lium", "up", "exec-2"]        # lemon skipped
+    assert prov.machine_of(names[0]) == "exec-2"             # loop can name the machine
+    # Exclusions can exhaust the market: explicit error, never a silent re-rent.
+    with pytest.raises(ProvisionError):
+        prov.launch(_spec(count=2, exclude_ids=("exec-1",)))
+
+
 # ── hosts.toml templating ────────────────────────────────────────────────────
 
 

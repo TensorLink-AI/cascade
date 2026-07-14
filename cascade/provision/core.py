@@ -99,6 +99,11 @@ class LaunchSpec:
     # smaller machine strands lanes and a bigger one bills idle silicon. The
     # health gate re-asserts the shape on the booted pod.
     gpus_per_pod: int = 1
+    # Marketplace machine ids a launch must NOT pick — the replacement path
+    # lists offers deterministically, so without this a replacement re-rents
+    # the exact lemon that just failed its boot gate. Adapters that cannot
+    # map ids to offers may ignore it.
+    exclude_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -497,6 +502,9 @@ class LiumProvider:
     _spawn: Callable[[list[str]], object] | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     _now: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # pod name → executor id for pods this instance launched, so the loop can
+    # exclude a failed pod's machine when renting its replacement.
+    _executor_by_name: dict = field(default_factory=dict, repr=False)
 
     def _cli(self, args: list[str]) -> subprocess.CompletedProcess:
         try:
@@ -535,10 +543,12 @@ class LiumProvider:
 
     def launch(self, spec: LaunchSpec) -> list[str]:
         execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
+        if spec.exclude_ids:
+            execs = [e for e in execs if str(e.get("id")) not in spec.exclude_ids]
         if len(execs) < spec.count:
             raise ProvisionError(
-                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available, "
-                f"need {spec.count}"
+                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available"
+                f"{' after exclusions' if spec.exclude_ids else ''}, need {spec.count}"
             )
         spawn = self._spawn or _spawn_cli
         names: list[str] = []
@@ -556,8 +566,13 @@ class LiumProvider:
             argv += ["--name", name, "--yes"]
             spawn(argv)
             log.info("lium up → executor %s as %s", ex.get("id"), name)
+            self._executor_by_name[name] = str(ex.get("id"))
             names.append(name)
         return names
+
+    def machine_of(self, pod_id: str) -> str | None:
+        """Executor id a pod was launched on (this process's launches only)."""
+        return self._executor_by_name.get(pod_id)
 
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
         deadline = self._now() + timeout
