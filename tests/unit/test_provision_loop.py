@@ -895,3 +895,29 @@ def test_heartbeat_logs_at_cycle_start(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="cascade.provision.loop"):
         loop.run_once()
     assert any("heartbeat: cycle start" in r.message for r in caplog.records)
+
+
+def test_hung_chain_client_hits_deadline_and_rebuilds(tmp_path):
+    """A websocket that HANGS (not raises) must not block the loop — the
+    deadline converts the hang into a rebuild. Four rental windows died to
+    silent chain stalls before this."""
+    import threading
+
+    class HangingChain:
+        def current_block(self):
+            threading.Event().wait(30)          # would block half the cycle
+
+    prov = FakeProvider("lium")
+    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
+    loop.chain_client = HangingChain()
+    loop.chain_client_factory = lambda: FakeChain(880)
+    # shrink the deadline for test speed
+    orig = loop._with_deadline
+    loop_cls = type(loop)
+    try:
+        loop_cls._with_deadline = staticmethod(
+            lambda fn, seconds: orig(fn, 0.2 if seconds >= 60 else seconds))
+        loop.run_once()
+    finally:
+        loop_cls._with_deadline = staticmethod(orig)
+    assert plan_calls == [1]                    # rebuilt within the same cycle and triggered

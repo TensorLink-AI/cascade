@@ -268,6 +268,23 @@ class ProvisionerLoop:
             round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
             self._provision_round(round_id)
 
+    @staticmethod
+    def _with_deadline(fn, seconds: float):
+        """Run ``fn()`` with a HARD deadline in a helper thread.
+
+        bittensor's websocket calls can hang indefinitely (no client-side
+        timeout) — four rental windows were lost to silent chain-source stalls.
+        A timed-out call leaks its helper thread (daemon; it dies with the
+        process), which is an acceptable cost for a loop that must never
+        block. Raises ``TimeoutError`` on deadline."""
+        import concurrent.futures
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            return ex.submit(fn).result(timeout=seconds)
+        finally:
+            ex.shutdown(wait=False)
+
     def _current_block(self) -> int:
         """The chain height, with staleness detection and client rebuild.
 
@@ -280,13 +297,14 @@ class ProvisionerLoop:
         """
         now = self.clock()
         try:
-            block = int(self.chain_client.current_block())
-        except Exception as e:  # noqa: BLE001 — a dead client is rebuildable
+            block = int(self._with_deadline(self.chain_client.current_block, 60.0))
+        except Exception as e:  # noqa: BLE001 — a dead/hung client is rebuildable
             if self.chain_client_factory is None:
                 raise
-            log.warning("current_block failed (%s); rebuilding chain client", e)
-            self.chain_client = self.chain_client_factory()
-            block = int(self.chain_client.current_block())
+            log.warning("current_block failed/hung (%s); rebuilding chain client",
+                        type(e).__name__)
+            self.chain_client = self._with_deadline(self.chain_client_factory, 120.0)
+            block = int(self._with_deadline(self.chain_client.current_block, 60.0))
             self._block_changed_at = now
         if self._last_block is None or block != self._last_block:
             self._last_block = block
@@ -295,8 +313,8 @@ class ProvisionerLoop:
               and now - self._block_changed_at > self.stale_block_after_s):
             log.warning("block frozen at %d for %.0fs — rebuilding chain client "
                         "(quietly dead websocket?)", block, now - self._block_changed_at)
-            self.chain_client = self.chain_client_factory()
-            block = int(self.chain_client.current_block())
+            self.chain_client = self._with_deadline(self.chain_client_factory, 120.0)
+            block = int(self._with_deadline(self.chain_client.current_block, 60.0))
             self._last_block = block
             self._block_changed_at = now
         return block

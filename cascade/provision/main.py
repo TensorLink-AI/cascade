@@ -272,6 +272,18 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # UNMUTABLE service logging: bittensor's in-process logging machinery
+    # reconfigures the root logger when the chain client first connects, which
+    # silently swallowed every provisioner log after cycle 1 (observed live
+    # 2026-07-14: 3h of invisible-but-working loop, then an invisible trigger
+    # failure). Give the cascade tree its OWN handler and stop propagating —
+    # nothing bittensor does to root can mute us again.
+    cascade_logger = logging.getLogger("cascade")
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    cascade_logger.addHandler(handler)
+    cascade_logger.setLevel(args.log_level)
+    cascade_logger.propagate = False
     try:
         return _run(args)
     except ProvisionError as e:
