@@ -377,30 +377,43 @@ def filter_tagged_names(pods: Sequence[dict], prefix: str, *, id_key: str = "nam
     return out
 
 
-def shadeform_create_body(spec: LaunchSpec, offer: dict, *, name: str) -> dict:
+def shadeform_create_body(
+    spec: LaunchSpec, offer: dict, *, name: str, ssh_key_id: str | None = None
+) -> dict:
     """Build the ``POST /instances/create`` body for one pod of ``spec``.
 
-    Only ``SSH_PUBKEY`` is injected into the container env (the image contract);
-    Hippius creds are never placed on the pod. Container port 22 is exposed so
-    the orchestrator can SSH in.
+    Two boot modes:
+
+    * **docker** (default) — the pod runs ``spec.image`` (the digest-pinned
+      worker image, whose entrypoint starts sshd and reads ``SSH_PUBKEY``).
+    * **VM** (``ssh_key_id`` given) — no container: the bare VM boots with the
+      account's registered SSH key and the provisioner's bootstrap_script
+      provisions it over SSH (user ``shadeform``). This is the testnet path
+      while no worker image is published — ``spec.image`` is ignored here.
+
+    In neither mode do Hippius creds touch the pod.
     """
-    return {
+    body = {
         "cloud": offer["cloud"],
         "region": offer["region"],
         "shade_instance_type": offer["shade_instance_type"],
         "shade_cloud": True,
         "name": name,
-        "launch_configuration": {
-            "type": "docker",
-            "docker_configuration": {
-                "image": spec.image,
-                "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}],
-                "port_mappings": [
-                    {"host_port": spec.ssh_port, "container_port": DEFAULT_SSH_PORT}
-                ],
-            },
+    }
+    if ssh_key_id:
+        body["ssh_key_id"] = ssh_key_id
+        return body
+    body["launch_configuration"] = {
+        "type": "docker",
+        "docker_configuration": {
+            "image": spec.image,
+            "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}],
+            "port_mappings": [
+                {"host_port": spec.ssh_port, "container_port": DEFAULT_SSH_PORT}
+            ],
         },
     }
+    return body
 
 
 def shadeform_pod_address(info_json: dict, *, ssh_port: int = DEFAULT_SSH_PORT) -> PodAddress | None:
@@ -586,6 +599,9 @@ class ShadeformProvider:
     name: str = "shadeform"
     base_url: str = "https://api.shadeform.ai/v1"
     api_key_env: str = "SHADEFORM_API_KEY"
+    # Registered account key id → VM-mode launches (bare VM + bootstrap_script,
+    # user "shadeform"); empty → docker-mode (the worker-image contract).
+    ssh_key_id: str = ""
     poll_interval: float = POD_POLL_INTERVAL
     _session: object | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
@@ -633,7 +649,8 @@ class ShadeformProvider:
             raise ProvisionError(f"shadeform: no available {spec.sku} offer")
         ids: list[str] = []
         for i in range(spec.count):
-            body = shadeform_create_body(spec, offer, name=f"{spec.name_prefix}-{i}")
+            body = shadeform_create_body(spec, offer, name=f"{spec.name_prefix}-{i}",
+                                         ssh_key_id=self.ssh_key_id or None)
             resp = self._post("/instances/create", body)
             iid = resp.get("id")
             if not iid:
@@ -683,8 +700,13 @@ _PROVIDER_FACTORIES: dict[str, Callable[[], Provider]] = {
 }
 
 
-def build_providers(priority: Sequence[str]) -> list[Provider]:
-    """Instantiate the requested providers in priority order."""
+def build_providers(
+    priority: Sequence[str], options: dict[str, dict] | None = None
+) -> list[Provider]:
+    """Instantiate the requested providers in priority order.
+
+    ``options`` maps provider name → constructor kwargs (e.g. shadeform's
+    ``ssh_key_id`` for VM-mode launches) — unknown providers still raise."""
     out: list[Provider] = []
     for name in priority:
         factory = _PROVIDER_FACTORIES.get(name)
@@ -692,7 +714,7 @@ def build_providers(priority: Sequence[str]) -> list[Provider]:
             raise ProvisionError(
                 f"unknown provider {name!r}; known: {', '.join(sorted(_PROVIDER_FACTORIES))}"
             )
-        out.append(factory())
+        out.append(factory(**(options or {}).get(name, {})))
     return out
 
 

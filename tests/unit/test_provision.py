@@ -509,3 +509,23 @@ def test_lium_executors_filtered_by_gpu_count(monkeypatch):
     assert [e["id"] for e in prov._list_executors("A6000", gpus=8)] == ["e8"]
     assert prov.available("A6000", 1, gpus=8) is True
     assert prov.available("A6000", 2, gpus=8) is False  # only one 8x machine
+
+
+def test_shadeform_create_body_vm_mode():
+    """ssh_key_id ⇒ bare-VM launch (bootstrap_script provisions it); no docker
+    config, and the account key is what lets the orchestrator in as 'shadeform'."""
+    spec = LaunchSpec(sku="RTX4090", count=1, image="ignored-in-vm-mode",
+                      ssh_pubkey="ssh-ed25519 AAAA x", gpus_per_pod=4)
+    offer = {"cloud": "excesssupply", "region": "us", "shade_instance_type": "RTX4090x4"}
+    body = shadeform_create_body(spec, offer, name="cascade-900-heat-0",
+                                 ssh_key_id="key-123")
+    assert body["ssh_key_id"] == "key-123"
+    assert "launch_configuration" not in body
+    docker = shadeform_create_body(spec, offer, name="n")     # default: docker mode
+    assert docker["launch_configuration"]["type"] == "docker"
+    assert "ssh_key_id" not in docker
+
+
+def test_build_providers_options():
+    provs = build_providers(["shadeform"], {"shadeform": {"ssh_key_id": "key-123"}})
+    assert provs[0].ssh_key_id == "key-123"
