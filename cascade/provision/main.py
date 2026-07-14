@@ -288,9 +288,9 @@ def _run(args) -> int:
         # Image-boot mode: the pod IS the image, so a moving tag breaks the
         # expected_gpu re-derivation contract — digest pin required.
         validate_digest_pinned(image)
-    elif not image:
-        raise ProvisionError("[provisioner] image is required (bootstrap mode: the "
-                             "provider template to boot, e.g. a stock pytorch image)")
+    # Bootstrap mode: image may be EMPTY — lium then boots its default SSH
+    # template (a template name is not a valid docker ref and would 400), and
+    # shadeform VM-mode ignores the image entirely.
     pubkey_arg = str(top.get("ssh_pubkey", ""))
     if not pubkey_arg:
         raise ProvisionError("[provisioner] ssh_pubkey is required (inline key or .pub path)")

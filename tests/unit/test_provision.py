@@ -529,3 +529,20 @@ def test_shadeform_create_body_vm_mode():
 def test_build_providers_options():
     provs = build_providers(["shadeform"], {"shadeform": {"ssh_key_id": "key-123"}})
     assert provs[0].ssh_key_id == "key-123"
+
+
+def test_lium_launch_omits_image_in_bootstrap_mode(monkeypatch):
+    """Empty image ⇒ default SSH template; a template NAME as --image 400s."""
+    calls = []
+    prov = LiumProvider(_spawn=lambda argv: calls.append(argv))
+    canned = '[{"id": "e1", "gpu_type": "RTX4090", "gpu_count": 4}]'
+
+    class _P:
+        stdout = canned
+    monkeypatch.setattr(prov, "_cli", lambda argv: _P())
+    prov.launch(LaunchSpec(sku="RTX4090", count=1, image="", ssh_pubkey="k",
+                           gpus_per_pod=4, name_prefix="cascade-900-heat"))
+    assert "--image" not in calls[0] and "--name" in calls[0]
+    prov.launch(LaunchSpec(sku="RTX4090", count=1, image="img@sha256:aa", ssh_pubkey="k",
+                           gpus_per_pod=4, name_prefix="cascade-900-heat"))
+    assert "--image" in calls[1]

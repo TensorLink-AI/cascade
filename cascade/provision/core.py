@@ -544,13 +544,17 @@ class LiumProvider:
         names: list[str] = []
         for i, ex in enumerate(execs[: spec.count]):
             name = f"{spec.name_prefix}-{i}"
-            spawn([
-                self.bin, "up", str(ex["id"]),
-                "--image", spec.image,
-                "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
-                "--internal-ports", str(spec.ssh_port),
-                "--name", name, "--yes",
-            ])
+            argv = [self.bin, "up", str(ex["id"])]
+            if spec.image:
+                # docker-run style: the image must be a REAL docker ref whose
+                # entrypoint runs sshd and reads $SSH_PUBKEY (the worker image).
+                argv += ["--image", spec.image, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
+                         "--internal-ports", str(spec.ssh_port)]
+            # empty image ⇒ lium's default SSH template (bootstrap mode): lium
+            # injects the ACCOUNT's registered keys; a template NAME passed as
+            # --image 400s ("image reference is not valid") — never do that.
+            argv += ["--name", name, "--yes"]
+            spawn(argv)
             log.info("lium up → executor %s as %s", ex.get("id"), name)
             names.append(name)
         return names
