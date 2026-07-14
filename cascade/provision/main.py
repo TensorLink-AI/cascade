@@ -285,17 +285,36 @@ def main(argv: list[str] | None = None) -> int:
     # ensure_service_logging() re-asserts idempotently and the loop calls it
     # at EVERY cycle start (ProvisionerLoop.on_cycle).
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-    file_handler = logging.FileHandler("provisioner-service.log")
-    file_handler.setFormatter(fmt)
     level = args.log_level
+    state: dict = {"stream": None, "file": None}
+
+    def _alive(h) -> bool:
+        stream = getattr(h, "stream", None)
+        return h is not None and stream is not None and not getattr(stream, "closed", True)
 
     def ensure_service_logging() -> None:
+        """Re-assert AND, when necessary, REBUILD the service handlers.
+
+        bittensor's logging init doesn't just strip named loggers' handlers —
+        it can leave previously-attached handler objects with CLOSED streams,
+        so re-adding the same object emits into a ValueError that the logging
+        module swallows. Broken handlers are therefore reconstructed from
+        scratch, not re-attached.
+        """
         lg = logging.getLogger("cascade")
-        for h in (stream_handler, file_handler):
+        if not _alive(state["stream"]):
+            state["stream"] = logging.StreamHandler()
+            state["stream"].setFormatter(fmt)
+        if not _alive(state["file"]):
+            state["file"] = logging.FileHandler("provisioner-service.log")
+            state["file"].setFormatter(fmt)
+        for h in (state["stream"], state["file"]):
             if h not in lg.handlers:
                 lg.addHandler(h)
+        # drop dead strays so emits don't raise-and-swallow on them
+        for h in list(lg.handlers):
+            if h not in (state["stream"], state["file"]):
+                lg.removeHandler(h)
         lg.setLevel(level)
         lg.propagate = False
 

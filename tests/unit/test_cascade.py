@@ -289,9 +289,8 @@ def test_cascade_toggle_wires_controller(tmp_path):
     runner_off = build_runner(chain_toml=None)  # DEFAULT_CHAIN_TOML == chain.toml
     assert runner_off.cascade is None
 
-    # On (testnet) ⇒ controller wired.
-    on = load_chain_config("chain.testnet.toml")
-    assert on.scoring.cascade_enabled is True
+    # On ⇒ controller wired (synthetic toml; the shipped testnet file toggles
+    # this deliberately over time — deferred 2026-07-13 — so don't assert it).
     runner_on = build_runner(chain_toml=_write_toml_with_cascade(tmp_path, enabled=True))
     assert runner_on.cascade is not None
     assert runner_on.cascade.reign_days == 7
