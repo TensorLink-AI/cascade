@@ -317,6 +317,15 @@ def main(argv: list[str] | None = None) -> int:
                 lg.removeHandler(h)
         lg.setLevel(level)
         lg.propagate = False
+        lg.disabled = False
+        # bittensor sets level=CRITICAL on EVERY existing named logger — the
+        # children too ("cascade.provision.loop" etc.), and a child's own
+        # level beats any parent fix. Sweep the whole cascade.* tree back to
+        # NOTSET (defer to the parent) and re-enable.
+        for name, obj in list(logging.root.manager.loggerDict.items()):
+            if name.startswith("cascade.") and isinstance(obj, logging.Logger):
+                obj.setLevel(logging.NOTSET)
+                obj.disabled = False
 
     ensure_service_logging()
     globals()["_ensure_service_logging"] = ensure_service_logging
