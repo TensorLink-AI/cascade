@@ -104,6 +104,16 @@ def is_provisioner_pod_name(name: str) -> bool:
 
 
 @dataclass(frozen=True)
+class PodProfile:
+    """Per-provider pod paths: providers boot different base users/homes
+    (lium pods are root; shadeform VMs land as the ``shadeform`` user)."""
+
+    user: str = "root"
+    workdir: str = DEFAULT_WORKDIR
+    remote_python: str = DEFAULT_REMOTE_PYTHON
+
+
+@dataclass(frozen=True)
 class RenderSettings:
     """Everything hosts.toml rendering + pod launching needs beyond addresses."""
 
@@ -115,6 +125,12 @@ class RenderSettings:
     workdir: str = DEFAULT_WORKDIR
     chain_toml: str | None = None
     ssh_port: int = DEFAULT_SSH_PORT
+    # provider name → pod paths override; absent providers use the defaults above.
+    profiles: dict[str, PodProfile] = field(default_factory=dict)
+
+    def profile_for(self, provider: str) -> PodProfile:
+        return self.profiles.get(
+            provider, PodProfile(workdir=self.workdir, remote_python=self.remote_python))
 
 
 @dataclass
@@ -303,7 +319,7 @@ class ProvisionerLoop:
                 log.warning("provider %r not configured; skipping", name)
                 continue
             try:
-                if not prov.available(sp.marketplace_sku, count):
+                if not prov.available(sp.marketplace_sku, count, gpus=sp.gpus_per_pod):
                     log.info("provider %s: no capacity for %d×%s", name, count, sp.sku)
                     continue
             except Exception as e:  # noqa: BLE001
@@ -340,7 +356,7 @@ class ProvisionerLoop:
         spec = LaunchSpec(
             sku=_market_sku_for(self.policy, stage), count=fl.pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
-            name_prefix=f"{POD_TAG}{round_id}-{stage}",
+            name_prefix=f"{POD_TAG}{round_id}-{stage}", gpus_per_pod=fl.gpus_per_pod,
         )
         try:
             pod_ids = prov.launch(spec)
@@ -398,11 +414,11 @@ class ProvisionerLoop:
                 # rented bare and provisioned over SSH (rsync source + uv sync
                 # against the pinned lock). The hook runs BEFORE the health
                 # gate, so the gate verifies what bootstrap actually produced.
-                if not self.bootstrap(addr, stage):
+                if not self.bootstrap(addr, stage, prov.name):
                     log.warning("pod %s bootstrap failed", pid)
                     return None
             if self.health_check is not None:
-                report = self.health_check(addr, stage)
+                report = self.health_check(addr, stage, prov.name)
                 if not report.ok:
                     log.warning("pod %s failed health gate: %s", pid, report.summary())
                     return None
@@ -436,12 +452,14 @@ class ProvisionerLoop:
             if not entries:
                 continue
             fleet_gpus = _gpus_for(self.policy, stage)
+            prof = self.render.profile_for(entries[0][0].provider)
             sections.append(render_hosts_toml(
                 [addr for _inst, addr in entries],
                 key_path=self.render.key_path,
                 forward_env=self.render.forward_env,
-                remote_python=self.render.remote_python,
-                workdir=self.render.workdir,
+                remote_python=prof.remote_python,
+                workdir=prof.workdir,
+                user=prof.user,
                 chain_toml=self.render.chain_toml,
                 name_prefix=f"{POD_TAG}{self._state.round_id}-{stage}",
                 provider=entries[0][0].provider,

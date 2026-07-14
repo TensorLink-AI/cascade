@@ -35,7 +35,9 @@ from .core import (
     wait_ssh_reachable,
 )
 from .health import HealthGate, HealthReport
-from .loop import ProvisionerLoop, RenderSettings, parse_plan_output
+from dataclasses import replace
+
+from .loop import PodProfile, ProvisionerLoop, RenderSettings, parse_plan_output
 from .policy import ProvisionPolicy, StagePolicy
 
 log = logging.getLogger("cascade.provision.main")
@@ -127,27 +129,32 @@ def make_plan_fn(chain_toml: Path | None, work_root: Path) -> callable:
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                       image_digest: str, min_disk_gb: float,
                       hippius_probe) -> callable:
-    """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod."""
+    """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod.
+
+    Gates are built lazily per ``(stage, provider)``: the pod's user/workdir/
+    python differ by provider (lium=root, shadeform=the ``shadeform`` user)."""
     from ..trainer.remote import RemoteHost, build_ssh_argv, run_ssh
 
-    gates = {
-        stage: HealthGate(
-            sku=sp.sku, gpus=sp.gpus_per_pod,
-            remote_python=render.remote_python, workdir=render.workdir,
-            image_digest=image_digest, min_disk_gb=min_disk_gb,
-            hippius_probe=hippius_probe,
-        )
-        for stage, sp in (("heat", policy.heat), ("final", policy.final))
-    }
+    gates: dict = {}
 
-    def check(addr, stage: str) -> HealthReport:
+    def check(addr, stage: str, provider: str = "") -> HealthReport:
+        prof = render.profile_for(provider)
+        key = (stage, provider)
+        if key not in gates:
+            sp = policy.heat if stage == "heat" else policy.final
+            gates[key] = HealthGate(
+                sku=sp.sku, gpus=sp.gpus_per_pod,
+                remote_python=prof.remote_python, workdir=prof.workdir,
+                image_digest=image_digest, min_disk_gb=min_disk_gb,
+                hippius_probe=hippius_probe,
+            )
         host = RemoteHost(name="health-probe", host=addr.ip, port=addr.ssh_port,
-                          key_path=render.key_path, workdir=render.workdir)
+                          user=prof.user, key_path=render.key_path, workdir=prof.workdir)
 
         def run(remote_argv: Sequence[str]):
             return run_ssh(build_ssh_argv(host, shlex.join(list(remote_argv))), timeout=120)
 
-        return gates[stage].check(run)
+        return gates[key].check(run)
 
     return check
 
@@ -165,11 +172,13 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     """
     import os
 
-    def bootstrap(addr, stage: str) -> bool:
+    def bootstrap(addr, stage: str, provider: str = "") -> bool:
+        prof = render.profile_for(provider)
         env = dict(os.environ)
         env.update({
-            "POD_IP": addr.ip, "POD_PORT": str(addr.ssh_port), "POD_USER": pod_user,
-            "POD_KEY": render.key_path, "POD_STAGE": stage, "POD_WORKDIR": render.workdir,
+            "POD_IP": addr.ip, "POD_PORT": str(addr.ssh_port),
+            "POD_USER": prof.user if provider else pod_user,
+            "POD_KEY": render.key_path, "POD_STAGE": stage, "POD_WORKDIR": prof.workdir,
         })
         try:
             proc = subprocess.run(["bash", str(script)], env=env, timeout=timeout_s,
@@ -309,8 +318,22 @@ def _run(args) -> int:
             pod_user=str(top.get("pod_user", "root")),
         )
 
+    profiles = {
+        name: PodProfile(
+            user=str(t.get("user", "root")),
+            workdir=str(t.get("workdir", render.workdir)),
+            remote_python=str(t.get("remote_python", render.remote_python)),
+        )
+        for name, t in (top.get("pods", {}) or {}).items()
+    }
+    if profiles:
+        render = replace(render, profiles=profiles)
+
     provider_names = list(dict.fromkeys([*policy.heat.providers, *policy.final.providers]))
-    providers = {p.name: p for p in build_providers(provider_names)}
+    provider_opts: dict[str, dict] = {}
+    if top.get("shadeform_ssh_key_id"):
+        provider_opts["shadeform"] = {"ssh_key_id": str(top["shadeform_ssh_key_id"])}
+    providers = {p.name: p for p in build_providers(provider_names, provider_opts)}
 
     hippius_probe = None
     manifest_store = None

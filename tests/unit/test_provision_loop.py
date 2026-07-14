@@ -39,7 +39,7 @@ class FakeProvider:
         self.launched: list[str] = []
         self.terminated: list[str] = []
 
-    def available(self, sku, count):
+    def available(self, sku, count, *, gpus=1):
         if self._avail_raises:
             raise self._avail_raises
         return self._available
@@ -264,7 +264,7 @@ def test_unhealthy_pod_replaced_once(tmp_path):
     prov = FakeProvider("lium")
     bad_ips = {"10.0.0.1"}                                   # the first heat pod's IP
 
-    def health(addr, stage):
+    def health(addr, stage, provider=""):
         return _report(ok=addr.ip not in bad_ips)
 
     loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
@@ -281,7 +281,7 @@ def test_unhealthy_pod_replaced_once(tmp_path):
 def test_replacement_also_unhealthy_drops_the_slot(tmp_path):
     prov = FakeProvider("lium")
 
-    def health(addr, stage):
+    def health(addr, stage, provider=""):
         return _report(ok=(stage != "heat"))                 # every heat pod is a lemon
 
     loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
@@ -297,7 +297,7 @@ def test_replacement_also_unhealthy_drops_the_slot(tmp_path):
 def test_every_pod_unhealthy_clears_hosts(tmp_path):
     prov = FakeProvider("lium")
     loop, _ = make_loop(tmp_path, providers={"lium": prov},
-                        health=lambda addr, stage: _report(ok=False))
+                        health=lambda addr, stage, provider="": _report(ok=False))
     loop.run_once()
     assert prov.live == {}                                    # nothing left billing
     with pytest.raises(RemoteDispatchError):
@@ -544,7 +544,7 @@ def test_static_hosts_survive_every_publish_and_clear(tmp_path):
 def test_bootstrap_failure_replaces_pod_once(tmp_path):
     calls = []
 
-    def flaky_bootstrap(addr, stage):
+    def flaky_bootstrap(addr, stage, provider=""):
         calls.append(addr.ip)
         return len(calls) > 1                     # first pod fails, replacement passes
 
@@ -564,3 +564,21 @@ def test_unmanaged_final_rents_no_final_pods(tmp_path):
     plan = size_fleet(12, 1, 0.5, 3.0, 0.75, pol)
     assert plan.final.pods == 0                   # stage unmanaged: static pods serve it
     assert plan.heat.pods > 0
+
+
+def test_publish_uses_per_provider_profile(tmp_path):
+    """Shadeform VMs land as the 'shadeform' user under /home/shadeform — the
+    rendered hosts entries must carry that provider's paths, not lium's root."""
+    from dataclasses import replace as _replace
+
+    from cascade.provision.loop import PodProfile
+
+    prov = FakeProvider("shadeform")
+    loop, _ = make_loop(tmp_path, providers={"shadeform": prov})
+    loop.render = _replace(loop.render, profiles={"shadeform": PodProfile(
+        user="shadeform", workdir="/home/shadeform/cascade",
+        remote_python="/home/shadeform/cascade/.venv/bin/python")})
+    loop.run_once()
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert hosts and all(h.user == "shadeform" for h in hosts)
+    assert all(h.workdir == "/home/shadeform/cascade" for h in hosts)
