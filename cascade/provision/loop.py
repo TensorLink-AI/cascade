@@ -249,6 +249,16 @@ class ProvisionerLoop:
         first kills the previous round's eval pod, then (same tick) the new
         round rents its own — the two never coexist.
         """
+        now = self.clock()
+        if now - self._last_heartbeat_at >= self.heartbeat_every_s:
+            # Cycle-START heartbeat: every phase below makes network calls
+            # that can crawl on a bad night — liveness must never depend on
+            # reaching any of them (2026-07-14, twice: starved heartbeats
+            # masked a wedged loop through two rental windows).
+            log.info("heartbeat: cycle start, last_block=%s, owned_pods=%d",
+                     self._last_block if self._last_block is not None else "?",
+                     len(self._state.instances) if self._state else 0)
+            self._last_heartbeat_at = now
         self._reconcile_orphans()
         self._teardown_due_pods()
         block = self._current_block()
