@@ -22,7 +22,6 @@ internally-reproducible digest schemes — ``corpus_mode`` is in
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import itertools
 from collections.abc import Iterator
@@ -191,9 +190,16 @@ class _FreshSeriesStream(RoundStream):
 
     def close(self) -> None:
         if self._cm is not None:
-            with contextlib.suppress(Exception):
-                self._cm.__exit__(None, None, None)
-            self._cm = None
+            cm, self._cm = self._cm, None
+            try:
+                cm.__exit__(None, None, None)
+            except CorpusError:
+                # A sandbox VERDICT at stream close (e.g. the CPU-mode
+                # GPU-use rejection) must propagate and fail the entry —
+                # only ordinary teardown noise is safe to swallow.
+                raise
+            except Exception:  # noqa: BLE001, S110 - teardown must not mask training
+                pass
 
     @property
     def digest(self) -> str:
