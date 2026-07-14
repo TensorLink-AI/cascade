@@ -36,8 +36,8 @@ on:
       network:
         description: "Which chain config to publish"
         type: choice
-        options: [testnet, mainnet]
-        default: testnet
+        options: [mainnet, testnet]
+        default: mainnet
       effective_block:
         description: "Explicit effective_block (leave 'auto' once a trainer manifest exists)"
         required: false
@@ -89,11 +89,11 @@ jobs:
 
       - name: Build + publish snapshot  (CASCADE key)
         env:
-          NETWORK: ${{ github.event.inputs.network || 'testnet' }}
+          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
           EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
         run: |
-          TOML=chain.testnet.toml
-          [ "$NETWORK" = "mainnet" ] && TOML=chain.toml
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           echo "publishing with $TOML (effective-block=$EFFECTIVE_BLOCK)"
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \

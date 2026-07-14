@@ -240,7 +240,7 @@ manifest_bucket  = "cascade-manifests"              # round-<id>.json + latest.j
 logs_bucket      = "cascade-logs"                   # logs/round-<id>/<role>.jsonl
 # Eval-pool bucket (daily snapshots + pool/index.json, published with
 # `cascade-pool publish`). Empty = use the static [eval] window_pool ref instead.
-pool_bucket      = ""                               # e.g. "cascade-eval-pool"
+pool_bucket      = "cascade-eval-pool"              # daily snapshots from publish-pool.yml
 # Pool endpoint override (e.g. Cloudflare R2 + POOL_S3_ACCESS_KEY /
 # POOL_S3_SECRET_KEY); empty = reuse the Hippius S3 endpoint above.
 pool_s3_endpoint = ""
