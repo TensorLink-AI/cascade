@@ -274,7 +274,7 @@ backup_bucket      = ""                             # empty = reuse manifest_buc
 [manifest]
 # Signed training receipts in [storage] manifest_bucket. trainer_hotkey is the
 # only signer a validator trusts (see OPEN_QUESTIONS.md #1).
-trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
+trainer_hotkey  = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # owner trainer hotkey (mainnet)
 poll_seconds    = 120
 # Trust anchor for the public round receipts: the validator hotkey whose
 # signature `cascade-audit` requires. Empty = verify against the receipt's
