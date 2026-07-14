@@ -100,6 +100,29 @@ def seed_from_block_hash(block_hash: str) -> int:
     )
 
 
+def _defuse_substrate_destructor() -> None:
+    """Neuter async_substrate_interface's hanging ``__del__``.
+
+    Its destructor closes the websocket, whose close handshake ``join()``s a
+    thread with NO timeout — on a dead connection that join never returns, and
+    because ``__del__`` runs wherever garbage collection happens to fire, it
+    hangs the MAIN thread of whatever service triggered it. Observed live
+    2026-07-14: the validator froze mid-poll for 5.5h (rounds went unscored)
+    with the main thread parked in ``__del__ → close → join``. A leaked socket
+    on GC is harmless (the process's daemon threads die at exit); a hang is
+    fatal. Idempotent, best-effort, version-tolerant.
+    """
+    try:
+        from async_substrate_interface import sync_substrate
+
+        for cls_name in ("SubstrateInterface",):
+            cls = getattr(sync_substrate, cls_name, None)
+            if cls is not None and getattr(cls, "__del__", None) is not None:
+                cls.__del__ = lambda self: None  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001 — defusal must never break client construction
+        pass
+
+
 def _import_bittensor():
     try:
         import bittensor  # type: ignore
@@ -161,6 +184,7 @@ class ChainClient:
     def subtensor(self):
         if self._subtensor is None:
             bt = _import_bittensor()
+            _defuse_substrate_destructor()
             # bittensor <9 exposed a lowercase ``subtensor`` factory; 9+/10 only
             # ship the ``Subtensor`` class. Support both so the client works
             # across the ``bittensor>=8`` range pyproject allows.

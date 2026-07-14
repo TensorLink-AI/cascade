@@ -52,3 +52,19 @@ def test_raw_revealed_entries_skips_garbage_entry_only():
     out = _client()._raw_revealed_entries(
         _FakeSub([(None, 1), (raw_str, 2), (12345, 3)]), "hk")
     assert out == [(2, good)]
+
+
+def test_defuse_substrate_destructor_is_safe_without_package(monkeypatch):
+    """The defusal is best-effort: importable package → __del__ neutered;
+    missing package → silent no-op (unit envs without the chain extra)."""
+    from cascade.shared import chain as chain_mod
+
+    chain_mod._defuse_substrate_destructor()      # must never raise
+    try:
+        from async_substrate_interface import sync_substrate
+    except ImportError:
+        return
+    cls = getattr(sync_substrate, "SubstrateInterface", None)
+    if cls is not None:
+        obj = object.__new__(cls)
+        cls.__del__(obj)                          # neutered: returns instantly
