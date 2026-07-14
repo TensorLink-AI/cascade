@@ -367,6 +367,7 @@ def _run(args) -> int:
         policy=policy,
         providers=providers,
         chain_client=ChainClient.from_config(cfg, network=args.network),
+        chain_client_factory=lambda: ChainClient.from_config(cfg, network=args.network),
         plan_fn=make_plan_fn(args.chain_toml, work_root),
         render=render,
         hosts_path=hosts_path,

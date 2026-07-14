@@ -646,3 +646,42 @@ def test_sku_primary_wins_when_stocked(tmp_path):
     loop.run_once()
     assert lium.launched == ["cascade-900-heat-0"]   # 3 slots (12-field) @ 4x → 1 pod
     assert shade.launched == []
+
+
+# ── stale chain client (the silent no-trigger of 2026-07-14) ─────────────────
+
+
+def test_frozen_block_rebuilds_chain_client_and_triggers(tmp_path):
+    """A quietly-dead websocket keeps answering with a stale block; after
+    stale_block_after_s the loop must rebuild the client and see the real
+    height — otherwise it cycles forever and never rents."""
+    prov = FakeProvider("lium")
+    clock = Clock()
+    stale = FakeChain(700)                      # frozen far from the boundary
+    fresh = FakeChain(880)                      # the real height (in-window)
+    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.chain_client = stale
+    loop.chain_client_factory = lambda: fresh
+    loop.stale_block_after_s = 300.0
+
+    loop.run_once()                             # block seen, baseline set
+    clock.t += 200.0
+    loop.run_once()                             # frozen, but not stale yet
+    assert plan_calls == [] and prov.launched == []
+    clock.t += 200.0                            # now 400s frozen > 300s
+    loop.run_once()                             # rebuild → block 880 → trigger
+    assert plan_calls == [1]
+    assert prov.launched != []
+
+
+def test_raising_chain_client_rebuilds_once(tmp_path):
+    class DeadChain:
+        def current_block(self):
+            raise ConnectionError("ws closed")
+
+    prov = FakeProvider("lium")
+    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
+    loop.chain_client = DeadChain()
+    loop.chain_client_factory = lambda: FakeChain(880)
+    loop.run_once()
+    assert plan_calls == [1]                    # rebuilt and proceeded same cycle

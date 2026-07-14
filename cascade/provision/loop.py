@@ -170,6 +170,14 @@ class ProvisionerLoop:
     # final exists.
     static_hosts_text: str = ""
     ssh_probe: Callable[[str, int], bool] = field(default=lambda ip, port: True)
+    # Rebuilds chain_client when the block number freezes: a bittensor
+    # websocket can die QUIETLY and keep answering current_block() with a
+    # stale value — the loop then cycles forever without ever seeing the
+    # trigger window (observed live 2026-07-14: 2h19m of silent no-trigger).
+    # None disables the refresh (tests with static FakeChain blocks).
+    chain_client_factory: Callable[[], object] | None = None
+    stale_block_after_s: float = 300.0
+    heartbeat_every_s: float = 600.0
     ready_timeout: float = DEFAULT_READY_TIMEOUT
     poll_seconds: float = 30.0
     dry_run: bool = False
@@ -181,6 +189,9 @@ class ProvisionerLoop:
     _provisioned_round: int | None = field(default=None, init=False, repr=False)
     _addrs: dict[str, PodAddress] = field(default_factory=dict, init=False, repr=False)
     _manifest_baseline: str | None = field(default=None, init=False, repr=False)
+    _last_block: int | None = field(default=None, init=False, repr=False)
+    _block_changed_at: float = field(default=0.0, init=False, repr=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
     _learned_round_id: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -207,11 +218,50 @@ class ProvisionerLoop:
         """One poll tick: reconcile strays, tear down what's due, maybe rent."""
         self._reconcile_orphans()
         self._teardown_due_pods()
-        block = int(self.chain_client.current_block())
+        block = self._current_block()
         if should_trigger(block, self.epoch_blocks,
                           self.policy.trigger_margin_blocks, self._provisioned_round):
             round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
             self._provision_round(round_id)
+
+    def _current_block(self) -> int:
+        """The chain height, with staleness detection and client rebuild.
+
+        A frozen block number for ``stale_block_after_s`` (or a raising
+        client) triggers ONE rebuild via ``chain_client_factory`` per
+        occurrence; the fresh client's answer is trusted (its own staleness
+        clock restarts). Every path also emits a heartbeat log every
+        ``heartbeat_every_s`` so a silent stall is visible in the log, not
+        just in a missing trigger.
+        """
+        now = self.clock()
+        try:
+            block = int(self.chain_client.current_block())
+        except Exception as e:  # noqa: BLE001 — a dead client is rebuildable
+            if self.chain_client_factory is None:
+                raise
+            log.warning("current_block failed (%s); rebuilding chain client", e)
+            self.chain_client = self.chain_client_factory()
+            block = int(self.chain_client.current_block())
+            self._block_changed_at = now
+        if self._last_block is None or block != self._last_block:
+            self._last_block = block
+            self._block_changed_at = now
+        elif (self.chain_client_factory is not None
+              and now - self._block_changed_at > self.stale_block_after_s):
+            log.warning("block frozen at %d for %.0fs — rebuilding chain client "
+                        "(quietly dead websocket?)", block, now - self._block_changed_at)
+            self.chain_client = self.chain_client_factory()
+            block = int(self.chain_client.current_block())
+            self._last_block = block
+            self._block_changed_at = now
+        if now - self._last_heartbeat_at >= self.heartbeat_every_s:
+            boundary = (block // self.epoch_blocks + 1) * self.epoch_blocks
+            log.info("heartbeat: block=%d, blocks_to_boundary=%d, owned_pods=%d",
+                     block, boundary - block,
+                     len(self._state.instances) if self._state else 0)
+            self._last_heartbeat_at = now
+        return block
 
     def run_forever(self) -> None:  # pragma: no cover — glue over run_once
         """Poll forever; one bad cycle must never kill the service (pods that
