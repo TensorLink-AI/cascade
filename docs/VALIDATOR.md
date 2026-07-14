@@ -22,6 +22,13 @@ identically, `[manifest] trainer_hotkey` is the only trainer to trust, and the
 buckets are where the subnet's data actually lives. Your identity needs no toml
 entry — receipts are signed with your **wallet hotkey** automatically.
 
+*One optional exception*: `[manifest] validator_hotkey` is read only by
+`cascade-audit` — set it to **your own** hotkey and the audit pins receipts to
+exactly that signer; left empty, the audit still verifies the signature but
+WARNs that the signer is unpinned. The running validator never reads it.
+(Auditing someone else? `cascade-audit … --validator <their-hotkey>` does the
+same without editing the file.)
+
 **2. Environment variables — exactly these** (env only, never in the toml):
 
 ```bash
