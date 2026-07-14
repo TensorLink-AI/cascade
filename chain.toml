@@ -84,12 +84,12 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = "sha256:bd7e853bf6d71aafcd2cb7a8e52cdf7107afe001248c798067a4dd78591b69cf"
-# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.1.0. LAUNCH BLOCKER: this
-# digest predates PRs #76–#96 — tag a worker-v* release from the launch commit
-# and re-pin (scripts/repin_worker_image.sh <tag>) BEFORE go-live. Re-pin
-# protocol: digest folds into contract_digest ⇒ trainer AND validators restart
-# together at an epoch boundary, pods pull the new image.
+train_image_digest = "sha256:46bc78fa0ddd1590085bbe3ab909c7f6bb46ab3998a3873764cc6430cb8f3ce6"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0 (built from main incl.
+# PRs #76–#98). At launch: tag worker-v* from the LAUNCH commit and re-pin via
+# scripts/repin_worker_image.sh <tag>. Re-pin protocol: the digest folds into
+# contract_digest ⇒ trainer AND validators restart together at an epoch
+# boundary, pods pull the new image.
 
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
