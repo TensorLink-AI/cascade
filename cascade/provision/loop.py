@@ -251,8 +251,8 @@ class ProvisionerLoop:
         """
         self._reconcile_orphans()
         self._teardown_due_pods()
-        self._maybe_provision_eval()
         block = self._current_block()
+        self._maybe_provision_eval()
         if should_trigger(block, self.epoch_blocks,
                           self.policy.trigger_margin_blocks, self._provisioned_round):
             round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
@@ -289,12 +289,6 @@ class ProvisionerLoop:
             block = int(self.chain_client.current_block())
             self._last_block = block
             self._block_changed_at = now
-        if now - self._last_heartbeat_at >= self.heartbeat_every_s:
-            boundary = (block // self.epoch_blocks + 1) * self.epoch_blocks
-            log.info("heartbeat: block=%d, blocks_to_boundary=%d, owned_pods=%d",
-                     block, boundary - block,
-                     len(self._state.instances) if self._state else 0)
-            self._last_heartbeat_at = now
         return block
 
     def run_forever(self) -> None:  # pragma: no cover — glue over run_once
