@@ -259,3 +259,181 @@ def test_container_argv_scaled_cpu_cap_env(small_cfg, tmp_path):
     argv2 = container_argv(cfg, runtime="docker", name="sbx-4", repo=tmp_path,
                            child_args=["/sandbox/repo", "0", "{}", "/sandbox/out"])
     assert not any(a.startswith("CASCADE_SANDBOX_CPU_S=") for a in argv2)
+
+
+# ── CPU-mode generators stay off the GPU (blank env + detect-and-reject) ─────
+
+
+def test_child_env_cpu_profile_blanks_cuda_vars(monkeypatch):
+    """Layer 1: BLANK, not stripped — an absent CUDA_VISIBLE_DEVICES means
+    'all GPUs visible' to pip-torch's bundled CUDA runtime, so a dependency
+    that initializes CUDA would corrupt byte-exact audits and touch other
+    lanes' GPUs."""
+    from cascade.trainer.sandbox import _child_env
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    env = _child_env(gpu=False)
+    assert env["CUDA_VISIBLE_DEVICES"] == ""
+    assert env["NVIDIA_VISIBLE_DEVICES"] == "void"
+    # the GPU profile still passes the selection env through untouched
+    assert _child_env(gpu=True)["CUDA_VISIBLE_DEVICES"] == "3"
+
+
+def test_reject_gpu_use_raises_on_child_pid_and_skips_on_error():
+    from cascade.trainer.sandbox import _reject_gpu_use
+
+    with pytest.raises(CorpusError, match="generator_used_gpu_in_cpu_mode"):
+        _reject_gpu_use(1234, query_fn=lambda: [1234])
+    _reject_gpu_use(1234, query_fn=lambda: [])            # no GPU users: fine
+    _reject_gpu_use(1234, query_fn=lambda: [999999])      # someone else: fine
+
+    def boom():
+        raise FileNotFoundError("no nvidia-smi")          # CPU-only box
+
+    _reject_gpu_use(1234, query_fn=boom)                  # skip silently
+
+
+def _spy_child_pids(monkeypatch):
+    """Record every sandbox child pid so a fake nvidia-smi can 'see' it."""
+    import subprocess as sp
+
+    pids: list[int] = []
+    real_popen = sp.Popen
+
+    def spy(*a, **k):
+        p = real_popen(*a, **k)
+        pids.append(p.pid)
+        return p
+
+    monkeypatch.setattr(sp, "Popen", spy)
+    return pids
+
+
+def test_stream_cpu_rejects_child_that_used_gpu(tmp_path, small_cfg, monkeypatch):
+    pids = _spy_child_pids(monkeypatch)
+    repo = _write_repo(tmp_path, OK_GEN)
+    with pytest.raises(CorpusError, match="generator_used_gpu_in_cpu_mode"), \
+            sandbox_mod.stream_series(
+                repo, 0, small_cfg.generator, token_budget=256,
+                blocked=small_cfg.static_guard.blocked, allow_netns=False,
+                gpu_pid_query=lambda: pids,
+            ) as frames:
+        next(frames)  # the check fires at CLEAN close, after consumption
+
+
+def test_stream_gpu_profile_skips_the_check(tmp_path, small_cfg, monkeypatch):
+    # stream_gpu is tolerance mode: CUDA use is the whole point there.
+    pids = _spy_child_pids(monkeypatch)
+    repo = _write_repo(tmp_path, OK_GEN)
+    with sandbox_mod.stream_series(
+        repo, 0, small_cfg.generator, token_budget=256,
+        blocked=small_cfg.static_guard.blocked, allow_netns=False,
+        gpu=True, gpu_pid_query=lambda: pids,
+    ) as frames:
+        next(frames)
+
+
+def test_stream_cpu_clean_when_query_empty_or_failing(tmp_path, small_cfg, monkeypatch):
+    repo = _write_repo(tmp_path, OK_GEN)
+    for query in (lambda: [], lambda: (_ for _ in ()).throw(RuntimeError("x"))):
+        with sandbox_mod.stream_series(
+            repo, 0, small_cfg.generator, token_budget=256,
+            blocked=small_cfg.static_guard.blocked, allow_netns=False,
+            gpu_pid_query=query,
+        ) as frames:
+            assert next(frames).size > 0
+
+
+def test_batch_sandbox_rejects_child_that_used_gpu(tmp_path, small_cfg, monkeypatch):
+    pids = _spy_child_pids(monkeypatch)
+    repo = _write_repo(tmp_path, OK_GEN)
+    with pytest.raises(CorpusError, match="generator_used_gpu_in_cpu_mode"):
+        run_in_sandbox(repo, 0, small_cfg.generator,
+                       blocked=small_cfg.static_guard.blocked, allow_netns=False,
+                       gpu_pid_query=lambda: pids)
+
+
+def test_batch_sandbox_clean_when_no_gpu_users(tmp_path, small_cfg, monkeypatch):
+    repo = _write_repo(tmp_path, OK_GEN)
+    result = run_in_sandbox(repo, 0, small_cfg.generator,
+                            blocked=small_cfg.static_guard.blocked,
+                            allow_netns=False, gpu_pid_query=lambda: [])
+    assert result.n_series == small_cfg.generator.corpus_n_series
+
+
+def test_gpu_use_verdict_propagates_through_round_stream(tmp_path, small_cfg,
+                                                         monkeypatch):
+    """The trainer consumes sandbox streams via open_round_stream, whose close()
+    used to swallow every teardown exception — the rejection must survive it
+    (an entry with a corrupted byte-exact digest has to FAIL, not train on)."""
+    from cascade.trainer.stream import open_round_stream
+
+    pids = _spy_child_pids(monkeypatch)
+    monkeypatch.setattr(sandbox_mod, "_nvidia_compute_pids", lambda: set(pids))
+    repo = _write_repo(tmp_path, OK_GEN)
+    with pytest.raises(CorpusError, match="generator_used_gpu_in_cpu_mode"), \
+            open_round_stream(
+                "stream_cpu", repo, 0, small_cfg.generator, token_budget=256,
+                use_sandbox=True, blocked=small_cfg.static_guard.blocked,
+                allow_netns=False,
+            ) as rs:
+        for _ in rs.series():
+            pass
+
+
+# ── GPU-profile resident-memory cap (systemd-run scope) ───────────────────────
+
+
+def test_wrap_memory_scope_composes_outermost():
+    """systemd-run → unshare → python: the whole netns+child tree must land in
+    one scope, and the cap is resident (2× the VA-calibrated knob, no swap)."""
+    from cascade.trainer.sandbox import wrap_memory_scope
+
+    inner = ["unshare", "--user", "--map-root-user", "--net", "python", "-m", "x"]
+    argv = wrap_memory_scope(inner, 4096, True)
+    assert argv[:4] == ["systemd-run", "--scope", "--quiet", "--collect"]
+    assert argv[4:8] == ["-p", "MemoryMax=8192M", "-p", "MemorySwapMax=0"]
+    assert argv[8:] == inner              # the wrapped command is untouched
+
+
+def test_wrap_memory_scope_unavailable_passes_through():
+    from cascade.trainer.sandbox import wrap_memory_scope
+
+    inner = ["python", "-m", "x"]
+    assert wrap_memory_scope(inner, 4096, False) == inner
+
+
+def test_only_gpu_profile_gets_the_memory_scope(tmp_path, small_cfg, monkeypatch):
+    import subprocess as sp
+
+    monkeypatch.setattr(sandbox_mod, "_memory_scope_available", lambda: True)
+    captured: dict[str, list[str]] = {}
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = list(argv)
+        raise RuntimeError("stop before exec")
+
+    monkeypatch.setattr(sp, "Popen", fake_popen)
+    repo = _write_repo(tmp_path, OK_GEN)
+    for gpu in (True, False):
+        with pytest.raises(RuntimeError, match="stop before exec"), \
+                sandbox_mod.stream_series(
+                    repo, 0, small_cfg.generator, token_budget=256,
+                    blocked=small_cfg.static_guard.blocked, allow_netns=False,
+                    gpu=gpu,
+                ):
+            pass
+        assert (captured["argv"][0] == "systemd-run") is gpu
+
+
+def test_memory_scope_probe_degrades_with_one_warning(monkeypatch, caplog):
+    import shutil as shutil_mod
+
+    monkeypatch.setattr(sandbox_mod, "_MEMSCOPE_PROBE", None)
+    monkeypatch.setattr(shutil_mod, "which", lambda name: None)  # no systemd-run
+    with caplog.at_level("WARNING", logger="cascade.trainer.sandbox"):
+        assert sandbox_mod._memory_scope_available() is False
+        assert sandbox_mod._memory_scope_available() is False  # cached
+    warnings = [r for r in caplog.records if "systemd-run scopes unavailable" in r.message]
+    assert len(warnings) == 1             # named risk, warned exactly once
+    assert "OOM" in warnings[0].message

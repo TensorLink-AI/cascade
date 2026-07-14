@@ -100,6 +100,11 @@ heat_num_samples = 10     # samples per window in the heat (0 = reuse [eval] num
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
+# Go-live gate: only commitments revealed at/after this block ever compete
+# (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
+# squatters / rehearsal commits from before the official start never enter a
+# round (and never burn their one submission).
+commit_floor_block = 0
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet true)
 # Scaling seam (see chain.toml): screen at screen_size, judge the throne at throne_sizes.
 screen_size  = "toto2-4m"

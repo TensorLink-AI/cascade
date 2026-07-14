@@ -95,13 +95,18 @@ def container_argv(
     out_dir: Path | None = None,
     gpu: bool = False,
     cpu_seconds: int | None = None,
+    lane_cores: tuple[int, ...] | None = None,
 ) -> list[str]:
     """The full ``docker run`` argv for one sandboxed generator run.
 
     Pure (no I/O), so the hardening flags are unit-testable. ``child_args`` is
     everything after ``-m cascade.trainer.sandbox``. ``cpu_seconds`` overrides
     the child's self-applied CPU rlimit (streaming runs scale it with the
-    training wall budget — see ``sandbox.stream_cpu_rlimit``).
+    training wall budget — see ``sandbox.stream_cpu_rlimit``). ``lane_cores``
+    is this worker lane's CPU slice (see ``sandbox._lane_cpu_slice``): lane
+    fairness parity with the subprocess sandbox — the container is *placed*
+    on the lane's cores (``--cpuset-cpus``) and its BLAS thread pool capped at
+    the slice size, while ``--cpus`` stays the rate ceiling in both cases.
     """
     src_root = Path(__file__).resolve().parents[2]
     argv = [
@@ -129,6 +134,14 @@ def container_argv(
     ]
     if cpu_seconds is not None:
         argv += ["-e", f"CASCADE_SANDBOX_CPU_S={int(cpu_seconds)}"]
+    if lane_cores:
+        from .sandbox import _BLAS_ENV_KEYS
+
+        # Comma-joined ids, not a range: a pre-existing container cpuset can
+        # make the lane's allowed cores non-contiguous.
+        argv += ["--cpuset-cpus", ",".join(str(c) for c in sorted(lane_cores))]
+        for key in _BLAS_ENV_KEYS:
+            argv += ["-e", f"{key}={len(lane_cores)}"]
     if out_dir is not None:
         argv += ["-v", f"{out_dir}:{_OUT_MNT}:rw"]
     if gpu:
@@ -157,7 +170,7 @@ def run_in_container(
     Same contract: pre-flight → run the child → load + digest-verify the
     returned arrays. Raises :class:`CorpusError` on any failure.
     """
-    from .sandbox import _load_series, _preflight
+    from .sandbox import _lane_cpu_slice, _load_series, _preflight
 
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
@@ -167,10 +180,12 @@ def run_in_container(
         out_dir = Path(td)
         out_dir.chmod(0o777)  # the image's user must be able to write the mount
         name = f"cascade-sbx-{os.urandom(6).hex()}"
+        lane = _lane_cpu_slice()
         argv = container_argv(
             cfg, runtime=runtime, name=name, repo=repo, out_dir=out_dir,
             child_args=[_REPO_MNT, str(int(generation_seed)),
                         json.dumps(asdict(cfg)), _OUT_MNT],
+            lane_cores=tuple(sorted(lane[0])) if lane is not None else None,
         )
         timeout = int(cfg.max_generate_seconds) + 120  # + container startup slack
         try:
@@ -214,7 +229,13 @@ def stream_series_container(
     stdout; the caller stops at its budget and the container is always killed
     on exit.
     """
-    from .sandbox import _frame_iter, _preflight, _terminate, stream_cpu_rlimit
+    from .sandbox import (
+        _frame_iter,
+        _lane_cpu_slice,
+        _preflight,
+        _terminate,
+        stream_cpu_rlimit,
+    )
 
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
@@ -222,13 +243,18 @@ def stream_series_container(
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     name = f"cascade-sbx-{os.urandom(6).hex()}"
+    # Slice size when lane-pinned (the container is placed on the lane's cores
+    # via --cpuset-cpus, so that IS its core ceiling), the whole box otherwise.
+    lane = _lane_cpu_slice()
     cpu_cap = stream_cpu_rlimit(
-        cfg.max_generate_seconds, max_wall_seconds, os.cpu_count() or 1
+        cfg.max_generate_seconds, max_wall_seconds,
+        lane[1] if lane is not None else (os.cpu_count() or 1),
     )
     argv = container_argv(
         cfg, runtime=runtime, name=name, repo=repo, gpu=gpu, cpu_seconds=cpu_cap,
         child_args=["--stream", _REPO_MNT, str(int(generation_seed)),
                     json.dumps(asdict(cfg)), str(n_upper)],
+        lane_cores=tuple(sorted(lane[0])) if lane is not None else None,
     )
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,

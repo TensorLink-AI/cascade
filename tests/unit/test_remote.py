@@ -189,7 +189,8 @@ class _RecordingDispatcher:
     def __init__(self, *a, **k):
         pass
 
-    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block, arch_preset=None):
+    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                 arch_preset=None, lane_count=None):
         _RecordingDispatcher.calls.append((host.name, role, gen_ref))
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 

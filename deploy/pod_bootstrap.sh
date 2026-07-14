@@ -29,11 +29,19 @@ if [[ -n "${CASCADE_CHAIN_TOML:-}" ]]; then
   scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new     "$CASCADE_CHAIN_TOML" "$DEST:$POD_WORKDIR/$(basename "$CASCADE_CHAIN_TOML")"
 fi
 
+# Eval-stage pods benchmark checkpoints (GIFT-Eval/BOOM/TIME gate + cascade
+# bench) and need the pinned data at $POD_WORKDIR/bench_data — heat/final pods
+# never touch it, and 4.4G would slow their boot for nothing.
+if [[ "${POD_STAGE:-}" == "eval" && -d "$SRC_ROOT/bench_data" ]]; then
+  rsync -a -e "ssh ${SSH_OPTS[*]}" "$SRC_ROOT/bench_data/" "$DEST:$POD_WORKDIR/bench_data/"
+  ssh "${SSH_OPTS[@]}" "$DEST" "cd $POD_WORKDIR/benchmarks 2>/dev/null && export PATH=\$HOME/.local/bin:\$PATH && uv sync --frozen 2>&1 | tail -1 || true"
+fi
+
 ssh "${SSH_OPTS[@]}" "$DEST" bash -s <<REMOTE
 set -euo pipefail
 cd "$POD_WORKDIR"
 command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="\$HOME/.local/bin:\$PATH"
-uv sync --frozen --no-dev
+uv sync --frozen --all-extras --no-dev
 .venv/bin/python -c 'import sys, torch, cascade.trainer.worker; print("bootstrap ok:", sys.version.split()[0], torch.__version__)'
 REMOTE

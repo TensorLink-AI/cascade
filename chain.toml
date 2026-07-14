@@ -117,6 +117,11 @@ heat_guard_floor_seconds = 900
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
 # Anti-spam: a challenger hotkey that has entered a heat is burned and must
 # re-register to resubmit. Set false only on a throwaway testnet.
+# Go-live gate: only commitments revealed at/after this block ever compete
+# (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
+# squatters / rehearsal commits from before the official start never enter a
+# round (and never burn their one submission).
+commit_floor_block = 0
 one_submission_per_hotkey = true
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Scaling seam: which size the heat screens at, and which size(s) decide the

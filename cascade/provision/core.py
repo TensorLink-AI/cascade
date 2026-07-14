@@ -94,6 +94,11 @@ class LaunchSpec:
     ssh_pubkey: str                         # injected into the pod as $SSH_PUBKEY
     ssh_port: int = DEFAULT_SSH_PORT
     name_prefix: str = "cascade-pod"
+    # Pod shape: adapters must rent machines with EXACTLY this many GPUs of
+    # ``sku`` — the fleet plan fans one hosts.toml lane out per GPU, so a
+    # smaller machine strands lanes and a bigger one bills idle silicon. The
+    # health gate re-asserts the shape on the booted pod.
+    gpus_per_pod: int = 1
 
 
 @dataclass(frozen=True)
@@ -118,7 +123,7 @@ class Provider(Protocol):
 
     name: str
 
-    def available(self, sku: str, count: int) -> bool: ...
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool: ...
     def launch(self, spec: LaunchSpec) -> list[str]: ...        # → pod handles
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool: ...
     def get_ip(self, pod_id: str) -> PodAddress | None: ...
@@ -305,16 +310,19 @@ def lium_pod_address(pod: dict, *, container_ssh_port: int = DEFAULT_SSH_PORT) -
     return PodAddress(ip=str(ip), ssh_port=int(port))
 
 
-def pick_shadeform_offer(types_json: dict, sku: str) -> dict | None:
+def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1) -> dict | None:
     """Choose a ``(cloud, region, shade_instance_type)`` offer for ``sku``.
 
-    Filters ``GET /instances/types`` results to the requested ``gpu_type`` with
-    an available region, preferring the cheapest (``hourly_price``, in cents).
-    Returns ``None`` if nothing is available — the fall-through signal.
+    Filters ``GET /instances/types`` results to the requested ``gpu_type`` AND
+    the exact ``gpus`` pod shape (``configuration.num_gpus``) with an available
+    region, preferring the cheapest (``hourly_price``, in cents). Returns
+    ``None`` if nothing is available — the fall-through signal.
     """
     offers: list[tuple[int, dict]] = []
     for t in types_json.get("instance_types", []):
         if str(t.get("configuration", {}).get("gpu_type", "")).upper() != sku.upper():
+            continue
+        if int(t.get("configuration", {}).get("num_gpus", 1) or 1) != int(gpus):
             continue
         region = next(
             (a.get("region") for a in t.get("availability", []) if a.get("available")),
@@ -369,30 +377,43 @@ def filter_tagged_names(pods: Sequence[dict], prefix: str, *, id_key: str = "nam
     return out
 
 
-def shadeform_create_body(spec: LaunchSpec, offer: dict, *, name: str) -> dict:
+def shadeform_create_body(
+    spec: LaunchSpec, offer: dict, *, name: str, ssh_key_id: str | None = None
+) -> dict:
     """Build the ``POST /instances/create`` body for one pod of ``spec``.
 
-    Only ``SSH_PUBKEY`` is injected into the container env (the image contract);
-    Hippius creds are never placed on the pod. Container port 22 is exposed so
-    the orchestrator can SSH in.
+    Two boot modes:
+
+    * **docker** (default) — the pod runs ``spec.image`` (the digest-pinned
+      worker image, whose entrypoint starts sshd and reads ``SSH_PUBKEY``).
+    * **VM** (``ssh_key_id`` given) — no container: the bare VM boots with the
+      account's registered SSH key and the provisioner's bootstrap_script
+      provisions it over SSH (user ``shadeform``). This is the testnet path
+      while no worker image is published — ``spec.image`` is ignored here.
+
+    In neither mode do Hippius creds touch the pod.
     """
-    return {
+    body = {
         "cloud": offer["cloud"],
         "region": offer["region"],
         "shade_instance_type": offer["shade_instance_type"],
         "shade_cloud": True,
         "name": name,
-        "launch_configuration": {
-            "type": "docker",
-            "docker_configuration": {
-                "image": spec.image,
-                "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}],
-                "port_mappings": [
-                    {"host_port": spec.ssh_port, "container_port": DEFAULT_SSH_PORT}
-                ],
-            },
+    }
+    if ssh_key_id:
+        body["ssh_key_id"] = ssh_key_id
+        return body
+    body["launch_configuration"] = {
+        "type": "docker",
+        "docker_configuration": {
+            "image": spec.image,
+            "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}],
+            "port_mappings": [
+                {"host_port": spec.ssh_port, "container_port": DEFAULT_SSH_PORT}
+            ],
         },
     }
+    return body
 
 
 def shadeform_pod_address(info_json: dict, *, ssh_port: int = DEFAULT_SSH_PORT) -> PodAddress | None:
@@ -493,8 +514,14 @@ class LiumProvider:
             )
         return proc
 
-    def _list_executors(self, sku: str) -> list[dict]:
-        return parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+    def _list_executors(self, sku: str, *, gpus: int = 1) -> list[dict]:
+        """Marketplace executors of ``sku`` with EXACTLY ``gpus`` GPUs.
+
+        Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
+        a 1× machine rented against an 8-lane plan strands seven lanes (and the
+        health gate then kills the pod anyway — filter here, before renting)."""
+        execs = parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        return [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
 
     def _list_pods(self) -> list[dict]:
         return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
@@ -503,26 +530,31 @@ class LiumProvider:
         return next((p for p in self._list_pods()
                      if pod_id in (p.get("name"), p.get("huid"), p.get("id"))), None)
 
-    def available(self, sku: str, count: int) -> bool:
-        return len(self._list_executors(sku)) >= count
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
+        return len(self._list_executors(sku, gpus=gpus)) >= count
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        execs = self._list_executors(spec.sku)
+        execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
         if len(execs) < spec.count:
             raise ProvisionError(
-                f"lium: only {len(execs)} × {spec.sku} available, need {spec.count}"
+                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available, "
+                f"need {spec.count}"
             )
         spawn = self._spawn or _spawn_cli
         names: list[str] = []
         for i, ex in enumerate(execs[: spec.count]):
             name = f"{spec.name_prefix}-{i}"
-            spawn([
-                self.bin, "up", str(ex["id"]),
-                "--image", spec.image,
-                "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
-                "--internal-ports", str(spec.ssh_port),
-                "--name", name, "--yes",
-            ])
+            argv = [self.bin, "up", str(ex["id"])]
+            if spec.image:
+                # docker-run style: the image must be a REAL docker ref whose
+                # entrypoint runs sshd and reads $SSH_PUBKEY (the worker image).
+                argv += ["--image", spec.image, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
+                         "--internal-ports", str(spec.ssh_port)]
+            # empty image ⇒ lium's default SSH template (bootstrap mode): lium
+            # injects the ACCOUNT's registered keys; a template NAME passed as
+            # --image 400s ("image reference is not valid") — never do that.
+            argv += ["--name", name, "--yes"]
+            spawn(argv)
             log.info("lium up → executor %s as %s", ex.get("id"), name)
             names.append(name)
         return names
@@ -571,6 +603,9 @@ class ShadeformProvider:
     name: str = "shadeform"
     base_url: str = "https://api.shadeform.ai/v1"
     api_key_env: str = "SHADEFORM_API_KEY"
+    # Registered account key id → VM-mode launches (bare VM + bootstrap_script,
+    # user "shadeform"); empty → docker-mode (the worker-image contract).
+    ssh_key_id: str = ""
     poll_interval: float = POD_POLL_INTERVAL
     _session: object | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
@@ -603,22 +638,23 @@ class ShadeformProvider:
         r.raise_for_status()
         return r.json() if r.content else {}
 
-    def _offer(self, sku: str) -> dict | None:
+    def _offer(self, sku: str, *, gpus: int = 1) -> dict | None:
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
-        return pick_shadeform_offer(types, sku)
+        return pick_shadeform_offer(types, sku, gpus=gpus)
 
-    def available(self, sku: str, count: int) -> bool:
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         # Shadeform reports availability, not exact counts; an available offer
-        # means we can create the batch of `count`.
-        return self._offer(sku) is not None
+        # (in the requested pod shape) means we can create the batch of `count`.
+        return self._offer(sku, gpus=gpus) is not None
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        offer = self._offer(spec.sku)
+        offer = self._offer(spec.sku, gpus=spec.gpus_per_pod)
         if offer is None:
             raise ProvisionError(f"shadeform: no available {spec.sku} offer")
         ids: list[str] = []
         for i in range(spec.count):
-            body = shadeform_create_body(spec, offer, name=f"{spec.name_prefix}-{i}")
+            body = shadeform_create_body(spec, offer, name=f"{spec.name_prefix}-{i}",
+                                         ssh_key_id=self.ssh_key_id or None)
             resp = self._post("/instances/create", body)
             iid = resp.get("id")
             if not iid:
@@ -668,8 +704,13 @@ _PROVIDER_FACTORIES: dict[str, Callable[[], Provider]] = {
 }
 
 
-def build_providers(priority: Sequence[str]) -> list[Provider]:
-    """Instantiate the requested providers in priority order."""
+def build_providers(
+    priority: Sequence[str], options: dict[str, dict] | None = None
+) -> list[Provider]:
+    """Instantiate the requested providers in priority order.
+
+    ``options`` maps provider name → constructor kwargs (e.g. shadeform's
+    ``ssh_key_id`` for VM-mode launches) — unknown providers still raise."""
     out: list[Provider] = []
     for name in priority:
         factory = _PROVIDER_FACTORIES.get(name)
@@ -677,7 +718,7 @@ def build_providers(priority: Sequence[str]) -> list[Provider]:
             raise ProvisionError(
                 f"unknown provider {name!r}; known: {', '.join(sorted(_PROVIDER_FACTORIES))}"
             )
-        out.append(factory())
+        out.append(factory(**(options or {}).get(name, {})))
     return out
 
 

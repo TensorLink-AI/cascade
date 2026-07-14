@@ -10,7 +10,7 @@
 # its pods down on TTL. Do NOT add Requires=/BindsTo= a trainer unit.
 
 [Unit]
-Description=cascade per-round GPU pod provisioner (rents heat/final pods, publishes hosts.toml, tears down per stage)
+Description=cascade per-round GPU pod provisioner (rents heat/final/eval pods, publishes hosts.toml + eval_hosts.toml, tears down per stage)
 Wants=network-online.target
 After=network-online.target
 
@@ -22,8 +22,9 @@ WorkingDirectory=/root/cascade
 # holds the bittensor wallet. Example file contents:
 #   SHADEFORM_API_KEY=...
 #   LIUM_API_KEY=...
-#   HIPPIUS_S3_ACCESS_KEY=...      (manifest-store reachability probe + watch)
-#   HIPPIUS_S3_SECRET_KEY=...
+#   HIPPIUS_S3_ACCESS_KEY=...      (manifest-store probe + manifest/receipt watch —
+#   HIPPIUS_S3_SECRET_KEY=...       the elastic eval pod rents on a new manifest
+#                                   and dies on the round's receipt)
 EnvironmentFile=/root/cascade/.env.provisioner
 ExecStart=/usr/local/bin/uv run cascade-provisioner \
     --config /root/cascade/provision.toml \

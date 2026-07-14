@@ -21,6 +21,14 @@ the provisioner rents two fleets —
 Both fleets are bounded by ``max_pods`` per stage and by a hard
 ``max_spend_per_round`` circuit breaker computed at worst case (every pod
 billed for the full TTL) — a runaway round can cost at most that number.
+
+A third, OPTIONAL stage rides a different clock: the **eval** pod (one box,
+usually one GPU) serves the VALIDATOR's heavy evals (GIFT-Eval gate, cascade
+bench). It is manifest-triggered — rented when a round's manifest publishes,
+which is exactly when the trainer fleet is being torn down — and dies when
+that round's receipt appears (or a newer manifest makes it moot, or the TTL).
+Absent config (``policy.eval is None`` / ``max_pods = 0``) the stage does not
+exist and validators eval locally, the pre-elastic behaviour.
 """
 
 from __future__ import annotations
@@ -30,6 +38,8 @@ from dataclasses import dataclass
 
 __all__ = [
     "FleetPlan",
+    "SkuCandidate",
+    "pods_for_slots",
     "ProvisionPolicy",
     "StageFleet",
     "StagePolicy",
@@ -38,6 +48,27 @@ __all__ = [
     "teardown_due",
     "within_budget",
 ]
+
+
+@dataclass(frozen=True)
+class SkuCandidate:
+    """One rentable (SKU, shape, price) option for a stage.
+
+    ``sku`` is the exact nvidia-smi device string (the health gate asserts it
+    on the pod that was ACTUALLY rented); ``market_sku`` the marketplace's
+    alias when it differs; ``gpus_per_pod`` the pod shape to rent;
+    ``max_price_hr`` the per-pod-hour cap for THIS candidate (a 4× box
+    legitimately costs more than a 1× one).
+    """
+
+    sku: str
+    market_sku: str = ""
+    gpus_per_pod: int = 1
+    max_price_hr: float = 0.0
+
+    @property
+    def marketplace_sku(self) -> str:
+        return self.market_sku or self.sku
 
 
 @dataclass(frozen=True)
@@ -68,10 +99,25 @@ class StagePolicy:
     # nvidia-smi device string ("A6000" on lium vs "NVIDIA RTX A6000" on the
     # pod). Empty = same as ``sku``. The health gate ALWAYS asserts ``sku``.
     market_sku: str = ""
+    # Ordered SKU fallbacks tried AFTER the primary (sku/gpus_per_pod/
+    # max_price_hr above): the round takes the first candidate × provider with
+    # capacity for the WHOLE stage fleet. Heat scores are only ever compared
+    # within a round (they rank the field, pick finalists, get discarded), so
+    # round-to-round SKU variance costs nothing — within-round fairness stays
+    # perfect because a stage never mixes candidates.
+    candidates: tuple[SkuCandidate, ...] = ()
 
     @property
     def marketplace_sku(self) -> str:
         return self.market_sku or self.sku
+
+    @property
+    def sku_candidates(self) -> tuple[SkuCandidate, ...]:
+        """The primary shape first, then the configured fallbacks, in order."""
+        primary = SkuCandidate(sku=self.sku, market_sku=self.market_sku,
+                               gpus_per_pod=self.gpus_per_pod,
+                               max_price_hr=self.max_price_hr)
+        return (primary, *self.candidates)
 
 
 @dataclass(frozen=True)
@@ -93,6 +139,11 @@ class ProvisionPolicy:
     trigger_margin_blocks: int
     max_spend_per_round: float
     ttl_epochs: int = 1
+    # The validator's eval-offload pod (manifest-triggered lifecycle, see the
+    # module docstring). Optional and off by default: ``None`` (no
+    # [provisioner.eval] table) or ``max_pods = 0`` means no eval pod is ever
+    # rented — existing configs keep their exact behaviour.
+    eval: StagePolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +168,18 @@ class FleetPlan:
 
     heat: StageFleet
     final: StageFleet
+
+
+def pods_for_slots(slots: int, gpus_per_pod: int, max_pods: int) -> int:
+    """Pods needed to serve ``slots`` GPU-slots at a candidate's shape.
+
+    ``max_pods`` clamps (a clamped stage still completes, in serial waves);
+    ``max_pods == 0`` means the stage is unmanaged — always 0 pods. Zero slots
+    rents nothing regardless of shape.
+    """
+    if slots <= 0 or max_pods <= 0:
+        return 0
+    return min(math.ceil(slots / max(1, gpus_per_pod)), max_pods)
 
 
 def should_trigger(
@@ -249,6 +312,8 @@ def teardown_due(
     rented_at: float,
     now: float,
     ttl_hours: float,
+    receipt_seen: bool = False,
+    newer_manifest: bool = False,
 ) -> bool:
     """Whether a pod of ``stage`` should be terminated NOW.
 
@@ -261,15 +326,26 @@ def teardown_due(
     A published manifest also kills any heat pod the marker missed — the round
     being over subsumes the heat being over.
 
-    The TTL is the hard backstop for BOTH stages: ``rented_at``/``now`` are
+    **eval** pods live on the opposite phase: the manifest is what RENTED them
+    (the validator's heavy evals start when a round publishes), so
+    ``manifest_seen`` must never kill one. They die when the round's receipt
+    appears (``receipt_seen`` — the validator has scored and published, no
+    more offloaded evals are coming) or when a NEWER manifest supersedes the
+    round they served (``newer_manifest`` — those evals are moot; the new
+    round gets its own pod).
+
+    The TTL is the hard backstop for EVERY stage: ``rented_at``/``now`` are
     seconds on the same (injected) clock, and once ``ttl_hours`` have elapsed
-    the pod dies regardless of signals — a crashed trainer or an unreadable
-    manifest store must never turn into an eternally-billing pod.
+    the pod dies regardless of signals — a crashed trainer, a silent
+    validator, or an unreadable manifest store must never turn into an
+    eternally-billing pod.
     """
-    if stage not in ("heat", "final"):
-        raise ValueError(f"stage must be 'heat' or 'final'; got {stage!r}")
+    if stage not in ("heat", "final", "eval"):
+        raise ValueError(f"stage must be 'heat', 'final', or 'eval'; got {stage!r}")
     if now - rented_at >= ttl_hours * 3600.0:
         return True
+    if stage == "eval":
+        return receipt_seen or newer_manifest
     if manifest_seen:
         return True
     return stage == "heat" and heat_marker_seen

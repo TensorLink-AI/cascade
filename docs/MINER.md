@@ -153,6 +153,20 @@ cascade deploy ./my-generator \
 Re-deploy any time to submit a new version — the latest pre-cutoff commit per
 hotkey is the one that competes.
 
+> **⚠️ SDK version matters — use this repo's environment to commit.** The
+> on-chain pointer travels through bittensor's timelock commit-reveal, and the
+> reveal ENCODING differs across SDK lines: older `set_reveal_commitment`
+> variants (and `subtensor.commit()` / `publish_metadata` / raw btcli
+> commitments) write reveals the subnet's decoder cannot read — your commit
+> lands, but you are silently **skipped every round** with
+> `revealed-commitment decode failed: non-hexadecimal number found in
+> fromhex()`. This repo pins `bittensor==10.5.0` (what the validators run);
+> `cascade deploy` on this environment is the known-good path. Pass the plain
+> pointer string — do NOT pre-hex `data=` yourself. To self-check after a
+> deploy: `sub.get_revealed_commitment(netuid, <your uid>)` must return
+> `(block, "metro-v1:gen:hippius:…")` as a clean string. If you were affected,
+> simply re-deploy from this environment — the newest commit wins.
+
 ### 5a. If the Hippius Hub is down
 
 Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different

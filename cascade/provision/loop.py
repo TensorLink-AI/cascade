@@ -27,6 +27,16 @@ One cycle of the machine (each ``poll_seconds``, ~30s):
            not own are terminated (a crash between launch and ledger-save must
            not leak a billing box).
 
+The optional EVAL stage rides the opposite phase of the same machine: renting
+is triggered by a NEW round manifest appearing in the store (that is when the
+validator's heavy evals — GIFT-Eval gate, cascade bench — start needing GPU),
+the pod is published to a SEPARATE ``eval_hosts_path`` file that the validator
+re-reads lazily per eval (never the trainer's ``hosts_path``), and teardown
+comes from the round's receipt publishing under ``receipt_prefix`` (the
+validator is done), a newer manifest superseding the round, or the same TTL
+backstop. ``last_evaled_round`` persists in the ledger so restarts never
+double-rent. See ``_maybe_provision_eval``.
+
 Round-id note: the provisioner keys rounds by the upcoming BOUNDARY BLOCK
 (knowable before the round starts), while the trainer keys them by base_seed
 (the boundary block's hash — knowable only after). The two are reconciled at
@@ -72,6 +82,7 @@ from .policy import (
     should_trigger,
     size_fleet,
     teardown_due,
+    pods_for_slots,
     within_budget,
 )
 from .state import (
@@ -95,12 +106,22 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # this — never on the bare POD_TAG prefix, which operators' hand-rented pods
 # (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share. Reaping
 # by bare prefix terminated a live hand-rented final pod on 2026-07-13.
-_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final)(-|$)")
+_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 
 
 def is_provisioner_pod_name(name: str) -> bool:
     """True only for pod names this service itself creates (see _PROVISIONER_POD_RE)."""
     return _PROVISIONER_POD_RE.match(str(name)) is not None
+
+
+@dataclass(frozen=True)
+class PodProfile:
+    """Per-provider pod paths: providers boot different base users/homes
+    (lium pods are root; shadeform VMs land as the ``shadeform`` user)."""
+
+    user: str = "root"
+    workdir: str = DEFAULT_WORKDIR
+    remote_python: str = DEFAULT_REMOTE_PYTHON
 
 
 @dataclass(frozen=True)
@@ -115,6 +136,12 @@ class RenderSettings:
     workdir: str = DEFAULT_WORKDIR
     chain_toml: str | None = None
     ssh_port: int = DEFAULT_SSH_PORT
+    # provider name → pod paths override; absent providers use the defaults above.
+    profiles: dict[str, PodProfile] = field(default_factory=dict)
+
+    def profile_for(self, provider: str) -> PodProfile:
+        return self.profiles.get(
+            provider, PodProfile(workdir=self.workdir, remote_python=self.remote_python))
 
 
 @dataclass
@@ -141,6 +168,18 @@ class ProvisionerLoop:
     epoch_blocks: int
     final_hours: float                                      # [training] target_train_hours
     manifest_store: object | None = None
+    # The VALIDATOR's eval-offload hosts file (never the trainer's hosts_path):
+    # the eval pod is published here on rent and the file is cleared on
+    # teardown — safe mid-round because the validator re-resolves it lazily at
+    # each eval. None (the default) disables the eval stage even when a
+    # [provisioner.eval] policy exists: there is nowhere to publish.
+    eval_hosts_path: Path | None = None
+    # Where this deployment's validator publishes round receipts — the eval
+    # pod's primary teardown signal. Per-validator paths ("receipts/<hotkey>/",
+    # see cascade.shared.hippius.receipt_round_key); the watched key is
+    # ``<prefix>round-<manifest_round_id>.json``. Empty ⇒ receipts are never
+    # seen and the newer-manifest / TTL signals bound the pod's life instead.
+    receipt_prefix: str = ""
     health_check: Callable[[PodAddress, str], HealthReport] | None = None
     # Provisions a bare pod over SSH (rsync source + uv sync) before the health
     # gate — the testnet path while no digest-pinned worker image is published.
@@ -153,6 +192,14 @@ class ProvisionerLoop:
     # final exists.
     static_hosts_text: str = ""
     ssh_probe: Callable[[str, int], bool] = field(default=lambda ip, port: True)
+    # Rebuilds chain_client when the block number freezes: a bittensor
+    # websocket can die QUIETLY and keep answering current_block() with a
+    # stale value — the loop then cycles forever without ever seeing the
+    # trigger window (observed live 2026-07-14: 2h19m of silent no-trigger).
+    # None disables the refresh (tests with static FakeChain blocks).
+    chain_client_factory: Callable[[], object] | None = None
+    stale_block_after_s: float = 300.0
+    heartbeat_every_s: float = 600.0
     ready_timeout: float = DEFAULT_READY_TIMEOUT
     poll_seconds: float = 30.0
     dry_run: bool = False
@@ -164,7 +211,15 @@ class ProvisionerLoop:
     _provisioned_round: int | None = field(default=None, init=False, repr=False)
     _addrs: dict[str, PodAddress] = field(default_factory=dict, init=False, repr=False)
     _manifest_baseline: str | None = field(default=None, init=False, repr=False)
+    _last_block: int | None = field(default=None, init=False, repr=False)
+    _block_changed_at: float = field(default=0.0, init=False, repr=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
     _learned_round_id: str | None = field(default=None, init=False, repr=False)
+    # The eval stage's rent-once latch (mirrors _provisioned_round for the
+    # boundary stages): the manifest round an eval pod was last rented — or
+    # deliberately skipped — for. Restored from the ledger so restarts never
+    # double-rent; in dry-run it lives in memory only (no disk mutation).
+    _last_evaled_round: str = field(default="", init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._state = load_state(self.state_path)
@@ -173,6 +228,7 @@ class ProvisionerLoop:
                      self.state_path, self._state.round_id, len(self._state.instances))
             if self._state.round_id.isdigit():
                 self._provisioned_round = int(self._state.round_id)
+            self._last_evaled_round = self._state.last_evaled_round
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -187,14 +243,63 @@ class ProvisionerLoop:
     # ── the cycle ────────────────────────────────────────────────────────────
 
     def run_once(self) -> None:
-        """One poll tick: reconcile strays, tear down what's due, maybe rent."""
+        """One poll tick: reconcile strays, tear down what's due, maybe rent.
+
+        Teardown runs before the eval check on purpose: a newer manifest
+        first kills the previous round's eval pod, then (same tick) the new
+        round rents its own — the two never coexist.
+        """
+        now = self.clock()
+        if now - self._last_heartbeat_at >= self.heartbeat_every_s:
+            # Cycle-START heartbeat: every phase below makes network calls
+            # that can crawl on a bad night — liveness must never depend on
+            # reaching any of them (2026-07-14, twice: starved heartbeats
+            # masked a wedged loop through two rental windows).
+            log.info("heartbeat: cycle start, last_block=%s, owned_pods=%d",
+                     self._last_block if self._last_block is not None else "?",
+                     len(self._state.instances) if self._state else 0)
+            self._last_heartbeat_at = now
         self._reconcile_orphans()
         self._teardown_due_pods()
-        block = int(self.chain_client.current_block())
+        block = self._current_block()
+        self._maybe_provision_eval()
         if should_trigger(block, self.epoch_blocks,
                           self.policy.trigger_margin_blocks, self._provisioned_round):
             round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
             self._provision_round(round_id)
+
+    def _current_block(self) -> int:
+        """The chain height, with staleness detection and client rebuild.
+
+        A frozen block number for ``stale_block_after_s`` (or a raising
+        client) triggers ONE rebuild via ``chain_client_factory`` per
+        occurrence; the fresh client's answer is trusted (its own staleness
+        clock restarts). Every path also emits a heartbeat log every
+        ``heartbeat_every_s`` so a silent stall is visible in the log, not
+        just in a missing trigger.
+        """
+        now = self.clock()
+        try:
+            block = int(self.chain_client.current_block())
+        except Exception as e:  # noqa: BLE001 — a dead client is rebuildable
+            if self.chain_client_factory is None:
+                raise
+            log.warning("current_block failed (%s); rebuilding chain client", e)
+            self.chain_client = self.chain_client_factory()
+            block = int(self.chain_client.current_block())
+            self._block_changed_at = now
+        if self._last_block is None or block != self._last_block:
+            self._last_block = block
+            self._block_changed_at = now
+        elif (self.chain_client_factory is not None
+              and now - self._block_changed_at > self.stale_block_after_s):
+            log.warning("block frozen at %d for %.0fs — rebuilding chain client "
+                        "(quietly dead websocket?)", block, now - self._block_changed_at)
+            self.chain_client = self.chain_client_factory()
+            block = int(self.chain_client.current_block())
+            self._last_block = block
+            self._block_changed_at = now
+        return block
 
     def run_forever(self) -> None:  # pragma: no cover — glue over run_once
         """Poll forever; one bad cycle must never kill the service (pods that
@@ -231,14 +336,17 @@ class ProvisionerLoop:
                  round_id, payload["eligible_challengers"],
                  fleet.heat.pods, fleet.heat.slots, fleet.final.pods, fleet.final.slots)
 
-        chosen: dict[str, tuple[object, float]] = {}
+        # Per stage: the first (SKU candidate × provider) combination with
+        # capacity for the WHOLE stage fleet wins — a stage never mixes SKUs
+        # (within-round fairness by construction; see StagePolicy.candidates).
+        chosen: dict[str, tuple[object, float, object, int]] = {}
         for stage, sp, fl in (("heat", self.policy.heat, fleet.heat),
                               ("final", self.policy.final, fleet.final)):
             if fl.pods <= 0:
                 continue
-            prov, price = self._pick_provider(sp, fl.pods)
-            if prov is not None:
-                chosen[stage] = (prov, price)
+            picked = self._pick_offer(sp, fl.slots, stage)
+            if picked is not None:
+                chosen[stage] = picked
         if not chosen:
             # No provider anywhere: publish an EMPTY hosts file so the trainer
             # trains this round locally — the round is degraded, never lost.
@@ -247,9 +355,10 @@ class ProvisionerLoop:
             self._write_hosts([])
             return
 
-        offers = {stage: price for stage, (_prov, price) in chosen.items()}
-        ok, projected = within_budget(fleet, offers, self.policy.max_spend_per_round,
-                                      self.ttl_hours)
+        projected = sum(pods * price * self.ttl_hours
+                        for (_prov, price, _cand, pods) in chosen.values())
+        offers = {stage: price for stage, (_p, price, _c, _n) in chosen.items()}
+        ok = projected <= self.policy.max_spend_per_round
         if not ok:
             log.error("round %d REFUSED by budget breaker: worst-case $%.2f > cap $%.2f "
                       "(offers %s); clearing hosts", round_id, projected,
@@ -260,11 +369,10 @@ class ProvisionerLoop:
                  round_id, projected, self.policy.max_spend_per_round)
 
         if self.dry_run:
-            for stage, (prov, price) in chosen.items():
-                fl = fleet.heat if stage == "heat" else fleet.final
+            for stage, (prov, price, cand, pods) in chosen.items():
                 log.info("[dry-run] round %d %s: WOULD rent %d × %d-GPU %s pod(s) on %s "
-                         "@ $%.2f/hr (tag cascade-%d-%s)", round_id, stage, fl.pods,
-                         fl.gpus_per_pod, _sku_for(self.policy, stage), prov.name,
+                         "@ $%.2f/hr (tag cascade-%d-%s)", round_id, stage, pods,
+                         cand.gpus_per_pod, cand.sku, prov.name,
                          price, round_id, stage)
             return
 
@@ -278,9 +386,8 @@ class ProvisionerLoop:
         self._save()
 
         rented: dict[str, list[tuple[PodInstance, PodAddress]]] = {}
-        for stage, (prov, _price) in chosen.items():
-            fl = fleet.heat if stage == "heat" else fleet.final
-            healthy = self._rent_stage(round_id, stage, prov, fl)
+        for stage, (prov, _price, cand, pods) in chosen.items():
+            healthy = self._rent_stage(round_id, stage, prov, cand, pods)
             if healthy:
                 rented[stage] = healthy
         if not rented:
@@ -292,34 +399,50 @@ class ProvisionerLoop:
         self._state = replace(self._state, published=True)
         self._save()
 
-    def _pick_provider(self, sp, count: int) -> tuple[object, float] | tuple[None, None]:
-        """First provider in the stage's priority order with capacity and an
-        acceptable price. Any adapter fault (including ProvisionError — a
-        missing CLI or key) just skips that provider: a broken adapter means
-        fewer offers, never a dead provisioner."""
-        for name in sp.providers:
-            prov = self.providers.get(name)
-            if prov is None:
-                log.warning("provider %r not configured; skipping", name)
+    def _pick_offer(self, sp, slots: int,
+                    stage: str) -> tuple[object, float, object, int] | None:
+        """First (SKU candidate × provider) with capacity for the whole fleet.
+
+        Candidates in the stage's configured order, providers in priority order
+        within each candidate. The pod count is re-derived per candidate — an
+        8× fallback needs fewer pods for the same slots than a 4× primary. Any
+        adapter fault just skips that provider: a broken adapter means fewer
+        offers, never a dead provisioner. Returns ``(provider, price,
+        candidate, pods)`` or ``None``.
+        """
+        for cand in sp.sku_candidates:
+            pods = pods_for_slots(slots, cand.gpus_per_pod, sp.max_pods)
+            if pods <= 0:
                 continue
-            try:
-                if not prov.available(sp.marketplace_sku, count):
-                    log.info("provider %s: no capacity for %d×%s", name, count, sp.sku)
+            for name in sp.providers:
+                prov = self.providers.get(name)
+                if prov is None:
+                    log.warning("provider %r not configured; skipping", name)
                     continue
-            except Exception as e:  # noqa: BLE001
-                log.warning("provider %s availability probe failed (%s); skipping", name, e)
-                continue
-            price = self._offer_price(prov, sp.marketplace_sku)
-            if price is None:
-                # Unknown price ⇒ assume the stage cap: the budget breaker then
-                # projects at the worst price we were willing to pay.
-                price = sp.max_price_hr
-            if price > sp.max_price_hr:
-                log.warning("provider %s: %s at $%.2f/hr exceeds stage cap $%.2f/hr; skipping",
-                            name, sp.sku, price, sp.max_price_hr)
-                continue
-            return prov, float(price)
-        return None, None
+                try:
+                    if not prov.available(cand.marketplace_sku, pods,
+                                          gpus=cand.gpus_per_pod):
+                        log.info("provider %s: no capacity for %d × %dx%s",
+                                 name, pods, cand.gpus_per_pod, cand.sku)
+                        continue
+                except Exception as e:  # noqa: BLE001
+                    log.warning("provider %s availability probe failed (%s); skipping",
+                                name, e)
+                    continue
+                price = self._offer_price(prov, cand.marketplace_sku)
+                if price is None:
+                    # Unknown price ⇒ assume the candidate cap: the budget
+                    # breaker then projects at the worst price we accepted.
+                    price = cand.max_price_hr
+                if price > cand.max_price_hr:
+                    log.warning("provider %s: %s at $%.2f/hr exceeds cap $%.2f/hr; skipping",
+                                name, cand.sku, price, cand.max_price_hr)
+                    continue
+                if cand is not sp.sku_candidates[0]:
+                    log.info("%s stage falling back to %dx%s on %s (primary had no offer)",
+                             stage, cand.gpus_per_pod, cand.sku, name)
+                return prov, float(price), cand, pods
+        return None
 
     @staticmethod
     def _offer_price(prov: object, sku: str) -> float | None:
@@ -335,53 +458,56 @@ class ProvisionerLoop:
 
     # ── RENT + BOOT + HEALTH (with one replacement per failed pod) ───────────
 
-    def _rent_stage(self, round_id: int, stage: str, prov: object,
-                    fl: StageFleet) -> list[tuple[PodInstance, PodAddress]]:
+    def _rent_stage(self, round_id: int | str, stage: str, prov: object,
+                    cand, pods: int) -> list[tuple[PodInstance, PodAddress]]:
+        # round_id is the boundary block for heat/final and the manifest round
+        # id for eval — both digits, both satisfying _PROVISIONER_POD_RE.
         spec = LaunchSpec(
-            sku=_market_sku_for(self.policy, stage), count=fl.pods, image=self.render.image,
+            sku=cand.marketplace_sku, count=pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
-            name_prefix=f"{POD_TAG}{round_id}-{stage}",
+            name_prefix=f"{POD_TAG}{round_id}-{stage}", gpus_per_pod=cand.gpus_per_pod,
         )
         try:
             pod_ids = prov.launch(spec)
         except Exception as e:  # noqa: BLE001 — a failed stage is a smaller fleet
-            log.error("round %d %s: launch on %s failed: %s", round_id, stage, prov.name, e)
+            log.error("round %s %s: launch on %s failed: %s", round_id, stage, prov.name, e)
             return []
         # Write-ahead: the ledger owns these ids BEFORE we do anything else
         # with them — a crash from here on still tears them down on restart.
         for pid in pod_ids:
-            self._state = add_instance(self._state, self._instance(prov, pid, stage))
+            self._state = add_instance(self._state, self._instance(prov, pid, stage, cand))
         self._save()
 
         healthy: list[tuple[PodInstance, PodAddress]] = []
         for i, pid in enumerate(pod_ids):
-            addr = self._boot_and_gate(prov, pid, stage)
+            addr = self._boot_and_gate(prov, pid, stage, cand)
             if addr is not None:
                 healthy.append((self._find_instance(pid), addr))
                 continue
             # Terminate the dud and try ONE replacement — marketplace pods are
             # lemon-prone, but retrying forever would chase a bad batch all day.
-            log.warning("round %d %s: pod %s failed boot/health; replacing once",
+            log.warning("round %s %s: pod %s failed boot/health; replacing once",
                         round_id, stage, pid)
             self._terminate_and_drop(prov, pid)
             rspec = replace(spec, count=1, name_prefix=f"{POD_TAG}{round_id}-{stage}-r{i}")
             try:
                 rid = prov.launch(rspec)[0]
             except Exception as e:  # noqa: BLE001
-                log.error("round %d %s: replacement launch failed: %s", round_id, stage, e)
+                log.error("round %s %s: replacement launch failed: %s", round_id, stage, e)
                 continue
-            self._state = add_instance(self._state, self._instance(prov, rid, stage))
+            self._state = add_instance(self._state, self._instance(prov, rid, stage, cand))
             self._save()
-            raddr = self._boot_and_gate(prov, rid, stage)
+            raddr = self._boot_and_gate(prov, rid, stage, cand)
             if raddr is not None:
                 healthy.append((self._find_instance(rid), raddr))
             else:
-                log.error("round %d %s: replacement %s also failed; dropping the slot",
+                log.error("round %s %s: replacement %s also failed; dropping the slot",
                           round_id, stage, rid)
                 self._terminate_and_drop(prov, rid)
         return healthy
 
-    def _boot_and_gate(self, prov: object, pid: str, stage: str) -> PodAddress | None:
+    def _boot_and_gate(self, prov: object, pid: str, stage: str,
+                       cand=None) -> PodAddress | None:
         try:
             if not prov.wait_ready(pid, timeout=self.ready_timeout):
                 log.warning("pod %s not provider-ready within %.0fs", pid, self.ready_timeout)
@@ -398,11 +524,14 @@ class ProvisionerLoop:
                 # rented bare and provisioned over SSH (rsync source + uv sync
                 # against the pinned lock). The hook runs BEFORE the health
                 # gate, so the gate verifies what bootstrap actually produced.
-                if not self.bootstrap(addr, stage):
+                if not self.bootstrap(addr, stage, prov.name):
                     log.warning("pod %s bootstrap failed", pid)
                     return None
             if self.health_check is not None:
-                report = self.health_check(addr, stage)
+                report = (self.health_check(addr, stage, prov.name,
+                                            sku=cand.sku, gpus=cand.gpus_per_pod)
+                          if cand is not None else
+                          self.health_check(addr, stage, prov.name))
                 if not report.ok:
                     log.warning("pod %s failed health gate: %s", pid, report.summary())
                     return None
@@ -435,13 +564,15 @@ class ProvisionerLoop:
             entries = by_stage.get(stage)
             if not entries:
                 continue
-            fleet_gpus = _gpus_for(self.policy, stage)
+            fleet_gpus = entries[0][0].gpus or _gpus_for(self.policy, stage)
+            prof = self.render.profile_for(entries[0][0].provider)
             sections.append(render_hosts_toml(
                 [addr for _inst, addr in entries],
                 key_path=self.render.key_path,
                 forward_env=self.render.forward_env,
-                remote_python=self.render.remote_python,
-                workdir=self.render.workdir,
+                remote_python=prof.remote_python,
+                workdir=prof.workdir,
+                user=prof.user,
                 chain_toml=self.render.chain_toml,
                 name_prefix=f"{POD_TAG}{self._state.round_id}-{stage}",
                 provider=entries[0][0].provider,
@@ -484,6 +615,131 @@ class ProvisionerLoop:
             self._addrs[inst.instance_id] = addr
         return addr
 
+    # ── EVAL POD (manifest-triggered elastic stage) ──────────────────────────
+
+    @property
+    def _eval_enabled(self) -> bool:
+        """All three legs the stage needs: a policy, a place to publish, and a
+        store to watch. Any missing ⇒ the stage does not exist (backward
+        compatible with every pre-eval config)."""
+        return (self.policy.eval is not None and self.policy.eval.max_pods > 0
+                and self.eval_hosts_path is not None and self.manifest_store is not None)
+
+    def _maybe_provision_eval(self) -> None:
+        """Rent the round's eval pod when a NEW manifest appears in the store.
+
+        The eval stage is manifest-triggered, not boundary-triggered: the
+        validator only needs GPU once a round has PUBLISHED (the GIFT-Eval
+        gate and cascade bench score the manifest's checkpoints), which is
+        exactly when the trainer fleet is being torn down. ``latest.json``
+        moving to a round we have not yet served is the rent signal.
+
+        The ``_last_evaled_round`` latch is set the moment we act — including
+        on no-capacity and dry-run — so a failure degrades the round to local
+        validator evals instead of hammering providers every poll (same
+        discipline as the boundary stages' ``_provisioned_round``). It is
+        persisted (write-ahead, before launch) so a crash mid-rent never
+        double-rents on restart. A round whose receipt ALREADY exists is
+        latched without renting: a provisioner restarted between rounds must
+        not buy a pod just to watch the teardown signal kill it.
+        """
+        if not self._eval_enabled:
+            return
+        latest = self._latest_round_id()
+        if latest is None or latest == self._last_evaled_round:
+            return
+        if self._state is not None and instances_for_stage(self._state, "eval"):
+            # Still holding an eval pod (e.g. dry-run teardown is a no-op):
+            # the teardown sweep settles it first; re-check next cycle.
+            return
+        self._last_evaled_round = latest
+        if self._eval_receipt_seen(latest):
+            log.info("round %s already has a receipt; skipping its eval pod", latest)
+            self._persist_eval_latch(latest)
+            return
+        picked = self._pick_offer(self.policy.eval, 1, "eval")
+        if picked is None:
+            log.error("round %s eval: no provider has capacity; the validator "
+                      "runs this round's evals locally (degraded, never lost)", latest)
+            self._persist_eval_latch(latest)
+            return
+        prov, price, cand, pods = picked
+        if self.dry_run:
+            log.info("[dry-run] round %s eval: WOULD rent %d × %d-GPU %s pod(s) on %s "
+                     "@ $%.2f/hr (tag cascade-%s-eval)", latest, pods,
+                     cand.gpus_per_pod, cand.sku, prov.name, price, latest)
+            return
+        self._persist_eval_latch(latest)
+        healthy = self._rent_stage(latest, "eval", prov, cand, pods)
+        if not healthy:
+            log.error("round %s eval: every rented pod failed its health gate; "
+                      "the validator runs this round's evals locally", latest)
+            return
+        self._publish_eval_hosts(healthy)
+
+    def _persist_eval_latch(self, round_id: str) -> None:
+        """Write the eval latch through to the ledger (never in dry-run —
+        dry-run mutates nothing on disk; the in-memory latch suffices)."""
+        if self.dry_run:
+            return
+        self._state = (RoundState(round_id="") if self._state is None else self._state)
+        self._state = replace(self._state, last_evaled_round=round_id)
+        self._save()
+
+    def _publish_eval_hosts(self, entries: list[tuple[PodInstance, PodAddress]]) -> None:
+        """Publish the eval pod to the VALIDATOR's hosts file.
+
+        A separate file from the trainer's ``hosts_path`` by design — the two
+        consumers have different lifecycles and clobbering the trainer's fleet
+        with an eval pod (or vice versa) must be structurally impossible.
+        Rendered ``stage="any"`` so the validator's final/any filter matches,
+        and written atomically because the validator may re-read it at any
+        moment (it re-resolves lazily per eval).
+        """
+        inst = entries[0][0]
+        prof = self.render.profile_for(inst.provider)
+        text = render_hosts_toml(
+            [addr for _inst, addr in entries],
+            key_path=self.render.key_path,
+            forward_env=self.render.forward_env,
+            remote_python=prof.remote_python,
+            workdir=prof.workdir,
+            user=prof.user,
+            chain_toml=self.render.chain_toml,
+            name_prefix=f"{POD_TAG}{self._last_evaled_round}-eval",
+            provider=inst.provider,
+            stage="any",
+            gpus_per_pod=inst.gpus or 1,
+        )
+        write_hosts(self.eval_hosts_path, text)
+        log.info("published %s: %d eval pod(s) for round %s",
+                 self.eval_hosts_path, len(entries), self._last_evaled_round)
+
+    def _clear_eval_hosts(self) -> None:
+        """Empty the eval hosts file after teardown. Safe at any moment: the
+        validator re-resolves per eval, so an empty file just means its NEXT
+        eval runs locally — never a dispatch to a dead box."""
+        if self.eval_hosts_path is None:
+            return
+        clear_hosts(self.eval_hosts_path)
+        log.info("cleared %s (eval pod gone; validator evals run locally)",
+                 self.eval_hosts_path)
+
+    def _eval_receipt_seen(self, round_id: str) -> bool:
+        """Whether ``round_id``'s receipt is published — the eval pod's job is
+        done. Receipts live at per-validator keys (``receipts/<hotkey>/
+        round-<id>.json``, see ``cascade.validator.loop`` / ``publish_receipt``),
+        so the watched prefix is operator config. A missing key or a down
+        store both read as 'not yet' — the TTL backstops a store outage."""
+        if self.manifest_store is None or not self.receipt_prefix or not round_id:
+            return False
+        key = f"{self.receipt_prefix.rstrip('/')}/round-{round_id}.json"
+        try:
+            self.manifest_store.get_text(key)
+            return True
+        except Exception:  # noqa: BLE001 — not published yet (or store down: TTL backstops)
+            return False
+
     # ── WATCH + TEARDOWN ─────────────────────────────────────────────────────
 
     def _teardown_due_pods(self) -> None:
@@ -492,13 +748,24 @@ class ProvisionerLoop:
         now = self.clock()
         marker = self._heat_marker_seen()
         manifest = self._manifest_seen()
+        # The eval pod's two signals are only worth store round-trips while an
+        # eval pod is actually owned. ``newer_manifest`` compares the CURRENT
+        # latest pointer against the round the pod was rented for.
+        receipt = newer = False
+        if any(i.stage == "eval" for i in self._state.instances):
+            receipt = self._eval_receipt_seen(self._last_evaled_round)
+            latest = self._latest_round_id()
+            newer = (bool(self._last_evaled_round) and latest is not None
+                     and latest != self._last_evaled_round)
         dead: set[str] = set()
         for inst in self._state.instances:
             if teardown_due(inst.stage, heat_marker_seen=marker, manifest_seen=manifest,
+                            receipt_seen=receipt, newer_manifest=newer,
                             rented_at=_iso_ts(inst.rented_at_iso), now=now,
                             ttl_hours=self.ttl_hours):
-                log.info("tearing down %s pod %s (marker=%s manifest=%s ttl=%.1fh)",
-                         inst.stage, inst.instance_id, marker, manifest, self.ttl_hours)
+                log.info("tearing down %s pod %s (marker=%s manifest=%s receipt=%s "
+                         "newer=%s ttl=%.1fh)", inst.stage, inst.instance_id, marker,
+                         manifest, receipt, newer, self.ttl_hours)
                 prov = self.providers.get(inst.provider)
                 if prov is None:
                     log.error("no adapter for provider %r — pod %s may be LEAKED",
@@ -516,9 +783,16 @@ class ProvisionerLoop:
                 dead.add(inst.instance_id)
                 self._addrs.pop(inst.instance_id, None)
         if dead:
+            dead_eval = {i.instance_id for i in self._state.instances
+                         if i.instance_id in dead and i.stage == "eval"}
             self._state = drop_instances(self._state, dead)
             self._save()
-            self._republish_from_ledger()
+            # Each hosts file re-renders only when ITS pods died: the trainer's
+            # file must never be touched by eval churn, and vice versa.
+            if dead - dead_eval:
+                self._republish_from_ledger()
+            if dead_eval:
+                self._clear_eval_hosts()
 
     def _heat_marker_seen(self) -> bool:
         """Any ``heat_complete.json`` under the work-root newer than our rent.
@@ -529,10 +803,18 @@ class ProvisionerLoop:
         runs at a time, so any marker whose mtime postdates our earliest rent
         is this round's — and its directory name teaches us the base_seed for
         direct manifest polling.
+
+        Only heat/final rents anchor the comparison: an eval pod is rented at
+        the PREVIOUS round's manifest — before this round's fleet — and
+        anchoring on it could resurrect the previous round's marker as a
+        false teardown signal.
         """
-        if self._state is None or not self._state.instances:
+        if self._state is None:
             return False
-        rent_ts = min(_iso_ts(i.rented_at_iso) for i in self._state.instances)
+        rents = [_iso_ts(i.rented_at_iso) for i in self._state.instances if i.stage != "eval"]
+        if not rents:
+            return False
+        rent_ts = min(rents)
         try:
             markers = sorted(Path(self.work_root).glob("*/heat_complete.json"))
         except OSError:
@@ -617,10 +899,12 @@ class ProvisionerLoop:
 
     # ── small helpers ────────────────────────────────────────────────────────
 
-    def _instance(self, prov: object, pid: str, stage: str) -> PodInstance:
+    def _instance(self, prov: object, pid: str, stage: str, cand=None) -> PodInstance:
         rented_iso = datetime.fromtimestamp(self.clock(), tz=UTC).isoformat()
         return PodInstance(provider=prov.name, instance_id=pid, stage=stage,
-                           rented_at_iso=rented_iso)
+                           rented_at_iso=rented_iso,
+                           sku=(cand.sku if cand is not None else ""),
+                           gpus=(cand.gpus_per_pod if cand is not None else 1))
 
     def _find_instance(self, pid: str) -> PodInstance:
         return next(i for i in self._state.instances if i.instance_id == pid)
