@@ -530,7 +530,17 @@ def _s3_client(s3cfg: S3Config):
         region_name=s3cfg.region,
         aws_access_key_id=access,
         aws_secret_access_key=secret,
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        # Tight deadlines: Hippius's gateway has slow nights, and every caller
+        # here either has a fallback store (manifests) or retries on its own
+        # poll cadence (pool index, provisioner watches). boto's defaults
+        # (60s connect/read × legacy retries) let ONE bad GET burn minutes and
+        # starve poll loops — observed live 2026-07-14 (provisioner cycles
+        # taking minutes each, heartbeat/trigger starved). read_timeout is
+        # per-socket-read inactivity, not total transfer, so multi-MB objects
+        # still stream fine as long as bytes flow.
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
+                      connect_timeout=10, read_timeout=20,
+                      retries={"max_attempts": 2, "mode": "standard"}),
     )
 
 
