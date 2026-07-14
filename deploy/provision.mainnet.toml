@@ -25,7 +25,9 @@ receipt_prefix        = "receipts/<MAINNET-VALIDATOR-HOTKEY>/"   # teardown latc
 # Bootstrap mode (bare pods + rsync + uv sync) until the digest-pinned worker
 # image ships (MAINNET_LAUNCH.md blocker) — then set image to the GHCR ref
 # ghcr.io/tensorlink-ai/cascade-worker@sha256:… and drop bootstrap_script.
-image               = "Pytorch (Cuda + DinD)"    # lium template name (bootstrap mode)
+image               = ""    # bootstrap mode: EMPTY (omit --image → lium default template).
+                            # A template NAME here 400s EVERY lium rental (Invalid docker_image,
+                            # 2026-07-14). Set a real digest-pinned docker ref for image-boot mode.
 bootstrap_script    = "/root/cascade/deploy/pod_bootstrap.sh"
 bootstrap_timeout_s = 1800
 pod_user            = "root"
