@@ -399,6 +399,12 @@ class RoundConfig:
     # trainer's ``work_root`` when relative). Off ⇒ a hotkey re-competes every
     # epoch — handy for testnet iteration; keep ON for mainnet.
     one_submission_per_hotkey: bool = True
+    # Only commitments revealed AT/AFTER this block ever enter a round — the
+    # official go-live gate. Anything committed to the netuid before launch
+    # (squatters, rehearsal commits, migrated-from-testnet leftovers) never
+    # competes and never burns its one submission. 0 = no floor (testnet).
+    # Set to the announced launch block in mainnet chain.toml AT LAUNCH.
+    commit_floor_block: int = 0
     submissions_db_path: str = "trainer_submissions.json"
 
 
@@ -860,6 +866,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
+            commit_floor_block=int(r.get("commit_floor_block", 0)),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
         ),
         eval=EvalConfig(

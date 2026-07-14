@@ -176,7 +176,8 @@ def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
 
 
 def resolve_commitments(
-    commitments: list[Commitment], cutoff_block: int | None = None
+    commitments: list[Commitment], cutoff_block: int | None = None,
+    floor_block: int = 0,
 ) -> list[ResolvedGenerator]:
     """Parse each commitment's generator pointer, dropping malformed ones.
 
@@ -192,6 +193,12 @@ def resolve_commitments(
     """
     best: dict[str, tuple[int, ResolvedGenerator]] = {}
     for c in commitments:
+        # The go-live floor: commits from before the official launch block
+        # (netuid squatters, rehearsal commits) never compete — applied to
+        # EVERY resolution path, king lookup included, so a pre-live commit
+        # can neither enter a heat nor hold a throne.
+        if floor_block and c.commit_block < floor_block:
+            continue
         if cutoff_block is not None and c.commit_block >= cutoff_block:
             continue
         parsed = parse_commit(c.payload)
@@ -705,7 +712,8 @@ class TrainerRunner:
         Trains locally (sequential) by default, or across ``remote_hosts`` when
         configured. A king failure at any size aborts the round.
         """
-        resolved = resolve_commitments(commitments, cutoff_block=cutoff_block)
+        resolved = resolve_commitments(commitments, cutoff_block=cutoff_block,
+                                       floor_block=self.cfg.round.commit_floor_block)
         # The reigning king is NOT a new submission — it already holds the throne,
         # so it is exempt from the challenger submission cutoff. Resolve it from the
         # FULL commitment set: a champion that (re-)committed at/after the epoch
@@ -715,7 +723,9 @@ class TrainerRunner:
         king_rg = None
         if king_hotkey is not None:
             king_rg = next(
-                (rg for rg in resolve_commitments(commitments) if rg.hotkey == king_hotkey),
+                (rg for rg in resolve_commitments(
+                    commitments, floor_block=self.cfg.round.commit_floor_block)
+                 if rg.hotkey == king_hotkey),
                 None,
             )
         plan = plan_round(resolved, king_hotkey, king=king_rg)
