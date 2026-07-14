@@ -31,12 +31,14 @@ def _launch_ready(cfg):
 
 
 def test_assert_launch_ready_flags_default_placeholders(cfg):
-    # the committed chain.toml still has placeholder netuid + trainer_hotkey
-    # (operator secrets); base_arch_digest is pinned, so it must NOT be flagged.
+    # netuid is now the real mainnet value (91, decided 2026-07-14) so it must
+    # NOT be flagged; trainer_hotkey remains an operator secret placeholder and
+    # base_arch_digest is pinned — only the former should trip the check.
     with pytest.raises(LaunchConfigError) as ei:
         assert_launch_ready(cfg, role="trainer")
     msg = str(ei.value)
-    assert "netuid" in msg and "trainer_hotkey" in msg
+    assert "trainer_hotkey" in msg
+    assert "netuid" not in msg
     assert "base_arch_digest" not in msg
 
 
