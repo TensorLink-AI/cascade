@@ -328,6 +328,44 @@ class ChainClient:
         # No bulk API (older bittensor): decode per-UID.
         return self._revealed_per_uid(sub, meta, coldkeys)
 
+    def _raw_revealed_entries(self, sub: Any, hotkey: str) -> list[tuple[int, str]]:
+        """Read ``Commitments::RevealedCommitments`` directly and decode BOTH
+        substrate renderings — the escape hatch for bittensor's decoder bug.
+
+        py-substrate-interface returns storage bytes as a ``0x…`` hex string
+        UNLESS the bytes happen to be valid UTF-8, in which case it returns the
+        decoded string — and whether a reveal's bytes are UTF-8-valid depends
+        on its SCALE length prefix, i.e. on the PAYLOAD LENGTH
+        (``(4·len+1) mod 256 < 128`` ⇒ raw). bittensor's
+        ``decode_revealed_commitment`` assumes hex and raises ``fromhex`` on the
+        raw rendering, silently costing that miner every round (observed live:
+        7 UIDs skipped purely by pointer-length lottery — ``@hf:`` pointers at
+        91 chars raw, ``@sha256:`` at 109 hex). Returns ``[(block, payload)]``.
+        """
+        q = sub.substrate.query(module="Commitments",
+                                storage_function="RevealedCommitments",
+                                params=[self.netuid, hotkey])
+        v = getattr(q, "value", None)
+        out: list[tuple[int, str]] = []
+        for entry in (v or []):
+            try:
+                com, block = entry
+                if not isinstance(com, str) or not com:
+                    continue
+                if com.startswith("0x"):
+                    raw = bytes.fromhex(com[2:])
+                else:
+                    raw = com.encode("utf-8")
+                # strip the SCALE compact length prefix (mode in the low 2 bits)
+                mode = raw[0] & 0b11
+                offset = 1 if mode == 0 else 2 if mode == 1 else 4
+                payload = raw[offset:].decode("utf-8", errors="ignore")
+                if payload:
+                    out.append((int(block), payload))
+            except Exception:  # noqa: BLE001 — one bad entry is not the field
+                continue
+        return out
+
     def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None) -> list[Commitment]:
         """Decode each UID's revealed commitment individually — robust to a single
         malformed entry that would poison bittensor's batch decoder.
@@ -345,9 +383,20 @@ class ChainClient:
             if per_uid is not None:
                 try:
                     reveals = per_uid(self.netuid, uid)
-                except Exception as e:  # noqa: BLE001 — skip only this bad entry
-                    log.warning("skipping uid %d: revealed-commitment decode failed: %s", uid, e)
-                    continue
+                except Exception as e:  # noqa: BLE001 — try the raw store before skipping
+                    # bittensor's decoder chokes on the raw substrate rendering
+                    # (see _raw_revealed_entries) — read the store ourselves so a
+                    # miner is never skipped for their pointer's LENGTH.
+                    try:
+                        reveals = self._raw_revealed_entries(sub, hotkey)
+                    except Exception:  # noqa: BLE001
+                        reveals = None
+                    if not reveals:
+                        log.warning("skipping uid %d: revealed-commitment decode failed: %s",
+                                    uid, e)
+                        continue
+                    log.info("uid %d: recovered reveal via raw store (bittensor "
+                             "decoder bug — payload-length lottery)", uid)
                 if reveals:
                     block, payload = max(reveals, key=lambda r: int(r[0]))
                     if isinstance(payload, str) and payload:
