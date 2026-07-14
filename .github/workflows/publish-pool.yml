@@ -39,9 +39,14 @@ on:
         options: [mainnet, testnet]
         default: mainnet
       effective_block:
-        description: "Explicit effective_block (leave 'auto' once a trainer manifest exists)"
+        # Default is an INERT sentinel: 999999999999 is far beyond any real epoch
+        # block, so validators (which pick the greatest effective_block <= the
+        # round block) can never select it — safe for smoke-testing the relay
+        # without publishing a live snapshot. Set a real future epoch block for a
+        # production publish, or 'auto' once a trainer manifest exists.
+        description: "effective_block: 999999999999 = inert test snapshot; a real future epoch block for production; 'auto' needs a trainer manifest"
         required: false
-        default: "auto"
+        default: "999999999999"
 
 concurrency:
   group: publish-pool          # never let two publishes race on pool/index.json
