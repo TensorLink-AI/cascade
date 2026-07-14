@@ -5,24 +5,21 @@
 # a dated eval-pool snapshot to [storage] pool_bucket. Validators then pull the
 # rotating pool by effective_block — no chain.toml edit per round.
 #
-# TWO KEYS, because the two buckets are owned by different principals and no
-# single credential can touch both:
-#   * FORGE READ key  — read-only on the forge bucket, used ONLY by the aws s3
-#     sync step (secrets.TSFORGE_S3_ACCESS_KEY / _SECRET_KEY).
-#   * CASCADE key      — writes the eval-pool bucket and reads the manifest
-#     bucket, used by cascade-pool publish (secrets.HIPPIUS_S3_ACCESS_KEY /
-#     _SECRET_KEY). Scoped per step so neither key is exposed to the other's API.
+# ONE key drives both steps: TSFORGE_S3_* is provisioned with read+write on both
+# the forge bucket (sync reads it) and the eval-pool bucket (publish writes it).
+# The sync step consumes it as AWS_*, and it is aliased into HIPPIUS_S3_* for
+# cascade-pool publish (which reads HIPPIUS_S3_* to write the pool + read the
+# manifest bucket).
 #
 # REQUIRED repo secrets:
-#   TSFORGE_S3_ACCESS_KEY / TSFORGE_S3_SECRET_KEY   read-only forge-bucket key
-#   HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY   cascade eval-pool write key
+#   TSFORGE_S3_ACCESS_KEY / TSFORGE_S3_SECRET_KEY   read+write on forge + eval-pool
 # OPTIONAL repo variables:
 #   TSFORGE_BUCKET        forge raw-data bucket   (default: tsbench-forge-sources)
 #   HIPPIUS_S3_ENDPOINT   S3 endpoint             (default: https://s3.hippius.com)
 #
 # PREREQUISITE: `--effective-block auto` reads the trainer's latest.json from the
-# manifest bucket. Until a trainer is publishing manifests, run this manually
-# (workflow_dispatch) with an explicit effective_block.
+# manifest bucket — that needs this key to also read cascade-manifests AND a live
+# trainer. If either is missing, dispatch with an explicit effective_block.
 #
 # Use ONE publisher only — if another host already publishes to the pool bucket,
 # retire it before enabling the schedule (two publishers race on pool/index.json).
@@ -55,10 +52,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # cascade key — eval-pool WRITE + manifest READ (read by cascade-pool publish)
-      HIPPIUS_S3_ACCESS_KEY: ${{ secrets.HIPPIUS_S3_ACCESS_KEY }}
-      HIPPIUS_S3_SECRET_KEY: ${{ secrets.HIPPIUS_S3_SECRET_KEY }}
-      # forge-bucket config (read key is applied per-step, below)
+      # One key (TSFORGE_S3_*) with read+write on BOTH buckets drives both steps:
+      # cascade-pool publish reads HIPPIUS_S3_* to write the eval-pool bucket (and
+      # to read the manifest bucket for --effective-block auto), so we alias the
+      # single TSFORGE key into it. The sync step re-uses the same key as AWS_*.
+      HIPPIUS_S3_ACCESS_KEY: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
+      HIPPIUS_S3_SECRET_KEY: ${{ secrets.TSFORGE_S3_SECRET_KEY }}
       TSFORGE_BUCKET: ${{ vars.TSFORGE_BUCKET || 'tsbench-forge-sources' }}
       S3_ENDPOINT: ${{ vars.HIPPIUS_S3_ENDPOINT || 'https://s3.hippius.com' }}
     steps:
