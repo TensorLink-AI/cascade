@@ -17,7 +17,19 @@ from cascade.shared.config import ChainConfig, load_chain_config  # noqa: E402
 
 @pytest.fixture(scope="session")
 def cfg() -> ChainConfig:
-    return load_chain_config(REPO_ROOT / "chain.toml")
+    """The mainnet template with its ENFORCING pins neutralized.
+
+    chain.toml carries the real launch pins (expected_gpu, the worker-image
+    digest) — those assert real hardware and a real container env, neither of
+    which exists under pytest. Blank them HERE, in one place, so the template
+    can stay production-true while every fixture-driven test still runs on
+    fakes. Tests that exercise the pins set them explicitly via replace().
+    """
+    from dataclasses import replace
+
+    c = load_chain_config(REPO_ROOT / "chain.toml")
+    return replace(c, training=replace(c.training, expected_gpu="",
+                                       train_image_digest=""))
 
 
 @pytest.fixture(scope="session")

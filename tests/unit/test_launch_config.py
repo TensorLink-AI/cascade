@@ -55,11 +55,16 @@ def test_assert_launch_ready_passes_when_set(cfg):
     assert_launch_ready(ready, role="validator")      # window_pool ref set too
 
 
-def test_validator_requires_window_pool_ref(cfg):
+def test_validator_requires_some_eval_pool(cfg):
+    """The validator needs A pool source: the daily bucket (recommended) OR a
+    static window_pool ref — only both blank is unlaunchable."""
     ready = _launch_ready(cfg)
-    no_pool = replace(ready, eval=replace(ready.eval, window_pool=""))
+    bucket_only = replace(ready, eval=replace(ready.eval, window_pool=""))
+    assert_launch_ready(bucket_only, role="validator")   # template bucket suffices
+    no_pool = replace(bucket_only,
+                      storage=replace(bucket_only.storage, pool_bucket=""))
     with pytest.raises(LaunchConfigError) as ei:
         assert_launch_ready(no_pool, role="validator")
-    assert "window_pool" in str(ei.value)
+    assert "pool" in str(ei.value)
     # trainer doesn't need the pool, so it still passes
     assert_launch_ready(no_pool, role="trainer")

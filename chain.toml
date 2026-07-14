@@ -78,17 +78,18 @@ max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged d
 corpus_mode = "stream_cpu"
 # Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
 # "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
-expected_gpu = ""                # AT LAUNCH: "NVIDIA L40S" (exact nvidia-smi string;
-                                  # enforcing — folds into contract_digest, breaks unit
-                                  # fixtures if set pre-launch; see docs/MAINNET_LAUNCH.md)
+expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must
+                                  # train on identical silicon (folds into contract_digest;
+                                  # unit fixtures neutralize this in tests/conftest.py)
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = ""          # AT LAUNCH: pin the REBUILT worker image digest.
-                                  # Existing ghcr.io/tensorlink-ai/cascade-worker@
-                                  # sha256:bd7e853bf6d71aafcd2cb7a8e52cdf7107afe001248c798067a4dd78591b69cf
-                                  # is worker-v0.1.0 (pre-#76..#93) — REBUILD from the
-                                  # launch commit first; see docs/MAINNET_LAUNCH.md.
+train_image_digest = "sha256:bd7e853bf6d71aafcd2cb7a8e52cdf7107afe001248c798067a4dd78591b69cf"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.1.0. LAUNCH BLOCKER: this
+# digest predates PRs #76–#96 — tag a worker-v* release from the launch commit
+# and re-pin (scripts/repin_worker_image.sh <tag>) BEFORE go-live. Re-pin
+# protocol: digest folds into contract_digest ⇒ trainer AND validators restart
+# together at an epoch boundary, pods pull the new image.
 
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size

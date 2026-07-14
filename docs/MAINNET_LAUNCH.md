@@ -11,12 +11,14 @@ fixtures if active pre-launch.
 - [ ] `[round] commit_floor_block` = the announced go-live block. Pre-live
       commits (squatters, rehearsals) never compete and never burn their one
       submission (#93).
-- [ ] `[training] expected_gpu = "NVIDIA L40S"` — uncomment at launch.
-      Enforcing: folds into contract_digest; king+challenger hardware pairing.
-- [ ] `[training] train_image_digest` — REBUILD ghcr.io/tensorlink-ai/
-      cascade-worker from the LAUNCH COMMIT and pin the new digest. The
-      existing worker-v0.1.0 (sha256:bd7e853b…) predates #76–#93 (CPU-cap fix,
-      sandbox hardening, telemetry) and must not be pinned.
+- [x] `[training] expected_gpu = "NVIDIA L40S"` — PINNED (unit fixtures
+      neutralize it in tests/conftest.py; the template stays production-true).
+- [ ] `[training] train_image_digest` — pinned to worker-v0.1.0
+      (sha256:bd7e853b…) as a PLACEHOLDER; it predates #76+. At launch: tag a
+      `worker-v*` release from the launch commit (CI publish-worker.yml builds
+      + prints the digest) and run `scripts/repin_worker_image.sh <tag>`.
+      Re-pin protocol: digest folds into contract_digest ⇒ trainer AND all
+      validators restart together at an epoch boundary; pods pull the image.
 - [ ] `[training] ref_throughput_tokens_per_s` — re-measure on a real L40S with
       a saturating generator (expect ~170–185k; see CLAUDE.md "wall is the
       law" — the value is deliberately capability-calibrated, NOT median-miner).
