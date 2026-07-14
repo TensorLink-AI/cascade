@@ -883,3 +883,15 @@ def test_build_policy_rejects_bad_eval_table():
                             "providers": ["lium"], "max_price_hr": 1.2})
     with pytest.raises(ProvisionError):
         build_policy(raw, epoch_blocks=900)
+
+
+def test_heartbeat_logs_at_cycle_start(tmp_path, caplog):
+    """Liveness must not depend on any network phase completing — the
+    heartbeat fires at cycle START (starved twice on 2026-07-14 when it
+    lived behind reconcile/eval polls)."""
+    import logging
+
+    loop, _ = make_loop(tmp_path, block=100)
+    with caplog.at_level(logging.INFO, logger="cascade.provision.loop"):
+        loop.run_once()
+    assert any("heartbeat: cycle start" in r.message for r in caplog.records)
