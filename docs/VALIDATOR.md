@@ -22,7 +22,7 @@ Two supported shapes:
 | shape | what runs where |
 |---|---|
 | **GPU box** (recommended) | everything — wallet, private-pool duel, and benchmark evals — on one CUDA machine; run with `--device cuda` |
-| **CPU orchestrator + eval pod** | wallet, private-pool duel, and **all consensus decisions** stay on a cheap CPU box; the GPU-heavy public benchmarks are offloaded over SSH with `--eval-hosts` (only a public checkpoint and a report cross to the pod — never keys) |
+| **CPU orchestrator + eval pod** | wallet, private-pool duel, and **all consensus decisions** stay on a cheap CPU box; the GPU-heavy public benchmarks are offloaded over SSH with `--eval-hosts` (only a public checkpoint and a report cross to the pod — never keys). The pod can be **elastic** — rented per round by the owner's provisioner and torn down on your receipt — or a static box you maintain |
 
 Minimums (the GPU row applies to whichever box runs benchmarks — the GPU box
 itself, or the eval pod in the split shape):
@@ -158,7 +158,7 @@ cascade-validator --chain-toml chain.testnet.toml --network test \
 ```
 
 **CPU orchestrator + eval pod** — `--device` stays at its `cpu` default and the
-benchmark evals go to the first `final`/`any`-stage host in a `hosts.toml`
+heavy evals go to the first `final`/`any`-stage host in a `hosts.toml`
 (same format as the trainer's `scripts/remote_hosts.example.toml`):
 
 ```bash
@@ -166,8 +166,17 @@ cascade-validator --chain-toml chain.testnet.toml --network test \
   --wallet-name my-validator --wallet-hotkey default \
   --eval-hosts hosts.toml
 # log line to expect:
-#   GIFT-Eval gate offloaded to <name> (<host>); wallet + consensus stay local
+#   eval offload configured from hosts.toml (re-resolved per eval; local
+#   fallback on --device=cpu); wallet + consensus stay local
 ```
+
+The file is re-read at **each** offloaded eval, not pinned at startup — so it
+can be elastic: the owner's provisioner rents the pod when a round's manifest
+appears, publishes it into this file, and clears it once your round receipt
+lands (`[provisioner.eval]` in `scripts/provision.example.toml`). A missing,
+empty, or unparseable file never crashes the validator — that eval just runs
+locally on `--device`. A static hand-maintained file behaves the same, minus
+the elasticity.
 
 On startup it loads the eval pool (`loaded eval pool snapshot@block-… series=…`)
 and polls the manifest bucket. Each new round you'll see it gate, score, decide,
@@ -244,7 +253,7 @@ used for inference — scoring and benchmarks — never training.
 | weights never set | no validator permit (insufficient stake), or the weight extrinsic is failing — check `btcli` and the log's `weight set failed` line |
 | `gift-eval sidecar unavailable/errored` | the gift gate needs a GPU: pass `--device cuda` on a GPU box, or point `--eval-hosts` at a pod (see [Hardware](#hardware)); under `enforce` this makes rounds inconclusive |
 | CUDA errors with `--device cuda` | torch can't see the GPU — reinstall with `pip install -e '.[train]'` on a CUDA box and re-check `torch.cuda.is_available()` |
-| `--eval-hosts …: no 'final'/'any'-stage host found` | every host in the file is tagged `stage = "heat"` — the validator only offloads to `final`/`any`-stage hosts |
+| `eval-offload host gone (…); heavy evals run locally` | normal for an elastic pod between rounds (the provisioner clears the file on teardown); investigate only if it persists while the gift gate / cascade bench needs the GPU — check the provisioner, and that the file's hosts are `final`/`any`-stage (heat-tagged hosts are ignored) |
 | audit WARNs on `block-hash-onchain` / `commit-cutoff` | you're on a lite node without the historical block/commitment; point `--network` at an archive node for zero WARNs |
 
 ## Rewards
