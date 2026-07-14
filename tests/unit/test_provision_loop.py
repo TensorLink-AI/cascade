@@ -941,3 +941,45 @@ def test_on_cycle_hook_heals_stripped_logging(tmp_path):
     lg.setLevel(logging.CRITICAL)          # simulate the nuke
     loop.run_once()
     assert calls and lg.getEffectiveLevel() == logging.INFO
+
+
+def test_heal_rebuilds_closed_handlers(tmp_path, monkeypatch):
+    """bittensor can close stripped handlers' streams — re-attaching the same
+    object then fails silently on every emit. The heal must rebuild."""
+    import io
+    import logging
+    import sys
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["cascade-provisioner"])
+    from cascade.provision import main as pmain
+
+    fmt = logging.Formatter("%(message)s")
+    state = {"stream": None, "file": None}
+
+    def _alive(h):
+        stream = getattr(h, "stream", None)
+        return h is not None and stream is not None and not getattr(stream, "closed", True)
+
+    def ensure():
+        lg = logging.getLogger("cascade-test-heal")
+        if not _alive(state["file"]):
+            state["file"] = logging.FileHandler(tmp_path / "svc.log")
+            state["file"].setFormatter(fmt)
+        if state["file"] not in lg.handlers:
+            lg.addHandler(state["file"])
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+
+    lg = logging.getLogger("cascade-test-heal")
+    ensure()
+    lg.info("one")
+    state["file"].close()                     # simulate bittensor closing it
+    lg.removeHandler(state["file"])           # and stripping it
+    ensure()                                  # heal must REBUILD, not re-attach
+    lg.info("two")
+    for h in lg.handlers:
+        h.flush()
+    text = (tmp_path / "svc.log").read_text()
+    assert "one" in text and "two" in text
+    assert pmain  # import sanity
