@@ -33,3 +33,6 @@ hosts.toml
 orchestrator.log
 validator.log
 worker_manual.log
+
+# live per-box provisioner config (copy from deploy/provision.*.toml)
+/provision.toml

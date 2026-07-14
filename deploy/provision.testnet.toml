@@ -1,0 +1,109 @@
+# cascade-provisioner — CLUSTER config (activate after PR #78 merges + pull).
+# Heat = one-or-two 4x RTX4090 clusters; lium first, shadeform VM-mode fallback.
+# Finals unmanaged (static cascade-final-b).
+
+[provisioner]
+trigger_margin_blocks = 45          # ~9min: slow testnet RPC ate the 5-min window on 2026-07-14
+hosts_path            = "/root/cascade/hosts.toml"
+state_path            = "/root/cascade/provisioner_state.json"
+static_hosts          = "/root/cascade/static_hosts.toml"
+max_spend_per_round   = 25.0
+eval_hosts_path       = "/root/cascade/eval_hosts.toml"   # elastic eval pod (PR #85)
+receipt_prefix        = "receipts/5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR/"
+
+image               = "Pytorch (Cuda + DinD)"    # lium template (bootstrap mode)
+bootstrap_script    = "/root/cascade/deploy/pod_bootstrap.sh"
+bootstrap_timeout_s = 1800
+pod_user            = "root"
+shadeform_ssh_key_id = "c567c538-f4a3-40b6-8ca5-d0a903656274"   # registered 'cascade-worker' key → VM-mode
+
+ssh_pubkey    = "~/.ssh/lium_cascade_ed25519.pub"
+ssh_key_path  = "~/.ssh/lium_cascade_ed25519"
+remote_python = "/root/cascade/.venv/bin/python"
+workdir       = "/root/cascade"
+chain_toml    = "/root/cascade/chain.testnet.toml"
+forward_env   = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY",
+                 "HIPPIUS_HUB_USERNAME", "HIPPIUS_HUB_PASSWORD", "HF_TOKEN"]
+
+[provisioner.pods.shadeform]
+user          = "shadeform"
+workdir       = "/home/shadeform/cascade"
+remote_python = "/home/shadeform/cascade/.venv/bin/python"
+
+[provisioner.heat]
+# Primary: 4x RTX4090 clusters. Ordered fallbacks below — first
+# (candidate × provider) with capacity for the whole heat fleet wins;
+# a stage never mixes SKUs within a round.
+sku          = "NVIDIA GeForce RTX 4090"
+market_sku   = "RTX4090"                 # same marketplace name on lium AND shadeform
+gpus_per_pod = 4                         # CLUSTERS: one 4x box = 4 lanes, 1 bootstrap
+max_pods     = 8                         # slot-derived per shape: 4x rents 1-2, 1x singles can scale out
+providers    = ["lium", "shadeform"]     # lium first; no 4x on lium → shadeform VM-mode
+max_price_hr = 2.60                      # shadeform 4x RTX4090 = $2.40/hr/pod
+slot_overhead = 1.3
+
+[[provisioner.heat.candidate]]           # fallback 1: 4x A6000 cluster
+sku          = "NVIDIA RTX A6000"
+market_sku   = "A6000"
+gpus_per_pod = 4
+max_price_hr = 2.40
+
+[[provisioner.heat.candidate]]           # fallback 2: 8x RTX4090 cluster
+sku          = "NVIDIA GeForce RTX 4090"
+market_sku   = "RTX4090"
+gpus_per_pod = 8
+max_price_hr = 5.00
+
+[[provisioner.heat.candidate]]           # fallback 3: 8x A6000 cluster
+sku          = "NVIDIA RTX A6000"
+market_sku   = "A6000"
+gpus_per_pod = 8
+max_price_hr = 4.60
+
+[[provisioner.heat.candidate]]           # fallback 4: 2x 4090
+sku          = "NVIDIA GeForce RTX 4090"
+market_sku   = "RTX4090"
+gpus_per_pod = 2
+max_price_hr = 1.30
+
+[[provisioner.heat.candidate]]           # fallback 5: 2x A6000
+sku          = "NVIDIA RTX A6000"
+market_sku   = "A6000"
+gpus_per_pod = 2
+max_price_hr = 1.20
+
+[[provisioner.heat.candidate]]           # fallback 6: 1x 4090 singles — the always-liquid net
+sku          = "NVIDIA GeForce RTX 4090"
+market_sku   = "RTX4090"
+gpus_per_pod = 1
+max_price_hr = 0.85
+
+[[provisioner.heat.candidate]]           # fallback 7: 1x A6000 singles
+sku          = "NVIDIA RTX A6000"
+market_sku   = "A6000"
+gpus_per_pod = 1
+max_price_hr = 0.60
+
+[provisioner.final]
+sku          = "NVIDIA L40S"
+market_sku   = "L40S"
+gpus_per_pod = 1
+max_pods     = 0                         # UNMANAGED: static cascade-final-b
+providers    = ["lium"]
+max_price_hr = 1.00
+
+# ── elastic eval pod (PR #85): rented at manifest, torn down at receipt ──────
+
+[provisioner.eval]
+sku          = "NVIDIA GeForce RTX 3090"
+market_sku   = "RTX3090"
+gpus_per_pod = 1
+max_pods     = 1
+providers    = ["lium"]
+max_price_hr = 0.45
+
+[[provisioner.eval.candidate]]           # fallback: 1x 4090 if no 3090s
+sku          = "NVIDIA GeForce RTX 4090"
+market_sku   = "RTX4090"
+gpus_per_pod = 1
+max_price_hr = 0.85
