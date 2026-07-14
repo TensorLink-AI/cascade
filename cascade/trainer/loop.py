@@ -77,6 +77,46 @@ BenchEvalFn = Callable[[Path], "BenchScores | None"]
 log = logging.getLogger("cascade.trainer")
 
 
+def _pctl(vals: list[float], q: float) -> float:
+    """Linear-interpolated percentile of a non-empty list (pure; no numpy here)."""
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def telemetry_rollup_line(
+    round_id: int | str, heat_metrics: list[dict], final_metrics: list[dict]
+) -> str:
+    """One-line per-round starvation/deadline roll-up from run metrics dicts.
+
+    Pure formatting so the aggregation is unit-testable. Entries without the
+    telemetry keys are skipped (a custom BaseTrainer may not emit them; remote
+    runs keep their metrics on the pod — see ``_train_checkpoint``), and the
+    trailing count says how many runs actually reported, so a silent-majority
+    round can't masquerade as a healthy one.
+    """
+    heats = [m for m in heat_metrics if isinstance(m, dict) and "deadline_hit" in m]
+    finals = [m for m in final_metrics if isinstance(m, dict) and "deadline_hit" in m]
+    waits = [float(m["data_wait_frac"]) for m in (*heats, *finals) if "data_wait_frac" in m]
+    wait_part = (
+        f"data_wait_frac p50={_pctl(waits, 0.5):.3f} p95={_pctl(waits, 0.95):.3f}"
+        if waits else "data_wait_frac n/a"
+    )
+    hit_h = sum(bool(m.get("deadline_hit")) for m in heats)
+    hit_f = sum(bool(m.get("deadline_hit")) for m in finals)
+    reported = len(heats) + len(finals)
+    total = len(heat_metrics) + len(final_metrics)
+    return (
+        f"round={round_id} telemetry: deadline_hit {hit_h}/{len(heats)} heats + "
+        f"{hit_f}/{len(finals)} finals; {wait_part} ({reported}/{total} runs "
+        "reported metrics)"
+    )
+
+
 def _load_seen_hotkeys(path: Path) -> set[str]:
     """Load the persisted 1-hotkey-1-submission burn set (best-effort)."""
     try:
@@ -283,6 +323,13 @@ class TrainerRunner:
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
+    # Per-round starvation/deadline telemetry collected from every run trained
+    # IN THIS PROCESS (local rounds; a remote round's metrics stay on its pods,
+    # where each worker logs its own telemetry line). Keyed by stage for the
+    # roll-up; reset at every run_round.
+    _round_telemetry: dict = field(
+        default_factory=lambda: {"heat": [], "final": []}, repr=False
+    )
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -484,6 +531,23 @@ class TrainerRunner:
             seeds.base_seed, log_role, gen.hotkey, contract.corpus_mode,
             n_series, total_points, corpus_digest[:12],
         )
+        # One parseable key=value telemetry line per run. TrainResult.metrics
+        # never crosses the remote boundary (the worker's receipt is a
+        # TrainedEntry, which carries no metrics — and the receipt protocol
+        # stays as-is), so this line IS how a remote run's starvation/deadline
+        # telemetry reaches the dispatch output: it lands on the worker's
+        # stderr, which the orchestrator's SSH dispatch captures. Local runs
+        # additionally feed the per-round roll-up (telemetry_rollup_line).
+        m = result.metrics or {}
+        if "deadline_hit" in m:
+            log.info(
+                "round=%s run=%s telemetry: deadline_hit=%s tokens_frac=%s "
+                "data_wait_s=%s data_wait_frac=%s",
+                seeds.base_seed, log_role, m.get("deadline_hit"),
+                m.get("tokens_frac"), m.get("data_wait_s"), m.get("data_wait_frac"),
+            )
+        stage = "heat" if log_role.startswith("heat") else "final"
+        self._round_telemetry[stage].append(dict(m))
         return result, corpus_digest, n_series, total_points
 
     def train_one(
@@ -659,6 +723,8 @@ class TrainerRunner:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
+        # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
+        self._round_telemetry = {"heat": [], "final": []}
 
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
@@ -681,12 +747,14 @@ class TrainerRunner:
         # Heat settled (screened + burned + finalists chosen): signal external
         # watchers (the provisioner) that heat-stage pods are now safe to release.
         self._mark_heat_complete(base_seed, eligible, finalists)
+        self._log_telemetry_rollup(base_seed)  # heat-stage standings so far
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
         entries = self._train_final(jobs, seeds, block)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
+        self._log_telemetry_rollup(base_seed)  # complete heats + finals picture
 
         # Cascade: score the king's checkpoint on the public suites and stamp the
         # numbers onto its manifest entry, so every validator promotes off one
@@ -719,6 +787,15 @@ class TrainerRunner:
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
         )
+
+    def _log_telemetry_rollup(self, base_seed: int) -> None:
+        """INFO roll-up of the round's collected run telemetry (skipped when no
+        run trained in this process — a fully remote round's metrics live in
+        each pod's own telemetry line instead)."""
+        heats = self._round_telemetry["heat"]
+        finals = self._round_telemetry["final"]
+        if heats or finals:
+            log.info("%s", telemetry_rollup_line(base_seed, heats, finals))
 
     def _run_heat(
         self,
