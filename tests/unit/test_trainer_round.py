@@ -660,3 +660,16 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     final_timeouts = {t for is_heat, t in timeouts if not is_heat}
     assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml
     assert final_timeouts == {runner.remote_timeout_seconds}
+
+
+def test_commit_floor_drops_pre_launch_commits():
+    """Mainnet go-live gate: commits from before floor_block never resolve —
+    not into the field, and (via the same path) not into a throne."""
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 100),
+               _commit(2, "c", REF_C, 99)]
+    got = resolve_commitments(commits, floor_block=100)
+    assert [r.hotkey for r in got] == ["b"]           # only the post-live commit
+    assert [r.hotkey for r in resolve_commitments(commits, floor_block=0)] == ["a", "b", "c"]
+    # floor composes with the cutoff: post-live but pre-boundary only
+    got = resolve_commitments(commits, cutoff_block=100, floor_block=99)
+    assert [r.hotkey for r in got] == ["c"]

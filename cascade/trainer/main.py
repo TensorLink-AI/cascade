@@ -286,7 +286,8 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     block = int(client.current_block())
     epoch_blocks = max(1, cfg.round.epoch_blocks)
     next_boundary = (block // epoch_blocks + 1) * epoch_blocks
-    resolved = resolve_commitments(client.poll_commitments())
+    resolved = resolve_commitments(client.poll_commitments(),
+                                   floor_block=cfg.round.commit_floor_block)
     plan = plan_round(resolved, client.highest_incentive_hotkey())
     probe = TrainerRunner(cfg=cfg, base_trainer=None, work_root=Path(work_root))
     eligible = probe._filter_burned_challengers(plan.challengers)

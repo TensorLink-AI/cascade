@@ -24,7 +24,9 @@ ref to the measured median so equal-compute duels are the norm and speed is
 only a floor) is one config line + coordinated trainer+validator restart at a
 boundary — `[training]` keys fold into contract_digest.
 
-Pre-mainnet ops task: re-measure ref empirically on the pinned mainnet SKU
+Pre-mainnet ops tasks: (1) set `[round] commit_floor_block` in mainnet
+chain.toml to the announced go-live block (pre-live commits never compete —
+the knob exists, default 0/off); (2) re-measure ref empirically on the pinned mainnet SKU
 with a saturating generator (expect ~170–185k on L40S-class; small trim, not a
 rethink).
 
