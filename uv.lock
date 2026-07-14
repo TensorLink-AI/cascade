@@ -409,7 +409,7 @@ wandb = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'train'", specifier = ">=0.30" },
-    { name = "bittensor", marker = "extra == 'chain'", specifier = ">=8.0" },
+    { name = "bittensor", marker = "extra == 'chain'", specifier = "==10.5.0" },
     { name = "boto3", marker = "extra == 'hippius'", specifier = ">=1.34" },
     { name = "hippius-hub", marker = "extra == 'hippius'" },
     { name = "huggingface-hub", marker = "extra == 'hippius'", specifier = ">=0.23" },

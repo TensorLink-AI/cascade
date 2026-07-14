@@ -62,12 +62,18 @@ wandb = [
 ]
 chain = [
     # Bittensor stack pulled in only where needed (validator, trainer, miner CLI).
-    "bittensor>=8.0",
+    # PINNED exactly: the timelock-reveal encoding differs across SDK lines —
+    # v8-era set_reveal_commitment writes reveals the netuid's decoder cannot
+    # read (raw bytes where hex is expected), so a miner on the wrong SDK
+    # commits successfully yet is skipped every round ("non-hexadecimal
+    # number found in fromhex()"). 10.5.0 is what the trainer/validators run.
+    "bittensor==10.5.0",
 ]
 
 [project.scripts]
 cascade = "cascade.miner.cli:main"
 cascade-trainer = "cascade.trainer.main:main"
+cascade-provisioner = "cascade.provision.main:main"
 cascade-train-worker = "cascade.trainer.worker:main"
 cascade-validator = "cascade.validator.main:main"
 cascade-pool = "cascade.pool.cli:main"

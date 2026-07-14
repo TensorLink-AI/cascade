@@ -35,6 +35,7 @@ from ..shared.hippius import (
     LogSink,
     S3Config,
     S3Store,
+    StorageError,
     fetch_from_hub,
     publish_manifest,
     upload_dir_to_hub_or_hf,
@@ -52,6 +53,7 @@ from ..shared.manifest import (
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
+from .corpus import CorpusError
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -75,6 +77,58 @@ ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+
+def _http_status_in_chain(exc: BaseException | None) -> int | None:
+    """First HTTP status code found walking an exception's cause chain."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _pctl(vals: list[float], q: float) -> float:
+    """Linear-interpolated percentile of a non-empty list (pure; no numpy here)."""
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def telemetry_rollup_line(
+    round_id: int | str, heat_metrics: list[dict], final_metrics: list[dict]
+) -> str:
+    """One-line per-round starvation/deadline roll-up from run metrics dicts.
+
+    Pure formatting so the aggregation is unit-testable. Entries without the
+    telemetry keys are skipped (a custom BaseTrainer may not emit them; remote
+    runs keep their metrics on the pod — see ``_train_checkpoint``), and the
+    trailing count says how many runs actually reported, so a silent-majority
+    round can't masquerade as a healthy one.
+    """
+    heats = [m for m in heat_metrics if isinstance(m, dict) and "deadline_hit" in m]
+    finals = [m for m in final_metrics if isinstance(m, dict) and "deadline_hit" in m]
+    waits = [float(m["data_wait_frac"]) for m in (*heats, *finals) if "data_wait_frac" in m]
+    wait_part = (
+        f"data_wait_frac p50={_pctl(waits, 0.5):.3f} p95={_pctl(waits, 0.95):.3f}"
+        if waits else "data_wait_frac n/a"
+    )
+    hit_h = sum(bool(m.get("deadline_hit")) for m in heats)
+    hit_f = sum(bool(m.get("deadline_hit")) for m in finals)
+    reported = len(heats) + len(finals)
+    total = len(heat_metrics) + len(final_metrics)
+    return (
+        f"round={round_id} telemetry: deadline_hit {hit_h}/{len(heats)} heats + "
+        f"{hit_f}/{len(finals)} finals; {wait_part} ({reported}/{total} runs "
+        "reported metrics)"
+    )
 
 
 def _load_seen_hotkeys(path: Path) -> set[str]:
@@ -137,7 +191,8 @@ def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
 
 
 def resolve_commitments(
-    commitments: list[Commitment], cutoff_block: int | None = None
+    commitments: list[Commitment], cutoff_block: int | None = None,
+    floor_block: int = 0,
 ) -> list[ResolvedGenerator]:
     """Parse each commitment's generator pointer, dropping malformed ones.
 
@@ -155,6 +210,13 @@ def resolve_commitments(
     """
     best: dict[str, tuple[int, ResolvedGenerator]] = {}
     for c in commitments:
+        # The go-live floor: commits from before the official launch block
+        # (netuid squatters, rehearsal commits) never compete — applied to
+        # EVERY resolution path, king lookup included, so a pre-live commit
+        # can neither enter a heat nor hold a throne. Gates on the reveal
+        # block, the only block the revealed store carries.
+        if floor_block and c.reveal_block < floor_block:
+            continue
         if cutoff_block is not None and c.reveal_block >= cutoff_block:
             continue
         parsed = parse_commit(c.payload)
@@ -342,6 +404,13 @@ class TrainerRunner:
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
+    # Per-round starvation/deadline telemetry collected from every run trained
+    # IN THIS PROCESS (local rounds; a remote round's metrics stay on its pods,
+    # where each worker logs its own telemetry line). Keyed by stage for the
+    # roll-up; reset at every run_round.
+    _round_telemetry: dict = field(
+        default_factory=lambda: {"heat": [], "final": []}, repr=False
+    )
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -424,6 +493,37 @@ class TrainerRunner:
         seen = _load_seen_hotkeys(path)
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
+    def _mark_heat_complete(
+        self,
+        base_seed: int,
+        screened: list[ResolvedGenerator],
+        finalists: list[ResolvedGenerator],
+    ) -> None:
+        """Drop ``work_root/<round_id>/heat_complete.json`` when the heat settles.
+
+        The teardown signal for an external provisioner: once the field is
+        screened, burned, and the finalists chosen, no heat-stage dispatch can
+        occur for the rest of the round, so heat-tagged pods are safe to
+        terminate while the final still runs (see docs/DEPLOY_PODS.md). Written
+        atomically (tmp + rename) so a watcher never reads a torn file; the
+        round_id equals the round's base_seed (the work-root subdir key).
+        Best-effort: a write failure must never sink a round.
+        """
+        payload = {
+            "round_id": str(base_seed),
+            "screened": len(screened),
+            "finalists": [c.hotkey for c in finalists],
+        }
+        try:
+            out_dir = self.work_root / f"{base_seed}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out_dir / "heat_complete.json.tmp"
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            tmp.replace(out_dir / "heat_complete.json")
+        except OSError as e:
+            log.warning("could not write heat_complete marker for round=%s: %s",
+                        base_seed, e)
+
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
     def _train_checkpoint(
@@ -446,7 +546,18 @@ class TrainerRunner:
         total_points)``. Raises on any failure.
         """
         gen_dir = out_dir.parent / "generator"
-        fetch_from_hub(gen.ref, gen_dir, self.hub())
+        try:
+            fetch_from_hub(gen.ref, gen_dir, self.hub())
+        except StorageError as e:
+            status = _http_status_in_chain(e)
+            if status in (401, 403, 404):
+                # The MINER's repo, not our infra: a private or missing artifact
+                # is the submitter's fault (Hippius Harbor projects must be
+                # public for the trainer to pull them — see docs/MINER.md).
+                raise CorpusError(
+                    f"generator_artifact_unreachable: HTTP {status} for {gen.ref}"
+                ) from e
+            raise
         out_dir.mkdir(parents=True, exist_ok=True)
         log.info(
             "round=%s run=%s: fetched generator %s — building corpus + training "
@@ -482,6 +593,7 @@ class TrainerRunner:
             token_budget=token_budget,
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,
+            max_wall_seconds=contract.max_train_seconds,
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),
@@ -511,6 +623,23 @@ class TrainerRunner:
             seeds.base_seed, log_role, gen.hotkey, contract.corpus_mode,
             n_series, total_points, corpus_digest[:12],
         )
+        # One parseable key=value telemetry line per run. TrainResult.metrics
+        # never crosses the remote boundary (the worker's receipt is a
+        # TrainedEntry, which carries no metrics — and the receipt protocol
+        # stays as-is), so this line IS how a remote run's starvation/deadline
+        # telemetry reaches the dispatch output: it lands on the worker's
+        # stderr, which the orchestrator's SSH dispatch captures. Local runs
+        # additionally feed the per-round roll-up (telemetry_rollup_line).
+        m = result.metrics or {}
+        if "deadline_hit" in m:
+            log.info(
+                "round=%s run=%s telemetry: deadline_hit=%s tokens_frac=%s "
+                "data_wait_s=%s data_wait_frac=%s",
+                seeds.base_seed, log_role, m.get("deadline_hit"),
+                m.get("tokens_frac"), m.get("data_wait_s"), m.get("data_wait_frac"),
+            )
+        stage = "heat" if log_role.startswith("heat") else "final"
+        self._round_telemetry[stage].append(dict(m))
         return result, corpus_digest, n_series, total_points
 
     def train_one(
@@ -668,7 +797,8 @@ class TrainerRunner:
         Trains locally (sequential) by default, or across ``remote_hosts`` when
         configured. A king failure at any size aborts the round.
         """
-        resolved = resolve_commitments(commitments, cutoff_block=cutoff_block)
+        resolved = resolve_commitments(commitments, cutoff_block=cutoff_block,
+                                       floor_block=self.cfg.round.commit_floor_block)
         # The reigning king is NOT a new submission — it already holds the throne,
         # so it is exempt from the challenger submission cutoff. Resolve it from the
         # FULL commitment set: a champion that (re-)committed at/after the epoch
@@ -678,7 +808,9 @@ class TrainerRunner:
         king_rg = None
         if king_hotkey is not None:
             king_rg = next(
-                (rg for rg in resolve_commitments(commitments) if rg.hotkey == king_hotkey),
+                (rg for rg in resolve_commitments(
+                    commitments, floor_block=self.cfg.round.commit_floor_block)
+                 if rg.hotkey == king_hotkey),
                 None,
             )
         plan = plan_round(resolved, king_hotkey, king=king_rg)
@@ -686,6 +818,8 @@ class TrainerRunner:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
+        # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
+        self._round_telemetry = {"heat": [], "final": []}
 
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
@@ -705,6 +839,10 @@ class TrainerRunner:
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
         # submission is consumed by a round that never judged it.
         self._burn_hotkeys(eligible)
+        # Heat settled (screened + burned + finalists chosen): signal external
+        # watchers (the provisioner) that heat-stage pods are now safe to release.
+        self._mark_heat_complete(base_seed, eligible, finalists)
+        self._log_telemetry_rollup(base_seed)  # heat-stage standings so far
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
@@ -712,6 +850,7 @@ class TrainerRunner:
         entries = _drop_final_content_clones(entries, jobs)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
+        self._log_telemetry_rollup(base_seed)  # complete heats + finals picture
 
         # Cascade: score the king's checkpoint on the public suites and stamp the
         # numbers onto its manifest entry, so every validator promotes off one
@@ -744,6 +883,15 @@ class TrainerRunner:
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
         )
+
+    def _log_telemetry_rollup(self, base_seed: int) -> None:
+        """INFO roll-up of the round's collected run telemetry (skipped when no
+        run trained in this process — a fully remote round's metrics live in
+        each pod's own telemetry line instead)."""
+        heats = self._round_telemetry["heat"]
+        finals = self._round_telemetry["final"]
+        if heats or finals:
+            log.info("%s", telemetry_rollup_line(base_seed, heats, finals))
 
     def _run_heat(
         self,
@@ -931,15 +1079,22 @@ class TrainerRunner:
         heat slot or (for the king) the entire round. With a single host the
         retry re-uses it, since the failure may be transient rather than the
         box. A second failure propagates to the caller's policy (drop the
-        challenger / abort the round)."""
+        challenger / abort the round).
+
+        This seam also knows the round's full lane fan-out (``hosts``), so it
+        computes each pod's lane count here and hands it to the dispatch —
+        the pod-side sandbox slices its CPU cores off that geometry (see
+        ``remote.pod_lane_count`` / ``sandbox._lane_cpu_slice``)."""
+        from .remote import pod_lane_count
+
         host = hosts[i % len(hosts)]
         try:
-            return disp.dispatch(host, **kw)
+            return disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             retry_host = hosts[(i + 1) % len(hosts)]
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e, getattr(retry_host, "name", retry_host))
-            return disp.dispatch(retry_host, **kw)
+            return disp.dispatch(retry_host, lane_count=pod_lane_count(retry_host, hosts), **kw)
 
     def _heat_train_remote(
         self,

@@ -5,7 +5,7 @@
 schema_version = 1
 
 [subnet]
-netuid = 0                       # placeholder; set per network (mainnet/testnet)
+netuid = 91                      # MAINNET netuid
 name = "cascade"
 description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Toto2-4M trained from scratch."
 
@@ -78,11 +78,18 @@ max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged d
 corpus_mode = "stream_cpu"
 # Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
 # "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
-expected_gpu = ""
+expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must
+                                  # train on identical silicon (folds into contract_digest;
+                                  # unit fixtures neutralize this in tests/conftest.py)
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = ""
+train_image_digest = "sha256:46bc78fa0ddd1590085bbe3ab909c7f6bb46ab3998a3873764cc6430cb8f3ce6"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0 (built from main incl.
+# PRs #76–#98). At launch: tag worker-v* from the LAUNCH commit and re-pin via
+# scripts/repin_worker_image.sh <tag>. Re-pin protocol: the digest folds into
+# contract_digest ⇒ trainer AND validators restart together at an epoch
+# boundary, pods pull the new image.
 
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
@@ -117,6 +124,11 @@ heat_guard_floor_seconds = 900
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
 # Anti-spam: a challenger hotkey that has entered a heat is burned and must
 # re-register to resubmit. Set false only on a throwaway testnet.
+# Go-live gate: only commitments revealed at/after this block ever compete
+# (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
+# squatters / rehearsal commits from before the official start never enter a
+# round (and never burn their one submission).
+commit_floor_block = 0        # PLACEHOLDER: set to the announced go-live block at launch
 one_submission_per_hotkey = true
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
@@ -176,7 +188,10 @@ dethrone_cp          = 1         # consecutive round wins to take the throne
 # registered, all weight burns to burn_uid. 0 = pure winner-take-all.
 reward_prior_kings   = 4
 burn_uid             = 0         # weight sink (owner burn slot)
-king_decay           = 1.0       # geometric decay across [king, prior kings];
+king_decay           = 0.5       # geometric decay across [king, prior kings]: king ∝ 1,
+                                  # prior ∝ 0.5, 0.25, … — the king is UNAMBIGUOUSLY the
+                                  # highest-incentive UID (king resolution depends on it).
+                                  # 1.0 = flat split (ambiguous; do not use in production).
                                  # 1.0 = flat split, <1 skews to the current king
 # Public-benchmark no-regression gate (cascade.eval.gift_gate). AND-ed with the
 # private-pool decision: can BLOCK a dethrone, never grant one. Start on
@@ -246,7 +261,7 @@ manifest_bucket  = "cascade-manifests"              # round-<id>.json + latest.j
 logs_bucket      = "cascade-logs"                   # logs/round-<id>/<role>.jsonl
 # Eval-pool bucket (daily snapshots + pool/index.json, published with
 # `cascade-pool publish`). Empty = use the static [eval] window_pool ref instead.
-pool_bucket      = ""                               # e.g. "cascade-eval-pool"
+pool_bucket      = "cascade-eval-pool"              # daily snapshots from publish-pool.yml
 # Pool endpoint override (e.g. Cloudflare R2 + POOL_S3_ACCESS_KEY /
 # POOL_S3_SECRET_KEY); empty = reuse the Hippius S3 endpoint above.
 pool_s3_endpoint = ""
@@ -265,7 +280,7 @@ backup_bucket      = ""                             # empty = reuse manifest_buc
 [manifest]
 # Signed training receipts in [storage] manifest_bucket. trainer_hotkey is the
 # only signer a validator trusts (see OPEN_QUESTIONS.md #1).
-trainer_hotkey  = ""             # set to the owner trainer's ss58 hotkey
+trainer_hotkey  = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # owner trainer hotkey (mainnet)
 poll_seconds    = 120
 # Trust anchor for the public round receipts: the validator hotkey whose
 # signature `cascade-audit` requires. Empty = verify against the receipt's

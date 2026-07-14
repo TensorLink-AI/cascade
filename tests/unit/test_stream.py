@@ -75,3 +75,45 @@ def test_unknown_corpus_mode_rejected(small_cfg, example_generator_dir):
         open_round_stream(
             "stream_tpu", example_generator_dir, 0, small_cfg.generator, token_budget=BUDGET
         )
+
+
+def test_stream_forwards_wall_budget_to_sandbox(small_cfg, example_generator_dir, monkeypatch):
+    """The contract's wall budget must reach the sandbox child's rlimit math —
+    the whole SIGXCPU fix is this plumbing (loop/rederive → stream → sandbox)."""
+    import contextlib
+
+    from cascade.trainer import sandbox as sandbox_mod
+    from cascade.trainer import stream as stream_mod
+
+    seen: dict[str, object] = {}
+
+    @contextlib.contextmanager
+    def fake_stream_series(repo, seed, cfg, budget, **kw):
+        seen.update(kw)
+        yield iter(())
+
+    monkeypatch.setattr(stream_mod.sandbox, "stream_series", fake_stream_series)
+    with open_round_stream(
+        "stream_cpu", example_generator_dir, 0, small_cfg.generator,
+        token_budget=BUDGET, use_sandbox=True, blocked=(), allow_netns=False,
+        max_wall_seconds=2700,
+    ) as rs:
+        list(rs.series())
+    assert seen["max_wall_seconds"] == 2700
+    assert sandbox_mod  # imported for parity with the real path
+
+
+def test_stream_cpu_sandbox_with_wall_budget(small_cfg, example_generator_dir):
+    """End-to-end: a real sandboxed stream under a scaled CPU cap still streams
+    and digests identically to the in-process reference."""
+    ref, *_ = _drain(
+        "stream_cpu", example_generator_dir, small_cfg.generator, use_sandbox=False
+    )
+    with open_round_stream(
+        "stream_cpu", example_generator_dir, 0, small_cfg.generator,
+        token_budget=BUDGET, use_sandbox=True, blocked=("socket",),
+        allow_netns=False, max_wall_seconds=2700,
+    ) as rs:
+        for _ in rs.series():
+            pass
+        assert rs.digest == ref

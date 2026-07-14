@@ -157,6 +157,24 @@ def test_dispatch_raises_on_nonzero_rc():
                       base_seed=1, block=10)
 
 
+def test_dispatch_rc3_relays_one_line_miner_rejection():
+    """Incident 2026-07-14: miners with PRIVATE Hippius repos surfaced as
+    15-line infra tracebacks. Worker rc=3 = miner fault; only the final stderr
+    line (the one-line reason) travels to the orchestrator log."""
+    stderr = ("Traceback (most recent call last):\n  File ...\n"
+              "ERROR cascade.trainer.worker: miner submission rejected: "
+              "generator_artifact_unreachable: HTTP 401 for ns/repo@sha256:aa\n")
+    disp = RemoteDispatcher(trainer_spec="m:C",
+                            _runner=lambda argv, t: _fake_proc(rc=3, stderr=stderr))
+    with pytest.raises(RemoteDispatchError) as ei:
+        disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="challenger",
+                      base_seed=1, block=10)
+    msg = str(ei.value)
+    assert "miner submission rejected" in msg
+    assert "generator_artifact_unreachable: HTTP 401" in msg
+    assert "Traceback" not in msg
+
+
 def test_dispatch_rejects_role_mismatch():
     out = f"{RECEIPT_SENTINEL}{json.dumps(_receipt_dict(role='challenger'))}"
     disp = RemoteDispatcher(trainer_spec="m:C", _runner=lambda argv, t: _fake_proc(stdout=out))
@@ -191,7 +209,8 @@ class _RecordingDispatcher:
     def __init__(self, *a, **k):
         pass
 
-    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block, arch_preset=None):
+    def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                 arch_preset=None, lane_count=None):
         _RecordingDispatcher.calls.append((host.name, role, gen_ref))
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 

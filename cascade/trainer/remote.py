@@ -186,17 +186,51 @@ def worker_argv(
 PREEMPT_BENCHMARKS = "pkill -f 'bin/cascade[-]benchmark( |$)' 2>/dev/null; "
 
 
-def build_remote_command(host: RemoteHost, argv: list[str], env: dict[str, str]) -> str:
+def pod_lane_count(host: RemoteHost, hosts: list[RemoteHost] | None) -> int:
+    """How many worker lanes share ``host``'s physical pod in the active fleet.
+
+    A multi-GPU pod appears in the hosts list as one ``[[host]]`` entry per
+    GPU lane — same SSH endpoint, different ``cuda_device`` — so lanes on a
+    pod are exactly the entries sharing ``(host, port)``. Only the
+    orchestrator can count this fan-out (each lane's pod-side view is a
+    masked single device); the count travels to the pod via
+    :func:`build_remote_command` so the sandbox can slice cores fairly.
+    Endpoint-less host objects (test stubs) count as single-lane.
+    """
+    key = (getattr(host, "host", None), getattr(host, "port", None))
+    if not hosts or key[0] is None:
+        return 1
+    return sum(
+        1 for h in hosts
+        if (getattr(h, "host", None), getattr(h, "port", None)) == key
+    ) or 1
+
+
+def build_remote_command(
+    host: RemoteHost, argv: list[str], env: dict[str, str],
+    *, lane_count: int | None = None,
+) -> str:
     """The single shell string ssh runs on the pod: benchmark preemption, then
     ``cd workdir && ENV… argv``.
 
     Everything is ``shlex.quote``d so credentials/paths with spaces or shell
     metacharacters can't break out.
+
+    ``lane_count`` (the pod's lane fan-out, see :func:`pod_lane_count`) stamps
+    ``CASCADE_LANE_INDEX``/``CASCADE_LANE_COUNT`` into the lane's env — the
+    seam the sandbox's per-lane CPU fairness reads (``_lane_cpu_slice``). Both
+    are OMITTED unless the pod runs >1 lane AND ``cuda_device`` is a single
+    device ordinal, so local runs, single-lane pods, and non-lane masks keep
+    today's behavior exactly.
     """
     prefix = ""
     full_env = dict(env)
     if host.cuda_device is not None:
         full_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
+        device = str(host.cuda_device).strip()
+        if lane_count is not None and lane_count > 1 and device.isdigit():
+            full_env["CASCADE_LANE_INDEX"] = device
+            full_env["CASCADE_LANE_COUNT"] = str(int(lane_count))
     if full_env:
         prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(full_env.items())) + " "
     return f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {prefix}{shlex.join(argv)}"
@@ -270,6 +304,7 @@ class RemoteDispatcher:
         arch_preset: str | None = None,
         train_hours: float | None = None,
         repo_suffix: str = "",
+        lane_count: int | None = None,
     ) -> TrainedEntry:
         import os
 
@@ -279,7 +314,7 @@ class RemoteDispatcher:
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
         )
         env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
-        remote_cmd = build_remote_command(host, argv, env)
+        remote_cmd = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
                  host.cuda_device)
@@ -287,6 +322,13 @@ class RemoteDispatcher:
             proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds)
         except subprocess.TimeoutExpired as e:
             raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
+        if proc.returncode == 3:
+            # Worker rc=3 = miner submission rejected (CorpusError): the last
+            # stderr line is the one-line reason — no traceback to relay.
+            reason = (proc.stderr or "").strip().splitlines()[-1:] or ["(no reason)"]
+            raise RemoteDispatchError(
+                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}"
+            )
         if proc.returncode != 0:
             tail = (proc.stderr or "")[-2000:]
             raise RemoteDispatchError(

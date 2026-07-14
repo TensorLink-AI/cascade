@@ -142,6 +142,29 @@ def seed_from_block_hash(block_hash: str) -> int:
     )
 
 
+def _defuse_substrate_destructor() -> None:
+    """Neuter async_substrate_interface's hanging ``__del__``.
+
+    Its destructor closes the websocket, whose close handshake ``join()``s a
+    thread with NO timeout — on a dead connection that join never returns, and
+    because ``__del__`` runs wherever garbage collection happens to fire, it
+    hangs the MAIN thread of whatever service triggered it. Observed live
+    2026-07-14: the validator froze mid-poll for 5.5h (rounds went unscored)
+    with the main thread parked in ``__del__ → close → join``. A leaked socket
+    on GC is harmless (the process's daemon threads die at exit); a hang is
+    fatal. Idempotent, best-effort, version-tolerant.
+    """
+    try:
+        from async_substrate_interface import sync_substrate
+
+        for cls_name in ("SubstrateInterface",):
+            cls = getattr(sync_substrate, cls_name, None)
+            if cls is not None and getattr(cls, "__del__", None) is not None:
+                cls.__del__ = lambda self: None  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001 — defusal must never break client construction
+        pass
+
+
 def _import_bittensor():
     try:
         import bittensor  # type: ignore
@@ -210,6 +233,7 @@ class ChainClient:
     def subtensor(self):
         if self._subtensor is None:
             bt = _import_bittensor()
+            _defuse_substrate_destructor()
             # bittensor <9 exposed a lowercase ``subtensor`` factory; 9+/10 only
             # ship the ``Subtensor`` class. Support both so the client works
             # across the ``bittensor>=8`` range pyproject allows.
@@ -350,11 +374,18 @@ class ChainClient:
                 # One miner's malformed (non-hex) revealed commitment makes
                 # bittensor's BATCH decoder raise for the WHOLE netuid — which
                 # would blind the trainer to every other miner's submission (a
-                # field-wide DoS from a single bad commit). Fall back to a
-                # per-UID decode that skips only the undecodable entry.
+                # field-wide DoS from a single bad commit). Read the raw store
+                # ourselves: ONE query_map for the netuid, tolerant per-entry
+                # decode (~1s), instead of N per-UID queries (~13 min live —
+                # long enough to blow the provisioner's rental window).
                 log.warning("bulk revealed-commitment decode failed (%s); "
-                            "falling back to per-UID decode", e)
-                return self._revealed_per_uid(sub, meta, coldkeys)
+                            "reading the raw store map", e)
+                try:
+                    return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys)
+                except Exception as e2:  # noqa: BLE001
+                    log.warning("raw store map failed (%s); "
+                                "falling back to per-UID decode", e2)
+                    return self._revealed_per_uid(sub, meta, coldkeys)
             for hotkey, reveals in revealed.items():
                 uid = uid_by_hotkey.get(str(hotkey))
                 if uid is None or not reveals:
@@ -377,6 +408,75 @@ class ChainClient:
         # No bulk API (older bittensor): decode per-UID.
         return self._revealed_per_uid(sub, meta, coldkeys)
 
+    def _raw_revealed_entries(self, sub: Any, hotkey: str) -> list[tuple[int, str]]:
+        """Read ``Commitments::RevealedCommitments`` directly and decode BOTH
+        substrate renderings — the escape hatch for bittensor's decoder bug.
+
+        py-substrate-interface returns storage bytes as a ``0x…`` hex string
+        UNLESS the bytes happen to be valid UTF-8, in which case it returns the
+        decoded string — and whether a reveal's bytes are UTF-8-valid depends
+        on its SCALE length prefix, i.e. on the PAYLOAD LENGTH
+        (``(4·len+1) mod 256 < 128`` ⇒ raw). bittensor's
+        ``decode_revealed_commitment`` assumes hex and raises ``fromhex`` on the
+        raw rendering, silently costing that miner every round (observed live:
+        7 UIDs skipped purely by pointer-length lottery — ``@hf:`` pointers at
+        91 chars raw, ``@sha256:`` at 109 hex). Returns ``[(block, payload)]``.
+        """
+        q = sub.substrate.query(module="Commitments",
+                                storage_function="RevealedCommitments",
+                                params=[self.netuid, hotkey])
+        return self._decode_reveal_entries(getattr(q, "value", None))
+
+    @staticmethod
+    def _decode_reveal_entries(v: Any) -> list[tuple[int, str]]:
+        """Decode a RevealedCommitments storage value (either rendering) into
+        ``[(block, payload)]``, skipping undecodable entries."""
+        out: list[tuple[int, str]] = []
+        for entry in (v or []):
+            try:
+                com, block = entry
+                if not isinstance(com, str) or not com:
+                    continue
+                if com.startswith("0x"):
+                    raw = bytes.fromhex(com[2:])
+                else:
+                    raw = com.encode("utf-8")
+                # strip the SCALE compact length prefix (mode in the low 2 bits)
+                mode = raw[0] & 0b11
+                offset = 1 if mode == 0 else 2 if mode == 1 else 4
+                payload = raw[offset:].decode("utf-8", errors="ignore")
+                if payload:
+                    out.append((int(block), payload))
+            except Exception:  # noqa: BLE001 — one bad entry is not the field
+                continue
+        return out
+
+    def _revealed_raw_map(self, sub: Any, uid_by_hotkey: dict[str, int],
+                          coldkeys: list | None) -> list[Commitment]:
+        """All revealed commitments for the netuid in ONE ``query_map``, with the
+        tolerant both-renderings decode per entry.
+
+        Verified live on testnet: 38 hotkeys in ~1.1s where the per-UID path
+        takes ~13 minutes — the difference between making and missing the
+        provisioner's pre-boundary rental window."""
+        qm = sub.substrate.query_map(module="Commitments",
+                                     storage_function="RevealedCommitments",
+                                     params=[self.netuid], page_size=200)
+        out: list[Commitment] = []
+        for key, value in qm:
+            hotkey = str(getattr(key, "value", key))
+            uid = uid_by_hotkey.get(hotkey)
+            if uid is None:
+                continue
+            entries = self._decode_reveal_entries(getattr(value, "value", value))
+            if not entries:
+                continue
+            block, payload = max(entries, key=lambda r: int(r[0]))
+            out.append(Commitment(uid=uid, hotkey=hotkey,
+                                  coldkey=str(coldkeys[uid]) if coldkeys else None,
+                                  payload=payload, reveal_block=int(block)))
+        return out
+
     def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None) -> list[Commitment]:
         """Decode each UID's revealed commitment individually — robust to a single
         malformed entry that would poison bittensor's batch decoder.
@@ -394,9 +494,20 @@ class ChainClient:
             if per_uid is not None:
                 try:
                     reveals = per_uid(self.netuid, uid)
-                except Exception as e:  # noqa: BLE001 — skip only this bad entry
-                    log.warning("skipping uid %d: revealed-commitment decode failed: %s", uid, e)
-                    continue
+                except Exception as e:  # noqa: BLE001 — try the raw store before skipping
+                    # bittensor's decoder chokes on the raw substrate rendering
+                    # (see _raw_revealed_entries) — read the store ourselves so a
+                    # miner is never skipped for their pointer's LENGTH.
+                    try:
+                        reveals = self._raw_revealed_entries(sub, hotkey)
+                    except Exception:  # noqa: BLE001
+                        reveals = None
+                    if not reveals:
+                        log.warning("skipping uid %d: revealed-commitment decode failed: %s",
+                                    uid, e)
+                        continue
+                    log.info("uid %d: recovered reveal via raw store (bittensor "
+                             "decoder bug — payload-length lottery)", uid)
                 if reveals:
                     block, payload = max(reveals, key=lambda r: int(r[0]))
                     if isinstance(payload, str) and payload:

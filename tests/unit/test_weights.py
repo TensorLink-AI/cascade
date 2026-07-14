@@ -141,4 +141,4 @@ def test_decay_out_of_bounds_rejected():
 
 def test_king_decay_loads_from_toml(cfg):
     # shipped chain.toml keeps the flat split (back-compat)
-    assert cfg.scoring.king_decay == 1.0
+    assert cfg.scoring.king_decay == 0.5   # geometric decay shipped (2026-07-14)

@@ -166,6 +166,37 @@ def test_heat_screens_field_down_to_one_finalist(cfg, tmp_path, monkeypatch):
     assert sorted(e.size for e in manifest.entries_for_role("challenger")) == sizes
 
 
+def test_heat_complete_marker_written_when_heat_settles(cfg, tmp_path, monkeypatch):
+    """The provisioner's heat-teardown signal: once the field is screened and
+    finalists chosen, ``work_root/<round_id>/heat_complete.json`` appears with
+    the settled field — heat pods are safe to release from that moment."""
+    _patch_train_boundaries(monkeypatch)
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "1", "screened": 3, "finalists": ["c"]}
+    assert not (tmp_path / "1" / "heat_complete.json.tmp").exists()  # atomic publish
+
+
+def test_heat_complete_marker_written_even_without_a_screen(cfg, tmp_path, monkeypatch):
+    """Field ≤ finalists ⇒ no screening runs, but the heat stage is still
+    settled (no heat dispatch can follow) — the marker must appear anyway."""
+    _patch_train_boundaries(monkeypatch)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    runner.run_round(commits, king_hotkey="a", base_seed=7, block=10)
+
+    marker = json.loads((tmp_path / "7" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "7", "screened": 1, "finalists": ["b"]}
+
+
 def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     # Same field as above: cheapest (c) advances, everyone else is screened.
@@ -309,7 +340,7 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix=""):
+                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
             dispatched.append({"hotkey": hotkey, "role": role, "arch_preset": arch_preset,
                                "train_hours": train_hours, "repo_suffix": repo_suffix})
             return TrainedEntry(
@@ -433,7 +464,7 @@ def test_remote_dispatch_retries_once_on_next_host(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix=""):
+                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
             key = (hotkey, role, train_hours is not None)
             calls.setdefault(key, []).append(host)
             if key not in failed_once:
@@ -552,7 +583,7 @@ def test_stage_tagged_hosts_split_heat_from_final(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix=""):
+                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
             dispatched.append((host.name, role, train_hours is not None))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
@@ -609,7 +640,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
             self.timeout_seconds = timeout_seconds
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix=""):
+                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
             timeouts.append((train_hours is not None, self.timeout_seconds))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
@@ -712,3 +743,15 @@ def test_drop_final_content_clones_prefers_earliest_reveal():
     kept = _drop_final_content_clones(entries, jobs)
     assert [(e.miner_hotkey, e.size) for e in kept] == [
         ("king", "s1"), ("orig", "s1"), ("copier", "s2")]
+
+def test_commit_floor_drops_pre_launch_commits():
+    """Mainnet go-live gate: commits from before floor_block never resolve —
+    not into the field, and (via the same path) not into a throne."""
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 100),
+               _commit(2, "c", REF_C, 99)]
+    got = resolve_commitments(commits, floor_block=100)
+    assert [r.hotkey for r in got] == ["b"]           # only the post-live commit
+    assert [r.hotkey for r in resolve_commitments(commits, floor_block=0)] == ["a", "b", "c"]
+    # floor composes with the cutoff: post-live but pre-boundary only
+    got = resolve_commitments(commits, cutoff_block=100, floor_block=99)
+    assert [r.hotkey for r in got] == ["c"]

@@ -44,6 +44,32 @@ log = logging.getLogger("cascade.trainer.toto2")
 LOG_EVERY_STEPS = 50
 
 
+class _TimedStream:
+    """Iterator shim that accumulates seconds spent blocked in ``next()``.
+
+    Starvation telemetry: with a streaming corpus the GPU stalls whenever the
+    sandboxed generator falls behind, and that stall is invisible in the loss
+    curve — a ``deadline_hit`` alone can't say whether the device was slow or
+    the data path was starved. ``wait_s`` separates the two: it is exactly the
+    time training spent waiting on the corpus, so ``wait_s / train_seconds``
+    (``data_wait_frac``) reads directly as "fraction of the run starved".
+    """
+
+    def __init__(self, stream: Iterator[np.ndarray]) -> None:
+        self._it = iter(stream)
+        self.wait_s = 0.0
+
+    def __iter__(self) -> _TimedStream:
+        return self
+
+    def __next__(self) -> np.ndarray:
+        t0 = time.perf_counter()
+        try:
+            return next(self._it)
+        finally:
+            self.wait_s += time.perf_counter() - t0
+
+
 def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
     """warmup_cosine over the token budget: linear warmup then cosine to 0."""
     if warmup > 0 and token_pos < warmup:
@@ -243,6 +269,11 @@ class Toto2Trainer:
         # stays byte-reproducible under the shared training_seed.
         mask_rng = np.random.default_rng(training_seed % (2**63))
 
+        # Timed corpus pulls: every second blocked in next() is starvation the
+        # loss curve can't show (see _TimedStream) — surfaced as data_wait_s /
+        # data_wait_frac in the run's metrics and per-step records.
+        timed_stream = _TimedStream(stream)
+
         # Bucketed batching: series shorter than the full context still train (the
         # generator's max_length can be < context_length). Each batch holds series
         # of the same patch count P, so a single forward covers them; P caps at
@@ -250,7 +281,7 @@ class Toto2Trainer:
         # input spans (mask channel = 1) so the model learns to fill multiple
         # future patches from one forward pass — targets stay unmasked.
         for arr in iter_training_batches(
-            stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
+            timed_stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
         ):
             if deadline is None:             # first batch: training starts NOW
@@ -308,6 +339,8 @@ class Toto2Trainer:
                     "event": "step", "step": step, "loss": last_loss, "lr": lr,
                     "tokens": tokens, "tokens_frac": tokens / max(1, token_budget),
                     "throughput_tokens_per_s": tokens / elapsed,
+                    # live starvation signal: rides the existing S3/wandb sink
+                    "data_wait_frac": round(timed_stream.wait_s / elapsed, 3),
                 })
             if tokens >= token_budget or time.time() > deadline:
                 break
@@ -339,6 +372,14 @@ class Toto2Trainer:
             "throughput_tokens_per_s": tokens / max(1e-6, train_seconds),
             "gpu_name": gpu_name, "deterministic": self.deterministic,
             "deadline_hit": deadline_hit,
+            # Starvation + budget telemetry: how long training sat blocked on
+            # the corpus, as seconds and as a fraction of the training wall
+            # time (>1 possible when the FIRST batch is slow — waits before
+            # t0 count, the clock starts at the first batch), and how much of
+            # the token budget the run actually consumed.
+            "data_wait_s": round(timed_stream.wait_s, 1),
+            "data_wait_frac": round(timed_stream.wait_s / max(train_seconds, 1e-6), 3),
+            "tokens_frac": round(tokens / max(1, token_budget), 3),
         }
         if logger is not None:
             logger({"event": "done", **metrics})

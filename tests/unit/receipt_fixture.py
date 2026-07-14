@@ -3,7 +3,8 @@
 Shared by the receipt schema tests and the ``cascade-audit`` tests: every
 derivable quantity in the fixture is *actually derived* (base seed from the
 block hash, round seeds from the base seed, the verdict from the recorded
-scores via ``evaluate_round``, weights via ``equal_share_vector``), so a Tier-0
+scores via ``evaluate_round``, weights via ``decayed_share_vector`` at the
+config's own king_decay), so a Tier-0
 audit of the untampered fixture passes every recomputation — and any single
 mutation trips exactly the corresponding check.
 
@@ -18,7 +19,7 @@ import numpy as np
 
 from cascade.eval.koth import KothParams, evaluate_round
 from cascade.eval.scoring import WindowScore
-from cascade.shared.chain import equal_share_vector, seed_from_block_hash
+from cascade.shared.chain import decayed_share_vector, seed_from_block_hash
 from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -137,7 +138,12 @@ def make_scored_receipt(cfg=None, *, validator_hotkey: str = "", trainer_wallet=
         result=result, dethrone_cp=params.dethrone_cp, keep_former_kings=1,
     )
     reward_uids = (1, 0) if transition.dethroned else (0,)
-    weights = tuple(equal_share_vector(list(reward_uids), 4, burn_uid=0))
+    # Use the SAME decay the validator reads from cfg — hardcoding a flat
+    # split strands every audit fixture the moment [scoring] king_decay moves
+    # (it did: 1.0 → 0.5, 2026-07-14).
+    decay = cfg.scoring.king_decay if cfg is not None else 1.0
+    weights = tuple(decayed_share_vector(list(reward_uids), 4,
+                                         decay=decay, burn_uid=0))
 
     receipt = build_receipt(
         round_id=manifest.round_id,

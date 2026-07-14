@@ -1,7 +1,10 @@
 # TESTNET config — pass with `--chain-toml chain.testnet.toml` to validator/trainer.
-# Kept separate from the mainnet template (chain.toml) so storage never collides
-# across networks: distinct netuid, buckets, and state DBs. Values that differ
-# from the mainnet template are tagged TESTNET; see chain.toml for key docs.
+# Kept separate from the committed mainnet template (chain.toml) so storage never
+# collides across networks: distinct netuid, manifest/logs buckets, hub_namespace,
+# and state DBs. This file is gitignored (carries the testnet eval-pool ref).
+#
+# Single source of truth for active subnet configuration. Miners, the trainer,
+# and validators all read this file via cascade.shared.config. Schema is versioned.
 
 schema_version = 1
 
@@ -11,31 +14,53 @@ name = "cascade"
 description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Toto2-4M trained from scratch."
 
 [generator]
+# Bounds the trainer enforces on every generator's output. A generator that
+# violates any of these fails to qualify for the round (it can never affect the
+# king's run). From-scratch training wants more *unique* synthetic data than a
+# fine-tune does, so the corpus budget is larger here and is a real signal knob.
 corpus_n_series      = 16384     # series drawn from each generator per training run
 min_length           = 64        # per-series length band (timesteps)
-max_length           = 4096      # keep in lockstep with [training] context_length
-max_total_points     = 2_000_000_000
-max_generate_seconds = 600       # TESTNET: shorter stall window to fit the ~6-min heat budget (mainnet 1800)
+max_length           = 4096      # = [training] context_length (train on the full context,
+                                 # as Toto 2.0 does — see chain.toml); keep in lockstep
+max_total_points     = 2_000_000_000 # raised off 64M; real corpus size is set by corpus_n_series + memory/streaming (see notes)
+max_generate_seconds = 600       # TESTNET: generator stall window (streaming: max seconds
+                                 # between series). 1800s dwarfed the ~6-min heat budget —
+                                 # one stalling generator could idle a heat slot for 30 min;
+                                 # 600s still absorbs sandbox boot + torch import for the
+                                 # first frame. (Mainnet template keeps 1800.)
 max_memory_mb        = 4096      # rlimit for the generation sandbox
-max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
-max_channels         = 1         # per-series variates; 1 = univariate
-# Structural data-quality gates (see chain.toml).
-max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied
-reject_constant      = false     # reject flat (zero-range) series (parked for v1)
-max_dup_fraction     = 0.05      # cache_reuse only: max fraction of exact byte-duplicate series
-# Generation sandbox (see chain.toml). Testnet keeps the permissive defaults;
-# on mainnet set sandbox_strict = true or use a digest-pinned container.
+max_repo_mb          = 128       # cap on the fetched submission. Generators are code-only
+                                 # (purely algorithmic) — no shipped weights — so a repo is
+                                 # source + config, a few MB; this is the wall that actually
+                                 # makes a distilled model impossible. max_memory_mb /
+                                 # max_generate_seconds bound it at runtime.
+max_channels         = 1         # per-series variates. 1 = univariate (generators may
+                                 # yield 1-D, promoted to (1, L)); raise to enable
+                                 # multivariate priors without a schema change.
+# Cheap data-quality gates on generator output (see chain.toml for the rationale).
+max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.
+reject_constant      = false     # reject flat (zero-range) series (parked for v1).
+max_dup_fraction     = 0.05      # cache_reuse only: loose few-% cap on exact byte-duplicate series.
+# Generation sandbox (see chain.toml for the full explanation). Testnet keeps
+# the permissive defaults; on mainnet either set sandbox_strict = true or run
+# sandbox_mode = "container" with a digest-pinned sandbox_image.
 sandbox_mode   = "subprocess"
 sandbox_image  = ""
 sandbox_python = "python3"
 sandbox_strict = false
 
 [training]
-# The FIXED training contract — identical for king and challenger; folded into
-# contract_digest. See chain.toml for the full key docs.
+# The FIXED training contract — identical for king and challenger. The only
+# thing that varies between the two trained models is the generator's data.
+#
+# cascade trains a Toto2 backbone FROM RANDOM INIT on each corpus (it does not
+# fine-tune a released checkpoint): from scratch, the corpus is the only source
+# of learned signal. So the whole recipe is pinned here and folded into
+# contract_digest. Arch defaults track Datadog/Toto-2.0-4m — pin the exact
+# integers and base_arch_digest to that checkpoint's config.json before launch.
 base_arch          = "toto2"
 arch_preset        = "toto2-4m"
-base_arch_digest   = "953e40d292e037ea07ffea25ae1fdf2e8b7dc8990276c081fa67fb4371396147"  # recompute with `cascade-trainer --offline`
+base_arch_digest   = "953e40d292e037ea07ffea25ae1fdf2e8b7dc8990276c081fa67fb4371396147"  # recomputed for the CPM/Toto-2.0 arch + z-clamp (`cascade-trainer --offline`)
 # architecture (head_dim fixed at 64 across the Toto2 family; patch_size 32)
 d_model            = 256
 num_layers         = 4
@@ -51,36 +76,69 @@ cpm_c_max          = 16
 cpm_p_max          = 0.4
 input_transform    = "arcsinh_causal"
 # I/O lengths — must match [eval] so the trained model fits the eval windows
-context_length     = 4096
+context_length     = 4096    # Toto 2.0 training context (Table 1); was 512
 horizon            = 64
-# Token-count-enforced compute budget (see chain.toml).
-target_train_hours          = 0.25     # TESTNET: 15-min final budget per model (mainnet 3.0)
+# from-scratch budget — train each model for ~target_train_hours of GPU on the
+# OWNER'S REFERENCE BOX. Enforced as a fixed token count (= hours × reference
+# throughput, the train_tokens property) so king and challenger see identical
+# compute regardless of data-dependent throughput — a raw 3h timer would let a
+# generator win by emitting cheap-to-step data instead of better data, and would
+# not reproduce on a re-derived audit run. max_train_seconds is the hard guard.
+target_train_hours          = 0.75     # TESTNET: 45-min final budget per king/challenger (was 0.25≈15min)
 ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes the budget
+                                        # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
 warmup_fraction             = 0.05
-batch_size                  = 64       # Toto 2.0 global batch size
+batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was 256
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
-base_lr            = 4e-3        # u-muP width-independent learning rate
+base_lr            = 4e-3         # u-muP width-independent learning rate
 weight_decay       = 0.05
 lr_schedule        = "warmup_cosine"
-umup_base_d_model  = 256         # proxy width the HPs were tuned at
+umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 900         # TESTNET: cap = the 15-min final budget (mainnet 10800)
-# Corpus feed mode (see chain.toml): stream_cpu | stream_gpu | cache_reuse.
-# TESTNET uses stream_gpu: the base generator imports torch, which stream_cpu's
-# RLIMIT_AS cap (max_memory_mb) kills on import.
-corpus_mode = "stream_gpu"
-# GPU SKU pin for byte-exact re-derivation (see chain.toml). Empty = only
-# require king and challenger to match each other.
+max_train_seconds  = 2700        # TESTNET: cap = the 45-min final budget itself, measured
+                                  # from the first training batch. Token budget or deadline —
+                                  # first reached stops; a time stop is flagged deadline_hit.
+                                  # (Was 14400 — longer than the whole 3h testnet epoch.)
+# corpus feed mode — how generator data reaches the trainer. Identical for king
+# and challenger (folded into contract_digest). Three modes to A/B for now:
+#   stream_cpu  — live-stream fresh series from a CPU generator, no reuse, until
+#                 the token budget. Byte-exact reproducible (rolling digest).
+#   stream_gpu  — live-stream from a GPU-resident generator (torch). High
+#                 throughput, but audit is tolerance/same-hardware, not byte-exact.
+#                 Wired: torch is on the [dependencies] allowlist and the sandbox
+#                 has a GPU profile (relaxed RLIMIT_AS + CUDA env). Run the trainer
+#                 in a no-egress container, since RLIMIT_AS no longer bounds it.
+#   cache_reuse — draw a fixed corpus once, then multi-pass it under the budget.
+#                 Byte-exact, but reuses data (some memorisation).
+corpus_mode = "stream_gpu"   # TESTNET: base_generator imports torch (gpytorch GP-prior); stream_cpu's
+                             # RLIMIT_AS cap (max_memory_mb) kills torch on import. stream_gpu relaxes it.
+# Pin the GPU model for BYTE-EXACT re-derivation. The reference trainer runs
+# deterministically (deterministic cuBLAS/cuDNN, math attention, seeded RNG), so
+# on a fixed GPU SKU king/challenger and any audit re-run reproduce the exact
+# checkpoint. Set this to the exact torch device name of the SKU you rent on both
+# pods (e.g. "NVIDIA H100 80GB HBM3" — check with torch.cuda.get_device_name(0));
+# the validator then rejects any manifest whose entries weren't trained on it.
+# Empty = only require king and challenger to match each other.
 expected_gpu = ""
-# Training-runtime image pin (see chain.toml). Empty = unpinned — fine for testnet.
+# Pin the training-runtime IMAGE for byte-exact re-derivation (see chain.toml).
+# Set to the digest-pinned worker-image ref (…@sha256:<64hex>) or a bare
+# sha256:<64hex>, and inject the same digest as CASCADE_TRAIN_IMAGE_DIGEST into
+# each pod env at launch; final runs then refuse a mismatched runtime. Folded
+# into contract_digest. Empty = unpinned — fine for testnet iteration.
 train_image_digest = ""
 
-# Extra final-stage sizes (see chain.toml). 20M (Toto2-22M) is DISABLED at
-# launch; use testnet to validate the multi-size path first.
+# Extra final-stage sizes (see chain.toml for the full explanation). The throne
+# is decided on the COMBINED score across all sizes.
+#
+# === 20M (Toto2-22M) is DISABLED at launch ===
+# Uncomment to bring the 20M size into the final (combined 4M+20M throne). Use
+# testnet to validate the multi-size path first: pin width/depth + base_arch_digest
+# to the released Datadog/Toto-2.0-22m and recompute with
+# `cascade-trainer --offline --chain-toml chain.testnet.toml`.
 # [[training.sizes]]
 # arch_preset                 = "toto2-22m"
-# base_arch_digest            = "c7ecca53ed939eabfc34ccdb8a698d69101526c24f299efa21c0c0c288c96792"
+# base_arch_digest            = "c7ecca53ed939eabfc34ccdb8a698d69101526c24f299efa21c0c0c288c96792"  # sha256 of this size's frozen arch+init; recompute with `cascade-trainer --offline`
 # d_model                     = 512
 # num_layers                  = 8
 # num_heads                   = 8
@@ -88,68 +146,115 @@ train_image_digest = ""
 # ref_throughput_tokens_per_s = 90000
 
 [round]
-# Two-stage (heat → final) selection. TESTNET uses a short epoch so rounds turn
-# over quickly for iteration (mainnet template = 7200 ≈ 24h).
-epoch_blocks     = 900    # ~3h at 12s blocks
+# Daily-style cadence + two-stage (heat → final) selection. TESTNET uses a SHORT
+# epoch so rounds turn over quickly for iteration; mainnet template = 7200 (~24h).
+# The base seed is the block hash at the epoch boundary, so the whole epoch shares
+# one RoundSeeds; only commits before the boundary are eligible (the deadline).
+epoch_blocks     = 900    # ~3h at 12s blocks (mainnet template = 7200 ≈ 24h)
 round_hours      = 3.0    # informational
 heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
-heat_num_samples = 10     # samples per window in the heat (0 = reuse [eval] num_samples)
-# Heat wall-clock cap (see chain.toml). Testnet floor is low so the ~6-min heat
-# budget really is the cap.
+heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [eval] num_samples);
+                          # ranking-only, so small keeps the CPU screen quick on a 3h epoch
+# Heat wall-clock cap (see chain.toml): budget hours = the cap, measured from the
+# FIRST TRAINING BATCH (fetch/sandbox boot excluded), token budget or deadline —
+# first reached stops, deadline stop flagged deadline_hit. Testnet floor is low
+# so the ~6-min heat budget really is the cap.
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
+<<<<<<< HEAD
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet true)
 reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin (see chain.toml)
 # Scaling seam (see chain.toml): screen at screen_size, judge the throne at throne_sizes.
+=======
+one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
+# Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
+# throne_sizes. Both default to the 4M primary; point them at a bigger size to
+# promote a rung. To test the sliding window on testnet, uncomment the 22M size
+# above and set e.g. screen_size = "toto2-4m", throne_sizes = ["toto2-22m"].
+>>>>>>> origin/main
 screen_size  = "toto2-4m"
 throne_sizes = ["toto2-4m"]
 
 [eval]
-# Held-out eval windows, private and rotating per round (see chain.toml).
+# Held-out eval windows. The SAME windows are scored for king and challenger,
+# which is what makes the comparison a controlled measurement. The slice is
+# private and ROTATES per round (seeded by the block hash) so a generator cannot
+# distribution-match a fixed public benchmark — see cascade.validator.windows.
 eval_dataset   = "cascade-private-v1"  # identifier the validator matches on
-eval_source    = "private-rotating"    # rotating private pool (vs a fixed public set)
-window_pool    = ""                    # set out-of-band (not committed): the testnet
-                                       # eval-pool Hub/hf ref (see docs/EVAL_POOL.md)
-num_samples    = 40              # TESTNET: reduced for CPU eval speed (mainnet 100)
-n_windows      = 300             # TESTNET: > min_windows(200), tractable on CPU (mainnet 2000)
+eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
+window_pool    = "tensorlink-dev/cascade-eval-pool@hf:36601d31df4be195890bc08a3249980128ad3eb7"  # TESTNET override — set out-of-band (not committed): the testnet eval-pool
+                                          # Hub/hf ref (also lets the trainer heat-screener load).
+                                          # Build with `cascade-pool build` (see docs/EVAL_POOL.md).
+num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
+n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
-# TESTNET: cap datasets per suite for the Cascade king bench stamp — with
-# cascade_enabled = true the full battery alone can blow the 3h epoch.
+# TESTNET: cap datasets per suite for the Cascade king bench stamp. With
+# cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on the king EVERY
+# round, BEFORE the manifest publishes — uncapped (0 = full battery) that alone
+# can blow the 3h epoch, especially on a CPU orchestrator. (Mainnet ships
+# cascade_enabled = false, so its 0 stays the full battery.)
 cascade_bench_max_series = 3
-# Public-benchmark no-regression gate data (see chain.toml).
-gift_gate_datasets    = ""       # gift-eval config subset ("" = full 97 configs)
-gift_gate_num_samples = 0        # 0 reuses num_samples
-gift_gate_data_dir    = ""       # pinned benchmark data dir ("" = suite env vars)
-gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
+# Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
+# gift_gate_mode != "off"). Enforcing validators must have gift-eval data pinned.
+gift_gate_datasets    = ""       # gift-eval config subset for the gate ("" = full 97 configs)
+gift_gate_num_samples = 0        # samples for the gate's gift-eval run; 0 reuses num_samples
+gift_gate_data_dir    = "/root/cascade/bench_data"   # TESTNET: pinned GIFT-Eval/BOOM/TIME data (downloaded 2026-07-10)
+gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
-# King-of-the-hill — single-round, flat-margin dethroning (see chain.toml).
-win_margin_start     = 0.02
-win_margin_end       = 0.02      # == start ⇒ flat margin
-margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup
-min_windows          = 200       # below this many common windows, no decision
-min_clusters         = 0         # min distinct window clusters for a decision; 0 = off
+# King-of-the-hill — single-round, flat-margin dethroning (teutonic-style).
+# A challenger takes the throne the moment ONE round clears the win margin, and
+# the margin does NOT ramp with the king's tenure: every king is equally
+# challengeable (no "entrenched king" bonus). To restore the sticky/tenure
+# behaviour, set dethrone_cp > 1 and win_margin_end > win_margin_start with
+# margin_warmup_rounds > 0.
+win_margin_start     = 0.02      # flat win margin (kept == win_margin_end ⇒ no tenure ramp)
+win_margin_end       = 0.02      # equal to start; with margin_warmup_rounds = 0 the margin
+                                 # is constant at this value regardless of tenure
+margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup (flat margin)
+min_windows          = 80        # TESTNET override (template default 200)
+min_clusters         = 10        # TESTNET override (template default 0). Below this many distinct window clusters (upstream feeds,
+                                 # pool metadata `source`), no decision. Windows from one feed
+                                 # are correlated, so raw window count overstates the evidence;
+                                 # raise to ~30 once the pool carries source labels
+                                 # (e.g. the tsbench_forge source). 0 = off.
 bootstrap_B          = 10000     # paired-bootstrap resamples
 bootstrap_alpha      = 0.05      # one-sided LCB level
-dethrone_cp          = 1         # consecutive round wins to take the throne
-# Reward routing (see chain.toml).
+dethrone_cp          = 1         # consecutive round wins to take the throne (1 = single-round)
+# Reward routing (teutonic-style): equal weight split across the current king
+# plus up to `reward_prior_kings` previous DISTINCT kings that are still
+# registered. If none of them are registered, all weight burns to `burn_uid`.
+# Set reward_prior_kings = 0 for pure winner-take-all on the current king.
 reward_prior_kings   = 4         # prior distinct kings that share weight with the current king
-burn_uid             = 0         # weight sink when no rewarded king is registered
-# Public-benchmark no-regression gate (see chain.toml).
-gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
-gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
-gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
-# Cascade — king-reign promotion / warm-start (see chain.toml). TESTNET: enabled
-# with a 1-day reign for iteration (mainnet defaults off, reign 7).
-cascade_enabled      = true
-cascade_reign_days   = 1
+burn_uid             = 0         # weight sink when no rewarded king is registered (owner burn slot)
+king_decay           = 0.5       # TESTNET override (template default 1.0): geometric decay so the king is clearly highest
+# Public-benchmark no-regression gate (see cascade.eval.gift_gate). AND-ed with
+# the private-pool decision on a win: can BLOCK a dethrone on a broad-public
+# regression, never grant one. Start on "shadow" to calibrate the tolerance.
+gift_gate_mode       = "shadow"  # TESTNET: log-only to calibrate tolerance, then "enforce" (template default "off")
+gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
+gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
+# Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
+# Enabled on testnet with a shorter reign for iteration (mainnet defaults off,
+# reign 7). When the king holds this many consecutive undethroned wall-clock
+# days, the reign's best checkpoint (lowest geomean of the six GIFT-Eval / BOOM /
+# TIME CRPS/MASE numbers the trainer stamps onto the signed manifest) is installed
+# as the warm-start init and the throne is vacated so the field re-competes from
+# it.
+cascade_enabled      = false     # TESTNET: deferred — not running Cascade warm-start promotion / per-round king bench yet (2026-07-13)
+cascade_reign_days   = 1         # consecutive undethroned days before a Cascade fires
 
 [dependencies]
-# Allowlist for a generator's requirements.txt (see chain.toml): generators are
-# purely algorithmic, no weight files; torch is a compute library only.
+# Allowlist for a generator's requirements.txt — supply-chain restriction.
+# Generators are PURELY ALGORITHMIC: they compete on the data-generating prior,
+# not on shipped learned weights, so NO weight files of any kind are accepted
+# (the repo-layout check rejects pickle checkpoints AND code-free containers like
+# safetensors — see cascade.interface.validation). torch stays allowed as a
+# COMPUTE library for GP/kernel priors (gpytorch builds on it), not as a way to
+# ship a distilled model. Still hash-locked and capped at max_packages.
 max_packages = 16
 allowed = [
     "numpy",
@@ -158,7 +263,10 @@ allowed = [
     "statsmodels",
     "numba",
     "torch",
-    # GP/kernel/graph primitives for GP-prior generators (CPU-only generate path)
+    # GP/kernel-family priors (TempoPFN GP-prior, KernelSynth, CauKer). The base
+    # generator draws from Gaussian-process priors with composite kernels and
+    # SCM-DAG causal structure; these supply the GP/kernel/graph primitives.
+    # CPU-only on the generate path — no GPU (cupy) dependency.
     "scikit-learn",
     "gpytorch",
     "networkx",
@@ -190,29 +298,50 @@ blocked = [
 ]
 
 [storage]
-# Hippius storage layer (see chain.toml). Credentials come from the environment:
-# HIPPIUS_HUB_TOKEN (or _USERNAME/_PASSWORD), HIPPIUS_S3_ACCESS_KEY / _SECRET_KEY.
-hub_registry_url = "https://registry.hippius.com"   # informational; client uses its own default
-hub_namespace    = "cascade"                        # Harbor project the robot account can push to;
-                                                    # no separate "cascade-testnet" project exists yet
+# Hippius is cascade's storage layer. Two backends:
+#   registry (Hippius Hub OCI, https://docs.hippius.com/registry) —
+#                     models/checkpoints/generators, pinned by repo@digest.
+#                     Miners commit metro-v1:gen:hippius:<repo>@<digest>; the
+#                     trainer publishes metro-v1:trained:hippius:<repo>@<digest>.
+#   S3 (boto3)      — training manifests + per-round training logs/metrics.
+# Credentials are NEVER in this committed file — they come from the environment:
+#   registry: HIPPIUS_HUB_TOKEN (or HIPPIUS_HUB_USERNAME + HIPPIUS_HUB_PASSWORD)
+#   S3:       HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY
+hub_registry_url = "https://registry.hippius.com"   # informational: the hippius_hub
+                                                    # client targets its own default
+                                                    # endpoint; recorded here for ops
+hub_namespace    = "cascade"                      # Harbor project the robot account can push to
+                                                    # (robot$cascade+...). NOTE: no separate
+                                                    # "cascade-testnet" Harbor project exists yet;
+                                                    # create one + grant the robot to re-separate.
 s3_endpoint      = "https://s3.hippius.com"
 s3_region        = "decentralized"
-manifest_bucket  = "cascade-testnet-manifests"      # TESTNET bucket (mainnet: cascade-manifests)
-logs_bucket      = "cascade-testnet-logs"           # TESTNET bucket (mainnet: cascade-logs)
-# Eval-pool bucket (see chain.toml). Empty = use the static [eval] window_pool ref.
-pool_bucket      = ""                               # e.g. "cascade-eval-pool"
-pool_s3_endpoint = ""                               # e.g. Cloudflare R2; empty = Hippius S3 above
+manifest_bucket  = "cascade-testnet-manifests"    # TESTNET bucket (mainnet: cascade-manifests)
+logs_bucket      = "cascade-testnet-logs"         # TESTNET bucket (mainnet: cascade-logs)
+# Eval-pool bucket: daily snapshots + pool/index.json. When set, validators pull
+# the rotating pool from here (deterministic per-round snapshot selection) instead
+# of a static [eval] window_pool ref — the owner publishes daily with
+# `cascade-pool publish`. Leave empty to use the static ref path.
+pool_bucket      = "cascade-testnet-eval-pool"    # TESTNET override
+# Point these at Cloudflare R2 (+ POOL_S3_ACCESS_KEY / POOL_S3_SECRET_KEY) to
+# publish/pull the pool there; empty = reuse the Hippius S3 endpoint above.
+pool_s3_endpoint = ""
 pool_s3_region   = ""
-# S3-compatible backup of the manifest/receipt bucket (see chain.toml).
-# Credentials via BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.
+# Cloudflare R2 (or any S3-compatible) BACKUP of the manifest/receipt bucket:
+# dual-writes every manifest/receipt to R2 (a full backup, not just an outage
+# failover) and reads fall back there when Hippius S3 is down. Credentials via
+# BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY. See chain.toml for details.
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+hf_backup_repo   = "tensorlink-dev/cascade-testnet-mirror"   # TESTNET: S3-down fallback
 
 [manifest]
-# Signed training receipts (see chain.toml). trainer_hotkey is the only signer
-# a validator trusts.
+# The trainer publishes signed training receipts to the manifest S3 bucket
+# ([storage] manifest_bucket) and validators read them. trainer_hotkey is the
+# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
 trainer_hotkey  = "5Cyver53HZaxdn6j9K2W9LyaoGxjz1W3cXHoKcaDyzfjfpHs"  # owner hotkey (uid 0 on netuid 259)
+validator_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"  # TESTNET override
 poll_seconds    = 120
 
 [validator]
@@ -225,8 +354,12 @@ cascade_state_db_path      = "cascade_state.testnet.json"
 warm_start_init_path       = "warm_start_init.testnet.json"
 
 [wandb]
-# Optional live training dashboards (see chain.toml). Observability only;
-# WANDB_API_KEY comes from the environment, never this file.
+# Optional LIVE training dashboards (Weights & Biases). Observability only — the
+# numbers here NEVER feed scoring or weights, and held-out eval scores are not
+# sent. When enabled, the trainer mirrors its per-step S3 log into a wandb run
+# (one per round/competitor/size, tagged with the miner hotkey) so miners can
+# watch their generator train as it occurs. Requires the [wandb] extra; the
+# WANDB_API_KEY comes from the environment, never this committed file.
 enabled = true                  # testnet: on so miners can watch live
 project = "cascade-testnet"     # PUBLIC wandb project for miners to view
 entity  = ""                    # wandb team/user (empty = the API key's default)

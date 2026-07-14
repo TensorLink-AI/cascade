@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from deploy.provision import (
+from cascade.provision import (
     DEFAULT_FORWARD_ENV,
     LaunchSpec,
     LiumProvider,
@@ -34,6 +34,7 @@ from deploy.provision import (
     shadeform_pod_address,
     validate_digest_pinned,
 )
+from cascade.provision.core import filter_tagged_names, shadeform_offer_price_usd_hr
 
 IMG = "reg.example/cascade-worker@sha256:" + "a" * 64
 
@@ -81,7 +82,7 @@ class _FakeProvider:
         self.launched: list[str] = []
         self.terminated: list[str] = []
 
-    def available(self, sku, count):
+    def available(self, sku, count, *, gpus=1):
         if self._avail_raises:
             raise self._avail_raises
         return self._available
@@ -180,6 +181,42 @@ def test_lium_launch_injects_ssh_pubkey_env_and_port():
     assert up[up.index("--internal-ports") + 1] == "22"
 
 
+def test_plan_argv_forwards_the_network():
+    """Incident 2026-07-14: the COUNT subprocess defaulted to finney, so a
+    testnet provisioner counted MAINNET's netuid and planned eligible=0 for
+    three consecutive rental windows. The network must ride along."""
+    from pathlib import Path
+
+    from cascade.provision.main import plan_argv
+
+    argv = plan_argv(Path("chain.testnet.toml"), Path("_train_work"), "test")
+    assert argv[argv.index("--network") + 1] == "test"
+    assert argv[argv.index("--chain-toml") + 1] == "chain.testnet.toml"
+    assert "--plan-only" in argv
+    # No network given (defaults intended) → flag genuinely absent.
+    assert "--network" not in plan_argv(None, Path("w"), None)
+
+
+def test_lium_launch_excludes_lemons_and_remembers_machines():
+    """Replacement rents must skip the failed pod's executor (the offer list is
+    deterministic, so an unexcluded replacement re-rents the exact lemon —
+    observed live on round 5052267627071284702's eval slot)."""
+    spawned: list[list[str]] = []
+
+    def _run(argv):
+        import types
+        out = '[{"id": "exec-1"}, {"id": "exec-2"}]' if "ls" in argv else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    names = prov.launch(_spec(count=1, exclude_ids=("exec-1",)))
+    assert spawned[0][:3] == ["lium", "up", "exec-2"]        # lemon skipped
+    assert prov.machine_of(names[0]) == "exec-2"             # loop can name the machine
+    # Exclusions can exhaust the market: explicit error, never a silent re-rent.
+    with pytest.raises(ProvisionError):
+        prov.launch(_spec(count=2, exclude_ids=("exec-1",)))
+
+
 # ── hosts.toml templating ────────────────────────────────────────────────────
 
 
@@ -272,6 +309,50 @@ def test_parse_ssh_port_and_host():
     assert parse_ssh_host("ssh root@1.2.3.4 -p 40060") == "1.2.3.4"
 
 
+def test_lium_wait_ready_fast_fails_when_pod_never_appears():
+    """Live 2026-07-14: a failed `lium up` (executor in post-teardown cooldown)
+    creates NO pod, and wait_ready burned the full 900s polling for a ghost.
+    A pod absent from `lium ps` past the appear window will never arrive —
+    fail fast so the replacement path gets the time instead."""
+    import types
+
+    from cascade.provision.core import LIUM_APPEAR_TIMEOUT
+
+    def _run(argv):
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    clock = {"t": 0.0}
+    prov = LiumProvider(bin="lium", _run=_run,
+                        _sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                        _now=lambda: clock["t"])
+    assert prov.wait_ready("cascade-1-eval-0", timeout=900.0) is False
+    assert clock["t"] <= LIUM_APPEAR_TIMEOUT + prov.poll_interval   # not 900
+
+
+def test_lium_wait_ready_keeps_polling_a_pod_that_appeared():
+    """A listed-but-booting pod gets the FULL timeout (appear fast-fail must
+    only fire for pods that were never listed at all)."""
+    import types
+
+    calls = {"n": 0}
+
+    def _run(argv):
+        calls["n"] += 1
+        pod = {"name": "cascade-1-eval-0", "status": "PENDING", "ssh_cmd": ""}
+        if calls["n"] >= 30:                       # becomes ready late (t≈300s)
+            pod = {"name": "cascade-1-eval-0", "status": "RUNNING",
+                   "ssh_cmd": "ssh root@1.2.3.4 -p 55000"}
+        return types.SimpleNamespace(returncode=0, stdout=__import__("json").dumps([pod]),
+                                     stderr="")
+
+    clock = {"t": 0.0}
+    prov = LiumProvider(bin="lium", _run=_run,
+                        _sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                        _now=lambda: clock["t"])
+    assert prov.wait_ready("cascade-1-eval-0", timeout=900.0) is True
+    assert clock["t"] > 180.0                      # outlived the appear window
+
+
 def test_lium_pod_ready_requires_running_and_ssh():
     assert lium_pod_ready({"status": "RUNNING", "ssh_cmd": "ssh x@y -p 22"})
     assert not lium_pod_ready({"status": "PENDING", "ssh_cmd": "ssh x@y"})
@@ -349,6 +430,48 @@ def test_shadeform_pod_address_reads_ip():
     assert shadeform_pod_address({"ip": "198.51.100.7", "status": "active"}) == \
         PodAddress("198.51.100.7", 22)
     assert shadeform_pod_address({"status": "pending"}) is None
+
+
+def test_shadeform_offer_price_converts_cents_to_usd():
+    # hourly_price is in CENTS; the budget breaker works in USD — a mixup would
+    # 100× (or 1/100×) every projection.
+    assert shadeform_offer_price_usd_hr(_types(price=120), "L40S") == pytest.approx(1.20)
+    assert shadeform_offer_price_usd_hr(_types(available=False), "L40S") is None
+    assert shadeform_offer_price_usd_hr(_types(gpu="H100"), "L40S") is None
+
+
+def test_shadeform_offer_price_picks_cheapest():
+    cheap = _types(price=90)["instance_types"][0]
+    dear = _types(price=200)["instance_types"][0]
+    assert shadeform_offer_price_usd_hr({"instance_types": [dear, cheap]}, "L40S") == \
+        pytest.approx(0.90)
+
+
+# ── tagged-pod listing (the reconcile primitive) ─────────────────────────────
+
+
+def test_filter_tagged_names_by_prefix():
+    pods = [
+        {"name": "cascade-900-heat-0", "id": "i-1"},
+        {"name": "cascade-900-final-0", "id": "i-2"},
+        {"name": "someone-elses-box", "id": "i-3"},
+        {"id": "i-4"},                                   # nameless: never ours
+    ]
+    assert filter_tagged_names(pods, "cascade-", id_key="name") == \
+        ["cascade-900-heat-0", "cascade-900-final-0"]
+    # Shadeform terminates by opaque id, so the id is the returned handle.
+    assert filter_tagged_names(pods, "cascade-", id_key="id") == ["i-1", "i-2"]
+
+
+def test_lium_list_tagged_uses_ps_names():
+    def _run(argv):
+        import types
+        out = ('[{"name": "cascade-900-heat-0", "status": "RUNNING"},'
+               ' {"name": "other", "status": "RUNNING"}]') if "ps" in argv else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    assert LiumProvider(bin="lium", _run=_run).list_tagged("cascade-") == \
+        ["cascade-900-heat-0"]
 
 
 # ── launch + GUARANTEED teardown control flow ────────────────────────────────
@@ -437,3 +560,69 @@ def test_teardown_removes_sidecar_record(tmp_path):
         _run(prov, hosts_path=hp, removed=removed)
     # sidecar was recorded on launch and cleaned up during teardown
     assert removed == [hp.with_suffix(".toml.pods.json")]
+
+
+def test_pick_shadeform_offer_filters_pod_shape():
+    """The fleet plan fans one lane per GPU — a 1x machine against an 8-lane
+    plan strands lanes, so offers must match configuration.num_gpus exactly."""
+    types = {"instance_types": [
+        {"configuration": {"gpu_type": "A6000", "num_gpus": 1}, "hourly_price": 50,
+         "cloud": "hyperstack", "shade_instance_type": "A6000",
+         "availability": [{"region": "r1", "available": True}]},
+        {"configuration": {"gpu_type": "A6000", "num_gpus": 2}, "hourly_price": 100,
+         "cloud": "hyperstack", "shade_instance_type": "A6000x2",
+         "availability": [{"region": "r1", "available": True}]},
+    ]}
+    offer = pick_shadeform_offer(types, "A6000", gpus=2)
+    assert offer is not None and offer["shade_instance_type"] == "A6000x2"
+    assert pick_shadeform_offer(types, "A6000", gpus=8) is None  # no such shape
+
+
+def test_lium_executors_filtered_by_gpu_count(monkeypatch):
+    prov = LiumProvider()
+    canned = ('[{"id": "e1", "gpu_type": "A6000", "gpu_count": 1},'
+              ' {"id": "e8", "gpu_type": "A6000", "gpu_count": 8}]')
+
+    class _P:
+        stdout = canned
+    monkeypatch.setattr(prov, "_cli", lambda argv: _P())
+    assert [e["id"] for e in prov._list_executors("A6000", gpus=8)] == ["e8"]
+    assert prov.available("A6000", 1, gpus=8) is True
+    assert prov.available("A6000", 2, gpus=8) is False  # only one 8x machine
+
+
+def test_shadeform_create_body_vm_mode():
+    """ssh_key_id ⇒ bare-VM launch (bootstrap_script provisions it); no docker
+    config, and the account key is what lets the orchestrator in as 'shadeform'."""
+    spec = LaunchSpec(sku="RTX4090", count=1, image="ignored-in-vm-mode",
+                      ssh_pubkey="ssh-ed25519 AAAA x", gpus_per_pod=4)
+    offer = {"cloud": "excesssupply", "region": "us", "shade_instance_type": "RTX4090x4"}
+    body = shadeform_create_body(spec, offer, name="cascade-900-heat-0",
+                                 ssh_key_id="key-123")
+    assert body["ssh_key_id"] == "key-123"
+    assert "launch_configuration" not in body
+    docker = shadeform_create_body(spec, offer, name="n")     # default: docker mode
+    assert docker["launch_configuration"]["type"] == "docker"
+    assert "ssh_key_id" not in docker
+
+
+def test_build_providers_options():
+    provs = build_providers(["shadeform"], {"shadeform": {"ssh_key_id": "key-123"}})
+    assert provs[0].ssh_key_id == "key-123"
+
+
+def test_lium_launch_omits_image_in_bootstrap_mode(monkeypatch):
+    """Empty image ⇒ default SSH template; a template NAME as --image 400s."""
+    calls = []
+    prov = LiumProvider(_spawn=lambda argv: calls.append(argv))
+    canned = '[{"id": "e1", "gpu_type": "RTX4090", "gpu_count": 4}]'
+
+    class _P:
+        stdout = canned
+    monkeypatch.setattr(prov, "_cli", lambda argv: _P())
+    prov.launch(LaunchSpec(sku="RTX4090", count=1, image="", ssh_pubkey="k",
+                           gpus_per_pod=4, name_prefix="cascade-900-heat"))
+    assert "--image" not in calls[0] and "--name" in calls[0]
+    prov.launch(LaunchSpec(sku="RTX4090", count=1, image="img@sha256:aa", ssh_pubkey="k",
+                           gpus_per_pod=4, name_prefix="cascade-900-heat"))
+    assert "--image" in calls[1]

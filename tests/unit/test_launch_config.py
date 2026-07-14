@@ -31,10 +31,14 @@ def _launch_ready(cfg):
 
 
 def test_assert_launch_ready_flags_default_placeholders(cfg):
-    # the committed chain.toml still has placeholder netuid + trainer_hotkey
-    # (operator secrets); base_arch_digest is pinned, so it must NOT be flagged.
+    # The shipped template is now fully launch-valued (netuid 91, trainer
+    # hotkey set, digests pinned) — flagging is tested by explicitly blanking,
+    # and the shipped file itself must PASS for the trainer role.
+    assert_launch_ready(cfg, role="trainer")
+    blanked = replace(cfg, subnet=replace(cfg.subnet, netuid=0),
+                      manifest=replace(cfg.manifest, trainer_hotkey=""))
     with pytest.raises(LaunchConfigError) as ei:
-        assert_launch_ready(cfg, role="trainer")
+        assert_launch_ready(blanked, role="trainer")
     msg = str(ei.value)
     assert "netuid" in msg and "trainer_hotkey" in msg
     assert "base_arch_digest" not in msg
@@ -53,11 +57,16 @@ def test_assert_launch_ready_passes_when_set(cfg):
     assert_launch_ready(ready, role="validator")      # window_pool ref set too
 
 
-def test_validator_requires_window_pool_ref(cfg):
+def test_validator_requires_some_eval_pool(cfg):
+    """The validator needs A pool source: the daily bucket (recommended) OR a
+    static window_pool ref — only both blank is unlaunchable."""
     ready = _launch_ready(cfg)
-    no_pool = replace(ready, eval=replace(ready.eval, window_pool=""))
+    bucket_only = replace(ready, eval=replace(ready.eval, window_pool=""))
+    assert_launch_ready(bucket_only, role="validator")   # template bucket suffices
+    no_pool = replace(bucket_only,
+                      storage=replace(bucket_only.storage, pool_bucket=""))
     with pytest.raises(LaunchConfigError) as ei:
         assert_launch_ready(no_pool, role="validator")
-    assert "window_pool" in str(ei.value)
+    assert "pool" in str(ei.value)
     # trainer doesn't need the pool, so it still passes
     assert_launch_ready(no_pool, role="trainer")

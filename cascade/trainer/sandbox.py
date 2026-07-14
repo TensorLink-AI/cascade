@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,10 +68,184 @@ _GPU_ENV_KEYS = (
     "CUDA_HOME", "CUDA_DEVICE_ORDER", "LD_LIBRARY_PATH", "PYTORCH_CUDA_ALLOC_CONF",
 )
 
+# The env vars every mainstream BLAS/threadpool implementation honours. Set on
+# the child only when a lane slice is active (see _lane_cpu_slice), so a
+# generator's thread pool matches the cores it can actually run on.
+_BLAS_ENV_KEYS = (
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+)
+
+# Lane-geometry env stamped into each worker lane's environment at DISPATCH
+# (see cascade.trainer.remote.build_remote_command). Only the orchestrator
+# knows a pod's lane fan-out — the pod-side view (a masked
+# CUDA_VISIBLE_DEVICES, torch seeing one device) can't distinguish a
+# single-GPU pod from one lane of eight.
+LANE_INDEX_ENV = "CASCADE_LANE_INDEX"
+LANE_COUNT_ENV = "CASCADE_LANE_COUNT"
+
 _NETNS_PROBE: bool | None = None
+_MEMSCOPE_PROBE: bool | None = None
 
 
 # ───────────────────────────────── parent ──────────────────────────────────
+
+
+def _lane_cpu_slice() -> tuple[set[int], int] | None:
+    """This worker lane's contiguous CPU-core slice, from dispatch-injected env.
+
+    On a multi-GPU cluster pod the orchestrator runs one worker lane per GPU
+    (``CUDA_VISIBLE_DEVICES=<lane>``) but the kernel gives every lane ALL
+    cores, so one lane's multithreaded generator can starve its neighbours'
+    training loops. The dispatcher — the only party that knows the pod's lane
+    fan-out — stamps :data:`LANE_INDEX_ENV`/:data:`LANE_COUNT_ENV` into each
+    lane's env (see ``remote.build_remote_command``); lane ``i`` of ``N`` then
+    owns the contiguous cores ``[i*k, (i+1)*k)`` with ``k = max(1, cpu_count
+    // N)``, so the split is deterministic and equal.
+
+    The total-core figure is ``len(os.sched_getaffinity(0))``, not
+    ``os.cpu_count()``: on docker-template pods (lium) ``cpu_count`` reports
+    the HOST's cores even when the container is cgroup/cpuset-limited, while
+    the affinity set reflects what this process may actually use — and the
+    slice is carved out of the *allowed* core ids, so it stays inside any
+    pre-existing container limit.
+
+    Returns ``(cores, slice_size)``, or ``None`` when the env is absent or
+    malformed (local runs, single-lane pods, tests) — callers then keep the
+    uncapped legacy behavior. With more lanes than cores the slice wraps
+    modulo the core count so every lane still gets at least one VALID core
+    (an out-of-range set would make ``sched_setaffinity`` fail).
+    """
+    idx_s = os.environ.get(LANE_INDEX_ENV, "")
+    cnt_s = os.environ.get(LANE_COUNT_ENV, "")
+    if not (idx_s.isdigit() and cnt_s.isdigit()):
+        return None
+    idx, cnt = int(idx_s), int(cnt_s)
+    if cnt <= 1 or idx >= cnt:  # single lane, or inconsistent geometry
+        return None
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # non-Linux: no affinity API
+        allowed = list(range(os.cpu_count() or 1))
+    ncpu = len(allowed) or 1
+    k = max(1, ncpu // cnt)
+    start = (idx * k) % ncpu
+    cores = set(allowed[start:start + k])
+    return cores, len(cores)
+
+
+def _memory_scope_available() -> bool:
+    """Probe (once) whether systemd-run scopes can wrap a sandbox child.
+
+    The GPU profile skips RLIMIT_AS (torch's virtual-address over-reserve
+    would false-kill it), which leaves host RAM uncapped — a ballooning
+    generator gets the TRAINER OOM-killed, not itself. A ``systemd-run
+    --scope`` cgroup caps RESIDENT memory instead, so torch's VA reservation
+    is harmless while a real balloon dies in its own scope. Inside
+    docker-template pods there is no systemd, so the probe requires both the
+    binary and a successful trial scope; on failure this degrades to current
+    behavior with ONE warning naming the risk (the probe is cached, and only
+    the GPU-profile wrap path consults it).
+    """
+    global _MEMSCOPE_PROBE
+    if _MEMSCOPE_PROBE is None:
+        try:
+            _MEMSCOPE_PROBE = shutil.which("systemd-run") is not None and subprocess.run(
+                ["systemd-run", "--scope", "--quiet", "true"],
+                capture_output=True, timeout=10,
+            ).returncode == 0
+        except Exception:  # noqa: BLE001 - any failure means "no scopes here"
+            _MEMSCOPE_PROBE = False
+        if not _MEMSCOPE_PROBE:
+            log.warning(
+                "systemd-run scopes unavailable on this host: GPU-profile "
+                "generator host RAM stays UNCAPPED (RLIMIT_AS is skipped for "
+                "torch) — a ballooning generator can get the trainer "
+                "OOM-killed; run inside a memory-limited container for a hard "
+                "boundary"
+            )
+    return _MEMSCOPE_PROBE
+
+
+def wrap_memory_scope(argv: list[str], max_mb: int, available: bool) -> list[str]:
+    """Wrap ``argv`` in a resident-memory-capped systemd scope (pure).
+
+    ``MemoryMax`` is 2× the profile's ``max_memory_mb``: the cgroup counts
+    RESIDENT memory, unlike RLIMIT_AS's virtual-address accounting, so the
+    headroom keeps an honest torch generator (whose RSS can legitimately run
+    past the VA-calibrated knob) alive while still bounding a balloon.
+    ``MemorySwapMax=0`` makes the cap real — without it the kernel swaps the
+    balloon instead of killing it. ``--collect`` reaps the scope even when
+    the child is killed. Composes OUTERMOST around the unshare netns wrapper;
+    ``available=False`` (no systemd, see :func:`_memory_scope_available`)
+    passes ``argv`` through unchanged.
+    """
+    if not available:
+        return list(argv)
+    return [
+        "systemd-run", "--scope", "--quiet", "--collect",
+        "-p", f"MemoryMax={int(max_mb) * 2}M", "-p", "MemorySwapMax=0",
+        *argv,
+    ]
+
+
+def _nvidia_compute_pids() -> frozenset[int]:
+    """PIDs currently holding a CUDA compute context, per nvidia-smi.
+
+    Raises on ANY problem (missing binary, non-zero exit, timeout) — the
+    caller (:func:`_reject_gpu_use`) treats that as "nothing to check", so
+    CPU-only boxes skip silently.
+    """
+    r = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"nvidia-smi rc={r.returncode}")
+    return frozenset(int(tok) for tok in r.stdout.split() if tok.strip().isdigit())
+
+
+def _proc_child_pids(pid: int) -> set[int]:
+    """Direct children of ``pid`` via /proc (Linux; empty when gone/elsewhere)."""
+    kids: set[int] = set()
+    with contextlib.suppress(OSError):
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            with contextlib.suppress(OSError, ValueError):
+                kids |= {int(t) for t in (task / "children").read_text().split()}
+    return kids
+
+
+def _reject_gpu_use(pid: int, query_fn=None) -> None:
+    """Layer 2 of keeping CPU-mode generators off the GPU: detect and reject.
+
+    Env blanking (layer 1, see :func:`_child_env`) only stops *accidental*
+    CUDA — a generator that rewrites its own env still reaches the devices.
+    A secretly-CUDA corpus in a byte-exact mode is nondeterministic, so the
+    tier-1 audit re-derivation mismatches and reads as a FALSE FRAUD PROOF
+    against the trainer; the child can also touch other lanes' GPUs. Raising
+    :class:`CorpusError` here converts that audit corruption into the miner
+    losing their entry — incentive-correct.
+
+    Suspects are kept simple: the sandbox child pid plus its direct /proc
+    children. Known sampling race, documented: the query runs when the stream
+    closes / the batch child exits, so a cheat that finishes its GPU work
+    early (or hides it behind a re-parented grandchild) can evade this check
+    — container mode is the real boundary. ``query_fn`` is injected for
+    tests; the default shells out to nvidia-smi, and a missing nvidia-smi or
+    any query error skips silently (CPU-only boxes).
+    """
+    try:
+        gpu_pids = frozenset(int(p) for p in (query_fn or _nvidia_compute_pids)())
+    except Exception:  # noqa: BLE001 - unqueryable (no nvidia-smi): nothing to check
+        return
+    if not gpu_pids:
+        return
+    hits = sorted(({int(pid)} | _proc_child_pids(int(pid))) & gpu_pids)
+    if hits:
+        raise CorpusError(
+            f"generator_used_gpu_in_cpu_mode: sandbox child pid(s) {hits} held a "
+            "CUDA compute context in a CPU (byte-exact) corpus mode — the corpus "
+            "digest is untrustworthy, so this entry is rejected"
+        )
 
 
 def _netns_available() -> bool:
@@ -115,9 +290,65 @@ def _apply_rlimits(
             resource.setrlimit(name, vals)
 
 
+def stream_cpu_rlimit(
+    max_generate_seconds: int, max_wall_seconds: int | None, nproc: int
+) -> int:
+    """Cumulative ``RLIMIT_CPU`` for a *streaming* generator child.
+
+    Batch mode reuses ``max_generate_seconds`` as the CPU cap and that is
+    coherent there — the whole run is also wall-clock bounded by the same knob.
+    A streaming child is different: it lives for the entire training run, so its
+    legitimate cumulative CPU scales with the training wall budget × however
+    many cores its BLAS decides to use (the child env carries no thread caps).
+    Reusing the 600s stall window as the cap silently SIGXCPUs (rc=-24) any
+    CPU-busy honest generator once finals run longer than a few minutes.
+
+    ``max_wall_seconds`` is the caller's upper bound on how long the stream will
+    be consumed (the contract's ``max_train_seconds``); the cap allows full
+    ``nproc`` utilisation for that long, plus the stall window for sandbox boot
+    and first-frame latency. Abuse is NOT this limit's job — the per-frame stall
+    timeout (``_frame_iter``) kills a generator that stops emitting, and the
+    parent terminates the child when training ends. This is only the backstop
+    for a wedged parent, so generous is correct. ``None`` keeps the legacy cap
+    (short-lived screens with no known wall bound).
+
+    ``nproc`` is the child's real core ceiling: on a lane-pinned pod that is
+    the lane's slice size (see :func:`_lane_cpu_slice`) — budgeting the whole
+    box would let one lane's cap absorb every other lane's share.
+    """
+    if max_wall_seconds is None:
+        return int(max_generate_seconds)
+    return int(max_generate_seconds) + max(1, int(nproc)) * int(max_wall_seconds)
+
+
 def _child_env(*, gpu: bool = False) -> dict[str, str]:
+    """Minimal allowlisted env for the sandbox child, with lane thread caps.
+
+    When a lane slice is active, BLAS/threadpool env caps the generator's
+    threads at the slice size — a pool sized to the whole box would just
+    contend inside the lane's affinity set. No slice ⇒ no caps (legacy
+    behavior, local runs). NOTE: a threaded-BLAS corpus digest depends on the
+    thread count, and the slice size varies with pod shape — a future change
+    may pin this to a contract-configured constant for stream_cpu audit
+    reproducibility.
+    """
     keys = _SAFE_ENV_KEYS + (_GPU_ENV_KEYS if gpu else ())
     env = {k: os.environ[k] for k in keys if k in os.environ}
+    lane = _lane_cpu_slice()
+    if lane is not None:
+        for key in _BLAS_ENV_KEYS:
+            env[key] = str(lane[1])
+    if not gpu:
+        # Keep CPU-mode generators off the GPU, layer 1: BLANK, not stripped.
+        # An ABSENT CUDA_VISIBLE_DEVICES means "all GPUs visible", and
+        # pip-torch bundles its own CUDA runtime — so a dependency that
+        # initializes CUDA in a byte-exact (stream_cpu / cache_reuse) child
+        # would make the corpus nondeterministic and could touch OTHER lanes'
+        # GPUs. The blank/void values stop that ACCIDENTAL CUDA; a malicious
+        # generator can pop its own env — that is what layer 2
+        # (_reject_gpu_use) and container mode are for.
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["NVIDIA_VISIBLE_DEVICES"] = "void"
     # Ensure the child can import cascade even without an editable install.
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     return env
@@ -179,6 +410,7 @@ def run_in_sandbox(
     *,
     blocked: tuple[str, ...] = (),
     allow_netns: bool = True,
+    gpu_pid_query=None,
 ) -> CorpusResult:
     """Run :func:`build_corpus` in an isolated subprocess and return its result.
 
@@ -186,6 +418,10 @@ def run_in_sandbox(
     enforced before the generator is imported. ``allow_netns=False`` skips the
     network-namespace wrapper (used in tests; Python-level networking is still
     disabled in the child). Raises :class:`CorpusError` on any failure.
+
+    Batch mode is always the byte-exact CPU profile, so after the child exits
+    it is checked for GPU use (:func:`_reject_gpu_use`; ``gpu_pid_query`` is
+    the injectable pid source for tests).
 
     ``[generator] sandbox_mode = "container"`` reroutes to the docker/podman
     sandbox (:mod:`cascade.trainer.sandbox_container`) with this rlimited child
@@ -213,20 +449,38 @@ def run_in_sandbox(
         timeout = int(cfg.max_generate_seconds) + 30
         preexec = None
         if os.name == "posix":
+            lane = _lane_cpu_slice()
+
             def preexec() -> None:  # runs post-fork, pre-exec in the child
+                if lane is not None:
+                    # Same degrade-silently posture as _apply_rlimits: affinity
+                    # can fail in odd container setups, and fairness is
+                    # best-effort — never the reason a generator fails.
+                    with contextlib.suppress(OSError):
+                        os.sched_setaffinity(0, lane[0])
                 _apply_rlimits(cfg.max_memory_mb, cfg.max_generate_seconds, max_fsize)
 
+        # Popen instead of subprocess.run: the GPU-use check below needs the
+        # child's pid, which CompletedProcess does not carry.
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=_child_env(), preexec_fn=preexec,
+        )
         try:
-            proc = subprocess.run(
-                argv, capture_output=True, timeout=timeout,
-                env=_child_env(), preexec_fn=preexec,
-            )
+            _, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as e:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=5)
             raise CorpusError(f"generator_timeout: exceeded {timeout}s wall-clock") from e
+        # Batch = byte-exact CPU profile: a child that touched the GPU means an
+        # untrustworthy digest, regardless of what it wrote (see _reject_gpu_use
+        # for the sampling race — post-exit, this catches lingering contexts).
+        _reject_gpu_use(proc.pid, gpu_pid_query)
 
         meta_p = out_dir / "meta.json"
         if not meta_p.is_file():
-            tail = (proc.stderr or b"").decode("utf-8", "replace")[-2000:]
+            tail = (stderr or b"").decode("utf-8", "replace")[-2000:]
             raise CorpusError(f"sandbox_crashed (rc={proc.returncode}): {tail}")
         meta = json.loads(meta_p.read_text(encoding="utf-8"))
         if not meta.get("ok"):
@@ -302,8 +556,20 @@ def stream_series(
     blocked: tuple[str, ...] = (),
     allow_netns: bool = True,
     gpu: bool = False,
+    max_wall_seconds: int | None = None,
+    gpu_pid_query=None,
 ) -> Iterator[Iterator[np.ndarray]]:
     """Yield an iterator of fresh ``(C, L)`` series streamed from a sandboxed child.
+
+    ``max_wall_seconds`` bounds how long the caller will consume the stream
+    (pass the contract's ``max_train_seconds``); it scales the child's
+    cumulative CPU rlimit — see :func:`stream_cpu_rlimit` for why the batch-mode
+    cap must not be reused here.
+
+    In the CPU (byte-exact) profile, a clean stream close checks the child for
+    GPU use while its pid is still known and raises :class:`CorpusError` on a
+    hit — see :func:`_reject_gpu_use` (``gpu_pid_query`` is the injectable pid
+    source for tests).
 
     The child draws a prefix of ``generate`` long enough to cover ``token_budget``
     points — the generator is prefix-stable, so the consumed prefix is
@@ -329,6 +595,7 @@ def stream_series(
 
         with stream_series_container(
             repo_dir, generation_seed, cfg, token_budget, blocked=blocked, gpu=gpu,
+            max_wall_seconds=max_wall_seconds,
         ) as frames:
             yield frames
         return
@@ -342,12 +609,30 @@ def stream_series(
     ]
     if use_netns:
         argv = ["unshare", "--user", "--map-root-user", "--net", *argv]
+    if gpu:
+        # GPU profile: RLIMIT_AS is skipped below (torch VA over-reserve), so
+        # a cgroup scope is the only resident-memory bound — systemd-run
+        # OUTERMOST so the whole netns+python tree lands in one scope.
+        argv = wrap_memory_scope(argv, cfg.max_memory_mb, _memory_scope_available())
 
+    # nproc = the lane's slice size when pinned (that IS the child's real core
+    # ceiling — a host-wide count would over-budget every lane's cumulative
+    # CPU cap), the whole box otherwise.
+    lane = _lane_cpu_slice()
+    cpu_cap = stream_cpu_rlimit(
+        cfg.max_generate_seconds, max_wall_seconds,
+        lane[1] if lane is not None else (os.cpu_count() or 1),
+    )
     preexec = None
     if os.name == "posix":
         def preexec() -> None:
+            if lane is not None:
+                # Degrade-silently like _apply_rlimits: affinity can fail in
+                # odd container setups, and fairness must never fail a run.
+                with contextlib.suppress(OSError):
+                    os.sched_setaffinity(0, lane[0])
             _apply_rlimits(
-                cfg.max_memory_mb, cfg.max_generate_seconds, 256 * 1024 * 1024, set_as=not gpu
+                cfg.max_memory_mb, cpu_cap, 256 * 1024 * 1024, set_as=not gpu
             )
 
     proc = subprocess.Popen(
@@ -356,8 +641,20 @@ def stream_series(
     )
     try:
         yield _frame_iter(proc, cfg.max_generate_seconds)
-    finally:
+    except BaseException:
         _terminate(proc)
+        raise
+    else:
+        # Clean close (including the normal early stop at the token budget):
+        # in the byte-exact CPU profile, sample for GPU use BEFORE terminating
+        # — the child is usually still alive here, so a live CUDA context is
+        # attributable to its pid. On a hit the CorpusError propagates and
+        # the entry is rejected.
+        try:
+            if not gpu:
+                _reject_gpu_use(proc.pid, gpu_pid_query)
+        finally:
+            _terminate(proc)
 
 
 # ───────────────────────────────── child ───────────────────────────────────
@@ -399,8 +696,11 @@ def _maybe_self_rlimit(cfg: GeneratorConfig) -> None:
     if os.environ.get("CASCADE_SANDBOX_SELF_RLIMIT") != "1":
         return
     max_fsize = int(cfg.max_total_points) * 8 * 2 + 64 * 1024 * 1024
+    # Streaming containers pass a scaled CPU cap (see stream_cpu_rlimit) since
+    # there is no cascade parent to compute it in a preexec hook.
+    cpu_cap = int(os.environ.get("CASCADE_SANDBOX_CPU_S") or cfg.max_generate_seconds)
     _apply_rlimits(
-        cfg.max_memory_mb, cfg.max_generate_seconds, max_fsize,
+        cfg.max_memory_mb, cpu_cap, max_fsize,
         set_as=os.environ.get("CASCADE_SANDBOX_GPU") != "1",
     )
 

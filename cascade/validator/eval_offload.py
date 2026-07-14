@@ -28,16 +28,67 @@ from __future__ import annotations
 import json
 import logging
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 
 from ..eval.benchmarks import extract_bench_scores, gift_rows_from_report
-from ..trainer.remote import RemoteHost, build_ssh_argv, run_ssh
+from ..trainer.remote import (
+    RemoteDispatchError,
+    RemoteHost,
+    build_ssh_argv,
+    load_hosts,
+    run_ssh,
+)
 
 log = logging.getLogger("cascade.validator.eval_offload")
 
 # uv on the pod (runs the benchmarks/ sidecar's own locked env), matching
 # cascade.trainer.bench_hook.BenchPlan.uv_bin.
 DEFAULT_UV_BIN = "~/.local/bin/uv"
+
+
+def make_eval_host_fn(path: Path | str) -> Callable[[], RemoteHost | None]:
+    """A resolver that re-reads the eval-hosts file AT EACH offloaded eval.
+
+    The eval pod is elastic: the provisioner rents it when a round's manifest
+    appears and publishes/clears ``path`` as the pod comes and goes, so a
+    startup-time load would pin the validator to a box that may already be
+    torn down — or miss one rented minutes later. Each call re-resolves:
+    missing file, empty/cleared file, or no ``final``/``any``-stage entry ⇒
+    ``None`` ⇒ that eval runs locally on the validator's own device. An
+    unparseable file logs a WARNING and also falls back local — a bad hosts
+    file must degrade an eval, never crash the validator. A static
+    hand-maintained file that never changes behaves exactly like the old
+    one-shot startup load. Appear/disappear/change transitions are logged
+    once (INFO) per change, not per eval.
+    """
+    last_seen: str | None = None
+
+    def resolve() -> RemoteHost | None:
+        nonlocal last_seen
+        host: RemoteHost | None = None
+        p = Path(path)
+        if p.is_file():
+            try:
+                cands = [h for h in load_hosts(p) if h.stage in ("any", "final")]
+                host = cands[0] if cands else None
+            except RemoteDispatchError as e:
+                # Zero [[host]] entries is the provisioner's explicit
+                # "no pod right now" clear — normal, not an error.
+                log.debug("eval-hosts %s has no usable host (%s)", p, e)
+            except Exception as e:  # noqa: BLE001 — a bad hosts file degrades, never crashes
+                log.warning("eval-hosts %s unreadable (%s); this eval runs locally", p, e)
+        key = f"{host.name}@{host.host}" if host is not None else None
+        if key != last_seen:
+            if host is None:
+                log.info("eval-offload host gone (%s); heavy evals run locally", p)
+            else:
+                log.info("eval-offload host now %s (%s); heavy evals offload there "
+                         "(wallet + consensus stay local)", host.name, host.host)
+            last_seen = key
+        return host
+
+    return resolve
 
 
 def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:

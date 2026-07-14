@@ -66,6 +66,7 @@ def _rederive_digest(
     *,
     mode: str,
     token_budget: int,
+    max_wall_seconds: int | None = None,
 ) -> str:
     """Re-derive one corpus digest exactly as the trainer derived it."""
     if mode == "cache_reuse":
@@ -82,6 +83,7 @@ def _rederive_digest(
         mode, repo_dir, generation_seed, cfg.generator,
         token_budget=token_budget, use_sandbox=True,
         blocked=cfg.static_guard.blocked,
+        max_wall_seconds=max_wall_seconds,
     ) as rs:
         for _ in rs.series():
             pass
@@ -136,6 +138,7 @@ def run_tier1(
                 digest = _rederive_digest(
                     gen_dir, receipt.generation_seed, cfg,
                     mode=mode, token_budget=contract.train_tokens,
+                    max_wall_seconds=contract.max_train_seconds,
                 )
                 digest_cache[cache_key] = digest
         except Exception as e:  # noqa: BLE001 — fetch/build failure is a WARN, not proof
@@ -234,6 +237,7 @@ def run_tier2(
                 contract.corpus_mode, gen_dir, receipt.generation_seed, cfg.generator,
                 token_budget=contract.train_tokens, use_sandbox=True,
                 blocked=cfg.static_guard.blocked,
+                max_wall_seconds=contract.max_train_seconds,
             ) as rs:
                 base_trainer.train(
                     rs.series(), contract,

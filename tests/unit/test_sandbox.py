@@ -70,3 +70,17 @@ def test_sandbox_rejects_oversize_repo(tmp_path, small_cfg):
     tiny = replace(small_cfg.generator, max_repo_mb=0)  # nothing fits
     with pytest.raises(CorpusError):
         run_in_sandbox(tmp_path, 0, tiny, blocked=small_cfg.static_guard.blocked, allow_netns=False)
+
+
+def test_stream_cpu_rlimit_scales_with_wall_budget():
+    """Streaming children live for the whole training run: the CPU cap must
+    cover nproc-wide BLAS for the full wall budget plus the boot/stall window —
+    NOT the bare stall window (that silently SIGXCPUs 45-min finals)."""
+    from cascade.trainer.sandbox import stream_cpu_rlimit
+
+    # legacy: no wall bound known → the old stall-window cap
+    assert stream_cpu_rlimit(600, None, 32) == 600
+    # scaled: stall window + nproc × wall budget
+    assert stream_cpu_rlimit(600, 2700, 8) == 600 + 8 * 2700
+    # a zero/garbage nproc never zeroes the wall term
+    assert stream_cpu_rlimit(600, 2700, 0) == 600 + 2700

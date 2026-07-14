@@ -155,6 +155,7 @@ cascade deploy ./my-generator \
 Re-deploy any time to submit a new version — the latest pre-cutoff reveal per
 hotkey is the one that competes.
 
+<<<<<<< HEAD
 ### 5a. Protecting your submission (timed reveal)
 
 **Threat model.** Everything on cascade is public *after* a round locks — that's
@@ -251,6 +252,37 @@ content and the fallback is *sealed submissions* (upload ciphertext; the
 decryption key + plaintext digest ride in the timelocked payload).
 
 ### 5b. If the Hippius Hub is down
+=======
+> **⚠️ Your Hippius project must be PUBLIC.** The trainer pulls your generator
+> anonymously; a private Harbor project returns `401 Unauthorized` and your
+> submission is rejected every round as `generator_artifact_unreachable`
+> (observed live for several miners). New Hippius Harbor projects can default
+> to private — after your first push, open the Hippius Hub UI and set the
+> project's visibility to public. Self-check (should print `200`):
+>
+> ```bash
+> REPO=my-namespace/my-generator DIGEST=sha256:...   # from `cascade deploy` output
+> TOK=$(curl -s "https://registry.hippius.com/service/token?service=harbor-registry&scope=repository:${REPO}:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+> curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOK" \
+>   "https://registry.hippius.com/v2/${REPO}/manifests/${DIGEST}"
+> ```
+
+> **⚠️ SDK version matters — use this repo's environment to commit.** The
+> on-chain pointer travels through bittensor's timelock commit-reveal, and the
+> reveal ENCODING differs across SDK lines: older `set_reveal_commitment`
+> variants (and `subtensor.commit()` / `publish_metadata` / raw btcli
+> commitments) write reveals the subnet's decoder cannot read — your commit
+> lands, but you are silently **skipped every round** with
+> `revealed-commitment decode failed: non-hexadecimal number found in
+> fromhex()`. This repo pins `bittensor==10.5.0` (what the validators run);
+> `cascade deploy` on this environment is the known-good path. Pass the plain
+> pointer string — do NOT pre-hex `data=` yourself. To self-check after a
+> deploy: `sub.get_revealed_commitment(netuid, <your uid>)` must return
+> `(block, "metro-v1:gen:hippius:…")` as a clean string. If you were affected,
+> simply re-deploy from this environment — the newest commit wins.
+
+### 5a. If the Hippius Hub is down
+>>>>>>> origin/main
 
 Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
 service from Hippius **S3** (which only the trainer/validator use). If the Hub is
