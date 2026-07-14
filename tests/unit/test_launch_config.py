@@ -31,14 +31,16 @@ def _launch_ready(cfg):
 
 
 def test_assert_launch_ready_flags_default_placeholders(cfg):
-    # netuid is now the real mainnet value (91, decided 2026-07-14) so it must
-    # NOT be flagged; trainer_hotkey remains an operator secret placeholder and
-    # base_arch_digest is pinned — only the former should trip the check.
+    # The shipped template is now fully launch-valued (netuid 91, trainer
+    # hotkey set, digests pinned) — flagging is tested by explicitly blanking,
+    # and the shipped file itself must PASS for the trainer role.
+    assert_launch_ready(cfg, role="trainer")
+    blanked = replace(cfg, subnet=replace(cfg.subnet, netuid=0),
+                      manifest=replace(cfg.manifest, trainer_hotkey=""))
     with pytest.raises(LaunchConfigError) as ei:
-        assert_launch_ready(cfg, role="trainer")
+        assert_launch_ready(blanked, role="trainer")
     msg = str(ei.value)
-    assert "trainer_hotkey" in msg
-    assert "netuid" not in msg
+    assert "netuid" in msg and "trainer_hotkey" in msg
     assert "base_arch_digest" not in msg
 
 
