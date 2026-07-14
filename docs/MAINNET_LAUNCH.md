@@ -58,9 +58,14 @@ fixtures if active pre-launch.
       provider keys; write matching units for trainer+validator).
 - [ ] `WANDB_API_KEY` in the environment (wandb has been silently OFF —
       `[wandb] enabled` alone does nothing without the key).
-- [ ] Provisioner `provision.toml` for mainnet: heats SKU ladder as on testnet;
-      FINAL stage provisioner-managed (one 2-GPU L40S pod, expected_gpu-matched)
-      once the worker image exists; eval stage as on testnet.
+- [ ] Provisioner config for mainnet: copy `deploy/provision.mainnet.toml` to
+      the box as `provision.toml` and fill the two placeholders (validator
+      hotkey receipt prefix, shadeform key id). Heat = testnet's 4090/A6000
+      ladder (screening only, not GPU-pinned); FINAL = provisioner-managed
+      L40S (one 2-GPU pod, expected_gpu-matched; shadeform first — lium's
+      "L40" is a different device); EVAL = elastic 3090→4090 priority ladder.
+      Switch `image` to the digest-pinned worker ref once it ships (drops
+      bootstrap mode).
 - [ ] File the bittensor upstream bug: `decode_revealed_commitment` chokes on
       py-substrate-interface's raw (UTF-8-valid) rendering — payload-length
       lottery skips miners. #92 shields OUR readers; other validators' stacks
