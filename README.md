@@ -273,9 +273,10 @@ hash). A round the validator *rejected* still gets a receipt
 (`"status": "rejected"`) carrying the gate's reason. Verify one with
 `cascade-audit latest` — see `docs/AUDIT.md`.
 
-Before launching, set `chain.toml [subnet] netuid`, `[training] base_arch_digest`
-(sha256 of the frozen base architecture), `[manifest] trainer_hotkey`, `[eval]
-window_pool` (the held-out pool's Hub `repo@digest`), and `[storage]` endpoints.
+`chain.toml` ships with mainnet values baked in (netuid 91, the L40S GPU pin,
+the worker-image digest, `pool_bucket`). The remaining go-live steps —
+`trainer_hotkey`, `commit_floor_block`, the launch-commit image re-pin, flipping
+the gift gate — live in `docs/MAINNET_LAUNCH.md`.
 
 ## Quick start
 

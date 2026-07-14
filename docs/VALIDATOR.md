@@ -45,12 +45,13 @@ btcli subnet list --network test        # check the permit / stake threshold
 
 ## 2. Configure `chain.toml`
 
-Point the validator at the subnet and the trust anchors. Use `chain.testnet.toml`
-for testnet; the keys that matter to a validator:
+Pick the file for your network — the netuid is already baked in, don't edit it:
+`chain.toml` (**mainnet, netuid 91**) or `chain.testnet.toml` (testnet, 259).
+The keys that matter to a validator:
 
 ```toml
 [subnet]
-netuid = 259                       # 91 on mainnet
+netuid = 91                        # shipped per file: 91 mainnet / 259 testnet
 
 [manifest]
 trainer_hotkey   = "5Cyver…"       # the ONLY trainer whose manifest you trust
