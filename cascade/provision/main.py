@@ -196,8 +196,8 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
         # Per-pod provider attestation on the (stage-cached) gate — see
         # HealthGate.attested_digest for why pod env alone can't be trusted
         # to exist on sshd-as-PID-1 images.
-        gates[key].attested_digest = attested_digest
-        return gates[key].check(run)
+        gate = replace(gates[key], attested_digest=attested_digest)
+        return gate.check(run)
 
     return check
 
