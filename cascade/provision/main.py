@@ -419,6 +419,22 @@ def _run(args) -> int:
     )
     if not render.key_path:
         raise ProvisionError("[provisioner] ssh_key_path is required (private key for hosts.toml)")
+    # Per-provider pod profiles MUST attach before anything closes over render:
+    # RenderSettings is frozen, so replace() makes a NEW object — a consumer
+    # built earlier keeps the profile-less one. That exact bug ran every
+    # shadeform bootstrap as root@ (default profile) while the config said
+    # user="shadeform": three healthy 4xA6000s burned across two rental
+    # windows before the probe's stderr exposed the wrong user (2026-07-15).
+    profiles = {
+        name: PodProfile(
+            user=str(t.get("user", "root")),
+            workdir=str(t.get("workdir", render.workdir)),
+            remote_python=str(t.get("remote_python", render.remote_python)),
+        )
+        for name, t in (top.get("pods", {}) or {}).items()
+    }
+    if profiles:
+        render = replace(render, profiles=profiles)
 
     hosts_path = Path(top.get("hosts_path", "hosts.toml"))
     work_root = Path(args.work_root)
@@ -459,17 +475,6 @@ def _run(args) -> int:
             timeout_s=float(top.get("bootstrap_timeout_s", 1800.0)),
             pod_user=str(top.get("pod_user", "root")),
         )
-
-    profiles = {
-        name: PodProfile(
-            user=str(t.get("user", "root")),
-            workdir=str(t.get("workdir", render.workdir)),
-            remote_python=str(t.get("remote_python", render.remote_python)),
-        )
-        for name, t in (top.get("pods", {}) or {}).items()
-    }
-    if profiles:
-        render = replace(render, profiles=profiles)
 
     provider_names = list(dict.fromkeys([
         *policy.heat.providers, *policy.final.providers,
