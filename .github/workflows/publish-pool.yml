@@ -16,6 +16,12 @@
 # REQUIRED repo secrets:
 #   TSFORGE_S3_ACCESS_KEY / TSFORGE_S3_SECRET_KEY   read on forge bucket
 #   CASCADE_S3_ACCESS_KEY / CASCADE_S3_SECRET_KEY   write eval-pool + read manifest
+# OPTIONAL (enables the public HF reveal):
+#   HF_TOKEN                                        HF write token for HF_EVAL_REPO's org
+#   (repo var HF_EVAL_REPO, default Tensor-Link/cascade-eval-pool) — the daily
+#   24h-LAGGED snapshot is pushed here as a PUBLIC dataset with full labels. It is
+#   always a closed prior day, so it never reveals the round scored today. Unset
+#   HF_TOKEN => the reveal step is skipped and only the private publish runs.
 # OPTIONAL repo variables:
 #   TSFORGE_BUCKET        forge raw-data bucket   (default: tsbench-forge-sources)
 #   HIPPIUS_S3_ENDPOINT   S3 endpoint             (default: https://s3.hippius.com)
@@ -106,3 +112,26 @@ jobs:
             --chain-toml "$TOML" \
             --sources tsbench_forge \
             --effective-block "$EFFECTIVE_BLOCK"
+
+      # Public reveal: rebuild YESTERDAY's closed-day pool (deterministic, so it
+      # equals the snapshot scored a day ago) and push it, WITH labels, to a
+      # public HF dataset. A day stale by construction, so it never exposes the
+      # round being scored today. Skipped cleanly if HF_TOKEN isn't set.
+      - name: Reveal lagged snapshot to public HF
+        if: env.HF_TOKEN != ''
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_EVAL_REPO: ${{ vars.HF_EVAL_REPO || 'Tensor-Link/cascade-eval-pool' }}
+          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
+        run: |
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
+          AS_OF=$(date -u -d 'yesterday' +%F)
+          echo "revealing eval snapshot as_of=$AS_OF -> $HF_EVAL_REPO"
+          TSFORGE_DIR=./tsforge cascade-pool build \
+            --chain-toml "$TOML" \
+            --sources tsbench_forge \
+            --as-of "$AS_OF" \
+            --out ./public_pool --overwrite
+          python scripts/publish_hf_eval.py \
+            --pool-dir ./public_pool --repo-id "$HF_EVAL_REPO" --as-of "$AS_OF"

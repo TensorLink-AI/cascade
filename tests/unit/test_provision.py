@@ -197,6 +197,41 @@ def test_plan_argv_forwards_the_network():
     assert "--network" not in plan_argv(None, Path("w"), None)
 
 
+def test_launch_injects_image_digest_env_when_pinned():
+    """Image-boot pods MUST carry CASCADE_TRAIN_IMAGE_DIGEST: the health gate
+    requires it and final workers refuse a runtime without it (live dress
+    rehearsal 2026-07-15: pod booted fine but had no digest env — it would
+    have failed every health check on mainnet)."""
+    import types
+
+    from cascade.provision.core import image_digest_of, shadeform_create_body
+
+    digest = "sha256:" + "4" * 64
+    pinned = f"ghcr.io/tensorlink-ai/cascade-worker@{digest}"
+    assert image_digest_of(pinned) == digest
+    assert image_digest_of("") == ""                       # bootstrap mode
+    assert image_digest_of("ubuntu:22.04") == ""           # tag, not a pin
+
+    # lium: -e CASCADE_TRAIN_IMAGE_DIGEST rides along in image mode
+    spawned: list[list[str]] = []
+
+    def _run(argv):
+        out = '[{"id": "exec-1"}]' if "ls" in argv else ""
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    prov.launch(_spec(count=1, image=pinned))
+    up = spawned[0]
+    assert f"CASCADE_TRAIN_IMAGE_DIGEST={digest}" in up
+
+    # shadeform docker mode: env list carries the digest too
+    body = shadeform_create_body(_spec(count=1, image=pinned),
+                                 {"cloud": "c", "region": "r", "shade_instance_type": "t"},
+                                 name="cascade-x-0")
+    envs = {e["name"]: e["value"] for e in body["launch_configuration"]["docker_configuration"]["envs"]}
+    assert envs["CASCADE_TRAIN_IMAGE_DIGEST"] == digest
+
+
 def test_lium_launch_excludes_lemons_and_remembers_machines():
     """Replacement rents must skip the failed pod's executor (the offer list is
     deterministic, so an unexcluded replacement re-rents the exact lemon —
@@ -420,9 +455,12 @@ def test_shadeform_create_body_injects_only_ssh_pubkey_and_port():
     assert body["shade_instance_type"] == "L40S.1x" and body["shade_cloud"] is True
     docker = body["launch_configuration"]["docker_configuration"]
     assert docker["image"] == IMG
-    # Only SSH_PUBKEY is seeded — Hippius creds are NEVER placed on the pod.
-    assert docker["envs"] == [{"name": "SSH_PUBKEY", "value": "ssh-ed25519 AAAAkey orchestrator"}]
-    assert all("HIPPIUS" not in e["name"] for e in docker["envs"])
+    # Only SSH_PUBKEY + the image-digest pin are seeded — never any credential.
+    names = {e["name"] for e in docker["envs"]}
+    assert names <= {"SSH_PUBKEY", "CASCADE_TRAIN_IMAGE_DIGEST"}
+    assert {"name": "SSH_PUBKEY", "value": "ssh-ed25519 AAAAkey orchestrator"} in docker["envs"]
+    assert all("HIPPIUS" not in e["name"] and "KEY" not in e["name"].replace("PUBKEY", "")
+               for e in docker["envs"])
     assert docker["port_mappings"] == [{"host_port": 22, "container_port": 22}]
 
 

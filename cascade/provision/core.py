@@ -110,6 +110,17 @@ class LaunchSpec:
     exclude_ids: tuple[str, ...] = ()
 
 
+def image_digest_of(image: str) -> str:
+    """The ``sha256:<hex>`` digest pinned in an image ref (empty when unpinned).
+
+    Injected into pods as ``CASCADE_TRAIN_IMAGE_DIGEST`` at launch — the health
+    gate REQUIRES it on image-boot pods and final workers refuse a mismatched
+    runtime, so an image-boot pod without it can never pass health (found in a
+    live image-boot dress rehearsal, 2026-07-15)."""
+    _, sep, digest = image.partition("@")
+    return digest if sep and digest.startswith("sha256:") else ""
+
+
 @dataclass(frozen=True)
 class PodAddress:
     """Where the orchestrator SSHes to reach a launched pod."""
@@ -416,7 +427,10 @@ def shadeform_create_body(
         "type": "docker",
         "docker_configuration": {
             "image": spec.image,
-            "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}],
+            "envs": [{"name": "SSH_PUBKEY", "value": spec.ssh_pubkey}]
+                    + ([{"name": "CASCADE_TRAIN_IMAGE_DIGEST",
+                         "value": image_digest_of(spec.image)}]
+                       if image_digest_of(spec.image) else []),
             "port_mappings": [
                 {"host_port": spec.ssh_port, "container_port": DEFAULT_SSH_PORT}
             ],
@@ -570,6 +584,9 @@ class LiumProvider:
                 # entrypoint runs sshd and reads $SSH_PUBKEY (the worker image).
                 argv += ["--image", spec.image, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
                          "--internal-ports", str(spec.ssh_port)]
+                digest = image_digest_of(spec.image)
+                if digest:
+                    argv += ["-e", f"CASCADE_TRAIN_IMAGE_DIGEST={digest}"]
             # empty image ⇒ lium's default SSH template (bootstrap mode): lium
             # injects the ACCOUNT's registered keys; a template NAME passed as
             # --image 400s ("image reference is not valid") — never do that.

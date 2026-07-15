@@ -200,7 +200,8 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
 
 
 def make_bootstrap(script: Path, render: RenderSettings, *,
-                   timeout_s: float, pod_user: str) -> callable:
+                   timeout_s: float, pod_user: str,
+                   auth_wait_s: float = 180.0) -> callable:
     """The BOOTSTRAP boundary: run an operator-supplied script against a fresh pod.
 
     No digest-pinned worker image is published yet, so pods rent bare and get
@@ -212,12 +213,38 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     """
     import os
 
+    def _auth_ready(addr, user: str) -> bool:
+        """Marketplace pods inject SSH keys 30-60s AFTER sshd answers TCP; a
+        bootstrap launched at TCP-ready hits `Permission denied (publickey)`
+        and burns a healthy pod (observed live 2026-07-15, eval pod killed at
+        t+27s). Poll a no-op ssh until auth lands or the wait expires."""
+        import time as _t
+
+        argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                "-o", "BatchMode=yes", "-i", os.path.expanduser(render.key_path),
+                "-p", str(addr.ssh_port), f"{user}@{addr.ip}", "true"]
+        end = _t.monotonic() + auth_wait_s
+        while True:
+            try:
+                if subprocess.run(argv, capture_output=True, timeout=30).returncode == 0:
+                    return True
+            except subprocess.TimeoutExpired:
+                pass
+            if _t.monotonic() >= end:
+                return False
+            _t.sleep(10)
+
     def bootstrap(addr, stage: str, provider: str = "") -> bool:
         prof = render.profile_for(provider)
+        user = prof.user if provider else pod_user
+        if not _auth_ready(addr, user):
+            log.error("bootstrap %s:%s: ssh auth never came up within %.0fs "
+                      "(key injection lag exceeded)", addr.ip, addr.ssh_port, auth_wait_s)
+            return False
         env = dict(os.environ)
         env.update({
             "POD_IP": addr.ip, "POD_PORT": str(addr.ssh_port),
-            "POD_USER": prof.user if provider else pod_user,
+            "POD_USER": user,
             "POD_KEY": render.key_path, "POD_STAGE": stage, "POD_WORKDIR": prof.workdir,
         })
         try:
