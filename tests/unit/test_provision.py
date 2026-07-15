@@ -664,3 +664,54 @@ def test_lium_launch_omits_image_in_bootstrap_mode(monkeypatch):
     prov.launch(LaunchSpec(sku="RTX4090", count=1, image="img@sha256:aa", ssh_pubkey="k",
                            gpus_per_pod=4, name_prefix="cascade-900-heat"))
     assert "--image" in calls[1]
+
+
+# ── shadeform docker-mode readiness (container_status gating) ────────────────
+
+
+def _shadeform_with_infos(infos):
+    """ShadeformProvider whose /info responses replay from a list (last repeats)."""
+    from cascade.provision.core import ShadeformProvider
+
+    clock = {"t": 0.0}
+    prov = ShadeformProvider(
+        _sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        _now=lambda: clock["t"],
+    )
+    seq = list(infos)
+    prov._get = lambda path, params=None: (seq.pop(0) if len(seq) > 1 else seq[0])
+    return prov, clock
+
+
+def test_shadeform_wait_ready_waits_out_container_download():
+    """Live 2026-07-15: the INSTANCE goes "active" while the multi-GB worker
+    image is still pulling ("container_status": "downloading"); probing then
+    reaches the VM's own sshd → "Permission denied" → every image-boot pod was
+    killed as a dud. wait_ready must hold until the container itself runs."""
+    prov, clock = _shadeform_with_infos([
+        {"status": "pending"},
+        {"status": "active", "container_status": "downloading"},
+        {"status": "active", "container_status": "downloading"},
+        {"status": "active", "container_status": "running"},
+    ])
+    assert prov.wait_ready("i-1", timeout=900.0) is True
+    assert clock["t"] >= 3 * prov.poll_interval          # actually waited
+
+
+def test_shadeform_wait_ready_vm_mode_unchanged():
+    """No container_status field (VM-mode rental): active alone is ready."""
+    prov, _ = _shadeform_with_infos([{"status": "active"}])
+    assert prov.wait_ready("i-1", timeout=900.0) is True
+
+
+def test_shadeform_wait_ready_raises_on_container_failure():
+    import pytest as _pytest
+
+    from cascade.provision.core import ProvisionError
+
+    prov, _ = _shadeform_with_infos([
+        {"status": "active", "container_status": "downloading"},
+        {"status": "active", "container_status": "failed"},
+    ])
+    with _pytest.raises(ProvisionError, match="container entered 'failed'"):
+        prov.wait_ready("i-1", timeout=900.0)

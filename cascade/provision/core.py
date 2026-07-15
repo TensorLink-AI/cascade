@@ -454,6 +454,12 @@ def shadeform_pod_address(info_json: dict, *, ssh_port: int = DEFAULT_SSH_PORT) 
 
 SHADEFORM_READY = "active"                  # the "running/live" status (no "running" state)
 SHADEFORM_TERMINAL_BAD = {"error", "deleting", "deleted"}
+# Docker-mode: the INSTANCE goes "active" while the container is still pulling
+# ("downloading" → "running"). Probing at "active" reaches the VM's own sshd —
+# which knows nothing of SSH_PUBKEY — and reads as a dead pod (2026-07-15:
+# every image-boot rental failed its gate exactly this way).
+SHADEFORM_CONTAINER_READY = "running"
+SHADEFORM_CONTAINER_BAD = {"failed", "error", "stopped"}
 
 
 # ── side-effecting helpers (adapter surface, not unit-tested) ─────────────────
@@ -733,13 +739,25 @@ class ShadeformProvider:
 
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
         deadline = self._now() + timeout
+        last_container = None
         while self._now() < deadline:
             info = self._get(f"/instances/{pod_id}/info")
             status = str(info.get("status", "")).lower()
-            if status == SHADEFORM_READY:
-                return True
             if status in SHADEFORM_TERMINAL_BAD:
                 raise ProvisionError(f"shadeform instance {pod_id} entered {status!r}")
+            if status == SHADEFORM_READY:
+                container = str(info.get("container_status") or "").lower()
+                if container in SHADEFORM_CONTAINER_BAD:
+                    raise ProvisionError(
+                        f"shadeform instance {pod_id} container entered {container!r}"
+                    )
+                # No container_status field ⇒ VM-mode rental: active is ready.
+                if not container or container == SHADEFORM_CONTAINER_READY:
+                    return True
+                if container != last_container:
+                    log.info("shadeform %s active, container %s — waiting for %s",
+                             pod_id, container, SHADEFORM_CONTAINER_READY)
+                    last_container = container
             self._sleep(self.poll_interval)
         return False
 

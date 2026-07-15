@@ -57,6 +57,7 @@ import contextlib
 import json
 import logging
 import re
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -111,6 +112,20 @@ _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 def is_provisioner_pod_name(name: str) -> bool:
     """True only for pod names this service itself creates (see _PROVISIONER_POD_RE)."""
     return _PROVISIONER_POD_RE.match(str(name)) is not None
+
+
+def _scrub_known_host(ip: str, port: int = 22) -> None:
+    """Drop any stored host key for a freshly-rented pod's address.
+
+    Marketplace providers recycle IPs and the worker image generates fresh host
+    keys per boot (``ssh-keygen -A`` in the entrypoint), so a stale entry makes
+    every ``accept-new`` connection hard-fail with "Host key verification
+    failed" (2026-07-15: killed a replacement pod that re-drew its dud's IP).
+    Scrubbing at rent time keeps trust-on-first-use for the dispatch path."""
+    targets = [ip] if port == 22 else [ip, f"[{ip}]:{port}"]
+    for t in targets:
+        with contextlib.suppress(Exception):
+            subprocess.run(["ssh-keygen", "-R", t], capture_output=True, timeout=10)
 
 
 @dataclass(frozen=True)
@@ -559,6 +574,7 @@ class ProvisionerLoop:
             if addr is None:
                 log.warning("pod %s exposed no IP", pid)
                 return None
+            _scrub_known_host(addr.ip, addr.ssh_port)
             if not self.ssh_probe(addr.ip, addr.ssh_port):
                 log.warning("pod %s SSH %s:%d unreachable", pid, addr.ip, addr.ssh_port)
                 return None
