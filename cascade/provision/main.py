@@ -200,7 +200,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
 
 def make_bootstrap(script: Path, render: RenderSettings, *,
                    timeout_s: float, pod_user: str,
-                   auth_wait_s: float = 420.0) -> callable:
+                   auth_wait_s: float = 900.0) -> callable:
     """The BOOTSTRAP boundary: run an operator-supplied script against a fresh pod.
 
     No digest-pinned worker image is published yet, so pods rent bare and get
@@ -214,9 +214,10 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
 
     def _auth_ready(addr, user: str) -> bool:
         """Marketplace pods inject SSH keys well AFTER sshd answers TCP — lium
-        ~30-60s, hyperstack VMs (shadeform VM-mode) >180s of cloud-init
+        ~30-60s, hyperstack VMs (shadeform VM-mode) 7-8+ MINUTES of cloud-init
         (observed live 2026-07-15: eval pod killed at t+27s pre-gate; then a
-        healthy 4xA6000 burned when 180s wasn't enough). Poll a no-op ssh
+        healthy 4xA6000s burned at 180s AND 420s — auth landed ~1 min after
+        the 420s expiry). Poll a no-op ssh
         until auth lands or the wait expires."""
         import time as _t
 
@@ -224,13 +225,18 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
                 "-o", "BatchMode=yes", "-i", os.path.expanduser(render.key_path),
                 "-p", str(addr.ssh_port), f"{user}@{addr.ip}", "true"]
         end = _t.monotonic() + auth_wait_s
+        last_err = ""
         while True:
             try:
-                if subprocess.run(argv, capture_output=True, timeout=30).returncode == 0:
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+                if proc.returncode == 0:
                     return True
+                last_err = (proc.stderr or "").strip()[-200:]
             except subprocess.TimeoutExpired:
-                pass
+                last_err = "ssh probe timed out"
             if _t.monotonic() >= end:
+                log.warning("auth probe's last error for %s@%s:%s: %s",
+                            user, addr.ip, addr.ssh_port, last_err or "(none)")
                 return False
             _t.sleep(10)
 
