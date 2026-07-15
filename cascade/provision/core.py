@@ -442,13 +442,19 @@ def shadeform_create_body(
 def shadeform_pod_address(info_json: dict, *, ssh_port: int = DEFAULT_SSH_PORT) -> PodAddress | None:
     """Extract ``(ip, port)`` from a Shadeform ``/instances/{id}/info`` response.
 
-    The container's sshd is reached at the mapped ``host_port`` (we expose 22),
-    so we pair the reported ``ip`` with the port we mapped rather than the host
-    box's own ``ssh_port``.
+    Docker-mode: the container's sshd lives at the ``host_port`` of the
+    port mapping echoed back in ``launch_configuration`` — NOT at the VM's
+    port 22 (containers default to ``--network=host``, and the VM's own sshd
+    owns 22; live 2026-07-15). Prefer the echoed mapping; fall back to the
+    caller's ``ssh_port`` (VM-mode rentals carry no docker configuration).
     """
     ip = info_json.get("ip")
     if not ip:
         return None
+    docker = (info_json.get("launch_configuration") or {}).get("docker_configuration") or {}
+    for pm in docker.get("port_mappings") or []:
+        if int(pm.get("container_port", 0) or 0) == DEFAULT_SSH_PORT:
+            return PodAddress(ip=str(ip), ssh_port=int(pm["host_port"]))
     return PodAddress(ip=str(ip), ssh_port=ssh_port)
 
 
@@ -763,6 +769,19 @@ class ShadeformProvider:
 
     def get_ip(self, pod_id: str) -> PodAddress | None:
         return shadeform_pod_address(self._get(f"/instances/{pod_id}/info"))
+
+    def launched_image_digest(self, pod_id: str) -> str:
+        """The image digest Shadeform's own record says this instance runs.
+
+        Fallback attestation for the health gate: sshd-as-PID-1 worker images
+        destroy their /proc/1/environ (setproctitle), so the launch-env digest
+        can't be read off the pod itself (live 2026-07-15)."""
+        try:
+            info = self._get(f"/instances/{pod_id}/info")
+        except Exception:  # noqa: BLE001 — attestation is best-effort, gate decides
+            return ""
+        docker = (info.get("launch_configuration") or {}).get("docker_configuration") or {}
+        return image_digest_of(str(docker.get("image") or ""))
 
     def terminate(self, pod_id: str) -> None:
         try:

@@ -587,10 +587,16 @@ class ProvisionerLoop:
                     log.warning("pod %s bootstrap failed", pid)
                     return None
             if self.health_check is not None:
+                # Provider-echoed image digest (empty when unsupported/bare):
+                # the gate's fallback attestation for sshd-as-PID-1 images.
+                attest_fn = getattr(prov, "launched_image_digest", None)
+                attested = (attest_fn(pid) or "") if attest_fn is not None else ""
                 report = (self.health_check(addr, stage, prov.name,
-                                            sku=cand.sku, gpus=cand.gpus_per_pod)
+                                            sku=cand.sku, gpus=cand.gpus_per_pod,
+                                            attested_digest=attested)
                           if cand is not None else
-                          self.health_check(addr, stage, prov.name))
+                          self.health_check(addr, stage, prov.name,
+                                            attested_digest=attested))
                 if not report.ok:
                     log.warning("pod %s failed health gate: %s", pid, report.summary())
                     return None

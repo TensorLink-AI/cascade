@@ -120,6 +120,11 @@ class HealthGate:
     expected_python: str = EXPECTED_PYTHON
     expected_torch: str = EXPECTED_TORCH
     hippius_probe: Callable[[], bool] | None = field(default=None, compare=False)
+    # Provider-echoed image digest for the CURRENT pod (set per-check by the
+    # caller). Fallback attestation when the pod itself can't testify: an
+    # sshd-as-PID-1 image destroys its own /proc/1/environ via setproctitle
+    # (live 2026-07-15), so env-based digest checks can never pass there.
+    attested_digest: str = field(default="", compare=False)
 
     # ── the gate ─────────────────────────────────────────────────────────────
 
@@ -199,10 +204,32 @@ class HealthGate:
             return True, "unpinned"
         if pinned is None:
             return False, f"pin {self.image_digest!r} carries no sha256:<64hex>"
+        # sshd sessions do NOT inherit the container's launch env (PID 1 got
+        # it — that's how SSH_PUBKEY worked — but a login shell starts clean;
+        # live 2026-07-15). /proc/1/environ is the container's true launch
+        # env and root can always read it: a stronger attestation than
+        # printenv, which stays as the first try for non-container pods.
+        # Single-token remote command + LOCAL parse: run_ssh transports argv
+        # through a remote shell, so any pipeline/quoting collapses en route.
         proc = run_ssh(["printenv", "CASCADE_TRAIN_IMAGE_DIGEST"])
-        if proc.returncode != 0:
+        value = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        if not value:
+            proc = run_ssh(["cat", "/proc/1/environ"])
+            if proc.returncode == 0:
+                for entry in (proc.stdout or "").split("\0"):
+                    if entry.startswith("CASCADE_TRAIN_IMAGE_DIGEST="):
+                        value = entry.partition("=")[2].strip()
+                        break
+        if not value:
+            # Last resort: the provider's own record of what it launched
+            # (e.g. shadeform /info echoes the exact image@digest). Weaker
+            # than pod testimony in principle, but both are provider-mediated
+            # in practice — and sshd-as-PID-1 pods have no readable env.
+            attested = _sha256_of(self.attested_digest)
+            if attested == pinned:
+                return True, "provider-attested (pod env unreadable)"
             return False, "CASCADE_TRAIN_IMAGE_DIGEST unset on pod (inject at launch)"
-        runtime = _sha256_of(proc.stdout)
+        runtime = _sha256_of(value)
         if runtime != pinned:
             return False, f"pod digest {runtime} != pinned {pinned}"
         return True, ""

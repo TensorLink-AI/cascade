@@ -715,3 +715,72 @@ def test_shadeform_wait_ready_raises_on_container_failure():
     ])
     with _pytest.raises(ProvisionError, match="container entered 'failed'"):
         prov.wait_ready("i-1", timeout=900.0)
+
+
+def test_shadeform_pod_address_prefers_echoed_port_mapping():
+    """Docker-mode: the container's sshd lives at the mapped host_port from the
+    /info echo (host 22 belongs to the VM's own sshd — live 2026-07-15)."""
+    from cascade.provision.core import shadeform_pod_address
+
+    info = {"ip": "1.2.3.4", "launch_configuration": {"docker_configuration": {
+        "port_mappings": [{"host_port": 2222, "container_port": 22}]}}}
+    addr = shadeform_pod_address(info)
+    assert (addr.ip, addr.ssh_port) == ("1.2.3.4", 2222)
+    # VM-mode (no docker config): caller's port wins, default 22.
+    assert shadeform_pod_address({"ip": "1.2.3.4"}).ssh_port == 22
+
+
+def test_health_image_digest_falls_back_to_pid1_environ():
+    """sshd sessions don't inherit the container's launch env — printenv comes
+    back empty even though PID 1 carries the digest; /proc/1/environ is the
+    authoritative fallback (live 2026-07-15)."""
+    import types
+
+    from cascade.provision.health import HealthGate
+
+    pin = "sha256:" + "ab" * 32
+    calls = []
+
+    def run_ssh(argv):
+        calls.append(argv)
+        if argv[:1] == ["printenv"]:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        # cat /proc/1/environ: NUL-separated launch env, parsed locally —
+        # run_ssh flattens argv through a remote shell, so no pipelines here.
+        environ = f"PATH=/usr/bin\0CASCADE_TRAIN_IMAGE_DIGEST={pin}\0HOME=/root\0"
+        return types.SimpleNamespace(returncode=0, stdout=environ, stderr="")
+
+    gate = HealthGate(sku="A6000", image_digest=pin)
+    ok, why = gate._check_image_digest(run_ssh)
+    assert ok, why
+    assert ["cat", "/proc/1/environ"] in calls
+
+
+def test_health_image_digest_provider_attestation_fallback():
+    """sshd-as-PID-1 images destroy /proc/1/environ (setproctitle), so when
+    neither printenv nor environ yields the digest, the provider's own launch
+    record (attested_digest) decides — matching pin passes, anything else
+    keeps the hard failure (live 2026-07-15)."""
+    import types
+
+    from cascade.provision.health import HealthGate
+
+    pin = "sha256:" + "cd" * 32
+
+    def run_ssh(argv):
+        if argv[:1] == ["printenv"]:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        # environ clobbered by setproctitle: garbage, no digest entry
+        return types.SimpleNamespace(returncode=0, stdout="-D -e [listener]\0\0\0", stderr="")
+
+    gate = HealthGate(sku="A4000", image_digest=pin, attested_digest=pin)
+    ok, why = gate._check_image_digest(run_ssh)
+    assert ok and "attested" in why
+
+    gate_bad = HealthGate(sku="A4000", image_digest=pin, attested_digest="sha256:" + "ef" * 32)
+    ok, _ = gate_bad._check_image_digest(run_ssh)
+    assert not ok
+
+    gate_none = HealthGate(sku="A4000", image_digest=pin)
+    ok, _ = gate_none._check_image_digest(run_ssh)
+    assert not ok

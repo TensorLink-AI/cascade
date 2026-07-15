@@ -671,7 +671,7 @@ def test_sku_fallback_health_gate_gets_rented_sku(tmp_path):
     """The gate must assert the device that was ACTUALLY rented, not the primary."""
     seen = []
 
-    def health(addr, stage, provider="", *, sku="", gpus=0):
+    def health(addr, stage, provider="", *, sku="", gpus=0, **kw):
         seen.append((stage, sku, gpus))
         return _report(ok=True)
 
