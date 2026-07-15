@@ -249,3 +249,53 @@ def test_clear_hosts_means_local_fallback(tmp_path):
     assert tomllib.loads(path.read_text(encoding="utf-8")) == {}  # valid, empty TOML
     with pytest.raises(RemoteDispatchError):
         load_hosts(path)
+
+
+def test_bootstrap_waits_for_ssh_auth(monkeypatch, tmp_path):
+    """Incident 2026-07-15: key injection lags sshd by ~30-60s on marketplace
+    pods; bootstrap fired at TCP-ready, hit Permission denied, and a healthy
+    eval pod was terminated at t+27s. The bootstrap must poll a no-op ssh
+    until auth lands BEFORE running the script — and give up cleanly (script
+    never run) when auth never arrives."""
+    from types import SimpleNamespace
+
+    from cascade.provision import main as pm
+
+    script = tmp_path / "boot.sh"
+    script.write_text("#!/bin/bash\ntrue\n")
+    render = pm.RenderSettings(image="", ssh_pubkey="pk", key_path="~/.ssh/k")
+    addr = SimpleNamespace(ip="10.0.0.1", ssh_port=22)
+
+    calls = {"auth": 0, "script": 0}
+
+    def fake_run(argv, **kw):
+        if argv[0] == "ssh":
+            calls["auth"] += 1                       # deny twice, then let auth in
+            return SimpleNamespace(returncode=255 if calls["auth"] <= 2 else 0,
+                                   stdout="", stderr="Permission denied")
+        calls["script"] += 1
+        assert calls["auth"] >= 3, "script must not run before auth lands"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pm.subprocess, "run", fake_run)
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+    boot = pm.make_bootstrap(script, render, timeout_s=60, pod_user="root")
+    assert boot(addr, "eval") is True
+    assert calls["script"] == 1
+
+    # auth never lands → bootstrap gives up without running the script
+    calls.update(auth=0, script=0)
+
+    def always_denied(argv, **kw):
+        if argv[0] == "ssh":
+            return SimpleNamespace(returncode=255, stdout="", stderr="denied")
+        calls["script"] += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pm.subprocess, "run", always_denied)
+    boot = pm.make_bootstrap(script, render, timeout_s=60, pod_user="root",
+                             auth_wait_s=0.0)
+    assert boot(addr, "eval") is False
+    assert calls["script"] == 0
