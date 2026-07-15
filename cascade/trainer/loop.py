@@ -164,6 +164,16 @@ class RoundPlan:
     challengers: list[ResolvedGenerator]
 
 
+# Sentinel identity for the genesis baseline king ([round] genesis_generator_ref):
+# a fixed, un-earnable floor that is NOT a registered miner. ``GENESIS_KING_UID``
+# is -1 — out of range for every metagraph — so the validator's
+# ``decayed_share_vector`` drops it and burns to ``burn_uid``; the baseline
+# reigns without drawing emission until a real miner dethrones it. The hotkey is
+# a reserved string no wallet can hold, so it never collides with a challenger.
+GENESIS_KING_HOTKEY = "__genesis_baseline__"
+GENESIS_KING_UID = -1
+
+
 def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
     """Default Cascade bench evaluator: run the sidecar on a checkpoint dir over
     GIFT-Eval / BOOM / TIME and return the six-number :class:`BenchScores`, or
@@ -230,6 +240,7 @@ def plan_round(
     king_hotkey: str | None,
     *,
     king: ResolvedGenerator | None = None,
+    genesis_ref: str | None = None,
 ) -> RoundPlan:
     """Split the field into the king and the challengers.
 
@@ -259,14 +270,25 @@ def plan_round(
         king = by_hotkey.get(king_hotkey)
     field_ = sorted(resolved, key=lambda r: r.uid)
     if king is None:
-        if king_hotkey:
-            # A champion exists but we couldn't resolve its generator — never
-            # silently crown a challenger in its place (that orphans the throne
-            # and the validator rejects the round). Genesis (no champion) is the
-            # only case where promoting the lowest UID is correct.
-            log.warning("reigning king %s has no resolvable commitment; "
-                        "falling back to interim king (validator may hold)", king_hotkey[:12])
-        king = field_[0] if field_ else None
+        if genesis_ref:
+            # Genesis baseline king ([round] genesis_generator_ref): whenever no
+            # on-chain champion has a resolvable commitment, train a FIXED
+            # baseline generator as the king — an un-earnable floor — rather than
+            # promoting a miner. Its sentinel uid (-1) makes the validator burn
+            # emission until a real miner dethrones it (see GENESIS_KING_*). This
+            # also means a genesis round always has a king to train, instead of
+            # aborting "nothing to train" until the first miner resolves.
+            king = ResolvedGenerator(
+                hotkey=GENESIS_KING_HOTKEY, uid=GENESIS_KING_UID, ref=genesis_ref)
+        else:
+            if king_hotkey:
+                # A champion exists but we couldn't resolve its generator — never
+                # silently crown a challenger in its place (that orphans the throne
+                # and the validator rejects the round). Genesis (no champion) is the
+                # only case where promoting the lowest UID is correct.
+                log.warning("reigning king %s has no resolvable commitment; "
+                            "falling back to interim king (validator may hold)", king_hotkey[:12])
+            king = field_[0] if field_ else None
     king_ref = king.ref if king is not None else None
 
     challengers: list[ResolvedGenerator] = []
@@ -753,7 +775,8 @@ class TrainerRunner:
                  if rg.hotkey == king_hotkey),
                 None,
             )
-        plan = plan_round(resolved, king_hotkey, king=king_rg)
+        plan = plan_round(resolved, king_hotkey, king=king_rg,
+                          genesis_ref=self.cfg.round.genesis_generator_ref or None)
         if plan.king is None:
             raise RuntimeError("no resolvable generators on the netuid; nothing to train")
 

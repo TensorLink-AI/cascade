@@ -130,6 +130,13 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # round (and never burn their one submission).
 commit_floor_block = 8622922
 one_submission_per_hotkey = true
+# Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
+# (repo@digest). When set, the trainer trains THIS generator as the king
+# whenever no on-chain champion has a resolvable commitment — a fixed,
+# un-earnable floor — and the validator BURNS emission to burn_uid until a real
+# miner dethrones it (the king entry carries a sentinel uid = -1). Empty = off:
+# promote the lowest-UID miner to interim king (legacy behaviour).
+genesis_generator_ref = ""
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Scaling seam: which size the heat screens at, and which size(s) decide the
 # throne. arch_preset names from the size registry; >1 throne size = combined score.

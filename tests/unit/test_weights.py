@@ -35,6 +35,15 @@ def test_all_deregistered_burns():
     assert w == [0.0, 0.0, 1.0, 0.0]
 
 
+def test_negative_uid_burns_genesis_baseline_king():
+    # The genesis baseline king (cascade.trainer.loop.GENESIS_KING_UID = -1) is a
+    # non-registered sentinel; a negative uid is out of range, so it is dropped and
+    # emission burns to burn_uid — the baseline reigns without drawing reward until
+    # a real miner dethrones it.
+    w = equal_share_vector([-1], 4, burn_uid=0)
+    assert w == [1.0, 0.0, 0.0, 0.0]
+
+
 def test_burn_uid_out_of_range_raises():
     with pytest.raises(ChainError):
         equal_share_vector([], 4, burn_uid=9)

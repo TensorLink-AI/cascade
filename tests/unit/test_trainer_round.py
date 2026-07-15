@@ -278,6 +278,64 @@ def test_plan_round_never_silently_swaps_a_named_champion():
     assert plan_round(field, None).king.hotkey == "b"
 
 
+GENESIS_REF = "owner/base@sha256:" + "e" * 64
+
+
+def test_plan_round_genesis_baseline_king_when_no_king_resolves():
+    from cascade.trainer.loop import (
+        GENESIS_KING_HOTKEY,
+        GENESIS_KING_UID,
+        ResolvedGenerator,
+        plan_round,
+    )
+
+    field = [ResolvedGenerator(hotkey="b", uid=3, ref=REF_B)]
+    # genesis_ref set + no resolvable champion → the FIXED baseline is king (an
+    # un-earnable floor), NOT the lowest-UID miner; challengers are preserved.
+    plan = plan_round(field, king_hotkey=None, genesis_ref=GENESIS_REF)
+    assert plan.king.hotkey == GENESIS_KING_HOTKEY
+    assert plan.king.uid == GENESIS_KING_UID == -1     # sentinel → validator burns
+    assert plan.king.ref == GENESIS_REF
+    assert [c.hotkey for c in plan.challengers] == ["b"]
+    # a named-but-UNRESOLVABLE champion also falls back to the baseline floor
+    assert plan_round(field, "a", genesis_ref=GENESIS_REF).king.hotkey == GENESIS_KING_HOTKEY
+    # off (no genesis_ref) → legacy behaviour: promote the lowest-UID miner
+    assert plan_round(field, king_hotkey=None).king.hotkey == "b"
+
+
+def test_plan_round_baseline_yields_to_a_resolvable_real_king():
+    from cascade.trainer.loop import ResolvedGenerator, plan_round
+
+    field = [ResolvedGenerator(hotkey="b", uid=1, ref=REF_B)]
+    king_a = ResolvedGenerator(hotkey="a", uid=0, ref=REF_A)
+    # a real champion that resolves stays king even with genesis_ref set — the
+    # baseline is only the floor when nothing else resolves.
+    plan = plan_round(field, "a", king=king_a, genesis_ref=GENESIS_REF)
+    assert plan.king.hotkey == "a"
+    assert [c.hotkey for c in plan.challengers] == ["b"]
+
+
+def test_plan_round_baseline_reigns_alone_with_empty_field():
+    from cascade.trainer.loop import GENESIS_KING_HOTKEY, plan_round
+
+    # No submissions at all: the baseline is still king (it reigns and burns,
+    # no duel) instead of aborting "nothing to train".
+    plan = plan_round([], king_hotkey=None, genesis_ref=GENESIS_REF)
+    assert plan.king.hotkey == GENESIS_KING_HOTKEY
+    assert plan.challengers == []
+
+
+def test_plan_round_drops_a_challenger_that_copied_the_baseline():
+    from cascade.trainer.loop import ResolvedGenerator, plan_round
+
+    # A miner who submits a byte-identical copy of the baseline can only tie it,
+    # so it is dropped (same digest == king_ref); a distinct challenger stays.
+    field = [ResolvedGenerator(hotkey="b", uid=1, ref=GENESIS_REF),
+             ResolvedGenerator(hotkey="c", uid=2, ref=REF_B)]
+    plan = plan_round(field, king_hotkey=None, genesis_ref=GENESIS_REF)
+    assert [c.hotkey for c in plan.challengers] == ["c"]
+
+
 def test_resolve_commitments_cutoff_is_strict_and_latest_eligible_wins():
     # b re-deploys: REF_B at block 5 (eligible) then REF_C at block 60 (late).
     commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 5), _commit(1, "b", REF_C, 60)]
