@@ -85,10 +85,12 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = ""   # UNPINNED for the worker-v0.3.0 build commit (2026-07-15):
-# the image bakes this file, so the pin can only land AFTER CI publishes the
-# image built from THIS commit (with the corrected 20x token budget above).
-# Follow-up commit re-pins via scripts/repin_worker_image.sh worker-v0.3.0.
+train_image_digest = "sha256:f08d8c52a19616bcc218109b0e50a4c0191781de6d91b90ec082e2a47e1987a3"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.3.0 (2026-07-15, built from
+# ed2f4a1 — bakes the corrected 20x token budget). NOTE the baked chain.toml
+# inside the image carries an EMPTY pin (an image cannot contain its own
+# digest); enforcement is launch-env injection + the provisioner health gate,
+# and contract_digest is computed orchestrator-side only.
 # Prior pin: sha256:46bc78fa0ddd… = ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0
 # (built from main incl. PRs #76–#98; bakes the OLD 185k budget — do not reuse).
 # Re-pin protocol: the digest folds into contract_digest ⇒ trainer AND
