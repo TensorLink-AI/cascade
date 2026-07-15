@@ -184,3 +184,33 @@ def test_reveal_verdict_notes_exposure_beyond_the_margin():
         epoch_blocks=EPOCH, margin_blocks=MARGIN,
     )
     assert not missed and "exceeds" in report
+
+
+def test_pending_timelock_parses_commitment_of_record():
+    """Live shape 2026-07-15: CommitmentOf → {deposit, block, info.fields:
+    [{TimelockEncrypted: {encrypted, reveal_round}}]}. While pending, the
+    revealed store still shows the PREVIOUS submission — reveal-status must
+    surface the pending commit instead of gaslighting the miner."""
+    from types import SimpleNamespace
+
+    from cascade.miner.cli import _pending_timelock
+
+    record = {"deposit": 0, "block": 7561939,
+              "info": {"fields": [{"TimelockEncrypted":
+                                   {"encrypted": "0xabcd", "reveal_round": 19938211}}]}}
+
+    class _Substrate:
+        def query(self, module, storage_function, params):
+            assert (module, storage_function) == ("Commitments", "CommitmentOf")
+            return SimpleNamespace(value=record)
+
+    client = SimpleNamespace(netuid=259, subtensor=lambda: SimpleNamespace(substrate=_Substrate()))
+    assert _pending_timelock(client, "5FBi...") == (7561939, 19938211)
+
+    # no pending record (post-reveal): None, quietly
+    class _Empty:
+        def query(self, *a, **k):
+            return SimpleNamespace(value=None)
+
+    client = SimpleNamespace(netuid=259, subtensor=lambda: SimpleNamespace(substrate=_Empty()))
+    assert _pending_timelock(client, "5FBi...") is None

@@ -390,6 +390,28 @@ def _reveal_verdict(
     return missed, "\n".join(lines)
 
 
+def _pending_timelock(client, hotkey: str) -> tuple[int, int] | None:
+    """``(commit_block, reveal_round)`` of an un-revealed timelock commit, if any.
+
+    The plain commitment store (``Commitments::CommitmentOf``) holds the
+    encrypted payload until drand reveals it; once revealed the record is
+    consumed. Without this check, reveal-status shows the hotkey's PREVIOUS
+    reveal while a fresh timelock is pending — telling a miner their new
+    submission doesn't exist (observed during the 2026-07-15 live test)."""
+    try:
+        sub = client.subtensor()
+        q = sub.substrate.query(module="Commitments", storage_function="CommitmentOf",
+                                params=[client.netuid, hotkey])
+        v = getattr(q, "value", None) or {}
+        for f in ((v.get("info") or {}).get("fields") or []):
+            tl = f.get("TimelockEncrypted") if isinstance(f, dict) else None
+            if tl is not None:
+                return int(v.get("block") or 0), int(tl.get("reveal_round") or 0)
+    except Exception:  # noqa: BLE001 — advisory; never break the status report
+        return None
+    return None
+
+
 def _cmd_reveal_status(args: argparse.Namespace) -> int:
     import time
 
@@ -406,6 +428,18 @@ def _cmd_reveal_status(args: argparse.Namespace) -> int:
                 match = next((c for c in commitments if c.uid == int(args.hotkey)), None)
             else:
                 match = next((c for c in commitments if c.hotkey == args.hotkey), None)
+            pending = None if args.hotkey.isdigit() else _pending_timelock(client, args.hotkey)
+            if pending is not None and (match is None or pending[0] > match.reveal_block):
+                blk, rnd = pending
+                print(f"PENDING timelock commit (committed at block {blk}, drand round "
+                      f"{rnd}) — payload still encrypted on-chain; nothing copyable yet."
+                      + (f" Latest REVEALED entry below is the PREVIOUS submission "
+                         f"(block {match.reveal_block})." if match else ""))
+                if args.watch and time.monotonic() < deadline:
+                    time.sleep(12)
+                    continue
+                if match is None:
+                    return 0
             if match is not None:
                 missed, report = _reveal_verdict(
                     match.reveal_block, client.current_block(),
