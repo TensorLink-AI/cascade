@@ -274,6 +274,13 @@ class ProvisionerLoop:
         self._reconcile_orphans()
         self._teardown_due_pods()
         block = self._current_block()
+        # Re-assert AFTER the chain read: constructing the bittensor client
+        # strips the cascade tree's handlers, so everything below (rent, boot,
+        # health, teardown) logged into the void whenever a round triggered on
+        # cycle 1 — the cycle-start hook alone is too early to cover it.
+        if self.on_cycle is not None:
+            with contextlib.suppress(Exception):
+                self.on_cycle()
         self._maybe_provision_eval()
         if should_trigger(block, self.epoch_blocks,
                           self.policy.trigger_margin_blocks, self._provisioned_round):

@@ -60,7 +60,8 @@ horizon            = 64
 # From-scratch budget, enforced as a fixed token count (hours × ref throughput)
 # so king and challenger see identical compute; max_train_seconds is the hard guard.
 target_train_hours          = 3.0
-ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU at context_length; sizes the budget
+ref_throughput_tokens_per_s = 3700000  # 20x (2026-07-15): L40S is ~20x the old 185k ref, so it was
+                                        # finishing the budget early; 20x the TOKEN budget, same 3h wall
 warmup_fraction             = 0.05
 batch_size                  = 64       # Toto 2.0 global batch size
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
@@ -84,12 +85,16 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = "sha256:46bc78fa0ddd1590085bbe3ab909c7f6bb46ab3998a3873764cc6430cb8f3ce6"
-# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0 (built from main incl.
-# PRs #76–#98). At launch: tag worker-v* from the LAUNCH commit and re-pin via
-# scripts/repin_worker_image.sh <tag>. Re-pin protocol: the digest folds into
-# contract_digest ⇒ trainer AND validators restart together at an epoch
-# boundary, pods pull the new image.
+train_image_digest = "sha256:f08d8c52a19616bcc218109b0e50a4c0191781de6d91b90ec082e2a47e1987a3"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.3.0 (2026-07-15, built from
+# ed2f4a1 — bakes the corrected 20x token budget). NOTE the baked chain.toml
+# inside the image carries an EMPTY pin (an image cannot contain its own
+# digest); enforcement is launch-env injection + the provisioner health gate,
+# and contract_digest is computed orchestrator-side only.
+# Prior pin: sha256:46bc78fa0ddd… = ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0
+# (built from main incl. PRs #76–#98; bakes the OLD 185k budget — do not reuse).
+# Re-pin protocol: the digest folds into contract_digest ⇒ trainer AND
+# validators restart together at an epoch boundary, pods pull the new image.
 
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
@@ -136,7 +141,7 @@ one_submission_per_hotkey = true
 # un-earnable floor — and the validator BURNS emission to burn_uid until a real
 # miner dethrones it (the king entry carries a sentinel uid = -1). Empty = off:
 # promote the lowest-UID miner to interim king (legacy behaviour).
-genesis_generator_ref = ""
+genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Scaling seam: which size the heat screens at, and which size(s) decide the
 # throne. arch_preset names from the size registry; >1 throne size = combined score.
