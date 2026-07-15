@@ -405,6 +405,16 @@ class RoundConfig:
     # competes and never burns its one submission. 0 = no floor (testnet).
     # Set to the announced launch block in mainnet chain.toml AT LAUNCH.
     commit_floor_block: int = 0
+    # Genesis baseline king (burn-until-dethroned). A Hippius generator ref
+    # (repo@digest): whenever no on-chain champion has a resolvable commitment,
+    # the trainer trains THIS generator as the king — a fixed, un-earnable floor
+    # — instead of auto-promoting the lowest-UID miner. The king entry carries a
+    # sentinel hotkey and uid = -1, which is out-of-range for every metagraph, so
+    # the validator's weight routing drops it and BURNS to burn_uid until a real
+    # miner dethrones the baseline. Empty ("") = off: legacy behaviour (promote
+    # the lowest-UID challenger to interim king). The ref MUST be a PUBLIC Hub
+    # repo the trainer can fetch anonymously (same contract as a miner submission).
+    genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
     # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
     # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
@@ -875,6 +885,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
+            genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
             reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),

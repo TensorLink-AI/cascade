@@ -437,7 +437,7 @@ class ChainClient:
                 com, block = entry
                 if not isinstance(com, str) or not com:
                     continue
-                if com.startswith("0x"):
+                if com.startswith("0x"):  # noqa: SIM108 — explicit branch reads clearer here
                     raw = bytes.fromhex(com[2:])
                 else:
                     raw = com.encode("utf-8")

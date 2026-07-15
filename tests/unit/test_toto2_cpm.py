@@ -17,14 +17,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cascade.trainer.toto2_model import (
+from cascade.trainer.toto2_model import (  # noqa: E402 — imported after torch importorskip
     QUANTILE_LEVELS,
     Toto2Config,
     Toto2Model,
     causal_standardize,
     patch_anchors,
 )
-from cascade.trainer.toto2_trainer import Toto2Trainer, sample_cpm_masks
+from cascade.trainer.toto2_trainer import Toto2Trainer, sample_cpm_masks  # noqa: E402
 
 TINY = Toto2Config(
     d_model=16, num_layers=1, num_heads=1, head_dim=16, patch_size=4,

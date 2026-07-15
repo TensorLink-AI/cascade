@@ -21,6 +21,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from ..shared.config import load_chain_config
@@ -35,8 +36,6 @@ from .core import (
     wait_ssh_reachable,
 )
 from .health import HealthGate, HealthReport
-from dataclasses import replace
-
 from .loop import PodProfile, ProvisionerLoop, RenderSettings, parse_plan_output
 from .policy import ProvisionPolicy, SkuCandidate, StagePolicy
 
@@ -201,7 +200,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
 
 def make_bootstrap(script: Path, render: RenderSettings, *,
                    timeout_s: float, pod_user: str,
-                   auth_wait_s: float = 180.0) -> callable:
+                   auth_wait_s: float = 420.0) -> callable:
     """The BOOTSTRAP boundary: run an operator-supplied script against a fresh pod.
 
     No digest-pinned worker image is published yet, so pods rent bare and get
@@ -214,10 +213,11 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     import os
 
     def _auth_ready(addr, user: str) -> bool:
-        """Marketplace pods inject SSH keys 30-60s AFTER sshd answers TCP; a
-        bootstrap launched at TCP-ready hits `Permission denied (publickey)`
-        and burns a healthy pod (observed live 2026-07-15, eval pod killed at
-        t+27s). Poll a no-op ssh until auth lands or the wait expires."""
+        """Marketplace pods inject SSH keys well AFTER sshd answers TCP — lium
+        ~30-60s, hyperstack VMs (shadeform VM-mode) >180s of cloud-init
+        (observed live 2026-07-15: eval pod killed at t+27s pre-gate; then a
+        healthy 4xA6000 burned when 180s wasn't enough). Poll a no-op ssh
+        until auth lands or the wait expires."""
         import time as _t
 
         argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",

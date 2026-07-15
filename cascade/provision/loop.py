@@ -79,12 +79,10 @@ from .health import HealthReport
 from .hostsfile import clear_hosts, write_hosts
 from .policy import (
     ProvisionPolicy,
-    StageFleet,
+    pods_for_slots,
     should_trigger,
     size_fleet,
     teardown_due,
-    pods_for_slots,
-    within_budget,
 )
 from .state import (
     PodInstance,
@@ -557,7 +555,7 @@ class ProvisionerLoop:
             if not self.ssh_probe(addr.ip, addr.ssh_port):
                 log.warning("pod %s SSH %s:%d unreachable", pid, addr.ip, addr.ssh_port)
                 return None
-            if self.bootstrap is not None:
+            if self.bootstrap is not None:  # noqa: SIM102 — readability: distinct guard + gate
                 # No digest-pinned worker image exists yet (testnet): pods are
                 # rented bare and provisioned over SSH (rsync source + uv sync
                 # against the pinned lock). The hook runs BEFORE the health

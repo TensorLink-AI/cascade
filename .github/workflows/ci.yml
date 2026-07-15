@@ -1,0 +1,39 @@
+# Test + lint gate on every PR and push to main — the repo's FIRST automated
+# test CI. Added after a mainnet chain.toml change (commit_floor_block) silently
+# broke ~23 round tests with nothing to catch it. Ruff is scoped to cascade/ +
+# tests/; the vendored base_generator/, benchmarks/, and scripts/ carry separate
+# pre-existing lint debt (out of scope for this gate).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.28"
+          enable-cache: true
+
+      # --frozen: install exactly the pinned lock (the reproducibility contract);
+      # --all-extras pulls torch so the full suite runs (torch tests otherwise skip).
+      - name: Sync (frozen, all extras)
+        run: uv sync --frozen --all-extras
+
+      - name: Lint (ruff — cascade + tests)
+        run: uv run ruff check cascade tests
+
+      - name: Unit tests
+        run: uv run pytest tests/unit -q

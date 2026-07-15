@@ -131,6 +131,13 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
+# Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
+# (repo@digest). When set, the trainer trains THIS generator as the king
+# whenever no on-chain champion has a resolvable commitment — a fixed,
+# un-earnable floor — and the validator BURNS emission to burn_uid until a real
+# miner dethrones it (the king entry carries a sentinel uid = -1). Empty = off:
+# promote the lowest-UID miner to interim king (legacy behaviour).
+genesis_generator_ref = ""
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
 # reveal at `epoch boundary − reveal_margin_blocks` — hidden all window, public

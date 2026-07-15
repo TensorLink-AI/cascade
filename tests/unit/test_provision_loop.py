@@ -1007,7 +1007,6 @@ def test_on_cycle_hook_heals_stripped_logging(tmp_path):
 def test_heal_rebuilds_closed_handlers(tmp_path, monkeypatch):
     """bittensor can close stripped handlers' streams — re-attaching the same
     object then fails silently on every emit. The heal must rebuild."""
-    import io
     import logging
     import sys
 

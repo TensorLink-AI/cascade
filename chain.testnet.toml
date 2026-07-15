@@ -169,6 +169,12 @@ reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin 
 # Scaling seam (see chain.toml): screen at screen_size, judge the throne at throne_sizes.
 =======
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
+# Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
+# (repo@digest) trained as the king whenever no on-chain champion resolves — a
+# fixed floor whose sentinel uid = -1 makes the validator BURN to burn_uid until
+# a real miner dethrones it. Empty = off. Handy on testnet to seed a stable king
+# (e.g. the base_generator) so rounds run before any miner submits.
+genesis_generator_ref = ""
 # Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
 # throne_sizes. Both default to the 4M primary; point them at a bigger size to
 # promote a rung. To test the sliding window on testnet, uncomment the 22M size
