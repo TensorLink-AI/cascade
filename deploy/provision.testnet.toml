@@ -11,7 +11,9 @@ max_spend_per_round   = 25.0
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"   # elastic eval pod (PR #85)
 receipt_prefix        = "receipts/5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR/"
 
-image               = "Pytorch (Cuda + DinD)"    # lium template (bootstrap mode)
+image               = ""    # bootstrap mode: EMPTY (omit --image → lium default template).
+                            # A template NAME here 400s EVERY lium rental (Invalid docker_image
+                            # — observed live 2026-07-14, cost 5 pods). Real docker ref = image-boot mode.
 bootstrap_script    = "/root/cascade/deploy/pod_bootstrap.sh"
 bootstrap_timeout_s = 1800
 pod_user            = "root"
