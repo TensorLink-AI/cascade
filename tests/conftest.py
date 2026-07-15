@@ -20,16 +20,21 @@ def cfg() -> ChainConfig:
     """The mainnet template with its ENFORCING pins neutralized.
 
     chain.toml carries the real launch pins (expected_gpu, the worker-image
-    digest) — those assert real hardware and a real container env, neither of
-    which exists under pytest. Blank them HERE, in one place, so the template
-    can stay production-true while every fixture-driven test still runs on
-    fakes. Tests that exercise the pins set them explicitly via replace().
+    digest, and the go-live commit_floor_block) — those assert real hardware, a
+    real container env, and a mainnet-height submission window, none of which
+    exists under pytest (round fixtures commit at low block numbers). Blank them
+    HERE, in one place, so the template can stay production-true while every
+    fixture-driven test still runs on fakes. Tests that exercise the pins set
+    them explicitly via replace().
     """
     from dataclasses import replace
 
     c = load_chain_config(REPO_ROOT / "chain.toml")
-    return replace(c, training=replace(c.training, expected_gpu="",
-                                       train_image_digest=""))
+    return replace(
+        c,
+        training=replace(c.training, expected_gpu="", train_image_digest=""),
+        round=replace(c.round, commit_floor_block=0),
+    )
 
 
 @pytest.fixture(scope="session")
