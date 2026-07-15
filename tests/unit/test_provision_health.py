@@ -299,3 +299,32 @@ def test_bootstrap_waits_for_ssh_auth(monkeypatch, tmp_path):
                              auth_wait_s=0.0)
     assert boot(addr, "eval") is False
     assert calls["script"] == 0
+
+
+def test_bootstrap_probes_with_the_provider_profile_user(monkeypatch, tmp_path):
+    """The bug that burned three healthy shadeform 4xA6000s: make_bootstrap
+    captured render BEFORE profiles were attached (frozen dataclass ⇒
+    replace() makes a new object), so the auth probe ran as root@ against
+    VMs that only accept shadeform@. The probe must use the provider
+    profile's user."""
+    from types import SimpleNamespace
+
+    from cascade.provision import main as pm
+    from cascade.provision.loop import PodProfile
+
+    script = tmp_path / "boot.sh"
+    script.write_text("#!/bin/bash\ntrue\n")
+    render = pm.RenderSettings(image="", ssh_pubkey="pk", key_path="~/.ssh/k",
+                               profiles={"shadeform": PodProfile(user="shadeform")})
+    users = []
+
+    def fake_run(argv, **kw):
+        if argv[0] == "ssh":
+            users.append(next(a for a in argv if "@" in a).split("@")[0])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pm.subprocess, "run", fake_run)
+    boot = pm.make_bootstrap(script, render, timeout_s=60, pod_user="root")
+    assert boot(SimpleNamespace(ip="10.0.0.1", ssh_port=22), "heat", "shadeform") is True
+    assert users == ["shadeform"]                       # NOT root
