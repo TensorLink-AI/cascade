@@ -128,7 +128,8 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
 # squatters / rehearsal commits from before the official start never enter a
 # round (and never burn their one submission).
-commit_floor_block = 0        # PLACEHOLDER: set to the announced go-live block at launch
+commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
+                              # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
