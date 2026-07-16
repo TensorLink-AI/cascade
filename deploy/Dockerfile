@@ -43,6 +43,17 @@ RUN uv venv --python 3.11 /root/cascade/.venv \
         torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124 \
     && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius]'
 
+# Generator-runtime allowlist (chain.toml [dependencies]) — baked and PINNED so
+# every miner generator finds the identical numeric stack on every pod.
+# worker-v0.3.0 shipped without these: every generator importing pandas failed
+# heats with generator_import_failed (2026-07-15; pods were hand-patched).
+# Pins match uv.lock where present, else a frozen `uv pip compile` resolution
+# against it (2026-07-16). torch stays the cu124 build installed above.
+RUN uv pip install --python /root/cascade/.venv/bin/python \
+        numpy==2.4.6 pandas==3.0.3 pyarrow==25.0.0 pyyaml==6.0.3 \
+        scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 \
+        scikit-learn==1.9.0 gpytorch==1.15.2 networkx==3.6.1
+
 # The public contract (chain.toml) is baked in so every pod trains the identical
 # recipe; the worker cd's here and load_chain_config finds it. Override per-host
 # with hosts.toml `chain_toml` only if a pod must differ.
