@@ -536,12 +536,84 @@ def test_remote_dispatch_retries_once_on_next_host(cfg, tmp_path, monkeypatch):
                _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
-    # every dispatch survived its first failure via a retry on the OTHER host
+    # every dispatch survived its first failure via a retry
     assert manifest.entry_for_role("king").gen_ref == REF_A
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"
     for key, hosts_seen in calls.items():
         assert len(hosts_seen) == 2, key
-        assert hosts_seen[0] is not hosts_seen[1], key
+        (_hotkey, _role, is_heat) = key
+        # The FINAL keeps the strict next-host retry; heat retries land on
+        # whichever lane is FREE (a different one when available, but never a
+        # busy one — see test_heat_never_double_books_a_lane).
+        if not is_heat:
+            assert hosts_seen[0] is not hosts_seen[1], key
+
+
+def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
+    # A fast-failing challenger frees its worker THREAD immediately; the next
+    # challenger must land on an IDLE lane, not double-book a GPU that is
+    # still mid-heat (heats are wall-clock scored: a co-tenant halves your
+    # throughput and degrades your score — observed 2026-07-15 when a lane
+    # failure left one GPU idle while another ran two challengers).
+    import threading
+    import time as _time
+
+    import cascade.trainer.remote as remote_mod
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    _patch_train_boundaries(monkeypatch)
+    host_a, host_b = object(), object()
+    lock = threading.Lock()
+    active: dict[int, str] = {}          # id(host) -> hotkey currently on it
+    violations: list[tuple[str, str]] = []
+    failed_once: set[str] = set()
+
+    class _OccupancyDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+            if train_hours is None:      # final: single job per host, not under test
+                return TrainedEntry(
+                    miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                    trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                    train_block=block, gpu_name="",
+                    size=arch_preset or cfg.training.arch_preset,
+                )
+            with lock:
+                if id(host) in active:
+                    violations.append((active[id(host)], hotkey))
+                active[id(host)] = hotkey
+            try:
+                if hotkey == "b" and "b" not in failed_once:
+                    failed_once.add("b")     # fast failure: frees the thread at once
+                    raise RuntimeError("generator_import_failed")
+                _time.sleep(0.05)            # the others are still mid-heat
+                return TrainedEntry(
+                    miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                    trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                    train_block=block, gpu_name="",
+                    size=arch_preset or cfg.training.arch_preset,
+                )
+            finally:
+                with lock:
+                    active.pop(id(host), None)
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _OccupancyDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[host_a, host_b], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert violations == []                              # no lane ever ran two at once
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
 
 
 def test_reload_remote_hosts_per_round(cfg, tmp_path):

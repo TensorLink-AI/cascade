@@ -1032,6 +1032,40 @@ class TrainerRunner:
                         getattr(host, "name", host), e, getattr(retry_host, "name", retry_host))
             return disp.dispatch(retry_host, lane_count=pod_lane_count(retry_host, hosts), **kw)
 
+    @staticmethod
+    def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str, **kw):
+        """Dispatch on the next IDLE lane, retrying once on whichever lane is
+        free after a failure (a different one whenever one is available).
+
+        Same retry policy as :meth:`_dispatch_with_retry`, but lane occupancy
+        is tracked through ``free_lanes`` (a ``queue.Queue`` of hosts) instead
+        of a static ``i % n`` pin. The pin double-booked GPUs: a fast-failing
+        challenger freed its worker THREAD but not its lane, so the next
+        challenger landed on a still-busy GPU while the freed one idled — and
+        heats are wall-clock scored, so the co-tenant's throughput (and score)
+        halved (2026-07-15). A checked-out lane always returns to the pool,
+        success or failure: a lane that failed for a challenger-specific
+        reason (import error, OOM) is still good silicon."""
+        from .remote import pod_lane_count
+
+        host = free_lanes.get()
+        try:
+            entry = disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
+        except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
+            free_lanes.put(host)                 # failed lane rejoins the rotation
+            retry_host = free_lanes.get()        # next idle lane; different when one exists
+            log.warning("%s failed on %s (%s); retrying on %s", describe,
+                        getattr(host, "name", host), e,
+                        getattr(retry_host, "name", retry_host))
+            try:
+                return disp.dispatch(retry_host,
+                                     lane_count=pod_lane_count(retry_host, hosts), **kw)
+            finally:
+                free_lanes.put(retry_host)
+        else:
+            free_lanes.put(host)
+            return entry
+
     def _heat_train_remote(
         self,
         challengers: list[ResolvedGenerator],
@@ -1045,6 +1079,7 @@ class TrainerRunner:
         checkpoint back for local screening. Each pushes to a per-challenger repo
         so concurrent heat runs never collide. A challenger that fails to train or
         fetch is dropped."""
+        import queue
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from .remote import RemoteDispatcher
@@ -1061,9 +1096,15 @@ class TrainerRunner:
         heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
         disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout)
 
-        def _run(i: int, c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path]:
-            entry = self._dispatch_with_retry(
-                disp, hosts, i, describe=f"heat challenger {c.hotkey}",
+        # Lane pool: dispatch lands on whichever GPU lane is actually idle
+        # (see _dispatch_on_free_lane — the old i % n pin double-booked lanes).
+        free_lanes: queue.Queue = queue.Queue()
+        for h in hosts:
+            free_lanes.put(h)
+
+        def _run(c: ResolvedGenerator) -> tuple[ResolvedGenerator, Path]:
+            entry = self._dispatch_on_free_lane(
+                disp, free_lanes, hosts, describe=f"heat challenger {c.hotkey}",
                 gen_ref=c.ref, uid=c.uid, hotkey=c.hotkey, role="challenger",
                 base_seed=seeds.base_seed, block=block,
                 arch_preset=heat_contract.arch_preset,
@@ -1079,7 +1120,7 @@ class TrainerRunner:
 
         out: list[tuple[ResolvedGenerator, Path]] = []
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-            futs = {ex.submit(_run, i, c): c for i, c in enumerate(challengers)}
+            futs = {ex.submit(_run, c): c for c in challengers}
             for fut in as_completed(futs):
                 c = futs[fut]
                 try:
