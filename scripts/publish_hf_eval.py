@@ -22,6 +22,16 @@ import os
 import sys
 from pathlib import Path
 
+# Force the standard LFS/HTTP upload path, not the Xet backend. Recent
+# huggingface_hub auto-installs hf_xet and defaults uploads through Xet, which
+# needs a SEPARATE xet-write scope on the token. A plain write token (which can
+# create_repo and push LFS fine) gets 403 on .../xet-write-token/main, aborting
+# the whole upload_folder. Disabling Xet sidesteps that scope entirely; the
+# fallback path uses the same write token. setdefault so an explicit
+# HF_HUB_DISABLE_XET=0 (opt back into Xet) is still honoured. Must be set before
+# huggingface_hub is imported — its constants read this at import time.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 
 def _card(repo_id: str, as_of: str, pool_dir: Path) -> str:
     meta = json.loads((pool_dir / "metadata.json").read_text()) if (pool_dir / "metadata.json").is_file() else {}
