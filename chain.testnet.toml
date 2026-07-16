@@ -331,7 +331,8 @@ pool_s3_region   = ""
 # dual-writes every manifest/receipt to R2 (a full backup, not just an outage
 # failover) and reads fall back there when Hippius S3 is down. Credentials via
 # BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY. See chain.toml for details.
-backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
+# Empty = disabled; testnet keeps the HF fallback below instead.
+backup_s3_endpoint = ""                             # e.g. "https://<account>.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
 hf_backup_repo   = "tensorlink-dev/cascade-testnet-mirror"   # TESTNET: S3-down fallback
