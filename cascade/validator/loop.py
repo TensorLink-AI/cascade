@@ -1093,6 +1093,81 @@ def _load_state(path: str) -> ChampionState:
         return ChampionState()
 
 
+def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState | None:
+    """Champion inherited from the signed public receipt trail, or ``None``.
+
+    First-boot inheritance for a validator with no local state: the throne
+    otherwise lives only in each validator's private state DB, so a validator
+    joining mid-reign would judge the next manifest blind (``king_synced``
+    treats an unset champion as synced) and crown whichever king it happened
+    to see win first — a different champion than every validator that
+    witnessed the real dethrone (OPSLOG 2026-07-17).
+
+    ``anchor`` is the pinned receipt-signing ss58 (``[manifest]
+    validator_hotkey``, falling back to ``trainer_hotkey``) — the same trust
+    anchor the validator already applies to manifests, extended once, at
+    first boot, to the receipt trail. Reads the anchor's
+    ``receipts/<anchor>/latest.json`` (legacy shared pointer as fallback) and
+    adopts the throne recorded by a *scored* receipt whose signature
+    verifies. When ``latest.json`` is a hold/rejected receipt (verdict-less
+    by construction), the receipt *index* is consulted — but only as an
+    UNTRUSTED pointer to candidate round ids: nothing is adopted except from
+    a per-round receipt whose signature verifies against the anchor.
+
+    Anything short of that — missing objects, unreadable JSON, a bad
+    signature, a genesis throne (``king_hotkey`` unset) — returns ``None``
+    and the caller proceeds with the stock blank-slate behaviour. Storage
+    faults must never block validator startup.
+    """
+    if not anchor:
+        return None
+    from ..shared.hippius import (
+        RECEIPT_INDEX_KEY,
+        RECEIPT_LATEST_KEY,
+        receipt_latest_key,
+        receipt_round_key,
+    )
+    from ..shared.receipt import load_receipt, verify_receipt_signature
+
+    def _adopt_from(key: str) -> ChampionState | None:
+        try:
+            text = store.get_text(key)
+        except Exception:  # noqa: BLE001 — absent/unreachable key ⇒ next candidate
+            return None
+        try:
+            receipt = load_receipt(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("receipt bootstrap: unreadable receipt at %s (%s); skipped", key, e)
+            return None
+        if not verify_receipt_signature(receipt, anchor):
+            log.warning("receipt bootstrap: receipt at %s is not signed by the pinned "
+                        "hotkey %s…; skipped", key, anchor[:8])
+            return None
+        v = receipt.verdict
+        if receipt.status != "scored" or v is None or not v.king_hotkey or v.king_uid is None:
+            return None
+        log.info("receipt bootstrap: adopting champion %s (uid %d) from signed scored "
+                 "receipt round=%s", v.king_hotkey, int(v.king_uid), receipt.round_id)
+        return ChampionState(king_hotkey=str(v.king_hotkey), king_uid=int(v.king_uid))
+
+    adopted = _adopt_from(receipt_latest_key(anchor)) or _adopt_from(RECEIPT_LATEST_KEY)
+    if adopted is not None:
+        return adopted
+    try:
+        rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
+    except Exception:  # noqa: BLE001 — no index ⇒ nothing more to try
+        rows = []
+    # Index rows are chronological (oldest first, capped at most-recent);
+    # walk newest-first and adopt the first scored round that verifies.
+    for row in reversed(rows):
+        if str(row.get("status")) != "scored":
+            continue
+        adopted = _adopt_from(receipt_round_key(str(row.get("round_id", "")), anchor))
+        if adopted is not None:
+            return adopted
+    return None
+
+
 def _warm_start_installer(path: Path) -> Callable[[object], None]:
     """The default Cascade installer: promote the winning checkpoint by writing its
     pointer (and its eval numbers) to ``warm_start_init_path`` — the seam the
@@ -1153,10 +1228,26 @@ def build_runner(
     from ..shared.config import load_chain_config
 
     cfg = load_chain_config(chain_toml)
+    state = _load_state(cfg.validator.state_db_path)
+    if (cfg.validator.bootstrap_from_receipts and state.king_hotkey is None
+            and state.rounds_seen == 0 and not state.former_kings):
+        # Truly fresh validator (no champion, no history): inherit the throne
+        # from the signed receipt trail before the first manifest is judged.
+        from ..shared.hippius import open_manifest_store
+
+        anchor = cfg.manifest.validator_hotkey or cfg.manifest.trainer_hotkey
+        try:
+            adopted = _bootstrap_state_from_receipts(
+                open_manifest_store(cfg.storage), anchor)
+        except Exception as e:  # noqa: BLE001 — storage must never block startup
+            log.warning("receipt bootstrap skipped (%s); starting blank", e)
+            adopted = None
+        if adopted is not None:
+            state = adopted
     # Cascade is opt-in ([scoring] cascade_enabled); off ⇒ no controller is wired
     # and the runner is pure KOTH.
     cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
     return ValidatorRunner(
-        cfg=cfg, state=_load_state(cfg.validator.state_db_path),
+        cfg=cfg, state=state,
         cache_dir=cache_dir, device=device, cascade=cascade, eval_host_fn=eval_host_fn,
     )

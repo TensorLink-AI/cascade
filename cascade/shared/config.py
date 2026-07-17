@@ -631,6 +631,12 @@ class ValidatorConfig:
     # round from. Defaults keep older chain.toml loadable.
     cascade_state_db_path: str = "cascade_state.json"
     warm_start_init_path: str = "warm_start_init.json"
+    # First-boot champion inheritance: with no local state, adopt the throne
+    # from the signed public receipt trail (verified against the pinned
+    # manifest/receipt hotkey) instead of judging the next manifest blind.
+    # A validator joining mid-reign otherwise crowns whichever king it happens
+    # to see win first. Default on; existing state always wins over bootstrap.
+    bootstrap_from_receipts: bool = True
 
 
 @dataclass(frozen=True)
@@ -952,6 +958,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             state_db_path=str(v["state_db_path"]),
             cascade_state_db_path=str(v.get("cascade_state_db_path", "cascade_state.json")),
             warm_start_init_path=str(v.get("warm_start_init_path", "warm_start_init.json")),
+            bootstrap_from_receipts=bool(v.get("bootstrap_from_receipts", True)),
         ),
         wandb=WandbConfig(
             enabled=bool(wb.get("enabled", False)),

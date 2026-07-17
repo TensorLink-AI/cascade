@@ -306,6 +306,11 @@ state_db_path              = "validator_state.db"
 # checkpoint log, and the promoted warm-start pointer for the trainer.
 cascade_state_db_path      = "cascade_state.json"
 warm_start_init_path       = "warm_start_init.json"
+# First boot with no local state: inherit the current champion from the signed
+# public receipt trail (verified against the pinned [manifest] hotkey) instead
+# of judging the next manifest blind. Makes validator join-order irrelevant to
+# who holds the throne. Existing state always wins; flip false to opt out.
+bootstrap_from_receipts    = true
 
 [wandb]
 # Optional live training dashboards (Weights & Biases). Observability only —
