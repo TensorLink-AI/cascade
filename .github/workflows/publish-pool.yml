@@ -81,14 +81,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      # awscli is deliberately NOT pip-installed here. The ubuntu-latest runner
+      # ships AWS CLI v2 pre-installed (used by the sync step below), and pulling
+      # pip's awscli (v1, which EXACT-pins botocore) into the same resolve as the
+      # hippius extra's boto3>=1.34 sent pip's resolver into a long backtracking
+      # storm over botocore versions — the install stalled until the job hit
+      # "The operation was canceled". Rely on the pre-installed v2 instead.
       - name: Install cascade (pool-forge + hippius extras)
-        run: pip install -e ".[pool-forge,hippius]" awscli
+        run: pip install -e ".[pool-forge,hippius]"
 
       - name: Sync forge mirror down  (FORGE READ key only)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TSFORGE_S3_SECRET_KEY }}
         run: |
+          aws --version   # pre-installed AWS CLI v2; fail loudly if the image drops it
           if [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo "::error::TSFORGE_S3_ACCESS_KEY not set — cannot read the forge bucket."
             exit 1
