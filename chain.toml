@@ -317,7 +317,7 @@ bootstrap_from_receipts    = true
 # never feeds scoring or weights; held-out eval scores are not sent. One run per
 # (round, competitor, size), tagged with the miner hotkey. Requires the [wandb]
 # extra; WANDB_API_KEY comes from the environment, never this file.
-enabled = false                 # set true to turn on live wandb logging
+enabled = true                  # live wandb logging ON (owner 2026-07-18); observability only
 project = "cascade"             # wandb project; make it PUBLIC for miners to view
 entity  = ""                    # wandb team/user (empty = the API key's default)
 mode    = "online"              # online | offline | disabled

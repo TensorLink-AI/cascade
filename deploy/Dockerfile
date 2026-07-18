@@ -41,7 +41,12 @@ COPY . /root/cascade
 RUN uv venv --python 3.11 /root/cascade/.venv \
     && uv pip install --python /root/cascade/.venv/bin/python \
         torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124 \
-    && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius]'
+    && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius,wandb]'
+    # [wandb] extra (2026-07-18): lets pod workers mirror per-step training
+    # logs to wandb when [wandb] enabled=true AND WANDB_API_KEY is forwarded
+    # (provision.toml forward_env). Absent either, the sink no-ops. NOTE: this
+    # layer change lands in the NEXT image rotation (digest re-pin + contract
+    # recompute) — it is not worth a rotation on its own.
 
 # Generator-runtime allowlist (chain.toml [dependencies]) — baked and PINNED so
 # every miner generator finds the identical numeric stack on every pod.

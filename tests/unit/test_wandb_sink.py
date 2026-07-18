@@ -125,9 +125,12 @@ def test_emit_swallows_log_errors():
     sink.finish()
 
 
-def test_config_default_disabled(cfg):
-    # chain.toml ships [wandb] disabled by default; loading exposes the section.
-    assert cfg.wandb.enabled is False
+def test_config_section_loads(cfg):
+    # chain.toml ships [wandb] ENABLED (owner 2026-07-18) — observability only,
+    # and still gated at runtime on WANDB_API_KEY being present. The safety
+    # property this file guards is the no-key/no-package/error no-op behaviour
+    # (tests above), not the shipped toggle value.
+    assert cfg.wandb.enabled is True
     assert cfg.wandb.project
     assert cfg.wandb.mode in ("online", "offline", "disabled")
 
