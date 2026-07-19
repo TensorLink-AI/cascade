@@ -33,16 +33,15 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ..shared.chain_status import STAGE_OVERHEAD_SECONDS, stage_windows
 from ..shared.config import RoundConfig
 
 DEFAULT_SECONDS_PER_BLOCK = 12.0
 BAR_WIDTH = 28
 
-# Fixed per-stage overhead the timing estimate absorbs on top of the training
-# budgets: generator fetch, sandbox boot, checkpoint upload, screening eval,
-# manifest publish. Rough by design — the stage strip is an estimate until the
-# public receipt confirms the round settled.
-PHASE_OVERHEAD_SECONDS = 900.0
+# Per-stage overhead of the timing estimate — shared with the web dashboard's
+# status feed so both estimate off the same numbers (see shared.chain_status).
+PHASE_OVERHEAD_SECONDS = STAGE_OVERHEAD_SECONDS
 
 # Max submission rows rendered before collapsing to a "… N more" line.
 SUBMISSIONS_SHOWN = 8
@@ -161,20 +160,8 @@ class RoundTimeline:
 
     @classmethod
     def from_chain_config(cls, cfg: object) -> RoundTimeline:
-        rnd = cfg.round
-        screen = cfg.screen_contract()
-        # Mirrors TrainingContractConfig.for_hours: budget hours ARE the cap,
-        # with the floor absorbing fixed overheads, never above the pinned max.
-        guard = max(
-            rnd.heat_guard_factor * rnd.heat_train_hours * 3600.0,
-            float(rnd.heat_guard_floor_seconds),
-        )
-        heat_wall = min(guard, float(screen.max_train_seconds))
-        duel_wall = float(sum(c.max_train_seconds for c in cfg.throne_contracts()))
-        return cls(
-            heat_seconds=heat_wall + PHASE_OVERHEAD_SECONDS,
-            duel_seconds=duel_wall + PHASE_OVERHEAD_SECONDS,
-        )
+        heat_s, duel_s = stage_windows(cfg)
+        return cls(heat_seconds=heat_s, duel_seconds=duel_s)
 
 
 def phase_for(
