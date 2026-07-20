@@ -486,6 +486,14 @@ def check_weights(
     # new (state) king takes it. The state king can legitimately differ from
     # the manifest king on a no-dethrone round (see check_transition).
     v = receipt.verdict
+    if v is not None and not receipt.reward_uids:
+        # A scored round that deliberately burned: either the king was
+        # unregistered at vote time, or the operator ran [validator]
+        # force_burn. The vector already recomputed above (empty uids ⇒ the
+        # burn share), so this is consistent — surface it, don't fail it.
+        return _warn(name, "scored round recorded a deliberate burn (empty "
+                           "reward_uids): king unregistered at vote time, or "
+                           "the validator ran with [validator] force_burn")
     if v is not None:
         if v.dethroned:
             voted = v.king_uid

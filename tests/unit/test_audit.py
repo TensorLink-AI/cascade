@@ -246,6 +246,21 @@ def test_missing_weights_warns(audit_cfg, signed_receipt):
     assert r.status == C.WARN
 
 
+def test_deliberate_burn_warns_not_fails(audit_cfg, signed_receipt):
+    # A scored round that burned on purpose (king unregistered at vote time, or
+    # [validator] force_burn): reward_uids is empty but the burn vector was set
+    # and recomputes. Must surface as WARN, never FAIL.
+    from cascade.shared.chain import decayed_share_vector
+
+    burn = decayed_share_vector(
+        [], len(signed_receipt.weights),
+        decay=audit_cfg.scoring.king_decay, burn_uid=audit_cfg.scoring.burn_uid,
+    )
+    r = C.check_weights(
+        replace(signed_receipt, reward_uids=(), weights=tuple(burn)), audit_cfg)
+    assert r.status == C.WARN and "deliberate burn" in r.detail
+
+
 # ── chain-backed halves ───────────────────────────────────────────────────────
 
 

@@ -1080,7 +1080,14 @@ class ValidatorRunner:
         champion and no manifest king); the loop hands that to
         ``set_equal_share_weights``, which burns to ``burn_uid`` rather than
         reverting. The list is otherwise deduped/range-checked there too.
+
+        ``[validator] force_burn`` empties the list HERE — not just at the
+        weight push — so the published receipt's ``reward_uids`` agree with the
+        burn vector actually set (``cascade-audit`` recomputes one from the
+        other and fails on a mismatch).
         """
+        if self.cfg.validator.force_burn:
+            return []
         uids: list[int] = []
         king_uid = self._king_uid_to_vote(manifest, client=client)
         if king_uid is not None:
@@ -1097,8 +1104,23 @@ class ValidatorRunner:
         Shared by the scored path and the king-resync path. Always sets weights —
         an empty ``reward_uids`` burns to ``burn_uid`` so emission still leaves the
         network. A failed extrinsic is logged and retried next round (the empty
-        vector is recorded truthfully in the receipt)."""
+        vector is recorded truthfully in the receipt).
+
+        ``[validator] force_burn`` overrides the vector to a burn HERE — the
+        single choke point every push flows through (scored, resync, re-assert) —
+        so the receipt records the burn that was actually set. Champion state is
+        never touched by this override."""
         from ..shared.chain import decayed_share_vector
+
+        if self.cfg.validator.force_burn:
+            log.warning(
+                "FORCE-BURN active (round=%s): %sburning to uid %d (champion state "
+                "untouched — unset [validator] force_burn and restart to resume voting)",
+                round_id,
+                f"dropping reward_uids={reward_uids}; " if reward_uids else "",
+                self.cfg.scoring.burn_uid,
+            )
+            reward_uids = []
 
         decay = self.cfg.scoring.king_decay
         try:

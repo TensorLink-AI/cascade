@@ -637,6 +637,13 @@ class ValidatorConfig:
     # A validator joining mid-reign otherwise crowns whichever king it happens
     # to see win first. Default on; existing state always wins over bootstrap.
     bootstrap_from_receipts: bool = True
+    # Operator kill-switch: push the burn vector instead of the champion on
+    # EVERY weight-set (round votes, resync votes, and re-asserts) while still
+    # refreshing last_update — the validator stays Yuma-active but endorses no
+    # miner. Champion state keeps evolving on disk untouched, so flipping this
+    # back off resumes voting the persisted king immediately. For "something
+    # looks wrong, stop endorsing while I investigate" — NOT a shutdown.
+    force_burn: bool = False
 
 
 @dataclass(frozen=True)
@@ -959,6 +966,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             cascade_state_db_path=str(v.get("cascade_state_db_path", "cascade_state.json")),
             warm_start_init_path=str(v.get("warm_start_init_path", "warm_start_init.json")),
             bootstrap_from_receipts=bool(v.get("bootstrap_from_receipts", True)),
+            force_burn=bool(v.get("force_burn", False)),
         ),
         wandb=WandbConfig(
             enabled=bool(wb.get("enabled", False)),
