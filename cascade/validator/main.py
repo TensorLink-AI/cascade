@@ -32,6 +32,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         "file just runs that eval locally on --device. Wallet + all "
                         "consensus decisions stay on this box; only the heavy eval "
                         "runs on the pod. Omit to always run locally.")
+    p.add_argument("--force-burn", action="store_true",
+                   help="Operator kill-switch: burn to [scoring] burn_uid on every "
+                        "weight-set instead of voting the champion, while staying "
+                        "Yuma-active. Same as [validator] force_burn = true. Champion "
+                        "state is untouched; drop the flag and restart to resume voting.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -61,6 +66,16 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         eval_host_fn=eval_host_fn,
     )
+
+    if args.force_burn and not runner.cfg.validator.force_burn:
+        from dataclasses import replace
+        runner.cfg = replace(
+            runner.cfg, validator=replace(runner.cfg.validator, force_burn=True))
+    if runner.cfg.validator.force_burn:
+        logging.getLogger("cascade.validator").warning(
+            "FORCE-BURN mode: every weight-set burns to uid %d until this flag is "
+            "removed; champion state still updates normally",
+            runner.cfg.scoring.burn_uid)
 
     if args.offline:
         print(f"netuid:   {runner.cfg.netuid}")

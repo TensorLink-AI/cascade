@@ -1097,8 +1097,22 @@ class ValidatorRunner:
         Shared by the scored path and the king-resync path. Always sets weights —
         an empty ``reward_uids`` burns to ``burn_uid`` so emission still leaves the
         network. A failed extrinsic is logged and retried next round (the empty
-        vector is recorded truthfully in the receipt)."""
+        vector is recorded truthfully in the receipt).
+
+        ``[validator] force_burn`` overrides the vector to a burn HERE — the
+        single choke point every push flows through (scored, resync, re-assert) —
+        so the receipt records the burn that was actually set. Champion state is
+        never touched by this override."""
         from ..shared.chain import decayed_share_vector
+
+        if self.cfg.validator.force_burn:
+            log.warning(
+                "FORCE-BURN active (round=%s): dropping reward_uids=%s; burning to "
+                "uid %d (champion state untouched — unset [validator] force_burn "
+                "and restart to resume voting)",
+                round_id, reward_uids, self.cfg.scoring.burn_uid,
+            )
+            reward_uids = []
 
         decay = self.cfg.scoring.king_decay
         try:

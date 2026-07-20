@@ -136,6 +136,16 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
 | gift gate / bench slow | those want a GPU — `--eval-hosts`, or pin `gift_gate_data_dir` on a CUDA box |
 | audit WARNs on `block-hash-onchain` | lite node without history — use an archive node for zero WARNs |
 
+**Emergency: stop endorsing without going dark.** If something looks wrong —
+a suspect manifest, a scoring result you don't trust, a possibly-compromised
+key — don't stop the process (your last weights linger on chain and you go
+Yuma-inactive). Instead restart with `--force-burn` (or set
+`[validator] force_burn = true`): every weight-set burns to the subnet's
+burn UID while your `last_update` stays fresh, so you remain an active
+validator endorsing nobody. Your champion state keeps evolving normally on
+disk; drop the flag and restart to resume voting it. Every push logs
+`FORCE-BURN active` so it can't be forgotten.
+
 ## Rewards
 
 Weight splits across the current king plus recent distinct kings (geometric
