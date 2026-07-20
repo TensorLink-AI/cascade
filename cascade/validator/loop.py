@@ -21,6 +21,7 @@ behind the defaults.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -129,6 +130,11 @@ class ValidatorRunner:
     # a fired Cascade vacates the champion throne to re-open the competition from
     # the promoted warm-start init. None ⇒ Cascade is disabled (pure KOTH).
     cascade: CascadeController | None = None
+    # Block of the last successful (or attempted re-assert) weight-set; drives
+    # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
+    # never set this process, so the first live-loop tick re-asserts
+    # immediately (a restart is also a manual "refresh last_update now").
+    _last_weight_block: int | None = None
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -929,7 +935,49 @@ class ValidatorRunner:
                         self._cascade_round(manifest, outcome)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
+            try:
+                self._maybe_reassert_weights(client)
+            except Exception as e:  # noqa: BLE001
+                log.warning("weight re-assert check failed: %s", e)
             time.sleep(poll)
+
+    def _maybe_reassert_weights(self, client: object) -> None:
+        """Re-push the standing weight vector every ``weight_set_interval_blocks``.
+
+        Subtensor treats a validator whose ``last_update`` is older than the
+        subnet's ``activity_cutoff`` (5000 blocks ≈ 16.7 h on netuid 91) as
+        inactive in Yuma consensus. A mainnet round is 7200 blocks, so voting
+        only when a manifest lands blows through the cutoff every round — and a
+        stalled trainer silences the validator entirely. The vector needs no
+        manifest: it is recomputed from the persisted champion state (king +
+        registered prior kings; no champion burns to ``burn_uid``), so this is
+        a pure freshness signal that can never move the throne. The interval
+        must stay ≥ the subnet's ``weights_rate_limit`` (100 blocks on netuid
+        91) or the chain silently no-ops the extrinsic; ≤ 0 disables.
+        """
+        interval = int(self.cfg.validator.weight_set_interval_blocks)
+        if interval <= 0:
+            return
+        cur = int(client.current_block())  # type: ignore[attr-defined]
+        if self._last_weight_block is not None and cur - self._last_weight_block < interval:
+            return
+        uids: list[int] = []
+        if self.state.king_hotkey is not None:
+            uid = client.uid_for_hotkey(self.state.king_hotkey)  # type: ignore[attr-defined]
+            if uid is not None:
+                uids.append(uid)
+        for hk in self.state.former_kings:
+            uid = client.uid_for_hotkey(hk)  # type: ignore[attr-defined]
+            if uid is not None and uid not in uids:
+                uids.append(uid)
+        log.info("re-asserting weights (last set %s, block %d): reward_uids=%s",
+                 "never" if self._last_weight_block is None else
+                 f"{cur - self._last_weight_block} blocks ago", cur,
+                 uids or [self.cfg.scoring.burn_uid])
+        self._apply_weights(client, "weight-reassert", uids)
+        # Stamp even when the extrinsic failed: the next attempt comes after
+        # one interval (~27 more before the cutoff), not every poll tick.
+        self._last_weight_block = cur
 
     @staticmethod
     def _manifest_king_hotkey(manifest: TrainingManifest) -> str | None:
@@ -1063,6 +1111,9 @@ class ValidatorRunner:
             log.info("round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
                      round_id, reward_uids or [self.cfg.scoring.burn_uid], n_uids,
                      self.cfg.scoring.burn_uid)
+            # Reset the re-assert timer (fake test clients lack current_block).
+            with contextlib.suppress(Exception):
+                self._last_weight_block = int(client.current_block())  # type: ignore[attr-defined]
             return vec
         except Exception as e:  # noqa: BLE001 — retried next round
             log.warning("weight set failed for round=%s (king holds, retried next round): %s",
