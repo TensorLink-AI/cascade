@@ -70,6 +70,23 @@ def test_reassert_burns_but_stays_active(cfg):
     assert runner._last_weight_block == client.block
 
 
+class _NoKingManifest:
+    @staticmethod
+    def entry_for_role(role):
+        return None
+
+
+def test_reward_uids_empty_when_forced(cfg):
+    # The override must live in _reward_uids too, so the receipt's reward_uids
+    # agree with the burn vector actually set (cascade-audit recomputes one
+    # from the other).
+    client = _Client(uids={KING: 7})
+    runner = _runner(cfg, genesis(KING, 7), force_burn=True)
+    assert runner._reward_uids(_NoKingManifest(), None, client) == []
+    off = _runner(cfg, genesis(KING, 7), force_burn=False)
+    assert off._reward_uids(_NoKingManifest(), None, client) == [7]
+
+
 def test_champion_state_untouched(cfg):
     client = _Client(uids={KING: 7})
     state = genesis(KING, 7)

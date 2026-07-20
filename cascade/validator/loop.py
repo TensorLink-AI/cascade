@@ -1080,7 +1080,14 @@ class ValidatorRunner:
         champion and no manifest king); the loop hands that to
         ``set_equal_share_weights``, which burns to ``burn_uid`` rather than
         reverting. The list is otherwise deduped/range-checked there too.
+
+        ``[validator] force_burn`` empties the list HERE — not just at the
+        weight push — so the published receipt's ``reward_uids`` agree with the
+        burn vector actually set (``cascade-audit`` recomputes one from the
+        other and fails on a mismatch).
         """
+        if self.cfg.validator.force_burn:
+            return []
         uids: list[int] = []
         king_uid = self._king_uid_to_vote(manifest, client=client)
         if king_uid is not None:
@@ -1107,10 +1114,11 @@ class ValidatorRunner:
 
         if self.cfg.validator.force_burn:
             log.warning(
-                "FORCE-BURN active (round=%s): dropping reward_uids=%s; burning to "
-                "uid %d (champion state untouched — unset [validator] force_burn "
-                "and restart to resume voting)",
-                round_id, reward_uids, self.cfg.scoring.burn_uid,
+                "FORCE-BURN active (round=%s): %sburning to uid %d (champion state "
+                "untouched — unset [validator] force_burn and restart to resume voting)",
+                round_id,
+                f"dropping reward_uids={reward_uids}; " if reward_uids else "",
+                self.cfg.scoring.burn_uid,
             )
             reward_uids = []
 
