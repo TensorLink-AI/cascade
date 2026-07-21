@@ -1536,7 +1536,14 @@ function collapseByRound(d){
   d.rounds.forEach(function(r){
     var id=String(r.round_id);
     if(!(id in by)) order.push(id);
-    if(!by[id] || String(r.published_at||"") >= String(by[id].published_at||"")) by[id]=r;
+    // Scored beats rejected for the same round regardless of recency: the
+    // index is shared and any validator (on any code version) can append a
+    // rejected re-judgement row with a newer published_at (live 2026-07-21:
+    // uid 6's pool_pin reject outranked the crowning verdict and the dashboard
+    // showed "Rejected"). Among rows of equal status, newest wins as before.
+    var cur=by[id], rS=String(r.status)==="scored", cS=cur&&String(cur.status)==="scored";
+    if(!cur || (rS&&!cS) ||
+       (rS===!!cS && String(r.published_at||"") >= String(cur.published_at||""))) by[id]=r;
   });
   var out={}; for(var k in d) out[k]=d[k];
   out.rounds=order.map(function(id){ return by[id]; });
