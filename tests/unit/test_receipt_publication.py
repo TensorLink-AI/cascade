@@ -365,6 +365,27 @@ def test_publish_receipt_rejected_never_downgrades_scored_round():
     assert hippius.read_latest_receipt(store, "5Val") == rejected43
 
 
+def test_other_validators_reject_cannot_steal_shared_pointer():
+    """A validator that never scored the round (nothing at its own round key —
+    e.g. a gate reject) must not take the last-writer-wins shared pointer from
+    another validator's scored verdict of the SAME round. Its own prefix keeps
+    the rejection — that trail is the operator's diagnostic surface. A LATER
+    round's rejection still moves the shared pointer (real information)."""
+    store = _FakeS3Store()
+    scored = '{"round_id":"42","status":"scored","king_hotkey":"5King"}'
+    hippius.publish_receipt(store, scored, "42", validator_hotkey="5ValA")
+
+    rejected = '{"round_id":"42","status":"rejected","reject_reason":"pool_pin_unverifiable"}'
+    hippius.publish_receipt(store, rejected, "42", validator_hotkey="5ValB")
+    assert hippius.read_latest_receipt(store) == scored            # shared pointer kept
+    assert hippius.read_latest_receipt(store, "5ValB") == rejected  # own trail intact
+    assert hippius.read_receipt(store, "42", "5ValB") == rejected
+
+    rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
+    hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5ValB")
+    assert hippius.read_latest_receipt(store) == rejected43        # new round moves it
+
+
 def test_publish_receipt_namespaced_per_validator():
     """Two validators publish the same round: each keeps its own signed copy
     (single-writer prefixes), only the shared convenience pointer races."""

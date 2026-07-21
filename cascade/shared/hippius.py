@@ -961,6 +961,20 @@ def publish_receipt(
             "the rejection stays diagnosable here and in the journal.",
             round_id, round_key)
         return round_key
+    # Shared-pointer variant of the same protection: a validator that never
+    # scored this round (nothing at its own round key — e.g. it rejected at a
+    # gate) must still not steal the last-writer-wins shared pointer from
+    # another validator's scored verdict of the SAME round. Its own prefix
+    # keeps the rejection (that trail is the operator's diagnostic surface).
+    if (_receipt_status(receipt_text) == "rejected" and RECEIPT_LATEST_KEY in keys
+            and _scored_same_round_at(store, RECEIPT_LATEST_KEY, round_id)):
+        import logging
+
+        logging.getLogger("cascade.storage").warning(
+            "keeping shared %s on the scored round-%s receipt; this rejected "
+            "receipt publishes only under the validator's own prefix",
+            RECEIPT_LATEST_KEY, round_id)
+        keys.remove(RECEIPT_LATEST_KEY)
     try:
         for key in keys:
             store.put_text(key, receipt_text, content_type="application/json",
@@ -986,6 +1000,18 @@ def _scored_receipt_at(store: S3Store, key: str) -> bool:
     never a reason to fail a publish."""
     try:
         return _receipt_status(store.get_text(key)) == "scored"
+    except Exception:  # noqa: BLE001 — absent key or store hiccup
+        return False
+
+
+def _scored_same_round_at(store: S3Store, key: str, round_id: str) -> bool:
+    """Whether ``key`` holds a SCORED receipt for exactly ``round_id``.
+    A scored receipt for a DIFFERENT round reads False: a newer round's
+    rejection is real information and may move the pointer."""
+    try:
+        doc = json.loads(store.get_text(key))
+        return (isinstance(doc, dict) and str(doc.get("status")) == "scored"
+                and str(doc.get("round_id")) == str(round_id))
     except Exception:  # noqa: BLE001 — absent key or store hiccup
         return False
 
