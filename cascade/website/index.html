@@ -1428,10 +1428,19 @@ function collapseByRound(d){
 
 // seed immediately so it renders offline, then poll real endpoints (override on success)
 _index=SEED_INDEX; _latest=SEED_LATEST; _dataState="loading"; renderAll();
+// The verdict/king panels read the OWNER validator's own receipt trail, not the
+// shared last-writer-wins receipts/latest.json: any validator (on any code
+// version) can overwrite the shared pointer — e.g. a restart re-gating an old
+// manifest blanked the dashboard with a verdict-less rejected receipt
+// (2026-07-21). The anchored prefix is single-writer and signature-anchored
+// (same trail validator bootstrap trusts); shared stays as a fallback only.
+var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
 function poll(){
   fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
-  fetchJSON("receipts/latest.json").then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
+  fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
+    .catch(function(){ return fetchJSON("receipts/latest.json"); })
+    .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
 }
 poll();
 setInterval(poll, POLL_MS);
