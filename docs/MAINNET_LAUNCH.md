@@ -54,8 +54,11 @@ fixtures if active pre-launch.
       pod) — document in validator onboarding.
 - [ ] `dethrone_cp` (currently 1): one round win takes the throne. Consider 2
       for throne stability at 24h rounds with real emissions.
-- [ ] `cascade_enabled` (+ `cascade_reign_days = 7`): armed at launch or after
-      the first stable reign.
+- [ ] `cascade_enabled` (+ `cascade_reign_days = 7`): stays OFF at launch —
+      DEC-CA-0003: trainer consumption of `warm_start_init_path` is not
+      implemented, and the metronome must be block-anchored with a
+      synchronized trainer handoff first. Arm only after both land and a
+      full testnet cascade completes cleanly.
 - [ ] `corpus_mode = "stream_cpu"` stays for launch (byte-exact audits are the
       trust story; #88 closed the CPU-mode GPU escape). `stream_gpu` is a
       post-launch experiment — see CLAUDE.md and the generator evaluation notes.

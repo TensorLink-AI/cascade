@@ -17,6 +17,11 @@ in-context.
   and blockers in `docs/MAINNET_LAUNCH.md` (L40S pin, worker-image digest,
   container sandbox, pool-publish cron; gift gate shadow → enforce).
   (`decisions/DEC-CA-0002-mainnet-netuid-91.md`)
+- **DEC-CA-0003** — Cascade warm-start: half-built (validator promotes, trainer
+  never consumes). Revert testnet `cascade_enabled`; implement deterministic
+  metronome + synchronized handoff BEFORE trainer consumption + audit rework;
+  mainnet stays unarmed until both survive a full testnet cascade.
+  (`decisions/DEC-CA-0003-warm-start-sequencing.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
