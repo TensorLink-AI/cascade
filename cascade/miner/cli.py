@@ -29,10 +29,14 @@
 
 * ``cascade round`` — a live terminal dashboard counting down to the next
   round: current block, epoch progress, and the submission deadline (the next
-  epoch boundary — commit strictly before it to enter that round). Ticks every
-  second, re-syncing to the chain every ``--refresh`` seconds; ``--once``
-  prints a single snapshot (also the automatic behaviour when piped).
-  Read-only; needs the ``[chain]`` extra, no wallet.
+  epoch boundary — commit strictly before it to enter that round). Also shows
+  where the round roughly is (``heat ▸ duel ▸ validation ▸ settled`` —
+  estimated from the configured budgets, confirmed settled via the public
+  receipt index) and a live feed of revealed on-chain submissions (a commit
+  landing while you watch is flagged ``● new``). Ticks every second,
+  re-syncing to the chain every ``--refresh`` seconds; ``--once`` prints a
+  single snapshot (also the automatic behaviour when piped). Read-only; needs
+  the ``[chain]`` extra, no wallet.
 
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
@@ -253,7 +257,8 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
 def _add_round(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "round",
-        help="Live countdown dashboard to the next round (the submission deadline).",
+        help="Live round dashboard: deadline countdown, current stage "
+        "(heat/duel/validation/settled), and revealed submissions.",
     )
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
@@ -267,12 +272,14 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
 def _cmd_round(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainClient, ChainError
-    from .dashboard import run_dashboard
+    from .dashboard import RoundTimeline, fetch_public_receipt_index, run_dashboard
 
     try:
         client = ChainClient.from_config(cfg, network=args.network)
         return run_dashboard(
             client, cfg.round, args.network, once=args.once, refresh=args.refresh,
+            timeline=RoundTimeline.from_chain_config(cfg),
+            index_fetch=lambda: fetch_public_receipt_index(cfg.storage),
         )
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)

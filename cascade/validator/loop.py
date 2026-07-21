@@ -817,6 +817,31 @@ class ValidatorRunner:
 
     # ── live loop ────────────────────────────────────────────────────────────
 
+    def _publish_chain_status(self, client: object, store: object) -> None:  # pragma: no cover
+        """Publish the dashboard's live ``status/chain.json`` (current block,
+        epoch grid, stage windows, revealed submissions) on the poll cadence.
+
+        Purely presentational and best-effort — it feeds the web dashboard's
+        round-stage strip and live submissions panel between receipts, and any
+        failure (chain flake, storage outage) is swallowed: status telemetry
+        must never disturb a round.
+        """
+        from datetime import datetime
+
+        from ..shared.chain_status import build_chain_status, publish_chain_status
+
+        try:
+            status = build_chain_status(
+                self.cfg,
+                current_block=int(client.current_block()),  # type: ignore[attr-defined]
+                commitments=client.poll_commitments(),  # type: ignore[attr-defined]
+                network=str(getattr(client, "network", "")),
+                as_of=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            publish_chain_status(store, status)
+        except Exception as e:  # noqa: BLE001 — telemetry only
+            log.debug("chain status publish skipped: %s", e)
+
     def run_forever(self, client: object, *, window_source: object) -> None:  # pragma: no cover
         """Poll the manifest bucket → evaluate → set weights, once per round.
 
@@ -840,6 +865,10 @@ class ValidatorRunner:
         last_digest: str | None = None
         while True:
             try:
+                # Live dashboard telemetry first, every poll: between receipts
+                # this is the page's only fresh view of the chain (stage strip
+                # + live submissions). Best-effort; never affects the round.
+                self._publish_chain_status(client, store)
                 raw = read_latest_manifest(store)
                 digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 if digest == last_digest:

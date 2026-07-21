@@ -938,6 +938,22 @@ tbody tr:hover td .heat-pill { color: var(--bone-light); }
 .heat-empty .he-head { font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
 .heat-empty p { font-size: 12px; color: var(--muted); max-width: 58ch; margin: 0; }
 
+/* live round panel — stage strip + revealed submissions */
+.stage-strip { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 2px 0 4px; }
+.stage-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 11px; border: 1px solid var(--muted); color: var(--muted); border-radius: 999px; white-space: nowrap; }
+.stage-pill.done { border-color: var(--chal); color: var(--chal); opacity: 0.7; }
+.stage-pill.on { background: var(--chal); border-color: var(--chal); color: var(--bone-light); }
+.stage-sep { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.stage-detail { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+.stage-detail b { color: var(--ink); }
+.sub-tag { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 9px; border-radius: 999px; border: 1px solid currentColor; color: var(--muted); white-space: nowrap; }
+.sub-tag.next { color: var(--chal); }
+.sub-new { font-family: var(--font-mono); font-weight: 700; font-size: 10px; text-transform: uppercase; color: var(--good); margin-left: 7px; animation: subpulse 1.4s ease-in-out 5; }
+@keyframes subpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+tr.is-new td { background: rgba(126, 155, 126, 0.13); }
+tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light); }
+.subs-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+
 @media (max-width: 720px) {
   .page { padding: 16px; gap: 16px; }
   .header .wordmark { font-size: 34px; }
@@ -979,6 +995,16 @@ tbody tr:hover td .heat-pill { color: var(--bone-light); }
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
     <div class="verdict" id="verdict"></div>
+  </div>
+
+  <div>
+    <div class="section-label"><span>This round &mdash; live</span><span id="live-when" class="muted"></span></div>
+    <div class="stage-strip" id="stage-strip"></div>
+    <div class="stage-detail" id="stage-detail">--</div>
+    <div class="scroll-box scroll-field">
+      <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th><th>Enters</th></tr></thead><tbody id="subs"></tbody></table>
+    </div>
+    <div class="subs-note" id="subs-note" hidden></div>
   </div>
 
   <div>
@@ -1064,7 +1090,8 @@ var ENDPOINTS = [
 var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
-var _index = null, _latest = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading";
+var _index = null, _latest = null, _status = null, _subsSeen = null,
+    _chartMode = "geomean", _smooth = 0, _dataState = "loading";
 
 // ── seed (mock) data — real receipt shape; overwritten if endpoints respond ─
 var _now = Date.now();
@@ -1117,6 +1144,23 @@ var SEED_LATEST = {
       { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), status:"failed_train", rank:null, rel_score:null }
     ]
   } }
+};
+// Live status sample (status/chain.json shape — see cascade.shared.chain_status):
+// current block 2h into an epoch, so the sample stage strip lands on "duel".
+var SEED_STATUS = {
+  schema: 1, as_of: iso(1), network: IS_TESTNET ? "test" : "finney",
+  netuid: IS_TESTNET ? 259 : 91,
+  current_block: 4817400, epoch_blocks: 7200, epoch_start_block: 4816800,
+  block_time_s: 12.0,
+  stage_windows: { heat_seconds: 2700, duel_seconds: 11700 },
+  submissions: [
+    { uid:214, hotkey:"5FhR9kQ2mLpQ4d", gen_ref:gr("nimbus/synth-xl","91e7bb4402"), commit_block:4817180 },
+    { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), commit_block:4816950 },
+    { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), commit_block:4816700 },
+    { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"),   commit_block:4816520 },
+    { uid:88,  hotkey:"5Dk82mLpQ2vHse", gen_ref:gr("aurora/tsgen","7a2c55e910"),   commit_block:4816100 },
+    { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), commit_block:4815800 }
+  ]
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -1370,26 +1414,99 @@ function renderStatus(){
     : "Loading live results…";
 }
 function fmtDur(s){ if(s==null||!isFinite(s)) return "--"; s=Math.max(0,Math.round(s)); if(s<60) return s+"s"; var m=Math.floor(s/60); if(m<60) return m+"m "+(s%60)+"s"; var h=Math.floor(m/60); return h+"h "+(m%60)+"m"; }
-// Seconds until the next round (next epoch boundary), extrapolated from the
-// index's `chain` anchor: block-at-as_of + wall-clock elapsed / block_time.
-function nextRoundSecs(){
-  var c=_index&&_index.chain; if(!c||c.epoch_start_block==null||!c.epoch_blocks) return null;
-  var bt=c.block_time_s>0?c.block_time_s:12, eb=c.epoch_blocks, es=c.epoch_start_block;
+// Where the chain is right now, extrapolated from the freshest anchor we have:
+// the live status feed (status/chain.json, validator poll cadence) when it
+// responds, else the receipt index's per-round `chain` anchor. The epoch grid
+// is absolute (block // epoch_blocks — the trainer's own math), so the current
+// epoch start is a plain floor on the estimated height.
+function chainNow(){
+  var c=_status||( _index&&_index.chain); if(!c||!c.epoch_blocks) return null;
+  var bt=c.block_time_s>0?c.block_time_s:12, eb=c.epoch_blocks;
   var asOf=c.as_of?new Date(c.as_of).getTime():null;
-  var elapsed=asOf!=null?(Date.now()-asOf)/1000:0; if(elapsed<0) elapsed=0;
-  // current block now: from current_block at as_of; if unknown, assume the round
-  // scored at its epoch boundary (a lower bound → conservative, never-too-short ETA).
-  var base=c.current_block!=null?c.current_block:es;
+  var elapsed=asOf!=null?Math.max(0,(Date.now()-asOf)/1000):0;
+  var base=c.current_block!=null?c.current_block:(c.epoch_start_block||0);
   var est=base+elapsed/bt;
-  var k=Math.floor((est-es)/eb)+1; if(k<1) k=1;   // next boundary strictly past est
-  return Math.max(0,(es+k*eb-est)*bt);
+  return {est:est, epochStart:Math.floor(est/eb)*eb, epochBlocks:eb, bt:bt};
+}
+function nextRoundSecs(){
+  var cn=chainNow(); if(!cn) return null;
+  return Math.max(0,(cn.epochStart+cn.epochBlocks-cn.est)*cn.bt);
 }
 function renderCountdown(){
   var el=document.getElementById("next-round"); if(!el) return;
   var s=nextRoundSecs();
   el.textContent = s==null ? "" : ("next round ~"+fmtDur(s)+" · ");
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); renderCountdown(); }
+// ── live round panel: stage strip + revealed submissions ───────────────────
+// The trainer's internal progress is not public, so the pre-settle stages are
+// wall-clock ESTIMATES from the published stage windows (the same budgets the
+// trainer enforces; see cascade.shared.chain_status). "Settled" is confirmed:
+// a receipt for THIS epoch is in the index, and the strip shows its verdict.
+var STAGES=[["heat","Heat"],["duel","Duel"],["validation","Validation"],["settled","Settled"]];
+var STAGE_DEFAULT_WINDOWS={heat_seconds:2700, duel_seconds:11700};
+function currentStage(){
+  var cn=chainNow(); if(!cn) return null;
+  var settled=null;
+  (_index&&_index.rounds||[]).forEach(function(r){
+    if(Number(r.epoch_start_block)===cn.epochStart&&(!settled||r.status==="scored")) settled=r;
+  });
+  var el=(cn.est-cn.epochStart)*cn.bt;
+  if(settled) return {key:"settled", entry:settled, elapsed:el};
+  var w=(_status&&_status.stage_windows)||STAGE_DEFAULT_WINDOWS;
+  if(el<w.heat_seconds) return {key:"heat", elapsed:el, estimated:true};
+  if(el<w.heat_seconds+w.duel_seconds) return {key:"duel", elapsed:el, estimated:true};
+  return {key:"validation", elapsed:el, estimated:true};
+}
+function stageDetail(stg){
+  if(!stg) return "--";
+  var into=" · <b>"+fmtDur(stg.elapsed)+"</b> into the round";
+  if(stg.key==="heat") return "<b>Heat</b> — trainer screening every challenger at the cheap budget"+into+" · estimated";
+  if(stg.key==="duel") return "<b>Duel</b> — king vs finalists training at the full budget"+into+" · estimated";
+  if(stg.key==="validation") return "<b>Validation</b> — validators scoring the duel, receipt pending"+into+" · estimated";
+  var s=nextRoundSecs();
+  return "<b>Settled</b> — "+esc(verdictLabel(stg.entry))+(s!=null?" · next round ~"+fmtDur(s):"");
+}
+function renderStage(){
+  var strip=document.getElementById("stage-strip"), detail=document.getElementById("stage-detail");
+  if(!strip) return;
+  var stg=currentStage();
+  var idx=stg?STAGES.map(function(s){return s[0];}).indexOf(stg.key):-1;
+  strip.innerHTML=STAGES.map(function(s,i){
+    var cls=!stg?"":(i===idx?" on":(i<idx?" done":""));
+    return '<span class="stage-pill'+cls+'">'+s[1]+'</span>';
+  }).join('<span class="stage-sep">&#9656;</span>');
+  detail.innerHTML=stageDetail(stg);
+}
+function renderSubs(){
+  var tb=document.getElementById("subs"), note=document.getElementById("subs-note"),
+      when=document.getElementById("live-when");
+  if(!tb) return;
+  var subs=_status&&_status.submissions;
+  if(!subs){
+    when.textContent="";
+    tb.innerHTML='<tr><td colspan="5" class="empty">Live submissions unavailable</td></tr>';
+    note.hidden=false;
+    note.textContent="The status feed (status/chain.json) is not being published yet — the Field table below shows the last receipt's participant set instead.";
+    return;
+  }
+  note.hidden=true;
+  when.textContent=subs.length+" revealed · as of "+timeAgo(_status.as_of);
+  var cn=chainNow(), es=cn?cn.epochStart:null;
+  if(_subsSeen===null){ _subsSeen={}; subs.forEach(function(s){ _subsSeen[s.hotkey+"@"+s.commit_block]=1; }); }
+  if(!subs.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No submissions revealed yet</td></tr>'; return; }
+  var kingHk=_latest&&_latest.verdict&&_latest.verdict.king_hotkey;
+  tb.innerHTML=subs.slice().sort(function(a,b){ return (b.commit_block-a.commit_block)||(a.uid-b.uid); }).map(function(s){
+    var isNew=!_subsSeen[s.hotkey+"@"+s.commit_block];
+    var next=es!=null&&s.commit_block>=es;
+    var crown=s.hotkey&&s.hotkey===kingHk?'<span class="crown">&#9819;</span> ':'';
+    var tag=es==null?"--":'<span class="sub-tag'+(next?' next':'')+'">'+(next?"next round":"this round")+'</span>';
+    return '<tr'+(isNew?' class="is-new"':'')+'><td class="num">'+s.uid+'</td>'+
+      '<td title="'+esc(s.hotkey)+'">'+crown+esc(shortHk(s.hotkey))+'</td>'+
+      '<td>'+refLink(s.gen_ref)+'</td><td class="num">'+s.commit_block+'</td>'+
+      '<td>'+tag+(isNew?'<span class="sub-new">&#9679; new</span>':'')+'</td></tr>';
+  }).join("");
+}
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1427,7 +1544,7 @@ function collapseByRound(d){
 }
 
 // seed immediately so it renders offline, then poll real endpoints (override on success)
-_index=SEED_INDEX; _latest=SEED_LATEST; _dataState="loading"; renderAll();
+_index=SEED_INDEX; _latest=SEED_LATEST; _status=SEED_STATUS; _dataState="loading"; renderAll();
 // The verdict/king panels read the OWNER validator's own receipt trail, not the
 // shared last-writer-wins receipts/latest.json: any validator (on any code
 // version) can overwrite the shared pointer — e.g. a restart re-gating an old
@@ -1441,10 +1558,17 @@ function poll(){
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
     .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
+  // Live chain status (validator poll cadence). First live doc REPLACES the
+  // sample and resets the new-marker baseline, so ● new only ever flags a
+  // commit that appeared while THIS page was watching real data.
+  fetchJSON("status/chain.json").then(function(d){
+    if(_status===SEED_STATUS){ _subsSeen=null; }
+    _status=d; renderStage(); renderSubs(); renderCountdown();
+  }).catch(function(){ if(_status===SEED_STATUS&&_dataState==="live"){ _status=null; _subsSeen=null; renderStage(); renderSubs(); } });
 }
 poll();
 setInterval(poll, POLL_MS);
-setInterval(renderCountdown, 1000);  // tick the next-round ETA every second
+setInterval(function(){ renderCountdown(); renderStage(); }, 1000);  // tick ETA + stage clock
 </script>
 
 

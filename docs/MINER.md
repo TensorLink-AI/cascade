@@ -219,8 +219,10 @@ How it works, and what to know:
 
 Only commits revealed **strictly before** the epoch boundary enter the next
 round; commit at or after it and you wait a whole extra round (~24h). `cascade
-round` is a live countdown dashboard to that deadline — run it before you
-deploy so you don't commit into the wrong round:
+round` is a live round dashboard: the countdown to that deadline, where the
+round roughly is, and the revealed submissions — run it before you deploy so
+you don't commit into the wrong round, and keep it running to see your own
+commit land:
 
 ```bash
 cascade round --network test --chain-toml chain.testnet.toml
@@ -232,6 +234,13 @@ cascade round --network test --chain-toml chain.testnet.toml
 #   countdown       20h 39m 12s until next round  (~12.0s/block)
 #   deadline        commit strictly before block 4,327,200 to enter epoch 601
 #   eta             2026-07-12 03:51 UTC (estimated)
+#   stage           heat ▸ [DUEL] ▸ validation ▸ settled
+#                   king vs finalists training at the full budget — 3h 20m 48s into the round (est.)
+#   last round      king held (uid 3)
+#   submissions     4 in this round · 1 committed for the next
+#     uid   47  5F3sab…8kQz  my-ns/my-generator@ab12cd34…      block 4,320,100  → next round   ● new
+#     uid   12  5DkPcd…1mVx  other/gen@77aabb01…               block 4,319,882  in this round
+#     …
 ```
 
 It ticks every second, re-syncing to the real block height every `--refresh`
@@ -242,9 +251,30 @@ ETA are estimates from the configured cadence (`[round] round_hours` over
 `epoch_blocks`, ~12s/block). Read-only — no wallet needed. Don't cut it to the
 last block: leave margin for the upload plus commit inclusion.
 
+What the two live sections mean:
+
+- **stage** — where the current round is: `heat` (every challenger trained
+  cheaply and screened), `duel` (king vs the surviving finalists at the full
+  budget), `validation` (validators scoring the duel and setting weights),
+  `settled` (this round's receipt is public — the line shows the verdict:
+  king held, dethroned, or rejected). The trainer's internal progress isn't
+  public, so the pre-settle stages are wall-clock **estimates** from the
+  configured budgets (marked `est.`); `settled` is confirmed from the public
+  receipt index and needs no credentials. `last round` shows the previous
+  round's verdict while the current one is still in flight.
+- **submissions** — the revealed on-chain commitments, newest first: who is
+  competing in the current round vs committed for the next one (relative to
+  the epoch boundary). In watch mode the field re-polls about once a minute,
+  and a commit that appears while you watch is flagged `● new` — after
+  `cascade deploy`, that flag on your UID is the confirmation your submission
+  is on chain and which round it will enter.
+
 ## 6. Confirm it's competing
 
-Your commit is now on chain. Verify it two ways:
+Your commit is now on chain. The quickest check is `cascade round` — your UID
+appears in its **submissions** feed (flagged `● new` if you were already
+watching), tagged with the round it enters ([§5b](#5b-time-your-submission--cascade-round)).
+To verify from first principles instead:
 
 ```bash
 # it shows in the revealed commitments for the netuid …
