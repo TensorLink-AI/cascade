@@ -926,6 +926,12 @@ def publish_receipt(
     verdict, and each validator's authoritative copy lives under its own
     prefix regardless. Returns the per-round key.
 
+    Exception: a REJECTED receipt for a round whose round key already holds a
+    SCORED one publishes nothing (see the guard below) — such a same-round
+    downgrade is a restarted validator re-gating an old manifest, and letting
+    it take the latest pointers blanked the public dashboard until the next
+    scored round.
+
     Receipts are the audit-facing artefact, so each object is written with a
     ``public-read`` ACL: third parties can then GET it (and run
     ``cascade-audit``) with zero credentials while the bucket — manifests,
@@ -947,9 +953,14 @@ def publish_receipt(
         import logging
 
         logging.getLogger("cascade.storage").warning(
-            "NOT overwriting scored receipt at %s with a rejected one "
-            "(same-round re-judgement); latest pointers still updated", round_key)
-        keys = keys[1:]
+            "suppressing rejected receipt for round %s: a scored receipt already "
+            "sits at %s. A same-round scored→rejected re-judgement is a restart "
+            "re-gating an old manifest (king_resyncing), not a new verdict — "
+            "publishing it blanked the public dashboard's king/verdict for days "
+            "(2026-07-21). Round key AND latest pointers keep the scored copy; "
+            "the rejection stays diagnosable here and in the journal.",
+            round_id, round_key)
+        return round_key
     try:
         for key in keys:
             store.put_text(key, receipt_text, content_type="application/json",

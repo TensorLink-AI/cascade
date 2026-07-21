@@ -336,24 +336,33 @@ def test_publish_and_read_receipt_keys():
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
 
 
-def test_publish_receipt_rejected_never_clobbers_scored_round_key():
-    """A same-round re-judgement that ends in rejection must not erase the
-    signed scored receipt at the round key (2026-07-15: contract-switch
-    rejections erased the receipt that crowned the first king). The rejection
-    stays visible on the latest pointers; only another SCORED verdict may
-    replace a scored round record."""
+def test_publish_receipt_rejected_never_downgrades_scored_round():
+    """A same-round re-judgement that ends in rejection publishes NOTHING once
+    a scored receipt holds the round key. Two live incidents shaped this:
+    2026-07-15, contract-switch rejections erased the receipt that crowned the
+    first king (round key protection); 2026-07-21, restart re-gating of an old
+    manifest (king_resyncing) took the latest pointers and blanked the public
+    dashboard's king/verdict for days (latest protection). Only another SCORED
+    verdict may replace a scored round record. Rejections for rounds without a
+    scored receipt publish normally."""
     store = _FakeS3Store()
     scored = '{"round_id":"42","status":"scored","king_hotkey":"5King"}'
     key = hippius.publish_receipt(store, scored, "42", validator_hotkey="5Val")
 
-    rejected = '{"round_id":"42","status":"rejected","reject_reason":"contract_digest_mismatch"}'
+    rejected = '{"round_id":"42","status":"rejected","reject_reason":"king_resyncing: x != y"}'
     assert hippius.publish_receipt(store, rejected, "42", validator_hotkey="5Val") == key
-    assert store.objects[key] == scored                          # round key preserved
-    assert hippius.read_latest_receipt(store, "5Val") == rejected  # rejection visible
+    assert store.objects[key] == scored                            # round key preserved
+    assert hippius.read_latest_receipt(store, "5Val") == scored    # latest keeps the verdict
+    assert hippius.read_latest_receipt(store) == scored            # shared pointer too
 
     scored2 = '{"round_id":"42","status":"scored","king_hotkey":"5NewKing"}'
     hippius.publish_receipt(store, scored2, "42", validator_hotkey="5Val")
-    assert store.objects[key] == scored2                         # scored-over-scored wins
+    assert store.objects[key] == scored2                           # scored-over-scored wins
+
+    # a NEW round's rejection still publishes and moves latest (real information)
+    rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
+    hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5Val")
+    assert hippius.read_latest_receipt(store, "5Val") == rejected43
 
 
 def test_publish_receipt_namespaced_per_validator():
