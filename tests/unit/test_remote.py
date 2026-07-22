@@ -74,6 +74,38 @@ def test_worker_argv_heat_overrides_budget_and_repo():
     assert argv[argv.index("--arch-preset") + 1] == "toto2-4m"
 
 
+def test_worker_maps_train_hours_to_heat_label(cfg, tmp_path, monkeypatch):
+    # The pod worker is where a remote heat actually trains + logs. --train-hours
+    # (the cheap screen budget) is the sole heat/final discriminator, so it must
+    # flag heat=True into train_one — that's what routes the run's S3/wandb
+    # telemetry to heat-<hotkey> instead of the final's <role>-<size> key.
+    from cascade.shared.manifest import TrainedEntry
+    from cascade.trainer import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "load_chain_config", lambda p: cfg)
+    monkeypatch.setattr(worker_mod, "_load_trainer", lambda spec: object())
+    captured: dict = {}
+
+    def _fake_train_one(self, gen, role, seeds, block, *, contract=None,
+                        token_budget=None, repo_suffix="", heat=False):
+        captured["heat"] = heat
+        return TrainedEntry(
+            miner_hotkey=gen.hotkey, miner_uid=gen.uid, role=role, gen_ref=gen.ref,
+            trained_pointer=format_trained_pointer(REF_T), corpus_digest="d",
+            train_block=block, gpu_name="", size=(contract.arch_preset if contract else ""),
+        )
+
+    monkeypatch.setattr(TrainerRunner, "train_one", _fake_train_one)
+    base = ["--gen-ref", REF_A, "--uid", "5", "--hotkey", "hkB", "--role", "challenger",
+            "--base-seed", "1", "--block", "10", "--trainer", "m:C",
+            "--arch-preset", "toto2-4m", "--work-root", str(tmp_path)]
+
+    assert worker_mod.main(base + ["--train-hours", "0.02"]) == 0
+    assert captured["heat"] is True           # heat dispatch ⇒ heat-<hotkey> label
+    assert worker_mod.main(base) == 0         # no --train-hours ⇒ final
+    assert captured["heat"] is False
+
+
 def test_build_remote_command_sets_cd_cuda_and_env():
     host = _host(workdir="/root/metro", cuda_device="1")
     cmd = build_remote_command(host, ["python", "-m", "x"], {"HIPPIUS_S3_ACCESS_KEY": "ak"})
