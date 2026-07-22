@@ -56,7 +56,7 @@ fixtures if active pre-launch.
       for throne stability at 24h rounds with real emissions.
 - [ ] `cascade_enabled` (+ `cascade_reign_days = 7`): stays OFF at launch —
       DEC-CA-0003: trainer consumption of `warm_start_init_path` is not
-      implemented, and the metronome must be block-anchored with a
+      implemented, and the reign clock must be block-anchored with a
       synchronized trainer handoff first. Arm only after both land and a
       full testnet cascade completes cleanly.
 - [ ] `corpus_mode = "stream_cpu"` stays for launch (byte-exact audits are the

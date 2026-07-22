@@ -1,6 +1,6 @@
-"""Cascade — king-reign promotion for the warm-start metronome loop.
+"""Cascade — king-reign promotion for the warm-start loop.
 
-The metronome runs the daily king-of-the-hill: challengers train fresh models
+The daily king-of-the-hill loop runs underneath: challengers train fresh models
 from the shared init and dethrone the king when they clear the margin
 (:mod:`cascade.eval.koth` + :mod:`cascade.validator.state`). Cascade sits *on
 top* of that loop and answers a different question — *when has one king held the

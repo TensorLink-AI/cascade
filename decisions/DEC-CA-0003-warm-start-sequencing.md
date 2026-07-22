@@ -1,11 +1,11 @@
 ---
 id: DEC-CA-0003
 type: decision
-title: "Cascade warm-start: revert on testnet, sequence metronome before consumption"
+title: "Cascade warm-start: revert on testnet, sequence reign-clock determinism before consumption"
 status: active
 date: 2026-07-21
 tags: [cascade, warm-start, trainer, determinism, audit]
-revisit_when: "block-anchored metronome + manifest-derived reign log land and survive a full testnet cascade with no trainer/validator king divergence — then implement trainer consumption (Problem 1) and re-evaluate arming"
+revisit_when: "block-anchored reign clock + manifest-derived reign log land and survive a full testnet cascade with no trainer/validator king divergence — then implement trainer consumption (Problem 1) and re-evaluate arming"
 relations: {}
 ---
 Cascade warm-start (`[scoring] cascade_enabled`) is HALF-BUILT: the validator
@@ -26,7 +26,7 @@ DECISION — three parts, in order:
    rsync'd L40S host, never committed) — the revert is purely operational:
    flip on-host + restart trainer AND validator. `[scoring]` keys are not in
    `contract_digest`, but both processes read the flag.
-2. **Sequence Problem 2 before Problem 1.** First make the metronome
+2. **Sequence Problem 2 before Problem 1.** First make the reign clock
    deterministic and the handoff synchronized: (a) block-anchor the reign
    clock (`reign_blocks` from the crowning block, replacing wall-clock
    `reign_start` in `cascade.py crown()`/`should_cascade()`) — every
@@ -43,7 +43,7 @@ DECISION — three parts, in order:
 3. **Mainnet stays unarmed** until both land and a full testnet cascade
    completes cleanly (checklist item in `docs/MAINNET_LAUNCH.md`).
 
-Rationale for the sequencing: consumption without the deterministic metronome
+Rationale for the sequencing: consumption without a deterministic reign clock
 means fleet validators can disagree on WHICH init a round trains from —
 warm-start must happen in lockstep before the trainer actually initializes
 from it, or the audit contract and fairness (king+challenger sharing one

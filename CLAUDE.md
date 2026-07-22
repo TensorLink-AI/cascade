@@ -19,13 +19,13 @@ in-context.
   (`decisions/DEC-CA-0002-mainnet-netuid-91.md`)
 - **DEC-CA-0003** — Cascade warm-start: half-built (validator promotes, trainer
   never consumes). Revert testnet `cascade_enabled`; implement deterministic
-  metronome + synchronized handoff BEFORE trainer consumption + audit rework;
+  reign clock + synchronized handoff BEFORE trainer consumption + audit rework;
   mainnet stays unarmed until both survive a full testnet cascade.
   (`decisions/DEC-CA-0003-warm-start-sequencing.md`)
 - **DEC-CA-0004** — Cascade promotion PERSISTS the king (re-crown, reset clock
   only); vacate removed, not configurable (consensus-critical). Vacate had no
   benefit (shared init ⇒ no incumbency advantage; old king earns through the
-  vacancy anyway) and froze the metronome. Kills DEC-CA-0003's handoff-sync
+  vacancy anyway) and stalled all future promotions. Kills DEC-CA-0003's handoff-sync
   workstream. (`decisions/DEC-CA-0004-cascade-persist-throne.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line

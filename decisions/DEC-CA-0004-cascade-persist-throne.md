@@ -29,8 +29,8 @@ already won, keeps paying it, and breaks the state machine doing it:
   `state.apply_round` fills the throne only via its dethrone branch; an
   incumbent win returns `new_king_hotkey=None`, `genesis()` is never called
   in the live loop, and `_cascade_round`'s re-crown guard requires
-  `self.state.king_hotkey is not None` — so the cascade clock stays null and
-  the metronome freezes after ~1–2 cycles.
+  `self.state.king_hotkey is not None` — so the reign clock stays null and
+  promotions stop firing after ~1–2 cycles.
 - `ChampionState()` also wipes `former_kings` (the rewarded court) and
   tenure/streaks, dropping the anti-flap margin back to `start` for the very
   king most proven — pointless dethrone-cheapening plus lost court rewards.
@@ -41,8 +41,8 @@ Persist does not over-entrench: the dethrone path is untouched (a better
 generator dethrones any round) and `margin_for_tenure` is a CAPPED affine
 ramp saturating at `end` — tenure never compounds beyond it. Persist also
 DELETES Problem 2c of [[DEC-CA-0003]] (synchronized trainer vacate) — no
-handoff exists to synchronize; remaining metronome work is block-anchoring
-the clock + manifest-derived reign log.
+handoff exists to synchronize; remaining reign-clock work is block-anchoring
+it + the manifest-derived reign log.
 
 NOT configurable: promotion behavior is consensus-critical — validators
 splitting on vacate-vs-persist fork their champion states and weight
