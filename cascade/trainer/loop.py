@@ -404,6 +404,16 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
+    # Frozen-block protection for the live loop's chain reads. A bittensor
+    # websocket can go quietly stale (serving a ~20-min-old block) or hang
+    # without erroring, which makes run_forever re-enter an already-published
+    # round. When the height stops advancing for this long (blocks are ~12s, so
+    # a multi-minute freeze is anomalous) the substrate connection is rebuilt
+    # before the read is trusted — the same guard the provisioner already runs
+    # (cascade.provision.loop._current_block). ``chain_clock`` is the monotonic
+    # source the freeze timer reads (injected for tests).
+    stale_block_after_s: float = 300.0
+    chain_clock: Callable[[], float] = time.monotonic
     # Elastic fleet: when ``remote_hosts_path`` is set, run_forever RE-READS the
     # hosts TOML at the start of every round, so a per-round provisioner (rent
     # pods when the field is big, tear down after) changes the fleet without a
@@ -454,6 +464,10 @@ class TrainerRunner:
     # reporting for. ``_stage_published_at`` throttles heat-progress writes.
     _stage_ctx: dict | None = field(default=None, repr=False)
     _stage_published_at: float = field(default=0.0, repr=False)
+    # Frozen-block tracker (block height, wall-time it last advanced) for
+    # _block_with_freeze_guard. Rebuilt naturally on the first read.
+    _last_block: int | None = field(default=None, repr=False)
+    _block_changed_at: float = field(default=0.0, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -1548,6 +1562,36 @@ class TrainerRunner:
                 return
             time.sleep(min(15.0, max(1.0, deadline - time.time())))
 
+    def _block_with_freeze_guard(self, client: object) -> int:
+        """The chain height, rebuilding the connection when it has frozen.
+
+        A bittensor websocket can die quietly and keep answering
+        ``current_block()`` with a stale value (~20-min-old block), or hang
+        without erroring — the trainer then re-derives an already-published
+        round from the stale height and re-enters it. Track ``(block,
+        wall-time)`` exactly like the provisioner's ``_current_block``: if the
+        height has not advanced for ``stale_block_after_s`` (blocks are ~12s, so
+        a multi-minute freeze is anomalous), rebuild the substrate connection
+        via ``client.reconnect()`` and trust the fresh read (its own staleness
+        clock restarts). A client without ``reconnect`` (offline fakes) simply
+        re-reads."""
+        now = self.chain_clock()
+        block = int(client.current_block())
+        if self._last_block is None or block != self._last_block:
+            self._last_block = block
+            self._block_changed_at = now
+        elif now - self._block_changed_at > self.stale_block_after_s:
+            log.warning("chain block frozen at %d for %.0fs — rebuilding substrate "
+                        "connection (quietly dead websocket?)",
+                        block, now - self._block_changed_at)
+            reconnect = getattr(client, "reconnect", None)
+            if reconnect is not None:
+                reconnect()
+            block = int(client.current_block())
+            self._last_block = block
+            self._block_changed_at = now
+        return block
+
     def run_forever(self, client: object) -> None:  # pragma: no cover
         """Poll → train → publish, once per daily round (epoch).
 
@@ -1564,7 +1608,7 @@ class TrainerRunner:
         last_round: str | None = None
         while True:
             try:
-                block = client.current_block()
+                block = self._block_with_freeze_guard(client)
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)
