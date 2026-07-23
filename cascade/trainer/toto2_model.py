@@ -15,7 +15,7 @@ It follows the Toto 2.0 recipe (arXiv:2605.20119):
   attends over variates (full), the rest over time (causal, rotary positions);
   this matches ``Datadog/Toto-2.0-4m``'s ``layer_group_size=4`` /
   ``num_variate_layers_per_group=1`` / ``variate_layer_first=false``. cascade
-  currently trains and scores univariate, so the
+  currently trains and scores univariate (``OPEN_QUESTIONS.md`` §8), so the
   variate layers run at ``C = 1`` — present and trainable, dormant until
   multivariate corpora flip on.
 * **Attention details** — PerDimScale (learned per-dimension query scaling)
