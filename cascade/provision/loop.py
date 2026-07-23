@@ -246,6 +246,12 @@ class ProvisionerLoop:
     # manifest reads as round-over.
     _round_manifest_baseline: str | None = field(default=None, init=False, repr=False)
     _round_baseline_for: str | None = field(default=None, init=False, repr=False)
+    # Cache of the base_seed the CURRENT round's heat marker must carry, derived
+    # from the boundary block's hash (chain_client.block_seed). Keyed by the
+    # boundary so it recomputes once per round; None when the client can't
+    # answer (offline fakes) and the mtime heuristic stands in.
+    _expected_seed: str | None = field(default=None, init=False, repr=False)
+    _expected_seed_for: int | None = field(default=None, init=False, repr=False)
     # The eval stage's rent-once latch (mirrors _provisioned_round for the
     # boundary stages): the manifest round an eval pod was last rented — or
     # deliberately skipped — for. Restored from the ledger so restarts never
@@ -440,6 +446,14 @@ class ProvisionerLoop:
         # base_seed knowledge.
         self._manifest_baseline = self._latest_round_id()
         self._learned_round_id = None
+        # Reset EVERY piece of per-round baseline state together: a same-round-id
+        # relearn that cleared only _learned_round_id kept a stale (None) manifest
+        # baseline, so the marker re-teaching the id made the PREVIOUS run's
+        # manifest read as a fresh publish and tore down the just-rented final pod
+        # (Round 8690400, 2026-07-23). The marker re-learn then re-baselines any
+        # leftover manifest as stale, exactly as on a first learn.
+        self._round_baseline_for = None
+        self._round_manifest_baseline = None
         self._state = (RoundState(round_id=str(round_id)) if self._state is None
                        else replace(self._state, round_id=str(round_id), published=False))
         self._save()
@@ -889,15 +903,47 @@ class ProvisionerLoop:
             if dead_eval:
                 self._clear_eval_hosts()
 
-    def _heat_marker_seen(self) -> bool:
-        """Any ``heat_complete.json`` under the work-root newer than our rent.
+    def _expected_base_seed(self) -> str | None:
+        """The base_seed the CURRENT round's heat marker must carry, or None.
 
-        The trainer writes ``work_root/<base_seed>/heat_complete.json`` and the
-        provisioner cannot know base_seed in advance (it keys rounds by the
-        boundary block; the base seed is that block's hash). Only one round
-        runs at a time, so any marker whose mtime postdates our earliest rent
-        is this round's — and its directory name teaches us the base_seed for
-        direct manifest polling.
+        The trainer keys its work-dir by base_seed — the hash of the epoch
+        boundary block — and the provisioner keys the round by that same
+        boundary (``_provisioned_round``). Once the boundary is on-chain the
+        provisioner can derive the exact seed (``chain_client.block_seed``) and
+        so tell THIS round's marker from a DIFFERENT round's. Cached per
+        boundary (the hash is immutable). Returns None when the client can't
+        answer — boundary not yet finalised, no ``block_seed`` (offline fakes),
+        or a chain hiccup — leaving the mtime heuristic as the fallback."""
+        boundary = self._provisioned_round
+        if boundary is None:
+            return None
+        if self._expected_seed_for == boundary:
+            return self._expected_seed
+        seed_fn = getattr(self.chain_client, "block_seed", None)
+        if seed_fn is None:
+            return None
+        try:
+            # Under the same hard deadline as every other chain read: a hung
+            # block_seed must not wedge the teardown sweep (this runs each cycle
+            # until the boundary is on-chain and the seed caches).
+            seed = str(int(self._with_deadline(lambda: seed_fn(boundary), 30.0)))
+        except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down / hung
+            return None
+        self._expected_seed_for = boundary
+        self._expected_seed = seed
+        return seed
+
+    def _heat_marker_seen(self) -> bool:
+        """This round's ``heat_complete.json`` has landed — heat pods can go.
+
+        The trainer writes ``work_root/<base_seed>/heat_complete.json``. The
+        marker must both postdate our earliest rent (freshness) AND belong to
+        the round we are actually serving: mtime alone let a zombie trainer
+        re-touching an OLD round's marker read as this round's heat completing
+        and tear the fleet down (fix: match the marker's work-dir base_seed to
+        ``_expected_base_seed``). When the expected seed can't be derived
+        (offline fakes without ``block_seed``) the mtime heuristic stands in —
+        the directory name still teaches us the base_seed for manifest polling.
 
         Only heat/final rents anchor the comparison: an eval pod is rented at
         the PREVIOUS round's manifest — before this round's fleet — and
@@ -910,11 +956,14 @@ class ProvisionerLoop:
         if not rents:
             return False
         rent_ts = min(rents)
+        expected = self._expected_base_seed()
         try:
             markers = sorted(Path(self.work_root).glob("*/heat_complete.json"))
         except OSError:
             return False
         for m in markers:
+            if expected is not None and m.parent.name != expected:
+                continue                        # a different round's marker (zombie re-touch)
             try:
                 if m.stat().st_mtime >= rent_ts:
                     self._learned_round_id = m.parent.name

@@ -380,6 +380,51 @@ def test_heat_marker_tears_down_heat_while_final_runs(tmp_path):
     assert {i.stage for i in st.instances} == {"final"}
 
 
+class SeededChain(FakeChain):
+    """A chain that can answer block_seed(boundary) — the real ChainClient
+    surface the provisioner uses to match a marker to the round it belongs to."""
+
+    def __init__(self, block, seed):
+        super().__init__(block)
+        self._seed = seed
+
+    def block_seed(self, boundary):
+        return self._seed
+
+
+def test_zombie_marker_for_a_different_round_is_ignored(tmp_path):
+    # A zombie trainer re-touching an OLD round's heat_complete.json bumps its
+    # mtime past our rent time, so the mtime heuristic alone read it as THIS
+    # round's heat completing and tore down the fleet. Match the marker's
+    # work-dir base_seed to the round we are actually serving instead.
+    clock = Clock()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.chain_client = SeededChain(880, 54321)     # this round's base_seed = 54321
+    loop.run_once()
+    assert len(prov.live) == 2
+
+    # A zombie from a PRIOR round re-touches ITS marker (a different base_seed).
+    zombie = tmp_path / "work" / "99999"
+    zombie.mkdir(parents=True)
+    (zombie / "heat_complete.json").write_text(
+        json.dumps({"round_id": "99999", "screened": 5, "finalists": ["z"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.terminated == []                     # zombie ignored: fleet intact
+    assert len(prov.live) == 2
+
+    # This round's OWN marker (matching base_seed) settles the heat for real.
+    real = tmp_path / "work" / "54321"
+    real.mkdir(parents=True)
+    (real / "heat_complete.json").write_text(
+        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.terminated == ["cascade-900-heat-0"]  # heat down, final keeps running
+    assert "cascade-900-final-0" in prov.live
+
+
 def test_manifest_tears_down_everything(tmp_path):
     clock = Clock()
     store = FakeStore()
@@ -422,6 +467,50 @@ def test_stale_manifest_from_prior_run_does_not_tear_down(tmp_path):
     clock.t += 1800.0
     loop.run_once()
     assert prov.live == {}
+
+
+def test_relearn_of_same_round_resets_the_manifest_baseline(tmp_path):
+    # Same-round-id RELEARN (Round 8690400, 2026-07-23: fleet lost 31s after
+    # rent). _provision_round reset _learned_round_id but NOT the per-round
+    # manifest baseline (_round_baseline_for / _round_manifest_baseline). So a
+    # second provisioning of the same round kept the prior run's stale None
+    # baseline: when the marker re-taught the id, the previous run's manifest —
+    # still sitting at round-<id>.json — read as a FRESH publish and tore down
+    # the just-rented final pod.
+    clock = Clock()
+    store = FakeStore()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
+
+    # Round one: rent, then the marker teaches base_seed 54321 with NO manifest
+    # published yet → the per-round baseline is recorded as None.
+    loop.run_once()
+    marker_dir = tmp_path / "work" / "54321"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "heat_complete.json").write_text(
+        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert loop._round_baseline_for == "54321"
+    assert loop._round_manifest_baseline is None                # stale None seed
+
+    # That round finishes and publishes its manifest (now sitting at the key)…
+    store.texts["manifests/round-54321.json"] = (
+        '{"round_id": "54321", "contract_digest": "old"}')
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.live == {}                                       # round one fully torn down
+
+    # …and the SAME round re-provisions (relearn): a fresh final pod is rented
+    # while the previous run's manifest still sits at round-54321.json.
+    clock.t += 1800.0
+    loop._provisioned_round = None
+    loop._provision_round(900)
+    assert "cascade-900-final-0" in prov.live                    # freshly rented
+
+    # The teardown sweep must NOT read the leftover manifest as a new publish.
+    loop._teardown_due_pods()
+    assert "cascade-900-final-0" in prov.live                    # fresh pod survives
 
 
 def test_latest_pointer_change_also_ends_the_round(tmp_path):

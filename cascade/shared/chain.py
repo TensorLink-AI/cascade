@@ -256,6 +256,15 @@ class ChainClient:
             self._wallet = wallet_factory(**kwargs)
         return self._wallet
 
+    def reconnect(self) -> None:
+        """Drop the cached subtensor so the next call re-opens the websocket.
+
+        A long-lived bittensor websocket can go quietly stale — serving a
+        ~20-minute-old block or hanging without erroring — and the only
+        reliable recovery is a fresh connection. Mirrors the provisioner's
+        chain_client_factory rebuild (cascade.provision.loop._current_block)."""
+        self._subtensor = None
+
     def current_block(self) -> int:
         try:
             return int(self.subtensor().get_current_block())

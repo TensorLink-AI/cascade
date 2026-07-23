@@ -23,6 +23,15 @@ def _client():
     return c
 
 
+def test_reconnect_drops_cached_subtensor():
+    """A quietly-dead / hung websocket only recovers on a fresh connection:
+    reconnect() clears the cached subtensor so the next call re-opens it."""
+    c = _client()
+    c._subtensor = object()                 # a live (now stale) connection
+    c.reconnect()
+    assert c._subtensor is None
+
+
 def test_raw_revealed_entries_decodes_hex_rendering():
     """109-char payloads: SCALE prefix b5 01 is NOT valid UTF-8 → substrate
     returns hex — the path bittensor already handles; ours must too."""
