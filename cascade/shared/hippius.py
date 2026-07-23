@@ -831,13 +831,28 @@ class S3MirrorStore:
         self.put_bytes(key, text.encode("utf-8"), content_type=content_type, acl=acl)
 
     def get_bytes(self, key: str) -> bytes:
+        import logging
+        log = logging.getLogger("cascade.storage")
         try:
             return self.primary.get_bytes(key)
+        except ObjectNotFound as primary_absent:
+            # The primary authoritatively reports the object absent. It MIGHT
+            # still exist on the mirror (a primary data-loss event), so try the
+            # mirror as a best-effort recovery. But the mirror is only that —
+            # best-effort: if it too is absent OR is itself unreadable, trust the
+            # primary's verdict and re-raise ObjectNotFound. This keeps callers
+            # that treat absence as a normal empty state (e.g. read_pool_index's
+            # not-yet-published bootstrap) working even while R2 is down, instead
+            # of seeing a spurious read error that would reject every round.
+            with contextlib.suppress(Exception):
+                return self.mirror.get_bytes(key)
+            raise primary_absent
         except StorageError as e:
-            import logging
-            logging.getLogger("cascade.storage").warning(
-                "primary get failed for %s (%s); reading R2 backup %s",
-                key, e, self._mirror_label)
+            # A real primary read failure (5xx/auth/network), not absence: the
+            # object's existence is unknown, so a mirror miss must stay a read
+            # failure (never reported as definitive absence).
+            log.warning("primary get failed for %s (%s); reading R2 backup %s",
+                        key, e, self._mirror_label)
         try:
             return self.mirror.get_bytes(key)
         except Exception as e:  # noqa: BLE001
@@ -1362,14 +1377,51 @@ def fetch_pool_snapshot(store: S3Store, meta: PoolSnapshotMeta, dest_dir: Path |
     return unpack_tar_to_dir(data, dest_dir)
 
 
-def pool_s3_store(storage: object, *, bucket: str | None = None) -> S3Store:
-    """Build an :class:`S3Store` for the eval-pool bucket.
+def pool_backup_s3_store(storage: object, *, bucket: str) -> S3Store | None:
+    """Build the Cloudflare R2 (S3-compatible) live backup of the eval-pool bucket,
+    or ``None`` when no pool backup is configured.
 
-    Backend-agnostic: defaults to the Hippius S3 endpoint/credentials, but a
-    ``[storage] pool_s3_endpoint`` / ``pool_s3_region`` (e.g. Cloudflare R2) and
-    ``POOL_S3_ACCESS_KEY`` / ``POOL_S3_SECRET_KEY`` env override it. When the
+    Enabled by ``[storage] pool_backup_bucket`` (the R2 bucket name); the endpoint,
+    region, and credentials are REUSED from the manifest/receipt backup R2
+    (``backup_s3_endpoint`` / ``backup_s3_region``, ``BACKUP_S3_ACCESS_KEY`` /
+    ``BACKUP_S3_SECRET_KEY``), so a validator that already has the manifest mirror
+    working needs no new credentials — only the bucket name. Keyed off
+    ``pool_backup_bucket`` (not ``backup_s3_endpoint``, which is already set for the
+    manifest mirror) so the pool mirror stays OFF until the bucket is named.
+    Returns ``None`` — and :func:`pool_s3_store` returns a plain :class:`S3Store`,
+    unchanged — when either the bucket or the backup endpoint is unset.
+    """
+    bkt = getattr(storage, "pool_backup_bucket", "") or ""
+    endpoint = getattr(storage, "backup_s3_endpoint", "") or ""
+    if not bkt or not endpoint:
+        return None
+    region = getattr(storage, "backup_s3_region", "") or "auto"
+    cfg = S3Config(
+        endpoint=endpoint,
+        region=region,
+        bucket=bkt,
+        access_key_env="BACKUP_S3_ACCESS_KEY",
+        secret_key_env="BACKUP_S3_SECRET_KEY",
+    )
+    return S3Store(cfg)
+
+
+def pool_s3_store(storage: object, *, bucket: str | None = None) -> S3Store | S3MirrorStore:
+    """Build the eval-pool store, with an optional R2 live backup layered on.
+
+    Backend-agnostic: the primary defaults to the Hippius S3 endpoint/credentials,
+    but a ``[storage] pool_s3_endpoint`` / ``pool_s3_region`` (e.g. Cloudflare R2)
+    and ``POOL_S3_ACCESS_KEY`` / ``POOL_S3_SECRET_KEY`` env override it. When the
     POOL_* env is unset it falls back to the HIPPIUS_S3_* credentials, so a
     Hippius-only operator needs no extra config.
+
+    When ``[storage] pool_backup_bucket`` is set the result is wrapped in an
+    :class:`S3MirrorStore` that dual-writes every snapshot tar and ``pool/index.json``
+    to a Cloudflare R2 backup and, on a read, falls back to R2 when the primary
+    (Hippius) 5xx's — so a Hippius outage no longer strands the validator's
+    pool-pin gate as ``pool_pin_unverifiable``. With no ``pool_backup_bucket`` this
+    is exactly a plain :class:`S3Store` — no behaviour change. Every pool call site
+    (publisher and validator) builds its store through here.
     """
     bkt = bucket or getattr(storage, "pool_bucket", "") or "cascade-eval-pool"
     use_pool_env = bool(os.environ.get("POOL_S3_ACCESS_KEY"))
@@ -1384,4 +1436,6 @@ def pool_s3_store(storage: object, *, bucket: str | None = None) -> S3Store:
         access_key_env="POOL_S3_ACCESS_KEY" if use_pool_env else "HIPPIUS_S3_ACCESS_KEY",
         secret_key_env="POOL_S3_SECRET_KEY" if use_pool_env else "HIPPIUS_S3_SECRET_KEY",
     )
-    return S3Store(cfg)
+    primary = S3Store(cfg)
+    mirror = pool_backup_s3_store(storage, bucket=bkt)
+    return S3MirrorStore(primary, mirror) if mirror else primary

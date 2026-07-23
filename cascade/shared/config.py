@@ -571,6 +571,16 @@ class StorageConfig:
     pool_bucket: str = ""
     pool_s3_endpoint: str = ""
     pool_s3_region: str = ""
+    # Cloudflare R2 live backup of the eval-pool bucket. When ``pool_backup_bucket``
+    # is set, every pool write (snapshot tars + ``pool/index.json``) is mirrored to
+    # this bucket and validator reads fall back to it when Hippius S3 is down — so a
+    # Hippius 5xx no longer strands the pool-pin gate as ``pool_pin_unverifiable``
+    # (see cascade.shared.hippius.S3MirrorStore / pool_s3_store). The endpoint,
+    # region, and credentials are REUSED from the ``backup_*`` R2 below
+    # (BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY); only the bucket differs. Empty
+    # ⇒ no pool backup (plain S3, unchanged). Hippius stays primary — this is a
+    # backup, never a hard dependency: an R2-only failure is logged, not raised.
+    pool_backup_bucket: str = ""
     # HuggingFace-Hub dataset repo used as a manifest/receipt fallback ONLY when
     # Hippius S3 is down (see cascade.shared.hippius.HFFallbackStore). Empty ⇒
     # no fallback (plain S3). Make it a PUBLIC dataset so receipts stay auditable
@@ -970,6 +980,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             pool_bucket=str(st.get("pool_bucket", "")),
             pool_s3_endpoint=str(st.get("pool_s3_endpoint", "")),
             pool_s3_region=str(st.get("pool_s3_region", "")),
+            pool_backup_bucket=str(st.get("pool_backup_bucket", "")),
             hf_backup_repo=str(st.get("hf_backup_repo", "")),
             backup_bucket=str(st.get("backup_bucket", "")),
             backup_s3_endpoint=str(st.get("backup_s3_endpoint", "")),

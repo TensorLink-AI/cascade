@@ -293,6 +293,12 @@ hf_backup_repo   = ""                               # e.g. "yourorg/cascade-mani
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Live R2 BACKUP of the eval-pool bucket: dual-writes every snapshot tar +
+# pool/index.json and serves validator reads when Hippius S3 5xx's, so an outage
+# no longer strands the pool-pin gate (pool_pin_unverifiable). Endpoint/region/
+# creds are REUSED from backup_s3_* above (BACKUP_S3_ACCESS_KEY/_SECRET_KEY);
+# only the bucket differs. Empty = no pool backup. Hippius stays primary.
+pool_backup_bucket = "cascade-eval-pool"            # R2 bucket; "" disables
 # Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
 # generator that has ever held the throne (the code, fetched from the Hub and
 # packed to a tar) here, plus a kings/index.json "db" linking each king to its

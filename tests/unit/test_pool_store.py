@@ -18,9 +18,12 @@ from cascade.shared import hippius
 from cascade.shared.config import load_chain_config
 from cascade.shared.hippius import (
     ObjectNotFound,
+    S3MirrorStore,
+    S3Store,
     StorageError,
     fetch_pool_snapshot,
     pack_dir_to_tar,
+    pool_backup_s3_store,
     pool_s3_store,
     publish_pool_snapshot,
     read_pool_index,
@@ -37,18 +40,21 @@ class _FakeS3Store:
 
     Mirrors real S3 semantics: a missing key raises :class:`ObjectNotFound`
     (the ``NoSuchKey`` case), NOT a bare ``StorageError``. ``fail`` forces every
-    read to raise a plain ``StorageError`` instead, modelling an unreadable
-    bucket (auth/network/5xx) — distinct from a genuinely absent object."""
+    read AND write to raise a plain ``StorageError`` instead, modelling an
+    unreadable/unwritable bucket (auth/network/5xx) — distinct from a genuinely
+    absent object."""
 
     def __init__(self, *, fail: bool = False):
         self.objects: dict[str, bytes] = {}
         self.fail = fail
 
-    def put_bytes(self, key, data, *, content_type="application/octet-stream"):
+    def put_bytes(self, key, data, *, content_type="application/octet-stream", acl=None):
+        if self.fail:
+            raise StorageError(f"s3_put_failed: {key}: 500")
         self.objects[key] = bytes(data)
 
-    def put_text(self, key, text, *, content_type="text/plain"):
-        self.objects[key] = text.encode("utf-8")
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
+        self.put_bytes(key, text.encode("utf-8"), content_type=content_type, acl=acl)
 
     def get_bytes(self, key):
         if self.fail:
@@ -363,3 +369,129 @@ def test_resolve_effective_block_auto_projects_next_epoch(monkeypatch):
     assert cli._resolve_effective_block(args, cfg) == 28800
     args.round_buffer = 2
     assert cli._resolve_effective_block(args, cfg) == 36000
+
+
+# ── R2 live backup of the eval-pool bucket ───────────────────────────────────
+#
+# The pool store gains the same S3MirrorStore treatment the manifest bucket
+# already has: dual-write every snapshot + pool/index.json to R2, and fall back
+# to R2 on a Hippius 5xx — so an outage no longer strands the pool-pin gate as
+# ``pool_pin_unverifiable``. Endpoint/region/creds are REUSED from the manifest
+# backup R2 (BACKUP_S3_*); only the bucket differs. Hippius stays primary.
+
+
+def _pool_storage(**over):
+    base = dict(
+        pool_bucket="cascade-eval-pool", pool_s3_endpoint="", pool_s3_region="",
+        s3_endpoint="https://s3.hippius.com", s3_region="decentralized",
+        pool_backup_bucket="", backup_s3_endpoint="", backup_s3_region="",
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_pool_backup_store_none_when_unconfigured():
+    # No pool_backup_bucket ⇒ no mirror, even when the manifest backup endpoint
+    # is already set: the pool mirror is keyed off its OWN bucket, so it stays
+    # off until explicitly named (flipping it on is a one-line config change).
+    assert pool_backup_s3_store(_pool_storage(), bucket="cascade-eval-pool") is None
+    assert pool_backup_s3_store(
+        _pool_storage(backup_s3_endpoint="https://acct.r2.cloudflarestorage.com"),
+        bucket="cascade-eval-pool") is None
+
+
+def test_pool_backup_store_reuses_manifest_r2_creds():
+    store = pool_backup_s3_store(
+        _pool_storage(
+            pool_backup_bucket="cascade-eval-pool",
+            backup_s3_endpoint="https://acct.r2.cloudflarestorage.com",
+        ),
+        bucket="cascade-eval-pool",
+    )
+    assert isinstance(store, S3Store)
+    assert store.cfg.endpoint == "https://acct.r2.cloudflarestorage.com"
+    assert store.cfg.region == "auto"                        # R2 default
+    assert store.cfg.bucket == "cascade-eval-pool"
+    # REUSED from the manifest mirror — NOT a new POOL_* pair
+    assert store.cfg.access_key_env == "BACKUP_S3_ACCESS_KEY"
+    assert store.cfg.secret_key_env == "BACKUP_S3_SECRET_KEY"
+
+
+def test_pool_s3_store_plain_when_no_backup(monkeypatch):
+    monkeypatch.delenv("POOL_S3_ACCESS_KEY", raising=False)
+    assert isinstance(pool_s3_store(_pool_storage()), S3Store)
+
+
+def test_pool_s3_store_mirrored_when_backup_bucket_set(monkeypatch):
+    monkeypatch.delenv("POOL_S3_ACCESS_KEY", raising=False)
+    store = pool_s3_store(_pool_storage(
+        pool_backup_bucket="cascade-eval-pool",
+        backup_s3_endpoint="https://acct.r2.cloudflarestorage.com",
+    ))
+    assert isinstance(store, S3MirrorStore)
+    assert isinstance(store.primary, S3Store)
+    assert store.primary.cfg.endpoint == "https://s3.hippius.com"        # Hippius primary
+    assert store.mirror.cfg.endpoint.endswith("r2.cloudflarestorage.com")  # R2 backup
+    assert store.mirror.cfg.bucket == "cascade-eval-pool"
+
+
+def _pool_mirror(*, primary_fail=False, mirror_fail=False):
+    primary = _FakeS3Store(fail=primary_fail)
+    r2 = _FakeS3Store(fail=mirror_fail)
+    return S3MirrorStore(primary, r2), primary, r2
+
+
+def test_pool_publish_dual_writes_snapshot_and_index_to_r2(tmp_path):
+    s, _primary, r2 = _pool_mirror()
+    meta = publish_pool_snapshot(
+        s, _make_pool_tar(tmp_path, "p", n=4), effective_block=7200,
+        as_of="d", n_series=4, context_length=128, horizon=16,
+    )
+    # both the snapshot tar AND pool/index.json land on the R2 backup...
+    assert meta.key in r2.objects
+    assert hippius.POOL_INDEX_KEY in r2.objects
+    # ...so a validator could read the whole index straight from R2 alone
+    assert [m.effective_block for m in read_pool_index(r2)] == [7200]
+
+
+def test_pool_read_falls_back_to_r2_on_hippius_outage(tmp_path):
+    # Publish while healthy so R2 holds a complete copy...
+    s, primary, _r2 = _pool_mirror()
+    publish_pool_snapshot(s, _make_pool_tar(tmp_path, "p", n=6), effective_block=7200,
+                          as_of="d", n_series=6, context_length=128, horizon=16)
+    # ...then Hippius 5xx's: the validator still reads the index and fetches the
+    # verified tar off R2 — no pool_pin_unverifiable self-exclusion.
+    primary.fail = True
+    index = read_pool_index(s)
+    assert [m.effective_block for m in index] == [7200]
+    out = fetch_pool_snapshot(s, index[0], tmp_path / "restored")
+    assert len(list(out.glob("*.npy"))) == 6
+
+
+def test_pool_bootstrap_absent_through_mirror_reads_empty():
+    # No pool published yet: the index is absent on BOTH primary and R2. The
+    # mirror must preserve ObjectNotFound so read_pool_index sees genuine
+    # absence (→ []) rather than a spurious read error that rejects every round.
+    s, _primary, _r2 = _pool_mirror()
+    assert read_pool_index(s) == []
+
+
+def test_pool_mirror_recovers_index_after_primary_data_loss(tmp_path):
+    # The data-loss case the dual-write exists for: the primary lost the index
+    # object but R2 still holds it. It is served from the mirror, not reported
+    # absent (ObjectNotFound from the primary alone must not short-circuit).
+    s, primary, _r2 = _pool_mirror()
+    publish_pool_snapshot(s, _make_pool_tar(tmp_path, "p"), effective_block=7200,
+                          as_of="d", n_series=5, context_length=128, horizon=16)
+    del primary.objects[hippius.POOL_INDEX_KEY]          # primary drops the index
+    assert [m.effective_block for m in read_pool_index(s)] == [7200]  # recovered from R2
+
+
+def test_pool_backup_write_failure_is_not_fatal(tmp_path):
+    # An R2-only failure must never break publishing — Hippius stays primary and
+    # the pool backup is a backup, not a hard dependency.
+    s, primary, _r2 = _pool_mirror(mirror_fail=True)
+    meta = publish_pool_snapshot(s, _make_pool_tar(tmp_path, "p"), effective_block=7200,
+                                 as_of="d", n_series=5, context_length=128, horizon=16)
+    assert meta.key in primary.objects                    # primary copy intact
+    assert hippius.POOL_INDEX_KEY in primary.objects

@@ -335,6 +335,10 @@ pool_s3_region   = ""
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Live R2 BACKUP of the eval-pool bucket (reuses backup_s3_* endpoint/creds; only
+# the bucket differs). Dual-writes snapshots + pool/index.json and serves reads
+# when Hippius S3 5xx's. Empty = disabled. See chain.toml for details.
+pool_backup_bucket = "cascade-testnet-eval-pool"    # R2 bucket; "" disables
 # Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
 # throne-holding generator (code fetched from the Hub, packed to a tar) here plus
 # a kings/index.json "db" linking each king to its archived object. Endpoint/region
