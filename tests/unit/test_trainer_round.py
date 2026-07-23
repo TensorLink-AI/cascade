@@ -508,6 +508,44 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
     assert any(d["role"] == "king" and d["train_hours"] is None for d in dispatched)
 
 
+def test_frozen_block_rebuilds_substrate_and_reads_fresh(cfg, tmp_path):
+    # A quietly-dead bittensor websocket keeps answering current_block() with a
+    # stale (~20-min-old) height; without a freeze guard the live loop re-derives
+    # an already-published round from it and re-enters it. Once the height stops
+    # advancing past stale_block_after_s (blocks are ~12s), the guard rebuilds the
+    # substrate connection (reconnect) and trusts the fresh, advanced read.
+    class FrozenClient:
+        def __init__(self):
+            self.block = 1000
+            self.reconnects = 0
+
+        def current_block(self):
+            return self.block
+
+        def reconnect(self):
+            self.reconnects += 1
+            self.block = 5000            # the fresh websocket sees the real height
+
+    client = FrozenClient()
+    now = {"t": 0.0}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, stale_block_after_s=300.0,
+                           chain_clock=lambda: now["t"])
+
+    assert runner._block_with_freeze_guard(client) == 1000     # seeds the tracker
+    now["t"] = 200.0
+    assert runner._block_with_freeze_guard(client) == 1000     # within window: trusted
+    assert client.reconnects == 0
+    now["t"] = 400.0                                           # frozen past the window
+    assert runner._block_with_freeze_guard(client) == 5000     # rebuilt + fresh read
+    assert client.reconnects == 1
+    # a normally-advancing chain afterwards never triggers a spurious rebuild.
+    now["t"] = 410.0
+    client.block = 5100
+    assert runner._block_with_freeze_guard(client) == 5100
+    assert client.reconnects == 1
+
+
 def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
     # A round that dies MID-HEAT (pod fleet lost, trainer crash) must not consume
     # anyone's one lifetime submission: the burn is persisted only after the heat
