@@ -212,6 +212,22 @@ def run_tier2(
     registry = cfg.training.size_registry
     base_trainer = _load_trainer(trainer_spec)
     results: list[CheckResult] = []
+    # Warm-start pin (DEC-CA-0003): when the signed manifest records a promoted
+    # init, re-derivation must start from THAT checkpoint, not random init. The
+    # pointer is content-addressed, so the fetch is byte-pinned. A manifest that
+    # pins an init we cannot fetch fails every matching entry loudly.
+    warm_dir: Path | None = None
+    if manifest.warm_start_ckpt:
+        ws_ref = parse_trained_pointer(manifest.warm_start_ckpt)
+        if ws_ref is None:
+            return [CheckResult("retrain", FAIL,
+                                f"malformed warm_start_ckpt {manifest.warm_start_ckpt!r}")]
+        warm_dir = workdir / "warm_start" / hashlib.sha256(ws_ref.encode()).hexdigest()[:16]
+        try:
+            _fetch_generator(ws_ref, warm_dir, cfg)
+        except Exception as e:  # noqa: BLE001 — a pinned-but-unfetchable init fails the audit
+            return [CheckResult("retrain", FAIL,
+                                f"pinned warm-start init unfetchable ({type(e).__name__}: {e})")]
     for entry in manifest.entries:
         name = f"retrain:{entry.role}:{entry.size or cfg.training.arch_preset}"
         contract = registry.get(entry.size) if entry.size else cfg.training.primary_size
@@ -232,6 +248,11 @@ def run_tier2(
 
             out_dir = workdir / "retrained" / f"{entry.role}-{entry.size or 'primary'}"
             out_dir.mkdir(parents=True, exist_ok=True)
+            # The pinned init applies to the size it was trained at; other sizes
+            # trained (and re-derive) from random init.
+            entry_warm = (warm_dir if warm_dir is not None
+                          and (entry.size or cfg.training.arch_preset) ==
+                          (manifest.warm_start_size or cfg.training.arch_preset) else None)
             with open_round_stream(
                 contract.corpus_mode, gen_dir, receipt.generation_seed, cfg.generator,
                 token_budget=contract.train_tokens, use_sandbox=True,
@@ -243,6 +264,7 @@ def run_tier2(
                     training_seed=receipt.training_seed,
                     token_budget=contract.train_tokens,
                     out_dir=out_dir,
+                    **({"warm_start_dir": entry_warm} if entry_warm is not None else {}),
                 )
         except Exception as e:  # noqa: BLE001
             results.append(CheckResult(name, WARN, f"re-train failed "

@@ -204,7 +204,15 @@ def main(argv: list[str] | None = None) -> int:
     # authoritative set. Only wired when [scoring] cascade_enabled.
     bench_eval_fn = None
     cascade_bench_plan = None
+    warm_start_path = None
     if cfg.scoring.cascade_enabled:
+        # Warm-start consumption (DEC-CA-0005): read the promoted-init pointer
+        # the co-hosted validator's Cascade installs; every round then trains
+        # from that pinned checkpoint (and stamps it, signed, on the manifest).
+        from pathlib import Path as _Path
+
+        warm_start_path = _Path(cfg.validator.warm_start_init_path)
+        log.info("cascade warm-start consumption enabled: pointer file %s", warm_start_path)
         if remote_hosts:
             # Preferred: bench the king on the pod that just trained it — GPU, and
             # the checkpoint is already at its _train_work path. Reuses the
@@ -257,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         # dashboards show heat/duel/validation from the trainer, not a
         # wall-clock estimate. Off by default for offline runs and tests.
         publish_stage_status=True,
+        warm_start_path=warm_start_path,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",

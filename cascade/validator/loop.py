@@ -180,6 +180,34 @@ class ValidatorRunner:
         gpu_reason = self._check_gpu(manifest)
         if gpu_reason is not None:
             return gpu_reason
+        ws_reason = self._check_warm_start(manifest)
+        if ws_reason is not None:
+            return ws_reason
+        return None
+
+    def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
+        """Warm-start pin gate (Cascade, DEC-CA-0003): the manifest's signed
+        ``warm_start_ckpt`` must equal the init THIS validator's deterministic
+        promotion installed (its own ``warm_start_init_path`` file; "" before any
+        promotion). Every validator computes the same promotion (block-anchored
+        clock + trainer-signed bench scores), so agreement is fleet-wide. A
+        mismatch — trainer trained from random when a promotion is live, or from
+        a stale/foreign init — rejects the round rather than silently scoring
+        runs trained off-baseline; the trainer re-syncs by the next round. Only
+        enforced when Cascade is wired (off ⇒ pure KOTH, field ignored)."""
+        if self.cascade is None:
+            return None
+        expected = ""
+        p = Path(self.cfg.validator.warm_start_init_path)
+        if p.is_file():
+            try:
+                expected = str(json.loads(p.read_text(encoding="utf-8")).get("checkpoint_id") or "")
+            except Exception as e:  # noqa: BLE001 — unreadable pin must fail LOUD, not open
+                return f"warm_start_state_unreadable: {p}: {e}"
+        if manifest.warm_start_ckpt != expected:
+            return (f"warm_start_mismatch: manifest trained from "
+                    f"{manifest.warm_start_ckpt or '<random init>'!r}, this validator "
+                    f"expects {expected or '<random init>'!r}")
         return None
 
     @staticmethod
@@ -529,7 +557,7 @@ class ValidatorRunner:
         metrics = self._bench_scores_dict(entry) or self._bench_metrics_via_sidecar(entry)
         if metrics is None:
             return
-        self.cascade.record_checkpoint(entry.trained_pointer, now=now, **metrics)
+        self.cascade.record_checkpoint(entry.trained_pointer, now=now, size=entry.size, **metrics)
 
     def _cascade_round(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None
@@ -1373,9 +1401,12 @@ def _warm_start_installer(path: Path) -> Callable[[object], None]:
             json.dumps(
                 {
                     "checkpoint_id": getattr(winner, "checkpoint_id", None),
+                    "size": getattr(winner, "size", ""),
                     "score": getattr(winner, "score", None),
                     "gifteval_crps": getattr(winner, "gifteval_crps", None),
                     "gifteval_mase": getattr(winner, "gifteval_mase", None),
+                    "boom_crps": getattr(winner, "boom_crps", None),
+                    "boom_mase": getattr(winner, "boom_mase", None),
                     "time_crps": getattr(winner, "time_crps", None),
                     "time_mase": getattr(winner, "time_mase", None),
                     "installed_at": time.time(),
