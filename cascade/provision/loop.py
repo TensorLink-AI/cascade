@@ -10,9 +10,13 @@ One cycle of the machine (each ``poll_seconds``, ~30s):
            ``cascade-trainer --plan-only`` and parses its JSON line);
     SIZE   :func:`policy.size_fleet` — slot-based heat fleet off the eligible
            field, one multi-GPU final pod for king + finalists;
-    RENT   providers in each stage's priority order; an adapter failure means
-           fewer offers, never a dead loop; every pod is named/tagged
-           ``cascade-{round_id}-…`` so reconcile can find strays;
+    RENT   the stage's SKU ladder × provider priority order, with escalation:
+           a rung that delivers NO healthy pod (failed launch, or every pod
+           and its replacement a dud) falls to the next (candidate × provider)
+           rung under a wall-clock deadline, and a fleet below viability gets
+           one same-candidate top-up (see ``_rent_stage_escalating``); every
+           pod is named/tagged ``cascade-{round_id}-…`` so reconcile can find
+           strays;
     BOOT   provider-ready → SSH reachable → the seven-check health gate; a
            failed pod is terminated and replaced ONCE, then dropped;
     PUBLISH atomically write hosts.toml (heat + final entries) — the trainer
@@ -57,6 +61,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import re
 import subprocess
 import time
@@ -223,6 +228,13 @@ class ProvisionerLoop:
     heartbeat_every_s: float = 600.0
     ready_timeout: float = DEFAULT_READY_TIMEOUT
     poll_seconds: float = 30.0
+    # Rules of escalation (see _rent_stage_escalating): how long past its
+    # FIRST rent attempt a stage may keep walking the SKU ladder (0 = a rung
+    # that fails is final — the pre-escalation behaviour), and the fraction
+    # of demanded slots below which a partial fleet earns its one
+    # same-candidate top-up batch (0 = never top up).
+    escalate_deadline_s: float = 1800.0
+    min_viable_fleet: float = 0.5
     dry_run: bool = False
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
@@ -398,14 +410,21 @@ class ProvisionerLoop:
         # Per stage: the first (SKU candidate × provider) combination with
         # capacity for the WHOLE stage fleet wins — a stage never mixes SKUs
         # (within-round fairness by construction; see StagePolicy.candidates).
+        # The iterator is KEPT: if the chosen rung fails to deliver, renting
+        # escalates down the remaining ladder (see _rent_stage_escalating).
         chosen: dict[str, tuple[object, float, object, int]] = {}
+        offer_iters: dict[str, object] = {}
+        slot_demand: dict[str, int] = {}
         for stage, sp, fl in (("heat", self.policy.heat, fleet.heat),
                               ("final", self.policy.final, fleet.final)):
             if fl.pods <= 0:
                 continue
-            picked = self._pick_offer(sp, fl.slots, stage)
+            offers = self._iter_offers(sp, fl.slots, stage)
+            picked = next(offers, None)
             if picked is not None:
                 chosen[stage] = picked
+                offer_iters[stage] = offers
+                slot_demand[stage] = fl.slots
         if not chosen:
             # No provider anywhere: publish an EMPTY hosts file so the trainer
             # trains this round locally — the round is degraded, never lost.
@@ -445,8 +464,9 @@ class ProvisionerLoop:
         self._save()
 
         rented: dict[str, list[tuple[PodInstance, PodAddress]]] = {}
-        for stage, (prov, _price, cand, pods) in chosen.items():
-            healthy = self._rent_stage(round_id, stage, prov, cand, pods)
+        for stage in list(chosen):
+            healthy = self._rent_stage_escalating(
+                round_id, stage, chosen, offer_iters[stage], slot_demand[stage])
             if healthy:
                 rented[stage] = healthy
         if not rented:
@@ -458,18 +478,19 @@ class ProvisionerLoop:
         self._state = replace(self._state, published=True)
         self._save()
 
-    def _pick_offer(self, sp, slots: int,
-                    stage: str) -> tuple[object, float, object, int] | None:
-        """First (SKU candidate × provider) with capacity for the whole fleet.
+    def _iter_offers(self, sp, slots: int, stage: str):
+        """Yield every viable ``(provider, price, candidate, pods)``, ladder order.
 
         Candidates in the stage's configured order, providers in priority order
-        within each candidate. The pod count is re-derived per candidate — an
-        8× fallback needs fewer pods for the same slots than a 4× primary. Any
+        within each candidate — this IS the escalation ladder. Lazy on purpose:
+        capacity is probed when the consumer advances, so a rung reached ten
+        minutes into a failed rent sees the market as it is THEN, not as it was
+        at pick time. The pod count is re-derived per candidate — an 8×
+        fallback needs fewer pods for the same slots than a 4× primary. Any
         adapter fault just skips that provider: a broken adapter means fewer
-        offers, never a dead provisioner. Returns ``(provider, price,
-        candidate, pods)`` or ``None``.
+        offers, never a dead provisioner.
         """
-        for cand in sp.sku_candidates:
+        for rung, cand in enumerate(sp.sku_candidates):
             pods = pods_for_slots(slots, cand.gpus_per_pod, sp.max_pods)
             if pods <= 0:
                 continue
@@ -497,11 +518,130 @@ class ProvisionerLoop:
                     log.warning("provider %s: %s at $%.2f/hr exceeds cap $%.2f/hr; skipping",
                                 name, cand.sku, price, cand.max_price_hr)
                     continue
-                if cand is not sp.sku_candidates[0]:
-                    log.info("%s stage falling back to %dx%s on %s (primary had no offer)",
+                if rung > 0:
+                    log.info("%s stage falling back to %dx%s on %s (earlier rungs had no offer)",
                              stage, cand.gpus_per_pod, cand.sku, name)
-                return prov, float(price), cand, pods
-        return None
+                yield prov, float(price), cand, pods
+
+    def _pick_offer(self, sp, slots: int,
+                    stage: str) -> tuple[object, float, object, int] | None:
+        """First viable rung of :meth:`_iter_offers`, or ``None`` (no capacity)."""
+        return next(self._iter_offers(sp, slots, stage), None)
+
+    def _rent_stage_escalating(self, round_id: int | str, stage: str,
+                               chosen: dict, offers, slots: int,
+                               ) -> list[tuple[PodInstance, PodAddress]]:
+        """Rent one stage, escalating down the SKU ladder when a rung fails.
+
+        The rules of escalation, cheapest signal first:
+
+        1. A pod that fails boot/health gets ONE same-rung replacement, its
+           machine excluded from the re-pick (inside :meth:`_rent_stage`).
+        2. A stage that comes up EMPTY — the launch call failed, or every pod
+           AND its replacement was a dud — re-enters the offer ladder at the
+           next (candidate × provider) rung: capacity is probed at escalation
+           time (the iterator is lazy) and each new rung is re-checked against
+           the round budget with the other stages' current offers
+           (:meth:`_escalation_budget_ok`); an over-cap rung is skipped, not
+           fatal — a cheaper one may sit further down.
+        3. A stage that comes up PARTIAL below ``min_viable_fleet`` of its
+           slot demand gets ONE same-candidate top-up batch
+           (:meth:`_maybe_top_up`) — never a different SKU, so the
+           stage-never-mixes-candidates fairness invariant holds.
+
+        Everything is bounded by a wall-clock deadline (``escalate_deadline_s``
+        from the first rent attempt), not an attempt count: the heat window
+        shrinks in real time while we escalate, and pods that land an hour
+        late are worth less than the trainer's local fallback. Deadline or
+        ladder exhausted ⇒ the stage degrades exactly as before — fewer (or
+        no) pods, the round never lost.
+        """
+        deadline = self.clock() + self.escalate_deadline_s
+        prov, _price, cand, pods = chosen[stage]
+        attempt = 0
+        while True:
+            suffix = "" if attempt == 0 else f"-e{attempt}"
+            healthy = self._rent_stage(round_id, stage, prov, cand, pods, suffix=suffix)
+            if healthy:
+                return self._maybe_top_up(round_id, stage, prov, cand, pods,
+                                          healthy, slots, deadline, attempt)
+            while True:
+                if self.clock() >= deadline:
+                    log.error("round %s %s: escalation deadline (%.0fs) spent with no "
+                              "healthy fleet; degrading (trainer covers the round)",
+                              round_id, stage, self.escalate_deadline_s)
+                    return []
+                nxt = next(offers, None)
+                if nxt is None:
+                    log.error("round %s %s: SKU ladder exhausted with no healthy fleet; "
+                              "degrading (trainer covers the round)", round_id, stage)
+                    return []
+                if self._escalation_budget_ok(stage, nxt[1], nxt[3], chosen):
+                    break
+            prov, _price, cand, pods = nxt
+            chosen[stage] = nxt          # later stages' budget math sees the switch
+            attempt += 1
+            log.warning("round %s %s: rung delivered nothing; escalating to %d × %dx%s "
+                        "on %s (attempt %d)", round_id, stage, pods, cand.gpus_per_pod,
+                        cand.sku, prov.name, attempt)
+
+    def _maybe_top_up(self, round_id: int | str, stage: str, prov: object, cand,
+                      pods: int, healthy: list, slots: int, deadline: float,
+                      attempt: int) -> list[tuple[PodInstance, PodAddress]]:
+        """Escalation rule 3: ONE same-candidate top-up below viability.
+
+        ``min_viable_fleet`` is the fraction of the stage's intended slots —
+        ``min(slots, pods × gpus_per_pod)``, demand as clamped by the rung's
+        own shape — under which serial waves start threatening the heat
+        window. The top-up re-rents only the MISSING pods, on the same
+        provider and candidate: no SKU mixing, and the pod count never
+        exceeds what the budget breaker approved for this rung. One batch
+        only — a market that failed a pod and its replacement is thin, and
+        the deadline applies here like everywhere else. Whatever the top-up
+        yields is accepted: a below-viability fleet still beats pure local
+        training.
+        """
+        target = min(slots, pods * cand.gpus_per_pod)
+        have = len(healthy) * cand.gpus_per_pod
+        need = math.ceil(self.min_viable_fleet * target)
+        missing = pods - len(healthy)
+        if have >= need or missing <= 0:
+            return healthy
+        if self.clock() >= deadline:
+            log.warning("round %s %s: fleet below viability (%d/%d slots) but the "
+                        "escalation deadline is spent; proceeding partial",
+                        round_id, stage, have, target)
+            return healthy
+        log.warning("round %s %s: fleet below viability (%d/%d slots, need %d); "
+                    "topping up %d × %dx%s pod(s) on %s", round_id, stage, have,
+                    target, need, missing, cand.gpus_per_pod, cand.sku, prov.name)
+        healthy = healthy + self._rent_stage(round_id, stage, prov, cand, missing,
+                                             suffix=f"-t{attempt}")
+        have = len(healthy) * cand.gpus_per_pod
+        if have < need:
+            log.error("round %s %s: still below viability after top-up (%d/%d slots); "
+                      "proceeding partial (serial waves)", round_id, stage, have, target)
+        return healthy
+
+    def _escalation_budget_ok(self, stage: str, price: float, pods: int,
+                              chosen: dict) -> bool:
+        """Re-run the round budget gate for an escalated rung.
+
+        Same worst-case arithmetic as the round-level gate (every pod billed
+        the full TTL): THIS stage at the proposed rung, every other stage at
+        its current offer. Duds already terminated billed minutes, not TTLs —
+        like the replacement path, that sliver is accepted rather than
+        modelled.
+        """
+        others = sum(n * pr * self.ttl_hours
+                     for st, (_p, pr, _c, n) in chosen.items() if st != stage)
+        projected = others + pods * float(price) * self.ttl_hours
+        if projected > self.policy.max_spend_per_round:
+            log.warning("%s escalation rung refused by budget: worst-case $%.2f > cap "
+                        "$%.2f; trying the next rung", stage, projected,
+                        self.policy.max_spend_per_round)
+            return False
+        return True
 
     @staticmethod
     def _offer_price(prov: object, sku: str) -> float | None:
@@ -518,13 +658,17 @@ class ProvisionerLoop:
     # ── RENT + BOOT + HEALTH (with one replacement per failed pod) ───────────
 
     def _rent_stage(self, round_id: int | str, stage: str, prov: object,
-                    cand, pods: int) -> list[tuple[PodInstance, PodAddress]]:
+                    cand, pods: int, suffix: str = "",
+                    ) -> list[tuple[PodInstance, PodAddress]]:
         # round_id is the boundary block for heat/final and the manifest round
         # id for eval — both digits, both satisfying _PROVISIONER_POD_RE.
+        # ``suffix`` distinguishes escalation (-eN) / top-up (-tN) batches from
+        # the first attempt's pods (same regex, distinct names).
         spec = LaunchSpec(
             sku=cand.marketplace_sku, count=pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
-            name_prefix=f"{POD_TAG}{round_id}-{stage}", gpus_per_pod=cand.gpus_per_pod,
+            name_prefix=f"{POD_TAG}{round_id}-{stage}{suffix}",
+            gpus_per_pod=cand.gpus_per_pod,
         )
         try:
             pod_ids = prov.launch(spec)
@@ -553,7 +697,8 @@ class ProvisionerLoop:
             # 63243c2c…, round 5052267627071284702).
             lemon = getattr(prov, "machine_of", lambda _p: None)(pid)
             self._terminate_and_drop(prov, pid)
-            rspec = replace(spec, count=1, name_prefix=f"{POD_TAG}{round_id}-{stage}-r{i}",
+            rspec = replace(spec, count=1,
+                            name_prefix=f"{POD_TAG}{round_id}-{stage}{suffix}-r{i}",
                             exclude_ids=spec.exclude_ids + ((lemon,) if lemon else ()))
             try:
                 rid = prov.launch(rspec)[0]
@@ -731,6 +876,10 @@ class ProvisionerLoop:
             log.info("round %s already has a receipt; skipping its eval pod", latest)
             self._persist_eval_latch(latest)
             return
+        # Deliberately NO ladder escalation for eval (unlike the boundary
+        # stages): it is one pod with pick-time fallbacks and one replacement,
+        # and the validator's local-eval fallback is cheap — an escalation
+        # loop here would only delay the round's evals for marginal gain.
         picked = self._pick_offer(self.policy.eval, 1, "eval")
         if picked is None:
             log.error("round %s eval: no provider has capacity; the validator "

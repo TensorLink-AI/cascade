@@ -84,6 +84,17 @@ max_spend_per_round = 25.0
 # this many epochs after rent.
 ttl_epochs = 1
 
+# Rules of escalation. A stage whose rung delivers NO healthy pod (the launch
+# call failed, or every pod and its one replacement was a dud) re-enters the
+# SKU ladder at the next (candidate × provider) rung — capacity re-probed at
+# escalation time, each rung re-checked against max_spend_per_round — for at
+# most escalate_deadline_s of wall clock from its first rent attempt (late
+# pods are worth less than the trainer's local fallback; 0 = a failed rung is
+# final). A PARTIAL fleet below min_viable_fleet of its slot demand gets ONE
+# same-candidate top-up batch — never a different SKU (0 = never top up).
+escalate_deadline_s = 1800
+min_viable_fleet    = 0.5
+
 # Health-gate knobs (see cascade/provision/health.py for the full seven).
 min_disk_gb = 20.0
 

@@ -16,7 +16,7 @@ from cascade.provision.core import PodAddress, ProvisionError
 from cascade.provision.health import CheckResult, HealthReport
 from cascade.provision.loop import ProvisionerLoop, RenderSettings, parse_plan_output
 from cascade.provision.main import build_policy
-from cascade.provision.policy import ProvisionPolicy, StagePolicy
+from cascade.provision.policy import ProvisionPolicy, SkuCandidate, StagePolicy
 from cascade.provision.state import load_state
 from cascade.trainer.remote import RemoteDispatchError, load_hosts
 
@@ -121,7 +121,8 @@ PLAN = {
 
 def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
               clock=None, store=None, health=None, dry_run=False, plan_calls=None,
-              eval_hosts=None, receipt_prefix=""):
+              eval_hosts=None, receipt_prefix="", escalate_deadline_s=1800.0,
+              min_viable_fleet=0.5):
     providers = providers if providers is not None else {"lium": FakeProvider("lium")}
     plan_calls = plan_calls if plan_calls is not None else []
 
@@ -147,6 +148,8 @@ def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
         health_check=health,
         dry_run=dry_run,
         clock=clock or Clock(),
+        escalate_deadline_s=escalate_deadline_s,
+        min_viable_fleet=min_viable_fleet,
     ), plan_calls
 
 
@@ -346,6 +349,142 @@ def test_every_pod_unhealthy_clears_hosts(tmp_path):
     assert prov.live == {}                                    # nothing left billing
     with pytest.raises(RemoteDispatchError):
         load_hosts(tmp_path / "hosts.toml")
+
+
+# ── rules of escalation: empty rung → next rung; partial fleet → top-up ──────
+
+
+class LaunchFailProvider(FakeProvider):
+    """Capacity probe says yes, the actual rent call 500s — the gap that
+    escalation rule 2 closes (a launch failure used to lose the stage)."""
+
+    def launch(self, spec):
+        raise RuntimeError("api 500")
+
+
+def test_launch_failure_escalates_to_next_provider(tmp_path):
+    lium = LaunchFailProvider("lium")
+    shade = FakeProvider("shadeform")
+    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade})
+    loop.run_once()
+    # Both stages: lium accepted the probe, failed the launch → the same rung
+    # on shadeform rents instead (escalation batch names carry -e1).
+    assert lium.launched == []
+    assert shade.launched == ["cascade-900-heat-e1-0", "cascade-900-final-e1-0"]
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert {h.stage for h in hosts} == {"heat", "final"}
+
+
+def test_all_duds_on_one_provider_escalate_to_the_next(tmp_path):
+    lium = FakeProvider("lium")
+    shade = FakeProvider("shadeform")
+
+    def health(addr, stage, provider="", **shape):
+        return _report(ok=provider != "lium")                # a bad lium batch
+
+    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
+                        health=health)
+    loop.run_once()
+    # Per stage on lium: the pod AND its one replacement were duds → the stage
+    # (not just the slot) escalates and rents healthy on shadeform.
+    assert lium.live == {} and len(lium.terminated) == 4     # heat+final, orig+repl
+    assert shade.launched == ["cascade-900-heat-e1-0", "cascade-900-final-e1-0"]
+    st = load_state(tmp_path / "state.json")
+    assert {i.instance_id for i in st.instances} == {
+        "cascade-900-heat-e1-0", "cascade-900-final-e1-0"}
+
+
+def test_zero_deadline_disables_escalation(tmp_path):
+    lium = LaunchFailProvider("lium")
+    shade = FakeProvider("shadeform")
+    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
+                        escalate_deadline_s=0.0)
+    loop.run_once()
+    # Deadline already spent at the first failure → pre-escalation behaviour:
+    # the stage degrades, hosts clear, the trainer covers the round locally.
+    assert shade.launched == []
+    with pytest.raises(RemoteDispatchError):
+        load_hosts(tmp_path / "hosts.toml")
+
+
+def test_escalated_rung_rechecked_against_budget(tmp_path):
+    # Primary heat rung (one 8x pod) passes the round gate; its launch fails.
+    # The only fallback rung (1x singles → 3 pods) would blow the round cap
+    # with the final included → refused, ladder exhausted, heat degrades —
+    # but the final still rents.
+    class HeatLaunchFails(FakeProvider):
+        def launch(self, spec):
+            if "-heat" in spec.name_prefix:
+                raise RuntimeError("no heat capacity after all")
+            return super().launch(spec)
+
+    prov = HeatLaunchFails("lium", price=2.0)
+    policy = _policy(
+        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=4,
+                         providers=("lium",), max_price_hr=4.0,
+                         candidates=(SkuCandidate(sku="NVIDIA RTX A6000",
+                                                  gpus_per_pod=1, max_price_hr=4.0),)),
+        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
+                          providers=("lium",), max_price_hr=3.0),
+        max_spend_per_round=20.0)
+    # Initial projection: (1 heat + 1 final) × $2 × 3h TTL = $12 <= $20. The
+    # escalated rung projects 3 × $2 × 3h = $18 heat + $6 final = $24 > $20.
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy)
+    loop.run_once()
+    assert prov.launched == ["cascade-900-final-0"]
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert all(h.stage == "final" for h in hosts)            # degraded, not dead
+
+
+def test_below_viability_partial_fleet_tops_up_same_candidate(tmp_path):
+    prov = FakeProvider("lium")
+    plan = dict(PLAN, eligible_challengers=80)               # 19 slots → 3 × 8-GPU pods
+    # Heat pods rent as .1/.2/.3; replacements draw .4/.5. Duds: pods 0 and 1
+    # AND their replacements → 1 of 3 pods healthy = 8 of 19 slots < 50%.
+    bad = {"10.0.0.1", "10.0.0.2", "10.0.0.4", "10.0.0.5"}
+
+    def health(addr, stage, provider="", **shape):
+        return _report(ok=addr.ip not in bad)
+
+    policy = _policy(
+        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
+                         providers=("lium",), max_price_hr=4.0),
+        max_spend_per_round=100.0)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan,
+                        policy=policy, health=health)
+    loop.run_once()
+
+    # One same-candidate top-up batch re-rents exactly the two missing pods.
+    assert "cascade-900-heat-t0-0" in prov.launched
+    assert "cascade-900-heat-t0-1" in prov.launched
+    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
+    assert len(heat) == 3 * 8                                # back to full strength
+    st = load_state(tmp_path / "state.json")
+    heat_ids = {i.instance_id for i in st.instances if i.stage == "heat"}
+    assert heat_ids == {"cascade-900-heat-2",
+                        "cascade-900-heat-t0-0", "cascade-900-heat-t0-1"}
+
+
+def test_viable_partial_fleet_does_not_top_up(tmp_path):
+    prov = FakeProvider("lium")
+    plan = dict(PLAN, eligible_challengers=80)               # 19 slots → 3 × 8-GPU pods
+    bad = {"10.0.0.1", "10.0.0.4"}                           # pod 0 + its replacement
+
+    def health(addr, stage, provider="", **shape):
+        return _report(ok=addr.ip not in bad)
+
+    policy = _policy(
+        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
+                         providers=("lium",), max_price_hr=4.0),
+        max_spend_per_round=100.0)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan,
+                        policy=policy, health=health)
+    loop.run_once()
+    # 2 of 3 pods = 16 of 19 slots >= 50% → viable; the dropped slot stays
+    # dropped (serial waves), no top-up batch and no escalation.
+    assert not any("-t0" in p or "-e1" in p for p in prov.launched)
+    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
+    assert len(heat) == 2 * 8
 
 
 # ── watch + per-stage teardown ───────────────────────────────────────────────

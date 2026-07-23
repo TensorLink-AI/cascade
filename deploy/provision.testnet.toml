@@ -8,6 +8,13 @@ hosts_path            = "/root/cascade/hosts.toml"
 state_path            = "/root/cascade/provisioner_state.json"
 static_hosts          = "/root/cascade/static_hosts.toml"
 max_spend_per_round   = 25.0
+# Rules of escalation: a stage whose rung delivers NO healthy pod re-enters
+# the SKU ladder at the next (candidate × provider) rung, for at most
+# escalate_deadline_s of wall clock from its first rent attempt; a PARTIAL
+# fleet below min_viable_fleet of its slot demand gets one same-candidate
+# top-up batch. Both degrade to the trainer's local fallback when exhausted.
+escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
+min_viable_fleet      = 0.5         # 0 = never top up
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"   # elastic eval pod (PR #85)
 receipt_prefix        = "receipts/5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR/"
 

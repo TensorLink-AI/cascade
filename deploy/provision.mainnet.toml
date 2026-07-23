@@ -19,6 +19,13 @@ state_path            = "/root/cascade/provisioner_state.json"
 static_hosts          = "/root/cascade/static_hosts.toml"
 max_spend_per_round   = 120.0       # mainnet heats run ~hours on rented pods;
                                     # breaker sized for 2×4x4090 + 1×2x L40S × 24h epoch
+# Rules of escalation: a stage whose rung delivers NO healthy pod re-enters
+# the SKU ladder at the next (candidate × provider) rung, for at most
+# escalate_deadline_s of wall clock from its first rent attempt; a PARTIAL
+# fleet below min_viable_fleet of its slot demand gets one same-candidate
+# top-up batch. Both degrade to the trainer's local fallback when exhausted.
+escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
+min_viable_fleet      = 0.5         # 0 = never top up
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"
 receipt_prefix        = "receipts/<MAINNET-VALIDATOR-HOTKEY>/"   # teardown latch
 
