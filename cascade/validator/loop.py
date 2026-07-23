@@ -545,14 +545,17 @@ class ValidatorRunner:
 
         now = time.time()
         try:
+            # The reign clock runs on the round's epoch block — identical for every
+            # validator (from the signed manifest), so all fire on the same round.
+            block = self._epoch_start_block(manifest)
             # Reuse KOTH's dethrone signal to reset the clock (never reimplement it);
             # on genesis, crown the first champion so the reign clock starts ticking.
             if outcome is not None and outcome.transition.dethroned and outcome.transition.new_king_hotkey:
-                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, now=now)
+                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block)
             elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
-                self.cascade.note_dethrone(self.state.king_hotkey, now=now)
+                self.cascade.note_dethrone(self.state.king_hotkey, block=block)
             self._record_king_checkpoint(manifest, now)
-            event = self.cascade.cascade_check(now)
+            event = self.cascade.cascade_check(block=block, now=now)
             if event is not None:
                 self._apply_cascade(event)
         except Exception as e:  # noqa: BLE001 — Cascade must never disturb a round
