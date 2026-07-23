@@ -23,7 +23,10 @@ max_spend_per_round   = 120.0       # mainnet heats run ~hours on rented pods;
 # the SKU ladder at the next (candidate × provider) rung, for at most
 # escalate_deadline_s of wall clock from its first rent attempt; a PARTIAL
 # fleet below min_viable_fleet of its slot demand gets one same-candidate
-# top-up batch. Both degrade to the trainer's local fallback when exhausted.
+# top-up batch. The deadline exists because the rent path blocks the service
+# loop while escalating (teardown/heartbeat starve) — NOT because degrading
+# is fine: the orchestrator is CPU-only, so a round with no rented fleet is
+# effectively lost (and a locally-trained final can't pass the L40S pin).
 escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
 min_viable_fleet      = 0.5         # 0 = never top up
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"
@@ -98,8 +101,7 @@ max_price_hr = 1.20
 
 # No 1x rungs: every pod pays the full bootstrap cost (rsync + uv sync) for a
 # single lane, and a singles fleet burns max_pods on 8 flaky boxes for 8 slots.
-# The 2x rungs are the floor; below that the trainer's local fallback is
-# cheaper than a singles fleet.
+# The 2x rungs are the floor.
 
 # ── FINAL: the contract GPU — provisioner-MANAGED on mainnet ─────────────────
 # expected_gpu pins the duel to L40S. Primary: one 2-GPU pod (king + challenger

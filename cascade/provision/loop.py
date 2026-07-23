@@ -550,11 +550,16 @@ class ProvisionerLoop:
            stage-never-mixes-candidates fairness invariant holds.
 
         Everything is bounded by a wall-clock deadline (``escalate_deadline_s``
-        from the first rent attempt), not an attempt count: the heat window
-        shrinks in real time while we escalate, and pods that land an hour
-        late are worth less than the trainer's local fallback. Deadline or
-        ladder exhausted ⇒ the stage degrades exactly as before — fewer (or
-        no) pods, the round never lost.
+        from the first rent attempt), not an attempt count — NOT because the
+        degraded path is acceptable (on a CPU-only orchestrator, trainer-local
+        training is effectively a lost round, and a locally-trained final
+        can never pass the validator's expected_gpu pin anyway), but because
+        this rent path runs INLINE in the service loop: while it escalates,
+        teardown ticks, the heartbeat, and the orphan reaper are all starved
+        (the same starvation class that swallowed the round-5 heat window on
+        2026-07-14 and forced eval renting onto a thread). The deadline caps
+        that blindness; raise it only knowing that cost. Deadline or ladder
+        exhausted ⇒ the stage degrades as before — fewer (or no) pods.
         """
         deadline = self.clock() + self.escalate_deadline_s
         prov, _price, cand, pods = chosen[stage]
@@ -598,8 +603,8 @@ class ProvisionerLoop:
         exceeds what the budget breaker approved for this rung. One batch
         only — a market that failed a pod and its replacement is thin, and
         the deadline applies here like everywhere else. Whatever the top-up
-        yields is accepted: a below-viability fleet still beats pure local
-        training.
+        yields is accepted: on a CPU-only orchestrator any GPU fleet, however
+        thin, beats the trainer-local path.
         """
         target = min(slots, pods * cand.gpus_per_pod)
         have = len(healthy) * cand.gpus_per_pod

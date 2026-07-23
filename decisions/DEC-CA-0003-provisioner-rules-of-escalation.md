@@ -21,10 +21,15 @@ cheapest signal first (`ProvisionerLoop._rent_stage_escalating`):
    stage-never-mixes-candidates fairness invariant.
 
 Escalation is bounded by wall clock (`escalate_deadline_s`, 30 min), not
-attempt count: the heat window shrinks in real time, so late pods are worth
-less than the trainer's local fallback. The round-level rent-once latch stays —
-a failed round never retries within the round. The eval stage deliberately
-does not escalate (one pod; local validator evals are a cheap fallback).
+attempt count. The bound is NOT because degrading is acceptable — the
+orchestrator is CPU-only, so trainer-local training is effectively a lost
+round, and a locally-trained final can never pass the validator's
+`expected_gpu` pin regardless — but because the rent path blocks the service
+loop: while it escalates, teardown/heartbeat/reaper ticks starve (the
+starvation class behind the 2026-07-14 lost window). The round-level
+rent-once latch stays — a failed round never retries within the round. The
+eval stage deliberately does not escalate (one pod; the validator's local
+CPU evals are genuinely viable, unlike trainer-local training).
 
 Same decision, config side: the heat ladder's floor is 2× pods — no 1× rungs.
 A single-GPU pod pays the full bootstrap cost (rsync + `uv sync`) for one
