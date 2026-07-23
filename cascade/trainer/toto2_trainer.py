@@ -172,7 +172,9 @@ def _polar_express(G):
 class Toto2Trainer:
     """Owner GPU backend. Stateless across king/challenger calls (a fresh model
     is built per :meth:`train`), so the shared ``training_seed`` gives both the
-    identical random init the controlled experiment requires.
+    identical random init the controlled experiment requires — or, when a
+    Cascade promotion is live, the identical ``warm_start_dir`` weights (both
+    roles share the one pinned init either way; see DEC-CA-0005/0004).
 
     With ``deterministic=True`` (the default) the run is **byte-reproducible on a
     fixed GPU model**: deterministic cuBLAS/cuDNN, the math (not flash) attention
@@ -227,6 +229,7 @@ class Toto2Trainer:
         token_budget: int,
         out_dir: Path,
         logger: TrainLogger | None = None,
+        warm_start_dir: Path | None = None,
     ) -> TrainResult:
         import torch
 
@@ -246,6 +249,20 @@ class Toto2Trainer:
 
         cfg = Toto2Config.from_contract(contract)
         model = Toto2Model(cfg).to(self.device, self.dtype)
+        if warm_start_dir is not None:
+            # Cascade warm-start (DEC-CA-0005): replace the seeded random init
+            # with the promoted checkpoint's weights. Loaded AFTER the RNGs are
+            # seeded, so data order and CPM masks are byte-identical to a
+            # random-init run — only the starting weights differ. Strict load: a
+            # size/architecture mismatch must abort the run, never silently
+            # train from partial or random weights.
+            from safetensors.torch import load_file
+            weights = Path(warm_start_dir) / "weights.safetensors"
+            state = load_file(str(weights))
+            model.load_state_dict(
+                {k: v.to(self.device, self.dtype) for k, v in state.items()}
+            )
+            log.info("warm-start: loaded init weights from %s", weights)
         model.train()
         levels = QUANTILE_LEVELS[: cfg.num_quantiles] if cfg.num_quantiles <= len(QUANTILE_LEVELS) else QUANTILE_LEVELS
         optimizer = self._build_optimizer(model, contract)

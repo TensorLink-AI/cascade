@@ -90,7 +90,8 @@ def test_worker_maps_train_hours_to_heat_label(cfg, tmp_path, monkeypatch):
     captured: dict = {}
 
     def _fake_train_one(self, gen, role, seeds, block, *, contract=None,
-                        token_budget=None, repo_suffix="", heat=False):
+                        token_budget=None, repo_suffix="", heat=False,
+                        warm_start_ref=None):
         captured["heat"] = heat
         return TrainedEntry(
             miner_hotkey=gen.hotkey, miner_uid=gen.uid, role=role, gen_ref=gen.ref,
@@ -323,7 +324,7 @@ class _RecordingDispatcher:
         pass
 
     def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                 arch_preset=None, lane_count=None):
+                 arch_preset=None, warm_start_ref=None, lane_count=None):
         _RecordingDispatcher.calls.append((host.name, role, gen_ref))
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 
