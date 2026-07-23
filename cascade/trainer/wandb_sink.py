@@ -157,4 +157,18 @@ def open_wandb_run(
     except Exception as e:  # noqa: BLE001 — never let wandb init abort a round
         log.warning("[wandb] init failed (continuing without wandb): %s", e)
         return None
+
+    # Pin the per-step x-axis: the trainer's records carry a numeric ``step``, so
+    # plotting the per-step series against it gives a readable loss-vs-step curve
+    # out of the box — instead of wandb's internal ``_step`` counter, which the
+    # default dashboard uses when no step_metric is declared. Best-effort: axis
+    # setup is cosmetic, so a define_metric failure degrades to the default axes,
+    # never a failed round (same swallow-exceptions contract as init/log).
+    try:
+        run.define_metric("step")
+        run.define_metric("loss", step_metric="step", summary="min")
+        for k in ("lr", "throughput_tokens_per_s", "tokens", "tokens_frac", "data_wait_frac"):
+            run.define_metric(k, step_metric="step")
+    except Exception as e:  # noqa: BLE001 — axis setup must never abort a round
+        log.debug("wandb define_metric failed (continuing): %s", e)
     return WandbSink(run)
