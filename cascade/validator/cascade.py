@@ -9,11 +9,14 @@ whole field trains up from?*
 
 The mechanism has three moving parts:
 
-* **Trigger.** A wall-clock *reign clock* counts days since the current king last
-  took the throne. Every dethrone re-crowns and resets the clock to zero (Cascade
-  reuses the KOTH dethrone signal via :meth:`CascadeController.note_dethrone` — it
-  never re-implements dethroning). When a king reigns ``cascade_reign_days``
-  consecutive days undethroned, Cascade fires.
+* **Trigger.** A block-anchored *reign clock* counts blocks since the current king
+  last took the throne, anchored to the round's epoch-start block (derived
+  identically by every validator from the signed manifest's ``created_block`` —
+  never local wall-clock, so all validators fire on the SAME round with no skew).
+  Every dethrone re-crowns and resets the clock to zero (Cascade reuses the KOTH
+  dethrone signal via :meth:`CascadeController.note_dethrone` — it never
+  re-implements dethroning). When a king reigns ``cascade_reign_days`` worth of
+  blocks (``BLOCKS_PER_DAY`` = 7200 at 12 s/block) undethroned, Cascade fires.
 
 * **Checkpoint selection.** Every checkpoint the king produces during its reign is
   evaluated on the three public suites — GIFT-Eval, BOOM, and TIME — each yielding
@@ -39,10 +42,12 @@ The mechanism has three moving parts:
   dethrone — an incumbent that kept winning would leave it vacant and the clock
   dead forever (DEC-CA-0004).
 
-The reign clock is wall-clock driven, so :class:`CascadeState` (king identity,
-reign start, and the reign's checkpoint log) is JSON-serialisable and persisted
-next to the champion state — Cascade must survive process restarts and pick the
-clock back up where it left off.
+:class:`CascadeState` (king identity, reign-start block, and the reign's
+checkpoint log) is JSON-serialisable and persisted next to the champion state —
+Cascade must survive process restarts and pick the clock back up where it left
+off. A persisted state predating the block anchor (or missing one) is re-anchored
+at the next observed round's block instead of firing immediately, so stale state
+can never cause a spurious promotion on restart.
 
 The pure core (the dataclasses + transition functions) carries no I/O and is
 unit-tested directly; :class:`CascadeController` binds it to persistence and the
@@ -60,7 +65,10 @@ from pathlib import Path
 
 log = logging.getLogger("cascade.validator.cascade")
 
-SECONDS_PER_DAY = 86_400.0
+# The reign clock counts blocks (12 s each on subtensor), not wall-clock time —
+# every validator reads the same block from the signed manifest, so the clock is
+# identical across the fleet and across restarts.
+BLOCKS_PER_DAY = 7_200
 
 # A tiny floor so a zero/negative eval number can't collapse the geomean product
 # to 0 (or NaN under a fractional power). Mirrors eval.scoring.global_geomean.
@@ -147,10 +155,13 @@ class CascadeState:
 
     Attributes:
         king_hotkey: the reigning king Cascade is timing. ``None`` when the throne
-            is vacant (before genesis, or just after a Cascade fired and re-opened
-            the competition).
-        reign_start: wall-clock epoch seconds when ``king_hotkey`` took the
-            throne — the zero of the reign clock. ``None`` iff no king reigns.
+            is vacant (before genesis).
+        reign_start_block: epoch-start block when ``king_hotkey`` took the
+            throne — the zero of the reign clock, read identically by every
+            validator from the signed manifest. ``None`` when no king reigns OR
+            the state predates the block anchor (legacy wall-clock state); an
+            unanchored reign is re-anchored at the next observed round, never
+            fired from.
         checkpoints: every :class:`CheckpointRecord` the king produced this reign,
             in record order. Cleared on every re-crown so selection only ever sees
             the current reign; persisted so a mid-reign restart keeps selection a
@@ -158,7 +169,7 @@ class CascadeState:
     """
 
     king_hotkey: str | None = None
-    reign_start: float | None = None
+    reign_start_block: int | None = None
     checkpoints: tuple[CheckpointRecord, ...] = ()
 
 
@@ -166,10 +177,11 @@ class CascadeState:
 class CascadeEvent:
     """A fired Cascade: the record of what was promoted and why.
 
-    ``old_king`` reigned ``reign_days`` (wall-clock) before Cascade fired — the
-    name is historical; the king persists on the throne with a fresh clock.
-    ``winner`` is the reign's lowest-score checkpoint, now installed as the
-    warm-start init; ``timestamp`` is when the event fired (epoch seconds).
+    ``old_king`` reigned ``reign_days`` (block-derived: reign blocks / 7200)
+    before Cascade fired — the name is historical; the king persists on the
+    throne with a fresh clock. ``winner`` is the reign's lowest-score checkpoint,
+    now installed as the warm-start init; ``timestamp`` is when the event fired
+    (epoch seconds, local observability only).
     """
 
     old_king: str | None
@@ -181,15 +193,15 @@ class CascadeEvent:
 # ── pure transitions over CascadeState ───────────────────────────────────────
 
 
-def crown(state: CascadeState, *, king_hotkey: str, now: float) -> CascadeState:
-    """Re-crown for a newly-throned king: start the reign clock at ``now`` and
+def crown(state: CascadeState, *, king_hotkey: str, block: int) -> CascadeState:
+    """Re-crown for a newly-throned king: start the reign clock at ``block`` and
     clear the previous reign's checkpoint log. Called on every dethrone (Cascade
     reuses KOTH's dethrone signal rather than reimplementing it) and on every
     fired Cascade (the persisting king starts a fresh reign). Idempotent for a
-    king that is already reigning *from the same instant* — but a genuine re-crown
+    king that is already reigning *from the same block* — but a genuine re-crown
     of the same hotkey (it lost and retook the throne) correctly restarts its
     clock, which is what a reign is."""
-    return CascadeState(king_hotkey=king_hotkey, reign_start=float(now), checkpoints=())
+    return CascadeState(king_hotkey=king_hotkey, reign_start_block=int(block), checkpoints=())
 
 
 def record_checkpoint(state: CascadeState, record: CheckpointRecord) -> CascadeState:
@@ -197,36 +209,40 @@ def record_checkpoint(state: CascadeState, record: CheckpointRecord) -> CascadeS
     return replace(state, checkpoints=(*state.checkpoints, record))
 
 
-def reign_seconds(state: CascadeState, now: float) -> float | None:
-    """Wall-clock seconds the current king has reigned, or ``None`` if vacant."""
-    if state.reign_start is None:
+def reign_blocks(state: CascadeState, block: int) -> int | None:
+    """Blocks the current king has reigned, or ``None`` if vacant/unanchored."""
+    if state.reign_start_block is None:
         return None
-    return float(now) - state.reign_start
+    return int(block) - state.reign_start_block
 
 
-def reign_days(state: CascadeState, now: float) -> float | None:
-    """Wall-clock days the current king has reigned, or ``None`` if vacant."""
-    s = reign_seconds(state, now)
-    return None if s is None else s / SECONDS_PER_DAY
+def reign_days(state: CascadeState, block: int) -> float | None:
+    """Block-derived days the current king has reigned (reign blocks / 7200),
+    or ``None`` if vacant/unanchored."""
+    b = reign_blocks(state, block)
+    return None if b is None else b / BLOCKS_PER_DAY
 
 
 def select_winner(state: CascadeState) -> CheckpointRecord | None:
-    """The reign's lowest-score checkpoint (earliest wins ties, for determinism),
-    or ``None`` when the reign produced no scored checkpoint."""
+    """The reign's lowest-score checkpoint, or ``None`` when the reign produced
+    no scored checkpoint. Score ties break on ``checkpoint_id`` — identical for
+    every validator regardless of local record timestamps, so selection stays
+    consensus-safe even when validators logged the same reign at different
+    wall-clock instants."""
     if not state.checkpoints:
         return None
-    return min(state.checkpoints, key=lambda r: (r.score, r.timestamp))
+    return min(state.checkpoints, key=lambda r: (r.score, r.checkpoint_id))
 
 
-def should_cascade(state: CascadeState, now: float, reign_days_threshold: float) -> bool:
+def should_cascade(state: CascadeState, block: int, reign_days_threshold: float) -> bool:
     """Whether the reign clock has reached the threshold *and* there is at least
     one checkpoint to promote. A ripe clock with an empty log is not a Cascade —
     there is nothing to select — so the king simply holds until it produces one."""
-    if state.king_hotkey is None or state.reign_start is None:
+    if state.king_hotkey is None or state.reign_start_block is None:
         return False
     if not state.checkpoints:
         return False
-    days = reign_days(state, now)
+    days = reign_days(state, block)
     return days is not None and days >= reign_days_threshold
 
 
@@ -237,7 +253,7 @@ def dumps(state: CascadeState) -> str:
     return json.dumps(
         {
             "king_hotkey": state.king_hotkey,
-            "reign_start": state.reign_start,
+            "reign_start_block": state.reign_start_block,
             "checkpoints": [
                 {
                     "checkpoint_id": r.checkpoint_id,
@@ -273,10 +289,14 @@ def loads(text: str) -> CascadeState:
         )
         for c in (obj.get("checkpoints") or ())
     )
-    reign_start = obj.get("reign_start")
+    # Legacy wall-clock state files carry "reign_start" (epoch seconds) and no
+    # block anchor: load them UNANCHORED (reign_start_block=None) so the clock is
+    # re-anchored at the next observed round instead of misread — a stale
+    # wall-clock value must never translate into an instant ripe clock.
+    start_block = obj.get("reign_start_block")
     return CascadeState(
         king_hotkey=obj.get("king_hotkey"),
-        reign_start=None if reign_start is None else float(reign_start),
+        reign_start_block=None if start_block is None else int(start_block),
         checkpoints=checkpoints,
     )
 
@@ -305,13 +325,14 @@ class CascadeController:
     install_fn: InstallFn | None = None
     state_path: Path | None = None
 
-    def note_dethrone(self, new_king: str, *, now: float) -> None:
+    def note_dethrone(self, new_king: str, *, block: int) -> None:
         """Reset the reign clock for a fresh king. Call this on — and only on — a
         KOTH dethrone (``StateTransition.dethroned``); it re-crowns Cascade's view
-        so the wall-clock reign starts at the moment the throne changed hands."""
-        self.state = crown(self.state, king_hotkey=new_king, now=now)
+        so the reign starts at the epoch block the throne changed hands."""
+        self.state = crown(self.state, king_hotkey=new_king, block=block)
         self._persist()
-        log.info("cascade: reign clock reset for new king %s", (new_king or "?")[:12])
+        log.info("cascade: reign clock reset for new king %s at block %d",
+                 (new_king or "?")[:12], int(block))
 
     def record_checkpoint(
         self,
@@ -350,21 +371,36 @@ class CascadeController:
         )
         return rec
 
-    def cascade_check(self, now: float) -> CascadeEvent | None:
-        """The single per-round entry point: check the reign clock and, if it has
-        reached ``reign_days`` with a checkpoint to promote, perform the Cascade —
-        install the reign's best checkpoint as the warm-start init, then re-crown
-        the SAME king so its next promotion needs a fresh full reign. Returns the
-        :class:`CascadeEvent` when it fires, else ``None`` (clock not yet ripe,
-        throne vacant, or nothing to promote).
+    def cascade_check(self, *, block: int, now: float) -> CascadeEvent | None:
+        """The single per-round entry point: check the reign clock against the
+        round's epoch block and, if it has reached ``reign_days`` worth of blocks
+        with a checkpoint to promote, perform the Cascade — install the reign's
+        best checkpoint as the warm-start init, then re-crown the SAME king so its
+        next promotion needs a fresh full reign. Returns the :class:`CascadeEvent`
+        when it fires, else ``None`` (clock not yet ripe, throne vacant, or
+        nothing to promote). ``now`` stamps the event for local observability
+        only — the decision is purely block-driven.
+
+        A reigning king with no block anchor (legacy wall-clock state, or state
+        written before the anchor existed) is RE-ANCHORED at ``block`` — the clock
+        starts fresh rather than firing on stale state.
 
         Install happens *before* the re-crown, so if ``install_fn`` raises the
         reign (and its clock) is left intact for a clean retry next round.
         """
         state = self.state
-        if state.king_hotkey is None or state.reign_start is None:
+        if state.king_hotkey is None:
             return None
-        days = reign_days(state, now)
+        if state.reign_start_block is None:
+            self.state = replace(state, reign_start_block=int(block))
+            self._persist()
+            log.info(
+                "cascade: reign for king %s re-anchored at block %d (state had no "
+                "block anchor); clock starts fresh",
+                (state.king_hotkey or "?")[:12], int(block),
+            )
+            return None
+        days = reign_days(state, block)
         if days is None or days < self.reign_days:
             return None
         winner = select_winner(state)
@@ -384,7 +420,7 @@ class CascadeController:
         # Install first — a failure here must not touch the reign (retried next
         # round with the clock intact).
         self._install(winner)
-        self.state = crown(self.state, king_hotkey=state.king_hotkey, now=now)
+        self.state = crown(self.state, king_hotkey=state.king_hotkey, block=block)
         self._persist()
         log.info(
             "CASCADE fired: king=%s reign=%.2fd winner=%s score=%.5f "
