@@ -96,6 +96,24 @@ ttl_epochs = 1
 escalate_deadline_s = 1800
 min_viable_fleet    = 0.5
 
+# Within-round retry: a stage that rented NOTHING (no capacity anywhere, over
+# budget, or every pod a dud past escalation) re-attempts the full
+# pick→budget→rent pipeline on this cadence, for as long as the stage can
+# still matter — the heat while one serial screening wave fits in its
+# remaining window (the fleet re-sizes to that window), the final while its
+# full training hours + boot margin remain. 0 = one attempt per round.
+rent_retry_cooldown_s = 900
+
+# When to rent the FINAL fleet. "margin": with the heat at the epoch boundary
+# (the default). "heat_complete": just-in-time at the trainer's
+# heat_complete.json marker — the fleet is sized off the marker's ACTUAL
+# finalist list and the pinned-SKU pods stop idle-billing through the heat.
+# Requires a trainer new enough to re-read hosts before the duel (it waits
+# --hosts-wait-seconds for final-tagged entries; boot is 10-15 min). If the
+# primary final rung probes scarce at the margin, the final rents early via
+# the ladder anyway — the thin-market exception.
+final_rent_on = "margin"
+
 # Health-gate knobs (see cascade/provision/health.py for the full seven).
 min_disk_gb = 20.0
 

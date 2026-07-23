@@ -9,7 +9,12 @@ One cycle of the machine (each ``poll_seconds``, ~30s):
     COUNT  ask the trainer for the round plan (``plan_fn``; real impl runs
            ``cascade-trainer --plan-only`` and parses its JSON line);
     SIZE   :func:`policy.size_fleet` — slot-based heat fleet off the eligible
-           field, one multi-GPU final pod for king + finalists;
+           field, one multi-GPU final pod for king + finalists; with
+           ``final_rent_on = "heat_complete"`` the final is NOT rented here —
+           it defers to the trainer's heat_complete marker (sized off the
+           marker's ACTUAL finalist list) unless the pinned SKU's primary
+           rung probes scarce at the margin, the early-rental exception
+           (see ``_maybe_rent_final_jit`` / ``_final_primary_has_capacity``);
     RENT   the stage's SKU ladder × provider priority order, with escalation:
            a rung that delivers NO healthy pod (failed launch, or every pod
            and its replacement a dud) falls to the next (candidate × provider)
@@ -21,6 +26,11 @@ One cycle of the machine (each ``poll_seconds``, ~30s):
            failed pod is terminated and replaced ONCE, then dropped;
     PUBLISH atomically write hosts.toml (heat + final entries) — the trainer
            picks it up at round start (``--hosts-wait-seconds`` covers boot);
+    RETRY  a stage that rented NOTHING re-enters pick→budget→rent every
+           ``rent_retry_cooldown_s`` while enough of the round remains for
+           it to matter (the orchestrator is CPU-only — an un-retried failed
+           rental is a lost round, not a degraded one); the rent-once latch
+           still guards plan_fn and the poll cadence (``_maybe_retry_stages``);
     WATCH  the two teardown signals: the trainer's ``heat_complete.json``
            marker under the shared work-root, and the round manifest in the
            store;
@@ -113,6 +123,12 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share. Reaping
 # by bare prefix terminated a live hand-rented final pod on 2026-07-13.
 _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
+
+# Boot slack folded into the "is there still time?" checks for late rentals
+# (JIT final rental and within-round retries): pods take ~10-15 min from rent
+# to healthy, so a stage is only worth renting while at least its training
+# hours PLUS this margin remain in the round.
+BOOT_MARGIN_HOURS = 0.5
 
 
 def is_provisioner_pod_name(name: str) -> bool:
@@ -235,6 +251,19 @@ class ProvisionerLoop:
     # same-candidate top-up batch (0 = never top up).
     escalate_deadline_s: float = 1800.0
     min_viable_fleet: float = 0.5
+    # Within-round retry (see _maybe_retry_stages): a stage that rented
+    # NOTHING re-attempts the whole pick→budget→rent pipeline this often,
+    # for as long as enough of the round remains for the stage to still
+    # matter. 0 = the pre-retry behaviour (one attempt per round). The
+    # rent-once latch still guards plan_fn and the 30s poll cadence.
+    rent_retry_cooldown_s: float = 900.0
+    # When to rent the FINAL fleet: "margin" (with the heat, at the epoch
+    # boundary — the pre-phased behaviour) or "heat_complete" (just-in-time,
+    # when the trainer's marker says the finalists are known — see
+    # _maybe_rent_final_jit). JIT sizes the fleet off the marker's ACTUAL
+    # finalist list and stops paying for a final pod that idles through the
+    # whole heat.
+    final_rent_on: str = "margin"
     dry_run: bool = False
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
@@ -263,6 +292,20 @@ class ProvisionerLoop:
     # deliberately skipped — for. Restored from the ledger so restarts never
     # double-rent; in dry-run it lives in memory only (no disk mutation).
     _last_evaled_round: str = field(default="", init=False, repr=False)
+    # Per-round rental bookkeeping for retry/JIT. _round_plan caches the
+    # trigger's --plan-only payload (retries must not re-run the trainer);
+    # _stage_failed holds stages that rented NOTHING and are eligible for a
+    # cooldown retry; _committed maps successfully-rented stages to their
+    # approved worst-case USD so later rentals budget against them;
+    # _final_pending mirrors the ledger's stage-phased flag;
+    # _heat_marker_latched pins the marker sighting across the teardown that
+    # removes the heat instances the marker scan anchors on.
+    _round_plan: dict | None = field(default=None, init=False, repr=False)
+    _stage_failed: set = field(default_factory=set, init=False, repr=False)
+    _committed: dict = field(default_factory=dict, init=False, repr=False)
+    _last_rent_attempt_at: float = field(default=0.0, init=False, repr=False)
+    _final_pending: bool = field(default=False, init=False, repr=False)
+    _heat_marker_latched: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._state = load_state(self.state_path)
@@ -272,6 +315,13 @@ class ProvisionerLoop:
             if self._state.round_id.isdigit():
                 self._provisioned_round = int(self._state.round_id)
             self._last_evaled_round = self._state.last_evaled_round
+            self._final_pending = self._state.final_pending
+            # A restart that resumed a final-pending round with NO heat
+            # instances left means the heat already tore down — i.e. the
+            # marker (the JIT trigger) fired while we were away. Latch it:
+            # the marker scan anchors on heat rent times we no longer have.
+            self._heat_marker_latched = self._final_pending and not any(
+                i.stage == "heat" for i in self._state.instances)
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -320,6 +370,8 @@ class ProvisionerLoop:
                           self.policy.trigger_margin_blocks, self._provisioned_round):
             round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
             self._provision_round(round_id)
+        self._maybe_rent_final_jit(block)
+        self._maybe_retry_stages(block)
 
     @staticmethod
     def _with_deadline(fn, seconds: float):
@@ -391,9 +443,17 @@ class ProvisionerLoop:
             log.warning("plan_fn failed (will retry next poll): %s", e)
             return
         # Rent-once latch: set as soon as we HAVE a plan, so failures below
-        # (no capacity, over budget) don't hammer providers every 30s. The
-        # trainer's local fallback covers the round either way.
+        # (no capacity, over budget) don't hammer providers every 30s poll.
+        # A stage that rents NOTHING gets bounded re-attempts on the
+        # rent_retry_cooldown_s cadence instead (see _maybe_retry_stages) —
+        # on a CPU-only orchestrator there is no real local fallback, so a
+        # failed rental left un-retried is a lost round.
         self._provisioned_round = round_id
+        self._round_plan = dict(payload)
+        self._stage_failed = set()
+        self._committed = {}
+        self._final_pending = False
+        self._heat_marker_latched = False
 
         fleet = size_fleet(
             int(payload["eligible_challengers"]),
@@ -407,75 +467,267 @@ class ProvisionerLoop:
                  round_id, payload["eligible_challengers"],
                  fleet.heat.pods, fleet.heat.slots, fleet.final.pods, fleet.final.slots)
 
-        # Per stage: the first (SKU candidate × provider) combination with
-        # capacity for the WHOLE stage fleet wins — a stage never mixes SKUs
-        # (within-round fairness by construction; see StagePolicy.candidates).
-        # The iterator is KEPT: if the chosen rung fails to deliver, renting
-        # escalates down the remaining ladder (see _rent_stage_escalating).
+        wants: dict[str, int] = {}
+        if fleet.heat.pods > 0:
+            wants["heat"] = fleet.heat.slots
+        if fleet.final.pods > 0:
+            # Stage-phased rental: with final_rent_on = "heat_complete" the
+            # final fleet is deferred to the trainer's marker (which carries
+            # the ACTUAL finalist list — the fleet then matches the real
+            # duel, not the plan's prediction) UNLESS the pinned SKU's
+            # primary rung looks scarce RIGHT NOW — then early rental is the
+            # exception that locks capacity while any exists. A round with
+            # no heat pods rents the final at the margin regardless: no heat
+            # fleet means no rent-time anchor for the marker scan.
+            defer = (self.final_rent_on == "heat_complete" and fleet.heat.pods > 0)
+            if defer and self._final_primary_has_capacity(fleet.final.slots):
+                self._final_pending = True
+                log.info("round %d: deferring final rental until heat_complete "
+                         "(JIT; the primary %s rung has capacity)", round_id,
+                         self.policy.final.sku)
+            else:
+                if defer:
+                    log.warning("round %d: primary %s rung has NO capacity at the "
+                                "margin — scarce market, renting the final EARLY "
+                                "via the ladder", round_id, self.policy.final.sku)
+                wants["final"] = fleet.final.slots
+
+        if not self.dry_run:
+            # Baseline the manifest pointer BEFORE renting: any later change
+            # means a round published after our rent — the teardown signal
+            # that needs no base_seed knowledge.
+            self._manifest_baseline = self._latest_round_id()
+            self._learned_round_id = None
+            self._state = (RoundState(round_id=str(round_id)) if self._state is None
+                           else replace(self._state, round_id=str(round_id),
+                                        published=False))
+            self._state = replace(self._state, final_pending=self._final_pending)
+            self._save()
+        self._rent_stages(round_id, wants)
+
+    def _rent_stages(self, round_id: int | str, wants: dict[str, int]) -> None:
+        """Pick → budget → rent (with escalation) → publish, for ``wants``.
+
+        ``wants`` maps stage name to slot demand. The shared rental pipeline
+        for all three callers — the margin trigger, the cooldown retry, and
+        the JIT final — so they cannot drift: per stage the first (SKU
+        candidate × provider) combination with capacity for the WHOLE fleet
+        wins (a stage never mixes SKUs — within-round fairness by
+        construction), the round budget is gated against stages ALREADY
+        rented this round (``_committed``), and publishing re-renders from
+        the ledger so a JIT/retry rental never clobbers a surviving fleet.
+        Stages that rent nothing land in ``_stage_failed`` for the cooldown
+        retry.
+        """
+        sps = {"heat": self.policy.heat, "final": self.policy.final}
         chosen: dict[str, tuple[object, float, object, int]] = {}
         offer_iters: dict[str, object] = {}
-        slot_demand: dict[str, int] = {}
-        for stage, sp, fl in (("heat", self.policy.heat, fleet.heat),
-                              ("final", self.policy.final, fleet.final)):
-            if fl.pods <= 0:
-                continue
-            offers = self._iter_offers(sp, fl.slots, stage)
+        for stage, slots in wants.items():
+            offers = self._iter_offers(sps[stage], slots, stage)
             picked = next(offers, None)
-            if picked is not None:
+            if picked is None:
+                log.error("round %s: no provider has capacity for the %s stage",
+                          round_id, stage)
+                self._stage_failed.add(stage)
+            else:
                 chosen[stage] = picked
                 offer_iters[stage] = offers
-                slot_demand[stage] = fl.slots
+        self._last_rent_attempt_at = self.clock()
         if not chosen:
-            # No provider anywhere: publish an EMPTY hosts file so the trainer
-            # trains this round locally — the round is degraded, never lost.
-            log.error("round %d: no provider has capacity for any stage; "
-                      "publishing static fleet only (trainer degrades, never lost)", round_id)
-            self._write_hosts([])
+            if wants:
+                log.error("round %s: nothing rentable this attempt; publishing "
+                          "static fleet only (retry on cooldown)", round_id)
+            self._republish_from_ledger()
             return
 
         projected = sum(pods * price * self.ttl_hours
                         for (_prov, price, _cand, pods) in chosen.values())
-        offers = {stage: price for stage, (_p, price, _c, _n) in chosen.items()}
-        ok = projected <= self.policy.max_spend_per_round
-        if not ok:
-            log.error("round %d REFUSED by budget breaker: worst-case $%.2f > cap $%.2f "
-                      "(offers %s); clearing hosts", round_id, projected,
-                      self.policy.max_spend_per_round, offers)
-            self._write_hosts([])
+        committed = sum(usd for st, usd in self._committed.items() if st not in chosen)
+        offers_log = {stage: price for stage, (_p, price, _c, _n) in chosen.items()}
+        if projected + committed > self.policy.max_spend_per_round:
+            log.error("round %s REFUSED by budget breaker: worst-case $%.2f "
+                      "(+$%.2f already committed) > cap $%.2f (offers %s)",
+                      round_id, projected, committed,
+                      self.policy.max_spend_per_round, offers_log)
+            self._stage_failed.update(chosen)
+            self._republish_from_ledger()
             return
-        log.info("round %d budget ok: worst-case $%.2f <= cap $%.2f",
-                 round_id, projected, self.policy.max_spend_per_round)
+        log.info("round %s budget ok: worst-case $%.2f + $%.2f committed <= cap $%.2f",
+                 round_id, projected, committed, self.policy.max_spend_per_round)
 
         if self.dry_run:
             for stage, (prov, price, cand, pods) in chosen.items():
-                log.info("[dry-run] round %d %s: WOULD rent %d × %d-GPU %s pod(s) on %s "
-                         "@ $%.2f/hr (tag cascade-%d-%s)", round_id, stage, pods,
+                log.info("[dry-run] round %s %s: WOULD rent %d × %d-GPU %s pod(s) on %s "
+                         "@ $%.2f/hr (tag cascade-%s-%s)", round_id, stage, pods,
                          cand.gpus_per_pod, cand.sku, prov.name,
                          price, round_id, stage)
             return
 
-        # Baseline the manifest pointer BEFORE renting: any later change means
-        # a round published after our rent — the teardown signal that needs no
-        # base_seed knowledge.
-        self._manifest_baseline = self._latest_round_id()
-        self._learned_round_id = None
-        self._state = (RoundState(round_id=str(round_id)) if self._state is None
-                       else replace(self._state, round_id=str(round_id), published=False))
-        self._save()
-
-        rented: dict[str, list[tuple[PodInstance, PodAddress]]] = {}
+        rented_any = False
         for stage in list(chosen):
             healthy = self._rent_stage_escalating(
-                round_id, stage, chosen, offer_iters[stage], slot_demand[stage])
+                round_id, stage, chosen, offer_iters[stage], wants[stage])
             if healthy:
-                rented[stage] = healthy
-        if not rented:
-            log.error("round %d: every rented pod failed its health gate; "
-                      "publishing static fleet only (trainer degrades, never lost)", round_id)
-            self._write_hosts([])
+                rented_any = True
+                _prov, price, _cand, pods = chosen[stage]   # escalation-updated
+                self._committed[stage] = pods * price * self.ttl_hours
+                self._stage_failed.discard(stage)
+            else:
+                self._stage_failed.add(stage)
+        if not rented_any:
+            log.error("round %s: every rented pod failed its health gate; "
+                      "publishing surviving fleet only (retry on cooldown)", round_id)
+            self._republish_from_ledger()
             return
-        self._publish_hosts(rented)
+        self._republish_from_ledger()
         self._state = replace(self._state, published=True)
+        self._save()
+
+    # ── within-round retry + JIT final (the late-rental phases) ──────────────
+
+    def _remaining_epoch_hours(self, block: int) -> float:
+        """Hours left until the provisioned round's epoch boundary closes."""
+        if self._provisioned_round is None:
+            return 0.0
+        return (self._provisioned_round + self.epoch_blocks - block) * 12.0 / 3600.0
+
+    def _final_primary_has_capacity(self, slots: int) -> bool:
+        """Cheap availability pre-check — list offers, rent nothing.
+
+        Probes ONLY the final's primary rung: the JIT gamble (rent hours
+        after the margin) is safe when the pinned SKU looks liquid NOW, and
+        only-fallback-shapes-available is already a thin-market signal that
+        argues for renting early. Probe errors read as scarce — conservative,
+        because the cost of a wrong "scarce" is merely the pre-phased
+        behaviour (an idle final pod through the heat).
+        """
+        sp = self.policy.final
+        primary = sp.sku_candidates[0]
+        pods = pods_for_slots(slots, primary.gpus_per_pod, sp.max_pods)
+        if pods <= 0:
+            return False
+        for name in sp.providers:
+            prov = self.providers.get(name)
+            if prov is None:
+                continue
+            try:
+                if prov.available(primary.marketplace_sku, pods,
+                                  gpus=primary.gpus_per_pod):
+                    return True
+            except Exception as e:  # noqa: BLE001 — unknown market reads as scarce
+                log.warning("provider %s availability pre-check failed (%s)", name, e)
+        return False
+
+    def _final_slots_now(self) -> int:
+        """The final's slot demand at rent time: king + the ACTUAL finalists.
+
+        The trainer's ``heat_complete.json`` carries the finalist hotkeys —
+        the whole point of deferring: the fleet matches the real duel (48
+        eligible may still produce 1 finalist). Marker unreadable ⇒ the
+        plan's prediction; no plan (restart) ⇒ king + one challenger, the
+        minimal duel.
+        """
+        try:
+            if self._learned_round_id:
+                p = Path(self.work_root) / self._learned_round_id / "heat_complete.json"
+                return 1 + len(json.loads(p.read_text(encoding="utf-8"))["finalists"])
+            markers = sorted(Path(self.work_root).glob("*/heat_complete.json"),
+                             key=lambda m: m.stat().st_mtime)
+            if markers:
+                return 1 + len(json.loads(markers[-1].read_text(encoding="utf-8"))["finalists"])
+        except Exception:  # noqa: BLE001 — a torn/odd marker falls back to the plan
+            pass
+        if self._round_plan is not None:
+            return 1 + int(self._round_plan["finalists"])
+        return 2
+
+    def _maybe_rent_final_jit(self, block: int) -> None:
+        """Rent the deferred final fleet when the heat settles.
+
+        The trigger is the trainer's own ``heat_complete.json`` (the
+        trainer-pull channel: the same marker that tears the heat down says
+        the duel is about to need GPUs — finalists are chosen and the final
+        dispatch starts as soon as final-tagged hosts appear). The trainer
+        waits ``--hosts-wait-seconds`` for those hosts, and boot is 10-15
+        min, so just-in-time is comfortably inside its patience. No marker ⇒
+        the heat is still running (or the trainer died, in which case a
+        final fleet would idle-bill for nothing) — keep waiting; the next
+        round's trigger resets the pending flag either way.
+        """
+        if not self._final_pending:
+            return
+        if not (self._heat_marker_latched or self._heat_marker_seen()):
+            return
+        self._final_pending = False
+        self._persist_final_pending(False)
+        remaining = self._remaining_epoch_hours(block)
+        if remaining < self.final_hours + BOOT_MARGIN_HOURS:
+            log.error("round %s: heat_complete arrived with only %.1fh left "
+                      "(< final %.1fh + %.1fh boot); not renting the final",
+                      self._provisioned_round, remaining, self.final_hours,
+                      BOOT_MARGIN_HOURS)
+            return
+        slots = self._final_slots_now()
+        log.info("round %s: heat settled — renting the final fleet JIT "
+                 "(%d slot(s): king + actual finalists; %.1fh left)",
+                 self._provisioned_round, slots, remaining)
+        self._rent_stages(self._provisioned_round, {"final": slots})
+
+    def _maybe_retry_stages(self, block: int) -> None:
+        """Bounded re-attempts for stages that rented NOTHING this round.
+
+        The rent-once latch stops 30s hammering, but on a CPU-only
+        orchestrator a stage left failed is a lost round — so failed stages
+        re-enter the full pick→budget→rent pipeline every
+        ``rent_retry_cooldown_s``, for as long as the stage can still matter:
+        the heat while at least one serial screening wave fits in what
+        remains of its window (the fleet is RE-SIZED to that shrunken window
+        — a late heat wants more parallel slots), the final while its full
+        training hours plus boot margin remain. A stage whose window closed
+        is dropped from the retry set — at that point nothing rentable can
+        help the round.
+        """
+        if not self._stage_failed or self._provisioned_round is None:
+            return
+        if self.rent_retry_cooldown_s <= 0:
+            return
+        if self.clock() - self._last_rent_attempt_at < self.rent_retry_cooldown_s:
+            return
+        remaining = self._remaining_epoch_hours(block)
+        wants: dict[str, int] = {}
+        if "heat" in self._stage_failed:
+            plan = self._round_plan
+            heat_hours = float(plan["heat_train_hours"]) if plan else 0.0
+            if plan is None or remaining - self.final_hours < heat_hours:
+                self._stage_failed.discard("heat")
+                log.error("round %s: heat window closed (%.1fh left) — giving up "
+                          "on the heat fleet%s", self._provisioned_round, remaining,
+                          "" if plan else " (no cached plan after restart)")
+            else:
+                refleet = size_fleet(int(plan["eligible_challengers"]),
+                                     int(plan["finalists"]), heat_hours,
+                                     remaining, self.final_hours, self.policy)
+                if refleet.heat.pods > 0:
+                    wants["heat"] = refleet.heat.slots
+                else:
+                    self._stage_failed.discard("heat")
+        if "final" in self._stage_failed:
+            if remaining < self.final_hours + BOOT_MARGIN_HOURS:
+                self._stage_failed.discard("final")
+                log.error("round %s: final window closed (%.1fh left) — giving up "
+                          "on the final fleet", self._provisioned_round, remaining)
+            else:
+                wants["final"] = self._final_slots_now()
+        if wants:
+            log.warning("round %s: retrying failed stage(s) %s (%.1fh left in the round)",
+                        self._provisioned_round, sorted(wants), remaining)
+            self._rent_stages(self._provisioned_round, wants)
+
+    def _persist_final_pending(self, value: bool) -> None:
+        """Write the stage-phased flag through to the ledger (never in dry-run)."""
+        if self.dry_run or self._state is None:
+            return
+        self._state = replace(self._state, final_pending=value)
         self._save()
 
     def _iter_offers(self, sp, slots: int, stage: str):
@@ -634,12 +886,14 @@ class ProvisionerLoop:
 
         Same worst-case arithmetic as the round-level gate (every pod billed
         the full TTL): THIS stage at the proposed rung, every other stage at
-        its current offer. Duds already terminated billed minutes, not TTLs —
-        like the replacement path, that sliver is accepted rather than
-        modelled.
+        its current offer, plus whatever earlier rentals this round already
+        committed (``_committed`` — the JIT final budgets against the live
+        heat). Duds already terminated billed minutes, not TTLs — like the
+        replacement path, that sliver is accepted rather than modelled.
         """
         others = sum(n * pr * self.ttl_hours
                      for st, (_p, pr, _c, n) in chosen.items() if st != stage)
+        others += sum(usd for st, usd in self._committed.items() if st not in chosen)
         projected = others + pods * float(price) * self.ttl_hours
         if projected > self.policy.max_spend_per_round:
             log.warning("%s escalation rung refused by budget: worst-case $%.2f > cap "
@@ -814,6 +1068,9 @@ class ProvisionerLoop:
         sees only live pods. With nothing left, clear — an empty file is the
         trainer's local-fallback signal and never lists a dead box.
         """
+        if self._state is None:
+            self._write_hosts([])                # static-only / empty file
+            return
         by_stage: dict[str, list[tuple[PodInstance, PodAddress]]] = {}
         for stage in ("heat", "final"):
             for inst in instances_for_stage(self._state, stage):
@@ -996,6 +1253,11 @@ class ProvisionerLoop:
             return
         now = self.clock()
         marker = self._heat_marker_seen()
+        if marker:
+            # Latch for the JIT final trigger: this same sweep is about to
+            # drop the heat instances the marker scan anchors its mtime
+            # comparison on, so a later cycle could no longer re-detect it.
+            self._heat_marker_latched = True
         manifest = self._manifest_seen()
         # The eval pod's two signals are only worth store round-trips while an
         # eval pod is actually owned. ``newer_manifest`` compares the CURRENT

@@ -29,6 +29,17 @@ max_spend_per_round   = 120.0       # mainnet heats run ~hours on rented pods;
 # effectively lost (and a locally-trained final can't pass the L40S pin).
 escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
 min_viable_fleet      = 0.5         # 0 = never top up
+# A stage that rented NOTHING re-attempts the full pick→budget→rent pipeline
+# on this cadence while enough round remains for it to matter (heat: one
+# serial wave still fits; final: full duel hours + boot margin). 0 = one
+# attempt per round (the pre-retry behaviour).
+rent_retry_cooldown_s = 900
+# Stage-phased rental: rent the L40S duel pods at the trainer's heat_complete
+# marker (finalists known — the fleet matches the ACTUAL duel) instead of at
+# the margin, saving ~a heat's worth of idle L40S billing per round. If the
+# primary L40S rung probes scarce at the margin, the final rents early via
+# the ladder — the exception that locks capacity in a thin market.
+final_rent_on         = "heat_complete"
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"
 receipt_prefix        = "receipts/<MAINNET-VALIDATOR-HOTKEY>/"   # teardown latch
 

@@ -464,6 +464,15 @@ def _run(args) -> int:
         raise ProvisionError(
             f"min_viable_fleet must be in [0, 1] (0 disables top-up); "
             f"got {min_viable_fleet}")
+    rent_retry_cooldown_s = float(top.get("rent_retry_cooldown_s", 900.0))
+    if rent_retry_cooldown_s < 0:
+        raise ProvisionError(
+            f"rent_retry_cooldown_s must be >= 0 (0 disables within-round "
+            f"retry); got {rent_retry_cooldown_s}")
+    final_rent_on = str(top.get("final_rent_on", "margin"))
+    if final_rent_on not in ("margin", "heat_complete"):
+        raise ProvisionError(
+            f"final_rent_on must be 'margin' or 'heat_complete'; got {final_rent_on!r}")
 
     hosts_path = Path(top.get("hosts_path", "hosts.toml"))
     work_root = Path(args.work_root)
@@ -551,6 +560,8 @@ def _run(args) -> int:
         poll_seconds=float(top.get("poll_seconds", 30.0)),
         escalate_deadline_s=escalate_deadline_s,
         min_viable_fleet=min_viable_fleet,
+        rent_retry_cooldown_s=rent_retry_cooldown_s,
+        final_rent_on=final_rent_on,
         dry_run=bool(args.dry_run),
         on_cycle=globals().get("_ensure_service_logging"),
     )

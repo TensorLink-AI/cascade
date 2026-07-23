@@ -122,7 +122,8 @@ PLAN = {
 def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
               clock=None, store=None, health=None, dry_run=False, plan_calls=None,
               eval_hosts=None, receipt_prefix="", escalate_deadline_s=1800.0,
-              min_viable_fleet=0.5):
+              min_viable_fleet=0.5, rent_retry_cooldown_s=900.0,
+              final_rent_on="margin"):
     providers = providers if providers is not None else {"lium": FakeProvider("lium")}
     plan_calls = plan_calls if plan_calls is not None else []
 
@@ -150,6 +151,8 @@ def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
         clock=clock or Clock(),
         escalate_deadline_s=escalate_deadline_s,
         min_viable_fleet=min_viable_fleet,
+        rent_retry_cooldown_s=rent_retry_cooldown_s,
+        final_rent_on=final_rent_on,
     ), plan_calls
 
 
@@ -463,6 +466,108 @@ def test_below_viability_partial_fleet_tops_up_same_candidate(tmp_path):
     heat_ids = {i.instance_id for i in st.instances if i.stage == "heat"}
     assert heat_ids == {"cascade-900-heat-2",
                         "cascade-900-heat-t0-0", "cascade-900-heat-t0-1"}
+
+
+def test_failed_round_retries_after_cooldown(tmp_path):
+    prov = FakeProvider("lium", available=False)
+    clock = Clock()
+    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.run_once()
+    assert prov.launched == []                               # trigger found no capacity
+    loop.run_once()                                          # inside cooldown: latched
+    assert prov.launched == [] and plan_calls == [1]
+
+    prov._available = True                                   # the market recovered
+    clock.t += 901                                           # cooldown elapsed
+    loop.run_once()
+    # Both failed stages re-entered pick→budget→rent — no new plan_fn call
+    # (the trigger's payload is cached; reveals are closed mid-round anyway).
+    assert plan_calls == [1]
+    assert prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert {h.stage for h in hosts} == {"heat", "final"}
+
+
+def test_retry_gives_up_when_the_window_closes(tmp_path):
+    prov = FakeProvider("lium", available=False)
+    clock = Clock()
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.run_once()
+
+    prov._available = True
+    clock.t += 901
+    loop.chain_client.block = 1700                           # 0.33h left in the round:
+    loop.run_once()                                          # heat needs 0.5h + final
+    assert prov.launched == []                               # window closed → no rent
+    assert loop._stage_failed == set()                       # and no further retries
+
+
+def test_final_defers_until_heat_marker_and_sizes_off_it(tmp_path):
+    prov = FakeProvider("lium")
+    policy = _policy(max_spend_per_round=100.0)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
+                        final_rent_on="heat_complete")
+    loop.run_once()
+    # Margin trigger rents the HEAT only; the final waits on the trainer.
+    assert prov.launched == ["cascade-900-heat-0"]
+    assert load_state(tmp_path / "state.json").final_pending is True
+
+    # The trainer settles the heat: marker names TWO actual finalists (the
+    # plan predicted one) — the JIT fleet must match the marker, not the plan.
+    marker_dir = tmp_path / "work" / "777"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "heat_complete.json").write_text(json.dumps(
+        {"round_id": "777", "screened": 12, "finalists": ["f1", "f2"]}))
+    loop.run_once()
+    # Same tick: the marker tears the heat down AND rents the final — sized
+    # 1 + 2 actual finalists = 3 slots → two 2-GPU pods.
+    assert "cascade-900-heat-0" in prov.terminated
+    assert prov.launched[1:] == ["cascade-900-final-0", "cascade-900-final-1"]
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert all(h.stage == "final" for h in hosts) and len(hosts) == 4
+    st = load_state(tmp_path / "state.json")
+    assert st.final_pending is False
+    assert {i.stage for i in st.instances} == {"final"}
+
+
+def test_scarce_final_market_rents_early_at_the_margin(tmp_path):
+    """The JIT exception: when the pinned SKU's primary rung probes scarce at
+    the margin, the final rents EARLY (locking whatever the ladder finds)
+    instead of gambling that capacity exists hours later."""
+
+    class NoTwoGpuPods(FakeProvider):
+        def available(self, sku, count, *, gpus=1):
+            return gpus != 2                                 # 2x L40S pool is dry
+
+    prov = NoTwoGpuPods("lium")
+    policy = _policy(
+        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
+                          providers=("lium",), max_price_hr=3.0,
+                          candidates=(SkuCandidate(sku="NVIDIA L40S",
+                                                   gpus_per_pod=1, max_price_hr=1.5),)))
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
+                        final_rent_on="heat_complete")
+    loop.run_once()
+    # Final rented at the margin via the 1x fallback rung — not deferred.
+    assert "cascade-900-final-0" in prov.launched
+    assert "cascade-900-final-1" in prov.launched
+    assert load_state(tmp_path / "state.json").final_pending is False
+
+
+def test_final_pending_survives_restart(tmp_path):
+    prov = FakeProvider("lium")
+    policy = _policy(max_spend_per_round=100.0)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
+                        final_rent_on="heat_complete")
+    loop.run_once()
+    assert load_state(tmp_path / "state.json").final_pending is True
+
+    # New process, same ledger: still waiting on the marker (heat instances
+    # exist → the marker scan re-anchors on their rent times).
+    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
+                         final_rent_on="heat_complete")
+    assert loop2._final_pending is True
+    assert loop2._heat_marker_latched is False
 
 
 def test_viable_partial_fleet_does_not_top_up(tmp_path):

@@ -18,6 +18,11 @@ max_spend_per_round   = 25.0
 # effectively lost (and a locally-trained final can't pass the L40S pin).
 escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
 min_viable_fleet      = 0.5         # 0 = never top up
+# A stage that rented NOTHING re-attempts the full pick→budget→rent pipeline
+# on this cadence while enough round remains for it to matter. 0 = one
+# attempt per round. (final_rent_on stays "margin" here: the testnet final
+# is UNMANAGED — static cascade-final-b — so there is nothing to defer.)
+rent_retry_cooldown_s = 900
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"   # elastic eval pod (PR #85)
 receipt_prefix        = "receipts/5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR/"
 
