@@ -623,18 +623,26 @@ class ProvisionerLoop:
 
         The trainer's ``heat_complete.json`` carries the finalist hotkeys —
         the whole point of deferring: the fleet matches the real duel (48
-        eligible may still produce 1 finalist). Marker unreadable ⇒ the
-        plan's prediction; no plan (restart) ⇒ king + one challenger, the
-        minimal duel.
+        eligible may still produce 1 finalist). Markers are only trusted when
+        THIS round's marker is known to have fired (``_learned_round_id`` /
+        ``_heat_marker_latched``): the work-root keeps every previous round's
+        marker too, and sizing a pre-marker retry off a stale one both
+        mis-sizes the duel and can blow the retry's budget gate outright.
+        Pre-marker (or marker unreadable) ⇒ the plan's prediction; no plan
+        either (restart) ⇒ king + one challenger, the minimal duel.
         """
         try:
             if self._learned_round_id:
                 p = Path(self.work_root) / self._learned_round_id / "heat_complete.json"
                 return 1 + len(json.loads(p.read_text(encoding="utf-8"))["finalists"])
-            markers = sorted(Path(self.work_root).glob("*/heat_complete.json"),
-                             key=lambda m: m.stat().st_mtime)
-            if markers:
-                return 1 + len(json.loads(markers[-1].read_text(encoding="utf-8"))["finalists"])
+            if self._heat_marker_latched:
+                # Restart path: the marker fired but the round id that names
+                # its directory was lost with the process — newest wins.
+                markers = sorted(Path(self.work_root).glob("*/heat_complete.json"),
+                                 key=lambda m: m.stat().st_mtime)
+                if markers:
+                    return 1 + len(json.loads(
+                        markers[-1].read_text(encoding="utf-8"))["finalists"])
         except Exception:  # noqa: BLE001 — a torn/odd marker falls back to the plan
             pass
         if self._round_plan is not None:

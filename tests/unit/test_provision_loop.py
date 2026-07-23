@@ -554,6 +554,28 @@ def test_scarce_final_market_rents_early_at_the_margin(tmp_path):
     assert load_state(tmp_path / "state.json").final_pending is False
 
 
+def test_final_retry_ignores_a_previous_rounds_stale_marker(tmp_path):
+    """A pre-marker final retry must size off the PLAN, not whatever old
+    heat_complete.json the work-root still holds: a stale 5-finalist marker
+    inflated the retry fleet past the budget cap and sank the whole retry."""
+    marker_dir = tmp_path / "work" / "555"                   # a PREVIOUS round's
+    marker_dir.mkdir(parents=True)                           # marker, 5 finalists
+    (marker_dir / "heat_complete.json").write_text(json.dumps(
+        {"round_id": "555", "screened": 30,
+         "finalists": ["a", "b", "c", "d", "e"]}))
+
+    prov = FakeProvider("lium", available=False)
+    clock = Clock()
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.run_once()                                          # trigger: market dry
+    prov._available = True
+    clock.t += 901
+    loop.run_once()                                          # retry: market back
+    # Plan says 1 finalist → 2 slots → ONE 2-GPU final pod (and the budget
+    # gate passes: $12 heat + $6 final <= $25).
+    assert prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
+
+
 def test_final_pending_survives_restart(tmp_path):
     prov = FakeProvider("lium")
     policy = _policy(max_spend_per_round=100.0)
