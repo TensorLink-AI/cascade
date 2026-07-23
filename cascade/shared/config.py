@@ -586,6 +586,19 @@ class StorageConfig:
     backup_bucket: str = ""
     backup_s3_endpoint: str = ""
     backup_s3_region: str = ""
+    # Private king archive: a dedicated S3-compatible (Cloudflare R2) bucket where
+    # `cascade-scrape-kings` saves every generator that has held the throne — the
+    # code, fetched from the Hub by its content-addressed ref and packed to a
+    # deterministic tar — plus a ``kings/index.json`` "db" pointing each king back
+    # at its archived object (see cascade.shared.king_archive). This is a permanent
+    # private record of every king, independent of the public Hub repos (which a
+    # miner could delete). ``king_archive_s3_endpoint`` / ``king_archive_s3_region``
+    # default to the R2 ``backup_*`` values above; ``king_archive_bucket`` defaults
+    # to ``cascade-king-archive``. Credentials via KING_ARCHIVE_S3_ACCESS_KEY /
+    # KING_ARCHIVE_S3_SECRET_KEY, falling back to the BACKUP_S3_* pair when unset.
+    king_archive_bucket: str = ""
+    king_archive_s3_endpoint: str = ""
+    king_archive_s3_region: str = ""
 
 
 @dataclass(frozen=True)
@@ -961,6 +974,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             backup_bucket=str(st.get("backup_bucket", "")),
             backup_s3_endpoint=str(st.get("backup_s3_endpoint", "")),
             backup_s3_region=str(st.get("backup_s3_region", "")),
+            king_archive_bucket=str(st.get("king_archive_bucket", "")),
+            king_archive_s3_endpoint=str(st.get("king_archive_s3_endpoint", "")),
+            king_archive_s3_region=str(st.get("king_archive_s3_region", "")),
         ),
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),
