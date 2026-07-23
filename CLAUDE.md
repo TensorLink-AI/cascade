@@ -17,6 +17,12 @@ in-context.
   ships with the mainnet values baked in (netuid 91, L40S pin, worker-image
   digest, `pool_bucket`).
   (`decisions/DEC-CA-0002-mainnet-netuid-91.md`)
+- **DEC-CA-0003** — Provisioner rules of escalation: an EMPTY stage walks the
+  SKU ladder under a 30-min wall-clock deadline, a below-50% fleet gets one
+  same-SKU top-up, failed stages retry on a 15-min cooldown while their
+  window lasts, the final rents JIT at the heat_complete marker (mainnet),
+  and the heat ladder's floor is 2× pods (no 1× singles).
+  (`decisions/DEC-CA-0003-provisioner-rules-of-escalation.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.

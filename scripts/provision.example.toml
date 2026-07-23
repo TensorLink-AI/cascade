@@ -84,6 +84,37 @@ max_spend_per_round = 25.0
 # this many epochs after rent.
 ttl_epochs = 1
 
+# Rules of escalation. A stage whose rung delivers NO healthy pod (the launch
+# call failed, or every pod and its one replacement was a dud) re-enters the
+# SKU ladder at the next (candidate × provider) rung — capacity re-probed at
+# escalation time, each rung re-checked against max_spend_per_round — for at
+# most escalate_deadline_s of wall clock per attempt. Renting runs in a
+# worker thread (the poll loop keeps tearing down / heartbeating); the
+# deadline bounds the single worker so the JIT final, the retries, and the
+# next round's trigger are never starved (0 = a failed rung is final).
+# A PARTIAL fleet below min_viable_fleet of its slot demand gets ONE
+# same-candidate top-up batch — never a different SKU (0 = never top up).
+escalate_deadline_s = 1800
+min_viable_fleet    = 0.5
+
+# Within-round retry: a stage that rented NOTHING (no capacity anywhere, over
+# budget, or every pod a dud past escalation) re-attempts the full
+# pick→budget→rent pipeline on this cadence, for as long as the stage can
+# still matter — the heat while one serial screening wave fits in its
+# remaining window (the fleet re-sizes to that window), the final while its
+# full training hours + boot margin remain. 0 = one attempt per round.
+rent_retry_cooldown_s = 900
+
+# When to rent the FINAL fleet. "margin": with the heat at the epoch boundary
+# (the default). "heat_complete": just-in-time at the trainer's
+# heat_complete.json marker — the fleet is sized off the marker's ACTUAL
+# finalist list and the pinned-SKU pods stop idle-billing through the heat.
+# Requires a trainer new enough to re-read hosts before the duel (it waits
+# --hosts-wait-seconds for final-tagged entries; boot is 10-15 min). If the
+# primary final rung probes scarce at the margin, the final rents early via
+# the ladder anyway — the thin-market exception.
+final_rent_on = "margin"
+
 # Health-gate knobs (see cascade/provision/health.py for the full seven).
 min_disk_gb = 20.0
 
@@ -130,11 +161,11 @@ market_sku   = "RTX4090"
 gpus_per_pod = 8
 max_price_hr = 5.00
 
-[[provisioner.heat.candidate]]           # last resort: singles are always liquid
-sku          = "NVIDIA GeForce RTX 4090"
-market_sku   = "RTX4090"
-gpus_per_pod = 1
-max_price_hr = 0.60
+[[provisioner.heat.candidate]]           # last resort: 2x is the floor — 1x
+sku          = "NVIDIA GeForce RTX 4090"  # singles pay a full bootstrap per
+market_sku   = "RTX4090"                  # lane and rarely beat the trainer's
+gpus_per_pod = 2                          # local fallback
+max_price_hr = 1.30
 
 # ── final fleet: the pinned SKU, king + finalists on ONE pod ─────────────────
 # Default shape is a single pod with gpus_per_pod >= 1 + [round] finalists:

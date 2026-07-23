@@ -19,6 +19,46 @@ state_path            = "/root/cascade/provisioner_state.json"
 static_hosts          = "/root/cascade/static_hosts.toml"
 max_spend_per_round   = 120.0       # mainnet heats run ~hours on rented pods;
                                     # breaker sized for 2×4x4090 + 1×2x L40S × 24h epoch
+# Rules of escalation: a stage whose rung delivers NO healthy pod re-enters
+# the SKU ladder at the next (candidate × provider) rung, for at most
+# escalate_deadline_s of wall clock from its first rent attempt; a PARTIAL
+# fleet below min_viable_fleet of its slot demand gets one same-candidate
+# top-up batch. Renting runs in a worker thread (the loop keeps ticking);
+# the deadline bounds ONE attempt so the single worker never starves the
+# JIT final, the retries, or the next round's trigger. Degrading is NOT
+# fine — the orchestrator is CPU-only, so a round with no rented fleet is
+# effectively lost (and a locally-trained final can't pass the L40S pin) —
+# which is why failed stages keep retrying below.
+escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
+min_viable_fleet      = 0.5         # 0 = never top up
+# A stage that rented NOTHING re-attempts the full pick→budget→rent pipeline
+# on this cadence while enough round remains for it to matter (heat: one
+# serial wave still fits; final: full duel hours + boot margin). 0 = one
+# attempt per round (the pre-retry behaviour).
+rent_retry_cooldown_s = 900
+# Money backstop for zombie pools (pods that rent but never boot): dud
+# attempts double the stage's retry cooldown (capped 8x), and after this many
+# dud pods in one round the stage stops renting entirely. <= 0 = no cap.
+max_duds_per_stage    = 8
+# Stage-phased rental: rent the L40S duel pods at the trainer's heat_complete
+# marker (finalists known — the fleet matches the ACTUAL duel) instead of at
+# the margin, saving ~a heat's worth of idle L40S billing per round. If the
+# primary L40S rung probes scarce at the margin, the final rents early via
+# the ladder — the exception that locks capacity in a thin market.
+#
+# JIT delivery budget vs the trainer's pre-duel wait (--hosts-wait-seconds,
+# launched at 5400s): marker→healthy is ~15-25 min on the happy path (ready
+# wait + auth lag + bootstrap + health gate), ~35-70 min when a dud forces a
+# replacement or a rung escalates, and ~65-100 min when a whole attempt fails
+# and the 15-min retry delivers on attempt two. The trainer polls the hosts
+# file every ≤15s during its wait, so delivery latency is the only latency.
+# The pathological tail (every timeout maxed: 900s ready + 900s auth + 1800s
+# bootstrap per pod, dud + replacement sequential) can exceed the wait — the
+# trainer then duels on whatever is on file (static hosts) or locally, and
+# the late pods are torn down by the manifest/TTL. Don't shrink the trainer's
+# wait below ~5400s with this mode on; on a 24h epoch, waiting costs only
+# manifest lateness while a local L40S-pinned duel costs the round.
+final_rent_on         = "heat_complete"
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"
 receipt_prefix        = "receipts/<MAINNET-VALIDATOR-HOTKEY>/"   # teardown latch
 
@@ -83,23 +123,15 @@ market_sku   = "RTX4090"
 gpus_per_pod = 2
 max_price_hr = 1.30
 
-[[provisioner.heat.candidate]]           # fallback 5: 2x A6000
+[[provisioner.heat.candidate]]           # fallback 5 (floor): 2x A6000
 sku          = "NVIDIA RTX A6000"
 market_sku   = "A6000"
 gpus_per_pod = 2
 max_price_hr = 1.20
 
-[[provisioner.heat.candidate]]           # fallback 6: 1x 4090 singles
-sku          = "NVIDIA GeForce RTX 4090"
-market_sku   = "RTX4090"
-gpus_per_pod = 1
-max_price_hr = 0.85
-
-[[provisioner.heat.candidate]]           # fallback 7: 1x A6000 singles
-sku          = "NVIDIA RTX A6000"
-market_sku   = "A6000"
-gpus_per_pod = 1
-max_price_hr = 0.60
+# No 1x rungs: every pod pays the full bootstrap cost (rsync + uv sync) for a
+# single lane, and a singles fleet burns max_pods on 8 flaky boxes for 8 slots.
+# The 2x rungs are the floor.
 
 # ── FINAL: the contract GPU — provisioner-MANAGED on mainnet ─────────────────
 # expected_gpu pins the duel to L40S. Primary: one 2-GPU pod (king + challenger

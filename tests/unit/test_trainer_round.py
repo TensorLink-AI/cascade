@@ -725,6 +725,34 @@ def test_reload_remote_hosts_per_round(cfg, tmp_path):
     assert runner.remote_hosts is None
 
 
+def test_reload_require_stage_waits_for_final_capable_hosts(cfg, tmp_path):
+    # The JIT-final seam: a stage-phased provisioner rents the duel pods at the
+    # heat_complete marker, so the pre-duel re-read must wait for FINAL-capable
+    # hosts instead of dispatching onto the round-start heat snapshot. With
+    # only heat-tagged hosts on file the (zero-wait) re-read keeps them as the
+    # last-resort fallback; once a final-tagged host lands, it is picked up.
+    hosts_path = tmp_path / "hosts.toml"
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-heat"\nhost = "1.2.3.4"\nstage = "heat"\n',
+        encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts_path=hosts_path, hosts_wait_seconds=0)
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-heat"]   # fallback kept
+
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-final"\nhost = "1.2.3.5"\nstage = "final"\n',
+        encoding="utf-8")
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-final"]
+
+    # An "any"-tagged fleet serves every stage — accepted immediately.
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-any"\nhost = "1.2.3.6"\n', encoding="utf-8")
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-any"]
+
+
 def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
     # --plan-only runs the round's own eligibility pipeline (dedup + burn filter),
     # so the provisioner sizes pods off what the heat will actually train.

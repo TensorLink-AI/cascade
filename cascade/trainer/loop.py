@@ -946,6 +946,13 @@ class TrainerRunner:
         self._publish_stage("duel", heat_done=len(eligible),
                             heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far
+        # JIT final fleets: the marker we just wrote is what tells a
+        # stage-phased provisioner (final_rent_on = "heat_complete") to rent
+        # the duel pods — re-read hosts and wait for final-capable entries
+        # before dispatching, instead of duelling on the round-start snapshot
+        # of heat pods that the same marker is tearing down. Instant when the
+        # final entries were present all along (the pre-phased fleet shape).
+        self._reload_remote_hosts(require_stage="final")
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
@@ -1424,7 +1431,7 @@ class TrainerRunner:
 
     # ── live loop ────────────────────────────────────────────────────────────
 
-    def _reload_remote_hosts(self) -> None:
+    def _reload_remote_hosts(self, require_stage: str | None = None) -> None:
         """Refresh ``remote_hosts`` from ``remote_hosts_path`` for this round.
 
         The elastic-fleet seam: a per-round provisioner (sized off the revealed
@@ -1436,12 +1443,23 @@ class TrainerRunner:
         training rather than holding the round hostage. No-op when no
         ``remote_hosts_path`` is configured (a static ``remote_hosts`` list, or
         purely local training).
+
+        ``require_stage`` waits for a fleet that can SERVE that stage (a host
+        tagged with it, or ``"any"``): the mid-round re-read before the final
+        dispatch, for provisioners that rent the final fleet just-in-time at
+        the heat_complete marker (``final_rent_on = "heat_complete"``) —
+        without it the duel would dispatch onto the round-start snapshot,
+        i.e. heat pods that are being torn down at that very moment. On
+        timeout the last loaded fleet is kept (``_hosts_for`` then applies
+        its use-all-hosts fallback), preserving pre-phased behaviour for
+        fleets whose final entries were present all along.
         """
         if self.remote_hosts_path is None:
             return
         from .remote import RemoteDispatchError, load_hosts
 
         deadline = time.time() + max(0, self.hosts_wait_seconds)
+        hosts = None
         while True:
             try:
                 hosts = load_hosts(self.remote_hosts_path)
@@ -1449,7 +1467,9 @@ class TrainerRunner:
                 hosts, reason = None, str(e)
             else:
                 reason = ""
-            if hosts:
+            serves_stage = hosts and (require_stage is None or any(
+                getattr(h, "stage", "any") in ("any", require_stage) for h in hosts))
+            if serves_stage:
                 if self.remote_hosts is None or [h.name for h in hosts] != [
                     h.name for h in self.remote_hosts
                 ]:
@@ -1458,9 +1478,15 @@ class TrainerRunner:
                 self.remote_hosts = hosts
                 return
             if time.time() >= deadline:
-                log.warning("no remote hosts available (%s); training locally this round",
-                            reason or str(self.remote_hosts_path))
-                self.remote_hosts = None
+                if require_stage is not None and hosts:
+                    log.warning("no %s-stage hosts appeared within %ds; proceeding "
+                                "with the %d host(s) on file", require_stage,
+                                self.hosts_wait_seconds, len(hosts))
+                    self.remote_hosts = hosts
+                else:
+                    log.warning("no remote hosts available (%s); training locally this round",
+                                reason or str(self.remote_hosts_path))
+                    self.remote_hosts = None
                 return
             time.sleep(min(15.0, max(1.0, deadline - time.time())))
 
