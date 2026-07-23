@@ -335,6 +335,14 @@ pool_s3_region   = ""
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
+# throne-holding generator (code fetched from the Hub, packed to a tar) here plus
+# a kings/index.json "db" linking each king to its archived object. Endpoint/region
+# default to backup_* above; credentials via KING_ARCHIVE_S3_ACCESS_KEY /
+# KING_ARCHIVE_S3_SECRET_KEY (falling back to BACKUP_S3_*). Keep it PRIVATE.
+king_archive_bucket      = "cascade-testnet-king-archive"   # TESTNET bucket
+king_archive_s3_endpoint = ""                       # empty = reuse backup_s3_endpoint
+king_archive_s3_region   = ""                       # empty = reuse backup_s3_region ("auto")
 hf_backup_repo   = "tensorlink-dev/cascade-testnet-mirror"   # TESTNET: S3-down fallback
 
 [manifest]

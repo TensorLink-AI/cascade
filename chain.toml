@@ -293,6 +293,16 @@ hf_backup_repo   = ""                               # e.g. "yourorg/cascade-mani
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
+# generator that has ever held the throne (the code, fetched from the Hub and
+# packed to a tar) here, plus a kings/index.json "db" linking each king to its
+# archived object. A permanent private record, independent of the public Hub
+# repos a miner could delete. Endpoint/region default to the backup_* R2 above;
+# credentials via KING_ARCHIVE_S3_ACCESS_KEY / KING_ARCHIVE_S3_SECRET_KEY
+# (falling back to BACKUP_S3_* when unset). Keep the bucket PRIVATE.
+king_archive_bucket      = "cascade-king-archive"
+king_archive_s3_endpoint = ""                       # empty = reuse backup_s3_endpoint
+king_archive_s3_region   = ""                       # empty = reuse backup_s3_region ("auto")
 
 [manifest]
 # Signed training receipts in [storage] manifest_bucket. trainer_hotkey is the

@@ -194,6 +194,7 @@ docs/
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
   publish_website.py   upload the dashboard to the manifest bucket (public-read)
+  scrape_kings.py      archive every throne-holding generator to a private R2 bucket
 ```
 
 ## Console scripts
@@ -274,6 +275,20 @@ then lives at `<s3_endpoint>/<manifest_bucket>/index.html`.
 hash). A round the validator *rejected* still gets a receipt
 (`"status": "rejected"`) carrying the gate's reason. Verify one with
 `cascade-audit latest` — see `docs/AUDIT.md`.
+
+**King archive.** Generator repos on the Hub are content-addressed but a miner
+can delete their repo at any time, and the throne history lives only in the
+public `receipts/index.json`. `python scripts/scrape_kings.py` closes that gap:
+it reads that index, and for every generator that has ever held the throne
+fetches its code from the Hub and saves it — packed to a deterministic tar — to
+a **private** R2 bucket (`[storage] king_archive_bucket`), plus a
+`kings/index.json` "db" that links each king to its archived object (with the
+owning hotkey/uid and the rounds it reigned). The archive is content-addressed
+and append-only — a king already saved is never re-fetched — so it's cheap to
+run on a schedule (`.github/workflows/scrape-kings.yml` runs it daily). Endpoint
+and credentials default to the same R2 account chain.toml already uses for the
+manifest/receipt backup (`BACKUP_S3_*`), so no new account is needed; keep the
+bucket private. See `cascade.shared.king_archive`.
 
 `chain.toml` ships with mainnet values baked in (netuid 91, the L40S GPU pin,
 the worker-image digest, `pool_bucket`). The remaining operator-specific values —
