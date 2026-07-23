@@ -25,6 +25,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC
 from pathlib import Path
 
 from ..interface.validation import parse_commit
@@ -423,6 +424,13 @@ class TrainerRunner:
     # subprocess. The six numbers still go on the signed manifest. Falls back to
     # the local ``bench_eval_fn`` when there is no remote host.
     cascade_bench_plan: object | None = None
+    # Live round-stage reporting (``status/round.json``): the trainer tells the
+    # dashboards where the round actually is (heat/duel/validation + heat
+    # progress) instead of leaving them to a wall-clock estimate that ignores
+    # field size. OFF by default so offline runs and tests never touch storage;
+    # trainer.main enables it for the live service. Best-effort everywhere — a
+    # publish failure must never disturb a round.
+    publish_stage_status: bool = False
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -433,6 +441,11 @@ class TrainerRunner:
     _round_telemetry: dict = field(
         default_factory=lambda: {"heat": [], "final": []}, repr=False
     )
+    # Context for stage reporting, set at round start so publish() (which only
+    # sees the manifest) and the heat-progress hooks know which round they are
+    # reporting for. ``_stage_published_at`` throttles heat-progress writes.
+    _stage_ctx: dict | None = field(default=None, repr=False)
+    _stage_published_at: float = field(default=0.0, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -545,6 +558,56 @@ class TrainerRunner:
         except OSError as e:
             log.warning("could not write heat_complete marker for round=%s: %s",
                         base_seed, e)
+
+    # ── live round-stage reporting (status/round.json, presentational) ───────
+
+    HEAT_PROGRESS_PUBLISH_SECONDS = 300.0
+
+    def _publish_stage(
+        self,
+        stage: str,
+        *,
+        heat_done: int | None = None,
+        heat_total: int | None = None,
+        finalists: int | None = None,
+    ) -> None:
+        """Best-effort publish of the trainer-reported round stage.
+
+        No-op unless ``publish_stage_status`` is on and a round context was set
+        by :meth:`run_round`. Never raises: the doc is presentational (the
+        dashboards' live stage strip) and a storage failure must never disturb
+        the round it is describing.
+        """
+        if not self.publish_stage_status or self._stage_ctx is None:
+            return
+        from datetime import datetime
+
+        from ..shared.chain_status import build_round_status, publish_round_status
+
+        try:
+            doc = build_round_status(
+                round_id=self._stage_ctx["round_id"],
+                epoch_start_block=self._stage_ctx["epoch_start_block"],
+                stage=stage,
+                as_of=datetime.now(UTC).isoformat(),
+                heat_done=heat_done,
+                heat_total=heat_total,
+                finalists=finalists,
+            )
+            publish_round_status(self.manifest_store(), doc)
+            self._stage_published_at = time.time()
+        except Exception as e:  # noqa: BLE001 — presentational, never sinks a round
+            log.debug("round-stage publish failed (ignored): %s", e)
+
+    def _note_heat_progress(self, done: int, total: int) -> None:
+        """Throttled heat-progress publish from the heat train loops (at most
+        one write per :data:`HEAT_PROGRESS_PUBLISH_SECONDS`; the final count
+        lands with the ``duel`` transition anyway)."""
+        if not self.publish_stage_status or self._stage_ctx is None:
+            return
+        if time.time() - self._stage_published_at < self.HEAT_PROGRESS_PUBLISH_SECONDS:
+            return
+        self._publish_stage("heat", heat_done=done, heat_total=total)
 
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
@@ -865,6 +928,11 @@ class TrainerRunner:
             screen_block = (block // epoch_blocks) * epoch_blocks
 
         eligible = self._filter_burned_challengers(plan.challengers)
+        # Stage reporting context for this round; the epoch boundary is the
+        # dashboards' join key (they derive it from the same grid).
+        self._stage_ctx = {"round_id": str(base_seed),
+                           "epoch_start_block": int(screen_block)}
+        self._publish_stage("heat", heat_done=0, heat_total=len(eligible))
         finalists, heat = self._run_heat(eligible, seeds, block,
                                          screen_block=screen_block)
         # Burn only now, after the heat stage completed: every eligible entrant
@@ -875,6 +943,8 @@ class TrainerRunner:
         # Heat settled (screened + burned + finalists chosen): signal external
         # watchers (the provisioner) that heat-stage pods are now safe to release.
         self._mark_heat_complete(base_seed, eligible, finalists)
+        self._publish_stage("duel", heat_done=len(eligible),
+                            heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
@@ -1075,7 +1145,7 @@ class TrainerRunner:
         if self.remote_hosts:
             return self._heat_train_remote(challengers, seeds, block, heat_contract)
         out: list[tuple[ResolvedGenerator, Path, str]] = []
-        for c in challengers:
+        for done, c in enumerate(challengers, start=1):
             out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
             try:
                 result, digest, _, _ = self._train_checkpoint(
@@ -1084,6 +1154,7 @@ class TrainerRunner:
                 out.append((c, result.local_dir, digest))
             except Exception as e:  # noqa: BLE001
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
+            self._note_heat_progress(done, len(challengers))
         return out
 
     def _pod_extra_forward_env(self) -> tuple[str, ...]:
@@ -1231,12 +1302,13 @@ class TrainerRunner:
         out: list[tuple[ResolvedGenerator, Path, str]] = []
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
             futs = {ex.submit(_run, c): c for c in challengers}
-            for fut in as_completed(futs):
+            for done, fut in enumerate(as_completed(futs), start=1):
                 c = futs[fut]
                 try:
                     out.append(fut.result())
                 except Exception as e:  # noqa: BLE001
                     log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
+                self._note_heat_progress(done, len(challengers))
         return out
 
     def _train_final(
@@ -1344,6 +1416,11 @@ class TrainerRunner:
             manifest.round_id, len(manifest.entries), manifest.signature is not None,
             self.cfg.storage.manifest_bucket, key,
         )
+        # The manifest is out: validators take over. Guard on the round context
+        # matching so a direct publish() of some other round's manifest never
+        # mislabels the live one.
+        if self._stage_ctx is not None and self._stage_ctx["round_id"] == manifest.round_id:
+            self._publish_stage("validation")
 
     # ── live loop ────────────────────────────────────────────────────────────
 

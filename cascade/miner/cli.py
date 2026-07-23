@@ -313,7 +313,12 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
 def _cmd_round(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainClient, ChainError
-    from .dashboard import RoundTimeline, fetch_public_receipt_index, run_dashboard
+    from .dashboard import (
+        RoundTimeline,
+        fetch_public_receipt_index,
+        fetch_public_round_status,
+        run_dashboard,
+    )
 
     try:
         client = ChainClient.from_config(cfg, network=args.network)
@@ -321,6 +326,7 @@ def _cmd_round(args: argparse.Namespace) -> int:
             client, cfg.round, args.network, once=args.once, refresh=args.refresh,
             timeline=RoundTimeline.from_chain_config(cfg),
             index_fetch=lambda: fetch_public_receipt_index(cfg.storage),
+            status_fetch=lambda: fetch_public_round_status(cfg.storage),
         )
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)

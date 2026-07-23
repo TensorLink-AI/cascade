@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import types
 from dataclasses import replace
+from datetime import UTC
 
 import pytest
 
@@ -18,10 +19,12 @@ from cascade.miner.dashboard import (
     PhaseEstimate,
     RoundTimeline,
     fetch_public_receipt_index,
+    fetch_public_round_status,
     format_duration,
     latest_settled_before,
     outcome_line,
     phase_for,
+    phase_from_live,
     render,
     round_status,
     run_dashboard,
@@ -198,6 +201,57 @@ def test_phase_for_progression():
     p = phase_for(round_status(7200, rc), tl, settled_outcome="round settled — king held")
     assert (p.key, p.estimated) == ("settled", False)
     assert "king held" in p.detail
+
+
+def _live_doc(**over):
+    from datetime import datetime
+
+    doc = {"schema": 1, "round_id": "99", "epoch_start_block": 7200,
+           "stage": "heat", "heat_done": 12, "heat_total": 65,
+           "as_of": datetime.now(UTC).isoformat()}
+    doc.update(over)
+    return doc
+
+
+def test_phase_from_live_prefers_trainer_report_over_the_clock():
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    st = round_status(8400, rc)  # 4h in — the estimate would call "validation"
+    p = phase_from_live(_live_doc(), st)
+    assert p is not None
+    assert (p.key, p.estimated) == ("heat", False)
+    assert "12/65" in p.detail
+    assert "trainer-reported" in p.detail
+    # duel carries the finalist count; validation is plain
+    assert "1 finalist" in phase_from_live(
+        _live_doc(stage="duel", finalists=1), st).detail
+    assert phase_from_live(_live_doc(stage="validation"), st).key == "validation"
+
+
+def test_phase_from_live_rejects_stale_or_foreign_docs():
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    st = round_status(8400, rc)
+    assert phase_from_live(None, st) is None
+    assert phase_from_live(_live_doc(epoch_start_block=14400), st) is None
+    assert phase_from_live(_live_doc(as_of="2026-01-01T00:00:00+00:00"), st) is None
+
+
+def test_run_dashboard_stage_precedence_live_beats_estimate_settled_beats_live():
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    tl = RoundTimeline(1800.0, 10800.0)
+    # 4h into the epoch: the estimate alone would say validation…
+    out = io.StringIO()
+    run_dashboard(_FakeClient(8400), rc, "test", out=out, timeline=tl,
+                  status_fetch=lambda: _live_doc())
+    text = out.getvalue()
+    assert "stage           [HEAT]" in text          # …but the trainer says heat
+    assert "trainer-reported" in text
+    # a settled receipt for this round still outranks the live doc
+    settled = {"rounds": [{"epoch_start_block": 7200, "status": "scored",
+                           "dethroned": False, "post_round_king_uid": 3}]}
+    out = io.StringIO()
+    run_dashboard(_FakeClient(8400), rc, "test", out=out, timeline=tl,
+                  index_fetch=lambda: settled, status_fetch=lambda: _live_doc())
+    assert "[SETTLED]" in out.getvalue()
 
 
 def test_settled_entry_prefers_scored_and_outcome_lines():
@@ -391,3 +445,31 @@ def test_fetch_public_receipt_index_failures_return_none(monkeypatch):
         manifest_bucket = "b"
 
     assert fetch_public_receipt_index(_NoEndpoint()) is None
+
+
+def test_fetch_public_round_status(monkeypatch):
+    import io as _io
+    import urllib.request
+
+    captured = {}
+
+    class _Resp(_io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp(b'{"schema": 1, "stage": "heat"}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    doc = fetch_public_round_status(_Storage())
+    assert doc == {"schema": 1, "stage": "heat"}
+    assert captured["url"] == (
+        "https://s3.example.com/cascade-manifests/status/round.json")
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    assert fetch_public_round_status(_Storage()) is None

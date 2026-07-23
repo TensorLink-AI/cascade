@@ -1090,7 +1090,7 @@ var ENDPOINTS = [
 var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
-var _index = null, _latest = null, _status = null, _subsSeen = null,
+var _index = null, _latest = null, _status = null, _roundStatus = null, _subsSeen = null,
     _chartMode = "geomean", _smooth = 0, _dataState = "loading";
 
 // ── seed (mock) data — real receipt shape; overwritten if endpoints respond ─
@@ -1444,6 +1444,20 @@ function renderCountdown(){
 // a receipt for THIS epoch is in the index, and the strip shows its verdict.
 var STAGES=[["heat","Heat"],["duel","Duel"],["validation","Validation"],["settled","Settled"]];
 var STAGE_DEFAULT_WINDOWS={heat_seconds:2700, duel_seconds:11700};
+// Trainer-reported stage (status/round.json): preferred over the wall-clock
+// estimate when fresh (< 1h) and for THIS epoch — the estimate models the heat
+// as one competitor's budget and calls "duel" hours early on a large field.
+var ROUND_STATUS_FRESH_S=3600, ROUND_STATUS_SKEW_S=300;
+function liveStage(cn, el){
+  var d=_roundStatus;
+  if(!d||["heat","duel","validation"].indexOf(d.stage)<0) return null;
+  if(Number(d.epoch_start_block)!==cn.epochStart) return null;
+  var t=d.as_of?new Date(d.as_of).getTime():NaN; if(!isFinite(t)) return null;
+  var age=(Date.now()-t)/1000;
+  if(age>ROUND_STATUS_FRESH_S||age<-ROUND_STATUS_SKEW_S) return null;
+  return {key:d.stage, elapsed:el, live:true, asOf:d.as_of,
+          heatDone:d.heat_done, heatTotal:d.heat_total, finalists:d.finalists};
+}
 function currentStage(){
   var cn=chainNow(); if(!cn) return null;
   var settled=null;
@@ -1452,6 +1466,7 @@ function currentStage(){
   });
   var el=(cn.est-cn.epochStart)*cn.bt;
   if(settled) return {key:"settled", entry:settled, elapsed:el};
+  var live=liveStage(cn, el); if(live) return live;
   var w=(_status&&_status.stage_windows)||STAGE_DEFAULT_WINDOWS;
   if(el<w.heat_seconds) return {key:"heat", elapsed:el, estimated:true};
   if(el<w.heat_seconds+w.duel_seconds) return {key:"duel", elapsed:el, estimated:true};
@@ -1460,9 +1475,17 @@ function currentStage(){
 function stageDetail(stg){
   if(!stg) return "--";
   var into=" · <b>"+fmtDur(stg.elapsed)+"</b> into the round";
-  if(stg.key==="heat") return "<b>Heat</b> — trainer screening every challenger at the cheap budget"+into+" · estimated";
-  if(stg.key==="duel") return "<b>Duel</b> — king vs finalists training at the full budget"+into+" · estimated";
-  if(stg.key==="validation") return "<b>Validation</b> — validators scoring the duel, receipt pending"+into+" · estimated";
+  var src=stg.live?" · trainer-reported "+timeAgo(stg.asOf):" · estimated";
+  if(stg.key==="heat"){
+    var prog=(stg.live&&stg.heatDone!=null&&stg.heatTotal!=null)?
+      " ("+stg.heatDone+"/"+stg.heatTotal+" screened)":"";
+    return "<b>Heat</b> — trainer screening every challenger at the cheap budget"+prog+into+src;
+  }
+  if(stg.key==="duel"){
+    var who=(stg.live&&stg.finalists!=null)?stg.finalists+" finalist(s)":"finalists";
+    return "<b>Duel</b> — king vs "+who+" training at the full budget"+into+src;
+  }
+  if(stg.key==="validation") return "<b>Validation</b> — validators scoring the duel, receipt pending"+into+src;
   var s=nextRoundSecs();
   return "<b>Settled</b> — "+esc(verdictLabel(stg.entry))+(s!=null?" · next round ~"+fmtDur(s):"");
 }
@@ -1572,6 +1595,9 @@ function poll(){
     if(_status===SEED_STATUS){ _subsSeen=null; }
     _status=d; renderStage(); renderSubs(); renderCountdown();
   }).catch(function(){ if(_status===SEED_STATUS&&_dataState==="live"){ _status=null; _subsSeen=null; renderStage(); renderSubs(); } });
+  // Trainer-reported round stage (best-effort; staleness handled in liveStage).
+  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); })
+    .catch(function(){});
 }
 poll();
 setInterval(poll, POLL_MS);

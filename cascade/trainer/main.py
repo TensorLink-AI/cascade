@@ -253,6 +253,10 @@ def main(argv: list[str] | None = None) -> int:
         bench_plan=bench_plan,
         bench_eval_fn=bench_eval_fn,
         cascade_bench_plan=cascade_bench_plan,
+        # Live service: report the real round stage (status/round.json) so the
+        # dashboards show heat/duel/validation from the trainer, not a
+        # wall-clock estimate. Off by default for offline runs and tests.
+        publish_stage_status=True,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",

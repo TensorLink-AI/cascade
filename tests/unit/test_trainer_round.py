@@ -210,6 +210,59 @@ def test_heat_complete_marker_written_when_heat_settles(cfg, tmp_path, monkeypat
     assert not (tmp_path / "1" / "heat_complete.json.tmp").exists()  # atomic publish
 
 
+def test_round_stage_reported_heat_duel_validation(cfg, tmp_path, monkeypatch):
+    """Live stage reporting (status/round.json): a heat doc at round start, a
+    duel doc when the heat settles, a validation doc after the manifest
+    publish — each carrying the round's epoch join key. Enabled only for the
+    live service (publish_stage_status)."""
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(loop_mod, "publish_manifest",
+                        lambda store, text, rid: f"manifests/round-{rid}.json")
+
+    class _StageStore:
+        def __init__(self):
+            self.docs = []
+
+        def put_text(self, key, text, *, content_type="", acl=None):
+            self.docs.append((key, json.loads(text)))
+
+    store = _StageStore()
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    runner._manifest_store = store
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    runner.publish(manifest)
+
+    stage_docs = [d for k, d in store.docs if k == "status/round.json"]
+    assert [d["stage"] for d in stage_docs] == ["heat", "duel", "validation"]
+    heat, duel, _validation = stage_docs
+    assert heat["round_id"] == "1"
+    assert (heat["heat_done"], heat["heat_total"]) == (0, 3)
+    assert (duel["heat_done"], duel["heat_total"], duel["finalists"]) == (3, 3, 1)
+    # all three report the same epoch join key the dashboards derive
+    assert len({d["epoch_start_block"] for d in stage_docs}) == 1
+
+
+def test_round_stage_reporting_off_by_default(cfg, tmp_path, monkeypatch):
+    """Offline runs and tests must never touch storage: without
+    publish_stage_status the round publishes no stage docs."""
+    _patch_train_boundaries(monkeypatch)
+
+    class _Boom:
+        def put_text(self, *a, **k):
+            raise AssertionError("stage doc published with reporting off")
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _Boom()
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)  # no raise
+
+
 def test_heat_complete_marker_written_even_without_a_screen(cfg, tmp_path, monkeypatch):
     """Field ≤ finalists ⇒ no screening runs, but the heat stage is still
     settled (no heat dispatch can follow) — the marker must appear anyway."""

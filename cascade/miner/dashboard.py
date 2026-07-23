@@ -164,6 +164,41 @@ class RoundTimeline:
         return cls(heat_seconds=heat_s, duel_seconds=duel_s)
 
 
+def phase_from_live(
+    doc: object,
+    st: RoundStatus,
+    *,
+    now_s: float | None = None,
+) -> PhaseEstimate | None:
+    """The trainer-reported stage (``status/round.json``), when trustworthy.
+
+    Returns a confirmed :class:`PhaseEstimate` when the doc is fresh and
+    matches the current epoch (see ``live_round_stage``), else None — the
+    caller falls back to the wall-clock estimate. Preferred over the estimate
+    because the estimate models the heat as ONE competitor's budget and calls
+    "duel" hours early on a large field.
+    """
+    from ..shared.chain_status import live_round_stage
+
+    live = live_round_stage(doc, epoch_start_block=st.epoch_start,
+                            now_s=time.time() if now_s is None else now_s)
+    if live is None:
+        return None
+    stage = str(live["stage"])
+    if stage == "heat":
+        done, total = live.get("heat_done"), live.get("heat_total")
+        progress = (f" — screening {int(done)}/{int(total)} challengers"
+                    if done is not None and total is not None else "")
+        what = f"trainer screening the field at the heat budget{progress}"
+    elif stage == "duel":
+        n = live.get("finalists")
+        who = f"{int(n)} finalist(s)" if n is not None else "finalists"
+        what = f"king vs {who} training at the full budget"
+    else:
+        what = "manifest published; validators scoring (receipt pending)"
+    return PhaseEstimate(stage, f"{what} (trainer-reported)", estimated=False)
+
+
 def phase_for(
     st: RoundStatus,
     timeline: RoundTimeline,
@@ -221,6 +256,32 @@ def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dic
     if isinstance(doc, dict) and isinstance(doc.get("rounds"), list):
         return doc
     return None
+
+
+def fetch_public_round_status(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the trainer-reported ``status/round.json``.
+
+    Same zero-credential public-read path as the receipt index. Best-effort:
+    any failure returns None and the dashboard falls back to the wall-clock
+    stage estimate. Freshness/round-matching is the CONSUMER's job
+    (``phase_from_live``), so a stale doc here is returned as-is.
+    """
+    import urllib.request
+
+    endpoint = str(getattr(storage, "s3_endpoint", "") or "").rstrip("/")
+    bucket = str(getattr(storage, "manifest_bucket", "") or "")
+    if not endpoint.startswith(("http://", "https://")) or not bucket:
+        return None
+    from ..shared.chain_status import ROUND_STATUS_KEY
+
+    url = f"{endpoint}/{bucket}/{ROUND_STATUS_KEY}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            doc = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — best-effort enhancement
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _as_int(value: object) -> int | None:
@@ -352,8 +413,10 @@ class LiveFeed:
 
     client: object
     index_fetch: Callable[[], dict | None] | None = None
+    status_fetch: Callable[[], dict | None] | None = None
     commitments: list | None = None
     index_doc: dict | None = None
+    round_status_doc: dict | None = None
     _baseline: set[tuple[str, int]] | None = field(default=None, repr=False)
 
     def poll(self) -> None:
@@ -374,6 +437,13 @@ class LiveFeed:
                 doc = None
             if doc is not None:
                 self.index_doc = doc
+        if self.status_fetch is not None:
+            try:
+                sdoc = self.status_fetch()
+            except Exception:  # noqa: BLE001 — best-effort
+                sdoc = None
+            if sdoc is not None:
+                self.round_status_doc = sdoc
 
     def rows(self, epoch_start: int, *, floor_block: int = 0) -> list[SubmissionRow] | None:
         """Current submission rows, or None when the chain feed is unavailable
@@ -452,7 +522,8 @@ def compose_frame(
     """Assemble one full frame from the chain snapshot + the live feed.
 
     Stage precedence: a public receipt for THIS round confirms ``settled``;
-    otherwise the stage is the config-timing estimate (when a timeline is
+    then the trainer-reported stage (``status/round.json``) when fresh for
+    this round; otherwise the config-timing estimate (when a timeline is
     available). The "last round" context line is shown only while the current
     round is still in flight (it is redundant once this round settles).
     """
@@ -463,7 +534,8 @@ def compose_frame(
         phase = phase_for(st, timeline or RoundTimeline(0.0, 0.0),
                           settled_outcome=outcome_line(entry))
     else:
-        if timeline is not None:
+        phase = phase_from_live(feed.round_status_doc, st)
+        if phase is None and timeline is not None:
             phase = phase_for(st, timeline, drift_seconds=drift_seconds)
         prior = latest_settled_before(feed.index_doc, st.epoch_start)
         if prior is not None:
@@ -483,6 +555,7 @@ def run_dashboard(
     out=None,
     timeline: RoundTimeline | None = None,
     index_fetch: Callable[[], dict | None] | None = None,
+    status_fetch: Callable[[], dict | None] | None = None,
 ) -> int:
     """Print the round dashboard; in watch mode, keep it live until Ctrl+C.
 
@@ -493,11 +566,13 @@ def run_dashboard(
     to a single snapshot so piped/scripted runs never emit escape codes.
     ``timeline`` enables the stage estimate; ``index_fetch`` (e.g.
     :func:`fetch_public_receipt_index` bound to the storage config) enables
-    settled-round confirmation and last-round context. A client without
-    ``poll_commitments`` simply gets no submissions section.
+    settled-round confirmation and last-round context; ``status_fetch`` (e.g.
+    :func:`fetch_public_round_status`) enables the trainer-reported live
+    stage. A client without ``poll_commitments`` simply gets no submissions
+    section.
     """
     out = out if out is not None else sys.stdout
-    feed = LiveFeed(client, index_fetch=index_fetch)
+    feed = LiveFeed(client, index_fetch=index_fetch, status_fetch=status_fetch)
     st = round_status(client.current_block(), round_cfg)
     feed.poll()
     frame = compose_frame(st, network, round_cfg, feed, timeline)
