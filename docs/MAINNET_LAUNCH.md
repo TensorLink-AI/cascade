@@ -55,10 +55,11 @@ fixtures if active pre-launch.
 - [ ] `dethrone_cp` (currently 1): one round win takes the throne. Consider 2
       for throne stability at 24h rounds with real emissions.
 - [ ] `cascade_enabled` (+ `cascade_reign_days = 7`): stays OFF at launch —
-      DEC-CA-0003: trainer consumption of `warm_start_init_path` is not
-      implemented, and the reign clock must be block-anchored with a
-      synchronized trainer handoff first. Arm only after both land and a
-      full testnet cascade completes cleanly.
+      DEC-CA-0003/0004. Trainer consumption of `warm_start_init_path`, the
+      block-anchored reign clock, persist-throne promotion, and the signed
+      manifest warm-start pin are implemented; arm only after a full testnet
+      cascade completes cleanly end-to-end (promotion → warm-started round →
+      validator pin check → audit re-derivation from the pinned init).
 - [ ] `corpus_mode = "stream_cpu"` stays for launch (byte-exact audits are the
       trust story; #88 closed the CPU-mode GPU escape). `stream_gpu` is a
       post-launch experiment — see CLAUDE.md and the generator evaluation notes.
