@@ -281,6 +281,15 @@ class TrainingManifest:
     # Empty ⇒ unpinned (trainer predates the field, or no pool provenance).
     eval_pool_key: str = ""
     eval_pool_sha256: str = ""
+    # Warm-start pin (Cascade, DEC-CA-0003/0004): the content-addressed
+    # checkpoint pointer this round's runs at ``warm_start_size`` initialised
+    # from (same ``trained_pointer`` format — the OCI digest pins the bytes),
+    # instead of random init. Signed (see canonical_body), so validators verify
+    # the trainer trained from the init THEIR deterministic promotion selected,
+    # and cascade-audit re-derives from the pinned checkpoint. Empty ⇒ random
+    # init (no promotion yet, or a pre-warm-start trainer).
+    warm_start_ckpt: str = ""
+    warm_start_size: str = ""
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -327,6 +336,11 @@ class TrainingManifest:
         if self.eval_pool_key and self.eval_pool_sha256:
             body["eval_pool_key"] = self.eval_pool_key
             body["eval_pool_sha256"] = self.eval_pool_sha256
+        # Same drop-when-unset convention: a random-init round hashes exactly as
+        # it did before the warm-start fields existed.
+        if self.warm_start_ckpt:
+            body["warm_start_ckpt"] = self.warm_start_ckpt
+            body["warm_start_size"] = self.warm_start_size
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -379,6 +393,8 @@ def load_manifest(text: str) -> TrainingManifest:
         heat=_heat_from_json(obj.get("heat")),
         eval_pool_key=str(obj.get("eval_pool_key", "") or ""),
         eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
+        warm_start_ckpt=str(obj.get("warm_start_ckpt", "") or ""),
+        warm_start_size=str(obj.get("warm_start_size", "") or ""),
         signature=obj.get("signature"),
     )
 

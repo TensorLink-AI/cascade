@@ -108,7 +108,9 @@ class CheckpointRecord:
     registry ref). The six eval numbers are the CRPS and MASE the checkpoint
     scored on GIFT-Eval, BOOM, and TIME; ``score`` is their :func:`cascade_score`
     (geomean, lower is better); ``timestamp`` is wall-clock epoch seconds when it
-    was recorded (the selection tiebreak, and reign observability).
+    was recorded (local observability only — selection ties break on
+    ``checkpoint_id``); ``size`` is the arch preset the checkpoint was trained
+    at, so the promoted init is only ever loaded into a matching model.
     """
 
     checkpoint_id: str
@@ -120,6 +122,7 @@ class CheckpointRecord:
     time_mase: float
     score: float
     timestamp: float
+    size: str = ""
 
     @classmethod
     def scored(
@@ -133,6 +136,7 @@ class CheckpointRecord:
         time_crps: float,
         time_mase: float,
         timestamp: float,
+        size: str = "",
     ) -> CheckpointRecord:
         """Build a record, computing ``score`` from the six eval numbers so the
         geomean convention lives in exactly one place."""
@@ -146,6 +150,7 @@ class CheckpointRecord:
             time_mase=float(time_mase),
             score=cascade_score(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps, time_mase),
             timestamp=float(timestamp),
+            size=str(size),
         )
 
 
@@ -265,6 +270,7 @@ def dumps(state: CascadeState) -> str:
                     "time_mase": r.time_mase,
                     "score": r.score,
                     "timestamp": r.timestamp,
+                    "size": r.size,
                 }
                 for r in state.checkpoints
             ],
@@ -286,6 +292,7 @@ def loads(text: str) -> CascadeState:
             time_mase=float(c["time_mase"]),
             score=float(c["score"]),
             timestamp=float(c["timestamp"]),
+            size=str(c.get("size", "")),
         )
         for c in (obj.get("checkpoints") or ())
     )
@@ -345,6 +352,7 @@ class CascadeController:
         time_crps: float,
         time_mase: float,
         now: float,
+        size: str = "",
     ) -> CheckpointRecord | None:
         """Score and log a checkpoint the reigning king produced. No-op (returns
         ``None``) when the throne is vacant — Cascade only records within a reign,
@@ -360,6 +368,7 @@ class CascadeController:
             time_crps=time_crps,
             time_mase=time_mase,
             timestamp=now,
+            size=size,
         )
         self.state = record_checkpoint(self.state, rec)
         self._persist()

@@ -303,7 +303,9 @@ poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.db"
 # Cascade persistence (see [scoring] cascade_reign_days): reign clock + reign
-# checkpoint log, and the promoted warm-start pointer for the trainer.
+# checkpoint log, and the promoted warm-start pointer. The CO-HOSTED TRAINER
+# reads warm_start_init_path too (its rounds train from the pinned init once a
+# promotion fires) — point both processes at the same file.
 cascade_state_db_path      = "cascade_state.json"
 warm_start_init_path       = "warm_start_init.json"
 # Operator kill-switch (or `cascade-validator --force-burn`): burn to

@@ -52,6 +52,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo-suffix", default="",
                    help="Suffix on the checkpoint repo (ckpt-r<seed>-<role>-<size><suffix>) so "
                         "parallel runs at one size — heat challengers, finalists>1 — don't collide.")
+    p.add_argument("--warm-start-ref", default=None,
+                   help="Cascade warm-start init: the promoted checkpoint's trained_pointer. "
+                        "Fetched from the registry (digest-verified) and loaded as the run's "
+                        "init weights; a fetch/load failure fails the run — it never falls "
+                        "back to random init. Omitted ⇒ random init.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -113,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         entry = runner.train_one(gen, args.role, seeds, args.block,
                                  contract=contract, token_budget=token_budget,
-                                 repo_suffix=args.repo_suffix)
+                                 repo_suffix=args.repo_suffix,
+                                 warm_start_ref=args.warm_start_ref)
     except CorpusError as e:
         # Miner fault (bad submission, private/missing artifact): one line and a
         # distinct exit code, so the orchestrator logs it as a rejection rather

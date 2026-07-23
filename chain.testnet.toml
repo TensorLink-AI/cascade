@@ -349,7 +349,8 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.testnet.db"
-# Cascade persistence (see [scoring] cascade_reign_days).
+# Cascade persistence (see [scoring] cascade_reign_days). The co-hosted trainer
+# reads warm_start_init_path too — both processes must point at the same file.
 cascade_state_db_path      = "cascade_state.testnet.json"
 warm_start_init_path       = "warm_start_init.testnet.json"
 

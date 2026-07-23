@@ -143,6 +143,7 @@ def worker_argv(
     arch_preset: str | None = None,
     train_hours: float | None = None,
     repo_suffix: str = "",
+    warm_start_ref: str | None = None,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -150,7 +151,10 @@ def worker_argv(
     or one of ``[[training.sizes]]``); omitted ⇒ the worker trains the primary
     size, preserving single-size behaviour. ``train_hours`` overrides the compute
     budget (a cheap heat screen); ``repo_suffix`` disambiguates the checkpoint
-    repo so parallel same-size runs (heat challengers) don't collide."""
+    repo so parallel same-size runs (heat challengers) don't collide.
+    ``warm_start_ref`` is the round's pinned Cascade init (a trained_pointer);
+    the pod fetches it from the registry and trains from its weights instead of
+    random init — omitted ⇒ random init."""
     argv = [
         host.remote_python, "-m", "cascade.trainer.worker",
         "--gen-ref", gen_ref,
@@ -169,6 +173,8 @@ def worker_argv(
         # `=` form: the suffix starts with '-' (e.g. -heat-u3), which argparse
         # would otherwise mistake for a flag.
         argv.append(f"--repo-suffix={repo_suffix}")
+    if warm_start_ref:
+        argv += ["--warm-start-ref", warm_start_ref]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -304,6 +310,7 @@ class RemoteDispatcher:
         arch_preset: str | None = None,
         train_hours: float | None = None,
         repo_suffix: str = "",
+        warm_start_ref: str | None = None,
         lane_count: int | None = None,
     ) -> TrainedEntry:
         import os
@@ -312,6 +319,7 @@ class RemoteDispatcher:
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
+            warm_start_ref=warm_start_ref,
         )
         env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
         remote_cmd = build_remote_command(host, argv, env, lane_count=lane_count)

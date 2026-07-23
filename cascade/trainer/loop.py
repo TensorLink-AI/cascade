@@ -363,6 +363,14 @@ class TrainerRunner:
     # subprocess. The six numbers still go on the signed manifest. Falls back to
     # the local ``bench_eval_fn`` when there is no remote host.
     cascade_bench_plan: object | None = None
+    # Cascade warm-start consumption (DEC-CA-0003): path of the promoted-init
+    # pointer file (``[validator] warm_start_init_path`` — the trainer runs
+    # co-hosted with the owner's validator and reads the same file its Cascade
+    # installs). When the file exists, every run this round initialises from
+    # the pinned checkpoint instead of random init, and the manifest records
+    # the pin (signed) so validators verify it and cascade-audit re-derives
+    # from it. None ⇒ random init always (cascade off / pre-warm-start deploy).
+    warm_start_path: Path | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -497,6 +505,7 @@ class TrainerRunner:
         out_dir: Path,
         *,
         log_role: str,
+        warm_start_dir: Path | None = None,
     ) -> tuple[TrainResult, str, int, int]:
         """Fetch generator (registry) → build corpus → train into ``out_dir``,
         streaming per-step metrics to S3. No upload — the caller decides whether
@@ -504,8 +513,12 @@ class TrainerRunner:
 
         ``contract`` is the per-size training contract (the base recipe with this
         size's width/depth/digest/throughput); ``token_budget`` is its compute
-        budget for this stage. Returns ``(result, corpus_digest, n_series,
-        total_points)``. Raises on any failure.
+        budget for this stage. ``warm_start_dir`` is a fetched promoted-init
+        checkpoint dir: the run initialises from its weights instead of random
+        (Cascade consumption — forwarded to the backend only when set, so
+        custom BaseTrainers without the kwarg keep working random-init).
+        Returns ``(result, corpus_digest, n_series, total_points)``. Raises on
+        any failure.
         """
         gen_dir = out_dir.parent / "generator"
         try:
@@ -564,6 +577,7 @@ class TrainerRunner:
                 token_budget=token_budget,
                 out_dir=out_dir,
                 logger=logger,
+                **({"warm_start_dir": warm_start_dir} if warm_start_dir is not None else {}),
             )
             corpus_digest, n_series, total_points = rs.digest, rs.n_series, rs.total_points
 
@@ -614,6 +628,7 @@ class TrainerRunner:
         contract: TrainingContractConfig | None = None,
         token_budget: int | None = None,
         repo_suffix: str = "",
+        warm_start_ref: str | None = None,
     ) -> TrainedEntry:
         """Train one generator at one size, upload its checkpoint, return the receipt.
 
@@ -634,8 +649,13 @@ class TrainerRunner:
         token_budget = token_budget if token_budget is not None else contract.train_tokens
         size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
+        # Cascade warm-start: fetch the pinned promoted init (content-addressed;
+        # the OCI digest verifies the bytes). A fetch failure RAISES — the run
+        # must never silently fall back to random init (DEC-CA-0003).
+        ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
         result, corpus_digest, _, _ = self._train_checkpoint(
             gen, seeds, contract, token_budget, out_dir, log_role=f"{role}-{size}",
+            warm_start_dir=ws_dir,
         )
 
         ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
@@ -656,6 +676,33 @@ class TrainerRunner:
             gpu_name=str(result.metrics.get("gpu_name", "")),
             size=size,
         )
+
+    def _load_warm_start(self) -> tuple[str, str] | None:
+        """The live promoted init as ``(checkpoint pointer, size)``, or ``None``
+        when no promotion has fired (file absent) or consumption isn't wired.
+
+        A pointer file that EXISTS but is unusable (unreadable JSON, missing or
+        malformed ``checkpoint_id``) RAISES and aborts the round: once a
+        promotion is live, training must never silently fall back to random
+        init — the round's reproducibility contract pins the init
+        (DEC-CA-0003). ``size`` defaults to the primary arch preset for pointer
+        files written before the field existed."""
+        if self.warm_start_path is None:
+            return None
+        p = Path(self.warm_start_path)
+        if not p.is_file():
+            return None
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            ref = str(obj.get("checkpoint_id") or "")
+        except Exception as e:  # noqa: BLE001 — a live-but-broken pin must abort, not degrade
+            raise RuntimeError(f"warm-start pointer {p} unreadable: {e}") from e
+        if not ref or parse_trained_pointer(ref) is None:
+            raise RuntimeError(
+                f"warm-start pointer {p} carries no usable checkpoint_id: {ref!r}"
+            )
+        size = str(obj.get("size") or "") or self.cfg.training.primary_size.arch_preset
+        return ref, size
 
     def _fetch_checkpoint_dir(self, trained_pointer: str) -> Path:
         """Fetch a just-trained checkpoint from the registry to a local dir (the
@@ -783,6 +830,13 @@ class TrainerRunner:
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
+        # Cascade warm-start: the live promoted init every run this round trains
+        # from (heat AND final — screening must rank on the same init the final
+        # trains at). Raises on a live-but-broken pointer; None ⇒ random init.
+        warm_start = self._load_warm_start()
+        if warm_start is not None:
+            log.info("round=%s warm-start init: %s (size=%s)",
+                     base_seed, warm_start[0], warm_start[1])
 
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
@@ -796,7 +850,8 @@ class TrainerRunner:
 
         eligible = self._filter_burned_challengers(plan.challengers)
         finalists, heat = self._run_heat(eligible, seeds, block,
-                                         screen_block=screen_block)
+                                         screen_block=screen_block,
+                                         warm_start=warm_start)
         # Burn only now, after the heat stage completed: every eligible entrant
         # got its screening attempt (or its pass-through to the final). A crash
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
@@ -809,7 +864,7 @@ class TrainerRunner:
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
 
-        entries = self._train_final(jobs, seeds, block)
+        entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
         self._log_telemetry_rollup(base_seed)  # complete heats + finals picture
@@ -844,6 +899,8 @@ class TrainerRunner:
             heat=heat,
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
+            warm_start_ckpt=warm_start[0] if warm_start else "",
+            warm_start_size=warm_start[1] if warm_start else "",
         )
 
     def _log_telemetry_rollup(self, base_seed: int) -> None:
@@ -862,6 +919,7 @@ class TrainerRunner:
         block: int,
         *,
         screen_block: int | None = None,
+        warm_start: tuple[str, str] | None = None,
     ) -> tuple[list[ResolvedGenerator], HeatResult | None]:
         """Screen the field down to ``[round] finalists`` for the final stage.
 
@@ -902,7 +960,12 @@ class TrainerRunner:
             guard_floor_seconds=rnd.heat_guard_floor_seconds,
         )
         heat_tokens = heat_contract.train_tokens
-        trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens)
+        # Screen from the same init the final will train at (warm-start applies
+        # only to the matching size; other sizes keep random init).
+        ws_ref = (warm_start[0]
+                  if warm_start and warm_start[1] == heat_contract.arch_preset else None)
+        trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens,
+                                   warm_start_ref=ws_ref)
         trained_hotkeys = {c.hotkey for c, _ in trained}
         scored: list[tuple[float, int, ResolvedGenerator]] = []
         for c, ckpt_dir in trained:
@@ -968,6 +1031,8 @@ class TrainerRunner:
         block: int,
         heat_contract: TrainingContractConfig,
         heat_tokens: int,
+        *,
+        warm_start_ref: str | None = None,
     ) -> list[tuple[ResolvedGenerator, Path]]:
         """Train each heat challenger, returning ``[(challenger, local_ckpt_dir)]``
         for the ones that trained. Dispatches to ``remote_hosts`` (GPU pods) when
@@ -976,13 +1041,16 @@ class TrainerRunner:
         never needs a GPU — else trains locally. A failed train drops that
         challenger (it just doesn't qualify)."""
         if self.remote_hosts:
-            return self._heat_train_remote(challengers, seeds, block, heat_contract)
+            return self._heat_train_remote(challengers, seeds, block, heat_contract,
+                                           warm_start_ref=warm_start_ref)
+        ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
         out: list[tuple[ResolvedGenerator, Path]] = []
         for c in challengers:
             out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
             try:
                 result, *_ = self._train_checkpoint(
                     c, seeds, heat_contract, heat_tokens, out_dir, log_role=f"heat-{c.hotkey}",
+                    warm_start_dir=ws_dir,
                 )
                 out.append((c, result.local_dir))
             except Exception as e:  # noqa: BLE001
@@ -1072,6 +1140,8 @@ class TrainerRunner:
         seeds: RoundSeeds,
         block: int,
         heat_contract: TrainingContractConfig,
+        *,
+        warm_start_ref: str | None = None,
     ) -> list[tuple[ResolvedGenerator, Path]]:
         """Screen-train the field on the GPU pods: dispatch each challenger to a
         host (round-robin across ``remote_hosts``, in parallel), training at the
@@ -1110,6 +1180,7 @@ class TrainerRunner:
                 arch_preset=heat_contract.arch_preset,
                 train_hours=self.cfg.round.heat_train_hours,
                 repo_suffix=f"-heat-u{c.uid}",
+                warm_start_ref=warm_start_ref,
             )
             ref = parse_trained_pointer(entry.trained_pointer)
             if ref is None:
@@ -1130,13 +1201,16 @@ class TrainerRunner:
         return out
 
     def _train_final(
-        self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int
+        self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int,
+        *, warm_start: tuple[str, str] | None = None,
     ) -> list[TrainedEntry]:
         """Train the final jobs at each throne size, returning all receipts.
 
         One (king + finalists) pass per size in ``cfg.throne_contracts()`` (the
         ``[round] throne_sizes``); a king failure at any size aborts the round, a
-        challenger failure drops only that challenger from that size."""
+        challenger failure drops only that challenger from that size.
+        ``warm_start`` (pointer, size) applies to the matching size's pass only —
+        an init trained at one size can't initialise another."""
         if not self.remote_hosts:
             # This box is the runtime for a local final; with remote hosts the
             # check runs on each pod (cascade-train-worker), which is the runtime.
@@ -1144,10 +1218,14 @@ class TrainerRunner:
         entries: list[TrainedEntry] = []
         for contract in self.cfg.throne_contracts():
             token_budget = contract.train_tokens
+            ws_ref = (warm_start[0]
+                      if warm_start and warm_start[1] == contract.arch_preset else None)
             if self.remote_hosts:
-                entries += self._train_remote(jobs, seeds, block, contract, token_budget)
+                entries += self._train_remote(jobs, seeds, block, contract, token_budget,
+                                              warm_start_ref=ws_ref)
             else:
-                entries += self._train_local(jobs, seeds, block, contract, token_budget)
+                entries += self._train_local(jobs, seeds, block, contract, token_budget,
+                                             warm_start_ref=ws_ref)
         return entries
 
     def _train_local(
@@ -1157,6 +1235,8 @@ class TrainerRunner:
         block: int,
         contract: TrainingContractConfig,
         token_budget: int,
+        *,
+        warm_start_ref: str | None = None,
     ) -> list[TrainedEntry]:
         """Sequential training on this box for one size: king first (its failure
         aborts the round), then each challenger (a failure just drops it)."""
@@ -1165,7 +1245,8 @@ class TrainerRunner:
             try:
                 entries.append(
                     self.train_one(gen, role, seeds, block,
-                                   contract=contract, token_budget=token_budget)
+                                   contract=contract, token_budget=token_budget,
+                                   warm_start_ref=warm_start_ref)
                 )
             except Exception as e:  # noqa: BLE001
                 if role == "king":
@@ -1181,6 +1262,8 @@ class TrainerRunner:
         block: int,
         contract: TrainingContractConfig,
         token_budget: int,  # noqa: ARG002 — budget travels via chain.toml on the pod
+        *,
+        warm_start_ref: str | None = None,
     ) -> list[TrainedEntry]:
         """Parallel training across ``remote_hosts`` for one size (king→pod A,
         challenger→pod B over SSH). Equal compute is preserved (fixed token
@@ -1203,6 +1286,7 @@ class TrainerRunner:
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
+                warm_start_ref=warm_start_ref,
             )
 
         results: list[TrainedEntry | None] = [None] * len(jobs)

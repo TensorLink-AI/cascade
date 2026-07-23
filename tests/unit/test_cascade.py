@@ -275,15 +275,22 @@ def test_new_reign_after_cascade_can_fire_again():
 
 
 def test_state_round_trips_through_json():
+    sized = CheckpointRecord.scored(
+        "c", gifteval_crps=0.5, gifteval_mase=0.8, boom_crps=0.6, boom_mase=0.7,
+        time_crps=0.4, time_mase=0.9, timestamp=30.0, size="toto2-4m",
+    )
     st = CascadeState(
         king_hotkey="k",
         reign_start_block=12345,
         checkpoints=(
             _ckpt("a", 0.5, 0.8, 0.4, 0.9, 10.0, bc=0.6, bm=0.7),
             _ckpt("b", 0.4, 0.7, 0.3, 0.8, 20.0, bc=0.5, bm=0.6),
+            sized,
         ),
     )
-    assert loads(dumps(st)) == st
+    again = loads(dumps(st))
+    assert again == st
+    assert again.checkpoints[2].size == "toto2-4m"
 
 
 def test_empty_state_round_trips():
