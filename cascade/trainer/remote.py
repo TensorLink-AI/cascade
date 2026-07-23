@@ -42,7 +42,17 @@ RECEIPT_SENTINEL = "__CASCADE_RECEIPT__"
 
 
 class RemoteDispatchError(RuntimeError):
-    """An SSH dispatch or receipt parse failed."""
+    """An SSH dispatch or receipt parse failed.
+
+    ``returncode`` carries the ssh exit status when the failure was a non-zero
+    remote/transport exit — 255 marks an SSH transport failure (host
+    unreachable, auth refused, sshd not ready), which the heat fan-out counts to
+    refuse caching a fleet-wide dead-pod wipeout as a completed heat. ``None``
+    for parse/timeout/logic failures that carry no ssh status."""
+
+    def __init__(self, *args, returncode: int | None = None) -> None:
+        super().__init__(*args)
+        self.returncode = returncode
 
 
 HOST_STAGES = ("any", "heat", "final")
@@ -348,12 +358,14 @@ class RemoteDispatcher:
             # stderr line is the one-line reason — no traceback to relay.
             reason = (proc.stderr or "").strip().splitlines()[-1:] or ["(no reason)"]
             raise RemoteDispatchError(
-                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}"
+                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}",
+                returncode=3,
             )
         if proc.returncode != 0:
             tail = (proc.stderr or "")[-2000:]
             raise RemoteDispatchError(
-                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}"
+                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
+                returncode=proc.returncode,
             )
         entry = receipt_to_entry(parse_receipt(proc.stdout or ""))
         if entry.role != role:
@@ -364,3 +376,29 @@ class RemoteDispatcher:
 def run_ssh(ssh_argv: list[str], timeout: int):
     """Run the ssh command, returning the CompletedProcess (text mode)."""
     return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout)
+
+
+_HEAT_PROBE_TOKEN = "cascade-heat-probe-ok"
+
+
+def probe_host(host: RemoteHost, *, timeout: int = 15) -> bool:
+    """A cheap liveness probe before heat fan-out: an SSH echo over
+    ``BatchMode`` + key auth.
+
+    TCP reachability is NOT sufficient — a booting pod completes the TCP
+    handshake while sshd (or the pod account) is not ready yet, and every
+    dispatch there dies ``rc=255`` (2026-07-23: a dead pod burned all 48
+    challengers in 11s, each a one-and-done ``rc=255``, and the 0/48 heat was
+    cached as legitimate). Only a full SSH round-trip proves the host can run a
+    worker. A host with no address to reach (``host`` unset — offline fakes)
+    cannot be probed and is KEPT, never stranding a fleet on a local config
+    slip; a real :class:`RemoteHost` always carries one. Returns True only when
+    the echo round-trips."""
+    if not getattr(host, "host", None):
+        return True
+    try:
+        proc = run_ssh(build_ssh_argv(host, shlex.join(["echo", _HEAT_PROBE_TOKEN])), timeout)
+    except Exception:  # noqa: BLE001 — any transport failure ⇒ treat as dead
+        return False
+    return (getattr(proc, "returncode", 1) == 0
+            and _HEAT_PROBE_TOKEN in (getattr(proc, "stdout", "") or ""))

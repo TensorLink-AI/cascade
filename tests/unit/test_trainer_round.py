@@ -744,6 +744,115 @@ def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"
 
 
+def _heat_recording_dispatcher(cfg):
+    """A fake RemoteDispatcher class that records (host, is_heat) per dispatch."""
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    dispatched: list[tuple[str, bool]] = []
+
+    class _FakeDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix="",
+                     warm_start_ref=None, lane_count=None):
+            dispatched.append((host.name, train_hours is not None))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    return _FakeDisp, dispatched
+
+
+def test_heat_excludes_dead_hosts_before_dispatch(cfg, tmp_path, monkeypatch):
+    # A dead pod answers TCP but fails the SSH echo; dispatching to it burns one
+    # challenger per attempt (rc=255). Probe first and dispatch heat only to the
+    # live host — the dead one gets nothing.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    live = RemoteHost(name="live", host="10.0.0.1")
+    dead = RemoteHost(name="dead", host="10.0.0.2")
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: h.name == "live")
+    FakeDisp, dispatched = _heat_recording_dispatcher(cfg)
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[live, dead], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_hosts = {name for name, is_heat in dispatched if is_heat}
+    assert heat_hosts == {"live"}                     # dead host excluded from the heat
+
+
+def test_heat_all_hosts_dead_raises_and_writes_no_marker(cfg, tmp_path, monkeypatch):
+    # If NO heat host survives the probe, fail the stage loudly rather than
+    # dispatch into a dead fleet — and never write the heat-complete marker.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteDispatchError, RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: False)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[RemoteHost(name="h1", host="10.0.0.1"),
+                                         RemoteHost(name="h2", host="10.0.0.2")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    with pytest.raises(RemoteDispatchError):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "1" / "heat_complete.json").exists()
+
+
+def test_heat_all_dispatches_transport_fail_refuse_to_cache(cfg, tmp_path, monkeypatch):
+    # Hosts pass the probe but every dispatch then dies rc=255 (pod went dark
+    # mid-round): a 0/N heat is a dead-fleet wipeout, not a screened field. It
+    # must NOT be cached as complete (a king-only manifest would publish) —
+    # raise so the round retries after operator intervention.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteDispatchError, RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: True)
+
+    class _DeadDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, **kw):
+            raise RemoteDispatchError(f"remote on {host.name} failed (rc=255)", returncode=255)
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _DeadDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[RemoteHost(name="h", host="10.0.0.1")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    with pytest.raises(RemoteDispatchError):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "1" / "heat_complete.json").exists()
+
+
 def test_reload_remote_hosts_per_round(cfg, tmp_path):
     # The elastic-fleet seam: hosts TOML re-read per round; missing/empty file ⇒
     # local round; the provisioner writing the file brings the fleet up without a

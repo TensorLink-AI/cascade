@@ -1346,11 +1346,26 @@ class TrainerRunner:
         import queue
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        from .remote import RemoteDispatcher
+        from .remote import RemoteDispatcher, RemoteDispatchError, probe_host
 
         if not self.trainer_spec:
             raise RuntimeError("remote heat requires trainer_spec (BaseTrainer 'module:Class')")
         hosts = self._hosts_for("heat")
+        # Liveness probe BEFORE fan-out: a dead pod that still answers TCP burns
+        # one challenger per dispatch (rc=255) until the whole field is spent, so
+        # exclude hosts that don't pass a real SSH echo and fail the stage loudly
+        # if none survive (rather than dispatching a field into a dead fleet).
+        if hosts:
+            live_hosts = [h for h in hosts if probe_host(h)]
+            if len(live_hosts) != len(hosts):
+                log.warning("heat: %d of %d host(s) failed the SSH liveness probe; "
+                            "excluding them from dispatch", len(hosts) - len(live_hosts),
+                            len(hosts))
+            if not live_hosts:
+                raise RemoteDispatchError(
+                    f"heat stage: all {len(hosts)} host(s) failed the SSH liveness "
+                    "probe — refusing to dispatch into a dead fleet")
+            hosts = live_hosts
         hub = self.hub()  # pre-init (thread-safe) before the pool
         # Heat dispatches get a TIGHT SSH timeout: the pod-side guard already
         # kills a slow run at the scaled max_train_seconds, so the only thing a
@@ -1385,6 +1400,7 @@ class TrainerRunner:
             return c, out_dir, entry.corpus_digest
 
         out: list[tuple[ResolvedGenerator, Path, str]] = []
+        transport_failures = 0
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
             futs = {ex.submit(_run, c): c for c in challengers}
             for done, fut in enumerate(as_completed(futs), start=1):
@@ -1392,8 +1408,18 @@ class TrainerRunner:
                 try:
                     out.append(fut.result())
                 except Exception as e:  # noqa: BLE001
+                    if getattr(e, "returncode", None) == 255:
+                        transport_failures += 1
                     log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
                 self._note_heat_progress(done, len(challengers))
+        # A heat where EVERY dispatch died at the transport level (rc=255) is a
+        # dead-fleet wipeout, not a screened-out field: refuse to let the caller
+        # cache a 0/N heat as complete (a king-only manifest would publish).
+        # Raise so the round retries after operator intervention.
+        if challengers and not out and transport_failures == len(challengers):
+            raise RemoteDispatchError(
+                f"heat stage: all {len(challengers)} dispatch(es) failed with transport "
+                "errors (rc=255) — refusing to cache a 0/N heat as complete")
         return out
 
     def _train_final(
