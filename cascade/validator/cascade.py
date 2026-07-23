@@ -31,9 +31,13 @@ The mechanism has three moving parts:
   a checkpoint itself as a fallback when the manifest lacks the numbers.
 
 * **Action.** The selected checkpoint is installed as the warm-start init for all
-  subsequent rounds (promoted **as-is** — never retrained or fine-tuned). Then the
-  throne is vacated: the reigning king is cleared, the competition re-opens so all
-  miners re-compete from the new init, and the reign clock resets.
+  subsequent rounds (promoted **as-is** — never retrained or fine-tuned). The king
+  PERSISTS on the throne — only its reign clock and checkpoint log reset, so the
+  next promotion needs a fresh ``cascade_reign_days`` reign. The throne is never
+  vacated: both roles train from the shared init, so promotion confers no relative
+  advantage to give back, and a vacated throne could only be refilled through a
+  dethrone — an incumbent that kept winning would leave it vacant and the clock
+  dead forever (DEC-CA-0004).
 
 The reign clock is wall-clock driven, so :class:`CascadeState` (king identity,
 reign start, and the reign's checkpoint log) is JSON-serialisable and persisted
@@ -162,7 +166,8 @@ class CascadeState:
 class CascadeEvent:
     """A fired Cascade: the record of what was promoted and why.
 
-    ``old_king`` reigned ``reign_days`` (wall-clock) before Cascade fired;
+    ``old_king`` reigned ``reign_days`` (wall-clock) before Cascade fired — the
+    name is historical; the king persists on the throne with a fresh clock.
     ``winner`` is the reign's lowest-score checkpoint, now installed as the
     warm-start init; ``timestamp`` is when the event fired (epoch seconds).
     """
@@ -179,7 +184,8 @@ class CascadeEvent:
 def crown(state: CascadeState, *, king_hotkey: str, now: float) -> CascadeState:
     """Re-crown for a newly-throned king: start the reign clock at ``now`` and
     clear the previous reign's checkpoint log. Called on every dethrone (Cascade
-    reuses KOTH's dethrone signal rather than reimplementing it). Idempotent for a
+    reuses KOTH's dethrone signal rather than reimplementing it) and on every
+    fired Cascade (the persisting king starts a fresh reign). Idempotent for a
     king that is already reigning *from the same instant* — but a genuine re-crown
     of the same hotkey (it lost and retook the throne) correctly restarts its
     clock, which is what a reign is."""
@@ -189,12 +195,6 @@ def crown(state: CascadeState, *, king_hotkey: str, now: float) -> CascadeState:
 def record_checkpoint(state: CascadeState, record: CheckpointRecord) -> CascadeState:
     """Append a scored checkpoint to the current reign's log (pure)."""
     return replace(state, checkpoints=(*state.checkpoints, record))
-
-
-def vacate() -> CascadeState:
-    """The throne after a Cascade: no king, clock stopped, log cleared. The next
-    dethrone (or genesis crown) starts a fresh reign."""
-    return CascadeState()
 
 
 def reign_seconds(state: CascadeState, now: float) -> float | None:
@@ -353,12 +353,13 @@ class CascadeController:
     def cascade_check(self, now: float) -> CascadeEvent | None:
         """The single per-round entry point: check the reign clock and, if it has
         reached ``reign_days`` with a checkpoint to promote, perform the Cascade —
-        install the reign's best checkpoint as the warm-start init, then vacate the
-        throne and reset the clock. Returns the :class:`CascadeEvent` when it fires,
-        else ``None`` (clock not yet ripe, throne vacant, or nothing to promote).
+        install the reign's best checkpoint as the warm-start init, then re-crown
+        the SAME king so its next promotion needs a fresh full reign. Returns the
+        :class:`CascadeEvent` when it fires, else ``None`` (clock not yet ripe,
+        throne vacant, or nothing to promote).
 
-        Install happens *before* the state is vacated, so if ``install_fn`` raises
-        the reign (and its clock) is left intact for a clean retry next round.
+        Install happens *before* the re-crown, so if ``install_fn`` raises the
+        reign (and its clock) is left intact for a clean retry next round.
         """
         state = self.state
         if state.king_hotkey is None or state.reign_start is None:
@@ -380,15 +381,15 @@ class CascadeController:
         event = CascadeEvent(
             old_king=state.king_hotkey, reign_days=days, winner=winner, timestamp=float(now)
         )
-        # Install first — a failure here must not vacate the throne (retried next
-        # round with the reign intact).
+        # Install first — a failure here must not touch the reign (retried next
+        # round with the clock intact).
         self._install(winner)
-        self.state = vacate()
+        self.state = crown(self.state, king_hotkey=state.king_hotkey, now=now)
         self._persist()
         log.info(
-            "CASCADE fired: old_king=%s reign=%.2fd winner=%s score=%.5f "
+            "CASCADE fired: king=%s reign=%.2fd winner=%s score=%.5f "
             "(gift crps=%.5f mase=%.5f, boom crps=%.5f mase=%.5f, time crps=%.5f mase=%.5f); "
-            "installed as warm-start init, throne vacated, competition re-opened",
+            "installed as warm-start init, king persists, reign clock reset",
             (event.old_king or "?")[:12], event.reign_days, winner.checkpoint_id,
             winner.score, winner.gifteval_crps, winner.gifteval_mase,
             winner.boom_crps, winner.boom_mase, winner.time_crps, winner.time_mase,

@@ -521,9 +521,9 @@ class ScoringConfig:
     # and the reigning king holds the throne ``cascade_reign_days`` CONSECUTIVE
     # WALL-CLOCK DAYS undethroned, the reign's best checkpoint (lowest geomean of
     # the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the trainer stamps onto the
-    # signed manifest) is installed as the warm-start init and the throne is
-    # vacated to re-open the competition from it. The reign clock is wall-clock, so
-    # it is persisted and survives restarts.
+    # signed manifest) is installed as the warm-start init; the king persists on
+    # the throne with a fresh reign clock (DEC-CA-0004). The reign clock is
+    # wall-clock, so it is persisted and survives restarts.
     cascade_enabled: bool = False
     cascade_reign_days: int = 7
 

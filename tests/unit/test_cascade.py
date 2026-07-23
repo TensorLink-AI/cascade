@@ -1,7 +1,7 @@
 """Cascade — king-reign promotion: trigger, selection, action, persistence.
 
 The wall-clock reign clock, per-reign checkpoint log, lowest-score selection, and
-the vacate-throne action are exercised here on the pure controller (no I/O beyond
+the persist-throne action are exercised here on the pure controller (no I/O beyond
 an optional temp state file). Time is passed explicitly as ``now`` so nothing
 depends on the wall clock. Checkpoints are scored on six public-benchmark numbers
 (GIFT-Eval / BOOM / TIME CRPS+MASE).
@@ -26,7 +26,6 @@ from cascade.validator.cascade import (
     reign_days,
     select_winner,
     should_cascade,
-    vacate,
 )
 
 DAY = 86_400.0
@@ -154,7 +153,7 @@ def test_select_winner_none_when_empty():
     assert select_winner(CascadeState(king_hotkey="k", reign_start=0.0)) is None
 
 
-# ── action: fire the cascade, install, vacate ────────────────────────────────
+# ── action: fire the cascade, install, persist the king ─────────────────────
 
 
 def test_cascade_fires_at_threshold_and_selects_best():
@@ -174,16 +173,35 @@ def test_cascade_fires_at_threshold_and_selects_best():
     assert [r.checkpoint_id for r in installed] == ["best"]
 
 
-def test_cascade_vacates_throne_and_resets_clock():
+def test_cascade_persists_king_and_resets_clock():
     ctl = CascadeController(reign_days=7)
     ctl.note_dethrone("kingA", now=0.0)
     _record(ctl, "c", gc=1, gm=1, tc=1, tm=1, now=DAY)
     ctl.cascade_check(now=7 * DAY)
-    # Throne vacated: no king, clock stopped, reign log cleared.
-    assert ctl.state == CascadeState()
-    assert reign_days(ctl.state, now=8 * DAY) is None
-    # A vacant throne never fires again until a new king is crowned.
+    # King persists (DEC-CA-0004); the reign clock restarts at the fire instant
+    # and the checkpoint log is cleared for the fresh reign.
+    assert ctl.state.king_hotkey == "kingA"
+    assert ctl.state.reign_start == 7 * DAY
+    assert ctl.state.checkpoints == ()
+    # No new checkpoint yet → a ripe clock alone can't fire again.
     assert ctl.cascade_check(now=100 * DAY) is None
+
+
+def test_cascade_fires_again_without_a_dethrone():
+    """The freeze regression (DEC-CA-0004): with the incumbent never dethroned,
+    each reign_days of reign with a recorded checkpoint fires another promotion.
+    Under the old vacate behavior the clock died after the first fire."""
+    installed: list[CheckpointRecord] = []
+    ctl = CascadeController(reign_days=7, install_fn=installed.append)
+    ctl.note_dethrone("kingA", now=0.0)
+    _record(ctl, "first", gc=1, gm=1, tc=1, tm=1, now=DAY)
+    assert ctl.cascade_check(now=7 * DAY) is not None
+    # Same king keeps reigning and produces a new checkpoint next reign.
+    _record(ctl, "second", gc=0.5, gm=0.5, tc=0.5, tm=0.5, now=8 * DAY)
+    assert ctl.cascade_check(now=13 * DAY) is None            # new reign not ripe
+    ev = ctl.cascade_check(now=14 * DAY)                      # 7d after the first fire
+    assert ev is not None and ev.old_king == "kingA"
+    assert [r.checkpoint_id for r in installed] == ["first", "second"]
 
 
 def test_cascade_holds_when_clock_ripe_but_no_checkpoint():
@@ -219,8 +237,8 @@ def test_new_reign_after_cascade_can_fire_again():
     ctl = CascadeController(reign_days=7)
     ctl.note_dethrone("kingA", now=0.0)
     _record(ctl, "a", gc=1, gm=1, tc=1, tm=1, now=DAY)
-    ctl.cascade_check(now=7 * DAY)          # fires, throne vacated
-    # A fresh king is crowned; its own reign clock starts from the crown instant.
+    ctl.cascade_check(now=7 * DAY)          # fires, kingA persists with a fresh clock
+    # A dethrone still works exactly as before: kingB takes the throne.
     ctl.note_dethrone("kingB", now=8 * DAY)
     _record(ctl, "b", gc=0.5, gm=0.5, tc=0.5, tm=0.5, now=9 * DAY)
     assert ctl.cascade_check(now=8 * DAY + 6 * DAY) is None
@@ -270,10 +288,6 @@ def test_load_state_corrupt_file_is_fresh(tmp_path):
     p = tmp_path / "bad.json"
     p.write_text("{not json", encoding="utf-8")
     assert load_state(p) == CascadeState()
-
-
-def test_vacate_is_empty_state():
-    assert vacate() == CascadeState()
 
 
 # ── config toggle: warm-start on/off ─────────────────────────────────────────
