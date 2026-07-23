@@ -12,8 +12,8 @@ from cascade.shared.chain import Commitment
 from cascade.shared.hippius import HubRef, HubUpload
 from cascade.shared.manifest import dump_manifest, load_manifest
 from cascade.trainer import loop as loop_mod
-from cascade.trainer.contract import TrainResult
-from cascade.trainer.loop import TrainerRunner, resolve_commitments
+from cascade.trainer.contract import RoundSeeds, TrainResult
+from cascade.trainer.loop import ResolvedGenerator, TrainerRunner, resolve_commitments
 
 REF_A = "alice/gen-a@sha256:" + "a" * 64
 REF_B = "bob/gen-b@sha256:" + "b" * 64
@@ -73,6 +73,32 @@ def _patch_train_boundaries(monkeypatch, digest_fn=None):
 def _commit(uid, hotkey, ref, block):
     return Commitment(uid=uid, hotkey=hotkey, coldkey=None,
                       payload=f"metro-v1:gen:hippius:{ref}", commit_block=block)
+
+
+def test_train_one_heat_tags_telemetry_apart_from_final(two_size_cfg, tmp_path, monkeypatch):
+    # A remote heat runs through train_one (on the pod), so heat=True must route
+    # its S3/wandb telemetry to heat-<hotkey> — not the final's <role>-<size>,
+    # which would collide the heat and final logs for the same challenger.
+    monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
+    runner = TrainerRunner(cfg=two_size_cfg, base_trainer=_FakeBaseTrainer(),
+                           work_root=tmp_path, use_sandbox=False)
+    seen: list[str] = []
+
+    def _capture(gen, seeds, contract, budget, out_dir, *, log_role):
+        seen.append(log_role)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return TrainResult(local_dir=out_dir, param_count=1, train_seconds=1.0,
+                           metrics={}), "digest", 1, 1
+
+    monkeypatch.setattr(runner, "_train_checkpoint", _capture)
+    seeds = RoundSeeds.derive(1, two_size_cfg.training)
+    gen = ResolvedGenerator(hotkey="b", uid=1, ref=REF_B)
+
+    runner.train_one(gen, "challenger", seeds, 10, heat=True)
+    runner.train_one(gen, "challenger", seeds, 10, heat=False)
+    assert seen[0] == "heat-b"                       # heat screen → per-hotkey key
+    assert seen[1].startswith("challenger-")         # final → <role>-<size> key
+    assert seen[0] != seen[1]
 
 
 def test_run_round_trains_king_and_challenger_at_every_size(two_size_cfg, tmp_path, monkeypatch):
@@ -767,7 +793,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     timeouts: list[tuple[bool, int]] = []
 
     class _FakeDisp:
-        def __init__(self, *, trainer_spec, timeout_seconds):
+        def __init__(self, *, trainer_spec, timeout_seconds, extra_forward_env=()):
             self.timeout_seconds = timeout_seconds
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,

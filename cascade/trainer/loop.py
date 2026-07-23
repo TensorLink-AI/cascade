@@ -674,6 +674,7 @@ class TrainerRunner:
         contract: TrainingContractConfig | None = None,
         token_budget: int | None = None,
         repo_suffix: str = "",
+        heat: bool = False,
     ) -> TrainedEntry:
         """Train one generator at one size, upload its checkpoint, return the receipt.
 
@@ -686,6 +687,14 @@ class TrainerRunner:
         repos (same seed/role/size) so parallel runs — several heat challengers, or
         finalists>1 at one size — never overwrite each other's checkpoint.
 
+        ``heat`` tags this run as a heat SCREEN rather than a final, so its S3 and
+        wandb telemetry lands at a distinct ``heat-<hotkey>`` key — matching the
+        local heat path (:meth:`_heat_train`). Without it a remote heat and the
+        final for the SAME challenger at the primary size share one ``<role>-<size>``
+        key, so their S3 logs collide and their wandb runs are indistinguishable
+        (and, with the deterministic run id, collapse into one). The receipt's
+        ``role`` is unaffected — the manifest still pairs king vs challenger.
+
         Raises on any failure; the caller decides whether a failed challenger
         simply doesn't qualify (it does) or a failed king aborts the round (it
         does — there's nothing to defend against).
@@ -694,8 +703,9 @@ class TrainerRunner:
         token_budget = token_budget if token_budget is not None else contract.train_tokens
         size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
+        log_role = f"heat-{gen.hotkey}" if heat else f"{role}-{size}"
         result, corpus_digest, _, _ = self._train_checkpoint(
-            gen, seeds, contract, token_budget, out_dir, log_role=f"{role}-{size}",
+            gen, seeds, contract, token_budget, out_dir, log_role=log_role,
         )
 
         ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
@@ -1076,6 +1086,17 @@ class TrainerRunner:
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
         return out
 
+    def _pod_extra_forward_env(self) -> tuple[str, ...]:
+        """Env vars every pod dispatch forwards on top of each host's own list.
+
+        When [wandb] is enabled the training runs on the pod, so the POD is where
+        ``open_wandb_run`` needs ``WANDB_API_KEY`` — forwarding it here means
+        pod-side wandb logs land without the operator having to name the key in
+        every host's ``forward_env`` (the silent-no-op that leaves wandb runs with
+        no training logs). Only forwarded if actually present in the orchestrator
+        env; absent ⇒ the pod's wandb no-ops exactly as before."""
+        return ("WANDB_API_KEY",) if getattr(self.cfg.wandb, "enabled", False) else ()
+
     def _hosts_for(self, stage: str) -> list:
         """The pods serving ``stage`` ("heat" | "final"): hosts tagged with that
         stage or ``"any"``. The cheap-GPU seam — heats can run on a cheaper SKU
@@ -1182,7 +1203,8 @@ class TrainerRunner:
         # where SSH never returns) holding a heat slot for the full 6h default.
         # Guard + 30min covers fetch/sandbox/upload overheads around training.
         heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
-        disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout)
+        disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout,
+                                extra_forward_env=self._pod_extra_forward_env())
 
         # Lane pool: dispatch lands on whichever GPU lane is actually idle
         # (see _dispatch_on_free_lane — the old i % n pin double-booked lanes).
@@ -1282,7 +1304,8 @@ class TrainerRunner:
             raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
         hosts = self._hosts_for("final")
         disp = RemoteDispatcher(
-            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds
+            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
+            extra_forward_env=self._pod_extra_forward_env(),
         )
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:

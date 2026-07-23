@@ -55,7 +55,10 @@ class RemoteHost:
     ``forward_env`` names env vars the orchestrator copies from its own
     environment into the remote command (e.g. registry/S3 credentials) — use it
     only if you have not pre-seeded the pod's env; the bittensor wallet is never
-    forwarded. ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
+    forwarded. ``WANDB_API_KEY`` need not be listed here: when [wandb] is enabled
+    the trainer auto-forwards it (RemoteDispatcher.extra_forward_env) so pod-side
+    wandb logs, since the training — and its wandb run — happen on the pod.
+    ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
 
     ``stage`` restricts which round stage the pod serves: ``"heat"`` (screen
     trainings only), ``"final"`` (king/finalist trainings only), or ``"any"``
@@ -289,6 +292,13 @@ class RemoteDispatcher:
 
     trainer_spec: str
     timeout_seconds: int = 6 * 3600       # generous: a full ~3h training + overhead
+    # Env vars forwarded to EVERY pod on top of each host's own ``forward_env``,
+    # when present in the orchestrator env. The seam for observability creds the
+    # operator shouldn't have to list per-host: the trainer sets it to
+    # ``("WANDB_API_KEY",)`` when [wandb] is enabled, so pod-side wandb (where the
+    # training actually runs) gets the key and its per-step logs land — instead of
+    # silently no-opping because the key never left the orchestrator.
+    extra_forward_env: tuple[str, ...] = ()
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -313,7 +323,10 @@ class RemoteDispatcher:
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
         )
-        env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
+        # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
+        # dict.fromkeys de-dups while preserving order if a host lists one too.
+        names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
+        env = {k: os.environ[k] for k in names if k in os.environ}
         remote_cmd = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
