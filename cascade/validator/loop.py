@@ -115,6 +115,15 @@ class RoundOutcome:
     king_tenure_rounds: int = 0
 
 
+# How long the live loop keeps re-trying a round whose eval-pool index cannot
+# be READ at the pin gate (auth/network/5xx — not absence) before rejecting it
+# for real. Sized for observed Hippius blips (seconds-to-minutes) with a wide
+# margin — ~15 polls at the default 120s manifest cadence. A persistent failure
+# (bad credentials, dead endpoint) still ends in the loud reject receipt, just
+# this much later.
+POOL_PIN_READ_GRACE_SECONDS = 1800.0
+
+
 @dataclass
 class ValidatorRunner:
     cfg: ChainConfig
@@ -143,6 +152,12 @@ class ValidatorRunner:
     # never set this process, so the first live-loop tick re-asserts
     # immediately (a restart is also a manual "refresh last_update now").
     _last_weight_block: int | None = None
+    # First-failure clock (time.monotonic) per round for an UNREADABLE eval-pool
+    # index at the pin gate. Within POOL_PIN_READ_GRACE_SECONDS the round is
+    # re-tried on the next manifest poll (no latch, no reject receipt); once the
+    # grace expires the reject goes through, loudly. In-memory on purpose: a
+    # restart merely restarts the grace clock, which is harmless.
+    _pin_read_first_failure: dict[str, float] = field(default_factory=dict, repr=False)
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -181,6 +196,12 @@ class ValidatorRunner:
         index or tampered tar surfaces here as a loud reject instead of scoring
         on attacker-chosen data. Unpinned manifests (older trainers) keep the
         legacy index-trust behaviour. Returns a reject reason or ``None``.
+
+        Raises :class:`~cascade.shared.hippius.StorageError` when the pool
+        index could not be READ (auth/network/5xx) — that is a transient, not a
+        verdict, and the caller decides retry-vs-reject (the live loop retries
+        within :data:`POOL_PIN_READ_GRACE_SECONDS`). Every other failure is a
+        reject reason.
         """
         if not (manifest.eval_pool_key and manifest.eval_pool_sha256):
             return None
@@ -190,7 +211,11 @@ class ValidatorRunner:
                     "validator's pool source reports no provenance")
         try:
             key, sha = prov_fn(int(manifest.round_id), block=block)
-        except Exception as e:  # noqa: BLE001 — an unreadable pool must reject, not crash
+        except Exception as e:  # noqa: BLE001 — an unverifiable pin must reject, not crash
+            from ..shared.hippius import StorageError
+
+            if isinstance(e, StorageError):
+                raise  # read failure, not a verdict — caller retries (see above)
             return f"pool_pin_unverifiable: provenance lookup failed: {e}"
         if not key or not sha:
             return ("pool_pin_unverifiable: manifest pins the eval pool but this "
@@ -200,6 +225,36 @@ class ValidatorRunner:
                     f"{manifest.eval_pool_sha256[:12]}…, this validator resolved "
                     f"{key}@{sha[:12]}…")
         return None
+
+    def _pool_pin_read_failed(
+        self, round_id: str, err: Exception, *, now: float | None = None
+    ) -> str | None:
+        """Grace bookkeeping for an UNREADABLE pool index at the pin gate.
+
+        Returns ``None`` while ``round_id``'s read failures span less than
+        :data:`POOL_PIN_READ_GRACE_SECONDS` — the caller then skips the cycle
+        with no latch and no receipt, so the next manifest poll re-attempts the
+        round from scratch. Once the grace expires, returns the terminal reject
+        reason (and forgets the round, so a later re-publish starts a fresh
+        grace window).
+        """
+        import time
+
+        now = time.monotonic() if now is None else now
+        first = self._pin_read_first_failure.setdefault(str(round_id), now)
+        waited = now - first
+        if waited < POOL_PIN_READ_GRACE_SECONDS:
+            log.warning(
+                "pool index unreadable at pin gate for round=%s (%s); retrying "
+                "next poll (%.0fs into %.0fs grace, no reject latched)",
+                round_id, err, waited, POOL_PIN_READ_GRACE_SECONDS,
+            )
+            return None
+        self._pin_read_first_failure.pop(str(round_id), None)
+        return (
+            f"pool_pin_unverifiable: provenance lookup failed persistently "
+            f"({waited:.0f}s > {POOL_PIN_READ_GRACE_SECONDS:.0f}s grace): {err}"
+        )
 
     def _check_gpu(self, manifest: TrainingManifest) -> str | None:
         """Matched-hardware gate for byte-exact re-derivation.
@@ -852,7 +907,7 @@ class ValidatorRunner:
         """
         import time
 
-        from ..shared.hippius import open_manifest_store, read_latest_manifest
+        from ..shared.hippius import StorageError, open_manifest_store, read_latest_manifest
         from ..shared.manifest import load_manifest
 
         store = open_manifest_store(self.cfg.storage)
@@ -891,14 +946,30 @@ class ValidatorRunner:
                     )
                     # Gate first so a rejected manifest never moves weights.
                     reason = self.check_manifest(manifest)
+                    retry_pin = False
                     if reason is None:
                         # Pool-pin gate: the signed snapshot pin must match this
                         # validator's own deterministic selection for the round.
-                        reason = self.check_pool_pin(
-                            manifest, window_source,
-                            block=self._epoch_start_block(manifest),
-                        )
-                    if reason is not None:
+                        try:
+                            reason = self.check_pool_pin(
+                                manifest, window_source,
+                                block=self._epoch_start_block(manifest),
+                            )
+                        except StorageError as e:
+                            # The index could not be READ (auth/network/5xx) —
+                            # a transient, not a verdict. Within the grace
+                            # window: no latch, no receipt, retry next poll.
+                            reason = self._pool_pin_read_failed(manifest.round_id, e)
+                            retry_pin = reason is None
+                        else:
+                            self._pin_read_first_failure.pop(str(manifest.round_id), None)
+                    if retry_pin:
+                        # In-grace read failure: neither last_round nor
+                        # last_digest move, so the next manifest poll re-judges
+                        # this round from scratch. Falls through to the weight
+                        # re-assert + sleep below.
+                        pass
+                    elif reason is not None:
                         log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
                         last_round, last_digest = manifest.round_id, digest
                         # A rejected round still gets a public receipt carrying
