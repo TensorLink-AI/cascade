@@ -546,6 +546,64 @@ def test_frozen_block_rebuilds_substrate_and_reads_fresh(cfg, tmp_path):
     assert client.reconnects == 1
 
 
+def test_raising_or_hung_chain_read_rebuilds_and_recovers(cfg, tmp_path):
+    # The other two quietly-dead-websocket modes the provisioner already guards:
+    # a read that RAISES and a read that HANGS. Both must rebuild the connection
+    # (reconnect) and retry once, not wedge or crash the loop.
+    import time as _time
+
+    from cascade.shared.chain import ChainError
+
+    # (a) current_block raises until the connection is rebuilt.
+    class _Raises:
+        def __init__(self):
+            self.reconnects = 0
+
+        def current_block(self):
+            if self.reconnects == 0:
+                raise ChainError("get_current_block_failed")
+            return 7000
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    raiser = _Raises()
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    assert runner._block_with_freeze_guard(raiser) == 7000
+    assert raiser.reconnects == 1
+
+    # (b) current_block HANGS past the read deadline until the rebuild; the slow
+    # first call finishes harmlessly on its leaked worker thread.
+    class _Hangs:
+        def __init__(self):
+            self.reconnects = 0
+
+        def current_block(self):
+            if self.reconnects == 0:
+                _time.sleep(0.4)          # exceeds chain_read_timeout_s below
+                return 1
+            return 8000
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    hanger = _Hangs()
+    runner2 = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                            use_sandbox=False, chain_read_timeout_s=0.05)
+    assert runner2._block_with_freeze_guard(hanger) == 8000
+    assert hanger.reconnects == 1
+
+    # A reconnect-less client (offline fake) still propagates a raise rather than
+    # crashing on a None reconnect.
+    class _RaisesNoReconnect:
+        def current_block(self):
+            raise ChainError("down")
+
+    with pytest.raises(ChainError):
+        runner._block_with_freeze_guard(_RaisesNoReconnect())
+
+
 def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
     # A round that dies MID-HEAT (pod fleet lost, trainer crash) must not consume
     # anyone's one lifetime submission: the burn is persisted only after the heat

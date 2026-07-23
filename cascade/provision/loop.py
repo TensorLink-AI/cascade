@@ -923,8 +923,11 @@ class ProvisionerLoop:
         if seed_fn is None:
             return None
         try:
-            seed = str(int(seed_fn(boundary)))
-        except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down
+            # Under the same hard deadline as every other chain read: a hung
+            # block_seed must not wedge the teardown sweep (this runs each cycle
+            # until the boundary is on-chain and the seed caches).
+            seed = str(int(self._with_deadline(lambda: seed_fn(boundary), 30.0)))
+        except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down / hung
             return None
         self._expected_seed_for = boundary
         self._expected_seed = seed
