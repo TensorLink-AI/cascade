@@ -373,3 +373,73 @@ def test_bootstrap_fast_fails_dead_port_but_waits_out_auth_lag(monkeypatch, tmp_
     boot = pm.make_bootstrap(script, render, timeout_s=60, pod_user="root", auth_wait_s=900.0)
     assert boot(addr, "heat") is False
     assert clock["t"] >= 900                              # full auth-lag wait
+
+
+# ── per-pod attestation must not mutate the frozen, stage-cached gate ─────────
+
+
+def test_make_health_check_per_pod_attestation_does_not_mutate_frozen_gate(monkeypatch):
+    """Regression for the boot/health crash of 2026-07-15 (pod b913a43b):
+    ``make_health_check`` caches one HealthGate per (stage, provider, sku, gpus)
+    and stamps each pod's provider-attested image digest onto it. HealthGate is
+    ``@dataclass(frozen=True)``, so assigning ``attested_digest`` on the cached
+    gate raised ``cannot assign to field 'attested_digest'`` and failed EVERY
+    pod's boot — counting as a boot failure that burned the once-only
+    replacement slot. The per-pod copy must go through ``dataclasses.replace``.
+
+    Here the pod's own env is unreadable (``printenv`` empty, ``/proc/1/environ``
+    unreadable — the sshd-as-PID-1 case), so only the provider attestation can
+    satisfy the image_digest pin: a matching ``attested_digest`` must PASS
+    without raising, and a non-matching one on the SAME cache key must FAIL —
+    proving each call gets its own gate rather than mutating a shared one."""
+    from cascade.provision.loop import RenderSettings
+    from cascade.provision.main import make_health_check
+    from cascade.provision.policy import ProvisionPolicy, StagePolicy
+
+    pin = "reg.example/worker@sha256:" + "a" * 64
+    df_ok = ("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+             "/dev/vda1 524288000 104857600 419430400 20% /\n")
+
+    def fake_run_ssh(ssh_argv, timeout=120):
+        cmd = ssh_argv[-1]                                 # build_ssh_argv puts it last
+        if cmd.startswith("echo "):
+            return SimpleNamespace(returncode=0, stdout="cascade-health-ok\n", stderr="")
+        if cmd.startswith("nvidia-smi"):
+            return SimpleNamespace(returncode=0, stdout="NVIDIA L40S\nNVIDIA L40S\n", stderr="")
+        if "torch.__version__" in cmd:
+            return SimpleNamespace(returncode=0, stdout="3.11 2.4.1+cu124\n", stderr="")
+        if "import cascade.trainer.worker" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd.startswith("printenv"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")       # env stripped
+        if cmd.startswith("cat "):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")       # /proc/1 unreadable
+        if cmd.startswith("df"):
+            return SimpleNamespace(returncode=0, stdout=df_ok, stderr="")
+        raise AssertionError(f"unexpected remote command: {cmd!r}")
+
+    import cascade.trainer.remote as remote_mod
+    monkeypatch.setattr(remote_mod, "run_ssh", fake_run_ssh)
+
+    stage = StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
+                        providers=("lium",), max_price_hr=3.0)
+    policy = ProvisionPolicy(heat=stage, final=stage, trigger_margin_blocks=25,
+                             max_spend_per_round=25.0)
+    render = RenderSettings(image=pin, ssh_pubkey="ssh-ed25519 AAAA orch",
+                            key_path="~/.ssh/cascade_ed25519")
+    check = make_health_check(policy, render, image_digest=pin, min_disk_gb=20.0,
+                              hippius_probe=lambda: True)
+    addr = PodAddress("10.0.0.5", 22)
+
+    # Provider attestation matches the pin → passes, and (the bug) does NOT raise.
+    ok = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
+    assert ok.ok, ok.summary()
+
+    # Same cache key, a pod with NO usable attestation → image_digest fails. If the
+    # first call had mutated the cached gate, this would still carry the old pin.
+    bad = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest="")
+    assert "image_digest" in {c.name for c in bad.failures}
+
+    # And the matching attestation still passes afterwards: the cache survived intact.
+    again = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
+    assert again.ok, again.summary()
