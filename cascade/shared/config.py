@@ -526,12 +526,13 @@ class ScoringConfig:
     # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
     # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
     # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
-    # and the reigning king holds the throne ``cascade_reign_days`` CONSECUTIVE
-    # WALL-CLOCK DAYS undethroned, the reign's best checkpoint (lowest geomean of
-    # the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the trainer stamps onto the
-    # signed manifest) is installed as the warm-start init and the throne is
-    # vacated to re-open the competition from it. The reign clock is wall-clock, so
-    # it is persisted and survives restarts.
+    # and the reigning king holds the throne ``cascade_reign_days`` worth of
+    # BLOCKS (7200/day at 12 s, anchored to the manifest's epoch block so every
+    # validator fires the same round) undethroned, the reign's best checkpoint
+    # (lowest geomean of the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the
+    # trainer stamps onto the signed manifest) is installed as the warm-start
+    # init; the king persists on the throne with a fresh reign clock
+    # (DEC-CA-0004). The clock is persisted and survives restarts.
     cascade_enabled: bool = False
     cascade_reign_days: int = 7
 
