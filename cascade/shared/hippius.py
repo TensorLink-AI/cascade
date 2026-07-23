@@ -50,6 +50,33 @@ class StorageError(RuntimeError):
     """Any Hippius registry or S3 operation failed."""
 
 
+class ObjectNotFound(StorageError):
+    """A GET failed specifically because the OBJECT is absent (404 / NoSuchKey).
+
+    Distinct from a plain :class:`StorageError` (auth, network, wrong
+    bucket/region, a transient 5xx), which means "could not read" rather than
+    "not there". Callers that treat an absent object as a normal empty state —
+    e.g. a not-yet-published pool index — must catch THIS, never bare
+    ``StorageError``, so a read failure surfaces loudly instead of masquerading
+    as absence. Subclasses ``StorageError`` so existing ``except StorageError``
+    handlers keep catching it."""
+
+
+def _is_missing_object(exc: Exception) -> bool:
+    """True when a boto GET failed because the object key is absent.
+
+    Matches a missing OBJECT (``NoSuchKey`` / HTTP 404) only — a missing or
+    inaccessible BUCKET (``NoSuchBucket``, ``403``, connection errors) is a
+    read failure, not absence, and must NOT be reported as "not there".
+    """
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return False
+    code = str(resp.get("Error", {}).get("Code", ""))
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {"NoSuchKey", "404"} or status == 404
+
+
 # A Hippius Hub model reference is ``<repo>@<digest>``: a repo id plus an
 # immutable OCI manifest digest. Two digest shapes are accepted — ``sha256:``
 # (the canonical Hub OCI digest a push returns) and ``hf:`` (a vanilla
@@ -630,6 +657,8 @@ class S3Store:
             resp = self.client().get_object(Bucket=self.cfg.bucket, Key=key)
             return resp["Body"].read()
         except Exception as e:  # noqa: BLE001
+            if _is_missing_object(e):
+                raise ObjectNotFound(f"s3_get_missing: {key}") from e
             raise StorageError(f"s3_get_failed: {key}: {e}") from e
 
     def get_text(self, key: str) -> str:
@@ -1247,10 +1276,19 @@ class PoolSnapshotMeta:
 
 
 def read_pool_index(store: S3Store) -> list[PoolSnapshotMeta]:
-    """Read the snapshot index, sorted by ``effective_block``. Empty if absent."""
+    """Read the snapshot index, sorted by ``effective_block``.
+
+    Returns ``[]`` only when the index is genuinely ABSENT (no snapshot
+    published yet). A read that FAILS — auth, network, wrong bucket/region, a
+    transient 5xx — raises :class:`StorageError` rather than masquerading as an
+    empty index. The old bare ``except StorageError: return []`` conflated the
+    two, so a pool-bucket read blip read as "no snapshot" and the validator
+    rejected every trainer-pinned round as ``pool_pin_unverifiable`` — silently
+    self-excluding from consensus (observed live 2026-07-22).
+    """
     try:
         text = store.get_text(POOL_INDEX_KEY)
-    except StorageError:
+    except ObjectNotFound:
         return []
     doc = json.loads(text)
     snaps = [PoolSnapshotMeta.from_dict(s) for s in doc.get("snapshots", [])]

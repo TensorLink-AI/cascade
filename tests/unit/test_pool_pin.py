@@ -52,12 +52,15 @@ def test_pin_without_verifiable_provenance_rejects():
     # no provenance hook on the source
     reason = ValidatorRunner.check_pool_pin(m, object(), block=1000)
     assert reason is not None and reason.startswith("pool_pin_unverifiable")
-    # source resolved no snapshot
+    # source resolved no snapshot (index genuinely ABSENT) → "resolved no snapshot"
     reason = ValidatorRunner.check_pool_pin(m, _source("", ""), block=1000)
     assert reason is not None and reason.startswith("pool_pin_unverifiable")
-    # provenance lookup blew up (unreadable index) — reject, never crash
+    assert "resolved no snapshot" in reason
+    # provenance lookup blew up (index UNREADABLE) — reject, never crash, and
+    # report the distinct failure so a bucket blip is not mistaken for absence.
     def boom(seed, *, block=None):
         raise RuntimeError("index unreadable")
     reason = ValidatorRunner.check_pool_pin(
         m, types.SimpleNamespace(provenance_for_round=boom), block=1000)
     assert reason is not None and reason.startswith("pool_pin_unverifiable")
+    assert "provenance lookup failed" in reason

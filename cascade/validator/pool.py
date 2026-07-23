@@ -200,12 +200,15 @@ class BucketWindowSource:
 
     def provenance_for_round(self, round_seed, *, block=None) -> tuple[str, str]:
         """``(snapshot_key, tar_sha256)`` of the snapshot active for the round —
-        the pool provenance recorded in the round receipt. ("", "") when the
-        index is unreadable or empty (the receipt then carries no pool pin)."""
-        try:
-            meta = self._select(block)
-        except Exception:  # noqa: BLE001 — provenance is best-effort metadata
-            return ("", "")
+        the pool provenance recorded in the round receipt.
+
+        Returns ``("", "")`` only when the index is genuinely ABSENT (no
+        snapshot published yet → the receipt carries no pool pin, legacy
+        behaviour). A read FAILURE propagates: the pin gate must reject it as an
+        unverifiable read (``provenance lookup failed``), never swallow it into
+        ``("", "")`` — which reads as "resolved no snapshot" and rejects a valid
+        trainer-pinned round for the wrong reason."""
+        meta = self._select(block)
         return (meta.key, meta.sha256) if meta is not None else ("", "")
 
 
