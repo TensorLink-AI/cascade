@@ -416,6 +416,14 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
+    # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
+    # its whole window and is public only for the last few minutes before the
+    # field locks. The margin must absorb commit-inclusion + drand reveal jitter
+    # (a reveal landing AT/after the boundary misses the round) while staying
+    # too short for a copier to fetch + re-commit + land their own reveal.
+    # ~25 blocks ≈ 5 min at 12s blocks; tighten after measuring live jitter.
+    reveal_margin_blocks: int = 25
 
 
 @dataclass(frozen=True)
@@ -893,6 +901,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
+            reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),

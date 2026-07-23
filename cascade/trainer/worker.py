@@ -93,7 +93,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         contract = cfg.training.for_size(match)
 
-    if args.train_hours is not None:
+    # A budget override (--train-hours) IS the heat/final discriminator: heats
+    # dispatch the cheap screen budget, finals don't. One flag drives both the
+    # wall-clock scaling and the telemetry label, so they never drift.
+    is_heat = args.train_hours is not None
+    if is_heat:
         # Heat/screen run: scale the token budget AND the hard wall-clock cap
         # to the cheap budget, so a stalling generator costs this pod minutes,
         # never the final's full max_train_seconds (rented hours are billed).
@@ -104,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
         )
     token_budget = contract.train_tokens
-    if args.train_hours is None:
+    if not is_heat:
         # Full-budget run ⇒ this is a FINAL: this pod is the runtime, so the
         # contract's train_image_digest pin (if set) must match the image digest
         # injected at pod launch. Refuse loudly rather than train off-contract.
@@ -116,9 +120,11 @@ def main(argv: list[str] | None = None) -> int:
             log.error("%s", e)
             return 2
     try:
+        # heat=is_heat ⇒ the run's S3/wandb telemetry lands at heat-<hotkey>,
+        # matching local heats and keeping it off the final's <role>-<size> key.
         entry = runner.train_one(gen, args.role, seeds, args.block,
                                  contract=contract, token_budget=token_budget,
-                                 repo_suffix=args.repo_suffix,
+                                 repo_suffix=args.repo_suffix, heat=is_heat,
                                  warm_start_ref=args.warm_start_ref)
     except CorpusError as e:
         # Miner fault (bad submission, private/missing artifact): one line and a

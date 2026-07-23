@@ -154,7 +154,7 @@ class TrainedEntry:
             raise ValueError(f"malformed trained_pointer: {self.trained_pointer!r}")
 
 
-HEAT_STATUSES = ("advanced", "screened", "failed_train", "failed_screen")
+HEAT_STATUSES = ("advanced", "screened", "failed_train", "failed_screen", "duplicate")
 
 
 @dataclass(frozen=True)

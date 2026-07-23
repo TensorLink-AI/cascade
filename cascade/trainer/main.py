@@ -262,6 +262,10 @@ def main(argv: list[str] | None = None) -> int:
         bench_eval_fn=bench_eval_fn,
         cascade_bench_plan=cascade_bench_plan,
         warm_start_path=warm_start_path,
+        # Live service: report the real round stage (status/round.json) so the
+        # dashboards show heat/duel/validation from the trainer, not a
+        # wall-clock estimate. Off by default for offline runs and tests.
+        publish_stage_status=True,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",
@@ -295,7 +299,7 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     block = int(client.current_block())
     epoch_blocks = max(1, cfg.round.epoch_blocks)
     next_boundary = (block // epoch_blocks + 1) * epoch_blocks
-    resolved = resolve_commitments(client.poll_commitments(),
+    resolved = resolve_commitments(client.poll_commitments(include_history=True),
                                    floor_block=cfg.round.commit_floor_block)
     # Same king resolution as the live round (loop.py run_forever): without
     # genesis_ref the vacant-throne fallback seats the lowest UID as interim

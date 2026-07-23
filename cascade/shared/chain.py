@@ -85,6 +85,48 @@ def equal_share_vector(
     return decayed_share_vector(reward_uids, n_uids, decay=1.0, burn_uid=burn_uid)
 
 
+def blocks_until_boundary_reveal(
+    current_block: int,
+    epoch_blocks: int,
+    margin_blocks: int,
+    *,
+    next_epoch: bool = False,
+    min_blocks: int = 1,
+) -> int:
+    """The ``blocks_until_reveal`` delay that lands a timelock reveal just
+    before the next epoch boundary.
+
+    Eligibility gates on the REVEAL block strictly before the boundary
+    (:func:`cascade.trainer.loop.resolve_commitments`), so a reveal that lands
+    at/after the boundary silently costs the miner the round. The target is
+    therefore ``boundary − margin_blocks``: hidden for (almost) the whole
+    submission window, public only for the last ``margin_blocks`` — long enough
+    to absorb commit-inclusion and drand reveal jitter, short enough that a
+    copier cannot fetch + re-commit + land their own reveal before the same
+    boundary.
+
+    When the current block is already inside the margin, floors to
+    ``min_blocks`` (reveal now): the residual exposure is below the margin
+    anyway, and revealing beats silently slipping past the deadline and losing
+    a full epoch. Pass ``next_epoch=True`` to target the following boundary
+    instead (for miners who prefer a guaranteed-hidden window over entering the
+    imminent round). Pure — unit-testable without a chain.
+    """
+    if epoch_blocks < 1:
+        raise ValueError(f"epoch_blocks must be >= 1, got {epoch_blocks}")
+    if not (0 <= margin_blocks < epoch_blocks):
+        raise ValueError(
+            f"margin_blocks must be in [0, epoch_blocks={epoch_blocks}), got {margin_blocks}"
+        )
+    if min_blocks < 1:
+        raise ValueError(f"min_blocks must be >= 1, got {min_blocks}")
+    boundary = (current_block // epoch_blocks + 1) * epoch_blocks
+    if next_epoch:
+        boundary += epoch_blocks
+    delay = boundary - margin_blocks - current_block
+    return max(delay, min_blocks)
+
+
 def seed_from_block_hash(block_hash: str) -> int:
     """A round base seed from a chain block hash: blake2b of the hex digest as a
     64-bit int. Pure — the audit CLI recomputes a receipt's ``base_seed`` from
@@ -136,7 +178,15 @@ def _import_bittensor():
 
 @dataclass(frozen=True)
 class Commitment:
-    """One miner's revealed generator pointer string."""
+    """One miner's revealed generator pointer string.
+
+    ``commit_block`` is the block the timelock payload became publicly
+    readable at (the REVEAL block — what bittensor's ``RevealedCommitments``
+    store records), NOT the block the encrypted commit landed. Round
+    eligibility gates on it (reveal strictly before the epoch boundary), so a
+    timed reveal must target the boundary minus a safety margin
+    (:func:`blocks_until_boundary_reveal`).
+    """
 
     uid: int
     hotkey: str
@@ -296,7 +346,7 @@ class ChainClient:
             raise ChainError("metagraph carries no weight matrix (lite node?)")
         return [float(w) for w in matrix[uid]]
 
-    def poll_commitments(self) -> list[Commitment]:
+    def poll_commitments(self, include_history: bool = False) -> list[Commitment]:
         """Return the revealed generator pointer for every UID on the netuid.
         UIDs without a commitment are omitted.
 
@@ -306,6 +356,13 @@ class ChainClient:
         ``get_all_revealed_commitments`` (one call for the whole netuid) and map
         each hotkey back to its UID, taking the latest reveal per hotkey. Falls
         back to the per-UID ``get_commitment`` path on older bittensor builds.
+
+        ``include_history=True`` returns EVERY retained reveal per hotkey (one
+        ``Commitment`` each) instead of only the latest. Any caller applying an
+        eligibility cutoff (trainer resolve, validator receipt participants,
+        audit cross-checks) needs the history: collapsing to the latest reveal
+        FIRST erases a miner whose newest commit landed after the cutoff, even
+        though their eligible pre-cutoff reveal is still on chain.
         """
         sub = self.subtensor()
         try:
@@ -332,32 +389,37 @@ class ChainClient:
                 log.warning("bulk revealed-commitment decode failed (%s); "
                             "reading the raw store map", e)
                 try:
-                    return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys)
+                    return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys,
+                                                  include_history=include_history)
                 except Exception as e2:  # noqa: BLE001
                     log.warning("raw store map failed (%s); "
                                 "falling back to per-UID decode", e2)
-                    return self._revealed_per_uid(sub, meta, coldkeys)
+                    return self._revealed_per_uid(sub, meta, coldkeys,
+                                                  include_history=include_history)
             for hotkey, reveals in revealed.items():
                 uid = uid_by_hotkey.get(str(hotkey))
                 if uid is None or not reveals:
                     continue
-                # ``reveals`` is a sequence of (block, payload); take the latest.
-                block, payload = max(reveals, key=lambda r: int(r[0]))
-                if not isinstance(payload, str) or not payload:
-                    continue
-                out.append(
-                    Commitment(
-                        uid=uid,
-                        hotkey=str(hotkey),
-                        coldkey=str(coldkeys[uid]) if coldkeys else None,
-                        payload=payload,
-                        commit_block=int(block),
+                # ``reveals`` is a sequence of (block, payload).
+                picked = reveals if include_history else \
+                    [max(reveals, key=lambda r: int(r[0]))]
+                for block, payload in picked:
+                    if not isinstance(payload, str) or not payload:
+                        continue
+                    out.append(
+                        Commitment(
+                            uid=uid,
+                            hotkey=str(hotkey),
+                            coldkey=str(coldkeys[uid]) if coldkeys else None,
+                            payload=payload,
+                            commit_block=int(block),
+                        )
                     )
-                )
             return out
 
         # No bulk API (older bittensor): decode per-UID.
-        return self._revealed_per_uid(sub, meta, coldkeys)
+        return self._revealed_per_uid(sub, meta, coldkeys,
+                                      include_history=include_history)
 
     def _raw_revealed_entries(self, sub: Any, hotkey: str) -> list[tuple[int, str]]:
         """Read ``Commitments::RevealedCommitments`` directly and decode BOTH
@@ -403,7 +465,8 @@ class ChainClient:
         return out
 
     def _revealed_raw_map(self, sub: Any, uid_by_hotkey: dict[str, int],
-                          coldkeys: list | None) -> list[Commitment]:
+                          coldkeys: list | None,
+                          include_history: bool = False) -> list[Commitment]:
         """All revealed commitments for the netuid in ONE ``query_map``, with the
         tolerant both-renderings decode per entry.
 
@@ -422,13 +485,16 @@ class ChainClient:
             entries = self._decode_reveal_entries(getattr(value, "value", value))
             if not entries:
                 continue
-            block, payload = max(entries, key=lambda r: int(r[0]))
-            out.append(Commitment(uid=uid, hotkey=hotkey,
-                                  coldkey=str(coldkeys[uid]) if coldkeys else None,
-                                  payload=payload, commit_block=int(block)))
+            picked = entries if include_history else \
+                [max(entries, key=lambda r: int(r[0]))]
+            for block, payload in picked:
+                out.append(Commitment(uid=uid, hotkey=hotkey,
+                                      coldkey=str(coldkeys[uid]) if coldkeys else None,
+                                      payload=payload, commit_block=int(block)))
         return out
 
-    def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None) -> list[Commitment]:
+    def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None,
+                          include_history: bool = False) -> list[Commitment]:
         """Decode each UID's revealed commitment individually — robust to a single
         malformed entry that would poison bittensor's batch decoder.
 
@@ -460,10 +526,12 @@ class ChainClient:
                     log.info("uid %d: recovered reveal via raw store (bittensor "
                              "decoder bug — payload-length lottery)", uid)
                 if reveals:
-                    block, payload = max(reveals, key=lambda r: int(r[0]))
-                    if isinstance(payload, str) and payload:
-                        out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                              payload=payload, commit_block=int(block)))
+                    picked = reveals if include_history else \
+                        [max(reveals, key=lambda r: int(r[0]))]
+                    for block, payload in picked:
+                        if isinstance(payload, str) and payload:
+                            out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
+                                                  payload=payload, commit_block=int(block)))
                     continue
             # Last resort: the plain commitment store (older bittensor).
             try:
@@ -472,11 +540,11 @@ class ChainClient:
                 rec = None
             if not rec:
                 continue
-            payload, commit_block = _split_commitment(rec)
+            payload, reveal_block = _split_commitment(rec)
             if payload is None:
                 continue
             out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                  payload=payload, commit_block=int(commit_block)))
+                                  payload=payload, commit_block=int(reveal_block)))
         return out
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
@@ -531,7 +599,7 @@ class ChainClient:
 
 
 def _split_commitment(rec: Any) -> tuple[str | None, int]:
-    """Best-effort extraction of ``(payload, commit_block)`` across bittensor
+    """Best-effort extraction of ``(payload, reveal_block)`` across bittensor
     versions: a plain string, a 2-tuple, a dict, or an object with attrs."""
     if rec is None:
         return None, 0

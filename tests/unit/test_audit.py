@@ -321,6 +321,30 @@ def test_chain_payload_contradiction_fails_cutoff(signed_receipt):
     assert r.status == C.FAIL and "chain shows" in r.detail
 
 
+def test_recommitted_participant_verified_via_history(signed_receipt):
+    # A participant who re-committed for a later round is still verifiable:
+    # the cross-check reads the full reveal history and matches the recorded
+    # (block, payload) pair, instead of writing them off as unverifiable.
+    client = _FakeChain(signed_receipt)
+    orig = client.poll_commitments
+
+    def with_history(include_history=False):
+        from cascade.shared.chain import Commitment
+
+        commits = orig()
+        assert include_history  # the audit must ask for the full history
+        c = commits[0]
+        commits.append(Commitment(c.uid, c.hotkey, None,
+                                  "metro-v1:gen:hippius:next/round@sha256:" + "a" * 64,
+                                  c.commit_block + 500))
+        return commits
+
+    client.poll_commitments = with_history
+    r = C.check_commit_cutoff(signed_receipt, client)
+    assert r.status in (C.PASS, C.WARN)
+    assert "chain payloads match" in r.detail
+
+
 def test_onchain_weight_support_mismatch_warns(audit_cfg, signed_receipt):
     # A differing on-chain row is inclusion lag or a later round's overwrite —
     # never falsifying on its own (the pure recomputations are), so WARN.

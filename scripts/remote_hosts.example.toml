@@ -13,6 +13,12 @@
 # HIPPIUS_S3_SECRET_KEY) OR list them under forward_env to have the orchestrator
 # pass them over SSH.
 #
+# WANDB_API_KEY is special: when [wandb] enabled=true, the trainer AUTO-forwards
+# it to every pod (the training — and its wandb run — happen on the pod), so you
+# do NOT need to list it under forward_env. It's only forwarded when present in
+# the orchestrator's own env; without it, pod-side wandb silently no-ops and the
+# runs show no per-step training logs.
+#
 # For BYTE-EXACT re-derivation, rent the SAME GPU SKU on both pods and pin it in
 # chain.toml [training] expected_gpu (the reference trainer runs deterministically;
 # the validator rejects any round whose two checkpoints weren't trained on it).

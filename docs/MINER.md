@@ -129,7 +129,7 @@ export HIPPIUS_HUB_PASSWORD=...
 You do **not** need S3 credentials — those are the trainer/validator's.
 
 Optionally, set a HuggingFace token if you want the outage fallback in
-[§5a](#5a-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
+[§5b](#5b-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
 
 ```bash
 export HF_TOKEN=hf_...               # only needed for `--hf-repo`
@@ -147,10 +147,12 @@ cascade deploy ./my-generator \
   --wallet-name my-miner --wallet-hotkey gen1 \
   --hub-repo my-namespace/my-generator
 # → pushed to Hippius Hub: my-namespace/my-generator@sha256:…
+#   timed reveal: payload decrypts ~block 48575 (4820 blocks from now, 25 blocks
+#   before the epoch boundary at 48600) — hidden until the field locks.
 #   committed: metro-v1:gen:hippius:my-namespace/my-generator@sha256:…
 ```
 
-Re-deploy any time to submit a new version — the latest pre-cutoff commit per
+Re-deploy any time to submit a new version — the latest pre-cutoff reveal per
 hotkey is the one that competes.
 
 > **⚠️ Your Hippius project must be PUBLIC.** The trainer pulls your generator
@@ -181,7 +183,102 @@ hotkey is the one that competes.
 > `(block, "metro-v1:gen:hippius:…")` as a clean string. If you were affected,
 > simply re-deploy from this environment — the newest commit wins.
 
-### 5a. If the Hippius Hub is down
+### 5a. Protecting your submission (timed reveal)
+
+**Threat model.** Everything on cascade is public *after* a round locks — that's
+what makes every round independently re-derivable, and studying (or forking) the
+reigning king is the intended game. What should **not** be possible is a
+competitor copying your *fresh* submission into the **same round**, free-riding
+on work that hasn't even been evaluated yet. Two things could leak it early:
+
+1. **The on-chain pointer.** Deploy defaults to a **timed reveal**: the
+   timelock-encrypted commit decrypts `[round] reveal_margin_blocks` (~5 min)
+   before the epoch boundary. Your pointer is hidden for its whole submission
+   window; by the time it's readable, a copier can no longer land their own
+   reveal before the cutoff (eligibility requires the *reveal* — not the commit —
+   to be strictly before the boundary). Flags:
+   - `--reveal-now` — reveal immediately (the old behaviour). Your ref is public
+     and copyable for the rest of the window; committing someone's exact ref
+     needs no upload at all.
+   - `--next-epoch` — target the *following* boundary when you'd rather sit out
+     the imminent round than deploy inside the margin.
+   - `--blocks-until-reveal N` — full manual control.
+   Don't try to out-tune the margin by hand: reveal timing jitters by a few
+   blocks, and a reveal landing at/after the boundary misses the round entirely.
+2. **The generator content itself.** The upload to your Hub repo happens at
+   deploy time, *before* the reveal — and a predictable repo name (or a public
+   HuggingFace mirror, which lists your whole account) lets a competitor watch
+   your namespace and copy the content without ever reading the chain. Use
+   `--hub-namespace my-namespace` instead of `--hub-repo`: each deploy then goes
+   to a fresh, non-guessable `my-namespace/gen-<random>` repo, so the content is
+   only discoverable through the (still-hidden) on-chain ref. Avoid the
+   `--hf-repo` fallback for competitive submissions; it exists for Hub outages.
+
+Copying is also unrewarding by construction, at both levels the trainer can see:
+
+- **Same ref** (someone commits your exact `repo@digest` string — needs no
+  upload): the **earliest reveal** keeps the slot; the copy is dropped before
+  any training.
+- **Same content** (someone re-uploads your generator bytes under their own
+  repo — a different ref): under the round's shared seed an identical generator
+  produces an identical **corpus digest**, and the trainer drops the clone —
+  before screening in the heat (`duplicate` in the standings), and from the
+  final's entries — again keeping the earliest reveal. A clone can therefore
+  never tie you and steal your slot on a tiebreak; a challenger whose corpus is
+  byte-identical to the king's is discarded outright.
+
+What remains possible inside the ~5-minute margin is a *modified* fork — which
+is just the ordinary (allowed) forking game played with almost no time to
+actually improve anything.
+
+#### After you deploy: confirm the reveal, and what a miss means
+
+Reveal timing jitters by a few blocks, so don't assume — confirm. `deploy`
+prints the exact command:
+
+```bash
+cascade reveal-status <your-hotkey-ss58> --network test \
+    --expect-boundary <printed-boundary> --watch
+# → revealed at block 48577 — eligible for the round locking at block 48600 …
+# or, loudly:
+# → ⚠ MISSED the targeted boundary 48600: the reveal landed 3 block(s) at/after it.
+```
+
+If the reveal **misses** its boundary:
+
+- The submission **auto-rolls into the next round** — no re-commit needed
+  (eligibility is just "revealed before that round's boundary").
+- It has **not** consumed your one-submission budget: the burn is persisted
+  only after a round's heat stage actually screened the field, and a missed
+  reveal never entered one.
+- The cost is secrecy, not eligibility: the ref is public until the next
+  boundary. The same-ref and same-content rules above still keep your slot
+  yours; if you'd rather enter *fresh, improved* content hidden, just
+  re-deploy — the **latest reveal per hotkey** is the one that competes.
+
+**Fat-fingered a deploy?** Same mechanism: re-deploy the corrected generator
+before the boundary. Both commitments will eventually reveal; the later reveal
+wins. Two timed deploys in one window may target the same reveal block — if you
+need the replacement to be unambiguous, give it `--next-epoch` (or a later
+explicit `--blocks-until-reveal`) so its reveal strictly follows the original's.
+
+Two empirical assumptions behind this scheme can (and should) be re-checked
+against the live network:
+
+```bash
+# is the margin big enough? (needs a throwaway testnet hotkey; ~minutes)
+python scripts/measure_reveal_jitter.py --chain-toml chain.testnet.toml \
+    --network test --wallet-name probe --wallet-hotkey probe1
+
+# is content behind a random repo name actually undiscoverable? (~seconds)
+python scripts/probe_hub_enumeration.py
+```
+
+If the registry turns out to be enumerable, random repo names don't hide
+content and the fallback is *sealed submissions* (upload ciphertext; the
+decryption key + plaintext digest ride in the timelocked payload).
+
+### 5b. If the Hippius Hub is down
 
 Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
 service from Hippius **S3** (which only the trainer/validator use). If the Hub is
@@ -215,12 +312,14 @@ How it works, and what to know:
   *not* auto-migrate — re-deploy with just `--hub-repo` to move your submission back
   onto the content-addressed Hub (the preferred, audit-anchored form).
 
-### 5b. Time your submission — `cascade round`
+### 5c. Time your submission — `cascade round`
 
 Only commits revealed **strictly before** the epoch boundary enter the next
 round; commit at or after it and you wait a whole extra round (~24h). `cascade
-round` is a live countdown dashboard to that deadline — run it before you
-deploy so you don't commit into the wrong round:
+round` is a live round dashboard: the countdown to that deadline, where the
+round roughly is, and the revealed submissions — run it before you deploy so
+you don't commit into the wrong round, and keep it running to see your own
+commit land:
 
 ```bash
 cascade round --network test --chain-toml chain.testnet.toml
@@ -232,6 +331,13 @@ cascade round --network test --chain-toml chain.testnet.toml
 #   countdown       20h 39m 12s until next round  (~12.0s/block)
 #   deadline        commit strictly before block 4,327,200 to enter epoch 601
 #   eta             2026-07-12 03:51 UTC (estimated)
+#   stage           heat ▸ [DUEL] ▸ validation ▸ settled
+#                   king vs finalists training at the full budget — 3h 20m 48s into the round (est.)
+#   last round      king held (uid 3)
+#   submissions     4 in this round · 1 committed for the next
+#     uid   47  5F3sab…8kQz  my-ns/my-generator@ab12cd34…      block 4,320,100  → next round   ● new
+#     uid   12  5DkPcd…1mVx  other/gen@77aabb01…               block 4,319,882  in this round
+#     …
 ```
 
 It ticks every second, re-syncing to the real block height every `--refresh`
@@ -242,9 +348,30 @@ ETA are estimates from the configured cadence (`[round] round_hours` over
 `epoch_blocks`, ~12s/block). Read-only — no wallet needed. Don't cut it to the
 last block: leave margin for the upload plus commit inclusion.
 
+What the two live sections mean:
+
+- **stage** — where the current round is: `heat` (every challenger trained
+  cheaply and screened), `duel` (king vs the surviving finalists at the full
+  budget), `validation` (validators scoring the duel and setting weights),
+  `settled` (this round's receipt is public — the line shows the verdict:
+  king held, dethroned, or rejected). The trainer's internal progress isn't
+  public, so the pre-settle stages are wall-clock **estimates** from the
+  configured budgets (marked `est.`); `settled` is confirmed from the public
+  receipt index and needs no credentials. `last round` shows the previous
+  round's verdict while the current one is still in flight.
+- **submissions** — the revealed on-chain commitments, newest first: who is
+  competing in the current round vs committed for the next one (relative to
+  the epoch boundary). In watch mode the field re-polls about once a minute,
+  and a commit that appears while you watch is flagged `● new` — after
+  `cascade deploy`, that flag on your UID is the confirmation your submission
+  is on chain and which round it will enter.
+
 ## 6. Confirm it's competing
 
-Your commit is now on chain. Verify it two ways:
+Your commit is now on chain. The quickest check is `cascade round` — your UID
+appears in its **submissions** feed (flagged `● new` if you were already
+watching), tagged with the round it enters ([§5c](#5c-time-your-submission--cascade-round)).
+To verify from first principles instead:
 
 ```bash
 # it shows in the revealed commitments for the netuid …
@@ -259,7 +386,7 @@ for cm in c.poll_commitments():
 PY
 ```
 
-Then watch the **public round receipts** (or the dashboard): committed *before*
+Then watch the **public round receipts** (or the dashboard): revealed *before*
 the epoch boundary, your generator enters the next round's **heat**, gets
 trained and scored, and appears in that round's receipt participant set with
 your `gen_ref`. If it wins the heat it advances to the full final against the
@@ -303,5 +430,5 @@ needed, just Hub read credentials.
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
-| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5b](#5b-time-your-submission--cascade-round)); or it failed to train (heat drops it) |
+| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it) |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape |

@@ -13,12 +13,24 @@
   generator, push it to your Hippius Hub repo, and commit
   ``metro-v1:gen:hippius:<repo>@<digest>`` via ``set_reveal_commitment``. The OCI
   digest content-addresses your submission, so ``repo@digest`` both locates and
-  pins it (no separate git SHA). Requires the ``[chain]`` extra (bittensor) + a
+  pins it (no separate git SHA). The timelock reveal defaults to TIMED: the
+  payload decrypts ``[round] reveal_margin_blocks`` before the next epoch
+  boundary, so the submission stays hidden for its whole window and cannot be
+  copied into its own round (``--reveal-now`` / ``--blocks-until-reveal`` /
+  ``--next-epoch`` override). Pair with ``--hub-namespace`` (a fresh
+  non-guessable repo per submission) so the content is as undiscoverable as the
+  pointer — see docs/MINER.md "Protecting your submission". Requires the ``[chain]`` extra (bittensor) + a
   wallet, and the ``[hippius]`` extra + Hub credentials in the environment.
   ``--hf-repo <namespace/name>`` is a HuggingFace fallback (``repo@hf:<sha>``) used
   ONLY if the Hub push fails — the Hub is always tried first, so a healthy Hippius
   always wins (you cannot bypass it while it's up). The chain commit and the
   trainer's fetch/audit treat an ``hf:`` ref exactly like a Hub one.
+
+* ``cascade reveal-status <hotkey|uid>`` — check whether a timelock reveal has
+  landed and which round it is eligible for; with ``--expect-boundary`` (deploy
+  prints it) a reveal that jittered past its target is reported as a LOUD miss
+  instead of failing silently. ``--watch`` polls until it lands. Read-only, no
+  wallet.
 
 * ``cascade fetch king`` (or a uid / hotkey / ``repo@digest``) — download a
   competitor's on-chain generator to a local dir so you can inspect or fork it.
@@ -29,10 +41,14 @@
 
 * ``cascade round`` — a live terminal dashboard counting down to the next
   round: current block, epoch progress, and the submission deadline (the next
-  epoch boundary — commit strictly before it to enter that round). Ticks every
-  second, re-syncing to the chain every ``--refresh`` seconds; ``--once``
-  prints a single snapshot (also the automatic behaviour when piped).
-  Read-only; needs the ``[chain]`` extra, no wallet.
+  epoch boundary — commit strictly before it to enter that round). Also shows
+  where the round roughly is (``heat ▸ duel ▸ validation ▸ settled`` —
+  estimated from the configured budgets, confirmed settled via the public
+  receipt index) and a live feed of revealed on-chain submissions (a commit
+  landing while you watch is flagged ``● new``). Ticks every second,
+  re-syncing to the chain every ``--refresh`` seconds; ``--once`` prints a
+  single snapshot (also the automatic behaviour when piped). Read-only; needs
+  the ``[chain]`` extra, no wallet.
 
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
@@ -69,12 +85,41 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--wallet-name", required=True, help="Bittensor wallet (coldkey) name.")
     p.add_argument("--wallet-hotkey", required=True, help="Bittensor wallet hotkey name.")
     p.add_argument("--wallet-path", default=None, help="Optional non-default wallet root.")
-    p.add_argument("--blocks-until-reveal", type=int, default=1)
+    p.add_argument(
+        "--blocks-until-reveal",
+        type=int,
+        default=None,
+        help="Explicit timelock reveal delay in blocks. Default: TIMED REVEAL — the "
+        "payload decrypts just before the next epoch boundary ([round] "
+        "reveal_margin_blocks early), so your submission stays hidden for its whole "
+        "window and competitors cannot copy it into the same round.",
+    )
+    p.add_argument(
+        "--reveal-now",
+        action="store_true",
+        help="Reveal immediately (blocks_until_reveal=1) instead of the timed default. "
+        "Your pointer is public for the rest of the window — copyable into this round.",
+    )
+    p.add_argument(
+        "--next-epoch",
+        action="store_true",
+        help="Time the reveal for the FOLLOWING epoch boundary instead of the imminent "
+        "one — a guaranteed-hidden window when you'd otherwise commit inside the "
+        "reveal margin, at the cost of sitting out the imminent round.",
+    )
     p.add_argument("--skip-verify", action="store_true", help="Skip the local verify before upload.")
     p.add_argument(
         "--hub-repo",
         default=None,
         help="Your Hippius Hub repo id (namespace/name) to push the generator to.",
+    )
+    p.add_argument(
+        "--hub-namespace",
+        default=None,
+        help="Push to a FRESH, non-guessable repo under this Hub namespace "
+        "(gen-<random hex>) instead of a fixed --hub-repo name. Recommended: a "
+        "predictable repo name lets competitors watch your namespace and copy the "
+        "generator content before the on-chain pointer ever reveals.",
     )
     p.add_argument(
         "--hf-repo",
@@ -253,7 +298,8 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
 def _add_round(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "round",
-        help="Live countdown dashboard to the next round (the submission deadline).",
+        help="Live round dashboard: deadline countdown, current stage "
+        "(heat/duel/validation/settled), and revealed submissions.",
     )
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
@@ -267,12 +313,20 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
 def _cmd_round(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainClient, ChainError
-    from .dashboard import run_dashboard
+    from .dashboard import (
+        RoundTimeline,
+        fetch_public_receipt_index,
+        fetch_public_round_status,
+        run_dashboard,
+    )
 
     try:
         client = ChainClient.from_config(cfg, network=args.network)
         return run_dashboard(
             client, cfg.round, args.network, once=args.once, refresh=args.refresh,
+            timeline=RoundTimeline.from_chain_config(cfg),
+            index_fetch=lambda: fetch_public_receipt_index(cfg.storage),
+            status_fetch=lambda: fetch_public_round_status(cfg.storage),
         )
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)
@@ -284,6 +338,138 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
     print(report.render())
     return 0 if report.ok else 1
+
+
+def _add_reveal_status(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "reveal-status",
+        help="Check whether a hotkey's timelock reveal has landed and which round "
+        "it is eligible for — catches a reveal that missed its target boundary.",
+    )
+    p.add_argument("hotkey", help="The miner hotkey (ss58) to check, or a UID (int).")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
+    p.add_argument(
+        "--expect-boundary",
+        type=int,
+        default=None,
+        help="The epoch boundary the deploy targeted (deploy prints it). With this "
+        "set, a reveal landing at/after it is reported as a LOUD miss.",
+    )
+    p.add_argument("--watch", action="store_true",
+                   help="Poll until the reveal lands (or --timeout-s expires).")
+    p.add_argument("--timeout-s", type=int, default=3600,
+                   help="Max seconds to watch for (default 1h).")
+    p.set_defaults(func=_cmd_reveal_status)
+
+
+def _reveal_verdict(
+    reveal_block: int,
+    current_block: int,
+    epoch_blocks: int,
+    margin_blocks: int,
+    expect_boundary: int | None = None,
+) -> tuple[bool, str]:
+    """Judge a landed reveal: ``(missed, human-readable report)``.
+
+    A reveal is eligible for the round locking at the first epoch boundary
+    STRICTLY AFTER it (the trainer's cutoff rule); ``missed`` is True only when
+    ``expect_boundary`` was given and the reveal landed at/after it. Pure —
+    unit-testable without a chain."""
+    eligible_boundary = (reveal_block // epoch_blocks + 1) * epoch_blocks
+    lead = eligible_boundary - reveal_block
+    lines = [f"revealed at block {reveal_block} — eligible for the round locking at "
+             f"block {eligible_boundary} ({lead} blocks of pre-boundary exposure)"]
+    if lead > margin_blocks:
+        lines.append(f"note: exposure exceeds the {margin_blocks}-block reveal margin — "
+                     "the ref was copyable for longer than the timed default allows.")
+    if current_block >= eligible_boundary:
+        lines.append("that round's field has locked; the submission is in it (or was, "
+                     "if since replaced).")
+    else:
+        lines.append(f"field locks in {eligible_boundary - current_block} block(s).")
+    missed = expect_boundary is not None and reveal_block >= expect_boundary
+    if missed:
+        lines.insert(0, f"⚠ MISSED the targeted boundary {expect_boundary}: the reveal "
+                        f"landed {reveal_block - expect_boundary} block(s) at/after it.")
+        lines.append("consequences: the submission auto-rolls into the NEXT round (no "
+                     "re-commit needed) but its ref is public until then — a copy can "
+                     "only tie it, never take its slot (earliest reveal wins), yet a "
+                     "derived/tweaked fork is now possible. It has NOT consumed the "
+                     "one-submission budget (that burns only after a heat screens it). "
+                     "To re-hide "
+                     "improved content instead, re-deploy: the latest reveal per hotkey "
+                     "wins.")
+    return missed, "\n".join(lines)
+
+
+def _pending_timelock(client, hotkey: str) -> tuple[int, int] | None:
+    """``(commit_block, reveal_round)`` of an un-revealed timelock commit, if any.
+
+    The plain commitment store (``Commitments::CommitmentOf``) holds the
+    encrypted payload until drand reveals it; once revealed the record is
+    consumed. Without this check, reveal-status shows the hotkey's PREVIOUS
+    reveal while a fresh timelock is pending — telling a miner their new
+    submission doesn't exist (observed during the 2026-07-15 live test)."""
+    try:
+        sub = client.subtensor()
+        q = sub.substrate.query(module="Commitments", storage_function="CommitmentOf",
+                                params=[client.netuid, hotkey])
+        v = getattr(q, "value", None) or {}
+        for f in ((v.get("info") or {}).get("fields") or []):
+            tl = f.get("TimelockEncrypted") if isinstance(f, dict) else None
+            if tl is not None:
+                return int(v.get("block") or 0), int(tl.get("reveal_round") or 0)
+    except Exception:  # noqa: BLE001 — advisory; never break the status report
+        return None
+    return None
+
+
+def _cmd_reveal_status(args: argparse.Namespace) -> int:
+    import time
+
+    cfg = load_chain_config(args.chain_toml)
+    from ..shared.chain import ChainClient, ChainError
+
+    client = ChainClient.from_config(cfg, network=args.network)
+    deadline = time.monotonic() + args.timeout_s
+
+    try:
+        while True:
+            commitments = client.poll_commitments()
+            if args.hotkey.isdigit():
+                match = next((c for c in commitments if c.uid == int(args.hotkey)), None)
+            else:
+                match = next((c for c in commitments if c.hotkey == args.hotkey), None)
+            pending = None if args.hotkey.isdigit() else _pending_timelock(client, args.hotkey)
+            if pending is not None and (match is None or pending[0] > match.commit_block):
+                blk, rnd = pending
+                print(f"PENDING timelock commit (committed at block {blk}, drand round "
+                      f"{rnd}) — payload still encrypted on-chain; nothing copyable yet."
+                      + (f" Latest REVEALED entry below is the PREVIOUS submission "
+                         f"(block {match.commit_block})." if match else ""))
+                if args.watch and time.monotonic() < deadline:
+                    time.sleep(12)
+                    continue
+                if match is None:
+                    return 0
+            if match is not None:
+                missed, report = _reveal_verdict(
+                    match.commit_block, client.current_block(),
+                    cfg.round.epoch_blocks, cfg.round.reveal_margin_blocks,
+                    args.expect_boundary,
+                )
+                print(report)
+                return 1 if missed else 0
+            if not args.watch or time.monotonic() >= deadline:
+                print("no revealed commitment for that hotkey — still timelock-hidden, "
+                      "never committed, or not registered on the netuid."
+                      + ("" if args.watch else " (--watch polls until it lands.)"))
+                return 0 if not args.watch else 1
+            time.sleep(12)
+    except ChainError as e:
+        print(f"chain error: {e}", file=sys.stderr)
+        return 3
 
 
 def _upload_generator(args: argparse.Namespace, cfg) -> tuple[int, str | None]:
@@ -310,6 +496,10 @@ def _upload_generator(args: argparse.Namespace, cfg) -> tuple[int, str | None]:
             return 4, None
         print(f"Hippius Hub upload failed ({e});\n"
               f"  falling back to HuggingFace mirror {args.hf_repo}", file=sys.stderr)
+        print("warning: HuggingFace repos are PUBLIC and enumerable — anyone watching "
+              "your HF account sees this generator's content now, before the on-chain "
+              "pointer reveals. Prefer retrying the Hub for a competitive submission.",
+              file=sys.stderr)
 
     try:
         up = upload_dir_to_hf(args.repo_dir, args.hf_repo)
@@ -321,16 +511,74 @@ def _upload_generator(args: argparse.Namespace, cfg) -> tuple[int, str | None]:
     return 0, up.ref.immutable_ref
 
 
+def _fresh_hub_repo(namespace: str) -> str:
+    """A non-guessable, single-use Hub repo id under ``namespace``.
+
+    Content is public-by-ref once fetched, but an unpredictable repo name keeps
+    the generator undiscoverable while its on-chain pointer is still
+    timelock-hidden — a predictable name lets competitors poll the namespace
+    and copy the content before the reveal."""
+    import secrets
+
+    return f"{namespace}/gen-{secrets.token_hex(6)}"
+
+
+def _resolve_blocks_until_reveal(args: argparse.Namespace, cfg, current_block: int) -> int:
+    """The reveal delay for this deploy: an explicit ``--blocks-until-reveal``
+    wins, ``--reveal-now`` forces 1, and the default is the TIMED reveal —
+    ``next epoch boundary − [round] reveal_margin_blocks`` (see
+    :func:`cascade.shared.chain.blocks_until_boundary_reveal`), floored to
+    reveal-now when already inside the margin. Flag validation (mutual
+    exclusion) happens in ``_cmd_deploy`` before any chain connection."""
+    from ..shared.chain import blocks_until_boundary_reveal
+
+    if args.blocks_until_reveal is not None:
+        return int(args.blocks_until_reveal)
+    if args.reveal_now:
+        return 1
+    delay = blocks_until_boundary_reveal(
+        current_block,
+        cfg.round.epoch_blocks,
+        cfg.round.reveal_margin_blocks,
+        next_epoch=args.next_epoch,
+    )
+    target = current_block + delay
+    epoch_blocks = cfg.round.epoch_blocks
+    boundary = (target // epoch_blocks + 1) * epoch_blocks
+    print(
+        f"timed reveal: payload decrypts ~block {target} "
+        f"({delay} blocks from now, {boundary - target} blocks before the epoch "
+        f"boundary at {boundary}) — hidden until the field locks. "
+        f"Override with --reveal-now / --blocks-until-reveal / --next-epoch."
+    )
+    return delay
+
+
 def _cmd_deploy(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
+
+    if args.reveal_now and (args.blocks_until_reveal is not None or args.next_epoch):
+        print("error: --reveal-now conflicts with --blocks-until-reveal / --next-epoch.",
+              file=sys.stderr)
+        return 2
+    if args.next_epoch and args.blocks_until_reveal is not None:
+        print("error: --next-epoch conflicts with an explicit --blocks-until-reveal.",
+              file=sys.stderr)
+        return 2
+    if args.hub_repo and args.hub_namespace:
+        print("error: pass --hub-repo OR --hub-namespace, not both.", file=sys.stderr)
+        return 2
+    if args.hub_namespace:
+        args.hub_repo = _fresh_hub_repo(args.hub_namespace)
+        print(f"fresh submission repo: {args.hub_repo}")
 
     ref = args.ref
     if ref is None:
         if not args.hub_repo:
-            print("error: --hub-repo (Hippius Hub) is required to upload — it is always "
-                  "tried first. --hf-repo is only a fallback for when the Hub push fails; "
-                  "pass it alongside --hub-repo. Or use --ref to commit an already-"
-                  "uploaded ref.", file=sys.stderr)
+            print("error: --hub-repo or --hub-namespace (Hippius Hub) is required to "
+                  "upload — the Hub is always tried first. --hf-repo is only a fallback "
+                  "for when the Hub push fails; pass it alongside one of them. Or use "
+                  "--ref to commit an already-uploaded ref.", file=sys.stderr)
             return 2
         # Verify locally (cheaper than burning a chain commit), then upload.
         if not args.skip_verify:
@@ -361,12 +609,31 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             wallet_hotkey=args.wallet_hotkey,
             wallet_path=args.wallet_path,
         )
-        client.commit_submission(payload, blocks_until_reveal=args.blocks_until_reveal)
+        current_block = client.current_block()
+        blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
+        client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)
         return 3
+    except ValueError as e:
+        # blocks_until_boundary_reveal rejects inconsistent [round] config
+        # (e.g. reveal_margin_blocks >= epoch_blocks).
+        print(f"bad [round] reveal config: {e}", file=sys.stderr)
+        return 2
 
     print(f"committed: {payload}")
+    if args.blocks_until_reveal is None and not args.reveal_now:
+        # A timed reveal that jitters past its boundary silently misses the
+        # round — hand the miner the exact command that catches it loudly.
+        target = current_block + blocks_until_reveal
+        boundary = (target // cfg.round.epoch_blocks + 1) * cfg.round.epoch_blocks
+        try:
+            hotkey = client.wallet().hotkey.ss58_address
+        except Exception:  # noqa: BLE001 — a hint must never fail the deploy
+            hotkey = "<your-hotkey-ss58>"
+        print(f"confirm the reveal lands in time (from ~block {target}):\n"
+              f"  cascade reveal-status {hotkey} --network {args.network} "
+              f"--expect-boundary {boundary} --watch")
     return 0
 
 
@@ -379,6 +646,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_deploy(sub)
     _add_fetch(sub)
     _add_score(sub)
+    _add_reveal_status(sub)
     _add_round(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))

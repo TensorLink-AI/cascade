@@ -278,33 +278,37 @@ def check_commit_cutoff(
 def _cutoff_chain_note(receipt: RoundReceipt, client: object) -> str:
     """Cross-check recorded participants against currently visible reveals.
 
-    Only a definite contradiction (same hotkey, same block, different payload)
-    is a FAIL; a hotkey that re-committed since the round is unverifiable on a
-    lite node and noted as such.
+    Reads the FULL retained reveal history per hotkey, so a participant stays
+    verifiable even after re-committing for a later round. Only a definite
+    contradiction (same hotkey, same block, different payload) is a FAIL; a
+    reveal the chain no longer retains (pruned history, deregistered hotkey,
+    lite node) is noted as unverifiable.
     """
     from ..interface.validation import parse_commit
 
     try:
-        commitments = client.poll_commitments()
+        try:
+            commitments = client.poll_commitments(include_history=True)
+        except TypeError:  # pre-history client: latest reveal only
+            commitments = client.poll_commitments()
     except Exception as e:  # noqa: BLE001
         return f"; chain payload cross-check unavailable ({e})"
-    latest = {c.hotkey: c for c in commitments}
+    by_hotkey: dict[str, dict[int, str]] = {}
+    for c in commitments:
+        by_hotkey.setdefault(c.hotkey, {})[int(c.commit_block)] = c.payload
     unverifiable = 0
     for p in receipt.participants:
-        c = latest.get(p.hotkey)
-        if c is None:
-            unverifiable += 1  # deregistered / lite node without the reveal
+        payload = by_hotkey.get(p.hotkey, {}).get(int(p.commit_block))
+        if payload is None:
+            unverifiable += 1  # reveal no longer on chain / deregistered / lite node
             continue
-        parsed = parse_commit(c.payload)
-        if c.commit_block == p.commit_block:
-            if parsed is None or parsed.ref != p.gen_ref:
-                return (f"FAIL:participant {p.hotkey} recorded gen_ref {p.gen_ref[:32]}… "
-                        f"but chain shows {getattr(parsed, 'ref', c.payload)[:32]}… "
-                        f"at the same block {p.commit_block}")
-        else:
-            unverifiable += 1  # re-committed since; history not addressable
+        parsed = parse_commit(payload)
+        if parsed is None or parsed.ref != p.gen_ref:
+            return (f"FAIL:participant {p.hotkey} recorded gen_ref {p.gen_ref[:32]}… "
+                    f"but chain shows {getattr(parsed, 'ref', payload)[:32]}… "
+                    f"at the same block {p.commit_block}")
     if unverifiable:
-        return f"; {unverifiable} participant(s) re-committed since (history unverifiable)"
+        return f"; {unverifiable} participant(s) unverifiable (reveal no longer on chain)"
     return "; chain payloads match"
 
 

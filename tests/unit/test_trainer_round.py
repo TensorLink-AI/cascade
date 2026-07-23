@@ -12,8 +12,8 @@ from cascade.shared.chain import Commitment
 from cascade.shared.hippius import HubRef, HubUpload
 from cascade.shared.manifest import dump_manifest, load_manifest
 from cascade.trainer import loop as loop_mod
-from cascade.trainer.contract import TrainResult
-from cascade.trainer.loop import TrainerRunner, resolve_commitments
+from cascade.trainer.contract import RoundSeeds, TrainResult
+from cascade.trainer.loop import ResolvedGenerator, TrainerRunner, resolve_commitments
 
 REF_A = "alice/gen-a@sha256:" + "a" * 64
 REF_B = "bob/gen-b@sha256:" + "b" * 64
@@ -23,9 +23,11 @@ REF_OUT = "cascade/ckpt-out@sha256:" + "e" * 64
 
 
 class _FakeStream:
-    digest = "corpusdigest"
     n_series = 3
     total_points = 192
+
+    def __init__(self, digest="corpusdigest"):
+        self.digest = digest
 
     def __enter__(self):
         return self
@@ -54,15 +56,49 @@ def _fake_upload(local_dir, repo, hub=None, *, hf_repo=None, hf_token=None):
     return HubUpload(ref=HubRef.parse(REF_OUT), size_bytes=1)
 
 
-def _patch_train_boundaries(monkeypatch):
+def _patch_train_boundaries(monkeypatch, digest_fn=None):
+    """Fake the GPU/registry boundaries. Real corpus digests hash generator
+    CONTENT (distinct miners ⇒ distinct digests; byte-identical clones collide),
+    so the default derives a per-miner digest from the fetched generator dir.
+    Pass a collapsing ``digest_fn(gen_dir) -> str`` to simulate content clones."""
+    fn = digest_fn or (lambda gen_dir: f"digest-{gen_dir}")
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
-    monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(
+        loop_mod, "open_round_stream",
+        lambda mode, gen_dir, *a, **k: _FakeStream(digest=fn(gen_dir)),
+    )
     monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 
 def _commit(uid, hotkey, ref, block):
     return Commitment(uid=uid, hotkey=hotkey, coldkey=None,
                       payload=f"metro-v1:gen:hippius:{ref}", commit_block=block)
+
+
+def test_train_one_heat_tags_telemetry_apart_from_final(two_size_cfg, tmp_path, monkeypatch):
+    # A remote heat runs through train_one (on the pod), so heat=True must route
+    # its S3/wandb telemetry to heat-<hotkey> — not the final's <role>-<size>,
+    # which would collide the heat and final logs for the same challenger.
+    monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
+    runner = TrainerRunner(cfg=two_size_cfg, base_trainer=_FakeBaseTrainer(),
+                           work_root=tmp_path, use_sandbox=False)
+    seen: list[str] = []
+
+    def _capture(gen, seeds, contract, budget, out_dir, *, log_role, warm_start_dir=None):
+        seen.append(log_role)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return TrainResult(local_dir=out_dir, param_count=1, train_seconds=1.0,
+                           metrics={}), "digest", 1, 1
+
+    monkeypatch.setattr(runner, "_train_checkpoint", _capture)
+    seeds = RoundSeeds.derive(1, two_size_cfg.training)
+    gen = ResolvedGenerator(hotkey="b", uid=1, ref=REF_B)
+
+    runner.train_one(gen, "challenger", seeds, 10, heat=True)
+    runner.train_one(gen, "challenger", seeds, 10, heat=False)
+    assert seen[0] == "heat-b"                       # heat screen → per-hotkey key
+    assert seen[1].startswith("challenger-")         # final → <role>-<size> key
+    assert seen[0] != seen[1]
 
 
 def test_run_round_trains_king_and_challenger_at_every_size(two_size_cfg, tmp_path, monkeypatch):
@@ -172,6 +208,59 @@ def test_heat_complete_marker_written_when_heat_settles(cfg, tmp_path, monkeypat
     marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
     assert marker == {"round_id": "1", "screened": 3, "finalists": ["c"]}
     assert not (tmp_path / "1" / "heat_complete.json.tmp").exists()  # atomic publish
+
+
+def test_round_stage_reported_heat_duel_validation(cfg, tmp_path, monkeypatch):
+    """Live stage reporting (status/round.json): a heat doc at round start, a
+    duel doc when the heat settles, a validation doc after the manifest
+    publish — each carrying the round's epoch join key. Enabled only for the
+    live service (publish_stage_status)."""
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(loop_mod, "publish_manifest",
+                        lambda store, text, rid: f"manifests/round-{rid}.json")
+
+    class _StageStore:
+        def __init__(self):
+            self.docs = []
+
+        def put_text(self, key, text, *, content_type="", acl=None):
+            self.docs.append((key, json.loads(text)))
+
+    store = _StageStore()
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    runner._manifest_store = store
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    runner.publish(manifest)
+
+    stage_docs = [d for k, d in store.docs if k == "status/round.json"]
+    assert [d["stage"] for d in stage_docs] == ["heat", "duel", "validation"]
+    heat, duel, _validation = stage_docs
+    assert heat["round_id"] == "1"
+    assert (heat["heat_done"], heat["heat_total"]) == (0, 3)
+    assert (duel["heat_done"], duel["heat_total"], duel["finalists"]) == (3, 3, 1)
+    # all three report the same epoch join key the dashboards derive
+    assert len({d["epoch_start_block"] for d in stage_docs}) == 1
+
+
+def test_round_stage_reporting_off_by_default(cfg, tmp_path, monkeypatch):
+    """Offline runs and tests must never touch storage: without
+    publish_stage_status the round publishes no stage docs."""
+    _patch_train_boundaries(monkeypatch)
+
+    class _Boom:
+        def put_text(self, *a, **k):
+            raise AssertionError("stage doc published with reporting off")
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _Boom()
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)  # no raise
 
 
 def test_heat_complete_marker_written_even_without_a_screen(cfg, tmp_path, monkeypatch):
@@ -393,7 +482,7 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
                                "train_hours": train_hours, "repo_suffix": repo_suffix})
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
@@ -520,7 +609,7 @@ def test_remote_dispatch_retries_once_on_next_host(cfg, tmp_path, monkeypatch):
                 raise RuntimeError("pod flake")
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
@@ -577,9 +666,10 @@ def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
             if train_hours is None:      # final: single job per host, not under test
                 return TrainedEntry(
                     miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                    trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
-                    train_block=block, gpu_name="",
-                    size=arch_preset or cfg.training.arch_preset,
+                    trained_pointer=format_trained_pointer(REF_OUT),
+                    corpus_digest=f"d-{hotkey}",  # per-miner: a constant digest reads
+                    train_block=block, gpu_name="",  # as byte-identical content and the
+                    size=arch_preset or cfg.training.arch_preset,  # clone drop collapses it
                 )
             with lock:
                 if id(host) in active:
@@ -592,7 +682,7 @@ def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
                 _time.sleep(0.05)            # the others are still mid-heat
                 return TrainedEntry(
                     miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                    trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                    trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                     train_block=block, gpu_name="",
                     size=arch_preset or cfg.training.arch_preset,
                 )
@@ -644,7 +734,7 @@ def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
         def current_block(self):
             return 3 * cfg.round.epoch_blocks + 100
 
-        def poll_commitments(self):
+        def poll_commitments(self, include_history=False):
             return [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
                     _commit(2, "c", REF_A, 7)]   # 'c' copies the king's ref → deduped
 
@@ -707,7 +797,7 @@ def test_stage_tagged_hosts_split_heat_from_final(cfg, tmp_path, monkeypatch):
             dispatched.append((host.name, role, train_hours is not None))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
@@ -756,7 +846,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     timeouts: list[tuple[bool, int]] = []
 
     class _FakeDisp:
-        def __init__(self, *, trainer_spec, timeout_seconds):
+        def __init__(self, *, trainer_spec, timeout_seconds, extra_forward_env=()):
             self.timeout_seconds = timeout_seconds
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
@@ -764,7 +854,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
             timeouts.append((train_hours is not None, self.timeout_seconds))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
-                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest="d",
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
                 train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
             )
 
@@ -791,6 +881,78 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     assert heat_timeouts == {heat_guard + 1800}          # 5400 + 1800 on chain.toml
     assert final_timeouts == {runner.remote_timeout_seconds}
 
+
+def test_heat_drops_content_clone_keeping_earliest_reveal(cfg, tmp_path, monkeypatch):
+    # 'c' re-uploaded 'b''s generator content under its own repo (different ref,
+    # so plan_round's ref dedup can't see it) and revealed later. The heat's
+    # corpus-digest dedup drops 'c' before screening — a clone must never tie
+    # its original and steal the finalist slot on the UID tiebreak.
+    def collapse(gen_dir):
+        s = str(gen_dir)
+        return "cloned-corpus" if ("/heat/b/" in s or "/heat/c/" in s) else s
+
+    _patch_train_boundaries(monkeypatch, digest_fn=collapse)
+    scores = {"b": 0.9, "d": 0.5}
+    seen: list[str] = []
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        seen.append(gen.hotkey)
+        return scores[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert "c" not in seen  # the clone is never even screened
+    assert manifest.entry_for_role("challenger").miner_hotkey == "d"
+    status = {e.hotkey: e.status for e in manifest.heat.entrants}
+    assert status["c"] == "duplicate"
+    assert status["b"] == "screened" and status["d"] == "advanced"
+
+
+def test_final_drops_challenger_whose_corpus_matches_the_king(cfg, tmp_path, monkeypatch):
+    # 'b' re-uploaded the KING's generator content under a fresh repo — a
+    # different ref, so the ref-level duplicate-of-king filter misses it. The
+    # corpus digest cannot: identical content under the round's shared seed
+    # yields an identical corpus, and the final drops the clone entry.
+    _patch_train_boundaries(monkeypatch, digest_fn=lambda gen_dir: "same-content")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entry_for_role("king").gen_ref == REF_A
+    assert manifest.entries_for_role("challenger") == []
+
+
+def test_drop_final_content_clones_prefers_earliest_reveal():
+    # Pure check of the challenger-vs-challenger rule: same corpus digest at the
+    # same size → only the earliest reveal survives, whatever the UID order.
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+    from cascade.trainer.loop import ResolvedGenerator, _drop_final_content_clones
+
+    tp = format_trained_pointer(REF_OUT)
+
+    def entry(hotkey, uid, digest, role="challenger", size="s1"):
+        return TrainedEntry(miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=REF_B,
+                            trained_pointer=tp, corpus_digest=digest, train_block=10,
+                            size=size)
+
+    jobs = [
+        (ResolvedGenerator("king", 0, REF_A, reveal_block=1), "king"),
+        (ResolvedGenerator("orig", 9, REF_B, reveal_block=100), "challenger"),
+        (ResolvedGenerator("copier", 1, REF_C, reveal_block=200), "challenger"),
+    ]
+    entries = [
+        entry("king", 0, "king-digest", role="king"),
+        entry("orig", 9, "shared"),
+        entry("copier", 1, "shared"),      # lower UID, later reveal — must lose
+        entry("copier", 1, "unique", size="s2"),  # different corpus at s2 — kept
+    ]
+    kept = _drop_final_content_clones(entries, jobs)
+    assert [(e.miner_hotkey, e.size) for e in kept] == [
+        ("king", "s1"), ("orig", "s1"), ("copier", "s2")]
 
 def test_commit_floor_drops_pre_launch_commits():
     """Mainnet go-live gate: commits from before floor_block never resolve —

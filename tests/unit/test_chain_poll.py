@@ -32,7 +32,7 @@ class _Sub:
         # per-UID revealed data: (block, payload) tuples; uid 2 has none at all
         self._reveals = {
             0: ((100, _payload("gen0")),),
-            1: ((110, _payload("gen1")),),
+            1: ((90, _payload("gen1old")), (110, _payload("gen1"))),
             3: ((130, _payload("gen3")),),
         }
 
@@ -135,3 +135,37 @@ def test_malformed_batch_prefers_one_shot_raw_map():
     assert by_uid[1].commit_block == 110                  # latest, garbage skipped
     assert by_uid[1].payload == RAW_PAYLOAD               # raw rendering decoded
     assert by_uid[0].coldkey == CK[0]
+
+
+# ── include_history: the eligibility-cutoff read ──────────────────────────────
+# Callers that apply a cutoff (trainer resolve, receipt participants, audit)
+# need EVERY retained reveal: latest-only reads erase a miner whose newest
+# commit landed after the boundary, even though the pre-cutoff reveal that
+# fielded the round is still on chain (observed live: 9 of 30 entrants missing
+# from a round receipt after re-committing for the next round).
+
+
+def test_bulk_history_returns_every_reveal():
+    out = _client(_Sub()).poll_commitments(include_history=True)
+    assert sorted(c.commit_block for c in out if c.uid == 1) == [90, 110]
+    # everyone else still contributes their single reveal
+    assert sorted({c.uid for c in out}) == [0, 1, 3]
+    # the latest-only default is unchanged
+    latest = _client(_Sub()).poll_commitments()
+    assert [c.commit_block for c in latest if c.uid == 1] == [110]
+
+
+def test_per_uid_history_returns_every_reveal():
+    out = _client(_SubNoBulk()).poll_commitments(include_history=True)
+    assert sorted(c.commit_block for c in out if c.uid == 1) == [90, 110]
+
+
+def test_raw_map_history_returns_every_decodable_reveal():
+    out = _client(_SubRawMap()).poll_commitments(include_history=True)
+    # both of HK1's entries come back (the tolerant decoder yields SOME payload
+    # for the garbage one — parse_commit rejects it downstream, same as any
+    # malformed commitment); the real reveal is intact
+    by_block = {c.commit_block: c for c in out if c.uid == 1}
+    assert sorted(by_block) == [90, 110]
+    assert by_block[110].payload == RAW_PAYLOAD
+    assert sorted({c.uid for c in out}) == [0, 1, 3]

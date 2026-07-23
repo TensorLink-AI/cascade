@@ -93,8 +93,10 @@ flowchart TD
 **The round cadence.** A round is one ~24h epoch (`[round] epoch_blocks`): the
 trainer runs exactly one round per day, so the king is trained once per day and
 the whole day's trainings share one `RoundSeeds` (identical random init). Only
-generators committed on-chain *before* the epoch boundary compete in that round —
-commit late and you're in the next one. Each round has two stages: a cheap
+generators whose on-chain pointer *revealed* strictly before the epoch boundary
+compete in that round — deploy defaults to a timed reveal targeting just before
+the boundary (docs/MINER.md §5a), and a reveal that lands late rolls into the
+next one. Each round has two stages: a cheap
 **heat** trains every eligible challenger for `[round] heat_train_hours` (~30min,
 primary size) and the owner screens them down to the top `[round] finalists`; the
 **final** then trains the king and the surviving finalist to the full

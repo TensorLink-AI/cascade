@@ -137,7 +137,8 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
 # squatters / rehearsal commits from before the official start never enter a
 # round (and never burn their one submission).
-commit_floor_block = 8622922
+commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
+                              # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest). When set, the trainer trains THIS generator as the king
@@ -147,6 +148,12 @@ one_submission_per_hotkey = true
 # promote the lowest-UID miner to interim king (legacy behaviour).
 genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
+# Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
+# reveal at `epoch boundary − reveal_margin_blocks` — hidden all window, public
+# only the last ~5 min. Must absorb commit-inclusion + drand reveal jitter (a
+# reveal at/after the boundary misses the round) while staying under a copier's
+# automated turnaround. Tighten only after measuring jitter on a live round.
+reveal_margin_blocks = 25
 # Scaling seam: which size the heat screens at, and which size(s) decide the
 # throne. arch_preset names from the size registry; >1 throne size = combined score.
 screen_size  = "toto2-4m"

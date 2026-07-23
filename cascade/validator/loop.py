@@ -68,19 +68,27 @@ EvaluateFn = Callable[[TrainedEntry, list[EvalWindow]], list[WindowScore]]
 GiftRowsFn = Callable[[TrainedEntry], dict | None]
 
 
-def participants_from_commitments(commitments: list, cutoff_block: int) -> tuple[Participant, ...]:
+def participants_from_commitments(commitments: list, cutoff_block: int,
+                                  floor_block: int = 0) -> tuple[Participant, ...]:
     """The round's eligible participant set, for the public receipt.
 
     Mirrors the trainer's eligibility rule (``trainer.loop.resolve_commitments``):
-    parseable generator pointers revealed STRICTLY BEFORE the epoch boundary,
-    latest commit per hotkey among the eligible ones — but keeps ``commit_block``
-    so an auditor can re-check every entrant against the cutoff. Sorted by UID
-    for a deterministic receipt body.
+    parseable generator pointers revealed STRICTLY BEFORE the epoch boundary and
+    at/after the go-live ``floor_block``, latest commit per hotkey among the
+    eligible ones — but keeps ``commit_block`` so an auditor can re-check every
+    entrant against the cutoff. Sorted by UID for a deterministic receipt body.
+
+    ``commitments`` should carry each hotkey's FULL reveal history
+    (``poll_commitments(include_history=True)``): with only the latest reveal, a
+    miner who re-committed after the boundary vanishes from the record even
+    though their eligible pre-cutoff entry fielded the round.
     """
     from ..interface.validation import parse_commit
 
     best: dict[str, Participant] = {}
     for c in commitments:
+        if floor_block and c.commit_block < floor_block:
+            continue
         if c.commit_block >= cutoff_block:
             continue
         parsed = parse_commit(c.payload)
@@ -761,7 +769,9 @@ class ValidatorRunner:
             try:
                 epoch_hash = client.block_hash(epoch_start)
                 participants = participants_from_commitments(
-                    client.poll_commitments(), cutoff_block=epoch_start
+                    client.poll_commitments(include_history=True),
+                    cutoff_block=epoch_start,
+                    floor_block=self.cfg.round.commit_floor_block,
                 )
                 # Anchor for the dashboard's next-round countdown (best-effort;
                 # the client extrapolates block→wall-clock from this + as_of).
@@ -837,6 +847,31 @@ class ValidatorRunner:
 
     # ── live loop ────────────────────────────────────────────────────────────
 
+    def _publish_chain_status(self, client: object, store: object) -> None:  # pragma: no cover
+        """Publish the dashboard's live ``status/chain.json`` (current block,
+        epoch grid, stage windows, revealed submissions) on the poll cadence.
+
+        Purely presentational and best-effort — it feeds the web dashboard's
+        round-stage strip and live submissions panel between receipts, and any
+        failure (chain flake, storage outage) is swallowed: status telemetry
+        must never disturb a round.
+        """
+        from datetime import datetime
+
+        from ..shared.chain_status import build_chain_status, publish_chain_status
+
+        try:
+            status = build_chain_status(
+                self.cfg,
+                current_block=int(client.current_block()),  # type: ignore[attr-defined]
+                commitments=client.poll_commitments(),  # type: ignore[attr-defined]
+                network=str(getattr(client, "network", "")),
+                as_of=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            publish_chain_status(store, status)
+        except Exception as e:  # noqa: BLE001 — telemetry only
+            log.debug("chain status publish skipped: %s", e)
+
     def run_forever(self, client: object, *, window_source: object) -> None:  # pragma: no cover
         """Poll the manifest bucket → evaluate → set weights, once per round.
 
@@ -860,6 +895,10 @@ class ValidatorRunner:
         last_digest: str | None = None
         while True:
             try:
+                # Live dashboard telemetry first, every poll: between receipts
+                # this is the page's only fresh view of the chain (stage strip
+                # + live submissions). Best-effort; never affects the round.
+                self._publish_chain_status(client, store)
                 raw = read_latest_manifest(store)
                 digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 if digest == last_digest:

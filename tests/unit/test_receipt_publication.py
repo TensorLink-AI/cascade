@@ -106,6 +106,31 @@ def test_participants_keep_latest_precutoff_commit_per_hotkey():
     assert parts[0].commit_block == 200
 
 
+def test_participant_survives_post_cutoff_recommit():
+    # A miner who re-commits for the NEXT round after the boundary stays in
+    # THIS round's participant set via their pre-cutoff reveal (the live bug:
+    # latest-only chain reads dropped 9 of 30 entrants from a round receipt).
+    commits = [
+        Commitment(0, "a", None, f"metro-v1:gen:hippius:{GEN_REF_KING}", 100),
+        Commitment(0, "a", None, f"metro-v1:gen:hippius:{GEN_REF_CHAL}", EPOCH_START + 50),
+    ]
+    parts = participants_from_commitments(commits, cutoff_block=EPOCH_START)
+    assert len(parts) == 1
+    assert parts[0].gen_ref == GEN_REF_KING and parts[0].commit_block == 100
+
+
+def test_participants_apply_go_live_floor():
+    # Mirrors the trainer's commit_floor_block: pre-launch commits (netuid
+    # squatters, rehearsals) never fielded the round, so they must not appear
+    # in its public record either.
+    commits = [
+        Commitment(0, "a", None, f"metro-v1:gen:hippius:{GEN_REF_KING}", 40),   # pre-floor
+        Commitment(1, "b", None, f"metro-v1:gen:hippius:{GEN_REF_CHAL}", 100),
+    ]
+    parts = participants_from_commitments(commits, cutoff_block=EPOCH_START, floor_block=50)
+    assert [p.hotkey for p in parts] == ["b"]
+
+
 # ── receipt assembly on the runner ────────────────────────────────────────────
 
 
@@ -185,7 +210,7 @@ class _FakeClient:
         assert block == EPOCH_START  # epoch boundary derived from created_block
         return BLOCK_HASH
 
-    def poll_commitments(self):
+    def poll_commitments(self, include_history=False):
         return [
             Commitment(0, "king_hk", None, f"metro-v1:gen:hippius:{GEN_REF_KING}", 100),
             Commitment(1, "chal_hk", None, f"metro-v1:gen:hippius:{GEN_REF_CHAL}", 200),
@@ -311,24 +336,54 @@ def test_publish_and_read_receipt_keys():
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
 
 
-def test_publish_receipt_rejected_never_clobbers_scored_round_key():
-    """A same-round re-judgement that ends in rejection must not erase the
-    signed scored receipt at the round key (2026-07-15: contract-switch
-    rejections erased the receipt that crowned the first king). The rejection
-    stays visible on the latest pointers; only another SCORED verdict may
-    replace a scored round record."""
+def test_publish_receipt_rejected_never_downgrades_scored_round():
+    """A same-round re-judgement that ends in rejection publishes NOTHING once
+    a scored receipt holds the round key. Two live incidents shaped this:
+    2026-07-15, contract-switch rejections erased the receipt that crowned the
+    first king (round key protection); 2026-07-21, restart re-gating of an old
+    manifest (king_resyncing) took the latest pointers and blanked the public
+    dashboard's king/verdict for days (latest protection). Only another SCORED
+    verdict may replace a scored round record. Rejections for rounds without a
+    scored receipt publish normally."""
     store = _FakeS3Store()
     scored = '{"round_id":"42","status":"scored","king_hotkey":"5King"}'
     key = hippius.publish_receipt(store, scored, "42", validator_hotkey="5Val")
 
-    rejected = '{"round_id":"42","status":"rejected","reject_reason":"contract_digest_mismatch"}'
+    rejected = '{"round_id":"42","status":"rejected","reject_reason":"king_resyncing: x != y"}'
     assert hippius.publish_receipt(store, rejected, "42", validator_hotkey="5Val") == key
-    assert store.objects[key] == scored                          # round key preserved
-    assert hippius.read_latest_receipt(store, "5Val") == rejected  # rejection visible
+    assert store.objects[key] == scored                            # round key preserved
+    assert hippius.read_latest_receipt(store, "5Val") == scored    # latest keeps the verdict
+    assert hippius.read_latest_receipt(store) == scored            # shared pointer too
 
     scored2 = '{"round_id":"42","status":"scored","king_hotkey":"5NewKing"}'
     hippius.publish_receipt(store, scored2, "42", validator_hotkey="5Val")
-    assert store.objects[key] == scored2                         # scored-over-scored wins
+    assert store.objects[key] == scored2                           # scored-over-scored wins
+
+    # a NEW round's rejection still publishes and moves latest (real information)
+    rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
+    hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5Val")
+    assert hippius.read_latest_receipt(store, "5Val") == rejected43
+
+
+def test_other_validators_reject_cannot_steal_shared_pointer():
+    """A validator that never scored the round (nothing at its own round key —
+    e.g. a gate reject) must not take the last-writer-wins shared pointer from
+    another validator's scored verdict of the SAME round. Its own prefix keeps
+    the rejection — that trail is the operator's diagnostic surface. A LATER
+    round's rejection still moves the shared pointer (real information)."""
+    store = _FakeS3Store()
+    scored = '{"round_id":"42","status":"scored","king_hotkey":"5King"}'
+    hippius.publish_receipt(store, scored, "42", validator_hotkey="5ValA")
+
+    rejected = '{"round_id":"42","status":"rejected","reject_reason":"pool_pin_unverifiable"}'
+    hippius.publish_receipt(store, rejected, "42", validator_hotkey="5ValB")
+    assert hippius.read_latest_receipt(store) == scored            # shared pointer kept
+    assert hippius.read_latest_receipt(store, "5ValB") == rejected  # own trail intact
+    assert hippius.read_receipt(store, "42", "5ValB") == rejected
+
+    rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
+    hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5ValB")
+    assert hippius.read_latest_receipt(store) == rejected43        # new round moves it
 
 
 def test_publish_receipt_namespaced_per_validator():
