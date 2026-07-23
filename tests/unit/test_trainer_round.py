@@ -84,7 +84,7 @@ def test_train_one_heat_tags_telemetry_apart_from_final(two_size_cfg, tmp_path, 
                            work_root=tmp_path, use_sandbox=False)
     seen: list[str] = []
 
-    def _capture(gen, seeds, contract, budget, out_dir, *, log_role):
+    def _capture(gen, seeds, contract, budget, out_dir, *, log_role, warm_start_dir=None):
         seen.append(log_role)
         out_dir.mkdir(parents=True, exist_ok=True)
         return TrainResult(local_dir=out_dir, param_count=1, train_seconds=1.0,

@@ -282,7 +282,7 @@ class TrainingManifest:
     # Empty ⇒ unpinned (trainer predates the field, or no pool provenance).
     eval_pool_key: str = ""
     eval_pool_sha256: str = ""
-    # Warm-start pin (Cascade, DEC-CA-0003/0004): the content-addressed
+    # Warm-start pin (Cascade, DEC-CA-0005/0004): the content-addressed
     # checkpoint pointer this round's runs at ``warm_start_size`` initialised
     # from (same ``trained_pointer`` format — the OCI digest pins the bytes),
     # instead of random init. Signed (see canonical_body), so validators verify

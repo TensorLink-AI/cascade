@@ -212,7 +212,7 @@ def run_tier2(
     registry = cfg.training.size_registry
     base_trainer = _load_trainer(trainer_spec)
     results: list[CheckResult] = []
-    # Warm-start pin (DEC-CA-0003): when the signed manifest records a promoted
+    # Warm-start pin (DEC-CA-0005): when the signed manifest records a promoted
     # init, re-derivation must start from THAT checkpoint, not random init. The
     # pointer is content-addressed, so the fetch is byte-pinned. A manifest that
     # pins an init we cannot fetch fails every matching entry loudly.

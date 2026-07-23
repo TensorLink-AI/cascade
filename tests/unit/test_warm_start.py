@@ -1,4 +1,4 @@
-"""Cascade warm-start consumption (DEC-CA-0003/0004): the trainer's pointer
+"""Cascade warm-start consumption (DEC-CA-0005/0004): the trainer's pointer
 read, the validator's signed-pin gate, and the remote worker plumbing.
 
 The pointer file is what a fired Cascade installs (``warm_start_init_path``);
@@ -63,7 +63,7 @@ def test_pointer_file_without_size_defaults_to_primary(cfg, tmp_path):
 
 
 def test_broken_pointer_file_raises_never_falls_back(cfg, tmp_path):
-    # DEC-CA-0003: once a promotion is live, a round must never silently train
+    # DEC-CA-0005: once a promotion is live, a round must never silently train
     # from random init — a live-but-unusable pointer aborts the round.
     p = tmp_path / "ws.json"
     p.write_text("{not json", encoding="utf-8")
@@ -130,7 +130,7 @@ def test_matching_pin_passes_after_promotion(cfg, tmp_path):
 
 
 def test_random_init_rejected_once_promotion_is_live(cfg, tmp_path):
-    # The heart of DEC-CA-0003: a trainer that silently fell back to random
+    # The heart of DEC-CA-0005: a trainer that silently fell back to random
     # init after a promotion must be rejected, not scored.
     r = _validator(cfg, tmp_path, cascade=True, installed=PTR)
     reason = r.check_manifest(_manifest(cfg))

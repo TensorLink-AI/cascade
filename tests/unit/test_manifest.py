@@ -150,7 +150,7 @@ def test_warm_start_pin_round_trips_and_is_signed():
     assert again.warm_start_ckpt == format_trained_pointer(REF_T)
     assert again.warm_start_size == "toto2-4m"
     # The pin IS part of the signed body: validators verify the trainer trained
-    # from the init their own deterministic promotion selected (DEC-CA-0003).
+    # from the init their own deterministic promotion selected (DEC-CA-0005).
     assert again.canonical_body() == m.canonical_body()
     assert b"warm_start_ckpt" in m.canonical_body()
 

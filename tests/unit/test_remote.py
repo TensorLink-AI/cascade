@@ -90,7 +90,8 @@ def test_worker_maps_train_hours_to_heat_label(cfg, tmp_path, monkeypatch):
     captured: dict = {}
 
     def _fake_train_one(self, gen, role, seeds, block, *, contract=None,
-                        token_budget=None, repo_suffix="", heat=False):
+                        token_budget=None, repo_suffix="", heat=False,
+                        warm_start_ref=None):
         captured["heat"] = heat
         return TrainedEntry(
             miner_hotkey=gen.hotkey, miner_uid=gen.uid, role=role, gen_ref=gen.ref,

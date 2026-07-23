@@ -111,7 +111,7 @@ def test_should_cascade_requires_clock_and_a_checkpoint():
 
 
 def test_unanchored_reign_reanchors_instead_of_firing():
-    """The stale-state regression (DEC-CA-0003): a persisted reign with no block
+    """The stale-state regression (DEC-CA-0005): a persisted reign with no block
     anchor (legacy wall-clock state) must re-anchor at the observed round's
     block — never fire immediately off stale state."""
     ctl = CascadeController(

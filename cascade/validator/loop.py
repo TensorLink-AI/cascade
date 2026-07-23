@@ -186,7 +186,7 @@ class ValidatorRunner:
         return None
 
     def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
-        """Warm-start pin gate (Cascade, DEC-CA-0003): the manifest's signed
+        """Warm-start pin gate (Cascade, DEC-CA-0005): the manifest's signed
         ``warm_start_ckpt`` must equal the init THIS validator's deterministic
         promotion installed (its own ``warm_start_init_path`` file; "" before any
         promotion). Every validator computes the same promotion (block-anchored

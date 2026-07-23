@@ -174,7 +174,7 @@ class Toto2Trainer:
     is built per :meth:`train`), so the shared ``training_seed`` gives both the
     identical random init the controlled experiment requires — or, when a
     Cascade promotion is live, the identical ``warm_start_dir`` weights (both
-    roles share the one pinned init either way; see DEC-CA-0003/0004).
+    roles share the one pinned init either way; see DEC-CA-0005/0004).
 
     With ``deterministic=True`` (the default) the run is **byte-reproducible on a
     fixed GPU model**: deterministic cuBLAS/cuDNN, the math (not flash) attention
@@ -250,7 +250,7 @@ class Toto2Trainer:
         cfg = Toto2Config.from_contract(contract)
         model = Toto2Model(cfg).to(self.device, self.dtype)
         if warm_start_dir is not None:
-            # Cascade warm-start (DEC-CA-0003): replace the seeded random init
+            # Cascade warm-start (DEC-CA-0005): replace the seeded random init
             # with the promoted checkpoint's weights. Loaded AFTER the RNGs are
             # seeded, so data order and CPM masks are byte-identical to a
             # random-init run — only the starting weights differ. Strict load: a
