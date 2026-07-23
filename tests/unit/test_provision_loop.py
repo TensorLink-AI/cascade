@@ -380,6 +380,51 @@ def test_heat_marker_tears_down_heat_while_final_runs(tmp_path):
     assert {i.stage for i in st.instances} == {"final"}
 
 
+class SeededChain(FakeChain):
+    """A chain that can answer block_seed(boundary) — the real ChainClient
+    surface the provisioner uses to match a marker to the round it belongs to."""
+
+    def __init__(self, block, seed):
+        super().__init__(block)
+        self._seed = seed
+
+    def block_seed(self, boundary):
+        return self._seed
+
+
+def test_zombie_marker_for_a_different_round_is_ignored(tmp_path):
+    # A zombie trainer re-touching an OLD round's heat_complete.json bumps its
+    # mtime past our rent time, so the mtime heuristic alone read it as THIS
+    # round's heat completing and tore down the fleet. Match the marker's
+    # work-dir base_seed to the round we are actually serving instead.
+    clock = Clock()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.chain_client = SeededChain(880, 54321)     # this round's base_seed = 54321
+    loop.run_once()
+    assert len(prov.live) == 2
+
+    # A zombie from a PRIOR round re-touches ITS marker (a different base_seed).
+    zombie = tmp_path / "work" / "99999"
+    zombie.mkdir(parents=True)
+    (zombie / "heat_complete.json").write_text(
+        json.dumps({"round_id": "99999", "screened": 5, "finalists": ["z"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.terminated == []                     # zombie ignored: fleet intact
+    assert len(prov.live) == 2
+
+    # This round's OWN marker (matching base_seed) settles the heat for real.
+    real = tmp_path / "work" / "54321"
+    real.mkdir(parents=True)
+    (real / "heat_complete.json").write_text(
+        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.terminated == ["cascade-900-heat-0"]  # heat down, final keeps running
+    assert "cascade-900-final-0" in prov.live
+
+
 def test_manifest_tears_down_everything(tmp_path):
     clock = Clock()
     store = FakeStore()
