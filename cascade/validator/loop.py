@@ -144,8 +144,8 @@ class ValidatorRunner:
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
     # the reign clock is reset on each dethrone, every reigning-king checkpoint is
     # scored (GIFT-Eval + TIME) and logged, and once per round the clock is checked;
-    # a fired Cascade vacates the champion throne to re-open the competition from
-    # the promoted warm-start init. None ⇒ Cascade is disabled (pure KOTH).
+    # a fired Cascade installs the promoted warm-start init and re-crowns the
+    # same king (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
     cascade: CascadeController | None = None
     # Block of the last successful (or attempted re-assert) weight-set; drives
     # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
@@ -534,11 +534,11 @@ class ValidatorRunner:
     def _cascade_round(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None
     ) -> None:  # pragma: no cover — live-loop glue; the controller is unit-tested
-        """One Cascade step, run at the end of a round (after weights/receipts, so
-        the outgoing king still earns this round). Resets the reign clock on a
-        dethrone, records the reigning king's checkpoint, then checks the clock —
-        a fired Cascade vacates the champion throne so the field re-competes from
-        the promoted init next round. Fully guarded: Cascade never disturbs KOTH."""
+        """One Cascade step, run at the end of a round (after weights/receipts).
+        Resets the reign clock on a dethrone, records the reigning king's
+        checkpoint, then checks the clock — a fired Cascade installs the promoted
+        init and re-crowns the SAME king (DEC-CA-0004: the champion throne is
+        never touched). Fully guarded: Cascade never disturbs KOTH."""
         if self.cascade is None:
             return
         import time
@@ -559,17 +559,16 @@ class ValidatorRunner:
             log.warning("cascade step failed for round=%s: %s", manifest.round_id, e)
 
     def _apply_cascade(self, event: object) -> None:  # pragma: no cover — live-loop glue
-        """Vacate the champion throne after a Cascade so the competition re-opens:
-        clear the king (tenure/streaks reset) and persist. Next round crowns
-        whoever wins from the newly-installed warm-start init."""
+        """Log a fired Cascade. The champion throne is deliberately untouched
+        (DEC-CA-0004): the king persists — vacating had no benefit (both roles
+        train from the shared init) and a vacant throne refillable only via the
+        dethrone branch froze the reign clock when the incumbent kept winning."""
         winner = getattr(event, "winner", None)
-        old_king = getattr(event, "old_king", None)
-        self.state = ChampionState()
-        self._persist_state()
+        king = getattr(event, "old_king", None)
         log.info(
-            "cascade: champion throne vacated (old king %s); field re-competes from "
+            "cascade: promotion installed (king %s persists); field trains from "
             "checkpoint %s next round",
-            (old_king or "?")[:12],
+            (king or "?")[:12],
             getattr(winner, "checkpoint_id", "?"),
         )
 

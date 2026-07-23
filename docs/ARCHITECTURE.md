@@ -154,10 +154,12 @@ CRPS/MASE the same way — the shifted geometric mean, across tasks, of each met
 six numbers are the same kind of quantity before they enter the geomean. When a king holds the
 throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned, a
 **Cascade** fires: the reign's lowest-score checkpoint (a lookup, not a re-eval)
-is installed **as-is** as the warm-start init for all subsequent rounds, then the
-throne is vacated — the king is cleared, the competition re-opens from the new
-init, and the clock resets. The reign clock and checkpoint log persist next to the
-champion state, so Cascade survives validator restarts.
+is installed **as-is** as the warm-start init for all subsequent rounds; the king
+**persists** on the throne with a fresh reign clock (DEC-CA-0004 — both roles
+train from the shared init, so promotion confers no advantage worth vacating
+over, and the throne only changes hands via a genuine dethrone). The reign clock
+and checkpoint log persist next to the champion state, so Cascade survives
+validator restarts.
 
 Those six numbers are **authoritative from the trainer, not recomputed per
 validator**. The trainer (owner-operated, already the manifest trust anchor) runs
