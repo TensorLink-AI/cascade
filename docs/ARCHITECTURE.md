@@ -242,7 +242,7 @@ LCB already granted — and an uncomputable gate (sidecar down, too few configs,
 or king/challenger on different pinned data revisions) makes the round
 inconclusive rather than silently passing or failing. `gift_gate_mode = "shadow"`
 computes and logs the verdict without enforcing it, to calibrate the tolerance
-against real noise first. Rationale and ops notes: `OPEN_QUESTIONS.md` §9.
+against real noise first.
 
 ## Trust model (v1) and the path to decentralisation
 
@@ -250,8 +250,7 @@ v1 centralises training in the owner's trainer and trust in `[manifest]
 trainer_hotkey`. This is the pragmatic bootstrap: it makes the controlled
 experiment trivially enforceable. The corpus/contract digests already make every
 run *reproducible*, which is the hook for decentralising training later (have
-validators or a trainer quorum re-derive and challenge a manifest). See
-`OPEN_QUESTIONS.md` #1–#2.
+validators or a trainer quorum re-derive and challenge a manifest).
 
 ## What's implemented vs. a boundary
 
@@ -273,4 +272,4 @@ optimiser split, and a token-budget LR schedule. It is the one piece that needs 
 box, then pin `base_arch_digest` / `ref_throughput_tokens_per_s`. Other operator
 inputs before launch: the Hippius `[storage]` credentials/endpoints and the
 held-out eval-pool ref (`[eval] window_pool`). The corpus sandbox subprocess
-caveats are unchanged (OPEN_QUESTIONS.md #2).
+caveats are unchanged.

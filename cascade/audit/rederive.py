@@ -39,8 +39,7 @@ def _fetch_generator(gen_ref: str, dest: Path, cfg: ChainConfig) -> Path:
     """Fetch a pinned generator, preferring anonymous access.
 
     Audit runs credential-free where possible: try the authenticated client
-    only if the anonymous pull fails (public Hub repos need no token; see
-    OPEN_QUESTIONS.md on public-read).
+    only if the anonymous pull fails (public Hub repos need no token).
     """
     from ..shared.hippius import HubAuthError, HubConfig, fetch_from_hub
 

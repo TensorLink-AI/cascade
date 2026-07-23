@@ -41,7 +41,8 @@ DECISION — three parts, in order:
    cascade-audit re-derives from the pinned checkpoint (fetch failure must
    NOT silently fall back to random init — that breaks byte-exact audit).
 3. **Mainnet stays unarmed** until both land and a full testnet cascade
-   completes cleanly (checklist item in `docs/MAINNET_LAUNCH.md`).
+   completes cleanly end-to-end (promotion → warm-started round → validator
+   pin check → audit re-derivation from the pinned init).
 
 Rationale for the sequencing: consumption without a deterministic reign clock
 means fleet validators can disagree on WHICH init a round trains from —

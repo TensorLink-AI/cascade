@@ -6,8 +6,7 @@ CID, loads its ``.npy`` / ``.npz`` series + ``metadata.json``, and slices them
 into :class:`~cascade.eval.window.EvalWindow` s. This package is the *producer*
 of exactly that directory layout.
 
-The design follows the three anti-gaming levers the eval depends on
-(``OPEN_QUESTIONS.md`` #6):
+The design follows the three anti-gaming levers the eval depends on:
 
 * **Privacy** — the pool is owner-controlled and never published as a named
   public benchmark a generator could distribution-match.

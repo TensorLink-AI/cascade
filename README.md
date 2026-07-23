@@ -276,9 +276,9 @@ hash). A round the validator *rejected* still gets a receipt
 `cascade-audit latest` — see `docs/AUDIT.md`.
 
 `chain.toml` ships with mainnet values baked in (netuid 91, the L40S GPU pin,
-the worker-image digest, `pool_bucket`). The remaining go-live steps —
-`trainer_hotkey`, `commit_floor_block`, the launch-commit image re-pin, flipping
-the gift gate — live in `docs/MAINNET_LAUNCH.md`.
+the worker-image digest, `pool_bucket`). The remaining operator-specific values —
+`trainer_hotkey`, `commit_floor_block`, the launch-commit image re-pin, and the
+gift-gate mode — are set on the deployment box, not in the shipped `chain.toml`.
 
 ## Quick start
 

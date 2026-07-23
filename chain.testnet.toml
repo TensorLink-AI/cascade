@@ -340,7 +340,7 @@ hf_backup_repo   = "tensorlink-dev/cascade-testnet-mirror"   # TESTNET: S3-down 
 [manifest]
 # The trainer publishes signed training receipts to the manifest S3 bucket
 # ([storage] manifest_bucket) and validators read them. trainer_hotkey is the
-# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
+# only signer a validator trusts.
 trainer_hotkey  = "5Cyver53HZaxdn6j9K2W9LyaoGxjz1W3cXHoKcaDyzfjfpHs"  # owner hotkey (uid 0 on netuid 259)
 validator_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"  # TESTNET override
 poll_seconds    = 120

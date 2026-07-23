@@ -1,5 +1,5 @@
-"""Private eval-window **pool loader** — the integrator boundary from
-OPEN_QUESTIONS.md #6, now wired to Hippius.
+"""Private eval-window **pool loader** — the integrator boundary, now wired to
+Hippius.
 
 :mod:`cascade.validator.windows` owns the deterministic, validator-agreeing
 *selection and rotation* of windows; this module owns the other half: pulling the

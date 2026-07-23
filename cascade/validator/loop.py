@@ -1062,7 +1062,7 @@ class ValidatorRunner:
         """Whether the round's *trained* king matches the validator's champion.
 
         The trainer picks the king it trains from on-chain incentive, which lags
-        the validator's dethrone verdicts (OPEN_QUESTIONS #3). Until the champion
+        the validator's dethrone verdicts. Until the champion
         the validator crowned actually becomes the highest-incentive UID — and so
         the king the trainer trains — the two disagree, and a round trained
         against the *old* king must not have its verdict applied to the *new*

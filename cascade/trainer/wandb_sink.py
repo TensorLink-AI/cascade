@@ -7,7 +7,7 @@ into a live wandb run so miners can watch their generator train *as it occurs*.
 
 It is **observability only** — wandb numbers never feed scoring or weights, and
 the held-out eval-pool scores are deliberately *not* sent here (that stays the
-validator's private, rotating concern; see ``OPEN_QUESTIONS.md`` #6). What lands
+validator's private, rotating concern). What lands
 in wandb is exactly what already lands in the S3 log: training-corpus metrics.
 
 The integration is best-effort and fully decoupled:

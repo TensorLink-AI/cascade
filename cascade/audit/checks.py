@@ -452,13 +452,13 @@ def check_transition(receipt: RoundReceipt) -> CheckResult:
     ):
         # Legitimate steady state, not a contradiction: the trainer reads its
         # king from on-chain incentive while the validator's state tracks its
-        # own throne (OPEN_QUESTIONS #3) — they can diverge (e.g. after a
+        # own throne — they can diverge (e.g. after a
         # service outage or an interim-king promotion). The vote still goes to
         # the manifest king, which check_weights verifies. Surface it, don't
         # fail it — a receipt-chain audit is what would confirm the lineage.
         return _warn(name, f"validator-state king {v.king_hotkey!r} differs from the "
                            f"manifest king {king.miner_hotkey!r} (trainer reads incentive; "
-                           "state tracks its own throne — see OPEN_QUESTIONS #3)")
+                           "state tracks its own throne)")
     if cp > 1:
         return _warn(name, f"dethrone_cp={cp}: streak state spans rounds; verify the "
                            "receipt chain for full confirmation")

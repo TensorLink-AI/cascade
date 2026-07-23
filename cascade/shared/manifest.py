@@ -17,7 +17,8 @@ match.
 Trust model (v1): validators trust manifests signed by ``[manifest]
 trainer_hotkey`` only. :func:`sign_manifest` signs the canonical body with the
 trainer's bittensor hotkey and :func:`verify_signature` checks it against the
-configured ss58 address; see OPEN_QUESTIONS.md #1 for the decentralisation path.
+configured ss58 address. Decentralising training is future work; the
+corpus/contract digests already make every run independently reproducible.
 """
 
 from __future__ import annotations
