@@ -440,6 +440,14 @@ class ProvisionerLoop:
         # base_seed knowledge.
         self._manifest_baseline = self._latest_round_id()
         self._learned_round_id = None
+        # Reset EVERY piece of per-round baseline state together: a same-round-id
+        # relearn that cleared only _learned_round_id kept a stale (None) manifest
+        # baseline, so the marker re-teaching the id made the PREVIOUS run's
+        # manifest read as a fresh publish and tore down the just-rented final pod
+        # (Round 8690400, 2026-07-23). The marker re-learn then re-baselines any
+        # leftover manifest as stale, exactly as on a first learn.
+        self._round_baseline_for = None
+        self._round_manifest_baseline = None
         self._state = (RoundState(round_id=str(round_id)) if self._state is None
                        else replace(self._state, round_id=str(round_id), published=False))
         self._save()

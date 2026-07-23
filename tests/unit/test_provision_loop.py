@@ -424,6 +424,50 @@ def test_stale_manifest_from_prior_run_does_not_tear_down(tmp_path):
     assert prov.live == {}
 
 
+def test_relearn_of_same_round_resets_the_manifest_baseline(tmp_path):
+    # Same-round-id RELEARN (Round 8690400, 2026-07-23: fleet lost 31s after
+    # rent). _provision_round reset _learned_round_id but NOT the per-round
+    # manifest baseline (_round_baseline_for / _round_manifest_baseline). So a
+    # second provisioning of the same round kept the prior run's stale None
+    # baseline: when the marker re-taught the id, the previous run's manifest —
+    # still sitting at round-<id>.json — read as a FRESH publish and tore down
+    # the just-rented final pod.
+    clock = Clock()
+    store = FakeStore()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
+
+    # Round one: rent, then the marker teaches base_seed 54321 with NO manifest
+    # published yet → the per-round baseline is recorded as None.
+    loop.run_once()
+    marker_dir = tmp_path / "work" / "54321"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "heat_complete.json").write_text(
+        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
+    clock.t += 1800.0
+    loop.run_once()
+    assert loop._round_baseline_for == "54321"
+    assert loop._round_manifest_baseline is None                # stale None seed
+
+    # That round finishes and publishes its manifest (now sitting at the key)…
+    store.texts["manifests/round-54321.json"] = (
+        '{"round_id": "54321", "contract_digest": "old"}')
+    clock.t += 1800.0
+    loop.run_once()
+    assert prov.live == {}                                       # round one fully torn down
+
+    # …and the SAME round re-provisions (relearn): a fresh final pod is rented
+    # while the previous run's manifest still sits at round-54321.json.
+    clock.t += 1800.0
+    loop._provisioned_round = None
+    loop._provision_round(900)
+    assert "cascade-900-final-0" in prov.live                    # freshly rented
+
+    # The teardown sweep must NOT read the leftover manifest as a new publish.
+    loop._teardown_due_pods()
+    assert "cascade-900-final-0" in prov.live                    # fresh pod survives
+
+
 def test_latest_pointer_change_also_ends_the_round(tmp_path):
     # No marker ever seen (e.g. trainer crashed mid-write) — the latest.json
     # baseline still detects "a manifest published after we rented".
