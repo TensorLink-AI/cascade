@@ -4,12 +4,19 @@ assembly, with the GPU and Hippius boundaries faked (no torch, no Hub, no S3).""
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 import pytest
 
 from cascade.shared.chain import Commitment
-from cascade.shared.hippius import HubRef, HubUpload
+from cascade.shared.hippius import (
+    HubRef,
+    HubUpload,
+    ObjectNotFound,
+    StorageError,
+    manifest_round_key,
+)
 from cascade.shared.manifest import dump_manifest, load_manifest
 from cascade.trainer import loop as loop_mod
 from cascade.trainer.contract import RoundSeeds, TrainResult
@@ -1198,3 +1205,189 @@ def test_commit_floor_drops_pre_launch_commits():
     # floor composes with the cutoff: post-live but pre-boundary only
     got = resolve_commitments(commits, cutoff_block=100, floor_block=99)
     assert [r.hotkey for r in got] == ["c"]
+
+# ── restart re-entry guard (already-published rounds) ────────────────────────
+# round_id derives from the epoch-start block, so a trainer restarted mid-epoch
+# forgets last_round and re-enters the round it already published: the
+# 2026-07-23 re-entry re-published a stale manifest (feeding a full fleet
+# teardown 31s after rent); the 2026-07-24 one skipped every challenger as
+# burned and parked in the pre-duel final-hosts wait, primed to seize the NEXT
+# round's freshly rented pods for the stale duel.
+
+
+class _StopLoop(BaseException):
+    """Ends a run_forever drive; BaseException so the loop's blanket
+    ``except Exception`` round handler cannot swallow it."""
+
+
+class _GuardClient:
+    """Chain fake for run_forever: fixed height + seed, and a commitment poll
+    that must never fire on a skipped round."""
+
+    def __init__(self, cfg, base_seed=9797, allow_poll=True):
+        self.block = 3 * cfg.round.epoch_blocks + 7
+        self.base_seed = base_seed
+        self.allow_poll = allow_poll
+        self.polled = 0
+
+    def current_block(self):
+        return self.block
+
+    def block_seed(self, block):
+        return self.base_seed
+
+    def poll_commitments(self, include_history=False):
+        assert self.allow_poll, "commitments polled on a round the guard must skip"
+        self.polled += 1
+        return []
+
+    def highest_incentive_hotkey(self):
+        return "a"
+
+
+class _GuardStore:
+    """Manifest-store fake for the guard probe: known keys answer, misses raise
+    ObjectNotFound, and ``boom`` simulates a store that cannot be read at all."""
+
+    def __init__(self, docs=None, boom=None):
+        self.docs = dict(docs or {})
+        self.boom = boom
+        self.reads = []
+
+    def get_text(self, key):
+        self.reads.append(key)
+        if self.boom is not None:
+            raise self.boom
+        if key not in self.docs:
+            raise ObjectNotFound(f"s3_get_missing: {key}")
+        return self.docs[key]
+
+    def put_text(self, key, text, *, content_type="", acl=None):
+        self.docs[key] = text
+
+
+def _drive_polls(runner, client, monkeypatch, polls=1):
+    """Run run_forever until its Nth poll sleep, then break out."""
+    remaining = {"n": polls}
+
+    def _sleep(seconds):
+        remaining["n"] -= 1
+        if remaining["n"] <= 0:
+            raise _StopLoop
+
+    monkeypatch.setattr(loop_mod.time, "sleep", _sleep)
+    with pytest.raises(_StopLoop):
+        runner.run_forever(client)
+
+
+def test_restarted_trainer_skips_round_already_published(cfg, tmp_path, monkeypatch, caplog):
+    # Manifest already at its round key ⇒ the restarted loop must go straight
+    # back to the poll sleep — no commitment poll, no hosts wait, no run_round —
+    # with ONE clear log line, and last_round memoized so later polls of the
+    # same epoch never re-probe the store.
+    client = _GuardClient(cfg, allow_poll=False)
+    rid = str(client.base_seed)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    store = _GuardStore({manifest_round_key(rid): "{}"})
+    runner._manifest_store = store
+    monkeypatch.setattr(runner, "_reload_remote_hosts",
+                        lambda *a, **k: pytest.fail("hosts wait on a skipped round"))
+    monkeypatch.setattr(runner, "run_round",
+                        lambda *a, **k: pytest.fail("run_round on a skipped round"))
+    with caplog.at_level(logging.INFO, logger="cascade.trainer"):
+        _drive_polls(runner, client, monkeypatch, polls=2)
+
+    skips = [r for r in caplog.records if "already published" in r.getMessage()]
+    assert len(skips) == 1 and rid in skips[0].getMessage()
+    assert store.reads == [manifest_round_key(rid)]      # probed once, then memoized
+
+
+def test_restart_without_published_manifest_resumes_the_round(cfg, tmp_path, monkeypatch):
+    # Crash-resume: the trainer died mid-round BEFORE publishing, so the work
+    # dir (heat_complete cache etc.) exists but no manifest and no persisted
+    # marker do. The guard keys strictly on published-manifest presence — never
+    # the work dir — so the restarted trainer must re-enter and resume.
+    client = _GuardClient(cfg)
+    rid = str(client.base_seed)
+    (tmp_path / rid).mkdir()
+    (tmp_path / rid / "heat_complete.json").write_text("{}", encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore()               # nothing published anywhere
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1                    # round re-entered normally
+
+
+def test_guard_fails_open_when_manifest_store_is_unreadable(cfg, tmp_path, monkeypatch):
+    # Primary AND backup unreadable ⇒ the probe cannot answer. Fail open and
+    # run the round: re-running one finished round is recoverable, a trainer
+    # deadlocked on blind storage stalls the whole subnet.
+    client = _GuardClient(cfg)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore(boom=StorageError("both primary and R2 get failed"))
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1
+
+
+def test_persisted_last_round_marker_alone_skips_the_round(cfg, tmp_path, monkeypatch):
+    # The publish landed but the store cannot confirm it (flaky reads, or the
+    # object lost): the disk marker written after publish() is equivalent to
+    # the in-memory last_round — skip without ever touching the store.
+    client = _GuardClient(cfg, allow_poll=False)
+    rid = str(client.base_seed)
+    (tmp_path / "last_round.json").write_text(json.dumps({"round_id": rid}), encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    store = _GuardStore()                                # store has no manifest at all
+    runner._manifest_store = store
+    monkeypatch.setattr(runner, "run_round",
+                        lambda *a, **k: pytest.fail("run_round on a skipped round"))
+    _drive_polls(runner, client, monkeypatch)
+    assert store.reads == []                             # marker answered first
+
+
+def test_force_rerun_round_overrides_the_guard(cfg, tmp_path, monkeypatch):
+    # Operator escape hatch (--force-rerun-round, Approve-tier): a deliberate
+    # same-round re-publish must stay possible even with BOTH guard signals
+    # present (manifest published + persisted marker).
+    from cascade.trainer.main import _build_parser
+
+    client = _GuardClient(cfg)
+    rid = str(client.base_seed)
+    (tmp_path / "last_round.json").write_text(json.dumps({"round_id": rid}), encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, force_rerun_round=rid)
+    runner._manifest_store = _GuardStore({manifest_round_key(rid): "{}"})
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1                    # guard bypassed, round re-ran
+    # the CLI wires the hatch through as a plain round_id string
+    assert _build_parser().parse_args(["--force-rerun-round", rid]).force_rerun_round == rid
+
+
+def test_publish_persists_last_round_marker(cfg, tmp_path, monkeypatch):
+    # The disk half of the guard: a successful publish() records its round in
+    # work_root/last_round.json (atomically), so the next restart knows the
+    # round finished even if the store's reads are flaking.
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(loop_mod, "publish_manifest",
+                        lambda store, text, rid: f"manifests/round-{rid}.json")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore()
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "last_round.json").exists()   # never written pre-publish
+    runner.publish(manifest)
+    assert json.loads((tmp_path / "last_round.json").read_text()) == {"round_id": "1"}
+    assert not (tmp_path / "last_round.json.tmp").exists()  # atomic publish
