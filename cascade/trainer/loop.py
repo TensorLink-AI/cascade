@@ -34,10 +34,12 @@ from ..shared.config import ChainConfig, TrainingContractConfig
 from ..shared.hippius import (
     HubConfig,
     LogSink,
+    ObjectNotFound,
     S3Config,
     S3Store,
     StorageError,
     fetch_from_hub,
+    manifest_round_key,
     publish_manifest,
     upload_dir_to_hub_or_hf,
 )
@@ -455,6 +457,11 @@ class TrainerRunner:
     # the pin (signed) so validators verify it and cascade-audit re-derives
     # from it. None ⇒ random init always (cascade off / pre-warm-start deploy).
     warm_start_path: Path | None = None
+    # Restart re-entry escape hatch (--force-rerun-round, Approve-tier): the ONE
+    # round_id allowed past the already-published guard, for a legitimate
+    # operator-driven re-train/re-publish of a finished round. None ⇒ the guard
+    # always applies.
+    force_rerun_round: str | None = None
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -1561,6 +1568,83 @@ class TrainerRunner:
         # mislabels the live one.
         if self._stage_ctx is not None and self._stage_ctx["round_id"] == manifest.round_id:
             self._publish_stage("validation")
+        # The disk half of the restart re-entry guard: remember the published
+        # round across a process restart (and through a store too flaky to
+        # answer the guard's manifest probe).
+        self._persist_last_round(manifest.round_id)
+
+    # ── restart re-entry guard (already-published rounds) ────────────────────
+
+    def _last_round_path(self) -> Path:
+        return self.work_root / "last_round.json"
+
+    def _persist_last_round(self, round_id: str) -> None:
+        """Record the just-published round in ``work_root/last_round.json``.
+
+        run_forever's in-memory ``last_round`` dies with the process while the
+        round_id re-derives from the epoch-start block, so without a persisted
+        marker a restarted trainer walks straight back into the round it just
+        published. Written atomically (tmp + rename) so a crash never leaves a
+        torn marker; best-effort — the manifest-store probe still guards when
+        this write fails (and vice versa: the marker covers a store whose
+        publish landed but whose reads are flaking).
+        """
+        try:
+            self.work_root.mkdir(parents=True, exist_ok=True)
+            tmp = self.work_root / "last_round.json.tmp"
+            tmp.write_text(json.dumps({"round_id": str(round_id)}, sort_keys=True),
+                           encoding="utf-8")
+            tmp.replace(self._last_round_path())
+        except OSError as e:
+            log.warning("could not persist last_round marker for round=%s: %s", round_id, e)
+
+    def _persisted_last_round(self) -> str | None:
+        """The round_id persisted by the last successful publish, else None
+        (first round after deploy, wiped work dir, unreadable marker)."""
+        try:
+            return str(json.loads(self._last_round_path().read_text(encoding="utf-8"))["round_id"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _round_already_published(self, round_id: str) -> bool:
+        """True when this round is already finished — the restart re-entry guard.
+
+        A trainer restart mid-epoch forgets ``last_round`` and re-enters the
+        round it already completed: on 2026-07-23 the re-entry re-published a
+        stale manifest (feeding a full fleet teardown 31s after rent), and on
+        2026-07-24 it skipped every challenger as already burned and then sat
+        in the pre-duel final-hosts wait over an empty hosts.toml — primed to
+        seize the NEXT round's freshly rented final pods and dispatch the stale
+        duel onto them. "Finished" is strictly "manifest present at
+        ``manifest_round_key(round_id)``" or the persisted post-publish marker
+        — never the work dir, which a crash mid-round (pre-publish) also
+        leaves behind and which must still resume.
+
+        Fail-open by design: a manifest probe that errors (primary AND backup
+        unreadable) proceeds with the round — re-running one finished round is
+        recoverable, a trainer deadlocked on blind storage is not. The probe
+        reads through :meth:`manifest_store` (primary + R2 fallback), so a
+        Hippius outage alone does not blind the guard.
+        """
+        if self.force_rerun_round is not None and str(self.force_rerun_round) == str(round_id):
+            log.warning("force-rerun-round %s: bypassing the already-published guard "
+                        "(operator escape hatch)", round_id)
+            return False
+        if self._persisted_last_round() == str(round_id):
+            log.info("round %s already published (persisted last_round marker); "
+                     "resuming poll — restart re-entry guard", round_id)
+            return True
+        try:
+            self.manifest_store().get_text(manifest_round_key(str(round_id)))
+        except ObjectNotFound:
+            return False    # genuinely unpublished — normal round entry
+        except Exception as e:  # noqa: BLE001 — fail open rather than deadlock the subnet
+            log.warning("already-published probe failed for round=%s (%s); "
+                        "proceeding with the round (fail-open)", round_id, e)
+            return False
+        log.info("round %s already published (manifest present); resuming poll — "
+                 "restart re-entry guard", round_id)
+        return True
 
     # ── live loop ────────────────────────────────────────────────────────────
 
@@ -1705,6 +1789,15 @@ class TrainerRunner:
                 base_seed = client.block_seed(epoch_start)
                 round_id = str(base_seed)
                 if round_id == last_round:
+                    time.sleep(poll)
+                    continue
+                # A restart forgets last_round while the epoch-start block still
+                # derives the same round_id, so probe for a finished round
+                # BEFORE any round work — the commitment poll, the hosts wait —
+                # and re-skip it exactly like a matching last_round (see
+                # _round_already_published for the two incidents this stops).
+                if self._round_already_published(round_id):
+                    last_round = round_id
                     time.sleep(poll)
                     continue
                 # Full reveal history: a hotkey whose newest reveal landed at or

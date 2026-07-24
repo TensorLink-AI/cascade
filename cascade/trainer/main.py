@@ -62,6 +62,16 @@ def _build_parser() -> argparse.ArgumentParser:
              "off. Counts only settle once timed reveals have landed (reveals target "
              "boundary − reveal_margin_blocks), so run this at/after the reveal margin.",
     )
+    p.add_argument(
+        "--force-rerun-round", default=None, metavar="ROUND_ID",
+        help="Approve-tier operator escape hatch: re-run this ONE round_id even though "
+             "its manifest is already published, bypassing the restart re-entry guard "
+             "(which otherwise skips a finished round after a trainer restart — the "
+             "re-entries of 2026-07-23/24 re-published a stale manifest and camped the "
+             "next round's final pods). Re-publishing overwrites round-<id>.json AND "
+             "latest.json, so use only for a deliberate same-round re-train; remove "
+             "the flag after the re-run.",
+    )
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
     p.add_argument(
@@ -266,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         # wall-clock estimate. Off by default for offline runs and tests.
         publish_stage_status=True,
         warm_start_path=warm_start_path,
+        force_rerun_round=args.force_rerun_round,
     )
     log.info(
         "trainer up: netuid=%s manifest_bucket=%s registry=%s mode=%s screen=%s throne=%s",
