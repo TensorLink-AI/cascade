@@ -139,6 +139,16 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # round (and never burn their one submission).
 commit_floor_block = 8622922
 one_submission_per_hotkey = true
+# Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
+# rename-only copies, and near-copies (sim >= dedup_threshold) of the king or a
+# lower-UID challenger lose their heat slot; lowest UID keeps it. Pairwise only
+# — never transitive clusters. Dropped copies still burn their one submission.
+# [dedup_shadow_floor, dedup_threshold) is logged, never dropped: honest
+# template-sharing (everyone starts from example_generator) lives there.
+# Observed abuse sits at sim >= 0.99 (see similarity_report / OPSLOG).
+dedup_mode         = "enforce"   # off | shadow | enforce
+dedup_threshold    = 0.99
+dedup_shadow_floor = 0.90
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest). When set, the trainer trains THIS generator as the king
 # whenever no on-chain champion has a resolvable commitment — a fixed,

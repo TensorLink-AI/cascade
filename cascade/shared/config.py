@@ -416,6 +416,23 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # Content-level duplicate screen (cascade.interface.dedup): before the heat,
+    # each challenger repo is fingerprinted and compared PAIRWISE against the
+    # king and every kept lower-UID challenger; identical trees/token streams
+    # and near-copies at/above ``dedup_threshold`` lose their heat slot (lowest
+    # UID keeps it, so copying an existing submission can never displace it).
+    # Dropped entrants still burn their one lifetime submission — they entered
+    # the round; refunding would give free re-rolls against the threshold.
+    # Matches in [dedup_shadow_floor, dedup_threshold) are logged, never
+    # dropped: that band is where honest template-sharing lives.
+    # "off" = no screen; "shadow" = fingerprint + log verdicts, drop nothing;
+    # "enforce" = drop. Observed abuse sits at sim ≥ 0.99; keep the threshold
+    # there unless the shadow log shows honest submissions above it. The
+    # dataclass default is "off" (behavior-preserving for configs without the
+    # key); the shipped mainnet chain.toml sets "enforce".
+    dedup_mode: str = "off"
+    dedup_threshold: float = 0.99
+    dedup_shadow_floor: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -892,6 +909,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
+            dedup_mode=str(r.get("dedup_mode", "off")),
+            dedup_threshold=float(r.get("dedup_threshold", 0.99)),
+            dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),

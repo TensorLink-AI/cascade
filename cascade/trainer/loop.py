@@ -455,6 +455,113 @@ class TrainerRunner:
         seen = _load_seen_hotkeys(path)
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
+    # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
+
+    def _screen_duplicate_entrants(
+        self,
+        king: ResolvedGenerator | None,
+        entrants: list[ResolvedGenerator],
+        base_seed: int,
+    ) -> list[ResolvedGenerator]:
+        """Drop entrants whose repo CONTENT duplicates the king or a lower-UID
+        entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
+
+        The on-chain same-ref dedup in :func:`plan_round` only catches identical
+        ``repo@digest`` pointers; this compares the fetched trees, so re-uploads,
+        comment shuffles, rename-only copies, and near-copies at/above
+        ``[round] dedup_threshold`` all collapse to the lowest-UID original.
+        Judgement is pairwise against a specific rival, never transitive.
+
+        Fail-open: an infrastructure error (fetch outage, unexpected exception)
+        keeps the entrant in the heat rather than eating its slot on a guess —
+        except an entrant whose OWN ref does not fetch, which is dropped (it
+        could not have trained anyway; per the burn rules that was its shot).
+        In ``shadow`` mode verdicts are computed and logged but nothing drops.
+        Every verdict lands in ``<work_root>/<round>/dedup_report.json``.
+        """
+        mode = (self.cfg.round.dedup_mode or "off").lower()
+        if mode not in ("shadow", "enforce") or not entrants:
+            return entrants
+        from ..interface.dedup import fingerprint_dir, screen_duplicates
+
+        fetch_root = self.work_root / f"{base_seed}" / "dedup"
+        king_fp = None
+        if king is not None:
+            try:
+                king_fp = fingerprint_dir(
+                    fetch_from_hub(king.ref, fetch_root / "king", hub=self.hub()))
+            except Exception as e:  # noqa: BLE001 — king trains later regardless
+                log.warning("dedup: king repo %s unfetchable (%s); screening "
+                            "challengers against each other only", king.ref, e)
+
+        fetch_failed: list[ResolvedGenerator] = []
+        triples: list[tuple[str, int, object]] = []
+        for c in entrants:
+            try:
+                fp = fingerprint_dir(
+                    fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+            except StorageError as e:
+                # Enforce: an unfetchable ref could not have trained — drop it
+                # before it eats a heat pod dispatch (per the burn rules that
+                # was its shot). Shadow observes only, so keep it and let the
+                # heat retry the fetch.
+                log.info("dedup[%s]: challenger %s (uid=%s) ref %s does not fetch "
+                         "(%s)%s", mode, c.hotkey, c.uid, c.ref, e,
+                         " — dropped pre-heat" if mode == "enforce" else " — shadow, kept")
+                fetch_failed.append(c)
+                continue
+            triples.append((c.hotkey, c.uid, fp))
+
+        try:
+            result = screen_duplicates(
+                triples, king_fp,
+                threshold=self.cfg.round.dedup_threshold,
+                shadow_floor=self.cfg.round.dedup_shadow_floor,
+                enforce=(mode == "enforce"),
+            )
+        except Exception as e:  # noqa: BLE001 — the screen must never sink a round
+            log.warning("dedup: screen failed (%s); heat proceeds unscreened", e)
+            if mode == "enforce":
+                return [c for c in entrants if c not in fetch_failed]
+            return entrants
+        finally:
+            import shutil
+
+            shutil.rmtree(fetch_root, ignore_errors=True)
+
+        for v in result.dropped:
+            log.info("dedup[%s]: challenger %s (uid=%s) is %s of %s (uid=%s), "
+                     "sim=%.4f%s", mode, v.hotkey, v.uid, v.tier,
+                     v.matched_hotkey, v.matched_uid, v.score,
+                     "" if mode == "enforce" else " — shadow, kept")
+        for v in result.shadow:
+            log.info("dedup[shadow-band]: challenger %s (uid=%s) vs %s (uid=%s) "
+                     "sim=%.4f — below threshold, kept", v.hotkey, v.uid,
+                     v.matched_hotkey, v.matched_uid, v.score)
+
+        report = {
+            "round_id": str(base_seed),
+            "mode": mode,
+            "threshold": self.cfg.round.dedup_threshold,
+            "shadow_floor": self.cfg.round.dedup_shadow_floor,
+            "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
+                             for c in fetch_failed],
+            "dropped": [vars(v) | {"enforced": mode == "enforce"}
+                        for v in result.dropped],
+            "shadow": [vars(v) for v in result.shadow],
+        }
+        try:
+            out_dir = self.work_root / f"{base_seed}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "dedup_report.json").write_text(json.dumps(report, indent=1))
+        except OSError as e:
+            log.warning("dedup: could not write report for round=%s: %s", base_seed, e)
+
+        if mode != "enforce":
+            return entrants
+        kept = set(result.kept_hotkeys)
+        return [c for c in entrants if c.hotkey in kept]
+
     def _mark_heat_complete(
         self,
         base_seed: int,
@@ -795,7 +902,12 @@ class TrainerRunner:
             screen_block = (block // epoch_blocks) * epoch_blocks
 
         eligible = self._filter_burned_challengers(plan.challengers)
-        finalists, heat = self._run_heat(eligible, seeds, block,
+        # Content-level duplicate screen ([round] dedup_mode): re-uploads and
+        # near-copies of the king or a lower-UID challenger lose their heat GPU
+        # slot before any pod is dispatched. They stay in ``eligible`` — entering
+        # the round as a copy still consumes the one lifetime submission.
+        screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed)
+        finalists, heat = self._run_heat(screened, seeds, block,
                                          screen_block=screen_block)
         # Burn only now, after the heat stage completed: every eligible entrant
         # got its screening attempt (or its pass-through to the final). A crash

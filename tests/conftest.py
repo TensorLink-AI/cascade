@@ -52,7 +52,7 @@ def cfg() -> ChainConfig:
     c = load_chain_config(REPO_ROOT / "chain.toml")
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
-                   round=replace(c.round, commit_floor_block=0))
+                   round=replace(c.round, commit_floor_block=0, dedup_mode="off"))
 
 
 @pytest.fixture(scope="session")

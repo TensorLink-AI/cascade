@@ -17,6 +17,10 @@ in-context.
   and blockers in `docs/MAINNET_LAUNCH.md` (L40S pin, worker-image digest,
   container sandbox, pool-publish cron; gift gate shadow → enforce).
   (`decisions/DEC-CA-0002-mainnet-netuid-91.md`)
+- **DEC-CA-0003** — Pre-heat content dedup: pairwise (never transitive) at
+  sim ≥ 0.99, shadow-log 0.90–0.99; dropped copies still burn; LLM judge is
+  advisory-only, never in the enforcement path.
+  (`decisions/DEC-CA-0003-content-dedup-0.99.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
