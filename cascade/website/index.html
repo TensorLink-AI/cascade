@@ -1079,12 +1079,22 @@ var BUCKET = IS_TESTNET ? "cascade-testnet-manifests" : "cascade-manifests";
 // rewrite → index.html at the domain root reads /receipts/…). The absolute
 // Hippius endpoints stay as a fallback (those DO need bucket CORS to succeed).
 var SAME_ORIGIN = location.pathname.replace(/\/[^/]*$/, "").replace(/\/$/, "");
+// Cloudflare R2 public-read URL of the MANIFEST backup bucket — the same bucket
+// the validator dual-writes receipts + status/*.json to via S3MirrorStore. When
+// set, the browser races R2 alongside Hippius (fetchJSON resolves on the first
+// success), so the dashboard keeps serving LIVE data straight from the backup
+// during a Hippius S3 outage instead of falling back to nothing. Empty = Hippius
+// only (unchanged). Requires R2 public access enabled — an r2.dev subdomain or a
+// custom domain bound to the bucket (R2 buckets are private by default and the
+// mirror strips per-object ACLs), e.g. "https://pub-<hash>.r2.dev".
+var R2_PUBLIC_BASE = "";
 var ENDPOINTS = [
   SAME_ORIGIN,
   "https://s3.hippius.com/" + BUCKET,
   "https://us-east-1.hippius.com/" + BUCKET,
   "https://eu-central-1.hippius.com/" + BUCKET
 ];
+if(R2_PUBLIC_BASE){ ENDPOINTS.push(R2_PUBLIC_BASE.replace(/\/$/, "")); }
 // A Hippius Hub model page lives at hub.hippius.com/models/<owner>/<name>/<ref>.
 // hubUrl() appends the "/main" default ref: without a ref the page 404s.
 var HUB_BASE = "https://hub.hippius.com/models/";
@@ -1093,75 +1103,9 @@ var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _subsSeen = null,
     _chartMode = "geomean", _smooth = 0, _dataState = "loading";
 
-// ── seed (mock) data — real receipt shape; overwritten if endpoints respond ─
-var _now = Date.now();
-function iso(minAgo){ return new Date(_now - minAgo*60000).toISOString(); }
-function gr(repo, dig){ return repo + "@sha256:" + dig; }
-var SEED_INDEX = {
-  subnet: { netuid: IS_TESTNET ? 259 : 91, name: "cascade" },
-  updated_at: iso(1),
-  rounds: [
-    { round_id:"rnd_0af31c92", status:"scored", king_hotkey:"5Ck2rQ9aWdF0zx", king_uid:3, king_gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), chal_hotkey:"5CqW4bJr7xTa1p", chal_uid:57, chal_gen_ref:gr("helix/synth-v1","3d9e01ab7c"), dethroned:false, challenger_wins_round:false, inconclusive:false, king_geomean:0.921, chal_geomean:0.948, lcb:-0.011, margin:0.010, n_windows:960, n_participants:9, gift_gate_passed:true, n_rewarded:6, sizes:["4M","22M"], epoch_start_block:4818020, published_at:iso(2880) },
-    { round_id:"rnd_1b7ee430", status:"scored", king_hotkey:"5Ck2rQ9aWdF0zx", king_uid:3, king_gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), chal_hotkey:"5Dk82mLpQ2vHse", chal_uid:88, chal_gen_ref:gr("aurora/tsgen","7a2c55e910"), dethroned:true, challenger_wins_round:true, inconclusive:false, king_geomean:0.903, chal_geomean:0.861, lcb:0.021, margin:0.010, n_windows:1040, n_participants:11, gift_gate_passed:true, n_rewarded:7, sizes:["4M","22M"], epoch_start_block:4818640, published_at:iso(2460) },
-    { round_id:"rnd_2c04a9f1", status:"scored", king_hotkey:"5Dk82mLpQ2vHse", king_uid:88, king_gen_ref:gr("aurora/tsgen","7a2c55e910"), chal_hotkey:"5Ent1vHs9kMdap", chal_uid:190, chal_gen_ref:gr("delphi/forge","c41b0d7e22"), dethroned:false, challenger_wins_round:false, inconclusive:false, king_geomean:0.861, chal_geomean:0.879, lcb:-0.006, margin:0.010, n_windows:1040, n_participants:12, gift_gate_passed:true, n_rewarded:7, sizes:["4M","22M"], epoch_start_block:4819260, published_at:iso(2040) },
-    { round_id:"rnd_3d55f7aa", status:"rejected", king_hotkey:"5Dk82mLpQ2vHse", king_uid:88, king_gen_ref:gr("aurora/tsgen","7a2c55e910"), chal_hotkey:"5Cn52vFa8pRk0q", chal_uid:64, chal_gen_ref:gr("orbit/gen","55aa19c003"), dethroned:false, challenger_wins_round:false, inconclusive:false, reject_reason:"generator manifest failed determinism check", king_geomean:null, chal_geomean:null, lcb:null, margin:0.010, n_windows:null, n_participants:12, sizes:["4M","22M"], epoch_start_block:4819880, published_at:iso(1620) },
-    { round_id:"rnd_4e9021bd", status:"scored", king_hotkey:"5Dk82mLpQ2vHse", king_uid:88, king_gen_ref:gr("aurora/tsgen","7a2c55e910"), chal_hotkey:"5FhR9kQ2mLpQ4d", chal_uid:214, chal_gen_ref:gr("nimbus/synth-xl","91e7bb4402"), dethroned:true, challenger_wins_round:true, inconclusive:false, king_geomean:0.852, chal_geomean:0.791, lcb:0.034, margin:0.010, n_windows:1120, n_participants:13, gift_gate_passed:true, n_rewarded:8, sizes:["4M","22M","313M"], epoch_start_block:4820500, published_at:iso(1200) },
-    { round_id:"rnd_5fa3c7e8", status:"scored", king_hotkey:"5FhR9kQ2mLpQ4d", king_uid:214, king_gen_ref:gr("nimbus/synth-xl","91e7bb4402"), chal_hotkey:"5Fp36nZqLc9wte", chal_uid:277, chal_gen_ref:gr("cascade/gen-lab","2be80af115"), dethroned:false, challenger_wins_round:false, inconclusive:true, king_geomean:0.790, chal_geomean:0.786, lcb:0.003, margin:0.010, n_windows:1120, n_participants:14, gift_gate_passed:true, n_rewarded:8, sizes:["4M","22M","313M"], epoch_start_block:4821120, published_at:iso(780) },
-    { round_id:"rnd_6b12d044", status:"scored", king_hotkey:"5FhR9kQ2mLpQ4d", king_uid:214, king_gen_ref:gr("nimbus/synth-xl","91e7bb4402"), chal_hotkey:"5Gx09wLc2vFa7n", chal_uid:402, chal_gen_ref:gr("halcyon/tsgen2","0d4471aa88"), dethroned:false, challenger_wins_round:false, inconclusive:false, king_geomean:0.790, chal_geomean:0.803, lcb:-0.008, margin:0.010, n_windows:1200, n_participants:14, gift_gate_passed:false, n_rewarded:8, sizes:["4M","22M","313M"], epoch_start_block:4821740, published_at:iso(360) },
-    { round_id:"rnd_7c88 e0", status:"scored", round_id2:1, king_hotkey:"5FhR9kQ2mLpQ4d", king_uid:214, king_gen_ref:gr("nimbus/synth-xl","91e7bb4402"), chal_hotkey:"5Fp36nZqLc9wte", chal_uid:277, chal_gen_ref:gr("cascade/gen-lab","2be80af115"), dethroned:false, challenger_wins_round:false, inconclusive:false, king_geomean:0.788, chal_geomean:0.795, lcb:-0.004, margin:0.010, n_windows:1200, n_participants:15, gift_gate_passed:true, n_rewarded:9, sizes:["4M","22M","313M"], epoch_start_block:4822360, published_at:iso(30) }
-  ]
-};
-SEED_INDEX.rounds[7].round_id = "rnd_7c88f3e0";
-// Demo diagnostics + schedule anchor (SAMPLE only; live index.json overwrites).
-SEED_INDEX.rounds.forEach(function(r){
-  if(r.status==="scored"){
-    var won=r.challenger_wins_round;
-    r.win_rate = won?0.56:0.34; r.wilcoxon_p = won?3e-4:6e-7; r.n_clusters=26;
-    r.boot_p50 = won?0.05:-0.03; r.boot_p95 = won?0.12:0.04;
-  }
-});
-SEED_INDEX.chain = { as_of: iso(1), current_block: 4822980,
-  epoch_start_block: 4822360, epoch_blocks: IS_TESTNET?900:7200, block_time_s: 12.0 };
-var SEED_LATEST = {
-  round_id: "rnd_7c88f3e0",
-  verdict: { king_hotkey: "5FhR9kQ2mLpQ4d" },
-  participants: [
-    { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), commit_block:4822010 },
-    { uid:88,  hotkey:"5Dk82mLpQ2vHse", gen_ref:gr("aurora/tsgen","7a2c55e910"), commit_block:4822044 },
-    { uid:214, hotkey:"5FhR9kQ2mLpQ4d", gen_ref:gr("nimbus/synth-xl","91e7bb4402"), commit_block:4822090 },
-    { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), commit_block:4822120 },
-    { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), commit_block:4822150 },
-    { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"), commit_block:4822171 }
-  ],
-  // the receipt embeds the trainer's manifest verbatim; heat rides there (unsigned)
-  manifest: { heat: {
-    screen_size: "toto2-4m", finalists: 1,
-    entrants: [
-      { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), status:"advanced",     rank:1, rel_score:1.000 },
-      { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), status:"screened",     rank:2, rel_score:1.031 },
-      { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"),   status:"screened",     rank:3, rel_score:1.074 },
-      { uid:88,  hotkey:"5Dk82mLpQ2vHse", gen_ref:gr("aurora/tsgen","7a2c55e910"),   status:"screened",     rank:4, rel_score:1.120 },
-      { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), status:"failed_train", rank:null, rel_score:null }
-    ]
-  } }
-};
-// Live status sample (status/chain.json shape — see cascade.shared.chain_status):
-// current block 2h into an epoch, so the sample stage strip lands on "duel".
-var SEED_STATUS = {
-  schema: 1, as_of: iso(1), network: IS_TESTNET ? "test" : "finney",
-  netuid: IS_TESTNET ? 259 : 91,
-  current_block: 4817400, epoch_blocks: 7200, epoch_start_block: 4816800,
-  block_time_s: 12.0,
-  stage_windows: { heat_seconds: 2700, duel_seconds: 11700 },
-  submissions: [
-    { uid:214, hotkey:"5FhR9kQ2mLpQ4d", gen_ref:gr("nimbus/synth-xl","91e7bb4402"), commit_block:4817180 },
-    { uid:402, hotkey:"5Gx09wLc2vFa7n", gen_ref:gr("halcyon/tsgen2","0d4471aa88"), commit_block:4816950 },
-    { uid:277, hotkey:"5Fp36nZqLc9wte", gen_ref:gr("cascade/gen-lab","2be80af115"), commit_block:4816700 },
-    { uid:190, hotkey:"5Ent1vHs9kMdap", gen_ref:gr("delphi/forge","c41b0d7e22"),   commit_block:4816520 },
-    { uid:88,  hotkey:"5Dk82mLpQ2vHse", gen_ref:gr("aurora/tsgen","7a2c55e910"),   commit_block:4816100 },
-    { uid:3,   hotkey:"5Ck2rQ9aWdF0zx", gen_ref:gr("cascade/genesis-gen","00b1f4c2aa"), commit_block:4815800 }
-  ]
-};
+// No seed/sample data — the page renders explicit loading/empty states until
+// the live endpoints respond (see renderStatus + poll). It never ships
+// fabricated rounds, kings, or submissions.
 
 // ── helpers ────────────────────────────────────────────────────────────────
 (function initTheme(){
@@ -1399,10 +1343,10 @@ function renderRounds(){
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
 }
-// The page seeds with SAMPLE data so the layout renders before (or without) a
-// backend. Never let that masquerade as live: while loading, and especially when
-// the receipt fetch fails, show an explicit banner so the sample king (e.g. the
-// demo "nimbus" row) is never mistaken for real subnet state.
+// The page ships NO sample data: panels render explicit loading/empty states
+// until the live endpoints respond. While loading, and especially when the
+// receipt fetch fails, show a banner so the empty panels read as "unavailable"
+// and are never mistaken for live subnet state.
 function renderStatus(){
   var b=document.getElementById("data-banner");
   if(!b) return;
@@ -1410,7 +1354,7 @@ function renderStatus(){
   b.hidden=false;
   b.className="data-banner "+(_dataState==="offline"?"offline":"loading");
   b.textContent=_dataState==="offline"
-    ? "⚠ Live results unavailable — could not reach the validator receipts. The figures below are SAMPLE data, not live subnet state."
+    ? "⚠ Live results unavailable — could not reach the validator receipts (Hippius S3 may be down). Nothing is shown below rather than stale or sample figures."
     : "Loading live results…";
 }
 function fmtDur(s){ if(s==null||!isFinite(s)) return "--"; s=Math.max(0,Math.round(s)); if(s<60) return s+"s"; var m=Math.floor(s/60); if(m<60) return m+"m "+(s%60)+"s"; var h=Math.floor(m/60); return h+"h "+(m%60)+"m"; }
@@ -1573,8 +1517,9 @@ function collapseByRound(d){
   return out;
 }
 
-// seed immediately so it renders offline, then poll real endpoints (override on success)
-_index=SEED_INDEX; _latest=SEED_LATEST; _status=SEED_STATUS; _dataState="loading"; renderAll();
+// render explicit loading/empty states first, then poll the real endpoints and
+// fill in on success — no sample data is ever shown
+_dataState="loading"; renderAll();
 // The verdict/king panels read the OWNER validator's own receipt trail, not the
 // shared last-writer-wins receipts/latest.json: any validator (on any code
 // version) can overwrite the shared pointer — e.g. a restart re-gating an old
@@ -1588,13 +1533,14 @@ function poll(){
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
     .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
-  // Live chain status (validator poll cadence). First live doc REPLACES the
-  // sample and resets the new-marker baseline, so ● new only ever flags a
-  // commit that appeared while THIS page was watching real data.
+  // Live chain status (validator poll cadence). The first live doc resets the
+  // new-marker baseline, so ● new only ever flags a commit that appeared while
+  // THIS page was watching real data. On failure keep the last good doc (or the
+  // empty state) — never fabricate submissions.
   fetchJSON("status/chain.json").then(function(d){
-    if(_status===SEED_STATUS){ _subsSeen=null; }
+    if(_status===null){ _subsSeen=null; }
     _status=d; renderStage(); renderSubs(); renderCountdown();
-  }).catch(function(){ if(_status===SEED_STATUS&&_dataState==="live"){ _status=null; _subsSeen=null; renderStage(); renderSubs(); } });
+  }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
   fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); })
     .catch(function(){});
