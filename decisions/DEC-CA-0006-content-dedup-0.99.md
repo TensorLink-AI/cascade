@@ -146,6 +146,45 @@ the provisioner sizes the heat fleet off it. Without this the ~29% of the
 field the screen drops was still rented, so the saving showed up as idle pods
 rather than as cost.
 
+**Tie-break: earliest COMMIT, not lowest UID.** The content screen shipped
+ordering entrants by UID, on the reasoning that "lowest UID keeps the slot, so
+copying an existing submission can never displace it". That reasoning holds
+only while UIDs are handed out sequentially. Bittensor recycles the UID of a
+deregistered neuron to the next registrant, so on a saturated subnet a low UID
+means "inherited a pruned slot" — and pruned slots are the low-incentive ones,
+so recycled UIDs skew toward NEWCOMERS. An operator running many hotkeys (the
+observed meta-operator ran ~45) holds low UIDs by arithmetic, and every
+collision resolves in their favour: they keep the slot, the miner they copied
+is dropped AND burns its one lifetime submission. The rule inverts into an
+expropriation-and-griefing tool at $40 a victim, silently, the day the subnet
+fills. `plan_round`'s same-ref dedup had already rejected UID ordering for
+exactly this reason ("Earliest reveal (UID tiebreak) owns each duplicated ref
+— never the lowest UID, which would let a low-UID copier take the original's
+slot"); the content screen simply contradicted the tier above it.
+
+Ordering is now `(submission block, uid)`. The block is the one the miner's
+timelock commit landed at — a copyist cannot have committed before the thing
+they copied was even visible, which is what makes it the right evidence.
+Getting it requires a WITNESS: `Commitments::CommitmentOf` holds the encrypted
+payload and its block, and the pallet CONSUMES that record at reveal, leaving
+only `(payload, reveal_block)`. The commit block is therefore destroyed before
+any round screens on it, and exists only for whoever looked while the payload
+was sealed. The trainer now polls `poll_pending_commits()` every loop tick —
+including ticks that skip round work, since that is most of the window — and
+persists `{hotkey: {pending, committed}}` to `commit_witness_path`, freezing
+`pending` into `committed` when a hotkey's seal disappears. Timed reveals keep
+a payload sealed for most of its epoch, so any cadence finer than that window
+observes every commit, and a miner cannot shorten their own window without
+committing late — which is what the ordering penalises anyway.
+
+Where the witness has nothing (trainer down for the window, poll failure, a
+fresh deployment) that hotkey falls back to its REVEAL block, not to last
+place: an entrant we merely failed to observe must not be expropriated for our
+gap, and reveal order still puts a copyist behind their victim. This is
+trainer-local by design and needs no consensus: the trainer is the sole
+owner-operated authority for heat selection, and validators never re-derive
+which challengers were screened.
+
 Two smaller corrections: shadow mode is now a true counterfactual of enforce
 (a would-be-dropped entry no longer becomes a rival for later entries, so the
 log measures the verdicts enforce would have produced — the log is what
@@ -159,7 +198,8 @@ dedup_max_abs_delta/dedup_config_only_enforce/dedup_max_tokens/
 dedup_max_text_mb/dedup_sketch_mode/dedup_sketch_threshold/
 dedup_phase_seconds/dedup_probe_mode/dedup_probe_series/
 dedup_probe_generate_seconds/dedup_probe_budget_seconds/
-dedup_probe_allow_weak_sandbox` — dataclass defaults off/0.99/0.90/0/false/
+dedup_probe_allow_weak_sandbox` plus `commit_witness_path` — dataclass
+defaults off/0.99/0.90/0/false/
 50000/4/shadow/0.99/900/shadow/8/120/600/false; mainnet `chain.toml` = static
 `enforce` @ 0.99/0.90, delta cap 0, config_only shadow, sketch shadow, probe
 `shadow` × 8 with `[generator] sandbox_strict = true`; testnet = everything

@@ -160,6 +160,35 @@ def _save_seen_hotkeys(path: Path, seen: set[str]) -> None:
         log.warning("could not persist submissions db to %s: %s", path, e)
 
 
+def _load_commit_witness(path: Path) -> dict[str, dict]:
+    """Load the persisted commit-order witness (best-effort).
+
+    Shape: ``{hotkey: {"pending": block|None, "committed": block|None}}`` —
+    ``pending`` is a commit currently sealed on chain, ``committed`` is the
+    block of the last commit we watched go from sealed to revealed.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(h): {"pending": v.get("pending"), "committed": v.get("committed")}
+                for h, v in raw.items() if isinstance(v, dict)}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("commit witness %s unreadable (%s); commit order falls back "
+                    "to reveal order until it refills", path, e)
+        return {}
+
+
+def _save_commit_witness(path: Path, witness: dict[str, dict]) -> None:
+    """Persist the witness (best-effort — evidence collection must never abort
+    a round; a lost file degrades the tie-break, it does not break it)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(witness, sort_keys=True), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist commit witness to %s: %s", path, e)
+
+
 @dataclass(frozen=True)
 class ResolvedGenerator:
     hotkey: str
@@ -526,6 +555,89 @@ class TrainerRunner:
             )
         return self._logs_store
 
+    # ── anti-spam: commit-order witness (who submitted a generator FIRST) ────
+
+    def _commit_witness_path(self) -> Path:
+        p = Path(self.cfg.round.commit_witness_path)
+        return p if p.is_absolute() else (self.work_root / p)
+
+    def witness_commits(self, client: object) -> dict[str, dict]:
+        """Record which hotkeys have a commit sealed on chain right now.
+
+        Called every poll tick, INCLUDING the ticks that skip round work — the
+        window this observes is the epoch, not the round. The chain deletes a
+        commit's block when drand reveals it (see
+        :meth:`ChainClient.poll_pending_commits`), so evidence of who committed
+        first exists only for whoever was watching while it was sealed.
+
+        State machine per hotkey: a sealed commit sets ``pending``; when that
+        hotkey's seal disappears (the reveal landed) ``pending`` freezes into
+        ``committed``, which is what the duplicate screen orders on. A new seal
+        overwrites ``pending`` — a hotkey that re-commits is claiming a new
+        submission, and the old commit's priority must not follow it.
+
+        Best-effort throughout: this is evidence collection, and a tick that
+        fails just means the tie-break degrades to reveal order.
+        """
+        poll = getattr(client, "poll_pending_commits", None)
+        if poll is None:
+            return {}
+        try:
+            sealed = poll()
+        except Exception as e:  # noqa: BLE001 — advisory; never break the loop
+            log.warning("commit witness: poll failed (%s)", e)
+            return {}
+        path = self._commit_witness_path()
+        witness = _load_commit_witness(path)
+        changed = False
+        for hotkey, block in sealed.items():
+            entry = witness.setdefault(hotkey, {"pending": None, "committed": None})
+            if entry.get("pending") != block:
+                entry["pending"] = block
+                changed = True
+                log.info("commit witness: %s sealed a commit at block %s",
+                         hotkey, block)
+        for hotkey, entry in witness.items():
+            pending = entry.get("pending")
+            if pending is not None and hotkey not in sealed:
+                # The seal is gone: that commit revealed, so its block is now
+                # the hotkey's evidence of when it submitted.
+                entry["pending"] = None
+                entry["committed"] = int(pending)
+                changed = True
+                log.info("commit witness: %s revealed; commit block %s recorded",
+                         hotkey, pending)
+        if changed:
+            _save_commit_witness(path, witness)
+        return witness
+
+    def _commit_priority(self, entrants: list[ResolvedGenerator]) -> dict[str, int]:
+        """``{hotkey: ordering block}`` for the duplicate screen's tie-break.
+
+        The witnessed commit block when we have one; otherwise the entrant's
+        REVEAL block, which is the same units and always ``>=`` the commit it
+        belongs to. That fallback is deliberately not "sort them last": an
+        entrant we merely failed to observe must not be expropriated for it,
+        and reveal order still puts a copyist behind their victim — copying a
+        revealed repo means revealing after it.
+        """
+        witness = _load_commit_witness(self._commit_witness_path())
+        priority: dict[str, int] = {}
+        missing = []
+        for c in entrants:
+            committed = (witness.get(c.hotkey) or {}).get("committed")
+            if committed:
+                priority[c.hotkey] = int(committed)
+            else:
+                priority[c.hotkey] = int(c.reveal_block or 0)
+                missing.append(c.hotkey)
+        if missing:
+            log.info("commit witness: no commit block for %d/%d entrant(s) "
+                     "(%s%s) — they order on their reveal block",
+                     len(missing), len(entrants), ", ".join(missing[:5]),
+                     "…" if len(missing) > 5 else "")
+        return priority
+
     # ── anti-spam: 1 hotkey = 1 submission (lifetime) ────────────────────────
 
     def _submissions_path(self) -> Path:
@@ -727,6 +839,7 @@ class TrainerRunner:
                 config_only_enforce=rnd.dedup_config_only_enforce,
                 sketch_mode=rnd.dedup_sketch_mode,
                 sketch_threshold=rnd.dedup_sketch_threshold,
+                priority=self._commit_priority(entrants),
                 enforce=(mode == "enforce"),
             )
         except Exception as e:  # noqa: BLE001 — the screen must never sink a round
@@ -2207,6 +2320,10 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # BEFORE the round-skip branches: the commit-order evidence this
+                # collects is destroyed by the chain at reveal, and most of the
+                # window where it exists is on ticks that do no round work.
+                self.witness_commits(client)
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)

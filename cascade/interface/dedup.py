@@ -46,6 +46,7 @@ import json
 import re
 import tokenize
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -463,6 +464,11 @@ class DedupResult:
 
 KING_UID = -2
 
+# Sort position for an entry with no known submission block: after every entry
+# that has one. Only reachable when the caller passes a partial ``priority``;
+# the trainer always supplies a block for every entrant.
+_LAST = float("inf")
+
 
 def screen_duplicates(
     entries: list[tuple[str, int, RepoFingerprint]],
@@ -474,15 +480,27 @@ def screen_duplicates(
     config_only_enforce: bool = False,
     sketch_mode: str = "shadow",
     sketch_threshold: float = 0.99,
+    priority: Mapping[str, int] | None = None,
     enforce: bool = True,
 ) -> DedupResult:
     """Pairwise duplicate screen over ``(hotkey, uid, fingerprint)`` entries.
 
-    Entries are processed in ascending UID order; each is compared against the
+    Entries are processed OLDEST SUBMISSION FIRST; each is compared against the
     king and every previously KEPT entry. The first match at or above
-    ``threshold`` (or any identical digest) drops it — lowest UID keeps the
-    slot, so copying an existing submission can never displace it. Matches in
-    ``[shadow_floor, threshold)`` are recorded but never drop.
+    ``threshold`` (or any identical digest) drops it — the earlier submission
+    keeps the slot, so copying an existing submission can never displace it.
+    Matches in ``[shadow_floor, threshold)`` are recorded but never drop.
+
+    ``priority`` maps hotkey → the block that submission was made at (the
+    witnessed commit block, falling back to the reveal block); entries without
+    one sort last, and UID breaks any remaining tie. UID ALONE is not a
+    submission order: Bittensor recycles the UIDs of deregistered neurons to
+    new registrants, so on a saturated subnet a low UID means "inherited a
+    pruned slot", not "was here first" — and ordering a copy contest by it
+    would let a newcomer holding a recycled slot expropriate the miner they
+    copied (who then also burns their one lifetime submission). The block a
+    submission was committed at is the actual evidence, and a copyist cannot
+    have committed before the thing they copied was visible.
 
     ``max_abs_delta`` (0 = disabled): a ``near_duplicate`` drop additionally
     requires the absolute changed-token count to be at most this — pairs over
@@ -514,7 +532,8 @@ def screen_duplicates(
     of enforce (same verdicts, no drops), which is what makes the shadow log
     usable for calibrating the thresholds.
     """
-    ordered = sorted(entries, key=lambda e: e[1])
+    prio = priority or {}
+    ordered = sorted(entries, key=lambda e: (prio.get(e[0], _LAST), e[1]))
     kept: list[tuple[str, int, RepoFingerprint]] = []
     dropped: list[DedupVerdict] = []
     shadow: list[DedupVerdict] = []

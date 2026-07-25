@@ -430,6 +430,13 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # Commit-order witness: {hotkey: {pending, committed}} block numbers, written
+    # every poll tick. The chain deletes a commit's block when drand reveals it,
+    # so the evidence of who submitted a generator FIRST exists only for whoever
+    # watched while it was sealed — this file IS that record, and the duplicate
+    # screen's tie-break reads it (falling back to reveal order per hotkey when
+    # it has nothing). Relative paths resolve under work_root.
+    commit_witness_path: str = "trainer_commit_witness.json"
     # Content-level duplicate screen (cascade.interface.dedup): before the heat,
     # each challenger repo is fingerprinted and compared PAIRWISE against the
     # king and every kept lower-UID challenger; identical trees/token streams
@@ -1019,6 +1026,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
+            commit_witness_path=str(r.get("commit_witness_path",
+                                          "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
                                            "dedup_mode"),
             dedup_threshold=float(r.get("dedup_threshold", 0.99)),

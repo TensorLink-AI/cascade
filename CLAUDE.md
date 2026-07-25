@@ -37,8 +37,10 @@ in-context.
   sim ≥ 0.99, shadow-log 0.90–0.99; dropped copies still burn; behavioral
   probe enforces generator determinism and collapses identical-output
   processes; LLM judge is advisory-only, never in the enforcement path. The
-  screen is capped and clocked (difflib is O(n²) on submitter-chosen input)
-  and the probe refuses to run without a kernel-enforced sandbox.
+  screen is capped and clocked (difflib is O(n²) on submitter-chosen input),
+  the probe refuses to run without a kernel-enforced sandbox, and copy
+  contests resolve on earliest COMMIT (witnessed while sealed) — never on UID,
+  which recycles to newcomers.
   (`decisions/DEC-CA-0006-content-dedup-0.99.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
@@ -53,6 +55,9 @@ Canonical node: `decisions/NOTE-ca-operational-invariants.md`.
 - Pods are rsync'd trees, not git checkouts; `uv sync` needs `--all-extras`
   (torch lives behind the `train` extra).
 - Never restart the provisioner inside its pre-boundary trigger window.
+- A UID is not a seniority claim: Bittensor recycles deregistered UIDs to new
+  registrants. Anything deciding "who was here first" needs a block number
+  (commit or reveal), never a UID.
 - The orchestrator holds the private eval pool and the trainer's wallet. Any
   path that runs generator code there (today: the dedup probe) needs
   `sandbox_mode = "container"` or `sandbox_strict = true` — the subprocess

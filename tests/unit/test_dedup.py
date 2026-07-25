@@ -170,10 +170,11 @@ def dedup_runner(cfg, tmp_path, monkeypatch):
     repos = {}
     transport_fail: set[str] = set()
 
-    def add(name, uid, source):
+    def add(name, uid, source, reveal_block=0):
         ref = f"{name}/gen@sha256:{name[0] * 64}"
         repos[ref] = _repo(tmp_path / "repos", name, source)
-        return ResolvedGenerator(hotkey=name, uid=uid, ref=ref)
+        return ResolvedGenerator(hotkey=name, uid=uid, ref=ref,
+                                 reveal_block=reveal_block)
 
     def fake_fetch(ref, dest, hub=None):
         from types import SimpleNamespace
@@ -857,3 +858,117 @@ def test_over_cap_entrants_are_named_in_the_report(dedup_runner):
     report = json.loads((runner.work_root / "97" / "dedup_report.json").read_text())
     assert report["over_token_cap"][0]["hotkey"] == "alice"
     assert report["over_token_cap"][0]["n_tokens"] > 100
+
+
+# ── commit order: who submitted a generator FIRST ────────────────────────────
+
+class _WitnessClient:
+    """A chain client whose sealed-commit view the test drives directly."""
+
+    def __init__(self, sealed=None):
+        self.sealed = dict(sealed or {})
+
+    def poll_pending_commits(self):
+        return dict(self.sealed)
+
+
+def test_witness_freezes_the_commit_block_when_the_seal_disappears(dedup_runner):
+    # The chain deletes a commit's block at reveal, so the witness has to catch
+    # it while sealed and hold it: seen-sealed → pending, gone → committed.
+    runner, _ = dedup_runner
+    client = _WitnessClient({"alice": 100, "bob": 140})
+
+    w = runner.witness_commits(client)
+    assert w["alice"] == {"pending": 100, "committed": None}
+
+    del client.sealed["alice"]                     # alice's reveal lands
+    w = runner.witness_commits(client)
+    assert w["alice"] == {"pending": None, "committed": 100}
+    assert w["bob"] == {"pending": 140, "committed": None}   # bob still sealed
+
+
+def test_witness_survives_a_restart(dedup_runner, tmp_path):
+    # The record only exists on our disk; losing it on restart would silently
+    # drop the whole round back to reveal order.
+    from cascade.trainer.loop import TrainerRunner
+
+    runner, _ = dedup_runner
+    client = _WitnessClient({"alice": 100})
+    runner.witness_commits(client)
+    client.sealed.clear()
+    runner.witness_commits(client)
+
+    fresh = TrainerRunner(cfg=runner.cfg, base_trainer=object(),
+                          work_root=runner.work_root, use_sandbox=False)
+    assert fresh.witness_commits(_WitnessClient())["alice"]["committed"] == 100
+
+
+def test_a_new_seal_replaces_the_previous_pending_commit(dedup_runner):
+    # Re-committing claims a NEW submission; the old commit's priority must not
+    # follow the hotkey onto it.
+    runner, _ = dedup_runner
+    client = _WitnessClient({"alice": 100})
+    runner.witness_commits(client)
+    client.sealed["alice"] = 500                   # re-commit, still sealed
+    w = runner.witness_commits(client)
+    assert w["alice"]["pending"] == 500
+
+
+def test_witness_tolerates_a_client_without_the_read(dedup_runner):
+    runner, _ = dedup_runner
+    assert runner.witness_commits(object()) == {}
+
+
+def test_commit_priority_falls_back_to_reveal_block(dedup_runner):
+    # An entrant we merely failed to observe must not be expropriated for it:
+    # reveal order is the same units and still puts a copyist behind the repo
+    # they copied (copying a revealed repo means revealing after it).
+    runner, add = dedup_runner
+    seen = add("alice", 3, BASE_SOURCE, reveal_block=900)
+    unseen = add("bobby", 4, OTHER_SOURCE, reveal_block=880)
+    runner.witness_commits(_WitnessClient({"alice": 100}))
+    runner.witness_commits(_WitnessClient())       # alice reveals
+
+    prio = runner._commit_priority([seen, unseen])
+    assert prio == {"alice": 100, "bobby": 880}
+
+
+def test_earliest_commit_keeps_the_slot_over_a_lower_uid(tmp_path):
+    # The expropriation this exists to stop: Bittensor recycles deregistered
+    # UIDs, so a newcomer can hold a LOWER uid than the miner they copy. Order
+    # by when each was submitted, not by which slot they inherited.
+    entries = [
+        _entry(tmp_path, "victim", 200, BASE_SOURCE),        # high uid, committed first
+        _entry(tmp_path, "copyist", 12, "# mine now\n" + BASE_SOURCE),
+    ]
+    by_uid = screen_duplicates(entries, None)
+    assert by_uid.kept_hotkeys == ("copyist",)               # the old rule
+
+    by_commit = screen_duplicates(entries, None,
+                                  priority={"victim": 100, "copyist": 400})
+    assert by_commit.kept_hotkeys == ("victim",)
+    (v,) = by_commit.dropped
+    assert v.hotkey == "copyist" and v.matched_hotkey == "victim"
+
+
+def test_uid_still_breaks_a_tie_at_the_same_block(tmp_path):
+    entries = [
+        _entry(tmp_path, "aaa", 9, BASE_SOURCE),
+        _entry(tmp_path, "bbb", 4, "# copy\n" + BASE_SOURCE),
+    ]
+    result = screen_duplicates(entries, None, priority={"aaa": 100, "bbb": 100})
+    assert result.kept_hotkeys == ("bbb",)
+
+
+def test_runner_screen_orders_on_the_witnessed_commit(dedup_runner):
+    # End to end: the copyist holds the lower UID, but committed later.
+    runner, add = dedup_runner
+    victim = add("victim", 200, BASE_SOURCE, reveal_block=980)
+    copyist = add("copyst", 12, "# resubmit\n" + BASE_SOURCE, reveal_block=995)
+    runner.witness_commits(_WitnessClient({"victim": 100, "copyst": 400}))
+    runner.witness_commits(_WitnessClient())       # both reveal
+
+    kept = runner._screen_duplicate_entrants(None, [victim, copyist], base_seed=98)
+    assert [c.hotkey for c in kept] == ["victim"]
+    report = json.loads((runner.work_root / "98" / "dedup_report.json").read_text())
+    assert report["dropped"][0]["hotkey"] == "copyst"
