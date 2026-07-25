@@ -60,6 +60,7 @@ from .corpus import CorpusError
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
+
 @dataclass(frozen=True)
 class HeatScore:
     """A heat entrant's screen result: the combined ``geomean`` used to RANK the
