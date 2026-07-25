@@ -500,12 +500,20 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
     heat_summary = None
     if isinstance(heat, dict):
         ents = heat.get("entrants") or []
+        cut = heat.get("cut") if isinstance(heat.get("cut"), dict) else None
         heat_summary = {
             "screen_size": heat.get("screen_size", ""),
             "finalists": heat.get("finalists"),
             "n_entrants": len(ents),
             "n_advanced": sum(1 for e in ents if isinstance(e, dict)
                               and e.get("status") == "advanced"),
+            # Separation at the finalist boundary (cascade.eval.heat_cut) — never
+            # gated on, tracked so a chronically marginal screen is visible in the
+            # rounds table rather than only in a trainer log line.
+            "cut_lcb": cut.get("lcb") if cut else None,
+            "cut_observed": cut.get("observed") if cut else None,
+            "cut_margin": cut.get("margin") if cut else None,
+            "cut_separated": cut.get("separated") if cut else None,
         }
 
     return {

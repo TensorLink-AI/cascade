@@ -34,6 +34,14 @@ in-context.
   vacancy anyway) and stalled all future promotions. Kills DEC-CA-0005's handoff-sync
   workstream. (`decisions/DEC-CA-0004-cascade-persist-throne.md`)
 
+- **DEC-CA-0006** — Heat ranks on the OBSERVED geomean point estimate, never on
+  the bootstrap LCB (no "decline to decide" branch, no king at heat budget to
+  pair against, and LCB-ranking would reward low variance over low score). The
+  LCB is measured once per round at the finalist cut and tracked
+  (`HeatResult.cut`); a chronically unseparated cut means raise `finalists` /
+  `heat_n_windows` / `heat_num_samples`, not change the statistic.
+  (`decisions/DEC-CA-0006-heat-ranks-on-point-estimate.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

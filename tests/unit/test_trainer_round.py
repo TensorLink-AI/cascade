@@ -313,6 +313,93 @@ def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     assert load_manifest(dump_manifest(manifest)).heat == heat
 
 
+def _screen_scores(scale, n=64, seed=0):
+    """Per-window components a screener may report alongside its score."""
+    from cascade.eval.scoring import WindowScore
+
+    rng = np.random.default_rng(seed)
+    return [
+        WindowScore(series_id=str(i), mase=float(rng.uniform(0.5, 1.5)) * scale,
+                    qloss_per_q=rng.uniform(0.1, 1.0, size=9) * scale,
+                    abs_target=float(5.0 + i % 5))
+        for i in range(n)
+    ]
+
+
+def test_heat_records_cut_separation_without_changing_the_ranking(cfg, tmp_path, monkeypatch):
+    """A screener that reports per-window components buys the cut diagnostic:
+    the boundary pair (rank 1 vs rank 2) is bootstrapped and recorded. The field
+    still advances on the score alone."""
+    _patch_train_boundaries(monkeypatch)
+    scales = {"b": 0.9, "c": 0.2, "d": 0.5}
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        # Same windows for every entrant (same seed) — the pairing the cut needs.
+        scores = _screen_scores(scales[gen.hotkey])
+        from cascade.eval.scoring import global_geomean
+        return global_geomean(scores), scores
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    # Ranking is untouched by the diagnostic: cheapest still advances.
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+    cut = manifest.heat.cut
+    assert cut is not None
+    # c (0.2) vs d (0.5) at the cut — a wide, real gap.
+    assert cut.separated and cut.lcb >= cut.margin
+    assert cut.margin == cfg.scoring.win_margin_start
+    assert cut.n_windows == 64
+    assert cut.lcb <= cut.p50 <= cut.p95
+    # rides the wire with the rest of the (unsigned) heat block
+    assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
+
+
+def test_heat_cut_absent_when_screener_reports_only_a_score(cfg, tmp_path, monkeypatch):
+    """The bare-float ScreenFn contract still works — it just forgoes the cut."""
+    _patch_train_boundaries(monkeypatch)
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None:
+                               scores[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert manifest.heat is not None
+    assert manifest.heat.cut is None
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+
+
+def test_heat_cut_failure_does_not_sink_the_round(cfg, tmp_path, monkeypatch, caplog):
+    """A diagnostic that raises is logged and dropped — the round still lands."""
+    _patch_train_boundaries(monkeypatch)
+    scales = {"b": 0.9, "c": 0.2, "d": 0.5}
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        from cascade.eval.scoring import global_geomean
+        # 'd' is the far side of the cut and reports a different window count —
+        # unpairable, so measure_heat_cut raises and the diagnostic drops out.
+        n = 32 if gen.hotkey == "d" else 64
+        scores = _screen_scores(scales[gen.hotkey], n=n)
+        return global_geomean(scores), scores
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
+        manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert manifest.heat is not None and manifest.heat.cut is None
+    assert manifest.entry_for_role("challenger").miner_hotkey == "c"
+    assert "could not measure cut separation" in caplog.text
+
+
 def test_heat_none_when_no_screen_runs(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     # One challenger, finalists = 1 ⇒ it fits without a screen; no standings to show.

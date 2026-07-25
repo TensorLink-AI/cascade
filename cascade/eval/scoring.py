@@ -147,6 +147,21 @@ def stack_components(
     return qloss, abs_t, mase_a
 
 
+def window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
+    """Cluster labels for the paired bootstrap, one per (window, channel) row.
+
+    The cluster key is the upstream feed id (pool metadata ``source``) when
+    present; rows without one are their own singleton cluster, which degrades
+    exactly to the classic per-window bootstrap for legacy pools. Shared by the
+    KOTH verdict (:mod:`.koth`) and the heat-cut diagnostic (:mod:`.heat_cut`)
+    so both draw their bags over the same notion of an independent unit.
+    """
+    labels: list = []
+    for i, s in enumerate(scores):
+        labels.append(s.source if s.source else f"__row{i}")
+    return labels, len(set(labels))
+
+
 def global_geomean(scores: list[WindowScore]) -> float:
     """Round-level geomean(MWSQL, mean MASE) on the observed (non-resampled)
     windows. Reported for diagnostics; the bootstrap LCB gates dethroning."""

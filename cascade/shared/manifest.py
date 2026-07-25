@@ -186,6 +186,44 @@ class HeatEntrant:
 
 
 @dataclass(frozen=True)
+class HeatCut:
+    """How much daylight the screen had at its finalist boundary.
+
+    A paired-bootstrap read on the last entrant that advanced versus the first
+    that did not (see :func:`cascade.eval.heat_cut.measure_heat_cut`). Purely
+    observational: the heat ranks on the point estimate and this NEVER changes
+    who advances. It exists so a persistently marginal cut — ``lcb`` below
+    ``margin`` round after round — shows up as a tracked number instead of a
+    hunch, since with ``[round] finalists = 1`` the runner-up never reaches the
+    final for the real statistic to settle the order.
+
+    All values are relative improvements of the advanced entrant over the
+    rejected one, so they carry no information about the private pool's absolute
+    scale (the same reason :class:`HeatEntrant` publishes only ``rel_score``).
+
+    Attributes:
+        lcb: one-sided lower confidence bound at the round's ``bootstrap_alpha``.
+        p50 / p95: median and 95th pct of the same bootstrap draws — the spread
+            around the point estimate the ranking actually used.
+        observed: relative gap on the observed (non-resampled) windows.
+        margin: the KOTH win margin, recorded as the reference bar ``lcb`` is
+            being read against.
+        separated: ``lcb >= margin`` — the cut cleared the bar the final would
+            need to call a win. False for an uncomputable (NaN) cut.
+        n_windows / n_clusters: rows and independent clusters behind the read.
+    """
+
+    lcb: float
+    p50: float
+    p95: float
+    observed: float
+    margin: float
+    separated: bool
+    n_windows: int
+    n_clusters: int
+
+
+@dataclass(frozen=True)
 class HeatResult:
     """The round's heat screen, as a presentational (unsigned) block.
 
@@ -199,6 +237,10 @@ class HeatResult:
     screen_size: str               # arch_preset the heat screened at
     finalists: int                 # how many advanced to the final
     entrants: tuple[HeatEntrant, ...] = ()
+    # Separation at the finalist boundary; None when the round had nothing on the
+    # far side of the cut to compare against, or the screener returned no
+    # per-window components (a custom ScreenFn that reports only a score).
+    cut: HeatCut | None = None
 
 
 def _entry_body(e: TrainedEntry) -> dict:
@@ -227,11 +269,16 @@ def _bench_from_json(obj: object) -> BenchScores | None:
 def _heat_to_json(heat: HeatResult | None) -> dict | None:
     if heat is None:
         return None
-    return {
+    out = {
         "screen_size": heat.screen_size,
         "finalists": heat.finalists,
         "entrants": [asdict(e) for e in heat.entrants],
     }
+    # Omitted when absent so a heat block without a cut stays byte-identical to a
+    # pre-``cut`` one.
+    if heat.cut is not None:
+        out["cut"] = asdict(heat.cut)
+    return out
 
 
 def _heat_from_json(obj: object) -> HeatResult | None:
@@ -251,6 +298,22 @@ def _heat_from_json(obj: object) -> HeatResult | None:
             )
             for e in obj.get("entrants", ())
         ),
+        cut=_cut_from_json(obj.get("cut")),
+    )
+
+
+def _cut_from_json(obj: object) -> HeatCut | None:
+    if not isinstance(obj, dict):
+        return None
+    return HeatCut(
+        lcb=float(obj["lcb"]),
+        p50=float(obj["p50"]),
+        p95=float(obj["p95"]),
+        observed=float(obj["observed"]),
+        margin=float(obj["margin"]),
+        separated=bool(obj["separated"]),
+        n_windows=int(obj["n_windows"]),
+        n_clusters=int(obj["n_clusters"]),
     )
 
 

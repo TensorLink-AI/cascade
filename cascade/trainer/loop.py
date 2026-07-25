@@ -45,6 +45,7 @@ from ..shared.hippius import (
 )
 from ..shared.manifest import (
     BenchScores,
+    HeatCut,
     HeatEntrant,
     HeatResult,
     TrainedEntry,
@@ -68,7 +69,15 @@ from .wandb_sink import open_wandb_run
 # geomean(CRPS, MASE) on the held-out windows). Injected so the trainer's
 # screening stays a testable boundary — the default wiring (torch evaluator +
 # eval pool) is attached in cascade.trainer.main.
-ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
+#
+# May ALSO return ``(score, per_window_scores)`` — the WindowScore rows behind
+# the number — which buys the heat-cut diagnostic (see cascade.eval.heat_cut) and
+# nothing else: the ranking uses the score alone either way. A screener that
+# returns a bare float simply leaves the round's HeatResult without a ``cut``.
+ScreenFn = Callable[
+    [Path, "ResolvedGenerator", int, int | None],
+    "float | tuple[float, list]",
+]
 
 # Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
@@ -92,6 +101,20 @@ def _http_status_in_chain(exc: BaseException | None) -> int | None:
             return status
         exc = exc.__cause__ or exc.__context__
     return None
+
+
+def _split_screen_result(res) -> tuple[float, list | None]:
+    """Normalise a :data:`ScreenFn` return into ``(score, per_window_scores)``.
+
+    Accepts the bare float (the original contract, and what a custom screener or
+    a test stub returns) as well as the ``(score, scores)`` pair the default
+    wiring now hands back. The components are optional everywhere downstream —
+    only the heat-cut diagnostic consumes them.
+    """
+    if isinstance(res, tuple):
+        score, scores = res
+        return float(score), list(scores)
+    return float(res), None
 
 
 def _pctl(vals: list[float], q: float) -> float:
@@ -1159,26 +1182,85 @@ class TrainerRunner:
                      "earlier-revealed submission", hk)
 
         scored: list[tuple[float, int, ResolvedGenerator]] = []
+        components: dict[str, list] = {}   # hotkey -> per-window scores, when reported
         for c, ckpt_dir, _ in trained:
             if c.hotkey in duplicates:
                 continue
             try:
-                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block))
+                score, per_window = _split_screen_result(
+                    self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block)
+                )
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
+            if per_window is not None:
+                components[c.hotkey] = per_window
 
         scored.sort(key=lambda t: (t[0], t[1]))  # lower score better; UID tiebreak
         winners = [c for _, _, c in scored[:n]]
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
+        cut = self._measure_cut(scored, n, components, seeds.base_seed)
         heat = self._heat_result(
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
-            duplicates=duplicates,
+            duplicates=duplicates, cut=cut,
         )
         return winners, heat
+
+    def _measure_cut(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        n: int,
+        components: dict[str, list],
+        base_seed: int,
+    ) -> HeatCut | None:
+        """Bootstrap the gap between the last entrant in and the first one out.
+
+        Observational only — it runs *after* the field is already ranked and can
+        never change who advances (see :mod:`cascade.eval.heat_cut` for why the
+        heat ranks on the point estimate rather than on this bound). Returns None
+        when nothing was cut (the field fit inside ``finalists``) or the screener
+        reported no per-window components for both sides.
+
+        Best-effort throughout: a diagnostic must never sink a round, so any
+        failure is logged and swallowed.
+        """
+        if len(scored) <= n or n <= 0:
+            return None
+        advanced, rejected = scored[n - 1][2], scored[n][2]
+        a_scores = components.get(advanced.hotkey)
+        r_scores = components.get(rejected.hotkey)
+        if not a_scores or not r_scores:
+            return None
+        try:
+            from ..eval.heat_cut import measure_heat_cut
+
+            sc = self.cfg.scoring
+            cut = measure_heat_cut(
+                a_scores, r_scores,
+                alpha=sc.bootstrap_alpha,
+                B=sc.bootstrap_B,
+                # Same seed the round is keyed on: two trainers replaying the
+                # round draw identical bags, so the number is reproducible.
+                seed=base_seed,
+                margin=sc.win_margin_start,
+            )
+        except Exception as e:  # noqa: BLE001 — a diagnostic must never fail a round
+            log.warning("heat: could not measure cut separation: %s", e)
+            return None
+        log.log(
+            logging.INFO if cut.separated else logging.WARNING,
+            "heat: cut %s → %s lcb=%+.4f (p50=%+.4f p95=%+.4f observed=%+.4f) "
+            "vs margin %.4f on %d windows / %d clusters%s",
+            advanced.hotkey, rejected.hotkey, cut.lcb, cut.p50, cut.p95,
+            cut.observed, cut.margin, cut.n_windows, cut.n_clusters,
+            "" if cut.separated else
+            " — the screen split the field by less than the final calls a win; "
+            "raise [round] finalists / heat_n_windows / heat_num_samples if this persists",
+        )
+        return cut
 
     def _heat_result(
         self,
@@ -1190,6 +1272,7 @@ class TrainerRunner:
         finalists: int,
         *,
         duplicates: set[str] = frozenset(),
+        cut: HeatCut | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
@@ -1222,7 +1305,8 @@ class TrainerRunner:
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref, status=status,
             ))
-        return HeatResult(screen_size=screen_size, finalists=finalists, entrants=tuple(entrants))
+        return HeatResult(screen_size=screen_size, finalists=finalists,
+                          entrants=tuple(entrants), cut=cut)
 
     def _heat_train(
         self,

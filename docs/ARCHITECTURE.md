@@ -55,7 +55,14 @@ per epoch (so the king is trained once per day). Each round:
    (`[round] heat_train_hours`, ~30min, on the primary/smallest size), scores each
    on the held-out pool (geomean of CRPS/MASE), and keeps the top
    `[round] finalists` (default 1). A challenger that fails to train or score just
-   doesn't qualify.
+   doesn't qualify. The heat ranks on the **observed** geomean — not the bootstrap
+   LCB the throne decision gates on: it has to advance `finalists` entrants
+   whatever the evidence says, so there is nothing for a lower bound to gate
+   ([[DEC-CA-0006]]). It does *measure* the boundary — the same paired bootstrap
+   run on the last entrant in vs the first one out, recorded as `heat.cut` and
+   logged at WARNING when the gap falls short of the KOTH win margin. Purely
+   observational; a chronically marginal cut is the signal to raise `finalists`,
+   `heat_n_windows` or `heat_num_samples`.
 5. **Final.** For the king and each surviving finalist, at **every configured
    size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
    **under that one shared seed pair**:

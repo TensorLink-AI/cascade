@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from .config import ChainConfig, load_chain_config
 from .manifest import (
+    HeatCut,
     HeatEntrant,
     HeatResult,
     TrainedEntry,
@@ -20,6 +21,7 @@ from .manifest import (
 __all__ = [
     "ChainConfig",
     "load_chain_config",
+    "HeatCut",
     "HeatEntrant",
     "HeatResult",
     "TrainedEntry",

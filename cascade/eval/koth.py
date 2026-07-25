@@ -24,7 +24,7 @@ from .bootstrap import (
     paired_bootstrap_quantiles_aggregated,
 )
 from .gift_gate import GiftGateResult
-from .scoring import WindowScore, global_geomean, stack_components
+from .scoring import WindowScore, global_geomean, stack_components, window_clusters
 
 # The public-benchmark gate rollout modes (``[scoring] gift_gate_mode``):
 #   "off"     — gate never runs (default; pure private-pool KOTH).
@@ -143,19 +143,6 @@ class RoundResult:
     boot_p95: float | None = None
 
 
-def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
-    """Cluster labels for the paired bootstrap, one per (window, channel) row.
-
-    The cluster key is the upstream feed id (pool metadata ``source``) when
-    present; rows without one are their own singleton cluster, which degrades
-    exactly to the classic per-window bootstrap for legacy pools.
-    """
-    labels: list = []
-    for i, s in enumerate(scores):
-        labels.append(s.source if s.source else f"__row{i}")
-    return labels, len(set(labels))
-
-
 def _per_window_geomeans(scores: list[WindowScore]) -> np.ndarray:
     """Per-window geomean(WQL, MASE) — the scalar behind the shadow
     diagnostics only; the decision LCB uses the aggregate-then-divide form."""
@@ -212,7 +199,7 @@ def evaluate_round(
         )
     n = len(king_scores)
     margin = margin_for_tenure(params, king_tenure_rounds)
-    clusters, n_clusters = _window_clusters(king_scores)
+    clusters, n_clusters = window_clusters(king_scores)
 
     if n < params.min_windows or (params.min_clusters > 0 and n_clusters < params.min_clusters):
         return RoundResult(

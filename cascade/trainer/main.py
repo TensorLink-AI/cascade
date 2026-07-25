@@ -366,12 +366,16 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
     # keeps the sequential CPU screening from rivalling the heat training time.
     num_samples = cfg.round.heat_num_samples or cfg.eval.num_samples
 
-    def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None) -> float:
+    def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None):
         windows = window_source.windows_for_round(base_seed, n, block=block)
         scores = evaluate_checkpoint(
             ckpt_dir, windows, num_samples=num_samples, device="cpu"
         )
-        return global_geomean(scores)
+        # The per-window rows ride along with the score: every entrant in a round
+        # screens on this same slice, so the runner sorts the field on the score
+        # and then bootstraps the pair either side of the cut (cascade.eval.heat_cut)
+        # off components it would otherwise discard.
+        return global_geomean(scores), scores
 
     def pool_provenance(base_seed: int, block: int | None = None) -> tuple[str, str]:
         key, sha = window_source.provenance_for_round(base_seed, block=block)
