@@ -156,3 +156,15 @@ def global_geomean(scores: list[WindowScore]) -> float:
     mwsql = mwsql_from_components(qloss, abs_t)
     mase_mean = float(mase_a.mean())
     return float(np.sqrt(max(mwsql, 1e-12) * max(mase_mean, 1e-12)))
+
+
+def global_components(scores: list[WindowScore]) -> tuple[float, float]:
+    """The two components behind :func:`global_geomean`, ``(crps, mase)``, before
+    they are combined into the geomean: ``crps`` is the round-level CRPS-family
+    loss (mean weighted scaled quantile loss, MWSQL) and ``mase`` is the mean
+    MASE. NaN-safe — an empty list returns ``(nan, nan)``. Used by the heat
+    screener to report a challenger's raw error components, not just the geomean."""
+    if not scores:
+        return (float("nan"), float("nan"))
+    qloss, abs_t, mase_a = stack_components(scores)
+    return (float(mwsql_from_components(qloss, abs_t)), float(mase_a.mean()))

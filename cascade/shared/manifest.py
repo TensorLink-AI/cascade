@@ -165,12 +165,17 @@ class HeatEntrant:
     The heat trains every eligible challenger cheaply and ranks them; only the
     top ``finalists`` advance. Those scores are otherwise thrown away (the heat
     checkpoints are discarded), so this is the miner's only window into how a
-    non-finalist submission fared. It is deliberately coarse: a ``rank`` and a
-    ``rel_score`` *relative to the best entrant* (``heat_score / best``, ≥ 1.0,
-    where 1.0 is the best), never the raw per-window numbers — the eval pool
-    rotates privately and exposing absolute scores would hand a miner a gradient
-    to distribution-match it. ``rank``/``rel_score`` are None for an entrant that
-    never produced a score (``failed_train`` / ``failed_screen``).
+    non-finalist submission fared. It carries a ``rank``, a ``rel_score``
+    *relative to the best entrant* (``heat_score / best``, ≥ 1.0, where 1.0 is the
+    best), and the raw aggregate error components ``crps`` (CRPS-family MWSQL) and
+    ``mase`` on the round's eval-pool slice.
+
+    Note: publishing the raw ``crps``/``mase`` exposes absolute error on the
+    private, per-round rotated eval pool — deliberately withheld in earlier
+    versions, since an absolute per-round signal can help a miner distribution-
+    match the pool. It is emitted now by owner decision for miner transparency.
+    ``rank``/``rel_score``/``crps``/``mase`` are None for an entrant that never
+    produced a score (``failed_train`` / ``failed_screen``).
     """
 
     uid: int
@@ -179,6 +184,8 @@ class HeatEntrant:
     status: str                    # one of HEAT_STATUSES
     rank: int | None = None        # 1-based placement among scored entrants
     rel_score: float | None = None  # heat_score / best_heat_score (≥ 1.0; 1.0 = best)
+    crps: float | None = None      # raw CRPS-family loss (MWSQL) on the eval pool; None if unscored
+    mase: float | None = None      # raw mean MASE on the eval pool; None if unscored
 
     def __post_init__(self) -> None:
         if self.status not in HEAT_STATUSES:
@@ -248,6 +255,8 @@ def _heat_from_json(obj: object) -> HeatResult | None:
                 status=str(e["status"]),
                 rank=(None if e.get("rank") is None else int(e["rank"])),
                 rel_score=(None if e.get("rel_score") is None else float(e["rel_score"])),
+                crps=(None if e.get("crps") is None else float(e["crps"])),
+                mase=(None if e.get("mase") is None else float(e["mase"])),
             )
             for e in obj.get("entrants", ())
         ),

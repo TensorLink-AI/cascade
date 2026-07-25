@@ -302,8 +302,40 @@ def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     assert by_hk["d"].rel_score == pytest.approx(2.5)     # 0.5 / 0.2
     assert by_hk["b"].rank == 3 and by_hk["b"].status == "screened"
     assert by_hk["b"].rel_score == pytest.approx(4.5)     # 0.9 / 0.2
+    # a bare-float screener reports no raw components (back-compat path)
+    assert by_hk["c"].crps is None and by_hk["c"].mase is None
     # survives serialisation to the wire (rides the manifest, unsigned)
     assert load_manifest(dump_manifest(manifest)).heat == heat
+
+
+def test_heat_records_raw_crps_mase_when_screener_reports_them(cfg, tmp_path, monkeypatch):
+    """A screener returning :class:`HeatScore` carries each entrant's raw CRPS and
+    MASE through to the heat standings (published for miner transparency), while
+    ranking still keys on the combined geomean."""
+    from cascade.trainer.loop import HeatScore
+
+    _patch_train_boundaries(monkeypatch)
+    comp = {
+        "b": HeatScore(geomean=0.9, crps=1.4, mase=0.58),
+        "c": HeatScore(geomean=0.2, crps=0.3, mase=0.13),
+        "d": HeatScore(geomean=0.5, crps=0.7, mase=0.36),
+    }
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: comp[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    by_hk = {e.hotkey: e for e in manifest.heat.entrants}
+    # ranking still keys on the geomean — cheapest (c) advances, rel_score = 1.0
+    assert by_hk["c"].rank == 1 and by_hk["c"].rel_score == 1.0
+    # ...and the raw components ride through, per entrant
+    assert by_hk["c"].crps == pytest.approx(0.3) and by_hk["c"].mase == pytest.approx(0.13)
+    assert by_hk["d"].crps == pytest.approx(0.7) and by_hk["d"].mase == pytest.approx(0.36)
+    assert by_hk["b"].crps == pytest.approx(1.4) and by_hk["b"].mase == pytest.approx(0.58)
+    # survives the manifest round-trip (unsigned, presentational)
+    assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
 
 
 def test_heat_none_when_no_screen_runs(cfg, tmp_path, monkeypatch):

@@ -1316,12 +1316,14 @@ function renderHeat(){
       '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+'</td>'+
       '<td>'+refLink(e.gen_ref)+'</td>'+
       '<td class="heat-bar-cell"><span class="heat-bar"><i style="width:'+width.toFixed(0)+'%;background:'+fill+'"></i></span><span class="heat-rel">'+label+'</span></td>'+
+      '<td class="num">'+fmt(e.crps,4)+'</td>'+
+      '<td class="num">'+fmt(e.mase,3)+'</td>'+
       '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
   }).join("");
-  panel.innerHTML='<div class="heat-note">Ranked by heat score (lower is better); the top '+
-    (nf!=null?nf:"N")+' advance to the final. Scores are shown relative to the best entrant — the raw per-window numbers stay off the dashboard so the rotating private eval pool can’t be reverse-engineered.</div>'+
+  panel.innerHTML='<div class="heat-note">Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
+    (nf!=null?nf:"N")+' advance to the final. Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice.</div>'+
     '<div class="scroll-box scroll-field"><table><thead><tr>'+
-    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th>Standing</th>'+
+    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th class="num">CRPS</th><th class="num">MASE</th><th>Standing</th>'+
     '</tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 function renderRounds(){

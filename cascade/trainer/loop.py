@@ -58,15 +58,29 @@ from .corpus import CorpusError
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
+@dataclass(frozen=True)
+class HeatScore:
+    """A heat entrant's screen result: the combined ``geomean`` used to RANK the
+    field, plus its two components — ``crps`` (the CRPS-family MWSQL loss) and
+    ``mase`` — carried through to the dashboard. A :data:`ScreenFn` may still
+    return a bare ``float`` (geomean only), in which case the components surface
+    as ``None`` and only the relative ranking is published."""
+
+    geomean: float
+    crps: float | None = None
+    mase: float | None = None
+
+
 # Screens one heat checkpoint: given the trained heat-model directory, the
 # generator that produced its corpus, the round's base seed (so the screening
 # window slice can rotate per round), and the round's epoch-boundary block (so a
 # daily-snapshot pool selects the SAME snapshot the validator will judge the
 # final on — not whatever is newest), return a heat score (LOWER is better, e.g.
-# geomean(CRPS, MASE) on the held-out windows). Injected so the trainer's
-# screening stays a testable boundary — the default wiring (torch evaluator +
-# eval pool) is attached in cascade.trainer.main.
-ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
+# geomean(CRPS, MASE) on the held-out windows) — either a bare ``float`` or a
+# :class:`HeatScore` carrying the raw CRPS/MASE components too. Injected so the
+# trainer's screening stays a testable boundary — the default wiring (torch
+# evaluator + eval pool) is attached in cascade.trainer.main.
+ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], "float | HeatScore"]
 
 # Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
@@ -1062,14 +1076,19 @@ class TrainerRunner:
                      "earlier-revealed submission", hk)
 
         scored: list[tuple[float, int, ResolvedGenerator]] = []
+        components: dict[str, tuple[float | None, float | None]] = {}
         for c, ckpt_dir, _ in trained:
             if c.hotkey in duplicates:
                 continue
             try:
-                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block))
+                res = self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block)
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
+            if isinstance(res, HeatScore):
+                score, components[c.hotkey] = float(res.geomean), (res.crps, res.mase)
+            else:  # a bare float — geomean only, no raw components
+                score, components[c.hotkey] = float(res), (None, None)
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
 
@@ -1079,7 +1098,7 @@ class TrainerRunner:
                  len(winners), len(challengers), [c.hotkey for c in winners])
         heat = self._heat_result(
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
-            duplicates=duplicates,
+            duplicates=duplicates, components=components,
         )
         return winners, heat
 
@@ -1093,27 +1112,30 @@ class TrainerRunner:
         finalists: int,
         *,
         duplicates: set[str] = frozenset(),
+        components: dict[str, tuple[float | None, float | None]] | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
-        Scores are recorded only *relative to the best entrant* (``score / best``)
-        — the raw numbers stay off the public record so the private, per-round
-        rotated eval pool can't be reverse-engineered from the heat. Entrants that
-        never produced a score are carried too, tagged by how they dropped out:
-        ``duplicate`` (corpus byte-identical to an earlier reveal), ``failed_train``
-        (crashed the screen budget) or ``failed_screen`` (trained but the scorer
-        raised).
+        Each scored entrant carries its ``rel_score`` (``score / best``) plus, when
+        the screener reported them (via :class:`HeatScore`), its raw ``crps`` and
+        ``mase`` on the round's eval-pool slice — published so miners can see their
+        absolute error, not just the relative ranking. Entrants that never produced
+        a score are carried too, tagged by how they dropped out: ``duplicate``
+        (corpus byte-identical to an earlier reveal), ``failed_train`` (crashed the
+        screen budget) or ``failed_screen`` (trained but the scorer raised).
         """
+        comps = components or {}
         advanced = {c.hotkey for c in winners}
         scored_hotkeys = {c.hotkey for _, _, c in scored}
         best = scored[0][0] if scored else None
         entrants: list[HeatEntrant] = []
         for rank, (score, _uid, c) in enumerate(scored, start=1):
             rel = (score / best) if (best is not None and best > 0) else None
+            crps, mase = comps.get(c.hotkey, (None, None))
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
                 status="advanced" if c.hotkey in advanced else "screened",
-                rank=rank, rel_score=rel,
+                rank=rank, rel_score=rel, crps=crps, mase=mase,
             ))
         for c in challengers:
             if c.hotkey in scored_hotkeys:
