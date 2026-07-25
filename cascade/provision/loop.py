@@ -140,6 +140,18 @@ _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 BOOT_MARGIN_HOURS = 1.0
 
 
+def _heat_field(payload: dict) -> int:
+    """How many challengers the heat will actually train.
+
+    ``screened_challengers`` is the count AFTER the trainer's content-dedup
+    screen ([round] dedup_mode); sizing off the pre-screen count rents pods for
+    copies that never train. Older trainers (and ``dedup_mode = "off"``) omit
+    the key, so fall back to the raw eligible count.
+    """
+    n = payload.get("screened_challengers")
+    return int(n) if n is not None else int(payload["eligible_challengers"])
+
+
 def is_provisioner_pod_name(name: str) -> bool:
     """True only for pod names this service itself creates (see _PROVISIONER_POD_RE)."""
     return _PROVISIONER_POD_RE.match(str(name)) is not None
@@ -508,15 +520,17 @@ class ProvisionerLoop:
         self._rent_abort.clear()
 
         fleet = size_fleet(
-            int(payload["eligible_challengers"]),
+            _heat_field(payload),
             int(payload["finalists"]),
             float(payload["heat_train_hours"]),
             self.epoch_hours,
             self.final_hours,
             self.policy,
         )
-        log.info("round %d plan: eligible=%s → heat %d pod(s)/%d slot(s), final %d pod(s)/%d slot(s)",
+        log.info("round %d plan: eligible=%s screened=%s → heat %d pod(s)/%d slot(s), "
+                 "final %d pod(s)/%d slot(s)",
                  round_id, payload["eligible_challengers"],
+                 payload.get("screened_challengers", "n/a"),
                  fleet.heat.pods, fleet.heat.slots, fleet.final.pods, fleet.final.slots)
 
         wants: dict[str, int] = {}
@@ -863,7 +877,7 @@ class ProvisionerLoop:
                               "on the heat fleet%s", self._provisioned_round, remaining,
                               "" if plan else " (no cached plan after restart)")
                     continue
-                refleet = size_fleet(int(plan["eligible_challengers"]),
+                refleet = size_fleet(_heat_field(plan),
                                      int(plan["finalists"]), heat_hours,
                                      remaining, self.final_hours, self.policy)
                 if refleet.heat.pods > 0:

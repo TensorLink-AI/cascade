@@ -31,7 +31,10 @@ max_dup_fraction     = 0.05      # cache_reuse only: max fraction of exact byte-
 sandbox_mode   = "subprocess"
 sandbox_image  = ""              # e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>"
 sandbox_python = "python3"       # python inside sandbox_image
-sandbox_strict = false           # true on production: no netns => refuse, don't degrade
+sandbox_strict = true            # no netns => refuse, don't degrade to the socket guard.
+                                 # REQUIRED here: the dedup probe runs generator code on
+                                 # the orchestrator, which holds the eval pool and wallet
+                                 # (container mode is stronger still — see DEC-CA-0006).
 
 [training]
 # The FIXED training contract — identical for king and challenger; folded into
@@ -163,6 +166,20 @@ dedup_max_abs_delta = 0
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
 dedup_config_only_enforce = false
+# Cost caps. difflib's ratio is O(n^2) in tokens (2.3s @ 20k, 9.3s @ 40k,
+# 38.7s @ 80k) on an input the submitter chooses up to max_repo_mb, so two fat
+# near-copies would otherwise stall the screen — and the round — indefinitely.
+# Field repos are ~100KB / 7-11k tokens, so both caps have ~40x headroom.
+dedup_max_tokens   = 50000       # 0 = uncapped; do NOT run 0 in production
+dedup_max_text_mb  = 4           # tokenizer input budget per repo
+# Pairs over the cap are judged by a linear shingle-Jaccard sketch instead —
+# without it, padding a copy past the cap would evade the near_duplicate tier.
+# Jaccard has its own calibration, so it observes before it drops.
+dedup_sketch_mode      = "shadow"   # off | shadow | enforce
+dedup_sketch_threshold = 0.99
+# Wall clock for the WHOLE screen. On expiry the field proceeds unscreened: a
+# screen that cannot finish must not sink the round it protects.
+dedup_phase_seconds = 900
 # Behavioral probe: sandbox-draw N series per surviving entrant under the
 # shared round seed, twice. Twice-differs = non-deterministic generator
 # (contract violation, the entropy re-roll). Identical probe bytes across
@@ -172,6 +189,12 @@ dedup_config_only_enforce = false
 # probe ships SHADOW while the static tiers enforce.
 dedup_probe_mode   = "shadow"    # off | shadow | enforce
 dedup_probe_series = 8           # 0 = probe off
+# Total probe wall clock; the per-draw budget is derived from it (budget / waves
+# / 2 draws), so N hostile entrants each burning their clock cannot stretch the
+# stage past this. The probe REFUSES to run unless [generator] has
+# sandbox_mode = "container" or sandbox_strict = true — shadow mode gates the
+# drops, not the execution, and this host holds the eval pool and the wallet.
+dedup_probe_budget_seconds = 600
 
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest). When set, the trainer trains THIS generator as the king

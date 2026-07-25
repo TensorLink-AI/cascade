@@ -986,6 +986,9 @@ def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
     assert payload["resolved"] == 3
     assert payload["challengers"] == 1               # only 'b' survives dedup
     assert payload["eligible_challengers"] == 1
+    # …and the count the provisioner sizes on runs the CONTENT screen too, so
+    # the heat fleet matches what will actually train (here: screen off ⇒ same)
+    assert payload["screened_challengers"] == 1
     assert payload["next_boundary_block"] == 4 * cfg.round.epoch_blocks
     assert payload["blocks_to_boundary"] == cfg.round.epoch_blocks - 100
 

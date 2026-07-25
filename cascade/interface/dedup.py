@@ -15,20 +15,37 @@ digests point AT:
 * **similarity** — difflib ratio over the normalized token streams, for the
   near-copy tier (observed abuse sits at 0.99+; honest template-sharing sits
   well below).
+* **shingle sketch** — a bottom-k sample of hashed token 8-grams, giving a
+  linear-time Jaccard estimate for pairs the quadratic difflib tier refuses
+  to score (see the cost note below).
 
 Enforcement is strictly **pairwise against a specific earlier submission**
 (king first, then kept challengers in UID order — the same lowest-UID-wins
 convention as ``plan_round``'s same-ref dedup). Never transitive: chained
 similarity clusters merge honest template users and must not gate anything.
+
+COST (why the caps exist): ``SequenceMatcher.ratio`` with ``autojunk=False``
+is O(n²) in the token count — measured on this module, a near-identical pair
+costs 2.3 s at 20k tokens, 9.3 s at 40k, 38.7 s at 80k. Field repos run
+7–11k tokens (~1 s/pair), but ``[generator] max_repo_mb`` permits streams
+three orders of magnitude larger, which would let two hotkeys stall the
+pre-heat screen — and therefore the round — indefinitely. So the token stream
+is retained only up to ``max_tokens``; past that a fingerprint keeps its
+(exact, streamed) digests and its sketch but is NOT ``scoreable``, and the
+pairwise judgement falls to the sketch tier. Digests stay exact regardless of
+the cap: they are fed incrementally, never from the retained prefix, so a
+truncated stream can never collide two different repos.
 """
 
 from __future__ import annotations
 
 import hashlib
+import heapq
 import io
 import json
 import re
 import tokenize
+from collections import deque
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -47,29 +64,37 @@ _DROP_TOKEN_TYPES = frozenset({
 _NAME_MASK = "\x00N"  # placeholder for identifier tokens in the masked stream
 
 
-def normalized_tokens(source: str) -> tuple[str, ...]:
-    """The comment/whitespace-insensitive token stream of one Python source.
+def iter_normalized_tokens(source: str):
+    """Yield the comment/whitespace-insensitive token stream of one Python
+    source, one token at a time (never materialising the whole stream — a
+    submission may be far larger than anything worth holding in memory).
 
     Falls back to whitespace-split words when the source does not tokenize
     (a submission with a syntax error still deserves a stable fingerprint —
-    the static guard rejects it separately).
+    the static guard rejects it separately). The fallback restarts the stream,
+    so a source that fails PART-WAY through tokenizing yields its already-
+    emitted tokens and then the whole word split; that is deterministic, which
+    is all the digests require.
     """
     try:
-        toks = tokenize.generate_tokens(io.StringIO(source).readline)
-        out: list[str] = []
-        for tok in toks:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
             if tok.type in _DROP_TOKEN_TYPES:
                 continue
             # Docstrings are STRING tokens and stay in: replacing a docstring
             # is a real (if tiny) edit and the similarity tier absorbs it.
-            out.append(tok.string)
-        return tuple(out)
+            yield tok.string
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return tuple(source.split())
+        yield from source.split()
 
 
-def _mask_names(tokens: tuple[str, ...], maskable: tuple[bool, ...]) -> tuple[str, ...]:
-    """Replace identifier-shaped tokens so rename-only copies collapse.
+def normalized_tokens(source: str) -> tuple[str, ...]:
+    """:func:`iter_normalized_tokens` as a tuple (tests and small callers)."""
+    return tuple(iter_normalized_tokens(source))
+
+
+def _masked(token: str, maskable: bool) -> str:
+    """One token as it enters the name-masked stream, so rename-only copies
+    collapse.
 
     Only tokens flagged ``maskable`` (Python-source tokens) are masked — config
     values and requirement pins are DATA, and two repos that differ only in
@@ -78,10 +103,9 @@ def _mask_names(tokens: tuple[str, ...], maskable: tuple[bool, ...]) -> tuple[st
     differ only in NAME-shaped tokens are the same program skeleton, which is
     exactly what this digest is for.
     """
-    return tuple(
-        _NAME_MASK if m and (t[:1].isalpha() or t[:1] == "_") else t
-        for t, m in zip(tokens, maskable, strict=True)
-    )
+    if maskable and (token[:1].isalpha() or token[:1] == "_"):
+        return _NAME_MASK
+    return token
 
 
 _LINE_CONFIG_SUFFIXES = frozenset({".yaml", ".yml", ".toml", ".cfg", ".ini"})
@@ -114,23 +138,107 @@ def _config_tokens(path: Path, text: str) -> tuple[str, ...] | None:
     return None
 
 
+# Similarity-cost caps. DEFAULT_MAX_TOKENS bounds the retained stream (and so
+# the O(n²) difflib tier); the sketch is bottom-k over w-token shingles, which
+# is O(n) time and O(k) memory no matter how large the repo is.
+DEFAULT_MAX_TOKENS = 50_000    # field repos run 7–11k; nothing honest is near this
+SKETCH_K = 2048                # bottom-k sample size (≈±2% Jaccard error)
+SHINGLE_W = 8                  # tokens per shingle
+
+
 @dataclass(frozen=True)
 class RepoFingerprint:
-    """Content identity of one submitted generator repo."""
+    """Content identity of one submitted generator repo.
+
+    ``tokens`` is the retained prefix of the normalized stream and is EMPTY
+    when the stream ran past the cap (``scoreable`` False) — the digests and
+    the sketch cover the whole stream either way.
+    """
 
     tree_sha256: str
     token_sha256: str
     masked_sha256: str
-    py_sha256: str            # digest of the .py-only token stream (config_only tier)
+    py_sha256: str            # digest of the .py-only token stream ("" = no .py)
     tokens: tuple[str, ...] = field(repr=False)
+    n_tokens: int = 0
+    scoreable: bool = True    # False ⇒ over the cap, difflib tier must not run
+    sketch: tuple[int, ...] = field(default=(), repr=False)
+    sketch_complete: bool = False   # the sketch IS the full shingle set
+    truncated: bool = False   # some file was too large to decode in full
 
 
-def _sha256_tokens(tokens: tuple[str, ...]) -> str:
-    h = hashlib.sha256()
-    for t in tokens:
-        h.update(t.encode("utf-8", "replace"))
-        h.update(b"\x00")
-    return h.hexdigest()
+class _Accum:
+    """Streaming fingerprint state: exact digests + a bounded token prefix +
+    a bottom-k shingle sketch, all fed one token at a time.
+
+    The sketch keeps only k hashes, but ``_seen`` (which makes it a sample of
+    the shingle SET rather than the multiset) grows with the number of distinct
+    shingles. That is bounded by the caller's decode budget, not by repo size —
+    which is what actually caps this object's footprint.
+    """
+
+    def __init__(self, max_tokens: int) -> None:
+        self.tree = hashlib.sha256()
+        self._tok = hashlib.sha256()
+        self._masked = hashlib.sha256()
+        self._py = hashlib.sha256()
+        self._max_tokens = max_tokens
+        self.tokens: list[str] = []
+        self.n_tokens = 0
+        self.n_py_tokens = 0
+        self.overflow = False
+        self.truncated = False
+        self._window: deque[str] = deque(maxlen=SHINGLE_W)
+        self._heap: list[int] = []      # max-heap (negated) of the k smallest
+        self._seen: set[int] = set()
+        self.n_shingles = 0
+
+    def push(self, token: str, *, maskable: bool, py: bool) -> None:
+        blob = token.encode("utf-8", "replace") + b"\x00"
+        self._tok.update(blob)
+        self._masked.update(_masked(token, maskable).encode("utf-8", "replace") + b"\x00")
+        if py:
+            self._py.update(blob)
+            self.n_py_tokens += 1
+        self.n_tokens += 1
+        if self._max_tokens <= 0 or len(self.tokens) < self._max_tokens:
+            self.tokens.append(token)
+        else:
+            self.overflow = True
+        self._window.append(token)
+        if len(self._window) == SHINGLE_W:
+            self._add_shingle("\x00".join(self._window))
+
+    def _add_shingle(self, text: str) -> None:
+        h = int.from_bytes(
+            hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=8).digest(),
+            "big")
+        if h in self._seen:
+            return
+        self._seen.add(h)
+        self.n_shingles += 1
+        if len(self._heap) < SKETCH_K:
+            heapq.heappush(self._heap, -h)
+        elif -h > self._heap[0]:
+            heapq.heapreplace(self._heap, -h)
+
+    def finish(self) -> RepoFingerprint:
+        # A stream shorter than one full shingle still needs a sketch, or two
+        # tiny repos would compare as "no overlap" instead of "identical".
+        if self.n_shingles == 0 and self._window:
+            self._add_shingle("\x00".join(self._window))
+        return RepoFingerprint(
+            tree_sha256=self.tree.hexdigest(),
+            token_sha256=self._tok.hexdigest(),
+            masked_sha256=self._masked.hexdigest(),
+            py_sha256=self._py.hexdigest() if self.n_py_tokens else "",
+            tokens=tuple(self.tokens) if not self.overflow else (),
+            n_tokens=self.n_tokens,
+            scoreable=not self.overflow,
+            sketch=tuple(sorted(-h for h in self._heap)),
+            sketch_complete=self.n_shingles <= SKETCH_K,
+            truncated=self.truncated,
+        )
 
 
 # Path components / names that never shape the generative process and change
@@ -149,7 +257,21 @@ def _is_junk(rel_parts: tuple[str, ...]) -> bool:
     return name in _JUNK_NAMES or Path(name).suffix in _JUNK_SUFFIXES
 
 
-def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
+_CHUNK = 1 << 20              # tree-digest read size
+# Cumulative decode budget per repo. Tokenizing is linear but not cheap
+# (~2 s/MB measured), and the input size is attacker-chosen up to
+# ``[generator] max_repo_mb``; a whole-repo budget bounds one entrant's
+# fingerprint cost at ~10 s. Field submissions are code-only and run ~100 KB
+# of text, so this is ~40× headroom over anything honest.
+DEFAULT_MAX_TEXT_MB = 4
+
+
+def fingerprint_dir(
+    repo_dir: Path | str,
+    *,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_text_mb: float = DEFAULT_MAX_TEXT_MB,
+) -> RepoFingerprint:
     """Fingerprint a fetched repo tree.
 
     The tree digest covers every regular file (sorted by relative path),
@@ -162,47 +284,70 @@ def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
     delta, not collapse into "identical code". A path-independent file
     separator keeps split/merged modules from accidentally colliding. Docs
     and other non-functional files enter the tree digest only.
+
+    Bounded by construction (see the module docstring): files are hashed in
+    chunks, tokens are streamed rather than materialised per file, only the
+    first ``max_tokens`` are retained (``max_tokens=0`` disables the cap), and
+    once ``max_text_mb`` of text has been decoded every remaining file enters
+    the token streams as an OPAQUE content digest instead — so two repos
+    differing only inside skipped files still differ in every digest, while
+    both peak memory and CPU stay ``O(max_text_mb + max_tokens)`` however
+    large the repo is.
     """
     root = Path(repo_dir)
     files = sorted(
         (p for p in root.rglob("*") if p.is_file()),
         key=lambda p: str(p.relative_to(root)),
     )
-    tree = hashlib.sha256()
-    tokens: list[str] = []
-    maskable: list[bool] = []
-    py_tokens: list[str] = []
+    acc = _Accum(max_tokens)
+    text_cap = int(max(0.0, float(max_text_mb)) * 1024 * 1024)  # float: tests use fractions
+    text_used = 0
     for p in files:
         rel = p.relative_to(root)
         if _is_junk(rel.parts):
             continue
-        data = p.read_bytes()
-        tree.update(str(rel).encode("utf-8", "replace"))
-        tree.update(b"\x00")
-        tree.update(data)
-        tree.update(b"\x00")
-        if p.suffix == ".py":
-            file_toks = normalized_tokens(data.decode("utf-8", "replace"))
-            mask = True
-            py_tokens.append("\x00FILE")
-            py_tokens.extend(file_toks)
+        acc.tree.update(str(rel).encode("utf-8", "replace"))
+        acc.tree.update(b"\x00")
+        file_h = hashlib.sha256()
+        size = 0
+        with p.open("rb") as fh:
+            while chunk := fh.read(_CHUNK):
+                acc.tree.update(chunk)
+                file_h.update(chunk)
+                size += len(chunk)
+        acc.tree.update(b"\x00")
+
+        is_py = p.suffix == ".py"
+        over_budget = bool(text_cap) and text_used + size > text_cap
+        if over_budget and not is_py and _config_tokens(p, "") is None:
+            continue
+
+        # Past the decode budget, tokenize the PREFIX that still fits and
+        # append the whole file's content digest. The prefix keeps the file
+        # contributing real shingles — a stub would let a near-copy evade every
+        # similarity tier just by being large — and the digest keeps the token
+        # tiers exact, so two repos differing only inside the skipped tail
+        # cannot read as identical. Beyond this a submission is mostly padding,
+        # which `truncated` surfaces in the report rather than hiding.
+        take = size if not over_budget else max(0, text_cap - text_used)
+        with p.open("rb") as fh:
+            text = fh.read(take).decode("utf-8", "replace")
+        text_used += take
+        if is_py:
+            stream, mask = iter_normalized_tokens(text), True
         else:
-            cfg_toks = _config_tokens(p, data.decode("utf-8", "replace"))
+            cfg_toks = _config_tokens(p, text)
             if cfg_toks is None:
                 continue
-            file_toks, mask = cfg_toks, False
-        tokens.append("\x00FILE")
-        maskable.append(False)
-        tokens.extend(file_toks)
-        maskable.extend([mask] * len(file_toks))
-    toks = tuple(tokens)
-    return RepoFingerprint(
-        tree_sha256=tree.hexdigest(),
-        token_sha256=_sha256_tokens(toks),
-        masked_sha256=_sha256_tokens(_mask_names(toks, tuple(maskable))),
-        py_sha256=_sha256_tokens(tuple(py_tokens)),
-        tokens=toks,
-    )
+            stream, mask = iter(cfg_toks), False
+        acc.push("\x00FILE", maskable=False, py=is_py)
+        for t in stream:
+            acc.push(t, maskable=mask, py=is_py)
+        if over_budget:
+            acc.push(f"\x00OPAQUE:{file_h.hexdigest()}", maskable=False, py=is_py)
+            acc.overflow = True
+            acc.truncated = True
+    return acc.finish()
 
 
 def similarity(a: RepoFingerprint, b: RepoFingerprint) -> float:
@@ -211,10 +356,44 @@ def similarity(a: RepoFingerprint, b: RepoFingerprint) -> float:
     ``quick_ratio`` is a documented upper bound on ``ratio``, so using it as a
     cheap gate can only skip pairs whose true ratio is below the caller's
     floor — the caller passes that floor via :func:`screen_duplicates`.
+
+    Raises :class:`Unscoreable` when either side ran past the token cap: the
+    quadratic tier must never run on an unbounded stream. Callers fall back to
+    :func:`sketch_jaccard`.
     """
     if a.token_sha256 == b.token_sha256:
         return 1.0
+    if not (a.scoreable and b.scoreable):
+        raise Unscoreable(
+            f"token streams over the cap ({a.n_tokens} / {b.n_tokens} tokens)")
     return SequenceMatcher(None, a.tokens, b.tokens, autojunk=False).ratio()
+
+
+class Unscoreable(Exception):
+    """The difflib tier refused a pair: at least one stream is over the cap."""
+
+
+def sketch_jaccard(a: RepoFingerprint, b: RepoFingerprint) -> float:
+    """Jaccard similarity of two token-shingle sets, from their bottom-k
+    sketches — O(k), and defined for streams of any size.
+
+    When both sketches are complete (repos below ``SKETCH_K`` distinct
+    shingles, which is every honest submission seen so far) this is the EXACT
+    Jaccard. Otherwise it is the standard bottom-k estimator: the k smallest
+    hashes of the union, scored by how many lie in both sketches.
+
+    Jaccard is not difflib's ratio and does not share its calibration — it
+    ignores order and saturates differently — which is why the sketch tier
+    carries its own threshold and ships shadow-first.
+    """
+    A, B = set(a.sketch), set(b.sketch)
+    if not A or not B:
+        return 1.0 if A == B else 0.0
+    if a.sketch_complete and b.sketch_complete:
+        return len(A & B) / len(A | B)
+    k = min(len(A), len(B))
+    both = A & B
+    return sum(1 for h in heapq.nsmallest(k, A | B) if h in both) / k
 
 
 def _bounded_similarity(a: RepoFingerprint, b: RepoFingerprint, floor: float) -> float:
@@ -222,6 +401,16 @@ def _bounded_similarity(a: RepoFingerprint, b: RepoFingerprint, floor: float) ->
     if sm.real_quick_ratio() < floor or sm.quick_ratio() < floor:
         return 0.0
     return sm.ratio()
+
+
+def _same_code(a: RepoFingerprint, b: RepoFingerprint) -> bool:
+    """Identical normalized ``.py`` streams — the ``config_only`` precondition.
+
+    An empty ``py_sha256`` (a repo with no Python at all) never matches: two
+    such repos are not "the same code", they are two repos with no code, and
+    collapsing them on that basis would be a false positive.
+    """
+    return bool(a.py_sha256) and a.py_sha256 == b.py_sha256
 
 
 def _abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int:
@@ -235,13 +424,25 @@ def _abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int:
                for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
 
 
+def _safe_abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int | None:
+    """:func:`_abs_token_delta` when both streams are scoreable, else ``None``.
+
+    This is a SECOND quadratic pass, so it inherits the same cap — and unlike
+    the similarity tier it has no ``quick_ratio`` gate in front of it.
+    """
+    if not (a.scoreable and b.scoreable):
+        return None
+    return _abs_token_delta(a, b)
+
+
 @dataclass(frozen=True)
 class DedupVerdict:
     """One pairwise judgement, kept for the audit log whether or not it drops.
 
     Tiers: ``tree_identical`` | ``token_identical`` | ``rename_identical`` |
     ``config_only`` | ``near_duplicate`` | ``near_duplicate_large_delta``
-    (shadow-only) | ``shadow`` (similarity band) | ``behavior_identical``.
+    (shadow-only) | ``shadow`` (similarity band) | ``behavior_identical`` |
+    ``oversize_sketch`` (difflib refused the pair; score is Jaccard).
     """
 
     hotkey: str
@@ -271,6 +472,8 @@ def screen_duplicates(
     shadow_floor: float = 0.90,
     max_abs_delta: int = 0,
     config_only_enforce: bool = False,
+    sketch_mode: str = "shadow",
+    sketch_threshold: float = 0.99,
     enforce: bool = True,
 ) -> DedupResult:
     """Pairwise duplicate screen over ``(hotkey, uid, fingerprint)`` entries.
@@ -297,8 +500,19 @@ def screen_duplicates(
     weights" is both the ticket-spam pattern and the legitimate fork path;
     the log decides enforcement, it never exempts).
 
-    With ``enforce=False`` (shadow mode) would-be drops are logged as
-    verdicts but every entry is kept.
+    ``sketch_mode`` covers pairs the difflib tier refuses (either stream past
+    the token cap — see the module docstring on cost): their Jaccard estimate
+    is compared against ``sketch_threshold``. ``"enforce"`` lets it drop,
+    ``"shadow"`` (default) only logs an ``oversize_sketch`` verdict, ``"off"``
+    skips it entirely. Shadow-first because Jaccard carries its own
+    calibration; but note that ``"off"`` leaves a padding evasion open — a
+    near-copy inflated past the cap is then unjudged by every similarity tier.
+
+    With ``enforce=False`` (shadow mode) every entry is kept, but the RIVAL
+    set still follows enforce semantics — a would-be-dropped entry does not
+    become a rival for later entries. Shadow is therefore a true counterfactual
+    of enforce (same verdicts, no drops), which is what makes the shadow log
+    usable for calibrating the thresholds.
     """
     ordered = sorted(entries, key=lambda e: e[1])
     kept: list[tuple[str, int, RepoFingerprint]] = []
@@ -321,13 +535,25 @@ def screen_duplicates(
                 tier, score = "token_identical", 1.0
             elif fp.masked_sha256 == r_fp.masked_sha256:
                 tier, score = "rename_identical", 1.0
-            elif fp.py_sha256 == r_fp.py_sha256 and config_only_enforce:
+            elif _same_code(fp, r_fp) and config_only_enforce:
                 # Identical code, different functional configs — enforced as
                 # its own tier.
-                delta = _abs_token_delta(fp, r_fp)
+                delta = _safe_abs_token_delta(fp, r_fp)
                 tier, score = "config_only", 1.0
+            elif not (fp.scoreable and r_fp.scoreable):
+                # Over the cap: the quadratic tier is off limits, so the
+                # linear sketch judges the pair (or nobody does).
+                if sketch_mode == "off":
+                    continue
+                score = sketch_jaccard(fp, r_fp)
+                if sketch_mode == "enforce" and score >= sketch_threshold:
+                    tier = "oversize_sketch"
+                else:
+                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
+                                               "oversize_sketch", round(score, 4)))
+                    continue
             else:
-                if fp.py_sha256 == r_fp.py_sha256:
+                if _same_code(fp, r_fp):
                     # Identical code, different configs with enforcement off:
                     # shadow-log the label, then FALL THROUGH to the
                     # similarity tier — a tiny config sweep must still drop as
@@ -337,10 +563,10 @@ def screen_duplicates(
                     # from data, it never exempts the pair.
                     shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
                                                "config_only", 1.0,
-                                               _abs_token_delta(fp, r_fp)))
+                                               _safe_abs_token_delta(fp, r_fp)))
                 score = _bounded_similarity(fp, r_fp, shadow_floor)
                 if score >= threshold:
-                    delta = _abs_token_delta(fp, r_fp)
+                    delta = _safe_abs_token_delta(fp, r_fp)
                     if max_abs_delta > 0 and delta > max_abs_delta:
                         # Over the ratio bar but a real edit by absolute size:
                         # logged for threshold calibration, never dropped.
@@ -362,15 +588,14 @@ def screen_duplicates(
 
         if verdict is not None:
             dropped.append(verdict)
-            if not enforce:
-                kept.append((hotkey, uid, fp))
         else:
             if best_shadow is not None:
                 shadow.append(best_shadow)
             kept.append((hotkey, uid, fp))
 
     return DedupResult(
-        kept_hotkeys=tuple(h for h, _, _ in kept),
+        kept_hotkeys=(tuple(h for h, _, _ in kept) if enforce
+                      else tuple(h for h, _, _ in ordered)),
         dropped=tuple(dropped),
         shadow=tuple(shadow),
     )

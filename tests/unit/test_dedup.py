@@ -567,3 +567,293 @@ def test_mode_matrix_static_and_probe_gate_independently(
     if dedup_mode != "off" and probe_mode == "enforce":
         expected -= {"nondt"}
     assert set(kept) == expected
+
+
+# ── cost caps: the screen must not become the cheapest way to stall a round ──
+
+def _big_repo(tmp_path, name, nlines, extra=""):
+    """A repo whose token stream is far past any sane cap."""
+    src = "def build():\n" + "".join(
+        f"    x_{i} = compute(a_{i}, b_{i}) + 12345  # pad\n" for i in range(nlines))
+    return _repo(tmp_path, name, src + extra)
+
+
+def test_oversize_stream_is_not_scoreable_and_keeps_exact_digests(tmp_path):
+    # difflib is O(n²) in tokens, so a stream past the cap must not reach it —
+    # but the digests are fed incrementally and stay exact regardless.
+    a = fingerprint_dir(_big_repo(tmp_path, "a", 2000), max_tokens=500)
+    b = fingerprint_dir(_big_repo(tmp_path, "b", 2000), max_tokens=500)
+    c = fingerprint_dir(_big_repo(tmp_path, "c", 2000, extra="    y = 1\n"),
+                        max_tokens=500)
+    assert not a.scoreable and a.tokens == ()      # nothing retained
+    assert a.n_tokens > 500                        # but the count is real
+    assert a.token_sha256 == b.token_sha256        # identical trees still collide
+    assert a.token_sha256 != c.token_sha256        # a real edit still differs
+
+
+def test_similarity_refuses_an_uncapped_pair(tmp_path):
+    from cascade.interface.dedup import Unscoreable
+
+    a = fingerprint_dir(_big_repo(tmp_path, "a", 500), max_tokens=100)
+    b = fingerprint_dir(_big_repo(tmp_path, "b", 500, extra="    y = 1\n"),
+                        max_tokens=100)
+    with pytest.raises(Unscoreable):
+        similarity(a, b)
+
+
+def test_padding_past_the_cap_does_not_evade_the_screen(tmp_path):
+    # The evasion a naive "too big to score, keep it" cap would open: inflate a
+    # copy past the cap and it is judged by nobody. The sketch tier judges it.
+    orig = ("orig", 1, fingerprint_dir(_big_repo(tmp_path, "orig", 2000),
+                                       max_tokens=500))
+    # a near-copy, not a byte-copy: the identical tiers must not be what saves us
+    copy = ("copy", 2, fingerprint_dir(
+        _big_repo(tmp_path, "copy", 2000, extra="    y = 1\n"), max_tokens=500))
+    enforced = screen_duplicates([orig, copy], None, sketch_mode="enforce",
+                                 sketch_threshold=0.99)
+    assert enforced.kept_hotkeys == ("orig",)
+    assert enforced.dropped[0].tier == "oversize_sketch"
+
+    # shadow (the shipped default): logged with its Jaccard, never dropped
+    observed = screen_duplicates([orig, copy], None, sketch_mode="shadow")
+    assert observed.kept_hotkeys == ("orig", "copy")
+    assert [v.tier for v in observed.shadow] == ["oversize_sketch"]
+    assert observed.shadow[0].score >= 0.99
+
+    # off: nothing judges the pair at all — the padding hole, made explicit
+    assert screen_duplicates([orig, copy], None,
+                             sketch_mode="off").kept_hotkeys == ("orig", "copy")
+
+
+def test_sketch_separates_copies_from_distinct_repos(tmp_path):
+    from cascade.interface.dedup import sketch_jaccard
+
+    a = fingerprint_dir(_big_repo(tmp_path, "a", 400), max_tokens=50)
+    same = fingerprint_dir(_big_repo(tmp_path, "same", 400), max_tokens=50)
+    other = fingerprint_dir(_repo(tmp_path, "other", BASE_SOURCE), max_tokens=50)
+    assert sketch_jaccard(a, same) == 1.0
+    assert sketch_jaccard(a, other) < 0.05
+
+
+def test_undecoded_files_enter_the_digests_as_opaque_content(tmp_path):
+    # Past the decode budget the tokenizer is skipped — but a file's content
+    # must still reach the digests, or two repos differing only inside a large
+    # file would read as token_identical and one would be dropped as a copy.
+    big = "x = [" + ", ".join(str(i) for i in range(200_000)) + "]\n"
+    a = _repo(tmp_path, "a", BASE_SOURCE, extra={"data.py": big})
+    b = _repo(tmp_path, "b", BASE_SOURCE, extra={"data.py": big + "y = 1\n"})
+    fa = fingerprint_dir(a, max_text_mb=0)     # 0 ⇒ decode nothing
+    fb = fingerprint_dir(b, max_text_mb=0)
+    assert fa.token_sha256 != fb.token_sha256
+    assert fa.tree_sha256 != fb.tree_sha256
+    # …and with both budgets high enough, the same repo tokenizes normally
+    assert fingerprint_dir(a, max_text_mb=64, max_tokens=0).scoreable
+
+
+# ── shadow mode is a true counterfactual of enforce ──────────────────────────
+
+def test_shadow_verdicts_name_the_rival_enforce_would_have_used(tmp_path):
+    # A dropped entry must not become a rival for later entries: otherwise the
+    # shadow log measures a chain enforce would never produce, and it is the
+    # log that calibrates the thresholds.
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE),
+        _entry(tmp_path, "cop2", 2, "# a\n" + BASE_SOURCE),
+        _entry(tmp_path, "cop3", 3, "# b\n" + BASE_SOURCE),
+    ]
+    shadow = screen_duplicates(entries, None, enforce=False)
+    enforced = screen_duplicates(entries, None, enforce=True)
+    assert shadow.kept_hotkeys == ("orig", "cop2", "cop3")   # nothing drops
+    assert enforced.kept_hotkeys == ("orig",)
+    # same verdicts, same rivals, in both modes
+    assert ([(v.hotkey, v.matched_hotkey, v.tier) for v in shadow.dropped]
+            == [(v.hotkey, v.matched_hotkey, v.tier) for v in enforced.dropped]
+            == [("cop2", "orig", "token_identical"),
+                ("cop3", "orig", "token_identical")])
+
+
+def test_config_only_needs_actual_python(tmp_path):
+    # Two repos with no .py at all share an empty code digest; collapsing them
+    # on that basis would be a false positive.
+    a = ("a", 1, fingerprint_dir(_repo_no_py(tmp_path, "a", '{"lr": 1}')))
+    b = ("b", 2, fingerprint_dir(_repo_no_py(tmp_path, "b", '{"lr": 2}')))
+    result = screen_duplicates([a, b], None, config_only_enforce=True)
+    assert result.kept_hotkeys == ("a", "b")
+    assert not [v for v in result.dropped + result.shadow if v.tier == "config_only"]
+
+
+def _repo_no_py(tmp_path, name, config):
+    d = tmp_path / name
+    d.mkdir(parents=True)
+    (d / "config.json").write_text(config)
+    return d
+
+
+# ── trainer wiring: the screen's own cost and blast radius ───────────────────
+
+def test_runner_skips_oversize_repos_without_fingerprinting(dedup_runner, monkeypatch):
+    # A repo over [generator] max_repo_mb fails its heat run anyway, so the
+    # screen must not spend fingerprint time on input the miner chooses.
+    from dataclasses import replace
+
+    from cascade.interface import dedup as dedup_mod
+
+    runner, add = dedup_runner
+    runner.cfg = replace(runner.cfg,
+                         generator=replace(runner.cfg.generator, max_repo_mb=0))
+    seen = []
+    real = dedup_mod.fingerprint_dir
+    monkeypatch.setattr(dedup_mod, "fingerprint_dir",
+                        lambda d, **kw: seen.append(d) or real(d, **kw))
+
+    alice = add("alice", 3, BASE_SOURCE)
+    copy = add("mallory", 9, BASE_SOURCE)
+    kept = runner._screen_duplicate_entrants(None, [alice, copy], base_seed=91)
+
+    assert [c.hotkey for c in kept] == ["alice", "mallory"]   # kept, not dropped
+    assert seen == []                                         # and never hashed
+    report = json.loads((runner.work_root / "91" / "dedup_report.json").read_text())
+    assert [o["hotkey"] for o in report["oversize"]] == ["alice", "mallory"]
+
+
+def test_runner_screen_deadline_fails_open(dedup_runner, monkeypatch):
+    # The screen's inputs are attacker-chosen (repo bytes, generator runtime),
+    # so it runs under a wall clock — and an expired screen must not sink the
+    # round it exists to protect.
+    from cascade.trainer.loop import TrainerRunner
+
+    runner, add = dedup_runner
+    budget = []
+
+    def boom(fn, seconds):
+        budget.append(seconds)
+        raise TimeoutError("screen overran")
+
+    monkeypatch.setattr(TrainerRunner, "_with_deadline", staticmethod(boom))
+    alice = add("alice", 3, BASE_SOURCE)
+    copy = add("mallory", 9, BASE_SOURCE)          # would drop if the screen ran
+
+    kept = runner._screen_duplicate_entrants(None, [alice, copy], base_seed=92)
+    assert [c.hotkey for c in kept] == ["alice", "mallory"]
+    assert budget == [runner.cfg.round.dedup_phase_seconds]
+
+
+def test_probe_refuses_a_weak_sandbox(probe_runner, tmp_path):
+    # The probe executes untrusted generator code on the box that holds the
+    # eval pool and the wallet. Shadow mode gates the DROPS, not the execution,
+    # so a soft sandbox must disable the probe outright.
+    from dataclasses import replace
+
+    runner, add = probe_runner
+    runner.use_sandbox = True         # the real path, not the in-process one
+    runner.cfg = replace(runner.cfg, generator=replace(
+        runner.cfg.generator, sandbox_mode="subprocess", sandbox_strict=False))
+    ok = add("alice", 3, BASE_SOURCE)
+    bad = add("edgar", 5, OTHER_SOURCE)
+    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
+
+    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=93)
+    assert [c.hotkey for c in kept] == ["alice", "edgar"]   # probe never ran
+    report = json.loads((runner.work_root / "93" / "dedup_report.json").read_text())
+    assert report["probe_mode"] == "off"
+    assert report["probe_dropped"] == []
+    assert add.captured_cfgs == []
+
+
+@pytest.mark.parametrize("posture", [
+    {"sandbox_mode": "container"},                    # kernel-enforced
+    {"sandbox_mode": "subprocess", "sandbox_strict": True},   # netns or refuse
+])
+def test_probe_runs_under_hard_isolation(probe_runner, tmp_path, posture):
+    from dataclasses import replace
+
+    runner, add = probe_runner
+    runner.use_sandbox = True
+    runner.cfg = replace(runner.cfg,
+                         generator=replace(runner.cfg.generator, **posture))
+    ok = add("alice", 3, BASE_SOURCE)
+    bad = add("edgar", 5, OTHER_SOURCE)
+    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
+
+    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=94)
+    assert [c.hotkey for c in kept] == ["alice"]
+
+
+def test_probe_weak_sandbox_opt_in_is_explicit(probe_runner, tmp_path):
+    # Testnet's escape hatch: run the probe on a soft box, deliberately.
+    from dataclasses import replace
+
+    runner, add = probe_runner
+    runner.use_sandbox = True
+    runner.cfg = replace(
+        runner.cfg,
+        generator=replace(runner.cfg.generator, sandbox_mode="subprocess",
+                          sandbox_strict=False),
+        round=replace(runner.cfg.round, dedup_probe_allow_weak_sandbox=True))
+    ok = add("alice", 3, BASE_SOURCE)
+    bad = add("edgar", 5, OTHER_SOURCE)
+    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
+
+    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=95)
+    assert [c.hotkey for c in kept] == ["alice"]
+
+
+def test_probe_per_draw_clock_is_derived_from_the_stage_budget(probe_runner):
+    # N hostile entrants each burning the per-draw clock must not stretch the
+    # stage without bound: the share shrinks with the number of waves.
+    from dataclasses import replace
+
+    from cascade.trainer.loop import _PROBE_WORKERS
+
+    runner, add = probe_runner
+    runner.cfg = replace(runner.cfg, round=replace(
+        runner.cfg.round, dedup_probe_generate_seconds=120,
+        dedup_probe_budget_seconds=240))
+    # structurally distinct bodies: all 8 must SURVIVE the static tiers, or the
+    # wave count (and so the derived clock) would not be what this asserts
+    entrants = [add(f"m{i:03d}", i,
+                    "\n".join(f"z{i}_{j} = {j * (i + 1)} ** {i + 2} + {j % (i + 3)}"
+                              for j in range(40 + 25 * i)))
+                for i in range(_PROBE_WORKERS * 2)]     # 2 waves → 240/(2*2) = 60s
+
+    runner._screen_duplicate_entrants(None, entrants, base_seed=96)
+    assert {c.max_generate_seconds for c in add.captured_cfgs} == {60}
+    report = json.loads((runner.work_root / "96" / "dedup_report.json").read_text())
+    assert report["probe_seconds_per_draw"] == 60
+
+
+def test_a_near_copy_padded_past_the_decode_budget_is_still_judged(tmp_path):
+    # The gap a stub-on-overflow would leave: if an over-budget file
+    # contributed no shingles, inflating a copy past the DECODE budget (not
+    # just the token cap) would evade every similarity tier. The decoded
+    # prefix keeps it judgeable.
+    from cascade.interface.dedup import sketch_jaccard
+
+    body = "\n".join(f"    q{i} = weigh(p{i}, {i}) * 3.5" for i in range(4000))
+    orig = _repo(tmp_path, "orig", "def run():\n" + body)
+    copy = _repo(tmp_path, "copy", "def run():\n" + body + "\n    extra = 1\n")
+    fo = fingerprint_dir(orig, max_text_mb=0.05, max_tokens=500)
+    fc = fingerprint_dir(copy, max_text_mb=0.05, max_tokens=500)
+
+    assert fo.truncated and not fo.scoreable      # the file was cut short…
+    assert fo.token_sha256 != fc.token_sha256     # …but the digests still differ
+    assert sketch_jaccard(fo, fc) >= 0.99         # …and the sketch sees the copy
+    result = screen_duplicates([("orig", 1, fo), ("copy", 2, fc)], None,
+                               sketch_mode="enforce", sketch_threshold=0.99)
+    assert result.kept_hotkeys == ("orig",)
+
+
+def test_over_cap_entrants_are_named_in_the_report(dedup_runner):
+    # Honest submissions run ~100KB; bulk that only the sketch tier can judge
+    # is a pattern worth being able to see build up over rounds.
+    from dataclasses import replace
+
+    runner, add = dedup_runner
+    runner.cfg = replace(runner.cfg,
+                         round=replace(runner.cfg.round, dedup_max_tokens=100))
+    alice = add("alice", 3, BASE_SOURCE)
+
+    runner._screen_duplicate_entrants(None, [alice], base_seed=97)
+    report = json.loads((runner.work_root / "97" / "dedup_report.json").read_text())
+    assert report["over_token_cap"][0]["hotkey"] == "alice"
+    assert report["over_token_cap"][0]["n_tokens"] > 100

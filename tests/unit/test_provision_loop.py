@@ -987,6 +987,28 @@ def test_plan_failure_retries_next_tick(tmp_path):
     assert len(calls) == 2 and len(prov.launched) == 2        # …so the next tick rents
 
 
+def test_heat_fleet_sizes_off_the_screened_field(tmp_path):
+    # With [round] dedup_mode = "enforce" the content screen drops a slice of
+    # the field pre-heat; a fleet sized off the raw eligible count just rents
+    # pods for copies that never train.
+    from cascade.provision.loop import _heat_field
+
+    prov = FakeProvider("lium")
+    plan = dict(PLAN, eligible_challengers=80, screened_challengers=40)
+    policy = _policy(
+        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
+                         providers=("lium",), max_price_hr=4.0),
+        max_spend_per_round=100.0)
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan, policy=policy)
+    cycle(loop)
+    heat_pods = [n for n in prov.launched if "heat" in n]
+    assert len(heat_pods) == 2                    # 10 slots → 2 pods, not 3
+
+    # older trainers (and dedup_mode = "off") omit the key entirely
+    assert _heat_field(plan) == 40
+    assert _heat_field(PLAN) == 12
+
+
 # ── plan-output parsing + config validation (main.py pure parts) ─────────────
 
 

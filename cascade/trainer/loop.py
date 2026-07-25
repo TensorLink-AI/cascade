@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
 
-from ..interface.validation import parse_commit
+from ..interface.validation import check_repo_size, parse_commit
 from ..shared.chain import Commitment
 from ..shared.config import ChainConfig, TrainingContractConfig
 from ..shared.hippius import (
@@ -80,6 +80,12 @@ ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+# Dedup probe stage: concurrent sandboxes, and the floor under the per-draw
+# wall clock derived from [round] dedup_probe_budget_seconds (a budget so tight
+# that no generator could start would fail the whole field, not screen it).
+_PROBE_WORKERS = 4
+_PROBE_MIN_DRAW_SECONDS = 30
 
 
 def _http_status_in_chain(exc: BaseException | None) -> int | None:
@@ -564,12 +570,17 @@ class TrainerRunner:
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
+    # Probe concurrency: sandboxes are subprocesses, each holding up to
+    # [generator] max_memory_mb, so this also bounds the stage's peak RSS.
 
     def _screen_duplicate_entrants(
         self,
         king: ResolvedGenerator | None,
         entrants: list[ResolvedGenerator],
         base_seed: int,
+        *,
+        static_only: bool = False,
+        report: bool = True,
     ) -> list[ResolvedGenerator]:
         """Drop entrants whose repo CONTENT duplicates the king or a lower-UID
         entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
@@ -586,6 +597,14 @@ class TrainerRunner:
         could not have trained anyway; per the burn rules that was its shot).
         In ``shadow`` mode verdicts are computed and logged but nothing drops.
         Every verdict lands in ``<work_root>/<round>/dedup_report.json``.
+
+        The whole screen runs under ``[round] dedup_phase_seconds``. Its inputs
+        are attacker-chosen (repo bytes, generator runtime), so an unbounded
+        screen is a way to stall the round it exists to protect; on expiry the
+        field proceeds UNSCREENED, which is the same fail-open direction every
+        other error path here takes. ``static_only`` runs the fingerprint tiers
+        without the probe (no code execution) — that is what makes the screen
+        safe to call from the provisioner's sizing path.
         """
         mode = (self.cfg.round.dedup_mode or "off").lower()
         if mode not in ("shadow", "enforce") or not entrants:
@@ -593,9 +612,21 @@ class TrainerRunner:
         import shutil
 
         fetch_root = self.work_root / f"{base_seed}" / "dedup"
+        budget = max(60, int(self.cfg.round.dedup_phase_seconds or 0) or 10 ** 9)
         try:
-            return self._screen_duplicate_entrants_inner(
-                king, entrants, base_seed, mode, fetch_root)
+            return self._with_deadline(
+                lambda: self._screen_duplicate_entrants_inner(
+                    king, entrants, base_seed, mode, fetch_root,
+                    static_only=static_only, report=report),
+                budget)
+        except TimeoutError:
+            # The helper thread is abandoned (it dies with the process, as in
+            # _with_deadline's other callers) and its fetch tree is removed
+            # underneath it — any probe still running there fails harmlessly
+            # into a log line, because the round has already moved on.
+            log.error("dedup: screen exceeded its %ss budget for round=%s; the "
+                      "field proceeds UNSCREENED", budget, base_seed)
+            return entrants
         finally:
             shutil.rmtree(fetch_root, ignore_errors=True)
 
@@ -606,6 +637,9 @@ class TrainerRunner:
         base_seed: int,
         mode: str,
         fetch_root: Path,
+        *,
+        static_only: bool = False,
+        report: bool = True,
     ) -> list[ResolvedGenerator]:
         from ..interface.dedup import (
             collapse_identical_behavior,
@@ -613,25 +647,41 @@ class TrainerRunner:
             screen_duplicates,
         )
 
+        rnd = self.cfg.round
+        fp_kwargs = {"max_tokens": rnd.dedup_max_tokens,
+                     "max_text_mb": rnd.dedup_max_text_mb}
         king_fp = None
         king_dir: Path | None = None
         if king is not None:
             try:
                 king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
                                                hub=self.hub()))
-                king_fp = fingerprint_dir(king_dir)
+                king_fp = fingerprint_dir(king_dir, **fp_kwargs)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
                             "challengers against each other only", king.ref, e)
 
         fetch_failed: list[ResolvedGenerator] = []
         unscreened: list[ResolvedGenerator] = []
+        oversize: list[ResolvedGenerator] = []
+        bulky: list[tuple[ResolvedGenerator, object]] = []
         triples: list[tuple[str, int, object]] = []
         dirs: dict[str, Path] = {}
         for c in entrants:
             try:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
-                fp = fingerprint_dir(d)
+                # A repo over [generator] max_repo_mb fails its heat run anyway
+                # (build_round_corpus checks the same bound), so there is no
+                # reason to spend fingerprint time on it — and skipping it
+                # keeps the screen's cost off an input the miner chooses.
+                size = check_repo_size(d, self.cfg.generator.max_repo_mb)
+                if not size.ok:
+                    log.info("dedup[%s]: challenger %s (uid=%s) ref %s is %s — "
+                             "not screened; the heat rejects it on its own",
+                             mode, c.hotkey, c.uid, c.ref, size.reason)
+                    oversize.append(c)
+                    continue
+                fp = fingerprint_dir(d, **fp_kwargs)
             except StorageError as e:
                 # Fault attribution matters: pods fetch --gen-ref themselves,
                 # so an orchestrator-side fetch failure does NOT mean the ref
@@ -654,16 +704,29 @@ class TrainerRunner:
                                 c.hotkey, c.uid)
                     unscreened.append(c)
                 continue
+            if not fp.scoreable:
+                # Not an error, but not normal either: honest submissions run
+                # ~100KB / 7-11k tokens, and only the linear sketch tier can
+                # judge this entrant. Bulk that reads as padding belongs in the
+                # report where a human can see the pattern build.
+                log.warning("dedup: challenger %s (uid=%s) has %d tokens%s — over "
+                            "the %d cap; judged by the sketch tier only",
+                            c.hotkey, c.uid, fp.n_tokens,
+                            " (files too large to decode in full)"
+                            if fp.truncated else "", rnd.dedup_max_tokens)
+                bulky.append((c, fp))
             dirs[c.hotkey] = d
             triples.append((c.hotkey, c.uid, fp))
 
         try:
             result = screen_duplicates(
                 triples, king_fp,
-                threshold=self.cfg.round.dedup_threshold,
-                shadow_floor=self.cfg.round.dedup_shadow_floor,
-                max_abs_delta=self.cfg.round.dedup_max_abs_delta,
-                config_only_enforce=self.cfg.round.dedup_config_only_enforce,
+                threshold=rnd.dedup_threshold,
+                shadow_floor=rnd.dedup_shadow_floor,
+                max_abs_delta=rnd.dedup_max_abs_delta,
+                config_only_enforce=rnd.dedup_config_only_enforce,
+                sketch_mode=rnd.dedup_sketch_mode,
+                sketch_threshold=rnd.dedup_sketch_threshold,
                 enforce=(mode == "enforce"),
             )
         except Exception as e:  # noqa: BLE001 — the screen must never sink a round
@@ -682,11 +745,17 @@ class TrainerRunner:
         # Probe-derived drops are gated on [round] dedup_probe_mode,
         # INDEPENDENTLY of dedup_mode — the static tiers can enforce while
         # the probe observes (probe drops burn hotkeys; ship shadow first).
-        probe_mode = (self.cfg.round.dedup_probe_mode or "off").lower()
+        probe_mode = (rnd.dedup_probe_mode or "off").lower()
         probe_enforce = probe_mode == "enforce"
         probe_dropped: list[dict] = []
         behavior_dropped: tuple = ()
-        probe_n = int(self.cfg.round.dedup_probe_series or 0)
+        probe_n = int(rnd.dedup_probe_series or 0)
+        per_draw = 0
+        # static_only short-circuits: the sizing path must not even ask about
+        # the sandbox, let alone log about it.
+        if static_only or (probe_n > 0 and probe_mode != "off"
+                           and not self._probe_sandbox_ok()):
+            probe_mode, probe_enforce, probe_n = "off", False, 0
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
             from concurrent.futures import ThreadPoolExecutor
 
@@ -694,17 +763,27 @@ class TrainerRunner:
             survivors = [c for c in entrants
                          if c.hotkey in set(result.kept_hotkeys)
                          and c.hotkey in dirs]
-            # The probe gets its OWN wall clock: the full-corpus budget would
-            # let one hostile submission stall the orchestrator for its whole
-            # duration per draw — and execution is paid even in shadow mode.
+            # The probe gets its OWN wall clock, and the per-draw share is
+            # derived from the STAGE budget: the full-corpus budget would let
+            # one hostile submission stall the orchestrator for its whole
+            # duration per draw, and a fixed per-draw budget still scales the
+            # stage with the size of the field (which the field chooses).
+            # Worst case is dedup_probe_budget_seconds, not N × per-draw.
+            waves = max(1, -(-len(survivors) // _PROBE_WORKERS))
+            per_draw = max(_PROBE_MIN_DRAW_SECONDS,
+                           min(int(rnd.dedup_probe_generate_seconds),
+                               int(rnd.dedup_probe_budget_seconds) // (waves * 2)))
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
-                max_generate_seconds=self.cfg.round.dedup_probe_generate_seconds)
+                max_generate_seconds=per_draw)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
+            log.info("dedup-probe[%s]: %d survivor(s), %d wave(s), %ss per draw "
+                     "(stage budget %ss)", probe_mode, len(survivors), waves,
+                     per_draw, rnd.dedup_probe_budget_seconds)
 
             # Sandboxes are subprocesses, so a small thread pool bounds the
             # worst-case wall clock without stacking rlimits in-process.
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=_PROBE_WORKERS) as pool:
                 king_future = (pool.submit(self._probe_digest, king_dir, gen_seed,
                                            probe_cfg, check_determinism=False)
                                if king_dir is not None else None)
@@ -758,19 +837,29 @@ class TrainerRunner:
                      "sim=%.4f — below threshold, kept", v.hotkey, v.uid,
                      v.matched_hotkey, v.matched_uid, v.score)
 
-        report = {
+        report_doc = {
             "round_id": str(base_seed),
             "mode": mode,
-            "threshold": self.cfg.round.dedup_threshold,
-            "shadow_floor": self.cfg.round.dedup_shadow_floor,
-            "max_abs_delta": self.cfg.round.dedup_max_abs_delta,
-            "config_only_enforce": self.cfg.round.dedup_config_only_enforce,
+            "threshold": rnd.dedup_threshold,
+            "shadow_floor": rnd.dedup_shadow_floor,
+            "max_abs_delta": rnd.dedup_max_abs_delta,
+            "config_only_enforce": rnd.dedup_config_only_enforce,
+            "max_tokens": rnd.dedup_max_tokens,
+            "max_text_mb": rnd.dedup_max_text_mb,
+            "sketch_mode": rnd.dedup_sketch_mode,
+            "sketch_threshold": rnd.dedup_sketch_threshold,
             "probe_mode": probe_mode,
             "probe_series": probe_n,
+            "probe_seconds_per_draw": per_draw,
             "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                              for c in fetch_failed],
             "unscreened": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                            for c in unscreened],
+            "oversize": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
+                         for c in oversize],
+            "over_token_cap": [{"hotkey": c.hotkey, "uid": c.uid,
+                                "n_tokens": fp.n_tokens, "truncated": fp.truncated}
+                               for c, fp in bulky],
             "dropped": [
                 *(vars(v) | {"enforced": mode == "enforce"} for v in result.dropped),
                 *(vars(v) | {"enforced": probe_enforce} for v in behavior_dropped),
@@ -778,16 +867,37 @@ class TrainerRunner:
             "probe_dropped": [d | {"enforced": probe_enforce} for d in probe_dropped],
             "shadow": [vars(v) for v in result.shadow],
         }
-        report_json = json.dumps(report, indent=1)
+        if report:
+            self._write_dedup_report(base_seed, report_doc)
+
+        # Static-tier drops (and denied/missing refs) apply under dedup_mode;
+        # probe-derived drops apply under dedup_probe_mode — independent gates.
+        # (fetch_failed never entered triples, so enforce excludes them; the
+        # unscreened — orchestrator-side fetch faults — stay IN.)
+        kept = (set(result.kept_hotkeys) | {c.hotkey for c in unscreened}
+                | {c.hotkey for c in oversize}
+                if mode == "enforce" else {c.hotkey for c in entrants})
+        if probe_enforce:
+            kept -= {d["hotkey"] for d in probe_dropped}
+            kept -= {v.hotkey for v in behavior_dropped}
+        return [c for c in entrants if c.hotkey in kept]
+
+    def _write_dedup_report(self, base_seed: int, doc: dict) -> None:
+        """Persist the round's dedup verdicts to disk and to the logs store.
+
+        The logs-store copy is the shadow-mode EVIDENCE this feature exists to
+        collect, so it must not depend on orchestrator disk. It carries per-pair
+        similarity scores and the live thresholds, which is a calibration oracle
+        for anyone tuning a copy to sit just under the bar — keep the logs
+        bucket private, and if it is ever opened up, publish only the tiers.
+        """
+        report_json = json.dumps(doc, indent=1)
         try:
             out_dir = self.work_root / f"{base_seed}"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "dedup_report.json").write_text(report_json)
         except OSError as e:
             log.warning("dedup: could not write report for round=%s: %s", base_seed, e)
-        # The report is the shadow-mode EVIDENCE this feature exists to
-        # collect — publish it to the logs store (next to the round's
-        # training logs) so calibration doesn't depend on orchestrator disk.
         try:
             self.logs_store().put_text(
                 f"logs/round-{base_seed}/dedup_report.json", report_json,
@@ -795,16 +905,39 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — telemetry only, never sinks a round
             log.warning("dedup: report upload failed for round=%s: %s", base_seed, e)
 
-        # Static-tier drops (and denied/missing refs) apply under dedup_mode;
-        # probe-derived drops apply under dedup_probe_mode — independent gates.
-        # (fetch_failed never entered triples, so enforce excludes them; the
-        # unscreened — orchestrator-side fetch faults — stay IN.)
-        kept = (set(result.kept_hotkeys) | {c.hotkey for c in unscreened}
-                if mode == "enforce" else {c.hotkey for c in entrants})
-        if probe_enforce:
-            kept -= {d["hotkey"] for d in probe_dropped}
-            kept -= {v.hotkey for v in behavior_dropped}
-        return [c for c in entrants if c.hotkey in kept]
+    def _probe_sandbox_ok(self) -> bool:
+        """Whether the probe may execute untrusted generator code here.
+
+        The probe's threat model (DEC-CA-0006) rests entirely on the sandbox
+        being KERNEL-enforced, because unlike a pod the orchestrator is not
+        disposable: it holds the private eval pool and the trainer's wallet,
+        and the subprocess sandbox shares their uid and filesystem. Container
+        mode gives that (``--network=none``, ``--cap-drop=ALL``, read-only
+        rootfs, only the repo bind-mounted); subprocess mode gives it only with
+        ``sandbox_strict``, which refuses to run when netns is unavailable
+        instead of degrading to the in-process socket guard — a guard that does
+        not survive a C extension or a spawned child.
+
+        Neither ⇒ the probe disables itself. Note that SHADOW mode does not
+        make this safe: shadow gates the drops, not the execution.
+        """
+        g = self.cfg.generator
+        if g.sandbox_mode == "container" or g.sandbox_strict or not self.use_sandbox:
+            # use_sandbox=False is the in-process test path; no untrusted code
+            # runs there that the caller has not already chosen to run.
+            return True
+        if self.cfg.round.dedup_probe_allow_weak_sandbox:
+            log.warning("dedup-probe: running with sandbox_mode=%r and "
+                        "sandbox_strict=false — untrusted generator code shares "
+                        "this host with the eval pool and wallet "
+                        "(dedup_probe_allow_weak_sandbox=true)", g.sandbox_mode)
+            return True
+        log.error("dedup-probe: DISABLED — the probe executes untrusted "
+                  "generator code on the orchestrator and this host has neither "
+                  "sandbox_mode='container' nor sandbox_strict=true. Set one in "
+                  "[generator], or dedup_probe_allow_weak_sandbox=true to accept "
+                  "the risk. Static dedup tiers are unaffected.")
+        return False
 
     def _probe_digest(
         self,
