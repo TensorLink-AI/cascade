@@ -53,7 +53,7 @@ from ..shared.manifest import (
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
-from .corpus import CorpusError
+from .corpus import CorpusError, build_round_corpus
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -482,24 +482,47 @@ class TrainerRunner:
         mode = (self.cfg.round.dedup_mode or "off").lower()
         if mode not in ("shadow", "enforce") or not entrants:
             return entrants
-        from ..interface.dedup import fingerprint_dir, screen_duplicates
+        import shutil
 
         fetch_root = self.work_root / f"{base_seed}" / "dedup"
+        try:
+            return self._screen_duplicate_entrants_inner(
+                king, entrants, base_seed, mode, fetch_root)
+        finally:
+            shutil.rmtree(fetch_root, ignore_errors=True)
+
+    def _screen_duplicate_entrants_inner(
+        self,
+        king: ResolvedGenerator | None,
+        entrants: list[ResolvedGenerator],
+        base_seed: int,
+        mode: str,
+        fetch_root: Path,
+    ) -> list[ResolvedGenerator]:
+        from ..interface.dedup import (
+            collapse_identical_behavior,
+            fingerprint_dir,
+            screen_duplicates,
+        )
+
         king_fp = None
+        king_dir: Path | None = None
         if king is not None:
             try:
-                king_fp = fingerprint_dir(
-                    fetch_from_hub(king.ref, fetch_root / "king", hub=self.hub()))
+                king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
+                                               hub=self.hub()))
+                king_fp = fingerprint_dir(king_dir)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
                             "challengers against each other only", king.ref, e)
 
         fetch_failed: list[ResolvedGenerator] = []
         triples: list[tuple[str, int, object]] = []
+        dirs: dict[str, Path] = {}
         for c in entrants:
             try:
-                fp = fingerprint_dir(
-                    fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+                d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+                fp = fingerprint_dir(d)
             except StorageError as e:
                 # Enforce: an unfetchable ref could not have trained — drop it
                 # before it eats a heat pod dispatch (per the burn rules that
@@ -510,6 +533,7 @@ class TrainerRunner:
                          " — dropped pre-heat" if mode == "enforce" else " — shadow, kept")
                 fetch_failed.append(c)
                 continue
+            dirs[c.hotkey] = d
             triples.append((c.hotkey, c.uid, fp))
 
         try:
@@ -524,10 +548,59 @@ class TrainerRunner:
             if mode == "enforce":
                 return [c for c in entrants if c not in fetch_failed]
             return entrants
-        finally:
-            import shutil
 
-            shutil.rmtree(fetch_root, ignore_errors=True)
+        # ── behavioral probe: determinism + same-process collapse ────────────
+        # Probe only the entrants the static tiers kept — no sandbox time on
+        # already-dropped copies. Each survivor's generator draws a small
+        # corpus TWICE under the shared round seed: two draws that differ
+        # violate the determinism contract (`cascade verify` enforces the same
+        # rule miner-side); identical probe bytes across two survivors (or vs
+        # the king) is the same generative process, whatever the code says.
+        probe_dropped: list[dict] = []
+        behavior_dropped: tuple = ()
+        probe_n = int(self.cfg.round.dedup_probe_series or 0)
+        if probe_n > 0:
+            uid_of = {h: u for h, u, _ in triples}
+            survivors = [c for c in entrants
+                         if c.hotkey in set(result.kept_hotkeys)]
+            probe_cfg = replace(self.cfg.generator, corpus_n_series=probe_n)
+            gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
+
+            king_digest = None
+            if king_dir is not None:
+                try:
+                    king_digest = self._probe_digest(king_dir, gen_seed, probe_cfg,
+                                                     check_determinism=False)
+                except Exception as e:  # noqa: BLE001 — never the challengers' problem
+                    log.warning("dedup: king probe failed (%s); behavior tier runs "
+                                "among challengers only", e)
+
+            behaved: list[tuple[str, int, str]] = []
+            for c in survivors:
+                try:
+                    digest = self._probe_digest(dirs[c.hotkey], gen_seed, probe_cfg)
+                except CorpusError as e:
+                    tier = ("nondeterministic" if "non-deterministic" in str(e)
+                            else "probe_failed")
+                    log.info("dedup[%s]: challenger %s (uid=%s) %s: %s%s", mode,
+                             c.hotkey, c.uid, tier, e,
+                             "" if mode == "enforce" else " — shadow, kept")
+                    probe_dropped.append({"hotkey": c.hotkey, "uid": c.uid,
+                                          "tier": tier, "detail": str(e)[:300]})
+                except Exception as e:  # noqa: BLE001 — infra failure: fail open
+                    log.warning("dedup: probe infrastructure error for %s (%s); "
+                                "kept unprobed", c.hotkey, e)
+                    behaved.append((c.hotkey, uid_of[c.hotkey], f"\x00unprobed:{c.hotkey}"))
+                else:
+                    behaved.append((c.hotkey, uid_of[c.hotkey], digest))
+
+            behavior_kept, behavior_dropped = collapse_identical_behavior(
+                behaved, king_digest)
+            for v in behavior_dropped:
+                log.info("dedup[%s]: challenger %s (uid=%s) is behavior_identical "
+                         "to %s (uid=%s) under the shared seed%s", mode, v.hotkey,
+                         v.uid, v.matched_hotkey, v.matched_uid,
+                         "" if mode == "enforce" else " — shadow, kept")
 
         for v in result.dropped:
             log.info("dedup[%s]: challenger %s (uid=%s) is %s of %s (uid=%s), "
@@ -544,10 +617,12 @@ class TrainerRunner:
             "mode": mode,
             "threshold": self.cfg.round.dedup_threshold,
             "shadow_floor": self.cfg.round.dedup_shadow_floor,
+            "probe_series": probe_n,
             "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                              for c in fetch_failed],
             "dropped": [vars(v) | {"enforced": mode == "enforce"}
-                        for v in result.dropped],
+                        for v in (*result.dropped, *behavior_dropped)],
+            "probe_dropped": probe_dropped,
             "shadow": [vars(v) for v in result.shadow],
         }
         try:
@@ -560,7 +635,42 @@ class TrainerRunner:
         if mode != "enforce":
             return entrants
         kept = set(result.kept_hotkeys)
+        kept -= {d["hotkey"] for d in probe_dropped}
+        kept -= {v.hotkey for v in behavior_dropped}
         return [c for c in entrants if c.hotkey in kept]
+
+    def _probe_digest(
+        self,
+        repo_dir: Path,
+        generation_seed: int,
+        probe_cfg,
+        *,
+        check_determinism: bool = True,
+    ) -> str:
+        """Digest of a small sandbox-drawn corpus under the shared round seed.
+
+        With ``check_determinism`` the corpus is drawn twice and the digests
+        must match — the same contract ``cascade verify`` holds miners to,
+        enforced here so a generator that seeds from entropy cannot re-roll a
+        fresh corpus per run. Raises :class:`CorpusError` on mismatch or on
+        any generator failure.
+        """
+        first = build_round_corpus(
+            repo_dir, generation_seed, probe_cfg, "cache_reuse",
+            use_sandbox=self.use_sandbox,
+            blocked=self.cfg.static_guard.blocked,
+        )
+        if check_determinism:
+            second = build_round_corpus(
+                repo_dir, generation_seed, probe_cfg, "cache_reuse",
+                use_sandbox=self.use_sandbox,
+                blocked=self.cfg.static_guard.blocked,
+            )
+            if first.digest != second.digest:
+                raise CorpusError(
+                    "generator is non-deterministic: two probe draws at the same "
+                    "seed produced different corpora")
+        return first.digest
 
     def _mark_heat_complete(
         self,

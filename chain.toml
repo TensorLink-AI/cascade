@@ -149,6 +149,12 @@ one_submission_per_hotkey = true
 dedup_mode         = "enforce"   # off | shadow | enforce
 dedup_threshold    = 0.99
 dedup_shadow_floor = 0.90
+# Behavioral probe: sandbox-draw N series per surviving entrant under the
+# shared round seed, twice. Twice-differs = non-deterministic generator
+# (contract violation, the entropy re-roll) -> dropped. Identical probe bytes
+# across entrants/vs-king = same process regardless of code -> dropped.
+dedup_probe_series = 8           # 0 = probe off
+
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest). When set, the trainer trains THIS generator as the king
 # whenever no on-chain champion has a resolvable commitment — a fixed,

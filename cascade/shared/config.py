@@ -433,6 +433,14 @@ class RoundConfig:
     dedup_mode: str = "off"
     dedup_threshold: float = 0.99
     dedup_shadow_floor: float = 0.90
+    # Behavioral probe (runs under dedup_mode): sandbox-draw this many series
+    # per surviving entrant under the shared round seed, TWICE. Two draws that
+    # differ ⇒ the generator violates the determinism contract (the entropy
+    # re-roll that lets identical code mint distinct corpora) and is dropped.
+    # Identical probe output across two entrants (or vs the king) ⇒ same
+    # generative process regardless of how different the code looks — dropped
+    # as behavior_identical. 0 = probe disabled (static tiers only).
+    dedup_probe_series: int = 8
 
 
 @dataclass(frozen=True)
@@ -912,6 +920,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_mode=str(r.get("dedup_mode", "off")),
             dedup_threshold=float(r.get("dedup_threshold", 0.99)),
             dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
+            dedup_probe_series=int(r.get("dedup_probe_series", 8)),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),

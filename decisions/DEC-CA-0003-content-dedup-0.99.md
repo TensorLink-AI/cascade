@@ -7,10 +7,9 @@ date: 2026-07-24
 tags: [anti-spam, incentives, trainer]
 revisit_when: >-
   the shadow band (0.90-0.99) shows an enforced drop that would have BEATEN
-  its match in the heat, OR abusers adapt below 0.99 (semantic rewrites /
-  logic moved into pip deps) — then add behavioral fingerprinting (statistical
-  comparison of sandbox-drawn output under the shared round seed), which they
-  cannot evade without actually changing their data
+  its match in the heat, OR abusers adapt below the exact-behavior tier
+  (epsilon-jittered variants of one process) — then extend the behavioral
+  probe from exact digest match to statistical distance, in shadow first
 relations: {}
 ---
 Live field analysis (similarity_report.json, OPSLOG) showed most heat GPU
@@ -38,6 +37,19 @@ An LLM judge was explored and rejected for the enforcement path (non-
 reproducible, prompt-injectable, breaks re-derivability of the field); it may
 return in an advisory/dispute-triage role only.
 
-Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor` — dataclass
-default `off`, mainnet `chain.toml` = `enforce` @ 0.99/0.90, testnet =
-`shadow`.
+Round-2 field data (jtest/Radiant version ladders, iris999 config-delta trio)
+drove two extensions: **(a)** functional config files (`*.json`,
+`requirements.txt`, yaml/toml) are folded into the token stream — a config
+sweep reads as a measured delta, never as "identical code"; **(b)** a
+**behavioral probe** (`dedup_probe_series`): each surviving entrant
+sandbox-draws a small corpus twice under the shared round seed —
+twice-differs = non-deterministic (the entropy re-roll behind "identical code,
+distinct corpus digests"; seeds were never per-hotkey — `RoundSeeds` is
+shared, determinism just wasn't enforced trainer-side) and is dropped;
+identical probe bytes across entrants/vs-king = same process regardless of
+code (`behavior_identical`), the deterministic backstop for obfuscated forks
+and dependency-hidden logic.
+
+Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor/
+dedup_probe_series` — dataclass default `off`, mainnet `chain.toml` =
+`enforce` @ 0.99/0.90, probe 8; testnet = `shadow`.

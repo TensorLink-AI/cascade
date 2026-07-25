@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import re
 import tokenize
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -66,16 +68,50 @@ def normalized_tokens(source: str) -> tuple[str, ...]:
         return tuple(source.split())
 
 
-def _mask_names(tokens: tuple[str, ...]) -> tuple[str, ...]:
+def _mask_names(tokens: tuple[str, ...], maskable: tuple[bool, ...]) -> tuple[str, ...]:
     """Replace identifier-shaped tokens so rename-only copies collapse.
 
-    Python keywords are identifier-shaped too; masking them as well is fine —
-    two sources that differ only in NAME-shaped tokens are the same program
-    skeleton, which is exactly what this digest is for.
+    Only tokens flagged ``maskable`` (Python-source tokens) are masked — config
+    values and requirement pins are DATA, and two repos that differ only in
+    those are a parameter sweep, not a rename. Python keywords are
+    identifier-shaped too; masking them as well is fine — two sources that
+    differ only in NAME-shaped tokens are the same program skeleton, which is
+    exactly what this digest is for.
     """
     return tuple(
-        _NAME_MASK if t[:1].isalpha() or t[:1] == "_" else t for t in tokens
+        _NAME_MASK if m and (t[:1].isalpha() or t[:1] == "_") else t
+        for t, m in zip(tokens, maskable, strict=True)
     )
+
+
+_LINE_CONFIG_SUFFIXES = frozenset({".yaml", ".yml", ".toml", ".cfg", ".ini"})
+_JSON_PUNCT = re.compile(r"([{}\[\],:])")
+
+
+def _config_tokens(path: Path, text: str) -> tuple[str, ...] | None:
+    """Tokens for a functional non-Python file, or ``None`` for files that
+    don't shape the generative process (docs, licenses — tree-hash only).
+
+    JSON is parsed and re-serialized (sorted keys, canonical separators) so
+    reformatting is cosmetic but any value change is a real token delta —
+    a ``config.json`` sweep reads as a near-duplicate, never as identical.
+    """
+    if path.suffix.lower() == ".json":
+        try:
+            norm = json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+        except ValueError:
+            norm = " ".join(text.split())
+        return tuple(t for t in _JSON_PUNCT.split(norm) if t)
+    if path.name.lower() == "requirements.txt":
+        # Sorted + comment-stripped: dependency ORDER is cosmetic, the pin
+        # set is functional (deps can carry generator logic).
+        return tuple(sorted(
+            ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")))
+    if path.suffix.lower() in _LINE_CONFIG_SUFFIXES:
+        return tuple(ln.strip() for ln in text.splitlines()
+                     if ln.strip() and not ln.strip().startswith("#"))
+    return None
 
 
 @dataclass(frozen=True)
@@ -99,10 +135,14 @@ def _sha256_tokens(tokens: tuple[str, ...]) -> str:
 def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
     """Fingerprint a fetched repo tree.
 
-    The tree digest covers every regular file (sorted by relative path); the
-    token stream concatenates the normalized tokens of every ``.py`` file in
-    the same order, with a path-independent file separator so splitting one
-    module into two files does not accidentally collide.
+    The tree digest covers every regular file (sorted by relative path). The
+    token stream concatenates, in the same order, the normalized tokens of
+    every ``.py`` file AND of every functional config file (``*.json``,
+    ``requirements.txt``, yaml/toml-style configs) — parameters live in
+    configs as much as in code, so a config-only delta must read as a real
+    delta, not collapse into "identical code". A path-independent file
+    separator keeps split/merged modules from accidentally colliding. Docs
+    and other non-functional files enter the tree digest only.
     """
     root = Path(repo_dir)
     files = sorted(
@@ -111,6 +151,7 @@ def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
     )
     tree = hashlib.sha256()
     tokens: list[str] = []
+    maskable: list[bool] = []
     for p in files:
         rel = str(p.relative_to(root))
         data = p.read_bytes()
@@ -119,13 +160,22 @@ def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
         tree.update(data)
         tree.update(b"\x00")
         if p.suffix == ".py":
-            tokens.append("\x00FILE")
-            tokens.extend(normalized_tokens(data.decode("utf-8", "replace")))
+            file_toks = normalized_tokens(data.decode("utf-8", "replace"))
+            mask = True
+        else:
+            cfg_toks = _config_tokens(p, data.decode("utf-8", "replace"))
+            if cfg_toks is None:
+                continue
+            file_toks, mask = cfg_toks, False
+        tokens.append("\x00FILE")
+        maskable.append(False)
+        tokens.extend(file_toks)
+        maskable.extend([mask] * len(file_toks))
     toks = tuple(tokens)
     return RepoFingerprint(
         tree_sha256=tree.hexdigest(),
         token_sha256=_sha256_tokens(toks),
-        masked_sha256=_sha256_tokens(_mask_names(toks)),
+        masked_sha256=_sha256_tokens(_mask_names(toks, tuple(maskable))),
         tokens=toks,
     )
 
@@ -237,3 +287,32 @@ def screen_duplicates(
         dropped=tuple(dropped),
         shadow=tuple(shadow),
     )
+
+
+def collapse_identical_behavior(
+    entries: list[tuple[str, int, str]],
+    king_digest: str | None,
+) -> tuple[tuple[str, ...], tuple[DedupVerdict, ...]]:
+    """Collapse entrants whose PROBE OUTPUT is byte-identical under the shared
+    round seed: ``entries`` is ``(hotkey, uid, behavior_digest)``.
+
+    Two repos that produce identical bytes from the same seed are the same
+    generative process no matter how different the code looks — this is the
+    backstop for obfuscated forks and logic hidden in dependencies. Exact
+    equality is transitive-safe (unlike similarity), so a plain first-owner
+    map is equivalent to the pairwise rule: king first, then lowest UID.
+    """
+    seen: dict[str, tuple[str, int]] = {}
+    if king_digest:
+        seen[king_digest] = ("king", KING_UID)
+    kept: list[str] = []
+    dropped: list[DedupVerdict] = []
+    for hotkey, uid, digest in sorted(entries, key=lambda e: e[1]):
+        owner = seen.get(digest)
+        if owner is not None:
+            dropped.append(DedupVerdict(
+                hotkey, uid, owner[0], owner[1], "behavior_identical", 1.0))
+        else:
+            seen[digest] = (hotkey, uid)
+            kept.append(hotkey)
+    return tuple(kept), tuple(dropped)
