@@ -506,6 +506,12 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
             "n_entrants": len(ents),
             "n_advanced": sum(1 for e in ents if isinstance(e, dict)
                               and e.get("status") == "advanced"),
+            # How decisive the screen was (shadow; never gated the pick). A
+            # leader_lcb at or below 0 means first and second were statistically
+            # interchangeable on the heat's evidence.
+            "leader_lcb": heat.get("leader_lcb"),
+            "leader_p_best": next((e.get("p_best") for e in ents if isinstance(e, dict)
+                                   and e.get("rank") == 1), None),
         }
 
     return {

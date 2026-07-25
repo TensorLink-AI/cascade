@@ -19,6 +19,7 @@ validator draws identical bootstrap samples on the same comparison.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -229,6 +230,68 @@ def paired_bootstrap_lcb_aggregated(
     if rel.size == 0:
         return float("nan")
     return float(np.quantile(rel, alpha))
+
+
+def joint_bag_geomeans(
+    components: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    B: int = 10_000,
+    seed: int | str = 42,
+    clusters: list | np.ndarray | None = None,
+) -> np.ndarray:
+    """Bag geomeans for *several* competitors under ONE shared cluster resample.
+
+    ``components`` is one ``(qloss_per_q, abs_target, mase)`` triple per
+    competitor, all scored on the same windows in the same order. Returns
+    ``(n_competitors, B)`` bag geomeans (lower is better).
+
+    The single shared draw is the whole point: bag ``b`` is the *same* set of
+    clusters for every competitor, so window difficulty — which dominates the
+    marginal variance and is identical across competitors — cancels in any
+    within-bag comparison. Reading a competitor's own quantiles off a row gives
+    a marginal bound that is mostly a bound on the eval pool, not on the model;
+    comparisons *within* a column are the informative direction.
+
+    This generalises :func:`_rel_bootstrap_aggregated` (which is the two-row
+    case) to the heat's N-way field, where the question is a selection ("which
+    entrant is best?") rather than a two-sided test.
+
+    Raises ``ValueError`` if the competitors are not paired — differing window
+    counts, or ``abs_target`` vectors that disagree (``abs_target`` depends only
+    on the targets, so unequal values mean different windows were scored).
+    """
+    if not components:
+        return np.zeros((0, B), dtype=np.float64)
+
+    qloss0, abs0, mase0 = components[0]
+    if qloss0.ndim != 2:
+        raise ValueError(f"qloss must be (N, num_q); got {qloss0.shape}")
+    n = qloss0.shape[0]
+    for i, (qloss, abs_t, mase) in enumerate(components):
+        if qloss.shape != qloss0.shape:
+            raise ValueError(
+                f"competitor {i} qloss shape {qloss.shape} != {qloss0.shape}; "
+                "windows are not paired correctly"
+            )
+        for name, arr in (("abs_target", abs_t), ("mase", mase)):
+            if arr.shape != (n,):
+                raise ValueError(f"competitor {i} {name} shape {arr.shape}; expected ({n},)")
+        if not np.allclose(abs_t, abs0):
+            raise ValueError(
+                f"competitor {i} abs_target differs from competitor 0; "
+                "every competitor must be scored on the same windows"
+            )
+    if n == 0:
+        return np.zeros((len(components), 0), dtype=np.float64)
+
+    codes = cluster_codes(clusters, n)
+    g = int(codes.max()) + 1
+    rng = np.random.default_rng(_seed_to_int(seed))
+    idx = rng.integers(0, g, size=(B, g))
+    return np.stack([
+        _bag_geomeans(*_cluster_sums(qloss, abs_t, mase, codes, g), idx)
+        for qloss, abs_t, mase in components
+    ])
 
 
 def paired_bootstrap_quantiles_aggregated(

@@ -148,11 +148,24 @@ def stack_components(
 
 
 def global_geomean(scores: list[WindowScore]) -> float:
-    """Round-level geomean(MWSQL, mean MASE) on the observed (non-resampled)
-    windows. Reported for diagnostics; the bootstrap LCB gates dethroning."""
+    """Round-level geomean(MWSQL, geomean MASE) on the observed (non-resampled)
+    windows.
+
+    Deliberately the SAME functional form as one bootstrap bag
+    (:func:`cascade.eval.bootstrap._bag_geomeans`) evaluated on the identity
+    resample — MWSQL aggregated numerator/denominator then divided once, MASE
+    aggregated in log space. So this is exactly the quantity the LCB is a bound
+    on, and the heat screen (which ranks on it) selects on the same metric the
+    duel judges.
+
+    MASE is a *geometric* mean for the reason the bootstrap uses one: per-window
+    MASE is heavy-tailed, and an arithmetic mean lets a single exploding window
+    dominate the aggregate. That bites hardest in the heat, which screens on a
+    fraction of the windows and samples the final does.
+    """
     if not scores:
         return float("nan")
     qloss, abs_t, mase_a = stack_components(scores)
     mwsql = mwsql_from_components(qloss, abs_t)
-    mase_mean = float(mase_a.mean())
-    return float(np.sqrt(max(mwsql, 1e-12) * max(mase_mean, 1e-12)))
+    mase_geo = float(np.exp(np.log(np.maximum(mase_a, 1e-9)).mean()))
+    return float(np.sqrt(max(mwsql, 1e-12) * max(mase_geo, 1e-12)))

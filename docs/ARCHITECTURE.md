@@ -55,7 +55,11 @@ per epoch (so the king is trained once per day). Each round:
    (`[round] heat_train_hours`, ~30min, on the primary/smallest size), scores each
    on the held-out pool (geomean of CRPS/MASE), and keeps the top
    `[round] finalists` (default 1). A challenger that fails to train or score just
-   doesn't qualify.
+   doesn't qualify. Every entrant is screened on the *same* window slice, so a
+   joint cluster bootstrap over the field is paired: the heat records `p_best`
+   per entrant and a `leader_lcb` against the runner-up on the manifest's heat
+   block, saying how decisive the screen was. Those are **diagnostics only** —
+   the finalists are the observed ranking, never a bounded one (DEC-CA-0006).
 5. **Final.** For the king and each surviving finalist, at **every configured
    size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
    **under that one shared seed pair**:

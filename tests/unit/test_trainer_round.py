@@ -1391,3 +1391,68 @@ def test_publish_persists_last_round_marker(cfg, tmp_path, monkeypatch):
     runner.publish(manifest)
     assert json.loads((tmp_path / "last_round.json").read_text()) == {"round_id": "1"}
     assert not (tmp_path / "last_round.json.tmp").exists()  # atomic publish
+
+
+def _window_scores(scale, n=40):
+    """Per-window scores on one fixed window slice — what the real screener
+    returns. ``scale`` sets the entrant's quality (lower is better)."""
+    import numpy as np
+
+    from cascade.eval.scoring import WindowScore
+
+    rng = np.random.default_rng(4242)          # window draw: same for every entrant
+    return [
+        WindowScore(
+            series_id=str(i),
+            mase=float(rng.uniform(0.5, 1.5)) * scale,
+            qloss_per_q=rng.uniform(0.1, 1.0, size=9) * scale,
+            abs_target=float(rng.uniform(5.0, 10.0)),
+        )
+        for i in range(n)
+    ]
+
+
+def test_heat_records_shadow_selection_diagnostics(cfg, tmp_path, monkeypatch):
+    """A screener returning per-window scores gets the same ranking PLUS the
+    diagnostics saying how decisive the screen was. The pick is unchanged: the
+    cheapest entrant still advances."""
+    _patch_train_boundaries(monkeypatch)
+    scales = {"b": 1.8, "c": 1.0, "d": 1.4}     # c is clearly best
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return _window_scores(scales[gen.hotkey])
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = manifest.heat
+    by_hk = {e.hotkey: e for e in heat.entrants}
+    assert by_hk["c"].rank == 1 and by_hk["c"].status == "advanced"
+    # a decisive field: the leader wins essentially every bag and clears its runner-up
+    assert by_hk["c"].p_best > 0.99
+    assert heat.leader_lcb > 0.0
+    assert heat.n_windows == 40
+    assert heat.n_clusters == 40               # pool carries no source labels here
+    assert pytest.approx(1.0) == sum(e.p_best for e in heat.entrants)
+    assert load_manifest(dump_manifest(manifest)).heat == heat
+
+
+def test_scalar_screener_still_works_without_diagnostics(cfg, tmp_path, monkeypatch):
+    """A screener that can only produce a scalar ranks the field exactly as
+    before; the round simply carries no diagnostics."""
+    _patch_train_boundaries(monkeypatch)
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt, gen, seed, block=None: scores[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = manifest.heat
+    assert {e.hotkey for e in heat.entrants if e.status == "advanced"} == {"c"}
+    assert heat.leader_lcb is None and heat.n_clusters is None
+    assert all(e.p_best is None for e in heat.entrants)

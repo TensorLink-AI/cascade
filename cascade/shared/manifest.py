@@ -171,6 +171,13 @@ class HeatEntrant:
     rotates privately and exposing absolute scores would hand a miner a gradient
     to distribution-match it. ``rank``/``rel_score`` are None for an entrant that
     never produced a score (``failed_train`` / ``failed_screen``).
+
+    ``p_best`` is the shadow selection diagnostic (:mod:`cascade.eval.heat`): the
+    fraction of joint-bootstrap bags in which this entrant scored best. It says
+    how much of the ranking is signal — a leader sitting near ``1 / n_entrants``
+    was ranked by noise — and is safe to publish for the same reason ``rel_score``
+    is: it is a comparison among entrants, not an absolute pool score. None when
+    the screener returned only a scalar (no per-window components to resample).
     """
 
     uid: int
@@ -179,6 +186,7 @@ class HeatEntrant:
     status: str                    # one of HEAT_STATUSES
     rank: int | None = None        # 1-based placement among scored entrants
     rel_score: float | None = None  # heat_score / best_heat_score (≥ 1.0; 1.0 = best)
+    p_best: float | None = None    # P(best) over the joint bootstrap; diagnostic only
 
     def __post_init__(self) -> None:
         if self.status not in HEAT_STATUSES:
@@ -194,11 +202,22 @@ class HeatResult:
     auditor cannot cheaply reproduce a discarded heat checkpoint). ``None`` on a
     manifest means no screen ran: the field fit within ``finalists``, or the
     round had a single eligible challenger.
+
+    ``leader_lcb`` is the shadow diagnostic on how decisive the screen was: the
+    paired lower confidence bound on the leader's relative improvement over the
+    runner-up (the duel's statistic, with the runner-up in the king's slot).
+    ``> 0`` means the screen genuinely separated first from second; ``<= 0`` means
+    it did not and the two were interchangeable on this evidence. It never
+    changed which entrants advanced — see :mod:`cascade.eval.heat`. None when the
+    screener returned only scalars, or with a single scored entrant.
     """
 
     screen_size: str               # arch_preset the heat screened at
     finalists: int                 # how many advanced to the final
     entrants: tuple[HeatEntrant, ...] = ()
+    leader_lcb: float | None = None   # leader-vs-runner-up paired LCB; diagnostic only
+    n_windows: int | None = None      # eval windows the screen ranked on
+    n_clusters: int | None = None     # distinct upstream feeds behind those windows
 
 
 def _entry_body(e: TrainedEntry) -> dict:
@@ -231,6 +250,9 @@ def _heat_to_json(heat: HeatResult | None) -> dict | None:
         "screen_size": heat.screen_size,
         "finalists": heat.finalists,
         "entrants": [asdict(e) for e in heat.entrants],
+        "leader_lcb": heat.leader_lcb,
+        "n_windows": heat.n_windows,
+        "n_clusters": heat.n_clusters,
     }
 
 
@@ -248,9 +270,13 @@ def _heat_from_json(obj: object) -> HeatResult | None:
                 status=str(e["status"]),
                 rank=(None if e.get("rank") is None else int(e["rank"])),
                 rel_score=(None if e.get("rel_score") is None else float(e["rel_score"])),
+                p_best=(None if e.get("p_best") is None else float(e["p_best"])),
             )
             for e in obj.get("entrants", ())
         ),
+        leader_lcb=(None if obj.get("leader_lcb") is None else float(obj["leader_lcb"])),
+        n_windows=(None if obj.get("n_windows") is None else int(obj["n_windows"])),
+        n_clusters=(None if obj.get("n_clusters") is None else int(obj["n_clusters"])),
     )
 
 

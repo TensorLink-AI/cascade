@@ -34,6 +34,14 @@ in-context.
   vacancy anyway) and stalled all future promotions. Kills DEC-CA-0005's handoff-sync
   workstream. (`decisions/DEC-CA-0004-cascade-persist-throne.md`)
 
+- **DEC-CA-0006** — Heat screen keeps ranking on the observed geomean; the
+  bootstrap is a SHADOW diagnostic (`p_best`, `leader_lcb`), never the selection
+  rule. "Rank by lowest UCB" was simulated and rejected (~91% of marginal
+  variance is shared window difficulty; penalises dispersion the duel doesn't
+  score; −20pp in the adverse case). Also aligns `global_geomean` to the
+  bootstrap's geometric-mean MASE.
+  (`decisions/DEC-CA-0006-heat-lcb-diagnostics-not-selection.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

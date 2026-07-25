@@ -343,13 +343,15 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
     snapshot selection against it; see docs/EVAL_POOL.md).
 
     Loads the same private eval pool the validators use (owner-controlled) and
-    scores each heat checkpoint on a per-round-rotated slice, returning
-    geomean(CRPS, MASE) (lower is better) so the trainer can rank the field down
-    to ``[round] finalists`` before the expensive final. ``block`` (the round's
-    epoch boundary) keys a daily-snapshot pool to the same snapshot the
-    validator will judge on. Imports torch/pool lazily so the offline smoke and
-    unit tests never pull the heavy stacks."""
-    from ..eval.scoring import global_geomean
+    scores each heat checkpoint on a per-round-rotated slice, returning the
+    per-window scores so the trainer can rank the field down to ``[round]
+    finalists`` before the expensive final. The runner reduces them with
+    ``global_geomean`` (lower is better) for the ranking and additionally
+    resamples them for the shadow selection diagnostics — every entrant is
+    scored on the SAME slice, which is what makes that bootstrap paired.
+    ``block`` (the round's epoch boundary) keys a daily-snapshot pool to the same
+    snapshot the validator will judge on. Imports torch/pool lazily so the
+    offline smoke and unit tests never pull the heavy stacks."""
     from ..validator.evaluator import evaluate_checkpoint
 
     if cfg.storage.pool_bucket:
@@ -366,12 +368,11 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
     # keeps the sequential CPU screening from rivalling the heat training time.
     num_samples = cfg.round.heat_num_samples or cfg.eval.num_samples
 
-    def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None) -> float:
+    def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None):
         windows = window_source.windows_for_round(base_seed, n, block=block)
-        scores = evaluate_checkpoint(
+        return evaluate_checkpoint(
             ckpt_dir, windows, num_samples=num_samples, device="cpu"
         )
-        return global_geomean(scores)
 
     def pool_provenance(base_seed: int, block: int | None = None) -> tuple[str, str]:
         key, sha = window_source.provenance_for_round(base_seed, block=block)
