@@ -547,7 +547,7 @@ def test_fetch_receipt_exits_cleanly_when_unresolvable(cfg, monkeypatch):
 # ── trainer-king vs validator-state-king divergence (seen live 2026-07-07) ────
 # After a service outage the trainer's king-read (on-chain incentive) pointed at
 # a different hotkey than the validator's persisted state king. That is a
-# legitimate steady state (OPEN_QUESTIONS #3): the vote goes to the MANIFEST
+# legitimate steady state: the vote goes to the MANIFEST
 # king; the state king only moves on a dethrone. The audit must surface it as
 # WARN, not fail the receipt.
 

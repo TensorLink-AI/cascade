@@ -167,7 +167,9 @@ def test_deploy_rejects_hf_only_hippius_is_priority_one(monkeypatch, cfg, capsys
     # Hippius priority one: a miner CANNOT submit straight to HF. --hub-repo is
     # required (always tried first); --hf-repo alone is refused before any upload.
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
-    args = types.SimpleNamespace(ref=None, hub_repo=None, hf_repo="me/hf", chain_toml=None)
+    args = types.SimpleNamespace(ref=None, hub_repo=None, hub_namespace=None, hf_repo="me/hf",
+                                 chain_toml=None, blocks_until_reveal=None, reveal_now=False,
+                                 next_epoch=False)
     rc = cli._cmd_deploy(args)
     assert rc == 2
     assert "--hub-repo" in capsys.readouterr().err

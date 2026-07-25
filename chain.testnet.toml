@@ -165,6 +165,7 @@ heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
+reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin (see chain.toml)
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest) trained as the king whenever no on-chain champion resolves — a
 # fixed floor whose sentinel uid = -1 makes the validator BURN to burn_uid until
@@ -335,12 +336,20 @@ pool_s3_region   = ""
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
+# throne-holding generator (code fetched from the Hub, packed to a tar) here plus
+# a kings/index.json "db" linking each king to its archived object. Endpoint/region
+# default to backup_* above; credentials via KING_ARCHIVE_S3_ACCESS_KEY /
+# KING_ARCHIVE_S3_SECRET_KEY (falling back to BACKUP_S3_*). Keep it PRIVATE.
+king_archive_bucket      = "cascade-testnet-king-archive"   # TESTNET bucket
+king_archive_s3_endpoint = ""                       # empty = reuse backup_s3_endpoint
+king_archive_s3_region   = ""                       # empty = reuse backup_s3_region ("auto")
 hf_backup_repo   = "tensorlink-dev/cascade-testnet-mirror"   # TESTNET: S3-down fallback
 
 [manifest]
 # The trainer publishes signed training receipts to the manifest S3 bucket
 # ([storage] manifest_bucket) and validators read them. trainer_hotkey is the
-# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
+# only signer a validator trusts.
 trainer_hotkey  = "5Cyver53HZaxdn6j9K2W9LyaoGxjz1W3cXHoKcaDyzfjfpHs"  # owner hotkey (uid 0 on netuid 259)
 validator_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"  # TESTNET override
 poll_seconds    = 120
@@ -350,7 +359,8 @@ weight_set_interval_blocks = 180
 poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.testnet.db"
-# Cascade persistence (see [scoring] cascade_reign_days).
+# Cascade persistence (see [scoring] cascade_reign_days). The co-hosted trainer
+# reads warm_start_init_path too — both processes must point at the same file.
 cascade_state_db_path      = "cascade_state.testnet.json"
 warm_start_init_path       = "warm_start_init.testnet.json"
 

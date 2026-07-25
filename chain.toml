@@ -85,9 +85,14 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = "sha256:2126219a8909797e313b1688ff7b27a666eb7376652cd0d322e229e91cfe01b4"
-# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.3.1 (2026-07-16, built from
-# 56d40c7 — 20x budget + pinned [dependencies] generator allowlist baked).
+train_image_digest = "sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf75c8855715c9a0"
+# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.4.0 (2026-07-23, built from
+# 1325409 — [wandb] extra baked, warm-start worker plumbing, incident-hardening
+# trainer code; torch/generator-dependency stack unchanged from v0.3.1).
+# NOTE the baked chain.toml inside the image carries an EMPTY pin (an image
+# cannot contain its own digest — worker-v0.3.1 protocol).
+# Prior pin: sha256:2126219a8909797e313b1688ff7b27a666eb7376652cd0d322e229e91cfe01b4
+# (worker-v0.3.1, 2026-07-16, built from 56d40c7).
 # NOTE the baked chain.toml inside the image carries an EMPTY pin (an image
 # cannot contain its own digest); enforcement is launch-env injection + the
 # provisioner health gate, and contract_digest is computed orchestrator-side
@@ -137,7 +142,8 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
 # squatters / rehearsal commits from before the official start never enter a
 # round (and never burn their one submission).
-commit_floor_block = 8622922
+commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
+                              # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # rename-only copies, and near-copies (sim >= dedup_threshold) of the king or a
@@ -163,6 +169,12 @@ dedup_probe_series = 8           # 0 = probe off
 # promote the lowest-UID miner to interim king (legacy behaviour).
 genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
+# Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
+# reveal at `epoch boundary − reveal_margin_blocks` — hidden all window, public
+# only the last ~5 min. Must absorb commit-inclusion + drand reveal jitter (a
+# reveal at/after the boundary misses the round) while staying under a copier's
+# automated turnaround. Tighten only after measuring jitter on a live round.
+reveal_margin_blocks = 25
 # Scaling seam: which size the heat screens at, and which size(s) decide the
 # throne. arch_preset names from the size registry; >1 throne size = combined score.
 screen_size  = "toto2-4m"
@@ -302,10 +314,20 @@ hf_backup_repo   = ""                               # e.g. "yourorg/cascade-mani
 backup_s3_endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
 backup_s3_region   = ""                             # empty = "auto" (R2's region)
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
+# Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
+# generator that has ever held the throne (the code, fetched from the Hub and
+# packed to a tar) here, plus a kings/index.json "db" linking each king to its
+# archived object. A permanent private record, independent of the public Hub
+# repos a miner could delete. Endpoint/region default to the backup_* R2 above;
+# credentials via KING_ARCHIVE_S3_ACCESS_KEY / KING_ARCHIVE_S3_SECRET_KEY
+# (falling back to BACKUP_S3_* when unset). Keep the bucket PRIVATE.
+king_archive_bucket      = "cascade-king-archive"
+king_archive_s3_endpoint = ""                       # empty = reuse backup_s3_endpoint
+king_archive_s3_region   = ""                       # empty = reuse backup_s3_region ("auto")
 
 [manifest]
 # Signed training receipts in [storage] manifest_bucket. trainer_hotkey is the
-# only signer a validator trusts (see OPEN_QUESTIONS.md #1).
+# only signer a validator trusts.
 trainer_hotkey  = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # owner trainer hotkey (mainnet)
 poll_seconds    = 120
 # Trust anchor for the public round receipts: the validator hotkey whose
@@ -319,7 +341,9 @@ poll_seconds               = 120
 hf_cache_seconds           = 1800
 state_db_path              = "validator_state.db"
 # Cascade persistence (see [scoring] cascade_reign_days): reign clock + reign
-# checkpoint log, and the promoted warm-start pointer for the trainer.
+# checkpoint log, and the promoted warm-start pointer. The CO-HOSTED TRAINER
+# reads warm_start_init_path too (its rounds train from the pinned init once a
+# promotion fires) — point both processes at the same file.
 cascade_state_db_path      = "cascade_state.json"
 warm_start_init_path       = "warm_start_init.json"
 # Operator kill-switch (or `cascade-validator --force-burn`): burn to

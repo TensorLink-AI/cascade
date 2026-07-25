@@ -151,14 +151,19 @@ def test_demote_to_trained_crowns_trained_king_fresh():
 
 
 def test_resync_holds_survive_json_round_trip():
-    st = ChampionState(king_hotkey="k", king_uid=0, resync_holds=3)
+    st = ChampionState(king_hotkey="k", king_uid=0, resync_holds=3,
+                       last_resync_round_id="99")
     again = loads(dumps(st))
     assert again == st
     assert again.resync_holds == 3
+    assert again.last_resync_round_id == "99"
 
 
 def test_resync_holds_defaults_to_zero_for_legacy_state():
-    # State written before the safety valve existed has no resync_holds key.
+    # State written before the safety valve existed has no resync_holds key;
+    # state written before the same-round re-gate fix has no
+    # last_resync_round_id key. Both default safely.
     again = loads('{"king_hotkey": "k", "king_uid": 0, "tenure_rounds": 1}')
     assert again.resync_holds == 0
+    assert again.last_resync_round_id is None
     assert again.king_hotkey == "k"

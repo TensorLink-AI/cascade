@@ -50,6 +50,13 @@ class ChampionState:
     # champion that can never be trained as king (e.g. no usable commitment) does
     # not wedge the subnet forever. Persisted so the cap survives restarts.
     resync_holds: int = 0
+    # The round_id of the last manifest that bumped ``resync_holds``. A restart
+    # re-gates the SAME stale manifest, and before this field each re-gate
+    # advanced the counter — five restarts during a pause tripped the valve and
+    # demoted a healthy champion (2026-07-22). The counter only advances when
+    # the un-synced round is a NEW round_id; same-round re-gates hold without
+    # counting. Cleared with ``resync_holds`` on any normally-scored round.
+    last_resync_round_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +182,7 @@ def demote_to_trained(
         rounds_seen=state.rounds_seen + 1,
         former_kings=(),
         resync_holds=0,
+        last_resync_round_id=None,
     )
 
 
@@ -188,6 +196,7 @@ def dumps(state: ChampionState) -> str:
             "rounds_seen": state.rounds_seen,
             "former_kings": list(state.former_kings),
             "resync_holds": state.resync_holds,
+            "last_resync_round_id": state.last_resync_round_id,
         },
         sort_keys=True,
     )
@@ -203,4 +212,8 @@ def loads(text: str) -> ChampionState:
         rounds_seen=int(obj.get("rounds_seen", 0)),
         former_kings=tuple(str(k) for k in (obj.get("former_kings") or ())),
         resync_holds=int(obj.get("resync_holds", 0)),
+        last_resync_round_id=(
+            str(obj["last_resync_round_id"])
+            if obj.get("last_resync_round_id") is not None else None
+        ),
     )

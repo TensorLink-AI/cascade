@@ -152,12 +152,16 @@ time_mase)`, lower better — and kept in a per-reign log. All three suites repo
 CRPS/MASE the same way — the shifted geometric mean, across tasks, of each metric
 **normalized by the Seasonal-Naive baseline** (≈1.0 = baseline parity) — so the
 six numbers are the same kind of quantity before they enter the geomean. When a king holds the
-throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned, a
+throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned —
+counted in blocks (7200/day), anchored to the manifest's epoch-start block so
+every validator fires on the same round — a
 **Cascade** fires: the reign's lowest-score checkpoint (a lookup, not a re-eval)
-is installed **as-is** as the warm-start init for all subsequent rounds, then the
-throne is vacated — the king is cleared, the competition re-opens from the new
-init, and the clock resets. The reign clock and checkpoint log persist next to the
-champion state, so Cascade survives validator restarts.
+is installed **as-is** as the warm-start init for all subsequent rounds; the king
+**persists** on the throne with a fresh reign clock (DEC-CA-0004 — both roles
+train from the shared init, so promotion confers no advantage worth vacating
+over, and the throne only changes hands via a genuine dethrone). The reign clock
+and checkpoint log persist next to the champion state, so Cascade survives
+validator restarts.
 
 Those six numbers are **authoritative from the trainer, not recomputed per
 validator**. The trainer (owner-operated, already the manifest trust anchor) runs
@@ -238,7 +242,7 @@ LCB already granted — and an uncomputable gate (sidecar down, too few configs,
 or king/challenger on different pinned data revisions) makes the round
 inconclusive rather than silently passing or failing. `gift_gate_mode = "shadow"`
 computes and logs the verdict without enforcing it, to calibrate the tolerance
-against real noise first. Rationale and ops notes: `OPEN_QUESTIONS.md` §9.
+against real noise first.
 
 ## Trust model (v1) and the path to decentralisation
 
@@ -246,8 +250,7 @@ v1 centralises training in the owner's trainer and trust in `[manifest]
 trainer_hotkey`. This is the pragmatic bootstrap: it makes the controlled
 experiment trivially enforceable. The corpus/contract digests already make every
 run *reproducible*, which is the hook for decentralising training later (have
-validators or a trainer quorum re-derive and challenge a manifest). See
-`OPEN_QUESTIONS.md` #1–#2.
+validators or a trainer quorum re-derive and challenge a manifest).
 
 ## What's implemented vs. a boundary
 
@@ -269,4 +272,4 @@ optimiser split, and a token-budget LR schedule. It is the one piece that needs 
 box, then pin `base_arch_digest` / `ref_throughput_tokens_per_s`. Other operator
 inputs before launch: the Hippius `[storage]` credentials/endpoints and the
 held-out eval-pool ref (`[eval] window_pool`). The corpus sandbox subprocess
-caveats are unchanged (OPEN_QUESTIONS.md #2).
+caveats are unchanged.

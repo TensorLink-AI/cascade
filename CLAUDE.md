@@ -13,14 +13,31 @@ in-context.
   generator throughput is a compute multiplier and mass `deadline_hit`s are
   intentional — do NOT "fix" them by loosening the wall.
   (`decisions/DEC-CA-0001-throughput-wall-is-the-law.md`)
-- **DEC-CA-0002** — Mainnet home is netuid 91 (decided 2026-07-14). Checklist
-  and blockers in `docs/MAINNET_LAUNCH.md` (L40S pin, worker-image digest,
-  container sandbox, pool-publish cron; gift gate shadow → enforce).
+- **DEC-CA-0002** — Mainnet home is netuid 91 (decided 2026-07-14). `chain.toml`
+  ships with the mainnet values baked in (netuid 91, L40S pin, worker-image
+  digest, `pool_bucket`).
   (`decisions/DEC-CA-0002-mainnet-netuid-91.md`)
-- **DEC-CA-0003** — Pre-heat content dedup: pairwise (never transitive) at
-  sim ≥ 0.99, shadow-log 0.90–0.99; dropped copies still burn; LLM judge is
-  advisory-only, never in the enforcement path.
-  (`decisions/DEC-CA-0003-content-dedup-0.99.md`)
+- **DEC-CA-0003** — Provisioner rules of escalation: an EMPTY stage walks the
+  SKU ladder under a 30-min wall-clock deadline, a below-50% fleet gets one
+  same-SKU top-up, failed stages retry on a 15-min cooldown while their
+  window lasts, the final rents JIT at the heat_complete marker (mainnet),
+  and the heat ladder's floor is 2× pods (no 1× singles).
+  (`decisions/DEC-CA-0003-provisioner-rules-of-escalation.md`)
+- **DEC-CA-0005** — Cascade warm-start: half-built (validator promotes, trainer
+  never consumes). Revert testnet `cascade_enabled`; implement deterministic
+  reign clock + synchronized handoff BEFORE trainer consumption + audit rework;
+  mainnet stays unarmed until both survive a full testnet cascade.
+  (`decisions/DEC-CA-0005-warm-start-sequencing.md`)
+- **DEC-CA-0004** — Cascade promotion PERSISTS the king (re-crown, reset clock
+  only); vacate removed, not configurable (consensus-critical). Vacate had no
+  benefit (shared init ⇒ no incumbency advantage; old king earns through the
+  vacancy anyway) and stalled all future promotions. Kills DEC-CA-0005's handoff-sync
+  workstream. (`decisions/DEC-CA-0004-cascade-persist-throne.md`)
+- **DEC-CA-0006** — Pre-heat content dedup: pairwise (never transitive) at
+  sim ≥ 0.99, shadow-log 0.90–0.99; dropped copies still burn; behavioral
+  probe enforces generator determinism and collapses identical-output
+  processes; LLM judge is advisory-only, never in the enforcement path.
+  (`decisions/DEC-CA-0006-content-dedup-0.99.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.

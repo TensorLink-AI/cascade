@@ -42,7 +42,17 @@ RECEIPT_SENTINEL = "__CASCADE_RECEIPT__"
 
 
 class RemoteDispatchError(RuntimeError):
-    """An SSH dispatch or receipt parse failed."""
+    """An SSH dispatch or receipt parse failed.
+
+    ``returncode`` carries the ssh exit status when the failure was a non-zero
+    remote/transport exit — 255 marks an SSH transport failure (host
+    unreachable, auth refused, sshd not ready), which the heat fan-out counts to
+    refuse caching a fleet-wide dead-pod wipeout as a completed heat. ``None``
+    for parse/timeout/logic failures that carry no ssh status."""
+
+    def __init__(self, *args, returncode: int | None = None) -> None:
+        super().__init__(*args)
+        self.returncode = returncode
 
 
 HOST_STAGES = ("any", "heat", "final")
@@ -55,7 +65,10 @@ class RemoteHost:
     ``forward_env`` names env vars the orchestrator copies from its own
     environment into the remote command (e.g. registry/S3 credentials) — use it
     only if you have not pre-seeded the pod's env; the bittensor wallet is never
-    forwarded. ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
+    forwarded. ``WANDB_API_KEY`` need not be listed here: when [wandb] is enabled
+    the trainer auto-forwards it (RemoteDispatcher.extra_forward_env) so pod-side
+    wandb logs, since the training — and its wandb run — happen on the pod.
+    ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
 
     ``stage`` restricts which round stage the pod serves: ``"heat"`` (screen
     trainings only), ``"final"`` (king/finalist trainings only), or ``"any"``
@@ -143,6 +156,7 @@ def worker_argv(
     arch_preset: str | None = None,
     train_hours: float | None = None,
     repo_suffix: str = "",
+    warm_start_ref: str | None = None,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -150,7 +164,10 @@ def worker_argv(
     or one of ``[[training.sizes]]``); omitted ⇒ the worker trains the primary
     size, preserving single-size behaviour. ``train_hours`` overrides the compute
     budget (a cheap heat screen); ``repo_suffix`` disambiguates the checkpoint
-    repo so parallel same-size runs (heat challengers) don't collide."""
+    repo so parallel same-size runs (heat challengers) don't collide.
+    ``warm_start_ref`` is the round's pinned Cascade init (a trained_pointer);
+    the pod fetches it from the registry and trains from its weights instead of
+    random init — omitted ⇒ random init."""
     argv = [
         host.remote_python, "-m", "cascade.trainer.worker",
         "--gen-ref", gen_ref,
@@ -169,6 +186,8 @@ def worker_argv(
         # `=` form: the suffix starts with '-' (e.g. -heat-u3), which argparse
         # would otherwise mistake for a flag.
         argv.append(f"--repo-suffix={repo_suffix}")
+    if warm_start_ref:
+        argv += ["--warm-start-ref", warm_start_ref]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -289,6 +308,13 @@ class RemoteDispatcher:
 
     trainer_spec: str
     timeout_seconds: int = 6 * 3600       # generous: a full ~3h training + overhead
+    # Env vars forwarded to EVERY pod on top of each host's own ``forward_env``,
+    # when present in the orchestrator env. The seam for observability creds the
+    # operator shouldn't have to list per-host: the trainer sets it to
+    # ``("WANDB_API_KEY",)`` when [wandb] is enabled, so pod-side wandb (where the
+    # training actually runs) gets the key and its per-step logs land — instead of
+    # silently no-opping because the key never left the orchestrator.
+    extra_forward_env: tuple[str, ...] = ()
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -304,6 +330,7 @@ class RemoteDispatcher:
         arch_preset: str | None = None,
         train_hours: float | None = None,
         repo_suffix: str = "",
+        warm_start_ref: str | None = None,
         lane_count: int | None = None,
     ) -> TrainedEntry:
         import os
@@ -312,8 +339,12 @@ class RemoteDispatcher:
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
+            warm_start_ref=warm_start_ref,
         )
-        env = {k: os.environ[k] for k in host.forward_env if k in os.environ}
+        # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
+        # dict.fromkeys de-dups while preserving order if a host lists one too.
+        names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
+        env = {k: os.environ[k] for k in names if k in os.environ}
         remote_cmd = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
@@ -327,12 +358,14 @@ class RemoteDispatcher:
             # stderr line is the one-line reason — no traceback to relay.
             reason = (proc.stderr or "").strip().splitlines()[-1:] or ["(no reason)"]
             raise RemoteDispatchError(
-                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}"
+                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}",
+                returncode=3,
             )
         if proc.returncode != 0:
             tail = (proc.stderr or "")[-2000:]
             raise RemoteDispatchError(
-                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}"
+                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
+                returncode=proc.returncode,
             )
         entry = receipt_to_entry(parse_receipt(proc.stdout or ""))
         if entry.role != role:
@@ -343,3 +376,29 @@ class RemoteDispatcher:
 def run_ssh(ssh_argv: list[str], timeout: int):
     """Run the ssh command, returning the CompletedProcess (text mode)."""
     return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout)
+
+
+_HEAT_PROBE_TOKEN = "cascade-heat-probe-ok"
+
+
+def probe_host(host: RemoteHost, *, timeout: int = 15) -> bool:
+    """A cheap liveness probe before heat fan-out: an SSH echo over
+    ``BatchMode`` + key auth.
+
+    TCP reachability is NOT sufficient — a booting pod completes the TCP
+    handshake while sshd (or the pod account) is not ready yet, and every
+    dispatch there dies ``rc=255`` (2026-07-23: a dead pod burned all 48
+    challengers in 11s, each a one-and-done ``rc=255``, and the 0/48 heat was
+    cached as legitimate). Only a full SSH round-trip proves the host can run a
+    worker. A host with no address to reach (``host`` unset — offline fakes)
+    cannot be probed and is KEPT, never stranding a fleet on a local config
+    slip; a real :class:`RemoteHost` always carries one. Returns True only when
+    the echo round-trips."""
+    if not getattr(host, "host", None):
+        return True
+    try:
+        proc = run_ssh(build_ssh_argv(host, shlex.join(["echo", _HEAT_PROBE_TOKEN])), timeout)
+    except Exception:  # noqa: BLE001 — any transport failure ⇒ treat as dead
+        return False
+    return (getattr(proc, "returncode", 1) == 0
+            and _HEAT_PROBE_TOKEN in (getattr(proc, "stdout", "") or ""))

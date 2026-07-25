@@ -19,7 +19,7 @@ distribution-match. cascade resolves both with a single rule:
 
 The pool itself is owner-controlled and **private** (``[eval] window_pool``).
 Loading it — pulling the held-out corpus and slicing it into context/target
-windows — is the integrator boundary (see OPEN_QUESTIONS.md #6); this module owns
+windows — is the integrator boundary; this module owns
 the deterministic, validator-agreeing *selection and rotation*, which is pure and
 unit-tested. :func:`build_windows_from_series` is the reference cutter the loader
 can use to turn raw held-out series into :class:`EvalWindow` s.

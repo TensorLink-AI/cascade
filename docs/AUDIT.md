@@ -1,6 +1,6 @@
 # Auditing cascade rounds — `cascade-audit`
 
-cascade's training is owner-operated in v1 (`OPEN_QUESTIONS.md` #1), so the
+cascade's training is owner-operated in v1, so the
 trust machinery is built to let **anyone** re-derive the owner's published work
 instead of taking it on faith. Every round is a pure function of chain state:
 

@@ -312,6 +312,57 @@ def test_resync_valve_disabled_holds_indefinitely(cfg):
     assert reason.startswith("king_resyncing")
 
 
+def test_resync_step_same_round_regate_counts_once(cfg):
+    from dataclasses import replace
+
+    # 2026-07-22 incident: five validator RESTARTS re-gated the SAME stale
+    # round; each bumped resync_holds, tripping the 5-round valve and demoting
+    # a healthy champion. Re-gates of one round_id must count once — only a
+    # NEW un-synced round advances the cap.
+    m = _manifest(cfg)
+    runner = ValidatorRunner(cfg=cfg, state=genesis("chal_hk", 1), evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    s1, _ = runner._resync_step(m)
+    assert s1.resync_holds == 1
+    assert s1.last_resync_round_id == m.round_id
+    # restart re-gates the same round: held, NOT counted again
+    regated = ValidatorRunner(cfg=cfg, state=s1, evaluate_fn=lambda e, w: [],
+                              verify_signatures=False)
+    s2, reason = regated._resync_step(m)
+    assert s2.resync_holds == 1
+    assert reason.startswith("king_resyncing")
+    # a genuinely new un-synced round advances the counter
+    advanced = ValidatorRunner(cfg=cfg, state=s2, evaluate_fn=lambda e, w: [],
+                               verify_signatures=False)
+    s3, _ = advanced._resync_step(replace(m, round_id="2"))
+    assert s3.resync_holds == 2
+    assert s3.last_resync_round_id == "2"
+
+
+def test_resync_valve_not_tripped_by_restart_regate(cfg):
+    from dataclasses import replace
+
+    from cascade.validator.state import ChampionState
+
+    cfg = replace(cfg, scoring=replace(cfg.scoring, king_resync_max_rounds=5))
+    # At the cap threshold, but the incoming manifest is the SAME round that
+    # produced the last hold (a restart re-gate) — the valve must not fire.
+    state = ChampionState(king_hotkey="chal_hk", king_uid=1, resync_holds=4,
+                          last_resync_round_id=_manifest(cfg).round_id)
+    runner = ValidatorRunner(cfg=cfg, state=state, evaluate_fn=lambda e, w: [],
+                             verify_signatures=False)
+    new_state, reason = runner._resync_step(_manifest(cfg))
+    assert new_state.king_hotkey == "chal_hk"          # champion held, not demoted
+    assert new_state.resync_holds == 4
+    assert reason.startswith("king_resyncing")
+    # the NEXT distinct round is the fifth hold: valve fires as designed
+    fifth = ValidatorRunner(cfg=cfg, state=new_state, evaluate_fn=lambda e, w: [],
+                            verify_signatures=False)
+    demoted, dreason = fifth._resync_step(replace(_manifest(cfg), round_id="2"))
+    assert demoted.king_hotkey == "king_hk"
+    assert dreason.startswith("king_resync_demoted")
+
+
 def test_reward_uids_vote_champion_over_manifest_king(cfg):
     import types
 

@@ -24,7 +24,13 @@ REF_OUT = "cascade/ckpt-out@sha256:" + "e" * 64
 
 
 class _FakeStream:
-    digest, n_series, total_points = "d", 3, 192
+    n_series, total_points = 3, 192
+
+    def __init__(self, digest="d"):
+        # per-generator digest (from the fetched gen dir): a constant would make
+        # the king and challenger byte-identical and (rightly) trip the trainer's
+        # content-clone drop, which is not what these tests probe
+        self.digest = digest
 
     def __enter__(self):
         return self
@@ -70,7 +76,8 @@ def cascade_cfg(cfg):
 
 def _patch(monkeypatch):
     monkeypatch.setattr(loop_mod, "fetch_from_hub", lambda ref, dest, hub=None: dest)
-    monkeypatch.setattr(loop_mod, "open_round_stream", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(loop_mod, "open_round_stream",
+                        lambda mode, gen_dir, *a, **k: _FakeStream(digest=f"d-{gen_dir}"))
     monkeypatch.setattr(loop_mod, "upload_dir_to_hub_or_hf", _fake_upload)
 
 

@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0003
+id: DEC-CA-0006
 type: decision
 title: "Pre-heat content dedup at 0.99, pairwise only; LLM judge stays advisory"
 status: active

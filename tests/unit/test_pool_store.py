@@ -17,6 +17,7 @@ from cascade.pool.source import HarvestContext, HarvestedSeries
 from cascade.shared import hippius
 from cascade.shared.config import load_chain_config
 from cascade.shared.hippius import (
+    ObjectNotFound,
     StorageError,
     fetch_pool_snapshot,
     pack_dir_to_tar,
@@ -32,10 +33,16 @@ CFG = PoolBuildConfig(context_length=128, horizon=16, min_context=32)
 
 
 class _FakeS3Store:
-    """In-memory stand-in for S3Store (bytes + text surface, StorageError on miss)."""
+    """In-memory stand-in for S3Store (bytes + text surface).
 
-    def __init__(self):
+    Mirrors real S3 semantics: a missing key raises :class:`ObjectNotFound`
+    (the ``NoSuchKey`` case), NOT a bare ``StorageError``. ``fail`` forces every
+    read to raise a plain ``StorageError`` instead, modelling an unreadable
+    bucket (auth/network/5xx) — distinct from a genuinely absent object."""
+
+    def __init__(self, *, fail: bool = False):
         self.objects: dict[str, bytes] = {}
+        self.fail = fail
 
     def put_bytes(self, key, data, *, content_type="application/octet-stream"):
         self.objects[key] = bytes(data)
@@ -44,8 +51,10 @@ class _FakeS3Store:
         self.objects[key] = text.encode("utf-8")
 
     def get_bytes(self, key):
+        if self.fail:
+            raise StorageError(f"bucket_unavailable: {key}")
         if key not in self.objects:
-            raise StorageError(f"missing: {key}")
+            raise ObjectNotFound(f"s3_get_missing: {key}")
         return self.objects[key]
 
     def get_text(self, key):
@@ -95,6 +104,39 @@ def test_publish_index_and_fetch_round_trip(tmp_path):
 
 def test_read_index_empty_when_absent():
     assert read_pool_index(_FakeS3Store()) == []
+
+
+def test_read_index_raises_when_bucket_unreadable():
+    # A read FAILURE (auth/network/wrong bucket) must NOT masquerade as an empty
+    # index — the old bare ``except StorageError: return []`` turned a pool-bucket
+    # blip into "no snapshot" and the validator rejected every pinned round.
+    with pytest.raises(StorageError, match="bucket_unavailable"):
+        read_pool_index(_FakeS3Store(fail=True))
+
+
+def test_is_missing_object_distinguishes_absent_from_unreadable():
+    # A missing OBJECT (NoSuchKey / 404) is absence; a missing BUCKET or a 403
+    # is a read failure and must not be reported as "not there".
+    missing_key = SimpleNamespace(response={"Error": {"Code": "NoSuchKey"}})
+    http_404 = SimpleNamespace(response={"ResponseMetadata": {"HTTPStatusCode": 404}})
+    missing_bucket = SimpleNamespace(response={"Error": {"Code": "NoSuchBucket"}})
+    forbidden = SimpleNamespace(response={"ResponseMetadata": {"HTTPStatusCode": 403}})
+    assert hippius._is_missing_object(missing_key) is True
+    assert hippius._is_missing_object(http_404) is True
+    assert hippius._is_missing_object(missing_bucket) is False
+    assert hippius._is_missing_object(forbidden) is False
+    assert hippius._is_missing_object(RuntimeError("no .response attr")) is False
+
+
+def test_provenance_absent_returns_empty_but_unreadable_propagates(tmp_path):
+    # Absent index → ("", "") (legacy unpinned semantics, receipt carries no pin).
+    src = BucketWindowSource(_cfg_small(), _FakeS3Store(), cache_dir=tmp_path / "a")
+    assert src.provenance_for_round(123, block=7200) == ("", "")
+    # Unreadable index → propagate, so the pin gate reports a distinct
+    # "provenance lookup failed" reject rather than "resolved no snapshot".
+    bad = BucketWindowSource(_cfg_small(), _FakeS3Store(fail=True), cache_dir=tmp_path / "b")
+    with pytest.raises(StorageError, match="bucket_unavailable"):
+        bad.provenance_for_round(123, block=7200)
 
 
 def test_index_reads_legacy_effective_round_key():

@@ -1,0 +1,85 @@
+# Snapshot every cascade king generator into the private R2 king archive.
+#
+# Reads the validator's public throne history (receipts/index.json in the
+# manifest bucket) and, for every generator that has ever held the throne,
+# fetches its code from the Hippius Hub and saves it — packed to a deterministic
+# tar — to the PRIVATE R2 [storage] king_archive_bucket, alongside a
+# kings/index.json "db" linking each king to its archived object. See
+# scripts/scrape_kings.py and cascade.shared.king_archive.
+#
+# The archive is content-addressed + append-only: a king already in the bucket is
+# never re-fetched, only its throne metadata is refreshed. Safe to run often.
+#
+# REQUIRED repo secrets:
+#   CASCADE_S3_ACCESS_KEY / CASCADE_S3_SECRET_KEY   read the manifest bucket
+#     (receipts/index.json); aliased into HIPPIUS_S3_* below.
+#   BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY     WRITE the R2 king archive
+#     (the same R2 account chain.toml already uses for the manifest backup). The
+#     scraper falls back to this pair when KING_ARCHIVE_S3_* is unset.
+# King generators are PUBLIC by design, so the Hub pull needs no token (anonymous
+# pull of public repos). Set HIPPIUS_HUB_TOKEN only if you ever archive a private
+# repo.
+#
+# Use ONE scraper only — two concurrent runs would race on kings/index.json
+# (the concurrency group below already serialises this workflow's own runs).
+name: Scrape kings
+
+on:
+  schedule:
+    - cron: "40 4 * * *"          # 04:40 UTC daily — after the day's round settles
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Which chain config to read"
+        type: choice
+        options: [mainnet, testnet]
+        default: mainnet
+      dry_run:
+        description: "List what would be archived without writing anything"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scrape-kings            # never let two runs race on kings/index.json
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Manifest-bucket read key, aliased into the HIPPIUS_S3_* the scraper reads.
+      HIPPIUS_S3_ACCESS_KEY: ${{ secrets.CASCADE_S3_ACCESS_KEY }}
+      HIPPIUS_S3_SECRET_KEY: ${{ secrets.CASCADE_S3_SECRET_KEY }}
+      # R2 king-archive WRITE key (scraper falls back to BACKUP_S3_* when
+      # KING_ARCHIVE_S3_* is unset).
+      BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+      BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cascade (hippius extra)
+        run: pip install -e ".[hippius]"
+
+      - name: Scrape kings → private R2 archive
+        env:
+          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          if [ -z "$BACKUP_S3_ACCESS_KEY" ]; then
+            echo "::error::BACKUP_S3_ACCESS_KEY not set — cannot write the R2 king archive."
+            exit 1
+          fi
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
+          FLAGS=""
+          [ "$DRY_RUN" = "true" ] && FLAGS="--dry-run"
+          echo "scraping kings with $TOML $FLAGS"
+          python scripts/scrape_kings.py --chain-toml "$TOML" $FLAGS

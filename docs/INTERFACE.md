@@ -94,6 +94,14 @@ tree the trainer will fetch — needs the `[hippius]` extra and Hub credentials
 (`HIPPIUS_HUB_TOKEN`, or `HIPPIUS_HUB_USERNAME` + `HIPPIUS_HUB_PASSWORD`). Already
 pushed? Pass `--ref <repo@digest>` to skip the upload and just commit.
 
+The timelock reveal defaults to a **timed reveal**: the payload decrypts
+`[round] reveal_margin_blocks` before the next epoch boundary, so a submission
+stays hidden for its whole window and cannot be copied into its own round
+(`--reveal-now` / `--blocks-until-reveal N` / `--next-epoch` override). Prefer
+`--hub-namespace <ns>` over a fixed `--hub-repo` name — each deploy then uses a
+fresh non-guessable repo, keeping the content as undiscoverable as the pointer.
+See MINER.md §5a for the full threat model.
+
 ## What good data looks like
 
 You're optimising for **downstream forecast generalisation** of a Toto2-4M trained

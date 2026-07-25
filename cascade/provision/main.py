@@ -452,6 +452,29 @@ def _run(args) -> int:
     if profiles:
         render = replace(render, profiles=profiles)
 
+    # Rules of escalation (loop tunables, not policy — see
+    # ProvisionerLoop._rent_stage_escalating for the rules themselves).
+    escalate_deadline_s = float(top.get("escalate_deadline_s", 1800.0))
+    if escalate_deadline_s < 0:
+        raise ProvisionError(
+            f"escalate_deadline_s must be >= 0 (0 disables escalation); "
+            f"got {escalate_deadline_s}")
+    min_viable_fleet = float(top.get("min_viable_fleet", 0.5))
+    if not 0.0 <= min_viable_fleet <= 1.0:
+        raise ProvisionError(
+            f"min_viable_fleet must be in [0, 1] (0 disables top-up); "
+            f"got {min_viable_fleet}")
+    rent_retry_cooldown_s = float(top.get("rent_retry_cooldown_s", 900.0))
+    if rent_retry_cooldown_s < 0:
+        raise ProvisionError(
+            f"rent_retry_cooldown_s must be >= 0 (0 disables within-round "
+            f"retry); got {rent_retry_cooldown_s}")
+    final_rent_on = str(top.get("final_rent_on", "margin"))
+    if final_rent_on not in ("margin", "heat_complete"):
+        raise ProvisionError(
+            f"final_rent_on must be 'margin' or 'heat_complete'; got {final_rent_on!r}")
+    max_duds_per_stage = int(top.get("max_duds_per_stage", 8))
+
     hosts_path = Path(top.get("hosts_path", "hosts.toml"))
     work_root = Path(args.work_root)
     state_path = Path(top.get("state_path", work_root / "provisioner_state.json"))
@@ -536,6 +559,11 @@ def _run(args) -> int:
         static_hosts_text=static_hosts_text,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),
+        escalate_deadline_s=escalate_deadline_s,
+        min_viable_fleet=min_viable_fleet,
+        rent_retry_cooldown_s=rent_retry_cooldown_s,
+        final_rent_on=final_rent_on,
+        max_duds_per_stage=max_duds_per_stage,
         dry_run=bool(args.dry_run),
         on_cycle=globals().get("_ensure_service_logging"),
     )

@@ -6,23 +6,28 @@ the tests run anywhere (the integration is an optional extra).
 
 from __future__ import annotations
 
+import re
 import sys
 import types
 
 from cascade.shared.config import WandbConfig
-from cascade.trainer.wandb_sink import WandbSink, open_wandb_run
+from cascade.trainer.wandb_sink import WandbSink, open_wandb_run, wandb_run_id
 
 
 class _FakeRun:
     def __init__(self):
         self.logged: list[dict] = []
         self.finished = False
+        self.metrics: list[tuple[str, dict]] = []
 
     def log(self, record):
         self.logged.append(record)
 
     def finish(self):
         self.finished = True
+
+    def define_metric(self, name, **kwargs):
+        self.metrics.append((name, kwargs))
 
 
 def _install_fake_wandb(monkeypatch, *, run=None, init_raises=False):
@@ -79,6 +84,71 @@ def test_offline_mode_needs_no_api_key(monkeypatch):
     assert kw["config"]["miner_hotkey"] == "hk9"
     assert kw["config"]["miner_uid"] == 5
     assert kw["config"]["corpus_mode"] == "stream_cpu"
+
+
+def test_run_id_is_stable_and_unique_per_competitor():
+    # Same (round, role, hotkey) ⇒ same id, so a retried round resumes its run
+    # instead of minting a duplicate; a different competitor/size/stage differs.
+    a = wandb_run_id("2", "king-toto2-4m", "hkA")
+    assert a == wandb_run_id("2", "king-toto2-4m", "hkA")
+    assert a != wandb_run_id("2", "challenger-toto2-4m", "hkB")  # role differs
+    assert a != wandb_run_id("2", "king-toto2-22m", "hkA")       # size differs
+    assert a != wandb_run_id("3", "king-toto2-4m", "hkA")        # round differs
+
+
+def test_run_id_is_wandb_safe_for_odd_inputs():
+    # Non [A-Za-z0-9_-] chars are sanitised; a digest still keeps distinct keys
+    # apart even when the sanitised slugs would collide.
+    rid = wandb_run_id("2", "heat-a/b c", "hk:1")
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", rid)
+    assert wandb_run_id("2", "heat-a/b/c", "x") != wandb_run_id("2", "heat-a-b-c", "x")
+
+
+def test_retry_resumes_the_same_run(monkeypatch):
+    # Two inits for the same (round, role, hotkey) carry the SAME id and
+    # resume="allow" — wandb then resumes one run rather than piling up empties.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    cap = _install_fake_wandb(monkeypatch)
+    kw = dict(round_id="2", role="king-toto2-4m", hotkey="hkA", uid=0, size="toto2-4m")
+    open_wandb_run(WandbConfig(enabled=True, mode="online"), **kw)
+    first = cap["kwargs"]
+    assert first["resume"] == "allow"
+    assert first["id"] == wandb_run_id("2", "king-toto2-4m", "hkA")
+    open_wandb_run(WandbConfig(enabled=True, mode="online"), **kw)
+    assert cap["kwargs"]["id"] == first["id"]   # retry reuses the id ⇒ resume
+
+
+def test_defines_step_axis_for_per_step_metrics(monkeypatch):
+    # The per-step series must be pinned to the trainer's `step` x-axis so the
+    # default dashboard renders loss-vs-step, not loss-vs-wandb-_step.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    cap = _install_fake_wandb(monkeypatch)
+    open_wandb_run(
+        WandbConfig(enabled=True, mode="online"), round_id="2",
+        role="king-toto2-4m", hotkey="hkA", uid=0, size="toto2-4m",
+    )
+    defined = dict(cap["run"].metrics)
+    assert "step" in defined                              # x-axis declared
+    assert defined["loss"]["step_metric"] == "step"       # loss plotted against step
+    assert defined["loss"].get("summary") == "min"        # summary tracks best loss
+    for k in ("lr", "throughput_tokens_per_s", "tokens", "tokens_frac", "data_wait_frac"):
+        assert defined[k]["step_metric"] == "step"
+
+
+def test_define_metric_failure_never_aborts(monkeypatch):
+    # A backend that rejects define_metric must still yield a usable sink — axis
+    # setup is cosmetic and can never fail a round.
+    class _Run(_FakeRun):
+        def define_metric(self, name, **kwargs):
+            raise RuntimeError("define_metric unsupported")
+
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    _install_fake_wandb(monkeypatch, run=_Run())
+    sink = open_wandb_run(
+        WandbConfig(enabled=True, mode="online"), round_id="2",
+        role="king-toto2-4m", hotkey="hkA", uid=0, size="toto2-4m",
+    )
+    assert isinstance(sink, WandbSink)
 
 
 def test_missing_wandb_package_returns_none(monkeypatch):

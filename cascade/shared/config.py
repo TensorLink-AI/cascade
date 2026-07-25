@@ -441,6 +441,14 @@ class RoundConfig:
     # generative process regardless of how different the code looks — dropped
     # as behavior_identical. 0 = probe disabled (static tiers only).
     dedup_probe_series: int = 8
+    # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
+    # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
+    # its whole window and is public only for the last few minutes before the
+    # field locks. The margin must absorb commit-inclusion + drand reveal jitter
+    # (a reveal landing AT/after the boundary misses the round) while staying
+    # too short for a copier to fetch + re-commit + land their own reveal.
+    # ~25 blocks ≈ 5 min at 12s blocks; tighten after measuring live jitter.
+    reveal_margin_blocks: int = 25
 
 
 @dataclass(frozen=True)
@@ -543,12 +551,13 @@ class ScoringConfig:
     # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
     # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
     # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
-    # and the reigning king holds the throne ``cascade_reign_days`` CONSECUTIVE
-    # WALL-CLOCK DAYS undethroned, the reign's best checkpoint (lowest geomean of
-    # the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the trainer stamps onto the
-    # signed manifest) is installed as the warm-start init and the throne is
-    # vacated to re-open the competition from it. The reign clock is wall-clock, so
-    # it is persisted and survives restarts.
+    # and the reigning king holds the throne ``cascade_reign_days`` worth of
+    # BLOCKS (7200/day at 12 s, anchored to the manifest's epoch block so every
+    # validator fires the same round) undethroned, the reign's best checkpoint
+    # (lowest geomean of the six GIFT-Eval / BOOM / TIME CRPS+MASE numbers the
+    # trainer stamps onto the signed manifest) is installed as the warm-start
+    # init; the king persists on the throne with a fresh reign clock
+    # (DEC-CA-0004). The clock is persisted and survives restarts.
     cascade_enabled: bool = False
     cascade_reign_days: int = 7
 
@@ -603,6 +612,19 @@ class StorageConfig:
     backup_bucket: str = ""
     backup_s3_endpoint: str = ""
     backup_s3_region: str = ""
+    # Private king archive: a dedicated S3-compatible (Cloudflare R2) bucket where
+    # `cascade-scrape-kings` saves every generator that has held the throne — the
+    # code, fetched from the Hub by its content-addressed ref and packed to a
+    # deterministic tar — plus a ``kings/index.json`` "db" pointing each king back
+    # at its archived object (see cascade.shared.king_archive). This is a permanent
+    # private record of every king, independent of the public Hub repos (which a
+    # miner could delete). ``king_archive_s3_endpoint`` / ``king_archive_s3_region``
+    # default to the R2 ``backup_*`` values above; ``king_archive_bucket`` defaults
+    # to ``cascade-king-archive``. Credentials via KING_ARCHIVE_S3_ACCESS_KEY /
+    # KING_ARCHIVE_S3_SECRET_KEY, falling back to the BACKUP_S3_* pair when unset.
+    king_archive_bucket: str = ""
+    king_archive_s3_endpoint: str = ""
+    king_archive_s3_region: str = ""
 
 
 @dataclass(frozen=True)
@@ -921,6 +943,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_threshold=float(r.get("dedup_threshold", 0.99)),
             dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
             dedup_probe_series=int(r.get("dedup_probe_series", 8)),
+            reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),
         eval=EvalConfig(
             eval_dataset=str(e["eval_dataset"]),
@@ -981,6 +1004,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             backup_bucket=str(st.get("backup_bucket", "")),
             backup_s3_endpoint=str(st.get("backup_s3_endpoint", "")),
             backup_s3_region=str(st.get("backup_s3_region", "")),
+            king_archive_bucket=str(st.get("king_archive_bucket", "")),
+            king_archive_s3_endpoint=str(st.get("king_archive_s3_endpoint", "")),
+            king_archive_s3_region=str(st.get("king_archive_s3_region", "")),
         ),
         manifest=ManifestConfig(
             trainer_hotkey=str(m["trainer_hotkey"]),
