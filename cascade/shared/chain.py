@@ -307,7 +307,7 @@ class ChainClient:
             return None  # vacant throne — let the trainer pick an interim king
         return str(meta.hotkeys[best_uid])
 
-    def poll_pending_commits(self) -> dict[str, int]:
+    def poll_pending_commits(self) -> dict[str, int] | None:
         """``{hotkey: commit_block}`` for every timelock commit still ENCRYPTED
         on chain, in one ``query_map``.
 
@@ -326,9 +326,10 @@ class ChainClient:
         shorten the window without also committing late, which is precisely
         what the ordering is meant to penalise.
 
-        Best-effort by contract: returns ``{}`` rather than raising, since a
-        missed observation degrades the tie-break to reveal order (see
-        ``screen_duplicates``) and must never break a round.
+        Best-effort by contract: returns ``None`` on a failed read rather than
+        raising, and ``{}`` only when the chain genuinely holds no sealed
+        commit. The caller must not conflate them — "I could not look" is not
+        evidence that every pending commit revealed.
         """
         try:
             sub = self.subtensor()
@@ -338,7 +339,7 @@ class ChainClient:
         except Exception as e:  # noqa: BLE001 — advisory read; never break a round
             log.warning("pending-commit poll failed (%s); commit-order evidence "
                         "for this tick is lost", e)
-            return {}
+            return None
         out: dict[str, int] = {}
         for key, value in qm:
             try:

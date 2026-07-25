@@ -550,6 +550,14 @@ def screen_duplicates(
             delta: int | None = None
             if fp.tree_sha256 == r_fp.tree_sha256:
                 tier, score = "tree_identical", 1.0
+            elif not (fp.n_tokens and r_fp.n_tokens):
+                # At least one side has NO functional content (no .py, no
+                # config — docs only). Every such repo shares the empty-stream
+                # digest, so the token tiers would collapse two unrelated junk
+                # repos into a copy verdict, and the loser burns its one
+                # submission for it. No content, no content identity: only the
+                # tree tier above (real bytes) may speak for these.
+                continue
             elif fp.token_sha256 == r_fp.token_sha256:
                 tier, score = "token_identical", 1.0
             elif fp.masked_sha256 == r_fp.masked_sha256:

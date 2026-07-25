@@ -185,6 +185,25 @@ trainer-local by design and needs no consensus: the trainer is the sole
 owner-operated authority for heat selection, and validators never re-derive
 which challengers were screened.
 
+**Self-audit of the hardening (round 4), four defects it introduced or left:**
+the plan-path screen was handed the full 900s round budget while
+`cascade-trainer --plan-only` runs under a 600s subprocess timeout whose
+failure rents NO fleet — trading a spam screen for a lost rental window, so
+the sizing path now gets `dedup_plan_seconds = 120`; every repo with no `.py`
+and no config shares the empty-stream digest, so the token tiers collapsed two
+unrelated docs-only repos into a copy verdict (the same empty-digest trap the
+`config_only` guard had already fixed for `py_sha256`, missed on the identical
+tiers); an entrant with neither a witnessed commit nor a reveal block mapped to
+block 0, which sorts FIRST and wins every collision — the exact inversion of
+the fallback's intent, now omitted so it sorts last; and
+`poll_pending_commits` returned `{}` for both "nothing sealed" and "the read
+failed", so one failed poll would freeze every pending commit as though it had
+revealed (it now returns `None`, and the witness skips the freeze pass).
+The probe's sandbox gate also treated `use_sandbox = False` — generator code
+IN the trainer's own process — as an acceptable posture, because it is the
+in-process test path; it now needs the same explicit opt-in as a degradable
+sandbox.
+
 Two smaller corrections: shadow mode is now a true counterfactual of enforce
 (a would-be-dropped entry no longer becomes a rival for later entries, so the
 log measures the verdicts enforce would have produced — the log is what

@@ -586,7 +586,12 @@ class TrainerRunner:
             sealed = poll()
         except Exception as e:  # noqa: BLE001 — advisory; never break the loop
             log.warning("commit witness: poll failed (%s)", e)
-            return {}
+            sealed = None
+        if sealed is None:
+            # A failed read says nothing about what is sealed on chain. Running
+            # the freeze pass on it would treat every pending commit as just
+            # revealed, on no evidence at all.
+            return _load_commit_witness(self._commit_witness_path())
         path = self._commit_witness_path()
         witness = _load_commit_witness(path)
         changed = False
@@ -623,19 +628,29 @@ class TrainerRunner:
         """
         witness = _load_commit_witness(self._commit_witness_path())
         priority: dict[str, int] = {}
-        missing = []
+        missing, unknown = [], []
         for c in entrants:
             committed = (witness.get(c.hotkey) or {}).get("committed")
             if committed:
                 priority[c.hotkey] = int(committed)
-            else:
-                priority[c.hotkey] = int(c.reveal_block or 0)
+            elif c.reveal_block:
+                priority[c.hotkey] = int(c.reveal_block)
                 missing.append(c.hotkey)
+            else:
+                # Neither witnessed nor revealed at a known block. Leaving it
+                # out sorts it LAST (screen_duplicates' _LAST), with UID
+                # breaking ties among the equally-unknown. Mapping it to block
+                # 0 instead would sort it FIRST and let an entrant we know
+                # nothing about win every collision it appears in.
+                unknown.append(c.hotkey)
         if missing:
             log.info("commit witness: no commit block for %d/%d entrant(s) "
                      "(%s%s) — they order on their reveal block",
                      len(missing), len(entrants), ", ".join(missing[:5]),
                      "…" if len(missing) > 5 else "")
+        if unknown:
+            log.warning("commit witness: no commit AND no reveal block for %s "
+                        "— ordered last", ", ".join(unknown))
         return priority
 
     # ── anti-spam: 1 hotkey = 1 submission (lifetime) ────────────────────────
@@ -693,8 +708,9 @@ class TrainerRunner:
         *,
         static_only: bool = False,
         report: bool = True,
+        budget_seconds: int | None = None,
     ) -> list[ResolvedGenerator]:
-        """Drop entrants whose repo CONTENT duplicates the king or a lower-UID
+        """Drop entrants whose repo CONTENT duplicates the king or an earlier
         entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
 
         The on-chain same-ref dedup in :func:`plan_round` only catches identical
@@ -710,13 +726,15 @@ class TrainerRunner:
         In ``shadow`` mode verdicts are computed and logged but nothing drops.
         Every verdict lands in ``<work_root>/<round>/dedup_report.json``.
 
-        The whole screen runs under ``[round] dedup_phase_seconds``. Its inputs
-        are attacker-chosen (repo bytes, generator runtime), so an unbounded
-        screen is a way to stall the round it exists to protect; on expiry the
-        field proceeds UNSCREENED, which is the same fail-open direction every
-        other error path here takes. ``static_only`` runs the fingerprint tiers
+        The whole screen runs under ``[round] dedup_phase_seconds``, or
+        ``budget_seconds`` when the caller has a tighter one. Its inputs are
+        attacker-chosen (repo bytes, generator runtime), so an unbounded screen
+        is a way to stall the round it exists to protect; on expiry the field
+        proceeds UNSCREENED, which is the same fail-open direction every other
+        error path here takes. ``static_only`` runs the fingerprint tiers
         without the probe (no code execution) — that is what makes the screen
-        safe to call from the provisioner's sizing path.
+        safe to call from the provisioner's sizing path, which passes its own
+        budget because it is itself running under a subprocess timeout.
         """
         mode = (self.cfg.round.dedup_mode or "off").lower()
         if mode not in ("shadow", "enforce") or not entrants:
@@ -724,7 +742,8 @@ class TrainerRunner:
         import shutil
 
         fetch_root = self.work_root / f"{base_seed}" / "dedup"
-        budget = max(60, int(self.cfg.round.dedup_phase_seconds or 0) or 10 ** 9)
+        budget = max(30, int(budget_seconds if budget_seconds is not None
+                             else self.cfg.round.dedup_phase_seconds or 0) or 10 ** 9)
         try:
             return self._with_deadline(
                 lambda: self._screen_duplicate_entrants_inner(
@@ -1035,21 +1054,25 @@ class TrainerRunner:
         make this safe: shadow gates the drops, not the execution.
         """
         g = self.cfg.generator
-        if g.sandbox_mode == "container" or g.sandbox_strict or not self.use_sandbox:
-            # use_sandbox=False is the in-process test path; no untrusted code
-            # runs there that the caller has not already chosen to run.
+        if self.use_sandbox and (g.sandbox_mode == "container" or g.sandbox_strict):
             return True
+        # ``use_sandbox=False`` runs generator code IN THIS PROCESS — strictly
+        # worse than a degradable sandbox, so it needs the opt-in too. (Earlier
+        # revisions of this gate treated it as safe because it is the in-process
+        # test path; a security gate that returns "fine" for its worst input is
+        # wrong even while nothing in production reaches it.)
+        posture = "in-process (use_sandbox=false)" if not self.use_sandbox else \
+            f"sandbox_mode={g.sandbox_mode!r}, sandbox_strict=false"
         if self.cfg.round.dedup_probe_allow_weak_sandbox:
-            log.warning("dedup-probe: running with sandbox_mode=%r and "
-                        "sandbox_strict=false — untrusted generator code shares "
-                        "this host with the eval pool and wallet "
-                        "(dedup_probe_allow_weak_sandbox=true)", g.sandbox_mode)
+            log.warning("dedup-probe: running with %s — untrusted generator code "
+                        "shares this host with the eval pool and wallet "
+                        "(dedup_probe_allow_weak_sandbox=true)", posture)
             return True
         log.error("dedup-probe: DISABLED — the probe executes untrusted "
-                  "generator code on the orchestrator and this host has neither "
-                  "sandbox_mode='container' nor sandbox_strict=true. Set one in "
+                  "generator code on the orchestrator and this host offers only "
+                  "%s. Set sandbox_mode='container' or sandbox_strict=true in "
                   "[generator], or dedup_probe_allow_weak_sandbox=true to accept "
-                  "the risk. Static dedup tiers are unaffected.")
+                  "the risk. Static dedup tiers are unaffected.", posture)
         return False
 
     def _probe_digest(

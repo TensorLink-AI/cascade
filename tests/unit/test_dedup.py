@@ -430,9 +430,13 @@ def probe_runner(dedup_runner, monkeypatch):
     from cascade.trainer.corpus import CorpusError
 
     runner, add = dedup_runner
+    # build_round_corpus is faked below, but the probe gate cannot know that:
+    # use_sandbox=False means "run generator code in this process", the weakest
+    # posture there is, so the fixture has to accept it out loud.
     runner.cfg = replace(runner.cfg,
                          round=replace(runner.cfg.round, dedup_probe_series=4,
-                                       dedup_probe_mode="enforce"))
+                                       dedup_probe_mode="enforce",
+                                       dedup_probe_allow_weak_sandbox=True))
     ticks = count()
 
     class _Result:
@@ -747,8 +751,11 @@ def test_probe_refuses_a_weak_sandbox(probe_runner, tmp_path):
 
     runner, add = probe_runner
     runner.use_sandbox = True         # the real path, not the in-process one
-    runner.cfg = replace(runner.cfg, generator=replace(
-        runner.cfg.generator, sandbox_mode="subprocess", sandbox_strict=False))
+    runner.cfg = replace(
+        runner.cfg,
+        generator=replace(runner.cfg.generator, sandbox_mode="subprocess",
+                          sandbox_strict=False),
+        round=replace(runner.cfg.round, dedup_probe_allow_weak_sandbox=False))
     ok = add("alice", 3, BASE_SOURCE)
     bad = add("edgar", 5, OTHER_SOURCE)
     (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
@@ -972,3 +979,58 @@ def test_runner_screen_orders_on_the_witnessed_commit(dedup_runner):
     assert [c.hotkey for c in kept] == ["victim"]
     report = json.loads((runner.work_root / "98" / "dedup_report.json").read_text())
     assert report["dropped"][0]["hotkey"] == "copyst"
+
+
+# ── audit regressions ────────────────────────────────────────────────────────
+
+def test_repos_with_no_functional_content_do_not_collide(tmp_path):
+    # Every repo with no .py and no config shares the empty-stream digest, so
+    # the token tiers would call two unrelated junk repos copies of each other
+    # — and the loser burns its one lifetime submission on a false verdict.
+    def _docs(name, text):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "README.md").write_text(text)
+        return fingerprint_dir(d)
+
+    a, b = _docs("a", "one thing\n"), _docs("b", "a totally different thing\n")
+    assert a.token_sha256 == b.token_sha256      # the collision is real…
+    result = screen_duplicates([("a", 1, a), ("b", 2, b)], None)
+    assert result.kept_hotkeys == ("a", "b")     # …and must not be a verdict
+    assert not result.dropped
+
+    # byte-identical junk is still a genuine duplicate (the tree tier)
+    c, d = _docs("c", "same\n"), _docs("d", "same\n")
+    assert screen_duplicates([("c", 1, c), ("d", 2, d)],
+                             None).dropped[0].tier == "tree_identical"
+
+
+def test_unknown_submission_block_sorts_last_not_first(dedup_runner):
+    # Mapping "we know nothing" to block 0 would sort it FIRST and let that
+    # entrant win every collision it appears in.
+    runner, add = dedup_runner
+    known = add("alice", 200, BASE_SOURCE, reveal_block=900)
+    nothing = add("ghost", 12, "# copy\n" + BASE_SOURCE)    # no reveal block
+
+    prio = runner._commit_priority([known, nothing])
+    assert prio == {"alice": 900}                            # ghost omitted
+    kept = runner._screen_duplicate_entrants(None, [known, nothing], base_seed=99)
+    assert [c.hotkey for c in kept] == ["alice"]
+
+
+def test_witness_does_not_freeze_commits_on_a_failed_read(dedup_runner):
+    # "I could not look" is not evidence that every pending commit revealed.
+    runner, _ = dedup_runner
+
+    class _Failing:
+        def poll_pending_commits(self):
+            return None          # read failed, per ChainClient's contract
+
+    class _Raising:
+        def poll_pending_commits(self):
+            raise RuntimeError("websocket died")
+
+    runner.witness_commits(_WitnessClient({"alice": 100}))
+    for client in (_Failing(), _Raising()):
+        w = runner.witness_commits(client)
+        assert w["alice"] == {"pending": 100, "committed": None}, client

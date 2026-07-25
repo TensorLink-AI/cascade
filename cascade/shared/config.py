@@ -494,6 +494,13 @@ class RoundConfig:
     # probe). On expiry the round proceeds unscreened: a screen that cannot
     # finish must not be able to sink the round it protects.
     dedup_phase_seconds: int = 900
+    # The same screen runs inside `cascade-trainer --plan-only`, which the
+    # provisioner invokes as a subprocess under a HARD 600s timeout — and a
+    # timed-out plan rents no fleet at all, i.e. costs the round its GPU. So
+    # the sizing path gets its own, much smaller budget: over-rent (the screen
+    # gave up, size off the raw field) is a cost; a lost rental window is a
+    # round. Keep this well under the caller's timeout.
+    dedup_plan_seconds: int = 120
     # Behavioral probe: sandbox-draw dedup_probe_series series per surviving
     # entrant under the shared round seed, TWICE. Two draws that differ ⇒ the
     # generator violates the determinism contract (the entropy re-roll that
@@ -1040,6 +1047,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 str(r.get("dedup_sketch_mode", "shadow")), "dedup_sketch_mode"),
             dedup_sketch_threshold=float(r.get("dedup_sketch_threshold", 0.99)),
             dedup_phase_seconds=int(r.get("dedup_phase_seconds", 900)),
+            dedup_plan_seconds=int(r.get("dedup_plan_seconds", 120)),
             dedup_probe_mode=validate_dedup_mode(
                 str(r.get("dedup_probe_mode", "shadow")), "dedup_probe_mode"),
             dedup_probe_series=int(r.get("dedup_probe_series", 8)),
