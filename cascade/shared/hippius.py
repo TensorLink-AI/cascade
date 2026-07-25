@@ -329,6 +329,14 @@ _RETRYABLE_HUB_ERROR_SUBSTRINGS = (
     "broken pipe", "temporarily unavailable", "try again",
     " 500 ", " 502 ", " 503 ", " 504 ",
     "500 server error", "502 server error", "503 server error", "504 server error",
+    # hippius_hub wraps mid-transfer disconnects as RuntimeError("chunk N
+    # failed") whose cause chain reads "HTTP transport error / error decoding
+    # response body / ... / end of file before message length reached".
+    # Deliberately NOT matching "chunk ... failed" itself: the 401 variant
+    # ("server returned 401 (Failed chunk bytes ...)") is an auth failure and
+    # must stay non-retryable.
+    "http transport error", "error decoding response body",
+    "error reading a body", "end of file before message length reached",
 )
 
 
