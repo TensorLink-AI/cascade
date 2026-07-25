@@ -319,19 +319,35 @@ def test_abs_delta_floor_boundary(tmp_path):
 
 # ── config_only tier ─────────────────────────────────────────────────────────
 
-def test_config_only_shadow_by_default(tmp_path):
+def test_config_only_label_does_not_exempt_tiny_sweeps(tmp_path):
     entries = [
         _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
         _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
     ]
     result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
-    # Identical code + differing configs is CLAIMED by the config_only tier:
-    # shadow-logged, kept, and never falls through to a near_duplicate drop
-    # (the raw ratio here is >= 0.99).
-    assert result.kept_hotkeys == ("orig", "swp")
-    assert not result.dropped
+    # With enforcement off, config_only is a LABEL, not an exemption: the
+    # byte-identical-code A/B sweep is shadow-logged AND still drops on the
+    # similarity tier (its ratio is >= 0.99).
+    assert result.kept_hotkeys == ("orig",)
+    (d,) = result.dropped
+    assert d.hotkey == "swp" and d.tier == "near_duplicate"
     (v,) = [s for s in result.shadow if s.tier == "config_only"]
     assert v.hotkey == "swp" and v.matched_hotkey == "orig" and v.score == 1.0
+
+
+def test_config_only_large_rewrite_survives_with_label(tmp_path):
+    # A config rewrite big enough to fall under the ratio bar: identical code,
+    # genuinely different parameterization — kept, with the label recorded.
+    big_a = json.dumps({f"w{i}": i * 0.095 for i in range(400)})
+    big_b = json.dumps({f"w{i}": (i % 7) * 1.31 + 40 for i in range(400)})
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": big_a}),
+        _entry(tmp_path, "rew", 2, BASE_SOURCE, {"config.json": big_b}),
+    ]
+    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    assert result.kept_hotkeys == ("orig", "rew")
+    assert not result.dropped
+    assert [s.tier for s in result.shadow if s.hotkey == "rew"].count("config_only") == 1
 
 
 def test_config_only_enforced_drops(tmp_path):

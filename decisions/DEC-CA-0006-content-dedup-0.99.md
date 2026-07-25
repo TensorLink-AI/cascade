@@ -73,9 +73,12 @@ near_duplicate tier (0 = off at ship; on this field 60–260 is a no-op, ~24–4
 spares substantive edits incl. the finalist at ~half the drop rate —
 ratio-over-cap pairs shadow-log as `near_duplicate_large_delta`);
 `config_only` (identical .py, differing configs — the self-declared A/B/C
-sweeps, 3 of the 11 drops) is its own tier, shadow-only behind
-`dedup_config_only_enforce = false` because config is also the legitimate
-fork product; and the behavioral probe gates on its own
+sweeps, 3 of the 11 drops) is its own tier behind
+`dedup_config_only_enforce = false`; un-enforced it is a shadow LABEL that
+never exempts — the pair still faces the similarity tier, so tiny config
+sweeps keep dropping as near_duplicate while a genuinely different
+parameterization survives with the label recorded (config is also the
+legitimate fork product); and the behavioral probe gates on its own
 `dedup_probe_mode` (ships `shadow`) independently of `dedup_mode`, so the
 static tiers enforce while the probe observes.
 

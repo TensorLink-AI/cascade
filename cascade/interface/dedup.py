@@ -289,10 +289,13 @@ def screen_duplicates(
 
     ``config_only_enforce`` (default False): a pair whose ``.py`` token
     streams are identical but whose functional config files differ gets a
-    ``config_only`` verdict — with the flag off it is shadow-logged and the
-    entry is never dropped for that rival ("identical code, different
-    weights" is both the ticket-spam pattern and the legitimate way to fork a
-    public generator; measure before enforcing).
+    ``config_only`` verdict. With the flag on it drops as its own tier; with
+    the flag off it is shadow-logged as a LABEL and the pair still faces the
+    similarity tier — a tiny config sweep keeps dropping as
+    ``near_duplicate``, while a config rewrite large enough to fall under the
+    ratio bar survives with the label recorded ("identical code, different
+    weights" is both the ticket-spam pattern and the legitimate fork path;
+    the log decides enforcement, it never exempts).
 
     With ``enforce=False`` (shadow mode) would-be drops are logged as
     verdicts but every entry is kept.
@@ -318,17 +321,23 @@ def screen_duplicates(
                 tier, score = "token_identical", 1.0
             elif fp.masked_sha256 == r_fp.masked_sha256:
                 tier, score = "rename_identical", 1.0
-            elif fp.py_sha256 == r_fp.py_sha256:
-                # Identical code, different functional configs. Enforcement is
-                # its own flag; off ⇒ shadow-log and never fall through to the
-                # similarity tier for this rival (the tier CLAIMS the pair).
+            elif fp.py_sha256 == r_fp.py_sha256 and config_only_enforce:
+                # Identical code, different functional configs — enforced as
+                # its own tier.
                 delta = _abs_token_delta(fp, r_fp)
-                if not config_only_enforce:
-                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
-                                               "config_only", 1.0, delta))
-                    continue
                 tier, score = "config_only", 1.0
             else:
+                if fp.py_sha256 == r_fp.py_sha256:
+                    # Identical code, different configs with enforcement off:
+                    # shadow-log the label, then FALL THROUGH to the
+                    # similarity tier — a tiny config sweep must still drop as
+                    # near_duplicate (a byte-identical-code A/B ticket is the
+                    # clearest spam there is); the label only measures how
+                    # often the pattern occurs so enforcement can be decided
+                    # from data, it never exempts the pair.
+                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
+                                               "config_only", 1.0,
+                                               _abs_token_delta(fp, r_fp)))
                 score = _bounded_similarity(fp, r_fp, shadow_floor)
                 if score >= threshold:
                     delta = _abs_token_delta(fp, r_fp)
