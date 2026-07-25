@@ -1308,7 +1308,11 @@ function renderHeat(){
     var m=heatStatusMeta(e.status), rel=e.rel_score;
     var hasScore=rel!=null&&isFinite(rel)&&rel>0;
     var width=hasScore?Math.max(6,100/rel):0;
-    var label=!hasScore?"—":(e.rank===1?"best":"+"+((rel-1)*100).toFixed(1)+"%");
+    // Show the heat score itself (rel_score = heat_score / best, ≥ 1.00, where
+    // 1.00 = best) next to the gap vs the best entrant.
+    var label=!hasScore?"—":('<b>'+fmt(rel,3)+'</b>'+
+      (e.rank===1?' <span class="sub">best</span>'
+                 :' <span class="sub">+'+((rel-1)*100).toFixed(1)+'%</span>'));
     var fill=e.status==="advanced"?"var(--good)":"var(--chal)";
     return '<tr>'+
       '<td class="num'+(e.rank===1?' good':'')+'">'+(e.rank!=null?e.rank:"—")+'</td>'+
@@ -1321,7 +1325,7 @@ function renderHeat(){
   panel.innerHTML='<div class="heat-note">Ranked by heat score (lower is better); the top '+
     (nf!=null?nf:"N")+' advance to the final. Scores are shown relative to the best entrant — the raw per-window numbers stay off the dashboard so the rotating private eval pool can’t be reverse-engineered.</div>'+
     '<div class="scroll-box scroll-field"><table><thead><tr>'+
-    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th>Standing</th>'+
+    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat score</th><th>Standing</th>'+
     '</tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 function renderRounds(){
