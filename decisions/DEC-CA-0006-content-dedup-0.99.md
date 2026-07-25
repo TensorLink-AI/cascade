@@ -82,8 +82,29 @@ legitimate fork product); and the behavioral probe gates on its own
 `dedup_probe_mode` (ships `shadow`) independently of `dedup_mode`, so the
 static tiers enforce while the probe observes.
 
+Operational hardening (review round 2): the probe runs under its **own wall
+clock** (`dedup_probe_generate_seconds`, default 120s — probe EXECUTION is
+paid even in shadow mode, so the full 1800s corpus budget would let one
+hostile submission stall the orchestrator ~an hour per draw) and probes run
+4-wide concurrently. Orchestrator-side fetch failures **fail open** unless
+the HTTP status pins the fault on the miner (401/403/404 ⇒ drop+burn;
+transport/5xx/timeout ⇒ entrant proceeds unscreened — pods fetch refs
+themselves, and a flaky orchestrator↔Hub leg has coincided with pods pulling
+the same refs clean). The dedup report uploads to the S3 logs store
+(`logs/round-<id>/dedup_report.json`) so shadow evidence never depends on
+orchestrator disk.
+
+**Threat-model change, decided deliberately:** the probe executes untrusted
+generator code on the ORCHESTRATOR (previously pod-only, disposable) — via
+the same hardened sandbox path the pods use (netns, rlimits, static-guard
+blocklist; `[generator] sandbox_mode = "container"` is honored). Production
+orchestrators should set `sandbox_strict = true` and prefer container mode;
+if that posture is ever unacceptable, the alternative is moving probes onto
+heat pods (costs a dispatch round-trip pre-screen).
+
 Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor/
 dedup_max_abs_delta/dedup_config_only_enforce/dedup_probe_mode/
-dedup_probe_series` — dataclass defaults off/0.99/0.90/0/false/shadow/8;
-mainnet `chain.toml` = static `enforce` @ 0.99/0.90, delta cap 0, config_only
-shadow, probe `shadow` × 8; testnet = everything `shadow`.
+dedup_probe_series/dedup_probe_generate_seconds` — dataclass defaults
+off/0.99/0.90/0/false/shadow/8/120; mainnet `chain.toml` = static `enforce`
+@ 0.99/0.90, delta cap 0, config_only shadow, probe `shadow` × 8; testnet =
+everything `shadow`.

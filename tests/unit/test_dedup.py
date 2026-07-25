@@ -168,6 +168,7 @@ def dedup_runner(cfg, tmp_path, monkeypatch):
     from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
 
     repos = {}
+    transport_fail: set[str] = set()
 
     def add(name, uid, source):
         ref = f"{name}/gen@sha256:{name[0] * 64}"
@@ -175,14 +176,31 @@ def dedup_runner(cfg, tmp_path, monkeypatch):
         return ResolvedGenerator(hotkey=name, uid=uid, ref=ref)
 
     def fake_fetch(ref, dest, hub=None):
-        ref = str(ref)
-        if ref not in repos:
-            from cascade.shared.hippius import StorageError
+        from types import SimpleNamespace
 
-            raise StorageError(f"fetch of {ref}")
+        from cascade.shared.hippius import StorageError
+
+        ref = str(ref)
+        if ref in transport_fail:
+            raise StorageError(f"fetch of {ref}: connection reset by peer")
+        if ref not in repos:
+            cause = RuntimeError("not found")
+            cause.response = SimpleNamespace(status_code=404)
+            raise StorageError(f"fetch of {ref}") from cause
         return repos[ref]
 
+    class _FakeLogs:
+        def __init__(self):
+            self.puts = {}
+
+        def put_text(self, key, text, **kwargs):
+            self.puts[key] = text
+
+    fake_logs = _FakeLogs()
+    add.transport_fail = transport_fail
+    add.logs = fake_logs
     monkeypatch.setattr(loop_mod, "fetch_from_hub", fake_fetch)
+    monkeypatch.setattr(loop_mod.TrainerRunner, "logs_store", lambda self: fake_logs)
     dedup_cfg = replace(cfg, round=replace(cfg.round, dedup_mode="enforce",
                                            dedup_threshold=0.99,
                                            dedup_shadow_floor=0.90,
@@ -209,17 +227,37 @@ def test_runner_screen_drops_copy_and_writes_report(dedup_runner, tmp_path):
     assert report["dropped"][0]["matched_hotkey"] == "king"
     # fetched trees are cleaned up after screening
     assert not (runner.work_root / "77" / "dedup").exists()
+    # the report is also published to the logs store (shadow evidence must
+    # not depend on orchestrator disk)
+    assert "logs/round-77/dedup_report.json" in add.logs.puts
 
 
-def test_runner_unfetchable_ref_dropped_in_enforce(dedup_runner):
+def test_runner_denied_or_missing_ref_dropped_in_enforce(dedup_runner):
     from cascade.trainer.loop import ResolvedGenerator
 
     runner, add = dedup_runner
     ok = add("alice", 3, BASE_SOURCE)
+    # The fake fetch raises a StorageError chained to an HTTP 404 for unknown
+    # refs — the miner's fault (missing/denied), so enforce drops it.
     ghost = ResolvedGenerator(hotkey="ghost", uid=8,
                               ref="ghost/gen@sha256:" + "9" * 64)
     kept = runner._screen_duplicate_entrants(None, [ok, ghost], base_seed=78)
     assert [c.hotkey for c in kept] == ["alice"]
+
+
+def test_runner_transport_fetch_failure_fails_open(dedup_runner):
+    runner, add = dedup_runner
+    ok = add("alice", 3, BASE_SOURCE)
+    flaky = add("frank", 8, OTHER_SOURCE)
+    add.transport_fail.add(flaky.ref)
+
+    # Pods fetch refs themselves — an orchestrator-side transport failure
+    # must NOT cost the entrant its slot (or its burn), even in enforce.
+    kept = runner._screen_duplicate_entrants(None, [ok, flaky], base_seed=85)
+    assert [c.hotkey for c in kept] == ["alice", "frank"]
+    report = json.loads((runner.work_root / "85" / "dedup_report.json").read_text())
+    assert [u["hotkey"] for u in report["unscreened"]] == ["frank"]
+    assert report["fetch_failed"] == []
 
 
 def test_runner_mode_off_is_a_no_op(dedup_runner):
@@ -400,8 +438,11 @@ def probe_runner(dedup_runner, monkeypatch):
         def __init__(self, digest):
             self.digest = digest
 
+    captured_cfgs = []
+
     def fake_build(repo_dir, seed, cfg, mode, *, use_sandbox=True, blocked=(),
                    allow_netns=True):
+        captured_cfgs.append(cfg)
         repo = repo_dir
         if (repo / "BROKEN").exists():
             raise CorpusError("generator_import_failed")
@@ -410,6 +451,7 @@ def probe_runner(dedup_runner, monkeypatch):
         marker = repo / "BEHAVIOR"
         return _Result(marker.read_text() if marker.exists() else f"seeded-{seed}-{repo.name}")
 
+    add.captured_cfgs = captured_cfgs
     monkeypatch.setattr(loop_mod, "build_round_corpus", fake_build)
     return runner, add
 
@@ -450,6 +492,23 @@ def test_probe_matches_king_behavior(probe_runner, tmp_path):
 
     kept = runner._screen_duplicate_entrants(king, [c], base_seed=82)
     assert kept == []
+
+
+def test_probe_uses_its_own_wall_clock(probe_runner, tmp_path):
+    from dataclasses import replace
+
+    runner, add = probe_runner
+    runner.cfg = replace(runner.cfg, round=replace(
+        runner.cfg.round, dedup_probe_generate_seconds=90))
+    a = add("alice", 3, BASE_SOURCE)
+    runner._screen_duplicate_entrants(None, [a], base_seed=86)
+
+    # Every probe draw runs under the probe's OWN generation deadline — never
+    # the full-corpus 1800s budget (execution is paid even in shadow mode, so
+    # a hostile generator must not be able to stall the orchestrator).
+    assert add.captured_cfgs, "probe never ran"
+    assert all(c.max_generate_seconds == 90 for c in add.captured_cfgs)
+    assert all(c.corpus_n_series == 4 for c in add.captured_cfgs)
 
 
 def test_probe_failure_drops_in_enforce(probe_runner, tmp_path):

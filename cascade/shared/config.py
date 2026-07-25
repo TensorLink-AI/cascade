@@ -465,6 +465,13 @@ class RoundConfig:
     # 0 series disables the probe regardless of mode.
     dedup_probe_mode: str = "shadow"   # off | shadow | enforce
     dedup_probe_series: int = 8
+    # The probe's OWN wall clock, overriding [generator] max_generate_seconds
+    # for probe draws only. The full-corpus budget (1800s for 16384 series)
+    # would let one hostile submission stall the orchestrator ~an hour per
+    # draw — and probe EXECUTION is paid even in shadow mode. A generator
+    # that cannot emit dedup_probe_series series in this window while owing
+    # thousands in the full budget is pathological or hostile.
+    dedup_probe_generate_seconds: int = 120
     # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
     # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
     # its whole window and is public only for the last few minutes before the
@@ -970,6 +977,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
             dedup_probe_mode=str(r.get("dedup_probe_mode", "shadow")),
             dedup_probe_series=int(r.get("dedup_probe_series", 8)),
+            dedup_probe_generate_seconds=int(r.get("dedup_probe_generate_seconds", 120)),
             reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),
         eval=EvalConfig(

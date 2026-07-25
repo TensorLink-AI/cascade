@@ -625,6 +625,7 @@ class TrainerRunner:
                             "challengers against each other only", king.ref, e)
 
         fetch_failed: list[ResolvedGenerator] = []
+        unscreened: list[ResolvedGenerator] = []
         triples: list[tuple[str, int, object]] = []
         dirs: dict[str, Path] = {}
         for c in entrants:
@@ -632,14 +633,26 @@ class TrainerRunner:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
                 fp = fingerprint_dir(d)
             except StorageError as e:
-                # Enforce: an unfetchable ref could not have trained — drop it
-                # before it eats a heat pod dispatch (per the burn rules that
-                # was its shot). Shadow observes only, so keep it and let the
-                # heat retry the fetch.
-                log.info("dedup[%s]: challenger %s (uid=%s) ref %s does not fetch "
-                         "(%s)%s", mode, c.hotkey, c.uid, c.ref, e,
-                         " — dropped pre-heat" if mode == "enforce" else " — shadow, kept")
-                fetch_failed.append(c)
+                # Fault attribution matters: pods fetch --gen-ref themselves,
+                # so an orchestrator-side fetch failure does NOT mean the ref
+                # cannot train (a flaky orchestrator↔Hub leg has coincided
+                # with pods pulling the same refs clean). Drop only when the
+                # response pins the fault on the miner — denied or missing
+                # (401/403/404). Anything else (transport, 5xx, timeout) fails
+                # OPEN: the entrant proceeds to the heat unscreened and the
+                # pod re-fetches.
+                status = _http_status_in_chain(e)
+                if status in (401, 403, 404):
+                    log.info("dedup[%s]: challenger %s (uid=%s) ref %s denied/"
+                             "missing (HTTP %s)%s", mode, c.hotkey, c.uid, c.ref,
+                             status, " — dropped pre-heat" if mode == "enforce"
+                             else " — shadow, kept")
+                    fetch_failed.append(c)
+                else:
+                    log.warning("dedup: fetch of %s failed (%s); challenger %s "
+                                "(uid=%s) proceeds unscreened", c.ref, e,
+                                c.hotkey, c.uid)
+                    unscreened.append(c)
                 continue
             dirs[c.hotkey] = d
             triples.append((c.hotkey, c.uid, fp))
@@ -675,39 +688,57 @@ class TrainerRunner:
         behavior_dropped: tuple = ()
         probe_n = int(self.cfg.round.dedup_probe_series or 0)
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
+            from concurrent.futures import ThreadPoolExecutor
+
             uid_of = {h: u for h, u, _ in triples}
             survivors = [c for c in entrants
-                         if c.hotkey in set(result.kept_hotkeys)]
-            probe_cfg = replace(self.cfg.generator, corpus_n_series=probe_n)
+                         if c.hotkey in set(result.kept_hotkeys)
+                         and c.hotkey in dirs]
+            # The probe gets its OWN wall clock: the full-corpus budget would
+            # let one hostile submission stall the orchestrator for its whole
+            # duration per draw — and execution is paid even in shadow mode.
+            probe_cfg = replace(
+                self.cfg.generator, corpus_n_series=probe_n,
+                max_generate_seconds=self.cfg.round.dedup_probe_generate_seconds)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
 
-            king_digest = None
-            if king_dir is not None:
-                try:
-                    king_digest = self._probe_digest(king_dir, gen_seed, probe_cfg,
-                                                     check_determinism=False)
-                except Exception as e:  # noqa: BLE001 — never the challengers' problem
-                    log.warning("dedup: king probe failed (%s); behavior tier runs "
-                                "among challengers only", e)
+            # Sandboxes are subprocesses, so a small thread pool bounds the
+            # worst-case wall clock without stacking rlimits in-process.
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                king_future = (pool.submit(self._probe_digest, king_dir, gen_seed,
+                                           probe_cfg, check_determinism=False)
+                               if king_dir is not None else None)
+                futures = {c.hotkey: pool.submit(self._probe_digest,
+                                                 dirs[c.hotkey], gen_seed, probe_cfg)
+                           for c in survivors}
 
-            behaved: list[tuple[str, int, str]] = []
-            for c in survivors:
-                try:
-                    digest = self._probe_digest(dirs[c.hotkey], gen_seed, probe_cfg)
-                except CorpusError as e:
-                    tier = ("nondeterministic" if "non-deterministic" in str(e)
-                            else "probe_failed")
-                    log.info("dedup-probe[%s]: challenger %s (uid=%s) %s: %s%s",
-                             probe_mode, c.hotkey, c.uid, tier, e,
-                             "" if probe_enforce else " — shadow, kept")
-                    probe_dropped.append({"hotkey": c.hotkey, "uid": c.uid,
-                                          "tier": tier, "detail": str(e)[:300]})
-                except Exception as e:  # noqa: BLE001 — infra failure: fail open
-                    log.warning("dedup: probe infrastructure error for %s (%s); "
-                                "kept unprobed", c.hotkey, e)
-                    behaved.append((c.hotkey, uid_of[c.hotkey], f"\x00unprobed:{c.hotkey}"))
-                else:
-                    behaved.append((c.hotkey, uid_of[c.hotkey], digest))
+                king_digest = None
+                if king_future is not None:
+                    try:
+                        king_digest = king_future.result()
+                    except Exception as e:  # noqa: BLE001 — never the challengers' problem
+                        log.warning("dedup: king probe failed (%s); behavior tier "
+                                    "runs among challengers only", e)
+
+                behaved: list[tuple[str, int, str]] = []
+                for c in survivors:  # deterministic order regardless of completion
+                    try:
+                        digest = futures[c.hotkey].result()
+                    except CorpusError as e:
+                        tier = ("nondeterministic" if "non-deterministic" in str(e)
+                                else "probe_failed")
+                        log.info("dedup-probe[%s]: challenger %s (uid=%s) %s: %s%s",
+                                 probe_mode, c.hotkey, c.uid, tier, e,
+                                 "" if probe_enforce else " — shadow, kept")
+                        probe_dropped.append({"hotkey": c.hotkey, "uid": c.uid,
+                                              "tier": tier, "detail": str(e)[:300]})
+                    except Exception as e:  # noqa: BLE001 — infra failure: fail open
+                        log.warning("dedup: probe infrastructure error for %s (%s); "
+                                    "kept unprobed", c.hotkey, e)
+                        behaved.append((c.hotkey, uid_of[c.hotkey],
+                                        f"\x00unprobed:{c.hotkey}"))
+                    else:
+                        behaved.append((c.hotkey, uid_of[c.hotkey], digest))
 
             behavior_kept, behavior_dropped = collapse_identical_behavior(
                 behaved, king_digest)
@@ -738,6 +769,8 @@ class TrainerRunner:
             "probe_series": probe_n,
             "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                              for c in fetch_failed],
+            "unscreened": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
+                           for c in unscreened],
             "dropped": [
                 *(vars(v) | {"enforced": mode == "enforce"} for v in result.dropped),
                 *(vars(v) | {"enforced": probe_enforce} for v in behavior_dropped),
@@ -745,18 +778,29 @@ class TrainerRunner:
             "probe_dropped": [d | {"enforced": probe_enforce} for d in probe_dropped],
             "shadow": [vars(v) for v in result.shadow],
         }
+        report_json = json.dumps(report, indent=1)
         try:
             out_dir = self.work_root / f"{base_seed}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "dedup_report.json").write_text(json.dumps(report, indent=1))
+            (out_dir / "dedup_report.json").write_text(report_json)
         except OSError as e:
             log.warning("dedup: could not write report for round=%s: %s", base_seed, e)
+        # The report is the shadow-mode EVIDENCE this feature exists to
+        # collect — publish it to the logs store (next to the round's
+        # training logs) so calibration doesn't depend on orchestrator disk.
+        try:
+            self.logs_store().put_text(
+                f"logs/round-{base_seed}/dedup_report.json", report_json,
+                content_type="application/json")
+        except Exception as e:  # noqa: BLE001 — telemetry only, never sinks a round
+            log.warning("dedup: report upload failed for round=%s: %s", base_seed, e)
 
-        # Static-tier drops (and unfetchable refs) apply under dedup_mode;
+        # Static-tier drops (and denied/missing refs) apply under dedup_mode;
         # probe-derived drops apply under dedup_probe_mode — independent gates.
-        # (fetch_failed never entered triples, so enforce excludes them too)
-        kept = (set(result.kept_hotkeys) if mode == "enforce"
-                else {c.hotkey for c in entrants})
+        # (fetch_failed never entered triples, so enforce excludes them; the
+        # unscreened — orchestrator-side fetch faults — stay IN.)
+        kept = (set(result.kept_hotkeys) | {c.hotkey for c in unscreened}
+                if mode == "enforce" else {c.hotkey for c in entrants})
         if probe_enforce:
             kept -= {d["hotkey"] for d in probe_dropped}
             kept -= {v.hotkey for v in behavior_dropped}
@@ -777,6 +821,15 @@ class TrainerRunner:
         enforced here so a generator that seeds from entropy cannot re-roll a
         fresh corpus per run. Raises :class:`CorpusError` on mismatch or on
         any generator failure.
+
+        THREAT MODEL (deliberate): this executes untrusted generator code on
+        the ORCHESTRATOR — previously pod-only — via the same hardened path
+        the pods use (:func:`build_round_corpus` → ``run_in_sandbox``: netns,
+        rlimits, static-guard blocklist; ``[generator] sandbox_mode =
+        "container"`` reroutes to the docker/podman sandbox and is honored
+        here too). On a production orchestrator set ``sandbox_strict = true``
+        (refuse rather than degrade when netns is unavailable) and prefer
+        container mode. See DEC-CA-0006.
         """
         first = build_round_corpus(
             repo_dir, generation_seed, probe_cfg, "cache_reuse",
