@@ -8,9 +8,12 @@ tags: [anti-spam, incentives, trainer]
 revisit_when: >-
   the shadow log accumulates enough rounds to set dedup_max_abs_delta (spare
   substantive edits like the dropped finalist) and to decide
-  dedup_config_only_enforce and promoting dedup_probe_mode to enforce; OR
-  abusers adapt below the exact-behavior tier (epsilon-jittered variants of
-  one process) — then extend the probe to statistical distance, shadow first
+  dedup_config_only_enforce, dedup_sketch_threshold, and promoting
+  dedup_probe_mode to enforce; OR abusers adapt below the exact-behavior tier
+  (epsilon-jittered variants of one process) — then extend the probe to
+  statistical distance, shadow first; OR the orchestrator gains a container
+  runtime, at which point the probe should move to sandbox_mode = "container"
+  and sandbox_strict stops being the weakest acceptable posture
 relations: {}
 ---
 Live field analysis (similarity_report.json, OPSLOG) showed most heat GPU
@@ -102,9 +105,121 @@ orchestrators should set `sandbox_strict = true` and prefer container mode;
 if that posture is ever unacceptable, the alternative is moving probes onto
 heat pods (costs a dispatch round-trip pre-screen).
 
+**Hardening (review round 3) — the screen's own cost is an attack surface.**
+Three findings, all fixed before enforce is safe to run:
+
+1. **The similarity tier was a round-stalling DoS.** `SequenceMatcher.ratio`
+   with `autojunk=False` is O(n²) in tokens (measured: 2.3 s @ 20k, 9.3 s @
+   40k, 38.7 s @ 80k; a 2 MB pair did not finish in 2 min), the input size is
+   the submitter's choice up to `max_repo_mb = 128`, and the screen ran with
+   no cap and no clock on the round's critical path. Two hotkeys submitting
+   fat near-copies (~$80) could stall the pre-heat screen for days — the
+   anti-spam feature as the cheapest way to kill an epoch. Now: the fetched
+   tree is size-gated before fingerprinting (over `max_repo_mb` ⇒ unscreened,
+   the heat rejects it on its own terms); fingerprints stream (chunked
+   hashing, per-token feed, `dedup_max_text_mb = 4` tokenizer budget per repo,
+   files past it folded in as opaque content digests so no repo can hide code
+   from the digests); only `dedup_max_tokens = 50k` are retained for the
+   quadratic tier; and the whole screen runs under `dedup_phase_seconds = 900`
+   and fails OPEN. Field repos are ~100 KB / 7–11k tokens, so every cap has
+   ~40× headroom over anything honest.
+2. **A cap alone would be a padding oracle** — inflate a copy past it and the
+   only tier that fires on the live field (`near_duplicate`; the three exact
+   tiers fired zero) stops judging it. So over-cap pairs are judged by a
+   bottom-k shingle sketch (`dedup_sketch_mode`, O(n) time / O(k) memory).
+   Jaccard is not difflib's ratio and carries its own calibration, so it
+   ships `shadow` — and `"off"` is documented as reopening the hole.
+3. **The probe demands hard isolation, and shadow mode does not soften it** —
+   shadow gates the drops, not the execution. The orchestrator holds the
+   private eval pool and the trainer's wallet, and the subprocess sandbox
+   shares their uid and filesystem, so netns is the only real boundary.
+   The probe now refuses to run unless `sandbox_mode = "container"` or
+   `sandbox_strict = true`, unless `dedup_probe_allow_weak_sandbox` says
+   otherwise (testnet does; mainnet `chain.toml` sets `sandbox_strict = true`
+   instead). The probe stage also derives its per-draw clock from
+   `dedup_probe_budget_seconds = 600`, so the stage is bounded by that number
+   rather than by N × the per-draw budget.
+
+**Fleet sizing follows the screen.** `_plan_payload` now reports
+`screened_challengers` (static tiers only — fetch+hash, no code execution) and
+the provisioner sizes the heat fleet off it. Without this the ~29% of the
+field the screen drops was still rented, so the saving showed up as idle pods
+rather than as cost.
+
+**Tie-break: earliest COMMIT, not lowest UID.** The content screen shipped
+ordering entrants by UID, on the reasoning that "lowest UID keeps the slot, so
+copying an existing submission can never displace it". That reasoning holds
+only while UIDs are handed out sequentially. Bittensor recycles the UID of a
+deregistered neuron to the next registrant, so on a saturated subnet a low UID
+means "inherited a pruned slot" — and pruned slots are the low-incentive ones,
+so recycled UIDs skew toward NEWCOMERS. An operator running many hotkeys (the
+observed meta-operator ran ~45) holds low UIDs by arithmetic, and every
+collision resolves in their favour: they keep the slot, the miner they copied
+is dropped AND burns its one lifetime submission. The rule inverts into an
+expropriation-and-griefing tool at $40 a victim, silently, the day the subnet
+fills. `plan_round`'s same-ref dedup had already rejected UID ordering for
+exactly this reason ("Earliest reveal (UID tiebreak) owns each duplicated ref
+— never the lowest UID, which would let a low-UID copier take the original's
+slot"); the content screen simply contradicted the tier above it.
+
+Ordering is now `(submission block, uid)`. The block is the one the miner's
+timelock commit landed at — a copyist cannot have committed before the thing
+they copied was even visible, which is what makes it the right evidence.
+Getting it requires a WITNESS: `Commitments::CommitmentOf` holds the encrypted
+payload and its block, and the pallet CONSUMES that record at reveal, leaving
+only `(payload, reveal_block)`. The commit block is therefore destroyed before
+any round screens on it, and exists only for whoever looked while the payload
+was sealed. The trainer now polls `poll_pending_commits()` every loop tick —
+including ticks that skip round work, since that is most of the window — and
+persists `{hotkey: {pending, committed}}` to `commit_witness_path`, freezing
+`pending` into `committed` when a hotkey's seal disappears. Timed reveals keep
+a payload sealed for most of its epoch, so any cadence finer than that window
+observes every commit, and a miner cannot shorten their own window without
+committing late — which is what the ordering penalises anyway.
+
+Where the witness has nothing (trainer down for the window, poll failure, a
+fresh deployment) that hotkey falls back to its REVEAL block, not to last
+place: an entrant we merely failed to observe must not be expropriated for our
+gap, and reveal order still puts a copyist behind their victim. This is
+trainer-local by design and needs no consensus: the trainer is the sole
+owner-operated authority for heat selection, and validators never re-derive
+which challengers were screened.
+
+**Self-audit of the hardening (round 4), four defects it introduced or left:**
+the plan-path screen was handed the full 900s round budget while
+`cascade-trainer --plan-only` runs under a 600s subprocess timeout whose
+failure rents NO fleet — trading a spam screen for a lost rental window, so
+the sizing path now gets `dedup_plan_seconds = 120`; every repo with no `.py`
+and no config shares the empty-stream digest, so the token tiers collapsed two
+unrelated docs-only repos into a copy verdict (the same empty-digest trap the
+`config_only` guard had already fixed for `py_sha256`, missed on the identical
+tiers); an entrant with neither a witnessed commit nor a reveal block mapped to
+block 0, which sorts FIRST and wins every collision — the exact inversion of
+the fallback's intent, now omitted so it sorts last; and
+`poll_pending_commits` returned `{}` for both "nothing sealed" and "the read
+failed", so one failed poll would freeze every pending commit as though it had
+revealed (it now returns `None`, and the witness skips the freeze pass).
+The probe's sandbox gate also treated `use_sandbox = False` — generator code
+IN the trainer's own process — as an acceptable posture, because it is the
+in-process test path; it now needs the same explicit opt-in as a degradable
+sandbox.
+
+Two smaller corrections: shadow mode is now a true counterfactual of enforce
+(a would-be-dropped entry no longer becomes a rival for later entries, so the
+log measures the verdicts enforce would have produced — the log is what
+calibrates the thresholds), and `config_only` requires actual Python (two
+repos with no `.py` shared an empty code digest and could have collapsed).
+`dedup_mode` / `dedup_probe_mode` / `dedup_sketch_mode` are validated at load:
+a typo used to mean silently `off`.
+
 Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor/
-dedup_max_abs_delta/dedup_config_only_enforce/dedup_probe_mode/
-dedup_probe_series/dedup_probe_generate_seconds` — dataclass defaults
-off/0.99/0.90/0/false/shadow/8/120; mainnet `chain.toml` = static `enforce`
-@ 0.99/0.90, delta cap 0, config_only shadow, probe `shadow` × 8; testnet =
-everything `shadow`.
+dedup_max_abs_delta/dedup_config_only_enforce/dedup_max_tokens/
+dedup_max_text_mb/dedup_sketch_mode/dedup_sketch_threshold/
+dedup_phase_seconds/dedup_probe_mode/dedup_probe_series/
+dedup_probe_generate_seconds/dedup_probe_budget_seconds/
+dedup_probe_allow_weak_sandbox` plus `commit_witness_path` — dataclass
+defaults off/0.99/0.90/0/false/
+50000/4/shadow/0.99/900/shadow/8/120/600/false; mainnet `chain.toml` = static
+`enforce` @ 0.99/0.90, delta cap 0, config_only shadow, sketch shadow, probe
+`shadow` × 8 with `[generator] sandbox_strict = true`; testnet = everything
+`shadow` with `dedup_probe_allow_weak_sandbox = true`.

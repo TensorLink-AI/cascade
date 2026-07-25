@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
 
-from ..interface.validation import parse_commit
+from ..interface.validation import check_repo_size, parse_commit
 from ..shared.chain import Commitment
 from ..shared.config import ChainConfig, TrainingContractConfig
 from ..shared.hippius import (
@@ -80,6 +80,12 @@ ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+# Dedup probe stage: concurrent sandboxes, and the floor under the per-draw
+# wall clock derived from [round] dedup_probe_budget_seconds (a budget so tight
+# that no generator could start would fail the whole field, not screen it).
+_PROBE_WORKERS = 4
+_PROBE_MIN_DRAW_SECONDS = 30
 
 
 def _http_status_in_chain(exc: BaseException | None) -> int | None:
@@ -152,6 +158,35 @@ def _save_seen_hotkeys(path: Path, seen: set[str]) -> None:
         path.write_text(json.dumps(sorted(seen)), encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         log.warning("could not persist submissions db to %s: %s", path, e)
+
+
+def _load_commit_witness(path: Path) -> dict[str, dict]:
+    """Load the persisted commit-order witness (best-effort).
+
+    Shape: ``{hotkey: {"pending": block|None, "committed": block|None}}`` —
+    ``pending`` is a commit currently sealed on chain, ``committed`` is the
+    block of the last commit we watched go from sealed to revealed.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(h): {"pending": v.get("pending"), "committed": v.get("committed")}
+                for h, v in raw.items() if isinstance(v, dict)}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        log.warning("commit witness %s unreadable (%s); commit order falls back "
+                    "to reveal order until it refills", path, e)
+        return {}
+
+
+def _save_commit_witness(path: Path, witness: dict[str, dict]) -> None:
+    """Persist the witness (best-effort — evidence collection must never abort
+    a round; a lost file degrades the tie-break, it does not break it)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(witness, sort_keys=True), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not persist commit witness to %s: %s", path, e)
 
 
 @dataclass(frozen=True)
@@ -520,6 +555,104 @@ class TrainerRunner:
             )
         return self._logs_store
 
+    # ── anti-spam: commit-order witness (who submitted a generator FIRST) ────
+
+    def _commit_witness_path(self) -> Path:
+        p = Path(self.cfg.round.commit_witness_path)
+        return p if p.is_absolute() else (self.work_root / p)
+
+    def witness_commits(self, client: object) -> dict[str, dict]:
+        """Record which hotkeys have a commit sealed on chain right now.
+
+        Called every poll tick, INCLUDING the ticks that skip round work — the
+        window this observes is the epoch, not the round. The chain deletes a
+        commit's block when drand reveals it (see
+        :meth:`ChainClient.poll_pending_commits`), so evidence of who committed
+        first exists only for whoever was watching while it was sealed.
+
+        State machine per hotkey: a sealed commit sets ``pending``; when that
+        hotkey's seal disappears (the reveal landed) ``pending`` freezes into
+        ``committed``, which is what the duplicate screen orders on. A new seal
+        overwrites ``pending`` — a hotkey that re-commits is claiming a new
+        submission, and the old commit's priority must not follow it.
+
+        Best-effort throughout: this is evidence collection, and a tick that
+        fails just means the tie-break degrades to reveal order.
+        """
+        poll = getattr(client, "poll_pending_commits", None)
+        if poll is None:
+            return {}
+        try:
+            sealed = poll()
+        except Exception as e:  # noqa: BLE001 — advisory; never break the loop
+            log.warning("commit witness: poll failed (%s)", e)
+            sealed = None
+        if sealed is None:
+            # A failed read says nothing about what is sealed on chain. Running
+            # the freeze pass on it would treat every pending commit as just
+            # revealed, on no evidence at all.
+            return _load_commit_witness(self._commit_witness_path())
+        path = self._commit_witness_path()
+        witness = _load_commit_witness(path)
+        changed = False
+        for hotkey, block in sealed.items():
+            entry = witness.setdefault(hotkey, {"pending": None, "committed": None})
+            if entry.get("pending") != block:
+                entry["pending"] = block
+                changed = True
+                log.info("commit witness: %s sealed a commit at block %s",
+                         hotkey, block)
+        for hotkey, entry in witness.items():
+            pending = entry.get("pending")
+            if pending is not None and hotkey not in sealed:
+                # The seal is gone: that commit revealed, so its block is now
+                # the hotkey's evidence of when it submitted.
+                entry["pending"] = None
+                entry["committed"] = int(pending)
+                changed = True
+                log.info("commit witness: %s revealed; commit block %s recorded",
+                         hotkey, pending)
+        if changed:
+            _save_commit_witness(path, witness)
+        return witness
+
+    def _commit_priority(self, entrants: list[ResolvedGenerator]) -> dict[str, int]:
+        """``{hotkey: ordering block}`` for the duplicate screen's tie-break.
+
+        The witnessed commit block when we have one; otherwise the entrant's
+        REVEAL block, which is the same units and always ``>=`` the commit it
+        belongs to. That fallback is deliberately not "sort them last": an
+        entrant we merely failed to observe must not be expropriated for it,
+        and reveal order still puts a copyist behind their victim — copying a
+        revealed repo means revealing after it.
+        """
+        witness = _load_commit_witness(self._commit_witness_path())
+        priority: dict[str, int] = {}
+        missing, unknown = [], []
+        for c in entrants:
+            committed = (witness.get(c.hotkey) or {}).get("committed")
+            if committed:
+                priority[c.hotkey] = int(committed)
+            elif c.reveal_block:
+                priority[c.hotkey] = int(c.reveal_block)
+                missing.append(c.hotkey)
+            else:
+                # Neither witnessed nor revealed at a known block. Leaving it
+                # out sorts it LAST (screen_duplicates' _LAST), with UID
+                # breaking ties among the equally-unknown. Mapping it to block
+                # 0 instead would sort it FIRST and let an entrant we know
+                # nothing about win every collision it appears in.
+                unknown.append(c.hotkey)
+        if missing:
+            log.info("commit witness: no commit block for %d/%d entrant(s) "
+                     "(%s%s) — they order on their reveal block",
+                     len(missing), len(entrants), ", ".join(missing[:5]),
+                     "…" if len(missing) > 5 else "")
+        if unknown:
+            log.warning("commit witness: no commit AND no reveal block for %s "
+                        "— ordered last", ", ".join(unknown))
+        return priority
+
     # ── anti-spam: 1 hotkey = 1 submission (lifetime) ────────────────────────
 
     def _submissions_path(self) -> Path:
@@ -564,14 +697,20 @@ class TrainerRunner:
         _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
 
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
+    # Probe concurrency: sandboxes are subprocesses, each holding up to
+    # [generator] max_memory_mb, so this also bounds the stage's peak RSS.
 
     def _screen_duplicate_entrants(
         self,
         king: ResolvedGenerator | None,
         entrants: list[ResolvedGenerator],
         base_seed: int,
+        *,
+        static_only: bool = False,
+        report: bool = True,
+        budget_seconds: int | None = None,
     ) -> list[ResolvedGenerator]:
-        """Drop entrants whose repo CONTENT duplicates the king or a lower-UID
+        """Drop entrants whose repo CONTENT duplicates the king or an earlier
         entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
 
         The on-chain same-ref dedup in :func:`plan_round` only catches identical
@@ -586,6 +725,16 @@ class TrainerRunner:
         could not have trained anyway; per the burn rules that was its shot).
         In ``shadow`` mode verdicts are computed and logged but nothing drops.
         Every verdict lands in ``<work_root>/<round>/dedup_report.json``.
+
+        The whole screen runs under ``[round] dedup_phase_seconds``, or
+        ``budget_seconds`` when the caller has a tighter one. Its inputs are
+        attacker-chosen (repo bytes, generator runtime), so an unbounded screen
+        is a way to stall the round it exists to protect; on expiry the field
+        proceeds UNSCREENED, which is the same fail-open direction every other
+        error path here takes. ``static_only`` runs the fingerprint tiers
+        without the probe (no code execution) — that is what makes the screen
+        safe to call from the provisioner's sizing path, which passes its own
+        budget because it is itself running under a subprocess timeout.
         """
         mode = (self.cfg.round.dedup_mode or "off").lower()
         if mode not in ("shadow", "enforce") or not entrants:
@@ -593,9 +742,22 @@ class TrainerRunner:
         import shutil
 
         fetch_root = self.work_root / f"{base_seed}" / "dedup"
+        budget = max(30, int(budget_seconds if budget_seconds is not None
+                             else self.cfg.round.dedup_phase_seconds or 0) or 10 ** 9)
         try:
-            return self._screen_duplicate_entrants_inner(
-                king, entrants, base_seed, mode, fetch_root)
+            return self._with_deadline(
+                lambda: self._screen_duplicate_entrants_inner(
+                    king, entrants, base_seed, mode, fetch_root,
+                    static_only=static_only, report=report),
+                budget)
+        except TimeoutError:
+            # The helper thread is abandoned (it dies with the process, as in
+            # _with_deadline's other callers) and its fetch tree is removed
+            # underneath it — any probe still running there fails harmlessly
+            # into a log line, because the round has already moved on.
+            log.error("dedup: screen exceeded its %ss budget for round=%s; the "
+                      "field proceeds UNSCREENED", budget, base_seed)
+            return entrants
         finally:
             shutil.rmtree(fetch_root, ignore_errors=True)
 
@@ -606,6 +768,9 @@ class TrainerRunner:
         base_seed: int,
         mode: str,
         fetch_root: Path,
+        *,
+        static_only: bool = False,
+        report: bool = True,
     ) -> list[ResolvedGenerator]:
         from ..interface.dedup import (
             collapse_identical_behavior,
@@ -613,25 +778,41 @@ class TrainerRunner:
             screen_duplicates,
         )
 
+        rnd = self.cfg.round
+        fp_kwargs = {"max_tokens": rnd.dedup_max_tokens,
+                     "max_text_mb": rnd.dedup_max_text_mb}
         king_fp = None
         king_dir: Path | None = None
         if king is not None:
             try:
                 king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
                                                hub=self.hub()))
-                king_fp = fingerprint_dir(king_dir)
+                king_fp = fingerprint_dir(king_dir, **fp_kwargs)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
                             "challengers against each other only", king.ref, e)
 
         fetch_failed: list[ResolvedGenerator] = []
         unscreened: list[ResolvedGenerator] = []
+        oversize: list[ResolvedGenerator] = []
+        bulky: list[tuple[ResolvedGenerator, object]] = []
         triples: list[tuple[str, int, object]] = []
         dirs: dict[str, Path] = {}
         for c in entrants:
             try:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
-                fp = fingerprint_dir(d)
+                # A repo over [generator] max_repo_mb fails its heat run anyway
+                # (build_round_corpus checks the same bound), so there is no
+                # reason to spend fingerprint time on it — and skipping it
+                # keeps the screen's cost off an input the miner chooses.
+                size = check_repo_size(d, self.cfg.generator.max_repo_mb)
+                if not size.ok:
+                    log.info("dedup[%s]: challenger %s (uid=%s) ref %s is %s — "
+                             "not screened; the heat rejects it on its own",
+                             mode, c.hotkey, c.uid, c.ref, size.reason)
+                    oversize.append(c)
+                    continue
+                fp = fingerprint_dir(d, **fp_kwargs)
             except StorageError as e:
                 # Fault attribution matters: pods fetch --gen-ref themselves,
                 # so an orchestrator-side fetch failure does NOT mean the ref
@@ -654,16 +835,30 @@ class TrainerRunner:
                                 c.hotkey, c.uid)
                     unscreened.append(c)
                 continue
+            if not fp.scoreable:
+                # Not an error, but not normal either: honest submissions run
+                # ~100KB / 7-11k tokens, and only the linear sketch tier can
+                # judge this entrant. Bulk that reads as padding belongs in the
+                # report where a human can see the pattern build.
+                log.warning("dedup: challenger %s (uid=%s) has %d tokens%s — over "
+                            "the %d cap; judged by the sketch tier only",
+                            c.hotkey, c.uid, fp.n_tokens,
+                            " (files too large to decode in full)"
+                            if fp.truncated else "", rnd.dedup_max_tokens)
+                bulky.append((c, fp))
             dirs[c.hotkey] = d
             triples.append((c.hotkey, c.uid, fp))
 
         try:
             result = screen_duplicates(
                 triples, king_fp,
-                threshold=self.cfg.round.dedup_threshold,
-                shadow_floor=self.cfg.round.dedup_shadow_floor,
-                max_abs_delta=self.cfg.round.dedup_max_abs_delta,
-                config_only_enforce=self.cfg.round.dedup_config_only_enforce,
+                threshold=rnd.dedup_threshold,
+                shadow_floor=rnd.dedup_shadow_floor,
+                max_abs_delta=rnd.dedup_max_abs_delta,
+                config_only_enforce=rnd.dedup_config_only_enforce,
+                sketch_mode=rnd.dedup_sketch_mode,
+                sketch_threshold=rnd.dedup_sketch_threshold,
+                priority=self._commit_priority(entrants),
                 enforce=(mode == "enforce"),
             )
         except Exception as e:  # noqa: BLE001 — the screen must never sink a round
@@ -682,11 +877,17 @@ class TrainerRunner:
         # Probe-derived drops are gated on [round] dedup_probe_mode,
         # INDEPENDENTLY of dedup_mode — the static tiers can enforce while
         # the probe observes (probe drops burn hotkeys; ship shadow first).
-        probe_mode = (self.cfg.round.dedup_probe_mode or "off").lower()
+        probe_mode = (rnd.dedup_probe_mode or "off").lower()
         probe_enforce = probe_mode == "enforce"
         probe_dropped: list[dict] = []
         behavior_dropped: tuple = ()
-        probe_n = int(self.cfg.round.dedup_probe_series or 0)
+        probe_n = int(rnd.dedup_probe_series or 0)
+        per_draw = 0
+        # static_only short-circuits: the sizing path must not even ask about
+        # the sandbox, let alone log about it.
+        if static_only or (probe_n > 0 and probe_mode != "off"
+                           and not self._probe_sandbox_ok()):
+            probe_mode, probe_enforce, probe_n = "off", False, 0
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
             from concurrent.futures import ThreadPoolExecutor
 
@@ -694,17 +895,27 @@ class TrainerRunner:
             survivors = [c for c in entrants
                          if c.hotkey in set(result.kept_hotkeys)
                          and c.hotkey in dirs]
-            # The probe gets its OWN wall clock: the full-corpus budget would
-            # let one hostile submission stall the orchestrator for its whole
-            # duration per draw — and execution is paid even in shadow mode.
+            # The probe gets its OWN wall clock, and the per-draw share is
+            # derived from the STAGE budget: the full-corpus budget would let
+            # one hostile submission stall the orchestrator for its whole
+            # duration per draw, and a fixed per-draw budget still scales the
+            # stage with the size of the field (which the field chooses).
+            # Worst case is dedup_probe_budget_seconds, not N × per-draw.
+            waves = max(1, -(-len(survivors) // _PROBE_WORKERS))
+            per_draw = max(_PROBE_MIN_DRAW_SECONDS,
+                           min(int(rnd.dedup_probe_generate_seconds),
+                               int(rnd.dedup_probe_budget_seconds) // (waves * 2)))
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
-                max_generate_seconds=self.cfg.round.dedup_probe_generate_seconds)
+                max_generate_seconds=per_draw)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
+            log.info("dedup-probe[%s]: %d survivor(s), %d wave(s), %ss per draw "
+                     "(stage budget %ss)", probe_mode, len(survivors), waves,
+                     per_draw, rnd.dedup_probe_budget_seconds)
 
             # Sandboxes are subprocesses, so a small thread pool bounds the
             # worst-case wall clock without stacking rlimits in-process.
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=_PROBE_WORKERS) as pool:
                 king_future = (pool.submit(self._probe_digest, king_dir, gen_seed,
                                            probe_cfg, check_determinism=False)
                                if king_dir is not None else None)
@@ -758,19 +969,29 @@ class TrainerRunner:
                      "sim=%.4f — below threshold, kept", v.hotkey, v.uid,
                      v.matched_hotkey, v.matched_uid, v.score)
 
-        report = {
+        report_doc = {
             "round_id": str(base_seed),
             "mode": mode,
-            "threshold": self.cfg.round.dedup_threshold,
-            "shadow_floor": self.cfg.round.dedup_shadow_floor,
-            "max_abs_delta": self.cfg.round.dedup_max_abs_delta,
-            "config_only_enforce": self.cfg.round.dedup_config_only_enforce,
+            "threshold": rnd.dedup_threshold,
+            "shadow_floor": rnd.dedup_shadow_floor,
+            "max_abs_delta": rnd.dedup_max_abs_delta,
+            "config_only_enforce": rnd.dedup_config_only_enforce,
+            "max_tokens": rnd.dedup_max_tokens,
+            "max_text_mb": rnd.dedup_max_text_mb,
+            "sketch_mode": rnd.dedup_sketch_mode,
+            "sketch_threshold": rnd.dedup_sketch_threshold,
             "probe_mode": probe_mode,
             "probe_series": probe_n,
+            "probe_seconds_per_draw": per_draw,
             "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                              for c in fetch_failed],
             "unscreened": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                            for c in unscreened],
+            "oversize": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
+                         for c in oversize],
+            "over_token_cap": [{"hotkey": c.hotkey, "uid": c.uid,
+                                "n_tokens": fp.n_tokens, "truncated": fp.truncated}
+                               for c, fp in bulky],
             "dropped": [
                 *(vars(v) | {"enforced": mode == "enforce"} for v in result.dropped),
                 *(vars(v) | {"enforced": probe_enforce} for v in behavior_dropped),
@@ -778,16 +999,37 @@ class TrainerRunner:
             "probe_dropped": [d | {"enforced": probe_enforce} for d in probe_dropped],
             "shadow": [vars(v) for v in result.shadow],
         }
-        report_json = json.dumps(report, indent=1)
+        if report:
+            self._write_dedup_report(base_seed, report_doc)
+
+        # Static-tier drops (and denied/missing refs) apply under dedup_mode;
+        # probe-derived drops apply under dedup_probe_mode — independent gates.
+        # (fetch_failed never entered triples, so enforce excludes them; the
+        # unscreened — orchestrator-side fetch faults — stay IN.)
+        kept = (set(result.kept_hotkeys) | {c.hotkey for c in unscreened}
+                | {c.hotkey for c in oversize}
+                if mode == "enforce" else {c.hotkey for c in entrants})
+        if probe_enforce:
+            kept -= {d["hotkey"] for d in probe_dropped}
+            kept -= {v.hotkey for v in behavior_dropped}
+        return [c for c in entrants if c.hotkey in kept]
+
+    def _write_dedup_report(self, base_seed: int, doc: dict) -> None:
+        """Persist the round's dedup verdicts to disk and to the logs store.
+
+        The logs-store copy is the shadow-mode EVIDENCE this feature exists to
+        collect, so it must not depend on orchestrator disk. It carries per-pair
+        similarity scores and the live thresholds, which is a calibration oracle
+        for anyone tuning a copy to sit just under the bar — keep the logs
+        bucket private, and if it is ever opened up, publish only the tiers.
+        """
+        report_json = json.dumps(doc, indent=1)
         try:
             out_dir = self.work_root / f"{base_seed}"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "dedup_report.json").write_text(report_json)
         except OSError as e:
             log.warning("dedup: could not write report for round=%s: %s", base_seed, e)
-        # The report is the shadow-mode EVIDENCE this feature exists to
-        # collect — publish it to the logs store (next to the round's
-        # training logs) so calibration doesn't depend on orchestrator disk.
         try:
             self.logs_store().put_text(
                 f"logs/round-{base_seed}/dedup_report.json", report_json,
@@ -795,16 +1037,43 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — telemetry only, never sinks a round
             log.warning("dedup: report upload failed for round=%s: %s", base_seed, e)
 
-        # Static-tier drops (and denied/missing refs) apply under dedup_mode;
-        # probe-derived drops apply under dedup_probe_mode — independent gates.
-        # (fetch_failed never entered triples, so enforce excludes them; the
-        # unscreened — orchestrator-side fetch faults — stay IN.)
-        kept = (set(result.kept_hotkeys) | {c.hotkey for c in unscreened}
-                if mode == "enforce" else {c.hotkey for c in entrants})
-        if probe_enforce:
-            kept -= {d["hotkey"] for d in probe_dropped}
-            kept -= {v.hotkey for v in behavior_dropped}
-        return [c for c in entrants if c.hotkey in kept]
+    def _probe_sandbox_ok(self) -> bool:
+        """Whether the probe may execute untrusted generator code here.
+
+        The probe's threat model (DEC-CA-0006) rests entirely on the sandbox
+        being KERNEL-enforced, because unlike a pod the orchestrator is not
+        disposable: it holds the private eval pool and the trainer's wallet,
+        and the subprocess sandbox shares their uid and filesystem. Container
+        mode gives that (``--network=none``, ``--cap-drop=ALL``, read-only
+        rootfs, only the repo bind-mounted); subprocess mode gives it only with
+        ``sandbox_strict``, which refuses to run when netns is unavailable
+        instead of degrading to the in-process socket guard — a guard that does
+        not survive a C extension or a spawned child.
+
+        Neither ⇒ the probe disables itself. Note that SHADOW mode does not
+        make this safe: shadow gates the drops, not the execution.
+        """
+        g = self.cfg.generator
+        if self.use_sandbox and (g.sandbox_mode == "container" or g.sandbox_strict):
+            return True
+        # ``use_sandbox=False`` runs generator code IN THIS PROCESS — strictly
+        # worse than a degradable sandbox, so it needs the opt-in too. (Earlier
+        # revisions of this gate treated it as safe because it is the in-process
+        # test path; a security gate that returns "fine" for its worst input is
+        # wrong even while nothing in production reaches it.)
+        posture = "in-process (use_sandbox=false)" if not self.use_sandbox else \
+            f"sandbox_mode={g.sandbox_mode!r}, sandbox_strict=false"
+        if self.cfg.round.dedup_probe_allow_weak_sandbox:
+            log.warning("dedup-probe: running with %s — untrusted generator code "
+                        "shares this host with the eval pool and wallet "
+                        "(dedup_probe_allow_weak_sandbox=true)", posture)
+            return True
+        log.error("dedup-probe: DISABLED — the probe executes untrusted "
+                  "generator code on the orchestrator and this host offers only "
+                  "%s. Set sandbox_mode='container' or sandbox_strict=true in "
+                  "[generator], or dedup_probe_allow_weak_sandbox=true to accept "
+                  "the risk. Static dedup tiers are unaffected.", posture)
+        return False
 
     def _probe_digest(
         self,
@@ -2074,6 +2343,10 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # BEFORE the round-skip branches: the commit-order evidence this
+                # collects is destroyed by the chain at reveal, and most of the
+                # window where it exists is on ticks that do no round work.
+                self.witness_commits(client)
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)

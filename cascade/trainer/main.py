@@ -299,8 +299,9 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
 
     This is the provisioner's sizing input (``--plan-only``): the same
     eligibility pipeline the round itself will run — resolve reveals, split
-    king from challengers, dedup, drop burned hotkeys — so the count matches
-    what the heat will actually train, not raw commitments. Every reveal on
+    king from challengers, dedup (both the same-ref tier and, as
+    ``screened_challengers``, the content screen), drop burned hotkeys — so the
+    count matches what the heat will actually train, not raw commitments. Every reveal on
     chain now lands strictly before the NEXT boundary, so no cutoff is applied;
     with timed reveals the field only settles once reveals land
     (~reveal_margin_blocks before the boundary).
@@ -319,6 +320,18 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
                       genesis_ref=cfg.round.genesis_generator_ref or None)
     probe = TrainerRunner(cfg=cfg, base_trainer=None, work_root=Path(work_root))
     eligible = probe._filter_burned_challengers(plan.challengers)
+    # The heat fleet must be sized off the field that will actually train. With
+    # [round] dedup_mode = "enforce" the content screen drops a real slice of
+    # the field (~29% on the validated round), and a fleet sized before it just
+    # rents pods that idle. Static tiers only: fingerprints are fetch+hash, so
+    # this stays a read-only sizing path that never executes generator code.
+    # Budgeted well under the caller's 600s subprocess timeout (see
+    # provision.main.make_plan_fn): a screen that overruns would take the whole
+    # plan with it, and a plan that fails rents NO fleet — trading a spam
+    # screen for a lost rental window is never the right side of that.
+    screened = probe._screen_duplicate_entrants(
+        plan.king, eligible, next_boundary, static_only=True, report=False,
+        budget_seconds=cfg.round.dedup_plan_seconds)
     return {
         "block": block,
         "epoch_blocks": epoch_blocks,
@@ -328,6 +341,7 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
         "resolved": len(resolved),
         "challengers": len(plan.challengers),
         "eligible_challengers": len(eligible),
+        "screened_challengers": len(screened),
         "heat_train_hours": cfg.round.heat_train_hours,
         "finalists": cfg.round.finalists,
     }

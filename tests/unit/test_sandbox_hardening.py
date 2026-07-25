@@ -83,11 +83,14 @@ def test_strict_mode_refuses_without_netns(tmp_path, small_cfg, monkeypatch):
 def test_nonstrict_mode_warns_loudly_without_netns(tmp_path, small_cfg, monkeypatch,
                                                    caplog):
     monkeypatch.setattr(sandbox_mod, "_netns_available", lambda: False)
+    # Pin the flag: the shipped chain.toml now sets sandbox_strict = true (the
+    # dedup probe demands it), and this test is about the OTHER branch.
+    lenient = replace(small_cfg.generator, sandbox_strict=False)
     repo = _write_repo(tmp_path, OK_GEN)
     with caplog.at_level("WARNING", logger="cascade.trainer.sandbox"):
-        result = run_in_sandbox(repo, 0, small_cfg.generator,
+        result = run_in_sandbox(repo, 0, lenient,
                                 blocked=small_cfg.static_guard.blocked, allow_netns=True)
-    assert result.n_series == small_cfg.generator.corpus_n_series
+    assert result.n_series == lenient.corpus_n_series
     assert any("network namespaces unavailable" in r.message for r in caplog.records)
 
 

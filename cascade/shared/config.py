@@ -85,6 +85,20 @@ def validate_sandbox_mode(mode: str) -> str:
     return mode
 
 
+DEDUP_MODES = ("off", "shadow", "enforce")
+
+
+def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
+    """Return ``mode`` if it is a known dedup mode, else raise ValueError.
+
+    Typos used to fall through to "off": an anti-spam screen silently not
+    running is exactly the failure an operator would not notice.
+    """
+    if mode not in DEDUP_MODES:
+        raise ValueError(f"{key}={mode!r} invalid; expected one of {DEDUP_MODES}")
+    return mode
+
+
 # Corpus feed modes — how a generator's data reaches the trainer. Identical for
 # king and challenger (folded into contract_digest via TrainingContractConfig).
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse.
@@ -416,6 +430,13 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # Commit-order witness: {hotkey: {pending, committed}} block numbers, written
+    # every poll tick. The chain deletes a commit's block when drand reveals it,
+    # so the evidence of who submitted a generator FIRST exists only for whoever
+    # watched while it was sealed — this file IS that record, and the duplicate
+    # screen's tie-break reads it (falling back to reveal order per hotkey when
+    # it has nothing). Relative paths resolve under work_root.
+    commit_witness_path: str = "trainer_commit_witness.json"
     # Content-level duplicate screen (cascade.interface.dedup): before the heat,
     # each challenger repo is fingerprinted and compared PAIRWISE against the
     # king and every kept lower-UID challenger; identical trees/token streams
@@ -451,6 +472,35 @@ class RoundConfig:
     # generator. False (default): shadow-log the verdict, never drop, whatever
     # dedup_mode says. Flip only after the shadow log shows the split.
     dedup_config_only_enforce: bool = False
+    # Cost caps on the screen itself. difflib's ratio is O(n²) in tokens
+    # (measured: 2.3s at 20k, 9.3s at 40k, 38.7s at 80k) and the input size is
+    # attacker-chosen up to [generator] max_repo_mb, so two hotkeys submitting
+    # fat near-copies could stall the pre-heat screen — and the round — for
+    # days. dedup_max_tokens bounds the stream the quadratic tier will score
+    # (0 = uncapped, do not use in production); dedup_max_text_mb bounds the
+    # tokenizer's input per repo. Field repos run 7–11k tokens / ~100KB, so
+    # both defaults are orders of magnitude above anything honest.
+    dedup_max_tokens: int = 50_000
+    dedup_max_text_mb: int = 4
+    # Pairs the quadratic tier refuses (either side over dedup_max_tokens) are
+    # judged by a linear bottom-k shingle sketch instead. Without it an abuser
+    # could evade the near_duplicate tier just by PADDING a copy past the cap.
+    # Jaccard is not difflib's ratio and carries its own calibration, so the
+    # tier ships "shadow" (log an oversize_sketch verdict, never drop);
+    # "enforce" lets it drop, "off" disables it (and reopens the padding path).
+    dedup_sketch_mode: str = "shadow"   # off | shadow | enforce
+    dedup_sketch_threshold: float = 0.99
+    # Wall-clock budget for the WHOLE screen (fetch + fingerprint + compare +
+    # probe). On expiry the round proceeds unscreened: a screen that cannot
+    # finish must not be able to sink the round it protects.
+    dedup_phase_seconds: int = 900
+    # The same screen runs inside `cascade-trainer --plan-only`, which the
+    # provisioner invokes as a subprocess under a HARD 600s timeout — and a
+    # timed-out plan rents no fleet at all, i.e. costs the round its GPU. So
+    # the sizing path gets its own, much smaller budget: over-rent (the screen
+    # gave up, size off the raw field) is a cost; a lost rental window is a
+    # round. Keep this well under the caller's timeout.
+    dedup_plan_seconds: int = 120
     # Behavioral probe: sandbox-draw dedup_probe_series series per surviving
     # entrant under the shared round seed, TWICE. Two draws that differ ⇒ the
     # generator violates the determinism contract (the entropy re-roll that
@@ -472,6 +522,19 @@ class RoundConfig:
     # that cannot emit dedup_probe_series series in this window while owing
     # thousands in the full budget is pathological or hostile.
     dedup_probe_generate_seconds: int = 120
+    # Total wall clock for the probe stage. The per-draw budget above is
+    # derived from it (budget ÷ waves ÷ 2 draws, clamped), so N hostile
+    # entrants each burning their full clock cannot extend the stage without
+    # bound — worst case is this number, not N × the per-draw budget.
+    dedup_probe_budget_seconds: int = 600
+    # The probe EXECUTES untrusted generator code on the orchestrator — the box
+    # holding the private eval pool and the trainer's wallet — so it demands a
+    # kernel-enforced sandbox: [generator] sandbox_mode = "container", or
+    # subprocess mode with sandbox_strict = true (netns required, no silent
+    # degradation to the in-process socket guard). Without one of those the
+    # probe DISABLES itself and logs an error. Set this true to run it anyway
+    # on a box you are willing to treat as compromised (testnet).
+    dedup_probe_allow_weak_sandbox: bool = False
     # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
     # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
     # its whole window and is public only for the last few minutes before the
@@ -970,14 +1033,28 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
-            dedup_mode=str(r.get("dedup_mode", "off")),
+            commit_witness_path=str(r.get("commit_witness_path",
+                                          "trainer_commit_witness.json")),
+            dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
+                                           "dedup_mode"),
             dedup_threshold=float(r.get("dedup_threshold", 0.99)),
             dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
             dedup_max_abs_delta=int(r.get("dedup_max_abs_delta", 0)),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
-            dedup_probe_mode=str(r.get("dedup_probe_mode", "shadow")),
+            dedup_max_tokens=int(r.get("dedup_max_tokens", 50_000)),
+            dedup_max_text_mb=int(r.get("dedup_max_text_mb", 4)),
+            dedup_sketch_mode=validate_dedup_mode(
+                str(r.get("dedup_sketch_mode", "shadow")), "dedup_sketch_mode"),
+            dedup_sketch_threshold=float(r.get("dedup_sketch_threshold", 0.99)),
+            dedup_phase_seconds=int(r.get("dedup_phase_seconds", 900)),
+            dedup_plan_seconds=int(r.get("dedup_plan_seconds", 120)),
+            dedup_probe_mode=validate_dedup_mode(
+                str(r.get("dedup_probe_mode", "shadow")), "dedup_probe_mode"),
             dedup_probe_series=int(r.get("dedup_probe_series", 8)),
             dedup_probe_generate_seconds=int(r.get("dedup_probe_generate_seconds", 120)),
+            dedup_probe_budget_seconds=int(r.get("dedup_probe_budget_seconds", 600)),
+            dedup_probe_allow_weak_sandbox=bool(
+                r.get("dedup_probe_allow_weak_sandbox", False)),
             reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),
         eval=EvalConfig(

@@ -363,7 +363,14 @@ def tier1_setup(small_cfg, example_generator_dir, monkeypatch, tmp_path):
     generator's REAL digests, with the Hub fetch redirected to the local dir."""
     from cascade.trainer.corpus import build_round_corpus
 
+    # sandbox_strict is pinned OFF for the whole tier-1 path: the shipped
+    # chain.toml now sets it true (the dedup probe demands hard isolation), and
+    # this test re-derives a corpus on whatever host runs it — including CI
+    # runners with no unprivileged userns, where strict mode correctly refuses.
+    # run_tier1 → _rederive_digest runs its own sandbox off this same cfg, so
+    # the flag has to live here rather than at the call below.
     cfg = replace(small_cfg,
+                  generator=replace(small_cfg.generator, sandbox_strict=False),
                   training=replace(small_cfg.training, corpus_mode="cache_reuse"),
                   manifest=replace(small_cfg.manifest,
                                    trainer_hotkey=TRAINER_KP.ss58_address,

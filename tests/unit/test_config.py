@@ -188,6 +188,31 @@ def test_validate_corpus_mode_rejects_unknown():
         validate_corpus_mode("turbo")
 
 
+def test_validate_dedup_mode_rejects_unknown():
+    # A typo used to fall through to "off": an anti-spam screen that silently
+    # is not running is exactly the failure nobody notices.
+    import pytest
+
+    from cascade.shared.config import validate_dedup_mode
+
+    for bad in ("enfoce", "Enforce", "on", ""):
+        with pytest.raises(ValueError):
+            validate_dedup_mode(bad)
+    assert validate_dedup_mode("enforce") == "enforce"
+
+
+def test_shipped_config_backs_the_probe_with_hard_isolation(cfg):
+    # The dedup probe executes untrusted generator code on the orchestrator,
+    # which holds the private eval pool and the trainer's wallet. Shipping the
+    # probe on with a degradable sandbox is the one combination that must not
+    # occur (cascade.trainer.loop.TrainerRunner._probe_sandbox_ok enforces it
+    # at runtime; this pins the shipped file).
+    probe_on = (cfg.round.dedup_probe_mode != "off"
+                and cfg.round.dedup_probe_series > 0)
+    if probe_on and not cfg.round.dedup_probe_allow_weak_sandbox:
+        assert cfg.generator.sandbox_mode == "container" or cfg.generator.sandbox_strict
+
+
 def test_for_hours_scales_budget_and_wall_clock_guard(cfg):
     # A heat/screen contract scales BOTH the token budget and the hard wall-clock
     # guard to its cheap hours budget — a stalling generator costs minutes of a

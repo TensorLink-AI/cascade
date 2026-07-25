@@ -986,6 +986,9 @@ def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
     assert payload["resolved"] == 3
     assert payload["challengers"] == 1               # only 'b' survives dedup
     assert payload["eligible_challengers"] == 1
+    # …and the count the provisioner sizes on runs the CONTENT screen too, so
+    # the heat fleet matches what will actually train (here: screen off ⇒ same)
+    assert payload["screened_challengers"] == 1
     assert payload["next_boundary_block"] == 4 * cfg.round.epoch_blocks
     assert payload["blocks_to_boundary"] == cfg.round.epoch_blocks - 100
 
@@ -1391,3 +1394,40 @@ def test_publish_persists_last_round_marker(cfg, tmp_path, monkeypatch):
     runner.publish(manifest)
     assert json.loads((tmp_path / "last_round.json").read_text()) == {"round_id": "1"}
     assert not (tmp_path / "last_round.json.tmp").exists()  # atomic publish
+
+
+def test_plan_path_screen_runs_under_its_own_tight_budget(cfg, tmp_path, monkeypatch):
+    # --plan-only is a subprocess under a HARD 600s timeout in the provisioner
+    # (provision.main.make_plan_fn), and a timed-out plan rents NO fleet — so
+    # the content screen inside it must never be handed the full round budget.
+    from dataclasses import replace
+
+    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.main import _plan_payload
+
+    seen: list[float] = []
+    monkeypatch.setattr(
+        TrainerRunner, "_with_deadline",
+        staticmethod(lambda fn, seconds: seen.append(seconds) or fn()))
+    # Screen on, and every fetch fails transport-wise so the screen is a no-op
+    # apart from the budget it runs under.
+    monkeypatch.setattr(
+        "cascade.trainer.loop.fetch_from_hub",
+        lambda ref, dest, hub=None: (_ for _ in ()).throw(StorageError("no hub here")))
+    plan_cfg = replace(cfg, round=replace(cfg.round, dedup_mode="enforce",
+                                          dedup_plan_seconds=90))
+
+    class _StubClient:
+        def current_block(self):
+            return 3 * plan_cfg.round.epoch_blocks + 100
+
+        def poll_commitments(self, include_history=False):
+            return [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+
+        def highest_incentive_hotkey(self):
+            return "a"
+
+    payload = _plan_payload(plan_cfg, _StubClient(), tmp_path)
+    assert payload["screened_challengers"] == 1
+    assert seen, "the plan-path screen never ran under a deadline"
+    assert max(seen) <= 90 < plan_cfg.round.dedup_phase_seconds

@@ -307,6 +307,56 @@ class ChainClient:
             return None  # vacant throne — let the trainer pick an interim king
         return str(meta.hotkeys[best_uid])
 
+    def poll_pending_commits(self) -> dict[str, int] | None:
+        """``{hotkey: commit_block}`` for every timelock commit still ENCRYPTED
+        on chain, in one ``query_map``.
+
+        ``Commitments::CommitmentOf`` carries the encrypted payload and the
+        block it landed at; the pallet CONSUMES the record when drand reveals
+        it, and ``RevealedCommitments`` keeps only ``(payload, reveal_block)``.
+        So the commit block — the only on-chain evidence of who submitted a
+        given generator FIRST — is destroyed before any round screens on it,
+        and the sole way to have it is to have looked while the payload was
+        still sealed. That is what this read is for; see
+        :meth:`cascade.trainer.loop.TrainerRunner.witness_commits`.
+
+        Timed reveals keep a payload sealed for most of its epoch
+        (``reveal_margin_blocks`` before the boundary), so any polling cadence
+        finer than that window observes every commit — and a submitter cannot
+        shorten the window without also committing late, which is precisely
+        what the ordering is meant to penalise.
+
+        Best-effort by contract: returns ``None`` on a failed read rather than
+        raising, and ``{}`` only when the chain genuinely holds no sealed
+        commit. The caller must not conflate them — "I could not look" is not
+        evidence that every pending commit revealed.
+        """
+        try:
+            sub = self.subtensor()
+            qm = sub.substrate.query_map(module="Commitments",
+                                         storage_function="CommitmentOf",
+                                         params=[self.netuid], page_size=200)
+        except Exception as e:  # noqa: BLE001 — advisory read; never break a round
+            log.warning("pending-commit poll failed (%s); commit-order evidence "
+                        "for this tick is lost", e)
+            return None
+        out: dict[str, int] = {}
+        for key, value in qm:
+            try:
+                hotkey = str(getattr(key, "value", key))
+                v = getattr(value, "value", value) or {}
+                block = int(v.get("block") or 0)
+                if not block:
+                    continue
+                fields = (v.get("info") or {}).get("fields") or []
+                sealed = any(isinstance(f, dict) and f.get("TimelockEncrypted")
+                             for f in fields)
+                if sealed:
+                    out[hotkey] = block
+            except Exception:  # noqa: BLE001 — one bad entry is not the field
+                continue
+        return out
+
     def n_uids(self) -> int:
         """Number of UIDs registered on the netuid (for the weight vector)."""
         sub = self.subtensor()
