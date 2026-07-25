@@ -90,7 +90,8 @@ def test_worker_maps_train_hours_to_heat_label(cfg, tmp_path, monkeypatch):
     captured: dict = {}
 
     def _fake_train_one(self, gen, role, seeds, block, *, contract=None,
-                        token_budget=None, repo_suffix="", heat=False):
+                        token_budget=None, repo_suffix="", heat=False,
+                        warm_start_ref=None):
         captured["heat"] = heat
         return TrainedEntry(
             miner_hotkey=gen.hotkey, miner_uid=gen.uid, role=role, gen_ref=gen.ref,
@@ -236,6 +237,40 @@ def test_dispatch_raises_on_nonzero_rc():
                       base_seed=1, block=10)
 
 
+def test_dispatch_transport_failure_carries_returncode_255():
+    # rc=255 is an SSH transport failure — the heat fan-out counts it to refuse
+    # caching a fleet-wide dead-pod wipeout, so the error must carry the code.
+    disp = RemoteDispatcher(trainer_spec="m:C",
+                            _runner=lambda argv, t: _fake_proc(rc=255, stderr="ssh: connect"))
+    with pytest.raises(RemoteDispatchError) as ei:
+        disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
+                      base_seed=1, block=10)
+    assert ei.value.returncode == 255
+
+
+def test_probe_host_true_only_on_ssh_echo_roundtrip(monkeypatch):
+    # TCP reachability is not enough — only a full SSH echo round-trip proves a
+    # pod can run a worker (a booting pod accepts TCP but sshd dies rc=255).
+    monkeypatch.setattr(remote_mod, "run_ssh",
+                        lambda argv, t: _fake_proc(rc=0, stdout=remote_mod._HEAT_PROBE_TOKEN + "\n"))
+    assert remote_mod.probe_host(_host()) is True
+    # rc=255 transport failure ⇒ dead
+    monkeypatch.setattr(remote_mod, "run_ssh",
+                        lambda argv, t: _fake_proc(rc=255, stderr="connection refused"))
+    assert remote_mod.probe_host(_host()) is False
+    # rc=0 but no token (sshd banner / MOTD only) ⇒ not proven alive
+    monkeypatch.setattr(remote_mod, "run_ssh", lambda argv, t: _fake_proc(rc=0, stdout="motd"))
+    assert remote_mod.probe_host(_host()) is False
+    # a transport exception (no route) ⇒ dead
+    def _boom(argv, t):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(remote_mod, "run_ssh", _boom)
+    assert remote_mod.probe_host(_host()) is False
+    # an un-addressable host can't be probed ⇒ kept (never strand a fleet)
+    assert remote_mod.probe_host(types.SimpleNamespace(name="no-addr")) is True
+
+
 def test_dispatch_rc3_relays_one_line_miner_rejection():
     """Incident 2026-07-14: miners with PRIVATE Hippius repos surfaced as
     15-line infra tracebacks. Worker rc=3 = miner fault; only the final stderr
@@ -289,7 +324,7 @@ class _RecordingDispatcher:
         pass
 
     def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                 arch_preset=None, lane_count=None):
+                 arch_preset=None, warm_start_ref=None, lane_count=None):
         _RecordingDispatcher.calls.append((host.name, role, gen_ref))
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 

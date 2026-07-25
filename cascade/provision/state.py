@@ -68,12 +68,17 @@ class RoundState:
     round id an eval pod was last rented for. Persisted so a restart while
     that round is still live never rents a SECOND pod for the same manifest
     (the crash-safety twin of the in-memory latch). ``""`` = never evaled.
+    ``final_pending`` records a stage-phased round whose FINAL fleet is
+    deliberately not rented yet (waiting on the trainer's heat_complete
+    marker) — persisted so a restart keeps waiting instead of concluding the
+    final was never wanted.
     """
 
     round_id: str
     instances: tuple[PodInstance, ...] = field(default=())
     published: bool = False
     last_evaled_round: str = ""
+    final_pending: bool = False
 
 
 # ── pure transforms (the loop composes these, then saves) ────────────────────
@@ -133,6 +138,7 @@ def save_state(path: Path | str, state: RoundState) -> None:
         "round_id": state.round_id,
         "published": state.published,
         "last_evaled_round": state.last_evaled_round,
+        "final_pending": state.final_pending,
         "instances": [
             {
                 "provider": i.provider,
@@ -166,6 +172,7 @@ def load_state(path: Path | str) -> RoundState | None:
         round_id=str(raw["round_id"]),
         published=bool(raw.get("published", False)),
         last_evaled_round=str(raw.get("last_evaled_round", "")),
+        final_pending=bool(raw.get("final_pending", False)),
         instances=tuple(
             PodInstance(
                 provider=str(i["provider"]),

@@ -4,12 +4,19 @@ assembly, with the GPU and Hippius boundaries faked (no torch, no Hub, no S3).""
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 import pytest
 
 from cascade.shared.chain import Commitment
-from cascade.shared.hippius import HubRef, HubUpload
+from cascade.shared.hippius import (
+    HubRef,
+    HubUpload,
+    ObjectNotFound,
+    StorageError,
+    manifest_round_key,
+)
 from cascade.shared.manifest import dump_manifest, load_manifest
 from cascade.trainer import loop as loop_mod
 from cascade.trainer.contract import RoundSeeds, TrainResult
@@ -84,7 +91,7 @@ def test_train_one_heat_tags_telemetry_apart_from_final(two_size_cfg, tmp_path, 
                            work_root=tmp_path, use_sandbox=False)
     seen: list[str] = []
 
-    def _capture(gen, seeds, contract, budget, out_dir, *, log_role):
+    def _capture(gen, seeds, contract, budget, out_dir, *, log_role, warm_start_dir=None):
         seen.append(log_role)
         out_dir.mkdir(parents=True, exist_ok=True)
         return TrainResult(local_dir=out_dir, param_count=1, train_seconds=1.0,
@@ -509,7 +516,7 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+                     arch_preset=None, train_hours=None, repo_suffix="", warm_start_ref=None, lane_count=None):
             dispatched.append({"hotkey": hotkey, "role": role, "arch_preset": arch_preset,
                                "train_hours": train_hours, "repo_suffix": repo_suffix})
             return TrainedEntry(
@@ -538,6 +545,102 @@ def test_run_round_remote_heat_dispatches_to_pod(cfg, tmp_path, monkeypatch):
     # heat winner ('c') promoted; the final dispatch carries no heat overrides
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"
     assert any(d["role"] == "king" and d["train_hours"] is None for d in dispatched)
+
+
+def test_frozen_block_rebuilds_substrate_and_reads_fresh(cfg, tmp_path):
+    # A quietly-dead bittensor websocket keeps answering current_block() with a
+    # stale (~20-min-old) height; without a freeze guard the live loop re-derives
+    # an already-published round from it and re-enters it. Once the height stops
+    # advancing past stale_block_after_s (blocks are ~12s), the guard rebuilds the
+    # substrate connection (reconnect) and trusts the fresh, advanced read.
+    class FrozenClient:
+        def __init__(self):
+            self.block = 1000
+            self.reconnects = 0
+
+        def current_block(self):
+            return self.block
+
+        def reconnect(self):
+            self.reconnects += 1
+            self.block = 5000            # the fresh websocket sees the real height
+
+    client = FrozenClient()
+    now = {"t": 0.0}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, stale_block_after_s=300.0,
+                           chain_clock=lambda: now["t"])
+
+    assert runner._block_with_freeze_guard(client) == 1000     # seeds the tracker
+    now["t"] = 200.0
+    assert runner._block_with_freeze_guard(client) == 1000     # within window: trusted
+    assert client.reconnects == 0
+    now["t"] = 400.0                                           # frozen past the window
+    assert runner._block_with_freeze_guard(client) == 5000     # rebuilt + fresh read
+    assert client.reconnects == 1
+    # a normally-advancing chain afterwards never triggers a spurious rebuild.
+    now["t"] = 410.0
+    client.block = 5100
+    assert runner._block_with_freeze_guard(client) == 5100
+    assert client.reconnects == 1
+
+
+def test_raising_or_hung_chain_read_rebuilds_and_recovers(cfg, tmp_path):
+    # The other two quietly-dead-websocket modes the provisioner already guards:
+    # a read that RAISES and a read that HANGS. Both must rebuild the connection
+    # (reconnect) and retry once, not wedge or crash the loop.
+    import time as _time
+
+    from cascade.shared.chain import ChainError
+
+    # (a) current_block raises until the connection is rebuilt.
+    class _Raises:
+        def __init__(self):
+            self.reconnects = 0
+
+        def current_block(self):
+            if self.reconnects == 0:
+                raise ChainError("get_current_block_failed")
+            return 7000
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    raiser = _Raises()
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    assert runner._block_with_freeze_guard(raiser) == 7000
+    assert raiser.reconnects == 1
+
+    # (b) current_block HANGS past the read deadline until the rebuild; the slow
+    # first call finishes harmlessly on its leaked worker thread.
+    class _Hangs:
+        def __init__(self):
+            self.reconnects = 0
+
+        def current_block(self):
+            if self.reconnects == 0:
+                _time.sleep(0.4)          # exceeds chain_read_timeout_s below
+                return 1
+            return 8000
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    hanger = _Hangs()
+    runner2 = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                            use_sandbox=False, chain_read_timeout_s=0.05)
+    assert runner2._block_with_freeze_guard(hanger) == 8000
+    assert hanger.reconnects == 1
+
+    # A reconnect-less client (offline fake) still propagates a raise rather than
+    # crashing on a None reconnect.
+    class _RaisesNoReconnect:
+        def current_block(self):
+            raise ChainError("down")
+
+    with pytest.raises(ChainError):
+        runner._block_with_freeze_guard(_RaisesNoReconnect())
 
 
 def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
@@ -633,7 +736,7 @@ def test_remote_dispatch_retries_once_on_next_host(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+                     arch_preset=None, train_hours=None, repo_suffix="", warm_start_ref=None, lane_count=None):
             key = (hotkey, role, train_hours is not None)
             calls.setdefault(key, []).append(host)
             if key not in failed_once:
@@ -694,7 +797,7 @@ def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+                     arch_preset=None, train_hours=None, repo_suffix="", warm_start_ref=None, lane_count=None):
             if train_hours is None:      # final: single job per host, not under test
                 return TrainedEntry(
                     miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
@@ -738,6 +841,115 @@ def test_heat_never_double_books_a_lane(cfg, tmp_path, monkeypatch):
     assert manifest.entry_for_role("challenger").miner_hotkey == "c"
 
 
+def _heat_recording_dispatcher(cfg):
+    """A fake RemoteDispatcher class that records (host, is_heat) per dispatch."""
+    from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+
+    dispatched: list[tuple[str, bool]] = []
+
+    class _FakeDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
+                     arch_preset=None, train_hours=None, repo_suffix="",
+                     warm_start_ref=None, lane_count=None):
+            dispatched.append((host.name, train_hours is not None))
+            return TrainedEntry(
+                miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
+                trained_pointer=format_trained_pointer(REF_OUT), corpus_digest=f"d-{hotkey}",
+                train_block=block, gpu_name="", size=arch_preset or cfg.training.arch_preset,
+            )
+
+    return _FakeDisp, dispatched
+
+
+def test_heat_excludes_dead_hosts_before_dispatch(cfg, tmp_path, monkeypatch):
+    # A dead pod answers TCP but fails the SSH echo; dispatching to it burns one
+    # challenger per attempt (rc=255). Probe first and dispatch heat only to the
+    # live host — the dead one gets nothing.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    live = RemoteHost(name="live", host="10.0.0.1")
+    dead = RemoteHost(name="dead", host="10.0.0.2")
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: h.name == "live")
+    FakeDisp, dispatched = _heat_recording_dispatcher(cfg)
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", FakeDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[live, dead], trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat_hosts = {name for name, is_heat in dispatched if is_heat}
+    assert heat_hosts == {"live"}                     # dead host excluded from the heat
+
+
+def test_heat_all_hosts_dead_raises_and_writes_no_marker(cfg, tmp_path, monkeypatch):
+    # If NO heat host survives the probe, fail the stage loudly rather than
+    # dispatch into a dead fleet — and never write the heat-complete marker.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteDispatchError, RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: False)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[RemoteHost(name="h1", host="10.0.0.1"),
+                                         RemoteHost(name="h2", host="10.0.0.2")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    with pytest.raises(RemoteDispatchError):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "1" / "heat_complete.json").exists()
+
+
+def test_heat_all_dispatches_transport_fail_refuse_to_cache(cfg, tmp_path, monkeypatch):
+    # Hosts pass the probe but every dispatch then dies rc=255 (pod went dark
+    # mid-round): a 0/N heat is a dead-fleet wipeout, not a screened field. It
+    # must NOT be cached as complete (a king-only manifest would publish) —
+    # raise so the round retries after operator intervention.
+    import cascade.trainer.remote as remote_mod
+    from cascade.trainer.remote import RemoteDispatchError, RemoteHost
+
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(remote_mod, "probe_host", lambda h, **k: True)
+
+    class _DeadDisp:
+        def __init__(self, **kw):
+            pass
+
+        def dispatch(self, host, **kw):
+            raise RemoteDispatchError(f"remote on {host.name} failed (rc=255)", returncode=255)
+
+    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _DeadDisp)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen,
+                           remote_hosts=[RemoteHost(name="h", host="10.0.0.1")],
+                           trainer_spec="m:C")
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    with pytest.raises(RemoteDispatchError):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "1" / "heat_complete.json").exists()
+
+
 def test_reload_remote_hosts_per_round(cfg, tmp_path):
     # The elastic-fleet seam: hosts TOML re-read per round; missing/empty file ⇒
     # local round; the provisioner writing the file brings the fleet up without a
@@ -755,6 +967,34 @@ def test_reload_remote_hosts_per_round(cfg, tmp_path):
     hosts_path.write_text("", encoding="utf-8")             # fleet torn down
     runner._reload_remote_hosts()
     assert runner.remote_hosts is None
+
+
+def test_reload_require_stage_waits_for_final_capable_hosts(cfg, tmp_path):
+    # The JIT-final seam: a stage-phased provisioner rents the duel pods at the
+    # heat_complete marker, so the pre-duel re-read must wait for FINAL-capable
+    # hosts instead of dispatching onto the round-start heat snapshot. With
+    # only heat-tagged hosts on file the (zero-wait) re-read keeps them as the
+    # last-resort fallback; once a final-tagged host lands, it is picked up.
+    hosts_path = tmp_path / "hosts.toml"
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-heat"\nhost = "1.2.3.4"\nstage = "heat"\n',
+        encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           remote_hosts_path=hosts_path, hosts_wait_seconds=0)
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-heat"]   # fallback kept
+
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-final"\nhost = "1.2.3.5"\nstage = "final"\n',
+        encoding="utf-8")
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-final"]
+
+    # An "any"-tagged fleet serves every stage — accepted immediately.
+    hosts_path.write_text(
+        '[[host]]\nname = "pod-any"\nhost = "1.2.3.6"\n', encoding="utf-8")
+    runner._reload_remote_hosts(require_stage="final")
+    assert [h.name for h in runner.remote_hosts] == ["pod-any"]
 
 
 def test_plan_payload_counts_the_real_eligible_field(cfg, tmp_path):
@@ -825,7 +1065,7 @@ def test_stage_tagged_hosts_split_heat_from_final(cfg, tmp_path, monkeypatch):
             pass
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+                     arch_preset=None, train_hours=None, repo_suffix="", warm_start_ref=None, lane_count=None):
             dispatched.append((host.name, role, train_hours is not None))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
@@ -882,7 +1122,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
             self.timeout_seconds = timeout_seconds
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
-                     arch_preset=None, train_hours=None, repo_suffix="", lane_count=None):
+                     arch_preset=None, train_hours=None, repo_suffix="", warm_start_ref=None, lane_count=None):
             timeouts.append((train_hours is not None, self.timeout_seconds))
             return TrainedEntry(
                 miner_hotkey=hotkey, miner_uid=uid, role=role, gen_ref=gen_ref,
@@ -997,3 +1237,189 @@ def test_commit_floor_drops_pre_launch_commits():
     # floor composes with the cutoff: post-live but pre-boundary only
     got = resolve_commitments(commits, cutoff_block=100, floor_block=99)
     assert [r.hotkey for r in got] == ["c"]
+
+# ── restart re-entry guard (already-published rounds) ────────────────────────
+# round_id derives from the epoch-start block, so a trainer restarted mid-epoch
+# forgets last_round and re-enters the round it already published: the
+# 2026-07-23 re-entry re-published a stale manifest (feeding a full fleet
+# teardown 31s after rent); the 2026-07-24 one skipped every challenger as
+# burned and parked in the pre-duel final-hosts wait, primed to seize the NEXT
+# round's freshly rented pods for the stale duel.
+
+
+class _StopLoop(BaseException):
+    """Ends a run_forever drive; BaseException so the loop's blanket
+    ``except Exception`` round handler cannot swallow it."""
+
+
+class _GuardClient:
+    """Chain fake for run_forever: fixed height + seed, and a commitment poll
+    that must never fire on a skipped round."""
+
+    def __init__(self, cfg, base_seed=9797, allow_poll=True):
+        self.block = 3 * cfg.round.epoch_blocks + 7
+        self.base_seed = base_seed
+        self.allow_poll = allow_poll
+        self.polled = 0
+
+    def current_block(self):
+        return self.block
+
+    def block_seed(self, block):
+        return self.base_seed
+
+    def poll_commitments(self, include_history=False):
+        assert self.allow_poll, "commitments polled on a round the guard must skip"
+        self.polled += 1
+        return []
+
+    def highest_incentive_hotkey(self):
+        return "a"
+
+
+class _GuardStore:
+    """Manifest-store fake for the guard probe: known keys answer, misses raise
+    ObjectNotFound, and ``boom`` simulates a store that cannot be read at all."""
+
+    def __init__(self, docs=None, boom=None):
+        self.docs = dict(docs or {})
+        self.boom = boom
+        self.reads = []
+
+    def get_text(self, key):
+        self.reads.append(key)
+        if self.boom is not None:
+            raise self.boom
+        if key not in self.docs:
+            raise ObjectNotFound(f"s3_get_missing: {key}")
+        return self.docs[key]
+
+    def put_text(self, key, text, *, content_type="", acl=None):
+        self.docs[key] = text
+
+
+def _drive_polls(runner, client, monkeypatch, polls=1):
+    """Run run_forever until its Nth poll sleep, then break out."""
+    remaining = {"n": polls}
+
+    def _sleep(seconds):
+        remaining["n"] -= 1
+        if remaining["n"] <= 0:
+            raise _StopLoop
+
+    monkeypatch.setattr(loop_mod.time, "sleep", _sleep)
+    with pytest.raises(_StopLoop):
+        runner.run_forever(client)
+
+
+def test_restarted_trainer_skips_round_already_published(cfg, tmp_path, monkeypatch, caplog):
+    # Manifest already at its round key ⇒ the restarted loop must go straight
+    # back to the poll sleep — no commitment poll, no hosts wait, no run_round —
+    # with ONE clear log line, and last_round memoized so later polls of the
+    # same epoch never re-probe the store.
+    client = _GuardClient(cfg, allow_poll=False)
+    rid = str(client.base_seed)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    store = _GuardStore({manifest_round_key(rid): "{}"})
+    runner._manifest_store = store
+    monkeypatch.setattr(runner, "_reload_remote_hosts",
+                        lambda *a, **k: pytest.fail("hosts wait on a skipped round"))
+    monkeypatch.setattr(runner, "run_round",
+                        lambda *a, **k: pytest.fail("run_round on a skipped round"))
+    with caplog.at_level(logging.INFO, logger="cascade.trainer"):
+        _drive_polls(runner, client, monkeypatch, polls=2)
+
+    skips = [r for r in caplog.records if "already published" in r.getMessage()]
+    assert len(skips) == 1 and rid in skips[0].getMessage()
+    assert store.reads == [manifest_round_key(rid)]      # probed once, then memoized
+
+
+def test_restart_without_published_manifest_resumes_the_round(cfg, tmp_path, monkeypatch):
+    # Crash-resume: the trainer died mid-round BEFORE publishing, so the work
+    # dir (heat_complete cache etc.) exists but no manifest and no persisted
+    # marker do. The guard keys strictly on published-manifest presence — never
+    # the work dir — so the restarted trainer must re-enter and resume.
+    client = _GuardClient(cfg)
+    rid = str(client.base_seed)
+    (tmp_path / rid).mkdir()
+    (tmp_path / rid / "heat_complete.json").write_text("{}", encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore()               # nothing published anywhere
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1                    # round re-entered normally
+
+
+def test_guard_fails_open_when_manifest_store_is_unreadable(cfg, tmp_path, monkeypatch):
+    # Primary AND backup unreadable ⇒ the probe cannot answer. Fail open and
+    # run the round: re-running one finished round is recoverable, a trainer
+    # deadlocked on blind storage stalls the whole subnet.
+    client = _GuardClient(cfg)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore(boom=StorageError("both primary and R2 get failed"))
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1
+
+
+def test_persisted_last_round_marker_alone_skips_the_round(cfg, tmp_path, monkeypatch):
+    # The publish landed but the store cannot confirm it (flaky reads, or the
+    # object lost): the disk marker written after publish() is equivalent to
+    # the in-memory last_round — skip without ever touching the store.
+    client = _GuardClient(cfg, allow_poll=False)
+    rid = str(client.base_seed)
+    (tmp_path / "last_round.json").write_text(json.dumps({"round_id": rid}), encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    store = _GuardStore()                                # store has no manifest at all
+    runner._manifest_store = store
+    monkeypatch.setattr(runner, "run_round",
+                        lambda *a, **k: pytest.fail("run_round on a skipped round"))
+    _drive_polls(runner, client, monkeypatch)
+    assert store.reads == []                             # marker answered first
+
+
+def test_force_rerun_round_overrides_the_guard(cfg, tmp_path, monkeypatch):
+    # Operator escape hatch (--force-rerun-round, Approve-tier): a deliberate
+    # same-round re-publish must stay possible even with BOTH guard signals
+    # present (manifest published + persisted marker).
+    from cascade.trainer.main import _build_parser
+
+    client = _GuardClient(cfg)
+    rid = str(client.base_seed)
+    (tmp_path / "last_round.json").write_text(json.dumps({"round_id": rid}), encoding="utf-8")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, force_rerun_round=rid)
+    runner._manifest_store = _GuardStore({manifest_round_key(rid): "{}"})
+    ran = []
+    monkeypatch.setattr(runner, "run_round", lambda *a, **k: ran.append(True) or object())
+    monkeypatch.setattr(runner, "publish", lambda m: None)
+    _drive_polls(runner, client, monkeypatch)
+    assert ran and client.polled == 1                    # guard bypassed, round re-ran
+    # the CLI wires the hatch through as a plain round_id string
+    assert _build_parser().parse_args(["--force-rerun-round", rid]).force_rerun_round == rid
+
+
+def test_publish_persists_last_round_marker(cfg, tmp_path, monkeypatch):
+    # The disk half of the guard: a successful publish() records its round in
+    # work_root/last_round.json (atomically), so the next restart knows the
+    # round finished even if the store's reads are flaking.
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(loop_mod, "publish_manifest",
+                        lambda store, text, rid: f"manifests/round-{rid}.json")
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False)
+    runner._manifest_store = _GuardStore()
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert not (tmp_path / "last_round.json").exists()   # never written pre-publish
+    runner.publish(manifest)
+    assert json.loads((tmp_path / "last_round.json").read_text()) == {"round_id": "1"}
+    assert not (tmp_path / "last_round.json.tmp").exists()  # atomic publish
