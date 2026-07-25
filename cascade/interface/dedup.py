@@ -121,6 +121,7 @@ class RepoFingerprint:
     tree_sha256: str
     token_sha256: str
     masked_sha256: str
+    py_sha256: str            # digest of the .py-only token stream (config_only tier)
     tokens: tuple[str, ...] = field(repr=False)
 
 
@@ -132,11 +133,29 @@ def _sha256_tokens(tokens: tuple[str, ...]) -> str:
     return h.hexdigest()
 
 
+# Path components / names that never shape the generative process and change
+# between uploads of the same content (hub download caches embed content hashes
+# and timestamps): excluded from BOTH the tree digest and the token stream, so
+# re-uploading with fresh cache junk cannot mint a "different" tree.
+_JUNK_DIR_PARTS = frozenset({".cache", ".git", "__pycache__"})
+_JUNK_NAMES = frozenset({".gitattributes"})
+_JUNK_SUFFIXES = frozenset({".metadata"})
+
+
+def _is_junk(rel_parts: tuple[str, ...]) -> bool:
+    if any(part in _JUNK_DIR_PARTS for part in rel_parts[:-1]):
+        return True
+    name = rel_parts[-1]
+    return name in _JUNK_NAMES or Path(name).suffix in _JUNK_SUFFIXES
+
+
 def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
     """Fingerprint a fetched repo tree.
 
-    The tree digest covers every regular file (sorted by relative path). The
-    token stream concatenates, in the same order, the normalized tokens of
+    The tree digest covers every regular file (sorted by relative path),
+    minus cache/VCS junk (``.cache/``, ``.git/``, ``__pycache__/``,
+    ``*.metadata``, ``.gitattributes``) whose bytes churn on every upload.
+    The token stream concatenates, in the same order, the normalized tokens of
     every ``.py`` file AND of every functional config file (``*.json``,
     ``requirements.txt``, yaml/toml-style configs) — parameters live in
     configs as much as in code, so a config-only delta must read as a real
@@ -152,16 +171,21 @@ def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
     tree = hashlib.sha256()
     tokens: list[str] = []
     maskable: list[bool] = []
+    py_tokens: list[str] = []
     for p in files:
-        rel = str(p.relative_to(root))
+        rel = p.relative_to(root)
+        if _is_junk(rel.parts):
+            continue
         data = p.read_bytes()
-        tree.update(rel.encode("utf-8", "replace"))
+        tree.update(str(rel).encode("utf-8", "replace"))
         tree.update(b"\x00")
         tree.update(data)
         tree.update(b"\x00")
         if p.suffix == ".py":
             file_toks = normalized_tokens(data.decode("utf-8", "replace"))
             mask = True
+            py_tokens.append("\x00FILE")
+            py_tokens.extend(file_toks)
         else:
             cfg_toks = _config_tokens(p, data.decode("utf-8", "replace"))
             if cfg_toks is None:
@@ -176,6 +200,7 @@ def fingerprint_dir(repo_dir: Path | str) -> RepoFingerprint:
         tree_sha256=tree.hexdigest(),
         token_sha256=_sha256_tokens(toks),
         masked_sha256=_sha256_tokens(_mask_names(toks, tuple(maskable))),
+        py_sha256=_sha256_tokens(tuple(py_tokens)),
         tokens=toks,
     )
 
@@ -199,16 +224,33 @@ def _bounded_similarity(a: RepoFingerprint, b: RepoFingerprint, floor: float) ->
     return sm.ratio()
 
 
+def _abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int:
+    """Absolute changed-token count between two streams: over the non-equal
+    SequenceMatcher opcodes, the max of the two sides' spans, summed. A pure
+    ratio dilutes with repo size (7–11k-token repos tolerate ~90–110 changed
+    tokens at 0.99); the absolute count is what separates a rename from a
+    research edit."""
+    sm = SequenceMatcher(None, a.tokens, b.tokens, autojunk=False)
+    return sum(max(i2 - i1, j2 - j1)
+               for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
+
+
 @dataclass(frozen=True)
 class DedupVerdict:
-    """One pairwise judgement, kept for the audit log whether or not it drops."""
+    """One pairwise judgement, kept for the audit log whether or not it drops.
+
+    Tiers: ``tree_identical`` | ``token_identical`` | ``rename_identical`` |
+    ``config_only`` | ``near_duplicate`` | ``near_duplicate_large_delta``
+    (shadow-only) | ``shadow`` (similarity band) | ``behavior_identical``.
+    """
 
     hotkey: str
     uid: int
     matched_hotkey: str
     matched_uid: int          # -2 marks the king (any sentinel outside uid space)
-    tier: str                 # tree_identical | token_identical | rename_identical | near_duplicate | shadow
+    tier: str
     score: float
+    abs_delta: int | None = None   # changed-token count (similarity tiers only)
 
 
 @dataclass(frozen=True)
@@ -227,6 +269,8 @@ def screen_duplicates(
     *,
     threshold: float = 0.99,
     shadow_floor: float = 0.90,
+    max_abs_delta: int = 0,
+    config_only_enforce: bool = False,
     enforce: bool = True,
 ) -> DedupResult:
     """Pairwise duplicate screen over ``(hotkey, uid, fingerprint)`` entries.
@@ -235,9 +279,23 @@ def screen_duplicates(
     king and every previously KEPT entry. The first match at or above
     ``threshold`` (or any identical digest) drops it — lowest UID keeps the
     slot, so copying an existing submission can never displace it. Matches in
-    ``[shadow_floor, threshold)`` are recorded but never drop. With
-    ``enforce=False`` (shadow mode) would-be drops are logged as verdicts but
-    every entry is kept.
+    ``[shadow_floor, threshold)`` are recorded but never drop.
+
+    ``max_abs_delta`` (0 = disabled): a ``near_duplicate`` drop additionally
+    requires the absolute changed-token count to be at most this — pairs over
+    the ratio bar but past the cap land in the shadow list as
+    ``near_duplicate_large_delta`` (logged, never dropped), so a substantive
+    edit inside mostly-shared scaffold survives size dilution of the ratio.
+
+    ``config_only_enforce`` (default False): a pair whose ``.py`` token
+    streams are identical but whose functional config files differ gets a
+    ``config_only`` verdict — with the flag off it is shadow-logged and the
+    entry is never dropped for that rival ("identical code, different
+    weights" is both the ticket-spam pattern and the legitimate way to fork a
+    public generator; measure before enforcing).
+
+    With ``enforce=False`` (shadow mode) would-be drops are logged as
+    verdicts but every entry is kept.
     """
     ordered = sorted(entries, key=lambda e: e[1])
     kept: list[tuple[str, int, RepoFingerprint]] = []
@@ -253,15 +311,34 @@ def screen_duplicates(
         verdict: DedupVerdict | None = None
         best_shadow: DedupVerdict | None = None
         for r_hotkey, r_uid, r_fp in rivals:
+            delta: int | None = None
             if fp.tree_sha256 == r_fp.tree_sha256:
                 tier, score = "tree_identical", 1.0
             elif fp.token_sha256 == r_fp.token_sha256:
                 tier, score = "token_identical", 1.0
             elif fp.masked_sha256 == r_fp.masked_sha256:
                 tier, score = "rename_identical", 1.0
+            elif fp.py_sha256 == r_fp.py_sha256:
+                # Identical code, different functional configs. Enforcement is
+                # its own flag; off ⇒ shadow-log and never fall through to the
+                # similarity tier for this rival (the tier CLAIMS the pair).
+                delta = _abs_token_delta(fp, r_fp)
+                if not config_only_enforce:
+                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
+                                               "config_only", 1.0, delta))
+                    continue
+                tier, score = "config_only", 1.0
             else:
                 score = _bounded_similarity(fp, r_fp, shadow_floor)
                 if score >= threshold:
+                    delta = _abs_token_delta(fp, r_fp)
+                    if max_abs_delta > 0 and delta > max_abs_delta:
+                        # Over the ratio bar but a real edit by absolute size:
+                        # logged for threshold calibration, never dropped.
+                        shadow.append(DedupVerdict(
+                            hotkey, uid, r_hotkey, r_uid,
+                            "near_duplicate_large_delta", round(score, 4), delta))
+                        continue
                     tier = "near_duplicate"
                 elif score >= shadow_floor:
                     cand = DedupVerdict(hotkey, uid, r_hotkey, r_uid, "shadow", round(score, 4))
@@ -270,7 +347,8 @@ def screen_duplicates(
                     continue
                 else:
                     continue
-            verdict = DedupVerdict(hotkey, uid, r_hotkey, r_uid, tier, round(score, 4))
+            verdict = DedupVerdict(hotkey, uid, r_hotkey, r_uid, tier,
+                                   round(score, 4), delta)
             break
 
         if verdict is not None:

@@ -6,10 +6,11 @@ status: active
 date: 2026-07-24
 tags: [anti-spam, incentives, trainer]
 revisit_when: >-
-  the shadow band (0.90-0.99) shows an enforced drop that would have BEATEN
-  its match in the heat, OR abusers adapt below the exact-behavior tier
-  (epsilon-jittered variants of one process) — then extend the behavioral
-  probe from exact digest match to statistical distance, in shadow first
+  the shadow log accumulates enough rounds to set dedup_max_abs_delta (spare
+  substantive edits like the dropped finalist) and to decide
+  dedup_config_only_enforce and promoting dedup_probe_mode to enforce; OR
+  abusers adapt below the exact-behavior tier (epsilon-jittered variants of
+  one process) — then extend the probe to statistical distance, shadow first
 relations: {}
 ---
 Live field analysis (similarity_report.json, OPSLOG) showed most heat GPU
@@ -50,6 +51,36 @@ identical probe bytes across entrants/vs-king = same process regardless of
 code (`behavior_identical`), the deterministic backstop for obfuscated forks
 and dependency-hidden logic.
 
+**Validation against a real field** (38 repos, round 15787128089753493320):
+at enforce/0.99 the screen dropped 11/38 (~29% of heat GPU) — every drop on
+the `near_duplicate` similarity tier (the three identical tiers fired zero;
+uploads shuffle cache junk, so the tree tier only bites with junk excluded).
+The 0.99 threshold sits in an EMPTY GAP of the absolute-delta distribution:
+dropped pairs differ by 4–56 tokens, shadow-band pairs by 266–1389. But the
+ratio dilutes with repo size (7.3–11.4k tokens of shared scaffold ⇒ ~90–110
+tokens tolerated at 0.99), and **the original revisit_when condition fired on
+this very field**: the round's eventual finalist (best heat score) was
+dropped as a 0.995 near-copy of a different-coldkey sibling whose 46-token
+delta was a documented mechanism change. Within-family heat spreads (Radiant28
+n=9: 30%, jtest n=4: 37%, vs field 47.7%) also imply widespread generator
+nondeterminism — enforcing the probe blind could burn a large slice of a
+round in one flip.
+
+Refinements from that evidence, all shadow-first: cache/VCS junk (`.cache/`,
+`.git/`, `__pycache__/`, `*.metadata`, `.gitattributes`) is excluded from the
+fingerprint; `dedup_max_abs_delta` adds an absolute changed-token cap to the
+near_duplicate tier (0 = off at ship; on this field 60–260 is a no-op, ~24–40
+spares substantive edits incl. the finalist at ~half the drop rate —
+ratio-over-cap pairs shadow-log as `near_duplicate_large_delta`);
+`config_only` (identical .py, differing configs — the self-declared A/B/C
+sweeps, 3 of the 11 drops) is its own tier, shadow-only behind
+`dedup_config_only_enforce = false` because config is also the legitimate
+fork product; and the behavioral probe gates on its own
+`dedup_probe_mode` (ships `shadow`) independently of `dedup_mode`, so the
+static tiers enforce while the probe observes.
+
 Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor/
-dedup_probe_series` — dataclass default `off`, mainnet `chain.toml` =
-`enforce` @ 0.99/0.90, probe 8; testnet = `shadow`.
+dedup_max_abs_delta/dedup_config_only_enforce/dedup_probe_mode/
+dedup_probe_series` — dataclass defaults off/0.99/0.90/0/false/shadow/8;
+mainnet `chain.toml` = static `enforce` @ 0.99/0.90, delta cap 0, config_only
+shadow, probe `shadow` × 8; testnet = everything `shadow`.

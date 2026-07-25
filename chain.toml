@@ -152,13 +152,25 @@ one_submission_per_hotkey = true
 # [dedup_shadow_floor, dedup_threshold) is logged, never dropped: honest
 # template-sharing (everyone starts from example_generator) lives there.
 # Observed abuse sits at sim >= 0.99 (see similarity_report / OPSLOG).
-dedup_mode         = "enforce"   # off | shadow | enforce
+dedup_mode         = "enforce"   # off | shadow | enforce (static tiers)
 dedup_threshold    = 0.99
 dedup_shadow_floor = 0.90
+# Absolute changed-token cap on near_duplicate drops (0 = ratio only). On the
+# validated field: drops differ by 4-56 tokens, shadow band by 266-1389 —
+# 60-260 changes nothing, ~24-40 would spare substantive edits at roughly
+# half the drop rate. Keep 0 until the shadow log picks a value.
+dedup_max_abs_delta = 0
+# config_only tier (identical .py, differing configs): SHADOW-logged until
+# this is true — config sweeps are ticket-spam AND the legitimate fork path.
+dedup_config_only_enforce = false
 # Behavioral probe: sandbox-draw N series per surviving entrant under the
 # shared round seed, twice. Twice-differs = non-deterministic generator
-# (contract violation, the entropy re-roll) -> dropped. Identical probe bytes
-# across entrants/vs-king = same process regardless of code -> dropped.
+# (contract violation, the entropy re-roll). Identical probe bytes across
+# entrants/vs-king = same process regardless of code. Probe drops gate on
+# dedup_probe_mode INDEPENDENTLY of dedup_mode — within-family heat spreads
+# suggest nondeterminism is widespread, and probe drops burn hotkeys, so the
+# probe ships SHADOW while the static tiers enforce.
+dedup_probe_mode   = "shadow"    # off | shadow | enforce
 dedup_probe_series = 8           # 0 = probe off
 
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref

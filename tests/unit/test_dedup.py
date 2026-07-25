@@ -186,6 +186,7 @@ def dedup_runner(cfg, tmp_path, monkeypatch):
     dedup_cfg = replace(cfg, round=replace(cfg.round, dedup_mode="enforce",
                                            dedup_threshold=0.99,
                                            dedup_shadow_floor=0.90,
+                                           dedup_probe_mode="off",
                                            dedup_probe_series=0))
     runner = TrainerRunner(cfg=dedup_cfg, base_trainer=object(),
                            work_root=tmp_path / "work", use_sandbox=False)
@@ -271,6 +272,80 @@ def test_different_requirements_are_not_rename_identical(tmp_path):
     assert a.masked_sha256 != b.masked_sha256
 
 
+# ── cache/VCS junk exclusion ─────────────────────────────────────────────────
+
+def test_cache_junk_does_not_change_the_tree_digest(tmp_path):
+    a_dir = _repo(tmp_path, "a", BASE_SOURCE)
+    b_dir = _repo(tmp_path, "b", BASE_SOURCE)
+    # Hub-cache metadata churns per upload: content hashes + timestamps.
+    cache = b_dir / ".cache" / "huggingface" / "download"
+    cache.mkdir(parents=True)
+    (cache / "generator.py.metadata").write_text("etag: abc\ntimestamp: 1e9\n")
+    (cache / "state.lock").write_text("")
+    (b_dir / ".gitattributes").write_text("*.bin filter=lfs\n")
+    (b_dir / "__pycache__").mkdir()
+    (b_dir / "__pycache__" / "generator.cpython-311.pyc").write_bytes(b"\x00junk")
+
+    a, b = fingerprint_dir(a_dir), fingerprint_dir(b_dir)
+    assert a.tree_sha256 == b.tree_sha256
+    assert a.token_sha256 == b.token_sha256
+
+
+# ── absolute token-delta floor ───────────────────────────────────────────────
+
+def test_abs_delta_floor_boundary(tmp_path):
+    # Three single-token edits: sim stays >= 0.99, absolute delta is exactly 3.
+    tweaked = BASE_SOURCE.replace("size=64", "size=65", 3)
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE),
+        _entry(tmp_path, "twk", 2, tweaked),
+    ]
+    # Cap below the delta: over the ratio bar but a "large" edit — shadow-logged.
+    spared = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
+                               max_abs_delta=2)
+    assert spared.kept_hotkeys == ("orig", "twk")
+    (s,) = [v for v in spared.shadow if v.tier == "near_duplicate_large_delta"]
+    assert s.hotkey == "twk" and s.abs_delta == 3 and s.score >= 0.99
+    # Cap at the delta: dropped as before.
+    at_cap = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
+                               max_abs_delta=3)
+    assert at_cap.kept_hotkeys == ("orig",)
+    assert at_cap.dropped[0].tier == "near_duplicate"
+    assert at_cap.dropped[0].abs_delta == 3
+    # Cap disabled (0): current behavior unchanged.
+    disabled = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    assert disabled.kept_hotkeys == ("orig",)
+
+
+# ── config_only tier ─────────────────────────────────────────────────────────
+
+def test_config_only_shadow_by_default(tmp_path):
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
+        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
+    ]
+    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    # Identical code + differing configs is CLAIMED by the config_only tier:
+    # shadow-logged, kept, and never falls through to a near_duplicate drop
+    # (the raw ratio here is >= 0.99).
+    assert result.kept_hotkeys == ("orig", "swp")
+    assert not result.dropped
+    (v,) = [s for s in result.shadow if s.tier == "config_only"]
+    assert v.hotkey == "swp" and v.matched_hotkey == "orig" and v.score == 1.0
+
+
+def test_config_only_enforced_drops(tmp_path):
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
+        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
+    ]
+    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
+                               config_only_enforce=True)
+    assert result.kept_hotkeys == ("orig",)
+    (v,) = result.dropped
+    assert v.tier == "config_only" and v.hotkey == "swp"
+
+
 # ── behavioral probe ─────────────────────────────────────────────────────────
 
 def test_collapse_identical_behavior_pure():
@@ -301,7 +376,8 @@ def probe_runner(dedup_runner, monkeypatch):
 
     runner, add = dedup_runner
     runner.cfg = replace(runner.cfg,
-                         round=replace(runner.cfg.round, dedup_probe_series=4))
+                         round=replace(runner.cfg.round, dedup_probe_series=4,
+                                       dedup_probe_mode="enforce"))
     ticks = count()
 
     class _Result:
@@ -375,11 +451,44 @@ def test_probe_shadow_mode_drops_nothing(probe_runner, tmp_path):
 
     runner, add = probe_runner
     runner.cfg = replace(runner.cfg,
-                         round=replace(runner.cfg.round, dedup_mode="shadow"))
+                         round=replace(runner.cfg.round, dedup_probe_mode="shadow"))
     a = add("alice", 3, BASE_SOURCE)
     b = add("bobby", 6, OTHER_SOURCE)
     (tmp_path / "repos" / "alice" / "BEHAVIOR").write_text("same-bytes")
     (tmp_path / "repos" / "bobby" / "BEHAVIOR").write_text("same-bytes")
 
+    # Static tiers still ENFORCE; the probe observes: the behavior_identical
+    # verdict is logged in the report but bobby keeps its heat slot.
     kept = runner._screen_duplicate_entrants(None, [a, b], base_seed=84)
     assert [c.hotkey for c in kept] == ["alice", "bobby"]
+    report = json.loads((runner.work_root / "84" / "dedup_report.json").read_text())
+    behav = [d for d in report["dropped"] if d["tier"] == "behavior_identical"]
+    assert behav and behav[0]["enforced"] is False
+
+
+@pytest.mark.parametrize("dedup_mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("probe_mode", ["off", "shadow", "enforce"])
+def test_mode_matrix_static_and_probe_gate_independently(
+        probe_runner, tmp_path, dedup_mode, probe_mode):
+    """All 9 (dedup_mode × dedup_probe_mode) combinations: static drops apply
+    iff dedup_mode == enforce, probe drops iff dedup_probe_mode == enforce,
+    and dedup_mode == off disables the whole screen."""
+    from dataclasses import replace
+
+    runner, add = probe_runner
+    runner.cfg = replace(runner.cfg, round=replace(
+        runner.cfg.round, dedup_mode=dedup_mode, dedup_probe_mode=probe_mode))
+    alice = add("alice", 3, BASE_SOURCE)
+    copy = add("copyc", 7, "# reupload\n" + BASE_SOURCE)   # token-identical → static tier
+    nondet = add("nondt", 9, OTHER_SOURCE)                 # entropy-seeded → probe tier
+    (tmp_path / "repos" / "nondt" / "NONDET").write_text("")
+
+    kept = [c.hotkey for c in runner._screen_duplicate_entrants(
+        None, [alice, copy, nondet], base_seed=90)]
+
+    expected = {"alice", "copyc", "nondt"}
+    if dedup_mode == "enforce":
+        expected -= {"copyc"}
+    if dedup_mode != "off" and probe_mode == "enforce":
+        expected -= {"nondt"}
+    assert set(kept) == expected

@@ -433,13 +433,37 @@ class RoundConfig:
     dedup_mode: str = "off"
     dedup_threshold: float = 0.99
     dedup_shadow_floor: float = 0.90
-    # Behavioral probe (runs under dedup_mode): sandbox-draw this many series
-    # per surviving entrant under the shared round seed, TWICE. Two draws that
-    # differ ⇒ the generator violates the determinism contract (the entropy
-    # re-roll that lets identical code mint distinct corpora) and is dropped.
-    # Identical probe output across two entrants (or vs the king) ⇒ same
-    # generative process regardless of how different the code looks — dropped
-    # as behavior_identical. 0 = probe disabled (static tiers only).
+    # Absolute changed-token cap on the near_duplicate tier (0 = disabled). A
+    # pure ratio dilutes with repo size: at 7–11k tokens of mostly shared
+    # scaffold, 0.99 tolerates ~90–110 changed tokens and lumps a 5-token
+    # rename with a 56-token research edit. When > 0, a near_duplicate drop
+    # requires BOTH sim ≥ dedup_threshold AND changed-token count ≤ this cap;
+    # ratio-over-cap pairs are shadow-logged as near_duplicate_large_delta.
+    # On the observed field (drops 4–56 tokens apart, shadow band 266–1389) a
+    # cap anywhere in 60–260 changes nothing; ~24–40 would spare substantive
+    # edits (including a round's eventual finalist) at the cost of roughly
+    # halving the drop rate. Ship 0 and let the shadow log pick the value.
+    dedup_max_abs_delta: int = 0
+    # config_only tier: identical normalized .py streams, differing functional
+    # config/data files. This is BOTH the observed same-round ticket-spam
+    # pattern (self-declared A/B/C config sweeps) and the legitimate way to
+    # compete by forking a public generator — config IS the product for a data
+    # generator. False (default): shadow-log the verdict, never drop, whatever
+    # dedup_mode says. Flip only after the shadow log shows the split.
+    dedup_config_only_enforce: bool = False
+    # Behavioral probe: sandbox-draw dedup_probe_series series per surviving
+    # entrant under the shared round seed, TWICE. Two draws that differ ⇒ the
+    # generator violates the determinism contract (the entropy re-roll that
+    # lets identical code mint distinct corpora). Identical probe output
+    # across two entrants (or vs the king) ⇒ same generative process
+    # regardless of the code — behavior_identical. dedup_probe_mode gates
+    # probe-derived drops (nondeterministic / probe_failed /
+    # behavior_identical) INDEPENDENTLY of dedup_mode, so the static tiers
+    # can enforce while the probe observes: within-family heat spreads in the
+    # live field suggest nondeterminism is widespread, and probe drops burn
+    # hotkeys — ship shadow, enforce only after the log says it's safe.
+    # 0 series disables the probe regardless of mode.
+    dedup_probe_mode: str = "shadow"   # off | shadow | enforce
     dedup_probe_series: int = 8
     # Timed-reveal safety margin: `cascade deploy` targets its timelock reveal at
     # `epoch boundary − reveal_margin_blocks`, so a submission stays hidden for
@@ -942,6 +966,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_mode=str(r.get("dedup_mode", "off")),
             dedup_threshold=float(r.get("dedup_threshold", 0.99)),
             dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
+            dedup_max_abs_delta=int(r.get("dedup_max_abs_delta", 0)),
+            dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
+            dedup_probe_mode=str(r.get("dedup_probe_mode", "shadow")),
             dedup_probe_series=int(r.get("dedup_probe_series", 8)),
             reveal_margin_blocks=int(r.get("reveal_margin_blocks", 25)),
         ),

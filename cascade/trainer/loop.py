@@ -649,6 +649,8 @@ class TrainerRunner:
                 triples, king_fp,
                 threshold=self.cfg.round.dedup_threshold,
                 shadow_floor=self.cfg.round.dedup_shadow_floor,
+                max_abs_delta=self.cfg.round.dedup_max_abs_delta,
+                config_only_enforce=self.cfg.round.dedup_config_only_enforce,
                 enforce=(mode == "enforce"),
             )
         except Exception as e:  # noqa: BLE001 — the screen must never sink a round
@@ -664,10 +666,15 @@ class TrainerRunner:
         # violate the determinism contract (`cascade verify` enforces the same
         # rule miner-side); identical probe bytes across two survivors (or vs
         # the king) is the same generative process, whatever the code says.
+        # Probe-derived drops are gated on [round] dedup_probe_mode,
+        # INDEPENDENTLY of dedup_mode — the static tiers can enforce while
+        # the probe observes (probe drops burn hotkeys; ship shadow first).
+        probe_mode = (self.cfg.round.dedup_probe_mode or "off").lower()
+        probe_enforce = probe_mode == "enforce"
         probe_dropped: list[dict] = []
         behavior_dropped: tuple = ()
         probe_n = int(self.cfg.round.dedup_probe_series or 0)
-        if probe_n > 0:
+        if probe_n > 0 and probe_mode in ("shadow", "enforce"):
             uid_of = {h: u for h, u, _ in triples}
             survivors = [c for c in entrants
                          if c.hotkey in set(result.kept_hotkeys)]
@@ -690,9 +697,9 @@ class TrainerRunner:
                 except CorpusError as e:
                     tier = ("nondeterministic" if "non-deterministic" in str(e)
                             else "probe_failed")
-                    log.info("dedup[%s]: challenger %s (uid=%s) %s: %s%s", mode,
-                             c.hotkey, c.uid, tier, e,
-                             "" if mode == "enforce" else " — shadow, kept")
+                    log.info("dedup-probe[%s]: challenger %s (uid=%s) %s: %s%s",
+                             probe_mode, c.hotkey, c.uid, tier, e,
+                             "" if probe_enforce else " — shadow, kept")
                     probe_dropped.append({"hotkey": c.hotkey, "uid": c.uid,
                                           "tier": tier, "detail": str(e)[:300]})
                 except Exception as e:  # noqa: BLE001 — infra failure: fail open
@@ -705,10 +712,10 @@ class TrainerRunner:
             behavior_kept, behavior_dropped = collapse_identical_behavior(
                 behaved, king_digest)
             for v in behavior_dropped:
-                log.info("dedup[%s]: challenger %s (uid=%s) is behavior_identical "
-                         "to %s (uid=%s) under the shared seed%s", mode, v.hotkey,
-                         v.uid, v.matched_hotkey, v.matched_uid,
-                         "" if mode == "enforce" else " — shadow, kept")
+                log.info("dedup-probe[%s]: challenger %s (uid=%s) is "
+                         "behavior_identical to %s (uid=%s) under the shared "
+                         "seed%s", probe_mode, v.hotkey, v.uid, v.matched_hotkey,
+                         v.matched_uid, "" if probe_enforce else " — shadow, kept")
 
         for v in result.dropped:
             log.info("dedup[%s]: challenger %s (uid=%s) is %s of %s (uid=%s), "
@@ -725,12 +732,17 @@ class TrainerRunner:
             "mode": mode,
             "threshold": self.cfg.round.dedup_threshold,
             "shadow_floor": self.cfg.round.dedup_shadow_floor,
+            "max_abs_delta": self.cfg.round.dedup_max_abs_delta,
+            "config_only_enforce": self.cfg.round.dedup_config_only_enforce,
+            "probe_mode": probe_mode,
             "probe_series": probe_n,
             "fetch_failed": [{"hotkey": c.hotkey, "uid": c.uid, "ref": c.ref}
                              for c in fetch_failed],
-            "dropped": [vars(v) | {"enforced": mode == "enforce"}
-                        for v in (*result.dropped, *behavior_dropped)],
-            "probe_dropped": probe_dropped,
+            "dropped": [
+                *(vars(v) | {"enforced": mode == "enforce"} for v in result.dropped),
+                *(vars(v) | {"enforced": probe_enforce} for v in behavior_dropped),
+            ],
+            "probe_dropped": [d | {"enforced": probe_enforce} for d in probe_dropped],
             "shadow": [vars(v) for v in result.shadow],
         }
         try:
@@ -740,11 +752,14 @@ class TrainerRunner:
         except OSError as e:
             log.warning("dedup: could not write report for round=%s: %s", base_seed, e)
 
-        if mode != "enforce":
-            return entrants
-        kept = set(result.kept_hotkeys)
-        kept -= {d["hotkey"] for d in probe_dropped}
-        kept -= {v.hotkey for v in behavior_dropped}
+        # Static-tier drops (and unfetchable refs) apply under dedup_mode;
+        # probe-derived drops apply under dedup_probe_mode — independent gates.
+        # (fetch_failed never entered triples, so enforce excludes them too)
+        kept = (set(result.kept_hotkeys) if mode == "enforce"
+                else {c.hotkey for c in entrants})
+        if probe_enforce:
+            kept -= {d["hotkey"] for d in probe_dropped}
+            kept -= {v.hotkey for v in behavior_dropped}
         return [c for c in entrants if c.hotkey in kept]
 
     def _probe_digest(

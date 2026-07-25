@@ -165,6 +165,7 @@ heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
+dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin (see chain.toml)
 # Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
 # (repo@digest) trained as the king whenever no on-chain champion resolves — a
