@@ -316,17 +316,31 @@ def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
 
 
 def test_heat_records_raw_crps_mase_when_screener_reports_them(cfg, tmp_path, monkeypatch):
-    """A screener returning :class:`HeatScore` carries each entrant's raw CRPS and
-    MASE through to the heat standings (published for miner transparency), while
-    ranking still keys on the combined geomean."""
-    from cascade.trainer.loop import HeatScore
+    """A screener returning per-window ``list[WindowScore]`` carries each entrant's
+    raw CRPS and MASE through to the heat standings (published for miner
+    transparency), while ranking still keys on the combined geomean. The reported
+    ``(crps, mase)`` are exactly ``global_components(scores)`` — the same
+    geometric-MASE aggregation the geomean is built from."""
+    import numpy as np
+
+    from cascade.eval.scoring import WindowScore, global_components, global_geomean
+
+    def _scores(scale):
+        rng = np.random.default_rng(4242)  # window draw: same for every entrant
+        return [
+            WindowScore(
+                series_id=str(i),
+                mase=float(rng.uniform(0.5, 1.5)) * scale,
+                qloss_per_q=rng.uniform(0.1, 1.0, size=9) * scale,
+                abs_target=float(rng.uniform(5.0, 10.0)),
+            )
+            for i in range(40)
+        ]
 
     _patch_train_boundaries(monkeypatch)
-    comp = {
-        "b": HeatScore(geomean=0.9, crps=1.4, mase=0.58),
-        "c": HeatScore(geomean=0.2, crps=0.3, mase=0.13),
-        "d": HeatScore(geomean=0.5, crps=0.7, mase=0.36),
-    }
+    scales = {"b": 1.8, "c": 1.0, "d": 1.4}  # c is clearly best
+    comp = {hk: _scores(s) for hk, s in scales.items()}
+
     runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
                            use_sandbox=False,
                            screen_fn=lambda ckpt_dir, gen, base_seed, block=None: comp[gen.hotkey])
@@ -337,10 +351,13 @@ def test_heat_records_raw_crps_mase_when_screener_reports_them(cfg, tmp_path, mo
     by_hk = {e.hotkey: e for e in manifest.heat.entrants}
     # ranking still keys on the geomean — cheapest (c) advances, rel_score = 1.0
     assert by_hk["c"].rank == 1 and by_hk["c"].rel_score == 1.0
-    # ...and the raw components ride through, per entrant
-    assert by_hk["c"].crps == pytest.approx(0.3) and by_hk["c"].mase == pytest.approx(0.13)
-    assert by_hk["d"].crps == pytest.approx(0.7) and by_hk["d"].mase == pytest.approx(0.36)
-    assert by_hk["b"].crps == pytest.approx(1.4) and by_hk["b"].mase == pytest.approx(0.58)
+    # ...and each entrant's raw components are global_components of its own scores
+    for hk in scales:
+        exp_crps, exp_mase = global_components(comp[hk])
+        assert by_hk[hk].crps == pytest.approx(exp_crps)
+        assert by_hk[hk].mase == pytest.approx(exp_mase)
+        # sqrt(crps * mase) reproduces the geomean the ranking used
+        assert (by_hk[hk].crps * by_hk[hk].mase) ** 0.5 == pytest.approx(global_geomean(comp[hk]))
     # survives the manifest round-trip (unsigned, presentational)
     assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
 
