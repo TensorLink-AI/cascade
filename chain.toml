@@ -189,12 +189,13 @@ dedup_phase_seconds = 900
 # suggest nondeterminism is widespread, and probe drops burn hotkeys, so the
 # probe ships SHADOW while the static tiers enforce.
 dedup_probe_mode   = "shadow"    # off | shadow | enforce
-# Probe set to shadow/8 2026-07-26 (owner) — but the probe EXECUTES miner code
-# on the orchestrator even in shadow (shadow gates the drops, not the
-# execution), so _probe_sandbox_ok SELF-DISABLES it until [generator]
-# sandbox_strict = true or container mode. It will log that refusal each round.
-# Arming step remaining: verify worker pods under sandbox_strict, then flip it.
-dedup_probe_series = 8           # 0 = probe off
+# Probe OFF (owner, 2026-07-26): the probe EXECUTES miner code on the
+# orchestrator even in shadow (shadow gates the drops, not the execution).
+# To arm later: verify worker pods + this host under [generator]
+# sandbox_strict = true (or container mode), flip that first, then set
+# series = 8 with probe_mode = "shadow"; enforce only after reviewing
+# shadow verdicts. The static tiers above are independent and stay on.
+dedup_probe_series = 0           # 0 = probe off
 # Total probe wall clock; the per-draw budget is derived from it (budget / waves
 # / 2 draws), so N hostile entrants each burning their clock cannot stretch the
 # stage past this. The probe REFUSES to run unless [generator] has
