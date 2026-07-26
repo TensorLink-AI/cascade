@@ -168,7 +168,9 @@ class HeatEntrant:
     non-finalist submission fared. It carries a ``rank``, a ``rel_score``
     *relative to the best entrant* (``heat_score / best``, ≥ 1.0, where 1.0 is the
     best), and the raw aggregate error components ``crps`` (CRPS-family MWSQL) and
-    ``mase`` on the round's eval-pool slice.
+    ``mase`` (geometric-mean MASE) on the round's eval-pool slice — the same two
+    components the ranking geomean is built from, so ``sqrt(crps * mase)``
+    reproduces the ``heat_score`` behind ``rel_score``.
 
     Note: publishing the raw ``crps``/``mase`` exposes absolute error on the
     private, per-round rotated eval pool — deliberately withheld in earlier
@@ -185,7 +187,7 @@ class HeatEntrant:
     rank: int | None = None        # 1-based placement among scored entrants
     rel_score: float | None = None  # heat_score / best_heat_score (≥ 1.0; 1.0 = best)
     crps: float | None = None      # raw CRPS-family loss (MWSQL) on the eval pool; None if unscored
-    mase: float | None = None      # raw mean MASE on the eval pool; None if unscored
+    mase: float | None = None      # raw geometric-mean MASE on the eval pool; None if unscored
 
     def __post_init__(self) -> None:
         if self.status not in HEAT_STATUSES:
