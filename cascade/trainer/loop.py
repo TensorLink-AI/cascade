@@ -75,10 +75,12 @@ if TYPE_CHECKING:  # keeps the eval stack out of the trainer's import graph
 #
 # Returning the per-window ``list[WindowScore]`` instead of the scalar is
 # preferred: the ranking is identical (the runner reduces with global_geomean),
-# and the components additionally feed the shadow selection diagnostics in
-# cascade.eval.heat — P(best) per entrant and the leader-vs-runner-up LCB, which
-# say whether the screen was decisive. A scalar-only screener still works; the
-# round just carries no diagnostics.
+# and the per-window scores additionally (a) feed the shadow selection
+# diagnostics in cascade.eval.heat — P(best) per entrant and the
+# leader-vs-runner-up LCB, which say whether the screen was decisive — and
+# (b) yield the raw CRPS/MASE components, global_components(scores), published
+# on the heat standings for miner transparency. A scalar-only screener still
+# works; the round then carries neither diagnostics nor per-entrant components.
 ScreenFn = Callable[
     [Path, "ResolvedGenerator", int, int | None], "float | list[WindowScore]"
 ]
@@ -1172,9 +1174,12 @@ class TrainerRunner:
                      "earlier-revealed submission", hk)
 
         scored: list[tuple[float, int, ResolvedGenerator]] = []
-        # Per-window components per entrant, kept only when the screener hands
-        # them over — they feed the shadow diagnostics, never the ranking.
+        # Per-window scores per entrant, kept only when the screener hands them
+        # over — they feed the shadow diagnostics, never the ranking.
         components: dict[str, list] = {}
+        # The (crps, mase) aggregates published on the standings, derived from
+        # the same per-window scores. (None, None) for a scalar-only screener.
+        raw_components: dict[str, tuple[float | None, float | None]] = {}
         for c, ckpt_dir, _ in trained:
             if c.hotkey in duplicates:
                 continue
@@ -1184,8 +1189,14 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
-            if not isinstance(raw, float | int):
-                components[c.hotkey] = list(raw)
+            if isinstance(raw, float | int):  # a bare scalar — no raw components
+                raw_components[c.hotkey] = (None, None)
+            else:  # per-window scores: diagnostics AND the published components
+                from ..eval.scoring import global_components
+
+                scores = list(raw)
+                components[c.hotkey] = scores
+                raw_components[c.hotkey] = global_components(scores)
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
 
@@ -1196,7 +1207,7 @@ class TrainerRunner:
         diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         heat = self._heat_result(
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
-            duplicates=duplicates, diagnostics=diagnostics,
+            duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
         )
         return winners, heat
 
@@ -1255,21 +1266,23 @@ class TrainerRunner:
         *,
         duplicates: set[str] = frozenset(),
         diagnostics=None,
+        components: dict[str, tuple[float | None, float | None]] | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
-        Scores are recorded only *relative to the best entrant* (``score / best``)
-        — the raw numbers stay off the public record so the private, per-round
-        rotated eval pool can't be reverse-engineered from the heat. Entrants that
-        never produced a score are carried too, tagged by how they dropped out:
-        ``duplicate`` (corpus byte-identical to an earlier reveal), ``failed_train``
-        (crashed the screen budget) or ``failed_screen`` (trained but the scorer
-        raised).
+        Each scored entrant carries its ``rel_score`` (``score / best``) plus, when
+        the screener returned per-window scores, its raw ``crps`` and
+        ``mase`` on the round's eval-pool slice — published so miners can see their
+        absolute error, not just the relative ranking. Entrants that never produced
+        a score are carried too, tagged by how they dropped out: ``duplicate``
+        (corpus byte-identical to an earlier reveal), ``failed_train`` (crashed the
+        screen budget) or ``failed_screen`` (trained but the scorer raised).
 
         ``diagnostics`` (a :class:`cascade.eval.heat.HeatDiagnostics`, or None) is
         the shadow measurement of how decisive the screen was. It is recorded
         alongside the standings; it did not influence them.
         """
+        comps = components or {}
         advanced = {c.hotkey for c in winners}
         scored_hotkeys = {c.hotkey for _, _, c in scored}
         best = scored[0][0] if scored else None
@@ -1277,10 +1290,12 @@ class TrainerRunner:
         entrants: list[HeatEntrant] = []
         for rank, (score, _uid, c) in enumerate(scored, start=1):
             rel = (score / best) if (best is not None and best > 0) else None
+            crps, mase = comps.get(c.hotkey, (None, None))
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
                 status="advanced" if c.hotkey in advanced else "screened",
                 rank=rank, rel_score=rel, p_best=p_best.get(c.hotkey),
+                crps=crps, mase=mase,
             ))
         for c in challengers:
             if c.hotkey in scored_hotkeys:

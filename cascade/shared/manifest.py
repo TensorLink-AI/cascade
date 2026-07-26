@@ -165,19 +165,27 @@ class HeatEntrant:
     The heat trains every eligible challenger cheaply and ranks them; only the
     top ``finalists`` advance. Those scores are otherwise thrown away (the heat
     checkpoints are discarded), so this is the miner's only window into how a
-    non-finalist submission fared. It is deliberately coarse: a ``rank`` and a
-    ``rel_score`` *relative to the best entrant* (``heat_score / best``, ≥ 1.0,
-    where 1.0 is the best), never the raw per-window numbers — the eval pool
-    rotates privately and exposing absolute scores would hand a miner a gradient
-    to distribution-match it. ``rank``/``rel_score`` are None for an entrant that
-    never produced a score (``failed_train`` / ``failed_screen``).
+    non-finalist submission fared. It carries a ``rank``, a ``rel_score``
+    *relative to the best entrant* (``heat_score / best``, ≥ 1.0, where 1.0 is the
+    best), and the raw aggregate error components ``crps`` (CRPS-family MWSQL) and
+    ``mase`` (geometric-mean MASE) on the round's eval-pool slice — the same two
+    components the ranking geomean is built from, so ``sqrt(crps * mase)``
+    reproduces the ``heat_score`` behind ``rel_score``.
+
+    Note: publishing the raw ``crps``/``mase`` exposes absolute error on the
+    private, per-round rotated eval pool — deliberately withheld in earlier
+    versions, since an absolute per-round signal can help a miner distribution-
+    match the pool. It is emitted now by owner decision for miner transparency
+    (owner confirmed 2026-07-26; see OPSLOG and DEC-CA-0007 if written).
+    ``rank``/``rel_score``/``crps``/``mase`` are None for an entrant that never
+    produced a score (``failed_train`` / ``failed_screen``).
 
     ``p_best`` is the shadow selection diagnostic (:mod:`cascade.eval.heat`): the
     fraction of joint-bootstrap bags in which this entrant scored best. It says
     how much of the ranking is signal — a leader sitting near ``1 / n_entrants``
-    was ranked by noise — and is safe to publish for the same reason ``rel_score``
-    is: it is a comparison among entrants, not an absolute pool score. None when
-    the screener returned only a scalar (no per-window components to resample).
+    was ranked by noise. Unlike ``crps``/``mase`` it is a comparison among
+    entrants, not an absolute pool score. None when the screener returned only a
+    scalar (no per-window components to resample).
     """
 
     uid: int
@@ -187,6 +195,8 @@ class HeatEntrant:
     rank: int | None = None        # 1-based placement among scored entrants
     rel_score: float | None = None  # heat_score / best_heat_score (≥ 1.0; 1.0 = best)
     p_best: float | None = None    # P(best) over the joint bootstrap; diagnostic only
+    crps: float | None = None      # raw CRPS-family loss (MWSQL) on the eval pool; None if unscored
+    mase: float | None = None      # raw geometric-mean MASE on the eval pool; None if unscored
 
     def __post_init__(self) -> None:
         if self.status not in HEAT_STATUSES:
@@ -271,6 +281,8 @@ def _heat_from_json(obj: object) -> HeatResult | None:
                 rank=(None if e.get("rank") is None else int(e["rank"])),
                 rel_score=(None if e.get("rel_score") is None else float(e["rel_score"])),
                 p_best=(None if e.get("p_best") is None else float(e["p_best"])),
+                crps=(None if e.get("crps") is None else float(e["crps"])),
+                mase=(None if e.get("mase") is None else float(e["mase"])),
             )
             for e in obj.get("entrants", ())
         ),

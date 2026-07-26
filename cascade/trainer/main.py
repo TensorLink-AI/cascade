@@ -346,7 +346,8 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
     scores each heat checkpoint on a per-round-rotated slice, returning the
     per-window scores so the trainer can rank the field down to ``[round]
     finalists`` before the expensive final. The runner reduces them with
-    ``global_geomean`` (lower is better) for the ranking and additionally
+    ``global_geomean`` (lower is better) for the ranking, reports their
+    ``global_components`` (raw CRPS/MASE) on the heat standings, and additionally
     resamples them for the shadow selection diagnostics — every entrant is
     scored on the SAME slice, which is what makes that bootstrap paired.
     ``block`` (the round's epoch boundary) keys a daily-snapshot pool to the same
@@ -370,6 +371,9 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
 
     def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None):
         windows = window_source.windows_for_round(base_seed, n, block=block)
+        # Return the per-window scores: the runner ranks on global_geomean,
+        # publishes global_components (raw CRPS/MASE), and resamples them for
+        # the shadow selection diagnostics.
         return evaluate_checkpoint(
             ckpt_dir, windows, num_samples=num_samples, device="cpu"
         )
