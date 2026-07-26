@@ -690,10 +690,11 @@ class StorageConfig:
     # Private king archive: a dedicated S3-compatible (Cloudflare R2) bucket where
     # `cascade-scrape-kings` saves every generator that has held the throne — the
     # code, fetched from the Hub by its content-addressed ref and packed to a
-    # deterministic tar — plus a ``kings/index.json`` "db" pointing each king back
-    # at its archived object (see cascade.shared.king_archive). This is a permanent
-    # private record of every king, independent of the public Hub repos (which a
-    # miner could delete). ``king_archive_s3_endpoint`` / ``king_archive_s3_region``
+    # deterministic tar — under ``kings/`` plus a ``kings/index.json`` "db", and
+    # EVERY eligible participant generator under ``generators/`` with its own
+    # index (see cascade.shared.king_archive). This is a permanent private record,
+    # independent of the public Hub repos (which a miner could delete).
+    # ``king_archive_s3_endpoint`` / ``king_archive_s3_region``
     # default to the R2 ``backup_*`` values above; ``king_archive_bucket`` defaults
     # to ``cascade-king-archive``. Credentials via KING_ARCHIVE_S3_ACCESS_KEY /
     # KING_ARCHIVE_S3_SECRET_KEY, falling back to the BACKUP_S3_* pair when unset.

@@ -358,11 +358,13 @@ backup_s3_region   = ""                             # empty = "auto" (R2's regio
 backup_bucket      = ""                             # empty = reuse manifest_bucket name
 # Private KING ARCHIVE (Cloudflare R2): `cascade-scrape-kings` saves every
 # generator that has ever held the throne (the code, fetched from the Hub and
-# packed to a tar) here, plus a kings/index.json "db" linking each king to its
-# archived object. A permanent private record, independent of the public Hub
-# repos a miner could delete. Endpoint/region default to the backup_* R2 above;
-# credentials via KING_ARCHIVE_S3_ACCESS_KEY / KING_ARCHIVE_S3_SECRET_KEY
-# (falling back to BACKUP_S3_* when unset). Keep the bucket PRIVATE.
+# packed to a tar) under kings/ plus a kings/index.json "db" — and EVERY
+# eligible participant generator (from each round's full receipt) under
+# generators/ with its own generators/index.json. A permanent private record,
+# independent of the public Hub repos a miner could delete. Endpoint/region
+# default to the backup_* R2 above; credentials via KING_ARCHIVE_S3_ACCESS_KEY
+# / KING_ARCHIVE_S3_SECRET_KEY (falling back to BACKUP_S3_* when unset). Keep
+# the bucket PRIVATE.
 king_archive_bucket      = "cascade-king-archive"
 king_archive_s3_endpoint = ""                       # empty = reuse backup_s3_endpoint
 king_archive_s3_region   = ""                       # empty = reuse backup_s3_region ("auto")

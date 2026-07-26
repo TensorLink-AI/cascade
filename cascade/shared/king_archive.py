@@ -1,4 +1,5 @@
-"""King archive — a permanent private record of every throne-holding generator.
+"""King archive — a permanent private record of every throne-holding generator,
+plus a broader snapshot of EVERY generator that ever fielded a round.
 
 A generator wins the cascade king-of-the-hill and its ``repo@digest`` reigns
 until dethroned. Those generator repos live on the **public** Hippius Hub
@@ -8,22 +9,31 @@ This module snapshots both into a **private** S3-compatible bucket (Cloudflare
 R2), so cascade keeps a durable, independent record of every king even if the
 upstream Hub repo disappears.
 
-Two things are written to the archive bucket:
+Two prefixes are written to the archive bucket, one per scope:
 
 * ``kings/<repo>/<digest>.tar`` — the king's generator code, fetched from the Hub
   by its content-addressed ref and packed to a **deterministic** tar (the same
   reproducible packing the eval-pool snapshots use, so the tar's sha256 is
   stable). Content-addressed by the OCI digest, so the archive is inherently
   append-only and de-duplicated: an already-archived king is never re-fetched.
-* ``kings/index.json`` — the "db": one entry per distinct king generator, each
+  ``kings/index.json`` is the "db": one entry per distinct king generator, each
   pointing back at its archived object (``archive_key`` / ``archive_url``) with
   the throne attribution (hotkey, uid, the rounds it reigned).
+* ``generators/<repo>/<digest>.tar`` + ``generators/index.json`` — the same
+  treatment for **every eligible participant generator**, king or not. The
+  compact receipt index only names the king and the duel challenger, so
+  :func:`sync_generators` follows each round entry's ``receipt_key`` to the full
+  signed receipt and archives every ``participants[].gen_ref`` it names.
+  Attribution keeps the EARLIEST ``commit_block`` seen per ref — a UID recycles,
+  a block number doesn't (see the operational invariants) — and the db tracks
+  which rounds it has already scanned so old receipts aren't re-read every run.
 
 The source of truth for *who was king* is the validator's public
 ``receipts/index.json`` (see :func:`cascade.shared.hippius.read_receipt_index`);
 :func:`collect_king_refs` distils the throne history from it. Everything here is
-stdlib-only and pure except :func:`sync_kings`, which drives the Hub fetch + S3
-writes through injectable seams so it unit-tests without a network.
+stdlib-only and pure except :func:`sync_kings` / :func:`sync_generators`, which
+drive the Hub fetch + S3 writes through injectable seams so they unit-test
+without a network.
 """
 
 from __future__ import annotations
@@ -49,6 +59,9 @@ from .hippius import (
 
 KING_INDEX_KEY = "kings/index.json"
 KING_INDEX_SCHEMA = 1
+
+GENERATOR_INDEX_KEY = "generators/index.json"
+GENERATOR_INDEX_SCHEMA = 1
 
 
 # ───────────────────────────── who was king (pure) ──────────────────────────
@@ -148,19 +161,129 @@ def collect_king_refs(index_doc: dict) -> OrderedDict[str, dict]:
     return ordered
 
 
+# ──────────────────── every participant generator (pure-ish) ────────────────
+
+
+def collect_participant_refs(
+    index_doc: dict,
+    read_receipt,
+    *,
+    skip_rounds: set[str] | frozenset[str] = frozenset(),
+) -> tuple[OrderedDict[str, dict], list[str]]:
+    """Collect every participant generator ref from the rounds' full receipts.
+
+    The compact ``receipts/index.json`` entries only name the king and the duel
+    challenger; the complete eligible-entrant list (``participants[].gen_ref``)
+    lives on each round's full signed receipt, pointed at by the entry's
+    ``receipt_key``. This walks the index chronologically, reads ONE receipt per
+    ``round_id`` not in ``skip_rounds`` (participants are eligibility-derived,
+    so any validator's receipt for the round names the same set), and folds each
+    participant into an ordered ``{gen_ref: attribution}`` map.
+
+    ``read_receipt(receipt_key) -> dict | None`` is injectable; a ``None``
+    (unreadable/missing receipt) leaves that round UNSCANNED so a later sync
+    retries it. Returns ``(refs, scanned_round_ids)`` — only successfully read
+    rounds appear in ``scanned_round_ids``.
+
+    Attribution per ref: ``repo`` / ``digest``, the ``hotkey`` / ``uid`` /
+    ``commit_block`` of its EARLIEST commit (a UID recycles; the block number is
+    the seniority claim), first/last round seen, and ``rounds_seen``. Because
+    each round is scanned exactly once across syncs, ``rounds_seen`` merges
+    additively (:func:`_merge_generator_attribution`).
+    """
+    gens: OrderedDict[str, dict] = OrderedDict()
+    scanned: list[str] = []
+
+    rounds = index_doc.get("rounds", []) if isinstance(index_doc, dict) else []
+    rounds = [r for r in rounds if isinstance(r, dict) and r.get("receipt_key")]
+    # One receipt per round: group the (round, validator) entries by round_id,
+    # chronological, deterministic receipt order within a round.
+    by_round: OrderedDict[str, list[dict]] = OrderedDict()
+    for rnd in sorted(rounds, key=lambda r: (int(r.get("epoch_start_block", 0) or 0),
+                                             str(r.get("round_id", "")))):
+        rid = str(rnd.get("round_id", ""))
+        if rid and rid not in skip_rounds:
+            by_round.setdefault(rid, []).append(rnd)
+
+    for rid, entries in by_round.items():
+        doc = None
+        eb = int(entries[0].get("epoch_start_block", 0) or 0)
+        for rnd in sorted(entries, key=lambda r: str(r.get("validator_hotkey") or "")):
+            doc = read_receipt(str(rnd.get("receipt_key")))
+            if isinstance(doc, dict):
+                break
+            doc = None
+        if doc is None:
+            continue  # unreadable this run; not marked scanned, retried next sync
+        scanned.append(rid)
+
+        participants = doc.get("participants") or []
+        for p in participants:
+            if not isinstance(p, dict):
+                continue
+            gen_ref = str(p.get("gen_ref") or "")
+            if not gen_ref or not is_hub_ref(gen_ref):
+                continue
+            try:
+                ref = HubRef.parse(gen_ref)
+            except StorageError:
+                continue
+            cb = p.get("commit_block")
+            cb = int(cb) if cb is not None else None
+            cur = gens.get(gen_ref)
+            if cur is None:
+                cur = {
+                    "gen_ref": gen_ref,
+                    "repo": ref.repo,
+                    "digest": ref.digest,
+                    "hotkey": str(p["hotkey"]) if p.get("hotkey") else None,
+                    "uid": (int(p["uid"]) if p.get("uid") is not None else None),
+                    "commit_block": cb,
+                    "first_round_id": rid,
+                    "first_epoch_start_block": eb,
+                    "last_round_id": rid,
+                    "last_epoch_start_block": eb,
+                    "rounds_seen": 1,
+                    "_seen_round": rid,
+                }
+                gens[gen_ref] = cur
+                continue
+            # Two hotkeys can commit the same ref; the earliest commit owns it.
+            if cb is not None and (cur["commit_block"] is None or cb < cur["commit_block"]):
+                cur["commit_block"] = cb
+                cur["hotkey"] = str(p["hotkey"]) if p.get("hotkey") else cur["hotkey"]
+                cur["uid"] = int(p["uid"]) if p.get("uid") is not None else cur["uid"]
+            cur["last_round_id"] = rid
+            cur["last_epoch_start_block"] = eb
+            if cur["_seen_round"] != rid:      # count rounds, not appearances
+                cur["rounds_seen"] += 1
+                cur["_seen_round"] = rid
+
+    for cur in gens.values():
+        cur.pop("_seen_round", None)
+    return gens, scanned
+
+
 # ─────────────────────────── archive addressing (pure) ──────────────────────
 
 
-def archive_key_for_ref(gen_ref: str) -> str:
-    """The archive object key for a king generator ref (content-addressed).
+def archive_key_for_ref(gen_ref: str, prefix: str = "kings") -> str:
+    """The archive object key for a generator ref (content-addressed).
 
-    ``<repo>@<scheme>:<hex>`` → ``kings/<repo>/<scheme>-<hex>.tar``. The OCI
+    ``<repo>@<scheme>:<hex>`` → ``<prefix>/<repo>/<scheme>-<hex>.tar``. The OCI
     digest pins the content, so the key is stable and collision-free: the same
     generator always maps to the same object, which is what makes the archive
-    append-only.
+    append-only. Kings live under ``kings/``; the every-participant snapshot
+    lives under ``generators/`` (a king therefore appears under both prefixes —
+    two dbs, two audiences, and the tar bytes are identical by construction).
     """
     ref = HubRef.parse(gen_ref)
-    return f"kings/{ref.repo}/{ref.digest.replace(':', '-')}.tar"
+    return f"{prefix}/{ref.repo}/{ref.digest.replace(':', '-')}.tar"
+
+
+def generator_key_for_ref(gen_ref: str) -> str:
+    """The ``generators/`` snapshot key for any participant generator ref."""
+    return archive_key_for_ref(gen_ref, prefix="generators")
 
 
 def archive_url(endpoint: str, bucket: str, key: str) -> str:
@@ -184,6 +307,24 @@ def read_king_index(store: S3Store) -> dict:
         return empty
     if not isinstance(doc, dict) or not isinstance(doc.get("kings"), list):
         return empty
+    return doc
+
+
+def read_generator_index(store: S3Store) -> dict:
+    """Read ``generators/index.json``; return an empty index if absent/malformed."""
+    empty = {"schema": GENERATOR_INDEX_SCHEMA, "generators": [], "scanned_rounds": []}
+    try:
+        text = store.get_text(GENERATOR_INDEX_KEY)
+    except StorageError:
+        return empty
+    try:
+        doc = json.loads(text)
+    except (ValueError, TypeError):
+        return empty
+    if not isinstance(doc, dict) or not isinstance(doc.get("generators"), list):
+        return empty
+    if not isinstance(doc.get("scanned_rounds"), list):
+        doc["scanned_rounds"] = []
     return doc
 
 
@@ -230,22 +371,68 @@ def _merge_attribution(old: dict, new: dict) -> dict:
     return merged
 
 
+def _generator_attribution_fields(attr: dict) -> dict:
+    """The participation-history fields of a ``generators/`` index entry."""
+    return {
+        "gen_ref": attr["gen_ref"],
+        "repo": attr["repo"],
+        "digest": attr["digest"],
+        "hotkey": attr.get("hotkey"),
+        "uid": attr.get("uid"),
+        "commit_block": attr.get("commit_block"),
+        "first_round_id": attr.get("first_round_id"),
+        "first_epoch_start_block": attr.get("first_epoch_start_block"),
+        "last_round_id": attr.get("last_round_id"),
+        "last_epoch_start_block": attr.get("last_epoch_start_block"),
+        "rounds_seen": attr.get("rounds_seen", 0),
+    }
+
+
+def _merge_generator_attribution(old: dict, new: dict) -> dict:
+    """Fold a prior ``generators/`` entry into a freshly-collected one.
+
+    Unlike the kings merge, ``rounds_seen`` is ADDITIVE: each round is scanned
+    exactly once across syncs (the db's ``scanned_rounds`` gate), so old and new
+    counts cover disjoint rounds. Ownership follows the EARLIEST commit_block —
+    a UID recycles, a block number doesn't.
+    """
+    merged = dict(new)
+    if int(old.get("first_epoch_start_block", 1 << 62)) <= int(new.get("first_epoch_start_block", 0)):
+        merged["first_epoch_start_block"] = old.get("first_epoch_start_block")
+        merged["first_round_id"] = old.get("first_round_id")
+    if int(old.get("last_epoch_start_block", -1)) >= int(new.get("last_epoch_start_block", 0)):
+        merged["last_epoch_start_block"] = old.get("last_epoch_start_block")
+        merged["last_round_id"] = old.get("last_round_id")
+    merged["rounds_seen"] = int(old.get("rounds_seen", 0)) + int(new.get("rounds_seen", 0))
+    old_cb, new_cb = old.get("commit_block"), new.get("commit_block")
+    if old_cb is not None and (new_cb is None or int(old_cb) <= int(new_cb)):
+        merged["commit_block"] = old_cb
+        merged["hotkey"] = old.get("hotkey") or new.get("hotkey")
+        merged["uid"] = old.get("uid") if old.get("uid") is not None else new.get("uid")
+    return merged
+
+
 # ───────────────────────────── sync orchestration ───────────────────────────
 
 
 @dataclass
 class SyncResult:
-    """Outcome of a :func:`sync_kings` run."""
+    """Outcome of a :func:`sync_kings` / :func:`sync_generators` run."""
 
-    archived: int = 0          # kings fetched + uploaded this run
-    skipped: int = 0           # already-archived kings (metadata refreshed only)
-    would_archive: int = 0     # dry-run: kings that WOULD be fetched + uploaded
+    archived: int = 0          # generators fetched + uploaded this run
+    skipped: int = 0           # already-archived (metadata refreshed only)
+    would_archive: int = 0     # dry-run: generators that WOULD be fetched + uploaded
+    rounds_scanned: int = 0    # sync_generators: receipts newly read this run
     failed: list[str] = field(default_factory=list)   # gen_refs that errored
-    index: dict = field(default_factory=dict)         # the written kings/index.json
+    index: dict = field(default_factory=dict)         # the written index.json
 
     @property
     def total_kings(self) -> int:
         return len(self.index.get("kings", []))
+
+    @property
+    def total_generators(self) -> int:
+        return len(self.index.get("generators", []))
 
 
 def king_archive_config(storage: object) -> tuple[S3Config, str, str]:
@@ -390,5 +577,128 @@ def sync_kings(
         )
         log(f"wrote {KING_INDEX_KEY}: {len(entries)} king(s) "
             f"({result.archived} new, {result.skipped} already archived)")
+
+    return result
+
+
+def sync_generators(
+    *,
+    manifest_store: S3Store,
+    archive_store: S3Store,
+    hub: HubConfig,
+    endpoint: str,
+    bucket: str,
+    dry_run: bool = False,
+    updated_at: str = "",
+    fetch=fetch_from_hub,
+    pack=pack_dir_to_tar,
+    tmp_root: str | None = None,
+    log=lambda _msg: None,
+) -> SyncResult:
+    """Snapshot EVERY participant generator into the archive's ``generators/`` dir.
+
+    Broader sibling of :func:`sync_kings`, same bucket, different prefix: walks
+    the receipt index, follows each not-yet-scanned round's ``receipt_key`` to
+    the full receipt, and archives every ``participants[].gen_ref`` — kings,
+    challengers, and everyone the heat screened out alike. Content-addressed and
+    append-only like the kings dir; an entry that previously failed to fetch
+    (no ``tar_sha256``) is retried on every run until it lands, and successfully
+    scanned rounds are recorded in the db so their receipts are never re-read.
+
+    Writes ``generators/index.json`` (skipped on ``dry_run``; a dry run also
+    leaves ``scanned_rounds`` unrecorded). Returns a :class:`SyncResult`.
+    """
+    index_doc = read_receipt_index(manifest_store)
+    prior = read_generator_index(archive_store)
+    prior_by_ref = {str(e.get("gen_ref")): dict(e) for e in prior.get("generators", [])
+                    if isinstance(e, dict)}
+    scanned_prior = {str(r) for r in prior.get("scanned_rounds", [])}
+
+    def read_receipt(receipt_key: str) -> dict | None:
+        try:
+            return json.loads(manifest_store.get_text(receipt_key))
+        except (StorageError, ValueError, TypeError):
+            return None
+
+    gens, newly_scanned = collect_participant_refs(
+        index_doc, read_receipt, skip_rounds=scanned_prior)
+    result = SyncResult(rounds_scanned=len(newly_scanned))
+    log(f"scanned {len(newly_scanned)} new round receipt(s): "
+        f"{len(gens)} distinct participant generator(s)")
+
+    # Seed from the prior db (same reasoning as sync_kings: the archive is
+    # permanent, the receipt window is not, and a transient empty read must
+    # never blank the db).
+    merged: dict[str, dict] = dict(prior_by_ref)
+    for gen_ref, attr in gens.items():
+        base = _generator_attribution_fields(attr)
+        old = prior_by_ref.get(gen_ref)
+        if old:
+            base = _merge_generator_attribution(old, base)
+            for k in ("tar_sha256", "size_bytes", "archived_at"):
+                if old.get(k) is not None:
+                    base[k] = old[k]
+        merged[gen_ref] = base
+
+    for gen_ref, entry in merged.items():
+        try:
+            key = generator_key_for_ref(gen_ref)
+        except StorageError:
+            continue  # a malformed prior entry must not kill the sync
+        entry["archive_key"] = key
+        entry["archive_url"] = archive_url(endpoint, bucket, key)
+
+        if entry.get("tar_sha256"):
+            result.skipped += 1
+            continue
+
+        if dry_run:
+            log(f"WOULD SNAPSHOT {gen_ref} -> {key}")
+            entry.setdefault("tar_sha256", None)
+            entry.setdefault("size_bytes", None)
+            entry.setdefault("archived_at", None)
+            result.would_archive += 1
+            continue
+
+        try:
+            with tempfile.TemporaryDirectory(dir=tmp_root, prefix="gen-") as td:
+                dest = fetch(gen_ref, Path(td) / "gen", hub)
+                tar_bytes = pack(dest)
+            sha = tar_cid_digest(tar_bytes)
+            archive_store.put_bytes(key, tar_bytes, content_type="application/x-tar")
+            entry["tar_sha256"] = sha
+            entry["size_bytes"] = len(tar_bytes)
+            entry["archived_at"] = updated_at
+            result.archived += 1
+            log(f"snapshotted {gen_ref} -> {key} ({len(tar_bytes)} bytes, sha256 {sha[:12]}…)")
+        except (StorageError, OSError) as e:
+            log(f"FAILED {gen_ref}: {type(e).__name__}: {e}")
+            result.failed.append(gen_ref)
+            # Entry stays in the db without tar_sha256 ⇒ retried next run.
+            entry.setdefault("tar_sha256", None)
+            entry.setdefault("size_bytes", None)
+            entry.setdefault("archived_at", None)
+
+    entries = sorted(merged.values(),
+                     key=lambda e: (int(e.get("first_epoch_start_block", 0) or 0),
+                                    str(e.get("first_round_id", ""))))
+    doc: dict = {
+        "schema": GENERATOR_INDEX_SCHEMA,
+        "endpoint": endpoint,
+        "bucket": bucket,
+        "generators": entries,
+        "scanned_rounds": sorted(scanned_prior | set(newly_scanned)),
+    }
+    if updated_at:
+        doc["updated_at"] = updated_at
+    result.index = doc
+
+    if not dry_run:
+        archive_store.put_text(
+            GENERATOR_INDEX_KEY, json.dumps(doc, indent=2, sort_keys=True),
+            content_type="application/json",
+        )
+        log(f"wrote {GENERATOR_INDEX_KEY}: {len(entries)} generator(s) "
+            f"({result.archived} new, {result.skipped} already snapshotted)")
 
     return result
