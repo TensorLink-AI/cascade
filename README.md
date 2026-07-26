@@ -284,12 +284,13 @@ generator code from the Hub — packed to a deterministic tar — to a **private
 R2 bucket (`[storage] king_archive_bucket`) in two dirs. `kings/` holds every
 generator that has ever held the throne, plus a `kings/index.json` "db" that
 links each king to its archived object (with the owning hotkey/uid and the
-rounds it reigned). `generators/` holds **every eligible participant
-generator**, king or not — the compact index only names the king and duel
-challenger, so the scraper follows each round's `receipt_key` to the full
-signed receipt and snapshots every `participants[].gen_ref`, with a
-`generators/index.json` db (earliest commit block owns the attribution, and
-already-scanned rounds are never re-read). Both dirs are content-addressed and
+rounds it reigned). `generators/<hotkey>/` holds **every eligible participant
+generator**, king or not, grouped by the committing miner — the compact index
+only names the king and duel challenger, so the scraper follows each round's
+`receipt_key` to the full signed receipt and snapshots every
+`participants[].gen_ref`, with a `generators/index.json` db keeping one entry
+per (hotkey, generator) — each with that miner's earliest commit block — and
+already-scanned rounds are never re-read. Both dirs are content-addressed and
 append-only — a generator already saved is never re-fetched — so it's cheap to
 run on a schedule (`.github/workflows/scrape-kings.yml` runs it daily). Endpoint
 and credentials default to the same R2 account chain.toml already uses for the

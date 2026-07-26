@@ -8,9 +8,10 @@ and packed to a deterministic tar — into a **private** S3-compatible
 
 * ``kings/`` — every generator that has ever held the throne, plus a
   ``kings/index.json`` "db" linking each king to its archived object.
-* ``generators/`` — EVERY eligible participant generator, king or not,
-  gathered from each round's full signed receipt (the compact index only
-  names the king and duel challenger), plus ``generators/index.json``.
+* ``generators/<hotkey>/`` — EVERY eligible participant generator, king or
+  not, grouped by the committing miner and gathered from each round's full
+  signed receipt (the compact index only names the king and duel challenger),
+  plus ``generators/index.json`` with one entry per (hotkey, generator).
 
 See :mod:`cascade.shared.king_archive`.
 

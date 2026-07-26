@@ -691,8 +691,9 @@ class StorageConfig:
     # `cascade-scrape-kings` saves every generator that has held the throne — the
     # code, fetched from the Hub by its content-addressed ref and packed to a
     # deterministic tar — under ``kings/`` plus a ``kings/index.json`` "db", and
-    # EVERY eligible participant generator under ``generators/`` with its own
-    # index (see cascade.shared.king_archive). This is a permanent private record,
+    # EVERY eligible participant generator under ``generators/<hotkey>/`` (grouped
+    # by committing miner) with its own index (see cascade.shared.king_archive).
+    # This is a permanent private record,
     # independent of the public Hub repos (which a miner could delete).
     # ``king_archive_s3_endpoint`` / ``king_archive_s3_region``
     # default to the R2 ``backup_*`` values above; ``king_archive_bucket`` defaults

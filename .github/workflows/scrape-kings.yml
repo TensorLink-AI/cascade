@@ -4,8 +4,9 @@
 # manifest bucket) and saves generator code — fetched from the Hippius Hub,
 # packed to a deterministic tar — to the PRIVATE R2 [storage]
 # king_archive_bucket in two dirs: kings/ (every throne-holder, with a
-# kings/index.json "db") and generators/ (EVERY eligible participant, gathered
-# from each round's full signed receipt, with generators/index.json). See
+# kings/index.json "db") and generators/<hotkey>/ (EVERY eligible participant,
+# grouped by committing miner, gathered from each round's full signed receipt,
+# with generators/index.json). See
 # scripts/scrape_kings.py and cascade.shared.king_archive.
 #
 # The archive is content-addressed + append-only: a generator already in the
