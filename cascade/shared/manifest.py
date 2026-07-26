@@ -186,6 +186,13 @@ class HeatEntrant:
     was ranked by noise. Unlike ``crps``/``mase`` it is a comparison among
     entrants, not an absolute pool score. None when the screener returned only a
     scalar (no per-window components to resample).
+
+    ``note`` is a short human-readable reason attached by the trainer — the
+    failure cause for a ``failed_train``/``failed_screen`` entrant (e.g.
+    ``generator_artifact_unreachable: HTTP 401``), the matched earlier reveal
+    for a ``duplicate``, or budget telemetry (``deadline_hit``) for a scored
+    one. Informational like the rest of the heat block; None when the trainer
+    had nothing to attach (including every pre-``note`` manifest).
     """
 
     uid: int
@@ -197,6 +204,7 @@ class HeatEntrant:
     p_best: float | None = None    # P(best) over the joint bootstrap; diagnostic only
     crps: float | None = None      # raw CRPS-family loss (MWSQL) on the eval pool; None if unscored
     mase: float | None = None      # raw geometric-mean MASE on the eval pool; None if unscored
+    note: str | None = None        # trainer-attached reason/telemetry; miner feedback only
 
     def __post_init__(self) -> None:
         if self.status not in HEAT_STATUSES:
@@ -283,6 +291,7 @@ def _heat_from_json(obj: object) -> HeatResult | None:
                 p_best=(None if e.get("p_best") is None else float(e["p_best"])),
                 crps=(None if e.get("crps") is None else float(e["crps"])),
                 mase=(None if e.get("mase") is None else float(e["mase"])),
+                note=(None if e.get("note") is None else str(e["note"])),
             )
             for e in obj.get("entrants", ())
         ),

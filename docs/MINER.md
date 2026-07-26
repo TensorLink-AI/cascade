@@ -13,6 +13,7 @@ At a glance:
 ```
 fork a generator → cascade verify → make a wallet → register on the subnet
    → set Hippius creds → cascade deploy → confirm it competes in a round
+   → cascade results (see where you placed and why) → improve → re-deploy
 ```
 
 ## 0. Install
@@ -394,11 +395,59 @@ king. Verify any round independently with `cascade-audit latest` (see
 [`AUDIT.md`](AUDIT.md)).
 
 The dashboard's **Heat** panel shows where every entrant placed in the screen —
-your rank, your score *relative to the best entrant* (not the raw numbers; the
-eval pool rotates privately), and whether you advanced, were screened out, or
-failed to train. It's the fastest read on how close a non-winning submission
-was. The standings ride the latest receipt's embedded manifest as an
-informational (unsigned) block, so they never affect the signed verdict.
+your rank, your score *relative to the best entrant*, your raw CRPS/MASE on the
+round's eval slice, and whether you advanced, were screened out, or failed to
+train (hover a failure pill for the trainer's reason). The standings ride the
+latest receipt's embedded manifest as an informational (unsigned) block, so
+they never affect the signed verdict. For the same data — plus the diagnosis —
+in your terminal, use `cascade results` (next section).
+
+## 7. See where you went wrong — `cascade results`
+
+`cascade results` pulls **your** row out of a round's public receipt and turns
+it into a diagnosis: where you placed, how far you were from advancing, *why*
+you dropped out, and — if you made the duel — where you beat or lost to the
+opponent. Read-only, no wallet, no chain connection; receipts are public.
+
+```bash
+cascade results 47                       # your UID (or hotkey), latest round
+# cascade results — uid 47 (5F3sab…8kQz)
+#   round           2269901645662351552  ·  status: scored
+#   heat            screened — rank 3 / 9 scored  (12 entrants · 2 advance · screened at toto2-4m)
+#     score         1.8% behind the leader · 0.4% behind the last finalist
+#     components    crps 0.4127 · mase 0.3891  (geomean 0.4007, lower is better)
+#     p_best        0.110 — bootstrap probability this entry was truly the round's best
+#     read          screened out at rank 3 of 9; 1.8% behind the leader; 0.4% behind
+#                   the last finalist — that is the gap to close; (the screen itself
+#                   was not decisive: leader_lcb ≤ 0, …)
+#   next steps      - iterate offline against the reigning best: `cascade fetch king` + …
+
+cascade results 47 --round <id>          # a specific past round
+cascade results 47 --history 8           # one line per round — your progress over time
+cascade results 47 --json                # machine-readable (for your own tooling)
+cascade results 47 --receipt round.json  # offline, from a saved receipt
+```
+
+What it can tell you that the rank alone can't:
+
+- **The gap that matters.** Behind-the-*leader* is bragging distance;
+  behind-the-*last-finalist* is the number you have to close to reach the duel.
+- **Why a dropout dropped.** The trainer now attaches its reason to the
+  standings: `failed_train` shows e.g. `generator_artifact_unreachable: HTTP
+  401` (your Hub repo is private — [§5](#5-deploy)), a `duplicate` names the
+  earlier reveal that owns the content, and a scored-but-starved run shows
+  `deadline_hit: … trained on 41% of the budget` (your generator was too slow
+  to feed the trainer — make `generate()` faster, not richer). Rounds run
+  before this reporting existed simply show no note.
+- **Where a duel was won or lost.** For a finalist (or the king) the receipt
+  carries every per-window score, so the report breaks the verdict down per
+  eval domain and per upstream feed — worst feeds first. A close loss is
+  called out explicitly: `lcb > 0` but under the win margin means you measured
+  *better* than the king, just not decisively enough.
+
+The report is derived entirely from the validator-signed receipt — the same
+document `cascade-audit` verifies — so everything it says is independently
+re-derivable.
 
 ## Study the competition
 
@@ -430,5 +479,6 @@ needed, just Hub read credentials.
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
-| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it) |
-| loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape |
+| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train — `cascade results <uid>` shows the trainer's reason ([§7](#7-see-where-you-went-wrong--cascade-results)) |
+| `failed_train` / `failed_screen` in the standings | `cascade results <uid>` prints the trainer's note (unreachable artifact, crash, degenerate output); reproduce with `cascade verify` + `cascade score` before redeploying |
+| loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade results <uid> --history 8` tracks whether the gap to the finalists is actually closing |

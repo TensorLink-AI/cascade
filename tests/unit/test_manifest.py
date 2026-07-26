@@ -197,7 +197,8 @@ def test_heat_is_unsigned_and_round_trips():
                         rank=1, rel_score=1.0),
             HeatEntrant(uid=2, hotkey="hk2", gen_ref=REF, status="screened",
                         rank=2, rel_score=1.08),
-            HeatEntrant(uid=3, hotkey="hk3", gen_ref=REF, status="failed_train"),
+            HeatEntrant(uid=3, hotkey="hk3", gen_ref=REF, status="failed_train",
+                        note="generator_artifact_unreachable: HTTP 401 for x@sha256:ab"),
         ),
     )
     m = replace(base, heat=heat)
@@ -205,6 +206,28 @@ def test_heat_is_unsigned_and_round_trips():
     assert again.heat == heat
     # heat is informational: it must NOT change what the trainer signs.
     assert m.canonical_body() == base.canonical_body()
+
+
+def test_heat_entrant_note_absent_on_older_manifests():
+    # Manifests written before HeatEntrant.note simply lack the key — they must
+    # load with note=None, not raise (the wire is forward-written, never migrated).
+    import json
+
+    base = TrainingManifest(
+        round_id="42", created_block=1000,
+        contract_digest=contract_digest({"epochs": 3}), base_arch_digest="a" * 64,
+        eval_dataset="gift-eval", entries=[_entry("king", 0), _entry("challenger", 1)],
+        signature="sig",
+    )
+    m = replace(base, heat=HeatResult(
+        screen_size="toto2-4m", finalists=1,
+        entrants=(HeatEntrant(uid=1, hotkey="hk1", gen_ref=REF, status="failed_train"),),
+    ))
+    wire = json.loads(dump_manifest(m))
+    assert "note" in wire["heat"]["entrants"][0]  # written explicitly (None)
+    del wire["heat"]["entrants"][0]["note"]       # simulate a pre-note manifest
+    again = load_manifest(json.dumps(wire))
+    assert again.heat.entrants[0].note is None
 
 
 def test_heat_rejects_unknown_status():

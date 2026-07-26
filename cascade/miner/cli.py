@@ -39,6 +39,16 @@
   the competition: beat the visible best, don't hide. Read-only; no wallet
   needed, only the ``[chain]``/``[hippius]`` extras + Hub credentials.
 
+* ``cascade results <uid|hotkey>`` — pull YOUR result out of a round's public
+  receipt: your heat standing (rank, % behind the leader AND behind the last
+  finalist, raw CRPS/MASE, the trainer's failure note when you dropped out)
+  and — if you were in the duel — the verdict with a per-domain and
+  per-upstream-feed breakdown of where you beat or lost to the opponent,
+  plus concrete next steps. ``--round <id>`` for a past round, ``--history N``
+  for a one-line-per-round progress view, ``--json`` for scripts,
+  ``--receipt FILE`` for offline. Read-only; no wallet, no chain — receipts
+  are public.
+
 * ``cascade round`` — a live terminal dashboard counting down to the next
   round: current block, epoch progress, and the submission deadline (the next
   epoch boundary — commit strictly before it to enter that round). Also shows
@@ -338,6 +348,114 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
     print(report.render())
     return 0 if report.ok else 1
+
+
+def _add_results(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "results",
+        help="Pull YOUR result from a round's public receipt: heat standing, gap "
+        "to the finalists, failure reason, and the duel breakdown — the feedback "
+        "loop after a deploy. Read-only; no wallet, no chain.",
+    )
+    p.add_argument("who", help="Your miner UID (int) or hotkey (ss58).")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--round", default=None, dest="round_id",
+                   help="A specific round id (default: the latest published receipt).")
+    p.add_argument("--validator", default="",
+                   help="Read one validator's receipts (ss58) instead of the shared latest.")
+    p.add_argument("--receipt", type=Path, default=None,
+                   help="Read a local receipt JSON instead of fetching (offline).")
+    p.add_argument("--history", type=int, default=None, metavar="N",
+                   help="One line per round across the last N published rounds "
+                   "(max 20) — your progress over time.")
+    p.add_argument("--json", action="store_true", help="Emit the machine-readable report.")
+    p.set_defaults(func=_cmd_results)
+
+
+def _fetch_receipt(cfg, round_id: str | None, validator: str) -> str:
+    """One receipt's JSON text (anonymous-first S3 GET; see cascade.audit.main)."""
+    from ..audit.main import fetch_receipt_text
+
+    return fetch_receipt_text(cfg, round_id, validator)
+
+
+def _cmd_results(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from ..shared.receipt import load_receipt
+    from .results import build_report, render_report
+
+    cfg = load_chain_config(args.chain_toml)
+
+    if args.history is not None:
+        return _cmd_results_history(args, cfg)
+
+    if args.receipt is not None:
+        text = args.receipt.read_text(encoding="utf-8")
+    else:
+        try:
+            text = _fetch_receipt(cfg, args.round_id, args.validator)
+        except SystemExit as e:  # fetch_receipt_text raises with a helpful message
+            print(e, file=sys.stderr)
+            return 3
+    try:
+        receipt = load_receipt(text)
+    except (ValueError, KeyError) as e:
+        print(f"unreadable receipt: {e}", file=sys.stderr)
+        return 1
+    report = build_report(receipt, args.who)
+    print(_json.dumps(report, indent=2, sort_keys=True) if args.json
+          else render_report(report))
+    return 0
+
+
+def _cmd_results_history(args: argparse.Namespace, cfg) -> int:
+    """``results --history N``: a compact per-round progress feed for one miner,
+    walking the public receipt index newest-first (each row needs the full
+    receipt — the index alone carries no per-entrant standings)."""
+    import json as _json
+
+    from ..shared.receipt import load_receipt
+    from .dashboard import fetch_public_receipt_index
+    from .results import build_report, compact_row
+
+    n = max(1, min(int(args.history), 20))
+    index = fetch_public_receipt_index(cfg.storage)
+    if index is None:
+        print("could not fetch the public receipt index (offline, or storage "
+              "unreachable) — try `cascade results <who>` for the latest round only.",
+              file=sys.stderr)
+        return 3
+    rounds = [r for r in index.get("rounds", []) if isinstance(r, dict)]
+    rounds.sort(key=lambda r: (int(r.get("epoch_start_block") or 0),
+                               str(r.get("published_at") or "")), reverse=True)
+    from ..audit.main import _fetch_text  # anonymous-first bucket GET
+
+    reports: list[dict] = []
+    for entry in rounds[:n]:
+        rid = str(entry.get("round_id") or "")
+        key = entry.get("receipt_key")
+        try:
+            # Each index entry points straight at its signed receipt; fall back
+            # to by-round discovery for legacy entries without the pointer.
+            text = (_fetch_text(cfg, str(key)) if key
+                    else _fetch_receipt(cfg, rid or None, args.validator))
+        except (SystemExit, RuntimeError):
+            print(f"round {rid:<22}  (receipt unavailable)")
+            continue
+        try:
+            reports.append(build_report(load_receipt(text), args.who))
+        except (ValueError, KeyError):
+            print(f"round {rid:<22}  (receipt unreadable)")
+    if args.json:
+        print(_json.dumps(reports, indent=2, sort_keys=True))
+    else:
+        print(f"cascade results — history for {args.who} (newest first)")
+        for rep in reports:
+            print("  " + compact_row(rep))
+        if not reports:
+            print("  no readable receipts found")
+    return 0
 
 
 def _add_reveal_status(sub: argparse._SubParsersAction) -> None:
@@ -646,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_deploy(sub)
     _add_fetch(sub)
     _add_score(sub)
+    _add_results(sub)
     _add_reveal_status(sub)
     _add_round(sub)
     args = parser.parse_args(argv)

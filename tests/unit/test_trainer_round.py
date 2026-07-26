@@ -362,6 +362,115 @@ def test_heat_records_raw_crps_mase_when_screener_reports_them(cfg, tmp_path, mo
     assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
 
 
+def test_heat_notes_publish_failure_reasons(cfg, tmp_path, monkeypatch):
+    """A dropped heat entrant's WHY travels to the standings: a train crash and a
+    screen crash each land their exception message in ``HeatEntrant.note`` (the
+    miner's only feedback channel — the logs bucket is private)."""
+    _patch_train_boundaries(monkeypatch)
+
+    def _stream_or_boom(mode, gen_dir, *a, **k):
+        if "/heat/b/" in str(gen_dir):
+            raise loop_mod.CorpusError("generator_artifact_unreachable: HTTP 401 for b@ref")
+        return _FakeStream(digest=f"digest-{gen_dir}")
+
+    monkeypatch.setattr(loop_mod, "open_round_stream", _stream_or_boom)
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        if gen.hotkey == "d":
+            raise ValueError("forecast produced NaNs on 12 windows")
+        return {"c": 0.2}[gen.hotkey]
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    by_hk = {e.hotkey: e for e in manifest.heat.entrants}
+    assert by_hk["b"].status == "failed_train"
+    assert "generator_artifact_unreachable: HTTP 401" in by_hk["b"].note
+    assert by_hk["d"].status == "failed_screen"
+    assert "forecast produced NaNs" in by_hk["d"].note
+    # the scored survivor carries no note (nothing to explain)
+    assert by_hk["c"].status == "advanced" and by_hk["c"].note is None
+    # notes ride the manifest wire like the rest of the heat block
+    assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
+
+
+def test_heat_train_notes_never_leak_infra_details(cfg, tmp_path, monkeypatch):
+    """The heat block is PUBLIC: only miner-attributable failures (CorpusError /
+    the probe's miner-fault prefixes) publish their message verbatim; an infra
+    crash publishes a generic label — no trainer-side paths or hosts."""
+    _patch_train_boundaries(monkeypatch)
+
+    def _stream_or_boom(mode, gen_dir, *a, **k):
+        if "/heat/b/" in str(gen_dir):
+            raise OSError("No space left on device: '/mnt/trainer-secret/work'")
+        return _FakeStream(digest=f"digest-{gen_dir}")
+
+    monkeypatch.setattr(loop_mod, "open_round_stream", _stream_or_boom)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None:
+                           {"c": 0.2, "d": 0.5}[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    note = {e.hotkey: e for e in manifest.heat.entrants}["b"].note
+    assert "trainer-secret" not in note and "/mnt" not in note
+    assert "infrastructure" in note and "OSError" in note
+
+
+def test_heat_duplicate_note_names_the_earlier_reveal(cfg, tmp_path, monkeypatch):
+    # c and d submit byte-identical corpora; c revealed earlier so d drops, and
+    # d's note says WHO owned the content (uid, never hotkey-guessing).
+    def _collapse(gen_dir):
+        return "same" if ("/heat/c/" in str(gen_dir) or "/heat/d/" in str(gen_dir)) \
+            else f"digest-{gen_dir}"
+
+    _patch_train_boundaries(monkeypatch, digest_fn=_collapse)
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None:
+                           {"b": 0.9, "c": 0.2}[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    by_hk = {e.hotkey: e for e in manifest.heat.entrants}
+    assert by_hk["d"].status == "duplicate"
+    assert "uid 2" in by_hk["d"].note and "earliest reveal" in by_hk["d"].note
+    assert by_hk["c"].status == "advanced" and by_hk["c"].note is None
+
+
+def test_heat_deadline_hit_telemetry_lands_on_scored_entrants(cfg, tmp_path, monkeypatch):
+    """A scored entrant that hit the wall-clock wall gets the starvation note —
+    rank alone can't tell a miner their generator throughput capped training
+    (DEC-CA-0001: the wall stays; the note makes it visible)."""
+    _patch_train_boundaries(monkeypatch)
+
+    class _StarvedTrainer(_FakeBaseTrainer):
+        def train(self, stream, contract, *, training_seed, token_budget, out_dir,
+                  logger=None):
+            r = super().train(stream, contract, training_seed=training_seed,
+                              token_budget=token_budget, out_dir=out_dir, logger=logger)
+            r.metrics.update({"deadline_hit": True, "tokens_frac": 0.41})
+            return r
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_StarvedTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None:
+                           {"b": 0.9, "c": 0.2, "d": 0.5}[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    for e in manifest.heat.entrants:
+        assert e.rank is not None            # everyone trained and scored
+        assert "deadline_hit" in e.note and "41%" in e.note
+
+
 def test_heat_none_when_no_screen_runs(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
     # One challenger, finalists = 1 ⇒ it fits without a screen; no standings to show.

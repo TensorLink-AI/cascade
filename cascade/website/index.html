@@ -1282,6 +1282,7 @@ function heatStatusMeta(s){
   if(s==="screened") return {cls:"screened",label:"Screened"};
   if(s==="failed_train") return {cls:"nofit",label:"Did not train"};
   if(s==="failed_screen") return {cls:"nofit",label:"Screen error"};
+  if(s==="duplicate") return {cls:"nofit",label:"Duplicate"};
   return {cls:"screened",label:s||"--"};
 }
 function renderHeat(){
@@ -1318,7 +1319,9 @@ function renderHeat(){
       '<td class="heat-bar-cell"><span class="heat-bar"><i style="width:'+width.toFixed(0)+'%;background:'+fill+'"></i></span><span class="heat-rel">'+label+'</span></td>'+
       '<td class="num">'+fmt(e.crps,4)+'</td>'+
       '<td class="num">'+fmt(e.mase,3)+'</td>'+
-      '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
+      // note = the trainer-attached reason/telemetry (failure cause, deadline_hit)
+      '<td><span class="heat-pill '+m.cls+'"'+(e.note?' title="'+esc(e.note)+'"':'')+'>'+
+        m.label+(e.note?" ⓘ":"")+'</span></td></tr>';
   }).join("");
   panel.innerHTML='<div class="heat-note">Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
     (nf!=null?nf:"N")+' advance to the final. Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice.</div>'+

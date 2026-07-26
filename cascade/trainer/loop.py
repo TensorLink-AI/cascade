@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -167,6 +168,53 @@ def telemetry_rollup_line(
         f"{hit_f}/{len(finals)} finals; {wait_part} ({reported}/{total} runs "
         "reported metrics)"
     )
+
+
+def _failure_note(e: Exception, limit: int = 300) -> str:
+    """Compress an exception into the miner-readable reason published on a heat
+    standing (:attr:`cascade.shared.manifest.HeatEntrant.note`).
+
+    The message alone when it says something, the class name when it doesn't;
+    whitespace-collapsed and truncated so an entrant can never bloat the
+    manifest with a pathological error string.
+    """
+    msg = " ".join(str(e).split()).strip() or type(e).__name__
+    return msg[:limit]
+
+
+def _train_failure_note(e: Exception) -> str:
+    """The publishable reason for a heat TRAIN failure — fault-classified.
+
+    The heat block is public, so only messages that pin the fault on the
+    miner's own generator (``CorpusError``, or the same message prefixes the
+    dedup probe treats as miner faults) are published verbatim; anything else
+    — OOM, disk, a torn stream, a wedged pod — is our infrastructure and is
+    published as a generic label so trainer-side paths/hosts never leak into
+    the manifest and a miner never debugs a fault that isn't theirs.
+    """
+    msg = _failure_note(e)
+    if isinstance(e, CorpusError) or msg.startswith(_PROBE_MINER_FAULT_PREFIXES):
+        return msg
+    return (f"{type(e).__name__} during the training run — likely trainer-side "
+            "infrastructure, not necessarily your generator")
+
+
+def _deadline_note(metrics: dict | None) -> str | None:
+    """The ``deadline_hit`` telemetry note for a scored heat entrant, or None.
+
+    Hitting the wall is working-as-intended (DEC-CA-0001: the wall is the law;
+    throughput is a compute multiplier) — this note exists so the MINER can see
+    their generator starved training, which the rank alone doesn't show.
+    """
+    m = metrics or {}
+    if not m.get("deadline_hit"):
+        return None
+    parts = ["deadline_hit: wall-clock cap reached before the token budget"]
+    frac = m.get("tokens_frac")
+    if isinstance(frac, int | float) and math.isfinite(float(frac)):
+        parts.append(f"— trained on {float(frac):.0%} of the budget")
+    parts.append("(generator throughput limited training)")
+    return " ".join(parts)
 
 
 def _load_seen_hotkeys(path: Path) -> set[str]:
@@ -1756,8 +1804,8 @@ class TrainerRunner:
         # only to the matching size; other sizes keep random init).
         ws_ref = (warm_start[0]
                   if warm_start and warm_start[1] == heat_contract.arch_preset else None)
-        trained = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens,
-                                   warm_start_ref=ws_ref)
+        trained, notes = self._heat_train(challengers, seeds, block, heat_contract, heat_tokens,
+                                          warm_start_ref=ws_ref)
         trained_hotkeys = {c.hotkey for c, _, _ in trained}
         # Content-level first-submitter rule: two challengers whose corpora share
         # a digest under this round's shared seed submitted the same generator
@@ -1771,6 +1819,11 @@ class TrainerRunner:
             if cur is None or (c.reveal_block, c.uid) < (cur.reveal_block, cur.uid):
                 by_digest[digest] = c
         duplicates = {c.hotkey for c, _, digest in trained if by_digest[digest].hotkey != c.hotkey}
+        for c, _, digest in trained:
+            if c.hotkey in duplicates:
+                owner = by_digest[digest]
+                notes[c.hotkey] = (f"corpus byte-identical to uid {owner.uid}'s "
+                                   "earlier reveal — the earliest reveal keeps the slot")
         for hk in duplicates:
             log.info("heat: challenger %s dropped: corpus is byte-identical to an "
                      "earlier-revealed submission", hk)
@@ -1790,6 +1843,7 @@ class TrainerRunner:
                 score = self._screen_score(raw)
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
+                notes[c.hotkey] = _failure_note(e)
                 continue
             if isinstance(raw, float | int):  # a bare scalar — no raw components
                 raw_components[c.hotkey] = (None, None)
@@ -1810,6 +1864,7 @@ class TrainerRunner:
         heat = self._heat_result(
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
             duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
+            notes=notes,
         )
         return winners, heat
 
@@ -1869,6 +1924,7 @@ class TrainerRunner:
         duplicates: set[str] = frozenset(),
         diagnostics=None,
         components: dict[str, tuple[float | None, float | None]] | None = None,
+        notes: dict[str, str] | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
@@ -1883,8 +1939,15 @@ class TrainerRunner:
         ``diagnostics`` (a :class:`cascade.eval.heat.HeatDiagnostics`, or None) is
         the shadow measurement of how decisive the screen was. It is recorded
         alongside the standings; it did not influence them.
+
+        ``notes`` maps hotkey → the short reason/telemetry string published on
+        that entrant (:attr:`HeatEntrant.note`) — the failure cause behind a
+        ``failed_train``/``failed_screen``, the matched reveal behind a
+        ``duplicate``, or ``deadline_hit`` telemetry on a scored run. Purely
+        informational, like the rest of the block.
         """
         comps = components or {}
+        notes = notes or {}
         advanced = {c.hotkey for c in winners}
         scored_hotkeys = {c.hotkey for _, _, c in scored}
         best = scored[0][0] if scored else None
@@ -1897,7 +1960,7 @@ class TrainerRunner:
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
                 status="advanced" if c.hotkey in advanced else "screened",
                 rank=rank, rel_score=rel, p_best=p_best.get(c.hotkey),
-                crps=crps, mase=mase,
+                crps=crps, mase=mase, note=notes.get(c.hotkey),
             ))
         for c in challengers:
             if c.hotkey in scored_hotkeys:
@@ -1908,6 +1971,7 @@ class TrainerRunner:
                 status = "failed_screen" if c.hotkey in trained_hotkeys else "failed_train"
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref, status=status,
+                note=notes.get(c.hotkey),
             ))
         if diagnostics is not None:
             log.info("heat: screen decisiveness: leader=%s p_best=%.3f lcb_vs_runner_up=%+.4f "
@@ -1933,19 +1997,23 @@ class TrainerRunner:
         heat_tokens: int,
         *,
         warm_start_ref: str | None = None,
-    ) -> list[tuple[ResolvedGenerator, Path, str]]:
-        """Train each heat challenger, returning ``[(challenger, local_ckpt_dir,
-        corpus_digest)]`` for the ones that trained — the digest feeds the
-        content-level duplicate drop in :meth:`_run_heat`. Dispatches to
-        ``remote_hosts`` (GPU pods) when configured — the pod trains at the cheap
-        heat budget and the checkpoint is fetched back for local screening, so the
-        orchestrator (with the wallet) never needs a GPU — else trains locally. A
-        failed train drops that challenger (it just doesn't qualify)."""
+    ) -> tuple[list[tuple[ResolvedGenerator, Path, str]], dict[str, str]]:
+        """Train each heat challenger, returning ``([(challenger, local_ckpt_dir,
+        corpus_digest)], notes)`` — trained entries plus, per hotkey, the short
+        reason/telemetry string published on that entrant's heat standing (the
+        failure cause for a drop, ``deadline_hit`` telemetry for a scored run).
+        The digest feeds the content-level duplicate drop in :meth:`_run_heat`.
+        Dispatches to ``remote_hosts`` (GPU pods) when configured — the pod trains
+        at the cheap heat budget and the checkpoint is fetched back for local
+        screening, so the orchestrator (with the wallet) never needs a GPU — else
+        trains locally. A failed train drops that challenger (it just doesn't
+        qualify)."""
         if self.remote_hosts:
             return self._heat_train_remote(challengers, seeds, block, heat_contract,
                                            warm_start_ref=warm_start_ref)
         ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
         out: list[tuple[ResolvedGenerator, Path, str]] = []
+        notes: dict[str, str] = {}
         for done, c in enumerate(challengers, start=1):
             out_dir = self.work_root / f"{seeds.base_seed}" / "heat" / c.hotkey / "checkpoint"
             try:
@@ -1954,10 +2022,14 @@ class TrainerRunner:
                     warm_start_dir=ws_dir,
                 )
                 out.append((c, result.local_dir, digest))
+                note = _deadline_note(result.metrics)
+                if note:
+                    notes[c.hotkey] = note
             except Exception as e:  # noqa: BLE001
                 log.warning("heat: challenger %s failed to train: %s", c.hotkey, e)
+                notes[c.hotkey] = _train_failure_note(e)
             self._note_heat_progress(done, len(challengers))
-        return out
+        return out, notes
 
     def _pod_extra_forward_env(self) -> tuple[str, ...]:
         """Env vars every pod dispatch forwards on top of each host's own list.
@@ -2055,14 +2127,17 @@ class TrainerRunner:
         heat_contract: TrainingContractConfig,
         *,
         warm_start_ref: str | None = None,
-    ) -> list[tuple[ResolvedGenerator, Path, str]]:
+    ) -> tuple[list[tuple[ResolvedGenerator, Path, str]], dict[str, str]]:
         """Screen-train the field on the GPU pods: dispatch each challenger to a
         host (round-robin across ``remote_hosts``, in parallel), training at the
         cheap ``[round] heat_train_hours`` on the screen size, then fetch each
         checkpoint back for local screening. Each pushes to a per-challenger repo
         so concurrent heat runs never collide. A challenger that fails to train or
-        fetch is dropped. The pod's receipt carries the corpus digest, threaded
-        through for the content-level duplicate drop."""
+        fetch is dropped, and the failure reason lands in the returned ``notes``
+        (hotkey → string) for that entrant's heat standing — a transport-level
+        (rc=255) death is labelled infrastructure so a miner doesn't read a dead
+        pod as their generator's fault. The pod's receipt carries the corpus
+        digest, threaded through for the content-level duplicate drop."""
         import queue
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2123,6 +2198,7 @@ class TrainerRunner:
             return c, out_dir, entry.corpus_digest
 
         out: list[tuple[ResolvedGenerator, Path, str]] = []
+        notes: dict[str, str] = {}
         transport_failures = 0
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
             futs = {ex.submit(_run, c): c for c in challengers}
@@ -2133,6 +2209,10 @@ class TrainerRunner:
                 except Exception as e:  # noqa: BLE001
                     if getattr(e, "returncode", None) == 255:
                         transport_failures += 1
+                        notes[c.hotkey] = ("infrastructure: remote dispatch failed at the "
+                                           "transport level (not your generator)")
+                    else:
+                        notes[c.hotkey] = _train_failure_note(e)
                     log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
                 self._note_heat_progress(done, len(challengers))
         # A heat where EVERY dispatch died at the transport level (rc=255) is a
@@ -2143,7 +2223,7 @@ class TrainerRunner:
             raise RemoteDispatchError(
                 f"heat stage: all {len(challengers)} dispatch(es) failed with transport "
                 "errors (rc=255) — refusing to cache a 0/N heat as complete")
-        return out
+        return out, notes
 
     def _train_final(
         self, jobs: list[tuple[ResolvedGenerator, str]], seeds: RoundSeeds, block: int,
