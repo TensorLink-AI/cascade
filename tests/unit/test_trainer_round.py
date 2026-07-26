@@ -309,8 +309,57 @@ def test_heat_records_informational_standings(cfg, tmp_path, monkeypatch):
     assert by_hk["d"].rel_score == pytest.approx(2.5)     # 0.5 / 0.2
     assert by_hk["b"].rank == 3 and by_hk["b"].status == "screened"
     assert by_hk["b"].rel_score == pytest.approx(4.5)     # 0.9 / 0.2
+    # a bare-float screener reports no raw components (back-compat path)
+    assert by_hk["c"].crps is None and by_hk["c"].mase is None
     # survives serialisation to the wire (rides the manifest, unsigned)
     assert load_manifest(dump_manifest(manifest)).heat == heat
+
+
+def test_heat_records_raw_crps_mase_when_screener_reports_them(cfg, tmp_path, monkeypatch):
+    """A screener returning per-window ``list[WindowScore]`` carries each entrant's
+    raw CRPS and MASE through to the heat standings (published for miner
+    transparency), while ranking still keys on the combined geomean. The reported
+    ``(crps, mase)`` are exactly ``global_components(scores)`` — the same
+    geometric-MASE aggregation the geomean is built from."""
+    import numpy as np
+
+    from cascade.eval.scoring import WindowScore, global_components, global_geomean
+
+    def _scores(scale):
+        rng = np.random.default_rng(4242)  # window draw: same for every entrant
+        return [
+            WindowScore(
+                series_id=str(i),
+                mase=float(rng.uniform(0.5, 1.5)) * scale,
+                qloss_per_q=rng.uniform(0.1, 1.0, size=9) * scale,
+                abs_target=float(rng.uniform(5.0, 10.0)),
+            )
+            for i in range(40)
+        ]
+
+    _patch_train_boundaries(monkeypatch)
+    scales = {"b": 1.8, "c": 1.0, "d": 1.4}  # c is clearly best
+    comp = {hk: _scores(s) for hk, s in scales.items()}
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: comp[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    by_hk = {e.hotkey: e for e in manifest.heat.entrants}
+    # ranking still keys on the geomean — cheapest (c) advances, rel_score = 1.0
+    assert by_hk["c"].rank == 1 and by_hk["c"].rel_score == 1.0
+    # ...and each entrant's raw components are global_components of its own scores
+    for hk in scales:
+        exp_crps, exp_mase = global_components(comp[hk])
+        assert by_hk[hk].crps == pytest.approx(exp_crps)
+        assert by_hk[hk].mase == pytest.approx(exp_mase)
+        # sqrt(crps * mase) reproduces the geomean the ranking used
+        assert (by_hk[hk].crps * by_hk[hk].mase) ** 0.5 == pytest.approx(global_geomean(comp[hk]))
+    # survives the manifest round-trip (unsigned, presentational)
+    assert load_manifest(dump_manifest(manifest)).heat == manifest.heat
 
 
 def test_heat_none_when_no_screen_runs(cfg, tmp_path, monkeypatch):
@@ -1431,3 +1480,68 @@ def test_plan_path_screen_runs_under_its_own_tight_budget(cfg, tmp_path, monkeyp
     assert payload["screened_challengers"] == 1
     assert seen, "the plan-path screen never ran under a deadline"
     assert max(seen) <= 90 < plan_cfg.round.dedup_phase_seconds
+
+
+def _window_scores(scale, n=40):
+    """Per-window scores on one fixed window slice — what the real screener
+    returns. ``scale`` sets the entrant's quality (lower is better)."""
+    import numpy as np
+
+    from cascade.eval.scoring import WindowScore
+
+    rng = np.random.default_rng(4242)          # window draw: same for every entrant
+    return [
+        WindowScore(
+            series_id=str(i),
+            mase=float(rng.uniform(0.5, 1.5)) * scale,
+            qloss_per_q=rng.uniform(0.1, 1.0, size=9) * scale,
+            abs_target=float(rng.uniform(5.0, 10.0)),
+        )
+        for i in range(n)
+    ]
+
+
+def test_heat_records_shadow_selection_diagnostics(cfg, tmp_path, monkeypatch):
+    """A screener returning per-window scores gets the same ranking PLUS the
+    diagnostics saying how decisive the screen was. The pick is unchanged: the
+    cheapest entrant still advances."""
+    _patch_train_boundaries(monkeypatch)
+    scales = {"b": 1.8, "c": 1.0, "d": 1.4}     # c is clearly best
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        return _window_scores(scales[gen.hotkey])
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = manifest.heat
+    by_hk = {e.hotkey: e for e in heat.entrants}
+    assert by_hk["c"].rank == 1 and by_hk["c"].status == "advanced"
+    # a decisive field: the leader wins essentially every bag and clears its runner-up
+    assert by_hk["c"].p_best > 0.99
+    assert heat.leader_lcb > 0.0
+    assert heat.n_windows == 40
+    assert heat.n_clusters == 40               # pool carries no source labels here
+    assert pytest.approx(1.0) == sum(e.p_best for e in heat.entrants)
+    assert load_manifest(dump_manifest(manifest)).heat == heat
+
+
+def test_scalar_screener_still_works_without_diagnostics(cfg, tmp_path, monkeypatch):
+    """A screener that can only produce a scalar ranks the field exactly as
+    before; the round simply carries no diagnostics."""
+    _patch_train_boundaries(monkeypatch)
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False,
+                           screen_fn=lambda ckpt, gen, seed, block=None: scores[gen.hotkey])
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    heat = manifest.heat
+    assert {e.hotkey for e in heat.entrants if e.status == "advanced"} == {"c"}
+    assert heat.leader_lcb is None and heat.n_clusters is None
+    assert all(e.p_best is None for e in heat.entrants)

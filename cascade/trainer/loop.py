@@ -27,6 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..interface.validation import check_repo_size, parse_commit
 from ..shared.chain import Commitment
@@ -60,6 +61,9 @@ from .corpus import CorpusError, build_round_corpus
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
+if TYPE_CHECKING:  # keeps the eval stack out of the trainer's import graph
+    from ..eval.scoring import WindowScore
+
 # Screens one heat checkpoint: given the trained heat-model directory, the
 # generator that produced its corpus, the round's base seed (so the screening
 # window slice can rotate per round), and the round's epoch-boundary block (so a
@@ -68,7 +72,18 @@ from .wandb_sink import open_wandb_run
 # geomean(CRPS, MASE) on the held-out windows). Injected so the trainer's
 # screening stays a testable boundary — the default wiring (torch evaluator +
 # eval pool) is attached in cascade.trainer.main.
-ScreenFn = Callable[[Path, "ResolvedGenerator", int, int | None], float]
+#
+# Returning the per-window ``list[WindowScore]`` instead of the scalar is
+# preferred: the ranking is identical (the runner reduces with global_geomean),
+# and the per-window scores additionally (a) feed the shadow selection
+# diagnostics in cascade.eval.heat — P(best) per entrant and the
+# leader-vs-runner-up LCB, which say whether the screen was decisive — and
+# (b) yield the raw CRPS/MASE components, global_components(scores), published
+# on the heat standings for miner transparency. A scalar-only screener still
+# works; the round then carries neither diagnostics nor per-entrant components.
+ScreenFn = Callable[
+    [Path, "ResolvedGenerator", int, int | None], "float | list[WindowScore]"
+]
 
 # Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
@@ -1034,7 +1049,7 @@ class TrainerRunner:
     def _probe_sandbox_ok(self) -> bool:
         """Whether the probe may execute untrusted generator code here.
 
-        The probe's threat model (DEC-CA-0006) rests entirely on the sandbox
+        The probe's threat model (DEC-CA-0008) rests entirely on the sandbox
         being KERNEL-enforced, because unlike a pod the orchestrator is not
         disposable: it holds the private eval pool and the trainer's wallet,
         and the subprocess sandbox shares their uid and filesystem. Container
@@ -1092,7 +1107,7 @@ class TrainerRunner:
         "container"`` reroutes to the docker/podman sandbox and is honored
         here too). On a production orchestrator set ``sandbox_strict = true``
         (refuse rather than degrade when netns is unavailable) and prefer
-        container mode. See DEC-CA-0006.
+        container mode. See DEC-CA-0008.
         """
         first = build_round_corpus(
             repo_dir, generation_seed, probe_cfg, "cache_reuse",
@@ -1712,14 +1727,29 @@ class TrainerRunner:
                      "earlier-revealed submission", hk)
 
         scored: list[tuple[float, int, ResolvedGenerator]] = []
+        # Per-window scores per entrant, kept only when the screener hands them
+        # over — they feed the shadow diagnostics, never the ranking.
+        components: dict[str, list] = {}
+        # The (crps, mase) aggregates published on the standings, derived from
+        # the same per-window scores. (None, None) for a scalar-only screener.
+        raw_components: dict[str, tuple[float | None, float | None]] = {}
         for c, ckpt_dir, _ in trained:
             if c.hotkey in duplicates:
                 continue
             try:
-                score = float(self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block))
+                raw = self.screen_fn(ckpt_dir, c, seeds.base_seed, screen_block)
+                score = self._screen_score(raw)
             except Exception as e:  # noqa: BLE001 — a broken heat entry just doesn't qualify
                 log.warning("heat: challenger %s failed to screen: %s", c.hotkey, e)
                 continue
+            if isinstance(raw, float | int):  # a bare scalar — no raw components
+                raw_components[c.hotkey] = (None, None)
+            else:  # per-window scores: diagnostics AND the published components
+                from ..eval.scoring import global_components
+
+                scores = list(raw)
+                components[c.hotkey] = scores
+                raw_components[c.hotkey] = global_components(scores)
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
 
@@ -1727,11 +1757,56 @@ class TrainerRunner:
         winners = [c for _, _, c in scored[:n]]
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
+        diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         heat = self._heat_result(
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
-            duplicates=duplicates,
+            duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
         )
         return winners, heat
+
+    @staticmethod
+    def _screen_score(raw: object) -> float:
+        """Reduce a screener's return to the ranking scalar (lower is better).
+
+        A screener may return the scalar directly or the per-window
+        ``list[WindowScore]``; the latter is reduced with the same
+        ``global_geomean`` the duel reports, so both paths rank identically.
+        """
+        if isinstance(raw, float | int):
+            return float(raw)
+        from ..eval.scoring import global_geomean
+
+        return float(global_geomean(list(raw)))  # type: ignore[arg-type]
+
+    def _screen_diagnostics(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        components: dict[str, list],
+        base_seed: int,
+    ):
+        """Shadow selection diagnostics for a settled heat, or None.
+
+        Measures how decisive the screen was — it does NOT choose the finalists;
+        ``scored`` is already sorted and the winners already taken. Needs every
+        scored entrant to have handed over per-window components (they are all
+        screened on one window slice, so they are paired by construction).
+
+        Wrapped: a diagnostic must never cost a round its heat.
+        """
+        if len(scored) < 2 or any(c.hotkey not in components for _, _, c in scored):
+            return None
+        try:
+            from ..eval.heat import screen_diagnostics
+
+            return screen_diagnostics(
+                [(c.hotkey, components[c.hotkey]) for _, _, c in scored],
+                seed=base_seed,
+                B=self.cfg.scoring.bootstrap_B,
+                alpha=self.cfg.scoring.bootstrap_alpha,
+            )
+        except Exception as e:  # noqa: BLE001 — shadow only; never fails a heat
+            log.warning("heat: selection diagnostics unavailable: %s", e)
+            return None
 
     def _heat_result(
         self,
@@ -1743,27 +1818,37 @@ class TrainerRunner:
         finalists: int,
         *,
         duplicates: set[str] = frozenset(),
+        diagnostics=None,
+        components: dict[str, tuple[float | None, float | None]] | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
-        Scores are recorded only *relative to the best entrant* (``score / best``)
-        — the raw numbers stay off the public record so the private, per-round
-        rotated eval pool can't be reverse-engineered from the heat. Entrants that
-        never produced a score are carried too, tagged by how they dropped out:
-        ``duplicate`` (corpus byte-identical to an earlier reveal), ``failed_train``
-        (crashed the screen budget) or ``failed_screen`` (trained but the scorer
-        raised).
+        Each scored entrant carries its ``rel_score`` (``score / best``) plus, when
+        the screener returned per-window scores, its raw ``crps`` and
+        ``mase`` on the round's eval-pool slice — published so miners can see their
+        absolute error, not just the relative ranking. Entrants that never produced
+        a score are carried too, tagged by how they dropped out: ``duplicate``
+        (corpus byte-identical to an earlier reveal), ``failed_train`` (crashed the
+        screen budget) or ``failed_screen`` (trained but the scorer raised).
+
+        ``diagnostics`` (a :class:`cascade.eval.heat.HeatDiagnostics`, or None) is
+        the shadow measurement of how decisive the screen was. It is recorded
+        alongside the standings; it did not influence them.
         """
+        comps = components or {}
         advanced = {c.hotkey for c in winners}
         scored_hotkeys = {c.hotkey for _, _, c in scored}
         best = scored[0][0] if scored else None
+        p_best = diagnostics.p_best if diagnostics is not None else {}
         entrants: list[HeatEntrant] = []
         for rank, (score, _uid, c) in enumerate(scored, start=1):
             rel = (score / best) if (best is not None and best > 0) else None
+            crps, mase = comps.get(c.hotkey, (None, None))
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
                 status="advanced" if c.hotkey in advanced else "screened",
-                rank=rank, rel_score=rel,
+                rank=rank, rel_score=rel, p_best=p_best.get(c.hotkey),
+                crps=crps, mase=mase,
             ))
         for c in challengers:
             if c.hotkey in scored_hotkeys:
@@ -1775,7 +1860,20 @@ class TrainerRunner:
             entrants.append(HeatEntrant(
                 uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref, status=status,
             ))
-        return HeatResult(screen_size=screen_size, finalists=finalists, entrants=tuple(entrants))
+        if diagnostics is not None:
+            log.info("heat: screen decisiveness: leader=%s p_best=%.3f lcb_vs_runner_up=%+.4f "
+                     "(n_windows=%d n_clusters=%d)",
+                     diagnostics.leader_key, p_best.get(diagnostics.leader_key, float("nan")),
+                     diagnostics.leader_lcb if diagnostics.leader_lcb is not None else float("nan"),
+                     diagnostics.n_windows, diagnostics.n_clusters)
+        return HeatResult(
+            screen_size=screen_size,
+            finalists=finalists,
+            entrants=tuple(entrants),
+            leader_lcb=(diagnostics.leader_lcb if diagnostics is not None else None),
+            n_windows=(diagnostics.n_windows if diagnostics is not None else None),
+            n_clusters=(diagnostics.n_clusters if diagnostics is not None else None),
+        )
 
     def _heat_train(
         self,

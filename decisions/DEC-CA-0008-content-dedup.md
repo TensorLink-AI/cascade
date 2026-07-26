@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0006
+id: DEC-CA-0008
 type: decision
 title: "Pre-heat content dedup on EXACT identity only; similarity threshold removed; LLM judge stays advisory"
 status: active

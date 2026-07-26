@@ -34,7 +34,7 @@ sandbox_python = "python3"       # python inside sandbox_image
 sandbox_strict = true            # no netns => refuse, don't degrade to the socket guard.
                                  # REQUIRED here: the dedup probe runs generator code on
                                  # the orchestrator, which holds the eval pool and wallet
-                                 # (container mode is stronger still — see DEC-CA-0006).
+                                 # (container mode is stronger still — see DEC-CA-0008).
 
 [training]
 # The FIXED training contract — identical for king and challenger; folded into

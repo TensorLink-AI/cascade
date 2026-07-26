@@ -6,11 +6,13 @@ All numpy — no torch — so the statistics are unit-testable in a minimal env.
 from __future__ import annotations
 
 from .bootstrap import (
+    joint_bag_geomeans,
     paired_bootstrap_lcb,
     paired_bootstrap_lcb_aggregated,
     paired_bootstrap_quantiles_aggregated,
 )
 from .crps import DEFAULT_QUANTILE_LEVELS, mwsql_components, mwsql_from_components
+from .heat import HeatDiagnostics, screen_diagnostics
 from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
 from .mase import mase
 from .scoring import (
@@ -22,12 +24,15 @@ from .scoring import (
 from .window import EvalWindow
 
 __all__ = [
+    "joint_bag_geomeans",
     "paired_bootstrap_lcb",
     "paired_bootstrap_lcb_aggregated",
     "paired_bootstrap_quantiles_aggregated",
     "DEFAULT_QUANTILE_LEVELS",
     "mwsql_components",
     "mwsql_from_components",
+    "HeatDiagnostics",
+    "screen_diagnostics",
     "KothParams",
     "RoundResult",
     "evaluate_round",
