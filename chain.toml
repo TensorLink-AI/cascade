@@ -149,34 +149,26 @@ commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals bef
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
-# rename-only copies, and near-copies (sim >= dedup_threshold) of the king or a
-# lower-UID challenger lose their heat slot; lowest UID keeps it. Pairwise only
-# — never transitive clusters. Dropped copies still burn their one submission.
-# [dedup_shadow_floor, dedup_threshold) is logged, never dropped: honest
-# template-sharing (everyone starts from example_generator) lives there.
-# Observed abuse sits at sim >= 0.99 (see similarity_report / OPSLOG).
-dedup_mode         = "enforce"   # off | shadow | enforce (static tiers)
-dedup_threshold    = 0.99
-dedup_shadow_floor = 0.90
-# Absolute changed-token cap on near_duplicate drops (0 = ratio only). On the
-# validated field: drops differ by 4-56 tokens, shadow band by 266-1389 —
-# 60-260 changes nothing, ~24-40 would spare substantive edits at roughly
-# half the drop rate. Keep 0 until the shadow log picks a value.
-dedup_max_abs_delta = 0
+# and rename-only copies of the king or an earlier-committed challenger lose
+# their heat slot; the earliest submission keeps it. Pairwise only — never
+# transitive clusters. Dropped copies still burn their one submission.
+# NO similarity threshold: a ratio bar (originally sim >= 0.99, with a sketch
+# tier for oversize streams) is gameable by spacing edits just under it —
+# operators were already laddering variants at 0.90-0.986 — and it produced
+# the one confirmed false positive (a round's eventual finalist). Drops ride
+# on EXACT identity only: same tree, same normalized tokens, same tokens
+# modulo renames — and same probe OUTPUT once dedup_probe_mode enforces (a
+# zero-delta re-roll produces byte-identical probe bytes, so the spam a
+# threshold would target is caught ungameably).
+dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
 dedup_config_only_enforce = false
-# Cost caps. difflib's ratio is O(n^2) in tokens (2.3s @ 20k, 9.3s @ 40k,
-# 38.7s @ 80k) on an input the submitter chooses up to max_repo_mb, so two fat
-# near-copies would otherwise stall the screen — and the round — indefinitely.
-# Field repos are ~100KB / 7-11k tokens, so both caps have ~40x headroom.
+# Cost caps: tokenizer input is attacker-chosen up to max_repo_mb (~2s/MB);
+# the retained-token cap bounds the config_only delta measurement, the only
+# quadratic pass left. Field repos are ~100KB / 7-11k tokens (~40x headroom).
 dedup_max_tokens   = 50000       # 0 = uncapped; do NOT run 0 in production
 dedup_max_text_mb  = 4           # tokenizer input budget per repo
-# Pairs over the cap are judged by a linear shingle-Jaccard sketch instead —
-# without it, padding a copy past the cap would evade the near_duplicate tier.
-# Jaccard has its own calibration, so it observes before it drops.
-dedup_sketch_mode      = "shadow"   # off | shadow | enforce
-dedup_sketch_threshold = 0.99
 # Wall clock for the WHOLE screen. On expiry the field proceeds unscreened: a
 # screen that cannot finish must not sink the round it protects.
 dedup_phase_seconds = 900

@@ -12,7 +12,6 @@ from cascade.interface.dedup import (
     fingerprint_dir,
     normalized_tokens,
     screen_duplicates,
-    similarity,
 )
 
 # A generator body long enough that a one-line edit stays above a 0.99 token
@@ -50,7 +49,6 @@ def test_comment_and_whitespace_shuffle_is_token_identical(tmp_path):
     b = fingerprint_dir(_repo(tmp_path, "b", shuffled))
     assert a.tree_sha256 != b.tree_sha256
     assert a.token_sha256 == b.token_sha256
-    assert similarity(a, b) == 1.0
 
 
 def test_rename_only_copy_is_masked_identical(tmp_path):
@@ -75,31 +73,32 @@ def test_tokenize_fallback_on_syntax_error():
 
 # ── pairwise screen ──────────────────────────────────────────────────────────
 
-def test_near_duplicate_dropped_lowest_uid_kept(tmp_path):
+def test_near_copy_with_a_real_token_delta_is_kept(tmp_path):
+    # POLICY: there is no similarity threshold — a ratio bar is gameable by
+    # spacing edits under it and it false-positived a round's finalist. A
+    # 1-token edit is a different program; it is kept. (Zero-delta re-rolls
+    # are caught by the identical tiers / the behavioral probe instead.)
     tweaked = BASE_SOURCE.replace("size=64", "size=65", 1)
     entries = [
         _entry(tmp_path, "orig", 10, BASE_SOURCE),
-        _entry(tmp_path, "copy", 42, tweaked),
+        _entry(tmp_path, "twk", 42, tweaked),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
-    assert result.kept_hotkeys == ("orig",)
-    (v,) = result.dropped
-    assert v.hotkey == "copy" and v.matched_hotkey == "orig"
-    assert v.tier == "near_duplicate" and v.score >= 0.99
+    result = screen_duplicates(entries, None)
+    assert result.kept_hotkeys == ("orig", "twk")
+    assert not result.dropped
 
 
 def test_copy_of_king_dropped(tmp_path):
     king = fingerprint_dir(_repo(tmp_path, "king", BASE_SOURCE))
     entries = [_entry(tmp_path, "c", 7, "# defend the throne\n" + BASE_SOURCE)]
-    result = screen_duplicates(entries, king, threshold=0.99, shadow_floor=0.90)
+    result = screen_duplicates(entries, king)
     assert result.kept_hotkeys == ()
     (v,) = result.dropped
     assert v.matched_uid == KING_UID and v.tier == "token_identical"
 
 
-def test_template_band_is_shadow_logged_not_dropped(tmp_path):
-    # Rewrite ~5% of the weight lines: same template, genuinely different data
-    # process — must land in [floor, threshold) and survive.
+def test_template_variants_are_kept(tmp_path):
+    # Same scaffold, genuinely different data process — kept, no verdicts.
     variant = BASE_SOURCE
     for i in range(0, 120, 17):
         variant = variant.replace(f"* 0.5 + {i % 7}", f"* 1.5 - {i % 5}")
@@ -109,11 +108,9 @@ def test_template_band_is_shadow_logged_not_dropped(tmp_path):
         _entry(tmp_path, "orig", 1, BASE_SOURCE),
         _entry(tmp_path, "variant", 2, variant),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    result = screen_duplicates(entries, None)
     assert result.kept_hotkeys == ("orig", "variant")
-    assert not result.dropped
-    (s,) = result.shadow
-    assert s.hotkey == "variant" and 0.90 <= s.score < 0.99
+    assert not result.dropped and not result.shadow
 
 
 def test_distinct_generators_kept_silently(tmp_path):
@@ -122,28 +119,23 @@ def test_distinct_generators_kept_silently(tmp_path):
         _entry(tmp_path, "a", 1, BASE_SOURCE),
         _entry(tmp_path, "b", 2, other),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    result = screen_duplicates(entries, None)
     assert result.kept_hotkeys == ("a", "b")
     assert not result.dropped and not result.shadow
 
 
-def test_no_transitive_merging(tmp_path):
-    # b is a near-copy of a (dropped). c sits in the shadow band vs a. c must
-    # be judged against KEPT entries only — never chained through b.
-    near = BASE_SOURCE.replace("size=64", "size=63", 1)
-    variant = BASE_SOURCE
-    for i in range(0, 120, 17):
-        variant = variant.replace(f"* 0.5 + {i % 7}", f"* 2.5 - {i % 3}")
-        variant = variant.replace(f"rng.normal(0.0, 1.0, size=64) * self.w{i}",
-                                  f"rng.gumbel(1.0, 3.0, size=16) * self.w{i}")
+def test_dropped_copies_never_become_rivals(tmp_path):
+    # b and c are both copies of a. Each must be judged against KEPT entries
+    # (a) — never chained through another dropped copy.
     entries = [
         _entry(tmp_path, "a", 1, BASE_SOURCE),
-        _entry(tmp_path, "b", 2, near),
-        _entry(tmp_path, "c", 3, variant),
+        _entry(tmp_path, "b", 2, "# reup one\n" + BASE_SOURCE),
+        _entry(tmp_path, "c", 3, "# reup two\n" + BASE_SOURCE),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
-    assert result.kept_hotkeys == ("a", "c")
-    assert [v.hotkey for v in result.dropped] == ["b"]
+    result = screen_duplicates(entries, None)
+    assert result.kept_hotkeys == ("a",)
+    assert [(v.hotkey, v.matched_hotkey) for v in result.dropped] == [
+        ("b", "a"), ("c", "a")]
 
 
 def test_shadow_mode_drops_nothing(tmp_path):
@@ -151,8 +143,7 @@ def test_shadow_mode_drops_nothing(tmp_path):
         _entry(tmp_path, "orig", 1, BASE_SOURCE),
         _entry(tmp_path, "copy", 2, BASE_SOURCE),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
-                               enforce=False)
+    result = screen_duplicates(entries, None, enforce=False)
     assert result.kept_hotkeys == ("orig", "copy")  # kept…
     assert [v.hotkey for v in result.dropped] == ["copy"]  # …but the verdict logs
 
@@ -203,8 +194,6 @@ def dedup_runner(cfg, tmp_path, monkeypatch):
     monkeypatch.setattr(loop_mod, "fetch_from_hub", fake_fetch)
     monkeypatch.setattr(loop_mod.TrainerRunner, "logs_store", lambda self: fake_logs)
     dedup_cfg = replace(cfg, round=replace(cfg.round, dedup_mode="enforce",
-                                           dedup_threshold=0.99,
-                                           dedup_shadow_floor=0.90,
                                            dedup_probe_mode="off",
                                            dedup_probe_series=0))
     runner = TrainerRunner(cfg=dedup_cfg, base_trainer=object(),
@@ -294,11 +283,10 @@ def test_config_value_delta_is_a_real_delta_not_identical(tmp_path):
                               {"config.json": '{"alpha": 0.095}'}))
     b = fingerprint_dir(_repo(tmp_path, "b", BASE_SOURCE,
                               {"config.json": '{"alpha": 0.10}'}))
-    # A config sweep must never collapse into the identical tiers …
+    # A config sweep must never collapse into the identical tiers.
     assert a.token_sha256 != b.token_sha256
     assert a.masked_sha256 != b.masked_sha256
-    # … it is measured like any code delta (tiny sweep ⇒ near-duplicate tier).
-    assert similarity(a, b) >= 0.99
+    assert a.py_sha256 == b.py_sha256  # …the config_only tier claims it instead
 
 
 def test_different_requirements_are_not_rename_identical(tmp_path):
@@ -332,46 +320,22 @@ def test_cache_junk_does_not_change_the_tree_digest(tmp_path):
 
 # ── absolute token-delta floor ───────────────────────────────────────────────
 
-def test_abs_delta_floor_boundary(tmp_path):
-    # Three single-token edits: sim stays >= 0.99, absolute delta is exactly 3.
-    tweaked = BASE_SOURCE.replace("size=64", "size=65", 3)
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE),
-        _entry(tmp_path, "twk", 2, tweaked),
-    ]
-    # Cap below the delta: over the ratio bar but a "large" edit — shadow-logged.
-    spared = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
-                               max_abs_delta=2)
-    assert spared.kept_hotkeys == ("orig", "twk")
-    (s,) = [v for v in spared.shadow if v.tier == "near_duplicate_large_delta"]
-    assert s.hotkey == "twk" and s.abs_delta == 3 and s.score >= 0.99
-    # Cap at the delta: dropped as before.
-    at_cap = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
-                               max_abs_delta=3)
-    assert at_cap.kept_hotkeys == ("orig",)
-    assert at_cap.dropped[0].tier == "near_duplicate"
-    assert at_cap.dropped[0].abs_delta == 3
-    # Cap disabled (0): current behavior unchanged.
-    disabled = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
-    assert disabled.kept_hotkeys == ("orig",)
-
-
 # ── config_only tier ─────────────────────────────────────────────────────────
 
-def test_config_only_label_does_not_exempt_tiny_sweeps(tmp_path):
+def test_config_only_shadow_label_by_default(tmp_path):
     entries = [
         _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
         _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
-    # With enforcement off, config_only is a LABEL, not an exemption: the
-    # byte-identical-code A/B sweep is shadow-logged AND still drops on the
-    # similarity tier (its ratio is >= 0.99).
-    assert result.kept_hotkeys == ("orig",)
-    (d,) = result.dropped
-    assert d.hotkey == "swp" and d.tier == "near_duplicate"
+    result = screen_duplicates(entries, None)
+    # Identical code + differing configs: kept, labeled, with the absolute
+    # config delta recorded so the log separates a version-string A/B from a
+    # real re-parameterization.
+    assert result.kept_hotkeys == ("orig", "swp")
+    assert not result.dropped
     (v,) = [s for s in result.shadow if s.tier == "config_only"]
-    assert v.hotkey == "swp" and v.matched_hotkey == "orig" and v.score == 1.0
+    assert v.hotkey == "swp" and v.matched_hotkey == "orig"
+    assert v.abs_delta is not None and v.abs_delta >= 1
 
 
 def test_config_only_large_rewrite_survives_with_label(tmp_path):
@@ -383,7 +347,7 @@ def test_config_only_large_rewrite_survives_with_label(tmp_path):
         _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": big_a}),
         _entry(tmp_path, "rew", 2, BASE_SOURCE, {"config.json": big_b}),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90)
+    result = screen_duplicates(entries, None)
     assert result.kept_hotkeys == ("orig", "rew")
     assert not result.dropped
     assert [s.tier for s in result.shadow if s.hotkey == "rew"].count("config_only") == 1
@@ -394,8 +358,7 @@ def test_config_only_enforced_drops(tmp_path):
         _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
         _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
     ]
-    result = screen_duplicates(entries, None, threshold=0.99, shadow_floor=0.90,
-                               config_only_enforce=True)
+    result = screen_duplicates(entries, None, config_only_enforce=True)
     assert result.kept_hotkeys == ("orig",)
     (v,) = result.dropped
     assert v.tier == "config_only" and v.hotkey == "swp"
@@ -596,48 +559,22 @@ def test_oversize_stream_is_not_scoreable_and_keeps_exact_digests(tmp_path):
     assert a.token_sha256 != c.token_sha256        # a real edit still differs
 
 
-def test_similarity_refuses_an_uncapped_pair(tmp_path):
-    from cascade.interface.dedup import Unscoreable
-
-    a = fingerprint_dir(_big_repo(tmp_path, "a", 500), max_tokens=100)
-    b = fingerprint_dir(_big_repo(tmp_path, "b", 500, extra="    y = 1\n"),
-                        max_tokens=100)
-    with pytest.raises(Unscoreable):
-        similarity(a, b)
-
-
-def test_padding_past_the_cap_does_not_evade_the_screen(tmp_path):
-    # The evasion a naive "too big to score, keep it" cap would open: inflate a
-    # copy past the cap and it is judged by nobody. The sketch tier judges it.
+def test_padding_past_the_cap_does_not_evade_the_exact_tiers(tmp_path):
+    # Digests are streamed, never taken from the retained prefix — so a copy
+    # inflated past the token cap still collides on the token tier, while a
+    # padded repo with a REAL edit is kept (policy: no similarity threshold;
+    # an edit is a different program).
     orig = ("orig", 1, fingerprint_dir(_big_repo(tmp_path, "orig", 2000),
                                        max_tokens=500))
-    # a near-copy, not a byte-copy: the identical tiers must not be what saves us
-    copy = ("copy", 2, fingerprint_dir(
-        _big_repo(tmp_path, "copy", 2000, extra="    y = 1\n"), max_tokens=500))
-    enforced = screen_duplicates([orig, copy], None, sketch_mode="enforce",
-                                 sketch_threshold=0.99)
-    assert enforced.kept_hotkeys == ("orig",)
-    assert enforced.dropped[0].tier == "oversize_sketch"
-
-    # shadow (the shipped default): logged with its Jaccard, never dropped
-    observed = screen_duplicates([orig, copy], None, sketch_mode="shadow")
-    assert observed.kept_hotkeys == ("orig", "copy")
-    assert [v.tier for v in observed.shadow] == ["oversize_sketch"]
-    assert observed.shadow[0].score >= 0.99
-
-    # off: nothing judges the pair at all — the padding hole, made explicit
-    assert screen_duplicates([orig, copy], None,
-                             sketch_mode="off").kept_hotkeys == ("orig", "copy")
-
-
-def test_sketch_separates_copies_from_distinct_repos(tmp_path):
-    from cascade.interface.dedup import sketch_jaccard
-
-    a = fingerprint_dir(_big_repo(tmp_path, "a", 400), max_tokens=50)
-    same = fingerprint_dir(_big_repo(tmp_path, "same", 400), max_tokens=50)
-    other = fingerprint_dir(_repo(tmp_path, "other", BASE_SOURCE), max_tokens=50)
-    assert sketch_jaccard(a, same) == 1.0
-    assert sketch_jaccard(a, other) < 0.05
+    copy = ("copy", 2, fingerprint_dir(          # comment shuffle: new tree bytes
+        _big_repo(tmp_path, "copy", 2000, extra="# reupload comment\n"),
+        max_tokens=500))
+    edit = ("edit", 3, fingerprint_dir(
+        _big_repo(tmp_path, "edit", 2000, extra="    y = 1\n"), max_tokens=500))
+    result = screen_duplicates([orig, copy, edit], None)
+    assert result.kept_hotkeys == ("orig", "edit")
+    (v,) = result.dropped
+    assert v.hotkey == "copy" and v.tier == "token_identical"
 
 
 def test_undecoded_files_enter_the_digests_as_opaque_content(tmp_path):
@@ -660,7 +597,7 @@ def test_undecoded_files_enter_the_digests_as_opaque_content(tmp_path):
 def test_shadow_verdicts_name_the_rival_enforce_would_have_used(tmp_path):
     # A dropped entry must not become a rival for later entries: otherwise the
     # shadow log measures a chain enforce would never produce, and it is the
-    # log that calibrates the thresholds.
+    # log that would calibrate any future enforcement.
     entries = [
         _entry(tmp_path, "orig", 1, BASE_SOURCE),
         _entry(tmp_path, "cop2", 2, "# a\n" + BASE_SOURCE),
@@ -830,30 +767,30 @@ def test_probe_per_draw_clock_is_derived_from_the_stage_budget(probe_runner):
     assert report["probe_seconds_per_draw"] == 60
 
 
-def test_a_near_copy_padded_past_the_decode_budget_is_still_judged(tmp_path):
-    # The gap a stub-on-overflow would leave: if an over-budget file
-    # contributed no shingles, inflating a copy past the DECODE budget (not
-    # just the token cap) would evade every similarity tier. The decoded
-    # prefix keeps it judgeable.
-    from cascade.interface.dedup import sketch_jaccard
-
+def test_decode_budget_keeps_the_digests_exact(tmp_path):
+    # Past the decode budget the tokenizer stops, but every file's content
+    # still reaches the digests as an opaque hash — so an exact copy still
+    # collides, and an edited copy still differs, however large the repo.
     body = "\n".join(f"    q{i} = weigh(p{i}, {i}) * 3.5" for i in range(4000))
     orig = _repo(tmp_path, "orig", "def run():\n" + body)
-    copy = _repo(tmp_path, "copy", "def run():\n" + body + "\n    extra = 1\n")
+    copy = _repo(tmp_path, "copy", "def run():\n" + body)
+    edit = _repo(tmp_path, "edit", "def run():\n" + body + "\n    extra = 1\n")
     fo = fingerprint_dir(orig, max_text_mb=0.05, max_tokens=500)
     fc = fingerprint_dir(copy, max_text_mb=0.05, max_tokens=500)
+    fe = fingerprint_dir(edit, max_text_mb=0.05, max_tokens=500)
 
     assert fo.truncated and not fo.scoreable      # the file was cut short…
-    assert fo.token_sha256 != fc.token_sha256     # …but the digests still differ
-    assert sketch_jaccard(fo, fc) >= 0.99         # …and the sketch sees the copy
-    result = screen_duplicates([("orig", 1, fo), ("copy", 2, fc)], None,
-                               sketch_mode="enforce", sketch_threshold=0.99)
-    assert result.kept_hotkeys == ("orig",)
+    assert fo.token_sha256 == fc.token_sha256     # …an exact copy still collides
+    assert fo.token_sha256 != fe.token_sha256     # …and a real edit still differs
+    result = screen_duplicates(
+        [("orig", 1, fo), ("copy", 2, fc), ("edit", 3, fe)], None)
+    assert result.kept_hotkeys == ("orig", "edit")
+    assert result.dropped[0].tier in ("tree_identical", "token_identical")
 
 
 def test_over_cap_entrants_are_named_in_the_report(dedup_runner):
-    # Honest submissions run ~100KB; bulk that only the sketch tier can judge
-    # is a pattern worth being able to see build up over rounds.
+    # Honest submissions run ~100KB; bulk past the token cap (exact digest
+    # tiers only) is a pattern worth being able to see build up over rounds.
     from dataclasses import replace
 
     runner, add = dedup_runner

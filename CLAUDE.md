@@ -33,15 +33,16 @@ in-context.
   benefit (shared init ⇒ no incumbency advantage; old king earns through the
   vacancy anyway) and stalled all future promotions. Kills DEC-CA-0005's handoff-sync
   workstream. (`decisions/DEC-CA-0004-cascade-persist-throne.md`)
-- **DEC-CA-0006** — Pre-heat content dedup: pairwise (never transitive) at
-  sim ≥ 0.99, shadow-log 0.90–0.99; dropped copies still burn; behavioral
-  probe enforces generator determinism and collapses identical-output
-  processes; LLM judge is advisory-only, never in the enforcement path. The
-  screen is capped and clocked (difflib is O(n²) on submitter-chosen input),
-  the probe refuses to run without a kernel-enforced sandbox, and copy
-  contests resolve on earliest COMMIT (witnessed while sealed) — never on UID,
-  which recycles to newcomers.
-  (`decisions/DEC-CA-0006-content-dedup-0.99.md`)
+- **DEC-CA-0006** — Pre-heat content dedup on EXACT identity only (tree /
+  token / rename tiers, pairwise, never transitive); the 0.99 similarity
+  threshold was REMOVED — a ratio bar is gameable by spacing and it
+  false-dropped a finalist. Dropped copies still burn; `config_only` shadow-
+  labels; behavioral probe enforces generator determinism and collapses
+  identical-output processes (refuses to run without a kernel-enforced
+  sandbox); copy contests resolve on earliest COMMIT (witnessed while
+  sealed) — never on UID, which recycles; LLM judge is advisory-only, never
+  in the enforcement path.
+  (`decisions/DEC-CA-0006-content-dedup.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.

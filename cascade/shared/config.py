@@ -439,32 +439,22 @@ class RoundConfig:
     commit_witness_path: str = "trainer_commit_witness.json"
     # Content-level duplicate screen (cascade.interface.dedup): before the heat,
     # each challenger repo is fingerprinted and compared PAIRWISE against the
-    # king and every kept lower-UID challenger; identical trees/token streams
-    # and near-copies at/above ``dedup_threshold`` lose their heat slot (lowest
-    # UID keeps it, so copying an existing submission can never displace it).
-    # Dropped entrants still burn their one lifetime submission — they entered
-    # the round; refunding would give free re-rolls against the threshold.
-    # Matches in [dedup_shadow_floor, dedup_threshold) are logged, never
-    # dropped: that band is where honest template-sharing lives.
+    # king and every kept earlier-committed challenger; an EXACTLY identical
+    # repo — same tree, same normalized tokens, or same tokens modulo renames
+    # — loses its heat slot (the earlier submission keeps it, so copying can
+    # never displace the original). Dropped entrants still burn their one
+    # lifetime submission — they entered the round; refunding would give free
+    # re-rolls against the screen.
+    # There is deliberately NO similarity threshold: a ratio bar (originally
+    # drop at sim ≥ 0.99, with a sketch tier for oversize streams) is gameable
+    # by spacing edits just under it — operators were already laddering at
+    # 0.90–0.986 — and it produced the one confirmed false positive (a round's
+    # eventual finalist). Enforcement rests on EXACT identity of code (the
+    # digest tiers) or of output (the behavioral probe).
     # "off" = no screen; "shadow" = fingerprint + log verdicts, drop nothing;
-    # "enforce" = drop. Observed abuse sits at sim ≥ 0.99; keep the threshold
-    # there unless the shadow log shows honest submissions above it. The
-    # dataclass default is "off" (behavior-preserving for configs without the
-    # key); the shipped mainnet chain.toml sets "enforce".
+    # "enforce" = drop. The dataclass default is "off" (behavior-preserving
+    # for configs without the key); the shipped mainnet chain.toml enforces.
     dedup_mode: str = "off"
-    dedup_threshold: float = 0.99
-    dedup_shadow_floor: float = 0.90
-    # Absolute changed-token cap on the near_duplicate tier (0 = disabled). A
-    # pure ratio dilutes with repo size: at 7–11k tokens of mostly shared
-    # scaffold, 0.99 tolerates ~90–110 changed tokens and lumps a 5-token
-    # rename with a 56-token research edit. When > 0, a near_duplicate drop
-    # requires BOTH sim ≥ dedup_threshold AND changed-token count ≤ this cap;
-    # ratio-over-cap pairs are shadow-logged as near_duplicate_large_delta.
-    # On the observed field (drops 4–56 tokens apart, shadow band 266–1389) a
-    # cap anywhere in 60–260 changes nothing; ~24–40 would spare substantive
-    # edits (including a round's eventual finalist) at the cost of roughly
-    # halving the drop rate. Ship 0 and let the shadow log pick the value.
-    dedup_max_abs_delta: int = 0
     # config_only tier: identical normalized .py streams, differing functional
     # config/data files. This is BOTH the observed same-round ticket-spam
     # pattern (self-declared A/B/C config sweeps) and the legitimate way to
@@ -472,24 +462,15 @@ class RoundConfig:
     # generator. False (default): shadow-log the verdict, never drop, whatever
     # dedup_mode says. Flip only after the shadow log shows the split.
     dedup_config_only_enforce: bool = False
-    # Cost caps on the screen itself. difflib's ratio is O(n²) in tokens
-    # (measured: 2.3s at 20k, 9.3s at 40k, 38.7s at 80k) and the input size is
-    # attacker-chosen up to [generator] max_repo_mb, so two hotkeys submitting
-    # fat near-copies could stall the pre-heat screen — and the round — for
-    # days. dedup_max_tokens bounds the stream the quadratic tier will score
-    # (0 = uncapped, do not use in production); dedup_max_text_mb bounds the
-    # tokenizer's input per repo. Field repos run 7–11k tokens / ~100KB, so
-    # both defaults are orders of magnitude above anything honest.
+    # Cost caps on the screen itself. Tokenizing is linear but not cheap
+    # (~2s/MB) and input size is attacker-chosen up to [generator]
+    # max_repo_mb. dedup_max_text_mb bounds the tokenizer's input per repo;
+    # dedup_max_tokens bounds the retained token prefix, whose only remaining
+    # quadratic consumer is the absolute-delta measurement on config_only
+    # labels (0 = uncapped, do not use in production). Field repos run 7–11k
+    # tokens / ~100KB, so both defaults are orders of magnitude above honest.
     dedup_max_tokens: int = 50_000
     dedup_max_text_mb: int = 4
-    # Pairs the quadratic tier refuses (either side over dedup_max_tokens) are
-    # judged by a linear bottom-k shingle sketch instead. Without it an abuser
-    # could evade the near_duplicate tier just by PADDING a copy past the cap.
-    # Jaccard is not difflib's ratio and carries its own calibration, so the
-    # tier ships "shadow" (log an oversize_sketch verdict, never drop);
-    # "enforce" lets it drop, "off" disables it (and reopens the padding path).
-    dedup_sketch_mode: str = "shadow"   # off | shadow | enforce
-    dedup_sketch_threshold: float = 0.99
     # Wall-clock budget for the WHOLE screen (fetch + fingerprint + compare +
     # probe). On expiry the round proceeds unscreened: a screen that cannot
     # finish must not be able to sink the round it protects.
@@ -1037,15 +1018,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                                           "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
                                            "dedup_mode"),
-            dedup_threshold=float(r.get("dedup_threshold", 0.99)),
-            dedup_shadow_floor=float(r.get("dedup_shadow_floor", 0.90)),
-            dedup_max_abs_delta=int(r.get("dedup_max_abs_delta", 0)),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
             dedup_max_tokens=int(r.get("dedup_max_tokens", 50_000)),
             dedup_max_text_mb=int(r.get("dedup_max_text_mb", 4)),
-            dedup_sketch_mode=validate_dedup_mode(
-                str(r.get("dedup_sketch_mode", "shadow")), "dedup_sketch_mode"),
-            dedup_sketch_threshold=float(r.get("dedup_sketch_threshold", 0.99)),
             dedup_phase_seconds=int(r.get("dedup_phase_seconds", 900)),
             dedup_plan_seconds=int(r.get("dedup_plan_seconds", 120)),
             dedup_probe_mode=validate_dedup_mode(

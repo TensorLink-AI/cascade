@@ -12,40 +12,37 @@ digests point AT:
   digest.
 * **masked-token digest** — the same stream with identifier NAMEs masked:
   catches rename-only copies.
-* **similarity** — difflib ratio over the normalized token streams, for the
-  near-copy tier (observed abuse sits at 0.99+; honest template-sharing sits
-  well below).
-* **shingle sketch** — a bottom-k sample of hashed token 8-grams, giving a
-  linear-time Jaccard estimate for pairs the quadratic difflib tier refuses
-  to score (see the cost note below).
+Enforcement rests on EXACT identity only — of code (the digests above) or,
+via the trainer's behavioral probe, of output. A similarity threshold was
+shipped briefly (drop at difflib ratio ≥ 0.99, with a linear sketch tier for
+oversize streams) and deliberately REMOVED: a ratio bar is gameable by
+construction — operators were already spacing variants at 0.90–0.986, so it
+caught only the lazy tail while teaching spacing — and it produced the one
+confirmed false positive (a round's eventual finalist, a 46-token documented
+mechanism change at 0.995; a false drop permanently burns a hotkey). The
+zero-delta re-rolls it targeted produce byte-identical probe output and are
+caught by the ``behavior_identical`` tier instead, ungameably.
 
-Enforcement is strictly **pairwise against a specific earlier submission**
-(king first, then kept challengers in UID order — the same lowest-UID-wins
-convention as ``plan_round``'s same-ref dedup). Never transitive: chained
-similarity clusters merge honest template users and must not gate anything.
+Judgement is strictly **pairwise against a specific earlier submission**
+(king first, then previously kept entries, oldest submission first). Never
+transitive.
 
-COST (why the caps exist): ``SequenceMatcher.ratio`` with ``autojunk=False``
-is O(n²) in the token count — measured on this module, a near-identical pair
-costs 2.3 s at 20k tokens, 9.3 s at 40k, 38.7 s at 80k. Field repos run
-7–11k tokens (~1 s/pair), but ``[generator] max_repo_mb`` permits streams
-three orders of magnitude larger, which would let two hotkeys stall the
-pre-heat screen — and therefore the round — indefinitely. So the token stream
-is retained only up to ``max_tokens``; past that a fingerprint keeps its
-(exact, streamed) digests and its sketch but is NOT ``scoreable``, and the
-pairwise judgement falls to the sketch tier. Digests stay exact regardless of
-the cap: they are fed incrementally, never from the retained prefix, so a
-truncated stream can never collide two different repos.
+COST (why the caps exist): tokenizing is linear but not cheap (~2 s/MB), and
+the input size is attacker-chosen up to ``[generator] max_repo_mb``. Digests
+are fed incrementally (never from a retained buffer), the decode budget
+bounds per-repo CPU, and the retained token prefix — used only to measure the
+absolute config delta on ``config_only`` labels — is capped by
+``max_tokens``; past the cap a fingerprint keeps its exact digests but is not
+``scoreable`` and the label simply carries no delta.
 """
 
 from __future__ import annotations
 
 import hashlib
-import heapq
 import io
 import json
 import re
 import tokenize
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -139,12 +136,9 @@ def _config_tokens(path: Path, text: str) -> tuple[str, ...] | None:
     return None
 
 
-# Similarity-cost caps. DEFAULT_MAX_TOKENS bounds the retained stream (and so
-# the O(n²) difflib tier); the sketch is bottom-k over w-token shingles, which
-# is O(n) time and O(k) memory no matter how large the repo is.
+# Retained-stream cap: bounds the O(n²) SequenceMatcher pass that measures the
+# absolute delta on config_only labels (the only quadratic consumer left).
 DEFAULT_MAX_TOKENS = 50_000    # field repos run 7–11k; nothing honest is near this
-SKETCH_K = 2048                # bottom-k sample size (≈±2% Jaccard error)
-SHINGLE_W = 8                  # tokens per shingle
 
 
 @dataclass(frozen=True)
@@ -152,8 +146,8 @@ class RepoFingerprint:
     """Content identity of one submitted generator repo.
 
     ``tokens`` is the retained prefix of the normalized stream and is EMPTY
-    when the stream ran past the cap (``scoreable`` False) — the digests and
-    the sketch cover the whole stream either way.
+    when the stream ran past the cap (``scoreable`` False) — the digests cover
+    the whole stream either way.
     """
 
     tree_sha256: str
@@ -162,21 +156,14 @@ class RepoFingerprint:
     py_sha256: str            # digest of the .py-only token stream ("" = no .py)
     tokens: tuple[str, ...] = field(repr=False)
     n_tokens: int = 0
-    scoreable: bool = True    # False ⇒ over the cap, difflib tier must not run
-    sketch: tuple[int, ...] = field(default=(), repr=False)
-    sketch_complete: bool = False   # the sketch IS the full shingle set
+    scoreable: bool = True    # False ⇒ over the cap, no quadratic pass may run
     truncated: bool = False   # some file was too large to decode in full
 
 
 class _Accum:
-    """Streaming fingerprint state: exact digests + a bounded token prefix +
-    a bottom-k shingle sketch, all fed one token at a time.
-
-    The sketch keeps only k hashes, but ``_seen`` (which makes it a sample of
-    the shingle SET rather than the multiset) grows with the number of distinct
-    shingles. That is bounded by the caller's decode budget, not by repo size —
-    which is what actually caps this object's footprint.
-    """
+    """Streaming fingerprint state: exact digests + a bounded token prefix,
+    all fed one token at a time. Peak footprint is bounded by the caller's
+    decode budget and ``max_tokens``, not by repo size."""
 
     def __init__(self, max_tokens: int) -> None:
         self.tree = hashlib.sha256()
@@ -189,10 +176,6 @@ class _Accum:
         self.n_py_tokens = 0
         self.overflow = False
         self.truncated = False
-        self._window: deque[str] = deque(maxlen=SHINGLE_W)
-        self._heap: list[int] = []      # max-heap (negated) of the k smallest
-        self._seen: set[int] = set()
-        self.n_shingles = 0
 
     def push(self, token: str, *, maskable: bool, py: bool) -> None:
         blob = token.encode("utf-8", "replace") + b"\x00"
@@ -206,28 +189,8 @@ class _Accum:
             self.tokens.append(token)
         else:
             self.overflow = True
-        self._window.append(token)
-        if len(self._window) == SHINGLE_W:
-            self._add_shingle("\x00".join(self._window))
-
-    def _add_shingle(self, text: str) -> None:
-        h = int.from_bytes(
-            hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=8).digest(),
-            "big")
-        if h in self._seen:
-            return
-        self._seen.add(h)
-        self.n_shingles += 1
-        if len(self._heap) < SKETCH_K:
-            heapq.heappush(self._heap, -h)
-        elif -h > self._heap[0]:
-            heapq.heapreplace(self._heap, -h)
 
     def finish(self) -> RepoFingerprint:
-        # A stream shorter than one full shingle still needs a sketch, or two
-        # tiny repos would compare as "no overlap" instead of "identical".
-        if self.n_shingles == 0 and self._window:
-            self._add_shingle("\x00".join(self._window))
         return RepoFingerprint(
             tree_sha256=self.tree.hexdigest(),
             token_sha256=self._tok.hexdigest(),
@@ -236,8 +199,6 @@ class _Accum:
             tokens=tuple(self.tokens) if not self.overflow else (),
             n_tokens=self.n_tokens,
             scoreable=not self.overflow,
-            sketch=tuple(sorted(-h for h in self._heap)),
-            sketch_complete=self.n_shingles <= SKETCH_K,
             truncated=self.truncated,
         )
 
@@ -324,9 +285,7 @@ def fingerprint_dir(
             continue
 
         # Past the decode budget, tokenize the PREFIX that still fits and
-        # append the whole file's content digest. The prefix keeps the file
-        # contributing real shingles — a stub would let a near-copy evade every
-        # similarity tier just by being large — and the digest keeps the token
+        # append the whole file's content digest — the digest keeps the token
         # tiers exact, so two repos differing only inside the skipped tail
         # cannot read as identical. Beyond this a submission is mostly padding,
         # which `truncated` surfaces in the report rather than hiding.
@@ -349,59 +308,6 @@ def fingerprint_dir(
             acc.overflow = True
             acc.truncated = True
     return acc.finish()
-
-
-def similarity(a: RepoFingerprint, b: RepoFingerprint) -> float:
-    """difflib ratio over the normalized token streams (identical ⇒ 1.0).
-
-    ``quick_ratio`` is a documented upper bound on ``ratio``, so using it as a
-    cheap gate can only skip pairs whose true ratio is below the caller's
-    floor — the caller passes that floor via :func:`screen_duplicates`.
-
-    Raises :class:`Unscoreable` when either side ran past the token cap: the
-    quadratic tier must never run on an unbounded stream. Callers fall back to
-    :func:`sketch_jaccard`.
-    """
-    if a.token_sha256 == b.token_sha256:
-        return 1.0
-    if not (a.scoreable and b.scoreable):
-        raise Unscoreable(
-            f"token streams over the cap ({a.n_tokens} / {b.n_tokens} tokens)")
-    return SequenceMatcher(None, a.tokens, b.tokens, autojunk=False).ratio()
-
-
-class Unscoreable(Exception):
-    """The difflib tier refused a pair: at least one stream is over the cap."""
-
-
-def sketch_jaccard(a: RepoFingerprint, b: RepoFingerprint) -> float:
-    """Jaccard similarity of two token-shingle sets, from their bottom-k
-    sketches — O(k), and defined for streams of any size.
-
-    When both sketches are complete (repos below ``SKETCH_K`` distinct
-    shingles, which is every honest submission seen so far) this is the EXACT
-    Jaccard. Otherwise it is the standard bottom-k estimator: the k smallest
-    hashes of the union, scored by how many lie in both sketches.
-
-    Jaccard is not difflib's ratio and does not share its calibration — it
-    ignores order and saturates differently — which is why the sketch tier
-    carries its own threshold and ships shadow-first.
-    """
-    A, B = set(a.sketch), set(b.sketch)
-    if not A or not B:
-        return 1.0 if A == B else 0.0
-    if a.sketch_complete and b.sketch_complete:
-        return len(A & B) / len(A | B)
-    k = min(len(A), len(B))
-    both = A & B
-    return sum(1 for h in heapq.nsmallest(k, A | B) if h in both) / k
-
-
-def _bounded_similarity(a: RepoFingerprint, b: RepoFingerprint, floor: float) -> float:
-    sm = SequenceMatcher(None, a.tokens, b.tokens, autojunk=False)
-    if sm.real_quick_ratio() < floor or sm.quick_ratio() < floor:
-        return 0.0
-    return sm.ratio()
 
 
 def _same_code(a: RepoFingerprint, b: RepoFingerprint) -> bool:
@@ -441,9 +347,7 @@ class DedupVerdict:
     """One pairwise judgement, kept for the audit log whether or not it drops.
 
     Tiers: ``tree_identical`` | ``token_identical`` | ``rename_identical`` |
-    ``config_only`` | ``near_duplicate`` | ``near_duplicate_large_delta``
-    (shadow-only) | ``shadow`` (similarity band) | ``behavior_identical`` |
-    ``oversize_sketch`` (difflib refused the pair; score is Jaccard).
+    ``config_only`` | ``behavior_identical``.
     """
 
     hotkey: str
@@ -452,14 +356,14 @@ class DedupVerdict:
     matched_uid: int          # -2 marks the king (any sentinel outside uid space)
     tier: str
     score: float
-    abs_delta: int | None = None   # changed-token count (similarity tiers only)
+    abs_delta: int | None = None   # changed-token count (config_only labels)
 
 
 @dataclass(frozen=True)
 class DedupResult:
     kept_hotkeys: tuple[str, ...]
     dropped: tuple[DedupVerdict, ...]
-    shadow: tuple[DedupVerdict, ...]   # threshold > score ≥ shadow_floor (never drops)
+    shadow: tuple[DedupVerdict, ...]   # labels that never drop (config_only)
 
 
 KING_UID = -2
@@ -474,22 +378,18 @@ def screen_duplicates(
     entries: list[tuple[str, int, RepoFingerprint]],
     king: RepoFingerprint | None,
     *,
-    threshold: float = 0.99,
-    shadow_floor: float = 0.90,
-    max_abs_delta: int = 0,
     config_only_enforce: bool = False,
-    sketch_mode: str = "shadow",
-    sketch_threshold: float = 0.99,
     priority: Mapping[str, int] | None = None,
     enforce: bool = True,
 ) -> DedupResult:
     """Pairwise duplicate screen over ``(hotkey, uid, fingerprint)`` entries.
 
-    Entries are processed OLDEST SUBMISSION FIRST; each is compared against the
-    king and every previously KEPT entry. The first match at or above
-    ``threshold`` (or any identical digest) drops it — the earlier submission
-    keeps the slot, so copying an existing submission can never displace it.
-    Matches in ``[shadow_floor, threshold)`` are recorded but never drop.
+    Entries are processed OLDEST SUBMISSION FIRST; each is compared against
+    the king and every previously KEPT entry. Any identical digest drops it —
+    the earlier submission keeps the slot, so copying an existing submission
+    can never displace it. There is NO similarity threshold: drops ride on
+    exact identity only (a ratio bar is gameable by spacing edits under it;
+    see the module docstring).
 
     ``priority`` maps hotkey → the block that submission was made at (the
     witnessed commit block, falling back to the reveal block); entries without
@@ -502,35 +402,18 @@ def screen_duplicates(
     submission was committed at is the actual evidence, and a copyist cannot
     have committed before the thing they copied was visible.
 
-    ``max_abs_delta`` (0 = disabled): a ``near_duplicate`` drop additionally
-    requires the absolute changed-token count to be at most this — pairs over
-    the ratio bar but past the cap land in the shadow list as
-    ``near_duplicate_large_delta`` (logged, never dropped), so a substantive
-    edit inside mostly-shared scaffold survives size dilution of the ratio.
-
     ``config_only_enforce`` (default False): a pair whose ``.py`` token
     streams are identical but whose functional config files differ gets a
-    ``config_only`` verdict. With the flag on it drops as its own tier; with
-    the flag off it is shadow-logged as a LABEL and the pair still faces the
-    similarity tier — a tiny config sweep keeps dropping as
-    ``near_duplicate``, while a config rewrite large enough to fall under the
-    ratio bar survives with the label recorded ("identical code, different
-    weights" is both the ticket-spam pattern and the legitimate fork path;
-    the log decides enforcement, it never exempts).
-
-    ``sketch_mode`` covers pairs the difflib tier refuses (either stream past
-    the token cap — see the module docstring on cost): their Jaccard estimate
-    is compared against ``sketch_threshold``. ``"enforce"`` lets it drop,
-    ``"shadow"`` (default) only logs an ``oversize_sketch`` verdict, ``"off"``
-    skips it entirely. Shadow-first because Jaccard carries its own
-    calibration; but note that ``"off"`` leaves a padding evasion open — a
-    near-copy inflated past the cap is then unjudged by every similarity tier.
+    ``config_only`` verdict. With the flag on it drops as its own tier; off,
+    it is shadow-logged as a LABEL (with the absolute config delta recorded
+    when both streams are under the token cap) and the entry is kept —
+    "identical code, different weights" is both the ticket-spam pattern and
+    the legitimate fork path, so the log decides enforcement.
 
     With ``enforce=False`` (shadow mode) every entry is kept, but the RIVAL
     set still follows enforce semantics — a would-be-dropped entry does not
     become a rival for later entries. Shadow is therefore a true counterfactual
-    of enforce (same verdicts, no drops), which is what makes the shadow log
-    usable for calibrating the thresholds.
+    of enforce (same verdicts, no drops).
     """
     prio = priority or {}
     ordered = sorted(entries, key=lambda e: (prio.get(e[0], _LAST), e[1]))
@@ -545,11 +428,9 @@ def screen_duplicates(
         rivals.extend(kept)
 
         verdict: DedupVerdict | None = None
-        best_shadow: DedupVerdict | None = None
         for r_hotkey, r_uid, r_fp in rivals:
-            delta: int | None = None
             if fp.tree_sha256 == r_fp.tree_sha256:
-                tier, score = "tree_identical", 1.0
+                tier = "tree_identical"
             elif not (fp.n_tokens and r_fp.n_tokens):
                 # At least one side has NO functional content (no .py, no
                 # config — docs only). Every such repo shares the empty-stream
@@ -559,65 +440,27 @@ def screen_duplicates(
                 # tree tier above (real bytes) may speak for these.
                 continue
             elif fp.token_sha256 == r_fp.token_sha256:
-                tier, score = "token_identical", 1.0
+                tier = "token_identical"
             elif fp.masked_sha256 == r_fp.masked_sha256:
-                tier, score = "rename_identical", 1.0
-            elif _same_code(fp, r_fp) and config_only_enforce:
-                # Identical code, different functional configs — enforced as
-                # its own tier.
+                tier = "rename_identical"
+            elif _same_code(fp, r_fp):
+                # Identical code, different functional configs.
                 delta = _safe_abs_token_delta(fp, r_fp)
-                tier, score = "config_only", 1.0
-            elif not (fp.scoreable and r_fp.scoreable):
-                # Over the cap: the quadratic tier is off limits, so the
-                # linear sketch judges the pair (or nobody does).
-                if sketch_mode == "off":
-                    continue
-                score = sketch_jaccard(fp, r_fp)
-                if sketch_mode == "enforce" and score >= sketch_threshold:
-                    tier = "oversize_sketch"
-                else:
+                if not config_only_enforce:
                     shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
-                                               "oversize_sketch", round(score, 4)))
+                                               "config_only", 1.0, delta))
                     continue
+                verdict = DedupVerdict(hotkey, uid, r_hotkey, r_uid,
+                                       "config_only", 1.0, delta)
+                break
             else:
-                if _same_code(fp, r_fp):
-                    # Identical code, different configs with enforcement off:
-                    # shadow-log the label, then FALL THROUGH to the
-                    # similarity tier — a tiny config sweep must still drop as
-                    # near_duplicate (a byte-identical-code A/B ticket is the
-                    # clearest spam there is); the label only measures how
-                    # often the pattern occurs so enforcement can be decided
-                    # from data, it never exempts the pair.
-                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
-                                               "config_only", 1.0,
-                                               _safe_abs_token_delta(fp, r_fp)))
-                score = _bounded_similarity(fp, r_fp, shadow_floor)
-                if score >= threshold:
-                    delta = _safe_abs_token_delta(fp, r_fp)
-                    if max_abs_delta > 0 and delta > max_abs_delta:
-                        # Over the ratio bar but a real edit by absolute size:
-                        # logged for threshold calibration, never dropped.
-                        shadow.append(DedupVerdict(
-                            hotkey, uid, r_hotkey, r_uid,
-                            "near_duplicate_large_delta", round(score, 4), delta))
-                        continue
-                    tier = "near_duplicate"
-                elif score >= shadow_floor:
-                    cand = DedupVerdict(hotkey, uid, r_hotkey, r_uid, "shadow", round(score, 4))
-                    if best_shadow is None or cand.score > best_shadow.score:
-                        best_shadow = cand
-                    continue
-                else:
-                    continue
-            verdict = DedupVerdict(hotkey, uid, r_hotkey, r_uid, tier,
-                                   round(score, 4), delta)
+                continue
+            verdict = DedupVerdict(hotkey, uid, r_hotkey, r_uid, tier, 1.0)
             break
 
         if verdict is not None:
             dropped.append(verdict)
         else:
-            if best_shadow is not None:
-                shadow.append(best_shadow)
             kept.append((hotkey, uid, fp))
 
     return DedupResult(

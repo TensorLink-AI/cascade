@@ -1,19 +1,19 @@
 ---
 id: DEC-CA-0006
 type: decision
-title: "Pre-heat content dedup at 0.99, pairwise only; LLM judge stays advisory"
+title: "Pre-heat content dedup on EXACT identity only; similarity threshold removed; LLM judge stays advisory"
 status: active
 date: 2026-07-24
 tags: [anti-spam, incentives, trainer]
 revisit_when: >-
-  the shadow log accumulates enough rounds to set dedup_max_abs_delta (spare
-  substantive edits like the dropped finalist) and to decide
-  dedup_config_only_enforce, dedup_sketch_threshold, and promoting
-  dedup_probe_mode to enforce; OR abusers adapt below the exact-behavior tier
-  (epsilon-jittered variants of one process) — then extend the probe to
-  statistical distance, shadow first; OR the orchestrator gains a container
-  runtime, at which point the probe should move to sandbox_mode = "container"
-  and sandbox_strict stops being the weakest acceptable posture
+  the shadow log accumulates enough rounds to decide dedup_config_only_enforce
+  and promoting dedup_probe_mode to enforce; OR abusers adapt below the
+  exact-behavior tier (epsilon-jittered variants of one process) — then extend
+  the probe to statistical distance, shadow first, remembering why the code
+  similarity threshold was removed before reaching for another ratio bar; OR
+  the orchestrator gains a container runtime, at which point the probe should
+  move to sandbox_mode = "container" and sandbox_strict stops being the
+  weakest acceptable posture
 relations: {}
 ---
 Live field analysis (similarity_report.json, OPSLOG) showed most heat GPU
@@ -22,16 +22,18 @@ comment/whitespace shuffles, and near-copies at sim 0.992–0.998 — one
 meta-operator spanning ≥5 coldkeys and ~45 hotkeys, including the king
 defending its own throne with near-copies (finalist-slot blockade).
 
-Decision: the trainer screens challenger repo CONTENT before the heat
-(`cascade.interface.dedup`, wired in `TrainerRunner._screen_duplicate_entrants`):
-tree digest, normalized-token digest, name-masked digest, then a difflib
-token-ratio tier enforced at **0.99**. Judgement is **pairwise against a
-specific rival (king first, then kept lower-UID challengers)** — never
-transitive clusters, which single-linkage-chain honest template users (a 95-UID
-"cluster" in the field data was mostly the shared example_generator scaffold).
-[0.90, 0.99) is shadow-logged only. Dropped copies still burn their one
-lifetime submission (refunds would give free re-rolls against the threshold).
-Verdicts land in `<work_root>/<round>/dedup_report.json`.
+Decision (as it stands; the sections below are the history that got here):
+the trainer screens challenger repo CONTENT before the heat
+(`cascade.interface.dedup`, wired in `TrainerRunner._screen_duplicate_entrants`),
+and drops ride on **EXACT identity only** — tree digest, normalized-token
+digest, name-masked digest, config_only (flag-gated), and the behavioral
+probe's `behavior_identical`. Judgement is **pairwise against a specific
+rival (king first, then kept earlier-committed challengers)** — never
+transitive clusters, which single-linkage-chain honest template users (a
+95-UID "cluster" in the field data was mostly the shared example_generator
+scaffold). Dropped copies still burn their one lifetime submission (refunds
+would give free re-rolls against the screen). Verdicts land in
+`<work_root>/<round>/dedup_report.json`.
 
 Economics at ~$40/registration vs ~$4,000 reign value: blind flooding is
 already -EV at field ≥ ~100 (ticket ceiling ≈ prize/field < cost), and shared
@@ -209,17 +211,33 @@ Two smaller corrections: shadow mode is now a true counterfactual of enforce
 log measures the verdicts enforce would have produced — the log is what
 calibrates the thresholds), and `config_only` requires actual Python (two
 repos with no `.py` shared an empty code digest and could have collapsed).
-`dedup_mode` / `dedup_probe_mode` / `dedup_sketch_mode` are validated at load:
-a typo used to mean silently `off`.
+`dedup_mode` / `dedup_probe_mode` are validated at load: a typo used to mean
+silently `off`.
 
-Config: `[round] dedup_mode/dedup_threshold/dedup_shadow_floor/
-dedup_max_abs_delta/dedup_config_only_enforce/dedup_max_tokens/
-dedup_max_text_mb/dedup_sketch_mode/dedup_sketch_threshold/
-dedup_phase_seconds/dedup_probe_mode/dedup_probe_series/
-dedup_probe_generate_seconds/dedup_probe_budget_seconds/
+**Similarity thresholding REMOVED (owner decision, round 5).** The
+`near_duplicate` tier (drop at ratio ≥ 0.99), its `[0.90, 0.99)` shadow band,
+the `dedup_max_abs_delta` cap, and the oversize sketch tier are gone — a
+ratio bar is gameable by construction (operators were already laddering at
+0.90–0.986, so it caught only the lazy tail while teaching spacing), it
+produced the one confirmed false positive (the finalist, above), and the
+zero-delta re-rolls it targeted produce byte-identical probe output that
+`behavior_identical` catches ungameably. Exact identity cannot be gamed by
+spacing: evading it requires actually changing the program or its output,
+which is just competing. This supersedes the quadratic-tier and sketch parts
+of hardening rounds 3–4; the streaming/caps/deadline machinery stays (the
+retained-token cap now bounds only the `config_only` delta measurement), as
+do the earliest-commit witness, the config_only label semantics (label never
+exempts — but with no similarity tier beneath it, an un-enforced label is
+now kept outright), the probe gating, and every fail-open path. Tiny config
+sweeps (identical `.py`, a couple of changed values) are therefore KEPT until
+`dedup_config_only_enforce` flips — that flip, informed by the shadow labels,
+is the intended next ratchet, alongside promoting the probe to enforce.
+
+Config: `[round] dedup_mode/dedup_config_only_enforce/dedup_max_tokens/
+dedup_max_text_mb/dedup_phase_seconds/dedup_plan_seconds/dedup_probe_mode/
+dedup_probe_series/dedup_probe_generate_seconds/dedup_probe_budget_seconds/
 dedup_probe_allow_weak_sandbox` plus `commit_witness_path` — dataclass
-defaults off/0.99/0.90/0/false/
-50000/4/shadow/0.99/900/shadow/8/120/600/false; mainnet `chain.toml` = static
-`enforce` @ 0.99/0.90, delta cap 0, config_only shadow, sketch shadow, probe
-`shadow` × 8 with `[generator] sandbox_strict = true`; testnet = everything
-`shadow` with `dedup_probe_allow_weak_sandbox = true`.
+defaults off/false/50000/4/900/120/shadow/8/120/600/false; mainnet
+`chain.toml` = static `enforce`, config_only shadow, probe `shadow` × 8 with
+`[generator] sandbox_strict = true`; testnet = everything `shadow` with
+`dedup_probe_allow_weak_sandbox = true`.

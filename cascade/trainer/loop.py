@@ -714,10 +714,12 @@ class TrainerRunner:
         entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
 
         The on-chain same-ref dedup in :func:`plan_round` only catches identical
-        ``repo@digest`` pointers; this compares the fetched trees, so re-uploads,
-        comment shuffles, rename-only copies, and near-copies at/above
-        ``[round] dedup_threshold`` all collapse to the lowest-UID original.
-        Judgement is pairwise against a specific rival, never transitive.
+        ``repo@digest`` pointers; this compares the fetched trees, so
+        re-uploads, comment shuffles, and rename-only copies all collapse to
+        the earliest-committed original. Enforcement is EXACT-identity only
+        (no similarity threshold — gameable by spacing; see
+        :mod:`cascade.interface.dedup`). Judgement is pairwise against a
+        specific rival, never transitive.
 
         Fail-open: an infrastructure error (fetch outage, unexpected exception)
         keeps the entrant in the heat rather than eating its slot on a guess —
@@ -837,11 +839,13 @@ class TrainerRunner:
                 continue
             if not fp.scoreable:
                 # Not an error, but not normal either: honest submissions run
-                # ~100KB / 7-11k tokens, and only the linear sketch tier can
-                # judge this entrant. Bulk that reads as padding belongs in the
-                # report where a human can see the pattern build.
+                # ~100KB / 7-11k tokens. The exact digest tiers still judge
+                # this entrant (digests are streamed, never capped); only the
+                # config_only delta measurement is unavailable. Bulk that
+                # reads as padding belongs in the report where a human can
+                # see the pattern build.
                 log.warning("dedup: challenger %s (uid=%s) has %d tokens%s — over "
-                            "the %d cap; judged by the sketch tier only",
+                            "the %d cap; exact digest tiers only",
                             c.hotkey, c.uid, fp.n_tokens,
                             " (files too large to decode in full)"
                             if fp.truncated else "", rnd.dedup_max_tokens)
@@ -852,12 +856,7 @@ class TrainerRunner:
         try:
             result = screen_duplicates(
                 triples, king_fp,
-                threshold=rnd.dedup_threshold,
-                shadow_floor=rnd.dedup_shadow_floor,
-                max_abs_delta=rnd.dedup_max_abs_delta,
                 config_only_enforce=rnd.dedup_config_only_enforce,
-                sketch_mode=rnd.dedup_sketch_mode,
-                sketch_threshold=rnd.dedup_sketch_threshold,
                 priority=self._commit_priority(entrants),
                 enforce=(mode == "enforce"),
             )
@@ -960,26 +959,21 @@ class TrainerRunner:
                          v.matched_uid, "" if probe_enforce else " — shadow, kept")
 
         for v in result.dropped:
-            log.info("dedup[%s]: challenger %s (uid=%s) is %s of %s (uid=%s), "
-                     "sim=%.4f%s", mode, v.hotkey, v.uid, v.tier,
-                     v.matched_hotkey, v.matched_uid, v.score,
+            log.info("dedup[%s]: challenger %s (uid=%s) is %s of %s (uid=%s)%s",
+                     mode, v.hotkey, v.uid, v.tier,
+                     v.matched_hotkey, v.matched_uid,
                      "" if mode == "enforce" else " — shadow, kept")
         for v in result.shadow:
-            log.info("dedup[shadow-band]: challenger %s (uid=%s) vs %s (uid=%s) "
-                     "sim=%.4f — below threshold, kept", v.hotkey, v.uid,
-                     v.matched_hotkey, v.matched_uid, v.score)
+            log.info("dedup[label]: challenger %s (uid=%s) vs %s (uid=%s) "
+                     "%s (delta=%s) — logged, kept", v.hotkey, v.uid,
+                     v.matched_hotkey, v.matched_uid, v.tier, v.abs_delta)
 
         report_doc = {
             "round_id": str(base_seed),
             "mode": mode,
-            "threshold": rnd.dedup_threshold,
-            "shadow_floor": rnd.dedup_shadow_floor,
-            "max_abs_delta": rnd.dedup_max_abs_delta,
             "config_only_enforce": rnd.dedup_config_only_enforce,
             "max_tokens": rnd.dedup_max_tokens,
             "max_text_mb": rnd.dedup_max_text_mb,
-            "sketch_mode": rnd.dedup_sketch_mode,
-            "sketch_threshold": rnd.dedup_sketch_threshold,
             "probe_mode": probe_mode,
             "probe_series": probe_n,
             "probe_seconds_per_draw": per_draw,
@@ -1018,10 +1012,10 @@ class TrainerRunner:
         """Persist the round's dedup verdicts to disk and to the logs store.
 
         The logs-store copy is the shadow-mode EVIDENCE this feature exists to
-        collect, so it must not depend on orchestrator disk. It carries per-pair
-        similarity scores and the live thresholds, which is a calibration oracle
-        for anyone tuning a copy to sit just under the bar — keep the logs
-        bucket private, and if it is ever opened up, publish only the tiers.
+        collect, so it must not depend on orchestrator disk. Verdicts are
+        exact-identity tiers (no tunable bar to reverse-engineer), but the
+        config_only deltas still profile the field — keep the logs bucket
+        private.
         """
         report_json = json.dumps(doc, indent=1)
         try:
