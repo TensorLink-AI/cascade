@@ -133,7 +133,9 @@ train_image_digest = "sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf7
 # before the boundary are eligible.
 epoch_blocks     = 7200   # ≈24h at a 12s block time
 round_hours      = 24.0   # informational: wall-clock span of an epoch
-heat_train_hours = 0.5    # cheap screening budget per competitor (on screen_size)
+heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
+                          # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
+                          # ranking; watch p_best / leader_lcb to confirm it pays.
 heat_n_windows   = 256    # eval windows the heat screens on
 heat_num_samples = 20     # sample forecasts per window in the heat (0 = reuse [eval] num_samples)
 # Heat wall-clock cap: max(heat_guard_factor × heat_train_hours, floor), never
@@ -163,9 +165,11 @@ one_submission_per_hotkey = true
 # modulo renames — and same probe OUTPUT once dedup_probe_mode enforces (a
 # zero-delta re-roll produces byte-identical probe bytes, so the spam a
 # threshold would target is caught ungameably).
-# SHIPS OFF (DEC-CA-0008): enabling is a deliberate flip, testnet first, then
-# shadow, then enforce — never enforce on the round after a merge lands.
-dedup_mode         = "off"       # off | shadow | enforce (exact tiers)
+# ENABLED enforce 2026-07-26 by owner decision (DEC-CA-0008). The live-shadow
+# step was substituted by offline replay of the real screen on rounds
+# r1206/r1207/r1208 (drops: 2/0/0, all exact-identity or denied refs — zero
+# similarity-based verdicts possible since the threshold was removed).
+dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
 dedup_config_only_enforce = false
@@ -185,12 +189,12 @@ dedup_phase_seconds = 900
 # suggest nondeterminism is widespread, and probe drops burn hotkeys, so the
 # probe ships SHADOW while the static tiers enforce.
 dedup_probe_mode   = "shadow"    # off | shadow | enforce
-# SHIPS 0 (probe fully inert): the probe EXECUTES miner code on the
-# orchestrator even in shadow (shadow gates the drops, not the execution).
-# Before setting > 0: verify [generator] sandbox_strict = true (or container
-# mode) works on THIS host AND the worker pods, testnet first. Was 8 in the
-# original PR — restore that value when arming.
-dedup_probe_series = 0           # 0 = probe off
+# Probe set to shadow/8 2026-07-26 (owner) — but the probe EXECUTES miner code
+# on the orchestrator even in shadow (shadow gates the drops, not the
+# execution), so _probe_sandbox_ok SELF-DISABLES it until [generator]
+# sandbox_strict = true or container mode. It will log that refusal each round.
+# Arming step remaining: verify worker pods under sandbox_strict, then flip it.
+dedup_probe_series = 8           # 0 = probe off
 # Total probe wall clock; the per-draw budget is derived from it (budget / waves
 # / 2 draws), so N hostile entrants each burning their clock cannot stretch the
 # stage past this. The probe REFUSES to run unless [generator] has
@@ -370,7 +374,7 @@ poll_seconds    = 120
 # Trust anchor for the public round receipts: the validator hotkey whose
 # signature `cascade-audit` requires. Empty = verify against the receipt's
 # self-declared signer (audit warns that the signer is unpinned).
-validator_hotkey = ""
+validator_hotkey = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # LOCAL OVERRIDE (audit trust anchor) — re-apply after every pull; see OPSLOG 2026-07-26
 
 [validator]
 weight_set_interval_blocks = 180
