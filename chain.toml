@@ -31,10 +31,13 @@ max_dup_fraction     = 0.05      # cache_reuse only: max fraction of exact byte-
 sandbox_mode   = "subprocess"
 sandbox_image  = ""              # e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>"
 sandbox_python = "python3"       # python inside sandbox_image
-sandbox_strict = true            # no netns => refuse, don't degrade to the socket guard.
-                                 # REQUIRED here: the dedup probe runs generator code on
-                                 # the orchestrator, which holds the eval pool and wallet
-                                 # (container mode is stronger still — see DEC-CA-0008).
+sandbox_strict = false           # true on production: no netns => refuse, don't degrade.
+                                 # MUST be true (or container mode) before the dedup
+                                 # probe is armed (dedup_probe_series > 0): the probe runs
+                                 # generator code on the orchestrator, which holds the
+                                 # eval pool and wallet (DEC-CA-0008). Left false at merge
+                                 # because worker pods are UNVERIFIED under strict — flip
+                                 # is its own change, after verifying pods, testnet first.
 
 [training]
 # The FIXED training contract — identical for king and challenger; folded into
@@ -160,7 +163,9 @@ one_submission_per_hotkey = true
 # modulo renames — and same probe OUTPUT once dedup_probe_mode enforces (a
 # zero-delta re-roll produces byte-identical probe bytes, so the spam a
 # threshold would target is caught ungameably).
-dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
+# SHIPS OFF (DEC-CA-0008): enabling is a deliberate flip, testnet first, then
+# shadow, then enforce — never enforce on the round after a merge lands.
+dedup_mode         = "off"       # off | shadow | enforce (exact tiers)
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
 dedup_config_only_enforce = false
@@ -180,7 +185,12 @@ dedup_phase_seconds = 900
 # suggest nondeterminism is widespread, and probe drops burn hotkeys, so the
 # probe ships SHADOW while the static tiers enforce.
 dedup_probe_mode   = "shadow"    # off | shadow | enforce
-dedup_probe_series = 8           # 0 = probe off
+# SHIPS 0 (probe fully inert): the probe EXECUTES miner code on the
+# orchestrator even in shadow (shadow gates the drops, not the execution).
+# Before setting > 0: verify [generator] sandbox_strict = true (or container
+# mode) works on THIS host AND the worker pods, testnet first. Was 8 in the
+# original PR — restore that value when arming.
+dedup_probe_series = 0           # 0 = probe off
 # Total probe wall clock; the per-draw budget is derived from it (budget / waves
 # / 2 draws), so N hostile entrants each burning their clock cannot stretch the
 # stage past this. The probe REFUSES to run unless [generator] has

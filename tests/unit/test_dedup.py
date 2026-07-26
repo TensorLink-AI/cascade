@@ -278,6 +278,19 @@ def test_json_reformat_and_requirements_order_are_cosmetic(tmp_path):
     assert a.token_sha256 == b.token_sha256
 
 
+def test_deeply_nested_json_does_not_crash_the_fingerprinter(tmp_path):
+    # json.loads on attacker-chosen bytes raises RecursionError (not a
+    # ValueError) past ~stack-depth nesting; a 4KB file of brackets must fall
+    # back to whitespace normalization, not escape and sink the screen.
+    depth = 2000
+    hostile = "[" * depth + "]" * depth
+    a = fingerprint_dir(_repo(tmp_path, "a", BASE_SOURCE,
+                              {"config.json": hostile}))
+    b = fingerprint_dir(_repo(tmp_path, "b", BASE_SOURCE,
+                              {"config.json": hostile}))
+    assert a.token_sha256 == b.token_sha256  # still screened, still identical
+
+
 def test_config_value_delta_is_a_real_delta_not_identical(tmp_path):
     a = fingerprint_dir(_repo(tmp_path, "a", BASE_SOURCE,
                               {"config.json": '{"alpha": 0.095}'}))
@@ -414,6 +427,8 @@ def probe_runner(dedup_runner, monkeypatch):
         repo = repo_dir
         if (repo / "BROKEN").exists():
             raise CorpusError("generator_import_failed")
+        if (repo / "INFRA").exists():
+            raise CorpusError("sandbox_crashed (rc=137): oom or missing image")
         if (repo / "NONDET").exists():
             return _Result(f"entropy-{next(ticks)}")
         marker = repo / "BEHAVIOR"
@@ -435,6 +450,21 @@ def test_probe_drops_nondeterministic_generator(probe_runner, tmp_path):
     report = json.loads((runner.work_root / "80" / "dedup_report.json").read_text())
     assert report["probe_dropped"][0]["hotkey"] == "edgar"
     assert report["probe_dropped"][0]["tier"] == "nondeterministic"
+
+
+def test_probe_infra_fault_is_never_the_miners_problem(probe_runner, tmp_path):
+    # A sandbox_crashed / missing-image CorpusError is OUR infrastructure, not
+    # a generator verdict — under probe enforce it must keep the entrant, or a
+    # bad image on the orchestrator burns the whole field.
+    runner, add = probe_runner
+    ok = add("alice", 3, BASE_SOURCE)
+    unlucky = add("edgar", 5, OTHER_SOURCE)
+    (tmp_path / "repos" / "edgar" / "INFRA").write_text("")
+
+    kept = runner._screen_duplicate_entrants(None, [ok, unlucky], base_seed=82)
+    assert sorted(c.hotkey for c in kept) == ["alice", "edgar"]
+    report = json.loads((runner.work_root / "82" / "dedup_report.json").read_text())
+    assert report["probe_dropped"] == []
 
 
 def test_probe_collapses_same_behavior_different_code(probe_runner, tmp_path):
@@ -762,9 +792,36 @@ def test_probe_per_draw_clock_is_derived_from_the_stage_budget(probe_runner):
                 for i in range(_PROBE_WORKERS * 2)]     # 2 waves → 240/(2*2) = 60s
 
     runner._screen_duplicate_entrants(None, entrants, base_seed=96)
-    assert {c.max_generate_seconds for c in add.captured_cfgs} == {60}
+    # 240s / (2 waves * 2 draws) = 60s share, minus the 30s subprocess spawn
+    # grace the sandbox spends ON TOP of max_generate_seconds — the stage must
+    # fund it or it overruns its own budget and trips the phase deadline.
+    assert {c.max_generate_seconds for c in add.captured_cfgs} == {30}
     report = json.loads((runner.work_root / "96" / "dedup_report.json").read_text())
-    assert report["probe_seconds_per_draw"] == 60
+    assert report["probe_seconds_per_draw"] == 30
+
+
+def test_probe_skips_when_the_budget_cannot_fund_the_floor(probe_runner):
+    # A field too large for the stage budget must cost the PROBE, never the
+    # screen: overrunning would trip the outer dedup_phase_seconds deadline
+    # and discard the static verdicts with it.
+    from dataclasses import replace
+
+    from cascade.trainer.loop import _PROBE_WORKERS
+
+    runner, add = probe_runner
+    runner.cfg = replace(runner.cfg, round=replace(
+        runner.cfg.round, dedup_probe_generate_seconds=120,
+        dedup_probe_budget_seconds=100))   # 100/(2*2) - 30 < 30s floor
+    entrants = [add(f"m{i:03d}", i,
+                    "\n".join(f"z{i}_{j} = {j * (i + 1)} ** {i + 2} + {j % (i + 3)}"
+                              for j in range(40 + 25 * i)))
+                for i in range(_PROBE_WORKERS * 2)]
+
+    kept = runner._screen_duplicate_entrants(None, entrants, base_seed=97)
+    assert not add.captured_cfgs           # no sandbox was ever spawned
+    assert len(kept) == len(entrants)      # static tiers judged, probe skipped
+    report = json.loads((runner.work_root / "97" / "dedup_report.json").read_text())
+    assert report["probe_seconds_per_draw"] == 0
 
 
 def test_decode_budget_keeps_the_digests_exact(tmp_path):

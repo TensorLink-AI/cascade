@@ -121,7 +121,9 @@ def _config_tokens(path: Path, text: str) -> tuple[str, ...] | None:
     if path.suffix.lower() == ".json":
         try:
             norm = json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: json.loads on attacker-chosen bytes — a few KB of
+            # nested brackets blows the parser stack, and it is NOT a ValueError.
             norm = " ".join(text.split())
         return tuple(t for t in _JSON_PUNCT.split(norm) if t)
     if path.name.lower() == "requirements.txt":

@@ -101,6 +101,20 @@ log = logging.getLogger("cascade.trainer")
 # that no generator could start would fail the whole field, not screen it).
 _PROBE_WORKERS = 4
 _PROBE_MIN_DRAW_SECONDS = 30
+# CorpusError messages that pin the fault on the MINER's generator. Anything
+# else — sandbox_crashed, sandbox_isolation_unavailable, missing container
+# runtime/image, digest transit mismatch — is our infrastructure, and under
+# dedup_probe_mode = "enforce" a misattributed infra fault burns the entire
+# field (probe drops burn hotkeys). Unknown messages therefore fail OPEN.
+_PROBE_MINER_FAULT_PREFIXES = (
+    "generator is non-deterministic",   # _probe_digest's own verdict
+    "generator_",       # timeout / stalled / import / construct / output_rejected …
+    "missing generator.py",
+    "submission_too_large",
+    "repo_layout",
+    "repo_too_large",
+    "blocked_import",
+)
 
 
 def _http_status_in_chain(exc: BaseException | None) -> int | None:
@@ -852,6 +866,14 @@ class TrainerRunner:
                                 c.hotkey, c.uid)
                     unscreened.append(c)
                 continue
+            except Exception as e:  # noqa: BLE001 — repo bytes are attacker-chosen;
+                # one repo crafted to crash the fingerprinter must cost only its
+                # own screening, never the screen (let alone the round).
+                log.warning("dedup: fingerprint of %s failed (%s: %s); challenger "
+                            "%s (uid=%s) proceeds unscreened", c.ref,
+                            type(e).__name__, e, c.hotkey, c.uid)
+                unscreened.append(c)
+                continue
             if not fp.scoreable:
                 # Not an error, but not normal either: honest submissions run
                 # ~100KB / 7-11k tokens. The exact digest tiers still judge
@@ -915,10 +937,29 @@ class TrainerRunner:
             # duration per draw, and a fixed per-draw budget still scales the
             # stage with the size of the field (which the field chooses).
             # Worst case is dedup_probe_budget_seconds, not N × per-draw.
-            waves = max(1, -(-len(survivors) // _PROBE_WORKERS))
-            per_draw = max(_PROBE_MIN_DRAW_SECONDS,
-                           min(int(rnd.dedup_probe_generate_seconds),
-                               int(rnd.dedup_probe_budget_seconds) // (waves * 2)))
+            # The sandbox spends REAL wall clock on top of max_generate_seconds
+            # (+30s subprocess kill slack, +120s container startup — see
+            # sandbox.py/_container.py communicate timeouts), so the stage must
+            # fund per_draw + grace per draw or it overruns its budget, trips
+            # the outer dedup_phase_seconds deadline, and takes the static
+            # verdicts down with it. If the field is too large for the budget
+            # to fund even the floor, the probe SKIPS — never the whole screen.
+            grace = (120 if self.cfg.generator.sandbox_mode == "container"
+                     else 30)
+            waves = max(1, -(-(len(survivors) + (1 if king_dir is not None
+                                                 else 0)) // _PROBE_WORKERS))
+            per_draw = min(int(rnd.dedup_probe_generate_seconds),
+                           int(rnd.dedup_probe_budget_seconds) // (waves * 2)
+                           - grace)
+            if per_draw < _PROBE_MIN_DRAW_SECONDS:
+                log.warning(
+                    "dedup-probe[%s]: %d survivor(s) (%d wave(s)) cannot fit "
+                    "the %ss stage budget once the %ss spawn grace per draw is "
+                    "funded — probe SKIPPED this round; static tiers already "
+                    "applied", probe_mode, len(survivors), waves,
+                    rnd.dedup_probe_budget_seconds, grace)
+                probe_mode, probe_enforce, probe_n, per_draw = "off", False, 0, 0
+        if probe_n > 0 and probe_mode in ("shadow", "enforce"):
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
                 max_generate_seconds=per_draw)
@@ -950,6 +991,14 @@ class TrainerRunner:
                     try:
                         digest = futures[c.hotkey].result()
                     except CorpusError as e:
+                        if not str(e).startswith(_PROBE_MINER_FAULT_PREFIXES):
+                            # Sandbox/infra fault (missing image, no netns,
+                            # container crash) — never the miner's problem.
+                            log.warning("dedup: probe infra fault for %s (%s); "
+                                        "kept unprobed", c.hotkey, e)
+                            behaved.append((c.hotkey, uid_of[c.hotkey],
+                                            f"\x00unprobed:{c.hotkey}"))
+                            continue
                         tier = ("nondeterministic" if "non-deterministic" in str(e)
                                 else "probe_failed")
                         log.info("dedup-probe[%s]: challenger %s (uid=%s) %s: %s%s",
