@@ -1,14 +1,17 @@
-# Snapshot every cascade king generator into the private R2 king archive.
+# Snapshot cascade generators into the private R2 archive — kings AND everyone.
 #
 # Reads the validator's public throne history (receipts/index.json in the
-# manifest bucket) and, for every generator that has ever held the throne,
-# fetches its code from the Hippius Hub and saves it — packed to a deterministic
-# tar — to the PRIVATE R2 [storage] king_archive_bucket, alongside a
-# kings/index.json "db" linking each king to its archived object. See
+# manifest bucket) and saves generator code — fetched from the Hippius Hub,
+# packed to a deterministic tar — to the PRIVATE R2 [storage]
+# king_archive_bucket in two dirs: kings/ (every throne-holder, with a
+# kings/index.json "db") and generators/<hotkey>/ (EVERY eligible participant,
+# grouped by committing miner, gathered from each round's full signed receipt,
+# with generators/index.json). See
 # scripts/scrape_kings.py and cascade.shared.king_archive.
 #
-# The archive is content-addressed + append-only: a king already in the bucket is
-# never re-fetched, only its throne metadata is refreshed. Safe to run often.
+# The archive is content-addressed + append-only: a generator already in the
+# bucket is never re-fetched, only its metadata is refreshed, and already-scanned
+# round receipts are never re-read. Safe to run often.
 #
 # REQUIRED repo secrets:
 #   CASCADE_S3_ACCESS_KEY / CASCADE_S3_SECRET_KEY   read the manifest bucket
@@ -20,7 +23,7 @@
 # pull of public repos). Set HIPPIUS_HUB_TOKEN only if you ever archive a private
 # repo.
 #
-# Use ONE scraper only — two concurrent runs would race on kings/index.json
+# Use ONE scraper only — two concurrent runs would race on the index.json dbs
 # (the concurrency group below already serialises this workflow's own runs).
 name: Scrape kings
 
@@ -81,5 +84,5 @@ jobs:
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           FLAGS=""
           [ "$DRY_RUN" = "true" ] && FLAGS="--dry-run"
-          echo "scraping kings with $TOML $FLAGS"
+          echo "scraping kings + generator snapshots with $TOML $FLAGS"
           python scripts/scrape_kings.py --chain-toml "$TOML" $FLAGS

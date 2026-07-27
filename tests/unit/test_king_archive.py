@@ -91,6 +91,15 @@ def test_archive_key_is_content_addressed_and_stable():
     assert ka.archive_key_for_ref(f"cascade/gen-x@{SHA}") == key
 
 
+def test_generator_key_groups_by_hotkey():
+    key = ka.generator_key_for_ref(f"cascade/gen-x@{SHA}", "hk-miner")
+    assert key == "generators/hk-miner/sha256-" + "a" * 64 + ".tar"
+    # same ref, disjoint prefixes: kings/ and generators/ never collide,
+    # and two committers of the same ref each keep their own object
+    assert key != ka.archive_key_for_ref(f"cascade/gen-x@{SHA}")
+    assert key != ka.generator_key_for_ref(f"cascade/gen-x@{SHA}", "hk-other")
+
+
 def test_archive_url_joins_cleanly():
     url = ka.archive_url("https://acct.r2.cloudflarestorage.com/", "cascade-king-archive",
                          "kings/cascade/g/sha256-x.tar")
@@ -274,6 +283,267 @@ def test_sync_records_failure_without_dropping_prior_entry():
     # index still written (empty kings list), so the run is idempotent-safe
     idx = json.loads(archive.objects[ka.KING_INDEX_KEY].decode())
     assert idx["kings"] == []
+
+
+# ─────────────────── generators/ — every-participant snapshot ───────────────
+
+
+def _participant(hotkey, uid, ref, commit_block):
+    return {"hotkey": hotkey, "uid": uid, "gen_ref": ref, "commit_block": commit_block}
+
+
+def _manifest_store_with_receipts(rounds):
+    """rounds: list of (round_summary, participants|None). Builds the receipt
+    index with per-round receipt_key pointers plus the full receipts behind
+    them (a None participants list stores NO receipt — an unreadable round)."""
+    from cascade.shared.hippius import RECEIPT_INDEX_KEY
+    objects = {}
+    index_rounds = []
+    for rnd, participants in rounds:
+        rnd = dict(rnd)
+        hk = rnd.setdefault("validator_hotkey", "hk-val")
+        key = f"receipts/{hk}/round-{rnd['round_id']}.json"
+        rnd["receipt_key"] = key
+        index_rounds.append(rnd)
+        if participants is not None:
+            objects[key] = json.dumps({"participants": participants}).encode("utf-8")
+    objects[RECEIPT_INDEX_KEY] = json.dumps(
+        {"schema": 2, "rounds": index_rounds}).encode("utf-8")
+    return _FakeS3Store(objects)
+
+
+def test_collect_participants_one_entry_per_hotkey():
+    # the same ref committed by two hotkeys — BOTH are recorded, each under its
+    # own (hotkey, ref) entry with its own commit_block; a hotkey's re-commit
+    # keeps its EARLIEST reveal (a UID recycles; the block is the claim).
+    store = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/k@{SHC}"),
+         [_participant("hk-late", 9, f"cascade/a@{SHA}", 90),
+          _participant("hk-early", 3, f"cascade/a@{SHA}", 50)]),
+        (_round("r2", 200, king_ref=f"cascade/k@{SHC}"),
+         [_participant("hk-early", 3, f"cascade/a@{SHA}", 120),   # re-commit, later block
+          _participant("hk-b", 4, f"cascade/b@{SHB}", 150)]),
+    ])
+    from cascade.shared.hippius import read_receipt_index
+
+    def read_receipt(key):
+        return json.loads(store.get_text(key))
+
+    gens, scanned = ka.collect_participant_refs(read_receipt_index(store), read_receipt)
+    assert scanned == ["r1", "r2"]
+    early = gens[("hk-early", f"cascade/a@{SHA}")]
+    late = gens[("hk-late", f"cascade/a@{SHA}")]
+    assert early["commit_block"] == 50      # earliest reveal kept over the re-commit
+    assert early["rounds_seen"] == 2        # rounds, not appearances
+    assert early["first_round_id"] == "r1" and early["last_round_id"] == "r2"
+    assert late["commit_block"] == 90 and late["rounds_seen"] == 1
+    assert gens[("hk-b", f"cascade/b@{SHB}")]["rounds_seen"] == 1
+
+
+def test_collect_participants_unreadable_receipt_stays_unscanned():
+    store = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/k@{SHC}"),
+         [_participant("hk", 1, f"cascade/a@{SHA}", 50)]),
+        (_round("r2", 200, king_ref=f"cascade/k@{SHC}"), None),   # receipt missing
+    ])
+    from cascade.shared.hippius import ObjectNotFound, read_receipt_index
+
+    def read_receipt(key):
+        try:
+            return json.loads(store.get_text(key))
+        except ObjectNotFound:
+            return None
+
+    gens, scanned = ka.collect_participant_refs(read_receipt_index(store), read_receipt)
+    assert scanned == ["r1"]                # r2 will be retried next sync
+    assert set(gens) == {("hk", f"cascade/a@{SHA}")}
+
+
+def test_collect_participants_reads_one_receipt_per_round():
+    # two validators published the same round — its participants count ONCE.
+    reads: list[str] = []
+    r1a = dict(_round("r1", 100, king_ref=f"cascade/k@{SHC}"), validator_hotkey="hk-v1")
+    r1b = dict(_round("r1", 100, king_ref=f"cascade/k@{SHC}"), validator_hotkey="hk-v2")
+    store = _manifest_store_with_receipts([
+        (r1a, [_participant("hk", 1, f"cascade/a@{SHA}", 50)]),
+        (r1b, [_participant("hk", 1, f"cascade/a@{SHA}", 50)]),
+    ])
+    from cascade.shared.hippius import read_receipt_index
+
+    def read_receipt(key):
+        reads.append(key)
+        return json.loads(store.get_text(key))
+
+    gens, scanned = ka.collect_participant_refs(read_receipt_index(store), read_receipt)
+    assert scanned == ["r1"] and len(reads) == 1
+    assert gens[("hk", f"cascade/a@{SHA}")]["rounds_seen"] == 1
+
+
+def test_sync_generators_snapshots_every_participant():
+    fetched: list[str] = []
+    manifest = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-a", 1, f"cascade/a@{SHA}", 40),
+          _participant("hk-b", 2, f"cascade/b@{SHB}", 50),
+          _participant("hk-c", 3, f"cascade/c@{SHC}", 60)]),
+    ])
+    archive = _FakeS3Store()
+
+    res = ka.sync_generators(
+        manifest_store=manifest, archive_store=archive, hub=HUB,
+        endpoint="https://e", bucket="b", updated_at="t1",
+        fetch=_fake_fetch_factory(fetched),
+    )
+
+    assert res.archived == 3 and res.rounds_scanned == 1 and not res.failed
+    for hk, ref in (("hk-a", f"cascade/a@{SHA}"), ("hk-b", f"cascade/b@{SHB}"),
+                    ("hk-c", f"cascade/c@{SHC}")):
+        assert ka.generator_key_for_ref(ref, hk) in archive.objects
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    assert idx["schema"] == ka.GENERATOR_INDEX_SCHEMA
+    assert idx["scanned_rounds"] == ["r1"]
+    a = next(g for g in idx["generators"] if g["gen_ref"] == f"cascade/a@{SHA}")
+    assert a["archive_key"].startswith("generators/hk-a/")
+    assert a["archive_url"].endswith(a["archive_key"])
+    assert a["tar_sha256"] and a["size_bytes"] > 0 and a["commit_block"] == 40
+
+
+def test_sync_generators_shared_ref_lands_under_each_committer():
+    # two hotkeys committed the SAME ref — one snapshot per miner dir, one db
+    # entry per committer (the archive records, DEC-CA-0008 adjudicates).
+    fetched: list[str] = []
+    manifest = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-early", 1, f"cascade/a@{SHA}", 40),
+          _participant("hk-late", 2, f"cascade/a@{SHA}", 70)]),
+    ])
+    archive = _FakeS3Store()
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t1",
+                             fetch=_fake_fetch_factory(fetched))
+    assert res.archived == 2
+    early_key = ka.generator_key_for_ref(f"cascade/a@{SHA}", "hk-early")
+    late_key = ka.generator_key_for_ref(f"cascade/a@{SHA}", "hk-late")
+    assert archive.objects[early_key] == archive.objects[late_key]  # same bytes
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    by_hk = {g["hotkey"]: g for g in idx["generators"]}
+    assert by_hk["hk-early"]["commit_block"] == 40
+    assert by_hk["hk-late"]["commit_block"] == 70
+
+
+def test_sync_generators_second_run_rescans_and_reuploads_nothing():
+    fetched: list[str] = []
+    fetch = _fake_fetch_factory(fetched)
+    rounds = [(_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+               [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)])]
+    archive = _FakeS3Store()
+    ka.sync_generators(manifest_store=_manifest_store_with_receipts(rounds),
+                       archive_store=archive, hub=HUB, endpoint="https://e",
+                       bucket="b", updated_at="t1", fetch=fetch)
+    tar = archive.objects[ka.generator_key_for_ref(f"cascade/a@{SHA}", "hk-a")]
+
+    # a new round joins the window; the same ref participates again
+    rounds.append((_round("r2", 200, king_ref=f"cascade/a@{SHA}"),
+                   [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)]))
+    fetched.clear()
+    res = ka.sync_generators(manifest_store=_manifest_store_with_receipts(rounds),
+                             archive_store=archive, hub=HUB, endpoint="https://e",
+                             bucket="b", updated_at="t2", fetch=fetch)
+    assert res.rounds_scanned == 1          # only r2 read; r1 already scanned
+    assert res.archived == 0 and res.skipped == 1 and fetched == []
+    assert archive.objects[ka.generator_key_for_ref(f"cascade/a@{SHA}", "hk-a")] == tar
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    entry = idx["generators"][0]
+    assert entry["rounds_seen"] == 2        # additive across scans
+    assert entry["archived_at"] == "t1"     # original snapshot stamp kept
+    assert idx["scanned_rounds"] == ["r1", "r2"]
+
+
+def test_sync_generators_retries_a_failed_fetch_without_rereading_the_round():
+    from cascade.shared.hippius import StorageError
+
+    def boom(ref, dest, hub):
+        raise StorageError("hub down")
+
+    rounds = [(_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+               [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)])]
+    manifest = _manifest_store_with_receipts(rounds)
+    archive = _FakeS3Store()
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t1", fetch=boom)
+    assert res.failed == [f"hk-a:cascade/a@{SHA}"]
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    # the round IS scanned (attribution recorded) but the tar is still owed
+    assert idx["scanned_rounds"] == ["r1"]
+    assert idx["generators"][0]["tar_sha256"] is None
+
+    # next run: the Hub recovered — the tar lands even though r1 isn't re-read
+    fetched: list[str] = []
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t2",
+                             fetch=_fake_fetch_factory(fetched))
+    assert res.rounds_scanned == 0 and res.archived == 1 and not res.failed
+    assert fetched == [f"cascade/a@{SHA}"]
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    assert idx["generators"][0]["tar_sha256"] and idx["generators"][0]["archived_at"] == "t2"
+
+
+def test_sync_generators_preserves_entries_that_scrolled_off_the_window():
+    fetched: list[str] = []
+    fetch = _fake_fetch_factory(fetched)
+    archive = _FakeS3Store()
+    m1 = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)]),
+    ])
+    ka.sync_generators(manifest_store=m1, archive_store=archive, hub=HUB,
+                       endpoint="https://e", bucket="b", updated_at="t1", fetch=fetch)
+
+    # the window rolled (and a transient read could even be empty) — the db keeps `a`
+    m2 = _manifest_store_with_receipts([])
+    res = ka.sync_generators(manifest_store=m2, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t2", fetch=fetch)
+    assert res.total_generators == 1
+    idx = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())
+    assert {g["gen_ref"] for g in idx["generators"]} == {f"cascade/a@{SHA}"}
+    assert idx["scanned_rounds"] == ["r1"]   # scan history survives too
+
+
+def test_sync_generators_dry_run_writes_nothing():
+    fetched: list[str] = []
+    manifest = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)]),
+    ])
+    archive = _FakeS3Store()
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", dry_run=True,
+                             fetch=_fake_fetch_factory(fetched))
+    assert res.would_archive == 1 and res.archived == 0
+    assert fetched == []
+    assert archive.objects == {}             # not even the index / scanned_rounds
+
+
+def test_kings_and_generators_coexist_in_one_bucket():
+    fetched: list[str] = []
+    fetch = _fake_fetch_factory(fetched)
+    manifest = _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-a", 1, f"cascade/a@{SHA}", 40),
+          _participant("hk-b", 2, f"cascade/b@{SHB}", 50)]),
+    ])
+    archive = _FakeS3Store()
+    ka.sync_kings(manifest_store=manifest, archive_store=archive, hub=HUB,
+                  endpoint="https://e", bucket="b", updated_at="t", fetch=fetch)
+    ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                       endpoint="https://e", bucket="b", updated_at="t", fetch=fetch)
+    # the king lands under BOTH prefixes; the non-king only under generators/
+    assert ka.archive_key_for_ref(f"cascade/a@{SHA}") in archive.objects
+    assert ka.generator_key_for_ref(f"cascade/a@{SHA}", "hk-a") in archive.objects
+    assert ka.archive_key_for_ref(f"cascade/b@{SHB}") not in archive.objects
+    assert ka.generator_key_for_ref(f"cascade/b@{SHB}", "hk-b") in archive.objects
+    assert ka.KING_INDEX_KEY in archive.objects
+    assert ka.GENERATOR_INDEX_KEY in archive.objects
 
 
 def test_king_archive_config_falls_back_to_backup_endpoint(monkeypatch):
