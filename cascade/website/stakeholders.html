@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cascade · subnet scoreboard</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<meta name="description" content="Cascade (Bittensor SN91) stakeholder scoreboard: dethrone events, forecast improvement vs the launch baseline, scaling ladder, and training efficiency — every number derived from the signed public round receipts.">
+<meta name="description" content="Cascade (Bittensor SN91) scoreboard: how often the lead changes hands, how much the forecasts have improved since day one, how big the models are, and what that progress costs.">
 <style>
 /* ============================================================
    cascade — stakeholder scoreboard
@@ -105,13 +105,23 @@ a:hover{text-decoration:underline}
 
 /* baseline callout */
 .callout{border:var(--line);border-left:3px solid var(--accent);background:var(--surface);
-  padding:16px 20px;font-size:13px;line-height:1.65;color:var(--ink)}
-.callout h3{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;
-  letter-spacing:.08em;margin-bottom:7px;color:var(--ink)}
-.callout p{color:var(--muted);max-width:96ch}
-.callout p+p{margin-top:8px}
-.callout code{font-family:var(--font-mono);font-size:12px;background:var(--paper);
-  border:var(--line-faint);padding:1px 5px;color:var(--ink)}
+  padding:15px 19px;font-size:13.5px;line-height:1.6;color:var(--ink)}
+.callout b{font-weight:700}
+
+/* "how this is measured" expanders — detail on demand, never in the way */
+details{border-top:var(--line-faint);margin-top:14px}
+details summary{cursor:pointer;list-style:none;padding:10px 0 0;font-family:var(--font-mono);
+  font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+  display:flex;align-items:center;gap:7px}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:"+";font-weight:700;color:var(--accent);width:9px}
+details[open] summary::before{content:"−"}
+details summary:hover{color:var(--ink)}
+.detail-body{font-size:12.5px;color:var(--muted);line-height:1.7;padding:10px 0 4px;max-width:88ch}
+.detail-body p+p{margin-top:9px}
+.detail-body code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
+.detail-body ul{margin:6px 0 0 17px}
+.detail-body li{margin-bottom:5px}
 
 /* timeline */
 .timeline{position:relative;padding:8px 0 4px}
@@ -231,11 +241,9 @@ th.num{text-align:right}
 
   <div class="header">
     <span class="wordmark">cascade</span>
-    <span class="tagline">Subnet scoreboard · for stakeholders</span>
-    <p class="sub">Six numbers that say whether the competition is working, whether the models are
-    getting better, and what that improvement costs. Every figure below is derived from the
-    validator&rsquo;s <b>signed public round receipts</b> — the same trail
-    <code>cascade-audit</code> replays. Nothing here is hand-entered.</p>
+    <span class="tagline">Subnet scoreboard</span>
+    <p class="sub">Six numbers, updated live. Every one is calculated from the subnet&rsquo;s public,
+    signed record — nothing here is typed in by hand.</p>
   </div>
 
   <!-- headline tiles -->
@@ -246,103 +254,121 @@ th.num{text-align:right}
 
   <!-- competition -->
   <section>
-    <div class="section-label"><span>Competition &mdash; dethrone events</span>
+    <div class="section-label"><span>Is the competition working?</span>
       <span class="muted" id="deth-when"></span></div>
-    <p class="lede">A dethrone is the competition working: a challenger&rsquo;s generator beat the
-    reigning king by more than the win margin on held-out data, and took the throne. A subnet where
-    the king never changes is not competing; one that changes hands regularly is.</p>
+    <p class="lede">The leader holds the title until someone beats it. Each marker below is a
+    change of hands.</p>
     <div class="timeline" id="timeline"></div>
     <div class="scroll-box" style="margin-top:12px">
       <table><thead><tr>
-        <th>#</th><th>Took the throne</th><th class="num">UID</th><th>Generator</th>
-        <th>Round</th><th class="num">Improvement</th><th class="num">Held (rounds)</th>
+        <th>#</th><th>Took the lead</th><th class="num">Miner</th><th>Entry</th>
+        <th>Round</th><th class="num">By how much</th><th class="num">Rounds held</th>
       </tr></thead><tbody id="reigns"></tbody></table>
     </div>
   </section>
 
   <!-- performance vs baseline -->
   <section>
-    <div class="section-label"><span>Performance &mdash; forecast improvement vs baseline</span>
+    <div class="section-label"><span>Are the forecasts getting better?</span>
       <span class="muted" id="perf-when"></span></div>
-    <div class="callout" style="margin-bottom:18px">
-      <h3>The baseline, and why it does not move</h3>
-      <p id="baseline-def">The baseline is the generator that held the throne at the first round in
-      the public receipt record.</p>
-      <p>Improvement is <b>chained, not re-measured</b>. The subnet&rsquo;s eval pool rotates every
-      round (seeded by the block hash) so no generator can distribution-match it — which also means a
-      raw error number from round&nbsp;1 and one from round&nbsp;80 were measured on different
-      windows and are <i>not</i> comparable. What <i>is</i> comparable is each dethrone: king and
-      challenger are scored on the <b>same windows, same round</b>, so the ratio between them is a
-      clean paired measurement. Multiplying those ratios across every dethrone gives the cumulative
-      improvement over the launch baseline, with window difficulty cancelling at each step.</p>
-      <p><code>improvement = 1 − Π(challenger_error ÷ king_error)</code> over dethrone rounds. The
-      <b>conservative floor</b> replaces each factor with the round&rsquo;s 95% bootstrap lower
-      bound — the number the dethrone was actually gated on. Both are plotted; the gap between them
-      is the selection bias (a dethrone is granted on a favourable noisy estimate, so the observed
-      chain runs optimistic).</p>
+    <p class="lede">Measured against day one, and only counting gains that were independently
+    verified at the moment they happened.</p>
+    <div class="callout" style="margin-bottom:20px" id="baseline-def">
+      The starting point is whoever led the very first round.
     </div>
     <div class="chart-wrap"><svg id="chart-perf" preserveAspectRatio="none"></svg></div>
     <div class="chart-meta">
       <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Observed chain</span>
-        <span><i class="swatch" style="background:var(--saffron)"></i> Conservative floor (95% LCB)</span>
+        <span><i class="swatch" style="background:var(--accent)"></i> Measured</span>
+        <span><i class="swatch" style="background:var(--saffron)"></i> Guaranteed minimum</span>
       </div>
       <span id="perf-note">--</span>
     </div>
+    <details>
+      <summary>How this is measured</summary>
+      <div class="detail-body">
+        <p>Every round, the subnet tests entries on a <b>fresh set of hidden data</b>. That stops
+        anyone tuning their entry to the test — but it also means a score from round&nbsp;1 and a
+        score from round&nbsp;80 were taken on different data and can&rsquo;t be compared head to
+        head.</p>
+        <p>What <i>can</i> be compared is each change of lead: the old leader and the challenger are
+        tested on the <b>exact same data, in the same round</b>. So we record how much better the
+        winner was at each handover, and multiply those steps together. Difficulty of the data
+        cancels out at every step.</p>
+        <p>The <b>guaranteed minimum</b> line uses the cautious end of each measurement instead of
+        the best estimate — the same threshold the subnet itself required before awarding the win.
+        Reality sits between the two lines, and the gap is the honest margin of error.</p>
+        <p class="muted"><code>improvement = 1 − Π(challenger_error ÷ leader_error)</code> across
+        lead changes; the minimum line substitutes each round&rsquo;s 95% bootstrap lower bound.</p>
+      </div>
+    </details>
   </section>
 
   <!-- public benchmark -->
   <section>
-    <div class="section-label"><span>Performance &mdash; best public benchmark</span>
+    <div class="section-label"><span>How does it score on public tests?</span>
       <span class="muted" id="bench-when"></span></div>
-    <p class="lede">External credibility: how the subnet&rsquo;s champion checkpoint scores on the
-    open GIFT-Eval / BOOM / TIME batteries, normalised against the Seasonal-Naive reference exactly
-    as the public leaderboards do. <b>1.00 = Seasonal-Naive; lower is better.</b></p>
+    <p class="lede">Independent, industry-standard forecasting benchmarks that anyone can run.
+    <b>1.00 is the standard reference model; below 1.00 beats it.</b></p>
     <div id="bench-panel"></div>
+    <details>
+      <summary>Which benchmarks, and why they don&rsquo;t affect the competition</summary>
+      <div class="detail-body">
+        <p>GIFT-Eval, BOOM and TIME — three open forecasting benchmarks, scored the same way their
+        public leaderboards do, so the numbers are directly comparable to published results.</p>
+        <p>These scores are <b>reported only</b>. They never decide who wins a round. The benchmark
+        data is public, so scoring on it would just reward entries tuned to it; the competition is
+        settled on hidden data instead.</p>
+      </div>
+    </details>
   </section>
 
   <!-- scaling -->
   <section>
-    <div class="section-label"><span>Scaling &mdash; highest validated model size</span>
+    <div class="section-label"><span>How big are the models?</span>
       <span class="muted" id="scale-when"></span></div>
-    <p class="lede">A rung counts as <b>validated</b> once the full pipeline has run at that size and
-    produced a judged round — generators drawn, models trained under the fixed contract, and a
-    verdict written to a signed receipt.</p>
+    <p class="lede">The plan is to climb this ladder. A step turns green only after the whole
+    process has actually run at that size and produced a result.</p>
     <div class="ladder" id="ladder"></div>
     <p class="lede" style="margin-top:14px;margin-bottom:0" id="ladder-note"></p>
   </section>
 
   <!-- efficiency -->
   <section>
-    <div class="section-label"><span>Efficiency &mdash; skill gain per training token</span>
+    <div class="section-label"><span>Is the progress worth the compute?</span>
       <span class="muted" id="eff-when"></span></div>
-    <p class="lede">Accuracy that costs ever more compute is not progress. This divides the
-    cumulative improvement above by the training tokens the competition has burned to earn it —
-    every final king/challenger run plus every heat-screen run.</p>
+    <p class="lede">Accuracy bought with ever more computing power isn&rsquo;t really progress. This
+    is the improvement above, divided by the training it took to get there.</p>
     <div class="chart-wrap"><svg id="chart-eff" preserveAspectRatio="none"></svg></div>
     <div class="chart-meta">
       <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per 10<sup>12</sup> training tokens</span>
+        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per trillion training tokens</span>
       </div>
       <span id="eff-note">--</span>
     </div>
-    <p class="lede" style="margin-top:14px;margin-bottom:0" id="eff-caveat"></p>
+    <details>
+      <summary>How the training cost is counted</summary>
+      <div class="detail-body" id="eff-caveat"></div>
+    </details>
   </section>
 
   <!-- compounding -->
   <section>
-    <div class="section-label"><span>Compounding &mdash; gain retention across warm starts</span>
+    <div class="section-label"><span>Does progress carry forward?</span>
       <span class="muted" id="warm-when"></span></div>
-    <p class="lede">The core hypothesis: when a long-reigning king&rsquo;s best checkpoint is promoted
-    to become the floor everyone trains up from, do the accumulated gains survive the handoff?</p>
+    <p class="lede">Eventually the best model so far becomes the new starting line for everyone.
+    The question is how much of the accumulated progress survives that handover.</p>
     <div id="warm-panel"></div>
   </section>
 
   <!-- method -->
   <section>
-    <div class="section-label"><span>How to check these numbers</span><span class="muted">Verification</span></div>
-    <dl class="method" id="method"></dl>
-    <p class="foot" id="foot"></p>
+    <div class="section-label"><span>Checking these numbers</span><span class="muted">Sources</span></div>
+    <p class="lede" style="margin-bottom:0" id="foot"></p>
+    <details>
+      <summary>Where each number comes from</summary>
+      <dl class="method" id="method"></dl>
+    </details>
   </section>
 
 </div>
@@ -585,39 +611,33 @@ function renderTiles(){
 
   // 1 — dethrones
   cells.push(tile({
-    k:"Dethrone events", pill: rs.length?PILL_LIVE:PILL_PEND,
+    k:"Times the lead changed hands", pill: rs.length?PILL_LIVE:PILL_PEND,
     v: rs.length ? deth : "--",
     note: rs.length
-      ? deth + " throne change" + (deth===1?"":"s") + " across <b>" + rs.length +
-        "</b> judged round" + (rs.length===1?"":"s") + " &middot; " + rg.length +
-        " distinct reign" + (rg.length===1?"":"s")
-      : "Waiting for the first published round."
+      ? "Over <b>" + rs.length + "</b> round" + (rs.length===1?"":"s") + " of competition."
+      : "Waiting for the first round."
   }));
 
   // 2 — improvement vs baseline
   var haveChain = chain.steps.length > 0;
   cells.push(tile({
-    k:"Forecast improvement vs baseline", pill: haveChain?PILL_LIVE:PILL_PEND,
+    k:"Better than day one", pill: haveChain?PILL_LIVE:PILL_PEND,
     v: haveChain ? signedPct(chain.obs) : "--",
     note: haveChain
-      ? "Better than the launch baseline, chained across " + chain.steps.length +
-        " dethrone" + (chain.steps.length===1?"":"s") + ". Conservative floor: <b>" +
-        signedPct(chain.floor) + "</b>."
-      : (rs.length
-          ? "No dethrone yet — the baseline king still holds, so improvement is 0% by construction."
-          : "Waiting for the first published round.")
+      ? "At least <b>" + signedPct(chain.floor) + "</b> guaranteed."
+      : (rs.length ? "The original leader still holds, so nothing has improved on it yet."
+                   : "Waiting for the first round.")
   }));
 
   // 3 — public benchmark
   var b = benchScores();
   cells.push(tile({
-    k:"Best public benchmark", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:!!b,
-    v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">MASE</span>') : "Pending",
+    k:"Public benchmark score", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:!!b,
+    v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">vs 1.00</span>') : "Pending",
     note: b
-      ? "GIFT-Eval, Seasonal-Naive-normalised (1.00 = Seasonal-Naive). CRPS <b>" +
-        num(b.scores.gifteval_crps,3) + "</b>."
-      : "No benchmark result published yet. The trainer stamps GIFT-Eval / BOOM / TIME onto the " +
-        "king&rsquo;s signed manifest once the benchmark hook is armed."
+      ? "GIFT-Eval accuracy. Below 1.00 <b>" + (b.scores.gifteval_mase<1 ? "beats" : "trails") +
+        "</b> the standard reference model."
+      : "No public benchmark result yet. This fills in automatically when one is published."
   }));
 
   // 4 — scaling
@@ -626,36 +646,32 @@ function renderTiles(){
     if(seen[r.key]) { top=r; nxt=LADDER[i+1]||null; }
   });
   cells.push(tile({
-    k:"Highest validated model size", pill: top?PILL_LIVE:PILL_PEND,
-    v: top ? top.label : "--",
+    k:"Biggest model proven", pill: top?PILL_LIVE:PILL_PEND,
+    v: top ? (top.label + ' <span class="u">params</span>') : "--", small:!!top,
     note: top
-      ? "Validated over <b>" + seen[top.key] + "</b> judged round" + (seen[top.key]===1?"":"s") +
-        (nxt ? ". Next rung: <b>" + nxt.label + "</b>." : ". Top of the ladder.")
-      : "No judged round carries a size tag yet."
+      ? (nxt ? "Next step up: <b>" + nxt.label + "</b>." : "Top of the ladder.")
+      : "No result at any size yet."
   }));
 
   // 5 — efficiency
-  var last = chain.pts.length ? chain.pts[chain.pts.length-1] : null;
   var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
   var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
   cells.push(tile({
-    k:"Skill gain per training token", pill: eff!=null?PILL_LIVE:PILL_PEND, small:true,
-    v: eff!=null ? (signedPct(eff,2) + ' <span class="u">/ 10<sup>12</sup> tok</span>') : "Pending",
+    k:"Improvement per unit of compute", pill: eff!=null?PILL_LIVE:PILL_PEND,
+    v: eff!=null ? signedPct(eff,2) : "Pending", pending: eff==null, small: eff==null,
     note: eff!=null
-      ? "Cumulative improvement over <b>" + num(tot/1e12,1) + "T</b> contracted training tokens."
-      : "Unlocks with the first dethrone (needs a non-zero improvement to divide)."
+      ? "Per trillion training tokens. <b>" + num(tot/1e12,1) + " trillion</b> used so far."
+      : "Starts once there is an improvement to divide."
   }));
 
   // 6 — compounding
   var ws = warmStart();
   cells.push(tile({
-    k:"Gain retention (warm starts)", pill:PILL_PEND, pending:true, small:true,
-    v: ws ? "Armed" : "Dormant",
+    k:"Progress carried forward", pill:PILL_PEND, pending:true, small:true,
+    v: ws ? "Starting" : "Not started",
     note: ws
-      ? "Rounds now train from <b>" + esc(shortRef(ws.ckpt)) + "</b>. Retention becomes measurable " +
-        "at the first promotion with benchmark numbers on both sides of the handoff."
-      : "Cascade warm-start promotion is not armed, so no warm start has happened and there is " +
-        "nothing to retain yet."
+      ? "The best model so far is now everyone&rsquo;s starting line. First reading comes at the next handover."
+      : "Not switched on yet, so there is nothing to carry forward."
   }));
 
   document.getElementById("tiles").innerHTML = cells.join("");
@@ -688,22 +704,22 @@ function renderCompetition(){
       var label = !dense || i===0 || i===rg.length-1;
       return '<div class="tl-ev'+(g.baseline?" launch":"")+(i%2?" alt":"")+
         '" style="left:'+xs[i].toFixed(2)+'%" title="'+
-        esc((g.baseline?"Baseline":("Dethrone #"+(g.n-1)))+" · "+prettyDay(g.at)+" · uid "+
-            (g.uid!=null?g.uid:"?"))+'">' +
-        (label ? '<span class="tl-lab who">'+esc(g.baseline?"baseline":("#"+(g.n-1)))+'</span>' +
+        esc((g.baseline?"Starting point":("Lead change #"+(g.n-1)))+" · "+prettyDay(g.at)+
+            " · miner "+(g.uid!=null?g.uid:"?"))+'">' +
+        (label ? '<span class="tl-lab who">'+esc(g.baseline?"start":("#"+(g.n-1)))+'</span>' +
                  '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
         '<span class="tl-dot"></span></div>';
     }).join("");
     var deth = rg.length - 1;
     rail.innerHTML = '<div class="tl-rail"><div class="tl-line"></div>'+evs+'</div>' +
-      '<div class="tl-note">' + (deth ? deth + " dethrone" + (deth===1?"":"s") : "no dethrone yet") +
+      '<div class="tl-note">' + (deth ? deth + " lead change" + (deth===1?"":"s") : "no lead change yet") +
       " since " + esc(prettyDay(rg[0].at)) +
       (dense ? " · hover a marker for its date" : "") + "</div>";
   }
 
   var rows = rg.slice().reverse().map(function(g){
     return '<tr>' +
-      '<td>'+(g.baseline?'<span class="muted">base</span>':("#"+(g.n-1)))+'</td>' +
+      '<td>'+(g.baseline?'<span class="muted">start</span>':("#"+(g.n-1)))+'</td>' +
       '<td>'+esc(prettyDay(g.at))+'</td>' +
       '<td class="num">'+(g.uid!=null?g.uid:"--")+'</td>' +
       '<td>'+refLink(g.gen_ref)+'</td>' +
@@ -714,7 +730,7 @@ function renderCompetition(){
   document.getElementById("reigns").innerHTML = rows ||
     '<tr><td colspan="7" class="empty">No reigns recorded yet</td></tr>';
   document.getElementById("deth-when").textContent =
-    rg.length ? ("Baseline seated " + prettyDay(rg[0].at)) : "";
+    rg.length ? ("Since " + prettyDay(rg[0].at)) : "";
 }
 
 // ── charts ──────────────────────────────────────────────────────────────────
@@ -783,16 +799,13 @@ function renderPerf(){
   });
   var rg = reigns();
   document.getElementById("baseline-def").innerHTML = rg.length
-    ? "The baseline is <b>" + esc(shortRef(rg[0].gen_ref)) + "</b> (uid " + (rg[0].uid!=null?rg[0].uid:"--") +
-      "), the generator holding the throne at the first round in the public receipt record — round <code>" +
-      esc(shortRound(rg[0].round)) + "</code>, " + esc(prettyDay(rg[0].at)) + ". It is an anchor, not a " +
-      "competitor: it never re-runs, so the reference point cannot drift."
-    : "The baseline is the generator holding the throne at the first round in the public receipt record. " +
-      "No round has published yet.";
+    ? "<b>Starting point:</b> " + esc(shortRef(rg[0].gen_ref)) + ", the entry that led on " +
+      esc(prettyDay(rg[0].at)) + ". It is a fixed marker, not a competitor — it never re-runs, so " +
+      "the comparison point can&rsquo;t quietly move."
+    : "<b>Starting point:</b> whoever leads the very first round. None has been published yet.";
   document.getElementById("perf-note").textContent = chain.steps.length
-    ? (chain.steps.length + " dethrone step" + (chain.steps.length===1?"":"s") + " · " +
-       signedPct(chain.obs) + " observed / " + signedPct(chain.floor) + " floor")
-    : "Baseline king still holds";
+    ? (signedPct(chain.obs) + " measured · " + signedPct(chain.floor) + " guaranteed")
+    : "The original leader still holds";
   document.getElementById("perf-when").textContent =
     chain.steps.length ? ("Last gain " + timeAgo(chain.steps[chain.steps.length-1].at)) : "";
 }
@@ -809,23 +822,22 @@ function renderEfficiency(){
   });
   var tot = chain.pts.reduce(function(a,p){ return a+p.tokens; }, 0);
   document.getElementById("eff-note").textContent = tot > 0
-    ? (num(tot/1e12,1) + "T tokens burned · " +
-       (chain.steps.length ? signedPct(chain.obs/(tot/1e12),2) + " per 10^12" : "no gain yet"))
+    ? (num(tot/1e12,1) + " trillion tokens used" +
+       (chain.steps.length ? " · " + signedPct(chain.obs/(tot/1e12),2) + " per trillion" : ""))
     : "--";
   var eras = TOKEN_ERAS.map(function(e){
-    return (e.from === "0000-00-00" ? "launch" : e.from) + ": " +
-      num(e.train_h*3600*e.ref_tps/1e9,1) + "B per final run, " +
-      num(e.heat_h*3600*e.ref_tps/1e9,1) + "B per heat entrant (" + e.why + ")";
+    return (e.from === "0000-00-00" ? "at launch" : "from " + e.from) + ", " +
+      num(e.train_h*3600*e.ref_tps/1e9,1) + "B tokens per full training run and " +
+      num(e.heat_h*3600*e.ref_tps/1e9,1) + "B per screening run (" + e.why + ")";
   }).join("; ");
   document.getElementById("eff-caveat").innerHTML =
-    "<b>Assumption, stated:</b> the round receipts record the training contract&rsquo;s <i>digest</i>, " +
-    "not its token budget, so tokens are computed from the public <code>chain.toml</code> — " +
-    esc(eras) + ". Each round counts two final runs per trained size plus one heat run per entrant " +
-    "(entrant counts come from the receipts). A run stopped early by the wall-clock guard burned " +
-    "less than its budget, so this is an <b>upper bound on spend</b> — i.e. a conservative, " +
-    "lower-bound efficiency. Publishing <code>tokens_seen</code> in the round summary would make " +
-    "it exact.";
-  document.getElementById("eff-when").textContent = tot>0 ? (num(tot/1e12,1)+"T tokens") : "";
+    "<p>Every round trains the leader and the challenger from scratch, and briefly trains each " +
+    "entrant to screen the field. Those runs have <b>fixed, published budgets</b>, so the total is " +
+    "the number of runs multiplied by the budget in force at the time: " + esc(eras) + ".</p>" +
+    "<p>A run that hit its time limit early used less than its budget, so this figure <b>overstates " +
+    "the compute</b> — which means the efficiency shown is a cautious one, not a flattering one.</p>";
+  document.getElementById("eff-when").textContent =
+    tot>0 ? (num(tot/1e12,1)+" trillion tokens") : "";
 }
 
 // ── render: benchmark / ladder / warm start ─────────────────────────────────
@@ -835,13 +847,9 @@ function renderBench(){
     el.innerHTML = '<div class="pending-panel">' +
       '<span class="pg">&mdash; &mdash; &mdash;</span>' +
       '<span class="ph">Pending public benchmark</span>' +
-      '<p>No public-benchmark result has been published for a king checkpoint yet. The machinery ' +
-      'exists — the benchmark sidecar runs GIFT-Eval, BOOM and TIME with the leaderboards&rsquo; own ' +
-      'Seasonal-Naive normalisation, and the trainer stamps the six numbers onto the king&rsquo;s ' +
-      '<i>signed</i> manifest — but it only runs when the benchmark hook is armed ' +
-      '(<code>[scoring] cascade_enabled</code>). This tile fills itself in automatically from the ' +
-      'first receipt that carries them; until then it stays blank rather than showing a number ' +
-      'nobody can check.</p></div>';
+      '<p>No public benchmark result has been published yet. This panel fills in on its own the ' +
+      'moment one is. Until then it stays blank rather than showing a number nobody can check.</p>' +
+      '</div>';
     document.getElementById("bench-when").textContent = "";
     return;
   }
@@ -852,13 +860,11 @@ function renderBench(){
     { n:"TIME",      c:s.time_crps,     m:s.time_mase }
   ];
   el.innerHTML = '<div class="tiles">' + suites.map(function(x){
-    return tile({ k:x.n + " · vs Seasonal-Naive", small:true,
-      v: num(x.m,3) + ' <span class="u">MASE</span>',
-      note: "CRPS <b>" + num(x.c,3) + "</b> &middot; " +
-            (x.m<1 ? "beats" : "does not beat") + " the Seasonal-Naive reference (1.000)." });
+    return tile({ k:x.n, small:true,
+      v: num(x.m,3) + ' <span class="u">vs 1.00</span>',
+      note: (x.m<1 ? "Beats" : "Trails") + " the standard reference model." });
   }).join("") + '</div>';
-  document.getElementById("bench-when").textContent =
-    "King checkpoint" + (b.size ? " · " + b.size : "");
+  document.getElementById("bench-when").textContent = "Current leader";
 }
 
 function renderLadder(){
@@ -868,18 +874,16 @@ function renderLadder(){
     var done = !!seen[r.key], next = (i === topIdx+1);
     return '<div class="rung'+(done?" done":"")+(next?" next":"")+'">' +
       '<span class="rp">'+esc(r.label)+'</span>' +
-      '<span class="rs">'+(done?"Validated":(next?"Next":"Planned"))+'</span>' +
-      '<span class="rn">'+(done ? (seen[r.key]+" judged round"+(seen[r.key]===1?"":"s"))
-                                : esc(r.note||"not run")) +'</span></div>';
+      '<span class="rs">'+(done?"Proven":(next?"Next":"Planned"))+'</span>' +
+      '<span class="rn">'+(done ? (seen[r.key]+" round"+(seen[r.key]===1?"":"s")+" run")
+                                : esc(r.note||"not run yet")) +'</span></div>';
   }).join("");
   var top = topIdx>=0 ? LADDER[topIdx] : null, nxt = LADDER[topIdx+1] || null;
   document.getElementById("ladder-note").innerHTML = top
-    ? "Validated today: <b>" + esc(top.label) + "</b>" + (nxt ? "; next rung <b>" + esc(nxt.label) +
-      "</b>. A rung turns green the moment a judged round carries its size tag — enabling a size in " +
-      "the training contract is not enough." : "."
-      )
-    : "No size tag has appeared in a judged round yet.";
-  document.getElementById("scale-when").textContent = top ? (top.label + " validated") : "";
+    ? "Proven so far: <b>" + esc(top.label) + "</b>" +
+      (nxt ? ". Next: <b>" + esc(nxt.label) + "</b>." : " — the top of the ladder.")
+    : "No size has produced a result yet.";
+  document.getElementById("scale-when").textContent = top ? (top.label + " proven") : "";
 }
 
 function renderWarm(){
@@ -887,81 +891,59 @@ function renderWarm(){
   if(!ws){
     el.innerHTML = '<div class="pending-panel">' +
       '<span class="pg">&mdash; &mdash; &mdash;</span>' +
-      '<span class="ph">No warm start yet &mdash; Cascade is dormant</span>' +
-      '<p>Warm-start promotion (a long-reigning king&rsquo;s best checkpoint becoming the shared ' +
-      'init) is implemented but <b>not armed</b>: every round still trains from a random init, so ' +
-      'zero gains have been carried across a handoff and there is nothing to retain. Showing a ' +
-      'retention percentage now would be inventing one.</p>' +
-      '<p>When it arms, retention is measurable without any new evaluation: the promoted checkpoint ' +
-      'and the next round&rsquo;s king are both scored on the same fixed public battery and both ' +
-      'sets of numbers are signed into their manifests, so retention is ' +
-      '<code>promoted_score ÷ first_post_promotion_score</code> — one division over two signed ' +
-      'receipts.</p></div>';
+      '<span class="ph">Not switched on yet</span>' +
+      '<p>Right now every round starts from scratch, so no progress has been handed forward and ' +
+      'there is nothing to measure. A retention figure today would be invented.</p>' +
+      '<p class="muted">The formula is fixed in advance so it can&rsquo;t be chosen after the fact: ' +
+      'the promoted model&rsquo;s benchmark score divided by the next round&rsquo;s.</p></div>';
     document.getElementById("warm-when").textContent = "";
     return;
   }
   el.innerHTML = '<div class="pending-panel">' +
-    '<span class="ph">Warm start active</span>' +
-    '<p>Rounds are training from <b>' + esc(shortRef(ws.ckpt)) + '</b>' +
-    (ws.size ? ' at <code>' + esc(ws.size) + '</code>' : '') +
-    '. Retention is computed from the first promotion that has a post-promotion round with ' +
-    'published benchmark numbers on both sides.</p></div>';
-  document.getElementById("warm-when").textContent = "Warm start pinned";
+    '<span class="ph">Just switched on</span>' +
+    '<p>Everyone now starts from <b>' + esc(shortRef(ws.ckpt)) + '</b>, the best model so far. ' +
+    'The first retention reading arrives at the next handover.</p></div>';
+  document.getElementById("warm-when").textContent = "Active";
 }
 
 // ── render: method + chrome ─────────────────────────────────────────────────
 function renderMethod(){
   var chain = improvementChain(), rg = reigns();
   var items = [
-    ["Dethrone events",
-     "Count of rounds whose signed receipt carries <code>verdict.dethroned = true</code>. " +
-     "Read straight from <code>receipts/index.json</code>; each row links to the round receipt " +
-     "that produced it."],
-    ["Improvement vs baseline",
-     "Product of <code>chal_geomean ÷ king_geomean</code> over dethrone rounds, subtracted from 1. " +
-     "Both numbers come from the same receipt and were measured on the same eval windows in the " +
-     "same round, so the ratio is paired. The floor swaps each factor for the round&rsquo;s " +
-     "<code>lcb</code> — the 95% bootstrap bound the dethrone was gated on."],
-    ["Why not a single absolute score",
-     "The eval pool rotates per round (block-hash seeded) so generators cannot distribution-match " +
-     "it. That is a deliberate anti-gaming property, and it is exactly why round-1 and round-N " +
-     "error numbers are not directly comparable — the windows differ. Chaining paired ratios is " +
-     "the honest way to span them."],
-    ["Known bias",
-     "A dethrone is granted on a favourable noisy estimate, so each chained factor is selected " +
-     "upward (winner&rsquo;s curse) and the observed chain runs optimistic. The 95%-LCB floor is " +
-     "the counterpart that cannot be inflated this way. Quote the pair, not the headline alone."],
+    ["Lead changes",
+     "Counted from the signed record of each round — the field that says the title changed hands."],
+    ["Better than day one",
+     "Each lead change is a like-for-like test of old leader against challenger on the same data. " +
+     "Those gains are multiplied together. The guaranteed figure uses the cautious end of each " +
+     "measurement (<code>lcb</code>, the threshold the win had to clear)."],
+    ["Why not one single score",
+     "The test data changes every round so nobody can tune to it. That makes scores from different " +
+     "rounds non-comparable, which is why gains are chained from same-round comparisons instead."],
+    ["Margin of error",
+     "A win is awarded on a good measurement, and good measurements are sometimes lucky. So the " +
+     "measured line runs slightly optimistic and the guaranteed line runs conservative. Read them " +
+     "as a range."],
     ["Public benchmark",
-     "GIFT-Eval / BOOM / TIME via the pinned benchmark sidecar, aggregated with the leaderboards&rsquo; " +
-     "own shifted-geomean-over-Seasonal-Naive method, so 1.000 is the Seasonal-Naive reference and " +
-     "the numbers are leaderboard-comparable. Never feeds scoring or weights — the benchmark data is " +
-     "public and would be a Goodhart target."],
-    ["Highest validated size",
-     "Largest ladder rung whose size tag appears in a scored, non-inconclusive round. Configuring a " +
-     "size does not count it; a judged verdict does."],
-    ["Skill gain per training token",
-     "Cumulative improvement ÷ cumulative training tokens, tokens computed from the public training " +
-     "contract (see the note under the chart). Approximate in the numerator&rsquo;s denominator only: " +
-     "the improvement itself is receipt-derived."],
-    ["Gain retention",
-     "Undefined until a warm-start promotion happens. The formula is fixed in advance so it cannot " +
-     "be chosen after seeing the data."]
+     "GIFT-Eval, BOOM and TIME, scored as their public leaderboards do. Reported only — they " +
+     "never decide who wins."],
+    ["Biggest model proven",
+     "The largest size that has actually produced a judged result. Planning a size doesn&rsquo;t " +
+     "count it."],
+    ["Compute",
+     "Number of training runs times their published budgets. See the note under the chart."],
+    ["Progress carried forward",
+     "Not measurable until the hand-forward mechanism is switched on."]
   ];
   document.getElementById("method").innerHTML = items.map(function(p){
     return "<div><dt>"+esc(p[0])+"</dt><dd>"+p[1]+"</dd></div>"; }).join("");
 
-  var parts = [];
-  parts.push("Source: the validator&rsquo;s public receipt trail (<code>receipts/index.json</code> " +
-    "plus the anchored signed receipts), read live in your browser — this page holds no database " +
-    "and no cached figures.");
+  var parts = ["Read live from the subnet&rsquo;s public signed record. No database, no stored " +
+    "figures, nothing entered by hand — reload and it recalculates."];
   if(atCap()){
-    parts.push("<b>Note:</b> the shared index keeps a rolling window of the most recent " +
-      INDEX_MAX_KEEP + " rounds and is now at that cap, so &ldquo;since launch&rdquo; here means " +
-      "since the oldest round still in the window (" + esc(prettyDay(rg.length?rg[0].at:"")) +
-      "). Earlier rounds remain in the archived receipts.");
+    parts.push("The public record keeps the most recent " + INDEX_MAX_KEEP + " rounds, so " +
+      "&ldquo;day one&rdquo; here means " + esc(prettyDay(rg.length?rg[0].at:"")) +
+      ", the oldest round still listed.");
   }
-  parts.push("Every figure is reproducible with <code>cascade-audit</code> against the same " +
-    "receipts; see <code>docs/AUDIT.md</code>.");
   document.getElementById("foot").innerHTML = parts.join(" ");
 }
 
@@ -982,8 +964,8 @@ function renderChrome(){
     b.hidden = false;
     b.className = "data-banner " + (_state === "offline" ? "offline" : "loading");
     b.textContent = _state === "offline"
-      ? "Cannot reach the public receipt endpoints — showing nothing rather than stale or invented numbers."
-      : "Loading the public receipt trail…";
+      ? "Can\u2019t reach the public record right now — showing nothing rather than stale numbers."
+      : "Loading the public record…";
   }
 }
 

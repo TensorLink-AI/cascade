@@ -125,7 +125,7 @@ def test_pending_states_are_explicit(html: str):
     state rather than a placeholder number — the whole page's credibility rests
     on never showing a figure nobody can check."""
     assert "Pending public benchmark" in html
-    assert "Cascade is dormant" in html
+    assert "Not switched on yet" in html
     for phrase in ("bench_scores", "warm_start_ckpt"):
         assert phrase in html, f"page must key its pending state off {phrase}"
 
