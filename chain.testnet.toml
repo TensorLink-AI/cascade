@@ -146,11 +146,15 @@ train_image_digest = ""
 # ref_throughput_tokens_per_s = 90000
 
 [round]
-# Daily-style cadence + two-stage (heat → final) selection. TESTNET uses a SHORT
-# epoch so rounds turn over quickly for iteration; mainnet template = 7200 (~24h).
+# Two-stage (heat → final) selection. TESTNET uses a SHORT epoch so rounds turn
+# over quickly for iteration; mainnet is 3600 (~12h) since 2026-07-28, was 7200.
 # The base seed is the block hash at the epoch boundary, so the whole epoch shares
 # one RoundSeeds; only commits before the boundary are eligible (the deadline).
-epoch_blocks     = 900    # ~3h at 12s blocks (mainnet template = 7200 ≈ 24h)
+# NOTE: provision.toml is SHARED with mainnet and its trigger_margin_blocks
+# (3500, = mainnet epoch − 100) exceeds this 900-block epoch, which build_policy
+# rejects. Running the provisioner against testnet needs its own margin override
+# (~800). Pre-existing — the previous 7100 failed the same way.
+epoch_blocks     = 900    # ~3h at 12s blocks (mainnet = 3600 ≈ 12h)
 round_hours      = 3.0    # informational
 heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)

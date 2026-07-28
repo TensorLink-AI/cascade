@@ -65,9 +65,18 @@ from pathlib import Path
 
 log = logging.getLogger("cascade.validator.cascade")
 
-# The reign clock counts blocks (12 s each on subtensor), not wall-clock time —
-# every validator reads the same block from the signed manifest, so the clock is
-# identical across the fleet and across restarts.
+# The reign clock counts blocks — every validator reads the same block from the
+# signed manifest, so the clock is identical across the fleet and across
+# restarts.
+#
+# It is measured in ROUNDS, not wall-clock days. A reign is "survived N
+# challenges", and a challenge happens once per round; tying it to a day made
+# the threshold silently mean different things at different cadences (at 24h
+# rounds 7 days WAS 7 rounds; at 12h it would be 14). Round-relative keeps the
+# competitive meaning fixed under any future cadence change.
+#
+# Retained only so an old ``reign_days``-style reading can still be derived for
+# logs: 7200 blocks x 12 s = one real day. NOT used by the clock.
 BLOCKS_PER_DAY = 7_200
 
 # A tiny floor so a zero/negative eval number can't collapse the geomean product
@@ -221,9 +230,46 @@ def reign_blocks(state: CascadeState, block: int) -> int | None:
     return int(block) - state.reign_start_block
 
 
+def reign_rounds(
+    state: CascadeState, block: int, round_cfg: object | None = None
+) -> float | None:
+    """Rounds the current king has reigned, or ``None`` if vacant/unanchored.
+
+    Epoch-relative: the divisor is the round length in force, not a fixed day.
+    ``round_cfg`` is a :class:`~cascade.shared.config.RoundConfig`; ``None``
+    falls back to a 7200-block round, which reproduces the historical
+    day-denominated behaviour exactly.
+
+    A scheduled cadence change is handled exactly rather than approximated: the
+    reign is split at the activation block and each segment divided by its own
+    length, so a reign spanning the seam counts the rounds that actually ran.
+    """
+    b = reign_blocks(state, block)
+    if b is None:
+        return None
+    if b <= 0:
+        return 0.0
+    start = int(state.reign_start_block or 0)
+    end = int(block)
+    if round_cfg is None:
+        return b / BLOCKS_PER_DAY
+
+    from ..shared.config import effective_epoch_blocks
+
+    act = int(getattr(round_cfg, "epoch_activation_block", 0) or 0)
+    if act and start < act < end:
+        pre = (act - start) / effective_epoch_blocks(round_cfg, start)
+        post = (end - act) / effective_epoch_blocks(round_cfg, act)
+        return pre + post
+    return b / effective_epoch_blocks(round_cfg, start)
+
+
 def reign_days(state: CascadeState, block: int) -> float | None:
-    """Block-derived days the current king has reigned (reign blocks / 7200),
-    or ``None`` if vacant/unanchored."""
+    """Wall-clock days the current king has reigned (reign blocks / 7200).
+
+    Observability only — the Cascade trigger is round-based
+    (:func:`reign_rounds`). Kept because a human reading a log wants days.
+    """
     b = reign_blocks(state, block)
     return None if b is None else b / BLOCKS_PER_DAY
 
@@ -239,16 +285,26 @@ def select_winner(state: CascadeState) -> CheckpointRecord | None:
     return min(state.checkpoints, key=lambda r: (r.score, r.checkpoint_id))
 
 
-def should_cascade(state: CascadeState, block: int, reign_days_threshold: float) -> bool:
+def should_cascade(
+    state: CascadeState,
+    block: int,
+    reign_threshold: float,
+    round_cfg: object | None = None,
+) -> bool:
     """Whether the reign clock has reached the threshold *and* there is at least
     one checkpoint to promote. A ripe clock with an empty log is not a Cascade —
-    there is nothing to select — so the king simply holds until it produces one."""
+    there is nothing to select — so the king simply holds until it produces one.
+
+    ``reign_threshold`` is in ROUNDS (see :func:`reign_rounds`). With
+    ``round_cfg=None`` the divisor is 7200 blocks, so the historical
+    day-denominated behaviour is reproduced exactly.
+    """
     if state.king_hotkey is None or state.reign_start_block is None:
         return False
     if not state.checkpoints:
         return False
-    days = reign_days(state, block)
-    return days is not None and days >= reign_days_threshold
+    elapsed = reign_rounds(state, block, round_cfg)
+    return elapsed is not None and elapsed >= reign_threshold
 
 
 # ── persistence (JSON, alongside the champion state DB) ───────────────────────
@@ -320,17 +376,21 @@ InstallFn = Callable[[CheckpointRecord], None]
 class CascadeController:
     """Binds the pure Cascade core to persistence and the checkpoint installer.
 
-    ``reign_days`` is the trigger threshold (``[scoring] cascade_reign_days``).
+    ``reign_rounds_threshold`` is the trigger threshold, in ROUNDS (``[scoring]
+    cascade_reign_rounds``). ``round_cfg`` is the :class:`RoundConfig` the clock
+    divides by; leave it ``None`` and the divisor is a fixed 7200-block round,
+    reproducing the historical day-denominated behaviour exactly.
     ``install_fn`` promotes the selected checkpoint to the warm-start init; when
     unset the selection is logged but not installed (a plumbing warning, never a
     silent no-op). ``state_path`` is where :class:`CascadeState` is persisted (the
     reign clock must survive restarts); ``None`` keeps it in memory only.
     """
 
-    reign_days: float
+    reign_days: float          # threshold, in ROUNDS (name kept for call-site compat)
     state: CascadeState = field(default_factory=CascadeState)
     install_fn: InstallFn | None = None
     state_path: Path | None = None
+    round_cfg: object | None = None   # RoundConfig; None ⇒ fixed 7200-block rounds
 
     def note_dethrone(self, new_king: str, *, block: int) -> None:
         """Reset the reign clock for a fresh king. Call this on — and only on — a
@@ -409,9 +469,12 @@ class CascadeController:
                 (state.king_hotkey or "?")[:12], int(block),
             )
             return None
-        days = reign_days(state, block)
-        if days is None or days < self.reign_days:
+        # ROUNDS, not days — the reign threshold is "survived N challenges",
+        # which must not change meaning when the cadence does.
+        elapsed = reign_rounds(state, block, self.round_cfg)
+        if elapsed is None or elapsed < self.reign_days:
             return None
+        days = elapsed
         winner = select_winner(state)
         if winner is None:
             # Clock is ripe but the reign logged no checkpoint yet: hold the throne
@@ -432,7 +495,7 @@ class CascadeController:
         self.state = crown(self.state, king_hotkey=state.king_hotkey, block=block)
         self._persist()
         log.info(
-            "CASCADE fired: king=%s reign=%.2fd winner=%s score=%.5f "
+            "CASCADE fired: king=%s reign=%.2f rounds winner=%s score=%.5f "
             "(gift crps=%.5f mase=%.5f, boom crps=%.5f mase=%.5f, time crps=%.5f mase=%.5f); "
             "installed as warm-start init, king persists, reign clock reset",
             (event.old_king or "?")[:12], event.reign_days, winner.checkpoint_id,

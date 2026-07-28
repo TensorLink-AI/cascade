@@ -62,7 +62,7 @@ flowchart TD
     end
 
     subgraph trainer["Trainer: owner-operated (the GPU boundary)"]
-        resolve["resolve commitments before the<br/>24h epoch cutoff → king + field"]
+        resolve["resolve commitments before the<br/>12h epoch cutoff → king + field"]
         seeds["derive one shared RoundSeeds<br/>from epoch-boundary block hash<br/>(generation_seed + training_seed)"]
         heat["HEAT: train every challenger<br/>~30min (primary size) → screen<br/>→ top finalist"]
         trainK["FINAL: train king + finalist<br/>from random init at EVERY size<br/>(Toto2-4M, Toto2-22M)"]
@@ -90,9 +90,10 @@ flowchart TD
 > reuses one `RoundSeeds` for every run in the round, and the validator's digest gate
 > rejects any manifest where king and challenger didn't share that contract. Details below.
 
-**The round cadence.** A round is one ~24h epoch (`[round] epoch_blocks`): the
-trainer runs exactly one round per day, so the king is trained once per day and
-the whole day's trainings share one `RoundSeeds` (identical random init). Only
+**The round cadence.** A round is one ~12h epoch (`[round] epoch_blocks`; it was
+24h until 2026-07-28): the trainer runs exactly one round per epoch, so the king
+is retrained twice a day and each round's trainings share one `RoundSeeds`
+(identical random init). Only
 generators whose on-chain pointer *revealed* strictly before the epoch boundary
 compete in that round — deploy defaults to a timed reveal targeting just before
 the boundary (docs/MINER.md §5a), and a reveal that lands late rolls into the

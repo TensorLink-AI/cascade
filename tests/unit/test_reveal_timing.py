@@ -82,10 +82,16 @@ def _deploy_args(**over):
 
 def test_cli_default_is_the_timed_reveal(cfg, capsys):
     from cascade.miner.cli import _resolve_blocks_until_reveal
+    from cascade.shared.config import effective_epoch_blocks
 
     current = 1000
     delay = _resolve_blocks_until_reveal(_deploy_args(), cfg, current)
-    epoch, margin = cfg.round.epoch_blocks, cfg.round.reveal_margin_blocks
+    # Resolve through the accessor, not cfg.round.epoch_blocks: while a
+    # scheduled cadence change is pending, the raw field is the POST-switch
+    # length and a miner committing today must be quoted the deadline on the
+    # grid actually in force at `current`.
+    epoch = effective_epoch_blocks(cfg.round, current)
+    margin = cfg.round.reveal_margin_blocks
     assert current + delay == (current // epoch + 1) * epoch - margin
     assert "timed reveal" in capsys.readouterr().out
 

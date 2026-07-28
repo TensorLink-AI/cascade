@@ -74,19 +74,33 @@ same seeds, alpha, margin, clusters. Note this is indicative, NOT a
 counterfactual history: challengers optimised against the live rule, so it does
 not establish that the throne was wrongly held.
 
-    round                  pooled (live)   ->  per-window geomean   two-layer
-    14567400215825813659      +0.1085 WIN  ->  +0.2058 WIN          +0.2311 WIN
-    16369783168410731489      +0.0568 WIN  ->  +0.1492 WIN          +0.1432 WIN
-    10447302782510174565      -0.4243 loss ->  +0.0659 WIN          +0.0929 WIN
-    14597972378946389402      -0.1930 loss ->  +0.0812 WIN          +0.1003 WIN
-    7738837034499501847       -0.0315 loss ->  +0.1545 WIN          +0.1539 WIN
-    15787128089753493320      -1.8367 loss ->  -0.0822 loss         -0.1645 loss
-    9797713724704223682       -0.1254 loss ->  +0.0168 loss         -0.0042 loss
-                              2 WIN            5 WIN                5 WIN
+Ordered by the king's tenure, so the lineage is visible. The first two rows are
+CROWNINGS (vacant throne, then uid 64 losing to uid 131) — they already won
+under the pooled rule and are not evidence about it. The remaining five are uid
+131's defences. Tenure 2 and 4 have no archived receipt.
+
+    ten  round                  king->chal   pooled (live)   geomean      two-layer
+     0   14567400215825813659    -1 -> 64    +0.1085 WIN  ->  +0.2058 WIN  +0.2311 WIN   crowning
+     0   16369783168410731489    64 -> 131   +0.0568 WIN  ->  +0.1492 WIN  +0.1432 WIN   crowning
+     1   9797713724704223682    131 -> 164   -0.1254 loss ->  +0.0168 loss -0.0042 loss  near miss
+     3   15787128089753493320   131 -> 188   -1.8367 loss ->  -0.0822 loss -0.1645 loss  true blowout
+     5   7738837034499501847    131 -> 223   -0.0315 loss ->  +0.1545 WIN  +0.1539 WIN   <- reign ENDS here
+     6   14597972378946389402   131 -> 235   -0.1930 loss ->  +0.0812 WIN  +0.1003 WIN   unknowable
+     7   10447302782510174565   131 ->  22   -0.4243 loss ->  +0.0659 WIN  +0.0929 WIN   unknowable
+
+**Read this as a rate, NOT as a counterfactual history.** The rounds are
+path-dependent: the reign ends at the FIRST flip (tenure 5, 2026-07-25), and
+every round after that would have had a different king, a different field and a
+different duel. So the defensible claim is "uid 131 would have reigned ~5 rounds
+instead of 8+", not "there would have been 5 dethrones". Two of the eight
+defences (tenure 2, 4) are unarchived, so it could have ended earlier still.
 
 It discriminates rather than flipping everything — the genuinely worse
-challenger (15787…, a 2.6x blowout) still loses, and 9797… stays a near miss,
-which is the behaviour a corrected statistic should show.
+challenger (15787…, a 2.6x blowout) still loses by a wide margin, and 9797…
+stays a near miss at +0.0168 against a 0.02 bar. Of the five scoreable
+defences: 3 flip, 1 near miss, 1 clear loss. Margin is flat 0.02
+(`win_margin_start == win_margin_end`, `margin_warmup_rounds = 0`), so no
+tenure warmup is in play.
 
 **Relation to GIFT-Eval, and why "two-layer" is a documented alternative, not
 the choice.** GIFT-Eval computes CRPS in two layers: the pooled

@@ -30,7 +30,9 @@ from cascade.validator.cascade import (
     should_cascade,
 )
 
-DAY = BLOCKS_PER_DAY  # the reign clock counts blocks; 7200 blocks ≈ one day
+# The reign clock counts ROUNDS. With round_cfg=None the divisor is a fixed
+# 7200-block round, so these block arithmetic constants are unchanged.
+DAY = BLOCKS_PER_DAY  # one 7200-block round
 
 
 def _ckpt(cid, gc, gm, tc, tm, ts, *, bc=1.0, bm=1.0) -> CheckpointRecord:
@@ -104,10 +106,10 @@ def test_dethrone_resets_the_clock():
 def test_should_cascade_requires_clock_and_a_checkpoint():
     st = crown(CascadeState(), king_hotkey="k", block=0)
     # Ripe clock but empty log → not a cascade (nothing to promote).
-    assert not should_cascade(st, block=10 * DAY, reign_days_threshold=7)
+    assert not should_cascade(st, block=10 * DAY, reign_threshold=7)
     st = CascadeState(king_hotkey="k", reign_start_block=0, checkpoints=(_ckpt("a", 1, 1, 1, 1, 0.0),))
-    assert not should_cascade(st, block=6 * DAY, reign_days_threshold=7)  # too soon
-    assert should_cascade(st, block=7 * DAY, reign_days_threshold=7)      # ripe + a checkpoint
+    assert not should_cascade(st, block=6 * DAY, reign_threshold=7)  # too soon
+    assert should_cascade(st, block=7 * DAY, reign_threshold=7)      # ripe + a checkpoint
 
 
 def test_unanchored_reign_reanchors_instead_of_firing():
@@ -374,3 +376,45 @@ def _write_toml_with_cascade(tmp_path, *, enabled: bool):
     p = tmp_path / "chain.toml"
     p.write_text(text, encoding="utf-8")
     return p
+
+
+# ── epoch-relative reign clock ───────────────────────────────────────────────
+
+
+def test_reign_is_counted_in_rounds_not_wall_clock_days():
+    """The threshold means "survived N challenges". Halving the round must
+    halve the wall-clock a reign needs, not double the challenges required."""
+    from cascade.shared.config import RoundConfig
+    from cascade.validator.cascade import reign_rounds
+
+    st = crown(CascadeState(), king_hotkey="k", block=0)
+    slow = RoundConfig(epoch_blocks=7200)
+    fast = RoundConfig(epoch_blocks=3600)
+
+    seven_slow_rounds = 7 * 7200
+    assert math.isclose(reign_rounds(st, seven_slow_rounds, slow), 7.0)
+    # Same wall-clock at the faster cadence is twice as many challenges.
+    assert math.isclose(reign_rounds(st, seven_slow_rounds, fast), 14.0)
+    # ...and 7 challenges now takes half the wall clock.
+    assert math.isclose(reign_rounds(st, 7 * 3600, fast), 7.0)
+
+
+def test_reign_rounds_splits_at_a_cadence_activation():
+    """A reign spanning the switch counts the rounds that actually ran on each
+    side, not the whole span at either length."""
+    from cascade.shared.config import RoundConfig
+    from cascade.validator.cascade import reign_rounds
+
+    cfg = RoundConfig(epoch_blocks=3600, epoch_blocks_prev=7200,
+                      epoch_activation_block=100_000)
+    st = crown(CascadeState(), king_hotkey="k", block=100_000 - 2 * 7200)
+    # 2 rounds at 7200 before the switch, then 3 at 3600 after it.
+    got = reign_rounds(st, 100_000 + 3 * 3600, cfg)
+    assert math.isclose(got, 5.0)
+
+
+def test_reign_rounds_defaults_to_the_historical_divisor():
+    from cascade.validator.cascade import reign_rounds
+
+    st = crown(CascadeState(), king_hotkey="k", block=0)
+    assert math.isclose(reign_rounds(st, 7 * BLOCKS_PER_DAY, None), 7.0)

@@ -16,7 +16,7 @@ import importlib
 import logging
 from pathlib import Path
 
-from ..shared.config import load_chain_config
+from ..shared.config import effective_epoch_blocks, load_chain_config
 from ..shared.manifest import contract_digest
 from .contract import RoundSeeds
 
@@ -309,7 +309,7 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     from .loop import TrainerRunner, plan_round, resolve_commitments
 
     block = int(client.current_block())
-    epoch_blocks = max(1, cfg.round.epoch_blocks)
+    epoch_blocks = effective_epoch_blocks(cfg.round, block)
     next_boundary = (block // epoch_blocks + 1) * epoch_blocks
     resolved = resolve_commitments(client.poll_commitments(include_history=True),
                                    floor_block=cfg.round.commit_floor_block)

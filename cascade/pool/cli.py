@@ -29,7 +29,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
-from ..shared.config import load_chain_config
+from ..shared.config import effective_epoch_blocks, load_chain_config
 from .builder import PoolBuildConfig, build_pool
 from .source import HarvestContext, HttpFetcher
 from .sources import DEFAULT_SOURCES, available, get_sources
@@ -242,9 +242,16 @@ def _resolve_effective_block(args: argparse.Namespace, cfg) -> int:
     from ..shared.manifest import load_manifest
     store = open_manifest_store(cfg.storage)
     manifest = load_manifest(read_latest_manifest(store))
-    epoch_blocks = max(1, cfg.round.epoch_blocks)
-    epoch_start = (int(manifest.created_block) // epoch_blocks) * epoch_blocks
-    return epoch_start + max(1, args.round_buffer) * epoch_blocks
+    created = int(manifest.created_block)
+    epoch_blocks = effective_epoch_blocks(cfg.round, created)
+    epoch_start = (created // epoch_blocks) * epoch_blocks
+    # Step round by round, re-resolving the length at each step, so a buffer
+    # that straddles a scheduled cadence change lands on a real boundary
+    # instead of striding the old length across the switch.
+    target = epoch_start
+    for _ in range(max(1, args.round_buffer)):
+        target += effective_epoch_blocks(cfg.round, target)
+    return target
 
 
 def _upload_pool_ref(out_dir: Path, cfg, hub_repo: str | None) -> int:

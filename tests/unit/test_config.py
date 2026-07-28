@@ -236,11 +236,12 @@ def test_for_hours_scales_budget_and_wall_clock_guard(cfg):
 
 
 def test_heat_num_samples_knob(cfg):
-    # chain.toml ships a cheap ranking-only sample count for the heat screen;
+    # chain.toml ships the heat screen at the final's sample count (2026-07-27),
+    # so the screen ranks on the same estimator the duel decides on;
     # 0 (the default) means "reuse [eval] num_samples".
     from dataclasses import replace
 
-    assert cfg.round.heat_num_samples == 20
+    assert cfg.round.heat_num_samples == cfg.eval.num_samples == 100
     bare = replace(cfg.round, heat_num_samples=0)
     assert (bare.heat_num_samples or cfg.eval.num_samples) == cfg.eval.num_samples
 
@@ -255,3 +256,78 @@ def test_for_hours_guard_knobs_override_defaults(cfg):
     # chain.toml ships the owner policy: cap == budget, final cap == 3h budget
     assert cfg.round.heat_guard_factor == 1.0
     assert cfg.training.max_train_seconds == int(cfg.training.target_train_hours * 3600)
+
+
+# ── scheduled cadence change ([round] epoch_activation_block) ────────────────
+
+
+def test_effective_epoch_blocks_switches_at_the_activation_block():
+    """The whole point of the gate: the length depends on the BLOCK being
+    resolved, not on when the process started. Two nodes that restarted on
+    opposite sides of the switch must agree on every round."""
+    from cascade.shared.config import RoundConfig, effective_epoch_blocks
+
+    r = RoundConfig(epoch_blocks=3600, epoch_blocks_prev=7200,
+                    epoch_activation_block=8726400)
+    assert effective_epoch_blocks(r, 8726399) == 7200   # last pre-switch block
+    assert effective_epoch_blocks(r, 8726400) == 3600   # activation is inclusive
+    assert effective_epoch_blocks(r, 8730000) == 3600
+    assert effective_epoch_blocks(r, 0) == 7200
+
+
+def test_effective_epoch_blocks_is_identity_without_a_schedule():
+    from cascade.shared.config import RoundConfig, effective_epoch_blocks
+
+    r = RoundConfig(epoch_blocks=3600)
+    for b in (0, 1, 8726399, 8726400, 10**9):
+        assert effective_epoch_blocks(r, b) == 3600
+
+
+def test_epoch_start_agrees_across_the_switch_for_pre_switch_rounds():
+    """A round that ran under the old cadence keeps its original boundary
+    forever — this is what stops an audit disagreeing with the validator that
+    wrote the receipt."""
+    from cascade.shared.config import RoundConfig, effective_epoch_blocks
+
+    r = RoundConfig(epoch_blocks=3600, epoch_blocks_prev=7200,
+                    epoch_activation_block=8726400)
+    created = 8722585                       # mid-round, pre-switch
+    eb = effective_epoch_blocks(r, created)
+    assert (created // eb) * eb == 8719200  # NOT 8722800, which the 3600 grid gives
+
+
+def test_activation_block_must_be_on_both_grids(tmp_path):
+    """A seam that is not a boundary of both grids leaves the round spanning it
+    with two different lengths depending on which side you ask from."""
+    import shutil
+
+    import pytest
+
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+
+    src = DEFAULT_CHAIN_TOML.read_text()
+    p = tmp_path / "chain.toml"
+
+    # 8726400 is a multiple of both 7200 and 3600 — accepted.
+    p.write_text(src)
+    shutil.copy(DEFAULT_CHAIN_TOML, p)
+    load_chain_config(p)
+
+    # 8722800 is on the 3600 grid but NOT the 7200 grid — rejected.
+    p.write_text(src.replace("epoch_activation_block = 8726400",
+                             "epoch_activation_block = 8722800"))
+    with pytest.raises(ValueError, match="multiple of BOTH"):
+        load_chain_config(p)
+
+
+def test_cadence_keys_must_be_set_together(tmp_path):
+    import pytest
+
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+
+    src = DEFAULT_CHAIN_TOML.read_text()
+    p = tmp_path / "chain.toml"
+    p.write_text(src.replace("epoch_blocks_prev      = 7200",
+                             "epoch_blocks_prev      = 0"))
+    with pytest.raises(ValueError, match="must be set together"):
+        load_chain_config(p)

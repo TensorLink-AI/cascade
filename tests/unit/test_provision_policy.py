@@ -6,6 +6,8 @@ mainnet (7200-block) epoch shapes."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from cascade.provision.policy import (
@@ -258,3 +260,60 @@ def test_eval_signals_never_kill_trainer_stages():
         assert not teardown_due(stage, heat_marker_seen=False, manifest_seen=False,
                                 receipt_seen=True, newer_manifest=True,
                                 rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+# ── cadence change: epoch + trigger margin must both track the block ─────────
+
+
+def _loop_with_schedule(**over):
+    """A ProvisionerLoop with only the fields the cadence helpers touch."""
+    from cascade.provision.loop import ProvisionerLoop
+
+    base = dict(
+        providers={}, chain_client=None, plan_fn=lambda: {}, render=None,
+        hosts_path=Path("/tmp/h"), work_root=Path("/tmp"), state_path=Path("/tmp/s.json"),
+        epoch_blocks=3600, epoch_blocks_prev=7200, epoch_activation_block=8726400,
+        final_hours=3.0,
+    )
+    base.update(over)
+    return ProvisionerLoop(**base)
+
+
+def test_epoch_and_margin_track_the_activation_block():
+    """The bug this guards: a PINNED margin of 7100 is a hard startup failure at
+    epoch 3600, and a pinned 3500 defers renting to mid-round at epoch 7200.
+    The offset form must yield the right margin on BOTH sides of the switch."""
+    pol = ProvisionPolicy(
+        heat=StagePolicy(sku="x", gpus_per_pod=4, max_pods=8, providers=("p",),
+                         max_price_hr=2.6),
+        final=StagePolicy(sku="y", gpus_per_pod=2, max_pods=2, providers=("p",),
+                          max_price_hr=3.0),
+        trigger_margin_blocks=3500, trigger_offset_blocks=100,
+        max_spend_per_round=500.0,
+    )
+    loop = _loop_with_schedule(policy=pol)
+
+    assert loop.epoch_at(8726399) == 7200          # pre-switch
+    assert loop.epoch_at(8726400) == 3600          # from activation on
+    # margin = epoch - offset, so renting still starts 100 blocks past the
+    # boundary at BOTH cadences.
+    assert loop.trigger_margin_at(8726399) == 7100
+    assert loop.trigger_margin_at(8726400) == 3500
+
+
+def test_ttl_takes_the_longer_epoch_while_a_change_is_pending():
+    """A too-short TTL reaps live pods mid-round; a too-long one only delays a
+    backstop that receipt-latched teardown reaches first. Must err long."""
+    pol = ProvisionPolicy(
+        heat=StagePolicy(sku="x", gpus_per_pod=4, max_pods=8, providers=("p",),
+                         max_price_hr=2.6),
+        final=StagePolicy(sku="y", gpus_per_pod=2, max_pods=2, providers=("p",),
+                          max_price_hr=3.0),
+        trigger_margin_blocks=3500, max_spend_per_round=500.0, ttl_epochs=1,
+    )
+    pending = _loop_with_schedule(policy=pol)
+    assert pending.ttl_hours == 24.0        # NOT 12 — a 24h round is still live
+
+    settled = _loop_with_schedule(policy=pol, epoch_blocks_prev=0,
+                                  epoch_activation_block=0)
+    assert settled.ttl_hours == 12.0        # steady state after the switch

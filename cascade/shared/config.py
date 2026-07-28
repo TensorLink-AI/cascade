@@ -386,6 +386,23 @@ class RoundConfig:
 
     epoch_blocks: int = 7200          # ≈24h at 12s blocks; one round per epoch
     round_hours: float = 24.0         # informational: wall-clock span of an epoch
+    # ── Scheduled cadence change (see :func:`effective_epoch_blocks`) ────────
+    # A round-length change is CONSENSUS-RELEVANT: every validator derives the
+    # epoch from the block grid, so a fleet that switches at different moments
+    # selects different eval-pool snapshots for the same round. Restart timing
+    # cannot coordinate that across independent operators — so the switch is
+    # pinned to a BLOCK instead. Operators pull and restart whenever they like;
+    # every node flips at the same block on its own.
+    #
+    # ``epoch_activation_block`` is the first block on which ``epoch_blocks``
+    # applies; before it, ``epoch_blocks_prev`` does. Both 0 ⇒ no scheduled
+    # change, ``epoch_blocks`` always applies (the steady state — clear these
+    # two once the activation block is safely in the past).
+    #
+    # The activation block MUST be a boundary of BOTH grids, or a round is cut
+    # short or double-counted at the seam; ``load_chain_config`` enforces it.
+    epoch_blocks_prev: int = 0
+    epoch_activation_block: int = 0
     heat_train_hours: float = 0.5     # cheap screening budget per competitor
     heat_n_windows: int = 256         # eval windows the heat screens on (≤ [eval] n_windows)
     # Sample forecasts per window in the heat screen. The heat only RANKS the
@@ -634,6 +651,8 @@ class ScoringConfig:
     # init; the king persists on the throne with a fresh reign clock
     # (DEC-CA-0004). The clock is persisted and survives restarts.
     cascade_enabled: bool = False
+    # Threshold in ROUNDS ("survived N challenges"). Field name kept for
+    # call-site compatibility; the config key is ``cascade_reign_rounds``.
     cascade_reign_days: int = 7
 
 
@@ -845,6 +864,37 @@ class LaunchConfigError(RuntimeError):
 _PLACEHOLDER_DIGEST = "0" * 64
 
 
+def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
+    """Round length in force AT ``block`` — the only correct way to turn a block
+    into an epoch.
+
+    A cadence change is consensus-relevant: the epoch is derived from the block
+    grid (``block // epoch_blocks``), so two validators using different lengths
+    for the same round select different eval-pool snapshots and reach different
+    verdicts. Restart timing cannot coordinate that across independent
+    operators, so the switch is pinned to ``epoch_activation_block``: every node
+    flips at the same block regardless of when it restarted, and an operator who
+    pulls early is not punished for it.
+
+    Returns ``epoch_blocks_prev`` for blocks strictly before the activation
+    block, ``epoch_blocks`` from it onward. With no scheduled change (both keys
+    0, the steady state) this is just ``epoch_blocks`` and the call is free.
+
+    ALWAYS pass the block the epoch is being derived FOR — a manifest's
+    ``created_block``, a receipt's ``epoch_start_block``, a reveal target —
+    never the current head. Deriving a historical round's epoch from the head
+    is what makes an audit disagree with the validator that wrote the receipt.
+    ``load_chain_config`` guarantees the activation block is a boundary of both
+    grids, so the seam is unambiguous.
+    """
+    eb = max(1, int(round_cfg.epoch_blocks))
+    act = int(round_cfg.epoch_activation_block)
+    prev = int(round_cfg.epoch_blocks_prev)
+    if act and prev > 0 and int(block) < act:
+        return max(1, prev)
+    return eb
+
+
 def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     """Refuse to start a live service while ``chain.toml`` holds placeholders.
 
@@ -937,6 +987,30 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     r = raw.get("round", {})
     wb = raw.get("wandb", {})
 
+    # Scheduled cadence change — reject a seam that would cut a round short.
+    # Both grids must agree at the activation block, else the epoch containing
+    # it has two different lengths depending on which side you ask from.
+    _eb = int(r.get("epoch_blocks", 7200))
+    _ebp = int(r.get("epoch_blocks_prev", 0))
+    _eab = int(r.get("epoch_activation_block", 0))
+    if bool(_ebp) != bool(_eab):
+        raise ValueError(
+            "[round] epoch_blocks_prev and epoch_activation_block must be set "
+            f"together (got prev={_ebp}, activation={_eab}); both 0 = no "
+            "scheduled cadence change"
+        )
+    if _eab:
+        if _ebp < 1 or _eb < 1:
+            raise ValueError(
+                f"[round] epoch_blocks={_eb} and epoch_blocks_prev={_ebp} must both be >= 1"
+            )
+        if _eab % _eb or _eab % _ebp:
+            raise ValueError(
+                f"[round] epoch_activation_block={_eab} must be a multiple of BOTH "
+                f"epoch_blocks={_eb} and epoch_blocks_prev={_ebp} — otherwise the "
+                "round spanning the seam has no well-defined length"
+            )
+
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
     extra_sizes = tuple(
@@ -1014,6 +1088,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
             round_hours=float(r.get("round_hours", 24.0)),
+            epoch_blocks_prev=int(r.get("epoch_blocks_prev", 0)),
+            epoch_activation_block=int(r.get("epoch_activation_block", 0)),
             heat_train_hours=float(r.get("heat_train_hours", 0.5)),
             heat_n_windows=int(r.get("heat_n_windows", 256)),
             heat_num_samples=int(r.get("heat_num_samples", 0)),
@@ -1080,7 +1156,14 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
-            cascade_reign_days=int(s.get("cascade_reign_days", 7)),
+            # ``cascade_reign_rounds`` is the current name; ``cascade_reign_days``
+            # is accepted as a legacy alias so deployed files keep loading. The
+            # UNIT changed with the clock (days -> rounds) — at the 24h cadence
+            # the two were numerically identical, which is why the old value
+            # carries over unchanged.
+            cascade_reign_days=int(
+                s.get("cascade_reign_rounds", s.get("cascade_reign_days", 7))
+            ),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
