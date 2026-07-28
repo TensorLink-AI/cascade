@@ -39,8 +39,9 @@ horizon scores the submitted model directly. See `docs/INTERFACE.md`.
 
 ### 2. Trainer — owner-operated, the GPU boundary
 
-A round is one ~24h epoch (`[round] epoch_blocks`); the trainer runs one round
-per epoch (so the king is trained once per day). Each round:
+A round is one ~12h epoch (`[round] epoch_blocks`, 24h before 2026-07-28); the
+trainer runs one round per epoch (so the king is retrained twice a day). Each
+round:
 
 1. Resolves on-chain commitments to `(hotkey, uid, repo, revision)`, keeping only
    those revealed **before the epoch boundary** (`resolve_commitments(...,

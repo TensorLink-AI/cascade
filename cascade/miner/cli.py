@@ -61,7 +61,7 @@ import sys
 from pathlib import Path
 
 from ..interface.validation import format_commit, parse_commit
-from ..shared.config import load_chain_config
+from ..shared.config import effective_epoch_blocks, load_chain_config
 from .verify import verify_repo
 
 
@@ -456,7 +456,8 @@ def _cmd_reveal_status(args: argparse.Namespace) -> int:
             if match is not None:
                 missed, report = _reveal_verdict(
                     match.commit_block, client.current_block(),
-                    cfg.round.epoch_blocks, cfg.round.reveal_margin_blocks,
+                    effective_epoch_blocks(cfg.round, match.commit_block),
+                    cfg.round.reveal_margin_blocks,
                     args.expect_boundary,
                 )
                 print(report)
@@ -536,14 +537,14 @@ def _resolve_blocks_until_reveal(args: argparse.Namespace, cfg, current_block: i
         return int(args.blocks_until_reveal)
     if args.reveal_now:
         return 1
+    epoch_blocks = effective_epoch_blocks(cfg.round, current_block)
     delay = blocks_until_boundary_reveal(
         current_block,
-        cfg.round.epoch_blocks,
+        epoch_blocks,
         cfg.round.reveal_margin_blocks,
         next_epoch=args.next_epoch,
     )
     target = current_block + delay
-    epoch_blocks = cfg.round.epoch_blocks
     boundary = (target // epoch_blocks + 1) * epoch_blocks
     print(
         f"timed reveal: payload decrypts ~block {target} "
@@ -626,7 +627,8 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         # A timed reveal that jitters past its boundary silently misses the
         # round — hand the miner the exact command that catches it loudly.
         target = current_block + blocks_until_reveal
-        boundary = (target // cfg.round.epoch_blocks + 1) * cfg.round.epoch_blocks
+        _eb = effective_epoch_blocks(cfg.round, current_block)
+        boundary = (target // _eb + 1) * _eb
         try:
             hotkey = client.wallet().hotkey.ss58_address
         except Exception:  # noqa: BLE001 — a hint must never fail the deploy

@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tenure:   {runner.state.tenure_rounds}")
         print(f"dethrone_cp: {runner.cfg.scoring.dethrone_cp}")
         print(f"cascade: {'on' if runner.cfg.scoring.cascade_enabled else 'off'} "
-              f"(reign_days={runner.cfg.scoring.cascade_reign_days})")
+              f"(reign_rounds={runner.cfg.scoring.cascade_reign_days})")
         if runner.cascade is not None:
             cs = runner.cascade.state
             print(f"cascade king: {cs.king_hotkey} "

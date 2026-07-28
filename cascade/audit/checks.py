@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
-from ..shared.config import ChainConfig
+from ..shared.config import ChainConfig, effective_epoch_blocks
 from ..shared.manifest import TrainingManifest, contract_digest
 from ..shared.receipt import RoundReceipt
 
@@ -163,7 +163,10 @@ def check_epoch_alignment(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResul
     """The recorded boundary sits on an epoch multiple (the submission deadline
     is deterministic, not validator-chosen)."""
     name = "epoch-alignment"
-    epoch_blocks = max(1, cfg.round.epoch_blocks)
+    # Resolve the length in force AT the recorded boundary, not at the head:
+    # a receipt written before a scheduled cadence change must keep validating
+    # against the grid it was written on, forever.
+    epoch_blocks = effective_epoch_blocks(cfg.round, receipt.epoch_start_block)
     if receipt.epoch_start_block % epoch_blocks != 0:
         return _fail(name, f"epoch_start_block {receipt.epoch_start_block} is not a "
                            f"multiple of [round] epoch_blocks {epoch_blocks}")

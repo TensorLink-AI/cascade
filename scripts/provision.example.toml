@@ -73,6 +73,16 @@ ssh_key_path = "~/.ssh/cascade_ed25519"
 # round starts; the trainer's --hosts-wait-seconds covers that gap.
 trigger_margin_blocks = 25
 
+# PREFERRED alternative when your rounds train from the epoch START (continuous
+# ops): blocks AFTER the boundary at which to start renting. The loop derives
+# margin = epoch_blocks − trigger_offset_blocks every tick, so it survives a
+# cadence change; a pinned trigger_margin_blocks does not. A margin sized for
+# 7200-block rounds is a HARD startup failure at 3600 (margin must be < epoch)
+# and, if hand-corrected to 3500, silently defers renting to mid-round back at
+# 7200. Set this instead and the knob cannot be wrong in either direction.
+# Takes precedence over trigger_margin_blocks when non-zero.
+# trigger_offset_blocks = 100
+
 # HARD per-round spend ceiling in USD, projected at WORST case (every pod
 # billed for the full TTL). If the projection exceeds this, the round rents
 # NOTHING and the trainer trains locally — a runaway field can never surprise

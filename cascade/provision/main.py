@@ -99,10 +99,20 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     # (or max_pods = 0) the stage does not exist: pre-eval configs keep their
     # exact behaviour, which is why it is not in the required loop above.
     eval_sp = build_stage_policy(top["eval"], "eval") if "eval" in top else None
-    margin = int(top.get("trigger_margin_blocks", 25))
-    if not 0 < margin < epoch_blocks:
-        raise ProvisionError(
-            f"trigger_margin_blocks={margin} must be in (0, epoch_blocks={epoch_blocks})")
+    offset = int(top.get("trigger_offset_blocks", 0))
+    if offset:
+        if not 0 < offset < epoch_blocks:
+            raise ProvisionError(
+                f"trigger_offset_blocks={offset} must be in (0, epoch_blocks={epoch_blocks})")
+        # Derived per tick from the epoch in force; this is the startup value.
+        margin = epoch_blocks - offset
+    else:
+        margin = int(top.get("trigger_margin_blocks", 25))
+        if not 0 < margin < epoch_blocks:
+            raise ProvisionError(
+                f"trigger_margin_blocks={margin} must be in (0, epoch_blocks={epoch_blocks}). "
+                "A PINNED margin does not survive a cadence change — prefer "
+                "trigger_offset_blocks (blocks after the boundary), which tracks it.")
     max_spend = float(top.get("max_spend_per_round", 0))
     if max_spend <= 0:
         raise ProvisionError(f"max_spend_per_round must be > 0 USD; got {max_spend}")
@@ -114,6 +124,7 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
         final=build_stage_policy(top["final"], "final"),
         eval=eval_sp,
         trigger_margin_blocks=margin,
+        trigger_offset_blocks=offset,
         max_spend_per_round=max_spend,
         ttl_epochs=ttl_epochs,
     )
@@ -545,6 +556,8 @@ def _run(args) -> int:
         work_root=work_root,
         state_path=state_path,
         epoch_blocks=cfg.round.epoch_blocks,
+        epoch_blocks_prev=cfg.round.epoch_blocks_prev,
+        epoch_activation_block=cfg.round.epoch_activation_block,
         final_hours=cfg.training.target_train_hours,
         manifest_store=manifest_store,
         eval_hosts_path=eval_hosts_path,

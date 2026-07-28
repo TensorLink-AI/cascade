@@ -224,6 +224,12 @@ class ProvisionerLoop:
     state_path: Path
     epoch_blocks: int
     final_hours: float                                      # [training] target_train_hours
+    # Scheduled cadence change, mirroring [round] epoch_blocks_prev /
+    # epoch_activation_block. Both 0 ⇒ epoch_blocks always applies. Resolved
+    # per tick (never cached) so the provisioner flips at the same block as the
+    # trainer and validator without needing its own restart.
+    epoch_blocks_prev: int = 0
+    epoch_activation_block: int = 0
     manifest_store: object | None = None
     # The VALIDATOR's eval-offload hosts file (never the trainer's hosts_path):
     # the eval pod is published here on rent and the file is cleared on
@@ -377,13 +383,49 @@ class ProvisionerLoop:
 
     # ── properties ───────────────────────────────────────────────────────────
 
+    def epoch_at(self, block: int) -> int:
+        """Round length in force AT ``block`` — see
+        :func:`cascade.shared.config.effective_epoch_blocks`, which this
+        mirrors so the fleet flips on the same block as the trainer."""
+        if (self.epoch_activation_block and self.epoch_blocks_prev > 0
+                and int(block) < self.epoch_activation_block):
+            return max(1, self.epoch_blocks_prev)
+        return max(1, self.epoch_blocks)
+
+    def trigger_margin_at(self, block: int) -> int:
+        """Blocks-before-boundary that open the rent window.
+
+        Derived from ``trigger_offset_blocks`` (blocks AFTER the boundary to
+        start renting) when set, so it tracks the epoch length automatically.
+        A PINNED margin is the trap: 7100 was correct at 7200 and is a hard
+        startup failure at 3600 (``build_policy`` rejects margin >= epoch), and
+        a pinned 3500 silently delays renting to mid-round at 7200. The offset
+        form cannot be wrong in either direction."""
+        offset = int(getattr(self.policy, "trigger_offset_blocks", 0) or 0)
+        if offset > 0:
+            return max(1, self.epoch_at(block) - offset)
+        return int(self.policy.trigger_margin_blocks)
+
+    def epoch_hours_at(self, block: int) -> float:
+        return self.epoch_at(block) * 12.0 / 3600.0         # 12s block time
+
     @property
     def epoch_hours(self) -> float:
         return self.epoch_blocks * 12.0 / 3600.0            # 12s block time
 
     @property
     def ttl_hours(self) -> float:
-        return self.policy.ttl_epochs * self.epoch_hours
+        """Hard pod-lifetime backstop, in hours.
+
+        While a cadence change is pending this takes the LONGER of the two
+        epoch lengths. The asymmetry is deliberate: a TTL that is too long only
+        delays a backstop that normal receipt-latched teardown reaches first,
+        while a TTL that is too short reaps live pods mid-round. Using the
+        post-switch 12h here before activation would kill a 24h round's fleet
+        at the halfway mark."""
+        span = max(int(self.epoch_blocks),
+                   int(self.epoch_blocks_prev) if self.epoch_activation_block else 0)
+        return self.policy.ttl_epochs * (max(1, span) * 12.0 / 3600.0)
 
     # ── the cycle ────────────────────────────────────────────────────────────
 
@@ -418,8 +460,8 @@ class ProvisionerLoop:
             with contextlib.suppress(Exception):
                 self.on_cycle()
         self._maybe_provision_eval()
-        if should_trigger(block, self.epoch_blocks,
-                          self.policy.trigger_margin_blocks, self._provisioned_round):
+        if should_trigger(block, self.epoch_at(block),
+                          self.trigger_margin_at(block), self._provisioned_round):
             if self._rent_inflight:
                 # A rent worker (previous round's retry, most likely) is still
                 # running. The rent-once latch is only set inside
@@ -428,7 +470,8 @@ class ProvisionerLoop:
                 log.warning("trigger window open but a rent worker is still "
                             "running; deferring the round trigger one tick")
             else:
-                round_id = (block // self.epoch_blocks + 1) * self.epoch_blocks
+                _eb = self.epoch_at(block)
+                round_id = (block // _eb + 1) * _eb
                 self._provision_round(round_id)
         self._maybe_rent_final_jit(block)
         self._maybe_retry_stages(block)
@@ -523,7 +566,7 @@ class ProvisionerLoop:
             _heat_field(payload),
             int(payload["finalists"]),
             float(payload["heat_train_hours"]),
-            self.epoch_hours,
+            self.epoch_hours_at(round_id),
             self.final_hours,
             self.policy,
         )
@@ -724,7 +767,7 @@ class ProvisionerLoop:
         """Hours left until the provisioned round's epoch boundary closes."""
         if self._provisioned_round is None:
             return 0.0
-        return (self._provisioned_round + self.epoch_blocks - block) * 12.0 / 3600.0
+        return (self._provisioned_round + self.epoch_at(block) - block) * 12.0 / 3600.0
 
     def _final_primary_has_capacity(self, slots: int) -> bool:
         """Cheap availability pre-check — list offers, rent nothing.

@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from ..eval.koth import RoundResult, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
-from ..shared.config import ChainConfig
+from ..shared.config import ChainConfig, effective_epoch_blocks
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -722,8 +722,13 @@ class ValidatorRunner:
         epoch grid. Monotonic and identical for every validator (from the shared
         manifest), so it is the consensus key for daily eval-pool snapshot
         selection — unlike the round id, which is a block *hash* (non-monotonic).
+
+        The length is resolved AT ``created_block`` (not at the head) so a
+        scheduled cadence change is consensus-safe: every validator floors this
+        round on the same grid whether it restarted before or after the switch,
+        and a round that predates the switch keeps its original epoch forever.
         """
-        epoch_blocks = max(1, self.cfg.round.epoch_blocks)
+        epoch_blocks = effective_epoch_blocks(self.cfg.round, manifest.created_block)
         return (manifest.created_block // epoch_blocks) * epoch_blocks
 
     # ── public round receipts ────────────────────────────────────────────────
@@ -1087,9 +1092,12 @@ class ValidatorRunner:
 
         Subtensor treats a validator whose ``last_update`` is older than the
         subnet's ``activity_cutoff`` (5000 blocks ≈ 16.7 h on netuid 91) as
-        inactive in Yuma consensus. A mainnet round is 7200 blocks, so voting
-        only when a manifest lands blows through the cutoff every round — and a
-        stalled trainer silences the validator entirely. The vector needs no
+        inactive in Yuma consensus. A mainnet round is 3600 blocks (12 h since
+        2026-07-28; it was 7200, which alone blew the cutoff every round), so a
+        manifest now lands inside the cutoff — but voting only on manifests
+        still goes inactive the moment the trainer stalls, and the margin is
+        one missed round. This re-assert is what keeps that from silencing the
+        validator. The vector needs no
         manifest: it is recomputed from the persisted champion state (king +
         registered prior kings; no champion burns to ``burn_uid``), so this is
         a pure freshness signal that can never move the throne. The interval
@@ -1432,6 +1440,9 @@ def _build_cascade(cfg: ChainConfig) -> CascadeController:
         state=load_state(state_path),
         install_fn=_warm_start_installer(Path(cfg.validator.warm_start_init_path)),
         state_path=state_path,
+        # The clock divides by the ROUND length in force, not a fixed day, so
+        # the threshold keeps meaning "survived N challenges" under any cadence.
+        round_cfg=cfg.round,
     )
 
 

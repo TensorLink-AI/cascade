@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 
 from ..interface.validation import check_repo_size, parse_commit
 from ..shared.chain import Commitment
-from ..shared.config import ChainConfig, TrainingContractConfig
+from ..shared.config import ChainConfig, TrainingContractConfig, effective_epoch_blocks
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -1617,7 +1617,7 @@ class TrainerRunner:
         # final on (``None`` would mean "newest").
         screen_block = cutoff_block
         if screen_block is None:
-            epoch_blocks = max(1, self.cfg.round.epoch_blocks)
+            epoch_blocks = effective_epoch_blocks(self.cfg.round, block)
             screen_block = (block // epoch_blocks) * epoch_blocks
 
         eligible = self._filter_burned_challengers(plan.challengers)
@@ -2479,11 +2479,15 @@ class TrainerRunner:
         (validators own the dethrone decision; the trainer just reads weights).
         """
         poll = self.cfg.manifest.poll_seconds
-        epoch_blocks = max(1, self.cfg.round.epoch_blocks)
         last_round: str | None = None
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # Resolved per tick, NOT hoisted: under a scheduled cadence
+                # change ([round] epoch_activation_block) a hoisted value would
+                # pin the trainer to the pre-switch length until it restarted,
+                # which is exactly the drift the block gate exists to prevent.
+                epoch_blocks = effective_epoch_blocks(self.cfg.round, block)
                 # BEFORE the round-skip branches: the commit-order evidence this
                 # collects is destroyed by the chain at reveal, and most of the
                 # window where it exists is on ticks that do no round work.

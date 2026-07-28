@@ -315,7 +315,7 @@ How it works, and what to know:
 ### 5c. Time your submission — `cascade round`
 
 Only commits revealed **strictly before** the epoch boundary enter the next
-round; commit at or after it and you wait a whole extra round (~24h). `cascade
+round; commit at or after it and you wait a whole extra round (~12h). `cascade
 round` is a live round dashboard: the countdown to that deadline, where the
 round roughly is, and the revealed submissions — run it before you deploy so
 you don't commit into the wrong round, and keep it running to see your own

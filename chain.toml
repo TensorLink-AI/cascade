@@ -128,16 +128,50 @@ train_image_digest = "sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf7
 # ref_throughput_tokens_per_s = 90000   # MEASURE on the reference GPU for THIS size
 
 [round]
-# Daily round cadence + two-stage (heat → final) selection. The base seed is the
-# chain block hash at the epoch boundary; only commitments revealed strictly
-# before the boundary are eligible.
-epoch_blocks     = 7200   # ≈24h at a 12s block time
-round_hours      = 24.0   # informational: wall-clock span of an epoch
+# Twice-daily round cadence + two-stage (heat → final) selection. The base seed
+# is the chain block hash at the epoch boundary; only commitments revealed
+# strictly before the boundary are eligible.
+#
+# 7200 → 3600 on 2026-07-28 (owner): halve the round to double throughput.
+# CONSENSUS-RELEVANT — every validator derives the epoch from this for
+# pool-snapshot selection (validator/loop.py:726), so it must land in LOCKSTEP
+# across operators exactly like a scoring-rule change. Nothing detects a stale
+# value; a validator on 7200 silently selects a different snapshot.
+# Not part of contract_digest (that is [training] only), so no digest recompute
+# and no manifest invalidation.
+# The heat fleet needs NO manual resize: plan_fleet (provision/policy.py:218)
+# derives it from this value every round —
+#   heat_slots = ceil(n × heat_train_hours × slot_overhead / (epoch_h − final_h))
+# so 24h/n=31 → 2 slots → 1 pod (4 GPU) becomes 12h/n=31 → 5 slots → 2 pods
+# (8 GPU); at the observed peak field n=48 → 7 slots → 2 pods. max_pods = 8
+# (32 GPU) stays well clear. Do NOT hand-pin gpus_per_pod/max_pods to "help" —
+# that overrides the derivation and over-rents on quiet rounds.
+epoch_blocks     = 3600   # ≈12h at a 12s block time
+round_hours      = 12.0   # informational: wall-clock span of an epoch
+# SCHEDULED ACTIVATION — this is what lets operators merge and restart TODAY
+# while the change takes effect tomorrow, with no coordinated restart. Every
+# node resolves the round length through effective_epoch_blocks(round, block),
+# so a validator that restarted early and one that restarted late agree on
+# every round: 7200 for blocks before the activation, 3600 from it on.
+# 8726400 = Wed 2026-07-29 ~08:17 UTC. It is a boundary of BOTH grids
+# (8726400 / 7200 = 1212, / 3600 = 2424) — load_chain_config enforces that, so
+# no round is cut short at the seam.
+# CLEAN-UP: once 8726400 is safely past, set both keys to 0 (the steady state);
+# the accessor then returns epoch_blocks unconditionally.
+epoch_blocks_prev      = 7200
+epoch_activation_block = 8726400
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
                           # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
                           # ranking; watch p_best / leader_lcb to confirm it pays.
 heat_n_windows   = 256    # eval windows the heat screens on
-heat_num_samples = 20     # sample forecasts per window in the heat (0 = reuse [eval] num_samples)
+heat_num_samples = 100    # sample forecasts per window in the heat (0 = reuse [eval] num_samples)
+                          # 20 → 100 on 2026-07-27 (owner): match the final's
+                          # sample count so the screen ranks on the same
+                          # estimator the duel decides on. Finite-sample CRPS
+                          # bias grows with predictive spread, so a 20-sample
+                          # screen mis-prices wide-distribution checkpoints
+                          # relative to the 100-sample verdict. Measured cost:
+                          # ~5.4s → ~30s per entrant (20-entrant field ≈ 10min).
 # Heat wall-clock cap: max(heat_guard_factor × heat_train_hours, floor), never
 # above max_train_seconds. RAISE the factor if heat pods are a slower SKU than
 # the reference box, else every heat time-truncates.
@@ -215,7 +249,15 @@ genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708
 # reveal at `epoch boundary − reveal_margin_blocks` — hidden all window, public
 # only the last ~5 min. Must absorb commit-inclusion + drand reveal jitter (a
 # reveal at/after the boundary misses the round) while staying under a copier's
-# automated turnaround. Tighten only after measuring jitter on a live round.
+# automated turnaround. Tighten only after measuring jitter on a live round
+# (scripts/measure_reveal_jitter.py).
+# Deliberately UNCHANGED by the 2026-07-28 24h → 12h round switch. This is an
+# absolute quantity anchored to the boundary: both terms that size it — chain
+# jitter and copier turnaround — are properties of the chain and the adversary,
+# not of the round length, so halving it alongside epoch_blocks would cut the
+# jitter headroom for no reason. The only coupling is the public-exposure
+# fraction, 25/7200 = 0.35% → 25/3600 = 0.69% of a round: still negligible.
+# Sole hard constraint is reveal_margin_blocks < epoch_blocks (25 < 3600).
 reveal_margin_blocks = 25
 # Scaling seam: which size the heat screens at, and which size(s) decide the
 # throne. arch_preset names from the size registry; >1 throne size = combined score.
@@ -283,7 +325,16 @@ gift_gate_min_configs = 15       # shared configs below which the gate is uncomp
 # cascade_reign_days consecutive undethroned days, the reign's best checkpoint
 # becomes the warm-start init and the throne is vacated.
 cascade_enabled      = false     # master on/off for warm-start promotion
-cascade_reign_days   = 7         # consecutive undethroned days before a Cascade fires
+# Consecutive undethroned ROUNDS before a Cascade fires — "survived N
+# challenges". Renamed from cascade_reign_days on 2026-07-28 (the old key is
+# still accepted): the clock used to divide reign blocks by a fixed 7200-block
+# day, which at the 24h cadence happened to equal one round. At 12h rounds that
+# same 7 would have silently meant 14 challenges. The clock is now epoch-
+# relative (cascade.validator.cascade.reign_rounds), so this number means the
+# same thing at any cadence and needs no re-tuning when the round length moves.
+# Value unchanged at 7 — identical to the old behaviour at the old cadence.
+# Cascade remains dormant; arming it is a separate Approve decision.
+cascade_reign_rounds = 7
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely

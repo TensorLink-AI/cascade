@@ -139,6 +139,14 @@ class ProvisionPolicy:
     trigger_margin_blocks: int
     max_spend_per_round: float
     ttl_epochs: int = 1
+    # Preferred, epoch-relative form of the same knob: blocks AFTER the
+    # boundary at which to start renting. The loop derives
+    # ``margin = epoch_blocks - trigger_offset_blocks`` per tick, so it tracks a
+    # cadence change automatically. Set this instead of pinning the margin — a
+    # pinned margin is silently wrong the moment epoch_blocks changes (7100 was
+    # right at 7200, is a hard startup failure at 3600; 3500 is accepted at
+    # 7200 but defers renting to mid-round). 0 ⇒ use trigger_margin_blocks.
+    trigger_offset_blocks: int = 0
     # The validator's eval-offload pod (manifest-triggered lifecycle, see the
     # module docstring). Optional and off by default: ``None`` (no
     # [provisioner.eval] table) or ``max_pods = 0`` means no eval pod is ever
