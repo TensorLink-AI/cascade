@@ -23,6 +23,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from .crps import wql_per_window
+
 
 def _seed_to_int(seed: int | str) -> int:
     if isinstance(seed, int):
@@ -107,7 +109,15 @@ def _cluster_sums(
         codes, weights=np.log(np.maximum(mase, 1e-9)), minlength=n_clusters
     )
     n_c = np.bincount(codes, minlength=n_clusters).astype(np.float64)
-    return qloss_c, abs_c, logmase_c, n_c
+    # Scale-invariant CRPS half: per-window WQL summed in log space, plus the
+    # count of windows it is DEFINED on (|y| > 0). Zero-target windows are
+    # excluded from this half only — they still count for MASE.
+    wql, valid = wql_per_window(qloss_per_q, abs_target)
+    logwql = np.zeros_like(wql)
+    logwql[valid] = np.log(np.maximum(wql[valid], 1e-12))
+    logwql_c = np.bincount(codes, weights=logwql, minlength=n_clusters)
+    nvalid_c = np.bincount(codes, weights=valid.astype(np.float64), minlength=n_clusters)
+    return qloss_c, abs_c, logmase_c, n_c, logwql_c, nvalid_c
 
 
 def _bag_geomeans(
@@ -115,28 +125,46 @@ def _bag_geomeans(
     abs_c: np.ndarray,
     logmase_c: np.ndarray,
     n_c: np.ndarray,
+    logwql_c: np.ndarray,
+    nvalid_c: np.ndarray,
     idx: np.ndarray,
     eps: float = 1e-9,
+    wql_mode: str = "geomean",
 ) -> np.ndarray:
-    """Per-bag geomean(MWSQL, geomean MASE) under cluster resampling.
+    """Per-bag geomean(WQL, geomean MASE) under cluster resampling.
 
-    Each bag draws clusters with replacement (``idx`` indexes clusters),
-    aggregates the MWSQL numerator/denominator separately, and divides once
-    (eps floor) — removing the per-window pathology of MWSQL. MASE is
-    aggregated as a *geometric* mean (log-space): per-window MASE differences
+    Each bag draws clusters with replacement (``idx`` indexes clusters). Both
+    halves are aggregated as *geometric* means in log space: per-window ratios
     are heavy-tailed, and an arithmetic mean lets a single exploding window
     dominate every bag it lands in, inflating the LCB's variance.
 
-    Shapes: qloss_c (G, num_q), abs_c / logmase_c / n_c (G,), idx (B, g).
-    Returns (B,) bag geomeans.
+    ``wql_mode`` selects the CRPS-family half:
+
+    * ``"geomean"`` (default, live) — geometric mean of per-window WQL over the
+      windows where it is defined (``nvalid_c`` counts those; ``|y| == 0`` has no
+      scale to normalise by). Scale-invariant, so a pool spanning many orders of
+      magnitude cannot be decided by its largest-magnitude series.
+    * ``"pooled"`` — the historical MWSQL: bag numerators and denominators summed
+      separately and divided once (eps floor). Immune to a zero denominator, but
+      it weights every window by its own ``|y|``; on the live pool three windows
+      reached 100% of the denominator. Retained ONLY to replay archived receipts.
+
+    Shapes: qloss_c (G, num_q), abs_c / logmase_c / n_c / logwql_c / nvalid_c
+    (G,), idx (B, g). Returns (B,) bag geomeans.
     """
-    bag_qloss_sum = qloss_c[idx].sum(axis=1)                  # (B, num_q)
-    bag_abs_sum = np.maximum(abs_c[idx].sum(axis=1), eps)     # (B,)
-    per_q = 2.0 * bag_qloss_sum / bag_abs_sum[:, None]        # (B, num_q)
-    bag_mwsql = per_q.mean(axis=1)                            # (B,)
     bag_n = np.maximum(n_c[idx].sum(axis=1), 1.0)             # (B,)
     bag_mase = np.exp(logmase_c[idx].sum(axis=1) / bag_n)     # (B,) geomean MASE
-    return np.sqrt(np.maximum(bag_mwsql, 1e-12) * np.maximum(bag_mase, 1e-12))
+    if wql_mode == "geomean":
+        bag_nv = np.maximum(nvalid_c[idx].sum(axis=1), 1.0)   # (B,)
+        bag_crps = np.exp(logwql_c[idx].sum(axis=1) / bag_nv)  # (B,) geomean WQL
+    elif wql_mode == "pooled":
+        bag_qloss_sum = qloss_c[idx].sum(axis=1)                  # (B, num_q)
+        bag_abs_sum = np.maximum(abs_c[idx].sum(axis=1), eps)     # (B,)
+        per_q = 2.0 * bag_qloss_sum / bag_abs_sum[:, None]        # (B, num_q)
+        bag_crps = per_q.mean(axis=1)                             # (B,)
+    else:
+        raise ValueError(f"wql_mode must be 'geomean' or 'pooled'; got {wql_mode!r}")
+    return np.sqrt(np.maximum(bag_crps, 1e-12) * np.maximum(bag_mase, 1e-12))
 
 
 def _rel_bootstrap_aggregated(
@@ -150,6 +178,7 @@ def _rel_bootstrap_aggregated(
     B: int,
     seed: int | str,
     clusters: list | np.ndarray | None,
+    wql_mode: str = "geomean",
 ) -> np.ndarray:
     """The ``(B,)`` paired-cluster bootstrap distribution of relative geomean
     improvement ``(king − chal) / king``. Shared core of the decision LCB and the
@@ -186,8 +215,8 @@ def _rel_bootstrap_aggregated(
 
     rng = np.random.default_rng(_seed_to_int(seed))
     idx = rng.integers(0, g, size=(B, g))
-    king_geo = _bag_geomeans(*king_c, idx)
-    chal_geo = _bag_geomeans(*chal_c, idx)
+    king_geo = _bag_geomeans(*king_c, idx, wql_mode=wql_mode)
+    chal_geo = _bag_geomeans(*chal_c, idx, wql_mode=wql_mode)
     safe_king = np.where(np.abs(king_geo) < 1e-9, 1e-9, king_geo)
     return (king_geo - chal_geo) / safe_king
 
@@ -203,13 +232,21 @@ def paired_bootstrap_lcb_aggregated(
     B: int = 10_000,
     seed: int | str = 42,
     clusters: list | np.ndarray | None = None,
+    wql_mode: str = "geomean",
 ) -> float:
     """Paired (cluster) bootstrap LCB on relative geomean improvement.
 
-    The metric is the global geomean of ``MeanWeightedSumQuantileLoss`` and
-    geometric-mean MASE. Each bag resamples once (paired across king and
-    challenger) and aggregates the MWSQL numerator/denominator separately
-    before dividing — which removes the per-window pathology of MWSQL.
+    The metric is ``sqrt(WQL * MASE)`` with BOTH halves geometric means over
+    windows (``wql_mode="geomean"``, the live rule since DEC-CA-0009). Each bag
+    resamples once, paired across king and challenger, so shared window
+    difficulty cancels.
+
+    ``wql_mode="pooled"`` is the pre-2026-07-28 rule — a single
+    ``MeanWeightedSumQuantileLoss`` ratio over the whole bag — kept only so
+    ``cascade-audit`` can replay archived receipts. It is scale-dependent: on
+    the live pool three feeds reached 100% of its denominator, which left the
+    LCB with an effective sample size of ~3 and a bootstrap spread ~4x wider
+    than the geomean rule at an almost identical median.
 
     ``clusters`` (optional, one hashable label per window — e.g. the upstream
     feed id from pool metadata ``source``) switches to a **cluster bootstrap**:
@@ -225,7 +262,7 @@ def paired_bootstrap_lcb_aggregated(
     rel = _rel_bootstrap_aggregated(
         king_qloss, king_abs_target, king_mase,
         chal_qloss, chal_abs_target, chal_mase,
-        B=B, seed=seed, clusters=clusters,
+        B=B, seed=seed, clusters=clusters, wql_mode=wql_mode,
     )
     if rel.size == 0:
         return float("nan")
@@ -238,6 +275,7 @@ def joint_bag_geomeans(
     B: int = 10_000,
     seed: int | str = 42,
     clusters: list | np.ndarray | None = None,
+    wql_mode: str = "geomean",
 ) -> np.ndarray:
     """Bag geomeans for *several* competitors under ONE shared cluster resample.
 
@@ -289,7 +327,7 @@ def joint_bag_geomeans(
     rng = np.random.default_rng(_seed_to_int(seed))
     idx = rng.integers(0, g, size=(B, g))
     return np.stack([
-        _bag_geomeans(*_cluster_sums(qloss, abs_t, mase, codes, g), idx)
+        _bag_geomeans(*_cluster_sums(qloss, abs_t, mase, codes, g), idx, wql_mode=wql_mode)
         for qloss, abs_t, mase in components
     ])
 
@@ -305,6 +343,7 @@ def paired_bootstrap_quantiles_aggregated(
     B: int = 10_000,
     seed: int | str = 42,
     clusters: list | np.ndarray | None = None,
+    wql_mode: str = "geomean",
 ) -> dict[float, float]:
     """Diagnostic spread of the *same* bootstrap the LCB gates on.
 
@@ -318,7 +357,7 @@ def paired_bootstrap_quantiles_aggregated(
     rel = _rel_bootstrap_aggregated(
         king_qloss, king_abs_target, king_mase,
         chal_qloss, chal_abs_target, chal_mase,
-        B=B, seed=seed, clusters=clusters,
+        B=B, seed=seed, clusters=clusters, wql_mode=wql_mode,
     )
     if rel.size == 0:
         return {q: float("nan") for q in quantiles}

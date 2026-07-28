@@ -11,7 +11,13 @@ from .bootstrap import (
     paired_bootstrap_lcb_aggregated,
     paired_bootstrap_quantiles_aggregated,
 )
-from .crps import DEFAULT_QUANTILE_LEVELS, mwsql_components, mwsql_from_components
+from .crps import (
+    DEFAULT_QUANTILE_LEVELS,
+    geomean_wql_from_components,
+    mwsql_components,
+    mwsql_from_components,
+    wql_per_window,
+)
 from .heat import HeatDiagnostics, screen_diagnostics
 from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
 from .mase import mase
@@ -31,6 +37,8 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "mwsql_components",
     "mwsql_from_components",
+    "geomean_wql_from_components",
+    "wql_per_window",
     "HeatDiagnostics",
     "screen_diagnostics",
     "KothParams",

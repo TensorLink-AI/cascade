@@ -86,6 +86,65 @@ def mwsql_from_components(
     return float(per_q.mean())
 
 
+def wql_per_window(
+    qloss_per_q: np.ndarray,
+    abs_target: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-window weighted quantile loss — each window normalised by its OWN |y|.
+
+    Returns ``(wql, valid)``, both ``(N,)``: the per-window ratio, and a boolean
+    mask of the windows it is defined on.
+
+    Why this exists alongside :func:`mwsql_from_components`: that function sums
+    numerators and denominators across all windows and divides once. It is
+    immune to a zero denominator, but it implicitly weights every window by its
+    own ``|y|``. On a pool spanning ~15 orders of magnitude in scale that is not
+    a mild bias — three windows (BTC difficulty, two US-debt series) were
+    measured at 100% of the denominator on a 2000-window round, so half the
+    decision statistic had an effective sample size of 3. Normalising per window
+    first makes the aggregate scale-invariant, which is what a cross-domain pool
+    needs.
+
+    ``abs_target == 0`` (an all-zero target across the horizon — ~3% of a live
+    pool: idle bike-share docks, intermittent counts) carries no scale to
+    normalise by, so WQL is genuinely undefined there and the window is MASKED
+    rather than floored. Flooring the denominator at eps instead injects values
+    of order 1e11 into a log-space aggregate and swamps it.
+    """
+    if qloss_per_q.ndim != 2 or abs_target.ndim != 1:
+        raise ValueError(
+            f"expected qloss_per_q (N, num_q) and abs_target (N,); "
+            f"got {qloss_per_q.shape}, {abs_target.shape}"
+        )
+    if qloss_per_q.shape[0] != abs_target.shape[0]:
+        raise ValueError(
+            f"window count mismatch: qloss_per_q {qloss_per_q.shape[0]} vs "
+            f"abs_target {abs_target.shape[0]}"
+        )
+    valid = np.abs(abs_target) > 0.0
+    wql = np.zeros_like(abs_target, dtype=np.float64)
+    if valid.any():
+        wql[valid] = 2.0 * qloss_per_q[valid].mean(axis=1) / np.abs(abs_target[valid])
+    return wql, valid
+
+
+def geomean_wql_from_components(
+    qloss_per_q: np.ndarray,
+    abs_target: np.ndarray,
+    floor: float = 1e-12,
+) -> float:
+    """Scale-invariant CRPS-family aggregate: geometric mean of per-window WQL.
+
+    The geometric mean mirrors the MASE half of the round metric, and for the
+    same reason: per-window ratios are heavy-tailed and an arithmetic mean lets
+    one window dominate. NaN when no window has a defined WQL.
+    """
+    wql, valid = wql_per_window(qloss_per_q, abs_target)
+    if not valid.any():
+        return float("nan")
+    return float(np.exp(np.log(np.maximum(wql[valid], floor)).mean()))
+
+
 def crps_ensemble_numpy(samples: np.ndarray, obs: np.ndarray) -> np.ndarray:
     """Per-cell CRPS via the Gneiting–Raftery sorted-samples identity.
 

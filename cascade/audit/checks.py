@@ -375,11 +375,31 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     if not paired:
         return _fail(name, "verdict recorded but no paired (king, challenger) size")
 
-    result = evaluate_round(
-        king, chal, params,
-        seed=_bootstrap_seed(v.bootstrap_seed),
-        king_tenure_rounds=v.king_tenure_rounds,
-    )
+    # Replay under the rule that DECIDED the round, not necessarily today's.
+    # The receipt cannot record which rule it used (a new VerdictRecord field
+    # would change the signed canonical body and invalidate every archived
+    # receipt — see the note in cascade/shared/receipt.py), so we replay under
+    # each known aggregation and take the one that reproduces the recorded LCB.
+    # This is self-verifying: reproducing an LCB to 1e-9 under the wrong rule is
+    # not something a mis-scored or tampered receipt does by accident.
+    def _replay(mode: str):
+        return evaluate_round(
+            king, chal, params,
+            seed=_bootstrap_seed(v.bootstrap_seed),
+            king_tenure_rounds=v.king_tenure_rounds,
+            wql_mode=mode,
+        )
+
+    result = _replay("geomean")
+    scoring_note = ""
+    if not _close(None if math.isnan(result.lcb) else result.lcb, v.lcb):
+        legacy = _replay("pooled")
+        if _close(None if math.isnan(legacy.lcb) else legacy.lcb, v.lcb):
+            result = legacy
+            scoring_note = (
+                " (judged under the pre-2026-07-28 pooled-MWSQL rule; "
+                "reproduced under that rule, not the current one)"
+            )
     problems = []
     if result.n_windows != v.n_windows:
         problems.append(f"n_windows {v.n_windows} != recomputed {result.n_windows}")
@@ -419,7 +439,7 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
         return _fail(name, "; ".join(problems))
     lcb_txt = "n/a" if v.lcb is None else f"{v.lcb:.5f}"
     return _ok(name, f"lcb={lcb_txt} margin={v.margin:.5f} win={v.challenger_wins_round} "
-                     f"reproduced over {len(paired)} size(s){gate_note}")
+                     f"reproduced over {len(paired)} size(s){gate_note}{scoring_note}")
 
 
 def check_transition(receipt: RoundReceipt) -> CheckResult:

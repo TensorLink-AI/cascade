@@ -111,6 +111,17 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   computed at startup; a validator running across the owner's `[training]` edit
   rejects every round (`contract_digest_mismatch`) until restarted. Owner
   announcements of a re-pin = pull + restart.
+- **Restart in LOCKSTEP after any announced scoring-rule change.** A change to
+  how the duel is decided (the aggregation behind `geomean(CRPS, MASE)` — e.g.
+  DEC-CA-0009) is a *network* change, not a local one, and unlike a `[training]`
+  re-pin **nothing detects it for you**: there is no digest gate on `[scoring]`
+  and no version handshake between validators. A validator left on the old rule
+  keeps scoring duels and setting weights — it simply reaches a different
+  verdict, and the resulting split is resolved by stake-weighted consensus, so
+  whichever side holds less stake is clipped and its verdict does not land.
+  Treat these announcements as time-boxed: pull, `uv sync --frozen`, and restart
+  **before the announced round boundary**, and confirm your weight vector agrees
+  with the other validators on the round after.
 - **CPU is enough.** A duel scores in well under a minute on CPU. The GPU-heavy
   parts (GIFT-Eval gate, cascade bench) can be offloaded with
   `--eval-hosts eval_hosts.toml` — one `[[host]]` entry, re-read at every eval,

@@ -5,10 +5,21 @@ per-window :class:`WindowScore` records carrying MASE and the MWSQL components
 ``(qloss_per_q, abs_target)``. The KOTH decision (:mod:`.koth`) feeds the
 king's and challenger's components into the paired bootstrap.
 
-Why components, not a scalar CRPS: the gluonts ``MeanWeightedSumQuantileLoss``
-is a GLOBAL ratio; dividing per window blows up on near-zero-mean windows. The
-bootstrap resamples the components and divides once per bag — the GIFT-Eval
-aligned value without the per-window pathology.
+Why components, not a scalar CRPS: the bootstrap needs the numerator and
+denominator separately so a bag can aggregate before dividing, and so the
+aggregation rule stays a choice made at scoring time rather than baked into
+the per-window record.
+
+On GIFT-Eval alignment (this used to say the opposite — see DEC-CA-0009).
+The gluonts ``MeanWeightedSumQuantileLoss`` is a pooled ratio
+``sum QL_q / sum |y|``, and GIFT-Eval applies it WITHIN one dataset/freq/term
+config, where the scale is homogeneous. It then aggregates ACROSS its 97
+configs with a *geometric mean* of Seasonal-Naive-normalised values. We had
+collapsed those two layers into one: the pooled ratio applied to the whole
+heterogeneous pool. Over ~15 orders of magnitude that made three feeds 100%
+of the denominator. The current rule — a geometric mean of per-window WQL —
+is the analogue of GIFT-Eval's *outer* layer, which is the one that carries
+the cross-scale aggregation.
 """
 
 from __future__ import annotations
@@ -18,10 +29,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .crps import DEFAULT_QUANTILE_LEVELS, mwsql_components, mwsql_from_components
+from .crps import (
+    DEFAULT_QUANTILE_LEVELS,
+    geomean_wql_from_components,
+    mwsql_components,
+    mwsql_from_components,
+)
 from .mase import mase as mase_one
 from .seasonality import get_seasonality
 from .window import EvalWindow
+
+# CRPS-family aggregation for the round metric. "geomean" (scale-invariant,
+# per-window normalised) is the live rule; "pooled" is the pre-2026-07-28 MWSQL,
+# kept only to replay archived receipts. See :func:`global_geomean`.
+WQL_MODES = ("geomean", "pooled")
 
 # A forecaster: ``f(history_1d, horizon, num_samples) -> (1, num_samples, H)``.
 ForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
@@ -147,40 +168,59 @@ def stack_components(
     return qloss, abs_t, mase_a
 
 
-def global_geomean(scores: list[WindowScore]) -> float:
-    """Round-level geomean(MWSQL, geomean MASE) on the observed (non-resampled)
+def global_geomean(scores: list[WindowScore], wql_mode: str = "geomean") -> float:
+    """Round-level geomean(WQL, geomean MASE) on the observed (non-resampled)
     windows.
 
     Deliberately the SAME functional form as one bootstrap bag
     (:func:`cascade.eval.bootstrap._bag_geomeans`) evaluated on the identity
-    resample — MWSQL aggregated numerator/denominator then divided once, MASE
-    aggregated in log space. So this is exactly the quantity the LCB is a bound
-    on, and the heat screen (which ranks on it) selects on the same metric the
-    duel judges.
+    resample, so this is exactly the quantity the LCB is a bound on, and the
+    heat screen (which ranks on it) selects on the same metric the duel judges.
+    Both halves are geometric means over windows.
 
-    MASE is a *geometric* mean for the reason the bootstrap uses one: per-window
-    MASE is heavy-tailed, and an arithmetic mean lets a single exploding window
+    Both halves aggregate in log space for the same reason: per-window ratios
+    are heavy-tailed, and an arithmetic mean lets a single exploding window
     dominate the aggregate. That bites hardest in the heat, which screens on a
     fraction of the windows and samples the final does.
+
+    ``wql_mode`` selects the CRPS-family half and exists ONLY so that archived
+    receipts stay verifiable:
+
+    * ``"geomean"`` (default, live) — geometric mean of per-window WQL, each
+      window normalised by its own ``|y|``. Scale-invariant.
+    * ``"pooled"`` — the historical MWSQL: numerators and denominators summed
+      across windows, divided once. Retained solely to replay receipts written
+      before 2026-07-28; it is scale-dominated on a cross-domain pool (see
+      :func:`cascade.eval.crps.wql_per_window`) and must not be used for new
+      decisions.
     """
     if not scores:
         return float("nan")
-    qloss, abs_t, mase_a = stack_components(scores)
-    mwsql = mwsql_from_components(qloss, abs_t)
-    mase_geo = float(np.exp(np.log(np.maximum(mase_a, 1e-9)).mean()))
-    return float(np.sqrt(max(mwsql, 1e-12) * max(mase_geo, 1e-12)))
+    crps, mase_geo = global_components(scores, wql_mode=wql_mode)
+    if crps != crps:  # NaN — no window had a defined WQL
+        return float("nan")
+    return float(np.sqrt(max(crps, 1e-12) * max(mase_geo, 1e-12)))
 
 
-def global_components(scores: list[WindowScore]) -> tuple[float, float]:
+def global_components(
+    scores: list[WindowScore], wql_mode: str = "geomean"
+) -> tuple[float, float]:
     """The two components behind :func:`global_geomean`, ``(crps, mase)``, before
     they are combined into the geomean: ``crps`` is the round-level CRPS-family
-    loss (mean weighted scaled quantile loss, MWSQL) and ``mase`` is the
-    *geometric* mean MASE — the same aggregation :func:`global_geomean` uses, so
-    ``sqrt(crps * mase)`` reproduces the geomean the heat ranks on. NaN-safe — an
-    empty list returns ``(nan, nan)``. Used by the heat screener to report a
-    challenger's raw error components, not just the geomean."""
+    loss and ``mase`` is the *geometric* mean MASE — the same aggregation
+    :func:`global_geomean` uses, so ``sqrt(crps * mase)`` reproduces the geomean
+    the heat ranks on. NaN-safe — an empty list returns ``(nan, nan)``. Used by
+    the heat screener to report a challenger's raw error components, not just
+    the geomean. See :func:`global_geomean` for ``wql_mode``."""
     if not scores:
         return (float("nan"), float("nan"))
+    if wql_mode not in WQL_MODES:
+        raise ValueError(f"wql_mode must be one of {WQL_MODES}; got {wql_mode!r}")
     qloss, abs_t, mase_a = stack_components(scores)
     mase_geo = float(np.exp(np.log(np.maximum(mase_a, 1e-9)).mean()))
-    return (float(mwsql_from_components(qloss, abs_t)), mase_geo)
+    crps = (
+        geomean_wql_from_components(qloss, abs_t)
+        if wql_mode == "geomean"
+        else float(mwsql_from_components(qloss, abs_t))
+    )
+    return (crps, mase_geo)
