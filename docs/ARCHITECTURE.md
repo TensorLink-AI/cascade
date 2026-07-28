@@ -217,10 +217,23 @@ Univariate windows produce one score each (`channel = 0`); a multivariate window
 contributes one row per channel.
 
 The KOTH decision is a **paired bootstrap LCB** on the relative improvement of
-`geomean(MWSQL, mean MASE)`, challenger vs king, resampling window indices once
-per bag and aggregating MWSQL numerator/denominator before dividing (robust to
-near-zero-mean windows). The challenger wins a round iff that LCB clears the
-win margin on at least `min_windows` common windows. The windows
+`geomean(WQL, MASE)`, challenger vs king, resampling window clusters once per
+bag. Both halves are **geometric means over windows**, each window normalised by
+its own scale first: WQL by that window's `sum|y|`, MASE by its own seasonal-
+naive denominator. The challenger wins a round iff that LCB clears the win
+margin on at least `min_windows` common windows.
+
+The CRPS half was originally a *pooled* MWSQL — numerators and denominators
+summed across all windows, divided once — which is scale-dominated on a
+cross-domain pool: on a 2000-window round in July 2026 three high-magnitude
+series (BTC difficulty, two US-debt series) were measured at 100% of the
+denominator, giving half the decision statistic an effective sample size of 3.
+Normalising per window first is what makes the aggregate scale-invariant.
+Windows with `sum|y| == 0` have no scale to normalise by, so WQL is undefined
+there and they are excluded from that half (they still count for MASE).
+Receipts written before 2026-07-28 were judged under the pooled rule;
+`cascade-audit` replays each receipt under both and reports which one
+reproduces the recorded LCB. The windows
 are a **rotating private slice** (`cascade.validator.windows`): seeded by the
 round's block hash so every validator scores the identical set and the king/
 challenger comparison is paired, but rotated each round so no fixed eval set can

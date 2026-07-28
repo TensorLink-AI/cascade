@@ -51,6 +51,16 @@ in-context.
   in the enforcement path.
   (`decisions/DEC-CA-0008-content-dedup.md`)
 
+- **DEC-CA-0009** — The CRPS half of the round metric is a per-window geomean of
+  WQL, not a pooled MWSQL. Pooling a ratio weights each window by its magnitude;
+  on a pool spanning ~15 orders of magnitude three windows reached 100% of the
+  denominator (effective n=3) and held the throne for 8 rounds against
+  challengers the diagnostics scored as better. Zero-`sum|y|` windows are masked
+  from that half, not floored. Margin/alpha deliberately untouched; no receipt
+  format change (it would break the signed audit trail) — `cascade-audit`
+  replays under both rules. Trainer + validator must deploy together.
+  (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

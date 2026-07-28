@@ -198,6 +198,16 @@ class VerdictRecord:
     boot_p50: float | None = None
     boot_p95: float | None = None
 
+    # NOTE: do NOT add fields here to record scoring-rule changes. ``asdict`` of
+    # this dataclass goes verbatim into ``RoundReceipt.canonical_body`` — the
+    # SIGNED bytes — so any new field (even with a default) re-serialises every
+    # archived receipt with bytes that were never signed, and the whole public
+    # audit trail fails signature verification. Bumping ``RECEIPT_VERSION`` is
+    # not an escape either: ``load_receipt`` rejects any version but the current
+    # one, so archived receipts would stop loading at all. Scoring-rule changes
+    # are instead re-derived by ``cascade.audit.checks.check_verdict``, which
+    # replays under each known rule and reports which one reproduces the LCB.
+
     @classmethod
     def from_round(
         cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0

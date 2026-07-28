@@ -141,6 +141,10 @@ class RoundResult:
     # whose point estimate rides a heavy tail. Display only; never gates.
     boot_p50: float | None = None
     boot_p95: float | None = None
+    # Which CRPS-family aggregation judged this round ("geomean" | "pooled").
+    # Recorded on the receipt so an auditor replays a round under the rule that
+    # actually decided it; see :func:`cascade.eval.scoring.global_geomean`.
+    wql_mode: str = "geomean"
 
 
 def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
@@ -202,9 +206,15 @@ def evaluate_round(
     *,
     seed: int | str,
     king_tenure_rounds: int = 0,
+    wql_mode: str = "geomean",
 ) -> RoundResult:
     """Judge one round. ``king_scores`` and ``chal_scores`` must be paired:
     same windows, same order. Raises ``ValueError`` if lengths disagree.
+
+    ``wql_mode`` is the CRPS-family aggregation (see
+    :func:`cascade.eval.scoring.global_geomean`). Live rounds use the default
+    ``"geomean"``; pass ``"pooled"`` only when replaying a receipt written
+    before 2026-07-28, which recorded its own mode for exactly this purpose.
     """
     if len(king_scores) != len(chal_scores):
         raise ValueError(
@@ -220,10 +230,11 @@ def evaluate_round(
             lcb=float("nan"),
             margin=margin,
             n_windows=n,
-            king_geomean=global_geomean(king_scores),
-            chal_geomean=global_geomean(chal_scores),
+            king_geomean=global_geomean(king_scores, wql_mode=wql_mode),
+            chal_geomean=global_geomean(chal_scores, wql_mode=wql_mode),
             inconclusive=True,
             n_clusters=n_clusters,
+            wql_mode=wql_mode,
         )
 
     k_qloss, k_abs, k_mase = stack_components(king_scores)
@@ -235,6 +246,7 @@ def evaluate_round(
         B=params.bootstrap_B,
         seed=seed,
         clusters=clusters,
+        wql_mode=wql_mode,
     )
     win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
     boot_p50 = boot_p95 = None
@@ -244,6 +256,7 @@ def evaluate_round(
         qs = paired_bootstrap_quantiles_aggregated(
             k_qloss, k_abs, k_mase, c_qloss, c_abs, c_mase,
             quantiles=(0.5, 0.95), B=params.bootstrap_B, seed=seed, clusters=clusters,
+            wql_mode=wql_mode,
         )
         boot_p50, boot_p95 = qs.get(0.5), qs.get(0.95)
     except Exception:  # noqa: BLE001 — spread is display-only
@@ -253,10 +266,11 @@ def evaluate_round(
         lcb=lcb,
         margin=margin,
         n_windows=n,
-        king_geomean=global_geomean(king_scores),
-        chal_geomean=global_geomean(chal_scores),
+        king_geomean=global_geomean(king_scores, wql_mode=wql_mode),
+        chal_geomean=global_geomean(chal_scores, wql_mode=wql_mode),
         inconclusive=False,
         n_clusters=n_clusters,
+        wql_mode=wql_mode,
         win_rate=win_rate,
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,

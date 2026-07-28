@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from cascade.eval.bootstrap import paired_bootstrap_lcb, paired_bootstrap_lcb_aggregated
-from cascade.eval.crps import mwsql_components, mwsql_from_components
+from cascade.eval.crps import (
+    geomean_wql_from_components,
+    mwsql_components,
+    mwsql_from_components,
+    wql_per_window,
+)
 from cascade.eval.mase import in_sample_naive_mae, mase
 
 
@@ -133,3 +138,92 @@ def test_cluster_bootstrap_deterministic_in_seed_and_labels():
     assert a == b
     c = paired_bootstrap_lcb_aggregated(k_q, abs_t, k_m, c_q, abs_t, c_m, B=500, seed="y", clusters=labels)
     assert a != c
+
+
+# --- scale-invariant CRPS aggregation (2026-07-28) --------------------------
+# Regression cover for the defect that let three high-magnitude windows become
+# 100% of the CRPS denominator on a 2000-window round. See
+# cascade.eval.crps.wql_per_window.
+
+
+def test_wql_per_window_masks_zero_target_windows():
+    qloss = np.array([[1.0, 1.0], [1.0, 1.0]])
+    abs_t = np.array([4.0, 0.0])
+    wql, valid = wql_per_window(qloss, abs_t)
+    assert valid.tolist() == [True, False]
+    assert wql[0] == 0.5 and wql[1] == 0.0
+
+
+def test_geomean_wql_ignores_undefined_windows():
+    """A zero-|y| window must not enter the aggregate — flooring its denominator
+    would inject ~1e11 into a log-space mean and swamp it."""
+    qloss = np.array([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+    abs_t = np.array([4.0, 4.0, 0.0])
+    assert geomean_wql_from_components(qloss, abs_t) == geomean_wql_from_components(
+        qloss[:2], abs_t[:2]
+    )
+    assert np.isnan(geomean_wql_from_components(qloss[2:], abs_t[2:]))
+
+
+def test_geomean_wql_is_scale_invariant_but_pooled_is_not():
+    """Rescaling ONE window's magnitude must not move a scale-invariant
+    aggregate. The pooled MWSQL moves a long way — that is the bug."""
+    # Two windows the model does DIFFERENTLY well on (wql 0.2 vs 0.6) — if the
+    # ratios matched there would be nothing for a reweighting to shift.
+    qloss = np.array([[1.0, 1.0], [6.0, 6.0]])
+    abs_t = np.array([10.0, 20.0])
+    big_qloss = qloss.copy()
+    big_abs = abs_t.copy()
+    big_qloss[1] *= 1e6          # same window, same ratio, 1e6x the magnitude
+    big_abs[1] *= 1e6
+    assert np.isclose(
+        geomean_wql_from_components(qloss, abs_t),
+        geomean_wql_from_components(big_qloss, big_abs),
+    )
+    assert not np.isclose(
+        mwsql_from_components(qloss, abs_t),
+        mwsql_from_components(big_qloss, big_abs),
+        rtol=0.05,
+    )
+
+
+def test_one_huge_window_cannot_decide_the_duel():
+    """Challenger is better on 99 windows and worse on one 1e9x-magnitude
+    window. Pooled MWSQL hands the round to the king on that single window;
+    the scale-invariant aggregate does not."""
+    n = 100
+    nq = 2
+    abs_t = np.full(n, 10.0)
+    abs_t[0] = 1e10                                   # one giant-magnitude series
+    king_q = np.full((n, nq), 0.30) * abs_t[:, None]
+    chal_q = np.full((n, nq), 0.20) * abs_t[:, None]  # challenger better everywhere
+    chal_q[0] = 0.90 * abs_t[0]                       # ...except on the giant one
+    king_mase = np.full(n, 1.0)
+    chal_mase = np.full(n, 1.0)
+
+    pooled = paired_bootstrap_lcb_aggregated(
+        king_q, abs_t, king_mase, chal_q, abs_t, chal_mase,
+        B=2000, seed=7, wql_mode="pooled",
+    )
+    geo = paired_bootstrap_lcb_aggregated(
+        king_q, abs_t, king_mase, chal_q, abs_t, chal_mase,
+        B=2000, seed=7, wql_mode="geomean",
+    )
+    assert pooled < 0.0 < geo
+
+
+def test_bootstrap_default_is_the_scale_invariant_rule():
+    rng = np.random.default_rng(3)
+    n, nq = 40, 2
+    abs_t = rng.uniform(1.0, 5.0, size=n)
+    king_q = rng.uniform(0.2, 0.4, size=(n, nq)) * abs_t[:, None]
+    chal_q = rng.uniform(0.1, 0.3, size=(n, nq)) * abs_t[:, None]
+    mase_a = np.full(n, 1.0)
+    kw = dict(B=500, seed=11)
+    default = paired_bootstrap_lcb_aggregated(
+        king_q, abs_t, mase_a, chal_q, abs_t, mase_a, **kw
+    )
+    explicit = paired_bootstrap_lcb_aggregated(
+        king_q, abs_t, mase_a, chal_q, abs_t, mase_a, wql_mode="geomean", **kw
+    )
+    assert default == explicit
