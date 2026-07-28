@@ -1496,23 +1496,29 @@ document.getElementById("smooth").addEventListener("input",function(){ _smooth=N
 document.getElementById("theme-toggle").textContent=document.documentElement.dataset.theme==="dark"?"LIGHT":"DARK";
 
 // Multiple validators publish into the shared rolling index (entries keyed by
-// round_id + validator_hotkey). The notebook renders one row per round: keep
-// the newest entry per round_id by published_at — honest validators agree on
-// the verdict, so any one entry is representative.
+// round_id + validator_hotkey). The notebook renders one row per round, picked
+// in TRUST order, not by recency alone: around a scoring-rule change (live
+// 2026-07-28, DEC-CA-0009) two honest validators on different code versions
+// sign OPPOSITE verdicts for the same round, and newest-wins let a peer's late
+// re-verdict flip the table, chart and king lineage while the anchored verdict
+// panels still showed the anchor's verdict — the page contradicted itself.
 function collapseByRound(d){
   if(!d || !Array.isArray(d.rounds)) return d;
   var by={}, order=[];
   d.rounds.forEach(function(r){
     var id=String(r.round_id);
     if(!(id in by)) order.push(id);
-    // Scored beats rejected for the same round regardless of recency: the
-    // index is shared and any validator (on any code version) can append a
-    // rejected re-judgement row with a newer published_at (live 2026-07-21:
-    // uid 6's pool_pin reject outranked the crowning verdict and the dashboard
-    // showed "Rejected"). Among rows of equal status, newest wins as before.
-    var cur=by[id], rS=String(r.status)==="scored", cS=cur&&String(cur.status)==="scored";
+    // Precedence: (1) scored beats rejected regardless of recency (live
+    // 2026-07-21: uid 6's pool_pin reject outranked the crowning verdict and
+    // the dashboard showed "Rejected"); (2) the anchor validator beats peers —
+    // the same trust anchor the verdict/king panels and cascade-audit pin, so
+    // every panel tells one story; (3) among equals, newest wins as before.
+    var cur=by[id], rS=String(r.status)==="scored", cS=!!(cur&&String(cur.status)==="scored");
+    var rA=String(r.validator_hotkey||"")===RECEIPT_ANCHOR,
+        cA=!!(cur&&String(cur.validator_hotkey||"")===RECEIPT_ANCHOR);
     if(!cur || (rS&&!cS) ||
-       (rS===!!cS && String(r.published_at||"") >= String(cur.published_at||""))) by[id]=r;
+       (rS===cS && ((rA&&!cA) ||
+        (rA===cA && String(r.published_at||"") >= String(cur.published_at||""))))) by[id]=r;
   });
   var out={}; for(var k in d) out[k]=d[k];
   out.rounds=order.map(function(id){ return by[id]; });
