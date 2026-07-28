@@ -890,7 +890,13 @@ class ValidatorRunner:
                     "as_of": now_iso,
                     "current_block": current_block,
                     "epoch_start_block": epoch_start,
-                    "epoch_blocks": int(self.cfg.round.epoch_blocks),
+                    # Length of the round STARTING at epoch_start, not the raw
+                    # field: while a cadence change is pending the raw value is
+                    # the post-switch length, and the client's next-boundary
+                    # countdown (epoch_start + epoch_blocks) would point
+                    # mid-round. A round never spans the activation block, so
+                    # resolving at epoch_start is exact on both sides.
+                    "epoch_blocks": int(effective_epoch_blocks(self.cfg.round, epoch_start)),
                     "block_time_s": 12.0,
                 }
                 update_receipt_index(

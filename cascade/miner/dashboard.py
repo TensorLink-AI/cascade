@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..shared.chain_status import STAGE_OVERHEAD_SECONDS, stage_windows
-from ..shared.config import RoundConfig
+from ..shared.config import RoundConfig, effective_epoch_blocks
 
 DEFAULT_SECONDS_PER_BLOCK = 12.0
 BAR_WIDTH = 28
@@ -99,9 +99,12 @@ class RoundStatus:
 
 
 def round_status(block: int, round_cfg: RoundConfig) -> RoundStatus:
+    # Resolve the grid AT the snapshot block: while a scheduled cadence change
+    # ([round] epoch_activation_block) is pending, the raw field is the
+    # POST-switch length and would show miners the new boundaries a day early.
     return RoundStatus(
         block=int(block),
-        epoch_blocks=max(1, round_cfg.epoch_blocks),
+        epoch_blocks=max(1, effective_epoch_blocks(round_cfg, int(block))),
         spb=seconds_per_block(round_cfg),
     )
 
