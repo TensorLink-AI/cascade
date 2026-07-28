@@ -1,0 +1,1022 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cascade · subnet scoreboard</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta name="description" content="Cascade (Bittensor SN91) stakeholder scoreboard: dethrone events, forecast improvement vs the launch baseline, scaling ladder, and training efficiency — every number derived from the signed public round receipts.">
+<style>
+/* ============================================================
+   cascade — stakeholder scoreboard
+   Self-contained. Palette + layout language mirror the technical
+   dashboard (index.html); the brand webfonts are NOT inlined here
+   (index.html carries ~1.3MB of them), so this page renders in the
+   same colours on the system font stack.
+   ============================================================ */
+:root {
+  --clay:#BF5B3D; --clay-700:#8C3F29; --clay-100:#F0D6CC;
+  --sage:#7E9B7E; --sage-700:#526B51; --sage-300:#A9C1A9; --sage-100:#DCE7DC;
+  --saffron:#DBA047; --saffron-600:#C4882F;
+  --slate:#33404E; --slate-500:#55677A; --slate-400:#7E8EA0;
+  --bone-light:#F4ECE3;
+  --mist:#F1F3EE; --mist-card:#F8FAF6; --mist-border:#DBE1D7;
+
+  --font-display:Georgia,'Times New Roman',serif;
+  --font-sans:system-ui,-apple-system,'Segoe UI',sans-serif;
+  --font-mono:ui-monospace,'SF Mono',Menlo,'IBM Plex Mono',monospace;
+
+  --paper:var(--mist); --surface:var(--mist-card); --ink:var(--slate);
+  --muted:var(--slate-400);
+  --line:1px dashed var(--mist-border);
+  --line-faint:1px dotted rgba(51,64,78,0.16);
+  --accent:var(--sage); --good:var(--sage-700); --warn:var(--saffron-600);
+  --pending-bg:rgba(219,160,71,0.10); --pending-fg:#8a6414;
+}
+[data-theme="dark"] {
+  --paper:#232D38; --surface:#29343F; --ink:var(--bone-light); --muted:#8A99A8;
+  --line:1px dashed rgba(229,219,201,0.26);
+  --line-faint:1px dotted rgba(229,219,201,0.14);
+  --accent:var(--sage-300); --good:var(--sage-300); --warn:var(--saffron);
+  --pending-bg:rgba(219,160,71,0.14); --pending-fg:var(--saffron);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--paper);color:var(--ink);font:14px/1.55 var(--font-sans);
+  display:flex;justify-content:center;min-height:100vh;-webkit-font-smoothing:antialiased;
+  transition:background .2s,color .2s}
+.page{width:100%;max-width:1180px;padding:30px 40px 90px;display:flex;flex-direction:column;gap:34px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* top bar */
+#top-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  border-bottom:var(--line);padding:8px 0;font-family:var(--font-mono);font-size:11px;
+  text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+#top-bar b{color:var(--ink);font-weight:600}
+.tb-group{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.net-badge{font-weight:700;letter-spacing:.08em;padding:3px 9px;border:1px solid currentColor;border-radius:2px}
+.net-badge.net-mainnet{color:var(--sage-700)}
+[data-theme="dark"] .net-badge.net-mainnet{color:var(--sage-300)}
+.net-badge.net-testnet{color:#BF5B3D;background:rgba(191,91,61,.10)}
+.btn{background:none;border:var(--line);color:var(--ink);font:600 10px/1 var(--font-mono);
+  text-transform:uppercase;letter-spacing:.06em;padding:6px 11px;cursor:pointer;border-radius:2px}
+.btn:hover{background:var(--accent);color:var(--bone-light);border-color:var(--accent)}
+.data-banner{padding:9px 14px;border-radius:3px;font-size:13px}
+.data-banner.loading{color:var(--muted);border:1px dashed rgba(127,127,127,.4)}
+.data-banner.offline{color:#BF5B3D;background:rgba(191,91,61,.10);border:1px solid rgba(191,91,61,.45);font-weight:600}
+
+/* masthead */
+.header{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0 0}
+.header .wordmark{font-family:var(--font-display);font-weight:700;font-size:44px;letter-spacing:-.03em;
+  color:var(--accent);line-height:1}
+.header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
+.header .sub{color:var(--muted);max-width:70ch;margin-top:12px;font-size:13.5px}
+
+/* section */
+.section-label{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+  text-transform:uppercase;font-family:var(--font-mono);font-weight:700;font-size:11px;
+  letter-spacing:.09em;border-bottom:var(--line);padding-bottom:9px;margin-bottom:16px;color:var(--ink)}
+.section-label .muted{color:var(--muted);font-weight:400;letter-spacing:.04em}
+.lede{color:var(--muted);font-size:13px;max-width:82ch;margin-bottom:18px;line-height:1.65}
+
+/* headline tiles */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:14px}
+.tile{border:var(--line);background:var(--surface);padding:18px 19px;position:relative;
+  display:flex;flex-direction:column;gap:5px;min-height:150px}
+.tile::before{content:"";position:absolute;inset:4px;border:var(--line-faint);pointer-events:none}
+.tile>*{position:relative;z-index:1}
+.tile .k{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--muted)}
+.tile .v{font-family:var(--font-mono);font-size:clamp(26px,3.4vw,34px);line-height:1.1;
+  margin-top:2px;color:var(--ink);font-weight:600}
+.tile .v.sm{font-size:clamp(19px,2.4vw,23px)}
+.tile .u{font-size:14px;color:var(--muted);font-weight:400}
+.tile .note{font-size:12px;color:var(--muted);margin-top:auto;line-height:1.5}
+.tile .note b{color:var(--ink);font-weight:600}
+.tile.pending .v{color:var(--pending-fg)}
+.pill{display:inline-block;font-family:var(--font-mono);font-weight:700;font-size:9.5px;
+  text-transform:uppercase;letter-spacing:.07em;padding:2px 8px;border-radius:999px;
+  border:1px solid currentColor;white-space:nowrap}
+.pill.live{color:var(--good)}
+.pill.pend{color:var(--pending-fg);background:var(--pending-bg);border-color:transparent}
+.good{color:var(--good)}
+.tile-head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+
+/* baseline callout */
+.callout{border:var(--line);border-left:3px solid var(--accent);background:var(--surface);
+  padding:16px 20px;font-size:13px;line-height:1.65;color:var(--ink)}
+.callout h3{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;
+  letter-spacing:.08em;margin-bottom:7px;color:var(--ink)}
+.callout p{color:var(--muted);max-width:96ch}
+.callout p+p{margin-top:8px}
+.callout code{font-family:var(--font-mono);font-size:12px;background:var(--paper);
+  border:var(--line-faint);padding:1px 5px;color:var(--ink)}
+
+/* timeline */
+.timeline{position:relative;padding:8px 0 4px}
+.tl-rail{position:relative;height:92px}
+.tl-line{position:absolute;left:0;right:0;top:44px;border-top:var(--line)}
+.tl-ev{position:absolute;top:0;height:92px;transform:translateX(-50%);white-space:nowrap;
+  display:flex;flex-direction:column;align-items:center}
+.tl-dot{width:11px;height:11px;border-radius:50%;background:var(--accent);
+  border:2px solid var(--paper);position:absolute;top:39px;box-shadow:0 0 0 1px var(--accent)}
+.tl-ev.launch .tl-dot{background:var(--paper);box-shadow:0 0 0 1px var(--muted)}
+.tl-lab{position:absolute;left:50%;transform:translateX(-50%);font-family:var(--font-mono);
+  font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.tl-lab.who{top:22px;color:var(--ink);font-weight:700}
+.tl-ev.launch .tl-lab.who{color:var(--muted);font-weight:400}
+/* dates alternate above/below the rail so neighbouring events never overlap */
+.tl-lab.date{top:58px}
+.tl-ev.alt .tl-lab.who{top:74px}
+.tl-ev.alt .tl-lab.date{top:6px}
+.tl-note{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.05em;margin-top:6px}
+
+/* chart */
+.chart-wrap{width:100%;aspect-ratio:5/2;min-height:190px}
+.chart-wrap svg{width:100%;height:100%;display:block}
+.chart-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  font-family:var(--font-mono);font-size:11px;text-transform:uppercase;margin-top:12px;color:var(--muted)}
+.legend{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.swatch{width:15px;height:3px;display:inline-block}
+
+/* ladder */
+.ladder{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+.rung{flex:1 1 130px;border:var(--line);border-right:none;padding:14px 15px;background:var(--surface);
+  display:flex;flex-direction:column;gap:4px;position:relative}
+.rung:last-child{border-right:var(--line)}
+.rung .rp{font-family:var(--font-mono);font-size:19px;font-weight:600;color:var(--muted)}
+.rung .rs{font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.rung .rn{font-size:11.5px;color:var(--muted)}
+.rung.done{background:var(--sage-100)}
+[data-theme="dark"] .rung.done{background:rgba(126,155,126,.16)}
+.rung.done .rp{color:var(--good)}
+.rung.done .rs{color:var(--good)}
+.rung.next{border-left:3px solid var(--saffron)}
+.rung.next .rp{color:var(--ink)}
+
+/* tables */
+.scroll-box{overflow:auto;scrollbar-width:thin;max-height:330px}
+.scroll-box::-webkit-scrollbar{width:5px;height:5px}
+.scroll-box::-webkit-scrollbar-thumb{background:var(--accent)}
+table{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px}
+th{text-transform:uppercase;font-weight:700;font-size:9.5px;letter-spacing:.06em;text-align:left;
+  padding:9px 16px 9px 0;border-bottom:var(--line);background:var(--paper);position:sticky;top:0;
+  z-index:1;white-space:nowrap;color:var(--muted)}
+td{padding:8px 16px 8px 0;white-space:nowrap;color:var(--ink)}
+tr{border-bottom:var(--line-faint)}
+tbody tr:hover td{background:var(--accent);color:var(--bone-light)}
+tbody tr:hover td a{color:var(--bone-light)}
+.num{text-align:right}
+th.num{text-align:right}
+.muted{color:var(--muted)}
+.empty{color:var(--muted);text-transform:uppercase;padding:16px 0;text-align:center;
+  font-family:var(--font-mono);font-size:11px;letter-spacing:.05em}
+
+/* pending panel */
+.pending-panel{border:var(--line);background:var(--surface);padding:26px;display:flex;
+  flex-direction:column;align-items:center;gap:9px;text-align:center}
+.pending-panel .pg{font-family:var(--font-mono);font-size:16px;color:var(--pending-fg);letter-spacing:.3em}
+.pending-panel .ph{font-family:var(--font-mono);font-weight:700;font-size:12px;
+  text-transform:uppercase;letter-spacing:.06em;color:var(--ink)}
+.pending-panel p{font-size:13px;color:var(--muted);max-width:72ch;line-height:1.65}
+.pending-panel code{font-family:var(--font-mono);font-size:11.5px;background:var(--paper);
+  border:var(--line-faint);padding:2px 6px;color:var(--ink)}
+
+/* method */
+.method{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px 32px}
+.method dt{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--ink);font-weight:700;margin-bottom:5px}
+.method dd{font-size:12.5px;color:var(--muted);line-height:1.65}
+.method code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
+.foot{border-top:var(--line);padding-top:16px;font-size:12px;color:var(--muted);line-height:1.7}
+
+@media (max-width:760px){
+  .page{padding:20px 16px 60px;gap:26px}
+  .header .wordmark{font-size:34px}
+  .chart-wrap{aspect-ratio:3/2}
+  table{min-width:620px}
+  .rung{border-right:var(--line);flex-basis:100%}
+  /* a date label is wider than the gap between markers at this width — keep the
+     rail readable (dots + reign numbers) and let the table carry the dates */
+  .tl-lab.date{display:none}
+  .tl-rail{height:56px}
+  .tl-line{top:30px}
+  .tl-dot{top:25px}
+  .tl-lab.who{top:6px}
+  .tl-ev.alt .tl-lab.who{top:40px}
+}
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <div id="top-bar">
+    <div class="tb-group">
+      <span id="net-badge" class="net-badge net-mainnet">MAINNET</span>
+      <span>SUBNET <b id="tb-netuid">--</b></span>
+      <span>ROUNDS <b id="tb-rounds">--</b></span>
+      <span>UPDATED <b id="tb-updated">--</b></span>
+    </div>
+    <div class="tb-group">
+      <a class="btn" href="index.html">Technical dashboard →</a>
+      <button id="theme-toggle" class="btn">DARK</button>
+    </div>
+  </div>
+
+  <div id="data-banner" class="data-banner loading" hidden></div>
+
+  <div class="header">
+    <span class="wordmark">cascade</span>
+    <span class="tagline">Subnet scoreboard · for stakeholders</span>
+    <p class="sub">Six numbers that say whether the competition is working, whether the models are
+    getting better, and what that improvement costs. Every figure below is derived from the
+    validator&rsquo;s <b>signed public round receipts</b> — the same trail
+    <code>cascade-audit</code> replays. Nothing here is hand-entered.</p>
+  </div>
+
+  <!-- headline tiles -->
+  <section>
+    <div class="section-label"><span>Headline</span><span class="muted" id="headline-when">--</span></div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <!-- competition -->
+  <section>
+    <div class="section-label"><span>Competition &mdash; dethrone events</span>
+      <span class="muted" id="deth-when"></span></div>
+    <p class="lede">A dethrone is the competition working: a challenger&rsquo;s generator beat the
+    reigning king by more than the win margin on held-out data, and took the throne. A subnet where
+    the king never changes is not competing; one that changes hands regularly is.</p>
+    <div class="timeline" id="timeline"></div>
+    <div class="scroll-box" style="margin-top:12px">
+      <table><thead><tr>
+        <th>#</th><th>Took the throne</th><th class="num">UID</th><th>Generator</th>
+        <th>Round</th><th class="num">Improvement</th><th class="num">Held (rounds)</th>
+      </tr></thead><tbody id="reigns"></tbody></table>
+    </div>
+  </section>
+
+  <!-- performance vs baseline -->
+  <section>
+    <div class="section-label"><span>Performance &mdash; forecast improvement vs baseline</span>
+      <span class="muted" id="perf-when"></span></div>
+    <div class="callout" style="margin-bottom:18px">
+      <h3>The baseline, and why it does not move</h3>
+      <p id="baseline-def">The baseline is the generator that held the throne at the first round in
+      the public receipt record.</p>
+      <p>Improvement is <b>chained, not re-measured</b>. The subnet&rsquo;s eval pool rotates every
+      round (seeded by the block hash) so no generator can distribution-match it — which also means a
+      raw error number from round&nbsp;1 and one from round&nbsp;80 were measured on different
+      windows and are <i>not</i> comparable. What <i>is</i> comparable is each dethrone: king and
+      challenger are scored on the <b>same windows, same round</b>, so the ratio between them is a
+      clean paired measurement. Multiplying those ratios across every dethrone gives the cumulative
+      improvement over the launch baseline, with window difficulty cancelling at each step.</p>
+      <p><code>improvement = 1 − Π(challenger_error ÷ king_error)</code> over dethrone rounds. The
+      <b>conservative floor</b> replaces each factor with the round&rsquo;s 95% bootstrap lower
+      bound — the number the dethrone was actually gated on. Both are plotted; the gap between them
+      is the selection bias (a dethrone is granted on a favourable noisy estimate, so the observed
+      chain runs optimistic).</p>
+    </div>
+    <div class="chart-wrap"><svg id="chart-perf" preserveAspectRatio="none"></svg></div>
+    <div class="chart-meta">
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i> Observed chain</span>
+        <span><i class="swatch" style="background:var(--saffron)"></i> Conservative floor (95% LCB)</span>
+      </div>
+      <span id="perf-note">--</span>
+    </div>
+  </section>
+
+  <!-- public benchmark -->
+  <section>
+    <div class="section-label"><span>Performance &mdash; best public benchmark</span>
+      <span class="muted" id="bench-when"></span></div>
+    <p class="lede">External credibility: how the subnet&rsquo;s champion checkpoint scores on the
+    open GIFT-Eval / BOOM / TIME batteries, normalised against the Seasonal-Naive reference exactly
+    as the public leaderboards do. <b>1.00 = Seasonal-Naive; lower is better.</b></p>
+    <div id="bench-panel"></div>
+  </section>
+
+  <!-- scaling -->
+  <section>
+    <div class="section-label"><span>Scaling &mdash; highest validated model size</span>
+      <span class="muted" id="scale-when"></span></div>
+    <p class="lede">A rung counts as <b>validated</b> once the full pipeline has run at that size and
+    produced a judged round — generators drawn, models trained under the fixed contract, and a
+    verdict written to a signed receipt.</p>
+    <div class="ladder" id="ladder"></div>
+    <p class="lede" style="margin-top:14px;margin-bottom:0" id="ladder-note"></p>
+  </section>
+
+  <!-- efficiency -->
+  <section>
+    <div class="section-label"><span>Efficiency &mdash; skill gain per training token</span>
+      <span class="muted" id="eff-when"></span></div>
+    <p class="lede">Accuracy that costs ever more compute is not progress. This divides the
+    cumulative improvement above by the training tokens the competition has burned to earn it —
+    every final king/challenger run plus every heat-screen run.</p>
+    <div class="chart-wrap"><svg id="chart-eff" preserveAspectRatio="none"></svg></div>
+    <div class="chart-meta">
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per 10<sup>12</sup> training tokens</span>
+      </div>
+      <span id="eff-note">--</span>
+    </div>
+    <p class="lede" style="margin-top:14px;margin-bottom:0" id="eff-caveat"></p>
+  </section>
+
+  <!-- compounding -->
+  <section>
+    <div class="section-label"><span>Compounding &mdash; gain retention across warm starts</span>
+      <span class="muted" id="warm-when"></span></div>
+    <p class="lede">The core hypothesis: when a long-reigning king&rsquo;s best checkpoint is promoted
+    to become the floor everyone trains up from, do the accumulated gains survive the handoff?</p>
+    <div id="warm-panel"></div>
+  </section>
+
+  <!-- method -->
+  <section>
+    <div class="section-label"><span>How to check these numbers</span><span class="muted">Verification</span></div>
+    <dl class="method" id="method"></dl>
+    <p class="foot" id="foot"></p>
+  </section>
+
+</div>
+
+<script>
+// ── config ──────────────────────────────────────────────────────────────────
+// Mirrors index.html: the network is chosen by hostname, and receipts are read
+// same-origin first (CORS-free behind the Vercel rewrite or straight from the
+// bucket), with the absolute Hippius endpoints raced as a fallback.
+var IS_TESTNET = /testnet/.test(location.hostname);
+var BUCKET = IS_TESTNET ? "cascade-testnet-manifests" : "cascade-manifests";
+var SAME_ORIGIN = location.pathname.replace(/\/[^/]*$/, "").replace(/\/$/, "");
+var ENDPOINTS = [
+  SAME_ORIGIN,
+  "https://s3.hippius.com/" + BUCKET,
+  "https://us-east-1.hippius.com/" + BUCKET,
+  "https://eu-central-1.hippius.com/" + BUCKET
+];
+// Trust anchor: the validator hotkey whose signed trail the verdict panels and
+// cascade-audit pin. Peers publish into the same shared index; entries are
+// collapsed in trust order, never by recency alone (see collapseByRound).
+var RECEIPT_ANCHOR = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
+var HUB_BASE = "https://hub.hippius.com/models/", HUB_REF = "main";
+var POLL_MS = 60000;
+// The shared index is a ROLLING window (RECEIPT_INDEX_MAX_KEEP). At the cap the
+// "since launch" framing stops being literally true and the page says so.
+var INDEX_MAX_KEEP = 400;
+
+// Training-token accounting. NOT carried in the receipts — the round summary
+// records the contract DIGEST, not its parameters — so the budget is read from
+// the public chain.toml, whose history gives the eras below. Each entry is
+// (effective date, reference throughput, final-run hours, heat-screen hours);
+// tokens = hours × 3600 × throughput. Verifiable against `git log -p chain.toml`.
+var TOKEN_ERAS = [
+  { from: "0000-00-00", ref_tps: 185000,  train_h: 3.0, heat_h: 0.5, why: "launch contract" },
+  { from: "2026-07-15", ref_tps: 3700000, train_h: 3.0, heat_h: 0.5, why: "L40S pods: 20× token budget, same 3h wall" },
+  { from: "2026-07-26", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, why: "heat screen 0.5h → 1.0h" }
+];
+
+// Scaling ladder. The rungs are the roadmap; which of them is VALIDATED is read
+// from the receipts (a rung with at least one judged round).
+var LADDER = [
+  { key: "4m",   label: "4M",    note: "launch size" },
+  { key: "22m",  label: "22M",   note: "" },
+  { key: "313m", label: "313M",  note: "" },
+  { key: "1b",   label: "1B",    note: "" },
+  { key: "2.5b", label: "2.5B",  note: "" },
+  { key: "10b",  label: "10B",   note: "" }
+];
+
+var _index = null, _latest = null, _state = "loading";
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+(function initTheme(){
+  var saved = localStorage.getItem("cascDashTheme");
+  document.documentElement.dataset.theme = saved === "dark" ? "dark" : "light";
+})();
+function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
+  .replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function splitRef(r){ if(!r) return {repo:"",digest:""}; var i=r.indexOf("@");
+  return i<0?{repo:r,digest:""}:{repo:r.slice(0,i),digest:r.slice(i+1)}; }
+function genUrl(ref){ var p=splitRef(ref); if(!p.repo) return "#";
+  return p.digest.indexOf("hf:")===0 ? "https://huggingface.co/"+p.repo : HUB_BASE+p.repo+"/"+HUB_REF; }
+function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--";
+  var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):"";
+  return d?p.repo+"@"+d:p.repo; }
+function refLink(ref){ var p=splitRef(ref);
+  if(!p.repo) return '<span class="muted">--</span>';
+  return '<a href="'+genUrl(ref)+'" target="_blank" rel="noopener" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
+function shortRound(id){ id=String(id||""); return id.length>12?id.slice(0,6)+"…"+id.slice(-4):id; }
+function num(x,dp){ if(x==null||!isFinite(x)) return "--"; return Number(x).toFixed(dp==null?2:dp); }
+function signedPct(x,dp){ if(x==null||!isFinite(x)) return "--";
+  var v=Number(x)*100; return (v>=0?"+":"−")+Math.abs(v).toFixed(dp==null?1:dp)+"%"; }
+function dayOf(iso){ return iso ? String(iso).slice(0,10) : ""; }
+function prettyDay(iso){
+  var d = iso ? new Date(iso) : null;
+  if(!d || isNaN(d.getTime())) return "--";
+  return d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});
+}
+function timeAgo(i){ if(!i) return "--";
+  var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0;
+  if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago";
+  var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
+
+function fetchJSON(path){
+  var bust="?t="+Date.now();
+  return new Promise(function(resolve,reject){
+    var pending=ENDPOINTS.length, settled=false;
+    ENDPOINTS.forEach(function(base){
+      fetch(base+"/"+path+bust)
+        .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+        .then(function(d){ if(settled) return; settled=true; resolve(d); })
+        .catch(function(){ pending--; if(pending===0&&!settled) reject(new Error("all endpoints failed")); });
+    });
+  });
+}
+
+// Peers publish into the same rolling index (keyed round_id + validator_hotkey).
+// One row per round, picked in trust order: scored beats rejected, the anchor
+// validator beats peers, then newest wins. Identical to index.html — the two
+// dashboards must never disagree about who is king.
+function collapseByRound(d){
+  if(!d || !Array.isArray(d.rounds)) return d;
+  var by={}, order=[];
+  d.rounds.forEach(function(r){
+    var id=String(r.round_id);
+    if(!(id in by)) order.push(id);
+    var cur=by[id],
+        rS=String(r.status)==="scored", cS=!!(cur&&String(cur.status)==="scored"),
+        rA=String(r.validator_hotkey||"")===RECEIPT_ANCHOR,
+        cA=!!(cur&&String(cur.validator_hotkey||"")===RECEIPT_ANCHOR);
+    if(!cur || (rS&&!cS) ||
+       (rS===cS && ((rA&&!cA) ||
+        (rA===cA && String(r.published_at||"") >= String(cur.published_at||""))))) by[id]=r;
+  });
+  var out={}; for(var k in d) out[k]=d[k];
+  out.rounds=order.map(function(id){ return by[id]; });
+  return out;
+}
+
+// ── domain ──────────────────────────────────────────────────────────────────
+function allRounds(){ return (_index && _index.rounds) || []; }
+function scoredRounds(){ return allRounds().filter(function(r){ return r.status==="scored"; }); }
+function judgedRounds(){ return scoredRounds().filter(function(r){ return !r.inconclusive; }); }
+function atCap(){ return allRounds().length >= INDEX_MAX_KEEP; }
+
+// Every throne change in the record, oldest first. reigns[0] is the BASELINE —
+// the king already seated at the first round the public index still carries.
+function reigns(){
+  var out=[], cur=null, rs=scoredRounds();
+  rs.forEach(function(r){
+    if(!cur){
+      cur={n:1,hotkey:r.king_hotkey,uid:r.king_uid,gen_ref:r.king_gen_ref,
+           round:r.round_id,block:r.epoch_start_block,at:r.published_at,
+           gain:null,rounds:0,baseline:true};
+      out.push(cur);
+    }
+    cur.rounds++;
+    if(r.dethroned){
+      var gain = (r.king_geomean>0 && r.chal_geomean>0) ? (1 - r.chal_geomean/r.king_geomean) : null;
+      cur={n:out.length+1,hotkey:r.chal_hotkey,uid:r.chal_uid,gen_ref:r.chal_gen_ref,
+           round:r.round_id,block:r.epoch_start_block,at:r.published_at,
+           gain:gain,rounds:0,baseline:false};
+      out.push(cur);
+    }
+  });
+  return out;
+}
+
+// The chained improvement over the baseline king. One factor per dethrone,
+// each a same-round / same-windows paired ratio, so per-round window difficulty
+// cancels instead of accumulating as noise.
+//   observed : Π (chal_geomean / king_geomean)
+//   floor    : Π (1 − lcb), the 95% bootstrap bound the dethrone was gated on
+function improvementChain(){
+  var obs=1, flo=1, pts=[], steps=[];
+  scoredRounds().forEach(function(r){
+    if(r.dethroned && r.king_geomean>0 && r.chal_geomean>0 &&
+       isFinite(r.king_geomean) && isFinite(r.chal_geomean)){
+      var f = r.chal_geomean / r.king_geomean;
+      // The LCB is the same bootstrap's 5th percentile of relative improvement;
+      // 1−lcb is therefore the pessimistic counterpart of f. Never let it credit
+      // MORE than observed (clamped at f) — the floor must stay a floor.
+      var lf = (r.lcb!=null && isFinite(r.lcb)) ? Math.max(f, 1 - r.lcb) : f;
+      obs *= f; flo *= Math.min(1, lf);
+      steps.push({ round_id:r.round_id, at:r.published_at, factor:f, lfactor:lf,
+                   lcb:r.lcb, margin:r.margin });
+    }
+    pts.push({ round_id:r.round_id, at:r.published_at, obs:1-obs, flo:1-flo,
+               tokens:roundTokens(r) });
+  });
+  return { obs:1-obs, floor:1-flo, steps:steps, pts:pts };
+}
+
+function eraFor(iso){
+  var d = dayOf(iso) || "9999-99-99", pick = TOKEN_ERAS[0];
+  TOKEN_ERAS.forEach(function(e){ if(d >= e.from) pick = e; });
+  return pick;
+}
+// Training tokens one round burned: the king and challenger final runs at every
+// trained size, plus one heat-screen run per entrant. The contract fixes the
+// budget, so this is the CONTRACTED spend — a run stopped by the wall-clock
+// guard (deadline_hit) burned less. Stated on the page, not hidden.
+function roundTokens(r){
+  if(r.status !== "scored") return 0;
+  var e = eraFor(r.published_at);
+  var sizes = (r.sizes && r.sizes.filter(Boolean).length) || 1;
+  var entrants = (r.heat && r.heat.n_entrants) || 0;
+  return 2 * sizes * e.train_h * 3600 * e.ref_tps + entrants * e.heat_h * 3600 * e.ref_tps;
+}
+
+// Size tag ("toto2-4m", "toto2-313m") → ladder rung key.
+function rungKey(tag){
+  var m = String(tag||"").toLowerCase().match(/(\d+(?:\.\d+)?)\s*([mb])\b/);
+  return m ? (m[1] + m[2]) : "";
+}
+function validatedRungs(){
+  var seen = {};
+  judgedRounds().forEach(function(r){
+    (r.sizes||[]).forEach(function(s){
+      var k = rungKey(s); if(!k) return;
+      seen[k] = (seen[k]||0) + 1;
+    });
+  });
+  return seen;
+}
+
+// Public-benchmark scores ride on the KING's manifest entry, stamped by the
+// trainer (BenchScores). They exist only when [scoring] cascade_enabled — the
+// tile stays explicitly PENDING until a real one lands, never a placeholder.
+function benchScores(){
+  var m = _latest && _latest.manifest;
+  var entries = (m && m.entries) || [];
+  for(var i=0;i<entries.length;i++){
+    var e = entries[i];
+    if(e && e.role === "king" && e.bench_scores) return { scores:e.bench_scores, size:e.size||"" };
+  }
+  return null;
+}
+function warmStart(){
+  var m = _latest && _latest.manifest;
+  return (m && m.warm_start_ckpt) ? { ckpt:m.warm_start_ckpt, size:m.warm_start_size||"" } : null;
+}
+
+// ── render: headline tiles ──────────────────────────────────────────────────
+function tile(o){
+  return '<div class="tile'+(o.pending?" pending":"")+'">' +
+    '<div class="tile-head"><span class="k">'+esc(o.k)+'</span>' +
+      (o.pill||'') + '</div>' +
+    '<div class="v'+(o.small?" sm":"")+'">'+o.v+'</div>' +
+    '<div class="note">'+(o.note||"")+'</div></div>';
+}
+var PILL_LIVE = '<span class="pill live">Live</span>';
+var PILL_PEND = '<span class="pill pend">Pending</span>';
+
+function renderTiles(){
+  var rs = scoredRounds(), rg = reigns(), chain = improvementChain();
+  var deth = rs.filter(function(r){ return r.dethroned; }).length;
+  var cells = [];
+
+  // 1 — dethrones
+  cells.push(tile({
+    k:"Dethrone events", pill: rs.length?PILL_LIVE:PILL_PEND,
+    v: rs.length ? deth : "--",
+    note: rs.length
+      ? deth + " throne change" + (deth===1?"":"s") + " across <b>" + rs.length +
+        "</b> judged round" + (rs.length===1?"":"s") + " &middot; " + rg.length +
+        " distinct reign" + (rg.length===1?"":"s")
+      : "Waiting for the first published round."
+  }));
+
+  // 2 — improvement vs baseline
+  var haveChain = chain.steps.length > 0;
+  cells.push(tile({
+    k:"Forecast improvement vs baseline", pill: haveChain?PILL_LIVE:PILL_PEND,
+    v: haveChain ? signedPct(chain.obs) : "--",
+    note: haveChain
+      ? "Better than the launch baseline, chained across " + chain.steps.length +
+        " dethrone" + (chain.steps.length===1?"":"s") + ". Conservative floor: <b>" +
+        signedPct(chain.floor) + "</b>."
+      : (rs.length
+          ? "No dethrone yet — the baseline king still holds, so improvement is 0% by construction."
+          : "Waiting for the first published round.")
+  }));
+
+  // 3 — public benchmark
+  var b = benchScores();
+  cells.push(tile({
+    k:"Best public benchmark", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:!!b,
+    v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">MASE</span>') : "Pending",
+    note: b
+      ? "GIFT-Eval, Seasonal-Naive-normalised (1.00 = Seasonal-Naive). CRPS <b>" +
+        num(b.scores.gifteval_crps,3) + "</b>."
+      : "No benchmark result published yet. The trainer stamps GIFT-Eval / BOOM / TIME onto the " +
+        "king&rsquo;s signed manifest once the benchmark hook is armed."
+  }));
+
+  // 4 — scaling
+  var seen = validatedRungs(), top=null, nxt=null;
+  LADDER.forEach(function(r,i){
+    if(seen[r.key]) { top=r; nxt=LADDER[i+1]||null; }
+  });
+  cells.push(tile({
+    k:"Highest validated model size", pill: top?PILL_LIVE:PILL_PEND,
+    v: top ? top.label : "--",
+    note: top
+      ? "Validated over <b>" + seen[top.key] + "</b> judged round" + (seen[top.key]===1?"":"s") +
+        (nxt ? ". Next rung: <b>" + nxt.label + "</b>." : ". Top of the ladder.")
+      : "No judged round carries a size tag yet."
+  }));
+
+  // 5 — efficiency
+  var last = chain.pts.length ? chain.pts[chain.pts.length-1] : null;
+  var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
+  var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
+  cells.push(tile({
+    k:"Skill gain per training token", pill: eff!=null?PILL_LIVE:PILL_PEND, small:true,
+    v: eff!=null ? (signedPct(eff,2) + ' <span class="u">/ 10<sup>12</sup> tok</span>') : "Pending",
+    note: eff!=null
+      ? "Cumulative improvement over <b>" + num(tot/1e12,1) + "T</b> contracted training tokens."
+      : "Unlocks with the first dethrone (needs a non-zero improvement to divide)."
+  }));
+
+  // 6 — compounding
+  var ws = warmStart();
+  cells.push(tile({
+    k:"Gain retention (warm starts)", pill:PILL_PEND, pending:true, small:true,
+    v: ws ? "Armed" : "Dormant",
+    note: ws
+      ? "Rounds now train from <b>" + esc(shortRef(ws.ckpt)) + "</b>. Retention becomes measurable " +
+        "at the first promotion with benchmark numbers on both sides of the handoff."
+      : "Cascade warm-start promotion is not armed, so no warm start has happened and there is " +
+        "nothing to retain yet."
+  }));
+
+  document.getElementById("tiles").innerHTML = cells.join("");
+  var upd = _index && _index.updated_at;
+  document.getElementById("headline-when").textContent = upd ? ("Updated " + timeAgo(upd)) : "--";
+}
+
+// ── render: dethrone timeline + reigns ──────────────────────────────────────
+function renderCompetition(){
+  var rg = reigns(), rail = document.getElementById("timeline");
+  if(!rg.length){
+    rail.innerHTML = '<div class="empty">Waiting for the first published round</div>';
+  } else {
+    // True chronological placement, then a left-to-right pass that pushes any
+    // two events at least MIN_GAP apart so neighbouring labels cannot collide
+    // (a burst of dethrones in one day would otherwise print on top of itself).
+    var t0 = new Date(rg[0].at || Date.now()).getTime(), t1 = Date.now();
+    var span = Math.max(1, t1 - t0);
+    var MIN_GAP = rg.length > 1 ? Math.min(11, 86/(rg.length-1)) : 0;
+    var dense = rg.length > 14;   // too many to label; dots + endpoints only
+    var xs = rg.map(function(g){
+      var t = new Date(g.at || t0).getTime();
+      return 7 + 86 * Math.min(1, Math.max(0, (t - t0) / span));
+    });
+    for(var i=1; i<xs.length; i++) xs[i] = Math.max(xs[i], xs[i-1] + MIN_GAP);
+    var over = xs.length ? Math.max(0, xs[xs.length-1] - 93) : 0;
+    if(over > 0) xs = xs.map(function(x){ return x - over * (x - 7) / Math.max(1, xs[xs.length-1] - 7); });
+
+    var evs = rg.map(function(g,i){
+      var label = !dense || i===0 || i===rg.length-1;
+      return '<div class="tl-ev'+(g.baseline?" launch":"")+(i%2?" alt":"")+
+        '" style="left:'+xs[i].toFixed(2)+'%" title="'+
+        esc((g.baseline?"Baseline":("Dethrone #"+(g.n-1)))+" · "+prettyDay(g.at)+" · uid "+
+            (g.uid!=null?g.uid:"?"))+'">' +
+        (label ? '<span class="tl-lab who">'+esc(g.baseline?"baseline":("#"+(g.n-1)))+'</span>' +
+                 '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
+        '<span class="tl-dot"></span></div>';
+    }).join("");
+    var deth = rg.length - 1;
+    rail.innerHTML = '<div class="tl-rail"><div class="tl-line"></div>'+evs+'</div>' +
+      '<div class="tl-note">' + (deth ? deth + " dethrone" + (deth===1?"":"s") : "no dethrone yet") +
+      " since " + esc(prettyDay(rg[0].at)) +
+      (dense ? " · hover a marker for its date" : "") + "</div>";
+  }
+
+  var rows = rg.slice().reverse().map(function(g){
+    return '<tr>' +
+      '<td>'+(g.baseline?'<span class="muted">base</span>':("#"+(g.n-1)))+'</td>' +
+      '<td>'+esc(prettyDay(g.at))+'</td>' +
+      '<td class="num">'+(g.uid!=null?g.uid:"--")+'</td>' +
+      '<td>'+refLink(g.gen_ref)+'</td>' +
+      '<td class="muted">'+esc(shortRound(g.round))+'</td>' +
+      '<td class="num">'+(g.gain!=null?'<span class="good">'+signedPct(g.gain)+'</span>':'<span class="muted">--</span>')+'</td>' +
+      '<td class="num">'+g.rounds+'</td></tr>';
+  }).join("");
+  document.getElementById("reigns").innerHTML = rows ||
+    '<tr><td colspan="7" class="empty">No reigns recorded yet</td></tr>';
+  document.getElementById("deth-when").textContent =
+    rg.length ? ("Baseline seated " + prettyDay(rg[0].at)) : "";
+}
+
+// ── charts ──────────────────────────────────────────────────────────────────
+function drawLines(svgId, series, opts){
+  var svg = document.getElementById(svgId);
+  var W = 1000, H = 400, pad = { l:58, r:14, t:16, b:30 };
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  var all = [];
+  series.forEach(function(s){ s.data.forEach(function(v){ if(v!=null&&isFinite(v)) all.push(v); }); });
+  if(!all.length){
+    svg.innerHTML = '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" ' +
+      'fill="currentColor" opacity=".45" font-size="17" font-family="'+
+      'ui-monospace,monospace">'+esc(opts.empty||"No data yet")+'</text>';
+    return;
+  }
+  var n = Math.max.apply(null, series.map(function(s){ return s.data.length; }));
+  var lo = Math.min.apply(null, all.concat([0])), hi = Math.max.apply(null, all);
+  if(hi === lo) hi = lo + 1;
+  var padY = (hi - lo) * 0.12; lo -= padY; hi += padY;
+  var X = function(i){ return pad.l + (n<=1 ? 0 : (W-pad.l-pad.r) * i/(n-1)); };
+  var Y = function(v){ return pad.t + (H-pad.t-pad.b) * (1 - (v-lo)/(hi-lo)); };
+  var out = [];
+  // gridlines + y labels
+  for(var g=0; g<=4; g++){
+    var v = lo + (hi-lo)*g/4, y = Y(v);
+    out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+
+      '" stroke="currentColor" stroke-opacity=".13" stroke-dasharray="3 4"/>');
+    out.push('<text x="'+(pad.l-9)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="currentColor" '+
+      'opacity=".5" font-size="15" font-family="ui-monospace,monospace">'+
+      esc(opts.fmtY ? opts.fmtY(v) : num(v,2))+'</text>');
+  }
+  // zero line
+  if(lo < 0 && hi > 0){
+    out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+Y(0).toFixed(1)+'" y2="'+Y(0).toFixed(1)+
+      '" stroke="currentColor" stroke-opacity=".3"/>');
+  }
+  series.forEach(function(s){
+    var d = "", started = false;
+    s.data.forEach(function(v,i){
+      if(v==null||!isFinite(v)) return;
+      d += (started?" L":"M") + X(i).toFixed(1) + " " + Y(v).toFixed(1);
+      started = true;
+    });
+    if(d) out.push('<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="'+
+      (s.width||3)+'" stroke-linejoin="round" stroke-linecap="round"'+
+      (s.dash?' stroke-dasharray="'+s.dash+'"':'')+'/>');
+  });
+  // dethrone markers
+  (opts.marks||[]).forEach(function(i){
+    out.push('<line x1="'+X(i).toFixed(1)+'" x2="'+X(i).toFixed(1)+'" y1="'+pad.t+'" y2="'+
+      (H-pad.b)+'" stroke="currentColor" stroke-opacity=".22" stroke-dasharray="2 5"/>');
+  });
+  svg.innerHTML = out.join("");
+}
+
+function renderPerf(){
+  var chain = improvementChain();
+  drawLines("chart-perf", [
+    { data: chain.pts.map(function(p){ return p.obs; }), color:"var(--accent)" },
+    { data: chain.pts.map(function(p){ return p.flo; }), color:"var(--saffron)", width:2, dash:"5 4" }
+  ], {
+    fmtY: function(v){ return (v*100).toFixed(0)+"%"; },
+    marks: chain.pts.reduce(function(a,p,i){
+      if(chain.steps.some(function(s){ return s.round_id===p.round_id; })) a.push(i); return a; }, []),
+    empty: "No scored rounds published yet"
+  });
+  var rg = reigns();
+  document.getElementById("baseline-def").innerHTML = rg.length
+    ? "The baseline is <b>" + esc(shortRef(rg[0].gen_ref)) + "</b> (uid " + (rg[0].uid!=null?rg[0].uid:"--") +
+      "), the generator holding the throne at the first round in the public receipt record — round <code>" +
+      esc(shortRound(rg[0].round)) + "</code>, " + esc(prettyDay(rg[0].at)) + ". It is an anchor, not a " +
+      "competitor: it never re-runs, so the reference point cannot drift."
+    : "The baseline is the generator holding the throne at the first round in the public receipt record. " +
+      "No round has published yet.";
+  document.getElementById("perf-note").textContent = chain.steps.length
+    ? (chain.steps.length + " dethrone step" + (chain.steps.length===1?"":"s") + " · " +
+       signedPct(chain.obs) + " observed / " + signedPct(chain.floor) + " floor")
+    : "Baseline king still holds";
+  document.getElementById("perf-when").textContent =
+    chain.steps.length ? ("Last gain " + timeAgo(chain.steps[chain.steps.length-1].at)) : "";
+}
+
+function renderEfficiency(){
+  var chain = improvementChain(), cum = 0, data = [];
+  chain.pts.forEach(function(p){
+    cum += p.tokens;
+    data.push(cum > 0 ? p.obs / (cum/1e12) : null);
+  });
+  drawLines("chart-eff", [{ data:data, color:"var(--accent)" }], {
+    fmtY: function(v){ return (v*100).toFixed(1)+"%"; },
+    empty: "No scored rounds published yet"
+  });
+  var tot = chain.pts.reduce(function(a,p){ return a+p.tokens; }, 0);
+  document.getElementById("eff-note").textContent = tot > 0
+    ? (num(tot/1e12,1) + "T tokens burned · " +
+       (chain.steps.length ? signedPct(chain.obs/(tot/1e12),2) + " per 10^12" : "no gain yet"))
+    : "--";
+  var eras = TOKEN_ERAS.map(function(e){
+    return (e.from === "0000-00-00" ? "launch" : e.from) + ": " +
+      num(e.train_h*3600*e.ref_tps/1e9,1) + "B per final run, " +
+      num(e.heat_h*3600*e.ref_tps/1e9,1) + "B per heat entrant (" + e.why + ")";
+  }).join("; ");
+  document.getElementById("eff-caveat").innerHTML =
+    "<b>Assumption, stated:</b> the round receipts record the training contract&rsquo;s <i>digest</i>, " +
+    "not its token budget, so tokens are computed from the public <code>chain.toml</code> — " +
+    esc(eras) + ". Each round counts two final runs per trained size plus one heat run per entrant " +
+    "(entrant counts come from the receipts). A run stopped early by the wall-clock guard burned " +
+    "less than its budget, so this is an <b>upper bound on spend</b> — i.e. a conservative, " +
+    "lower-bound efficiency. Publishing <code>tokens_seen</code> in the round summary would make " +
+    "it exact.";
+  document.getElementById("eff-when").textContent = tot>0 ? (num(tot/1e12,1)+"T tokens") : "";
+}
+
+// ── render: benchmark / ladder / warm start ─────────────────────────────────
+function renderBench(){
+  var b = benchScores(), el = document.getElementById("bench-panel");
+  if(!b){
+    el.innerHTML = '<div class="pending-panel">' +
+      '<span class="pg">&mdash; &mdash; &mdash;</span>' +
+      '<span class="ph">Pending public benchmark</span>' +
+      '<p>No public-benchmark result has been published for a king checkpoint yet. The machinery ' +
+      'exists — the benchmark sidecar runs GIFT-Eval, BOOM and TIME with the leaderboards&rsquo; own ' +
+      'Seasonal-Naive normalisation, and the trainer stamps the six numbers onto the king&rsquo;s ' +
+      '<i>signed</i> manifest — but it only runs when the benchmark hook is armed ' +
+      '(<code>[scoring] cascade_enabled</code>). This tile fills itself in automatically from the ' +
+      'first receipt that carries them; until then it stays blank rather than showing a number ' +
+      'nobody can check.</p></div>';
+    document.getElementById("bench-when").textContent = "";
+    return;
+  }
+  var s = b.scores;
+  var suites = [
+    { n:"GIFT-Eval", c:s.gifteval_crps, m:s.gifteval_mase },
+    { n:"BOOM",      c:s.boom_crps,     m:s.boom_mase },
+    { n:"TIME",      c:s.time_crps,     m:s.time_mase }
+  ];
+  el.innerHTML = '<div class="tiles">' + suites.map(function(x){
+    return tile({ k:x.n + " · vs Seasonal-Naive", small:true,
+      v: num(x.m,3) + ' <span class="u">MASE</span>',
+      note: "CRPS <b>" + num(x.c,3) + "</b> &middot; " +
+            (x.m<1 ? "beats" : "does not beat") + " the Seasonal-Naive reference (1.000)." });
+  }).join("") + '</div>';
+  document.getElementById("bench-when").textContent =
+    "King checkpoint" + (b.size ? " · " + b.size : "");
+}
+
+function renderLadder(){
+  var seen = validatedRungs(), el = document.getElementById("ladder"), topIdx = -1;
+  LADDER.forEach(function(r,i){ if(seen[r.key]) topIdx = i; });
+  el.innerHTML = LADDER.map(function(r,i){
+    var done = !!seen[r.key], next = (i === topIdx+1);
+    return '<div class="rung'+(done?" done":"")+(next?" next":"")+'">' +
+      '<span class="rp">'+esc(r.label)+'</span>' +
+      '<span class="rs">'+(done?"Validated":(next?"Next":"Planned"))+'</span>' +
+      '<span class="rn">'+(done ? (seen[r.key]+" judged round"+(seen[r.key]===1?"":"s"))
+                                : esc(r.note||"not run")) +'</span></div>';
+  }).join("");
+  var top = topIdx>=0 ? LADDER[topIdx] : null, nxt = LADDER[topIdx+1] || null;
+  document.getElementById("ladder-note").innerHTML = top
+    ? "Validated today: <b>" + esc(top.label) + "</b>" + (nxt ? "; next rung <b>" + esc(nxt.label) +
+      "</b>. A rung turns green the moment a judged round carries its size tag — enabling a size in " +
+      "the training contract is not enough." : "."
+      )
+    : "No size tag has appeared in a judged round yet.";
+  document.getElementById("scale-when").textContent = top ? (top.label + " validated") : "";
+}
+
+function renderWarm(){
+  var ws = warmStart(), el = document.getElementById("warm-panel");
+  if(!ws){
+    el.innerHTML = '<div class="pending-panel">' +
+      '<span class="pg">&mdash; &mdash; &mdash;</span>' +
+      '<span class="ph">No warm start yet &mdash; Cascade is dormant</span>' +
+      '<p>Warm-start promotion (a long-reigning king&rsquo;s best checkpoint becoming the shared ' +
+      'init) is implemented but <b>not armed</b>: every round still trains from a random init, so ' +
+      'zero gains have been carried across a handoff and there is nothing to retain. Showing a ' +
+      'retention percentage now would be inventing one.</p>' +
+      '<p>When it arms, retention is measurable without any new evaluation: the promoted checkpoint ' +
+      'and the next round&rsquo;s king are both scored on the same fixed public battery and both ' +
+      'sets of numbers are signed into their manifests, so retention is ' +
+      '<code>promoted_score ÷ first_post_promotion_score</code> — one division over two signed ' +
+      'receipts.</p></div>';
+    document.getElementById("warm-when").textContent = "";
+    return;
+  }
+  el.innerHTML = '<div class="pending-panel">' +
+    '<span class="ph">Warm start active</span>' +
+    '<p>Rounds are training from <b>' + esc(shortRef(ws.ckpt)) + '</b>' +
+    (ws.size ? ' at <code>' + esc(ws.size) + '</code>' : '') +
+    '. Retention is computed from the first promotion that has a post-promotion round with ' +
+    'published benchmark numbers on both sides.</p></div>';
+  document.getElementById("warm-when").textContent = "Warm start pinned";
+}
+
+// ── render: method + chrome ─────────────────────────────────────────────────
+function renderMethod(){
+  var chain = improvementChain(), rg = reigns();
+  var items = [
+    ["Dethrone events",
+     "Count of rounds whose signed receipt carries <code>verdict.dethroned = true</code>. " +
+     "Read straight from <code>receipts/index.json</code>; each row links to the round receipt " +
+     "that produced it."],
+    ["Improvement vs baseline",
+     "Product of <code>chal_geomean ÷ king_geomean</code> over dethrone rounds, subtracted from 1. " +
+     "Both numbers come from the same receipt and were measured on the same eval windows in the " +
+     "same round, so the ratio is paired. The floor swaps each factor for the round&rsquo;s " +
+     "<code>lcb</code> — the 95% bootstrap bound the dethrone was gated on."],
+    ["Why not a single absolute score",
+     "The eval pool rotates per round (block-hash seeded) so generators cannot distribution-match " +
+     "it. That is a deliberate anti-gaming property, and it is exactly why round-1 and round-N " +
+     "error numbers are not directly comparable — the windows differ. Chaining paired ratios is " +
+     "the honest way to span them."],
+    ["Known bias",
+     "A dethrone is granted on a favourable noisy estimate, so each chained factor is selected " +
+     "upward (winner&rsquo;s curse) and the observed chain runs optimistic. The 95%-LCB floor is " +
+     "the counterpart that cannot be inflated this way. Quote the pair, not the headline alone."],
+    ["Public benchmark",
+     "GIFT-Eval / BOOM / TIME via the pinned benchmark sidecar, aggregated with the leaderboards&rsquo; " +
+     "own shifted-geomean-over-Seasonal-Naive method, so 1.000 is the Seasonal-Naive reference and " +
+     "the numbers are leaderboard-comparable. Never feeds scoring or weights — the benchmark data is " +
+     "public and would be a Goodhart target."],
+    ["Highest validated size",
+     "Largest ladder rung whose size tag appears in a scored, non-inconclusive round. Configuring a " +
+     "size does not count it; a judged verdict does."],
+    ["Skill gain per training token",
+     "Cumulative improvement ÷ cumulative training tokens, tokens computed from the public training " +
+     "contract (see the note under the chart). Approximate in the numerator&rsquo;s denominator only: " +
+     "the improvement itself is receipt-derived."],
+    ["Gain retention",
+     "Undefined until a warm-start promotion happens. The formula is fixed in advance so it cannot " +
+     "be chosen after seeing the data."]
+  ];
+  document.getElementById("method").innerHTML = items.map(function(p){
+    return "<div><dt>"+esc(p[0])+"</dt><dd>"+p[1]+"</dd></div>"; }).join("");
+
+  var parts = [];
+  parts.push("Source: the validator&rsquo;s public receipt trail (<code>receipts/index.json</code> " +
+    "plus the anchored signed receipts), read live in your browser — this page holds no database " +
+    "and no cached figures.");
+  if(atCap()){
+    parts.push("<b>Note:</b> the shared index keeps a rolling window of the most recent " +
+      INDEX_MAX_KEEP + " rounds and is now at that cap, so &ldquo;since launch&rdquo; here means " +
+      "since the oldest round still in the window (" + esc(prettyDay(rg.length?rg[0].at:"")) +
+      "). Earlier rounds remain in the archived receipts.");
+  }
+  parts.push("Every figure is reproducible with <code>cascade-audit</code> against the same " +
+    "receipts; see <code>docs/AUDIT.md</code>.");
+  document.getElementById("foot").innerHTML = parts.join(" ");
+}
+
+function renderChrome(){
+  var sub = (_index && _index.subnet) || {};
+  document.getElementById("tb-netuid").textContent = sub.netuid!=null ? ("#"+sub.netuid) : "--";
+  document.getElementById("tb-rounds").textContent = allRounds().length || "--";
+  document.getElementById("tb-updated").textContent =
+    _index && _index.updated_at ? timeAgo(_index.updated_at) : "--";
+  var el = document.getElementById("net-badge");
+  el.textContent = IS_TESTNET ? "TESTNET" : "MAINNET";
+  el.className = "net-badge " + (IS_TESTNET ? "net-testnet" : "net-mainnet");
+  if(IS_TESTNET && document.title.indexOf("testnet") !== 0) document.title = "testnet · " + document.title;
+
+  var b = document.getElementById("data-banner");
+  if(_state === "live"){ b.hidden = true; }
+  else {
+    b.hidden = false;
+    b.className = "data-banner " + (_state === "offline" ? "offline" : "loading");
+    b.textContent = _state === "offline"
+      ? "Cannot reach the public receipt endpoints — showing nothing rather than stale or invented numbers."
+      : "Loading the public receipt trail…";
+  }
+}
+
+function renderAll(){
+  renderChrome(); renderTiles(); renderCompetition(); renderPerf();
+  renderBench(); renderLadder(); renderEfficiency(); renderWarm(); renderMethod();
+}
+
+document.getElementById("theme-toggle").addEventListener("click", function(){
+  var dark = document.documentElement.dataset.theme !== "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  localStorage.setItem("cascDashTheme", dark ? "dark" : "light");
+  this.textContent = dark ? "LIGHT" : "DARK";
+  renderPerf(); renderEfficiency();
+});
+document.getElementById("theme-toggle").textContent =
+  document.documentElement.dataset.theme === "dark" ? "LIGHT" : "DARK";
+
+function poll(){
+  fetchJSON("receipts/index.json")
+    .then(function(d){ _index = collapseByRound(d); _state = "live"; renderAll(); })
+    .catch(function(){ _state = "offline"; renderChrome(); });
+  // The anchored trail, not the shared last-writer-wins pointer: any validator
+  // can overwrite receipts/latest.json, and the bench/warm-start reads below
+  // must come from the same signer the rest of the page trusts.
+  fetchJSON("receipts/" + RECEIPT_ANCHOR + "/latest.json")
+    .catch(function(){ return fetchJSON("receipts/latest.json"); })
+    .then(function(d){ _latest = d; renderTiles(); renderBench(); renderWarm(); })
+    .catch(function(){});
+}
+renderAll();
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
