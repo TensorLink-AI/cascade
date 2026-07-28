@@ -957,8 +957,35 @@ class ValidatorRunner:
         # already-seen round id (same-round-id rerun, e.g. after a contract
         # fix) must be re-judged, not silently skipped (2026-07-15: the
         # round_id-only latch ignored the rerun manifest with no log line).
-        last_round: str | None = None
-        last_digest: str | None = None
+        # The latch is PERSISTED (trainer PR #157's twin): a restart resumes
+        # from the last handled (round, sha) instead of re-judging the already-
+        # published round — under a changed scoring rule that re-judgement can
+        # flip a settled verdict (2026-07-28, DEC-CA-0009). State files from
+        # before the marker existed are seeded from this validator's own
+        # signature-verified receipt trail; a same-round re-publish with
+        # different content still re-judges (the sha differs).
+        last_round: str | None = self.state.last_handled_round_id
+        last_digest: str | None = self.state.last_handled_manifest_sha
+        if last_round is None:
+            seeded = self._probe_own_receipt_round(client, store)
+            if seeded is not None:
+                try:
+                    raw = read_latest_manifest(store)
+                    if load_manifest(raw).round_id == seeded:
+                        last_round = seeded
+                        last_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                        self.state = replace(
+                            self.state,
+                            last_handled_round_id=str(seeded),
+                            last_handled_manifest_sha=last_digest,
+                        )
+                        self._persist_state()
+                except (StorageError, ValueError) as e:
+                    log.warning("re-entry probe could not read the latest manifest "
+                                "(%s); proceeding without a seeded marker", e)
+        if last_round is not None:
+            log.info("round %s already handled (persisted/receipt marker); resuming poll",
+                     last_round)
         while True:
             try:
                 # Live dashboard telemetry first, every poll: between receipts
@@ -1013,6 +1040,10 @@ class ValidatorRunner:
                     elif reason is not None:
                         log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
                         last_round, last_digest = manifest.round_id, digest
+                        self.state = replace(
+                            self.state, last_handled_round_id=str(manifest.round_id),
+                            last_handled_manifest_sha=digest)
+                        self._persist_state()
                         # A rejected round still gets a public receipt carrying
                         # the gate's reason — visible, not silently absent.
                         self._publish_round_receipt(
@@ -1026,6 +1057,12 @@ class ValidatorRunner:
                         # the safety valve (see _resync_step). A public receipt
                         # records why, not a silent skip.
                         last_round, last_digest = manifest.round_id, digest
+                        # Fold the marker in BEFORE _resync_step: it derives the
+                        # next state from this one, so the marker rides along
+                        # (demote_to_trained passes it through explicitly).
+                        self.state = replace(
+                            self.state, last_handled_round_id=str(manifest.round_id),
+                            last_handled_manifest_sha=digest)
                         self.state, reject_reason = self._resync_step(manifest)
                         self._persist_state()
                         reward_uids = self._reward_uids(manifest, None, client)
@@ -1055,6 +1092,9 @@ class ValidatorRunner:
                             self.state = replace(
                                 self.state, resync_holds=0, last_resync_round_id=None)
                         last_round, last_digest = manifest.round_id, digest
+                        self.state = replace(
+                            self.state, last_handled_round_id=str(manifest.round_id),
+                            last_handled_manifest_sha=digest)
                         self._persist_state()
                         reward_uids = self._reward_uids(manifest, outcome, client)
                         weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
@@ -1311,6 +1351,35 @@ class ValidatorRunner:
             )
         except Exception as e:  # noqa: BLE001
             log.warning("failed to persist validator state: %s", e)
+
+    def _probe_own_receipt_round(self, client: object, store: object) -> str | None:
+        """Round id of this validator's own latest published receipt, or None.
+
+        Boot fallback for state files that predate ``last_handled_round_id``:
+        without it, the first restart after the upgrade would still re-judge
+        the already-published round once. Only a receipt whose signature
+        verifies against this validator's OWN hotkey seeds the marker — the
+        receipt prefix is public-read, so an unverified object must never be
+        able to make a validator skip a round. Any fault returns None (the
+        stock re-judge behaviour); storage must never block startup.
+        """
+        from ..shared.hippius import receipt_latest_key
+        from ..shared.receipt import load_receipt, verify_receipt_signature
+
+        try:
+            wallet = getattr(client, "wallet", lambda: None)()
+            hotkey = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", "") or "")
+            if not hotkey:
+                return None
+            receipt = load_receipt(store.get_text(receipt_latest_key(hotkey)))
+            if not verify_receipt_signature(receipt, hotkey):
+                log.warning("re-entry probe: own latest receipt fails signature "
+                            "verification; ignoring it")
+                return None
+            return str(receipt.round_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("re-entry probe: no usable own receipt (%s)", e)
+            return None
 
 
 def _load_state(path: str) -> ChampionState:

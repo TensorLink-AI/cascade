@@ -57,6 +57,16 @@ class ChampionState:
     # the un-synced round is a NEW round_id; same-round re-gates hold without
     # counting. Cleared with ``resync_holds`` on any normally-scored round.
     last_resync_round_id: str | None = None
+    # Restart re-entry guard (the trainer's PR #157 twin — OPSLOG 2026-07-25):
+    # the (round_id, manifest sha256) the loop last handled (scored, rejected,
+    # or resync-held). Persisted so a restart does NOT re-judge the already-
+    # published round — under a changed scoring rule that re-judgement can
+    # flip a settled verdict (live 2026-07-28: DEC-CA-0009 would have retro-
+    # dethroned round 10447… at boot). The sha keeps the 2026-07-15 semantics
+    # across restarts: a re-published manifest with DIFFERENT content for the
+    # same round id is still re-judged, never silently skipped.
+    last_handled_round_id: str | None = None
+    last_handled_manifest_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +148,8 @@ def apply_round(
                 former_kings=_roll_former_kings(
                     state, new_king=challenger_hotkey, keep=keep_former_kings
                 ),
+                last_handled_round_id=state.last_handled_round_id,
+                last_handled_manifest_sha=state.last_handled_manifest_sha,
             ),
             dethroned=True,
             new_king_hotkey=challenger_hotkey,
@@ -183,6 +195,11 @@ def demote_to_trained(
         former_kings=(),
         resync_holds=0,
         last_resync_round_id=None,
+        # The throne is being reset, not the loop's position in the manifest
+        # stream — dropping the marker here would re-judge the round that
+        # triggered the demotion on the next restart.
+        last_handled_round_id=state.last_handled_round_id,
+        last_handled_manifest_sha=state.last_handled_manifest_sha,
     )
 
 
@@ -197,6 +214,8 @@ def dumps(state: ChampionState) -> str:
             "former_kings": list(state.former_kings),
             "resync_holds": state.resync_holds,
             "last_resync_round_id": state.last_resync_round_id,
+            "last_handled_round_id": state.last_handled_round_id,
+            "last_handled_manifest_sha": state.last_handled_manifest_sha,
         },
         sort_keys=True,
     )
@@ -215,5 +234,13 @@ def loads(text: str) -> ChampionState:
         last_resync_round_id=(
             str(obj["last_resync_round_id"])
             if obj.get("last_resync_round_id") is not None else None
+        ),
+        last_handled_round_id=(
+            str(obj["last_handled_round_id"])
+            if obj.get("last_handled_round_id") is not None else None
+        ),
+        last_handled_manifest_sha=(
+            str(obj["last_handled_manifest_sha"])
+            if obj.get("last_handled_manifest_sha") is not None else None
         ),
     )
