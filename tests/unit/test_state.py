@@ -167,3 +167,41 @@ def test_resync_holds_defaults_to_zero_for_legacy_state():
     assert again.resync_holds == 0
     assert again.last_resync_round_id is None
     assert again.king_hotkey == "k"
+
+
+def test_handled_marker_survives_json_round_trip():
+    st = ChampionState(king_hotkey="k", king_uid=0,
+                       last_handled_round_id="10447302782510174565",
+                       last_handled_manifest_sha="ab" * 32)
+    again = loads(dumps(st))
+    assert again == st
+    assert again.last_handled_round_id == "10447302782510174565"
+    assert again.last_handled_manifest_sha == "ab" * 32
+
+
+def test_handled_marker_defaults_to_none_for_legacy_state():
+    # State written before the restart re-entry guard has neither key; a None
+    # marker means "no persisted position" and the loop falls back to the
+    # own-receipt probe, never to a crash or a spurious skip.
+    again = loads('{"king_hotkey": "k", "king_uid": 0, "tenure_rounds": 1}')
+    assert again.last_handled_round_id is None
+    assert again.last_handled_manifest_sha is None
+
+
+def test_handled_marker_survives_dethrone_and_demote():
+    # Both transitions that REBUILD ChampionState (dethrone crowning a new
+    # king, and the resync safety valve's demote_to_trained) must carry the
+    # marker: they reset the throne, not the loop's position in the manifest
+    # stream — dropping it would re-judge that round on the next restart.
+    st = ChampionState(king_hotkey="k", king_uid=0,
+                       last_handled_round_id="123",
+                       last_handled_manifest_sha="cd" * 32)
+    t = apply_round(st, challenger_hotkey="chal", challenger_uid=1,
+                    result=_win(), dethrone_cp=1)
+    assert t.dethroned
+    assert t.state.last_handled_round_id == "123"
+    assert t.state.last_handled_manifest_sha == "cd" * 32
+
+    demoted = demote_to_trained(st, trained_hotkey="trained", trained_uid=2)
+    assert demoted.last_handled_round_id == "123"
+    assert demoted.last_handled_manifest_sha == "cd" * 32
