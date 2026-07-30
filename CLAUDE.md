@@ -61,6 +61,14 @@ in-context.
   replays under both rules. Trainer + validator must deploy together.
   (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
 
+- **DEC-CA-0010** — Host variance is MEASURED, not normalized. Every run stamps a
+  `host` record (lane geometry, CPU/GPU capability, opaque pod + machine ids, and
+  a FIXED pre-stream calibration bench) into the public training log; nothing
+  consumes it. `[telemetry]`, not `[training]` — no `contract_digest` change, no
+  wire-format change. The bench cannot be resized (only disabled), or its numbers
+  stop being poolable across the fleet.
+  (`decisions/DEC-CA-0010-host-telemetry-measure-not-normalize.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

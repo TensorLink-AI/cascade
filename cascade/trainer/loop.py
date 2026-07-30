@@ -58,6 +58,7 @@ from ..shared.manifest import (
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
 from .corpus import CorpusError, build_round_corpus
+from .host_probe import host_snapshot, host_summary_line
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -140,16 +141,63 @@ def _pctl(vals: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (pos - lo)
 
 
+def host_spread_part(entries: list[dict]) -> str:
+    """Fleet-uniformity clause for the round roll-up, from host-probe facts.
+
+    The operator's one-line answer to "was this round's field screened on one
+    class of hardware?". ``spread`` is max/min of the calibration bench — the
+    number to watch, because it bounds how much of a round's throughput dispersion
+    the pods could account for on their own; at 1.0x the fleet is uniform and any
+    remaining spread is the generators. ``pods``/``machines`` count distinct
+    ``host_id``/``host_boot_id``: fewer machines than pods means co-tenancy, which
+    is a slow-run explanation no per-pod field can show.
+
+    Empty string when no run reported a bench, so the roll-up degrades to exactly
+    its previous text rather than printing a hollow clause.
+    """
+    benches = [
+        float(e["host_bench_tokens_per_s"]) for e in entries
+        if isinstance(e, dict) and "host_bench_tokens_per_s" in e
+    ]
+    if not benches:
+        return ""
+    lo, hi = min(benches), max(benches)
+    pods = {e.get("host_id") for e in entries if isinstance(e, dict) and e.get("host_id")}
+    machines = {
+        e.get("host_boot_id") for e in entries
+        if isinstance(e, dict) and e.get("host_boot_id")
+    }
+    skus = {
+        e.get("host_gpu_name") for e in entries
+        if isinstance(e, dict) and e.get("host_gpu_name")
+    }
+    part = (
+        f"host_bench min={lo:,.0f} p50={_pctl(benches, 0.5):,.0f} max={hi:,.0f} "
+        f"spread={hi / max(lo, 1e-9):.2f}x ({len(benches)} benched, "
+        f"{len(pods)} pods"
+    )
+    if machines:
+        part += f", {len(machines)} machines"
+    if skus:
+        part += f", {len(skus)} skus"
+    return part + ")"
+
+
 def telemetry_rollup_line(
     round_id: int | str, heat_metrics: list[dict], final_metrics: list[dict]
 ) -> str:
-    """One-line per-round starvation/deadline roll-up from run metrics dicts.
+    """One-line per-round starvation/deadline/host roll-up from run metrics dicts.
 
     Pure formatting so the aggregation is unit-testable. Entries without the
     telemetry keys are skipped (a custom BaseTrainer may not emit them; remote
     runs keep their metrics on the pod — see ``_train_checkpoint``), and the
     trailing count says how many runs actually reported, so a silent-majority
     round can't masquerade as a healthy one.
+
+    The host clause (:func:`host_spread_part`) is filtered separately: host facts
+    come from the pod probe, not the backend's metrics, so a run can carry them
+    while lacking ``deadline_hit`` — and a fleet-uniformity number computed over
+    only the metrics-reporting subset would be the wrong denominator.
     """
     heats = [m for m in heat_metrics if isinstance(m, dict) and "deadline_hit" in m]
     finals = [m for m in final_metrics if isinstance(m, dict) and "deadline_hit" in m]
@@ -162,10 +210,11 @@ def telemetry_rollup_line(
     hit_f = sum(bool(m.get("deadline_hit")) for m in finals)
     reported = len(heats) + len(finals)
     total = len(heat_metrics) + len(final_metrics)
+    host_part = host_spread_part([*heat_metrics, *final_metrics])
     return (
         f"round={round_id} telemetry: deadline_hit {hit_h}/{len(heats)} heats + "
         f"{hit_f}/{len(finals)} finals; {wait_part} ({reported}/{total} runs "
-        "reported metrics)"
+        "reported metrics)" + (f"; {host_part}" if host_part else "")
     )
 
 
@@ -1324,6 +1373,20 @@ class TrainerRunner:
         emitters = [s for s in (sink, wandb_sink) if s is not None]
         logger = (lambda record: [s.emit(record) for s in emitters]) if emitters else None
 
+        # Host telemetry, taken HERE — after the generator is fetched but before
+        # the corpus stream (and therefore the sandbox child) exists, so the
+        # calibration bench measures the pod and not the submission competing
+        # with it. It cannot eat the compute budget: max_train_seconds anchors at
+        # the first training batch, and token_budget is a token count.
+        host_facts = self._host_snapshot()
+        if host_facts:
+            for s in emitters:
+                s.emit({"event": "host", "role": log_role, **host_facts})
+            log.info(
+                "round=%s run=%s host: %s",
+                seeds.base_seed, log_role, host_summary_line(host_facts),
+            )
+
         with open_round_stream(
             contract.corpus_mode,
             gen_dir, seeds.generation_seed, self.cfg.generator,
@@ -1343,9 +1406,15 @@ class TrainerRunner:
             )
             corpus_digest, n_series, total_points = rs.digest, rs.n_series, rs.total_points
 
+        # The host facts are repeated on the summary row, not just left on their
+        # own "host" record: the whole point is regressing realized throughput on
+        # host capability, and that is a one-liner only when both live on the same
+        # row. The standalone record is what a run that DIES before the summary
+        # leaves behind — on the live wandb mirror and the stderr line, since the
+        # S3 blob is only written at flush.
         summary = {"event": "summary", "role": log_role, "corpus_digest": corpus_digest,
                    "n_series": n_series, "total_points": total_points,
-                   "train_seconds": result.train_seconds, **result.metrics}
+                   "train_seconds": result.train_seconds, **host_facts, **result.metrics}
         for s in emitters:
             s.emit(summary)
         if sink is not None:
@@ -1377,8 +1446,29 @@ class TrainerRunner:
                 m.get("tokens_frac"), m.get("data_wait_s"), m.get("data_wait_frac"),
             )
         stage = "heat" if log_role.startswith("heat") else "final"
-        self._round_telemetry[stage].append(dict(m))
+        self._round_telemetry[stage].append({**host_facts, **m})
         return result, corpus_digest, n_series, total_points
+
+    def _host_snapshot(self) -> dict:
+        """Host facts for the run about to start, per ``[telemetry]`` — ``{}`` when
+        disabled or wholly unavailable.
+
+        The device comes from the backend when it exposes one: ``BaseTrainer`` is a
+        Protocol and only the reference implementation carries a ``.device``, so a
+        custom backend benches on whatever torch finds rather than not at all.
+        """
+        tcfg = getattr(self.cfg, "telemetry", None)
+        if tcfg is not None and not getattr(tcfg, "host_probe", True):
+            return {}
+        run_bench = getattr(tcfg, "host_bench", True) if tcfg is not None else True
+        try:
+            return host_snapshot(
+                device=getattr(self.base_trainer, "device", None),
+                run_bench=bool(run_bench),
+            )
+        except Exception as e:  # noqa: BLE001 — telemetry must never abort a round
+            log.warning("host telemetry unavailable (continuing): %s", e)
+            return {}
 
     def train_one(
         self,

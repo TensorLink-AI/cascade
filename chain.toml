@@ -469,3 +469,16 @@ enabled = true                  # live wandb logging ON (owner 2026-07-18); obse
 project = "cascade"             # wandb project; make it PUBLIC for miners to view
 entity  = ""                    # wandb team/user (empty = the API key's default)
 mode    = "online"              # online | offline | disabled
+
+[telemetry]
+# Host-side run telemetry (cascade.trainer.host_probe). Observability only —
+# these fields ride the training-log channel next to the per-step metrics, never
+# the manifest, the receipt, or contract_digest, and nothing in the scoring path
+# reads them. They exist because the heat prices generator speed (DEC-CA-0001) on
+# a fleet rented per round: data_wait_frac can rule the CORPUS out as the cause of
+# a slow run, but only a host-side measurement can rule the POD in. host_bench
+# times a fixed calibration workload before each run's corpus stream opens (a few
+# GPU-seconds; it cannot eat the compute budget — max_train_seconds anchors at the
+# first training batch), and is the one field comparable across pods.
+host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
+host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
