@@ -4,7 +4,9 @@
 The dashboard is a single self-contained ``cascade/website/index.html`` that
 reads the validator's public-read receipts — ``receipts/index.json`` (the
 rolling round summary the validator maintains) and ``receipts/latest.json`` —
-straight from the manifest bucket. Serving the page from that same bucket means
+plus the live ``status/*.json`` docs (chain anchor, round stage, and the heat
+standings the trainer publishes as soon as a heat settles) straight from the
+manifest bucket. Serving the page from that same bucket means
 one public origin for everything (mirrors teutonic, whose validator re-uploads
 its dashboard on restart).
 
@@ -75,6 +77,9 @@ def main() -> None:
     print("it reads (public-read):")
     print(f"  {base}/receipts/index.json")
     print(f"  {base}/receipts/latest.json")
+    print(f"  {base}/status/chain.json      (validator: live block anchor + submissions)")
+    print(f"  {base}/status/round.json      (trainer: live round stage)")
+    print(f"  {base}/status/heat.json       (trainer: heat standings, at heat completion)")
 
 
 if __name__ == "__main__":

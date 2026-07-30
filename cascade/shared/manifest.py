@@ -253,7 +253,11 @@ def _bench_from_json(obj: object) -> BenchScores | None:
     )
 
 
-def _heat_to_json(heat: HeatResult | None) -> dict | None:
+def heat_to_json(heat: HeatResult | None) -> dict | None:
+    """The heat block's JSON shape. Public because the trainer publishes the
+    SAME shape mid-round as the standalone heat mirror
+    (:mod:`cascade.shared.heat_status`) — one shape means the dashboards render
+    a live heat and a settled round's heat with one code path."""
     if heat is None:
         return None
     return {
@@ -396,7 +400,7 @@ def dump_manifest(manifest: TrainingManifest) -> str:
     # single-finalist round, and every manifest predating this field) serialises
     # byte-for-byte as before — no wire-format break, no version bump.
     if manifest.heat is not None:
-        body["heat"] = _heat_to_json(manifest.heat)
+        body["heat"] = heat_to_json(manifest.heat)
     return json.dumps(body, indent=2, sort_keys=True)
 
 

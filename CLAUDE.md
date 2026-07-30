@@ -61,6 +61,14 @@ in-context.
   replays under both rules. Trainer + validator must deploy together.
   (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
 
+- **DEC-CA-0010** — Heat standings publish when the HEAT settles (trainer →
+  `status/heat.json` + `heats/round-<id>.json` + `heats/index.json`), not when a
+  validator's receipt lands hours later — and they publish for a round rejected
+  at a gate, where the manifest copy never appears. Same field shape as the
+  manifest block, still unsigned/presentational; a no-screen round publishes its
+  reason so the live pointer can't serve the previous round's ranking.
+  (`decisions/DEC-CA-0010-heat-standings-published-at-heat-completion.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

@@ -61,6 +61,12 @@ round:
    per entrant and a `leader_lcb` against the runner-up on the manifest's heat
    block, saying how decisive the screen was. Those are **diagnostics only** —
    the finalists are the observed ranking, never a bounded one (DEC-CA-0006).
+   The standings are published the moment the heat settles — `status/heat.json`
+   plus a per-round `heats/round-<id>.json` and `heats/index.json`
+   (`cascade.shared.heat_status`) — so the dashboards and `cascade heat` show a
+   miner where it placed while the duel is still training, instead of waiting
+   for the round's receipt hours later. Presentational and unsigned, exactly
+   like the manifest's copy.
 5. **Final.** For the king and each surviving finalist, at **every configured
    size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
    **under that one shared seed pair**:

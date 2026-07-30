@@ -506,12 +506,14 @@ class TrainerRunner:
     # subprocess. The six numbers still go on the signed manifest. Falls back to
     # the local ``bench_eval_fn`` when there is no remote host.
     cascade_bench_plan: object | None = None
-    # Live round-stage reporting (``status/round.json``): the trainer tells the
-    # dashboards where the round actually is (heat/duel/validation + heat
-    # progress) instead of leaving them to a wall-clock estimate that ignores
-    # field size. OFF by default so offline runs and tests never touch storage;
-    # trainer.main enables it for the live service. Best-effort everywhere — a
-    # publish failure must never disturb a round.
+    # Live presentational reporting for the dashboards: the round stage
+    # (``status/round.json`` — where the round actually is, instead of a
+    # wall-clock estimate that ignores field size) AND the heat standings
+    # (``status/heat.json`` + ``heats/`` — published when the heat settles, not
+    # when the round's receipt lands; DEC-CA-0010). OFF by default so offline
+    # runs and tests never touch storage; trainer.main enables it for the live
+    # service. Best-effort everywhere — a publish failure must never disturb a
+    # round.
     publish_stage_status: bool = False
     # Cascade warm-start consumption (DEC-CA-0005): path of the promoted-init
     # pointer file (``[validator] warm_start_init_path`` — the trainer runs
@@ -1256,6 +1258,65 @@ class TrainerRunner:
             return
         self._publish_stage("heat", heat_done=done, heat_total=total)
 
+    def _publish_heat_standings(
+        self,
+        heat: HeatResult | None,
+        *,
+        screened: int,
+    ) -> None:
+        """Publish the heat standings the moment the heat settles.
+
+        The same standings ride the manifest, but that only reaches the public
+        through a validator's receipt — after the duel trained AND was scored,
+        hours later, and not at all for a round rejected at a gate. A miner's
+        next submission deadline can pass in that gap, so the trainer mirrors
+        them here instead (``status/heat.json`` + ``heats/``; see
+        :mod:`cascade.shared.heat_status`).
+
+        A no-screen round publishes too, carrying the reason: otherwise the live
+        pointer would keep serving the PREVIOUS round's standings as this
+        round's. Gated on ``publish_stage_status`` like the stage doc, and
+        equally best-effort — presentational, unsigned, never weight-bearing, so
+        a storage failure must not disturb the round it describes.
+        """
+        if not self.publish_stage_status or self._stage_ctx is None:
+            return
+        from datetime import datetime
+
+        from ..shared.heat_status import (
+            build_heat_status,
+            publish_heat_status,
+            update_heat_index,
+        )
+
+        n = max(0, self.cfg.round.finalists)
+        if screened == 0:
+            reason = "no eligible challengers entered the round"
+        elif self.screen_fn is None:
+            reason = "no screener configured; the field advanced by UID order"
+        else:
+            reason = (f"the field fit within the {n} finalist slot(s) — every entrant "
+                      "advanced without spending heat compute")
+        try:
+            doc = build_heat_status(
+                heat,
+                round_id=self._stage_ctx["round_id"],
+                epoch_start_block=self._stage_ctx["epoch_start_block"],
+                as_of=datetime.now(UTC).isoformat(),
+                screened=screened,
+                netuid=self.cfg.subnet.netuid,
+                no_screen_reason="" if heat is not None else reason,
+                finalists=n,
+            )
+            store = self.manifest_store()
+            publish_heat_status(store, doc)
+            update_heat_index(store, doc)
+            log.info("round=%s: published heat standings (%d entrants) to status/heat.json "
+                     "+ heats/round-%s.json", self._stage_ctx["round_id"],
+                     len(doc.get("entrants", ())), self._stage_ctx["round_id"])
+        except Exception as e:  # noqa: BLE001 — presentational, never sinks a round
+            log.warning("heat-standings publish failed (ignored): %s", e)
+
     # ── per-generator train (GPU + registry + S3 boundary) ───────────────────
 
     def _train_checkpoint(
@@ -1642,6 +1703,10 @@ class TrainerRunner:
         # Heat settled (screened + burned + finalists chosen): signal external
         # watchers (the provisioner) that heat-stage pods are now safe to release.
         self._mark_heat_complete(base_seed, eligible, finalists)
+        # Heat feedback goes public NOW, not with the round's receipt: the duel
+        # and its validation still have hours to run, and a miner reading its
+        # placement needs it before the next submission deadline.
+        self._publish_heat_standings(heat, screened=len(screened))
         self._publish_stage("duel", heat_done=len(eligible),
                             heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far

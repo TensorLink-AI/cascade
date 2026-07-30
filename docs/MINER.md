@@ -348,7 +348,7 @@ ETA are estimates from the configured cadence (`[round] round_hours` over
 `epoch_blocks`, ~12s/block). Read-only — no wallet needed. Don't cut it to the
 last block: leave margin for the upload plus commit inclusion.
 
-What the two live sections mean:
+What the live sections mean:
 
 - **stage** — where the current round is: `heat` (every challenger trained
   cheaply and screened), `duel` (king vs the surviving finalists at the full
@@ -359,6 +359,12 @@ What the two live sections mean:
   configured budgets (marked `est.`); `settled` is confirmed from the public
   receipt index and needs no credentials. `last round` shows the previous
   round's verdict while the current one is still in flight.
+- **heat** — this round's screening standings, shown from the moment the heat
+  settles (the trainer publishes them then, not with the round's receipt): every
+  entrant's rank, its gap to the best entrant, its raw CRPS/MASE, and whether it
+  advanced. Pass `--hotkey <your-ss58|uid>` and your row is marked `← you` and
+  always shown, however far down you placed. Full view:
+  [`cascade heat`](#your-heat-result--cascade-heat).
 - **submissions** — the revealed on-chain commitments, newest first: who is
   competing in the current round vs committed for the next one (relative to
   the epoch boundary). In watch mode the field re-polls about once a minute,
@@ -393,12 +399,43 @@ your `gen_ref`. If it wins the heat it advances to the full final against the
 king. Verify any round independently with `cascade-audit latest` (see
 [`AUDIT.md`](AUDIT.md)).
 
-The dashboard's **Heat** panel shows where every entrant placed in the screen —
-your rank, your score *relative to the best entrant* (not the raw numbers; the
-eval pool rotates privately), and whether you advanced, were screened out, or
-failed to train. It's the fastest read on how close a non-winning submission
-was. The standings ride the latest receipt's embedded manifest as an
-informational (unsigned) block, so they never affect the signed verdict.
+### Your heat result — `cascade heat`
+
+The heat is the only place a non-winning submission is ever scored, and you do
+**not** have to wait for the round to settle to read it: the trainer publishes
+the standings the moment the heat settles — before the duel trains, hours before
+a validator signs the receipt, and even for a round that is later rejected at a
+gate.
+
+```bash
+cascade heat --hotkey <your-hotkey-ss58> --network test --chain-toml chain.testnet.toml
+# cascade heat — round 4321000  ·  epoch start block 4,320,000
+#   published       2026-07-30T04:12:19+00:00
+#   field           5 entrants · 1 advanced · screened at tiny-24m
+#   advancing       top 1 to the duel against the king
+#   decisiveness    leader LCB +0.0310 — the screen separated 1st from 2nd (n_windows=120, feeds=9)
+#
+#     #1  uid    2  5FcCso…yfsw  carol/gen-a@cccccccc…    best  crps   0.4123  mase   1.021  ▲ advanced
+#     #2  uid   47  5F3sab…8kQz  my-ns/my-gen@dddddddd…  +4.8%  crps   0.5100  mase   1.200  screened   ← you
+#      —  uid    4  5Gzzzz…qwer  frank/gen@ffffffff…         —  crps        —  mase       —  did not train
+```
+
+What you get per entrant: your **rank**, your heat score *relative to the best
+entrant* (`+4.8%` = 4.8% worse than the leader), your raw **CRPS** and **MASE**
+on that round's held-out eval-pool slice, and your **standing** — advanced,
+screened out, `duplicate` (byte-identical corpus to an earlier reveal), did not
+train, or screen error. `--round <id>` reads an archived round, `--history`
+lists what has been published. Read-only: no wallet, no chain call, no
+credentials.
+
+`cascade round` shows the same standings inline as soon as this round's heat
+lands (pass `--hotkey` there too and your row is marked `← you` and always
+shown, however far down you placed), and the web dashboard's **Heat** panel
+switches to the live standings the moment they are published — labelled *Live*
+while the duel is still training. Everything here is informational and
+**unsigned** (it rides the manifest as a presentational block and is mirrored to
+`status/heat.json` + `heats/round-<id>.json`), so it never affects the signed
+verdict.
 
 ## Study the competition
 
@@ -430,5 +467,5 @@ needed, just Hub read credentials.
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
-| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it) |
-| loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape |
+| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
+| loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |
