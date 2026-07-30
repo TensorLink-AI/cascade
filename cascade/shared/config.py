@@ -755,6 +755,31 @@ class WandbConfig:
 
 
 @dataclass(frozen=True)
+class TelemetryConfig:
+    """Host-side run telemetry (:mod:`cascade.trainer.host_probe`).
+
+    Observability only, and never part of ``contract_digest``: these fields ride
+    the training-log channel next to the per-step metrics and are read by nobody
+    in the scoring path. They exist because the heat prices generator speed
+    (DEC-CA-0001) on a fleet rented per round — so "was this run slow because of
+    the submission or because of the pod?" needs host-side evidence, and
+    ``data_wait_frac`` can only rule out the corpus.
+
+    ``host_probe`` gathers the free facts (lane geometry, CPU/GPU capability,
+    opaque pod + machine ids). ``host_bench`` additionally times the fixed
+    calibration workload before the corpus stream opens — a few seconds of GPU
+    per run, and the only field that is comparable ACROSS pods. Both default on;
+    turn ``host_bench`` off if a provider's pods are so slow to boot that the
+    extra seconds matter. There is deliberately no size knob: a resizable bench
+    produces numbers that cannot be pooled across the fleet (see
+    ``host_probe.HOST_BENCH_SPEC``).
+    """
+
+    host_probe: bool = True
+    host_bench: bool = True
+
+
+@dataclass(frozen=True)
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
     them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
@@ -814,6 +839,7 @@ class ChainConfig:
     manifest: ManifestConfig
     validator: ValidatorConfig
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -986,6 +1012,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     v = raw["validator"]
     r = raw.get("round", {})
     wb = raw.get("wandb", {})
+    tm = raw.get("telemetry", {})
 
     # Scheduled cadence change — reject a seam that would cut a round short.
     # Both grids must agree at the activation block, else the epoch containing
@@ -1211,6 +1238,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             project=str(wb.get("project", "cascade")),
             entity=str(wb.get("entity", "")),
             mode=str(wb.get("mode", "online")),
+        ),
+        telemetry=TelemetryConfig(
+            host_probe=bool(tm.get("host_probe", True)),
+            host_bench=bool(tm.get("host_bench", True)),
         ),
         raw=raw,
     )

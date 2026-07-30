@@ -390,3 +390,13 @@ enabled = true                  # testnet: on so miners can watch live
 project = "cascade-testnet"     # PUBLIC wandb project for miners to view
 entity  = ""                    # wandb team/user (empty = the API key's default)
 mode    = "online"              # online | offline | disabled
+
+[telemetry]
+# Host-side run telemetry (cascade.trainer.host_probe). Observability only — never
+# feeds scoring, weights, or contract_digest. The heat prices generator speed
+# (DEC-CA-0001) on a per-round rented fleet, so a slow run needs host-side
+# evidence to separate the pod from the submission; data_wait_frac only rules out
+# the corpus. host_bench times a fixed calibration workload before each run's
+# corpus stream opens — the one field that is comparable pod to pod.
+host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
+host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)

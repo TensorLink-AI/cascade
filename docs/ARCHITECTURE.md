@@ -79,6 +79,14 @@ round:
      `[wandb] enabled`, mirroring the *same* records into a live wandb run — one
      per round/competitor/size, tagged with the miner hotkey — so miners can watch
      their generator train as it occurs; observability only, never fed to scoring),
+   - stamps one **host** record per run before the corpus stream opens
+     (`cascade.trainer.host_probe`, `[telemetry]`): lane geometry, CPU/GPU
+     capability, opaque pod + machine ids, and a *fixed* calibration bench
+     (`host_bench_tokens_per_s`) that is identical on every pod and independent of
+     the submission. It rides the same log channel and is what separates
+     pod-attributable slowness from generator-attributable slowness — the wall
+     prices generator speed deliberately (DEC-CA-0001), and `data_wait_frac` can
+     only rule the *corpus* out. Never signed, never scored,
    - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
      size-tagged ref.
 6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref

@@ -167,7 +167,8 @@ def open_wandb_run(
     try:
         run.define_metric("step")
         run.define_metric("loss", step_metric="step", summary="min")
-        for k in ("lr", "throughput_tokens_per_s", "tokens", "tokens_frac", "data_wait_frac"):
+        for k in ("lr", "throughput_tokens_per_s", "steps_per_s", "tokens",
+                  "tokens_frac", "data_wait_frac"):
             run.define_metric(k, step_metric="step")
     except Exception as e:  # noqa: BLE001 — axis setup must never abort a round
         log.debug("wandb define_metric failed (continuing): %s", e)

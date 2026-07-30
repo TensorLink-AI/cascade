@@ -400,6 +400,44 @@ failed to train. It's the fastest read on how close a non-winning submission
 was. The standings ride the latest receipt's embedded manifest as an
 informational (unsigned) block, so they never affect the signed verdict.
 
+### Reading the training log — was it your generator, or the pod?
+
+Every run streams a JSONL log to the public logs bucket at
+`logs/round-<id>/<role>.jsonl` — `heat-<your-hotkey>.jsonl` for a heat entry,
+`king-<size>` / `challenger-<size>` for a final. When `[wandb] enabled`, the
+same records mirror live into the public wandb project while the run is in
+flight. Per-step rows carry `loss`, `lr`, `tokens`, `throughput_tokens_per_s`,
+`steps_per_s`, and `data_wait_frac`; the closing `summary` row carries those
+totals plus `tokens_frac` and `deadline_hit`.
+
+The wall prices generator speed on purpose — a slow generator gets less compute
+and that *is* the score, not a bug (`decisions/DEC-CA-0001`). But the fleet is
+rented per round, sometimes across providers, so a run can also be slow for
+reasons you don't control. Each run therefore publishes a `host` record (also
+merged onto the `summary` row) describing the pod it landed on:
+
+| field | what it tells you |
+|---|---|
+| `host_bench_tokens_per_s` | a **fixed** calibration workload, timed before your generator starts. Identical on every pod and independent of your submission, so it is the one number directly comparable host to host. |
+| `host_bench_cpu_tokens_per_s` | the CPU leg alone — per-core speed of the core this lane got. |
+| `host_bench_d2d_gb_s` | the GPU's achieved memory bandwidth (catches a throttled or cut-down card). |
+| `host_lane_index` / `host_lane_count` | the pod's GPU fan-out. `host_gen_cpu_slice` is the core count your generator was confined to. |
+| `host_cpu_count`, `host_cpu_model` | cores this run could actually use, and the CPU it ran on. |
+| `host_gpu_name`, `host_gpu_sm_count`, `host_pcie_gen`, `host_pcie_width` | the device, its SM count, and the PCIe link it negotiated. |
+| `host_id`, `host_boot_id` | opaque ids — the pod, and the physical machine. Two runs sharing `host_boot_id` but not `host_id` were **co-tenants on one box**. |
+
+Use them to tell the two causes apart. High `data_wait_frac` means training sat
+waiting on your generator — that is yours to fix. Low `data_wait_frac` *and* a
+`host_bench_tokens_per_s` well below the round's other entries means the pod was
+slow, not the generator. `host_bench_spec` tags the workload version; only
+compare numbers that share it, and read the bench as a host *index* — it is a
+different workload from a training step, so its absolute value is not comparable
+to `throughput_tokens_per_s`.
+
+This is observability, not an appeal channel: these fields are not signed, not
+in the manifest, and never re-weight a score. They exist so a claim about host
+variance can be checked against numbers instead of inferred.
+
 ## Study the competition
 
 Every committed generator is content-addressed and **public** — that's what
