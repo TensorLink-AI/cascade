@@ -61,6 +61,18 @@ in-context.
   replays under both rules. Trainer + validator must deploy together.
   (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
 
+- **DEC-CA-0010** — `[round] finalists` responds to the screen's own statistic:
+  a separated leader advances alone, a tied top is re-scored on a larger eval
+  (CPU-only, incremental windows via the seeded-prefix property), and survivors
+  advance capped and duel SEQUENTIALLY — best point estimate first, stop at the
+  first to clear the margin. Judging cost is then bounded by the outcome
+  (expected ≈ one duel; all-fail = today's king-holds); GPU training lanes are
+  bounded only by `max_finalists`, which is why the run-off is load-bearing.
+  Tie bar is 0, not the 2% margin (no incumbent among challengers); multiplicity
+  deliberately uncorrected. Ships inert; validator/audit multi-challenger fix
+  goes FIRST.
+  (`decisions/DEC-CA-0010-tie-aware-finalists-sequential-duel.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 
