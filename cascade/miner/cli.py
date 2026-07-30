@@ -45,10 +45,19 @@
   where the round roughly is (``heat ▸ duel ▸ validation ▸ settled`` —
   estimated from the configured budgets, confirmed settled via the public
   receipt index) and a live feed of revealed on-chain submissions (a commit
-  landing while you watch is flagged ``● new``). Ticks every second,
-  re-syncing to the chain every ``--refresh`` seconds; ``--once`` prints a
-  single snapshot (also the automatic behaviour when piped). Read-only; needs
-  the ``[chain]`` extra, no wallet.
+  landing while you watch is flagged ``● new``). Once the round's heat settles
+  it also shows the heat standings inline (``--hotkey`` marks your row).
+  Ticks every second, re-syncing to the chain every ``--refresh`` seconds;
+  ``--once`` prints a single snapshot (also the automatic behaviour when
+  piped). Read-only; needs the ``[chain]`` extra, no wallet.
+
+* ``cascade heat`` — the heat standings for a round: every entrant's rank, its
+  score relative to the best entrant, its raw CRPS/MASE on the round's eval-pool
+  slice, and whether it advanced. Published by the trainer the moment the heat
+  settles — hours before the round's receipt, and the ONLY place they appear for
+  a round later rejected at a gate. ``--hotkey`` marks your row, ``--round``
+  reads an archived round, ``--history`` lists what has been published.
+  Read-only: no wallet, no chain call, no credentials.
 
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
@@ -307,6 +316,9 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
                    help="Print a single snapshot instead of the live countdown.")
     p.add_argument("--refresh", type=float, default=30.0,
                    help="Seconds between chain re-syncs in watch mode (default: 30).")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) or UID — marks your row '← you' in the "
+                        "heat standings and always shows it, however far down you placed.")
     p.set_defaults(func=_cmd_round)
 
 
@@ -315,6 +327,7 @@ def _cmd_round(args: argparse.Namespace) -> int:
     from ..shared.chain import ChainClient, ChainError
     from .dashboard import (
         RoundTimeline,
+        fetch_public_heat,
         fetch_public_receipt_index,
         fetch_public_round_status,
         run_dashboard,
@@ -327,10 +340,62 @@ def _cmd_round(args: argparse.Namespace) -> int:
             timeline=RoundTimeline.from_chain_config(cfg),
             index_fetch=lambda: fetch_public_receipt_index(cfg.storage),
             status_fetch=lambda: fetch_public_round_status(cfg.storage),
+            heat_fetch=lambda: fetch_public_heat(cfg.storage),
+            me=args.hotkey,
         )
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)
         return 3
+
+
+def _add_heat(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "heat",
+        help="Heat standings: where every entrant placed in the cheap screen "
+        "(published as soon as the heat settles, before the duel finishes).",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) or UID — marks your row '← you'.")
+    p.add_argument("--round", dest="round_id", default=None,
+                   help="A specific round id (default: the latest published heat).")
+    p.add_argument("--history", action="store_true",
+                   help="List the published heats (heats/index.json) instead of one round.")
+    p.add_argument("--limit", type=int, default=20,
+                   help="Rounds listed by --history (default: 20).")
+    p.set_defaults(func=_cmd_heat)
+
+
+def _cmd_heat(args: argparse.Namespace) -> int:
+    """Print the public heat standings — no wallet, no chain call, no credentials.
+
+    The trainer publishes the standings when the heat settles, so this is a
+    miner's feedback on the round it just entered while the duel is still
+    training (the receipt lands hours later, and never at all if the round is
+    rejected at a gate).
+    """
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import (
+        fetch_public_heat,
+        fetch_public_heat_index,
+        fetch_public_heat_round,
+        render_heat,
+        render_heat_index,
+    )
+
+    if args.history:
+        print(render_heat_index(fetch_public_heat_index(cfg.storage), limit=args.limit))
+        return 0
+    doc = (fetch_public_heat_round(cfg.storage, args.round_id) if args.round_id
+           else fetch_public_heat(cfg.storage))
+    if doc is None:
+        target = f"round {args.round_id}" if args.round_id else "the latest heat"
+        print(f"no published heat standings for {target} — the trainer writes them "
+              "when a round's heat settles; try 'cascade heat --history'",
+              file=sys.stderr)
+        return 1
+    print(render_heat(doc, me=args.hotkey))
+    return 0
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -650,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_score(sub)
     _add_reveal_status(sub)
     _add_round(sub)
+    _add_heat(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

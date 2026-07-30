@@ -232,14 +232,14 @@ def _phase_strip(current: str) -> str:
 # ── public receipt index (settled-round evidence; no credentials needed) ─────
 
 
-def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dict | None:
-    """Anonymously GET the dashboard-facing ``receipts/index.json``.
+def fetch_public_json(storage: object, key: str, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET one public-read JSON object from the manifest bucket.
 
-    Receipts (and the index) are written public-read exactly so third parties
-    can read them with zero credentials (see ``cascade.shared.hippius``), so a
-    plain path-style HTTPS GET against the manifest bucket works without boto
-    or the S3 keys. Best-effort: any failure — offline, private backend,
-    malformed JSON — returns None and the dashboard simply shows estimates.
+    Receipts, the receipt index and the ``status/`` docs are written public-read
+    exactly so third parties can read them with zero credentials (see
+    ``cascade.shared.hippius``), so a plain path-style HTTPS GET works without
+    boto or the S3 keys. Best-effort: any failure — offline, private backend,
+    malformed JSON, a non-object body — returns None and the caller degrades.
     """
     import urllib.request
 
@@ -247,44 +247,66 @@ def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dic
     bucket = str(getattr(storage, "manifest_bucket", "") or "")
     if not endpoint.startswith(("http://", "https://")) or not bucket:
         return None
-    from ..shared.hippius import RECEIPT_INDEX_KEY
-
-    url = f"{endpoint}/{bucket}/{RECEIPT_INDEX_KEY}"
+    url = f"{endpoint}/{bucket}/{key}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             doc = json.loads(resp.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 — the index is a best-effort enhancement
+    except Exception:  # noqa: BLE001 — every public doc is a best-effort enhancement
         return None
-    if isinstance(doc, dict) and isinstance(doc.get("rounds"), list):
-        return doc
-    return None
+    return doc if isinstance(doc, dict) else None
+
+
+def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the dashboard-facing ``receipts/index.json``. None on any
+    failure (the dashboard then simply shows estimates)."""
+    from ..shared.hippius import RECEIPT_INDEX_KEY
+
+    doc = fetch_public_json(storage, RECEIPT_INDEX_KEY, timeout=timeout)
+    return doc if doc is not None and isinstance(doc.get("rounds"), list) else None
 
 
 def fetch_public_round_status(storage: object, *, timeout: float = 10.0) -> dict | None:
     """Anonymously GET the trainer-reported ``status/round.json``.
 
-    Same zero-credential public-read path as the receipt index. Best-effort:
-    any failure returns None and the dashboard falls back to the wall-clock
-    stage estimate. Freshness/round-matching is the CONSUMER's job
+    Best-effort: any failure returns None and the dashboard falls back to the
+    wall-clock stage estimate. Freshness/round-matching is the CONSUMER's job
     (``phase_from_live``), so a stale doc here is returned as-is.
     """
-    import urllib.request
-
-    endpoint = str(getattr(storage, "s3_endpoint", "") or "").rstrip("/")
-    bucket = str(getattr(storage, "manifest_bucket", "") or "")
-    if not endpoint.startswith(("http://", "https://")) or not bucket:
-        return None
     from ..shared.chain_status import ROUND_STATUS_KEY
 
-    url = f"{endpoint}/{bucket}/{ROUND_STATUS_KEY}"
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            doc = json.loads(resp.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 — best-effort enhancement
-        return None
-    return doc if isinstance(doc, dict) else None
+    return fetch_public_json(storage, ROUND_STATUS_KEY, timeout=timeout)
+
+
+def fetch_public_heat(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the latest published heat standings (``status/heat.json``).
+
+    Written by the trainer the moment the heat settles — hours before the round's
+    receipt — so this is a miner's first read on where its submission placed.
+    Round-matching is the consumer's job (``cascade.shared.heat_status.
+    live_heat``), so another round's standings are returned as-is.
+    """
+    from ..shared.heat_status import HEAT_STATUS_KEY
+
+    return fetch_public_json(storage, HEAT_STATUS_KEY, timeout=timeout)
+
+
+def fetch_public_heat_round(
+    storage: object, round_id: str, *, timeout: float = 10.0
+) -> dict | None:
+    """Anonymously GET one round's archived heat standings."""
+    from ..shared.heat_status import heat_round_key
+
+    return fetch_public_json(storage, heat_round_key(str(round_id)), timeout=timeout)
+
+
+def fetch_public_heat_index(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET ``heats/index.json`` — the discoverable list of published
+    heats (a static reader cannot list the bucket)."""
+    from ..shared.heat_status import HEAT_INDEX_KEY
+
+    doc = fetch_public_json(storage, HEAT_INDEX_KEY, timeout=timeout)
+    return doc if doc is not None and isinstance(doc.get("heats"), list) else None
 
 
 def _as_int(value: object) -> int | None:
@@ -338,6 +360,201 @@ def outcome_line(entry: dict) -> str:
     king = entry.get("post_round_king_uid")
     held = f"king held (uid {king})" if king is not None else "king held"
     return f"round settled — {held}"
+
+
+# ── heat standings (public heat mirror; no credentials needed) ───────────────
+#
+# The heat is the cheap screen that ranks every eligible challenger and advances
+# the top `finalists`; the losing checkpoints are thrown away. The trainer
+# publishes the standings the moment the heat settles (status/heat.json +
+# heats/round-<id>.json — see cascade.shared.heat_status), which is hours before
+# the round's receipt and, for a round later rejected at a gate, the only place
+# they ever appear. This section renders them for the terminal.
+
+# Rows shown in the round dashboard's inline heat block before collapsing (the
+# miner's own row is always shown, however far down it placed).
+HEAT_ROWS_SHOWN = 6
+
+_HEAT_LABELS = {
+    "advanced": "▲ advanced",
+    "screened": "screened",
+    "failed_train": "did not train",
+    "failed_screen": "screen error",
+    "duplicate": "duplicate",
+}
+
+
+@dataclass(frozen=True)
+class HeatRow:
+    """One entrant's heat standing, dashboard-shaped."""
+
+    rank: int | None        # 1-based placement among scored entrants; None if unscored
+    uid: int
+    hotkey: str
+    ref: str
+    status: str             # one of manifest.HEAT_STATUSES
+    rel_score: float | None  # heat_score / best (1.0 = best); None if unscored
+    crps: float | None      # raw CRPS-family error on the round's eval-pool slice
+    mase: float | None      # raw geometric-mean MASE on that slice
+    mine: bool = False      # this is the hotkey/uid the caller asked about
+
+
+def _matches_me(uid: int, hotkey: str, me: str | None) -> bool:
+    if not me:
+        return False
+    me = me.strip()
+    return me == hotkey or (me.isdigit() and int(me) == uid)
+
+
+def heat_rows(doc: dict | None, *, me: str | None = None) -> list[HeatRow]:
+    """Shape a published heat document into rows, best rank first.
+
+    Unscored entrants (``failed_train`` / ``failed_screen`` / ``duplicate``)
+    carry no rank and sort last, by UID. ``me`` is a hotkey (ss58) or UID whose
+    row is flagged ``mine``.
+    """
+    if not isinstance(doc, dict):
+        return []
+    rows: list[HeatRow] = []
+    for e in doc.get("entrants", ()):
+        if not isinstance(e, dict):
+            continue
+        try:
+            uid, hotkey = int(e.get("uid", -1)), str(e.get("hotkey", ""))
+        except (TypeError, ValueError):
+            continue
+        rank = e.get("rank")
+        rows.append(HeatRow(
+            rank=None if rank is None else int(rank),
+            uid=uid,
+            hotkey=hotkey,
+            ref=str(e.get("gen_ref", "")),
+            status=str(e.get("status", "")),
+            rel_score=_as_float(e.get("rel_score")),
+            crps=_as_float(e.get("crps")),
+            mase=_as_float(e.get("mase")),
+            mine=_matches_me(uid, hotkey, me),
+        ))
+    rows.sort(key=lambda r: (r.rank is None, r.rank if r.rank is not None else 0, r.uid))
+    return rows
+
+
+def _as_float(value: object) -> float | None:
+    try:
+        return None if value is None else float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def heat_headline(doc: dict | None) -> str:
+    """One line summarising a published heat: field size, how many advanced, the
+    size it screened at — or why no screen ran."""
+    if not isinstance(doc, dict):
+        return "no heat standings published"
+    rows = heat_rows(doc)
+    if doc.get("no_screen") or not rows:
+        why = str(doc.get("no_screen_reason") or "no screen ran this round")
+        return f"no screen — {why}"
+    adv = sum(1 for r in rows if r.status == "advanced")
+    size = str(doc.get("screen_size") or "")
+    parts = [f"{len(rows)} entrants", f"{adv} advanced"]
+    if size:
+        parts.append(f"screened at {size}")
+    return " · ".join(parts)
+
+
+def _heat_row_line(r: HeatRow, *, show_error: bool = True) -> str:
+    """One standings row. ``show_error`` carries the raw CRPS/MASE columns —
+    decided per document (a scalar-only screener publishes neither, and empty
+    columns on every row would be noise) so the status column stays aligned
+    across rows where only SOME entrants were scored."""
+    if r.rel_score is not None and r.rel_score > 0:
+        gap = "best" if r.rank == 1 else f"+{(r.rel_score - 1.0) * 100:.1f}%"
+    else:
+        gap = "—"
+    err = ""
+    if show_error:
+        crps = "—" if r.crps is None else f"{r.crps:.4f}"
+        mase = "—" if r.mase is None else f"{r.mase:.3f}"
+        err = f"  crps {crps:>8}  mase {mase:>7}"
+    rank = f"#{r.rank}" if r.rank is not None else "—"
+    label = _HEAT_LABELS.get(r.status, r.status or "--")
+    return (f"    {rank:>4}  uid {r.uid:>4}  {_short_hotkey(r.hotkey):<11}  "
+            f"{_short_ref(r.ref):<32}  {gap:>7}{err}  {label}"
+            + ("   ← you" if r.mine else ""))
+
+
+def heat_block(
+    doc: dict | None,
+    *,
+    me: str | None = None,
+    limit: int | None = HEAT_ROWS_SHOWN,
+) -> list[str]:
+    """The heat section's lines: a headline plus one line per entrant.
+
+    ``limit`` caps the rows rendered (None = all); the caller's own row is
+    always included, however far down it placed, and the collapsed remainder is
+    reported. Empty list when nothing is published.
+    """
+    if not isinstance(doc, dict):
+        return []
+    rows = heat_rows(doc, me=me)
+    lines = [f"  heat            {heat_headline(doc)}"]
+    if not rows:
+        return lines
+    shown = rows if limit is None else rows[:limit]
+    hidden = rows[len(shown):]
+    mine_hidden = [r for r in hidden if r.mine]
+    show_error = any(r.crps is not None or r.mase is not None for r in rows)
+    lines += [_heat_row_line(r, show_error=show_error) for r in shown]
+    lines += [_heat_row_line(r, show_error=show_error) for r in mine_hidden]
+    rest = len(hidden) - len(mine_hidden)
+    if rest > 0:
+        lines.append(f"    … {rest} more (lower placings not shown)")
+    return lines
+
+
+def render_heat(doc: dict | None, *, me: str | None = None) -> str:
+    """The standalone ``cascade heat`` view of one published heat document."""
+    if not isinstance(doc, dict):
+        return ("no heat standings published yet — the trainer writes them when a "
+                "round's heat settles (status/heat.json)")
+    head = [
+        f"cascade heat — round {doc.get('round_id', '--')}"
+        f"  ·  epoch start block {doc.get('epoch_start_block', '--')}",
+        f"  published       {doc.get('as_of', '--')}",
+        f"  field           {heat_headline(doc)}",
+    ]
+    finalists = doc.get("finalists")
+    if finalists is not None:
+        head.append(f"  advancing       top {finalists} to the duel against the king")
+    lcb, nw, nc = doc.get("leader_lcb"), doc.get("n_windows"), doc.get("n_clusters")
+    if lcb is not None:
+        decisive = "separated 1st from 2nd" if float(lcb) > 0 else "did NOT separate 1st from 2nd"
+        head.append(f"  decisiveness    leader LCB {float(lcb):+.4f} — the screen {decisive}"
+                    + (f" (n_windows={nw}, feeds={nc})" if nw is not None else ""))
+    body = heat_block(doc, me=me, limit=None)
+    return "\n".join(head + ([""] + body[1:] if len(body) > 1 else []))
+
+
+def render_heat_index(doc: dict | None, *, limit: int = 20) -> str:
+    """The ``cascade heat --history`` view of ``heats/index.json``."""
+    heats = [h for h in (doc or {}).get("heats", []) if isinstance(h, dict)]
+    if not heats:
+        return "no published heats found (heats/index.json is absent or empty)"
+    lines = [f"cascade heat — {len(heats)} published heat(s), newest last"]
+    for h in heats[-limit:]:
+        lcb = h.get("leader_lcb")
+        lines.append(
+            f"  round {str(h.get('round_id', '--')):<14} block {h.get('epoch_start_block', '--'):>11}  "
+            f"{h.get('n_entrants', 0):>3} entrants  {h.get('n_advanced', 0):>2} advanced  "
+            f"leader uid {str(h.get('leader_uid', '--')):>4}"
+            + (f"  lcb {float(lcb):+.4f}" if lcb is not None else "")
+            + ("  (no screen)" if h.get("no_screen") else "")
+        )
+    if len(heats) > limit:
+        lines.append(f"  … {len(heats) - limit} older not shown (--limit to widen)")
+    return "\n".join(lines)
 
 
 # ── live submissions (revealed on-chain commitments) ─────────────────────────
@@ -417,9 +634,11 @@ class LiveFeed:
     client: object
     index_fetch: Callable[[], dict | None] | None = None
     status_fetch: Callable[[], dict | None] | None = None
+    heat_fetch: Callable[[], dict | None] | None = None
     commitments: list | None = None
     index_doc: dict | None = None
     round_status_doc: dict | None = None
+    heat_doc: dict | None = None
     _baseline: set[tuple[str, int]] | None = field(default=None, repr=False)
 
     def poll(self) -> None:
@@ -433,20 +652,17 @@ class LiveFeed:
                 if self._baseline is None:
                     self._baseline = {(str(c.hotkey), int(c.commit_block)) for c in cms}
                 self.commitments = cms
-        if self.index_fetch is not None:
+        for fetch, attr in ((self.index_fetch, "index_doc"),
+                            (self.status_fetch, "round_status_doc"),
+                            (self.heat_fetch, "heat_doc")):
+            if fetch is None:
+                continue
             try:
-                doc = self.index_fetch()
-            except Exception:  # noqa: BLE001 — best-effort
+                doc = fetch()
+            except Exception:  # noqa: BLE001 — best-effort; keep the last good doc
                 doc = None
             if doc is not None:
-                self.index_doc = doc
-        if self.status_fetch is not None:
-            try:
-                sdoc = self.status_fetch()
-            except Exception:  # noqa: BLE001 — best-effort
-                sdoc = None
-            if sdoc is not None:
-                self.round_status_doc = sdoc
+                setattr(self, attr, doc)
 
     def rows(self, epoch_start: int, *, floor_block: int = 0) -> list[SubmissionRow] | None:
         """Current submission rows, or None when the chain feed is unavailable
@@ -468,12 +684,13 @@ def render(
     phase: PhaseEstimate | None = None,
     submissions: list[SubmissionRow] | None = None,
     last_outcome: str | None = None,
+    heat_lines: list[str] | None = None,
 ) -> str:
     """The dashboard frame. ``drift_seconds`` is the wall-clock time elapsed
     since ``st.block`` was fetched, so watch mode can tick the countdown every
-    second between chain polls. ``phase`` / ``submissions`` / ``last_outcome``
-    are optional sections (None omits each), so the countdown-only frame is
-    unchanged for callers without the live feed."""
+    second between chain polls. ``phase`` / ``submissions`` / ``last_outcome`` /
+    ``heat_lines`` are optional sections (None omits each), so the countdown-only
+    frame is unchanged for callers without the live feed."""
     remaining = max(0.0, st.seconds_remaining - drift_seconds)
     eta = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(time.time() + remaining))
     pct = st.progress * 100.0
@@ -495,6 +712,8 @@ def render(
         lines.append(f"                  {phase.detail}")
     if last_outcome:
         lines.append(f"  last round      {last_outcome}")
+    if heat_lines:
+        lines += heat_lines
     if submissions is not None:
         n_next = sum(1 for r in submissions if r.next_round)
         n_this = len(submissions) - n_next
@@ -521,6 +740,7 @@ def compose_frame(
     timeline: RoundTimeline | None,
     *,
     drift_seconds: float = 0.0,
+    me: str | None = None,
 ) -> str:
     """Assemble one full frame from the chain snapshot + the live feed.
 
@@ -529,7 +749,14 @@ def compose_frame(
     this round; otherwise the config-timing estimate (when a timeline is
     available). The "last round" context line is shown only while the current
     round is still in flight (it is redundant once this round settles).
+
+    The heat block appears as soon as THIS round's heat is published — the
+    trainer writes it when the heat settles, so it lands while the duel is
+    still training rather than with the round's receipt. ``me`` (a hotkey or
+    UID) flags the caller's own row.
     """
+    from ..shared.heat_status import live_heat
+
     phase: PhaseEstimate | None = None
     last_outcome: str | None = None
     entry = settled_entry_for(feed.index_doc, st.epoch_start)
@@ -543,9 +770,13 @@ def compose_frame(
         prior = latest_settled_before(feed.index_doc, st.epoch_start)
         if prior is not None:
             last_outcome = outcome_line(prior).removeprefix("round settled — ")
+    heat_doc = live_heat(feed.heat_doc, epoch_start_block=st.epoch_start,
+                         now_s=time.time())
+    heat_lines = heat_block(heat_doc, me=me) if heat_doc is not None else None
     submissions = feed.rows(st.epoch_start, floor_block=round_cfg.commit_floor_block)
     return render(st, network, drift_seconds=drift_seconds, phase=phase,
-                  submissions=submissions, last_outcome=last_outcome)
+                  submissions=submissions, last_outcome=last_outcome,
+                  heat_lines=heat_lines)
 
 
 def run_dashboard(
@@ -559,6 +790,8 @@ def run_dashboard(
     timeline: RoundTimeline | None = None,
     index_fetch: Callable[[], dict | None] | None = None,
     status_fetch: Callable[[], dict | None] | None = None,
+    heat_fetch: Callable[[], dict | None] | None = None,
+    me: str | None = None,
 ) -> int:
     """Print the round dashboard; in watch mode, keep it live until Ctrl+C.
 
@@ -571,14 +804,17 @@ def run_dashboard(
     :func:`fetch_public_receipt_index` bound to the storage config) enables
     settled-round confirmation and last-round context; ``status_fetch`` (e.g.
     :func:`fetch_public_round_status`) enables the trainer-reported live
-    stage. A client without ``poll_commitments`` simply gets no submissions
-    section.
+    stage; ``heat_fetch`` (e.g. :func:`fetch_public_heat`) enables the heat
+    standings block once this round's heat settles, with ``me`` (hotkey or UID)
+    flagging the caller's own row. A client without ``poll_commitments`` simply
+    gets no submissions section.
     """
     out = out if out is not None else sys.stdout
-    feed = LiveFeed(client, index_fetch=index_fetch, status_fetch=status_fetch)
+    feed = LiveFeed(client, index_fetch=index_fetch, status_fetch=status_fetch,
+                    heat_fetch=heat_fetch)
     st = round_status(client.current_block(), round_cfg)
     feed.poll()
-    frame = compose_frame(st, network, round_cfg, feed, timeline)
+    frame = compose_frame(st, network, round_cfg, feed, timeline, me=me)
     print(frame, file=out)
     if once or not getattr(out, "isatty", lambda: False)():
         return 0
@@ -597,7 +833,7 @@ def run_dashboard(
                 feed.poll()
                 feed_at = time.monotonic()
             frame = compose_frame(st, network, round_cfg, feed, timeline,
-                                  drift_seconds=drift)
+                                  drift_seconds=drift, me=me)
             # move to the top of the previous frame, clear below, redraw
             print(f"\x1b[{lines}F\x1b[J" + frame, file=out)
             lines = frame.count("\n") + 1  # the feed can grow/shrink the frame
