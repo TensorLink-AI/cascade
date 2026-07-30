@@ -470,15 +470,26 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
     """
     entries = receipt.manifest.get("entries", []) if isinstance(receipt.manifest, dict) else []
 
+    # The challenger the verdict belongs to: the LAST one scored. Under the cohort
+    # duel (DEC-CA-0010) a round can carry several, and the validator scores the
+    # crowned clearer last — taking the first would attribute the round to a
+    # challenger that did not take the throne.
+    duelled = [es.hotkey for es in receipt.entry_scores if es.role == "challenger"]
+    decided_hotkey = duelled[-1] if duelled else None
+
     def _gen_ref(role: str) -> str | None:
+        want = decided_hotkey if role == "challenger" else None
         for e in entries:
-            if isinstance(e, dict) and e.get("role") == role:
+            if not isinstance(e, dict) or e.get("role") != role:
+                continue
+            if want is None or e.get("miner_hotkey") == want:
                 return e.get("gen_ref")
         return None
 
     def _scorer(role: str):
+        want = decided_hotkey if role == "challenger" else None
         for es in receipt.entry_scores:
-            if es.role == role:
+            if es.role == role and (want is None or es.hotkey == want):
                 return es
         return None
 

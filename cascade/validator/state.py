@@ -109,6 +109,7 @@ def apply_round(
     result: RoundResult,
     dethrone_cp: int,
     keep_former_kings: int = 0,
+    defeated_hotkeys: tuple[str, ...] = (),
 ) -> StateTransition:
     """Fold one round's result into the champion state.
 
@@ -117,6 +118,16 @@ def apply_round(
     untouched but still counts the king's tenure. On a dethrone, the outgoing
     king is rolled into ``former_kings`` (capped at ``keep_former_kings``) so
     reward routing can pay the recent court of champions.
+
+    ``challenger_hotkey`` is the round's *decided* challenger — the crowned
+    margin-clearer, or the best of the cohort when none cleared.
+    ``defeated_hotkeys`` are the other challengers the validator duelled this
+    round (DEC-CA-0010); their streaks reset. That includes a challenger which
+    cleared the margin but was not crowned: a streak is a claim on the throne and
+    only one challenger can hold that claim per round, so a non-crowned clearer
+    does not bank progress toward ``dethrone_cp``. Dormant at ``dethrone_cp = 1``.
+    An inconclusive round leaves every streak untouched, the cohort included —
+    no duel in it produced a decision.
     """
     rounds_seen = state.rounds_seen + 1
 
@@ -130,6 +141,9 @@ def apply_round(
         )
 
     streaks = dict(state.streaks)
+    for hk in defeated_hotkeys:
+        if hk != challenger_hotkey:
+            streaks.pop(hk, None)
     if result.challenger_wins_round:
         streaks[challenger_hotkey] = streaks.get(challenger_hotkey, 0) + 1
     else:

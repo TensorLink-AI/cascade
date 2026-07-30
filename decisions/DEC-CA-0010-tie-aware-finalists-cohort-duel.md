@@ -116,6 +116,20 @@ a *selection*, and ranking a selection by a bound penalises per-window dispersio
 — a property the duel does not score. Crowning by highest LCB would re-import
 exactly the error that node measured at −20pp.
 
+**Size coverage: the maximal common set, NOT the king's full set.** Crowning
+compares challengers by observed geomean, so they must be scored on the same
+sizes or the comparison is meaningless. But requiring every challenger to cover
+the king's *whole* size set would regress long-standing behaviour — a size the
+challenger never trained is currently skipped and the round is still decided on
+the rest (pinned by `test_combined_score_skips_size_missing_a_challenger`), and
+that rule must survive untouched for a cohort of one. So: group challengers by
+the size set they share with the king and duel only the **maximal** group —
+largest set wins, ties broken toward the earlier (primary) sizes. A challenger
+that failed to train where its peers succeeded does not compete against them.
+Training more never costs a slot, every survivor is comparable by construction,
+and with one challenger there is exactly one group, so the old rule is recovered
+exactly. This lives on `TrainingManifest.duel_cohort()` (see below).
+
 **What stays sequential: the public-benchmark gate, and only it.** The gift gate
 is a sidecar GIFT-Eval sweep, the one genuinely expensive step per challenger.
 So it runs on the best clearer first; if an `enforce` gate blocks it, fall to the
@@ -159,11 +173,18 @@ it, obey the simpler one until the logs justify the switch.
 **Implementation trap worth naming.** Do NOT write the adjusted alpha into
 `VerdictRecord.params`. `check_koth_params` asserts the recorded `KothParams`
 equal published `chain.toml [scoring]`, so a per-round-mutated alpha would fail
-its own audit. Record the unmodified config params; `k` is the count of
-challenger entries in the **signed** manifest, so the audit derives
-`α_eff = bootstrap_alpha / k` itself and replays. Strictly better than the
-`wql_mode` precedent in `check_verdict`, which has to guess among known rules —
-here the correction is a deterministic function of signed data.
+its own audit. Record the unmodified config params; `k` comes from the **signed
+manifest** — `len(TrainingManifest.duel_cohort()[0])`, one helper the validator
+and `cascade-audit` both call so they cannot derive different alphas — and the
+audit re-computes `α_eff = bootstrap_alpha / k` itself and replays. Strictly
+better than the `wql_mode` precedent in `check_verdict`, which has to guess among
+known rules: here the correction is a deterministic function of signed data.
+
+`k` must NOT be counted off the receipt's `entry_scores`, which is the tempting
+shortcut. An inconclusive round stops the cohort early and therefore records
+FEWER challengers than the cohort whose size fixed the alpha — deriving `k` from
+what was scored would make the audit reject a perfectly valid receipt. The alpha
+is a property of what the trainer *advanced*, not of how far the validator got.
 
 **Streaks.** Only the crowned challenger's streak advances; every other duelled
 challenger's streak resets, including a clearer that was not crowned. A streak is

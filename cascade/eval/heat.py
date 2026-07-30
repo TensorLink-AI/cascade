@@ -36,7 +36,7 @@ See ``decisions/DEC-CA-0006-heat-lcb-diagnostics-not-selection.md``.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -55,6 +55,14 @@ class HeatDiagnostics:
         leader_lcb: paired LCB on the leader's relative improvement over the
             runner-up, ``(runner - leader) / runner``. Positive means the screen
             separated the top two. ``None`` with fewer than two entrants.
+            Equals ``lcb_vs[runner_up_key]``; kept as its own field because it is
+            the headline "was the screen decisive" number on the heat block.
+        lcb_vs: ``{key: paired LCB of the leader over that entrant}`` for every
+            NON-leader entrant, off the same joint bootstrap. The leader
+            *separates* from an entrant iff its value is ``> 0``; entrants it does
+            not separate from are statistically interchangeable with it on this
+            evidence and form the tied set (see :func:`tied_set`). Empty with
+            fewer than two entrants.
         leader_key / runner_up_key: the two entrants ``leader_lcb`` compares, by
             observed rank. ``runner_up_key`` is ``None`` with a single entrant.
         n_windows / n_clusters: the evidence behind the screen. ``n_clusters``
@@ -68,6 +76,7 @@ class HeatDiagnostics:
     runner_up_key: str | None
     n_windows: int
     n_clusters: int
+    lcb_vs: dict[str, float] = field(default_factory=dict)
 
 
 def _clusters(scores: Sequence[WindowScore]) -> tuple[list, int]:
@@ -119,13 +128,19 @@ def screen_diagnostics(
     counts = np.bincount(bags.argmin(axis=0), minlength=len(keys))
     p_best = {k: float(c / bags.shape[1]) for k, c in zip(keys, counts, strict=True)}
 
-    leader_lcb: float | None = None
-    runner_up_key: str | None = None
-    if len(keys) >= 2:
-        runner_up_key = keys[1]
-        runner = bags[1]
-        safe_runner = np.where(np.abs(runner) < 1e-9, 1e-9, runner)
-        leader_lcb = float(np.quantile((runner - bags[0]) / safe_runner, alpha))
+    # Paired LCB of the leader over EVERY other entrant, off the one shared
+    # resample above — so window difficulty cancels in each comparison. This is
+    # the runner-up formula with bags[1] generalised to bags[j]; leader_lcb below
+    # is literally lcb_vs[runner_up_key], which is what keeps the DEC-CA-0006
+    # pin ("leader_lcb equals the duel statistic on the top two") meaningful.
+    lcb_vs: dict[str, float] = {}
+    for j in range(1, len(keys)):
+        other = bags[j]
+        safe_other = np.where(np.abs(other) < 1e-9, 1e-9, other)
+        lcb_vs[keys[j]] = float(np.quantile((other - bags[0]) / safe_other, alpha))
+
+    runner_up_key = keys[1] if len(keys) >= 2 else None
+    leader_lcb = lcb_vs[runner_up_key] if runner_up_key is not None else None
 
     return HeatDiagnostics(
         p_best=p_best,
@@ -134,4 +149,50 @@ def screen_diagnostics(
         runner_up_key=runner_up_key,
         n_windows=n_windows,
         n_clusters=n_clusters,
+        lcb_vs=lcb_vs,
     )
+
+
+def tied_set(
+    diagnostics: HeatDiagnostics | None,
+    ranked_keys: Sequence[str],
+    *,
+    cap: int,
+) -> list[str]:
+    """The leader plus every entrant the screen did NOT separate it from.
+
+    ``ranked_keys`` is every scored entrant in observed rank order (best first);
+    the returned list preserves that order and is truncated to ``cap``. The
+    criterion is ``lcb_vs[key] <= 0`` — the leader's paired 95% lower bound on
+    relative improvement over that entrant fails to clear zero, so on this
+    evidence the two are interchangeable.
+
+    The bar is 0, not the duel's win margin: the margin exists because the *king*
+    holds ties, and among challengers there is no incumbent and no null. Dropping
+    an entrant is safe exactly when we are confident the leader is at least as
+    good, which is what a one-sided bound at 0 states.
+
+    Multiplicity is deliberately NOT corrected. Testing the leader against N−1
+    entrants at 5% inflates this set (~1 false inclusion on a 20-entrant field),
+    but a field-size-dependent bar would let the same two generators separate or
+    not depending on how many unrelated entrants showed up, and could be gamed by
+    padding the field. ``cap`` is the control instead. See
+    ``decisions/DEC-CA-0010-tie-aware-finalists-cohort-duel.md``.
+
+    Degrades safely: no diagnostics (a scalar-only screener, an unpaired field, a
+    single entrant) returns just the leader, i.e. exactly the pre-DEC-CA-0010
+    behaviour. ``cap <= 0`` returns empty.
+    """
+    if cap <= 0 or not ranked_keys:
+        return []
+    if diagnostics is None or not diagnostics.lcb_vs:
+        return list(ranked_keys[:1])
+    out = [ranked_keys[0]]
+    for key in ranked_keys[1:]:
+        lcb = diagnostics.lcb_vs.get(key)
+        # An entrant with no recorded comparison cannot be shown to be separated,
+        # but neither can it be shown to be tied; treat a missing value as
+        # separated so a partial diagnostic never inflates GPU spend.
+        if lcb is not None and lcb <= 0.0:
+            out.append(key)
+    return out[:cap]
