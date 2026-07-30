@@ -406,6 +406,122 @@ def test_single_challenger_round_skips_the_cohort_check(cfg):
     assert C.check_verdict(receipt).status == C.PASS
 
 
+# ── what the receipt publishes ────────────────────────────────────────────────
+
+
+def _receipt(cfg, challengers, mapping, king, seed=7):
+    fake_eval, _ = _by_hotkey(king, mapping)
+    m = _cohort_manifest(cfg, challengers)
+    runner = _runner(cfg, fake_eval)
+    outcome = runner.process_round(m, windows=[], base_seed=seed)
+    return runner.build_round_receipt(
+        m, base_seed=seed, epoch_start_block=10,
+        epoch_block_hash="0x" + "ab" * 32, outcome=outcome, windows=[],
+    ), outcome
+
+
+def test_receipt_publishes_k_and_every_challenger_lcb(cfg):
+    """The externally-checkable record: k, each challenger's bound under alpha/k,
+    and the margin those bounds are compared against."""
+    king = _scores(1.0, 0)
+    receipt, outcome = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1), ("c_hk", 3, 2)],
+                               {"a_hk": _rescale(king, 0.7),
+                                "b_hk": _rescale(king, 0.4),
+                                "c_hk": _rescale(king, 1.2)}, king)
+    v = receipt.verdict
+    assert v.cohort_k == 3
+    assert set(v.cohort_lcbs) == {"a_hk", "b_hk", "c_hk"}
+    # Everything needed to re-check "who cleared" is present and self-consistent.
+    cleared = {h for h, lcb in v.cohort_lcbs.items() if lcb >= v.margin}
+    assert cleared == {"a_hk", "b_hk"}
+    assert v.cohort_lcbs[outcome.decided_hotkey] == max(
+        v.cohort_lcbs[h] for h in cleared) or outcome.decided_hotkey in cleared
+
+
+def test_alpha_over_k_moves_the_quantile_and_leaves_the_margin_alone(cfg):
+    """The semantics ask: alpha/k tightens the BOOTSTRAP QUANTILE, not the margin.
+    Pinned here because raising the margin instead would give different answers at
+    3+ challengers, and a receipt replayed under the wrong lever won't reproduce."""
+    king = _scores(1.0, 0)
+    chal = _rescale(king, 0.9)
+    solo, _ = _receipt(cfg, [("a_hk", 1, 0)], {"a_hk": chal}, king)
+    trio, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1), ("c_hk", 3, 2)],
+                       {"a_hk": chal, "b_hk": chal, "c_hk": chal}, king)
+    # The margin is IDENTICAL — the correction did not touch it.
+    assert trio.verdict.margin == solo.verdict.margin == cfg.scoring.win_margin_end
+    # The bound moved down: a lower quantile of the same paired distribution.
+    assert trio.verdict.lcb < solo.verdict.lcb
+    # And the published alpha is the quantile actually taken.
+    from cascade.shared.receipt import summarize_receipt
+
+    s = summarize_receipt(trio)
+    assert s["cohort_k"] == 3
+    assert s["cohort_alpha"] == pytest.approx(cfg.scoring.bootstrap_alpha / 3)
+    assert summarize_receipt(solo)["cohort_alpha"] is None
+
+
+def test_single_challenger_receipt_body_is_byte_identical_to_pre_cohort(cfg):
+    """The reason the cohort fields are safe to put in a SIGNED structure: at their
+    defaults they must vanish from the canonical body, or every archived receipt
+    re-serialises with bytes that were never signed."""
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("chal_hk", 1, 0)], {"chal_hk": _rescale(king, 0.6)}, king)
+    body = receipt.canonical_body()
+    assert b"cohort_k" not in body
+    assert b"cohort_lcbs" not in body
+    # A cohort round DOES carry them, so they are inside what the validator signs.
+    cohort, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                         {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    assert b"cohort_k" in cohort.canonical_body()
+
+
+def test_cohort_fields_round_trip_and_preserve_the_signed_bytes(cfg):
+    from cascade.shared.receipt import dump_receipt, load_receipt
+
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    back = load_receipt(dump_receipt(receipt))
+    assert back.canonical_body() == receipt.canonical_body()
+    assert back.verdict.cohort_k == 2
+    assert back.verdict.cohort_lcbs == receipt.verdict.cohort_lcbs
+
+
+def test_audit_rejects_a_doctored_published_lcb(cfg):
+    """A published bound that does not replay is a hard failure — those numbers are
+    what an outside party checks the selection with."""
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    assert C.check_duel_cohort(receipt).status == C.PASS
+    bad = dict(receipt.verdict.cohort_lcbs)
+    bad["a_hk"] = bad["a_hk"] + 0.5      # claim a_hk did far better than it did
+    tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_lcbs=bad))
+    r = C.check_duel_cohort(tampered)
+    assert r.status == C.FAIL
+    assert "replays as" in r.detail
+
+
+def test_audit_rejects_a_mismatched_k(cfg):
+    """k sets the alpha, so a k that disagrees with the signed manifest means the
+    round was not judged under the alpha it claims."""
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_k=5))
+    r = C.check_duel_cohort(tampered)
+    assert r.status == C.FAIL
+    assert "cohort_k=5" in r.detail
+
+
 def test_inconclusive_leaves_the_whole_cohort_untouched():
     state = ChampionState(king_hotkey="king_hk", king_uid=0,
                           streaks={"a_hk": 1, "b_hk": 1})

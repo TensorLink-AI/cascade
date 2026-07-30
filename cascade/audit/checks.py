@@ -397,6 +397,17 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
        the king's being shared). This is what catches a validator crowning a
        clearer that was not the best, which is exactly the artifact the rejected
        sequential rule would have produced.
+    3. The receipt's PUBLISHED ``cohort_k`` and ``cohort_lcbs`` match what the
+       signed manifest implies and what the scores replay to. Those two fields are
+       the round's math in public form — with ``margin`` they are the complete
+       input to the selection rule — so anyone can check "who cleared and was the
+       crowned one the best" without re-running the bootstrap; this check
+       confirms the published numbers are the ones that actually decided.
+
+    Note the correction is applied to the bootstrap QUANTILE, not to the margin:
+    the LCB becomes the ``alpha/k`` percentile of the paired distribution while
+    ``margin`` stays flat. Replaying with a raised margin instead will not
+    reproduce these numbers, and is not the rule.
 
     A gift-gate block legitimately moves the crown down the clearer list, so when
     the recorded verdict shows the gate ran, requirement 2 is relaxed to "the
@@ -426,6 +437,12 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
         return _fail(name, f"{len(duelled)} challengers were scored but the signed "
                            f"manifest's cohort is {k} — the alpha correction the "
                            f"round was judged under cannot be re-derived")
+    # The receipt PUBLISHES the k it used; it must equal the one the signed
+    # manifest implies, or the alpha the round was judged under is not the alpha
+    # it claims. (0 = a pre-cohort receipt, which never reaches here.)
+    if v.cohort_k and v.cohort_k != k:
+        return _fail(name, f"receipt records cohort_k={v.cohort_k} but the signed "
+                           f"manifest's cohort is {k}")
     duel_params = _cohort_params(params, manifest)
 
     replayed: list[tuple[str, object]] = []
@@ -448,6 +465,20 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
     crowned = duelled[-1]
     clearers = [(hk, r) for hk, r in replayed if r.challenger_wins_round]
     problems = []
+    # Every published per-challenger LCB must be the one that replays. This is
+    # what lets a third party check the selection arithmetically — the recorded
+    # bounds and the recorded margin are the whole input to "who cleared" — so a
+    # published bound that does not reproduce is a hard failure, not a warning.
+    for hk, res in replayed:
+        recorded = (v.cohort_lcbs or {}).get(hk)
+        if recorded is None:
+            problems.append(f"no published LCB for duelled challenger {hk}")
+        elif not _close(recorded, None if math.isnan(res.lcb) else res.lcb):
+            problems.append(f"published LCB for {hk} is {recorded} but replays as "
+                            f"{res.lcb}")
+    for hk in (v.cohort_lcbs or {}):
+        if hk not in {h for h, _ in replayed}:
+            problems.append(f"published an LCB for {hk}, which was never scored")
     if v.inconclusive:
         if clearers:
             problems.append(

@@ -152,6 +152,32 @@ feature activates. Throne stability under simultaneous challengers is the produc
 being protected, so this is where a correction belongs even though it does not
 belong on the drop rule.
 
+**The correction tightens the bootstrap QUANTILE, not the margin.** These are not
+interchangeable and they diverge as `k` grows, so the lever is part of the
+decision. `α/k` flows into `paired_bootstrap_lcb_aggregated(alpha=…)`: the LCB
+becomes the `α/k` percentile of the paired relative-improvement distribution
+(at `k = 3`, the 1.67th instead of the 5th) while `win_margin` stays flat at 2%.
+
+Quantile is the right lever because multiplicity is an **error-rate** problem, and
+the quantile is the only knob that controls error rates. It also scales with each
+challenger's own uncertainty: a challenger whose advantage is tight and
+well-replicated across windows is barely penalised, a noisy one is penalised
+heavily — which is exactly the right incentive, since it is the noisy ones that
+generate the false dethrones the correction exists to prevent. Raising the margin
+instead would demand a larger **effect size** from every challenger regardless of
+how well established its advantage is, and — the decisive objection — it would not
+control family-wise error at all: with enough per-window noise you still get `k`
+independent bites at the tail, just against a higher bar. It is an economic
+statement dressed as a statistical one. The margin's job is throne stickiness
+under a *single* challenger and it should keep doing only that.
+
+Practical limit worth recording: the quantile is estimated from `bootstrap_B =
+10000` resamples, so `α/k` sits on roughly `500/k` order statistics — 167 draws at
+`k = 3`, 100 at `k = 5`. Fine at the cap, but the Monte-Carlo error on the bound
+grows as the cap does, which is an independent argument against a large
+`max_finalists` and another reason the max-statistic diagnostic matters: it prices
+the correlation instead of pushing further into a thinning tail.
+
 **Ship Bonferroni: per-challenger alpha becomes `bootstrap_alpha / k`**, with
 `k` = advanced challengers actually duelled. At `k = 3`, α goes 0.05 → 0.0167.
 Simple, and conservative in the protective direction — under the real correlation
@@ -242,18 +268,37 @@ signatures stay valid, and `MANIFEST_VERSION` does not move. Non-contiguous rank
 are fine (the final content-clone drop can remove one); the validator sorts
 rather than indexes.
 
-**No receipt format change.** `VerdictRecord` cannot gain fields — `asdict` goes
-verbatim into the signed body, so a new field re-serialises every archived
-receipt with bytes that were never signed, and `RECEIPT_VERSION` cannot be bumped
-because `load_receipt` rejects any other version. Multiple `EntryScores` records
-are per-round data, not a format change, and they already carry `hotkey`.
+**The receipt publishes the cohort's math, under a strict constraint.** `k` and
+every duelled challenger's LCB are recorded (`cohort_k`, `cohort_lcbs`) so a third
+party can check the selection arithmetically — with `margin`, already on the
+verdict, those are the *complete* input to "who cleared, and was the crowned one
+the best" — without re-running the bootstrap or trusting any validator.
+
+Getting them into a SIGNED structure required the one safe shape:
+**drop-when-default**, via a new `_verdict_body` mirroring
+`manifest._entry_body`. A single-challenger round carries `cohort_k = 0` and
+`cohort_lcbs = None`, both omitted, so its canonical body serialises byte-for-byte
+as it did before the fields were declared and every archived signature still
+verifies; the payload grows only for rounds that genuinely carry the data.
+`tests/fixtures/round_receipt_v3.json` is the guard — it is a *signed* fixture, so
+a field leaking into the body fails its signature check.
+
+This does NOT reopen `VerdictRecord` generally, and in particular not for
+scoring-rule changes: those have no natural "absent" default (every round used
+*some* rule), so recording one would grow the body for archived receipts too.
+`RECEIPT_VERSION` is still no escape — `load_receipt` rejects any other version.
+Rule changes stay re-derived by `check_verdict`'s replay-under-each-known-rule.
+Multiple `EntryScores` records are per-round data, not a format change, and they
+already carry `hotkey`.
 
 The audit gets **stronger**, and cohort judging is what makes it so — there is no
 path dependence to reconstruct. A new `check_duel_cohort` asserts that every
-recorded challenger's LCB reproduces at `α_eff = bootstrap_alpha / k`, that `k`
-matches the challenger-entry count in the signed manifest, and that the crowned
-challenger is the best observed relative improvement among the clearers. That
-verifies the **selection**, not just the verdict, which nothing does today.
+recorded challenger's LCB reproduces at `α_eff = bootstrap_alpha / k`, that the
+published `cohort_k` and `cohort_lcbs` are the numbers that actually decided (a
+bound that does not replay is a hard failure, not a warning), that `k` matches the
+cohort the signed manifest implies, and that the crowned challenger is the best
+observed relative improvement among the clearers. That verifies the **selection**,
+not just the verdict, which nothing does today.
 
 ## Blast radius beyond the two stages
 

@@ -121,6 +121,15 @@ class RoundOutcome:
     # of this from the signed manifest plus ``entry_scores``.
     decided_hotkey: str | None = None
     duelled_hotkeys: tuple[str, ...] = ()
+    # Published on the receipt (DEC-CA-0010): the k that set the per-challenger
+    # alpha, and every duelled challenger's LCB under it. With the verdict's
+    # ``margin`` these are the complete input to the selection rule, so a third
+    # party checks "who cleared, and was the crowned one the best" without
+    # re-running the bootstrap or trusting this validator. ``cohort_k = 0`` on a
+    # single-challenger round keeps the signed body byte-identical to a
+    # pre-cohort receipt.
+    cohort_k: int = 0
+    cohort_lcbs: dict[str, float] = field(default_factory=dict)
 
 
 # How long the live loop keeps re-trying a round whose eval-pool index cannot
@@ -839,6 +848,10 @@ class ValidatorRunner:
             result=result, transition=transition, entry_scores=tuple(score_records),
             king_tenure_rounds=tenure_at_decision,
             decided_hotkey=decided_hotkey, duelled_hotkeys=duelled,
+            # Only on a genuine cohort: k <= 1 must leave the receipt's signed
+            # bytes exactly as a pre-DEC-CA-0010 round's.
+            cohort_k=(k if k > 1 else 0),
+            cohort_lcbs=({hk: r.lcb for hk, _, r in judged} if k > 1 else {}),
         )
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
@@ -905,6 +918,7 @@ class ValidatorRunner:
             outcome.result, outcome.transition,
             params=self.cfg.koth_params(), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
+            cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
         )
         return build_receipt(
             round_id=manifest.round_id, status="scored",

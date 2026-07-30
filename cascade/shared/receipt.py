@@ -198,21 +198,53 @@ class VerdictRecord:
     boot_p50: float | None = None
     boot_p95: float | None = None
 
-    # NOTE: do NOT add fields here to record scoring-rule changes. ``asdict`` of
-    # this dataclass goes verbatim into ``RoundReceipt.canonical_body`` — the
-    # SIGNED bytes — so any new field (even with a default) re-serialises every
-    # archived receipt with bytes that were never signed, and the whole public
-    # audit trail fails signature verification. Bumping ``RECEIPT_VERSION`` is
-    # not an escape either: ``load_receipt`` rejects any version but the current
-    # one, so archived receipts would stop loading at all. Scoring-rule changes
-    # are instead re-derived by ``cascade.audit.checks.check_verdict``, which
-    # replays under each known rule and reports which one reproduces the LCB.
+    # ── the cohort duel (DEC-CA-0010) ───────────────────────────────────────
+    # Recorded so a third party can check the multiplicity math without trusting
+    # the validator or re-deriving anything: ``cohort_k`` is the k that set the
+    # per-challenger alpha, and ``cohort_lcbs`` is every duelled challenger's LCB
+    # under it. With ``margin`` (already here) that is the complete input to the
+    # selection rule — who cleared, and whether the crowned one was the best.
+    #
+    # Both are DROPPED from the canonical body at their defaults (see
+    # :func:`_verdict_body`), which is what makes adding them safe; see the note
+    # below. ``cohort_k = 0`` means "not a cohort round" — every single-challenger
+    # round, i.e. every round before this shipped.
+    cohort_k: int = 0
+    cohort_lcbs: dict | None = None   # {challenger_hotkey: lcb at alpha/k}
+
+    # NOTE on adding fields here. ``asdict`` of this dataclass goes into
+    # ``RoundReceipt.canonical_body`` — the SIGNED bytes — so a field that always
+    # serialises re-writes every archived receipt with bytes that were never
+    # signed, and the whole public audit trail fails verification. Bumping
+    # ``RECEIPT_VERSION`` is not an escape: ``load_receipt`` rejects any version
+    # but the current one, so archived receipts would stop loading at all.
+    #
+    # The ONLY safe shape is drop-when-default, via :func:`_verdict_body` — the
+    # same convention ``manifest._entry_body`` uses for ``bench_scores`` /
+    # ``duel_rank``. An archived receipt re-serialises byte-for-byte because its
+    # new fields sit at their defaults and are omitted; the payload grows only for
+    # rounds that genuinely carry the data. ``tests/fixtures/round_receipt_v3.json``
+    # is the regression guard: it is a SIGNED fixture, so if a new field leaks into
+    # the body its signature check fails.
+    #
+    # This does not extend to scoring-RULE changes. Those have no natural "absent"
+    # default (every round used some rule), so recording one would grow the body
+    # for archived receipts too. They stay re-derived by
+    # ``cascade.audit.checks.check_verdict``, which replays under each known rule
+    # and reports which reproduces the LCB.
 
     @classmethod
     def from_round(
-        cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0
+        cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0,
+        cohort_k: int = 0, cohort_lcbs: dict | None = None,
     ) -> VerdictRecord:
-        """From an ``eval.koth.RoundResult`` + ``validator.state.StateTransition``."""
+        """From an ``eval.koth.RoundResult`` + ``validator.state.StateTransition``.
+
+        ``params`` is the UNMODIFIED ``chain.toml [scoring]`` set even on a cohort
+        round — ``check_koth_params`` asserts exactly that — so the per-challenger
+        alpha is published as ``cohort_k`` and the resulting bounds as
+        ``cohort_lcbs`` instead of by mutating ``params.bootstrap_alpha``.
+        """
         return cls(
             params=dict(asdict(params)),
             bootstrap_seed=str(bootstrap_seed),
@@ -236,7 +268,32 @@ class VerdictRecord:
             per_domain_win_rate=_clean_per_domain(getattr(result, "per_domain_win_rate", None)),
             boot_p50=_none_for_nan(getattr(result, "boot_p50", None)),
             boot_p95=_none_for_nan(getattr(result, "boot_p95", None)),
+            cohort_k=int(cohort_k or 0),
+            cohort_lcbs=(
+                {str(h): _none_for_nan(float(v)) for h, v in cohort_lcbs.items()}
+                if cohort_lcbs else None
+            ),
         )
+
+
+def _verdict_body(v: VerdictRecord | None) -> dict | None:
+    """One verdict's canonical dict, with the cohort fields omitted at their
+    defaults.
+
+    This is what makes the DEC-CA-0010 fields safe to add to a SIGNED structure: a
+    single-challenger round — every round archived before the cohort duel existed —
+    carries ``cohort_k = 0`` and ``cohort_lcbs = None``, both dropped, so its body
+    serialises byte-for-byte as it did before the fields were declared and its
+    signature still verifies. Mirrors ``manifest._entry_body``.
+    """
+    if v is None:
+        return None
+    d = asdict(v)
+    if not d.get("cohort_k"):
+        d.pop("cohort_k", None)
+    if not d.get("cohort_lcbs"):
+        d.pop("cohort_lcbs", None)
+    return d
 
 
 @dataclass(frozen=True)
@@ -303,7 +360,7 @@ class RoundReceipt:
             "participants": [asdict(p) for p in self.participants],
             "eval_context": asdict(self.eval_context) if self.eval_context else None,
             "entry_scores": [asdict(e) for e in self.entry_scores],
-            "verdict": asdict(self.verdict) if self.verdict else None,
+            "verdict": _verdict_body(self.verdict),
             "reward_uids": list(self.reward_uids),
             "weights": list(self.weights),
             "reject_reason": self.reject_reason,
@@ -445,6 +502,14 @@ def load_receipt(text: str) -> RoundReceipt:
             per_domain_win_rate=_clean_per_domain(verdict.get("per_domain_win_rate")),
             boot_p50=(None if verdict.get("boot_p50") is None else float(verdict["boot_p50"])),
             boot_p95=(None if verdict.get("boot_p95") is None else float(verdict["boot_p95"])),
+            # Absent on every pre-cohort receipt; the defaults round-trip back to
+            # an omitted key in _verdict_body, so the signed bytes are preserved.
+            cohort_k=int(verdict.get("cohort_k", 0) or 0),
+            cohort_lcbs=(
+                {str(h): (None if v is None else float(v))
+                 for h, v in verdict["cohort_lcbs"].items()}
+                if verdict.get("cohort_lcbs") else None
+            ),
         ) if verdict else None,
         reward_uids=tuple(int(u) for u in obj.get("reward_uids", ())),
         weights=tuple(float(w) for w in obj.get("weights", ())),
@@ -556,6 +621,16 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "chal_geomean": v.chal_geomean if v else None,
         "lcb": v.lcb if v else None,
         "margin": v.margin if v else None,
+        # Cohort duel (DEC-CA-0010). ``cohort_k`` is 0/absent on a single-challenger
+        # round. ``cohort_alpha`` is derived, not stored: the correction tightens
+        # the bootstrap QUANTILE (the LCB becomes this percentile of the paired
+        # distribution) while ``margin`` above stays flat.
+        "cohort_k": (v.cohort_k or None) if v else None,
+        "cohort_alpha": (
+            v.params.get("bootstrap_alpha", 0) / v.cohort_k
+            if v and v.cohort_k else None
+        ),
+        "cohort_lcbs": (v.cohort_lcbs or None) if v else None,
         # shadow diagnostics that explain the LCB (see VerdictRecord) — the
         # geomean-vs-winrate pairing is what exposes a rare-but-big-wins verdict
         "win_rate": v.win_rate if v else None,
