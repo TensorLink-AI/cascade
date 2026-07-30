@@ -64,14 +64,18 @@ in-context.
 - **DEC-CA-0010** — `[round] finalists` responds to the screen's own statistic:
   a separated leader advances alone, a tied top is re-scored on a larger eval
   (CPU-only, incremental windows via the seeded-prefix property), and survivors
-  advance capped and duel SEQUENTIALLY — best point estimate first, stop at the
-  first to clear the margin. Judging cost is then bounded by the outcome
-  (expected ≈ one duel; all-fail = today's king-holds); GPU training lanes are
-  bounded only by `max_finalists`, which is why the run-off is load-bearing.
-  Tie bar is 0, not the 2% margin (no incumbent among challengers); multiplicity
-  deliberately uncorrected. Ships inert; validator/audit multi-challenger fix
-  goes FIRST.
-  (`decisions/DEC-CA-0010-tie-aware-finalists-sequential-duel.md`)
+  advance capped. The whole cohort then duels — NOT sequentially (a full paired
+  eval is 106s CPU; stopping early saves ~53s per challenger against 3h GPU
+  lanes, decides ties by ordering noise, and breaks the alpha correction via
+  optional stopping). Gate on LCB ≥ margin, crown the best POINT ESTIMATE among
+  clearers. Per-challenger alpha tightens to `α/k` or `k` challengers triple the
+  king's false-dethrone risk; `k` is derivable from the signed manifest, so the
+  adjusted alpha must NOT go in `VerdictRecord.params`. Screen's drop bar stays
+  0 and uncorrected (field-size-dependent bars are padding-gameable). No
+  heat-based dethrone-hopelessness gate, ever — cross-hardware bias, and u86
+  won with an 8.3% LCB from apparent hopelessness. Ships inert; validator/audit
+  multi-challenger fix goes FIRST.
+  (`decisions/DEC-CA-0010-tie-aware-finalists-cohort-duel.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
