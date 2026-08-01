@@ -41,6 +41,19 @@ image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:000000000000000000000000000
 # SSH key id (GET /v1/sshkeys) — pods boot as bare VMs, user "shadeform".
 # shadeform_ssh_key_id = "00000000-0000-0000-0000-000000000000"
 
+# Per-adapter knobs. Keys map onto the adapter's constructor and a typo is
+# REJECTED at load against its field list — a silently-ignored quality floor
+# would rent off machines the config claims were vetted. Known adapters:
+# lium, shadeform, runpod, vast (see docs/DEPLOY_PODS.md).
+# [provisioner.provider_options.runpod]
+# cloud_type = "SECURE"          # RunPod's own/partner DCs; "COMMUNITY" = cheaper
+# disk_gb    = 60
+# [provisioner.provider_options.vast]
+# verified_only         = true   # datacenter-verified hosts only
+# min_reliability       = 0.98
+# min_cpu_cores_per_gpu = 4.0    # the corpus streams from a CPU generator
+# disk_gb               = 60
+
 # Operator's static [[host]] entries (a long-lived hand-rented pod, e.g. the
 # final box) — validated at startup with the trainer's own loader, appended
 # verbatim to EVERY hosts.toml publish, and NEVER dropped by provisioner

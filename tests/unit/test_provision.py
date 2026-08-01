@@ -34,7 +34,19 @@ from cascade.provision import (
     shadeform_pod_address,
     validate_digest_pinned,
 )
-from cascade.provision.core import filter_tagged_names, shadeform_offer_price_usd_hr
+from cascade.provision.core import (
+    filter_tagged_names,
+    filter_vast_offers,
+    pick_runpod_gpu_type,
+    runpod_create_body,
+    runpod_gpu_price_usd_hr,
+    runpod_pod_address,
+    shadeform_offer_price_usd_hr,
+    vast_create_body,
+    vast_offer_price_usd_hr,
+    vast_offer_query,
+    vast_pod_address,
+)
 
 IMG = "reg.example/cascade-worker@sha256:" + "a" * 64
 
@@ -823,3 +835,365 @@ def test_make_health_check_attested_digest_on_frozen_gate(monkeypatch):
     r2 = check(addr, "heat", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
                attested_digest="sha256:" + "bb" * 32)
     assert isinstance(r1, HealthReport) and isinstance(r2, HealthReport)
+
+
+# ── RunPod adapter (pure parts) ──────────────────────────────────────────────
+
+
+def _runpod_types(gpu="NVIDIA L40S", secure=True, community=True,
+                  secure_price=0.86, community_price=0.69):
+    return [{
+        "id": gpu, "displayName": gpu.replace("NVIDIA ", ""), "memoryInGb": 48,
+        "secureCloud": secure, "communityCloud": community,
+        "securePrice": secure_price, "communityPrice": community_price,
+    }]
+
+
+def test_pick_runpod_gpu_type_matches_id_or_display_name():
+    assert pick_runpod_gpu_type(_runpod_types(), "NVIDIA L40S")["id"] == "NVIDIA L40S"
+    assert pick_runpod_gpu_type(_runpod_types(), "l40s")["id"] == "NVIDIA L40S"
+    assert pick_runpod_gpu_type(_runpod_types(), "NVIDIA L40") is None
+
+
+def test_pick_runpod_gpu_type_secure_tier_is_not_satisfied_by_community():
+    """The whole reason to pick runpod for the FINAL is Secure Cloud; a type
+    sold only on the Community host marketplace must fall through, not
+    silently downgrade the tier the duel runs on."""
+    only_community = _runpod_types(secure=False)
+    assert pick_runpod_gpu_type(only_community, "NVIDIA L40S", secure=True) is None
+    assert pick_runpod_gpu_type(only_community, "NVIDIA L40S", secure=False) is not None
+
+
+def test_pick_runpod_gpu_type_normalizes_graphql_and_rest_shapes():
+    rest = _runpod_types()
+    assert pick_runpod_gpu_type({"gpuTypes": rest}, "NVIDIA L40S") is not None
+    assert pick_runpod_gpu_type({"data": {"gpuTypes": rest}}, "NVIDIA L40S") is not None
+    assert pick_runpod_gpu_type({}, "NVIDIA L40S") is None
+
+
+def test_runpod_price_is_per_pod_not_per_gpu():
+    """RunPod quotes per GPU-hour; within_budget bills per POD-hour. Failing to
+    multiply under-projects the round breaker by the pod shape."""
+    assert runpod_gpu_price_usd_hr(_runpod_types(), "NVIDIA L40S", gpus=1) == \
+        pytest.approx(0.86)
+    assert runpod_gpu_price_usd_hr(_runpod_types(), "NVIDIA L40S", gpus=4) == \
+        pytest.approx(3.44)
+    assert runpod_gpu_price_usd_hr(_runpod_types(), "NVIDIA L40S", gpus=2,
+                                   secure=False) == pytest.approx(1.38)
+    assert runpod_gpu_price_usd_hr(_runpod_types(), "NVIDIA H100") is None
+
+
+def test_runpod_create_body_seeds_only_ssh_and_digest():
+    spec = _spec(count=1, gpus_per_pod=2)
+    body = runpod_create_body(spec, "NVIDIA L40S", name="cascade-900-final-0")
+    assert body["name"] == "cascade-900-final-0"
+    assert body["imageName"] == IMG and body["gpuTypeIds"] == ["NVIDIA L40S"]
+    assert body["gpuCount"] == 2 and body["cloudType"] == "SECURE"
+    assert body["ports"] == ["22/tcp"] and body["supportPublicIp"] is True
+    # A reclaimed spot pod mid-duel costs the round more than the discount.
+    assert body["interruptible"] is False
+    assert set(body["env"]) == {"SSH_PUBKEY", "PUBLIC_KEY", "CASCADE_TRAIN_IMAGE_DIGEST"}
+    assert body["env"]["SSH_PUBKEY"] == body["env"]["PUBLIC_KEY"]
+    assert body["env"]["CASCADE_TRAIN_IMAGE_DIGEST"] == "sha256:" + "a" * 64
+    assert not any("HIPPIUS" in k for k in body["env"])
+
+
+def test_runpod_create_body_omits_digest_env_when_unpinned():
+    spec = LaunchSpec(sku="NVIDIA L40S", count=1, image="reg.example/worker:latest",
+                      ssh_pubkey="ssh-ed25519 AAAA x")
+    body = runpod_create_body(spec, "NVIDIA L40S", name="n")
+    assert "CASCADE_TRAIN_IMAGE_DIGEST" not in body["env"]
+
+
+def test_runpod_pod_address_reads_the_nat_mapping_not_port_22():
+    """sshd answers on the NATted public port; probing 22 reaches nothing."""
+    info = {"publicIp": "198.51.100.9", "portMappings": {"22": 40123}}
+    assert runpod_pod_address(info) == PodAddress("198.51.100.9", 40123)
+
+
+def test_runpod_pod_address_falls_back_to_runtime_ports():
+    info = {"publicIp": "198.51.100.9", "runtime": {"ports": [
+        {"privatePort": 8888, "publicPort": 41000, "ip": "198.51.100.9"},
+        {"privatePort": 22, "publicPort": 40999, "ip": "198.51.100.9"},
+    ]}}
+    assert runpod_pod_address(info) == PodAddress("198.51.100.9", 40999)
+
+
+def test_runpod_pod_address_none_without_ip():
+    assert runpod_pod_address({"portMappings": {"22": 40123}}) is None
+    assert runpod_pod_address({}) is None
+
+
+def test_runpod_wait_ready_requires_the_port_map_not_just_running(monkeypatch):
+    """Regression shape of the 2026-07-15 shadeform lesson: RUNNING while the
+    image is still pulling has no mapping, and probing then reads as a dead
+    pod. Readiness must mean 'address resolvable'."""
+    from cascade.provision.core import RunPodProvider
+
+    states = [
+        {"desiredStatus": "RUNNING"},                                  # no map yet
+        {"desiredStatus": "RUNNING", "portMappings": {"22": 40123},
+         "publicIp": "198.51.100.9"},
+    ]
+    clock = {"t": 0.0}
+    prov = RunPodProvider(_sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                          _now=lambda: clock["t"])
+    monkeypatch.setattr(prov, "_get", lambda p, params=None: states.pop(0))
+    assert prov.wait_ready("pod-1", timeout=60) is True
+    assert states == []          # it kept polling past the first RUNNING
+
+
+def test_runpod_wait_ready_raises_on_terminal_status(monkeypatch):
+    from cascade.provision.core import RunPodProvider
+
+    clock = {"t": 0.0}
+    prov = RunPodProvider(_sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+                          _now=lambda: clock["t"])
+    monkeypatch.setattr(prov, "_get", lambda p, params=None: {"desiredStatus": "FAILED"})
+    with pytest.raises(ProvisionError, match="FAILED"):
+        prov.wait_ready("pod-1", timeout=60)
+
+
+def test_runpod_list_tagged_returns_ids(monkeypatch):
+    from cascade.provision.core import RunPodProvider
+
+    prov = RunPodProvider()
+    rows = [{"name": "cascade-900-heat-0", "id": "p1"},
+            {"name": "someone-else", "id": "p2"}]
+    monkeypatch.setattr(prov, "_get", lambda p, params=None: rows)
+    assert prov.list_tagged("cascade-") == ["p1"]
+    monkeypatch.setattr(prov, "_get", lambda p, params=None: {"pods": rows})
+    assert prov.list_tagged("cascade-") == ["p1"]
+
+
+# ── Vast.ai adapter (pure parts) ─────────────────────────────────────────────
+
+
+def _vast_offer(oid=1, machine=100, price=0.30, gpus=4, name="RTX 4090",
+                reliability=0.995, cores=32.0, verified=True, rentable=True):
+    return {"id": oid, "machine_id": machine, "dph_total": price, "num_gpus": gpus,
+            "gpu_name": name, "reliability2": reliability,
+            "cpu_cores_effective": cores, "verified": verified,
+            "rentable": rentable, "rented": False, "geolocation": "US"}
+
+
+def _vast(*offers):
+    return {"offers": list(offers)}
+
+
+def test_filter_vast_offers_applies_quality_floors():
+    """DEC-CA-0010 as procurement: the heat ranks runs ACROSS pods, so an
+    unvetted or CPU-thin box turns host variance into rank variance."""
+    good = _vast_offer(oid=1, machine=1)
+    unverified = _vast_offer(oid=2, machine=2, verified=False)
+    flaky = _vast_offer(oid=3, machine=3, reliability=0.80)
+    cpu_thin = _vast_offer(oid=4, machine=4, cores=8.0)      # 2 cores/GPU at 4×
+    got = filter_vast_offers(_vast(good, unverified, flaky, cpu_thin), "RTX 4090", gpus=4)
+    assert [o["id"] for o in got] == [1]
+
+
+def test_filter_vast_offers_rejects_wrong_shape_and_unrentable():
+    assert filter_vast_offers(_vast(_vast_offer(gpus=2)), "RTX 4090", gpus=4) == []
+    assert filter_vast_offers(_vast(_vast_offer(rentable=False)), "RTX 4090", gpus=4) == []
+    assert filter_vast_offers(_vast(_vast_offer(name="RTX 3090")), "RTX 4090", gpus=4) == []
+
+
+def test_filter_vast_offers_one_per_machine_cheapest_first():
+    """Two lanes of one physical box are co-tenants: a '2-pod' fleet that lands
+    twice on the same machine bills double and shares a memory bus."""
+    a = _vast_offer(oid=1, machine=7, price=0.40)
+    b = _vast_offer(oid=2, machine=7, price=0.30)            # same box, cheaper
+    c = _vast_offer(oid=3, machine=8, price=0.35)
+    got = filter_vast_offers(_vast(a, b, c), "RTX 4090", gpus=4)
+    assert [o["id"] for o in got] == [2, 3]                  # 0.30 then 0.35
+
+
+def test_filter_vast_offers_honours_machine_exclusions():
+    """The replacement path must not re-rent the lemon it just tore down —
+    offer lists are deterministic, so without this it would."""
+    got = filter_vast_offers(
+        _vast(_vast_offer(oid=1, machine=7), _vast_offer(oid=2, machine=8)),
+        "RTX 4090", gpus=4, exclude_machines=("7",))
+    assert [o["id"] for o in got] == [2]
+
+
+def test_vast_offer_price_prices_the_qualifying_set_only():
+    """A cheap offer the floors reject must not set the breaker's projection."""
+    cheap_junk = _vast_offer(oid=1, machine=1, price=0.10, verified=False)
+    good = _vast_offer(oid=2, machine=2, price=0.32)
+    assert vast_offer_price_usd_hr(_vast(cheap_junk, good), "RTX 4090", gpus=4) == \
+        pytest.approx(0.32)
+    assert vast_offer_price_usd_hr(_vast(cheap_junk), "RTX 4090", gpus=4) is None
+
+
+def test_vast_offer_query_carries_the_floors_server_side():
+    q = vast_offer_query("RTX 4090", gpus=4, min_reliability=0.97)
+    assert q["gpu_name"] == {"eq": "RTX 4090"} and q["num_gpus"] == {"eq": 4}
+    assert q["reliability2"] == {"gte": 0.97} and q["verified"] == {"eq": True}
+    assert q["order"] == [["dph_total", "asc"]] and q["type"] == "on-demand"
+    assert "verified" not in vast_offer_query("RTX 4090", verified_only=False)
+
+
+def test_vast_create_body_seeds_only_ssh_and_digest():
+    body = vast_create_body(_spec(count=1, gpus_per_pod=4), label="cascade-900-heat-0")
+    assert body["image"] == IMG and body["label"] == "cascade-900-heat-0"
+    assert body["runtype"] == "ssh" and body["direct"] is True
+    assert body["env"]["-p 22:22"] == "1"
+    assert body["env"]["SSH_PUBKEY"] == "ssh-ed25519 AAAAkey orchestrator"
+    assert body["env"]["CASCADE_TRAIN_IMAGE_DIGEST"] == "sha256:" + "a" * 64
+    assert not any("HIPPIUS" in k for k in body["env"])
+
+
+def test_vast_pod_address_prefers_direct_mapping_then_proxy():
+    direct = {"public_ipaddr": "198.51.100.4",
+              "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "40010"}]},
+              "ssh_host": "ssh5.vast.ai", "ssh_port": 12345}
+    assert vast_pod_address(direct) == PodAddress("198.51.100.4", 40010)
+    proxy = {"ssh_host": "ssh5.vast.ai", "ssh_port": 12345}
+    assert vast_pod_address(proxy) == PodAddress("ssh5.vast.ai", 12345)
+    assert vast_pod_address({}) is None
+
+
+def test_vast_launch_rents_distinct_machines_and_remembers_them(monkeypatch):
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    offers = _vast(_vast_offer(oid=11, machine=71, price=0.30),
+                   _vast_offer(oid=12, machine=72, price=0.31))
+    monkeypatch.setattr(prov, "_bundles", lambda sku, gpus: offers)
+    calls = []
+
+    def _req(method, path, *, params=None, body=None):
+        calls.append((method, path, body))
+        return {"success": True, "new_contract": 900 + len(calls)}
+
+    monkeypatch.setattr(prov, "_request", _req)
+    ids = prov.launch(_spec(count=2, sku="RTX 4090", gpus_per_pod=4,
+                            name_prefix="cascade-900-heat"))
+    assert ids == ["901", "902"]
+    assert [c[1] for c in calls] == ["/asks/11/", "/asks/12/"]
+    assert [c[2]["label"] for c in calls] == ["cascade-900-heat-0", "cascade-900-heat-1"]
+    # machine_of feeds the loop's lemon exclusion — vast CAN support it.
+    assert prov.machine_of("901") == "71" and prov.machine_of("902") == "72"
+
+
+def test_vast_launch_refuses_a_short_fleet(monkeypatch):
+    """Never split or under-deliver a stage: a 2-pod plan with one qualifying
+    offer must fall through to the next rung, not rent half a fleet."""
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    monkeypatch.setattr(prov, "_bundles", lambda sku, gpus: _vast(_vast_offer()))
+    with pytest.raises(ProvisionError, match="only 1 qualifying"):
+        prov.launch(_spec(count=2, sku="RTX 4090", gpus_per_pod=4))
+
+
+def test_vast_available_counts_distinct_qualifying_boxes(monkeypatch):
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    monkeypatch.setattr(prov, "_bundles", lambda sku, gpus: _vast(
+        _vast_offer(oid=1, machine=1), _vast_offer(oid=2, machine=1),   # same box
+        _vast_offer(oid=3, machine=2)))
+    assert prov.available("RTX 4090", 2, gpus=4) is True
+    assert prov.available("RTX 4090", 3, gpus=4) is False
+
+
+def test_vast_list_tagged_maps_label_to_the_shared_primitive(monkeypatch):
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    monkeypatch.setattr(prov, "_get", lambda p, params=None: {"instances": [
+        {"label": "cascade-900-heat-0", "id": 901},
+        {"label": "someone-else", "id": 902},
+        {"id": 903},
+    ]})
+    assert prov.list_tagged("cascade-") == ["901"]
+
+
+# ── budget breaker: per-pod pricing across adapters ──────────────────────────
+
+
+def test_shadeform_offer_price_scans_only_the_rented_shape():
+    """Pricing a 4× rung off the 1× listing under-projects the round breaker
+    4× — it approves a spend it will never bill against."""
+    one = {"configuration": {"gpu_type": "RTX4090", "num_gpus": 1},
+           "hourly_price": 70, "cloud": "c", "shade_instance_type": "RTX4090",
+           "availability": [{"region": "r", "available": True}]}
+    four = {"configuration": {"gpu_type": "RTX4090", "num_gpus": 4},
+            "hourly_price": 260, "cloud": "c", "shade_instance_type": "RTX4090x4",
+            "availability": [{"region": "r", "available": True}]}
+    types = {"instance_types": [one, four]}
+    assert shadeform_offer_price_usd_hr(types, "RTX4090", gpus=4) == pytest.approx(2.60)
+    assert shadeform_offer_price_usd_hr(types, "RTX4090", gpus=1) == pytest.approx(0.70)
+    assert shadeform_offer_price_usd_hr(types, "RTX4090") == pytest.approx(0.70)
+
+
+def test_loop_offer_price_passes_the_candidate_shape():
+    from cascade.provision.loop import ProvisionerLoop
+
+    seen = {}
+
+    class _P:
+        name = "runpod"
+
+        def offer_price(self, sku, *, gpus=1):
+            seen["args"] = (sku, gpus)
+            return 0.86 * gpus
+
+    assert ProvisionerLoop._offer_price(_P(), "NVIDIA L40S", 2) == pytest.approx(1.72)
+    assert seen["args"] == ("NVIDIA L40S", 2)
+
+
+def test_loop_offer_price_tolerates_an_adapter_without_the_shape_kwarg():
+    from cascade.provision.loop import ProvisionerLoop
+
+    class _Old:
+        name = "legacy"
+
+        def offer_price(self, sku):
+            return 1.25
+
+    assert ProvisionerLoop._offer_price(_Old(), "L40S", 4) == pytest.approx(1.25)
+
+
+# ── provider registry + options ──────────────────────────────────────────────
+
+
+def test_build_providers_knows_the_new_adapters():
+    provs = build_providers(["runpod", "vast"])
+    assert [p.name for p in provs] == ["runpod", "vast"]
+
+
+def test_build_providers_passes_adapter_options():
+    provs = build_providers(
+        ["runpod", "vast"],
+        {"runpod": {"cloud_type": "COMMUNITY"},
+         "vast": {"min_cpu_cores_per_gpu": 8.0, "verified_only": False}})
+    assert provs[0].cloud_type == "COMMUNITY" and provs[0]._secure is False
+    assert provs[1].min_cpu_cores_per_gpu == 8.0 and provs[1].verified_only is False
+
+
+def test_validate_provider_opts_rejects_typos():
+    """A silently-ignored `min_reliabilty` would rent the heat off unvetted
+    machines while the config claims otherwise."""
+    from cascade.provision.main import _validate_provider_opts
+
+    _validate_provider_opts({"vast": {"min_reliability": 0.99}})       # no raise
+    with pytest.raises(ProvisionError, match="min_reliabilty"):
+        _validate_provider_opts({"vast": {"min_reliabilty": 0.99}})
+
+
+def test_sku_matching_folds_marketplace_spelling_not_distinct_devices():
+    """`providers` is stage-level, so one candidate's market_sku is offered to
+    every adapter: shadeform says RTX4090, vast says 'RTX 4090'. Folding
+    spacing makes the rung portable; it must NOT merge L40 into L40S."""
+    offers = _vast(_vast_offer(name="RTX 4090"))
+    assert len(filter_vast_offers(offers, "RTX4090", gpus=4)) == 1
+    assert len(filter_vast_offers(offers, "rtx 4090", gpus=4)) == 1
+    assert filter_vast_offers(_vast(_vast_offer(name="RTX 4090D")), "RTX4090", gpus=4) == []
+
+    types = _runpod_types(gpu="NVIDIA L40S")
+    assert pick_runpod_gpu_type(types, "NVIDIA L40S") is not None
+    assert pick_runpod_gpu_type(types, "L40 S") is not None      # displayName "L40S"
+    assert pick_runpod_gpu_type(types, "NVIDIA L40") is None     # different silicon

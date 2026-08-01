@@ -364,18 +364,29 @@ def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1) -> dict |
     return offers[0][1]
 
 
-def shadeform_offer_price_usd_hr(types_json: dict, sku: str) -> float | None:
-    """Cheapest available hourly price for ``sku`` in USD/hr (``None`` if none).
+def shadeform_offer_price_usd_hr(
+    types_json: dict, sku: str, *, gpus: int | None = None
+) -> float | None:
+    """Cheapest available PER-POD hourly price for ``sku`` in USD/hr.
 
     The API reports ``hourly_price`` in CENTS; the provisioner's budget breaker
     (``policy.within_budget``) works in USD, so convert here — a silent
     cents-as-dollars mixup would either 100× the projection (refusing every
     round) or 1/100 it (defeating the breaker).
+
+    ``gpus`` restricts the scan to the pod shape actually being rented, which
+    is what :func:`pick_shadeform_offer` will launch. Leaving it ``None``
+    scans every shape and therefore returns the 1× price for a 4× rung —
+    a 4× UNDER-projection that hands the breaker a number it never spends
+    against. The loop always passes the candidate's shape; ``None`` remains
+    only for callers that genuinely want "cheapest at any shape".
     """
     prices = [
         int(t.get("hourly_price", 1 << 30))
         for t in types_json.get("instance_types", [])
         if str(t.get("configuration", {}).get("gpu_type", "")).upper() == sku.upper()
+        and (gpus is None
+             or int(t.get("configuration", {}).get("num_gpus", 1) or 1) == int(gpus))
         and any(a.get("available") for a in t.get("availability", []))
     ]
     return min(prices) / 100.0 if prices else None
@@ -466,6 +477,320 @@ SHADEFORM_TERMINAL_BAD = {"error", "deleting", "deleted"}
 # every image-boot rental failed its gate exactly this way).
 SHADEFORM_CONTAINER_READY = "running"
 SHADEFORM_CONTAINER_BAD = {"failed", "error", "stopped"}
+
+
+# ── RunPod pure helpers ──────────────────────────────────────────────────────
+#
+# RunPod's GPU-type ids ARE the nvidia-smi device strings ("NVIDIA L40S",
+# "NVIDIA GeForce RTX 4090"), so a stage needs no ``market_sku`` here — the
+# health gate's exact device assertion and the marketplace name coincide.
+
+RUNPOD_READY = "RUNNING"
+RUNPOD_TERMINAL_BAD = {"FAILED", "TERMINATED", "EXITED", "DEAD"}
+RUNPOD_SECURE = "SECURE"
+RUNPOD_COMMUNITY = "COMMUNITY"
+DEFAULT_RUNPOD_DISK_GB = 60
+
+
+def _sku_key(name: str) -> str:
+    """Whitespace-insensitive, case-insensitive key for a marketplace SKU name.
+
+    The same silicon is spelled differently per marketplace — shadeform says
+    ``RTX4090``, vast says ``RTX 4090``, runpod says ``NVIDIA GeForce RTX 4090``
+    — but ``providers`` is a STAGE-level list, so one candidate's
+    ``market_sku`` is offered to every adapter in the ladder. Folding spacing
+    means a rung written for one marketplace still matches on another instead
+    of silently probing as "no capacity". It never widens a match across
+    genuinely different devices (``RTX 4090`` vs ``RTX 4090D``, ``L40`` vs
+    ``L40S``) — those differ by more than spacing, which is the whole point of
+    the health gate's exact device assertion downstream.
+    """
+    return "".join(name.split()).upper()
+
+
+def _runpod_gpu_types(types_json: object) -> list[dict]:
+    """Normalize ``GET /gputypes`` to a list across REST and GraphQL shapes."""
+    if isinstance(types_json, list):
+        return [t for t in types_json if isinstance(t, dict)]
+    if isinstance(types_json, dict):
+        for key in ("gpuTypes", "data"):
+            inner = types_json.get(key)
+            if isinstance(inner, dict):
+                inner = inner.get("gpuTypes")
+            if isinstance(inner, list):
+                return [t for t in inner if isinstance(t, dict)]
+    return []
+
+
+def pick_runpod_gpu_type(
+    types_json: object, sku: str, *, secure: bool = True
+) -> dict | None:
+    """The ``GET /gputypes`` entry for ``sku``, or ``None`` if it is not sold.
+
+    Matches ``id`` (the nvidia-smi string) first, then ``displayName`` for the
+    short aliases RunPod also answers to. ``secure`` requires the type to be
+    offered on Secure Cloud — RunPod's own/partner datacenters — rather than
+    Community Cloud's host marketplace; that tier choice is the whole reason
+    to reach for this provider on the ``final`` stage, so a type that exists
+    only on Community must NOT silently satisfy a secure request.
+
+    RunPod publishes no per-shape stock count, so a returned entry means "this
+    SKU is purchasable on this tier", not "N pods are free right now" — the
+    same class of probe as Shadeform's, and the reason both are backed by the
+    loop's dud counter and replacement path rather than trusted outright.
+    """
+    tier_flag = "secureCloud" if secure else "communityCloud"
+    price_key = "securePrice" if secure else "communityPrice"
+    want = _sku_key(sku)
+    for t in _runpod_gpu_types(types_json):
+        names = {_sku_key(str(t.get("id", ""))), _sku_key(str(t.get("displayName", "")))}
+        if want not in names:
+            continue
+        # Absent flag ⇒ unknown tier support; only an explicit False excludes.
+        if t.get(tier_flag) is False:
+            continue
+        price = t.get(price_key)
+        if price is None or float(price) <= 0:
+            continue
+        return t
+    return None
+
+
+def runpod_gpu_price_usd_hr(
+    types_json: object, sku: str, *, gpus: int = 1, secure: bool = True
+) -> float | None:
+    """PER-POD USD/hr for a ``gpus``-GPU pod of ``sku`` (``None`` if unsold).
+
+    RunPod quotes **per GPU-hour**; ``policy.within_budget`` bills per POD-hour.
+    Multiplying here is not cosmetic — a 4× pod priced per-GPU under-projects
+    the round breaker 4×, which is exactly the failure mode the Shadeform
+    cents-vs-dollars note guards against on the other adapter.
+    """
+    entry = pick_runpod_gpu_type(types_json, sku, secure=secure)
+    if entry is None:
+        return None
+    price = entry.get("securePrice" if secure else "communityPrice")
+    return float(price) * max(1, int(gpus))
+
+
+def runpod_create_body(
+    spec: LaunchSpec, gpu_type_id: str, *, name: str,
+    cloud_type: str = RUNPOD_SECURE, disk_gb: int = DEFAULT_RUNPOD_DISK_GB,
+) -> dict:
+    """Build the ``POST /pods`` body for one pod of ``spec``.
+
+    The pod boots the digest-pinned worker image, whose entrypoint starts sshd
+    and reads ``SSH_PUBKEY``. ``PUBLIC_KEY`` carries the same key because
+    RunPod's own base images seed ``authorized_keys`` from that name instead —
+    setting both means a fallback image still admits the orchestrator. No
+    credential is ever seeded; Hippius secrets ride the per-dispatch SSH env.
+
+    ``interruptible`` is pinned False: a spot pod reclaimed mid-heat costs the
+    round more than the discount saves, and mid-FINAL it costs the duel.
+    """
+    env = {"SSH_PUBKEY": spec.ssh_pubkey, "PUBLIC_KEY": spec.ssh_pubkey}
+    digest = image_digest_of(spec.image)
+    if digest:
+        env["CASCADE_TRAIN_IMAGE_DIGEST"] = digest
+    return {
+        "name": name,
+        "imageName": spec.image,
+        "gpuTypeIds": [gpu_type_id],
+        "gpuCount": int(spec.gpus_per_pod),
+        "cloudType": cloud_type,
+        "containerDiskInGb": int(disk_gb),
+        "volumeInGb": 0,
+        "ports": [f"{DEFAULT_SSH_PORT}/tcp"],
+        "env": env,
+        "supportPublicIp": True,
+        "interruptible": False,
+    }
+
+
+def runpod_pod_address(
+    info_json: dict, *, ssh_port: int = DEFAULT_SSH_PORT
+) -> PodAddress | None:
+    """Extract ``(ip, port)`` from a RunPod ``GET /pods/{id}`` response.
+
+    RunPod NATs container 22 to a random public port, so the mapping — not
+    port 22 — is where sshd answers. The mapping only materializes once the
+    container is actually running, which makes "address resolvable" a
+    stricter and more honest readiness signal than the pod's own status
+    field (the Shadeform active-but-still-pulling lesson, 2026-07-15).
+
+    Handles both the REST ``portMappings`` dict and the older
+    ``runtime.ports`` list.
+    """
+    ip = str(info_json.get("publicIp") or "").strip()
+    mappings = info_json.get("portMappings") or {}
+    if isinstance(mappings, dict):
+        mapped = mappings.get(str(DEFAULT_SSH_PORT)) or mappings.get(DEFAULT_SSH_PORT)
+        if ip and mapped:
+            return PodAddress(ip=ip, ssh_port=int(mapped))
+    for p in ((info_json.get("runtime") or {}).get("ports") or []):
+        if int(p.get("privatePort", 0) or 0) != DEFAULT_SSH_PORT:
+            continue
+        pub_ip = str(p.get("ip") or ip).strip()
+        pub_port = p.get("publicPort")
+        if pub_ip and pub_port:
+            return PodAddress(ip=pub_ip, ssh_port=int(pub_port))
+    return PodAddress(ip=ip, ssh_port=ssh_port) if ip else None
+
+
+# ── Vast.ai pure helpers ─────────────────────────────────────────────────────
+#
+# Vast is a marketplace of INDIVIDUAL hosts, not a homogeneous fleet, so the
+# offer filter carries quality floors the other adapters do not need. This is
+# the DEC-CA-0010 constraint expressed as procurement: heat ranking compares
+# runs across pods, so a fleet spanning wildly different CPU budgets or
+# oversubscribed machines turns host variance into rank variance. Rent narrow.
+
+VAST_READY = "running"
+VAST_TERMINAL_BAD = {"exited", "error", "offline"}
+DEFAULT_VAST_DISK_GB = 60
+DEFAULT_VAST_MIN_RELIABILITY = 0.98
+DEFAULT_VAST_MIN_CPU_CORES_PER_GPU = 4.0
+
+
+def vast_offer_query(
+    sku: str, *, gpus: int = 1, min_reliability: float = DEFAULT_VAST_MIN_RELIABILITY,
+    verified_only: bool = True, limit: int = 64,
+) -> dict:
+    """The ``GET /bundles/`` search body for ``gpus``× ``sku`` offers.
+
+    Server-side narrowing only — :func:`pick_vast_offer` re-applies every floor
+    client-side, because the quality bar is a correctness property of the fleet
+    and must not depend on the marketplace honouring a query parameter.
+    """
+    q: dict = {
+        "gpu_name": {"eq": sku},
+        "num_gpus": {"eq": int(gpus)},
+        "rentable": {"eq": True},
+        "rented": {"eq": False},
+        "reliability2": {"gte": float(min_reliability)},
+        "type": "on-demand",
+        "order": [["dph_total", "asc"]],
+        "limit": int(limit),
+    }
+    if verified_only:
+        q["verified"] = {"eq": True}
+    return q
+
+
+def filter_vast_offers(
+    bundles_json: dict, sku: str, *, gpus: int = 1,
+    exclude_machines: Sequence[str] = (),
+    min_reliability: float = DEFAULT_VAST_MIN_RELIABILITY,
+    min_cpu_cores_per_gpu: float = DEFAULT_VAST_MIN_CPU_CORES_PER_GPU,
+    verified_only: bool = True,
+) -> list[dict]:
+    """Rentable offers matching the SKU, shape and quality floors, cheapest first.
+
+    At most ONE offer per ``machine_id``: two lanes of the same physical box
+    are co-tenants, and a "2-pod" fleet that lands twice on one machine is a
+    1-pod fleet that bills double and shares a memory bus.
+
+    ``min_cpu_cores_per_gpu`` is the floor that matters most for cascade: the
+    corpus streams from a CPU generator (``[training] corpus_mode =
+    stream_cpu``) and each lane's threads are capped to its slice of the box
+    (``trainer.sandbox._lane_cpu_slice``), so a CPU-thin machine starves the
+    run and reads as a slow generator in the heat.
+    """
+    excluded = {str(m) for m in exclude_machines}
+    want = _sku_key(sku)
+    out: list[tuple[float, dict]] = []
+    for o in bundles_json.get("offers", []) or []:
+        if _sku_key(str(o.get("gpu_name", ""))) != want:
+            continue
+        if int(o.get("num_gpus", 0) or 0) != int(gpus):
+            continue
+        if not o.get("rentable", False) or o.get("rented", False):
+            continue
+        if verified_only and not o.get("verified", False):
+            continue
+        if float(o.get("reliability2", 0.0) or 0.0) < float(min_reliability):
+            continue
+        cores = float(o.get("cpu_cores_effective", 0.0) or 0.0)
+        if cores / max(1, int(gpus)) < float(min_cpu_cores_per_gpu):
+            continue
+        if str(o.get("machine_id", "")) in excluded:
+            continue
+        price = o.get("dph_total")
+        if price is None or float(price) <= 0:
+            continue
+        out.append((float(price), o))
+    out.sort(key=lambda x: (x[0], str(x[1].get("id", ""))))
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for _, o in out:
+        mid = str(o.get("machine_id", ""))
+        if mid and mid in seen:
+            continue
+        if mid:
+            seen.add(mid)
+        uniq.append(o)
+    return uniq
+
+
+def pick_vast_offer(bundles_json: dict, sku: str, **kw) -> dict | None:
+    """The cheapest qualifying offer, or ``None`` — the fall-through signal."""
+    offers = filter_vast_offers(bundles_json, sku, **kw)
+    return offers[0] if offers else None
+
+
+def vast_offer_price_usd_hr(bundles_json: dict, sku: str, **kw) -> float | None:
+    """Cheapest qualifying PER-POD USD/hr (``dph_total`` covers the whole box).
+
+    Priced off the SAME filtered set the launch will choose from, so the
+    breaker never approves a round against a cheap offer the quality floors
+    would have rejected.
+    """
+    offer = pick_vast_offer(bundles_json, sku, **kw)
+    return float(offer["dph_total"]) if offer else None
+
+
+def vast_create_body(spec: LaunchSpec, *, label: str, disk_gb: int = DEFAULT_VAST_DISK_GB) -> dict:
+    """Build the ``PUT /asks/{id}/`` body for one pod of ``spec``.
+
+    ``runtype: "ssh"`` with ``direct`` asks Vast for a routable host:port into
+    the container rather than its SSH proxy. The ``-p 22:22`` env key is Vast's
+    docker-options channel (its CLI emits the same), and ``SSH_PUBKEY`` is the
+    worker-image contract. NOTE the orchestrator's public key must ALSO be
+    registered on the Vast account: Vast seeds its own authorized_keys on the
+    ssh runtype, and an image whose entrypoint ignores ``SSH_PUBKEY`` would
+    otherwise be unreachable.
+    """
+    env = {f"-p {DEFAULT_SSH_PORT}:{DEFAULT_SSH_PORT}": "1", "SSH_PUBKEY": spec.ssh_pubkey}
+    digest = image_digest_of(spec.image)
+    if digest:
+        env["CASCADE_TRAIN_IMAGE_DIGEST"] = digest
+    return {
+        "client_id": "me",
+        "image": spec.image,
+        "disk": int(disk_gb),
+        "runtype": "ssh",
+        "direct": True,
+        "label": label,
+        "env": env,
+    }
+
+
+def vast_pod_address(inst: dict, *, ssh_port: int = DEFAULT_SSH_PORT) -> PodAddress | None:
+    """Extract ``(ip, port)`` from a Vast instance record.
+
+    Prefers the direct public mapping of container 22; falls back to Vast's
+    ``ssh_host``/``ssh_port`` proxy, which resolves once the instance runs.
+    """
+    ports = inst.get("ports") or {}
+    entry = ports.get(f"{DEFAULT_SSH_PORT}/tcp") or ports.get(str(DEFAULT_SSH_PORT))
+    if isinstance(entry, list) and entry:
+        entry = entry[0]
+    ip = str(inst.get("public_ipaddr") or "").strip()
+    if ip and isinstance(entry, dict) and entry.get("HostPort"):
+        return PodAddress(ip=ip, ssh_port=int(entry["HostPort"]))
+    if inst.get("ssh_host") and inst.get("ssh_port"):
+        return PodAddress(ip=str(inst["ssh_host"]).strip(), ssh_port=int(inst["ssh_port"]))
+    return PodAddress(ip=ip, ssh_port=ssh_port) if ip else None
 
 
 # ── side-effecting helpers (adapter surface, not unit-tested) ─────────────────
@@ -796,15 +1121,334 @@ class ShadeformProvider:
             self._get("/instances").get("instances", []), prefix, id_key="id"
         )
 
-    def offer_price(self, sku: str) -> float | None:
-        """Cheapest available USD/hr for ``sku`` (the budget breaker's input)."""
+    def offer_price(self, sku: str, *, gpus: int = 1) -> float | None:
+        """Cheapest available USD/pod-hr for ``sku`` at the ``gpus`` pod shape."""
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
-        return shadeform_offer_price_usd_hr(types, sku)
+        return shadeform_offer_price_usd_hr(types, sku, gpus=gpus)
+
+
+# ── RunPod + Vast adapters (REST, bearer auth) ───────────────────────────────
+
+
+class _BearerRestMixin:
+    """Lazy ``requests`` session with ``Authorization: Bearer`` from the env.
+
+    Lazy on purpose, exactly as the Shadeform adapter is: a lower-priority
+    provider in the ladder must not demand an API key when a higher one wins
+    the round.
+    """
+
+    base_url: str
+    api_key_env: str
+    name: str
+
+    def _http(self):
+        if getattr(self, "_session", None) is not None:
+            return self._session
+        try:
+            import requests
+        except ModuleNotFoundError as e:  # pragma: no cover - env guard
+            raise ProvisionError(
+                f"the {self.name} adapter needs `requests` (pip install -e '.[deploy]')"
+            ) from e
+        key = os.environ.get(self.api_key_env)
+        if not key:
+            raise ProvisionError(f"{self.name}: set ${self.api_key_env}")
+        s = requests.Session()
+        s.headers.update({"Authorization": f"Bearer {key}",
+                          "Content-Type": "application/json"})
+        self._session = s
+        return s
+
+    def _request(self, method: str, path: str, *, params=None, body=None) -> dict:
+        r = self._http().request(method, f"{self.base_url}{path}",
+                                 params=params, json=body, timeout=30)
+        r.raise_for_status()
+        if not r.content:
+            return {}
+        out = r.json()
+        return out if isinstance(out, (dict, list)) else {}
+
+    def _get(self, path: str, params: dict | None = None):
+        return self._request("GET", path, params=params)
+
+    def _post(self, path: str, body: dict | None = None):
+        return self._request("POST", path, body=body)
+
+
+@dataclass
+class RunPodProvider(_BearerRestMixin):
+    """RunPod via its REST v1 API (``$RUNPOD_API_KEY``).
+
+    Defaults to **Secure Cloud** — RunPod's own and partner datacenters — which
+    is the point of reaching for it: the ``final`` stage's L40S duel is the one
+    leg where a zombie rental costs the round, and Secure Cloud is a real
+    operator rather than a reseller pool. ``cloud_type = "COMMUNITY"`` opts into
+    the cheaper host marketplace for heat-class work.
+
+    NO ``machine_of``: RunPod schedules the machine itself and ``POST /pods``
+    cannot target or avoid one, so the loop's lemon-exclusion path has nothing
+    to exclude with (see ``LaunchSpec.exclude_ids`` — adapters that cannot map
+    ids to offers may ignore it). A bad pod is handled by the replacement +
+    dud-counter path instead.
+    """
+
+    name: str = "runpod"
+    base_url: str = "https://rest.runpod.io/v1"
+    api_key_env: str = "RUNPOD_API_KEY"
+    cloud_type: str = RUNPOD_SECURE
+    disk_gb: int = DEFAULT_RUNPOD_DISK_GB
+    poll_interval: float = POD_POLL_INTERVAL
+    _session: object | None = field(default=None, repr=False)
+    _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    _now: Callable[[], float] = field(default=time.monotonic, repr=False)
+
+    @property
+    def _secure(self) -> bool:
+        return str(self.cloud_type).upper() != RUNPOD_COMMUNITY
+
+    def _gpu_types(self):
+        return self._get("/gputypes")
+
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:  # noqa: ARG002
+        # RunPod publishes no per-shape stock, so neither `count` nor `gpus`
+        # can narrow this: the probe answers "sold on this tier", and the
+        # dud counter + replacement path absorb the rest (see the class doc).
+        return pick_runpod_gpu_type(self._gpu_types(), sku, secure=self._secure) is not None
+
+    def launch(self, spec: LaunchSpec) -> list[str]:
+        entry = pick_runpod_gpu_type(self._gpu_types(), spec.sku, secure=self._secure)
+        if entry is None:
+            raise ProvisionError(
+                f"runpod: {spec.sku} not offered on {self.cloud_type} cloud")
+        gpu_type_id = str(entry.get("id") or spec.sku)
+        ids: list[str] = []
+        for i in range(spec.count):
+            body = runpod_create_body(
+                spec, gpu_type_id, name=f"{spec.name_prefix}-{i}",
+                cloud_type=self.cloud_type, disk_gb=self.disk_gb)
+            resp = self._post("/pods", body)
+            pid = resp.get("id") if isinstance(resp, dict) else None
+            if not pid:
+                raise ProvisionError(f"runpod create returned no id: {resp}")
+            log.info("runpod create → %s (%s × %s, %s)", pid, spec.gpus_per_pod,
+                     gpu_type_id, self.cloud_type)
+            ids.append(str(pid))
+        return ids
+
+    def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
+        """Ready = RUNNING **and** the container's port-22 mapping resolves.
+
+        Status alone is not readiness: RunPod reports RUNNING while the image
+        is still pulling, and probing then reaches nothing. The mapping only
+        appears once the container runs, so it is the honest gate.
+        """
+        deadline = self._now() + timeout
+        last = None
+        while self._now() < deadline:
+            info = self._get(f"/pods/{pod_id}")
+            status = str(info.get("desiredStatus") or "").upper()
+            if status in RUNPOD_TERMINAL_BAD:
+                raise ProvisionError(f"runpod pod {pod_id} entered {status!r}")
+            if status == RUNPOD_READY and runpod_pod_address(info) is not None:
+                return True
+            if status != last:
+                log.info("runpod %s status %s — waiting for %s + port map",
+                         pod_id, status or "?", RUNPOD_READY)
+                last = status
+            self._sleep(self.poll_interval)
+        return False
+
+    def get_ip(self, pod_id: str) -> PodAddress | None:
+        return runpod_pod_address(self._get(f"/pods/{pod_id}"))
+
+    def launched_image_digest(self, pod_id: str) -> str:
+        """The digest RunPod's own record says this pod runs (best-effort)."""
+        try:
+            info = self._get(f"/pods/{pod_id}")
+        except Exception:  # noqa: BLE001 — attestation is best-effort, gate decides
+            return ""
+        return image_digest_of(str(info.get("image") or info.get("imageName") or ""))
+
+    def terminate(self, pod_id: str) -> None:
+        try:
+            self._request("DELETE", f"/pods/{pod_id}")
+            log.info("runpod delete %s", pod_id)
+        except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
+            log.warning("runpod delete %s: %s (treating as already terminated)", pod_id, e)
+
+    def list_tagged(self, prefix: str) -> list[str]:
+        """Live pod IDs whose ``name`` starts with ``prefix`` (delete takes the id)."""
+        pods = self._get("/pods")
+        if isinstance(pods, dict):
+            pods = pods.get("pods", [])
+        return filter_tagged_names(pods or [], prefix, id_key="id")
+
+    def offer_price(self, sku: str, *, gpus: int = 1) -> float | None:
+        """PER-POD USD/hr — RunPod quotes per GPU, so this multiplies by shape."""
+        return runpod_gpu_price_usd_hr(self._gpu_types(), sku, gpus=gpus,
+                                       secure=self._secure)
+
+
+@dataclass
+class VastProvider(_BearerRestMixin):
+    """Vast.ai marketplace via its REST API (``$VAST_API_KEY``).
+
+    Vast is the price floor for consumer silicon and the most heterogeneous
+    supply in the ladder, which is a genuine hazard for the HEAT: the screen
+    ranks runs across pods, so machine-to-machine spread becomes rank spread
+    (DEC-CA-0010). The quality floors below are therefore part of the
+    adapter's contract, not tuning — ``verified_only`` keeps rentals in
+    datacenter-verified hosts, ``min_reliability`` drops flaky machines, and
+    ``min_cpu_cores_per_gpu`` guards the CPU generator that actually feeds
+    training. Loosen them and the heat inherits the variance.
+
+    Not recommended for ``final``: the duel wants one multi-GPU box from a
+    single operator, which is what runpod/shadeform sell and Vast does not
+    guarantee.
+    """
+
+    name: str = "vast"
+    base_url: str = "https://console.vast.ai/api/v0"
+    api_key_env: str = "VAST_API_KEY"
+    disk_gb: int = DEFAULT_VAST_DISK_GB
+    min_reliability: float = DEFAULT_VAST_MIN_RELIABILITY
+    min_cpu_cores_per_gpu: float = DEFAULT_VAST_MIN_CPU_CORES_PER_GPU
+    verified_only: bool = True
+    poll_interval: float = POD_POLL_INTERVAL
+    _session: object | None = field(default=None, repr=False)
+    _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    _now: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # pod id → machine id, remembered at launch so lemon exclusion works even
+    # after the instance is gone from /instances (the lookup it would need).
+    _machines: dict[str, str] = field(default_factory=dict, repr=False)
+
+    @property
+    def _floors(self) -> dict:
+        return {"min_reliability": self.min_reliability,
+                "min_cpu_cores_per_gpu": self.min_cpu_cores_per_gpu,
+                "verified_only": self.verified_only}
+
+    def _bundles(self, sku: str, *, gpus: int) -> dict:
+        q = vast_offer_query(sku, gpus=gpus, min_reliability=self.min_reliability,
+                             verified_only=self.verified_only)
+        out = self._get("/bundles/", {"q": json.dumps(q)})
+        return out if isinstance(out, dict) else {"offers": []}
+
+    def _qualifying(self, sku: str, *, gpus: int,
+                    exclude: Sequence[str] = ()) -> list[dict]:
+        return filter_vast_offers(self._bundles(sku, gpus=gpus), sku, gpus=gpus,
+                                  exclude_machines=exclude, **self._floors)
+
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
+        """Vast lists real per-machine offers, so this counts DISTINCT boxes."""
+        return len(self._qualifying(sku, gpus=gpus)) >= count
+
+    def launch(self, spec: LaunchSpec) -> list[str]:
+        offers = self._qualifying(spec.sku, gpus=spec.gpus_per_pod,
+                                  exclude=spec.exclude_ids)
+        if len(offers) < spec.count:
+            raise ProvisionError(
+                f"vast: only {len(offers)} qualifying {spec.gpus_per_pod}×{spec.sku} "
+                f"offer(s)"
+                f"{' after exclusions' if spec.exclude_ids else ''}, need {spec.count}")
+        ids: list[str] = []
+        for i, offer in enumerate(offers[:spec.count]):
+            body = vast_create_body(spec, label=f"{spec.name_prefix}-{i}",
+                                    disk_gb=self.disk_gb)
+            resp = self._request("PUT", f"/asks/{offer['id']}/", body=body)
+            contract = resp.get("new_contract") if isinstance(resp, dict) else None
+            if not resp.get("success", False) or not contract:
+                raise ProvisionError(f"vast create on ask {offer['id']} failed: {resp}")
+            log.info("vast rent → %s (machine %s, %s, $%.3f/hr, reliability %.3f)",
+                     contract, offer.get("machine_id"), offer.get("geolocation"),
+                     float(offer.get("dph_total", 0.0)),
+                     float(offer.get("reliability2", 0.0)))
+            ids.append(str(contract))
+            self._machines[str(contract)] = str(offer.get("machine_id", ""))
+        return ids
+
+    def _instance(self, pod_id: str) -> dict:
+        out = self._get(f"/instances/{pod_id}/")
+        inst = out.get("instances") if isinstance(out, dict) else None
+        if isinstance(inst, list):
+            return inst[0] if inst else {}
+        return inst if isinstance(inst, dict) else (out if isinstance(out, dict) else {})
+
+    def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
+        deadline = self._now() + timeout
+        last = None
+        while self._now() < deadline:
+            inst = self._instance(pod_id)
+            status = str(inst.get("actual_status") or "").lower()
+            if status in VAST_TERMINAL_BAD:
+                raise ProvisionError(
+                    f"vast instance {pod_id} entered {status!r}: "
+                    f"{inst.get('status_msg') or 'no reason given'}")
+            if status == VAST_READY and vast_pod_address(inst) is not None:
+                return True
+            if status != last:
+                log.info("vast %s status %s — waiting for %s + address",
+                         pod_id, status or "?", VAST_READY)
+                last = status
+            self._sleep(self.poll_interval)
+        return False
+
+    def get_ip(self, pod_id: str) -> PodAddress | None:
+        return vast_pod_address(self._instance(pod_id))
+
+    def machine_of(self, pod_id: str) -> str | None:
+        """The physical machine behind a pod — the lemon-exclusion key.
+
+        Vast DOES support this (unlike runpod): launches pick an explicit
+        offer, so a machine that failed its boot gate can be excluded from the
+        replacement's offer list instead of being re-rented deterministically.
+        """
+        cached = self._machines.get(str(pod_id))
+        if cached:
+            return cached
+        mid = str(self._instance(pod_id).get("machine_id") or "")
+        return mid or None
+
+    def launched_image_digest(self, pod_id: str) -> str:
+        try:
+            inst = self._instance(pod_id)
+        except Exception:  # noqa: BLE001 — attestation is best-effort, gate decides
+            return ""
+        return image_digest_of(str(inst.get("image") or inst.get("image_uuid") or ""))
+
+    def terminate(self, pod_id: str) -> None:
+        try:
+            self._request("DELETE", f"/instances/{pod_id}/")
+            log.info("vast destroy %s", pod_id)
+        except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
+            log.warning("vast destroy %s: %s (treating as already terminated)", pod_id, e)
+        finally:
+            self._machines.pop(str(pod_id), None)
+
+    def list_tagged(self, prefix: str) -> list[str]:
+        """Live instance IDs whose ``label`` starts with ``prefix``.
+
+        Vast names the field ``label``; normalize to ``name`` so the shared
+        reconcile primitive stays the one implementation.
+        """
+        out = self._get("/instances/")
+        rows = out.get("instances", []) if isinstance(out, dict) else (out or [])
+        return filter_tagged_names(
+            [{"name": r.get("label"), "id": r.get("id")} for r in rows if isinstance(r, dict)],
+            prefix, id_key="id")
+
+    def offer_price(self, sku: str, *, gpus: int = 1) -> float | None:
+        """Cheapest QUALIFYING per-pod USD/hr (``dph_total`` covers the box)."""
+        return vast_offer_price_usd_hr(self._bundles(sku, gpus=gpus), sku, gpus=gpus,
+                                       **self._floors)
 
 
 _PROVIDER_FACTORIES: dict[str, Callable[[], Provider]] = {
     "lium": LiumProvider,
     "shadeform": ShadeformProvider,
+    "runpod": RunPodProvider,
+    "vast": VastProvider,
     # "targon": TargonProvider,  # seam: add for SKUs where Targon has capacity.
 }
 

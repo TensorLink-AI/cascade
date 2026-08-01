@@ -73,6 +73,30 @@ bootstrap_timeout_s = 1800
 pod_user            = "root"
 shadeform_ssh_key_id = "<SHADEFORM-SSH-KEY-ID>"  # `curl api.shadeform.ai/v1/sshkeys`
 
+# ── extra marketplace adapters (registered, NOT yet in any ladder) ───────────
+# runpod and vast are wired but UNPROVEN on a live cascade round: their response
+# parsing is unit-tested against recorded shapes, nothing more. Smoke-test with
+# --dry-run, then one testnet heat rung, before adding either to `providers`
+# above. See docs/DEPLOY_PODS.md ("Marketplace adapters").
+#
+# runpod — Secure Cloud is its own/partner DCs (not a broker pool), which is
+# what the FINAL wants; its gpu-type ids ARE the nvidia-smi strings, so a stage
+# using it needs no market_sku. Prices are per GPU-hour and the adapter
+# multiplies by the pod shape for the budget breaker.
+# [provisioner.provider_options.runpod]
+# cloud_type = "SECURE"          # "COMMUNITY" = the cheaper host marketplace
+# disk_gb    = 60
+#
+# vast — cheapest consumer silicon, and the most heterogeneous supply here. The
+# HEAT ranks runs ACROSS pods, so machine spread becomes rank spread
+# (DEC-CA-0010): these floors are the contract, not tuning. min_cpu_cores_per_gpu
+# guards the stream_cpu generator that actually feeds training.
+# [provisioner.provider_options.vast]
+# verified_only         = true
+# min_reliability       = 0.98
+# min_cpu_cores_per_gpu = 4.0
+# disk_gb               = 60
+
 ssh_pubkey    = "~/.ssh/lium_cascade_ed25519.pub"
 ssh_key_path  = "~/.ssh/lium_cascade_ed25519"
 remote_python = "/root/cascade/.venv/bin/python"
@@ -138,6 +162,12 @@ max_price_hr = 1.20
 # train in parallel lanes on identical silicon). Fallback: two 1-GPU pods.
 # NOTE: lium mostly lists L40 (a DIFFERENT device — fails the pin); shadeform
 # carries true L40S — hence shadeform first for this stage.
+# Shadeform is a BROKER: it resells whichever backend was cheapest, so a flaky
+# round here is usually one bad underlying cloud rather than the marketplace.
+# Once smoke-tested, `providers = ["runpod", "shadeform", "lium"]` puts a real
+# operator (RunPod Secure Cloud) in front on the one stage where a zombie
+# rental costs the round — the sku string needs no change, runpod's gpu-type
+# ids are the nvidia-smi strings.
 
 [provisioner.final]
 sku          = "NVIDIA L40S"

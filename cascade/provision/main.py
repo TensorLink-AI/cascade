@@ -45,6 +45,31 @@ log = logging.getLogger("cascade.provision.main")
 # ── config (pure parse + validation; tested) ─────────────────────────────────
 
 
+def _validate_provider_opts(opts: dict[str, dict]) -> None:
+    """Reject provider kwargs the named adapter does not accept.
+
+    ``build_providers`` would raise a bare ``TypeError`` from the dataclass
+    constructor; this turns it into the same actionable ProvisionError as every
+    other config mistake, and names the accepted keys. Unknown PROVIDER names
+    are left to ``build_providers`` (which already lists the known adapters).
+    """
+    import dataclasses
+
+    from .core import _PROVIDER_FACTORIES
+
+    for name, kwargs in opts.items():
+        factory = _PROVIDER_FACTORIES.get(name)
+        if factory is None or not dataclasses.is_dataclass(factory):
+            continue
+        known = {f.name for f in dataclasses.fields(factory) if f.init
+                 and not f.name.startswith("_")}
+        unknown = sorted(set(kwargs) - known)
+        if unknown:
+            raise ProvisionError(
+                f"[provisioner.provider_options.{name}] unknown key(s) "
+                f"{', '.join(unknown)}; {name} accepts: {', '.join(sorted(known))}")
+
+
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     """One ``[provisioner.heat|final|eval]`` table → a validated :class:`StagePolicy`."""
     sku = str(raw.get("sku", "")).strip()
@@ -533,6 +558,18 @@ def _run(args) -> int:
     provider_opts: dict[str, dict] = {}
     if top.get("shadeform_ssh_key_id"):
         provider_opts["shadeform"] = {"ssh_key_id": str(top["shadeform_ssh_key_id"])}
+    # Generic per-adapter knobs: [provisioner.provider_options.<name>]. Keys map
+    # straight onto the adapter's constructor (e.g. runpod's cloud_type, vast's
+    # min_cpu_cores_per_gpu), so a typo is caught HERE against the adapter's own
+    # field list — not swallowed as a silently-ignored quality floor, which on
+    # the vast adapter would mean renting the heat off unvetted machines.
+    for pname, opts in (top.get("provider_options", {}) or {}).items():
+        if not isinstance(opts, dict):
+            raise ProvisionError(
+                f"[provisioner.provider_options.{pname}] must be a table of "
+                f"constructor kwargs; got {type(opts).__name__}")
+        provider_opts.setdefault(pname, {}).update(opts)
+    _validate_provider_opts(provider_opts)
     providers = {p.name: p for p in build_providers(provider_names, provider_opts)}
 
     hippius_probe = None
