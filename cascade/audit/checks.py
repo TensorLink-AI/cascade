@@ -340,7 +340,7 @@ def _pooled_scores(
     pooled them (paired sizes in manifest order, per-size scores concatenated).
 
     ``hotkey`` selects which challenger of a multi-finalist cohort to pool
-    (DEC-CA-0010); ``None`` takes the last one recorded, which is the challenger
+    (DEC-CA-0012); ``None`` takes the last one recorded, which is the challenger
     the receipt's verdict belongs to under the cohort rule — the crowned clearer,
     or the challenger that stopped an inconclusive cohort. Keying by ``(role,
     size)`` alone would silently collapse the cohort to one arbitrary entrant,
@@ -368,7 +368,7 @@ def _pooled_scores(
 
 
 def _cohort_params(params, manifest: TrainingManifest):
-    """``params`` with the duel's family-wise alpha applied (DEC-CA-0010).
+    """``params`` with the duel's family-wise alpha applied (DEC-CA-0012).
 
     ``bootstrap_alpha / k`` where ``k = len(manifest.duel_cohort())`` — the same
     derivation the validator ran, off the same signed manifest. ``k <= 1`` returns
@@ -384,7 +384,7 @@ def _cohort_params(params, manifest: TrainingManifest):
 
 
 def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
-    """Verify the cohort duel's SELECTION, not just its verdict (DEC-CA-0010).
+    """Verify the cohort duel's SELECTION, not just its verdict (DEC-CA-0012).
 
     With one challenger this is a no-op skip. With a cohort it replays every
     recorded challenger against the king under the corrected alpha and checks the
@@ -549,7 +549,7 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     # each known aggregation and take the one that reproduces the recorded LCB.
     # This is self-verifying: reproducing an LCB to 1e-9 under the wrong rule is
     # not something a mis-scored or tampered receipt does by accident.
-    # Family-wise alpha (DEC-CA-0010): the round was judged at
+    # Family-wise alpha (DEC-CA-0012): the round was judged at
     # ``bootstrap_alpha / k``, k = the advanced cohort size. The receipt records
     # the UNMODIFIED config params on purpose — a mutated alpha there would fail
     # ``check_koth_params`` against the published ``[scoring]`` — so re-derive the
@@ -632,7 +632,7 @@ def check_transition(receipt: RoundReceipt) -> CheckResult:
     except (ValueError, KeyError) as e:
         return _fail(name, f"embedded manifest unparseable: {e}")
     # The challenger the verdict belongs to — the last one scored, which under the
-    # cohort rule is the crowned clearer (DEC-CA-0010). Taking the manifest's
+    # cohort rule is the crowned clearer (DEC-CA-0012). Taking the manifest's
     # FIRST challenger would misattribute the throne on any multi-finalist round.
     duelled = _duelled_hotkeys(receipt)
     chal = next(

@@ -61,6 +61,12 @@ round:
    per entrant and a `leader_lcb` against the runner-up on the manifest's heat
    block, saying how decisive the screen was. Those are **diagnostics only** —
    the finalists are the observed ranking, never a bounded one (DEC-CA-0006).
+   The standings are published the moment the heat settles — `status/heat.json`
+   plus a per-round `heats/round-<id>.json` and `heats/index.json`
+   (`cascade.shared.heat_status`) — so the dashboards and `cascade heat` show a
+   miner where it placed while the duel is still training, instead of waiting
+   for the round's receipt hours later. Presentational and unsigned, exactly
+   like the manifest's copy.
 5. **Final.** For the king and each surviving finalist, at **every configured
    size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
    **under that one shared seed pair**:
@@ -79,6 +85,14 @@ round:
      `[wandb] enabled`, mirroring the *same* records into a live wandb run — one
      per round/competitor/size, tagged with the miner hotkey — so miners can watch
      their generator train as it occurs; observability only, never fed to scoring),
+   - stamps one **host** record per run before the corpus stream opens
+     (`cascade.trainer.host_probe`, `[telemetry]`): lane geometry, CPU/GPU
+     capability, opaque pod + machine ids, and a *fixed* calibration bench
+     (`host_bench_tokens_per_s`) that is identical on every pod and independent of
+     the submission. It rides the same log channel and is what separates
+     pod-attributable slowness from generator-attributable slowness — the wall
+     prices generator speed deliberately (DEC-CA-0001), and `data_wait_frac` can
+     only rule the *corpus* out. Never signed, never scored,
    - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
      size-tagged ref.
 6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref

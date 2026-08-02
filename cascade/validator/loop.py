@@ -113,7 +113,7 @@ class RoundOutcome:
     # The king's tenure AT decision time (it set the margin); recorded in the
     # receipt so an auditor can recompute margin_for_tenure without validator state.
     king_tenure_rounds: int = 0
-    # The cohort this round judged (DEC-CA-0010), best-clearer-first among those
+    # The cohort this round judged (DEC-CA-0012), best-clearer-first among those
     # that cleared. ``decided_hotkey`` is the crowned challenger — or, when none
     # cleared, the cohort's best point estimate, i.e. the challenger the verdict
     # in ``result`` belongs to. Internal only: NOT receipt fields (VerdictRecord
@@ -121,7 +121,7 @@ class RoundOutcome:
     # of this from the signed manifest plus ``entry_scores``.
     decided_hotkey: str | None = None
     duelled_hotkeys: tuple[str, ...] = ()
-    # Published on the receipt (DEC-CA-0010): the k that set the per-challenger
+    # Published on the receipt (DEC-CA-0012): the k that set the per-challenger
     # alpha, and every duelled challenger's LCB under it. With the verdict's
     # ``margin`` these are the complete input to the selection rule, so a third
     # party checks "who cleared, and was the crowned one the best" without
@@ -462,7 +462,7 @@ class ValidatorRunner:
         if outcome is None or not outcome.transition.dethroned:
             return
         # The crowned challenger, NOT the manifest's first — a multi-finalist
-        # cohort (DEC-CA-0010) carries several, and taking the first would
+        # cohort (DEC-CA-0012) carries several, and taking the first would
         # benchmark a checkpoint that did not take the throne.
         crowned = outcome.transition.new_king_hotkey
         new_king = next(
@@ -638,7 +638,7 @@ class ValidatorRunner:
 
         A round carries one king per trained size (the primary plus any
         ``[[training.sizes]]``) and, when the heat advanced a statistically tied
-        cohort, up to ``[round] max_finalists`` challengers (DEC-CA-0010). For each
+        cohort, up to ``[round] max_finalists`` challengers (DEC-CA-0012). For each
         challenger, every size's pair is scored on the SAME windows and the
         per-size scores are POOLED — king's across sizes vs challenger's across
         sizes, in identical order — so a single paired bootstrap decides ONE
@@ -663,7 +663,7 @@ class ValidatorRunner:
         the receipt keeps recording the UNMODIFIED config params (a mutated alpha
         there would fail ``check_koth_params`` against ``chain.toml``) and the
         audit re-derives the correction itself. At ``k = 1`` this is bit-identical
-        to the pre-DEC-CA-0010 rule.
+        to the pre-DEC-CA-0012 rule.
 
         Returns None (king holds, no state change) when the manifest carries no
         challenger paired with the king at every size, or fails the contract gate.
@@ -716,7 +716,7 @@ class ValidatorRunner:
         # real correlation — every challenger shares the king's scores and one
         # window draw — which over-protects the king rather than under-, the
         # correct side to err on for a change whose failure mode is an
-        # illegitimate dethrone. See DEC-CA-0010.
+        # illegitimate dethrone. See DEC-CA-0012.
         duel_params = (
             base_params if k <= 1
             else replace(base_params, bootstrap_alpha=base_params.bootstrap_alpha / k)
@@ -849,7 +849,7 @@ class ValidatorRunner:
             king_tenure_rounds=tenure_at_decision,
             decided_hotkey=decided_hotkey, duelled_hotkeys=duelled,
             # Only on a genuine cohort: k <= 1 must leave the receipt's signed
-            # bytes exactly as a pre-DEC-CA-0010 round's.
+            # bytes exactly as a pre-DEC-CA-0012 round's.
             cohort_k=(k if k > 1 else 0),
             cohort_lcbs=({hk: r.lcb for hk, _, r in judged} if k > 1 else {}),
         )
@@ -1533,8 +1533,17 @@ def _load_state(path: str) -> ChampionState:
         return ChampionState()
 
 
-def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState | None:
-    """Champion inherited from the signed public receipt trail, or ``None``.
+# First-boot receipt walk: each verified receipt costs one storage GET, so the
+# court derivation is bounded — a trail whose king never changed stops here
+# rather than reading every indexed round. 64 rounds ≈ a month of 12h rounds,
+# far past any plausible run of consecutive same-king receipts hiding a court.
+_BOOTSTRAP_MAX_RECEIPT_READS = 64
+
+
+def _bootstrap_state_from_receipts(
+    store: object, anchor: str, *, keep_former_kings: int = 0
+) -> ChampionState | None:
+    """Champion (and court) inherited from the signed receipt trail, or ``None``.
 
     First-boot inheritance for a validator with no local state: the throne
     otherwise lives only in each validator's private state DB, so a validator
@@ -1554,10 +1563,30 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
     UNTRUSTED pointer to candidate round ids: nothing is adopted except from
     a per-round receipt whose signature verifies against the anchor.
 
-    Anything short of that — missing objects, unreadable JSON, a bad
-    signature, a genesis throne (``king_hotkey`` unset) — returns ``None``
-    and the caller proceeds with the stock blank-slate behaviour. Storage
-    faults must never block validator startup.
+    ``keep_former_kings`` (``[scoring] reward_prior_kings``) additionally
+    seeds ``former_kings``: walking the index newest-first, each *distinct*
+    king recorded by a verified scored receipt is a reign, in recency order —
+    exactly the court ``apply_round`` would have accumulated had this
+    validator witnessed the dethrones itself. Without it a joining validator
+    votes the whole reward mass on the current king while established
+    validators split it across the court, and its vtrust is capped at the
+    consensus share of the top slot (observed 2026-07-31: a converged
+    external validator pinned at vtrust 0.52 — the court head's exact
+    consensus weight). A trail too short to fill the court seeds what it has;
+    the rest accrues from live dethrones. The walk is bounded
+    (``_BOOTSTRAP_MAX_RECEIPT_READS``) so first boot cannot stall on a long
+    index.
+
+    Only a TRULY fresh validator reaches this path (see the caller's gate) —
+    deliberately. ``demote_to_trained`` clears ``former_kings`` because a
+    dropped champion is not an honourably retired one; a bootstrap that
+    re-seeded the court on a validator with existing state would resurrect
+    exactly what the demotion semantics erased.
+
+    Anything short of a verified scored receipt — missing objects, unreadable
+    JSON, a bad signature, a genesis throne (``king_hotkey`` unset) — yields
+    ``None`` for the champion and the caller proceeds with the stock
+    blank-slate behaviour. Storage faults must never block validator startup.
     """
     if not anchor:
         return None
@@ -1569,7 +1598,8 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
     )
     from ..shared.receipt import load_receipt, verify_receipt_signature
 
-    def _adopt_from(key: str) -> ChampionState | None:
+    def _verified_throne(key: str) -> tuple[str, int, str] | None:
+        """(king_hotkey, king_uid, round_id) from a verified scored receipt."""
         try:
             text = store.get_text(key)
         except Exception:  # noqa: BLE001 — absent/unreachable key ⇒ next candidate
@@ -1586,26 +1616,47 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
         v = receipt.verdict
         if receipt.status != "scored" or v is None or not v.king_hotkey or v.king_uid is None:
             return None
-        log.info("receipt bootstrap: adopting champion %s (uid %d) from signed scored "
-                 "receipt round=%s", v.king_hotkey, int(v.king_uid), receipt.round_id)
-        return ChampionState(king_hotkey=str(v.king_hotkey), king_uid=int(v.king_uid))
+        return str(v.king_hotkey), int(v.king_uid), str(receipt.round_id)
 
-    adopted = _adopt_from(receipt_latest_key(anchor)) or _adopt_from(RECEIPT_LATEST_KEY)
-    if adopted is not None:
-        return adopted
-    try:
-        rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
-    except Exception:  # noqa: BLE001 — no index ⇒ nothing more to try
-        rows = []
-    # Index rows are chronological (oldest first, capped at most-recent);
-    # walk newest-first and adopt the first scored round that verifies.
+    throne = (_verified_throne(receipt_latest_key(anchor))
+              or _verified_throne(RECEIPT_LATEST_KEY))
+    rows: list = []
+    if throne is None or keep_former_kings > 0:
+        try:
+            rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
+        except Exception:  # noqa: BLE001 — no index ⇒ nothing beyond latest.json
+            rows = []
+    # Index rows are chronological (oldest first, capped at most-recent); walk
+    # newest-first. The first verified scored round supplies the champion when
+    # latest.json did not; every older distinct king fills the court.
+    court: list[str] = []
+    reads = 0
     for row in reversed(rows):
+        if throne is not None and len(court) >= keep_former_kings:
+            break
         if str(row.get("status")) != "scored":
             continue
-        adopted = _adopt_from(receipt_round_key(str(row.get("round_id", "")), anchor))
-        if adopted is not None:
-            return adopted
-    return None
+        if reads >= _BOOTSTRAP_MAX_RECEIPT_READS:
+            log.warning("receipt bootstrap: stopping after %d receipt reads with "
+                        "%d/%d former kings seeded; the rest accrue from live "
+                        "dethrones", reads, len(court), keep_former_kings)
+            break
+        reads += 1
+        found = _verified_throne(receipt_round_key(str(row.get("round_id", "")), anchor))
+        if found is None:
+            continue
+        if throne is None:
+            throne = found
+        elif found[0] != throne[0] and found[0] not in court:
+            court.append(found[0])
+    if throne is None:
+        return None
+    king_hotkey, king_uid, round_id = throne
+    log.info("receipt bootstrap: adopting champion %s (uid %d) from signed scored "
+             "receipt round=%s; former_kings=%s", king_hotkey, king_uid, round_id,
+             court or "[]")
+    return ChampionState(king_hotkey=king_hotkey, king_uid=king_uid,
+                         former_kings=tuple(court))
 
 
 def _warm_start_installer(path: Path) -> Callable[[object], None]:
@@ -1684,7 +1735,8 @@ def build_runner(
         anchor = cfg.manifest.validator_hotkey or cfg.manifest.trainer_hotkey
         try:
             adopted = _bootstrap_state_from_receipts(
-                open_manifest_store(cfg.storage), anchor)
+                open_manifest_store(cfg.storage), anchor,
+                keep_former_kings=cfg.scoring.reward_prior_kings)
         except Exception as e:  # noqa: BLE001 — storage must never block startup
             log.warning("receipt bootstrap skipped (%s); starting blank", e)
             adopted = None

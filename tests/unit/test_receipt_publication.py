@@ -83,7 +83,7 @@ def test_process_round_threads_scores_per_size(two_size_cfg):
     m = _multi_manifest(two_size_cfg, sizes=("toto2-4m", "toto2-test-xl"))
     outcome = runner.process_round(m, [], 7)
     # Every king size first, then the challenger's: the king is evaluated ONCE and
-    # its scores reused across the cohort (DEC-CA-0010), which is what makes an
+    # its scores reused across the cohort (DEC-CA-0012), which is what makes an
     # extra challenger cost one extra eval rather than two.
     assert [(e.role, e.size) for e in outcome.entry_scores] == [
         ("king", "toto2-4m"), ("king", "toto2-test-xl"),

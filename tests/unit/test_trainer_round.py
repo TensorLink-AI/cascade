@@ -254,6 +254,116 @@ def test_round_stage_reported_heat_duel_validation(cfg, tmp_path, monkeypatch):
     assert len({d["epoch_start_block"] for d in stage_docs}) == 1
 
 
+def test_heat_standings_published_when_the_heat_settles_not_after_the_duel(
+        cfg, tmp_path, monkeypatch):
+    """The public heat mirror (status/heat.json + heats/) is written the moment
+    the heat settles — BEFORE the duel trains, let alone before a validator
+    scores it. The same standings ride the manifest, but that only reaches the
+    public through a receipt hours later (and never for a round rejected at a
+    gate), by which time a miner's next submission deadline can have passed."""
+    _patch_train_boundaries(monkeypatch)
+    events: list[str] = []
+
+    class _Store:
+        def __init__(self):
+            self.objects: dict[str, str] = {}
+
+        def put_text(self, key, text, *, content_type="", acl=None):
+            events.append(key)
+            self.objects[key] = text
+
+        def get_text(self, key):
+            if key not in self.objects:
+                raise StorageError(key)
+            return self.objects[key]
+
+    store = _Store()
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    runner._manifest_store = store
+    train_final = runner._train_final
+    runner._train_final = lambda *a, **k: (events.append("duel-trains"), train_final(*a, **k))[1]
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+
+    assert events.index("status/heat.json") < events.index("duel-trains")
+    assert events.index("heats/index.json") < events.index("duel-trains")
+    doc = json.loads(store.objects["status/heat.json"])
+    assert doc == json.loads(store.objects["heats/round-1.json"])
+    assert doc["round_id"] == "1" and doc["screened"] == 3
+    assert doc["epoch_start_block"] == (10 // cfg.round.epoch_blocks) * cfg.round.epoch_blocks
+    # the standings themselves: identical to the manifest's (unsigned) heat block
+    from cascade.shared.manifest import heat_to_json
+
+    body = heat_to_json(manifest.heat)
+    assert {k: doc[k] for k in body} == body
+    assert [(e["uid"], e["status"]) for e in doc["entrants"]] == [
+        (2, "advanced"), (3, "screened"), (1, "screened")]
+    index = json.loads(store.objects["heats/index.json"])
+    assert [h["round_id"] for h in index["heats"]] == ["1"]
+    assert index["heats"][0]["leader_hotkey"] == "c"
+
+
+def test_heat_standings_published_for_a_round_with_no_screen(cfg, tmp_path, monkeypatch):
+    """Field ≤ finalists ⇒ nothing screened, but the mirror still publishes with
+    the reason: a silent round would leave the live pointer serving the PREVIOUS
+    round's standings as if they were this round's."""
+    _patch_train_boundaries(monkeypatch)
+    monkeypatch.setattr(loop_mod, "publish_manifest",
+                        lambda store, text, rid: f"manifests/round-{rid}.json")
+
+    class _Store:
+        def __init__(self):
+            self.objects: dict[str, str] = {}
+
+        def put_text(self, key, text, *, content_type="", acl=None):
+            self.objects[key] = text
+
+        def get_text(self, key):
+            raise StorageError(key)
+
+    store = _Store()
+    # A screener IS wired — the field simply fits within the finalist slots, so
+    # no heat compute is spent and every entrant advances unscreened.
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: 0.5)
+    runner._manifest_store = store
+    runner.run_round([_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)],
+                     king_hotkey="a", base_seed=7, block=10)
+
+    doc = json.loads(store.objects["status/heat.json"])
+    assert doc["round_id"] == "7" and doc["no_screen"] is True
+    assert doc["entrants"] == [] and doc["screened"] == 1
+    assert doc["finalists"] == cfg.round.finalists
+    assert "finalist slot" in doc["no_screen_reason"]
+
+
+def test_heat_standings_publish_failure_never_sinks_the_round(cfg, tmp_path, monkeypatch):
+    """Presentational and unsigned: a storage failure must not disturb the round
+    it describes."""
+    _patch_train_boundaries(monkeypatch)
+
+    class _Boom:
+        def put_text(self, *a, **k):
+            raise StorageError("hippius down")
+
+        def get_text(self, *a, **k):
+            raise StorageError("hippius down")
+
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: 0.5)
+    runner._manifest_store = _Boom()
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7)]
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.heat is not None  # the round completed with its standings
+
+
 def test_round_stage_reporting_off_by_default(cfg, tmp_path, monkeypatch):
     """Offline runs and tests must never touch storage: without
     publish_stage_status the round publishes no stage docs."""

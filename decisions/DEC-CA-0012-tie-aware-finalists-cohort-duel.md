@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0010
+id: DEC-CA-0012
 type: decision
 title: "Finalist count responds to the screen's own statistic; the tied cohort all duel under a family-wise alpha"
 status: active

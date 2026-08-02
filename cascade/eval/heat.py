@@ -177,10 +177,10 @@ def tied_set(
     but a field-size-dependent bar would let the same two generators separate or
     not depending on how many unrelated entrants showed up, and could be gamed by
     padding the field. ``cap`` is the control instead. See
-    ``decisions/DEC-CA-0010-tie-aware-finalists-cohort-duel.md``.
+    ``decisions/DEC-CA-0012-tie-aware-finalists-cohort-duel.md``.
 
     Degrades safely: no diagnostics (a scalar-only screener, an unpaired field, a
-    single entrant) returns just the leader, i.e. exactly the pre-DEC-CA-0010
+    single entrant) returns just the leader, i.e. exactly the pre-DEC-CA-0012
     behaviour. ``cap <= 0`` returns empty.
     """
     if cap <= 0 or not ranked_keys:

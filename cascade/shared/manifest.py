@@ -147,10 +147,10 @@ class TrainedEntry:
     size: str = ""            # arch_preset this entry was trained at ("" = primary/legacy).
                               # A round carries one king per size and, when the heat
                               # advanced a tied cohort, up to ``max_finalists``
-                              # challengers per size (DEC-CA-0010).
+                              # challengers per size (DEC-CA-0012).
     bench_scores: BenchScores | None = None  # trainer-signed public-benchmark scores (king only)
     # Heat placement within the advancing cohort, 0-based, best observed geomean
-    # first (DEC-CA-0010). Record order only — the validator judges the WHOLE
+    # first (DEC-CA-0012). Record order only — the validator judges the WHOLE
     # cohort and crowns the best margin-clearer, so this never decides the
     # throne; it exists so every validator serialises ``entry_scores`` in one
     # order and the dashboard can show the screen's ranking. Dropped from
@@ -269,7 +269,11 @@ def _bench_from_json(obj: object) -> BenchScores | None:
     )
 
 
-def _heat_to_json(heat: HeatResult | None) -> dict | None:
+def heat_to_json(heat: HeatResult | None) -> dict | None:
+    """The heat block's JSON shape. Public because the trainer publishes the
+    SAME shape mid-round as the standalone heat mirror
+    (:mod:`cascade.shared.heat_status`) — one shape means the dashboards render
+    a live heat and a settled round's heat with one code path."""
     if heat is None:
         return None
     return {
@@ -358,7 +362,7 @@ class TrainingManifest:
         ``[[training.sizes]]``) per distinct miner. Order follows the manifest's
         entry order, which the trainer emits size-by-size.
 
-        NOTE: with a multi-finalist cohort (DEC-CA-0010) the challenger role has
+        NOTE: with a multi-finalist cohort (DEC-CA-0012) the challenger role has
         one entry per (hotkey, size), so keying the result by ``size`` alone
         silently drops challengers. Use :meth:`challenger_cohort`.
         """
@@ -371,7 +375,7 @@ class TrainingManifest:
         the hotkey breaking ties so a legacy manifest (every ``duel_rank`` 0) is
         still ordered identically by every validator. This is *record* order, not
         precedence — the validator judges the whole cohort and crowns the best
-        margin-clearer (DEC-CA-0010), so nothing about the throne depends on it.
+        margin-clearer (DEC-CA-0012), so nothing about the throne depends on it.
 
         Grouping by hotkey rather than size is the whole point: one generator
         competes at every size, and the pooled decision needs all of a
@@ -405,7 +409,7 @@ class TrainingManifest:
         still decided on the rest. That is long-standing behaviour and it is
         preserved exactly for a single challenger.
 
-        With a cohort (DEC-CA-0010) the crowning step compares challengers by
+        With a cohort (DEC-CA-0012) the crowning step compares challengers by
         observed geomean, so they must be scored on the SAME sizes or the
         comparison is meaningless. Challengers are therefore grouped by the size
         set they share with the king and only the **maximal** group is duelled:
@@ -491,7 +495,7 @@ def dump_manifest(manifest: TrainingManifest) -> str:
     # single-finalist round, and every manifest predating this field) serialises
     # byte-for-byte as before — no wire-format break, no version bump.
     if manifest.heat is not None:
-        body["heat"] = _heat_to_json(manifest.heat)
+        body["heat"] = heat_to_json(manifest.heat)
     return json.dumps(body, indent=2, sort_keys=True)
 
 

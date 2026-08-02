@@ -122,7 +122,7 @@ def apply_round(
     ``challenger_hotkey`` is the round's *decided* challenger — the crowned
     margin-clearer, or the best of the cohort when none cleared.
     ``defeated_hotkeys`` are the other challengers the validator duelled this
-    round (DEC-CA-0010); their streaks reset. That includes a challenger which
+    round (DEC-CA-0012); their streaks reset. That includes a challenger which
     cleared the margin but was not crowned: a streak is a claim on the throne and
     only one challenger can hold that claim per round, so a non-crowned clearer
     does not bank progress toward ``dethrone_cp``. Dormant at ``dethrone_cp = 1``.

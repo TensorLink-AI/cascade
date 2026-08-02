@@ -18,14 +18,22 @@ from cascade.miner.dashboard import (
     LiveFeed,
     PhaseEstimate,
     RoundTimeline,
+    fetch_public_heat,
+    fetch_public_heat_index,
+    fetch_public_heat_round,
     fetch_public_receipt_index,
     fetch_public_round_status,
     format_duration,
+    heat_block,
+    heat_headline,
+    heat_rows,
     latest_settled_before,
     outcome_line,
     phase_for,
     phase_from_live,
     render,
+    render_heat,
+    render_heat_index,
     round_status,
     run_dashboard,
     seconds_per_block,
@@ -140,7 +148,8 @@ def test_cmd_round_wiring(monkeypatch, cfg, capsys):
                         lambda *_a, **_k: replace(cfg, round=RoundConfig(epoch_blocks=7200)))
     from cascade.shared.chain import ChainClient
     monkeypatch.setattr(ChainClient, "from_config", classmethod(lambda cls, *a, **k: client))
-    args = types.SimpleNamespace(chain_toml=None, network="test", once=True, refresh=30.0)
+    args = types.SimpleNamespace(chain_toml=None, network="test", once=True,
+                                refresh=30.0, hotkey=None)
     rc = cli._cmd_round(args)
     assert rc == 0
     assert "until next round" in capsys.readouterr().out
@@ -155,7 +164,8 @@ def test_cmd_round_chain_error_exits_3(monkeypatch, cfg, capsys):
 
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(ChainClient, "from_config", classmethod(lambda cls, *a, **k: _Dead()))
-    args = types.SimpleNamespace(chain_toml=None, network="test", once=True, refresh=30.0)
+    args = types.SimpleNamespace(chain_toml=None, network="test", once=True,
+                                refresh=30.0, hotkey=None)
     rc = cli._cmd_round(args)
     assert rc == 3
     assert "chain error" in capsys.readouterr().err
@@ -473,3 +483,192 @@ def test_fetch_public_round_status(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
     assert fetch_public_round_status(_Storage()) is None
+
+
+# ── heat standings (public heat mirror) ──────────────────────────────────────
+
+
+def _heat_doc(**over):
+    from datetime import datetime
+
+    doc = {
+        "schema": 1, "round_id": "1", "epoch_start_block": 14_400,
+        "as_of": datetime.now(UTC).isoformat(), "screened": 4,
+        "screen_size": "s", "finalists": 1,
+        "entrants": [
+            {"uid": 2, "hotkey": "hk-c", "gen_ref": "carol/gen@sha256:" + "c" * 64,
+             "status": "advanced", "rank": 1, "rel_score": 1.0, "p_best": 0.7,
+             "crps": 0.4123, "mase": 1.021},
+            {"uid": 3, "hotkey": "hk-d", "gen_ref": "dave/gen@sha256:" + "d" * 64,
+             "status": "screened", "rank": 2, "rel_score": 1.25, "p_best": 0.3,
+             "crps": 0.5, "mase": 1.2},
+            {"uid": 4, "hotkey": "hk-e", "gen_ref": "eve/gen@sha256:" + "e" * 64,
+             "status": "failed_train"},
+        ],
+        "leader_lcb": 0.031, "n_windows": 120, "n_clusters": 9,
+    }
+    doc.update(over)
+    return doc
+
+
+def test_heat_rows_rank_order_with_unscored_last_and_mine_flagged():
+    rows = heat_rows(_heat_doc(), me="hk-d")
+    assert [(r.rank, r.uid, r.status) for r in rows] == [
+        (1, 2, "advanced"), (2, 3, "screened"), (None, 4, "failed_train")]
+    assert [r.mine for r in rows] == [False, True, False]
+    # a UID identifies you just as well as the ss58
+    assert [r.mine for r in heat_rows(_heat_doc(), me="4")] == [False, False, True]
+    assert heat_rows(None) == [] and heat_rows({"entrants": "nope"}) == []
+
+
+def test_heat_headline_counts_and_no_screen_reason():
+    assert heat_headline(_heat_doc()) == "3 entrants · 1 advanced · screened at s"
+    doc = _heat_doc(entrants=[], no_screen=True,
+                    no_screen_reason="the field fit within the 1 finalist slot(s)")
+    assert heat_headline(doc).startswith("no screen — the field fit within")
+    assert heat_headline(None) == "no heat standings published"
+
+
+def test_heat_block_shows_gap_raw_error_and_always_your_own_row():
+    lines = heat_block(_heat_doc(), me="hk-e", limit=1)
+    assert "3 entrants · 1 advanced" in lines[0]
+    assert "#1" in lines[1] and "best" in lines[1]
+    assert "crps   0.4123" in lines[1] and "mase   1.021" in lines[1]
+    # limit=1 hides ranks 2+, but the caller's own (last-placed) row is kept…
+    assert "← you" in lines[2] and "did not train" in lines[2]
+    # …and the remainder is reported, not silently dropped
+    assert "… 1 more" in lines[-1]
+    # relative gap to the best entrant for a screened-out entrant
+    assert "+25.0%" in "\n".join(heat_block(_heat_doc(), limit=None))
+
+
+def test_render_heat_reports_decisiveness_and_missing_docs():
+    text = render_heat(_heat_doc(), me="hk-c")
+    assert "cascade heat — round 1" in text
+    assert "epoch start block 14400" in text
+    assert "top 1 to the duel" in text
+    assert "leader LCB +0.0310" in text and "separated 1st from 2nd" in text
+    assert "← you" in text
+    # a screen that did NOT separate the top two says so
+    assert "did NOT separate" in render_heat(_heat_doc(leader_lcb=-0.02))
+    assert "no heat standings published yet" in render_heat(None)
+
+
+def test_render_heat_index_lists_published_rounds():
+    doc = {"heats": [
+        {"round_id": "1", "epoch_start_block": 7_200, "n_entrants": 3,
+         "n_advanced": 1, "leader_uid": 2, "leader_lcb": 0.031},
+        {"round_id": "2", "epoch_start_block": 14_400, "n_entrants": 0,
+         "n_advanced": 0, "no_screen": True},
+    ]}
+    text = render_heat_index(doc)
+    assert "2 published heat(s)" in text
+    assert "round 1" in text and "leader uid    2" in text and "lcb +0.0310" in text
+    assert "(no screen)" in text
+    assert "no published heats found" in render_heat_index(None)
+
+
+def test_frame_shows_this_rounds_heat_as_soon_as_it_is_published():
+    # 4h into the round: the duel is still training, and until the heat mirror
+    # existed the standings only appeared with the receipt hours later.
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    out = io.StringIO()
+    run_dashboard(_FeedClient(14_400 + 1200, [_commit(2, "hk-c", 14_000)]), rc, "test",
+                  out=out, timeline=RoundTimeline(1800.0, 10800.0),
+                  heat_fetch=lambda: _heat_doc(), me="hk-d")
+    text = out.getvalue()
+    assert "heat            3 entrants · 1 advanced · screened at s" in text
+    assert "← you" in text
+
+
+def test_frame_ignores_another_rounds_heat_standings():
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    out = io.StringIO()
+    run_dashboard(_FakeClient(21_600 + 60), rc, "test", out=out,
+                  timeline=RoundTimeline(1800.0, 10800.0),
+                  heat_fetch=lambda: _heat_doc())   # epoch_start_block 14_400
+    assert "heat            " not in out.getvalue()
+
+
+def test_fetch_public_heat_docs(monkeypatch):
+    import io as _io
+    import urllib.request
+
+    urls = []
+
+    class _Resp(_io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        urls.append(req.full_url)
+        return _Resp(b'{"schema": 1, "entrants": [], "heats": []}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    base = "https://s3.example.com/cascade-manifests/"
+    assert fetch_public_heat(_Storage())["schema"] == 1
+    assert fetch_public_heat_round(_Storage(), "42")["schema"] == 1
+    assert fetch_public_heat_index(_Storage())["heats"] == []
+    assert urls == [base + "status/heat.json", base + "heats/round-42.json",
+                    base + "heats/index.json"]
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    assert fetch_public_heat(_Storage()) is None
+    assert fetch_public_heat_index(_Storage()) is None
+
+
+# ── `cascade heat` command ───────────────────────────────────────────────────
+
+
+def test_cmd_heat_prints_the_latest_standings(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat",
+                        lambda *_a, **_k: _heat_doc())
+    args = types.SimpleNamespace(chain_toml=None, hotkey="hk-d", round_id=None,
+                                history=False, limit=20)
+    assert cli._cmd_heat(args) == 0
+    out = capsys.readouterr().out
+    assert "cascade heat — round 1" in out and "← you" in out
+
+
+def test_cmd_heat_reads_an_archived_round_and_the_history(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    seen = {}
+
+    def _fetch_round(storage, rid, **_k):
+        seen["rid"] = rid
+        return _heat_doc(round_id=rid)
+
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat_round", _fetch_round)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat_index",
+                        lambda *_a, **_k: {"heats": [
+                            {"round_id": "42", "epoch_start_block": 7_200,
+                             "n_entrants": 3, "n_advanced": 1, "leader_uid": 2}]})
+    args = types.SimpleNamespace(chain_toml=None, hotkey=None, round_id="42",
+                                history=False, limit=20)
+    assert cli._cmd_heat(args) == 0
+    assert seen["rid"] == "42"
+    assert "cascade heat — round 42" in capsys.readouterr().out
+
+    assert cli._cmd_heat(types.SimpleNamespace(
+        chain_toml=None, hotkey=None, round_id=None, history=True, limit=20)) == 0
+    assert "1 published heat(s)" in capsys.readouterr().out
+
+
+def test_cmd_heat_exits_1_when_nothing_is_published(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat", lambda *_a, **_k: None)
+    args = types.SimpleNamespace(chain_toml=None, hotkey=None, round_id=None,
+                                history=False, limit=20)
+    assert cli._cmd_heat(args) == 1
+    assert "no published heat standings" in capsys.readouterr().err
+
+
+def test_heat_registered_in_parser():
+    with pytest.raises(SystemExit) as e:
+        cli.main(["heat", "--help"])
+    assert e.value.code == 0

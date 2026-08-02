@@ -61,21 +61,36 @@ in-context.
   replays under both rules. Trainer + validator must deploy together.
   (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
 
-- **DEC-CA-0010** — `[round] finalists` responds to the screen's own statistic:
+- **DEC-CA-0010** — Host variance is MEASURED, not normalized. Every run stamps a
+  `host` record (lane geometry, CPU/GPU capability, opaque pod + machine ids, and
+  a FIXED pre-stream calibration bench) into the public training log; nothing
+  consumes it. `[telemetry]`, not `[training]` — no `contract_digest` change, no
+  wire-format change. The bench cannot be resized (only disabled), or its numbers
+  stop being poolable across the fleet.
+  (`decisions/DEC-CA-0010-host-telemetry-measure-not-normalize.md`)
+- **DEC-CA-0011** — Heat standings publish when the HEAT settles (trainer →
+  `status/heat.json` + `heats/round-<id>.json` + `heats/index.json`), not when a
+  validator's receipt lands hours later — and they publish for a round rejected
+  at a gate, where the manifest copy never appears. Same field shape as the
+  manifest block, still unsigned/presentational; a no-screen round publishes its
+  reason so the live pointer can't serve the previous round's ranking.
+  (`decisions/DEC-CA-0011-heat-standings-published-at-heat-completion.md`)
+- **DEC-CA-0012** — `[round] finalists` responds to the screen's own statistic:
   a separated leader advances alone, a tied top is re-scored on a larger eval
   (CPU-only, incremental windows via the seeded-prefix property), and survivors
   advance capped. The whole cohort then duels — NOT sequentially (a full paired
   eval is 106s CPU; stopping early saves ~53s per challenger against 3h GPU
   lanes, decides ties by ordering noise, and breaks the alpha correction via
   optional stopping). Gate on LCB ≥ margin, crown the best POINT ESTIMATE among
-  clearers. Per-challenger alpha tightens to `α/k` or `k` challengers triple the
-  king's false-dethrone risk; `k` is derivable from the signed manifest, so the
-  adjusted alpha must NOT go in `VerdictRecord.params`. Screen's drop bar stays
-  0 and uncorrected (field-size-dependent bars are padding-gameable). No
-  heat-based dethrone-hopelessness gate, ever — cross-hardware bias, and u86
-  won with an 8.3% LCB from apparent hopelessness. Ships inert; validator/audit
-  multi-challenger fix goes FIRST.
-  (`decisions/DEC-CA-0010-tie-aware-finalists-cohort-duel.md`)
+  clearers. Per-challenger alpha tightens to `α/k` (quantile, NOT margin) or `k`
+  challengers triple the king's false-dethrone risk; `k` derives from the signed
+  manifest, so the adjusted alpha must NOT go in `VerdictRecord.params`; receipt
+  publishes `cohort_k` + per-challenger LCBs (drop-when-default, signatures
+  survive). Screen's drop bar stays 0 and uncorrected (field-size-dependent bars
+  are padding-gameable). No heat-based dethrone-hopelessness gate, ever —
+  cross-hardware bias, and u86 won with an 8.3% LCB from apparent hopelessness.
+  Ships inert; validator/audit multi-challenger fix goes FIRST.
+  (`decisions/DEC-CA-0012-tie-aware-finalists-cohort-duel.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.

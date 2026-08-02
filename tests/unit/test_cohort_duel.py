@@ -1,4 +1,4 @@
-"""The tie-aware cohort duel (DEC-CA-0010).
+"""The tie-aware cohort duel (DEC-CA-0012).
 
 Covers the three halves of the decision that are shippable ahead of the trainer's
 run-off: the generalised heat tie statistic, the validator judging a whole cohort
@@ -6,7 +6,7 @@ under a family-wise alpha, and the audit verifying the *selection* rather than
 just the verdict.
 
 The invariant that matters most for rollout is that a cohort of ONE is
-bit-identical to the pre-DEC-CA-0010 rule — that is what lets the validator ship
+bit-identical to the pre-DEC-CA-0012 rule — that is what lets the validator ship
 before the trainer ever advances more than one finalist.
 """
 
@@ -169,7 +169,7 @@ def test_tied_set_respects_the_cap_and_rank_order():
 
 def test_tied_set_degrades_to_the_leader_without_diagnostics():
     """A scalar-only screener or an unpaired field must fall back to exactly the
-    pre-DEC-CA-0010 behaviour, never to a wider cohort."""
+    pre-DEC-CA-0012 behaviour, never to a wider cohort."""
     assert tied_set(None, ["a", "b", "c"], cap=3) == ["a"]
 
 

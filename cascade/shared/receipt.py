@@ -198,7 +198,7 @@ class VerdictRecord:
     boot_p50: float | None = None
     boot_p95: float | None = None
 
-    # ── the cohort duel (DEC-CA-0010) ───────────────────────────────────────
+    # ── the cohort duel (DEC-CA-0012) ───────────────────────────────────────
     # Recorded so a third party can check the multiplicity math without trusting
     # the validator or re-deriving anything: ``cohort_k`` is the k that set the
     # per-challenger alpha, and ``cohort_lcbs`` is every duelled challenger's LCB
@@ -280,7 +280,7 @@ def _verdict_body(v: VerdictRecord | None) -> dict | None:
     """One verdict's canonical dict, with the cohort fields omitted at their
     defaults.
 
-    This is what makes the DEC-CA-0010 fields safe to add to a SIGNED structure: a
+    This is what makes the DEC-CA-0012 fields safe to add to a SIGNED structure: a
     single-challenger round — every round archived before the cohort duel existed —
     carries ``cohort_k = 0`` and ``cohort_lcbs = None``, both dropped, so its body
     serialises byte-for-byte as it did before the fields were declared and its
@@ -536,7 +536,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
     entries = receipt.manifest.get("entries", []) if isinstance(receipt.manifest, dict) else []
 
     # The challenger the verdict belongs to: the LAST one scored. Under the cohort
-    # duel (DEC-CA-0010) a round can carry several, and the validator scores the
+    # duel (DEC-CA-0012) a round can carry several, and the validator scores the
     # crowned clearer last — taking the first would attribute the round to a
     # challenger that did not take the throne.
     duelled = [es.hotkey for es in receipt.entry_scores if es.role == "challenger"]
@@ -621,7 +621,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "chal_geomean": v.chal_geomean if v else None,
         "lcb": v.lcb if v else None,
         "margin": v.margin if v else None,
-        # Cohort duel (DEC-CA-0010). ``cohort_k`` is 0/absent on a single-challenger
+        # Cohort duel (DEC-CA-0012). ``cohort_k`` is 0/absent on a single-challenger
         # round. ``cohort_alpha`` is derived, not stored: the correction tightens
         # the bootstrap QUANTILE (the LCB becomes this percentile of the paired
         # distribution) while ``margin`` above stays flat.
