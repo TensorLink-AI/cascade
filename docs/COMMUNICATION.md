@@ -84,9 +84,10 @@ The benchmark sidecar (`benchmarks/`, or an SSH eval pod via `--eval-hosts`) is
 `[eval] run_benchmarks` (log-only numbers on a dethrone), `[scoring]
 gift_gate_mode` (the gift-eval gate — the only mode in which the sidecar is
 load-bearing, since `enforce` turns a sidecar failure into an inconclusive
-round), and `[scoring] cascade_enabled` (warm-start promotion, which prefers
-the trainer-signed `bench_scores` on the manifest and touches the sidecar only
-as a non-consensus-safe fallback for manifests that carry none).
+round), and `[scoring] cascade_enabled` (warm-start promotion, which reads the
+trainer-signed per-round bench report — `benchmarks/round-<id>.json`, falling
+back to the in-entry `bench_scores` on older manifests — and never runs the
+sidecar itself; a round with neither simply contributes no bench numbers).
 
 Deliberately **not** on the list: the TSBench-Forge raw-data bucket. Validators
 consume forge data only through the built pool snapshots (channel 5). The raw

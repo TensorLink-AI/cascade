@@ -585,13 +585,21 @@ class EvalConfig:
     gift_gate_num_samples: int = 0
     gift_gate_data_dir: str = ""
     gift_gate_timeout_s: int = 3600
-    # Cascade king-eval coverage (see cascade.validator.cascade). Cap on datasets
-    # per suite when the trainer scores the king's checkpoint on GIFT-Eval / BOOM /
+    # Cascade duel-eval coverage (see cascade.validator.cascade). Cap on datasets
+    # per suite when the trainer scores the duel checkpoints on GIFT-Eval / BOOM /
     # TIME. ``0`` = the FULL battery (all configs) — the default, since Cascade's
     # promotion should see the whole eval. Kept separate from the log-only
     # ``benchmark_max_series`` so tightening telemetry never quietly shrinks the
     # Cascade decision. Set a positive cap only to speed up testnet iteration.
     cascade_bench_max_series: int = 0
+    # Cascade post-publish bench hold (see provision.policy.bench_hold_active):
+    # how long the provisioner may keep the round's FINAL pod alive past its
+    # normal teardown signal while the duel bench runs, in hours. The hold ends
+    # the moment the trainer's bench_complete marker lands (report uploaded or
+    # bench failed); this cap only bounds a crashed/wedged bench. Inert while
+    # ``[scoring] cascade_enabled`` is off — the trainer never writes the
+    # pending marker and the provisioner never arms the hold.
+    bench_hold_max_hours: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -1165,6 +1173,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_data_dir=str(e.get("gift_gate_data_dir", "")),
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
             cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
+            bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),

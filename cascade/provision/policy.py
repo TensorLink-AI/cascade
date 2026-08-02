@@ -312,6 +312,35 @@ def within_budget(
     return (projected <= max_spend, projected)
 
 
+def bench_hold_active(
+    *,
+    held_since: float | None,
+    bench_done: bool,
+    now: float,
+    hold_max_hours: float,
+) -> bool:
+    """Whether the Cascade post-publish duel bench is holding the FINAL pods.
+
+    The trainer drops ``bench_pending.json`` just before publishing the
+    manifest (only when ``[scoring] cascade_enabled`` — the marker never exists
+    otherwise) and ``bench_complete.json`` when the bench report is uploaded OR
+    the bench failed. ``held_since`` is when the provisioner FIRST observed the
+    live pending marker, on the same injected clock as ``now`` (never a file
+    mtime — those are wall-clock and would not compose with the injected clock;
+    ``None`` = no live marker). The hold is active while the marker is live,
+    the complete marker has not landed (``bench_done``), and less than
+    ``hold_max_hours`` have elapsed since first observation — past the cap the
+    pod is reaped regardless (a crashed trainer must never turn the hold into
+    an eternally-billing pod; the extra pod-hours up to the cap are the
+    accepted cost of benching on the pod that holds the checkpoint).
+    ``hold_max_hours <= 0`` disables the hold entirely, which is also how a
+    cascade-disabled deployment wires it.
+    """
+    if hold_max_hours <= 0 or bench_done or held_since is None:
+        return False
+    return (now - held_since) < hold_max_hours * 3600.0
+
+
 def teardown_due(
     stage: str,
     *,
@@ -322,6 +351,7 @@ def teardown_due(
     ttl_hours: float,
     receipt_seen: bool = False,
     newer_manifest: bool = False,
+    bench_hold: bool = False,
 ) -> bool:
     """Whether a pod of ``stage`` should be terminated NOW.
 
@@ -342,6 +372,12 @@ def teardown_due(
     round they served (``newer_manifest`` — those evals are moot; the new
     round gets its own pod).
 
+    ``bench_hold`` (see :func:`bench_hold_active`) suspends the manifest-driven
+    teardown for **final** pods ONLY: the Cascade post-publish duel bench runs
+    on the pod that trained each checkpoint, and the manifest — its normal
+    death signal — publishes *before* the bench starts. It never extends a
+    heat or eval pod, and never the TTL.
+
     The TTL is the hard backstop for EVERY stage: ``rented_at``/``now`` are
     seconds on the same (injected) clock, and once ``ttl_hours`` have elapsed
     the pod dies regardless of signals — a crashed trainer, a silent
@@ -355,7 +391,7 @@ def teardown_due(
     if stage == "eval":
         return receipt_seen or newer_manifest
     if manifest_seen:
-        return True
+        return not (stage == "final" and bench_hold)
     return stage == "heat" and heat_marker_seen
 
 

@@ -826,6 +826,105 @@ def test_manifest_tears_down_everything(tmp_path):
     assert load_state(tmp_path / "state.json").instances == ()
 
 
+def test_bench_pending_marker_holds_final_past_manifest(tmp_path):
+    # Cascade duel bench: the trainer drops bench_pending.json just before the
+    # manifest publishes, so the manifest — normally the final pod's death
+    # signal — must not reap it while the bench still runs on it. Heat pods are
+    # unaffected. bench_complete.json releases the hold.
+    clock = Clock()
+    store = FakeStore()
+    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
+    loop.bench_hold_max_hours = 2.0                          # cascade_enabled wiring
+    d = tmp_path / "work" / "54321"
+    d.mkdir(parents=True)
+    (d / "heat_complete.json").write_text("{}")
+    clock.t += 900.0
+    cycle(loop)                                              # heat settles; learns the id
+    assert prov.terminated == ["cascade-900-heat-0"]         # heat dies as always
+    # The trainer arms the hold just before publishing, then the manifest lands.
+    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
+    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
+    clock.t += 900.0
+    cycle(loop)
+    assert "cascade-900-final-0" in prov.live                # final held for the bench
+    # Report uploaded (or bench failed): the trainer writes bench_complete and
+    # removes the pending marker — the very next sweep reaps the final pod.
+    (d / "bench_complete.json").write_text('{"round_id": "54321", "uploaded": true}')
+    (d / "bench_pending.json").unlink()
+    clock.t += 60.0
+    cycle(loop)
+    assert prov.live == {}
+
+
+def test_bench_hold_expires_at_the_cap(tmp_path):
+    # A crashed/wedged bench never clears its marker: past bench_hold_max_hours
+    # the pod is reaped regardless (the extra pod-hours are the accepted cost,
+    # an eternally-billing pod is not).
+    clock = Clock()
+    store = FakeStore()
+    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
+    loop.bench_hold_max_hours = 0.5
+    d = tmp_path / "work" / "54321"
+    d.mkdir(parents=True)
+    (d / "heat_complete.json").write_text("{}")
+    clock.t += 60.0
+    cycle(loop)                                              # heat settles; learns the id
+    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
+    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
+    clock.t += 60.0
+    cycle(loop)
+    assert "cascade-900-final-0" in prov.live                # inside the cap: held
+    clock.t += 0.5 * 3600.0                                  # cap elapsed
+    cycle(loop)
+    assert prov.live == {}
+
+
+def test_bench_marker_ignored_when_hold_disabled(tmp_path):
+    # cascade_enabled off ⇒ the provisioner wires bench_hold_max_hours = 0 and
+    # a (stray) marker changes nothing: teardown is byte-identical to before.
+    clock = Clock()
+    store = FakeStore()
+    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
+    assert loop.bench_hold_max_hours == 0.0                  # the default
+    d = tmp_path / "work" / "54321"
+    d.mkdir(parents=True)
+    (d / "heat_complete.json").write_text("{}")
+    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
+    clock.t += 900.0
+    cycle(loop)
+    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
+    clock.t += 900.0
+    cycle(loop)
+    assert prov.live == {}
+
+
+def test_stale_bench_marker_from_prior_round_never_holds(tmp_path):
+    # A leftover bench_pending.json from ANOTHER round (trainer died mid-bench
+    # last round) must not hold the new fleet — same base_seed matching as the
+    # heat marker's zombie guard.
+    clock = Clock()
+    store = FakeStore()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, store=store, clock=clock)
+    loop.chain_client = SeededChain(880, 54321)     # this round's base_seed = 54321
+    loop.bench_hold_max_hours = 2.0
+    stale = tmp_path / "work" / "99999"
+    stale.mkdir(parents=True)
+    (stale / "bench_pending.json").write_text('{"round_id": "99999"}')
+    clock.t += 600.0
+    cycle(loop)
+    assert len(prov.live) == 2
+    d = tmp_path / "work" / "54321"
+    d.mkdir(parents=True)
+    (d / "heat_complete.json").write_text("{}")
+    clock.t += 900.0
+    cycle(loop)                                              # heat settles; learns the id
+    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
+    clock.t += 900.0
+    cycle(loop)
+    assert prov.live == {}                                   # other round's marker: no hold
+
+
 def test_stale_manifest_from_prior_run_does_not_tear_down(tmp_path):
     # Same-round-id rerun: the PREVIOUS run's manifest is still published at
     # round-<id>.json when the heat marker lands. That leftover must not read

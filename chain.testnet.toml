@@ -203,12 +203,17 @@ num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
 n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
-# TESTNET: cap datasets per suite for the Cascade king bench stamp. With
-# cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on the king EVERY
-# round, BEFORE the manifest publishes — uncapped (0 = full battery) that alone
-# can blow the 3h epoch, especially on a CPU orchestrator. (Mainnet ships
-# cascade_enabled = false, so its 0 stays the full battery.)
+# TESTNET: cap datasets per suite for the Cascade duel bench. With
+# cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on BOTH duel
+# checkpoints every round, AFTER the manifest publishes (the signed
+# benchmarks/round-<id>.json report) — uncapped (0 = full battery) that sweep
+# can outlive the 3h epoch's pod hold, especially on a CPU orchestrator.
+# (Mainnet ships cascade_enabled = false, so its 0 stays the full battery.)
 cascade_bench_max_series = 3
+# How long the provisioner may hold the FINAL pod past the manifest for that
+# post-publish sweep (released early by the bench_complete marker). Inert
+# while cascade_enabled = false.
+bench_hold_max_hours  = 2.0
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators must have gift-eval data pinned.
 gift_gate_datasets    = ""       # gift-eval config subset for the gate ("" = full 97 configs)

@@ -59,18 +59,25 @@ class BenchPlan:
     min_interval_seconds: int = 0
 
 
-def king_paths(host: RemoteHost, round_id: str, arch_preset: str) -> tuple[str, str]:
-    """(checkpoint dir, report path) of a round's king on the pod — the layout
-    ``cascade.trainer.worker`` writes under ``<workdir>/_train_work``."""
-    base = f"{host.workdir}/_train_work/{round_id}/{arch_preset}/king"
+def role_paths(host: RemoteHost, round_id: str, arch_preset: str,
+               role: str = "king") -> tuple[str, str]:
+    """(checkpoint dir, report path) of a round's final ``role`` on the pod —
+    the layout ``cascade.trainer.worker`` writes under ``<workdir>/_train_work``
+    (final runs carry no repo suffix, so the dir is exactly the role name)."""
+    base = f"{host.workdir}/_train_work/{round_id}/{arch_preset}/{role}"
     return f"{base}/checkpoint", f"{base}/benchmark_report.json"
 
 
+def king_paths(host: RemoteHost, round_id: str, arch_preset: str) -> tuple[str, str]:
+    """(checkpoint dir, report path) of a round's king on the pod."""
+    return role_paths(host, round_id, arch_preset, "king")
+
+
 def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str,
-                               plan: BenchPlan) -> tuple[str, str]:
-    """The remote shell string that benchmarks the round's king, plus the
-    report path it writes. Pure — safe to unit test."""
-    ckpt, report = king_paths(host, round_id, arch_preset)
+                               plan: BenchPlan, *, role: str = "king") -> tuple[str, str]:
+    """The remote shell string that benchmarks the round's final ``role``
+    checkpoint, plus the report path it writes. Pure — safe to unit test."""
+    ckpt, report = role_paths(host, round_id, arch_preset, role)
     argv = [
         "cascade-benchmark", ckpt, report,
         "--suites", plan.suites,
@@ -95,14 +102,16 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
 
 def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
                              plan: BenchPlan, *, work_root: Path | None = None,
-                             runner=None) -> dict | None:
-    """Benchmark the round's king on ``host`` and return the parsed report.
+                             runner=None, role: str = "king") -> dict | None:
+    """Benchmark the round's final ``role`` checkpoint on ``host`` and return
+    the parsed report.
 
     Blocking (call it from :func:`launch_post_round_benchmark`'s thread).
     Returns ``None`` on any failure — this path must never raise into a round.
     """
     try:
-        remote_cmd, report_path = build_bench_remote_command(host, round_id, arch_preset, plan)
+        remote_cmd, report_path = build_bench_remote_command(
+            host, round_id, arch_preset, plan, role=role)
         ssh = build_ssh_argv(host, remote_cmd)
         run = runner or run_ssh
         proc = run(ssh, plan.timeout_seconds)
@@ -117,10 +126,10 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
             return None
         report = json.loads(cat.stdout)
         if work_root is not None:
-            local = Path(work_root) / round_id / arch_preset / "king-benchmark_report.json"
+            local = Path(work_root) / round_id / arch_preset / f"{role}-benchmark_report.json"
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        log.info("bench round=%s %s", round_id, format_report(report))
+        log.info("bench round=%s role=%s %s", round_id, role, format_report(report))
         return report
     except Exception as e:  # noqa: BLE001 — log-only telemetry must never raise
         log.warning("post-round benchmark errored (ignored): %s", e)
