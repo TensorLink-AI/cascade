@@ -521,7 +521,7 @@ def test_lium_list_tagged_uses_ps_names():
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     assert LiumProvider(bin="lium", _run=_run).list_tagged("cascade-") == \
-        ["cascade-900-heat-0"]
+        [("cascade-900-heat-0", "cascade-900-heat-0")]
 
 
 # ── launch + GUARANTEED teardown control flow ────────────────────────────────
@@ -961,9 +961,9 @@ def test_runpod_list_tagged_returns_ids(monkeypatch):
     rows = [{"name": "cascade-900-heat-0", "id": "p1"},
             {"name": "someone-else", "id": "p2"}]
     monkeypatch.setattr(prov, "_get", lambda p, params=None: rows)
-    assert prov.list_tagged("cascade-") == ["p1"]
+    assert prov.list_tagged("cascade-") == [("cascade-900-heat-0", "p1")]
     monkeypatch.setattr(prov, "_get", lambda p, params=None: {"pods": rows})
-    assert prov.list_tagged("cascade-") == ["p1"]
+    assert prov.list_tagged("cascade-") == [("cascade-900-heat-0", "p1")]
 
 
 # ── Vast.ai adapter (pure parts) ─────────────────────────────────────────────
@@ -1108,7 +1108,7 @@ def test_vast_list_tagged_maps_label_to_the_shared_primitive(monkeypatch):
         {"label": "someone-else", "id": 902},
         {"id": 903},
     ]})
-    assert prov.list_tagged("cascade-") == ["901"]
+    assert prov.list_tagged("cascade-") == [("cascade-900-heat-0", "901")]
 
 
 # ── budget breaker: per-pod pricing across adapters ──────────────────────────
@@ -1197,3 +1197,497 @@ def test_sku_matching_folds_marketplace_spelling_not_distinct_devices():
     assert pick_runpod_gpu_type(types, "NVIDIA L40S") is not None
     assert pick_runpod_gpu_type(types, "L40 S") is not None      # displayName "L40S"
     assert pick_runpod_gpu_type(types, "NVIDIA L40") is None     # different silicon
+
+
+# ── orphan reaper: name-vs-handle (the reaper was a no-op on id adapters) ────
+
+
+def test_filter_tagged_pods_keeps_the_name_alongside_the_handle():
+    """Regression: the reaper decides WHAT is ours by matching the pod NAME
+    against `cascade-<round>-<stage>`, then kills by the provider's HANDLE.
+    Collapsing the two to just the handle made `is_provisioner_pod_name` see a
+    uuid, judge it "not ours", and skip it — so every shadeform orphan billed
+    until someone noticed by hand."""
+    from cascade.provision.core import filter_tagged_pods
+    from cascade.provision.loop import is_provisioner_pod_name
+
+    pods = [{"name": "cascade-900-heat-0", "id": "2f1c-uuid"},
+            {"name": "cascade-worker", "id": "hand-rented"},   # operator's own
+            {"name": "someone-else", "id": "nope"}]
+    tagged = filter_tagged_pods(pods, "cascade-", id_key="id")
+    assert tagged == [("cascade-900-heat-0", "2f1c-uuid"),
+                      ("cascade-worker", "hand-rented")]
+    reapable = [h for n, h in tagged if is_provisioner_pod_name(n)]
+    assert reapable == ["2f1c-uuid"]          # was [] before the fix
+    # And the operator's hand-rented box is still untouchable (2026-07-13).
+    assert "hand-rented" not in reapable
+
+
+def test_filter_tagged_pods_drops_nameless_rows():
+    """The tag is the only claim of ownership; an unnamed pod is never ours."""
+    from cascade.provision.core import filter_tagged_pods
+
+    assert filter_tagged_pods([{"id": "x"}], "cascade-", id_key="id") == []
+
+
+def test_reaper_terminates_id_addressed_orphans(tmp_path):
+    """End-to-end through the loop: an id-addressed adapter's orphan must
+    actually get terminated, not silently filtered out."""
+    from cascade.provision.loop import ProvisionerLoop
+
+    killed = []
+
+    class _IdAddressed:
+        name = "shadeform-like"
+
+        def list_tagged(self, prefix):
+            return [("cascade-900-heat-0", "uuid-1"),      # ours, unowned
+                    ("cascade-worker", "uuid-2"),          # operator's
+                    ("someone-else", "uuid-3")]
+
+        def terminate(self, pod_id):
+            killed.append(pod_id)
+
+    loop = object.__new__(ProvisionerLoop)
+    loop.providers = {"shadeform-like": _IdAddressed()}
+    loop._state = None
+    loop._rent_inflight = False
+    loop._eval_inflight = False
+    loop.dry_run = False
+    loop._reconcile_orphans()
+    assert killed == ["uuid-1"]
+
+
+def test_reaper_still_accepts_a_legacy_string_lister(tmp_path):
+    """A third-party adapter that predates the pair contract (name-is-handle,
+    the lium shape) must keep working rather than crash the sweep."""
+    from cascade.provision.loop import ProvisionerLoop
+
+    killed = []
+
+    class _Legacy:
+        name = "lium-like"
+
+        def list_tagged(self, prefix):
+            return ["cascade-900-final-0", "cascade-worker"]
+
+        def terminate(self, pod_id):
+            killed.append(pod_id)
+
+    loop = object.__new__(ProvisionerLoop)
+    loop.providers = {"lium-like": _Legacy()}
+    loop._state = None
+    loop._rent_inflight = False
+    loop._eval_inflight = False
+    loop.dry_run = False
+    loop._reconcile_orphans()
+    assert killed == ["cascade-900-final-0"]
+
+
+# ── batch launches are atomic ────────────────────────────────────────────────
+
+
+def test_runpod_partial_launch_unwinds_what_it_rented(monkeypatch):
+    """_rent_stage writes the ledger only AFTER launch returns, so a pod
+    rented before a mid-batch failure is money with no record. Unwind at the
+    source instead of waiting a poll cycle for the reaper."""
+    from cascade.provision.core import RunPodProvider
+
+    prov = RunPodProvider()
+    monkeypatch.setattr(prov, "_gpu_types", lambda: _runpod_types())
+    created, killed = [], []
+
+    def _post(path, body=None):
+        if len(created) >= 1:
+            raise ProvisionError("runpod 503")
+        created.append(body["name"])
+        return {"id": f"pod-{len(created)}"}
+
+    monkeypatch.setattr(prov, "_post", _post)
+    monkeypatch.setattr(prov, "terminate", killed.append)
+    with pytest.raises(ProvisionError, match="503"):
+        prov.launch(_spec(count=3, sku="NVIDIA L40S", gpus_per_pod=2))
+    assert killed == ["pod-1"]        # the one that was rented, torn back down
+
+
+def test_vast_partial_launch_unwinds_what_it_rented(monkeypatch):
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    monkeypatch.setattr(prov, "_bundles", lambda sku, gpus: _vast(
+        _vast_offer(oid=11, machine=71), _vast_offer(oid=12, machine=72)))
+    killed = []
+    calls = []
+
+    def _req(method, path, *, params=None, body=None):
+        calls.append(path)
+        if len(calls) >= 2:
+            return {"success": False, "error": "no longer available"}
+        return {"success": True, "new_contract": 901}
+
+    monkeypatch.setattr(prov, "_request", _req)
+    monkeypatch.setattr(prov, "terminate", killed.append)
+    with pytest.raises(ProvisionError, match="failed"):
+        prov.launch(_spec(count=2, sku="RTX 4090", gpus_per_pod=4))
+    assert killed == ["901"]
+
+
+def test_vast_launch_rejects_a_non_dict_response(monkeypatch):
+    """A marketplace that answers with a list/None must not read as success."""
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    monkeypatch.setattr(prov, "_bundles", lambda sku, gpus: _vast(_vast_offer()))
+    monkeypatch.setattr(prov, "_request", lambda *a, **k: [])
+    with pytest.raises(ProvisionError, match="failed"):
+        prov.launch(_spec(count=1, sku="RTX 4090", gpus_per_pod=4))
+
+
+# ── REST transport: retry only where it cannot double-rent ───────────────────
+
+
+class _FakeResp:
+    def __init__(self, status=200, payload=None):
+        self.status_code = status
+        self._payload = {} if payload is None else payload
+        self.content = b"{}" if payload is not None or status == 200 else b""
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def _wired(prov, responses):
+    """Attach a fake session returning `responses` in order; record calls."""
+    calls = []
+
+    class _S:
+        def request(self, method, url, params=None, json=None, timeout=None):
+            calls.append((method, url))
+            r = responses.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    prov._session = _S()
+    prov._sleep = lambda _s: None
+    return calls
+
+
+def test_rest_get_retries_transient_status_then_succeeds():
+    from cascade.provision.core import RunPodProvider
+
+    prov = RunPodProvider()
+    calls = _wired(prov, [_FakeResp(503), _FakeResp(429),
+                          _FakeResp(200, {"ok": True})])
+    assert prov._get("/pods") == {"ok": True}
+    assert len(calls) == 3
+
+
+def test_rest_get_gives_up_after_the_attempt_budget():
+    from cascade.provision.core import REST_RETRY_ATTEMPTS, RunPodProvider
+
+    prov = RunPodProvider()
+    calls = _wired(prov, [_FakeResp(503)] * REST_RETRY_ATTEMPTS)
+    with pytest.raises(RuntimeError, match="503"):
+        prov._get("/pods")
+    assert len(calls) == REST_RETRY_ATTEMPTS
+
+
+def test_rest_create_is_never_retried():
+    """A create that failed may still have been ACCEPTED upstream; retrying it
+    double-rents a fleet the ledger never learns about — the exact leak
+    _unwind_partial_launch exists to close."""
+    from cascade.provision.core import RunPodProvider
+
+    prov = RunPodProvider()
+    calls = _wired(prov, [_FakeResp(503), _FakeResp(200, {"id": "pod-1"})])
+    with pytest.raises(RuntimeError, match="503"):
+        prov._post("/pods", {"name": "x"})
+    assert len(calls) == 1          # one shot only
+
+
+def test_rest_delete_is_retried_because_terminate_is_idempotent():
+    from cascade.provision.core import VastProvider
+
+    prov = VastProvider()
+    calls = _wired(prov, [_FakeResp(502), _FakeResp(200, {})])
+    prov._request("DELETE", "/instances/1/")
+    assert len(calls) == 2
+
+
+def test_rest_session_is_built_once_under_concurrency(monkeypatch):
+    """Two rent workers (boundary + manifest-triggered eval) can race the lazy
+    init; without the lock they build two sessions and leak one."""
+    import sys
+    import threading
+    import types as _types
+
+    from cascade.provision.core import RunPodProvider
+
+    # `requests` lives behind the [deploy] extra; stub it so this exercises the
+    # lock rather than skipping wherever the extra is absent.
+    fake = _types.ModuleType("requests")
+    fake.Session = lambda: _types.SimpleNamespace(headers={}, request=None)
+    monkeypatch.setitem(sys.modules, "requests", fake)
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    prov = RunPodProvider()
+    seen, barrier = [], threading.Barrier(8)
+
+    def _go():
+        barrier.wait()
+        seen.append(id(prov._http()))
+
+    threads = [threading.Thread(target=_go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(seen)) == 1
+
+
+def test_shadeform_keeps_its_own_auth_header_on_the_shared_mixin():
+    """Folding shadeform onto _RestMixin must not silently turn X-API-KEY into
+    a bearer token — that would 401 every call on the live account."""
+    from cascade.provision.core import ShadeformProvider
+
+    assert ShadeformProvider()._auth_headers("secret") == {"X-API-KEY": "secret"}
+
+
+# ── one contract, every adapter ──────────────────────────────────────────────
+
+
+ADAPTERS = ["lium", "shadeform", "runpod", "vast"]
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_every_adapter_satisfies_the_provider_protocol(adapter):
+    prov = build_providers([adapter])[0]
+    for verb in ("available", "launch", "wait_ready", "get_ip", "terminate"):
+        assert callable(getattr(prov, verb, None)), f"{adapter} missing {verb}"
+    assert prov.name == adapter
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_every_adapter_lists_tagged_pods_as_name_handle_pairs(adapter):
+    """The reaper consumes one shape across adapters; a bare handle here is
+    what disabled it on shadeform."""
+    import inspect
+
+    prov = build_providers([adapter])[0]
+    src = inspect.getsource(type(prov).list_tagged)
+    assert "filter_tagged_pods" in src, f"{adapter} must use the shared primitive"
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_every_adapter_prices_per_pod_hour(adapter):
+    """offer_price must accept the pod shape: marketplaces that quote per
+    INSTANCE need it to scan the right shape, and ones that quote per GPU need
+    it to multiply. Either way, missing it under-projects the round breaker."""
+    import inspect
+
+    prov = build_providers([adapter])[0]
+    fn = getattr(prov, "offer_price", None)
+    if fn is None:
+        pytest.skip(f"{adapter} exposes no price probe")
+    assert "gpus" in inspect.signature(fn).parameters, \
+        f"{adapter}.offer_price must take the pod shape"
+
+
+@pytest.mark.parametrize("adapter", ADAPTERS)
+def test_every_adapter_terminate_is_idempotent(adapter, monkeypatch):
+    """Terminating an already-gone pod is success, never an exception — the
+    teardown sweep retries and must not be derailed by a 404."""
+    prov = build_providers([adapter])[0]
+
+    def _boom(*a, **k):
+        raise RuntimeError("404 not found")
+
+    for attr in ("_request", "_cli", "_post"):
+        if hasattr(prov, attr):
+            monkeypatch.setattr(prov, attr, _boom)
+    prov.terminate("already-gone")      # no raise
+
+
+# ── --check-providers preflight ──────────────────────────────────────────────
+
+
+def _policy_for_preflight(**kw):
+    from cascade.provision.policy import ProvisionPolicy, SkuCandidate, StagePolicy
+
+    heat = StagePolicy(
+        sku="NVIDIA GeForce RTX 4090", market_sku="RTX4090", gpus_per_pod=4,
+        max_pods=2, providers=("vast",), max_price_hr=2.60,
+        candidates=(SkuCandidate(sku="NVIDIA RTX A6000", market_sku="A6000",
+                                 gpus_per_pod=4, max_price_hr=2.40),))
+    final = StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=1,
+                        providers=("runpod",), max_price_hr=2.60)
+    return ProvisionPolicy(heat=heat, final=final, trigger_margin_blocks=45,
+                           max_spend_per_round=120.0, **kw)
+
+
+class _PreflightProv:
+    def __init__(self, name, *, have=True, price=1.0, rows=None, raises=None):
+        self.name, self._have, self._price = name, have, price
+        self._rows = [("cascade-900-heat-0", "h1")] if rows is None else rows
+        self._raises = raises
+
+    def available(self, sku, count, *, gpus=1):
+        if self._raises:
+            raise self._raises
+        return self._have
+
+    def offer_price(self, sku, *, gpus=1):
+        return self._price
+
+    def list_tagged(self, prefix):
+        return self._rows
+
+
+def test_check_providers_reports_capacity_and_price_without_renting():
+    from cascade.provision.main import check_providers
+
+    provs = {"vast": _PreflightProv("vast", price=1.10),
+             "runpod": _PreflightProv("runpod", price=2.40)}
+    ok, lines = check_providers(_policy_for_preflight(), provs)
+    assert ok
+    body = "\n".join(lines)
+    assert "heat[0] 4×NVIDIA GeForce RTX 4090 (RTX4090) on vast" in body
+    assert "heat[1] 4×NVIDIA RTX A6000 (A6000) on vast" in body
+    assert "final[0] 2×NVIDIA L40S (NVIDIA L40S) on runpod" in body
+    assert "$2.40/pod-hr (cap $2.60)" in body
+    # No launch/terminate on the fakes at all: a preflight that rents is not a
+    # preflight. (_PreflightProv has neither method — this would AttributeError.)
+
+
+def test_check_providers_flags_a_rung_priced_over_its_cap():
+    from cascade.provision.main import check_providers
+
+    provs = {"vast": _PreflightProv("vast", price=9.99),
+             "runpod": _PreflightProv("runpod", price=1.0)}
+    ok, lines = check_providers(_policy_for_preflight(), provs)
+    assert ok                       # over-cap is a finding, not a fault
+    assert any("OVER cap" in line for line in lines)
+
+
+def test_check_providers_fails_on_a_raising_adapter():
+    from cascade.provision.main import check_providers
+
+    provs = {"vast": _PreflightProv("vast", raises=ProvisionError("401 bad key")),
+             "runpod": _PreflightProv("runpod")}
+    ok, lines = check_providers(_policy_for_preflight(), provs)
+    assert not ok
+    assert any("401 bad key" in line for line in lines)
+
+
+def test_check_providers_catches_the_reaper_shape_regression():
+    """The whole point: an adapter returning bare handles must be caught HERE,
+    with credentials in hand, not discovered as an unreaped bill later."""
+    from cascade.provision.main import check_providers
+
+    provs = {"vast": _PreflightProv("vast", rows=["uuid-only"]),
+             "runpod": _PreflightProv("runpod")}
+    ok, lines = check_providers(_policy_for_preflight(), provs)
+    assert not ok
+    assert any("must yield (name, handle) pairs" in line for line in lines)
+
+
+def test_check_providers_warns_when_orphans_can_never_be_reaped():
+    from cascade.provision.main import check_providers
+
+    class _NoLister:
+        name = "bare"
+
+        def available(self, sku, count, *, gpus=1):
+            return True
+
+    provs = {"vast": _NoLister(), "runpod": _PreflightProv("runpod")}
+    provs["vast"].name = "vast"
+    ok, lines = check_providers(_policy_for_preflight(), provs)
+    assert any("orphans are NEVER reaped" in line for line in lines)
+
+
+def test_check_providers_skips_an_unmanaged_stage():
+    from cascade.provision.main import check_providers
+    from cascade.provision.policy import StagePolicy
+
+    policy = _policy_for_preflight()
+    policy = type(policy)(
+        heat=policy.heat,
+        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=0,
+                          providers=("runpod",), max_price_hr=2.6),
+        trigger_margin_blocks=45, max_spend_per_round=120.0)
+    ok, lines = check_providers(policy, {"vast": _PreflightProv("vast"),
+                                         "runpod": _PreflightProv("runpod")})
+    assert ok
+    assert any("final: unmanaged" in line for line in lines)
+
+
+def test_rest_config_faults_are_not_retried(monkeypatch):
+    """A missing API key is configuration, not weather. Retrying it burns the
+    full backoff ladder on every probe of every cycle and buries the real cause
+    under transport warnings (seen live running --check-providers)."""
+    import sys
+
+    from cascade.provision.core import RunPodProvider
+
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "requests", sys.modules.get("requests") or type(sys)("requests"))
+    slept = []
+    prov = RunPodProvider(_sleep=slept.append)
+    with pytest.raises(ProvisionError, match="RUNPOD_API_KEY"):
+        prov._get("/pods")
+    assert slept == []          # straight out, no backoff ladder
+
+
+def test_preflight_end_to_end_through_the_real_adapters():
+    """Real adapter classes, recorded marketplace payloads, no credentials:
+    exercises session → _request → response parsing → price units → the
+    reaper's listing shape, i.e. every assumption a live run would test."""
+    from cascade.provision.core import RunPodProvider, VastProvider
+    from cascade.provision.main import check_providers
+
+    runpod = RunPodProvider()
+    vast = VastProvider()
+
+    def _runpod_session():
+        class _S:
+            def request(self, method, url, params=None, json=None, timeout=None):
+                if url.endswith("/gputypes"):
+                    return _FakeResp(200, _runpod_types(gpu="NVIDIA L40S",
+                                                        secure_price=1.10))
+                if url.endswith("/pods"):
+                    return _FakeResp(200, [{"name": "cascade-900-final-0",
+                                            "id": "pod-xyz"}])
+                raise AssertionError(f"unexpected {method} {url}")
+        return _S()
+
+    def _vast_session():
+        class _S:
+            def request(self, method, url, params=None, json=None, timeout=None):
+                if "/bundles/" in url:
+                    return _FakeResp(200, _vast(
+                        _vast_offer(oid=1, machine=1, price=1.05, name="RTX 4090"),
+                        _vast_offer(oid=2, machine=2, price=0.90, name="RTX 4090",
+                                    verified=False)))       # junk: must not price
+                if "/instances/" in url:
+                    return _FakeResp(200, {"instances": []})
+                raise AssertionError(f"unexpected {method} {url}")
+        return _S()
+
+    runpod._session, vast._session = _runpod_session(), _vast_session()
+    ok, lines = check_providers(_policy_for_preflight(),
+                                {"runpod": runpod, "vast": vast})
+    body = "\n".join(lines)
+    assert ok, body
+    # runpod quotes PER GPU ($1.10) and the final rung is 2×L40S ⇒ $2.20/pod-hr.
+    assert "final[0] 2×NVIDIA L40S (NVIDIA L40S) on runpod: capacity, $2.20/pod-hr" in body
+    # vast prices the QUALIFYING set only: the cheaper unverified box is ignored.
+    assert "heat[0] 4×NVIDIA GeForce RTX 4090 (RTX4090) on vast: capacity, $1.05/pod-hr" in body
+    # config's market_sku is "RTX4090"; vast spells it "RTX 4090" — must match.
+    assert "no capacity" not in body.split("heat[1]")[0]
+    # listing shape is what the reaper can actually consume
+    assert "ok   runpod: list_tagged → 1 tagged pod(s)" in body

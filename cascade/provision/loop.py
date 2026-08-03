@@ -1717,7 +1717,18 @@ class ProvisionerLoop:
             if lister is None:
                 continue
             try:
-                live = {p for p in lister(POD_TAG) if is_provisioner_pod_name(p)}
+                # (name, handle): the naming scheme decides WHAT is ours, the
+                # handle is what terminate takes. On every id-addressed
+                # marketplace those differ, and matching the scheme against an
+                # opaque id silently reaps nothing — see filter_tagged_pods.
+                # A bare string (legacy adapter / test fake) is name-is-handle.
+                live = {
+                    handle
+                    for pod_name, handle in (
+                        e if isinstance(e, tuple) else (e, e) for e in lister(POD_TAG)
+                    )
+                    if is_provisioner_pod_name(pod_name)
+                }
             except Exception as e:  # noqa: BLE001 — a down adapter reconciles next cycle
                 log.warning("provider %s list_tagged failed (%s); skipping reconcile", name, e)
                 continue

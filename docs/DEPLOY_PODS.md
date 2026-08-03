@@ -345,7 +345,64 @@ Unknown keys in these tables are rejected at config load against the adapter's
 own field list — a silently-ignored `min_reliabilty` would rent the heat off
 unvetted machines while the config claims otherwise.
 
-**Both new adapters need a live smoke test before they enter a production
-ladder.** Their response parsing is unit-tested against recorded shapes, but
-no cascade round has rented through them yet. Bring one up with `--dry-run`
-first, then a single heat rung on testnet, before trusting it with a `final`.
+### What every adapter owes the loop
+
+Beyond the five protocol verbs, the loop duck-types four optional methods, and
+two of them are load-bearing for money:
+
+- **`list_tagged(prefix) -> [(name, handle)]`.** Both halves, always. The
+  orphan reaper decides *what* is ours by matching the pod NAME against
+  `cascade-<round>-<stage>`, then terminates by the provider's HANDLE — an
+  opaque id on every marketplace except lium. Returning bare handles makes
+  `is_provisioner_pod_name` see a uuid, judge it "not ours", and skip it, so
+  orphans bill until someone notices by hand. Use `filter_tagged_pods`.
+- **`offer_price(sku, *, gpus) -> USD per POD-hour.`** Not per GPU-hour. The
+  round breaker bills pods, so an adapter quoting per-GPU must multiply and one
+  listing per-instance must scan the right shape. Getting it wrong
+  under-projects `max_spend_per_round` silently, in the permissive direction.
+- `machine_of(handle)` enables lemon exclusion on the replacement path; omit it
+  where the marketplace picks the machine (runpod).
+- `launched_image_digest(handle)` is the provider-side attestation the health
+  gate falls back to when the pod cannot report its own launch env.
+
+Batch launches must be **atomic**: `_rent_stage` records the ledger only after
+`launch` returns, so an adapter that raises mid-batch strands whatever it
+already rented. Both REST adapters unwind on failure rather than leaving it to
+the reaper.
+
+Transport retries are bounded and apply to `GET`/`DELETE` only. A create that
+appears to fail may still have been accepted upstream, so retrying `POST`/`PUT`
+risks double-renting a fleet the ledger never learns about.
+
+### Preflight before arming a rung
+
+```bash
+cascade-provisioner --config provision.toml --chain-toml chain.toml --check-providers
+```
+
+Walks every configured `(stage × rung × provider)` against the live APIs and
+**rents nothing**. It exists because an adapter's real risk is not its control
+flow — that is unit-tested — but its assumptions about somebody else's JSON:
+endpoint paths, auth header, response field names, whether a price is dollars
+or cents and per-GPU or per-pod, and whether the pod listing carries the name
+the orphan reaper matches on. Every one of those fails looking like "no
+capacity" rather than "misconfigured", which is exactly the kind of fault that
+hides for weeks.
+
+```
+ok  heat[0] 4×NVIDIA GeForce RTX 4090 (RTX4090) on vast: capacity, $1.10/pod-hr (cap $2.60)
+--  heat[1] 4×NVIDIA RTX A6000 (A6000) on vast: no capacity, price unknown (rung would bill at its cap)
+ok  final[0] 2×NVIDIA L40S (NVIDIA L40S) on runpod: capacity, $2.40/pod-hr (cap $2.60)
+ok   runpod: list_tagged → 0 tagged pod(s)
+```
+
+It runs before the chain client and manifest store are opened, so it works on
+a box with marketplace credentials and nothing else — including before the
+service has ever been armed. Exit status is non-zero only for a hard fault
+(auth failure, a raising adapter, a listing in the wrong shape); no-capacity
+and over-cap are reported, not failed.
+
+**Both new adapters still need a live run before they carry a `final`.** Their
+response parsing is unit-tested against recorded shapes and preflight checks
+the rest against real credentials, but no cascade round has rented through
+them. Preflight, then a single heat rung on testnet, then the duel.

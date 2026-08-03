@@ -31,6 +31,7 @@ split across two SKUs or two providers.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -148,6 +150,15 @@ class Provider(Protocol):
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool: ...
     def get_ip(self, pod_id: str) -> PodAddress | None: ...
     def terminate(self, pod_id: str) -> None: ...
+
+    # Optional, but every adapter here implements them:
+    #   list_tagged(prefix) -> [(name, handle)]  — the orphan reaper matches
+    #     the NAME against the provisioner's scheme and terminates by HANDLE.
+    #     Returning bare handles disables the reaper on id-addressed
+    #     marketplaces; see filter_tagged_pods.
+    #   offer_price(sku, *, gpus) -> USD per POD-hour (not per GPU-hour).
+    #   machine_of(handle) -> the physical machine, for lemon exclusion.
+    #   launched_image_digest(handle) -> the provider's own image attestation.
 
 
 # ── pure helpers (unit-tested) ───────────────────────────────────────────────
@@ -392,20 +403,41 @@ def shadeform_offer_price_usd_hr(
     return min(prices) / 100.0 if prices else None
 
 
-def filter_tagged_names(pods: Sequence[dict], prefix: str, *, id_key: str = "name") -> list[str]:
-    """The ``id_key`` of every pod whose ``name`` starts with ``prefix``.
+def filter_tagged_pods(
+    pods: Sequence[dict], prefix: str, *, id_key: str = "name"
+) -> list[tuple[str, str]]:
+    """``(name, handle)`` for every pod whose ``name`` starts with ``prefix``.
 
-    The orphan-reconcile primitive shared by both adapters: a provider listing
-    is reduced to just the handles that carry OUR tag, so a shared marketplace
-    account's unrelated pods are never candidates for termination.
+    The orphan-reconcile primitive shared by every adapter. It yields BOTH
+    halves on purpose, because the reaper needs them separately: it decides
+    what to kill by matching the NAME against the provisioner's own naming
+    scheme (``cascade-<round>-<stage>``), then kills by the provider's
+    HANDLE, which on most marketplaces is an opaque id that no pattern
+    matches.
+
+    Collapsing the two — returning only the handle — silently disabled the
+    reaper on every id-addressed adapter: ``is_provisioner_pod_name("2f1c-…")``
+    is False for a uuid, so shadeform orphans were filtered out as "not ours"
+    and billed until someone noticed by hand. Lium was unaffected only because
+    it happens to address pods by name, which made the bug invisible.
+
+    A listing entry with no name is never ours (the tag is the only claim of
+    ownership), so it is dropped rather than defaulted.
     """
-    out = []
+    out: list[tuple[str, str]] = []
     for p in pods:
-        if str(p.get("name", "")).startswith(prefix):
-            handle = p.get(id_key) or p.get("name")
-            if handle:
-                out.append(str(handle))
+        name = str(p.get("name") or "")
+        if not name.startswith(prefix):
+            continue
+        handle = p.get(id_key) or p.get("name")
+        if handle:
+            out.append((name, str(handle)))
     return out
+
+
+def filter_tagged_names(pods: Sequence[dict], prefix: str, *, id_key: str = "name") -> list[str]:
+    """Just the handles from :func:`filter_tagged_pods` (name context dropped)."""
+    return [handle for _, handle in filter_tagged_pods(pods, prefix, id_key=id_key)]
 
 
 def shadeform_create_body(
@@ -844,6 +876,103 @@ def wait_ssh_reachable(ip: str, port: int, *, timeout: float, interval: float = 
     return False
 
 
+# Marketplace APIs rate-limit and flap; a blip must not cost a whole rung.
+REST_RETRY_ATTEMPTS = 3
+REST_RETRY_BACKOFF_S = 2.0
+REST_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+REST_TIMEOUT_S = 30.0
+# Retried ONLY for these. A create that times out may well have been accepted
+# by the marketplace, so retrying POST/PUT risks double-renting a fleet the
+# ledger will never know about — precisely the leak _unwind_partial_launch
+# exists to close. DELETE is safe because terminate is idempotent by contract.
+REST_IDEMPOTENT = frozenset({"GET", "HEAD", "DELETE"})
+
+
+class _RestMixin:
+    """Lazy, thread-safe ``requests`` session with bounded retry on read paths.
+
+    Lazy on purpose, exactly as every adapter here is: a lower-priority
+    provider in the ladder must not demand an API key when a higher one wins
+    the round.
+
+    Thread-safe because it has to be — the loop rents in a worker thread while
+    the main loop keeps ticking, and the manifest-triggered eval stage can be
+    renting on a second worker at the same time. Two threads racing the lazy
+    init would otherwise build two sessions and leak one.
+    """
+
+    base_url: str
+    api_key_env: str
+    name: str
+
+    def _auth_headers(self, key: str) -> dict[str, str]:
+        """Provider auth scheme; overridden where it is not bearer."""
+        return {"Authorization": f"Bearer {key}"}
+
+    def _http(self):
+        session = getattr(self, "_session", None)
+        if session is not None:
+            return session
+        lock = self.__dict__.setdefault("_session_lock", threading.Lock())
+        with lock:
+            if getattr(self, "_session", None) is not None:
+                return self._session
+            try:
+                import requests
+            except ModuleNotFoundError as e:  # pragma: no cover - env guard
+                raise ProvisionError(
+                    f"the {self.name} adapter needs `requests` "
+                    f"(pip install -e '.[deploy]')"
+                ) from e
+            key = os.environ.get(self.api_key_env)
+            if not key:
+                raise ProvisionError(f"{self.name}: set ${self.api_key_env}")
+            s = requests.Session()
+            s.headers.update({**self._auth_headers(key),
+                              "Content-Type": "application/json"})
+            self._session = s
+            return s
+
+    def _request(self, method: str, path: str, *, params=None, body=None):
+        # Resolve the session OUTSIDE the retry loop. Its failures — no API key,
+        # no `requests` — are configuration, not weather: retrying them burns
+        # the full backoff ladder on every probe of every cycle and buries the
+        # actual cause under transport warnings.
+        session = self._http()
+        url = f"{self.base_url}{path}"
+        retries = REST_RETRY_ATTEMPTS if method.upper() in REST_IDEMPOTENT else 1
+        last: Exception | None = None
+        for attempt in range(retries):
+            try:
+                r = session.request(method, url, params=params, json=body,
+                                    timeout=REST_TIMEOUT_S)
+                if r.status_code in REST_RETRY_STATUS and attempt < retries - 1:
+                    last = ProvisionError(f"{self.name} {method} {path} "
+                                          f"→ HTTP {r.status_code}")
+                else:
+                    r.raise_for_status()
+                    if not r.content:
+                        return {}
+                    out = r.json()
+                    return out if isinstance(out, (dict, list)) else {}
+            except Exception as e:  # noqa: BLE001 — transport faults retry the same way
+                if attempt >= retries - 1:
+                    raise
+                last = e
+            delay = REST_RETRY_BACKOFF_S * (2 ** attempt)
+            log.warning("%s %s %s failed (%s); retry %d/%d in %.0fs",
+                        self.name, method, path, last, attempt + 1, retries - 1, delay)
+            self._sleep(delay)
+        raise last if last is not None else ProvisionError(  # pragma: no cover
+            f"{self.name} {method} {path} exhausted retries")
+
+    def _get(self, path: str, params: dict | None = None):
+        return self._request("GET", path, params=params)
+
+    def _post(self, path: str, body: dict | None = None):
+        return self._request("POST", path, body=body)
+
+
 # ── Lium adapter (CLI shell-out, mirrors remote.py shelling to ssh) ───────────
 
 
@@ -984,20 +1113,26 @@ class LiumProvider:
         try:
             self._cli(["rm", pod_id])
             log.info("lium rm %s", pod_id)
-        except ProvisionError as e:
-            # Idempotent: an already-gone pod is success, not a leak.
+        except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
+            # Catches more than ProvisionError on purpose: `_run_cli` shells out,
+            # so a missing/renamed lium binary (FileNotFoundError) or a hung CLI
+            # (TimeoutExpired) escapes as its own type. Letting either propagate
+            # aborts the whole teardown SWEEP, stranding every pod behind this
+            # one — the opposite of what a teardown path should do on error.
             log.warning("lium rm %s: %s (treating as already terminated)", pod_id, e)
 
-    def list_tagged(self, prefix: str) -> list[str]:
-        """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""
-        return filter_tagged_names(self._list_pods(), prefix, id_key="name")
+    def list_tagged(self, prefix: str) -> list[tuple[str, str]]:
+        """Live ``(name, handle)`` pairs — Lium addresses pods by name, so both
+        halves coincide here. Returned as pairs anyway so the reaper has one
+        shape to consume across adapters."""
+        return filter_tagged_pods(self._list_pods(), prefix, id_key="name")
 
 
 # ── Shadeform adapter (REST) ─────────────────────────────────────────────────
 
 
 @dataclass
-class ShadeformProvider:
+class ShadeformProvider(_RestMixin):
     """Shadeform marketplace via its REST API (``X-API-KEY``).
 
     API key from ``$SHADEFORM_API_KEY`` (read lazily so a lower-priority provider
@@ -1016,32 +1151,9 @@ class ShadeformProvider:
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     _now: Callable[[], float] = field(default=time.monotonic, repr=False)
 
-    def _http(self):
-        if self._session is not None:
-            return self._session
-        try:
-            import requests
-        except ModuleNotFoundError as e:  # pragma: no cover - env guard
-            raise ProvisionError(
-                "the shadeform adapter needs `requests` (pip install -e '.[deploy]')"
-            ) from e
-        key = os.environ.get(self.api_key_env)
-        if not key:
-            raise ProvisionError(f"shadeform: set ${self.api_key_env}")
-        s = requests.Session()
-        s.headers.update({"X-API-KEY": key, "Content-Type": "application/json"})
-        self._session = s
-        return s
-
-    def _get(self, path: str, params: dict | None = None) -> dict:
-        r = self._http().get(f"{self.base_url}{path}", params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
-
-    def _post(self, path: str, body: dict | None = None) -> dict:
-        r = self._http().post(f"{self.base_url}{path}", json=body, timeout=30)
-        r.raise_for_status()
-        return r.json() if r.content else {}
+    def _auth_headers(self, key: str) -> dict[str, str]:
+        """Shadeform authenticates with a bare header, not a bearer token."""
+        return {"X-API-KEY": key}
 
     def _offer(self, sku: str, *, gpus: int = 1) -> dict | None:
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
@@ -1115,9 +1227,10 @@ class ShadeformProvider:
         except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
             log.warning("shadeform delete %s: %s (treating as already terminated)", pod_id, e)
 
-    def list_tagged(self, prefix: str) -> list[str]:
-        """Live instance IDs whose ``name`` starts with ``prefix`` (delete takes the id)."""
-        return filter_tagged_names(
+    def list_tagged(self, prefix: str) -> list[tuple[str, str]]:
+        """Live ``(name, id)`` pairs — Shadeform deletes by opaque id, which no
+        name pattern matches, so the reaper needs the name alongside it."""
+        return filter_tagged_pods(
             self._get("/instances").get("instances", []), prefix, id_key="id"
         )
 
@@ -1127,57 +1240,31 @@ class ShadeformProvider:
         return shadeform_offer_price_usd_hr(types, sku, gpus=gpus)
 
 
+def _unwind_partial_launch(prov, ids: Sequence[str], why: BaseException) -> None:
+    """Terminate pods already rented when a batch launch fails mid-way.
+
+    ``_rent_stage`` records the ledger write-ahead only AFTER ``launch``
+    RETURNS, so anything rented before the raise is money the provisioner has
+    no record of. The orphan reaper does eventually collect it (the pods carry
+    the ``cascade-<round>-<stage>`` tag), but that is a whole poll cycle of
+    billing for a fleet nobody will ever use — and it only works because the
+    tag is right. Unwinding here makes the batch atomic at the source.
+
+    Best-effort by construction: each terminate is already idempotent and
+    swallowing its errors, and the original failure is what the caller must
+    see, so nothing here can mask it.
+    """
+    for pid in ids:
+        log.warning("unwinding partial launch: terminating %s (batch failed: %s)", pid, why)
+        with contextlib.suppress(Exception):
+            prov.terminate(pid)
+
+
 # ── RunPod + Vast adapters (REST, bearer auth) ───────────────────────────────
 
 
-class _BearerRestMixin:
-    """Lazy ``requests`` session with ``Authorization: Bearer`` from the env.
-
-    Lazy on purpose, exactly as the Shadeform adapter is: a lower-priority
-    provider in the ladder must not demand an API key when a higher one wins
-    the round.
-    """
-
-    base_url: str
-    api_key_env: str
-    name: str
-
-    def _http(self):
-        if getattr(self, "_session", None) is not None:
-            return self._session
-        try:
-            import requests
-        except ModuleNotFoundError as e:  # pragma: no cover - env guard
-            raise ProvisionError(
-                f"the {self.name} adapter needs `requests` (pip install -e '.[deploy]')"
-            ) from e
-        key = os.environ.get(self.api_key_env)
-        if not key:
-            raise ProvisionError(f"{self.name}: set ${self.api_key_env}")
-        s = requests.Session()
-        s.headers.update({"Authorization": f"Bearer {key}",
-                          "Content-Type": "application/json"})
-        self._session = s
-        return s
-
-    def _request(self, method: str, path: str, *, params=None, body=None) -> dict:
-        r = self._http().request(method, f"{self.base_url}{path}",
-                                 params=params, json=body, timeout=30)
-        r.raise_for_status()
-        if not r.content:
-            return {}
-        out = r.json()
-        return out if isinstance(out, (dict, list)) else {}
-
-    def _get(self, path: str, params: dict | None = None):
-        return self._request("GET", path, params=params)
-
-    def _post(self, path: str, body: dict | None = None):
-        return self._request("POST", path, body=body)
-
-
 @dataclass
-class RunPodProvider(_BearerRestMixin):
+class RunPodProvider(_RestMixin):
     """RunPod via its REST v1 API (``$RUNPOD_API_KEY``).
 
     Defaults to **Secure Cloud** — RunPod's own and partner datacenters — which
@@ -1223,17 +1310,21 @@ class RunPodProvider(_BearerRestMixin):
                 f"runpod: {spec.sku} not offered on {self.cloud_type} cloud")
         gpu_type_id = str(entry.get("id") or spec.sku)
         ids: list[str] = []
-        for i in range(spec.count):
-            body = runpod_create_body(
-                spec, gpu_type_id, name=f"{spec.name_prefix}-{i}",
-                cloud_type=self.cloud_type, disk_gb=self.disk_gb)
-            resp = self._post("/pods", body)
-            pid = resp.get("id") if isinstance(resp, dict) else None
-            if not pid:
-                raise ProvisionError(f"runpod create returned no id: {resp}")
-            log.info("runpod create → %s (%s × %s, %s)", pid, spec.gpus_per_pod,
-                     gpu_type_id, self.cloud_type)
-            ids.append(str(pid))
+        try:
+            for i in range(spec.count):
+                body = runpod_create_body(
+                    spec, gpu_type_id, name=f"{spec.name_prefix}-{i}",
+                    cloud_type=self.cloud_type, disk_gb=self.disk_gb)
+                resp = self._post("/pods", body)
+                pid = resp.get("id") if isinstance(resp, dict) else None
+                if not pid:
+                    raise ProvisionError(f"runpod create returned no id: {resp}")
+                log.info("runpod create → %s (%s × %s, %s)", pid, spec.gpus_per_pod,
+                         gpu_type_id, self.cloud_type)
+                ids.append(str(pid))
+        except BaseException as e:
+            _unwind_partial_launch(self, ids, e)
+            raise
         return ids
 
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
@@ -1277,12 +1368,12 @@ class RunPodProvider(_BearerRestMixin):
         except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
             log.warning("runpod delete %s: %s (treating as already terminated)", pod_id, e)
 
-    def list_tagged(self, prefix: str) -> list[str]:
-        """Live pod IDs whose ``name`` starts with ``prefix`` (delete takes the id)."""
+    def list_tagged(self, prefix: str) -> list[tuple[str, str]]:
+        """Live ``(name, id)`` pairs — RunPod deletes by opaque id."""
         pods = self._get("/pods")
         if isinstance(pods, dict):
             pods = pods.get("pods", [])
-        return filter_tagged_names(pods or [], prefix, id_key="id")
+        return filter_tagged_pods(pods or [], prefix, id_key="id")
 
     def offer_price(self, sku: str, *, gpus: int = 1) -> float | None:
         """PER-POD USD/hr — RunPod quotes per GPU, so this multiplies by shape."""
@@ -1291,7 +1382,7 @@ class RunPodProvider(_BearerRestMixin):
 
 
 @dataclass
-class VastProvider(_BearerRestMixin):
+class VastProvider(_RestMixin):
     """Vast.ai marketplace via its REST API (``$VAST_API_KEY``).
 
     Vast is the price floor for consumer silicon and the most heterogeneous
@@ -1353,19 +1444,26 @@ class VastProvider(_BearerRestMixin):
                 f"offer(s)"
                 f"{' after exclusions' if spec.exclude_ids else ''}, need {spec.count}")
         ids: list[str] = []
-        for i, offer in enumerate(offers[:spec.count]):
-            body = vast_create_body(spec, label=f"{spec.name_prefix}-{i}",
-                                    disk_gb=self.disk_gb)
-            resp = self._request("PUT", f"/asks/{offer['id']}/", body=body)
-            contract = resp.get("new_contract") if isinstance(resp, dict) else None
-            if not resp.get("success", False) or not contract:
-                raise ProvisionError(f"vast create on ask {offer['id']} failed: {resp}")
-            log.info("vast rent → %s (machine %s, %s, $%.3f/hr, reliability %.3f)",
-                     contract, offer.get("machine_id"), offer.get("geolocation"),
-                     float(offer.get("dph_total", 0.0)),
-                     float(offer.get("reliability2", 0.0)))
-            ids.append(str(contract))
-            self._machines[str(contract)] = str(offer.get("machine_id", ""))
+        try:
+            for i, offer in enumerate(offers[:spec.count]):
+                body = vast_create_body(spec, label=f"{spec.name_prefix}-{i}",
+                                        disk_gb=self.disk_gb)
+                resp = self._request("PUT", f"/asks/{offer['id']}/", body=body)
+                contract = (resp.get("new_contract")
+                            if isinstance(resp, dict) else None)
+                if not isinstance(resp, dict) or not resp.get("success", False) \
+                        or not contract:
+                    raise ProvisionError(
+                        f"vast create on ask {offer['id']} failed: {resp}")
+                log.info("vast rent → %s (machine %s, %s, $%.3f/hr, reliability %.3f)",
+                         contract, offer.get("machine_id"), offer.get("geolocation"),
+                         float(offer.get("dph_total", 0.0)),
+                         float(offer.get("reliability2", 0.0)))
+                ids.append(str(contract))
+                self._machines[str(contract)] = str(offer.get("machine_id", ""))
+        except BaseException as e:
+            _unwind_partial_launch(self, ids, e)
+            raise
         return ids
 
     def _instance(self, pod_id: str) -> dict:
@@ -1426,15 +1524,15 @@ class VastProvider(_BearerRestMixin):
         finally:
             self._machines.pop(str(pod_id), None)
 
-    def list_tagged(self, prefix: str) -> list[str]:
-        """Live instance IDs whose ``label`` starts with ``prefix``.
+    def list_tagged(self, prefix: str) -> list[tuple[str, str]]:
+        """Live ``(label, id)`` pairs — Vast destroys by numeric contract id.
 
         Vast names the field ``label``; normalize to ``name`` so the shared
         reconcile primitive stays the one implementation.
         """
         out = self._get("/instances/")
         rows = out.get("instances", []) if isinstance(out, dict) else (out or [])
-        return filter_tagged_names(
+        return filter_tagged_pods(
             [{"name": r.get("label"), "id": r.get("id")} for r in rows if isinstance(r, dict)],
             prefix, id_key="id")
 
