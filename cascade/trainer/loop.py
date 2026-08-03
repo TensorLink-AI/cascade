@@ -1697,13 +1697,35 @@ class TrainerRunner:
         except OSError as e:
             log.warning("could not write bench_complete marker for round=%s: %s", round_id, e)
 
+    def _release_stale_bench_hold(self, round_id: str) -> None:
+        """Free a teardown hold whose bench is never coming.
+
+        A restart between publish and bench completion kills the bench thread
+        with the process, but its ``bench_pending.json`` stays armed — and the
+        restarted trainer skips the already-published round, so nothing would
+        release the provisioner's hold until the cap. Called from the
+        restart re-entry skip path; a marker with its completion already
+        recorded is left alone."""
+        try:
+            if (self._bench_pending_path(round_id).is_file()
+                    and not self._bench_complete_path(round_id).is_file()):
+                log.warning("round=%s: bench_pending marker with no completed bench "
+                            "(restart mid-bench?); releasing the teardown hold",
+                            round_id)
+                self._mark_bench_complete(round_id, uploaded=False)
+        except OSError:
+            pass
+
     def run_post_publish_bench(self, manifest: TrainingManifest) -> object | None:
         """Bench BOTH final-duel checkpoints and publish the round's signed bench
         report — strictly AFTER :meth:`publish` (validators are already scoring;
         nothing here can delay or modify the round). Best-effort throughout:
         returns the published :class:`~cascade.shared.bench_report.BenchReport`
         or ``None``, never raises, and always releases the provisioner's
-        teardown hold on exit."""
+        teardown hold on exit. A no-op (no markers touched) when the bench is
+        not armed — the marker lifecycle exists only where the hold does."""
+        if not self.will_run_post_publish_bench():
+            return None
         report = None
         try:
             report = self._post_publish_bench(manifest)
@@ -1723,8 +1745,6 @@ class TrainerRunner:
             sign_bench_report,
         )
 
-        if not self.will_run_post_publish_bench():
-            return None
         primary = self.cfg.throne_contracts()[0].arch_preset
         # The duel at the primary throne size: the king plus each finalist
         # (legacy size == "" reads as primary). Benched checkpoint-by-checkpoint;
@@ -1791,7 +1811,13 @@ class TrainerRunner:
             def _bench_host_group(group: tuple[object, list[TrainedEntry]]) -> None:
                 host, host_entries = group
                 for entry in host_entries:
-                    scores = self._remote_bench_scores(host, entry, round_id, primary)
+                    try:
+                        scores = self._remote_bench_scores(host, entry, round_id, primary)
+                    except Exception as e:  # noqa: BLE001 — one bad sweep must not lose the rest
+                        log.warning("round=%s: remote bench failed for %s %s on %s: %s",
+                                    round_id, entry.role, entry.miner_hotkey,
+                                    getattr(host, "name", host), e)
+                        continue
                     if scores is not None:
                         out[entry.trained_pointer] = scores
 
@@ -2856,6 +2882,11 @@ class TrainerRunner:
                 # and re-skip it exactly like a matching last_round (see
                 # _round_already_published for the two incidents this stops).
                 if self._round_already_published(round_id):
+                    # A restart between publish and bench completion leaves the
+                    # bench_pending marker armed with no bench coming (the
+                    # thread died with the old process) — release the hold
+                    # rather than bill the final pod to the cap.
+                    self._release_stale_bench_hold(round_id)
                     last_round = round_id
                     time.sleep(poll)
                     continue

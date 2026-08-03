@@ -1038,6 +1038,10 @@ class ValidatorRunner:
         from ..shared.manifest import load_manifest
 
         store = open_manifest_store(self.cfg.storage)
+        if self.bench_report_store is None:
+            # Bench reports live in the same bucket — reuse this store (and its
+            # R2/HF fallbacks) instead of lazily building a second client.
+            self.bench_report_store = store
         poll = self.cfg.manifest.poll_seconds
         # Dedup on CONTENT, not round_id: a re-published manifest for an
         # already-seen round id (same-round-id rerun, e.g. after a contract

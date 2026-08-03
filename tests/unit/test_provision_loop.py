@@ -898,6 +898,44 @@ def test_bench_marker_ignored_when_hold_disabled(tmp_path):
     assert prov.live == {}
 
 
+def test_bench_hold_rearms_for_a_new_rounds_marker(tmp_path):
+    # Regression: one round's EXPIRED hold (crashed bench, cap ran out, pod
+    # reaped) must not deny the next round's bench its own hold. Once the
+    # ledger empties the sweep stops consulting _bench_hold, so the latch
+    # can't rely on being reset between rounds — a different marker identity
+    # must re-arm it.
+    from datetime import UTC, datetime
+
+    from cascade.provision.state import PodInstance, RoundState
+
+    clock = Clock()
+    loop, _ = make_loop(tmp_path, clock=clock)
+    loop.bench_hold_max_hours = 1.0
+    (tmp_path / "work").mkdir(parents=True, exist_ok=True)
+
+    def _fleet(round_key):
+        return RoundState(round_id=round_key, instances=(
+            PodInstance(provider="lium", instance_id=f"{round_key}-final", stage="final",
+                        rented_at_iso=datetime.fromtimestamp(clock.t, tz=UTC).isoformat()),))
+
+    # Round 111: hold arms, the trainer dies mid-bench, the cap expires.
+    loop._state = _fleet("900")
+    d1 = tmp_path / "work" / "111"
+    d1.mkdir(parents=True)
+    (d1 / "bench_pending.json").write_text('{"round_id": "111"}')
+    assert loop._bench_hold() is True
+    clock.t += 1.0 * 3600.0
+    assert loop._bench_hold() is False                       # expired: reap regardless
+    # Round 222: fresh fleet, fresh marker (the old round's marker is gone —
+    # settled or cleaned; in production its mtime also predates the new rent).
+    (d1 / "bench_pending.json").unlink()
+    loop._state = _fleet("1800")
+    d2 = tmp_path / "work" / "222"
+    d2.mkdir(parents=True)
+    (d2 / "bench_pending.json").write_text('{"round_id": "222"}')
+    assert loop._bench_hold() is True                        # latch re-armed
+
+
 def test_stale_bench_marker_from_prior_round_never_holds(tmp_path):
     # A leftover bench_pending.json from ANOTHER round (trainer died mid-bench
     # last round) must not hold the new fleet — same base_seed matching as the

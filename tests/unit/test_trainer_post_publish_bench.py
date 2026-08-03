@@ -208,9 +208,32 @@ def test_disabled_or_unwired_is_a_no_op(cfg, cascade_cfg, tmp_path, monkeypatch)
     assert runner.will_run_post_publish_bench() is False
     assert runner.run_post_publish_bench(manifest) is None
     assert called == [] and runner._manifest_store.texts == {}
+    # And no marker lifecycle either — the hold markers exist only where the
+    # bench (and therefore the provisioner hold) is armed.
+    assert not (tmp_path / "1" / "bench_pending.json").exists()
+    assert not (tmp_path / "1" / "bench_complete.json").exists()
     # cascade_enabled on but no eval path wired ⇒ equally a no-op predicate.
     unwired = _runner(cascade_cfg, tmp_path / "b", monkeypatch, bench_eval_fn=None)
     assert unwired.will_run_post_publish_bench() is False
+
+
+def test_restart_releases_a_stale_bench_hold(cascade_cfg, tmp_path, monkeypatch):
+    # A trainer restart between publish and bench completion kills the bench
+    # thread but leaves bench_pending armed; the restart re-entry skip path
+    # must release the hold instead of billing the pod to the cap.
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=lambda d: _BENCH)
+    runner._mark_bench_pending("42")
+    runner._release_stale_bench_hold("42")
+    assert not (tmp_path / "42" / "bench_pending.json").exists()
+    done = json.loads((tmp_path / "42" / "bench_complete.json").read_text())
+    assert done == {"round_id": "42", "uploaded": False}
+    # Idempotent-safe: an already-completed round is left alone…
+    before = (tmp_path / "42" / "bench_complete.json").read_text()
+    runner._release_stale_bench_hold("42")
+    assert (tmp_path / "42" / "bench_complete.json").read_text() == before
+    # …and a round with no markers at all stays marker-free.
+    runner._release_stale_bench_hold("43")
+    assert not (tmp_path / "43").exists()
 
 
 def test_wandb_pair_logged_per_round(cascade_cfg, tmp_path, monkeypatch):
