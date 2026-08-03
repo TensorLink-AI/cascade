@@ -127,8 +127,13 @@ POOL_PIN_READ_GRACE_SECONDS = 1800.0
 # missing bench report before writing that round off. The trainer publishes the
 # report ~30-60 min after the manifest (the bench runs post-publish), so it is
 # usually there by the time the NEXT round's cascade step runs — one retry
-# catches nearly everything; the rest is slack for a storage blip.
-BENCH_REPORT_RETRY_ROUNDS = 3
+# catches nearly everything. The budget is deliberately generous anyway (each
+# retry is one GET against an R2-backed store): a validator that misses a
+# report its peers recorded ends the reign with a DIFFERENT log, can select a
+# different promotion winner, and then rejects rounds at the warm-start pin
+# gate — so convergence is worth days of cheap re-probing, and 5 retries at
+# 12h rounds spans most of a 7-round reign.
+BENCH_REPORT_RETRY_ROUNDS = 5
 
 
 @dataclass
