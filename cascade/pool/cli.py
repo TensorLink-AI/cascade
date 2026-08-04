@@ -125,6 +125,57 @@ def _add_publish(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_publish)
 
 
+def _add_reveal(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "reveal",
+        help="Mirror RETIRED pool snapshot tars (exact bytes, sha256-verified) "
+        "to the public HF dataset.",
+    )
+    p.add_argument("--hf-repo", required=True, help="Target HF dataset repo id.")
+    p.add_argument(
+        "--keep-newest",
+        type=int,
+        default=2,
+        help="Withhold the N newest real snapshots (default 2: pending + possibly-active).",
+    )
+    p.add_argument("--max-reveal", type=int, default=6, help="Upload at most N per run.")
+    p.add_argument("--out", type=Path, default=Path("./_reveal_stage"), help="Local staging dir.")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.set_defaults(func=_cmd_reveal)
+
+
+def _cmd_reveal(args: argparse.Namespace) -> int:
+    import os
+
+    cfg = load_chain_config(args.chain_toml)
+    if not cfg.storage.pool_bucket:
+        print("error: [storage] pool_bucket is empty; nothing to reveal from.", file=sys.stderr)
+        return 2
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("HF_TOKEN not set — skipping reveal", file=sys.stderr)
+        return 0
+
+    from ..shared.hippius import StorageError, pool_s3_store
+    from .reveal import reveal_snapshots
+
+    try:
+        store = pool_s3_store(cfg.storage)
+        n = reveal_snapshots(
+            store,
+            args.hf_repo,
+            hf_token=token,
+            keep_newest=args.keep_newest,
+            max_reveal=args.max_reveal,
+            work_dir=args.out,
+        )
+    except StorageError as e:
+        print(f"reveal failed: {e}", file=sys.stderr)
+        return 4
+    print(f"revealed {n} snapshot(s) to https://huggingface.co/datasets/{args.hf_repo}")
+    return 0
+
+
 def _add_sources(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("sources", help="List registered data sources.")
     p.set_defaults(func=_cmd_sources)
@@ -306,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_build(sub)
     _add_publish(sub)
+    _add_reveal(sub)
     _add_sources(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
