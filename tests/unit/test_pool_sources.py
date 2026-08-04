@@ -333,6 +333,51 @@ def test_tsbench_forge_respects_max_series(tmp_path):
     assert len(out) == 1
 
 
+def test_tsbench_forge_per_feed_panel_cap(tmp_path):
+    """max_series_per_source caps panel rows PER catalog feed; ctx.max_series
+    is the whole-harvest budget. Confusing the two nukes the pool (the caps
+    workflow flags depend on this distinction)."""
+    from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
+
+    as_of = dt.date(2026, 6, 1)
+    root = _write_forge_mirror(tmp_path, as_of)
+    ctx = HarvestContext(as_of=as_of, context_length=512, horizon=16, max_series=100)
+    out = list(TsbenchForgeSource(root, max_series_per_source=1).harvest(lambda u, p: None, ctx))
+
+    ids = sorted(s.series_id for s in out)
+    # grid_load's two panel rows collapse to its first (sorted) region; the
+    # unpaneled wiki_views feed is untouched by the per-feed cap.
+    assert ids == ["tsforge__grid_load__REGION_north", "tsforge__wiki_views"]
+
+
+def test_cli_plumbs_per_feed_cap_to_forge_source(tmp_path, monkeypatch):
+    """--max-panel-series-per-feed must reach TsbenchForgeSource (the registry
+    builds sources with zero-arg factories, so the CLI patches the instance)."""
+    from cascade.pool import cli
+    from cascade.pool.sources.tsbench_forge import ENV_FORGE_DIR
+
+    as_of = dt.date(2026, 6, 1)
+    root = _write_forge_mirror(tmp_path, as_of)
+    monkeypatch.setenv(ENV_FORGE_DIR, str(root))
+
+    seen = {}
+    real_build_pool = cli.build_pool
+
+    def spy(sources, *a, **kw):
+        seen["caps"] = [getattr(s, "max_series_per_source", None) for s in sources]
+        return real_build_pool(sources, *a, **kw)
+
+    monkeypatch.setattr(cli, "build_pool", spy)
+    rc = cli.main([
+        "build", "--out", str(tmp_path / "pool"),
+        "--sources", "tsbench_forge",
+        "--as-of", as_of.isoformat(),
+        "--max-panel-series-per-feed", "1",
+    ])
+    assert rc == 0
+    assert seen["caps"] == [1]
+
+
 def test_resolve_frequency_derivation_matches_the_pinned_table():
     """The generic ISO-duration path must reproduce every canonical entry, so a
     catalog cadence dropping out of FREQ_MAP can never change behaviour."""

@@ -55,8 +55,29 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-context", type=int, default=256, help="Minimum context a kept window affords.")
     p.add_argument("--max-missing-frac", type=float, default=0.2, help="Drop series gappier than this.")
     p.add_argument("--max-series-per-domain", type=int, default=None)
+    p.add_argument(
+        "--max-series-per-domain-freq",
+        type=int,
+        default=None,
+        help="Cap per (domain, granularity) cell — an hourly flood inside a domain "
+        "can't crowd out that domain's daily series.",
+    )
     p.add_argument("--max-series-total", type=int, default=None)
-    p.add_argument("--max-series-per-source", type=int, default=10_000)
+    p.add_argument(
+        "--max-series-per-source",
+        type=int,
+        default=10_000,
+        help="Budget across a source's WHOLE harvest (for tsbench_forge that is the "
+        "entire catalog, not per feed — see --max-panel-series-per-feed).",
+    )
+    p.add_argument(
+        "--max-panel-series-per-feed",
+        type=int,
+        default=None,
+        help="Cap panel-expanded series kept per catalog feed (tsbench_forge only; "
+        "default: the source's built-in cap). Keeps the first N panel rows in the "
+        "source's deterministic sort order.",
+    )
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--timeout", type=float, default=30.0, help="Per-request HTTP timeout (s).")
 
@@ -119,6 +140,11 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
     context_length = args.context_length or cfg.eval.context_length
     horizon = args.horizon or cfg.eval.horizon
     sources = get_sources([s.strip() for s in args.sources.split(",") if s.strip()])
+    if getattr(args, "max_panel_series_per_feed", None) is not None:
+        for src in sources:
+            # Only panel-expanding sources carry a per-feed cap (tsbench_forge).
+            if hasattr(src, "max_series_per_source"):
+                src.max_series_per_source = int(args.max_panel_series_per_feed)
     ctx = HarvestContext(
         as_of=_parse_date(args.as_of),
         span_days=args.span_days,
@@ -132,6 +158,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         min_context=args.min_context,
         max_missing_frac=args.max_missing_frac,
         max_series_per_domain=args.max_series_per_domain,
+        max_series_per_domain_freq=args.max_series_per_domain_freq,
         max_series_total=args.max_series_total,
     )
     return build_pool(
