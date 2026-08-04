@@ -64,7 +64,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60   # build time grew with the pool; caps below pull it back, 60 is headroom
     env:
       # CASCADE key — writes the eval-pool bucket (and reads the manifest bucket
       # for --effective-block auto). cascade-pool publish reads HIPPIUS_S3_*, so
@@ -115,9 +115,25 @@ jobs:
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           echo "publishing with $TOML (effective-block=$EFFECTIVE_BLOCK)"
+          # SERIES CAPS — keep IDENTICAL to the reveal step below. The reveal
+          # rebuilds yesterday's pool deterministically on the promise that it
+          # equals the snapshot validators scored; different caps break that.
+          # --max-panel-series-per-feed 25: each GBFS bike-share feed panel-expands
+          #   into ~200 station series (8 feeds put transport at ~73% of the pool);
+          #   25 per feed keeps the signal without the flood.
+          # --max-series-per-domain-freq 300: balance by domain AND granularity —
+          #   no (domain, freq) cell can dominate, so an hourly flood inside a
+          #   domain can't crowd out that domain's daily series either.
+          # --max-series-per-domain 600: outer bound — every domain is already
+          #   multi-granularity (4-9 freqs), so the cell cap alone would let one
+          #   domain span cells up to 300 x n_freqs; 600 absolute caps that.
+          #   Binds nothing in today's pool (largest post-cap domain ~367).
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
+            --max-panel-series-per-feed 25 \
+            --max-series-per-domain-freq 300 \
+            --max-series-per-domain 600 \
             --effective-block "$EFFECTIVE_BLOCK"
 
       # Public reveal: rebuild YESTERDAY's closed-day pool (deterministic, so it
@@ -135,9 +151,16 @@ jobs:
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           AS_OF=$(date -u -d 'yesterday' +%F)
           echo "revealing eval snapshot as_of=$AS_OF -> $HF_EVAL_REPO"
+          # Caps MUST match the publish step above — see the comment there.
+          # KNOWN one-day artifact: the first run after the caps merge reveals
+          # yesterday's pool, which was published UNCAPPED, so that single HF
+          # snapshot will not byte-match the scored one. Self-heals next day.
           TSFORGE_DIR=./tsforge cascade-pool build \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
+            --max-panel-series-per-feed 25 \
+            --max-series-per-domain-freq 300 \
+            --max-series-per-domain 600 \
             --as-of "$AS_OF" \
             --out ./public_pool --overwrite
           python scripts/publish_hf_eval.py \
