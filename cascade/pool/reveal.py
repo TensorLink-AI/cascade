@@ -95,6 +95,13 @@ def reveal_snapshots(
     Raises :class:`StorageError` if any downloaded tar fails its index sha256 —
     an integrity failure must be loud, never published.
     """
+    import os
+
+    # A plain HF write token 403s on the Xet upload path that recent
+    # huggingface_hub versions default to; force the standard LFS/HTTP path.
+    # Must be set before the import — hub constants read it at import time.
+    # setdefault so an explicit HF_HUB_DISABLE_XET=0 still opts back in.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from huggingface_hub import HfApi  # hippius extra; lazy like the HF script
 
     index = read_pool_index(store)
