@@ -18,10 +18,12 @@
 #   CASCADE_S3_ACCESS_KEY / CASCADE_S3_SECRET_KEY   write eval-pool + read manifest
 # OPTIONAL (enables the public HF reveal):
 #   HF_TOKEN                                        HF write token for HF_EVAL_REPO's org
-#   (repo var HF_EVAL_REPO, default Tensor-Link/cascade-eval-pool) — the daily
-#   24h-LAGGED snapshot is pushed here as a PUBLIC dataset with full labels. It is
-#   always a closed prior day, so it never reveals the round scored today. Unset
-#   HF_TOKEN => the reveal step is skipped and only the private publish runs.
+#   (repo var HF_EVAL_REPO, default Tensor-Link/cascade-eval-pool) — RETIRED
+#   snapshot tars are mirrored here byte-identically (sha256-verified against
+#   pool/index.json, the same hash round receipts pin). Only snapshots already
+#   superseded by a newer active one are revealed (~48h lag), so a revealed
+#   pool can never be selected by a current or future round. Unset HF_TOKEN =>
+#   the reveal step is skipped and only the private publish runs.
 # OPTIONAL repo variables:
 #   TSFORGE_BUCKET        forge raw-data bucket   (default: tsbench-forge-sources)
 #   HIPPIUS_S3_ENDPOINT   S3 endpoint             (default: https://s3.hippius.com)
@@ -115,9 +117,8 @@ jobs:
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           echo "publishing with $TOML (effective-block=$EFFECTIVE_BLOCK)"
-          # SERIES CAPS — keep IDENTICAL to the reveal step below. The reveal
-          # rebuilds yesterday's pool deterministically on the promise that it
-          # equals the snapshot validators scored; different caps break that.
+          # SERIES CAPS (publish only — the reveal below mirrors the published
+          # tar byte-for-byte and builds nothing, so no flag parity is needed).
           # --max-panel-series-per-feed 25: each GBFS bike-share feed panel-expands
           #   into ~200 station series (8 feeds put transport at ~73% of the pool);
           #   25 per feed keeps the signal without the flood.
@@ -136,11 +137,17 @@ jobs:
             --max-series-per-domain 600 \
             --effective-block "$EFFECTIVE_BLOCK"
 
-      # Public reveal: rebuild YESTERDAY's closed-day pool (deterministic, so it
-      # equals the snapshot scored a day ago) and push it, WITH labels, to a
-      # public HF dataset. A day stale by construction, so it never exposes the
-      # round being scored today. Skipped cleanly if HF_TOKEN isn't set.
-      - name: Reveal lagged snapshot to public HF
+      # Public reveal: mirror RETIRED snapshot tars from the pool bucket to a
+      # public HF dataset — the EXACT bytes validators scored, sha256-verified
+      # against pool/index.json (the hash round receipts pin). Nothing is
+      # rebuilt: the old rebuild-based reveal drifted from the pinned tar
+      # whenever mirror partitions landed after the publish (observed live:
+      # block-8740800 = 3,356 series vs its rebuild = 3,442). The newest two
+      # snapshots are withheld (pending + possibly-active), so a revealed pool
+      # can never be selected by a current or future round; effective lag ~48h.
+      # Idempotent per snapshot — backlog backfills across runs (max 6/run).
+      # Skipped cleanly if HF_TOKEN isn't set.
+      - name: Reveal retired snapshots to public HF  (exact bytes)
         if: env.HF_TOKEN != ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -149,19 +156,4 @@ jobs:
         run: |
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
-          AS_OF=$(date -u -d 'yesterday' +%F)
-          echo "revealing eval snapshot as_of=$AS_OF -> $HF_EVAL_REPO"
-          # Caps MUST match the publish step above — see the comment there.
-          # KNOWN one-day artifact: the first run after the caps merge reveals
-          # yesterday's pool, which was published UNCAPPED, so that single HF
-          # snapshot will not byte-match the scored one. Self-heals next day.
-          TSFORGE_DIR=./tsforge cascade-pool build \
-            --chain-toml "$TOML" \
-            --sources tsbench_forge \
-            --max-panel-series-per-feed 25 \
-            --max-series-per-domain-freq 300 \
-            --max-series-per-domain 600 \
-            --as-of "$AS_OF" \
-            --out ./public_pool --overwrite
-          python scripts/publish_hf_eval.py \
-            --pool-dir ./public_pool --repo-id "$HF_EVAL_REPO" --as-of "$AS_OF"
+          cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO"
