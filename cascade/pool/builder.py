@@ -67,6 +67,9 @@ class PoolBuildConfig:
     min_std: float = 1e-8
     keep_tail: bool = True
     max_series_per_domain: int | None = None
+    # Cap per (domain, freq) CELL — the granularity-aware balance knob: an
+    # hourly flood inside a domain can't crowd out that domain's daily series.
+    max_series_per_domain_freq: int | None = None
     max_series_total: int | None = None
 
     @property
@@ -221,6 +224,7 @@ def collect_records(
     used_counts: dict[str, int] = {}
     assigned: set[str] = set()
     per_domain: Counter = Counter()
+    per_cell: Counter = Counter()  # (domain, freq) — granularity-aware cap
 
     for src in sources:
         for hs in src.harvest(fetch, ctx):
@@ -240,6 +244,13 @@ def collect_records(
             ):
                 drops["domain_cap"] += 1
                 continue
+            cell = (rec.domain, rec.metadata.get("freq"))
+            if (
+                cfg.max_series_per_domain_freq is not None
+                and per_cell[cell] >= cfg.max_series_per_domain_freq
+            ):
+                drops["domain_freq_cap"] += 1
+                continue
 
             # Disambiguate any sanitised-id collision so every record maps to a
             # unique filename / metadata key.
@@ -256,6 +267,7 @@ def collect_records(
 
             seen_hash.add(rec.content_hash)
             per_domain[rec.domain] += 1
+            per_cell[cell] += 1
             records.append(rec)
 
     records.sort(key=lambda r: r.series_id)  # deterministic on-disk order
