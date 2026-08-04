@@ -111,6 +111,12 @@ jobs:
         env:
           NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
           EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
+          # R2 dual-write of the pool snapshot + index ([storage]
+          # pool_backup_bucket). Scoped to this step like the other keys.
+          # Unset secrets => empty env => backup cleanly disabled (logged),
+          # so this is safe to merge before the repo secrets exist.
+          BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+          BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
         run: |
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
