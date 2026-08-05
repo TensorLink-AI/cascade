@@ -1701,9 +1701,7 @@ class ProvisionerLoop:
         # (2026-07-29: round-8733600 final + eval pods killed 49min into
         # their round by round-8730000's post-wall publish).
         expected = self._expected_base_seed()
-        if expected is not None and current != expected:
-            return False
-        return True
+        return expected is None or current == expected
 
     def _latest_round_id(self) -> str | None:
         if self.manifest_store is None:
