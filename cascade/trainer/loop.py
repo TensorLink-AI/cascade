@@ -1792,25 +1792,29 @@ class TrainerRunner:
 
         Remote plan wired ⇒ each checkpoint benches on the pod that trained it
         (GPU, checkpoint already at its ``_train_work`` path). Checkpoints on
-        DIFFERENT pods bench in parallel — a serial king+challenger full
-        battery would spend most of the provisioner's teardown hold — but two
-        launches on ONE pod stay sequential, because every bench launch
-        preempts the previous sweep (PREEMPT_BENCHMARKS). No remote plan ⇒
+        DIFFERENT physical pods bench in parallel — a serial king+challenger
+        full battery would spend most of the provisioner's teardown hold — but
+        launches sharing ONE pod (per-lane host entries with the same address,
+        the JIT-final topology) run sequentially: every bench launch pkills any
+        running sweep on its pod (PREEMPT_BENCHMARKS), so a parallel same-pod
+        launch would murder its sibling mid-battery. Grouping is therefore by
+        pod ADDRESS, not host name; each entry still benches through its own
+        lane host so it keeps its assigned CUDA device. No remote plan ⇒
         sequential local ``bench_eval_fn`` over registry fetches."""
         from concurrent.futures import ThreadPoolExecutor
 
         out: dict[str, BenchScores] = {}
         if self.cascade_bench_plan is not None and self.remote_hosts:
-            by_host: dict[str, tuple[object, list[TrainedEntry]]] = {}
+            by_pod: dict[str, list[tuple[object, TrainedEntry]]] = {}
             for entry in duel:
                 host = self._bench_host_for(entry, primary)
                 if host is None:
                     continue
-                by_host.setdefault(getattr(host, "name", str(host)), (host, []))[1].append(entry)
+                pod = str(getattr(host, "host", None) or getattr(host, "name", host))
+                by_pod.setdefault(pod, []).append((host, entry))
 
-            def _bench_host_group(group: tuple[object, list[TrainedEntry]]) -> None:
-                host, host_entries = group
-                for entry in host_entries:
+            def _bench_pod_group(pairs: list[tuple[object, TrainedEntry]]) -> None:
+                for host, entry in pairs:
                     try:
                         scores = self._remote_bench_scores(host, entry, round_id, primary)
                     except Exception as e:  # noqa: BLE001 — one bad sweep must not lose the rest
@@ -1821,8 +1825,8 @@ class TrainerRunner:
                     if scores is not None:
                         out[entry.trained_pointer] = scores
 
-            with ThreadPoolExecutor(max_workers=max(1, len(by_host))) as ex:
-                list(ex.map(_bench_host_group, by_host.values()))
+            with ThreadPoolExecutor(max_workers=max(1, len(by_pod))) as ex:
+                list(ex.map(_bench_pod_group, by_pod.values()))
             return out
         if self.bench_eval_fn is not None:
             for entry in duel:

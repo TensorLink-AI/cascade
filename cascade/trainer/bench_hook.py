@@ -91,10 +91,23 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     prefix = ""
     if host.cuda_device is not None:
         prefix = f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
+    project = shlex.quote(f"{host.workdir}/benchmarks")
+    # Image-booted pods deliberately bake no benchmark data (4.4G would slow
+    # every heat boot for nothing) — self-provision on first bench instead.
+    # && -chained so a failed download fails the sweep (best-effort upstream)
+    # rather than benching against an empty data dir. Same-pod launches are
+    # serialized by the caller (grouped by pod address), so the guard never
+    # races itself.
+    data_guard = (
+        f"{{ test -d {shlex.quote(plan.data_dir)} || "
+        f"{plan.uv_bin} run --project {project} cascade-benchmark-download "
+        f"--data-dir {shlex.quote(plan.data_dir)}; }} && "
+    )
     cmd = (
         PREEMPT_BENCHMARKS
+        + data_guard
         + prefix
-        + f"{plan.uv_bin} run --project {shlex.quote(f'{host.workdir}/benchmarks')} "
+        + f"{plan.uv_bin} run --project {project} "
         + quoted
     )
     return cmd, report

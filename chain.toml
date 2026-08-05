@@ -91,7 +91,10 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-train_image_digest = "sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf75c8855715c9a0"
+# worker-v0.5.0 (2026-08-05, CI run 30974674919): bakes DEC-CA-0010 host
+# telemetry + PR-174 bench pipeline tree. v0.4.0 retired:
+# sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf75c8855715c9a0
+train_image_digest = "sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c91303163b6f57"
 # ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.4.0 (2026-07-23, built from
 # 1325409 — [wandb] extra baked, warm-start worker plumbing, incident-hardening
 # trainer code; torch/generator-dependency stack unchanged from v0.3.1).
@@ -291,7 +294,9 @@ benchmark_max_series  = 0        # cap datasets/tasks for a fast smoke run; 0 = 
 # provisioner holds the round's FINAL pod for that sweep past its normal
 # teardown signal; the hold releases early when the bench_complete marker
 # lands. Inert while cascade_enabled = false.
-bench_hold_max_hours  = 2.0
+bench_hold_max_hours  = 3.0   # king+challenger bench SEQUENTIALLY on the one final pod
+                              # (same-pod parallel launches preempt each other) — ~1h each
+                              # + first-rental 4.4G data download needs headroom past 2h
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators need the data pinned locally.
 gift_gate_datasets    = ""       # gift-eval config subset ("" = full 97 configs)
@@ -332,7 +337,7 @@ gift_gate_min_configs = 15       # shared configs below which the gate is uncomp
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade). After
 # cascade_reign_days consecutive undethroned days, the reign's best checkpoint
 # becomes the warm-start init and the throne is vacated.
-cascade_enabled      = false     # master on/off for warm-start promotion
+cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post-publish duel bench live
 # Consecutive undethroned ROUNDS before a Cascade fires — "survived N
 # challenges". Renamed from cascade_reign_days on 2026-07-28 (the old key is
 # still accepted): the clock used to divide reign blocks by a fixed 7200-block
@@ -340,9 +345,10 @@ cascade_enabled      = false     # master on/off for warm-start promotion
 # same 7 would have silently meant 14 challenges. The clock is now epoch-
 # relative (cascade.validator.cascade.reign_rounds), so this number means the
 # same thing at any cadence and needs no re-tuning when the round length moves.
-# Value unchanged at 7 — identical to the old behaviour at the old cadence.
-# Cascade remains dormant; arming it is a separate Approve decision.
-cascade_reign_rounds = 7
+# Lowered 7 → 5 at arming (owner, 2026-08-05): at the 12h cadence, 5 rounds
+# ≈ 2.5 days per promotion cycle. CONSENSUS-relevant — every validator must
+# run the same value or cascades fire at different rounds (divergent pins).
+cascade_reign_rounds = 5
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely
