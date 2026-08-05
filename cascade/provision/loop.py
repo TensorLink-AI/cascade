@@ -763,11 +763,27 @@ class ProvisionerLoop:
 
     # ── within-round retry + JIT final (the late-rental phases) ──────────────
 
+    def _round_closes_at(self) -> int | None:
+        """The block at which the provisioned round ends.
+
+        ``_provisioned_round`` is the boundary NEXT after rent time, so its
+        meaning follows the trigger form: the post-boundary offset trigger
+        rents just after the round opens (boundary = END), while the
+        pre-boundary margin trigger rents just before it opens (boundary =
+        START, round closes one epoch later). Treating it as START under the
+        offset form double-counted the epoch (+12h, 2026-07-29)."""
+        if self._provisioned_round is None:
+            return None
+        if int(getattr(self.policy, "trigger_offset_blocks", 0) or 0) > 0:
+            return self._provisioned_round
+        return self._provisioned_round + self.epoch_at(self._provisioned_round)
+
     def _remaining_epoch_hours(self, block: int) -> float:
         """Hours left until the provisioned round's epoch boundary closes."""
-        if self._provisioned_round is None:
+        closes_at = self._round_closes_at()
+        if closes_at is None:
             return 0.0
-        return (self._provisioned_round + self.epoch_at(block) - block) * 12.0 / 3600.0
+        return (closes_at - block) * 12.0 / 3600.0
 
     def _final_primary_has_capacity(self, slots: int) -> bool:
         """Cheap availability pre-check — list offers, rent nothing.
@@ -1561,10 +1577,16 @@ class ProvisionerLoop:
         boundary (the hash is immutable). Returns None when the client can't
         answer — boundary not yet finalised, no ``block_seed`` (offline fakes),
         or a chain hiccup — leaving the mtime heuristic as the fallback."""
-        boundary = self._provisioned_round
-        if boundary is None:
+        closes_at = self._round_closes_at()
+        if closes_at is None:
             return None
-        if self._expected_seed_for == boundary:
+        # The trainer seeds the round off the block that OPENS it. Under the
+        # offset trigger _provisioned_round is the END boundary — deriving
+        # from it named a marker that could never match, and mid-round its
+        # hash doesn't even exist yet (2026-07-29 JIT incident: the marker was
+        # skipped every cycle and the final fell back to heat 4090s).
+        boundary = closes_at - self.epoch_at(closes_at)
+        if boundary == self._expected_seed_for:
             return self._expected_seed
         seed_fn = getattr(self.chain_client, "block_seed", None)
         if seed_fn is None:
@@ -1573,6 +1595,13 @@ class ProvisionerLoop:
             # Under the same hard deadline as every other chain read: a hung
             # block_seed must not wedge the teardown sweep (this runs each cycle
             # until the boundary is on-chain and the seed caches).
+            hash_fn = getattr(self.chain_client, "block_hash", None)
+            if hash_fn is not None and not self._with_deadline(
+                    lambda: hash_fn(boundary), 30.0):
+                # No hash for the boundary (not on-chain / node behind):
+                # block_seed would silently hash None into a plausible garbage
+                # seed — never derive from a missing hash.
+                return None
             seed = str(int(self._with_deadline(lambda: seed_fn(boundary), 30.0)))
         except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down / hung
             return None
@@ -1663,8 +1692,18 @@ class ProvisionerLoop:
                 if digest != self._round_manifest_baseline:
                     return True
         current = self._latest_round_id()
-        return (self._manifest_baseline is not None and current is not None
-                and current != self._manifest_baseline)
+        if (self._manifest_baseline is None or current is None
+                or current == self._manifest_baseline):
+            return False
+        # latest.json moved — but only OUR round's publish ends this round. A
+        # PREVIOUS round's late manifest also moves the pointer, and reading
+        # that as "round over" swept a freshly rented next-round fleet
+        # (2026-07-29: round-8733600 final + eval pods killed 49min into
+        # their round by round-8730000's post-wall publish).
+        expected = self._expected_base_seed()
+        if expected is not None and current != expected:
+            return False
+        return True
 
     def _latest_round_id(self) -> str | None:
         if self.manifest_store is None:

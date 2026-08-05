@@ -95,6 +95,10 @@ class StagePolicy:
     providers: tuple[str, ...]
     max_price_hr: float
     slot_overhead: float = 1.3
+    # Floor on the stage's GPU slots whenever the stage runs at all (heat
+    # only in practice; 0 = purely field-sized). A small field still rents
+    # this many lanes — the owner's guaranteed-capacity knob.
+    min_slots: int = 0
     # The marketplace's name for the same silicon when it differs from the
     # nvidia-smi device string ("A6000" on lium vs "NVIDIA RTX A6000" on the
     # pod). Empty = same as ``sku``. The health gate ALWAYS asserts ``sku``.
@@ -261,6 +265,10 @@ def size_fleet(
     if n_to_screen > 0:
         window = max(epoch_hours - final_hours, heat_hours)
         heat_slots = math.ceil(n_to_screen * heat_hours * policy.heat.slot_overhead / window)
+        # Floor is one lane per screened entrant, capped at min_slots: a lane
+        # beyond n_to_screen would idle through the single screen wave, so a
+        # small field rents exactly its own size (owner 2026-07-30).
+        heat_slots = max(heat_slots, min(n_to_screen, policy.heat.min_slots))
         heat_pods = _clamp(math.ceil(heat_slots / policy.heat.gpus_per_pod),
                            0, policy.heat.max_pods)
     else:
