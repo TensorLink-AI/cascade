@@ -199,9 +199,11 @@ def test_one_role_miss_publishes_partial_report(cascade_cfg, tmp_path, monkeypat
 
 
 def test_disabled_or_unwired_is_a_no_op(cfg, cascade_cfg, tmp_path, monkeypatch):
-    # cascade_enabled off (the deployed default) ⇒ no bench, no report, no marker.
+    # cascade_enabled off (explicit — chain.toml ships armed since 2026-08-05)
+    # ⇒ no bench, no report, no marker.
+    off_cfg = replace(cfg, scoring=replace(cfg.scoring, cascade_enabled=False))
     called: list = []
-    runner = _runner(cfg, tmp_path, monkeypatch,
+    runner = _runner(off_cfg, tmp_path, monkeypatch,
                      bench_eval_fn=lambda d: called.append(d) or _BENCH)
     manifest = runner.run_round([_commit(0, "a", REF_A, 1)], king_hotkey="a",
                                 base_seed=1, block=10)

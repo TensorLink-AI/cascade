@@ -347,13 +347,16 @@ def test_cascade_toggle_wires_controller(tmp_path):
     from cascade.validator.loop import build_runner
 
     base = load_chain_config("chain.toml")
-    # Off (mainnet default) ⇒ no controller wired (pure KOTH).
-    assert base.scoring.cascade_enabled is False
-    runner_off = build_runner(chain_toml=None)  # DEFAULT_CHAIN_TOML == chain.toml
+    # Shipped ARMED (2026-08-05). Config assert only — building a runner from
+    # the repo toml with cascade on would persist reign state into the repo
+    # root, so both runner checks below use synthetic tomls under tmp.
+    assert base.scoring.cascade_enabled is True
+
+    # Off ⇒ no controller wired (pure KOTH).
+    runner_off = build_runner(chain_toml=_write_toml_with_cascade(tmp_path, enabled=False))
     assert runner_off.cascade is None
 
-    # On ⇒ controller wired (synthetic toml; the shipped testnet file toggles
-    # this deliberately over time — deferred 2026-07-13 — so don't assert it).
+    # On ⇒ controller wired.
     runner_on = build_runner(chain_toml=_write_toml_with_cascade(tmp_path, enabled=True))
     assert runner_on.cascade is not None
     assert runner_on.cascade.reign_days == 7

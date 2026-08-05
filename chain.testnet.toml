@@ -261,7 +261,7 @@ gift_gate_min_configs = 15       # shared gift-eval configs below which the gate
 # TIME CRPS/MASE numbers the trainer stamps onto the signed manifest) is installed
 # as the warm-start init and the throne is vacated so the field re-competes from
 # it.
-cascade_enabled      = false     # TESTNET: deferred — not running Cascade warm-start promotion / per-round king bench yet (2026-07-13)
+cascade_enabled      = true      # TESTNET: armed 2026-08-05 for the PR-174 bench-pipeline drill (reports, hold, retry, promotion)
 cascade_reign_days   = 1         # consecutive undethroned days before a Cascade fires
 
 [dependencies]
