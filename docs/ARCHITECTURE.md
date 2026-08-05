@@ -280,6 +280,17 @@ is still available: set `dethrone_cp > 1` (a challenger must then win that many
 and let `win_margin_end > win_margin_start` ramp over `margin_warmup_rounds` of
 tenure so an entrenched king must be beaten more decisively.
 
+**Stale-throne margin decay.** The shipped config also arms the opposite lever:
+once a king survives `margin_decay_after_rounds` (3) rounds undethroned, the win
+margin's excess above `margin_floor` is multiplied by `margin_decay_rate` (0.5)
+each further round — `0.02 → 0.01 → 0.005 → …` — so a throne nobody takes gets
+steadily cheaper to take. At the floor (`0.0`) a challenger still needs a
+statistically significant improvement (LCB ≥ 0), just no extra margin. A
+dethrone resets the king's tenure and with it the schedule for the new king.
+The decayed margin is a pure function of `king_tenure_rounds`, which the
+receipt already records, so audits replay it without any receipt change. It is
+consensus-critical: all validators must run the same `margin_decay_*` values.
+
 **Public-benchmark no-regression gate (optional, off by default).** With
 `[scoring] gift_gate_mode = "enforce"`, a dethrone additionally requires that the
 challenger has not *statistically meaningfully regressed* on broad public data
