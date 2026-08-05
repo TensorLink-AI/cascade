@@ -581,6 +581,11 @@ def _run(args) -> int:
         rent_retry_cooldown_s=rent_retry_cooldown_s,
         final_rent_on=final_rent_on,
         max_duds_per_stage=max_duds_per_stage,
+        # Cascade duel-bench teardown hold: armed ONLY while [scoring]
+        # cascade_enabled — off, the trainer never writes the marker and this
+        # stays 0, so final-pod teardown is byte-identical to before.
+        bench_hold_max_hours=(cfg.eval.bench_hold_max_hours
+                              if cfg.scoring.cascade_enabled else 0.0),
         dry_run=bool(args.dry_run),
         on_cycle=globals().get("_ensure_service_logging"),
     )

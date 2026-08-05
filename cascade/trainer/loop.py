@@ -86,11 +86,12 @@ ScreenFn = Callable[
     [Path, "ResolvedGenerator", int, int | None], "float | list[WindowScore]"
 ]
 
-# Scores the king's trained checkpoint on the public suites (GIFT-Eval / BOOM /
+# Scores one final-duel checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
-# BenchScores the trainer stamps onto the king's manifest entry, or None when the
-# sidecar could not produce a complete set (best-effort — a miss just leaves the
-# king entry without bench_scores). Injected so the trainer's Cascade eval stays a
+# BenchScores the trainer publishes in the round's signed bench report
+# (cascade.shared.bench_report) AFTER the manifest is out, or None when the
+# sidecar could not produce a complete set (best-effort — a miss just leaves that
+# checkpoint out of the report). Injected so the trainer's Cascade eval stays a
 # testable boundary; the default wiring (fetch + benchmark sidecar) is attached in
 # cascade.trainer.main.
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
@@ -296,7 +297,7 @@ def make_bench_eval_fn(cfg: ChainConfig, *, device: str = "cpu") -> BenchEvalFn:
     GIFT-Eval / BOOM / TIME and return the six-number :class:`BenchScores`, or
     ``None`` when the sidecar can't produce a complete set. Wired in trainer.main
     when ``[scoring] cascade_enabled``; the checkpoint fetch is the caller's job
-    (``TrainerRunner._stamp_king_bench_scores``)."""
+    (``TrainerRunner._bench_duel_checkpoints``)."""
 
     def _eval(ckpt_dir: Path) -> BenchScores | None:
         from ..eval.benchmarks import extract_bench_scores, run_benchmarks
@@ -506,11 +507,12 @@ class TrainerRunner:
     # rather than trusting the unsigned pool index. None ⇒ manifests go out
     # unpinned (legacy). Wired in trainer.main from the screen pool source.
     pool_provenance_fn: object | None = None
-    # Cascade: scores the king's checkpoint on GIFT-Eval / BOOM / TIME and stamps
-    # the numbers onto its manifest entry (so validators read one authoritative,
-    # signed set — consensus-safe promotion). Runs only when [scoring]
-    # cascade_enabled. None ⇒ no stamping (the king entry carries no bench_scores
-    # and validators fall back to scoring it themselves). Wired in trainer.main.
+    # Cascade: scores a duel checkpoint on GIFT-Eval / BOOM / TIME for the round's
+    # POST-PUBLISH signed bench report (cascade.shared.bench_report) — validators
+    # read one authoritative signed set per role, so promotion stays consensus-
+    # safe. Runs only when [scoring] cascade_enabled, strictly after the manifest
+    # is published (publication never waits on a benchmark). None ⇒ no report
+    # (rounds simply contribute no bench numbers). Wired in trainer.main.
     bench_eval_fn: BenchEvalFn | None = None
     # Remote (two-device) training: when ``remote_hosts`` is set, each round's
     # king and challenger train on separate SSH GPU pods in parallel (see
@@ -549,11 +551,12 @@ class TrainerRunner:
     # king on the idle pod. LOG-ONLY: validators score rounds exclusively on the
     # private eval pool; this never feeds weights or the throne (see bench_hook).
     bench_plan: object | None = None
-    # Cascade king bench eval on the REMOTE worker: when set (cascade_enabled +
-    # remote_hosts), the king's GIFT-Eval/BOOM/TIME scoring runs on the pod that
-    # just trained it — GPU, checkpoint already local — instead of a local-CPU
-    # subprocess. The six numbers still go on the signed manifest. Falls back to
-    # the local ``bench_eval_fn`` when there is no remote host.
+    # Cascade duel bench on the REMOTE workers: when set (cascade_enabled +
+    # remote_hosts), each duel checkpoint's GIFT-Eval/BOOM/TIME scoring runs on
+    # the pod that just trained it — GPU, checkpoint already local — instead of
+    # a local-CPU subprocess. The numbers land in the round's post-publish
+    # signed bench report. Falls back to the local ``bench_eval_fn`` when there
+    # is no remote host.
     cascade_bench_plan: object | None = None
     # Live presentational reporting for the dashboards: the round stage
     # (``status/round.json`` — where the round actually is, instead of a
@@ -587,6 +590,11 @@ class TrainerRunner:
     _round_telemetry: dict = field(
         default_factory=lambda: {"heat": [], "final": []}, repr=False
     )
+    # Which pod each FINAL run actually landed on, keyed by (role, size,
+    # hotkey) — the post-publish bench runs on the pod that holds the
+    # checkpoint at its _train_work path, and the dispatch retry means that is
+    # not always the round-robin pick. Reset at every run_round.
+    _final_role_hosts: dict = field(default_factory=dict, repr=False)
     # Context for stage reporting, set at round start so publish() (which only
     # sees the manifest) and the heat-progress hooks know which round they are
     # reporting for. ``_stage_published_at`` throttles heat-progress writes.
@@ -1640,65 +1648,266 @@ class TrainerRunner:
         fetch_from_hub(ref, dest, self.hub())
         return dest
 
-    def _stamp_king_bench_scores(
-        self, entries: list[TrainedEntry], seeds: RoundSeeds
-    ) -> list[TrainedEntry]:
-        """Score the king's checkpoint on GIFT-Eval / BOOM / TIME and return the
-        entries with those numbers stamped onto the king's (primary throne size)
-        entry. Best-effort: any failure logs and returns the entries unchanged, so
-        a benchmark hiccup never fails a round — validators then fall back to
-        scoring the checkpoint themselves."""
-        primary = self.cfg.throne_contracts()[0].arch_preset
-        king_idx = next(
-            (i for i, e in enumerate(entries)
-             if e.role == "king" and (e.size == primary or e.size == "")),
-            next((i for i, e in enumerate(entries) if e.role == "king"), None),
-        )
-        if king_idx is None:
-            return entries
-        king = entries[king_idx]
-        arch_preset = king.size or primary
-        try:
-            if self.cascade_bench_plan is not None and self.remote_hosts:
-                # Bench on the pod that just trained the king: GPU, and the
-                # checkpoint is already at its _train_work path (no local fetch).
-                scores = self._remote_king_bench_scores(str(seeds.base_seed), arch_preset)
-            elif self.bench_eval_fn is not None:
-                ckpt = self._fetch_checkpoint_dir(king.trained_pointer)
-                scores = self.bench_eval_fn(ckpt)
-            else:
-                scores = None
-        except Exception as e:  # noqa: BLE001 — Cascade telemetry must never fail a round
-            log.warning("round=%s: king bench eval failed (%s); manifest omits bench_scores",
-                        seeds.base_seed, e)
-            return entries
-        if scores is None:
-            log.warning("round=%s: king bench eval produced no complete score set; "
-                        "manifest omits bench_scores", seeds.base_seed)
-            return entries
-        log.info(
-            "round=%s: stamped king bench_scores gift(crps=%.5f mase=%.5f) "
-            "boom(crps=%.5f mase=%.5f) time(crps=%.5f mase=%.5f)",
-            seeds.base_seed, scores.gifteval_crps, scores.gifteval_mase,
-            scores.boom_crps, scores.boom_mase, scores.time_crps, scores.time_mase,
-        )
-        entries[king_idx] = replace(king, bench_scores=scores)
-        return entries
+    # ── Cascade post-publish duel bench (signed bench report) ────────────────
 
-    def _remote_king_bench_scores(self, round_id: str, arch_preset: str) -> BenchScores | None:
-        """Score the round's king on GIFT-Eval/BOOM/TIME on the pod that trained it
-        (GPU; the checkpoint is already at its ``_train_work`` path) and parse the
-        six signed numbers. Reuses the post-round-benchmark remote path; best-effort
-        — returns None on any miss, so the manifest simply omits ``bench_scores``."""
+    def will_run_post_publish_bench(self) -> bool:
+        """Whether this trainer benches the duel after publishing — [scoring]
+        cascade_enabled plus a wired eval path. Everything bench-related (the
+        report, the wandb pair, the provisioner's teardown-hold marker) keys off
+        this one predicate so nothing fires while Cascade is off."""
+        return bool(self.cfg.scoring.cascade_enabled) and (
+            self.bench_eval_fn is not None or self.cascade_bench_plan is not None
+        )
+
+    def _bench_pending_path(self, round_id: str) -> Path:
+        return self.work_root / str(round_id) / "bench_pending.json"
+
+    def _bench_complete_path(self, round_id: str) -> Path:
+        return self.work_root / str(round_id) / "bench_complete.json"
+
+    def _mark_bench_pending(self, round_id: str) -> None:
+        """Drop ``work_root/<round_id>/bench_pending.json`` BEFORE the manifest
+        publishes — the provisioner's signal to hold the final pod's teardown
+        for the post-publish bench (see provision.policy.bench_hold_active).
+        Written pre-publish because the teardown trigger IS the manifest: a
+        marker written after it races the very sweep it exists to pause.
+        Atomic (tmp + rename) and best-effort, like the heat marker."""
+        try:
+            out_dir = self.work_root / str(round_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out_dir / "bench_pending.json.tmp"
+            tmp.write_text(json.dumps({"round_id": str(round_id)}, sort_keys=True),
+                           encoding="utf-8")
+            tmp.replace(self._bench_pending_path(round_id))
+        except OSError as e:
+            log.warning("could not write bench_pending marker for round=%s: %s", round_id, e)
+
+    def _mark_bench_complete(self, round_id: str, *, uploaded: bool) -> None:
+        """Release the teardown hold: record the outcome in ``bench_complete.json``
+        and remove the pending marker. Runs on success AND failure — a failed
+        bench must free the pod immediately, not ride out the hold cap."""
+        try:
+            out_dir = self.work_root / str(round_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out_dir / "bench_complete.json.tmp"
+            tmp.write_text(json.dumps({"round_id": str(round_id), "uploaded": bool(uploaded)},
+                                      sort_keys=True), encoding="utf-8")
+            tmp.replace(self._bench_complete_path(round_id))
+            self._bench_pending_path(round_id).unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("could not write bench_complete marker for round=%s: %s", round_id, e)
+
+    def _release_stale_bench_hold(self, round_id: str) -> None:
+        """Free a teardown hold whose bench is never coming.
+
+        A restart between publish and bench completion kills the bench thread
+        with the process, but its ``bench_pending.json`` stays armed — and the
+        restarted trainer skips the already-published round, so nothing would
+        release the provisioner's hold until the cap. Called from the
+        restart re-entry skip path; a marker with its completion already
+        recorded is left alone."""
+        try:
+            if (self._bench_pending_path(round_id).is_file()
+                    and not self._bench_complete_path(round_id).is_file()):
+                log.warning("round=%s: bench_pending marker with no completed bench "
+                            "(restart mid-bench?); releasing the teardown hold",
+                            round_id)
+                self._mark_bench_complete(round_id, uploaded=False)
+        except OSError:
+            pass
+
+    def run_post_publish_bench(self, manifest: TrainingManifest) -> object | None:
+        """Bench BOTH final-duel checkpoints and publish the round's signed bench
+        report — strictly AFTER :meth:`publish` (validators are already scoring;
+        nothing here can delay or modify the round). Best-effort throughout:
+        returns the published :class:`~cascade.shared.bench_report.BenchReport`
+        or ``None``, never raises, and always releases the provisioner's
+        teardown hold on exit. A no-op (no markers touched) when the bench is
+        not armed — the marker lifecycle exists only where the hold does."""
+        if not self.will_run_post_publish_bench():
+            return None
+        report = None
+        try:
+            report = self._post_publish_bench(manifest)
+        except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
+            log.warning("round=%s: post-publish bench failed (ignored): %s",
+                        manifest.round_id, e)
+        finally:
+            self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
+        return report
+
+    def _post_publish_bench(self, manifest: TrainingManifest) -> object | None:
+        from ..shared.bench_report import (
+            BenchEntry,
+            BenchReport,
+            dump_bench_report,
+            publish_bench_report,
+            sign_bench_report,
+        )
+
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        # The duel at the primary throne size: the king plus each finalist
+        # (legacy size == "" reads as primary). Benched checkpoint-by-checkpoint;
+        # a miss drops that entry from the report, never the report itself.
+        duel = [e for e in manifest.entries if (e.size or primary) == primary]
+        scored = self._bench_duel_checkpoints(duel, manifest.round_id, primary)
+        entries = []
+        for m_entry in duel:
+            scores = scored.get(m_entry.trained_pointer)
+            if scores is None:
+                log.warning("round=%s: bench produced no complete score set for %s %s; "
+                            "report omits it", manifest.round_id, m_entry.role,
+                            m_entry.miner_hotkey)
+                continue
+            entries.append(BenchEntry(
+                role=m_entry.role, size=m_entry.size or primary,
+                miner_hotkey=m_entry.miner_hotkey, miner_uid=m_entry.miner_uid,
+                trained_pointer=m_entry.trained_pointer, scores=scores,
+            ))
+        if not entries:
+            log.warning("round=%s: no duel checkpoint produced bench scores; "
+                        "no bench report published", manifest.round_id)
+            return None
+        report = BenchReport(round_id=manifest.round_id,
+                             created_block=manifest.created_block,
+                             entries=tuple(entries))
+        if self.wallet is not None:
+            report = sign_bench_report(report, self.wallet)
+        else:
+            log.warning("publishing an UNSIGNED bench report (no wallet); "
+                        "validators will ignore it")
+        key = publish_bench_report(self.manifest_store(), dump_bench_report(report),
+                                   manifest.round_id)
+        log.info("published bench report round=%s roles=[%s] signed=%s → s3://%s/%s",
+                 manifest.round_id, ", ".join(e.role for e in entries),
+                 report.signature is not None, self.cfg.storage.manifest_bucket, key)
+        self._log_bench_pair_wandb(report)
+        return report
+
+    def _bench_duel_checkpoints(
+        self, duel: list[TrainedEntry], round_id: str, primary: str
+    ) -> dict:
+        """Score each duel checkpoint on GIFT-Eval/BOOM/TIME, returning
+        ``{trained_pointer: BenchScores}`` (misses simply absent).
+
+        Remote plan wired ⇒ each checkpoint benches on the pod that trained it
+        (GPU, checkpoint already at its ``_train_work`` path). Checkpoints on
+        DIFFERENT pods bench in parallel — a serial king+challenger full
+        battery would spend most of the provisioner's teardown hold — but two
+        launches on ONE pod stay sequential, because every bench launch
+        preempts the previous sweep (PREEMPT_BENCHMARKS). No remote plan ⇒
+        sequential local ``bench_eval_fn`` over registry fetches."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        out: dict[str, BenchScores] = {}
+        if self.cascade_bench_plan is not None and self.remote_hosts:
+            by_host: dict[str, tuple[object, list[TrainedEntry]]] = {}
+            for entry in duel:
+                host = self._bench_host_for(entry, primary)
+                if host is None:
+                    continue
+                by_host.setdefault(getattr(host, "name", str(host)), (host, []))[1].append(entry)
+
+            def _bench_host_group(group: tuple[object, list[TrainedEntry]]) -> None:
+                host, host_entries = group
+                for entry in host_entries:
+                    try:
+                        scores = self._remote_bench_scores(host, entry, round_id, primary)
+                    except Exception as e:  # noqa: BLE001 — one bad sweep must not lose the rest
+                        log.warning("round=%s: remote bench failed for %s %s on %s: %s",
+                                    round_id, entry.role, entry.miner_hotkey,
+                                    getattr(host, "name", host), e)
+                        continue
+                    if scores is not None:
+                        out[entry.trained_pointer] = scores
+
+            with ThreadPoolExecutor(max_workers=max(1, len(by_host))) as ex:
+                list(ex.map(_bench_host_group, by_host.values()))
+            return out
+        if self.bench_eval_fn is not None:
+            for entry in duel:
+                try:
+                    ckpt = self._fetch_checkpoint_dir(entry.trained_pointer)
+                    scores = self.bench_eval_fn(ckpt)
+                except Exception as e:  # noqa: BLE001 — one miss must not sink the rest
+                    log.warning("round=%s: local bench failed for %s %s: %s",
+                                round_id, entry.role, entry.miner_hotkey, e)
+                    continue
+                if scores is not None:
+                    out[entry.trained_pointer] = scores
+        return out
+
+    def _bench_host_for(self, entry: TrainedEntry, primary: str) -> object | None:
+        """The pod holding ``entry``'s checkpoint: the tracked dispatch host,
+        or the round-robin heuristic (king first, challenger next) when a
+        restart between duel and bench lost the tracking dict."""
+        host = self._final_role_hosts.get(
+            (entry.role, entry.size or primary, entry.miner_hotkey))
+        if host is not None:
+            return host
+        hosts = self._hosts_for("final")
+        if not hosts:
+            return None
+        return hosts[0] if entry.role == "king" else hosts[1 % len(hosts)]
+
+    def _remote_bench_scores(
+        self, host: object, entry: TrainedEntry, round_id: str, primary: str
+    ) -> BenchScores | None:
+        """One remote sweep → six numbers, or ``None`` on any miss."""
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import run_post_round_benchmark
 
-        host = self.remote_hosts[0]  # the king trains on the first pod (single-worker today)
         report = run_post_round_benchmark(
-            host, round_id, arch_preset, self.cascade_bench_plan, work_root=self.work_root,
+            host, round_id, entry.size or primary, self.cascade_bench_plan,
+            work_root=self.work_root, role=entry.role,
         )
         scores = extract_bench_scores(report) if report is not None else None
         return BenchScores(**scores) if scores is not None else None
+
+    def _log_bench_pair_wandb(self, report: object) -> None:
+        """Mirror the round's king/challenger bench pair to wandb when
+        ``[wandb] enabled`` — observability only, same swallow-everything
+        contract as the per-step training mirror."""
+        try:
+            if not getattr(self.cfg.wandb, "enabled", False):
+                return
+            entries = list(getattr(report, "entries", ()) or ())
+            if not entries:
+                return
+            anchor = next((e for e in entries if e.role == "king"), entries[0])
+            sink = open_wandb_run(
+                self.cfg.wandb, round_id=str(report.round_id),
+                role=f"bench-{anchor.size}", hotkey=anchor.miner_hotkey,
+                uid=anchor.miner_uid, size=anchor.size,
+            )
+            if sink is None:
+                return
+            for e in entries:
+                s = e.scores
+                sink.emit({
+                    "event": "cascade_bench", "role": e.role,
+                    "miner_hotkey": e.miner_hotkey, "miner_uid": e.miner_uid,
+                    "gifteval_crps": s.gifteval_crps, "gifteval_mase": s.gifteval_mase,
+                    "boom_crps": s.boom_crps, "boom_mase": s.boom_mase,
+                    "time_crps": s.time_crps, "time_mase": s.time_mase,
+                })
+            sink.finish()
+        except Exception as e:  # noqa: BLE001 — wandb must never disturb the bench
+            log.debug("wandb bench-pair log failed (continuing): %s", e)
+
+    def launch_post_publish_bench(self, manifest: TrainingManifest) -> object | None:
+        """Fire-and-forget wrapper around :meth:`run_post_publish_bench`: a
+        daemon thread, so the live loop moves straight on to polling the next
+        epoch while validators score the already-published round."""
+        import threading
+
+        t = threading.Thread(
+            target=self.run_post_publish_bench, args=(manifest,),
+            name=f"cascade-bench-{manifest.round_id}", daemon=True,
+        )
+        t.start()
+        log.info("post-publish duel bench launched for round=%s", manifest.round_id)
+        return t
 
     def run_round(
         self,
@@ -1753,6 +1962,7 @@ class TrainerRunner:
         seeds = RoundSeeds.derive(base_seed, self.cfg.training)
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
+        self._final_role_hosts = {}
         # Cascade warm-start: the live promoted init every run this round trains
         # from (heat AND final — screening must rank on the same init the final
         # trains at). Raises on a live-but-broken pointer; None ⇒ random init.
@@ -1816,14 +2026,11 @@ class TrainerRunner:
             raise RuntimeError("king training produced no entry; aborting round")
         self._log_telemetry_rollup(base_seed)  # complete heats + finals picture
 
-        # Cascade: score the king's checkpoint on the public suites and stamp the
-        # numbers onto its manifest entry, so every validator promotes off one
-        # signed set (see cascade.validator.cascade). Best-effort and gated on
-        # [scoring] cascade_enabled; a failure just leaves bench_scores unset.
-        if self.cfg.scoring.cascade_enabled and (
-            self.bench_eval_fn is not None or self.cascade_bench_plan is not None
-        ):
-            entries = self._stamp_king_bench_scores(entries, seeds)
+        # Cascade's public-benchmark eval deliberately does NOT run here: it
+        # runs strictly AFTER publish() — validators must start scoring the
+        # duel the moment the manifest lands — and its numbers travel in the
+        # round's separate signed bench report (run_post_publish_bench), never
+        # inside the manifest entry.
 
         # Pin the round's eval pool: the provenance of the snapshot the heat
         # screened on (selected at screen_block, same rule the validator uses),
@@ -2144,7 +2351,8 @@ class TrainerRunner:
         return matched
 
     @staticmethod
-    def _dispatch_with_retry(disp, hosts: list, i: int, *, describe: str, **kw):
+    def _dispatch_with_retry(disp, hosts: list, i: int, *, describe: str,
+                             used_host: list | None = None, **kw):
         """Dispatch to the round-robin host, retrying ONCE on the next host on
         any failure. Rented pods churn — SSH flaps, reclaimed boxes, slow image
         pulls — and one flaky box must cost a retry, not a challenger's only
@@ -2156,17 +2364,24 @@ class TrainerRunner:
         This seam also knows the round's full lane fan-out (``hosts``), so it
         computes each pod's lane count here and hands it to the dispatch —
         the pod-side sandbox slices its CPU cores off that geometry (see
-        ``remote.pod_lane_count`` / ``sandbox._lane_cpu_slice``)."""
+        ``remote.pod_lane_count`` / ``sandbox._lane_cpu_slice``). ``used_host``
+        (when given) receives the host the dispatch actually SUCCEEDED on —
+        the post-publish duel bench must target the pod that holds the
+        checkpoint, and a retry moves it off the round-robin pick."""
         from .remote import pod_lane_count
 
         host = hosts[i % len(hosts)]
         try:
-            return disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
+            entry = disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             retry_host = hosts[(i + 1) % len(hosts)]
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e, getattr(retry_host, "name", retry_host))
-            return disp.dispatch(retry_host, lane_count=pod_lane_count(retry_host, hosts), **kw)
+            entry = disp.dispatch(retry_host, lane_count=pod_lane_count(retry_host, hosts), **kw)
+            host = retry_host
+        if used_host is not None:
+            used_host.append(host)
+        return entry
 
     @staticmethod
     def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str, **kw):
@@ -2382,13 +2597,20 @@ class TrainerRunner:
         )
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
-            return self._dispatch_with_retry(
+            used: list = []
+            entry = self._dispatch_with_retry(
                 disp, hosts, i, describe=f"final {role} {gen.hotkey}",
+                used_host=used,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
                 warm_start_ref=warm_start_ref,
             )
+            if used:
+                # Post-publish bench target: the pod actually holding this
+                # final checkpoint at its _train_work path.
+                self._final_role_hosts[(role, contract.arch_preset, gen.hotkey)] = used[-1]
+            return entry
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
         with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
@@ -2660,6 +2882,11 @@ class TrainerRunner:
                 # and re-skip it exactly like a matching last_round (see
                 # _round_already_published for the two incidents this stops).
                 if self._round_already_published(round_id):
+                    # A restart between publish and bench completion leaves the
+                    # bench_pending marker armed with no bench coming (the
+                    # thread died with the old process) — release the hold
+                    # rather than bill the final pod to the cap.
+                    self._release_stale_bench_hold(round_id)
                     last_round = round_id
                     time.sleep(poll)
                     continue
@@ -2676,11 +2903,32 @@ class TrainerRunner:
                 manifest = self.run_round(
                     commitments, king_hotkey, base_seed, block, cutoff_block=epoch_start,
                 )
+                # Cascade duel bench hold: the marker must be on disk BEFORE the
+                # manifest publishes — the manifest is the provisioner's final-pod
+                # teardown trigger, and a marker written after it races the very
+                # sweep it pauses. Never written while cascade_enabled is off.
+                will_bench = self.will_run_post_publish_bench()
+                if will_bench:
+                    self._mark_bench_pending(round_id)
                 self.publish(manifest)
-                if self.bench_plan is not None and self.remote_hosts:
+                if will_bench:
+                    # Guarded separately (like the telemetry launch below): the
+                    # round is published, so a bench failure must not fall
+                    # through to the round handler and re-run it next poll.
+                    try:
+                        self.launch_post_publish_bench(manifest)
+                    except Exception as e:  # noqa: BLE001 — telemetry/promotion input only
+                        self._mark_bench_complete(round_id, uploaded=False)
+                        log.warning("post-publish bench launch failed (ignored): %s", e)
+                if self.bench_plan is not None and self.remote_hosts and not will_bench:
                     # Guarded separately: the round is already published, so a
                     # telemetry failure here must not fall through to the round
                     # handler and re-run (re-train + re-publish) it next poll.
+                    # Skipped when the cascade bench runs (`not will_bench`
+                    # above): both shell out to cascade-benchmark on the final
+                    # pod and every launch preempts the previous sweep, so the
+                    # two would kill each other — and the cascade bench already
+                    # covers the king this telemetry would have sampled.
                     try:
                         from .bench_hook import launch_post_round_benchmark
 

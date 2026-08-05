@@ -284,6 +284,14 @@ benchmark_project_dir = "benchmarks"  # path to the sidecar project
 benchmark_suites      = []       # subset of ["gift-eval","boom","time"]; [] = all three
 benchmark_num_samples = 0        # 0 reuses num_samples above
 benchmark_max_series  = 0        # cap datasets/tasks for a fast smoke run; 0 = full benchmark
+# Cascade post-publish duel bench (used only when [scoring] cascade_enabled).
+# After each manifest publishes, the trainer benches BOTH duel checkpoints on
+# GIFT-Eval/BOOM/TIME and publishes a separate signed report
+# (benchmarks/round-<id>.json). bench_hold_max_hours caps how long the
+# provisioner holds the round's FINAL pod for that sweep past its normal
+# teardown signal; the hold releases early when the bench_complete marker
+# lands. Inert while cascade_enabled = false.
+bench_hold_max_hours  = 2.0
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators need the data pinned locally.
 gift_gate_datasets    = ""       # gift-eval config subset ("" = full 97 configs)
