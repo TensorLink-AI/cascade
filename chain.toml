@@ -345,9 +345,10 @@ cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post
 # same 7 would have silently meant 14 challenges. The clock is now epoch-
 # relative (cascade.validator.cascade.reign_rounds), so this number means the
 # same thing at any cadence and needs no re-tuning when the round length moves.
-# Value unchanged at 7 — identical to the old behaviour at the old cadence.
-# Cascade remains dormant; arming it is a separate Approve decision.
-cascade_reign_rounds = 7
+# Lowered 7 → 5 at arming (owner, 2026-08-05): at the 12h cadence, 5 rounds
+# ≈ 2.5 days per promotion cycle. CONSENSUS-relevant — every validator must
+# run the same value or cascades fire at different rounds (divergent pins).
+cascade_reign_rounds = 5
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely

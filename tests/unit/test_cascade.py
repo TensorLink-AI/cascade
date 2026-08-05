@@ -359,7 +359,7 @@ def test_cascade_toggle_wires_controller(tmp_path):
     # On ⇒ controller wired.
     runner_on = build_runner(chain_toml=_write_toml_with_cascade(tmp_path, enabled=True))
     assert runner_on.cascade is not None
-    assert runner_on.cascade.reign_days == 7
+    assert runner_on.cascade.reign_days == 5  # cascade_reign_rounds, lowered at arming
 
 
 def _write_toml_with_cascade(tmp_path, *, enabled: bool):
