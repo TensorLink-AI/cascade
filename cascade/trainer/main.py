@@ -224,15 +224,26 @@ def main(argv: list[str] | None = None) -> int:
 
         warm_start_path = _Path(cfg.validator.warm_start_init_path)
         log.info("cascade warm-start consumption enabled: pointer file %s", warm_start_path)
-        if remote_hosts:
+        if remote_hosts or args.remote_hosts:
             # Preferred: bench each duel checkpoint on the pod that just trained
             # it — GPU, and the checkpoint is already at its _train_work path.
             # Reuses the post-round-benchmark remote path; the numbers land in
             # the round's signed bench report via
             # TrainerRunner.run_post_publish_bench (strictly after publish).
+            #
+            # Keyed on the hosts PATH, not the hosts present right now: the live
+            # service restarts in the between-rounds idle window, when the
+            # elastic fleet is torn down and hosts.toml is EMPTY — the loop
+            # re-reads it every round, but a plan wired off startup contents
+            # would silently latch the local fallback for the process lifetime
+            # (2026-08-05: a full round benched "skipped" on the GPU-less box).
             from .bench_hook import BenchPlan
 
-            wd = remote_hosts[0].workdir
+            # Elastic pods all publish the canonical workdir; fall back to it
+            # when the fleet is empty at startup (provisioner default,
+            # remote.py). A static heterogeneous-workdir fleet still resolves
+            # checkpoint paths per host at bench time — only data_dir uses this.
+            wd = remote_hosts[0].workdir if remote_hosts else "/root/cascade"
             # Per-sweep guard: a capped battery is ~minutes on an L40; the full
             # battery ([eval] cascade_bench_max_series = 0) gets the same
             # ceiling as the provisioner's teardown hold — past that the pod is
