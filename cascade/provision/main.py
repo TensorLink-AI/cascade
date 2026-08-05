@@ -67,6 +67,9 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     overhead = float(raw.get("slot_overhead", 1.3))
     if overhead < 1.0:
         raise ProvisionError(f"[provisioner.{stage}] slot_overhead must be >= 1.0; got {overhead}")
+    min_slots = int(raw.get("min_slots", 0))
+    if min_slots < 0:
+        raise ProvisionError(f"[provisioner.{stage}] min_slots must be >= 0; got {min_slots}")
     candidates = []
     for i, c in enumerate(raw.get("candidate", ())):
         csku = str(c.get("sku", "")).strip()
@@ -81,6 +84,7 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
                                        gpus_per_pod=cgpus, max_price_hr=cprice))
     return StagePolicy(sku=sku, gpus_per_pod=gpus, max_pods=max_pods,
                        providers=providers, max_price_hr=price, slot_overhead=overhead,
+                       min_slots=min_slots,
                        market_sku=str(raw.get("market_sku", "")).strip(),
                        candidates=tuple(candidates))
 
