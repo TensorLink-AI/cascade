@@ -49,7 +49,10 @@ class BenchPlan:
     batch_size: int = 512
     device: str = "cuda"
     data_dir: str = "/root/bench_data"
-    uv_bin: str = "~/.local/bin/uv"  # uv on the pod (runs the sidecar's own env)
+    # uv on the pod (runs the sidecar's own env). Image-booted pods bake it at
+    # /bin/uv (deploy/Dockerfile); ~/.local/bin/uv was the rsync/bootstrap-era
+    # installer path — override for a bootstrap-provisioned fleet.
+    uv_bin: str = "/bin/uv"
     timeout_seconds: int = 2 * 3600
     # Decouple telemetry cadence from round cadence: skip launching when the
     # last launch was under this many seconds ago (0 = benchmark every round).
