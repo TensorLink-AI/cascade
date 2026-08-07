@@ -19,9 +19,13 @@
 #   BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY     WRITE the R2 king archive
 #     (the same R2 account chain.toml already uses for the manifest backup). The
 #     scraper falls back to this pair when KING_ARCHIVE_S3_* is unset.
-# King generators are PUBLIC by design, so the Hub pull needs no token (anonymous
-# pull of public repos). Set HIPPIUS_HUB_TOKEN only if you ever archive a private
-# repo.
+#   HIPPIUS_HUB_TOKEN                               pull PRIVATE Hub repos.
+#     Anonymous pull covers public repos only, and while king generators are
+#     public by design, the generators/ sweep archives EVERY participant ref
+#     from the round receipts — and miners do commit private Hub repos (e.g.
+#     cascade-private/*). Without the token each private ref fails on every
+#     run and the job exits 1.
+#   HF_TOKEN (optional)                             same, for private `@hf:` refs.
 #
 # Use ONE scraper only — two concurrent runs would race on the index.json dbs
 # (the concurrency group below already serialises this workflow's own runs).
@@ -61,6 +65,10 @@ jobs:
       # KING_ARCHIVE_S3_* is unset).
       BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
       BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+      # Hub pull auth: public repos pull anonymously, but participant refs can
+      # point at PRIVATE Hub repos (and private `@hf:` refs) — those need a token.
+      HIPPIUS_HUB_TOKEN: ${{ secrets.HIPPIUS_HUB_TOKEN }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +87,9 @@ jobs:
           if [ -z "$BACKUP_S3_ACCESS_KEY" ]; then
             echo "::error::BACKUP_S3_ACCESS_KEY not set — cannot write the R2 king archive."
             exit 1
+          fi
+          if [ -z "$HIPPIUS_HUB_TOKEN" ]; then
+            echo "::warning::HIPPIUS_HUB_TOKEN not set — anonymous pull covers public repos only; private generator repos will fail to snapshot."
           fi
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml

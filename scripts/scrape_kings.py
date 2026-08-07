@@ -23,8 +23,10 @@ plenty, rounds are epoch-paced.
 Usage::
 
     # reads [storage] from chain.toml; needs S3 read creds for the manifest
-    # bucket (HIPPIUS_S3_ACCESS_KEY / _SECRET_KEY), Hub pull creds (public repos
-    # pull anonymously), and R2 write creds for the archive
+    # bucket (HIPPIUS_S3_ACCESS_KEY / _SECRET_KEY), Hub pull creds
+    # (HIPPIUS_HUB_TOKEN — public repos pull anonymously, but miners commit
+    # private Hub repos too, and those refs fail without a token; HF_TOKEN
+    # likewise for private `@hf:` refs), and R2 write creds for the archive
     # (KING_ARCHIVE_S3_ACCESS_KEY / _SECRET_KEY, or the BACKUP_S3_* pair).
     python scripts/scrape_kings.py
     python scripts/scrape_kings.py --chain-toml chain.testnet.toml
