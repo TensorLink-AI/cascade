@@ -103,20 +103,24 @@ a:hover{text-decoration:underline}
 .lede{color:var(--muted);font-size:13.5px;max-width:84ch;margin-bottom:18px;line-height:1.65}
 .lede b{color:var(--ink)}
 
-/* headline tiles — 3×2 on desktop, 2-up on tablet, stacked on phones */
-.tiles{display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:1fr;gap:14px}
-@media (max-width:980px){.tiles{grid-template-columns:repeat(2,1fr)}}
+/* headline tiles — the eight critical-level metrics: 4×2 on desktop,
+   2×4 on tablet, 1×8 on phones. Same order at every breakpoint. */
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);grid-auto-rows:1fr;gap:14px}
+.tiles.auto{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+@media (max-width:1020px){.tiles{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:620px){.tiles{grid-template-columns:1fr}}
-.tile{border:var(--line);background:var(--surface);padding:18px 19px;position:relative;
-  display:flex;flex-direction:column;gap:7px;min-height:176px}
+.tile{border:var(--line);background:var(--surface);padding:17px 18px;position:relative;
+  display:flex;flex-direction:column;gap:7px;min-height:190px}
 .tile::before{content:"";position:absolute;inset:4px;border:var(--line-faint);pointer-events:none}
 .tile>*{position:relative;z-index:1}
 .tile .k{font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;
   letter-spacing:.06em;color:var(--muted);font-weight:700;line-height:1.5}
-.tile .v{font-family:var(--font-mono);font-size:clamp(25px,3.2vw,32px);line-height:1.1;
+.tile .v{font-family:var(--font-mono);font-size:clamp(23px,2.3vw,29px);line-height:1.1;
   margin-top:1px;color:var(--ink);font-weight:600}
-.tile .v.sm{font-size:clamp(19px,2.4vw,23px)}
+.tile .v.sm{font-size:clamp(18px,1.9vw,22px)}
 .tile .u{font-size:13px;color:var(--muted);font-weight:400}
+.tile .vlab{font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--muted);margin-top:-2px}
 .tile .interp{font-size:13px;color:var(--ink);line-height:1.55}
 .tile .interp b{font-weight:700}
 .tile .ctx{font-size:11.5px;color:var(--muted);margin-top:auto;line-height:1.5}
@@ -196,6 +200,11 @@ details summary:hover{color:var(--ink)}
 .tl-ev.alt .tl-lab.date{top:6px}
 .tl-note{font-family:var(--font-mono);font-size:10.5px;color:var(--muted);text-transform:uppercase;
   letter-spacing:.05em;margin-top:6px}
+
+/* aggregate context strip (competition section) */
+.stat-row{display:flex;gap:22px;flex-wrap:wrap;font-family:var(--font-mono);font-size:11px;
+  text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:14px}
+.stat-row b{color:var(--ink);font-weight:700;font-size:13px}
 
 /* chart */
 .chart-wrap{width:100%;aspect-ratio:5/2;min-height:220px}
@@ -304,8 +313,9 @@ th.num{text-align:right}
   <div class="header">
     <span class="wordmark">cascade</span>
     <span class="tagline">Subnet scoreboard</span>
-    <p class="sub">The state of the Cascade forecasting competition, in six answers. Every figure is
-    calculated live from the subnet&rsquo;s public, signed record — nothing here is typed in by hand.</p>
+    <p class="sub">The state of the Cascade forecasting competition, in eight headline measures. Every
+    figure is calculated live from the subnet&rsquo;s public, signed record — nothing here is typed
+    in by hand.</p>
   </div>
 
   <!-- headline tiles + current read -->
@@ -329,6 +339,7 @@ th.num{text-align:right}
     <div class="section-label"><span>Is the competition working?</span>
       <span class="muted" id="deth-when"></span></div>
     <p class="answer" id="comp-answer">--</p>
+    <div class="stat-row" id="comp-stats" hidden></div>
     <p class="lede">The leader holds the title until someone measurably beats it on the same test.
     Each marker below is a change of hands.</p>
     <div class="timeline" id="timeline"></div>
@@ -631,6 +642,23 @@ function distinctLeaders(rg){
   return Object.keys(seen).length;
 }
 
+// Field size = n_participants on the signed round summary: miners whose
+// committed entry was ELIGIBLE at that round's cutoff. That is the precise
+// thing the record counts — not "registered" and not "active", so the tile
+// says exactly that. Latest reading plus the range across the record.
+function fieldSize(){
+  var rs = scoredRounds(), latest = null, min = null, max = null, n = 0;
+  rs.forEach(function(r){
+    var p = r.n_participants;
+    if(p == null || !isFinite(p)) return;
+    latest = { n: p, at: r.published_at };
+    if(min === null || p < min) min = p;
+    if(max === null || p > max) max = p;
+    n++;
+  });
+  return latest ? { latest: latest, min: min, max: max, rounds: n } : null;
+}
+
 // The chained improvement over the baseline king. One factor per dethrone,
 // each a same-round / same-windows paired ratio, so per-round window difficulty
 // cancels instead of accumulating as noise.
@@ -712,13 +740,15 @@ function warmStart(){
 }
 
 // ── render: headline tiles ──────────────────────────────────────────────────
-// Every headline card carries: plain-English question (k) · dominant value (v)
-// · one-line interpretation in ink (interp) · muted context (ctx) · status pill.
+// Every headline card carries: plain-English label (k) · dominant value (v)
+// · optional unit line under the value (vlab) · one-line interpretation in
+// ink (interp) · muted context (ctx) · status pill.
 function tile(o){
   return '<div class="tile'+(o.pending?" pending":"")+'">' +
     '<div class="tile-head"><span class="k">'+esc(o.k)+'</span>' +
       (o.pill||'') + '</div>' +
     '<div class="v'+(o.small?" sm":"")+'">'+o.v+'</div>' +
+    (o.vlab?'<div class="vlab">'+esc(o.vlab)+'</div>':'') +
     '<div class="interp">'+(o.interp||"")+'</div>' +
     '<div class="ctx">'+(o.ctx||"")+'</div></div>';
 }
@@ -726,105 +756,139 @@ var PILL_LIVE = '<span class="pill live">Live</span>';
 var PILL_PEND = '<span class="pill pend">Pending</span>';
 var PILL_OFF  = '<span class="pill off">Not started</span>';
 
+// The eight critical-level metrics, 4×2 on desktop. Row 1 tells the
+// competition story (who competes → is the lead moving → is quality improving
+// → at what scale); row 2 covers validation, efficiency, durability and
+// economics. Everything deeper is section-level, not headline-level.
 function renderTiles(){
   var rs = scoredRounds(), rg = reigns(), chain = improvementChain();
   var deth = rs.filter(function(r){ return r.dethroned; }).length;
   var nLead = distinctLeaders(rg);
   var cells = [];
 
-  // 1 — competition: lead changes WITH the denominators that make it readable
+  // 1 — miners / participants (n_participants: eligible entries at cutoff)
+  var fs = fieldSize();
+  cells.push(tile({
+    k:"Miners competing", pill: fs?PILL_LIVE:PILL_PEND, pending:!fs, small:!fs,
+    v: fs ? (fs.latest.n + ' <span class="u">miners</span>') : "Pending",
+    interp: fs
+      ? "Each holds an <b>eligible entry</b> committed for the latest round."
+      : "The public record has not reported a field size yet.",
+    ctx: fs
+      ? (fs.rounds > 1 ? "Field per round across the record: " + fs.min +
+          (fs.min===fs.max ? "" : "&ndash;" + fs.max) + " miners." : "First recorded round.")
+      : "Populates from the signed round record&rsquo;s participant count."
+  }));
+
+  // 2 — lead changes WITH the denominators that make them readable
   var compCtx = !rs.length ? "Waiting for the first round."
     : deth === 0 ? "The day-one leader has not been beaten yet."
-    : nLead >= 3 ? "Several independent entrants have taken the title — the lead is genuinely contested."
+    : nLead >= 3 ? "The lead is genuinely contested."
     : "So far the title has passed between two entrants.";
   cells.push(tile({
-    k:"Is real competition happening?", pill: rs.length?PILL_LIVE:PILL_PEND,
-    v: rs.length ? (deth + ' <span class="u">lead change'+(deth===1?"":"s")+'</span>') : "--",
+    k:"Lead changes", pill: rs.length?PILL_LIVE:PILL_PEND,
+    v: rs.length ? (deth + ' <span class="u">time'+(deth===1?"":"s")+'</span>') : "--",
     interp: rs.length
-      ? "Across <b>" + rs.length + " round" + (rs.length===1?"":"s") + "</b>, <b>" + nLead +
+      ? "Across <b>" + rs.length + " round" + (rs.length===1?"":"s") + "</b> — <b>" + nLead +
         " different miner" + (nLead===1?"":"s") + "</b> " + (nLead===1?"has":"have") + " held the lead."
       : "No round has been published yet.",
     ctx: compCtx
   }));
 
-  // 2 — improvement vs baseline: measured AND guaranteed, explicitly labelled
+  // 3 — improvement vs day one: the big number is MEASURED; the guaranteed
+  //     minimum is essential meaning, so it lives in the readable interp line
   var haveChain = chain.steps.length > 0;
   cells.push(tile({
-    k:"Are the forecasts improving?", pill: haveChain?PILL_LIVE:PILL_PEND,
-    v: haveChain ? (signedPct(chain.obs) + ' <span class="u">measured</span>') : "--",
+    k:"Better than day one", pill: haveChain?PILL_LIVE:PILL_PEND,
+    v: haveChain ? signedPct(chain.obs) : "--",
+    vlab: haveChain ? "measured improvement" : null,
     interp: haveChain
-      ? "At least <b>" + signedPct(chain.floor) + "</b> is guaranteed — the cautious lower bound of the same verified measurements."
+      ? "<b>" + signedPct(chain.floor) + " guaranteed minimum</b> — the cautious, independently supportable floor."
       : (rs.length ? "The original leader still holds, so no improvement has been demonstrated yet."
                    : "Waiting for the first round."),
-    ctx: "Compared against the entry that led on day one."
+    ctx: "Both figures compare today&rsquo;s leader with the entry that led on day one."
   }));
 
-  // 3 — scaling: what is proven, and what is explicitly NOT yet
+  // 4 — scaling: demonstrated result first, next milestone clearly NOT done
   var tr = topRung();
+  var topRuns = tr.top ? (tr.seen[tr.top.key] || 0) : 0;
   cells.push(tile({
-    k:"What model scale is proven?", pill: tr.top?PILL_LIVE:PILL_PEND,
+    k:"Biggest model proven", pill: tr.top?PILL_LIVE:PILL_PEND,
     v: tr.top ? (tr.top.label + ' <span class="u">parameters</span>') : "--",
     interp: tr.top
-      ? (tr.next ? "Next milestone: <b>" + tr.next.label + "</b> — not yet run."
-                 : "Top of the planned ladder.")
+      ? "<b>" + topRuns + " round" + (topRuns===1?"":"s") + "</b> completed at this size." +
+        (tr.next ? " Next: <b>" + tr.next.label + "</b> — not yet run." : " Top of the planned ladder.")
       : "No size has produced a judged result yet.",
-    ctx: "&ldquo;Proven&rdquo; means a full competition round completed and judged at that size."
-  }));
-
-  // 4 — efficiency
-  var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
-  var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
-  cells.push(tile({
-    k:"Is improvement compute-efficient?", pill: eff!=null?PILL_LIVE:PILL_PEND,
-    pending: eff==null, small: eff==null,
-    v: eff!=null ? (signedPct(eff,2) + ' <span class="u">per trillion tokens</span>') : "Pending",
-    interp: eff!=null
-      ? "Verified forecast gain per trillion training tokens, over <b>" + num(tot/1e12,1) +
-        " trillion</b> spent so far."
-      : "Starts once there is a verified improvement to divide by the compute spent.",
-    ctx: "Tracks whether accuracy comes from better methods, not just more compute."
+    ctx: "&ldquo;Proven&rdquo; means full rounds ran and were judged at that size."
   }));
 
   // 5 — public benchmark (pending until a real result exists)
   var b = benchScores();
   cells.push(tile({
-    k:"Independently benchmarked?", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:true,
+    k:"Public benchmark", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:true,
     v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">vs 1.00</span>') : "Pending",
     interp: b
       ? "GIFT-Eval accuracy. Below 1.00 <b>" + (b.scores.gifteval_mase<1 ? "beats" : "trails") +
         "</b> the standard reference model."
-      : "Populates when the first publicly verifiable benchmark score (GIFT-Eval, BOOM or TIME) is published for a leading model.",
+      : "No public benchmark result has been published yet.",
     ctx: b ? "Reported only — public benchmarks never decide who wins a round."
-           : "Kept blank rather than estimated — every figure here must be checkable."
+           : "This will populate automatically when one is available (GIFT-Eval, BOOM or TIME)."
   }));
 
-  // 6 — compounding
+  // 6 — efficiency: the unit lives in the label so it cannot be missed, and it
+  //     is the SAME unit the section, chart and axis use (per trillion tokens)
+  var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
+  var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
+  cells.push(tile({
+    k:"Improvement per trillion tokens", pill: eff!=null?PILL_LIVE:PILL_PEND,
+    pending: eff==null, small: eff==null,
+    v: eff!=null ? signedPct(eff,2) : "Pending",
+    interp: eff!=null
+      ? "<b>" + num(tot/1e12,1) + " trillion</b> training tokens used so far."
+      : "Starts once there is a verified improvement to divide by the compute spent.",
+    ctx: "Asks: are we getting more forecasting improvement for the compute being spent?"
+  }));
+
+  // 7 — carry-forward durability
   var ws = warmStart();
   cells.push(tile({
-    k:"Does progress carry forward?", pill: ws?PILL_PEND:PILL_OFF, pending:true, small:true,
+    k:"Progress carried forward", pill: ws?PILL_PEND:PILL_OFF, pending:true, small:true,
     v: ws ? "Starting" : "Not started",
     interp: ws
       ? "The best model so far is now everyone&rsquo;s starting line. The first retention reading arrives at the next handover."
-      : "Measurable once the carry-forward mechanism is switched on and the first handover occurs.",
-    ctx: ws ? "" : "Today every round starts from scratch, so there is nothing to carry forward yet."
+      : "Carry-forward is not enabled yet, so there is nothing to measure.",
+    ctx: ws ? "" : "Every round currently starts from scratch."
+  }));
+
+  // 8 — economics. No economic statistic exists in the public record feed yet
+  //     (receipts carry the reward split, not an economic measure; the chain
+  //     status feed carries blocks and commitments). A truthful pending tile
+  //     beats an arbitrary KPI — never invent this number.
+  cells.push(tile({
+    k:"Economics", pill:PILL_PEND, pending:true, small:true,
+    v: "Pending",
+    interp: "No economic statistic is published in the subnet&rsquo;s public record yet.",
+    ctx: "Populates when network economics (emissions / rewards) reporting is added to the signed public feed."
   }));
 
   document.getElementById("tiles").innerHTML = cells.join("");
   var upd = _index && _index.updated_at;
   document.getElementById("headline-when").textContent = upd ? ("Updated " + timeAgo(upd)) : "--";
-  renderReadout(rs, rg, chain, deth, nLead, tr, b, ws);
+  renderReadout(rs, rg, chain, deth, nLead, tr, b, ws, fs);
 }
 
 // The compact interpretation under the headline grid: factual, no promotion.
-function renderReadout(rs, rg, chain, deth, nLead, tr, b, ws){
+function renderReadout(rs, rg, chain, deth, nLead, tr, b, ws, fs){
   var box = document.getElementById("readout");
   if(!rs.length){ box.hidden = true; return; }
   box.hidden = false;
+  var field = fs ? (fs.latest.n + " miners hold eligible entries and ") : "";
   var parts = [];
   parts.push(deth > 0
-    ? "Competition is active — the lead has changed hands " + deth + " time" + (deth===1?"":"s") +
+    ? "Competition is active — " + field + "the lead has changed hands " + deth + " time" + (deth===1?"":"s") +
       " among " + nLead + " miner" + (nLead===1?"":"s") + " over " + rs.length + " rounds."
     : "Competition is running (" + rs.length + " round" + (rs.length===1?"":"s") +
+      (fs ? ", " + fs.latest.n + " miners with eligible entries" : "") +
       ") but the day-one leader has not yet been beaten.");
   if(chain.steps.length)
     parts.push("Forecast accuracy has improved <b>" + signedPct(chain.obs) + " measured</b> (at least <b>" +
@@ -845,6 +909,7 @@ function renderReadout(rs, rg, chain, deth, nLead, tr, b, ws){
   watch.push(ws
     ? "<b>First carry-forward reading</b> — how much progress survives the next handover."
     : "<b>Carry-forward activation</b> — when the best model becomes everyone&rsquo;s starting line.");
+  watch.push("<b>Economic reporting</b> — network emissions / rewards wired into the public feed.");
   document.getElementById("watch-list").innerHTML =
     watch.map(function(w){ return "<li>"+w+"</li>"; }).join("");
 }
@@ -855,14 +920,29 @@ function renderCompetition(){
   var deth = rg.length ? rg.length - 1 : 0, nLead = distinctLeaders(rg);
 
   // conclusion first — the sentence the timeline and table are evidence for
+  var fs = fieldSize();
   var ans;
   if(!rs.length) ans = "No round has been published yet — the competition has not started.";
   else if(deth === 0) ans = "Not yet decided: over <b>" + rs.length + " round" + (rs.length===1?"":"s") +
     "</b> the day-one leader has not been beaten. A healthy competition should produce lead changes over time.";
   else ans = "<b>Yes.</b> The lead has changed hands <b>" + deth + " time" + (deth===1?"":"s") +
-    "</b> across <b>" + rs.length + " rounds</b>, and <b>" + nLead + " different miners</b> have held it" +
+    "</b> across <b>" + rs.length + " rounds</b>" +
+    (fs ? ", with <b>" + fs.latest.n + " miners</b> holding eligible entries in the latest round" : "") +
+    ", and <b>" + nLead + " different miners</b> have held the lead" +
     (nLead >= 3 ? " — the title is genuinely contested, not traded between two entrants." : ".");
   document.getElementById("comp-answer").innerHTML = ans;
+
+  // aggregate context the table supports — read this instead of scanning IDs
+  var stats = document.getElementById("comp-stats");
+  if(rs.length){
+    var chips = [];
+    if(fs) chips.push("<span><b>" + fs.latest.n + "</b> miners in the latest round</span>");
+    chips.push("<span><b>" + rs.length + "</b> rounds</span>");
+    chips.push("<span><b>" + deth + "</b> lead change" + (deth===1?"":"s") + "</span>");
+    chips.push("<span><b>" + nLead + "</b> distinct leader" + (nLead===1?"":"s") + "</span>");
+    stats.innerHTML = chips.join("");
+    stats.hidden = false;
+  } else stats.hidden = true;
 
   if(!rg.length){
     rail.innerHTML = '<div class="empty">Waiting for the first published round</div>';
@@ -1157,7 +1237,7 @@ function renderBench(){
     { n:"BOOM",      c:s.boom_crps,     m:s.boom_mase },
     { n:"TIME",      c:s.time_crps,     m:s.time_mase }
   ];
-  el.innerHTML = '<div class="tiles">' + suites.map(function(x){
+  el.innerHTML = '<div class="tiles auto">' + suites.map(function(x){
     return tile({ k:x.n, small:true, pill:PILL_LIVE,
       v: num(x.m,3) + ' <span class="u">vs 1.00</span>',
       interp: (x.m<1 ? "<b>Beats</b>" : "Trails") + " the standard reference model.",
@@ -1217,6 +1297,10 @@ function renderWarm(){
 function renderMethod(){
   var rg = reigns();
   var items = [
+    ["Miners competing",
+     "The signed round summary&rsquo;s participant count: miners whose committed entry was " +
+     "<b>eligible at the round&rsquo;s cutoff</b>. Not &ldquo;registered&rdquo; and not " +
+     "&ldquo;active&rdquo; in any looser sense — exactly the entries the round could judge."],
     ["Lead changes",
      "Counted from the signed record of each round — the field that says the title changed hands. " +
      "&ldquo;Different miners&rdquo; are counted by cryptographic key, not UID (UIDs get re-used)."],
@@ -1240,7 +1324,11 @@ function renderMethod(){
     ["Compute",
      "Number of training runs times their published budgets. See the note under the chart."],
     ["Progress carried forward",
-     "Not measurable until the hand-forward mechanism is switched on."]
+     "Not measurable until the hand-forward mechanism is switched on."],
+    ["Economics",
+     "No economic statistic (emissions, rewards, cost) is carried in the public record feed " +
+     "this page reads, so the tile stays pending. It will be sourced from signed public data " +
+     "when that reporting lands — never typed in by hand."]
   ];
   document.getElementById("method").innerHTML = items.map(function(p){
     return "<div><dt>"+esc(p[0])+"</dt><dd>"+p[1]+"</dd></div>"; }).join("");
