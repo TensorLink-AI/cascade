@@ -76,6 +76,13 @@ in-context.
   reason so the live pointer can't serve the previous round's ranking.
   (`decisions/DEC-CA-0011-heat-standings-published-at-heat-completion.md`)
 
+- **DEC-CA-0012** — Duel win margin DECAYS on a stale throne: after 3
+  undethroned rounds the excess above `margin_floor` halves each round
+  (0.02 → 0.01 → 0.005 → …), floor 0.0 so a challenger still needs LCB ≥ 0.
+  Pure function of receipt-recorded tenure — no receipt change; consensus:
+  validators deploy `margin_decay_*` together.
+  (`decisions/DEC-CA-0012-stale-throne-margin-decay.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

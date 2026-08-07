@@ -648,6 +648,17 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Stale-throne margin decay (see cascade.eval.koth.margin_for_tenure): once
+    # the king has survived ``margin_decay_after_rounds`` rounds undethroned,
+    # the win margin's excess above ``margin_floor`` shrinks by
+    # ``margin_decay_rate`` per round, so an unbeaten king gets steadily easier
+    # to challenge. A dethrone resets the schedule for the new king.
+    # ``margin_decay_after_rounds = 0`` disables (defaults keep older chain.toml
+    # loadable and the margin flat). CONSENSUS: all validators must run the same
+    # values or they reach different verdicts on the same round.
+    margin_decay_after_rounds: int = 0
+    margin_decay_rate: float = 0.5
+    margin_floor: float = 0.0
     # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
     # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
     # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
@@ -888,6 +899,9 @@ class ChainConfig:
             gift_gate_mode=self.scoring.gift_gate_mode,
             gift_gate_tolerance=self.scoring.gift_gate_tolerance,
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
+            margin_decay_after_rounds=self.scoring.margin_decay_after_rounds,
+            margin_decay_rate=self.scoring.margin_decay_rate,
+            margin_floor=self.scoring.margin_floor,
         )
 
 
@@ -978,6 +992,35 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
 _GIFT_GATE_MODES = ("off", "shadow", "enforce")
 
 
+def _validate_margin_decay(s: dict) -> tuple[int, float, float]:
+    """Validate the ``[scoring]`` stale-throne margin-decay keys at load time.
+
+    The decay is consensus-critical (it sets the margin every validator judges
+    against), so a nonsense value must fail fast, not quietly grow or invert
+    the margin: with decay enabled the rate must actually decay (0 < rate < 1)
+    and the floor must sit at or below both ends of the margin schedule
+    (a floor above them would *raise* the margin the round decay starts).
+    """
+    after = int(s.get("margin_decay_after_rounds", 0))
+    rate = float(s.get("margin_decay_rate", 0.5))
+    floor = float(s.get("margin_floor", 0.0))
+    if after < 0:
+        raise ValueError(f"[scoring] margin_decay_after_rounds={after} must be >= 0")
+    if after > 0:
+        if not 0.0 < rate < 1.0:
+            raise ValueError(
+                f"[scoring] margin_decay_rate={rate} must be in (0, 1) when "
+                "margin_decay_after_rounds > 0"
+            )
+        lo = min(float(s["win_margin_start"]), float(s["win_margin_end"]))
+        if not 0.0 <= floor <= lo:
+            raise ValueError(
+                f"[scoring] margin_floor={floor} must be in [0, {lo}] (at or below "
+                "the margin schedule) when margin_decay_after_rounds > 0"
+            )
+    return after, rate, floor
+
+
 def _gift_gate_mode(value: object) -> str:
     """Validate ``[scoring] gift_gate_mode`` at load time so a typo fails fast
     rather than silently disabling the consensus gate."""
@@ -1045,6 +1088,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 f"epoch_blocks={_eb} and epoch_blocks_prev={_ebp} — otherwise the "
                 "round spanning the seam has no well-defined length"
             )
+
+    _md_after, _md_rate, _md_floor = _validate_margin_decay(s)
 
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
@@ -1191,6 +1236,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            margin_decay_after_rounds=_md_after,
+            margin_decay_rate=_md_rate,
+            margin_floor=_md_floor,
             cascade_enabled=bool(s.get("cascade_enabled", False)),
             # ``cascade_reign_rounds`` is the current name; ``cascade_reign_days``
             # is accepted as a legacy alias so deployed files keep loading. The

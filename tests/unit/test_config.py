@@ -143,6 +143,36 @@ def test_koth_params_builds_from_scoring(cfg):
     assert isinstance(params, KothParams)
     assert params.win_margin_start <= params.win_margin_end
     assert params.dethrone_cp == cfg.scoring.dethrone_cp
+    # Stale-throne margin decay rides KothParams into the receipt's recorded
+    # params, so an auditor replays the decayed margin from tenure alone.
+    assert params.margin_decay_after_rounds == cfg.scoring.margin_decay_after_rounds
+    assert params.margin_decay_rate == cfg.scoring.margin_decay_rate
+    assert params.margin_floor == cfg.scoring.margin_floor
+
+
+def test_margin_decay_validated_at_load():
+    import pytest
+
+    from cascade.shared.config import _validate_margin_decay
+
+    base = {"win_margin_start": 0.02, "win_margin_end": 0.02}
+    # Absent keys parse to the inert defaults (older chain.toml stays loadable).
+    assert _validate_margin_decay(dict(base)) == (0, 0.5, 0.0)
+    assert _validate_margin_decay(
+        dict(base, margin_decay_after_rounds=3, margin_decay_rate=0.5)
+    ) == (3, 0.5, 0.0)
+    # A rate that does not decay, or a floor above the margin schedule, would
+    # silently corrupt the consensus margin — both must fail at load time.
+    with pytest.raises(ValueError, match="margin_decay_rate"):
+        _validate_margin_decay(
+            dict(base, margin_decay_after_rounds=3, margin_decay_rate=1.0)
+        )
+    with pytest.raises(ValueError, match="margin_floor"):
+        _validate_margin_decay(
+            dict(base, margin_decay_after_rounds=3, margin_floor=0.05)
+        )
+    with pytest.raises(ValueError, match="margin_decay_after_rounds"):
+        _validate_margin_decay(dict(base, margin_decay_after_rounds=-1))
 
 
 def test_static_guard_blocks_internal_modules(cfg):

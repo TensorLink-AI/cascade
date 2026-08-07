@@ -45,6 +45,21 @@ class KothParams:
             entrenched king must be beaten more decisively.
         margin_warmup_rounds: tenure (in won rounds) over which the margin
             ramps from start to end.
+        margin_decay_after_rounds: stale-throne relief. When > 0 and the king
+            has survived this many rounds without a dethrone, the margin decays
+            geometrically each round from then on (``margin_decay_rate`` per
+            round) toward ``margin_floor``, so an unbeaten king gets steadily
+            easier to challenge. ``0`` disables (margin never decays). A
+            dethrone resets tenure to 0, which resets the margin to the full
+            schedule for the new king.
+        margin_decay_rate: per-round multiplier applied to the excess margin
+            above ``margin_floor`` once decay is active. Must be in (0, 1) to
+            actually decay; e.g. ``0.5`` halves the excess every round.
+        margin_floor: the decayed margin's asymptote — the margin never drops
+            below this. Keep it ``>= 0``: at ``0`` a fully decayed throne still
+            requires a challenger whose LCB shows a statistically significant
+            improvement, just with no extra margin; below 0 a statistically
+            *tied* challenger could take the throne.
         min_windows: below this many common eval windows, no decision is made
             (the round is inconclusive; the king holds).
         min_clusters: below this many distinct window clusters (upstream feeds,
@@ -74,20 +89,44 @@ class KothParams:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Stale-throne margin decay (see class docstring). Defaults keep it inert.
+    margin_decay_after_rounds: int = 0
+    margin_decay_rate: float = 0.5
+    margin_floor: float = 0.0
 
 
 def margin_for_tenure(params: KothParams, king_tenure_rounds: int) -> float:
-    """Affine margin schedule as a function of the king's tenure.
+    """Margin schedule as a function of the king's tenure.
 
-    ``start`` at tenure 0, ramping linearly to ``end`` at
-    ``margin_warmup_rounds`` and clamped there after. Mirrors horizon's
-    ``win_margin_start``/``win_margin_end`` warmup so an established king is
-    harder to displace than a brand-new one.
+    Two tenure-keyed phases, both pure functions of ``king_tenure_rounds`` (so
+    the receipt's recorded tenure fully replays the margin):
+
+    * **Warmup** — ``start`` at tenure 0, ramping linearly to ``end`` at
+      ``margin_warmup_rounds`` and clamped there after. Mirrors horizon's
+      ``win_margin_start``/``win_margin_end`` warmup so an established king is
+      harder to displace than a brand-new one.
+    * **Decay** — when ``margin_decay_after_rounds > 0`` and tenure exceeds it,
+      the excess margin above ``margin_floor`` shrinks by ``margin_decay_rate``
+      per further round: a throne nobody takes gets steadily cheaper to take.
+      A dethrone resets tenure, and with it the margin, for the new king.
     """
     if params.margin_warmup_rounds <= 0:
-        return params.win_margin_end
-    frac = min(max(king_tenure_rounds, 0) / params.margin_warmup_rounds, 1.0)
-    return params.win_margin_start + frac * (params.win_margin_end - params.win_margin_start)
+        margin = params.win_margin_end
+    else:
+        frac = min(max(king_tenure_rounds, 0) / params.margin_warmup_rounds, 1.0)
+        margin = params.win_margin_start + frac * (
+            params.win_margin_end - params.win_margin_start
+        )
+    grace = params.margin_decay_after_rounds
+    if grace > 0 and king_tenure_rounds >= grace:
+        # Rounds judged at tenure 0 .. grace-1 carry the full margin; the round
+        # judged at tenure == grace is the first decayed one (the king already
+        # survived `grace` rounds to reach it).
+        decayed = params.margin_floor + (margin - params.margin_floor) * (
+            params.margin_decay_rate ** (king_tenure_rounds - grace + 1)
+        )
+        margin = max(decayed, params.margin_floor)
+    return margin
 
 
 @dataclass(frozen=True)

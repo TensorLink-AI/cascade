@@ -305,9 +305,10 @@ gift_gate_data_dir    = ""       # pinned benchmark data dir ("" = suite env var
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
 
 [scoring]
-# King-of-the-hill — single-round, flat-margin dethroning; the margin does not
-# ramp with tenure. For sticky/tenure behaviour set dethrone_cp > 1 and
-# win_margin_end > win_margin_start with margin_warmup_rounds > 0.
+# King-of-the-hill — single-round dethroning; the margin does not ramp with
+# tenure, but it DECAYS on a stale throne (margin_decay_* below). For
+# sticky/tenure behaviour set dethrone_cp > 1 and win_margin_end >
+# win_margin_start with margin_warmup_rounds > 0.
 win_margin_start     = 0.02
 win_margin_end       = 0.02      # == start ⇒ flat margin
 margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup
@@ -318,6 +319,17 @@ min_clusters         = 0         # min distinct window clusters (pool `source` l
 bootstrap_B          = 10000     # paired-bootstrap resamples
 bootstrap_alpha      = 0.05      # one-sided LCB level
 dethrone_cp          = 1         # consecutive round wins to take the throne
+# Stale-throne margin decay: once the king survives margin_decay_after_rounds
+# rounds undethroned, the win margin's excess above margin_floor is multiplied
+# by margin_decay_rate each round (0.02 → 0.01 → 0.005 → …), so an unbeaten
+# king gets steadily easier to challenge. A dethrone resets the schedule for
+# the new king. 0 = off (flat margin forever). CONSENSUS: all validators must
+# run the same values or they reach different verdicts on the same round.
+margin_decay_after_rounds = 3    # full-margin rounds before decay starts (0 = off)
+margin_decay_rate    = 0.5       # per-round multiplier on the excess above the floor
+margin_floor         = 0.0       # decay asymptote; at 0.0 a challenger still needs a
+                                 # statistically significant win (LCB >= 0), just no
+                                 # extra margin — keep >= 0 or a tied challenger passes
 # Reward routing: weight split across the current king plus up to
 # reward_prior_kings previous distinct kings still registered; if none are
 # registered, all weight burns to burn_uid. 0 = pure winner-take-all.

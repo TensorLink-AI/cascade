@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
+import pytest
 
 from cascade.eval.koth import KothParams, evaluate_round, margin_for_tenure
 from cascade.eval.scoring import WindowScore
@@ -40,6 +43,77 @@ def test_margin_schedule_ramps_and_clamps():
     assert margin_for_tenure(PARAMS, 100) == 0.10
     mid = margin_for_tenure(PARAMS, 2)
     assert 0.02 < mid < 0.10
+
+
+DECAY_PARAMS = KothParams(
+    win_margin_start=0.02,
+    win_margin_end=0.02,
+    margin_warmup_rounds=0,
+    min_windows=20,
+    bootstrap_B=1000,
+    bootstrap_alpha=0.05,
+    dethrone_cp=1,
+    margin_decay_after_rounds=3,
+    margin_decay_rate=0.5,
+    margin_floor=0.0,
+)
+
+
+def test_margin_decay_disabled_by_default():
+    # Defaults keep the mechanic inert: the schedule never decays with tenure.
+    assert PARAMS.margin_decay_after_rounds == 0
+    assert margin_for_tenure(PARAMS, 1000) == 0.10
+
+
+def test_margin_decays_after_grace_rounds():
+    # Full margin while the king earns its grace (rounds judged at tenure 0..2),
+    # then the excess above the floor halves every round.
+    for tenure in range(3):
+        assert margin_for_tenure(DECAY_PARAMS, tenure) == 0.02
+    assert margin_for_tenure(DECAY_PARAMS, 3) == pytest.approx(0.01)
+    assert margin_for_tenure(DECAY_PARAMS, 4) == pytest.approx(0.005)
+    assert margin_for_tenure(DECAY_PARAMS, 5) == pytest.approx(0.0025)
+    # Asymptotically the floor (0 here), never below it.
+    assert 0.0 <= margin_for_tenure(DECAY_PARAMS, 60) < 1e-6
+    # A dethrone resets tenure to 0 — and with it the margin, for the new king.
+    assert margin_for_tenure(DECAY_PARAMS, 0) == 0.02
+
+
+def test_margin_decay_respects_floor():
+    p = replace(DECAY_PARAMS, margin_floor=0.008)
+    # Excess above the floor halves: 0.008 + (0.02 - 0.008) / 2.
+    assert margin_for_tenure(p, 3) == pytest.approx(0.014)
+    assert margin_for_tenure(p, 100) == pytest.approx(0.008)
+    assert margin_for_tenure(p, 100) >= p.margin_floor
+
+
+def test_margin_decay_composes_with_warmup():
+    # With warmup on, decay applies to the warmup-scheduled value at that
+    # tenure: warmup(3) = 0.02 + 3/5 * 0.08 = 0.068, decayed once -> 0.034.
+    p = replace(
+        PARAMS, margin_decay_after_rounds=3, margin_decay_rate=0.5, margin_floor=0.0
+    )
+    assert margin_for_tenure(p, 2) == margin_for_tenure(PARAMS, 2)  # in grace
+    assert margin_for_tenure(p, 3) == pytest.approx(0.034)
+
+
+def test_stale_throne_easier_to_beat():
+    # A challenger uniformly 1% better has LCB == 0.01 exactly (uniform scaling
+    # survives the paired bootstrap). That loses to the full 0.02 margin while
+    # the throne is fresh, and wins once the stale-throne decay undercuts it.
+    king = _scores(100, 1.0, 0)
+    chal = [
+        WindowScore(s.series_id, s.mase * 0.99, s.qloss_per_q * 0.99, s.abs_target)
+        for s in king
+    ]
+    fresh = evaluate_round(king, chal, DECAY_PARAMS, seed="s", king_tenure_rounds=0)
+    assert not fresh.challenger_wins_round
+    assert fresh.margin == 0.02
+
+    stale = evaluate_round(king, chal, DECAY_PARAMS, seed="s", king_tenure_rounds=4)
+    assert stale.margin == pytest.approx(0.005)
+    assert stale.challenger_wins_round
+    assert stale.lcb >= stale.margin
 
 
 def test_inconclusive_below_min_windows():
