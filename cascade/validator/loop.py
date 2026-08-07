@@ -113,6 +113,23 @@ class RoundOutcome:
     # The king's tenure AT decision time (it set the margin); recorded in the
     # receipt so an auditor can recompute margin_for_tenure without validator state.
     king_tenure_rounds: int = 0
+    # The cohort this round judged (DEC-CA-0012), best-clearer-first among those
+    # that cleared. ``decided_hotkey`` is the crowned challenger — or, when none
+    # cleared, the cohort's best point estimate, i.e. the challenger the verdict
+    # in ``result`` belongs to. Internal only: NOT receipt fields (VerdictRecord
+    # cannot grow — see cascade/shared/receipt.py), and an auditor re-derives all
+    # of this from the signed manifest plus ``entry_scores``.
+    decided_hotkey: str | None = None
+    duelled_hotkeys: tuple[str, ...] = ()
+    # Published on the receipt (DEC-CA-0012): the k that set the per-challenger
+    # alpha, and every duelled challenger's LCB under it. With the verdict's
+    # ``margin`` these are the complete input to the selection rule, so a third
+    # party checks "who cleared, and was the crowned one the best" without
+    # re-running the bootstrap or trusting this validator. ``cohort_k = 0`` on a
+    # single-challenger round keeps the signed body byte-identical to a
+    # pre-cohort receipt.
+    cohort_k: int = 0
+    cohort_lcbs: dict[str, float] = field(default_factory=dict)
 
 
 # How long the live loop keeps re-trying a round whose eval-pool index cannot
@@ -472,7 +489,15 @@ class ValidatorRunner:
             return
         if outcome is None or not outcome.transition.dethroned:
             return
-        new_king = manifest.entry_for_role("challenger")
+        # The crowned challenger, NOT the manifest's first — a multi-finalist
+        # cohort (DEC-CA-0012) carries several, and taking the first would
+        # benchmark a checkpoint that did not take the throne.
+        crowned = outcome.transition.new_king_hotkey
+        new_king = next(
+            (e for e in manifest.entries_for_role("challenger")
+             if e.miner_hotkey == crowned),
+            None,
+        )
         if new_king is None:
             return
         try:
@@ -702,16 +727,37 @@ class ValidatorRunner:
     ) -> RoundOutcome | None:
         """Evaluate one manifest against the eval windows and update state.
 
-        A round carries one (king, challenger) pair PER trained size (the primary
-        plus any ``[[training.sizes]]``). Each size's pair is scored on the SAME
-        windows, then the per-size scores are POOLED — king's across sizes vs
-        challenger's across sizes, in identical order — and a single paired
-        bootstrap decides ONE throne on the combined score (scaling-aware KOTH).
-        Pooling preserves pairing because each size's king and challenger share
-        the window ``abs_target``.
+        A round carries one king per trained size (the primary plus any
+        ``[[training.sizes]]``) and, when the heat advanced a statistically tied
+        cohort, up to ``[round] max_finalists`` challengers (DEC-CA-0012). For each
+        challenger, every size's pair is scored on the SAME windows and the
+        per-size scores are POOLED — king's across sizes vs challenger's across
+        sizes, in identical order — so a single paired bootstrap decides ONE
+        throne on the combined score (scaling-aware KOTH). Pooling preserves
+        pairing because each size's king and challenger share the window
+        ``abs_target``.
+
+        The WHOLE cohort is judged; the duel deliberately does NOT stop at the
+        first challenger to clear the margin. Judging is cheap (the king is
+        evaluated once and reused, so an extra challenger is one extra eval),
+        stopping early would let the screen's noisy ranking decide the throne
+        among challengers it could not separate, and an early stop makes the
+        family-wise alpha below unsound (optional stopping). Clearers are then
+        ranked by OBSERVED relative improvement, not by their bound — gate on the
+        bound, select on the point estimate (DEC-CA-0006 measured ranking a
+        selection by a bound at −20pp in the adverse case).
+
+        Because ``k`` challengers each get a draw at the ``bootstrap_alpha`` tail,
+        a merely-equal cohort would multiply the king's false-dethrone risk. The
+        per-challenger alpha is therefore tightened to ``bootstrap_alpha / k``.
+        ``k`` is the duelled-cohort size, derivable from the signed manifest, so
+        the receipt keeps recording the UNMODIFIED config params (a mutated alpha
+        there would fail ``check_koth_params`` against ``chain.toml``) and the
+        audit re-derives the correction itself. At ``k = 1`` this is bit-identical
+        to the pre-DEC-CA-0012 rule.
 
         Returns None (king holds, no state change) when the manifest carries no
-        size with both a king and a challenger, or fails the contract gate.
+        challenger paired with the king at every size, or fails the contract gate.
         Otherwise returns the round outcome with the (already-applied) transition.
         """
         reason = self.check_manifest(manifest)
@@ -720,65 +766,149 @@ class ValidatorRunner:
             return None
 
         king_by_size = {e.size: e for e in manifest.entries_for_role("king")}
-        chal_by_size = {e.size: e for e in manifest.entries_for_role("challenger")}
-        paired_sizes = [s for s in manifest.sizes() if s in king_by_size and s in chal_by_size]
-        if not paired_sizes:
-            log.info("manifest round=%s has no king/challenger pair; king holds", manifest.round_id)
+        # The cohort and the sizes it is judged on, derived from the signed
+        # manifest by a helper SHARED with cascade-audit so the two cannot derive
+        # a different `k` (see TrainingManifest.duel_cohort).
+        cohort, paired_sizes = manifest.duel_cohort()
+        advanced = {hk for hk, _ in cohort}
+        for hk, by_size in manifest.challenger_cohort():
+            if hk in advanced:
+                continue
+            log.info("round=%s challenger %s dropped from the duel: trained at %s, "
+                     "the cohort is judged on %s", manifest.round_id, hk,
+                     sorted(by_size), paired_sizes)
+        if not cohort:
+            log.info("manifest round=%s has no king/challenger pair; king holds",
+                     manifest.round_id)
             return None
 
-        king_scores: list[WindowScore] = []
-        chal_scores: list[WindowScore] = []
         score_records: list[EntryScores] = []
-        for size in paired_sizes:
-            import time as _time
 
-            _t0 = _time.perf_counter()
+        # The king is evaluated ONCE and reused across the cohort — the windows
+        # are identical, which is what makes every comparison paired, and it is
+        # what makes an extra challenger cost one extra eval instead of two.
+        import time as _time
+
+        king_scores: list[WindowScore] = []
+        _t0 = _time.perf_counter()
+        for size in paired_sizes:
             ks = self._evaluate(king_by_size[size], windows)
-            _t_king = _time.perf_counter() - _t0
-            _t1 = _time.perf_counter()
-            cs = self._evaluate(chal_by_size[size], windows)
-            _t_chal = _time.perf_counter() - _t1
-            log.info(
-                "round=%s eval-timing size=%s device=%s n_windows=%d num_samples=%d "
-                "king=%.1fs challenger=%.1fs total=%.1fs",
-                manifest.round_id, size, self.device, len(windows),
-                self.cfg.eval.num_samples, _t_king, _t_chal, _t_king + _t_chal,
-            )
             king_scores += ks
-            chal_scores += cs
-            for entry, scores in ((king_by_size[size], ks), (chal_by_size[size], cs)):
-                score_records.append(EntryScores(
-                    role=entry.role, size=size,
-                    hotkey=entry.miner_hotkey, uid=entry.miner_uid,
-                    scores=tuple(WindowScoreRecord.from_score(s) for s in scores),
-                ))
-        # One challenger generator competes at every size, so any size's entry
-        # carries its identity for the KOTH state machine.
-        chal_entry = chal_by_size[paired_sizes[0]]
+            score_records.append(EntryScores(
+                role="king", size=size,
+                hotkey=king_by_size[size].miner_hotkey, uid=king_by_size[size].miner_uid,
+                scores=tuple(WindowScoreRecord.from_score(s) for s in ks),
+            ))
+        _t_king = _time.perf_counter() - _t0
+
+        base_params = self.cfg.koth_params()
+        k = len(cohort)
+        # Family-wise (Bonferroni) correction. Conservative under the cohort's
+        # real correlation — every challenger shares the king's scores and one
+        # window draw — which over-protects the king rather than under-, the
+        # correct side to err on for a change whose failure mode is an
+        # illegitimate dethrone. See DEC-CA-0012.
+        duel_params = (
+            base_params if k <= 1
+            else replace(base_params, bootstrap_alpha=base_params.bootstrap_alpha / k)
+        )
+        if k > 1:
+            log.info("round=%s cohort duel: k=%d challengers, alpha %.4f -> %.5f",
+                     manifest.round_id, k, base_params.bootstrap_alpha,
+                     duel_params.bootstrap_alpha)
 
         tenure_at_decision = self.state.tenure_rounds
-        result = evaluate_round(
-            king_scores,
-            chal_scores,
-            self.cfg.koth_params(),
-            seed=base_seed,
-            king_tenure_rounds=tenure_at_decision,
-        )
-        # Public-benchmark no-regression gate: only on a private-pool win, and
-        # only when enabled. It can block a dethrone (or, uncomputable, hold the
-        # round) but never grant one. Gated on the primary size's checkpoint
-        # pair (the pooled decision spans sizes; the gate screens on one).
-        if self.cfg.scoring.gift_gate_mode != "off" and result.challenger_wins_round:
-            gate_size = (
-                self.cfg.training.arch_preset
-                if self.cfg.training.arch_preset in king_by_size and
-                self.cfg.training.arch_preset in chal_by_size
-                else paired_sizes[0]
+        judged: list[tuple[str, TrainedEntry, RoundResult]] = []
+        inconclusive: RoundResult | None = None
+        for hk, by_size in cohort:
+            chal_scores: list[WindowScore] = []
+            _t1 = _time.perf_counter()
+            for size in paired_sizes:
+                cs = self._evaluate(by_size[size], windows)
+                chal_scores += cs
+                score_records.append(EntryScores(
+                    role="challenger", size=size,
+                    hotkey=by_size[size].miner_hotkey, uid=by_size[size].miner_uid,
+                    scores=tuple(WindowScoreRecord.from_score(s) for s in cs),
+                ))
+            _t_chal = _time.perf_counter() - _t1
+            log.info(
+                "round=%s eval-timing challenger=%s device=%s n_windows=%d "
+                "num_samples=%d king=%.1fs challenger=%.1fs",
+                manifest.round_id, hk, self.device, len(windows),
+                self.cfg.eval.num_samples, _t_king, _t_chal,
             )
-            result = self._run_gift_gate(
-                result, king_by_size[gate_size], chal_by_size[gate_size],
-                seed=base_seed, round_id=manifest.round_id,
+            result = evaluate_round(
+                king_scores, chal_scores, duel_params,
+                seed=base_seed, king_tenure_rounds=tenure_at_decision,
             )
+            if result.inconclusive:
+                # ``min_windows``/``min_clusters`` are properties of the window
+                # slice, identical for every challenger — if one duel is
+                # inconclusive they all are. Hold the throne and stop rather than
+                # evaluate the rest for a verdict that cannot arrive.
+                log.info("round=%s duel inconclusive (n_windows=%d n_clusters=%d); "
+                         "king holds, remaining cohort not evaluated",
+                         manifest.round_id, result.n_windows, result.n_clusters)
+                inconclusive = result
+                break
+            judged.append((hk, by_size[paired_sizes[0]], result))
+            log.info("round=%s duel %s lcb=%.4f margin=%.4f clears=%s",
+                     manifest.round_id, hk, result.lcb, result.margin,
+                     result.challenger_wins_round)
+
+        if inconclusive is not None:
+            decided_hotkey, chal_entry, result = (
+                cohort[len(judged)][0],
+                cohort[len(judged)][1][paired_sizes[0]],
+                inconclusive,
+            )
+            duelled: tuple[str, ...] = tuple(hk for hk, _, _ in judged) + (decided_hotkey,)
+        else:
+            # Gate on the bound, select on the point estimate: among the
+            # challengers that cleared the margin, crown the best OBSERVED
+            # relative improvement. The king's geomean is shared across the
+            # cohort, so lowest ``chal_geomean`` IS the best improvement.
+            def _pick(cands):
+                return min(cands, key=lambda t: (t[2].chal_geomean,
+                                                 t[1].train_block, t[1].miner_uid))
+
+            clearers = [t for t in judged if t[2].challenger_wins_round]
+            decided_hotkey, chal_entry, result = _pick(clearers or judged)
+            duelled = tuple(hk for hk, _, _ in judged)
+            if len(clearers) > 1:
+                log.info("round=%s %d challengers cleared the margin; crowning %s "
+                         "(best observed geomean %.5f)", manifest.round_id,
+                         len(clearers), decided_hotkey, result.chal_geomean)
+            # Public-benchmark no-regression gate: only on a private-pool win,
+            # and only when enabled. It can block a dethrone (or, uncomputable,
+            # hold the round) but never grant one. It is a sidecar sweep — the
+            # one genuinely expensive per-challenger step — so it runs on the
+            # best clearer and falls through to the next-best only if an
+            # ``enforce`` gate blocks. Gated on the primary size's pair (the
+            # pooled decision spans sizes; the gate screens on one).
+            if self.cfg.scoring.gift_gate_mode != "off" and clearers:
+                remaining = sorted(
+                    clearers, key=lambda t: (t[2].chal_geomean,
+                                             t[1].train_block, t[1].miner_uid))
+                for hk, entry, res in remaining:
+                    gate_size = (
+                        self.cfg.training.arch_preset
+                        if self.cfg.training.arch_preset in king_by_size
+                        and self.cfg.training.arch_preset in dict(cohort)[hk]
+                        else paired_sizes[0]
+                    )
+                    gated = self._run_gift_gate(
+                        res, king_by_size[gate_size], dict(cohort)[hk][gate_size],
+                        seed=base_seed, round_id=manifest.round_id,
+                    )
+                    decided_hotkey, chal_entry, result = hk, entry, gated
+                    if gated.challenger_wins_round or gated.inconclusive:
+                        break
+                    log.info("round=%s %s cleared the private pool but was blocked by "
+                             "the public-benchmark gate; falling through to the next "
+                             "clearer", manifest.round_id, hk)
+
         transition = state_mod.apply_round(
             self.state,
             challenger_hotkey=chal_entry.miner_hotkey,
@@ -786,12 +916,14 @@ class ValidatorRunner:
             result=result,
             dethrone_cp=self.cfg.scoring.dethrone_cp,
             keep_former_kings=self.cfg.scoring.reward_prior_kings,
+            defeated_hotkeys=duelled,
         )
         self.state = transition.state
         log.info(
-            "round=%s lcb=%.4f margin=%.4f win=%s %s king=%s tenure=%d",
-            manifest.round_id, result.lcb, result.margin, result.challenger_wins_round,
-            transition.note, self.state.king_hotkey, self.state.tenure_rounds,
+            "round=%s k=%d decided=%s lcb=%.4f margin=%.4f win=%s %s king=%s tenure=%d",
+            manifest.round_id, k, decided_hotkey, result.lcb, result.margin,
+            result.challenger_wins_round, transition.note,
+            self.state.king_hotkey, self.state.tenure_rounds,
         )
         # Shadow diagnostics: never gate the verdict. A rank-based view that
         # disagrees with the LCB, or a per-domain win-rate sign flip, means the
@@ -806,6 +938,11 @@ class ValidatorRunner:
         return RoundOutcome(
             result=result, transition=transition, entry_scores=tuple(score_records),
             king_tenure_rounds=tenure_at_decision,
+            decided_hotkey=decided_hotkey, duelled_hotkeys=duelled,
+            # Only on a genuine cohort: k <= 1 must leave the receipt's signed
+            # bytes exactly as a pre-DEC-CA-0012 round's.
+            cohort_k=(k if k > 1 else 0),
+            cohort_lcbs=({hk: r.lcb for hk, _, r in judged} if k > 1 else {}),
         )
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
@@ -872,6 +1009,7 @@ class ValidatorRunner:
             outcome.result, outcome.transition,
             params=self.cfg.koth_params(), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
+            cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
         )
         return build_receipt(
             round_id=manifest.round_id, status="scored",

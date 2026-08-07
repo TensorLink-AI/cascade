@@ -145,8 +145,20 @@ class TrainedEntry:
     train_block: int
     gpu_name: str = ""        # GPU model the run used; gated for matched-hardware audit
     size: str = ""            # arch_preset this entry was trained at ("" = primary/legacy).
-                              # A round carries one (king, challenger) pair PER size.
+                              # A round carries one king per size and, when the heat
+                              # advanced a tied cohort, up to ``max_finalists``
+                              # challengers per size (DEC-CA-0012).
     bench_scores: BenchScores | None = None  # trainer-signed public-benchmark scores (king only)
+    # Heat placement within the advancing cohort, 0-based, best observed geomean
+    # first (DEC-CA-0012). Record order only — the validator judges the WHOLE
+    # cohort and crowns the best margin-clearer, so this never decides the
+    # throne; it exists so every validator serialises ``entry_scores`` in one
+    # order and the dashboard can show the screen's ranking. Dropped from
+    # ``canonical_body`` when 0 (see :func:`_entry_body`), so a single-finalist
+    # manifest hashes exactly as it did before the field existed. Ranks may be
+    # non-contiguous — ``_drop_final_content_clones`` can remove one — so
+    # consumers sort, never index.
+    duel_rank: int = 0
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -231,12 +243,16 @@ class HeatResult:
 
 
 def _entry_body(e: TrainedEntry) -> dict:
-    """One entry's canonical dict. ``bench_scores`` is omitted when ``None`` so a
-    manifest without it is byte-identical to a pre-``bench_scores`` manifest — the
-    signed payload only grows for entries that actually carry the scores."""
+    """One entry's canonical dict. ``bench_scores`` is omitted when ``None`` and
+    ``duel_rank`` when 0, so a manifest without them is byte-identical to a
+    manifest predating those fields — the signed payload only grows for entries
+    that actually carry them, which keeps every archived signature valid without
+    a ``MANIFEST_VERSION`` bump."""
     d = asdict(e)
     if d.get("bench_scores") is None:
         d.pop("bench_scores", None)
+    if not d.get("duel_rank"):
+        d.pop("duel_rank", None)
     return d
 
 
@@ -343,9 +359,88 @@ class TrainingManifest:
 
     def entries_for_role(self, role: str) -> list[TrainedEntry]:
         """All entries for ``role`` — one per trained size (the primary plus any
-        ``[[training.sizes]]``). Order follows the manifest's entry order, which
-        the trainer emits size-by-size."""
+        ``[[training.sizes]]``) per distinct miner. Order follows the manifest's
+        entry order, which the trainer emits size-by-size.
+
+        NOTE: with a multi-finalist cohort (DEC-CA-0012) the challenger role has
+        one entry per (hotkey, size), so keying the result by ``size`` alone
+        silently drops challengers. Use :meth:`challenger_cohort`.
+        """
         return [e for e in self.entries if e.role == role]
+
+    def challenger_cohort(self) -> list[tuple[str, dict[str, TrainedEntry]]]:
+        """The advancing cohort as ``[(hotkey, {size: entry})]`` in duel order.
+
+        Duel order is ``(duel_rank, hotkey)``: the heat's observed ranking, with
+        the hotkey breaking ties so a legacy manifest (every ``duel_rank`` 0) is
+        still ordered identically by every validator. This is *record* order, not
+        precedence — the validator judges the whole cohort and crowns the best
+        margin-clearer (DEC-CA-0012), so nothing about the throne depends on it.
+
+        Grouping by hotkey rather than size is the whole point: one generator
+        competes at every size, and the pooled decision needs all of a
+        challenger's sizes together.
+        """
+        by_hotkey: dict[str, dict[str, TrainedEntry]] = {}
+        rank: dict[str, int] = {}
+        for e in self.entries:
+            if e.role != "challenger":
+                continue
+            by_hotkey.setdefault(e.miner_hotkey, {})[e.size] = e
+            # A generator carries one rank for the round; entries agree across
+            # sizes, but take the lowest defensively so a malformed manifest
+            # cannot make the order depend on dict insertion.
+            prev = rank.get(e.miner_hotkey)
+            rank[e.miner_hotkey] = e.duel_rank if prev is None else min(prev, e.duel_rank)
+        return [(hk, by_hotkey[hk]) for hk in sorted(by_hotkey, key=lambda h: (rank[h], h))]
+
+    def king_sizes(self) -> list[str]:
+        """Sizes the king was trained at, in manifest order."""
+        king = {e.size for e in self.entries if e.role == "king"}
+        return [s for s in self.sizes() if s in king]
+
+    def duel_cohort(
+        self,
+    ) -> tuple[list[tuple[str, dict[str, TrainedEntry]]], list[str]]:
+        """``(cohort, paired_sizes)`` — who gets duelled, and on which sizes.
+
+        A challenger is scored on the sizes it shares with the king; a size the
+        king trained but the challenger did not is simply skipped, and the round is
+        still decided on the rest. That is long-standing behaviour and it is
+        preserved exactly for a single challenger.
+
+        With a cohort (DEC-CA-0012) the crowning step compares challengers by
+        observed geomean, so they must be scored on the SAME sizes or the
+        comparison is meaningless. Challengers are therefore grouped by the size
+        set they share with the king and only the **maximal** group is duelled:
+        largest set wins, ties broken toward the earlier (primary) sizes. A
+        challenger that failed to train at a size where its peers succeeded does
+        not qualify to compete against them — training more never costs you a
+        slot, and every survivor is comparable by construction. With one
+        challenger there is exactly one group, so this reduces to the rule above.
+
+        ``len(cohort)`` is the ``k`` that sets the duel's family-wise alpha
+        (``bootstrap_alpha / k``). It lives here, on the signed manifest, so the
+        validator and ``cascade-audit`` derive it from one implementation and
+        cannot drift — the receipt deliberately does NOT record the adjusted alpha
+        (that would fail ``check_koth_params`` against the published
+        ``[scoring]``). Note it counts the ADVANCED cohort, not the number
+        evaluated: an inconclusive round stops early, but the alpha it was judged
+        under was already fixed by the cohort size.
+        """
+        king_sizes = self.king_sizes()
+        if not king_sizes:
+            return [], []
+        idx = {s: i for i, s in enumerate(king_sizes)}
+        groups: dict[tuple[str, ...], list[tuple[str, dict[str, TrainedEntry]]]] = {}
+        for hk, by_size in self.challenger_cohort():
+            common = tuple(s for s in king_sizes if s in by_size)
+            if common:
+                groups.setdefault(common, []).append((hk, by_size))
+        if not groups:
+            return [], []
+        best = min(groups, key=lambda c: (-len(c), tuple(idx[s] for s in c)))
+        return groups[best], list(best)
 
     def sizes(self) -> list[str]:
         """Distinct size tags present, in first-seen order (e.g. the king's
@@ -422,6 +517,7 @@ def load_manifest(text: str) -> TrainingManifest:
             gpu_name=str(e.get("gpu_name", "")),
             size=str(e.get("size", "")),
             bench_scores=_bench_from_json(e.get("bench_scores")),
+            duel_rank=int(e.get("duel_rank", 0)),
         )
         for e in obj["entries"]
     ]
