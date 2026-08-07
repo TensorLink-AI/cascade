@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cascade · subnet scoreboard</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<meta name="description" content="Cascade (Bittensor SN91) scoreboard: how often the lead changes hands, how much the forecasts have improved since day one, how big the models are, and what that progress costs.">
+<meta name="description" content="Cascade (Bittensor SN91) scoreboard: is real competition happening, how much have the forecasts improved, what model scale has been demonstrated, and what that progress costs — all computed live from the subnet's public signed record.">
 <style>
 /* ============================================================
    cascade — stakeholder scoreboard
@@ -13,6 +13,20 @@
    dashboard (index.html); the brand webfonts are NOT inlined here
    (index.html carries ~1.3MB of them), so this page renders in the
    same colours on the system font stack.
+
+   Reading order is CONCLUSION → EVIDENCE → DETAIL → METHODOLOGY:
+   every section opens with a plain-English answer, the chart/table
+   is evidence for it, and identifiers/formulae sit in expanders.
+
+   Type scale (keep this hierarchy intact):
+     L1 wordmark        44px display
+     L2 section question 12px mono bold caps
+     L3 answer line      15px sans, --ink
+     L4 headline value   ~30px mono, --ink
+     L5 body / lede      13.5px sans, --muted
+     L6 metadata         11px mono caps, --faint
+   --muted is EXPLANATORY text and must stay comfortably readable
+   on --paper in light mode; --faint is true metadata only.
    ============================================================ */
 :root {
   --clay:#BF5B3D; --clay-700:#8C3F29; --clay-100:#F0D6CC;
@@ -26,32 +40,36 @@
   --font-sans:system-ui,-apple-system,'Segoe UI',sans-serif;
   --font-mono:ui-monospace,'SF Mono',Menlo,'IBM Plex Mono',monospace;
 
-  --paper:var(--mist); --surface:var(--mist-card); --ink:var(--slate);
-  --muted:var(--slate-400);
+  --paper:var(--mist); --surface:var(--mist-card); --ink:#2E3A47;
+  --muted:#526376;          /* explanatory copy — AA on --paper */
+  --faint:var(--slate-400); /* metadata only, never body copy */
   --line:1px dashed var(--mist-border);
   --line-faint:1px dotted rgba(51,64,78,0.16);
-  --accent:var(--sage); --good:var(--sage-700); --warn:var(--saffron-600);
+  --accent:var(--sage); --accent-deep:var(--sage-700);
+  --good:var(--sage-700); --warn:var(--saffron-600);
   --pending-bg:rgba(219,160,71,0.10); --pending-fg:#8a6414;
 }
 [data-theme="dark"] {
-  --paper:#232D38; --surface:#29343F; --ink:var(--bone-light); --muted:#8A99A8;
+  --paper:#232D38; --surface:#29343F; --ink:var(--bone-light);
+  --muted:#A8B4C0; --faint:#8A99A8;
   --line:1px dashed rgba(229,219,201,0.26);
   --line-faint:1px dotted rgba(229,219,201,0.14);
-  --accent:var(--sage-300); --good:var(--sage-300); --warn:var(--saffron);
+  --accent:var(--sage-300); --accent-deep:var(--sage-300);
+  --good:var(--sage-300); --warn:var(--saffron);
   --pending-bg:rgba(219,160,71,0.14); --pending-fg:var(--saffron);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--paper);color:var(--ink);font:14px/1.55 var(--font-sans);
   display:flex;justify-content:center;min-height:100vh;-webkit-font-smoothing:antialiased;
   transition:background .2s,color .2s}
-.page{width:100%;max-width:1180px;padding:30px 40px 90px;display:flex;flex-direction:column;gap:34px}
-a{color:var(--accent);text-decoration:none}
+.page{width:100%;max-width:1180px;padding:30px 40px 90px;display:flex;flex-direction:column;gap:36px}
+a{color:var(--accent-deep);text-decoration:none}
 a:hover{text-decoration:underline}
 
 /* top bar */
 #top-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
   border-bottom:var(--line);padding:8px 0;font-family:var(--font-mono);font-size:11px;
-  text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  text-transform:uppercase;letter-spacing:.05em;color:var(--faint)}
 #top-bar b{color:var(--ink);font-weight:600}
 .tb-group{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
 .net-badge{font-weight:700;letter-spacing:.08em;padding:3px 9px;border:1px solid currentColor;border-radius:2px}
@@ -68,45 +86,80 @@ a:hover{text-decoration:underline}
 /* masthead */
 .header{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0 0}
 .header .wordmark{font-family:var(--font-display);font-weight:700;font-size:44px;letter-spacing:-.03em;
-  color:var(--accent);line-height:1}
-.header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--muted);
+  color:var(--accent-deep);line-height:1}
+[data-theme="dark"] .header .wordmark{color:var(--accent)}
+.header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--faint);
   text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
-.header .sub{color:var(--muted);max-width:70ch;margin-top:12px;font-size:13.5px}
+.header .sub{color:var(--muted);max-width:72ch;margin-top:12px;font-size:13.5px}
 
 /* section */
 .section-label{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
-  text-transform:uppercase;font-family:var(--font-mono);font-weight:700;font-size:11px;
-  letter-spacing:.09em;border-bottom:var(--line);padding-bottom:9px;margin-bottom:16px;color:var(--ink)}
-.section-label .muted{color:var(--muted);font-weight:400;letter-spacing:.04em}
-.lede{color:var(--muted);font-size:13px;max-width:82ch;margin-bottom:18px;line-height:1.65}
+  text-transform:uppercase;font-family:var(--font-mono);font-weight:700;font-size:12px;
+  letter-spacing:.09em;border-bottom:var(--line);padding-bottom:9px;margin-bottom:14px;color:var(--ink)}
+.section-label .muted{color:var(--faint);font-weight:400;letter-spacing:.04em;font-size:11px}
+/* the one-sentence answer every section leads with */
+.answer{font-size:15px;line-height:1.6;color:var(--ink);max-width:86ch;margin-bottom:12px}
+.answer b{font-weight:700}
+.lede{color:var(--muted);font-size:13.5px;max-width:84ch;margin-bottom:18px;line-height:1.65}
+.lede b{color:var(--ink)}
 
-/* headline tiles */
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:14px}
+/* headline tiles — 3×2 on desktop, 2-up on tablet, stacked on phones */
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);grid-auto-rows:1fr;gap:14px}
+@media (max-width:980px){.tiles{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:620px){.tiles{grid-template-columns:1fr}}
 .tile{border:var(--line);background:var(--surface);padding:18px 19px;position:relative;
-  display:flex;flex-direction:column;gap:5px;min-height:150px}
+  display:flex;flex-direction:column;gap:7px;min-height:176px}
 .tile::before{content:"";position:absolute;inset:4px;border:var(--line-faint);pointer-events:none}
 .tile>*{position:relative;z-index:1}
-.tile .k{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;
-  letter-spacing:.07em;color:var(--muted)}
-.tile .v{font-family:var(--font-mono);font-size:clamp(26px,3.4vw,34px);line-height:1.1;
-  margin-top:2px;color:var(--ink);font-weight:600}
+.tile .k{font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--muted);font-weight:700;line-height:1.5}
+.tile .v{font-family:var(--font-mono);font-size:clamp(25px,3.2vw,32px);line-height:1.1;
+  margin-top:1px;color:var(--ink);font-weight:600}
 .tile .v.sm{font-size:clamp(19px,2.4vw,23px)}
-.tile .u{font-size:14px;color:var(--muted);font-weight:400}
-.tile .note{font-size:12px;color:var(--muted);margin-top:auto;line-height:1.5}
-.tile .note b{color:var(--ink);font-weight:600}
-.tile.pending .v{color:var(--pending-fg)}
+.tile .u{font-size:13px;color:var(--muted);font-weight:400}
+.tile .interp{font-size:13px;color:var(--ink);line-height:1.55}
+.tile .interp b{font-weight:700}
+.tile .ctx{font-size:11.5px;color:var(--muted);margin-top:auto;line-height:1.5}
+/* pending results stay in the grid but carry less visual weight */
+.tile.pending{background:transparent}
+.tile.pending .v{color:var(--pending-fg);font-size:clamp(17px,2vw,20px);font-weight:600}
+.tile.pending .interp{color:var(--muted)}
+.tile.pending .k{color:var(--faint)}
 .pill{display:inline-block;font-family:var(--font-mono);font-weight:700;font-size:9.5px;
   text-transform:uppercase;letter-spacing:.07em;padding:2px 8px;border-radius:999px;
   border:1px solid currentColor;white-space:nowrap}
 .pill.live{color:var(--good)}
 .pill.pend{color:var(--pending-fg);background:var(--pending-bg);border-color:transparent}
+.pill.off{color:var(--faint)}
 .good{color:var(--good)}
-.tile-head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.tile-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+
+/* current read — the two-minute takeaway right under the headline grid */
+.readout{border:var(--line);border-left:3px solid var(--accent);background:var(--surface);
+  display:grid;grid-template-columns:1fr 265px;gap:16px 36px;padding:18px 22px;margin-top:14px}
+.ro-label{display:block;font-family:var(--font-mono);font-size:10.5px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:7px}
+.readout p{font-size:13.5px;line-height:1.7;color:var(--ink)}
+.readout ul{list-style:none}
+.readout li{font-size:12.5px;color:var(--muted);line-height:1.5;padding-left:15px;
+  position:relative;margin-bottom:7px}
+.readout li::before{content:"→";position:absolute;left:0;color:var(--accent-deep)}
+.readout li b{color:var(--ink)}
+@media (max-width:760px){.readout{grid-template-columns:1fr}}
+
+/* the measured-vs-guaranteed figure key */
+.figure-key{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;margin-bottom:18px}
+.fk{border:var(--line);background:var(--surface);padding:14px 17px}
+.fk .fkl{font-family:var(--font-mono);font-size:10.5px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--muted);display:flex;align-items:center;gap:8px}
+.fk .fkl .swatch{flex:none}
+.fk .fkv{font-family:var(--font-mono);font-size:23px;font-weight:600;color:var(--ink);margin-top:5px}
+.fk p{font-size:12.5px;color:var(--muted);margin-top:5px;line-height:1.6}
 
 /* baseline callout */
 .callout{border:var(--line);border-left:3px solid var(--accent);background:var(--surface);
-  padding:15px 19px;font-size:13.5px;line-height:1.6;color:var(--ink)}
-.callout b{font-weight:700}
+  padding:14px 18px;font-size:13px;line-height:1.6;color:var(--muted)}
+.callout b{font-weight:700;color:var(--ink)}
 
 /* "how this is measured" expanders — detail on demand, never in the way */
 details{border-top:var(--line-faint);margin-top:14px}
@@ -114,11 +167,12 @@ details summary{cursor:pointer;list-style:none;padding:10px 0 0;font-family:var(
   font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
   display:flex;align-items:center;gap:7px}
 details summary::-webkit-details-marker{display:none}
-details summary::before{content:"+";font-weight:700;color:var(--accent);width:9px}
+details summary::before{content:"+";font-weight:700;color:var(--accent-deep);width:9px}
 details[open] summary::before{content:"−"}
 details summary:hover{color:var(--ink)}
 .detail-body{font-size:12.5px;color:var(--muted);line-height:1.7;padding:10px 0 4px;max-width:88ch}
 .detail-body p+p{margin-top:9px}
+.detail-body b{color:var(--ink)}
 .detail-body code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
 .detail-body ul{margin:6px 0 0 17px}
 .detail-body li{margin-bottom:5px}
@@ -140,25 +194,26 @@ details summary:hover{color:var(--ink)}
 .tl-lab.date{top:58px}
 .tl-ev.alt .tl-lab.who{top:74px}
 .tl-ev.alt .tl-lab.date{top:6px}
-.tl-note{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;
+.tl-note{font-family:var(--font-mono);font-size:10.5px;color:var(--muted);text-transform:uppercase;
   letter-spacing:.05em;margin-top:6px}
 
 /* chart */
-.chart-wrap{width:100%;aspect-ratio:5/2;min-height:190px}
+.chart-wrap{width:100%;aspect-ratio:5/2;min-height:220px}
 .chart-wrap svg{width:100%;height:100%;display:block}
 .chart-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;
   font-family:var(--font-mono);font-size:11px;text-transform:uppercase;margin-top:12px;color:var(--muted)}
 .legend{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
 .legend span{display:inline-flex;align-items:center;gap:6px}
-.swatch{width:15px;height:3px;display:inline-block}
+.swatch{width:16px;height:4px;display:inline-block}
+.swatch.dashed{background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 7px)}
 
 /* ladder */
 .ladder{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
 .rung{flex:1 1 130px;border:var(--line);border-right:none;padding:14px 15px;background:var(--surface);
   display:flex;flex-direction:column;gap:4px;position:relative}
 .rung:last-child{border-right:var(--line)}
-.rung .rp{font-family:var(--font-mono);font-size:19px;font-weight:600;color:var(--muted)}
-.rung .rs{font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.rung .rp{font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--faint)}
+.rung .rs{font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint)}
 .rung .rn{font-size:11.5px;color:var(--muted)}
 .rung.done{background:var(--sage-100)}
 [data-theme="dark"] .rung.done{background:rgba(126,155,126,.16)}
@@ -166,8 +221,10 @@ details summary:hover{color:var(--ink)}
 .rung.done .rs{color:var(--good)}
 .rung.next{border-left:3px solid var(--saffron)}
 .rung.next .rp{color:var(--ink)}
+.rung.next .rs{color:var(--pending-fg)}
 
 /* tables */
+.table-caption{font-size:12.5px;color:var(--muted);margin:14px 0 8px}
 .scroll-box{overflow:auto;scrollbar-width:thin;max-height:330px}
 .scroll-box::-webkit-scrollbar{width:5px;height:5px}
 .scroll-box::-webkit-scrollbar-thumb{background:var(--accent)}
@@ -182,17 +239,22 @@ tbody tr:hover td a{color:var(--bone-light)}
 .num{text-align:right}
 th.num{text-align:right}
 .muted{color:var(--muted)}
+.faint{color:var(--faint)}
+.badge{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.05em;padding:1px 7px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.badge.new{color:var(--good)}
+.badge.ret{color:var(--faint)}
 .empty{color:var(--muted);text-transform:uppercase;padding:16px 0;text-align:center;
   font-family:var(--font-mono);font-size:11px;letter-spacing:.05em}
 
-/* pending panel */
-.pending-panel{border:var(--line);background:var(--surface);padding:26px;display:flex;
-  flex-direction:column;align-items:center;gap:9px;text-align:center}
-.pending-panel .pg{font-family:var(--font-mono);font-size:16px;color:var(--pending-fg);letter-spacing:.3em}
-.pending-panel .ph{font-family:var(--font-mono);font-weight:700;font-size:12px;
-  text-transform:uppercase;letter-spacing:.06em;color:var(--ink)}
-.pending-panel p{font-size:13px;color:var(--muted);max-width:72ch;line-height:1.65}
-.pending-panel code{font-family:var(--font-mono);font-size:11.5px;background:var(--paper);
+/* pending panel — informative, deliberately quieter than live results */
+.pending-panel{border:var(--line);background:transparent;padding:16px 20px;display:flex;
+  flex-direction:column;gap:6px}
+.pending-panel .ph{font-family:var(--font-mono);font-weight:700;font-size:11px;
+  text-transform:uppercase;letter-spacing:.06em;color:var(--pending-fg)}
+.pending-panel p{font-size:13px;color:var(--muted);max-width:82ch;line-height:1.65}
+.pending-panel p b{color:var(--ink)}
+.pending-panel code{font-family:var(--font-mono);font-size:11.5px;background:var(--surface);
   border:var(--line-faint);padding:2px 6px;color:var(--ink)}
 
 /* method */
@@ -201,10 +263,10 @@ th.num{text-align:right}
   color:var(--ink);font-weight:700;margin-bottom:5px}
 .method dd{font-size:12.5px;color:var(--muted);line-height:1.65}
 .method code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
-.foot{border-top:var(--line);padding-top:16px;font-size:12px;color:var(--muted);line-height:1.7}
+.foot{border-top:var(--line);padding-top:16px;font-size:12.5px;color:var(--muted);line-height:1.7}
 
 @media (max-width:760px){
-  .page{padding:20px 16px 60px;gap:26px}
+  .page{padding:20px 16px 60px;gap:28px}
   .header .wordmark{font-size:34px}
   .chart-wrap{aspect-ratio:3/2}
   table{min-width:620px}
@@ -242,45 +304,71 @@ th.num{text-align:right}
   <div class="header">
     <span class="wordmark">cascade</span>
     <span class="tagline">Subnet scoreboard</span>
-    <p class="sub">Six numbers, updated live. Every one is calculated from the subnet&rsquo;s public,
-    signed record — nothing here is typed in by hand.</p>
+    <p class="sub">The state of the Cascade forecasting competition, in six answers. Every figure is
+    calculated live from the subnet&rsquo;s public, signed record — nothing here is typed in by hand.</p>
   </div>
 
-  <!-- headline tiles -->
+  <!-- headline tiles + current read -->
   <section>
     <div class="section-label"><span>Headline</span><span class="muted" id="headline-when">--</span></div>
     <div class="tiles" id="tiles"></div>
+    <div class="readout" id="readout" hidden>
+      <div>
+        <span class="ro-label">Current read</span>
+        <p id="readout-text">--</p>
+      </div>
+      <div>
+        <span class="ro-label">What to watch next</span>
+        <ul id="watch-list"></ul>
+      </div>
+    </div>
   </section>
 
   <!-- competition -->
   <section>
     <div class="section-label"><span>Is the competition working?</span>
       <span class="muted" id="deth-when"></span></div>
-    <p class="lede">The leader holds the title until someone beats it. Each marker below is a
-    change of hands.</p>
+    <p class="answer" id="comp-answer">--</p>
+    <p class="lede">The leader holds the title until someone measurably beats it on the same test.
+    Each marker below is a change of hands.</p>
     <div class="timeline" id="timeline"></div>
-    <div class="scroll-box" style="margin-top:12px">
+    <p class="table-caption" id="reigns-caption" hidden>Every change of lead, newest first —
+    read straight from the signed round record. <b class="muted">First-time</b> marks a miner
+    taking the lead for the first time.</p>
+    <div class="scroll-box">
       <table><thead><tr>
-        <th>#</th><th>Took the lead</th><th class="num">Miner</th><th>Entry</th>
-        <th>Round</th><th class="num">By how much</th><th class="num">Rounds held</th>
+        <th>#</th><th>Took the lead</th><th>Leader</th><th class="num">Won by</th>
+        <th class="num">Rounds held</th><th>Entry</th><th>Round</th>
       </tr></thead><tbody id="reigns"></tbody></table>
     </div>
+    <details>
+      <summary>How to read this table</summary>
+      <div class="detail-body">
+        <p>Each row is a reign: the miner that took the lead, when, and by how much it beat the
+        previous leader in a same-round head-to-head. <b>Miner</b> numbers are network UIDs;
+        <b>Entry</b> links to the exact submitted model; <b>Round</b> is the signed record that
+        awarded the win. Miner UIDs can be re-used by the network over time, so the
+        first-time/returning badges are matched on the miner&rsquo;s cryptographic key, not the UID.</p>
+      </div>
+    </details>
   </section>
 
   <!-- performance vs baseline -->
   <section>
     <div class="section-label"><span>Are the forecasts getting better?</span>
       <span class="muted" id="perf-when"></span></div>
-    <p class="lede">Measured against day one, and only counting gains that were independently
-    verified at the moment they happened.</p>
-    <div class="callout" style="margin-bottom:20px" id="baseline-def">
+    <p class="answer" id="perf-answer">--</p>
+    <div class="figure-key" id="figure-key" hidden></div>
+    <div class="callout" style="margin-bottom:18px" id="baseline-def">
       The starting point is whoever led the very first round.
     </div>
-    <div class="chart-wrap"><svg id="chart-perf" preserveAspectRatio="none"></svg></div>
+    <div class="chart-wrap"><svg id="chart-perf" preserveAspectRatio="none" role="img"
+      aria-label="Cumulative forecast improvement over the day-one baseline, by round"></svg></div>
     <div class="chart-meta">
       <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Measured</span>
-        <span><i class="swatch" style="background:var(--saffron)"></i> Guaranteed minimum</span>
+        <span><i class="swatch" style="background:var(--accent)"></i> Measured improvement</span>
+        <span><i class="swatch dashed" style="color:var(--saffron)"></i> Guaranteed minimum</span>
+        <span class="faint">| marks a change of lead</span>
       </div>
       <span id="perf-note">--</span>
     </div>
@@ -304,10 +392,47 @@ th.num{text-align:right}
     </details>
   </section>
 
+  <!-- scaling -->
+  <section>
+    <div class="section-label"><span>How big are the models?</span>
+      <span class="muted" id="scale-when"></span></div>
+    <p class="answer" id="scale-answer">--</p>
+    <p class="lede">The plan is to climb this ladder. A step turns green only after the whole
+    competition has actually run at that size and produced a judged result — planned sizes are
+    never shown as achieved.</p>
+    <div class="ladder" id="ladder"></div>
+    <p class="lede" style="margin-top:14px;margin-bottom:0" id="ladder-note"></p>
+  </section>
+
+  <!-- efficiency -->
+  <section>
+    <div class="section-label"><span>Is improvement becoming more compute-efficient?</span>
+      <span class="muted" id="eff-when"></span></div>
+    <p class="answer" id="eff-answer">--</p>
+    <p class="lede">The question this section answers: <b>are we extracting more forecasting
+    accuracy from the same amount of training compute?</b> Accuracy bought with ever more computing
+    power isn&rsquo;t really progress — so this divides the verified improvement above by the total
+    training the competition has consumed to produce it. The line drifts down through rounds that
+    spend compute without a verified gain, and steps up at each change of lead.</p>
+    <div class="chart-wrap"><svg id="chart-eff" preserveAspectRatio="none" role="img"
+      aria-label="Verified improvement per trillion training tokens, by round"></svg></div>
+    <div class="chart-meta">
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per trillion training tokens</span>
+      </div>
+      <span id="eff-note">--</span>
+    </div>
+    <details>
+      <summary>How the training cost is counted</summary>
+      <div class="detail-body" id="eff-caveat"></div>
+    </details>
+  </section>
+
   <!-- public benchmark -->
   <section>
     <div class="section-label"><span>How does it score on public tests?</span>
       <span class="muted" id="bench-when"></span></div>
+    <p class="answer" id="bench-answer">--</p>
     <p class="lede">Independent, industry-standard forecasting benchmarks that anyone can run.
     <b>1.00 is the standard reference model; below 1.00 beats it.</b></p>
     <div id="bench-panel"></div>
@@ -323,39 +448,11 @@ th.num{text-align:right}
     </details>
   </section>
 
-  <!-- scaling -->
-  <section>
-    <div class="section-label"><span>How big are the models?</span>
-      <span class="muted" id="scale-when"></span></div>
-    <p class="lede">The plan is to climb this ladder. A step turns green only after the whole
-    process has actually run at that size and produced a result.</p>
-    <div class="ladder" id="ladder"></div>
-    <p class="lede" style="margin-top:14px;margin-bottom:0" id="ladder-note"></p>
-  </section>
-
-  <!-- efficiency -->
-  <section>
-    <div class="section-label"><span>Is the progress worth the compute?</span>
-      <span class="muted" id="eff-when"></span></div>
-    <p class="lede">Accuracy bought with ever more computing power isn&rsquo;t really progress. This
-    is the improvement above, divided by the training it took to get there.</p>
-    <div class="chart-wrap"><svg id="chart-eff" preserveAspectRatio="none"></svg></div>
-    <div class="chart-meta">
-      <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per trillion training tokens</span>
-      </div>
-      <span id="eff-note">--</span>
-    </div>
-    <details>
-      <summary>How the training cost is counted</summary>
-      <div class="detail-body" id="eff-caveat"></div>
-    </details>
-  </section>
-
   <!-- compounding -->
   <section>
     <div class="section-label"><span>Does progress carry forward?</span>
       <span class="muted" id="warm-when"></span></div>
+    <p class="answer" id="warm-answer">--</p>
     <p class="lede">Eventually the best model so far becomes the new starting line for everyone.
     The question is how much of the accumulated progress survives that handover.</p>
     <div id="warm-panel"></div>
@@ -448,6 +545,11 @@ function prettyDay(iso){
   if(!d || isNaN(d.getTime())) return "--";
   return d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});
 }
+function shortDay(iso){
+  var d = iso ? new Date(iso) : null;
+  if(!d || isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined,{month:"short",day:"numeric"});
+}
 function timeAgo(i){ if(!i) return "--";
   var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0;
   if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago";
@@ -497,25 +599,36 @@ function atCap(){ return allRounds().length >= INDEX_MAX_KEEP; }
 
 // Every throne change in the record, oldest first. reigns[0] is the BASELINE —
 // the king already seated at the first round the public index still carries.
+// `first` marks a hotkey's first time in the lead — matched on the hotkey, not
+// the UID, because Bittensor recycles deregistered UIDs to new registrants.
 function reigns(){
-  var out=[], cur=null, rs=scoredRounds();
+  var out=[], cur=null, rs=scoredRounds(), seen={};
   rs.forEach(function(r){
     if(!cur){
       cur={n:1,hotkey:r.king_hotkey,uid:r.king_uid,gen_ref:r.king_gen_ref,
            round:r.round_id,block:r.epoch_start_block,at:r.published_at,
-           gain:null,rounds:0,baseline:true};
+           gain:null,rounds:0,baseline:true,
+           first:true};
+      seen[String(r.king_hotkey||"")]=1;
       out.push(cur);
     }
     cur.rounds++;
     if(r.dethroned){
       var gain = (r.king_geomean>0 && r.chal_geomean>0) ? (1 - r.chal_geomean/r.king_geomean) : null;
+      var hk = String(r.chal_hotkey||"");
       cur={n:out.length+1,hotkey:r.chal_hotkey,uid:r.chal_uid,gen_ref:r.chal_gen_ref,
            round:r.round_id,block:r.epoch_start_block,at:r.published_at,
-           gain:gain,rounds:0,baseline:false};
+           gain:gain,rounds:0,baseline:false,
+           first:!seen[hk]};
+      seen[hk]=1;
       out.push(cur);
     }
   });
   return out;
+}
+function distinctLeaders(rg){
+  var seen={}; (rg||reigns()).forEach(function(g){ seen[String(g.hotkey||("uid:"+g.uid))]=1; });
+  return Object.keys(seen).length;
 }
 
 // The chained improvement over the baseline king. One factor per dethrone,
@@ -575,6 +688,11 @@ function validatedRungs(){
   });
   return seen;
 }
+function topRung(){
+  var seen = validatedRungs(), idx = -1;
+  LADDER.forEach(function(r,i){ if(seen[r.key]) idx = i; });
+  return { idx:idx, top: idx>=0 ? LADDER[idx] : null, next: LADDER[idx+1] || null, seen:seen };
+}
 
 // Public-benchmark scores ride on the KING's manifest entry, stamped by the
 // trainer (BenchScores). They exist only when [scoring] cascade_enabled — the
@@ -594,94 +712,158 @@ function warmStart(){
 }
 
 // ── render: headline tiles ──────────────────────────────────────────────────
+// Every headline card carries: plain-English question (k) · dominant value (v)
+// · one-line interpretation in ink (interp) · muted context (ctx) · status pill.
 function tile(o){
   return '<div class="tile'+(o.pending?" pending":"")+'">' +
     '<div class="tile-head"><span class="k">'+esc(o.k)+'</span>' +
       (o.pill||'') + '</div>' +
     '<div class="v'+(o.small?" sm":"")+'">'+o.v+'</div>' +
-    '<div class="note">'+(o.note||"")+'</div></div>';
+    '<div class="interp">'+(o.interp||"")+'</div>' +
+    '<div class="ctx">'+(o.ctx||"")+'</div></div>';
 }
 var PILL_LIVE = '<span class="pill live">Live</span>';
 var PILL_PEND = '<span class="pill pend">Pending</span>';
+var PILL_OFF  = '<span class="pill off">Not started</span>';
 
 function renderTiles(){
   var rs = scoredRounds(), rg = reigns(), chain = improvementChain();
   var deth = rs.filter(function(r){ return r.dethroned; }).length;
+  var nLead = distinctLeaders(rg);
   var cells = [];
 
-  // 1 — dethrones
+  // 1 — competition: lead changes WITH the denominators that make it readable
+  var compCtx = !rs.length ? "Waiting for the first round."
+    : deth === 0 ? "The day-one leader has not been beaten yet."
+    : nLead >= 3 ? "Several independent entrants have taken the title — the lead is genuinely contested."
+    : "So far the title has passed between two entrants.";
   cells.push(tile({
-    k:"Times the lead changed hands", pill: rs.length?PILL_LIVE:PILL_PEND,
-    v: rs.length ? deth : "--",
-    note: rs.length
-      ? "Over <b>" + rs.length + "</b> round" + (rs.length===1?"":"s") + " of competition."
-      : "Waiting for the first round."
+    k:"Is real competition happening?", pill: rs.length?PILL_LIVE:PILL_PEND,
+    v: rs.length ? (deth + ' <span class="u">lead change'+(deth===1?"":"s")+'</span>') : "--",
+    interp: rs.length
+      ? "Across <b>" + rs.length + " round" + (rs.length===1?"":"s") + "</b>, <b>" + nLead +
+        " different miner" + (nLead===1?"":"s") + "</b> " + (nLead===1?"has":"have") + " held the lead."
+      : "No round has been published yet.",
+    ctx: compCtx
   }));
 
-  // 2 — improvement vs baseline
+  // 2 — improvement vs baseline: measured AND guaranteed, explicitly labelled
   var haveChain = chain.steps.length > 0;
   cells.push(tile({
-    k:"Better than day one", pill: haveChain?PILL_LIVE:PILL_PEND,
-    v: haveChain ? signedPct(chain.obs) : "--",
-    note: haveChain
-      ? "At least <b>" + signedPct(chain.floor) + "</b> guaranteed."
-      : (rs.length ? "The original leader still holds, so nothing has improved on it yet."
-                   : "Waiting for the first round.")
+    k:"Are the forecasts improving?", pill: haveChain?PILL_LIVE:PILL_PEND,
+    v: haveChain ? (signedPct(chain.obs) + ' <span class="u">measured</span>') : "--",
+    interp: haveChain
+      ? "At least <b>" + signedPct(chain.floor) + "</b> is guaranteed — the cautious lower bound of the same verified measurements."
+      : (rs.length ? "The original leader still holds, so no improvement has been demonstrated yet."
+                   : "Waiting for the first round."),
+    ctx: "Compared against the entry that led on day one."
   }));
 
-  // 3 — public benchmark
-  var b = benchScores();
+  // 3 — scaling: what is proven, and what is explicitly NOT yet
+  var tr = topRung();
   cells.push(tile({
-    k:"Public benchmark score", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:!!b,
-    v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">vs 1.00</span>') : "Pending",
-    note: b
-      ? "GIFT-Eval accuracy. Below 1.00 <b>" + (b.scores.gifteval_mase<1 ? "beats" : "trails") +
-        "</b> the standard reference model."
-      : "No public benchmark result yet. This fills in automatically when one is published."
+    k:"What model scale is proven?", pill: tr.top?PILL_LIVE:PILL_PEND,
+    v: tr.top ? (tr.top.label + ' <span class="u">parameters</span>') : "--",
+    interp: tr.top
+      ? (tr.next ? "Next milestone: <b>" + tr.next.label + "</b> — not yet run."
+                 : "Top of the planned ladder.")
+      : "No size has produced a judged result yet.",
+    ctx: "&ldquo;Proven&rdquo; means a full competition round completed and judged at that size."
   }));
 
-  // 4 — scaling
-  var seen = validatedRungs(), top=null, nxt=null;
-  LADDER.forEach(function(r,i){
-    if(seen[r.key]) { top=r; nxt=LADDER[i+1]||null; }
-  });
-  cells.push(tile({
-    k:"Biggest model proven", pill: top?PILL_LIVE:PILL_PEND,
-    v: top ? (top.label + ' <span class="u">params</span>') : "--", small:!!top,
-    note: top
-      ? (nxt ? "Next step up: <b>" + nxt.label + "</b>." : "Top of the ladder.")
-      : "No result at any size yet."
-  }));
-
-  // 5 — efficiency
+  // 4 — efficiency
   var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
   var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
   cells.push(tile({
-    k:"Improvement per unit of compute", pill: eff!=null?PILL_LIVE:PILL_PEND,
-    v: eff!=null ? signedPct(eff,2) : "Pending", pending: eff==null, small: eff==null,
-    note: eff!=null
-      ? "Per trillion training tokens. <b>" + num(tot/1e12,1) + " trillion</b> used so far."
-      : "Starts once there is an improvement to divide."
+    k:"Is improvement compute-efficient?", pill: eff!=null?PILL_LIVE:PILL_PEND,
+    pending: eff==null, small: eff==null,
+    v: eff!=null ? (signedPct(eff,2) + ' <span class="u">per trillion tokens</span>') : "Pending",
+    interp: eff!=null
+      ? "Verified forecast gain per trillion training tokens, over <b>" + num(tot/1e12,1) +
+        " trillion</b> spent so far."
+      : "Starts once there is a verified improvement to divide by the compute spent.",
+    ctx: "Tracks whether accuracy comes from better methods, not just more compute."
+  }));
+
+  // 5 — public benchmark (pending until a real result exists)
+  var b = benchScores();
+  cells.push(tile({
+    k:"Independently benchmarked?", pill: b?PILL_LIVE:PILL_PEND, pending:!b, small:true,
+    v: b ? (num(b.scores.gifteval_mase,3) + ' <span class="u">vs 1.00</span>') : "Pending",
+    interp: b
+      ? "GIFT-Eval accuracy. Below 1.00 <b>" + (b.scores.gifteval_mase<1 ? "beats" : "trails") +
+        "</b> the standard reference model."
+      : "Populates when the first publicly verifiable benchmark score (GIFT-Eval, BOOM or TIME) is published for a leading model.",
+    ctx: b ? "Reported only — public benchmarks never decide who wins a round."
+           : "Kept blank rather than estimated — every figure here must be checkable."
   }));
 
   // 6 — compounding
   var ws = warmStart();
   cells.push(tile({
-    k:"Progress carried forward", pill:PILL_PEND, pending:true, small:true,
+    k:"Does progress carry forward?", pill: ws?PILL_PEND:PILL_OFF, pending:true, small:true,
     v: ws ? "Starting" : "Not started",
-    note: ws
-      ? "The best model so far is now everyone&rsquo;s starting line. First reading comes at the next handover."
-      : "Not switched on yet, so there is nothing to carry forward."
+    interp: ws
+      ? "The best model so far is now everyone&rsquo;s starting line. The first retention reading arrives at the next handover."
+      : "Measurable once the carry-forward mechanism is switched on and the first handover occurs.",
+    ctx: ws ? "" : "Today every round starts from scratch, so there is nothing to carry forward yet."
   }));
 
   document.getElementById("tiles").innerHTML = cells.join("");
   var upd = _index && _index.updated_at;
   document.getElementById("headline-when").textContent = upd ? ("Updated " + timeAgo(upd)) : "--";
+  renderReadout(rs, rg, chain, deth, nLead, tr, b, ws);
+}
+
+// The compact interpretation under the headline grid: factual, no promotion.
+function renderReadout(rs, rg, chain, deth, nLead, tr, b, ws){
+  var box = document.getElementById("readout");
+  if(!rs.length){ box.hidden = true; return; }
+  box.hidden = false;
+  var parts = [];
+  parts.push(deth > 0
+    ? "Competition is active — the lead has changed hands " + deth + " time" + (deth===1?"":"s") +
+      " among " + nLead + " miner" + (nLead===1?"":"s") + " over " + rs.length + " rounds."
+    : "Competition is running (" + rs.length + " round" + (rs.length===1?"":"s") +
+      ") but the day-one leader has not yet been beaten.");
+  if(chain.steps.length)
+    parts.push("Forecast accuracy has improved <b>" + signedPct(chain.obs) + " measured</b> (at least <b>" +
+      signedPct(chain.floor) + "</b> guaranteed) over the day-one baseline.");
+  if(tr.top)
+    parts.push("A <b>" + esc(tr.top.label) + "-parameter</b> model has been demonstrated end to end.");
+  var outstanding = [];
+  if(!b) outstanding.push("independent benchmark validation");
+  if(!ws) outstanding.push("progress carry-forward");
+  else if(ws) outstanding.push("the first carry-forward retention reading");
+  if(outstanding.length)
+    parts.push("Still outstanding: " + outstanding.join(" and ") + ".");
+  document.getElementById("readout-text").innerHTML = parts.join(" ");
+
+  var watch = [];
+  if(tr.next) watch.push("<b>" + esc(tr.next.label) + " model milestone</b> — the next rung of the scaling ladder.");
+  if(!b) watch.push("<b>First public benchmark result</b> — GIFT-Eval / BOOM / TIME score for a leading model.");
+  watch.push(ws
+    ? "<b>First carry-forward reading</b> — how much progress survives the next handover."
+    : "<b>Carry-forward activation</b> — when the best model becomes everyone&rsquo;s starting line.");
+  document.getElementById("watch-list").innerHTML =
+    watch.map(function(w){ return "<li>"+w+"</li>"; }).join("");
 }
 
 // ── render: dethrone timeline + reigns ──────────────────────────────────────
 function renderCompetition(){
-  var rg = reigns(), rail = document.getElementById("timeline");
+  var rs = scoredRounds(), rg = reigns(), rail = document.getElementById("timeline");
+  var deth = rg.length ? rg.length - 1 : 0, nLead = distinctLeaders(rg);
+
+  // conclusion first — the sentence the timeline and table are evidence for
+  var ans;
+  if(!rs.length) ans = "No round has been published yet — the competition has not started.";
+  else if(deth === 0) ans = "Not yet decided: over <b>" + rs.length + " round" + (rs.length===1?"":"s") +
+    "</b> the day-one leader has not been beaten. A healthy competition should produce lead changes over time.";
+  else ans = "<b>Yes.</b> The lead has changed hands <b>" + deth + " time" + (deth===1?"":"s") +
+    "</b> across <b>" + rs.length + " rounds</b>, and <b>" + nLead + " different miners</b> have held it" +
+    (nLead >= 3 ? " — the title is genuinely contested, not traded between two entrants." : ".");
+  document.getElementById("comp-answer").innerHTML = ans;
+
   if(!rg.length){
     rail.innerHTML = '<div class="empty">Waiting for the first published round</div>';
   } else {
@@ -710,7 +892,6 @@ function renderCompetition(){
                  '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
         '<span class="tl-dot"></span></div>';
     }).join("");
-    var deth = rg.length - 1;
     rail.innerHTML = '<div class="tl-rail"><div class="tl-line"></div>'+evs+'</div>' +
       '<div class="tl-note">' + (deth ? deth + " lead change" + (deth===1?"":"s") : "no lead change yet") +
       " since " + esc(prettyDay(rg[0].at)) +
@@ -718,91 +899,186 @@ function renderCompetition(){
   }
 
   var rows = rg.slice().reverse().map(function(g){
+    var who = g.baseline
+      ? '<span class="muted">miner '+(g.uid!=null?g.uid:"?")+'</span> <span class="badge ret">day one</span>'
+      : 'miner '+(g.uid!=null?g.uid:"?")+' '+
+        (g.first ? '<span class="badge new">first-time</span>' : '<span class="badge ret">returning</span>');
     return '<tr>' +
       '<td>'+(g.baseline?'<span class="muted">start</span>':("#"+(g.n-1)))+'</td>' +
       '<td>'+esc(prettyDay(g.at))+'</td>' +
-      '<td class="num">'+(g.uid!=null?g.uid:"--")+'</td>' +
-      '<td>'+refLink(g.gen_ref)+'</td>' +
-      '<td class="muted">'+esc(shortRound(g.round))+'</td>' +
+      '<td>'+who+'</td>' +
       '<td class="num">'+(g.gain!=null?'<span class="good">'+signedPct(g.gain)+'</span>':'<span class="muted">--</span>')+'</td>' +
-      '<td class="num">'+g.rounds+'</td></tr>';
+      '<td class="num">'+g.rounds+'</td>' +
+      '<td>'+refLink(g.gen_ref)+'</td>' +
+      '<td class="muted">'+esc(shortRound(g.round))+'</td></tr>';
   }).join("");
   document.getElementById("reigns").innerHTML = rows ||
     '<tr><td colspan="7" class="empty">No reigns recorded yet</td></tr>';
+  document.getElementById("reigns-caption").hidden = !rows;
   document.getElementById("deth-when").textContent =
     rg.length ? ("Since " + prettyDay(rg[0].at)) : "";
 }
 
 // ── charts ──────────────────────────────────────────────────────────────────
+// Restrained but legible: solid hairline grid, dated x-ticks, a y-axis caption,
+// ringed end-markers, and native tooltips on the moments that matter.
 function drawLines(svgId, series, opts){
   var svg = document.getElementById(svgId);
-  var W = 1000, H = 400, pad = { l:58, r:14, t:16, b:30 };
+  var W = 1000, H = 400, pad = { l:78, r:20, t:18, b:44 };
   svg.setAttribute("viewBox", "0 0 " + W + " " + H);
   var all = [];
   series.forEach(function(s){ s.data.forEach(function(v){ if(v!=null&&isFinite(v)) all.push(v); }); });
   if(!all.length){
     svg.innerHTML = '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" ' +
-      'fill="currentColor" opacity=".45" font-size="17" font-family="'+
+      'fill="currentColor" opacity=".55" font-size="17" font-family="'+
       'ui-monospace,monospace">'+esc(opts.empty||"No data yet")+'</text>';
     return;
   }
   var n = Math.max.apply(null, series.map(function(s){ return s.data.length; }));
-  var lo = Math.min.apply(null, all.concat([0])), hi = Math.max.apply(null, all);
-  if(hi === lo) hi = lo + 1;
-  var padY = (hi - lo) * 0.12; lo -= padY; hi += padY;
+  // Clean axis: snap the domain to a round tick step, and never extend below
+  // zero when every value is non-negative (a phantom negative band misleads).
+  var dMin = Math.min.apply(null, all.concat([0])), dMax = Math.max.apply(null, all);
+  if(dMax === dMin) dMax = dMin + 1;
+  var raw = (dMax - dMin) / 4, mag = Math.pow(10, Math.floor(Math.log(raw)/Math.LN10));
+  var step = 10 * mag;
+  [1, 2, 2.5, 5].some(function(m){ if(m*mag >= raw){ step = m*mag; return true; } return false; });
+  var lo = Math.floor(dMin/step) * step, hi = Math.ceil(dMax/step) * step;
+  if(dMin >= 0 && lo < 0) lo = 0;
+  if(hi - dMax < step * 0.1) hi += step;   // headroom so the top line isn't glued to the frame
   var X = function(i){ return pad.l + (n<=1 ? 0 : (W-pad.l-pad.r) * i/(n-1)); };
   var Y = function(v){ return pad.t + (H-pad.t-pad.b) * (1 - (v-lo)/(hi-lo)); };
   var out = [];
-  // gridlines + y labels
-  for(var g=0; g<=4; g++){
-    var v = lo + (hi-lo)*g/4, y = Y(v);
+  // gridlines + y labels (solid hairlines, recessive; labels legible)
+  var nT = Math.max(1, Math.round((hi-lo)/step));
+  for(var g=0; g<=nT; g++){
+    var v = lo + step*g, y = Y(v);
     out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+
-      '" stroke="currentColor" stroke-opacity=".13" stroke-dasharray="3 4"/>');
-    out.push('<text x="'+(pad.l-9)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="currentColor" '+
-      'opacity=".5" font-size="15" font-family="ui-monospace,monospace">'+
+      '" stroke="currentColor" stroke-opacity=".12"/>');
+    out.push('<text x="'+(pad.l-10)+'" y="'+(y+5).toFixed(1)+'" text-anchor="end" fill="currentColor" '+
+      'opacity=".72" font-size="15" font-family="ui-monospace,monospace">'+
       esc(opts.fmtY ? opts.fmtY(v) : num(v,2))+'</text>');
   }
+  // y-axis caption, rotated along the left edge
+  if(opts.ylab){
+    out.push('<text transform="rotate(-90)" x="'+(-(pad.t+(H-pad.t-pad.b)/2))+'" y="16" '+
+      'text-anchor="middle" fill="currentColor" opacity=".72" font-size="13.5" '+
+      'font-family="ui-monospace,monospace" letter-spacing=".04em">'+esc(opts.ylab)+'</text>');
+  }
+  // x ticks (dates)
+  (opts.xticks||[]).forEach(function(t){
+    var x = X(t.i);
+    out.push('<line x1="'+x.toFixed(1)+'" x2="'+x.toFixed(1)+'" y1="'+(H-pad.b)+'" y2="'+(H-pad.b+5)+
+      '" stroke="currentColor" stroke-opacity=".35"/>');
+    out.push('<text x="'+x.toFixed(1)+'" y="'+(H-pad.b+22)+'" text-anchor="'+
+      (t.i===0 ? "start" : (t.i===n-1 ? "end" : "middle"))+'" fill="currentColor" opacity=".72" '+
+      'font-size="14" font-family="ui-monospace,monospace">'+esc(t.label)+'</text>');
+  });
   // zero line
   if(lo < 0 && hi > 0){
     out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+Y(0).toFixed(1)+'" y2="'+Y(0).toFixed(1)+
       '" stroke="currentColor" stroke-opacity=".3"/>');
   }
-  series.forEach(function(s){
-    var d = "", started = false;
-    s.data.forEach(function(v,i){
-      if(v==null||!isFinite(v)) return;
-      d += (started?" L":"M") + X(i).toFixed(1) + " " + Y(v).toFixed(1);
-      started = true;
-    });
-    if(d) out.push('<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="'+
-      (s.width||3)+'" stroke-linejoin="round" stroke-linecap="round"'+
-      (s.dash?' stroke-dasharray="'+s.dash+'"':'')+'/>');
-  });
-  // dethrone markers
+  // dethrone markers behind the lines
   (opts.marks||[]).forEach(function(i){
     out.push('<line x1="'+X(i).toFixed(1)+'" x2="'+X(i).toFixed(1)+'" y1="'+pad.t+'" y2="'+
       (H-pad.b)+'" stroke="currentColor" stroke-opacity=".22" stroke-dasharray="2 5"/>');
   });
+  series.forEach(function(s){
+    var d = "", started = false, lastI = -1, lastV = null;
+    s.data.forEach(function(v,i){
+      if(v==null||!isFinite(v)) return;
+      d += (started?" L":"M") + X(i).toFixed(1) + " " + Y(v).toFixed(1);
+      started = true; lastI = i; lastV = v;
+    });
+    if(!d) return;
+    out.push('<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="'+
+      (s.width||2.5)+'" stroke-linejoin="round" stroke-linecap="round"'+
+      (s.dash?' stroke-dasharray="'+s.dash+'"':'')+'/>');
+    // ringed end-marker so the current value is findable at a glance
+    out.push('<circle cx="'+X(lastI).toFixed(1)+'" cy="'+Y(lastV).toFixed(1)+'" r="5.5" fill="'+
+      s.color+'" stroke="var(--surface)" stroke-width="2">'+
+      (s.endTitle?'<title>'+esc(s.endTitle)+'</title>':'')+'</circle>');
+  });
+  // generous invisible hover targets with native tooltips on key points
+  (opts.pointTitles||[]).forEach(function(p){
+    var v = series[0].data[p.i];
+    if(v==null||!isFinite(v)) return;
+    out.push('<circle cx="'+X(p.i).toFixed(1)+'" cy="'+Y(v).toFixed(1)+
+      '" r="13" fill="transparent"><title>'+esc(p.title)+'</title></circle>');
+  });
   svg.innerHTML = out.join("");
 }
 
+// Tick formatter: whole percents stay compact ("50%"), fractional steps keep
+// one decimal ("12.5%") — wide labels crowd the rotated axis caption.
+function pctTick(v){
+  var p = v*100;
+  return (Math.abs(p - Math.round(p)) < 0.01 ? p.toFixed(0) : p.toFixed(1)) + "%";
+}
+
+function dateTicks(pts){
+  var n = pts.length; if(!n) return [];
+  var idx = n <= 4 ? pts.map(function(_,i){ return i; })
+                   : [0, Math.round((n-1)/3), Math.round(2*(n-1)/3), n-1];
+  var seen = {}, out = [];
+  idx.forEach(function(i){
+    var lab = shortDay(pts[i].at);
+    if(!lab || seen[lab]) return;
+    seen[lab] = 1; out.push({ i:i, label:lab });
+  });
+  return out;
+}
+
 function renderPerf(){
-  var chain = improvementChain();
+  var chain = improvementChain(), rg = reigns();
+
+  // conclusion first
+  var ans;
+  if(!chain.pts.length) ans = "No scored round has been published yet.";
+  else if(!chain.steps.length) ans = "Not yet: the day-one leader still holds, so no verified improvement exists to report.";
+  else ans = "<b>Yes.</b> Forecast accuracy is <b>" + signedPct(chain.obs) + " better</b> than the " +
+    "day-one baseline on the measured reading — and at least <b>" + signedPct(chain.floor) +
+    " better</b> on the most cautious one. Improvement has arrived step by step as leads changed hands.";
+  document.getElementById("perf-answer").innerHTML = ans;
+
+  // the two figures, explicitly told apart so they never read as rivals
+  var fk = document.getElementById("figure-key");
+  if(chain.steps.length){
+    fk.hidden = false;
+    fk.innerHTML =
+      '<div class="fk"><span class="fkl"><i class="swatch" style="background:var(--accent)"></i>' +
+        'Measured improvement</span><div class="fkv">'+signedPct(chain.obs)+'</div>' +
+        '<p>The best estimate: every verified gain at each change of lead, multiplied together.</p></div>' +
+      '<div class="fk"><span class="fkl"><i class="swatch dashed" style="color:var(--saffron)"></i>' +
+        'Guaranteed minimum</span><div class="fkv">'+signedPct(chain.floor)+'</div>' +
+        '<p>The same steps using the cautious end of each measurement (its 95% lower bound) — ' +
+        'smaller by construction. The truth sits between the two figures.</p></div>';
+  } else { fk.hidden = true; }
+
   drawLines("chart-perf", [
-    { data: chain.pts.map(function(p){ return p.obs; }), color:"var(--accent)" },
-    { data: chain.pts.map(function(p){ return p.flo; }), color:"var(--saffron)", width:2, dash:"5 4" }
+    { data: chain.pts.map(function(p){ return p.obs; }), color:"var(--accent)",
+      endTitle: chain.steps.length ? ("Measured improvement today: "+signedPct(chain.obs)) : null },
+    { data: chain.pts.map(function(p){ return p.flo; }), color:"var(--saffron)", width:2, dash:"5 4",
+      endTitle: chain.steps.length ? ("Guaranteed minimum today: "+signedPct(chain.floor)) : null }
   ], {
-    fmtY: function(v){ return (v*100).toFixed(0)+"%"; },
+    fmtY: pctTick,
+    ylab: "better than day one",
+    xticks: dateTicks(chain.pts),
     marks: chain.pts.reduce(function(a,p,i){
       if(chain.steps.some(function(s){ return s.round_id===p.round_id; })) a.push(i); return a; }, []),
+    pointTitles: chain.pts.reduce(function(a,p,i){
+      var st = null;
+      chain.steps.forEach(function(s){ if(s.round_id===p.round_id) st = s; });
+      if(st) a.push({ i:i, title:"Lead change · "+prettyDay(p.at)+" · winner was "+
+        signedPct(1-st.factor)+" better · running total "+signedPct(p.obs) });
+      return a; }, []),
     empty: "No scored rounds published yet"
   });
-  var rg = reigns();
   document.getElementById("baseline-def").innerHTML = rg.length
-    ? "<b>Starting point:</b> " + esc(shortRef(rg[0].gen_ref)) + ", the entry that led on " +
-      esc(prettyDay(rg[0].at)) + ". It is a fixed marker, not a competitor — it never re-runs, so " +
-      "the comparison point can&rsquo;t quietly move."
-    : "<b>Starting point:</b> whoever leads the very first round. None has been published yet.";
+    ? "<b>What&rsquo;s the baseline?</b> The entry that led on " + esc(prettyDay(rg[0].at)) +
+      ", the first round in the public record (<b>" + esc(shortRef(rg[0].gen_ref)) + "</b>). It is a " +
+      "fixed marker, not a competitor — it never re-runs, so the comparison point can&rsquo;t quietly move."
+    : "<b>What&rsquo;s the baseline?</b> Whoever leads the very first round. None has been published yet.";
   document.getElementById("perf-note").textContent = chain.steps.length
     ? (signedPct(chain.obs) + " measured · " + signedPct(chain.floor) + " guaranteed")
     : "The original leader still holds";
@@ -816,11 +1092,26 @@ function renderEfficiency(){
     cum += p.tokens;
     data.push(cum > 0 ? p.obs / (cum/1e12) : null);
   });
-  drawLines("chart-eff", [{ data:data, color:"var(--accent)" }], {
-    fmtY: function(v){ return (v*100).toFixed(1)+"%"; },
+  var tot = chain.pts.reduce(function(a,p){ return a+p.tokens; }, 0);
+  var eff = (chain.steps.length && tot>0) ? chain.obs/(tot/1e12) : null;
+
+  // conclusion first
+  var ans;
+  if(!chain.pts.length) ans = "No scored round has been published yet.";
+  else if(eff==null) ans = "Not measurable yet: compute is being spent (" + num(tot/1e12,1) +
+    " trillion training tokens so far) but no verified improvement exists to divide by it.";
+  else ans = "Every trillion training tokens spent has bought <b>" + signedPct(eff,2) +
+    "</b> of verified forecast improvement, over the " + num(tot/1e12,1) + " trillion tokens " +
+    "consumed since " + esc(prettyDay(chain.pts[0].at)) + ".";
+  document.getElementById("eff-answer").innerHTML = ans;
+
+  drawLines("chart-eff", [{ data:data, color:"var(--accent)",
+    endTitle: eff!=null ? ("Today: "+signedPct(eff,2)+" per trillion tokens") : null }], {
+    fmtY: pctTick,
+    ylab: "gain per trillion tokens",
+    xticks: dateTicks(chain.pts),
     empty: "No scored rounds published yet"
   });
-  var tot = chain.pts.reduce(function(a,p){ return a+p.tokens; }, 0);
   document.getElementById("eff-note").textContent = tot > 0
     ? (num(tot/1e12,1) + " trillion tokens used" +
        (chain.steps.length ? " · " + signedPct(chain.obs/(tot/1e12),2) + " per trillion" : ""))
@@ -843,12 +1134,19 @@ function renderEfficiency(){
 // ── render: benchmark / ladder / warm start ─────────────────────────────────
 function renderBench(){
   var b = benchScores(), el = document.getElementById("bench-panel");
+  document.getElementById("bench-answer").innerHTML = b
+    ? "The current leader scores <b>" + num(b.scores.gifteval_mase,3) + "</b> on GIFT-Eval — " +
+      (b.scores.gifteval_mase<1 ? "<b>beating</b>" : "trailing") + " the standard reference model (1.00)."
+    : "Not yet — no public benchmark result has been published for a leading model.";
   if(!b){
     el.innerHTML = '<div class="pending-panel">' +
-      '<span class="pg">&mdash; &mdash; &mdash;</span>' +
-      '<span class="ph">Pending public benchmark</span>' +
-      '<p>No public benchmark result has been published yet. This panel fills in on its own the ' +
-      'moment one is. Until then it stays blank rather than showing a number nobody can check.</p>' +
+      '<span class="ph">Pending — public benchmark</span>' +
+      '<p><b>Why pending:</b> benchmark scores are stamped onto a leader&rsquo;s signed record by the ' +
+      'training pipeline, and that step has not produced its first qualifying result yet.</p>' +
+      '<p><b>What will appear here:</b> GIFT-Eval, BOOM and TIME scores for the leading model, ' +
+      'scored exactly as their public leaderboards score them — filled in automatically the moment ' +
+      'the first result is published, and kept blank until then rather than showing a number ' +
+      'nobody can check.</p>' +
       '</div>';
     document.getElementById("bench-when").textContent = "";
     return;
@@ -860,42 +1158,51 @@ function renderBench(){
     { n:"TIME",      c:s.time_crps,     m:s.time_mase }
   ];
   el.innerHTML = '<div class="tiles">' + suites.map(function(x){
-    return tile({ k:x.n, small:true,
+    return tile({ k:x.n, small:true, pill:PILL_LIVE,
       v: num(x.m,3) + ' <span class="u">vs 1.00</span>',
-      note: (x.m<1 ? "Beats" : "Trails") + " the standard reference model." });
+      interp: (x.m<1 ? "<b>Beats</b>" : "Trails") + " the standard reference model.",
+      ctx: "Scored as the public leaderboard scores it." });
   }).join("") + '</div>';
   document.getElementById("bench-when").textContent = "Current leader";
 }
 
 function renderLadder(){
-  var seen = validatedRungs(), el = document.getElementById("ladder"), topIdx = -1;
-  LADDER.forEach(function(r,i){ if(seen[r.key]) topIdx = i; });
+  var tr = topRung(), el = document.getElementById("ladder");
+  document.getElementById("scale-answer").innerHTML = tr.top
+    ? "A <b>" + esc(tr.top.label) + "-parameter model</b> has been demonstrated end to end" +
+      (tr.next ? "; the next milestone is <b>" + esc(tr.next.label) + "</b>, which has not been run yet." :
+        " — the top of the planned ladder.")
+    : "No model size has produced a judged result yet.";
   el.innerHTML = LADDER.map(function(r,i){
-    var done = !!seen[r.key], next = (i === topIdx+1);
+    var done = !!tr.seen[r.key], next = (i === tr.idx+1);
     return '<div class="rung'+(done?" done":"")+(next?" next":"")+'">' +
       '<span class="rp">'+esc(r.label)+'</span>' +
-      '<span class="rs">'+(done?"Proven":(next?"Next":"Planned"))+'</span>' +
-      '<span class="rn">'+(done ? (seen[r.key]+" round"+(seen[r.key]===1?"":"s")+" run")
+      '<span class="rs">'+(done?"Proven ✓":(next?"Next":"Planned"))+'</span>' +
+      '<span class="rn">'+(done ? (tr.seen[r.key]+" round"+(tr.seen[r.key]===1?"":"s")+" run")
                                 : esc(r.note||"not run yet")) +'</span></div>';
   }).join("");
-  var top = topIdx>=0 ? LADDER[topIdx] : null, nxt = LADDER[topIdx+1] || null;
-  document.getElementById("ladder-note").innerHTML = top
-    ? "Proven so far: <b>" + esc(top.label) + "</b>" +
-      (nxt ? ". Next: <b>" + esc(nxt.label) + "</b>." : " — the top of the ladder.")
+  document.getElementById("ladder-note").innerHTML = tr.top
+    ? "Proven so far: <b>" + esc(tr.top.label) + "</b>" +
+      (tr.next ? ". Next: <b>" + esc(tr.next.label) + "</b>." : " — the top of the ladder.")
     : "No size has produced a result yet.";
-  document.getElementById("scale-when").textContent = top ? (top.label + " proven") : "";
+  document.getElementById("scale-when").textContent = tr.top ? (tr.top.label + " proven") : "";
 }
 
 function renderWarm(){
   var ws = warmStart(), el = document.getElementById("warm-panel");
+  document.getElementById("warm-answer").innerHTML = ws
+    ? "The carry-forward mechanism has just switched on; the first retention reading arrives at the next handover."
+    : "Not yet measurable — every round currently starts from scratch, so no progress has been handed forward.";
   if(!ws){
     el.innerHTML = '<div class="pending-panel">' +
-      '<span class="pg">&mdash; &mdash; &mdash;</span>' +
-      '<span class="ph">Not switched on yet</span>' +
-      '<p>Right now every round starts from scratch, so no progress has been handed forward and ' +
-      'there is nothing to measure. A retention figure today would be invented.</p>' +
-      '<p class="muted">The formula is fixed in advance so it can&rsquo;t be chosen after the fact: ' +
-      'the promoted model&rsquo;s benchmark score divided by the next round&rsquo;s.</p></div>';
+      '<span class="ph">Not started — carry-forward</span>' +
+      '<p><b>Why not started:</b> the mechanism that promotes the best model to everyone&rsquo;s ' +
+      'starting line is not switched on yet, so there is nothing to measure. A retention figure ' +
+      'today would be invented.</p>' +
+      '<p><b>What will appear here:</b> once it activates and the first handover happens, this ' +
+      'section shows how much of the accumulated improvement survived. The formula is fixed in ' +
+      'advance so it can&rsquo;t be chosen after the fact: the promoted model&rsquo;s benchmark ' +
+      'score divided by the next round&rsquo;s.</p></div>';
     document.getElementById("warm-when").textContent = "";
     return;
   }
@@ -908,11 +1215,12 @@ function renderWarm(){
 
 // ── render: method + chrome ─────────────────────────────────────────────────
 function renderMethod(){
-  var chain = improvementChain(), rg = reigns();
+  var rg = reigns();
   var items = [
     ["Lead changes",
-     "Counted from the signed record of each round — the field that says the title changed hands."],
-    ["Better than day one",
+     "Counted from the signed record of each round — the field that says the title changed hands. " +
+     "&ldquo;Different miners&rdquo; are counted by cryptographic key, not UID (UIDs get re-used)."],
+    ["Measured vs guaranteed improvement",
      "Each lead change is a like-for-like test of old leader against challenger on the same data. " +
      "Those gains are multiplied together. The guaranteed figure uses the cautious end of each " +
      "measurement (<code>lcb</code>, the threshold the win had to clear)."],
@@ -964,14 +1272,14 @@ function renderChrome(){
     b.hidden = false;
     b.className = "data-banner " + (_state === "offline" ? "offline" : "loading");
     b.textContent = _state === "offline"
-      ? "Can\u2019t reach the public record right now — showing nothing rather than stale numbers."
+      ? "Can’t reach the public record right now — showing nothing rather than stale numbers."
       : "Loading the public record…";
   }
 }
 
 function renderAll(){
   renderChrome(); renderTiles(); renderCompetition(); renderPerf();
-  renderBench(); renderLadder(); renderEfficiency(); renderWarm(); renderMethod();
+  renderLadder(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
 }
 
 document.getElementById("theme-toggle").addEventListener("click", function(){
