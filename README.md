@@ -296,7 +296,10 @@ append-only — a generator already saved is never re-fetched — so it's cheap 
 run on a schedule (`.github/workflows/scrape-kings.yml` runs it daily). Endpoint
 and credentials default to the same R2 account chain.toml already uses for the
 manifest/receipt backup (`BACKUP_S3_*`), so no new account is needed; keep the
-bucket private. See `cascade.shared.king_archive`.
+bucket private. Hub pulls of public repos are anonymous, but miners commit
+private Hub repos too — set `HIPPIUS_HUB_TOKEN` (and `HF_TOKEN` for private
+`hf:` refs) or those snapshots fail on every run. See
+`cascade.shared.king_archive`.
 
 `chain.toml` ships with mainnet values baked in (netuid 91, the L40S GPU pin,
 the worker-image digest, `pool_bucket`). The remaining operator-specific values —
