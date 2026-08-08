@@ -1266,9 +1266,9 @@ function renderBoard(){
   var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
 
   var row1 = [
-    cell({ k:"Miners competing",
+    cell({ k:"Miners entered",
       v: fs ? String(fs.latest.n) : "&mdash;",
-      q: fs ? "latest round" : "awaiting first round",
+      q: fs ? "one entry each · latest round" : "awaiting first round",
       state: fs ? "live" : "pend" }),
     cell({ k:"Lead changes",
       v: rs.length ? String(deth) : "&mdash;",
@@ -1330,7 +1330,8 @@ function renderCompetition(){
   if(!rs.length) ans = "No round has been published yet — the competition has not started.";
   else if(deth === 0) ans = "Not yet decided: over <b>" + rs.length + " round" + (rs.length===1?"":"s") +
     "</b> the day-one leader has not been beaten. A healthy competition should produce lead changes over time.";
-  else ans = "<b>Yes.</b> " + (fs ? ("<b>" + fs.latest.n + " miners</b> hold eligible entries and ") : "") +
+  else ans = "<b>Yes.</b> " + (fs ? ("<b>" + fs.latest.n + " miners</b> entered the latest round " +
+    "(one entry per miner) and ") : "") +
     "the lead has changed hands <b>" + deth + " time" + (deth===1?"":"s") +
     "</b> across <b>" + rs.length + " rounds</b> — <b>" + nLead + " different miners</b> have held it" +
     (nLead >= 3 ? ", so the title is genuinely contested." : ".");
@@ -1681,10 +1682,12 @@ function renderWarm(){
 function renderMethod(){
   var rg = reigns();
   var items = [
-    ["Miners competing",
+    ["Miners entered",
      "The signed round summary&rsquo;s participant count: miners whose committed entry was " +
-     "<b>eligible at the round&rsquo;s cutoff</b>. Not &ldquo;registered&rdquo; and not " +
-     "&ldquo;active&rdquo; in any looser sense — exactly the entries the round could judge."],
+     "<b>eligible at the round&rsquo;s cutoff</b>. Each hotkey fields <b>one entry per round</b> " +
+     "— its latest on-chain commitment — so this is both the miner count and the entry count. " +
+     "Not &ldquo;registered&rdquo; and not &ldquo;active&rdquo; in any looser sense — exactly " +
+     "the entries the round judged."],
     ["Lead changes",
      "Counted from the signed record of each round — the field that says the title changed hands. " +
      "&ldquo;Different miners&rdquo; are counted by cryptographic key, not UID (UIDs get re-used)."],
