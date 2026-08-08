@@ -624,10 +624,10 @@ a:hover{text-decoration:underline}
 
 /* ── the scoreboard: eight measures, two rows, one composition ── */
 .board{border-top:var(--line);border-bottom:var(--line)}
-.brow{padding:16px 0 20px}
+.brow{padding:13px 0 16px}
 .brow+.brow{border-top:var(--line-faint)}
 .brow-cap{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.18em;color:var(--faint);margin-bottom:13px}
+  letter-spacing:.18em;color:var(--faint);margin-bottom:11px}
 .bcells{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 44px}
 .cell{display:flex;flex-direction:column;gap:6px;min-width:0}
 .cell .bk{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;
@@ -637,7 +637,7 @@ a:hover{text-decoration:underline}
 .cell.s-warn .bar{background:var(--clay)}
 .cell.s-off .bar{background:var(--faint);opacity:.55}
 .cell .bv{font-family:var(--font-mono);font-weight:600;letter-spacing:-.01em;
-  font-size:clamp(29px,2.9vw,38px);line-height:1.05;color:var(--ink);white-space:nowrap}
+  font-size:clamp(30px,3.1vw,41px);line-height:1.05;color:var(--ink);white-space:nowrap}
 .cell.s-pend .bv,.cell.s-off .bv{color:var(--faint);font-weight:500}
 .cell .bq{font-family:var(--font-mono);font-size:11px;color:var(--muted);line-height:1.5}
 .cell.s-pend .bq,.cell.s-off .bq{color:var(--faint)}
@@ -832,10 +832,7 @@ th.num{text-align:right}
       <span class="when" id="deth-when"></span></div>
     <p class="answer" id="comp-answer">--</p>
     <div class="timeline" id="timeline"></div>
-    <p class="table-caption" id="reigns-caption" hidden>Every change of lead, newest first —
-    read straight from the signed round record. <b class="muted">First-time</b> marks a miner
-    taking the lead for the first time.</p>
-    <div class="scroll-box">
+    <div class="scroll-box" style="margin-top:16px">
       <table><thead><tr>
         <th>#</th><th>Took the lead</th><th>Leader</th><th class="num">Won by</th>
         <th class="num">Rounds held</th><th>Entry</th><th>Round</th>
@@ -844,8 +841,10 @@ th.num{text-align:right}
     <details>
       <summary>How to read this table</summary>
       <div class="detail-body">
-        <p>Each row is a reign: the miner that took the lead, when, and by how much it beat the
-        previous leader in a same-round head-to-head. <b>Miner</b> numbers are network UIDs;
+        <p>Rows are reigns, newest first, read straight from the signed round record: the miner
+        that took the lead, when, and by how much it beat the previous leader in a same-round
+        head-to-head. <b>First-time</b> marks a miner taking the lead for the first time.
+        <b>Miner</b> numbers are network UIDs;
         <b>Entry</b> links to the exact submitted model; <b>Round</b> is the signed record that
         awarded the win. Miner UIDs can be re-used by the network over time, so the
         first-time/returning badges are matched on the miner&rsquo;s cryptographic key, not the UID.</p>
@@ -1350,10 +1349,10 @@ function renderCompetition(){
                  '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
         '<span class="tl-dot"></span></div>';
     }).join("");
+    // the answer line above already states the count — the rail only adds a
+    // hover hint when it is too dense to label every marker
     rail.innerHTML = '<div class="tl-rail"><div class="tl-line"></div>'+evs+'</div>' +
-      '<div class="tl-note">' + (deth ? deth + " lead change" + (deth===1?"":"s") : "no lead change yet") +
-      " since " + esc(prettyDay(rg[0].at)) +
-      (dense ? " · hover a marker for its date" : "") + "</div>";
+      (dense ? '<div class="tl-note">hover a marker for its date</div>' : '');
   }
 
   var rows = rg.slice().reverse().map(function(g){
@@ -1372,7 +1371,6 @@ function renderCompetition(){
   }).join("");
   document.getElementById("reigns").innerHTML = rows ||
     '<tr><td colspan="7" class="empty">No reigns recorded yet</td></tr>';
-  document.getElementById("reigns-caption").hidden = !rows;
   document.getElementById("deth-when").textContent =
     rg.length ? ("Since " + prettyDay(rg[0].at)) : "";
 }
