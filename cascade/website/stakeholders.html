@@ -1020,12 +1020,12 @@ var LADDER = [
   { key: "10b",  label: "10B",  disc: 66 }
 ];
 
-// Community links. Only GitHub has a known public URL today; the X and
-// Discord glyphs stay hidden until their REAL links are filled in here —
-// never ship a guessed handle or invite.
+// Community links. A glyph renders only when its URL is set — never ship a
+// guessed handle or invite. NOTE: the Discord link is a channel deep-link
+// (works for members); swap in a discord.gg invite to onboard outsiders.
 var COMMUNITY = {
-  x:       "",   // e.g. "https://x.com/<handle>"
-  discord: "",   // e.g. "https://discord.gg/<invite>"
+  x:       "https://x.com/cascade_sn91",
+  discord: "https://discord.com/channels/799672011265015819/1524889682520047776",
   github:  "https://github.com/TensorLink-AI/cascade"
 };
 
