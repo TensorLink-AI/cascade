@@ -944,6 +944,10 @@ th.num{text-align:right}
         <p>These scores are <b>reported only</b>. They never decide who wins a round. The benchmark
         data is public, so scoring on it would just reward entries tuned to it; the competition is
         settled on hidden data instead.</p>
+        <p>A trainer-signed report (<code>benchmarks/round-&lt;id&gt;.json</code>) is published after
+        a round&rsquo;s duel when the battery completes for at least one checkpoint. Some rounds have
+        none — the battery can fail, or a report can land late — which is normal; the page probes
+        the recent record for the reports that actually exist.</p>
       </div>
     </details>
   </section>
@@ -1069,8 +1073,10 @@ function timeAgo(i){ if(!i) return "--";
   if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago";
   var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
 
-function fetchJSON(path){
-  var bust="?t="+Date.now();
+function fetchJSON(path, opts){
+  // opts.bust=false for immutable objects (per-round bench reports): lets the
+  // browser/CDN cache them instead of refetching on every poll.
+  var bust=(opts && opts.bust===false) ? "" : "?t="+Date.now();
   return new Promise(function(resolve,reject){
     var pending=ENDPOINTS.length, settled=false;
     ENDPOINTS.forEach(function(base){
@@ -1226,8 +1232,8 @@ function topRung(){
 }
 
 // Public-benchmark scores ride on the KING's manifest entry, stamped by the
-// trainer (BenchScores). They exist only when [scoring] cascade_enabled — the
-// cell stays explicitly pending until a real one lands, never a placeholder.
+// trainer (BenchScores). They exist only when [scoring] cascade_enabled — kept
+// as the fallback source behind the per-round reports below.
 function benchScores(){
   var m = _latest && _latest.manifest;
   var entries = (m && m.entries) || [];
@@ -1236,6 +1242,97 @@ function benchScores(){
     if(e && e.role === "king" && e.bench_scores) return { scores:e.bench_scores, size:e.size||"" };
   }
   return null;
+}
+
+// ── per-round public-benchmark reports ──────────────────────────────────────
+// The trainer publishes a signed BenchReport at benchmarks/round-<id>.json
+// after a round's duel — GIFT-Eval / BOOM / TIME, CRPS + MASE, per checkpoint
+// (king and challenger). Not every round has one: the battery can fail or a
+// report can land late, so the page probes rather than assumes. Reports are
+// immutable once published (fetched uncached-busted exactly once); a miss is
+// permanent for the session except among the newest few rounds, where a
+// late-landing report is still expected.
+var BENCH_SCAN_MAX = 48, BENCH_RETRY_NEWEST = 6;
+var _benchReports = {}, _benchMissing = {}, _benchInflight = {};
+var SIX_KEYS = ["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
+
+// The six numbers follow extract_bench_scores' key convention; the exact
+// nesting on a BenchEntry is read tolerantly (flat, .scores, or .bench_scores).
+function readSix(o){
+  if(!o) return null;
+  var src = (typeof o.gifteval_mase === "number") ? o
+    : (o.scores && typeof o.scores.gifteval_mase === "number") ? o.scores
+    : (o.bench_scores && typeof o.bench_scores.gifteval_mase === "number") ? o.bench_scores
+    : null;
+  if(!src) return null;
+  var out = {};
+  for(var i=0;i<SIX_KEYS.length;i++){
+    var v = src[SIX_KEYS[i]];
+    if(typeof v !== "number" || !isFinite(v)) return null;
+    out[SIX_KEYS[i]] = v;
+  }
+  return out;
+}
+// The promotion-metric convention: geometric mean of all six (lower is better).
+function sixGeomean(s){
+  var sum = 0;
+  for(var i=0;i<SIX_KEYS.length;i++){
+    if(!(s[SIX_KEYS[i]] > 0)) return null;
+    sum += Math.log(s[SIX_KEYS[i]]);
+  }
+  return Math.exp(sum/6);
+}
+
+function scanBench(){
+  var rs = scoredRounds(), recent = rs.slice(-BENCH_SCAN_MAX);
+  var newest = {};
+  rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)] = 1; });
+  recent.forEach(function(r){
+    var id = String(r.round_id);
+    if(_benchReports[id] || _benchInflight[id]) return;
+    if(_benchMissing[id] && !newest[id]) return;
+    _benchInflight[id] = true;
+    fetchJSON("benchmarks/round-" + id + ".json", { bust:false })
+      .then(function(d){
+        delete _benchInflight[id]; delete _benchMissing[id];
+        _benchReports[id] = d;
+        renderBoard(); renderBench();
+      })
+      .catch(function(){ delete _benchInflight[id]; _benchMissing[id] = true; });
+  });
+}
+
+// What the benchmark section shows:
+//   latest — the CURRENT LEADER's most recent published scores (the entry for
+//            the round's winner: challenger on a dethrone round, king else);
+//   best   — the lowest six-score geomean across every loaded report entry.
+// Falls back to the manifest-embedded king scores when no report has loaded.
+function benchView(){
+  var rs = scoredRounds(), latest = null, best = null;
+  rs.forEach(function(r){
+    var rep = _benchReports[String(r.round_id)];
+    if(!rep) return;
+    var entries = rep.entries || rep.checkpoints || [];
+    var wantRole = r.dethroned ? "challenger" : "king";
+    entries.forEach(function(e){
+      var six = readSix(e);
+      if(!six) return;
+      var g = sixGeomean(six);
+      if(g != null && (!best || g < best.geomean))
+        best = { geomean:g, six:six, role:String(e.role||""), uid:e.uid,
+                 round_id:r.round_id, at:r.published_at };
+      if(String(e && e.role || "") === wantRole)
+        latest = { six:six, geomean:g, round_id:r.round_id, at:r.published_at, src:"report" };
+    });
+  });
+  if(!latest){
+    var b = benchScores();
+    if(b){
+      var six = readSix(b.scores);
+      if(six) latest = { six:six, geomean:sixGeomean(six), round_id:null, at:null, src:"manifest" };
+    }
+  }
+  return { latest:latest, best:best };
 }
 function warmStart(){
   var m = _latest && _latest.manifest;
@@ -1260,7 +1357,7 @@ function renderBoard(){
   var rs = scoredRounds(), rg = reigns(), chain = improvementChain();
   var deth = rs.filter(function(r){ return r.dethroned; }).length;
   var nLead = distinctLeaders(rg);
-  var fs = fieldSize(), tr = topRung(), b = benchScores(), ws = warmStart();
+  var fs = fieldSize(), tr = topRung(), bv = benchView(), ws = warmStart();
   var haveChain = chain.steps.length > 0;
   var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
   var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
@@ -1286,10 +1383,10 @@ function renderBoard(){
   ];
   var row2 = [
     cell({ k:"Public benchmark",
-      v: b ? num(b.scores.gifteval_mase,3) : "&mdash;",
-      q: b ? ((b.scores.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval")
-           : "awaiting first result",
-      state: b ? (b.scores.gifteval_mase<1 ? "live" : "warn") : "pend" }),
+      v: bv.latest ? num(bv.latest.six.gifteval_mase,3) : "&mdash;",
+      q: bv.latest ? ((bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval")
+                   : "awaiting first result",
+      state: bv.latest ? (bv.latest.six.gifteval_mase<1 ? "live" : "warn") : "pend" }),
     cell({ k:"Compute efficiency",
       v: eff!=null ? signedPct(eff,2) : "&mdash;",
       q: eff!=null ? "per trillion tokens" : "awaiting first verified gain",
@@ -1606,12 +1703,21 @@ function renderEfficiency(){
 
 // ── render: benchmark / ladder / warm start ─────────────────────────────────
 function renderBench(){
-  var b = benchScores(), el = document.getElementById("bench-panel");
-  document.getElementById("bench-answer").innerHTML = b
-    ? "The current leader scores <b>" + num(b.scores.gifteval_mase,3) + "</b> on GIFT-Eval — " +
-      (b.scores.gifteval_mase<1 ? "<b>beating</b>" : "trailing") + " the standard reference model (1.00)."
-    : "No qualifying public result yet.";
-  if(!b){
+  var bv = benchView(), el = document.getElementById("bench-panel");
+  var L = bv.latest;
+  var ans = !L
+    ? "No qualifying public result yet."
+    : "The current leader&rsquo;s latest published checkpoint scores <b>" +
+      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval — " +
+      (L.six.gifteval_mase<1 ? "<b>beating</b>" : "trailing") +
+      " the standard reference model (1.00).";
+  if(L && bv.best && bv.best.geomean != null &&
+     (L.geomean == null || bv.best.geomean < L.geomean - 1e-9)){
+    ans += " The best checkpoint published so far sits at <b>" + num(bv.best.geomean,3) +
+      "</b> across all six public scores.";
+  }
+  document.getElementById("bench-answer").innerHTML = ans;
+  if(!L){
     el.innerHTML = '<div class="pending-panel">' +
       '<span class="ph">Awaiting first result</span>' +
       '<p>GIFT-Eval, BOOM and TIME scores for the leading model appear here automatically when ' +
@@ -1620,18 +1726,25 @@ function renderBench(){
     document.getElementById("bench-when").textContent = "";
     return;
   }
-  var s = b.scores;
+  var s = L.six;
   var suites = [
     { n:"GIFT-Eval", c:s.gifteval_crps, m:s.gifteval_mase },
     { n:"BOOM",      c:s.boom_crps,     m:s.boom_mase },
     { n:"TIME",      c:s.time_crps,     m:s.time_mase }
   ];
+  var bestLine = "";
+  if(bv.best && bv.best.geomean != null){
+    bestLine = '<p class="lede" style="margin:14px 0 0">Best published to date: <b>' +
+      num(bv.best.geomean,3) + '</b> — the geometric mean of all six scores (lower is better), a ' +
+      esc(bv.best.role || "leading") + ' checkpoint from ' + esc(prettyDay(bv.best.at)) + '.</p>';
+  }
   el.innerHTML = '<div class="bcells bench-cells">' + suites.map(function(x){
     return cell({ k:x.n, v:num(x.m,3),
-      q:(x.m<1 ? "beats" : "trails") + " reference (1.00)",
+      q:(x.m<1 ? "beats" : "trails") + " reference · CRPS " + num(x.c,3),
       state:(x.m<1 ? "live" : "warn") });
-  }).join("") + '</div>';
-  document.getElementById("bench-when").textContent = "Current leader";
+  }).join("") + '</div>' + bestLine;
+  document.getElementById("bench-when").textContent = L.src === "report"
+    ? ("Report " + prettyDay(L.at)) : "Current leader";
 }
 
 function renderLadder(){
@@ -1703,8 +1816,11 @@ function renderMethod(){
      "measured line runs slightly optimistic and the guaranteed line runs conservative. Read them " +
      "as a range."],
     ["Public benchmark",
-     "GIFT-Eval, BOOM and TIME, scored as their public leaderboards do. Reported only — they " +
-     "never decide who wins."],
+     "Trainer-signed per-round reports (<code>benchmarks/round-&lt;id&gt;.json</code>): GIFT-Eval, " +
+     "BOOM and TIME, CRPS + MASE, scored as their public leaderboards do. The headline is the " +
+     "current leader&rsquo;s most recent report; &ldquo;best published&rdquo; is the lowest " +
+     "six-score geometric mean in the scanned recent record. Not every round has a report. " +
+     "Reported only — they never decide who wins."],
     ["Biggest model proven",
      "The largest size that has actually produced a judged result. Planning a size doesn&rsquo;t " +
      "count it."],
@@ -1790,7 +1906,7 @@ document.getElementById("theme-toggle").textContent =
 
 function poll(){
   fetchJSON("receipts/index.json")
-    .then(function(d){ _index = collapseByRound(d); _state = "live"; renderAll(); })
+    .then(function(d){ _index = collapseByRound(d); _state = "live"; renderAll(); scanBench(); })
     .catch(function(){ _state = "offline"; renderChrome(); });
   // The anchored trail, not the shared last-writer-wins pointer: any validator
   // can overwrite receipts/latest.json, and the bench/warm-start reads below
