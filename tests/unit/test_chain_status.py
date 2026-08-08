@@ -66,6 +66,20 @@ def test_build_chain_status_document(cfg):
     assert [(s["uid"], s["commit_block"]) for s in status["submissions"]] == [
         (7, 14_450), (3, 14_000)]
     assert status["submissions"][0]["gen_ref"] == "ns/gen-7@sha256:" + "a" * 64
+    # no economics passed → no key (older publishers keep producing valid docs)
+    assert "economics" not in status
+
+
+def test_build_chain_status_carries_economics(cfg):
+    econ = {"alpha_price_tao": 0.0142,
+            "tao_in_emission_per_day": 128.4, "as_of_block": 14_500}
+    status = build_chain_status(
+        cfg, current_block=14_500, commitments=[], economics=econ)
+    assert status["economics"] == econ
+    # None (chain flake / shape drift) degrades to the no-key document
+    status = build_chain_status(
+        cfg, current_block=14_500, commitments=[], economics=None)
+    assert "economics" not in status
 
 
 class _Store:

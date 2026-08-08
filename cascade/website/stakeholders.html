@@ -1025,7 +1025,7 @@ var COMMUNITY = {
   github:  "https://github.com/TensorLink-AI/cascade"
 };
 
-var _index = null, _latest = null, _state = "loading";
+var _index = null, _latest = null, _chain = null, _state = "loading";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 (function initTheme(){
@@ -1058,6 +1058,11 @@ function shortDay(iso){
   var d = iso ? new Date(iso) : null;
   if(!d || isNaN(d.getTime())) return "";
   return d.toLocaleDateString(undefined,{month:"short",day:"numeric"});
+}
+function fmtTao(x){
+  if(x==null||!isFinite(x)) return null;
+  var a=Math.abs(x), dp = a>=100?0 : a>=1?2 : a>=0.1?3 : 4;
+  return "τ"+Number(x).toFixed(dp);
 }
 function timeAgo(i){ if(!i) return "--";
   var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0;
@@ -1293,18 +1298,25 @@ function renderBoard(){
       v: "&mdash;",
       q: ws ? "switching on" : "not active yet",
       state: ws ? "pend" : "off" }),
-    // PROVISIONAL EIGHTH METRIC — the slot is fixed (4×2), the metric is not.
-    // Swap this single cell() once the stakeholder-agreed economic statistic
-    // lands in the signed public feed. Never fill it with an invented value.
-    cell({ k:"Economics",
-      v: "&mdash;",
-      q: "not yet reported",
-      state: "pend" })
+    // Economics: alpha price + TAO emissions/day, read from the chain via the
+    // validator-published status feed (status/chain.json). Live and unsigned —
+    // when the feed doesn't carry it yet, the cell stays honestly pending.
+    econCell()
   ];
 
   document.getElementById("board").innerHTML =
     '<div class="brow"><div class="bcells">' + row1.join("") + '</div></div>' +
     '<div class="brow"><div class="bcells">' + row2.join("") + '</div></div>';
+}
+
+function econCell(){
+  var ec = (_chain && _chain.economics) || null;
+  var price = ec ? fmtTao(ec.alpha_price_tao) : null;
+  var emit  = ec ? fmtTao(ec.tao_in_emission_per_day) : null;
+  if(price) return cell({ k:"Economics", v:price,
+    q:"alpha price" + (emit ? " · " + emit + "/day emissions" : ""), state:"live" });
+  if(emit) return cell({ k:"Economics", v:emit, q:"emissions per day", state:"live" });
+  return cell({ k:"Economics", v:"&mdash;", q:"not yet reported", state:"pend" });
 }
 
 // ── render: dethrone timeline + reigns ──────────────────────────────────────
@@ -1698,9 +1710,11 @@ function renderMethod(){
     ["Progress carried forward",
      "Not measurable until the hand-forward mechanism is switched on."],
     ["Economics",
-     "No economic statistic (emissions, rewards, cost) is carried in the public record feed " +
-     "this page reads, so the cell stays pending. It will be sourced from signed public data " +
-     "when that reporting lands — never typed in by hand."]
+     "The subnet&rsquo;s alpha price (TAO per alpha, from the on-chain pool) and TAO emissions " +
+     "per day, read from the chain and published in the dashboard&rsquo;s live status feed " +
+     "(<code>status/chain.json</code>) on the validator&rsquo;s poll cadence. Unlike the round " +
+     "record this feed is presentational and unsigned; when it is absent the cell stays " +
+     "pending rather than guessing."]
   ];
   document.getElementById("method").innerHTML = items.map(function(p){
     return "<div><dt>"+esc(p[0])+"</dt><dd>"+p[1]+"</dd></div>"; }).join("");
@@ -1781,6 +1795,10 @@ function poll(){
   fetchJSON("receipts/" + RECEIPT_ANCHOR + "/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
     .then(function(d){ _latest = d; renderBoard(); renderBench(); renderWarm(); })
+    .catch(function(){});
+  // Live chain view (unsigned, presentational): feeds the Economics cell.
+  fetchJSON("status/chain.json")
+    .then(function(d){ _chain = d; renderBoard(); })
     .catch(function(){});
 }
 renderAll();
