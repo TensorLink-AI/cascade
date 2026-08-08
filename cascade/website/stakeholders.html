@@ -614,37 +614,33 @@ a:hover{text-decoration:underline}
 .data-banner.loading{color:var(--muted);border:1px dashed rgba(127,127,127,.4)}
 .data-banner.offline{color:#BF5B3D;background:rgba(191,91,61,.10);border:1px solid rgba(191,91,61,.45);font-weight:600}
 
-/* masthead */
-.header{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:26px 0 30px}
+/* masthead — establish identity, then get out of the way */
+.header{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:18px 0 22px}
 .header .wordmark{font-family:var(--font-display);font-weight:900;font-size:46px;letter-spacing:-.03em;
   color:var(--accent);line-height:1}
 .header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--faint);
   text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
-.header .sub{color:var(--muted);max-width:72ch;margin-top:10px;font-size:13.5px}
+.header .sub{color:var(--muted);max-width:72ch;margin-top:8px;font-size:13.5px}
 
-/* ── the scoreboard: eight measures, two rows, one composition ── */
+/* ── the scoreboard: eight measures, two rows, one composition.
+   No row captions — spacing and metric order carry the grouping;
+   the numbers are the hero, labels and qualifiers recede. ── */
 .board{border-top:var(--line);border-bottom:var(--line)}
-.brow{padding:13px 0 16px}
+.brow{padding:20px 0 22px}
 .brow+.brow{border-top:var(--line-faint)}
-.brow-cap{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.18em;color:var(--faint);margin-bottom:11px}
 .bcells{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 44px}
-.cell{display:flex;flex-direction:column;gap:6px;min-width:0}
-.cell .bk{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--muted);line-height:1.45}
+.cell{display:flex;flex-direction:column;gap:7px;min-width:0}
+.cell .bk{font-family:var(--font-mono);font-size:10px;font-weight:500;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--faint);line-height:1.45}
 .cell .bar{width:22px;height:3px;background:var(--accent);border-radius:1px}
 .cell.s-pend .bar{background:var(--saffron)}
 .cell.s-warn .bar{background:var(--clay)}
 .cell.s-off .bar{background:var(--faint);opacity:.55}
 .cell .bv{font-family:var(--font-mono);font-weight:600;letter-spacing:-.01em;
-  font-size:clamp(30px,3.1vw,41px);line-height:1.05;color:var(--ink);white-space:nowrap}
+  font-size:clamp(32px,3.3vw,44px);line-height:1.04;color:var(--ink);white-space:nowrap}
 .cell.s-pend .bv,.cell.s-off .bv{color:var(--faint);font-weight:500}
 .cell .bq{font-family:var(--font-mono);font-size:11px;color:var(--muted);line-height:1.5}
 .cell.s-pend .bq,.cell.s-off .bq{color:var(--faint)}
-/* the single-line milestone strip under the board */
-.watch{margin-top:11px;font-family:var(--font-mono);font-size:10.5px;letter-spacing:.06em;
-  text-transform:uppercase;color:var(--faint)}
-.watch b{color:var(--muted);font-weight:600}
 @media (max-width:1020px){.bcells{grid-template-columns:repeat(2,1fr);gap:18px 30px}}
 @media (max-width:430px){.bcells{grid-template-columns:1fr;gap:16px}}
 
@@ -685,23 +681,25 @@ details summary:hover{color:var(--ink)}
 .detail-body ul{margin:6px 0 0 17px}
 .detail-body li{margin-bottom:5px}
 
-/* timeline */
-.timeline{position:relative;padding:8px 0 4px}
-.tl-rail{position:relative;height:96px}
-.tl-line{position:absolute;left:0;right:0;top:46px;border-top:var(--line)}
-.tl-ev{position:absolute;top:0;height:96px;transform:translateX(-50%);white-space:nowrap;
+/* timeline — the section's primary evidence once the table is collapsed.
+   Filled dot = a first-time leader, hollow dot = a returning one; the
+   baseline marker is neutral. Dates alternate above/below the rail. */
+.timeline{position:relative;padding:10px 0 6px}
+.tl-rail{position:relative;height:116px}
+.tl-line{position:absolute;left:0;right:0;top:56px;border-top:var(--line)}
+.tl-ev{position:absolute;top:0;height:116px;transform:translateX(-50%);white-space:nowrap;
   display:flex;flex-direction:column;align-items:center}
-.tl-dot{width:12px;height:12px;border-radius:50%;background:var(--accent);
-  border:2px solid var(--paper);position:absolute;top:40px;box-shadow:0 0 0 1px var(--accent)}
+.tl-dot{width:13px;height:13px;border-radius:50%;background:var(--accent);
+  border:2px solid var(--paper);position:absolute;top:49px;box-shadow:0 0 0 1.5px var(--accent)}
+.tl-ev.ret .tl-dot{background:var(--paper)}
 .tl-ev.launch .tl-dot{background:var(--paper);box-shadow:0 0 0 1px var(--muted)}
 .tl-lab{position:absolute;left:50%;transform:translateX(-50%);font-family:var(--font-mono);
   font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.tl-lab.who{top:23px;color:var(--ink);font-weight:700}
+.tl-lab.who{top:30px;color:var(--ink);font-weight:700}
 .tl-ev.launch .tl-lab.who{color:var(--muted);font-weight:400}
-/* dates alternate above/below the rail so neighbouring events never overlap */
-.tl-lab.date{top:61px}
-.tl-ev.alt .tl-lab.who{top:77px}
-.tl-ev.alt .tl-lab.date{top:7px}
+.tl-lab.date{top:76px}
+.tl-ev.alt .tl-lab.who{top:92px}
+.tl-ev.alt .tl-lab.date{top:12px}
 .tl-note{font-family:var(--font-mono);font-size:10.5px;color:var(--muted);text-transform:uppercase;
   letter-spacing:.05em;margin-top:6px}
 
@@ -735,7 +733,6 @@ details summary:hover{color:var(--ink)}
 @media (max-width:640px){.ladder{--lscale:.7}}
 
 /* tables */
-.table-caption{font-size:12.5px;color:var(--muted);margin:16px 0 8px}
 .scroll-box{overflow:auto;scrollbar-width:thin;max-height:330px}
 .scroll-box::-webkit-scrollbar{width:5px;height:5px}
 .scroll-box::-webkit-scrollbar-thumb{background:var(--accent)}
@@ -823,7 +820,6 @@ th.num{text-align:right}
   <!-- the scoreboard -->
   <section>
     <div class="board" id="board"></div>
-    <div class="watch" id="watch-line" hidden></div>
   </section>
 
   <!-- competition -->
@@ -832,14 +828,8 @@ th.num{text-align:right}
       <span class="when" id="deth-when"></span></div>
     <p class="answer" id="comp-answer">--</p>
     <div class="timeline" id="timeline"></div>
-    <div class="scroll-box" style="margin-top:16px">
-      <table><thead><tr>
-        <th>#</th><th>Took the lead</th><th>Leader</th><th class="num">Won by</th>
-        <th class="num">Rounds held</th><th>Entry</th><th>Round</th>
-      </tr></thead><tbody id="reigns"></tbody></table>
-    </div>
     <details>
-      <summary>How to read this table</summary>
+      <summary>View full lead history</summary>
       <div class="detail-body">
         <p>Rows are reigns, newest first, read straight from the signed round record: the miner
         that took the lead, when, and by how much it beat the previous leader in a same-round
@@ -848,6 +838,12 @@ th.num{text-align:right}
         <b>Entry</b> links to the exact submitted model; <b>Round</b> is the signed record that
         awarded the win. Miner UIDs can be re-used by the network over time, so the
         first-time/returning badges are matched on the miner&rsquo;s cryptographic key, not the UID.</p>
+      </div>
+      <div class="scroll-box" style="margin:4px 0 6px">
+        <table><thead><tr>
+          <th>#</th><th>Took the lead</th><th>Leader</th><th class="num">Won by</th>
+          <th class="num">Rounds held</th><th>Entry</th><th>Round</th>
+        </tr></thead><tbody id="reigns"></tbody></table>
       </div>
     </details>
   </section>
@@ -1249,7 +1245,7 @@ function renderBoard(){
   var row1 = [
     cell({ k:"Miners competing",
       v: fs ? String(fs.latest.n) : "&mdash;",
-      q: fs ? "eligible entries · latest round" : "awaiting first round",
+      q: fs ? "latest round" : "awaiting first round",
       state: fs ? "live" : "pend" }),
     cell({ k:"Lead changes",
       v: rs.length ? String(deth) : "&mdash;",
@@ -1273,13 +1269,15 @@ function renderBoard(){
       state: b ? (b.scores.gifteval_mase<1 ? "live" : "warn") : "pend" }),
     cell({ k:"Compute efficiency",
       v: eff!=null ? signedPct(eff,2) : "&mdash;",
-      q: eff!=null ? ("per trillion tokens · " + num(tot/1e12,1) + "T used")
-                   : "awaiting first verified gain",
+      q: eff!=null ? "per trillion tokens" : "awaiting first verified gain",
       state: eff!=null ? "live" : "pend" }),
     cell({ k:"Carry-forward",
       v: "&mdash;",
-      q: ws ? "switching on · first handover next" : "not active yet",
+      q: ws ? "switching on" : "not active yet",
       state: ws ? "pend" : "off" }),
+    // PROVISIONAL EIGHTH METRIC — the slot is fixed (4×2), the metric is not.
+    // Swap this single cell() once the stakeholder-agreed economic statistic
+    // lands in the signed public feed. Never fill it with an invented value.
     cell({ k:"Economics",
       v: "&mdash;",
       q: "not yet reported",
@@ -1287,21 +1285,8 @@ function renderBoard(){
   ];
 
   document.getElementById("board").innerHTML =
-    '<div class="brow"><div class="brow-cap">Competition &middot; Progress</div>' +
-      '<div class="bcells">' + row1.join("") + '</div></div>' +
-    '<div class="brow"><div class="brow-cap">Validation &middot; Efficiency &middot; Durability &middot; Economics</div>' +
-      '<div class="bcells">' + row2.join("") + '</div></div>';
-
-  // one quiet line of milestones — not another panel
-  var wl = document.getElementById("watch-line"), watch = [];
-  if(tr.next) watch.push(tr.next.label + " run");
-  if(!b) watch.push("first public benchmark");
-  watch.push(ws ? "first carry-forward reading" : "carry-forward activation");
-  watch.push("economic reporting");
-  if(rs.length && watch.length){
-    wl.innerHTML = "<b>Watching</b> &mdash; " + watch.map(esc).join(" &middot; ");
-    wl.hidden = false;
-  } else wl.hidden = true;
+    '<div class="brow"><div class="bcells">' + row1.join("") + '</div></div>' +
+    '<div class="brow"><div class="bcells">' + row2.join("") + '</div></div>';
 }
 
 // ── render: dethrone timeline + reigns ──────────────────────────────────────
@@ -1341,10 +1326,10 @@ function renderCompetition(){
 
     var evs = rg.map(function(g,i){
       var label = !dense || i===0 || i===rg.length-1;
-      return '<div class="tl-ev'+(g.baseline?" launch":"")+(i%2?" alt":"")+
+      return '<div class="tl-ev'+(g.baseline?" launch":(g.first?"":" ret"))+(i%2?" alt":"")+
         '" style="left:'+xs[i].toFixed(2)+'%" title="'+
-        esc((g.baseline?"Starting point":("Lead change #"+(g.n-1)))+" · "+prettyDay(g.at)+
-            " · miner "+(g.uid!=null?g.uid:"?"))+'">' +
+        esc((g.baseline?"Starting point":("Lead change #"+(g.n-1)+(g.first?" · first-time leader":" · returning leader")))+
+            " · "+prettyDay(g.at)+" · miner "+(g.uid!=null?g.uid:"?"))+'">' +
         (label ? '<span class="tl-lab who">'+esc(g.baseline?"start":("#"+(g.n-1)))+'</span>' +
                  '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
         '<span class="tl-dot"></span></div>';
@@ -1557,8 +1542,7 @@ function renderEfficiency(){
     " trillion training tokens so far) but no verified improvement exists to divide by it.";
   else ans = "Every trillion training tokens spent has bought <b>" + signedPct(eff,2) +
     "</b> of verified forecast improvement — " + num(tot/1e12,1) + " trillion tokens since " +
-    esc(prettyDay(chain.pts[0].at)) + ". The line falls through rounds without a verified gain " +
-    "and steps up at each change of lead.";
+    esc(prettyDay(chain.pts[0].at)) + ".";
   document.getElementById("eff-answer").innerHTML = ans;
 
   drawLines("chart-eff", [{ data:data, color:"var(--accent)",
@@ -1578,6 +1562,8 @@ function renderEfficiency(){
       num(e.heat_h*3600*e.ref_tps/1e9,1) + "B per screening run (" + e.why + ")";
   }).join("; ");
   document.getElementById("eff-caveat").innerHTML =
+    "<p>Reading the line: it falls through rounds that spend compute without a verified gain, " +
+    "and steps up at each change of lead.</p>" +
     "<p>Every round trains the leader and the challenger from scratch, and briefly trains each " +
     "entrant to screen the field. Those runs have <b>fixed, published budgets</b>, so the total is " +
     "the number of runs multiplied by the budget in force at the time: " + esc(eras) + ".</p>" +
@@ -1593,13 +1579,12 @@ function renderBench(){
   document.getElementById("bench-answer").innerHTML = b
     ? "The current leader scores <b>" + num(b.scores.gifteval_mase,3) + "</b> on GIFT-Eval — " +
       (b.scores.gifteval_mase<1 ? "<b>beating</b>" : "trailing") + " the standard reference model (1.00)."
-    : "Not yet — no qualifying public benchmark result has been published.";
+    : "No qualifying public result yet.";
   if(!b){
     el.innerHTML = '<div class="pending-panel">' +
       '<span class="ph">Awaiting first result</span>' +
-      '<p>GIFT-Eval, BOOM and TIME scores for the leading model appear here automatically the ' +
-      'moment the first externally reproducible result is published — blank until then rather ' +
-      'than showing a number nobody can check.</p>' +
+      '<p>GIFT-Eval, BOOM and TIME scores for the leading model appear here automatically when ' +
+      'the first externally reproducible result is published — blank until then.</p>' +
       '</div>';
     document.getElementById("bench-when").textContent = "";
     return;
@@ -1644,15 +1629,14 @@ function renderWarm(){
   var ws = warmStart(), el = document.getElementById("warm-panel");
   document.getElementById("warm-answer").innerHTML = ws
     ? "The carry-forward mechanism has just switched on; the first retention reading arrives at the next handover."
-    : "Not yet measurable — every round currently starts from scratch, so no progress has been handed forward.";
+    : "Not active yet — every round starts from scratch, so nothing has been handed forward.";
   if(!ws){
     el.innerHTML = '<div class="pending-panel">' +
       '<span class="ph">Not active yet</span>' +
-      '<p>Once the best model becomes everyone&rsquo;s starting line and the first handover happens, ' +
-      'this section shows how much of the accumulated improvement survived. The formula is fixed in ' +
-      'advance so it can&rsquo;t be chosen after the fact: <b>the promoted model&rsquo;s benchmark ' +
-      'score divided by the next round&rsquo;s</b>. Until then a retention figure would be invented, ' +
-      'so none is shown.</p></div>';
+      '<p>This populates once the best model becomes everyone&rsquo;s starting line and the first ' +
+      'handover happens: it will show how much of the accumulated improvement survived, using a ' +
+      'formula fixed in advance — <b>the promoted model&rsquo;s benchmark score divided by the ' +
+      'next round&rsquo;s</b>.</p></div>';
     document.getElementById("warm-when").textContent = "";
     return;
   }
