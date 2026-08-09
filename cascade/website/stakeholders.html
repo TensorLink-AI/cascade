@@ -910,6 +910,32 @@ th.num{text-align:right}
     </details>
   </section>
 
+  <!-- vs the official Toto2 -->
+  <section class="q">
+    <div class="sec-head"><h2>Is it catching the official Toto2?</h2>
+      <span class="when" id="ref-when"></span></div>
+    <p class="answer" id="ref-answer">--</p>
+    <div id="ref-panel"></div>
+    <details>
+      <summary>How the head-to-head is measured</summary>
+      <div class="detail-body">
+        <p>Cascade trains the <b>same Toto2 architecture</b> the official Datadog release uses —
+        the layer shapes are pinned against the official checkpoint&rsquo;s own config — from
+        <b>random initialisation</b>, so no official weights are reused. At each ladder size the
+        comparison is therefore: same model, same size, <b>different training data</b>.</p>
+        <p>Both sides are scored by the <b>identical benchmark battery</b> (GIFT-Eval, BOOM, TIME;
+        CRPS + MASE; pinned data revisions): the official checkpoint is run through the same
+        sidecar as every round checkpoint and published as a reference doc
+        (<code>benchmarks/reference-&lt;size&gt;.json</code>), so no number here is transcribed
+        from a leaderboard. The percentage compares six-score geometric means (lower is better).</p>
+        <p>The fight is deliberately uneven: the official release was trained on its full corpus
+        at full budget, while every Cascade checkpoint is trained under the round&rsquo;s fixed,
+        published compute budget. And as everywhere on this page, these scores are
+        <b>report-only</b> — rounds are still settled on hidden data, never on public benchmarks.</p>
+      </div>
+    </details>
+  </section>
+
   <!-- efficiency -->
   <section class="q">
     <div class="sec-head"><h2>Is the progress worth the compute?</h2>
@@ -1296,7 +1322,7 @@ function scanBench(){
       .then(function(d){
         delete _benchInflight[id]; delete _benchMissing[id];
         _benchReports[id] = d;
-        renderBoard(); renderBench();
+        renderBoard(); renderBench(); renderRef();
       })
       .catch(function(){ delete _benchInflight[id]; _benchMissing[id] = true; });
   });
@@ -1307,8 +1333,18 @@ function scanBench(){
 //            the round's winner: challenger on a dethrone round, king else);
 //   best   — the lowest six-score geomean across every loaded report entry.
 // Falls back to the manifest-embedded king scores when no report has loaded.
+// Which ladder rung a bench entry belongs to: its own size tag when carried,
+// else the size embedded in the checkpoint pointer ("…/king-4m@sha256:…"),
+// else the round's single trained size.
+function entrySizeKey(e, r){
+  var k = rungKey(e && e.size || "");
+  if(!k) k = rungKey((e && (e.checkpoint || e.trained_pointer)) || "");
+  if(!k && r && r.sizes && r.sizes.filter(Boolean).length === 1) k = rungKey(r.sizes[0]);
+  return k;
+}
+
 function benchView(){
-  var rs = scoredRounds(), latest = null, best = null;
+  var rs = scoredRounds(), latest = null, best = null, bySize = {};
   rs.forEach(function(r){
     var rep = _benchReports[String(r.round_id)];
     if(!rep) return;
@@ -1321,6 +1357,10 @@ function benchView(){
       if(g != null && (!best || g < best.geomean))
         best = { geomean:g, six:six, role:String(e.role||""), uid:e.uid,
                  round_id:r.round_id, at:r.published_at };
+      var sk = entrySizeKey(e, r);
+      if(g != null && sk && (!bySize[sk] || g < bySize[sk].geomean))
+        bySize[sk] = { geomean:g, six:six, role:String(e.role||""),
+                       round_id:r.round_id, at:r.published_at };
       if(String(e && e.role || "") === wantRole)
         latest = { six:six, geomean:g, round_id:r.round_id, at:r.published_at, src:"report" };
     });
@@ -1332,7 +1372,88 @@ function benchView(){
       if(six) latest = { six:six, geomean:sixGeomean(six), round_id:null, at:null, src:"manifest" };
     }
   }
-  return { latest:latest, best:best };
+  return { latest:latest, best:best, bySize:bySize };
+}
+
+// ── official-Toto2 reference docs ───────────────────────────────────────────
+// benchmarks/reference-<preset>.json: the OFFICIAL Datadog checkpoint of a
+// ladder size, run through the identical benchmark battery and published by
+// scripts/publish_reference_bench.py. Probed per rung; a missing doc simply
+// means that size's official checkpoint hasn't been benched yet.
+var _refBench = {}, _refMissing = {}, _refInflight = {};
+function scanRefs(retryMissing){
+  LADDER.forEach(function(r){
+    var pid = "toto2-" + r.key;
+    if(_refBench[pid] || _refInflight[pid]) return;
+    if(_refMissing[pid] && !retryMissing) return;
+    _refInflight[pid] = true;
+    fetchJSON("benchmarks/reference-" + pid + ".json", { bust:false })
+      .then(function(d){
+        delete _refInflight[pid]; delete _refMissing[pid];
+        _refBench[pid] = d; renderRef();
+      })
+      .catch(function(){ delete _refInflight[pid]; _refMissing[pid] = true; });
+  });
+}
+
+function renderRef(){
+  var bv = benchView(), el = document.getElementById("ref-panel");
+  var refs = [];
+  LADDER.forEach(function(r){
+    var doc = _refBench["toto2-" + r.key];
+    if(!doc) return;
+    var six = readSix(doc);
+    var g = six ? sixGeomean(six) : (typeof doc.geomean === "number" ? doc.geomean : null);
+    if(g != null) refs.push({ rung:r, doc:doc, geomean:g });
+  });
+
+  if(!refs.length){
+    document.getElementById("ref-answer").innerHTML =
+      "Not yet measured — the official Toto2 checkpoints haven&rsquo;t been run through the battery yet.";
+    el.innerHTML = '<div class="pending-panel">' +
+      '<span class="ph">Awaiting the official baselines</span>' +
+      '<p>Cascade trains the same Toto2 architecture as the official Datadog release, from random ' +
+      'initialisation, at the same ladder of sizes — so each size is a direct head-to-head: same ' +
+      'model, different data. This section populates when the official checkpoints are scored by ' +
+      'the <b>identical benchmark battery</b> and published as reference docs, rather than quoting ' +
+      'anyone&rsquo;s leaderboard numbers.</p></div>';
+    document.getElementById("ref-when").textContent = "";
+    return;
+  }
+
+  var pair = null;   // largest rung where both sides exist — the headline bout
+  var cells = refs.map(function(x){
+    var mine = bv.bySize[x.rung.key];
+    if(!mine) return cell({ k:"vs official · " + x.rung.label, v:"&mdash;",
+      q:"awaiting a Cascade result at this size", state:"off" });
+    var pct = x.geomean / mine.geomean * 100, beaten = pct >= 100;
+    pair = { rung:x.rung, pct:pct, beaten:beaten };
+    return cell({ k:"vs official · " + x.rung.label,
+      v: num(pct,1) + '<span class="u">%</span>',
+      q: beaten ? ("beats official by " + signedPct(pct/100 - 1, 1)) : "of the official score",
+      state: beaten ? "live" : "pend" });
+  });
+
+  document.getElementById("ref-answer").innerHTML = pair
+    ? (pair.beaten
+        ? "<b>Beaten at " + esc(pair.rung.label) + ".</b> Cascade&rsquo;s best " + esc(pair.rung.label) +
+          " checkpoint beats the official Toto2-" + esc(pair.rung.label) + " by <b>" +
+          signedPct(pair.pct/100 - 1, 1) + "</b> on the shared six-score battery."
+        : "Closing in: Cascade&rsquo;s best " + esc(pair.rung.label) + " checkpoint is at <b>" +
+          num(pair.pct,1) + "%</b> of the official Toto2-" + esc(pair.rung.label) +
+          "&rsquo;s score — same architecture, same size, scored by the identical battery.")
+    : "The official baselines are benched; awaiting a comparable Cascade result.";
+
+  var src = refs.map(function(x){
+    return esc(x.doc.source || ("Toto2-" + x.rung.label)) +
+      (x.doc.as_of ? " (" + esc(prettyDay(x.doc.as_of)) + ")" : "");
+  }).join(" · ");
+  el.innerHTML = '<div class="bcells bench-cells">' + cells.join("") + '</div>' +
+    '<p class="lede" style="margin:14px 0 0">Official side: ' + src +
+    ', scored by the same battery as every round checkpoint. Cascade trains from random ' +
+    'initialisation under the round&rsquo;s fixed compute budget.</p>';
+  document.getElementById("ref-when").textContent =
+    pair ? (pair.rung.label + " head-to-head") : "";
 }
 function warmStart(){
   var m = _latest && _latest.manifest;
@@ -1824,6 +1945,11 @@ function renderMethod(){
     ["Biggest model proven",
      "The largest size that has actually produced a judged result. Planning a size doesn&rsquo;t " +
      "count it."],
+    ["Vs official Toto2",
+     "Reference docs (<code>benchmarks/reference-&lt;size&gt;.json</code>): the official Datadog " +
+     "checkpoint of a ladder size, scored by the identical benchmark battery and published by " +
+     "the operator — never a transcribed leaderboard number. The percentage compares six-score " +
+     "geometric means against Cascade&rsquo;s best published checkpoint at that size."],
     ["Compute",
      "Number of training runs times their published budgets. See the note under the chart."],
     ["Progress carried forward",
@@ -1891,7 +2017,7 @@ function renderChrome(){
 
 function renderAll(){
   renderChrome(); renderBoard(); renderCompetition(); renderPerf();
-  renderLadder(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
+  renderLadder(); renderRef(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
 }
 
 document.getElementById("theme-toggle").addEventListener("click", function(){
@@ -1904,7 +2030,12 @@ document.getElementById("theme-toggle").addEventListener("click", function(){
 document.getElementById("theme-toggle").textContent =
   document.documentElement.dataset.theme === "dark" ? "LIGHT" : "DARK";
 
+var _pollN = 0;
 function poll(){
+  _pollN++;
+  // reference docs are static-ish: probe on load, then re-probe misses every
+  // 10th poll (~10 min) so a freshly published baseline appears without a reload
+  scanRefs(_pollN === 1 || _pollN % 10 === 0);
   fetchJSON("receipts/index.json")
     .then(function(d){ _index = collapseByRound(d); _state = "live"; renderAll(); scanBench(); })
     .catch(function(){ _state = "offline"; renderChrome(); });
