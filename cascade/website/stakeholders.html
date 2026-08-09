@@ -796,6 +796,12 @@ th.num{text-align:right}
   text-transform:uppercase;letter-spacing:.07em;color:var(--pending-fg)}
 .pending-panel p{font-size:13.5px;color:var(--muted);max-width:84ch;line-height:1.65}
 .pending-panel p b{color:var(--ink)}
+/* pretraining-completion meter — same visual language as the hero meter */
+.pmeter{display:flex;flex-direction:column;gap:6px;max-width:420px;margin-top:10px}
+.pmeter .ptrack{position:relative;height:6px;border-radius:3px;background:var(--hairline)}
+.pmeter .pfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
+.pmeter .plabels{display:flex;justify-content:space-between;
+  font:600 11px/1 "IBM Plex Mono",monospace;letter-spacing:.04em;color:var(--faint)}
 
 /* benchmark result cells reuse the scoreboard anatomy */
 .bench-cells{max-width:820px}
@@ -966,6 +972,32 @@ th.num{text-align:right}
     </details>
   </section>
 
+  <!-- pretraining completion -->
+  <section class="q">
+    <div class="sec-head"><h2>How much of a full pretraining has the champion had?</h2>
+      <span class="when" id="pretrain-when"></span></div>
+    <p class="answer" id="pretrain-answer">--</p>
+    <div id="pretrain-panel"></div>
+    <details>
+      <summary>How the steps are counted</summary>
+      <div class="detail-body">
+        <p>Every round trains under a <b>fixed, published compute contract</b>: a set token budget
+        per checkpoint (hours &times; reference throughput), at a set global batch size and context
+        length. Steps per round is just that budget divided by tokens per step — nothing here is
+        measured off a training log; it is the contracted spend.</p>
+        <p>The champion&rsquo;s cumulative pretraining counts the latest round plus every
+        consecutive earlier round whose training was <b>warm-started</b> from the previous
+        round&rsquo;s promoted checkpoint (recorded on each round&rsquo;s signed manifest). A round
+        that trained from scratch resets the chain. Until carry-forward is switched on, every
+        chain is exactly one round long — that is stated, not hidden.</p>
+        <p>The target is the <b>official Toto2 release&rsquo;s own step count</b> at the same model
+        size, transcribed from its published training recipe — Cascade aims for a comparable
+        number of training steps at each size. Until that figure is transcribed, the completion
+        bar stays pending rather than guessing.</p>
+      </div>
+    </details>
+  </section>
+
   <!-- efficiency -->
   <section class="q">
     <div class="sec-head"><h2>Is the progress worth the compute?</h2>
@@ -1059,10 +1091,26 @@ var INDEX_MAX_KEEP = 400;
 // (effective date, reference throughput, final-run hours, heat-screen hours);
 // tokens = hours × 3600 × throughput. Verifiable against `git log -p chain.toml`.
 var TOKEN_ERAS = [
-  { from: "0000-00-00", ref_tps: 185000,  train_h: 3.0, heat_h: 0.5, why: "launch contract" },
-  { from: "2026-07-15", ref_tps: 3700000, train_h: 3.0, heat_h: 0.5, why: "L40S pods: 20× token budget, same 3h wall" },
-  { from: "2026-07-26", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, why: "heat screen 0.5h → 1.0h" }
+  { from: "0000-00-00", ref_tps: 185000,  train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "launch contract" },
+  { from: "2026-07-15", ref_tps: 3700000, train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "L40S pods: 20× token budget, same 3h wall" },
+  { from: "2026-07-26", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "heat screen 0.5h → 1.0h" }
 ];
+
+// Official Toto2 pretraining budget per ladder size, in OPTIMISER STEPS — the
+// target Cascade's cumulative per-size training is measured against ("similar
+// number of training steps as the official release at each size"). TRANSCRIBE
+// each value from the Toto 2.0 tech report / model card, with its citation in
+// `source`; null = not yet transcribed and the completion section pends.
+// NEVER estimate these — an invented target would poison the one honest
+// completion number on the page.
+var TOTO2_PRETRAIN = {
+  "4m":   { steps: null, source: "" },
+  "22m":  { steps: null, source: "" },
+  "313m": { steps: null, source: "" },
+  "1b":   { steps: null, source: "" },
+  "2.5b": { steps: null, source: "" },
+  "10b":  { steps: null, source: "" }
+};
 
 // Scaling ladder. The rungs are the roadmap; which of them is VALIDATED is read
 // from the receipts (a rung with at least one judged round). disc = the marker
@@ -1264,6 +1312,37 @@ function roundTokens(r){
   var sizes = (r.sizes && r.sizes.filter(Boolean).length) || 1;
   var entrants = (r.heat && r.heat.n_entrants) || 0;
   return 2 * sizes * e.train_h * 3600 * e.ref_tps + entrants * e.heat_h * 3600 * e.ref_tps;
+}
+
+// One round's optimiser-step budget PER SIZE: the contracted token budget
+// divided by tokens per step (global batch × context length) — every trained
+// size gets the full budget, so this is per-size, not summed across sizes.
+function stepsPerRound(e){
+  return e.train_h * 3600 * e.ref_tps / (e.batch * e.ctx);
+}
+
+// Cumulative pretraining of the CURRENT champion at each trained size: the
+// latest round's step budget, plus the budgets of the consecutive rounds
+// behind it whose runs were warm-started from the previous round's promoted
+// checkpoint (index `warm_start`). A round without the flag trained from
+// scratch — the chain ends there. Until carry-forward is switched on, every
+// chain is honestly one round long.
+function kingPretraining(){
+  var rs = scoredRounds();
+  if(!rs.length) return null;
+  var steps = 0, tokens = 0, n = 0;
+  for(var i = rs.length - 1; i >= 0; i--){
+    var e = eraFor(rs[i].published_at);
+    steps += stepsPerRound(e); tokens += e.train_h * 3600 * e.ref_tps; n++;
+    if(!rs[i].warm_start) break;  // this round started from scratch
+  }
+  return { steps:steps, tokens:tokens, rounds:n };
+}
+function fmtSteps(x){
+  if(x==null || !isFinite(x)) return "--";
+  if(x >= 1e6) return num(x/1e6, x >= 1e7 ? 0 : 1) + "M";
+  if(x >= 1e3) return num(x/1e3, 0) + "k";
+  return num(x, 0);
 }
 
 // Size tag ("toto2-4m", "toto2-313m") → ladder rung key.
@@ -2031,6 +2110,51 @@ function renderWarm(){
   document.getElementById("warm-when").textContent = "Active";
 }
 
+function renderPretrain(){
+  var pt = kingPretraining(), el = document.getElementById("pretrain-panel");
+  var ans = document.getElementById("pretrain-answer");
+  var when = document.getElementById("pretrain-when");
+  if(!pt){
+    ans.innerHTML = "No round has been published yet.";
+    el.innerHTML = ""; when.textContent = "";
+    return;
+  }
+  var tr = topRung();
+  var chained = pt.rounds > 1;
+  ans.innerHTML = "The champion has trained for <b>&asymp;" + fmtSteps(pt.steps) +
+    " optimiser steps</b> at each of its sizes (" + num(pt.tokens/1e9, 0) +
+    "B training tokens per size) — " +
+    (chained
+      ? ("<b>" + pt.rounds + " consecutive rounds</b> carried forward into it.")
+      : "one round&rsquo;s fixed budget. Training does not carry forward between rounds yet, " +
+        "so every champion so far has had exactly one round of pretraining.");
+  when.textContent = chained ? (pt.rounds + " rounds chained") : "1 round";
+
+  // completion vs the official release's own step count at the champion's
+  // largest proven size — only when that target has been transcribed.
+  var key = tr.top ? tr.top.key : null;
+  var tgt = key && TOTO2_PRETRAIN[key];
+  if(tgt && tgt.steps > 0){
+    var frac = Math.max(0, Math.min(1, pt.steps / tgt.steps));
+    el.innerHTML =
+      '<div class="pmeter" title="' +
+        esc(Math.round(pt.steps).toLocaleString() + " of " + tgt.steps.toLocaleString() +
+            " steps (" + (frac*100).toFixed(1) + "% of the official " + tr.top.label +
+            " pretraining) — " + tgt.source) + '">' +
+        '<div class="ptrack"><i class="pfill" style="width:' + (frac*100).toFixed(1) + '%"></i></div>' +
+        '<div class="plabels"><span>' + fmtSteps(pt.steps) + ' steps</span>' +
+        '<span>official ' + esc(tr.top.label) + ': ' + fmtSteps(tgt.steps) + '</span></div>' +
+      '</div>';
+  } else {
+    el.innerHTML = '<div class="pending-panel">' +
+      '<span class="ph">Completion bar pending</span>' +
+      '<p>Cascade targets a <b>similar number of training steps as the official Toto2 release</b> ' +
+      'at each model size. The official per-size step count has not been transcribed from its ' +
+      'published training recipe yet, so no completion percentage is shown — the bar appears ' +
+      'when the target is on the page with its citation, never from a guess.</p></div>';
+  }
+}
+
 // ── render: method + chrome ─────────────────────────────────────────────────
 function renderMethod(){
   var rg = reigns();
@@ -2072,6 +2196,12 @@ function renderMethod(){
      "completion meter&rsquo;s origin is the <b>genesis king</b> benched the same way " +
      "(<code>benchmarks/genesis-&lt;size&gt;.json</code>) — the fixed day-one anchor — falling " +
      "back to the earliest published round result until that lands."],
+    ["Pretraining completion",
+     "Steps per round are the <b>contracted</b> training budget (hours &times; reference " +
+     "throughput &divide; batch &times; context — all published in the training contract), not a " +
+     "measured log. Rounds chain only through the signed manifest&rsquo;s warm-start record; a " +
+     "from-scratch round resets the chain. The target is the official release&rsquo;s own step " +
+     "count at the same size, transcribed with citation — pending until it is."],
     ["Compute",
      "Number of training runs times their published budgets. See the note under the chart."],
     ["Progress carried forward",
@@ -2139,7 +2269,7 @@ function renderChrome(){
 
 function renderAll(){
   renderChrome(); renderBoard(); renderCompetition(); renderPerf();
-  renderLadder(); renderRef(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
+  renderLadder(); renderRef(); renderPretrain(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
 }
 
 document.getElementById("theme-toggle").addEventListener("click", function(){

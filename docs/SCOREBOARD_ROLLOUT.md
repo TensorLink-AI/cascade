@@ -122,7 +122,18 @@ python scripts/publish_reference_bench.py /out/genesis-report.json \
 Until the genesis doc lands, the meter falls back to the earliest
 published round result at that size.
 
-## 5. Verify
+## 5. Pretraining-completion target (one constant, with citation)
+
+The "How much of a full pretraining has the champion had?" section computes
+the Cascade side entirely from the training contract and the signed
+warm-start record — nothing to operate. Its completion bar, however, needs
+the OFFICIAL release's per-size step count: fill `TOTO2_PRETRAIN` in
+`cascade/website/stakeholders.html` with the step count from the Toto 2.0
+tech report / model card and cite it in `source`. A unit test refuses a
+filled value without a citation; until filled the section shows an explicit
+pending state. Never estimate these values.
+
+## 6. Verify
 
 Open the published page and check, in order:
 

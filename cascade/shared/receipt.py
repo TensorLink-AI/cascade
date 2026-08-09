@@ -536,6 +536,12 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "chal_uid": chal_es.uid if chal_es else None,
         "chal_gen_ref": _gen_ref("challenger"),
         "sizes": sizes,
+        # this round's runs initialised from the previous round's promoted
+        # checkpoint (manifest warm_start_ckpt) — the dashboard counts the
+        # consecutive chain of these to state the champion's cumulative
+        # pretraining. Absent/empty = trained from scratch.
+        "warm_start": bool(receipt.manifest.get("warm_start_ckpt")
+                           if isinstance(receipt.manifest, dict) else False),
         "n_participants": len(receipt.participants),
         # verdict headline
         "n_windows": (receipt.eval_context.n_windows if receipt.eval_context

@@ -62,6 +62,17 @@ def test_summarize_scored_receipt_pulls_identities_and_verdict():
     assert json.loads(json.dumps(s)) == s
 
 
+def test_summarize_flags_warm_start_from_manifest():
+    # The dashboard counts consecutive warm-started rounds to state the
+    # champion's cumulative pretraining — the flag must track the manifest's
+    # warm_start_ckpt and default to False (from scratch) when absent.
+    receipt, _k, _c = make_scored_receipt()
+    assert summarize_receipt(receipt)["warm_start"] is False
+    receipt.manifest["warm_start_ckpt"] = (
+        "metro-v1:trained:hippius:ns/king@sha256:" + "a" * 64)
+    assert summarize_receipt(receipt)["warm_start"] is True
+
+
 def test_summarize_rejected_receipt_has_reason_and_empty_verdict():
     receipt = make_rejected_receipt(reason="signature_invalid")
     s = summarize_receipt(receipt)
