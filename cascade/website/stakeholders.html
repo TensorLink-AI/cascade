@@ -796,12 +796,26 @@ th.num{text-align:right}
   text-transform:uppercase;letter-spacing:.07em;color:var(--pending-fg)}
 .pending-panel p{font-size:13.5px;color:var(--muted);max-width:84ch;line-height:1.65}
 .pending-panel p b{color:var(--ink)}
-/* pretraining-completion meter — same visual language as the hero meter */
-.pmeter{display:flex;flex-direction:column;gap:6px;max-width:420px;margin-top:10px}
-.pmeter .ptrack{position:relative;height:6px;border-radius:3px;background:var(--hairline)}
-.pmeter .pfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
-.pmeter .plabels{display:flex;justify-content:space-between;
-  font:600 11px/1 "IBM Plex Mono",monospace;letter-spacing:.04em;color:var(--faint)}
+/* pretraining campaign — one progress row per ladder size, same visual
+   language as the hero meter (thin track, saffron in flight, sage done) */
+.pboard{margin-top:12px}
+.prow{display:grid;grid-template-columns:56px minmax(140px,1fr) minmax(220px,auto);gap:18px;
+  align-items:center;padding:11px 0;border-top:var(--line-faint)}
+.prow:last-child{border-bottom:var(--line-faint)}
+.prow .pz{font-family:var(--font-mono);font-size:14px;font-weight:600;color:var(--faint)}
+.prow.run .pz{color:var(--ink)}
+.prow.full .pz{color:var(--good)}
+.prow .ptrack{position:relative;height:6px;border-radius:3px;background:rgba(126,155,126,.22)}
+.prow .pfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
+.prow.full .pfill{background:var(--accent)}
+.prow .pnote{font-family:var(--font-mono);font-size:11px;letter-spacing:.03em;
+  color:var(--muted);text-align:right;white-space:nowrap}
+.prow.off .pnote,.prow.off .ptrack{opacity:.55}
+.prow.off .pnote{color:var(--faint)}
+@media (max-width:640px){
+  .prow{grid-template-columns:44px 1fr;gap:8px 14px}
+  .prow .pnote{grid-column:1 / -1;text-align:left}
+}
 
 /* benchmark result cells reuse the scoreboard anatomy */
 .bench-cells{max-width:820px}
@@ -990,10 +1004,12 @@ th.num{text-align:right}
         round&rsquo;s promoted checkpoint (recorded on each round&rsquo;s signed manifest). A round
         that trained from scratch resets the chain. Until carry-forward is switched on, every
         chain is exactly one round long — that is stated, not hidden.</p>
-        <p>The target is the <b>official Toto2 release&rsquo;s own step count</b> at the same model
-        size, transcribed from its published training recipe — Cascade aims for a comparable
-        number of training steps at each size. Until that figure is transcribed, the completion
-        bar stays pending rather than guessing.</p>
+        <p>Each ladder size gets its own bar because Cascade&rsquo;s goal at every size is a
+        <b>full Toto2-scale pretraining</b>: the target behind each bar is the official
+        release&rsquo;s own step count at that size, transcribed from its published training
+        recipe. Until a size&rsquo;s figure is transcribed its bar shows the banked steps with the
+        target marked pending — never a guessed percentage. A size with no judged rounds yet
+        reads &ldquo;not started&rdquo;.</p>
       </div>
     </details>
   </section>
@@ -1321,22 +1337,28 @@ function stepsPerRound(e){
   return e.train_h * 3600 * e.ref_tps / (e.batch * e.ctx);
 }
 
-// Cumulative pretraining of the CURRENT champion at each trained size: the
-// latest round's step budget, plus the budgets of the consecutive rounds
-// behind it whose runs were warm-started from the previous round's promoted
-// checkpoint (index `warm_start`). A round without the flag trained from
-// scratch — the chain ends there. Until carry-forward is switched on, every
-// chain is honestly one round long.
-function kingPretraining(){
+// Cumulative pretraining of the CURRENT champion, per ladder size: the latest
+// round's step budget at each size it trained, plus the budgets of the
+// consecutive rounds behind it whose runs were warm-started from the previous
+// round's promoted checkpoint (index `warm_start`). A round without the flag
+// trained from scratch — the chain ends there, and steps from before it do
+// not count (that training was discarded, not carried). Until carry-forward
+// is switched on, every chain is honestly one round long.
+function pretrainBySize(){
   var rs = scoredRounds();
   if(!rs.length) return null;
-  var steps = 0, tokens = 0, n = 0;
+  var by = {}, rounds = 0;
   for(var i = rs.length - 1; i >= 0; i--){
-    var e = eraFor(rs[i].published_at);
-    steps += stepsPerRound(e); tokens += e.train_h * 3600 * e.ref_tps; n++;
-    if(!rs[i].warm_start) break;  // this round started from scratch
+    var r = rs[i], sp = stepsPerRound(eraFor(r.published_at));
+    var seen = {};
+    (r.sizes || []).forEach(function(s){
+      var k = rungKey(s);
+      if(k && !seen[k]){ seen[k] = 1; by[k] = (by[k] || 0) + sp; }
+    });
+    rounds++;
+    if(!r.warm_start) break;  // this round started from scratch
   }
-  return { steps:steps, tokens:tokens, rounds:n };
+  return { by:by, rounds:rounds };
 }
 function fmtSteps(x){
   if(x==null || !isFinite(x)) return "--";
@@ -2111,7 +2133,7 @@ function renderWarm(){
 }
 
 function renderPretrain(){
-  var pt = kingPretraining(), el = document.getElementById("pretrain-panel");
+  var pt = pretrainBySize(), el = document.getElementById("pretrain-panel");
   var ans = document.getElementById("pretrain-answer");
   var when = document.getElementById("pretrain-when");
   if(!pt){
@@ -2119,40 +2141,68 @@ function renderPretrain(){
     el.innerHTML = ""; when.textContent = "";
     return;
   }
-  var tr = topRung();
-  var chained = pt.rounds > 1;
-  ans.innerHTML = "The champion has trained for <b>&asymp;" + fmtSteps(pt.steps) +
-    " optimiser steps</b> at each of its sizes (" + num(pt.tokens/1e9, 0) +
-    "B training tokens per size) — " +
-    (chained
-      ? ("<b>" + pt.rounds + " consecutive rounds</b> carried forward into it.")
-      : "one round&rsquo;s fixed budget. Training does not carry forward between rounds yet, " +
-        "so every champion so far has had exactly one round of pretraining.");
-  when.textContent = chained ? (pt.rounds + " rounds chained") : "1 round";
+  var tr = topRung(), chained = pt.rounds > 1;
+  var topKey = tr.top ? tr.top.key : null;
+  var topSteps = topKey ? (pt.by[topKey] || 0) : 0;
 
-  // completion vs the official release's own step count at the champion's
-  // largest proven size — only when that target has been transcribed.
-  var key = tr.top ? tr.top.key : null;
-  var tgt = key && TOTO2_PRETRAIN[key];
-  if(tgt && tgt.steps > 0){
-    var frac = Math.max(0, Math.min(1, pt.steps / tgt.steps));
-    el.innerHTML =
-      '<div class="pmeter" title="' +
-        esc(Math.round(pt.steps).toLocaleString() + " of " + tgt.steps.toLocaleString() +
-            " steps (" + (frac*100).toFixed(1) + "% of the official " + tr.top.label +
-            " pretraining) — " + tgt.source) + '">' +
-        '<div class="ptrack"><i class="pfill" style="width:' + (frac*100).toFixed(1) + '%"></i></div>' +
-        '<div class="plabels"><span>' + fmtSteps(pt.steps) + ' steps</span>' +
-        '<span>official ' + esc(tr.top.label) + ': ' + fmtSteps(tgt.steps) + '</span></div>' +
-      '</div>';
+  // the campaign board: every ladder size gets a row — steps banked toward a
+  // full Toto2-scale pretraining at that size, against the transcribed target
+  var anyTarget = false;
+  var rows = LADDER.map(function(r){
+    var steps = pt.by[r.key] || 0;
+    var tgt = TOTO2_PRETRAIN[r.key];
+    var t = (tgt && tgt.steps > 0) ? tgt.steps : null;
+    if(t) anyTarget = true;
+    var full = t != null && steps >= t;
+    var cls = full ? "full" : (steps > 0 ? "run" : "off");
+    var fill = t != null ? Math.max(0, Math.min(1, steps / t)) : 0;
+    var note;
+    if(steps <= 0) note = "not started";
+    else if(t != null) note = fmtSteps(steps) + " / " + fmtSteps(t) + " steps · " +
+      (full ? "target reached" : num(fill*100, fill < 0.1 ? 1 : 0) + "%");
+    else note = fmtSteps(steps) + " steps · target pending";
+    var title = t != null
+      ? Math.round(steps).toLocaleString() + " of " + Math.round(t).toLocaleString() +
+        " steps — target from: " + (tgt.source || "")
+      : Math.round(steps).toLocaleString() + " steps banked; official " + r.label +
+        " step count not yet transcribed";
+    return '<div class="prow ' + cls + '" title="' + esc(title) + '">' +
+      '<span class="pz">' + esc(r.label) + '</span>' +
+      '<div class="ptrack"><i class="pfill" style="width:' + (fill*100).toFixed(1) + '%"></i></div>' +
+      '<span class="pnote">' + note + '</span></div>';
+  });
+  el.innerHTML = '<div class="pboard">' + rows.join("") + '</div>' +
+    (anyTarget ? "" :
+      '<div class="pending-panel" style="margin-top:12px">' +
+      '<span class="ph">Targets pending</span>' +
+      '<p>Cascade trains to a <b>similar number of steps as the official Toto2 release</b> at ' +
+      'each size, so each bar&rsquo;s target is the official release&rsquo;s own step count — ' +
+      'transcribed from its published training recipe with a citation, never estimated. The ' +
+      'bars fill in as soon as those figures are on the page.</p></div>');
+
+  // headline: the overall campaign when every target is transcribed, else the
+  // current size's banked steps
+  var allT = LADDER.every(function(r){
+    var t = TOTO2_PRETRAIN[r.key]; return t && t.steps > 0; });
+  var chainNote = chained
+    ? "<b>" + pt.rounds + " consecutive rounds</b> carried forward"
+    : "one round&rsquo;s fixed budget — training does not carry forward between rounds yet";
+  if(allT){
+    var got = 0, want = 0;
+    LADDER.forEach(function(r){
+      var t = TOTO2_PRETRAIN[r.key].steps;
+      got += Math.min(pt.by[r.key] || 0, t); want += t; });
+    ans.innerHTML = "The full 4M&rarr;10B ladder is <b>" + num(got/want*100, got/want < 0.1 ? 1 : 0) +
+      "% pretrained</b> against the official Toto2 step budgets. At the current size" +
+      (tr.top ? " (" + esc(tr.top.label) + ")" : "") + " the champion has banked <b>&asymp;" +
+      fmtSteps(topSteps) + " steps</b>: " + chainNote + ".";
   } else {
-    el.innerHTML = '<div class="pending-panel">' +
-      '<span class="ph">Completion bar pending</span>' +
-      '<p>Cascade targets a <b>similar number of training steps as the official Toto2 release</b> ' +
-      'at each model size. The official per-size step count has not been transcribed from its ' +
-      'published training recipe yet, so no completion percentage is shown — the bar appears ' +
-      'when the target is on the page with its citation, never from a guess.</p></div>';
+    ans.innerHTML = "The champion has banked <b>&asymp;" + fmtSteps(topSteps) +
+      " optimiser steps</b>" + (tr.top ? " at " + esc(tr.top.label) : "") + " — " + chainNote +
+      ". Each size&rsquo;s goal is a full Toto2-scale pretraining: roughly the official " +
+      "release&rsquo;s own step count, banked round by round once training carries forward.";
   }
+  when.textContent = chained ? (pt.rounds + " rounds chained") : "1 round";
 }
 
 // ── render: method + chrome ─────────────────────────────────────────────────
