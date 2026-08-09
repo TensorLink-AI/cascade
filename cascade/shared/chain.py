@@ -365,6 +365,46 @@ class ChainClient:
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
 
+    def subnet_economics(self) -> dict | None:
+        """Live pool economics for the netuid, or None when unavailable.
+
+        Reads the subnet's ``DynamicInfo`` and returns::
+
+            {"alpha_price_tao": float,          # TAO per alpha (pool price)
+             "tao_in_emission_per_day": float,  # TAO/block injected × 7200
+             "as_of_block": int}
+
+        Presentational only (feeds ``status/chain.json`` for the dashboards) —
+        returns None instead of raising on any shape drift or chain flake, so
+        a publisher can simply omit the field. Balance-typed fields are read
+        via their ``.tao`` accessor with a float() fallback.
+        """
+        BLOCKS_PER_DAY = 86400 / 12.0  # bittensor block time is 12s
+
+        def _tao(v: object) -> float | None:
+            try:
+                return float(getattr(v, "tao", v))
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            sub = self.subtensor()
+            dyn = sub.subnet(self.netuid)
+            if dyn is None:
+                return None
+            price = _tao(getattr(dyn, "price", None))
+            tao_in = _tao(getattr(dyn, "tao_in_emission", None))
+            if price is None and tao_in is None:
+                return None
+            out: dict = {"as_of_block": int(sub.get_current_block())}
+            if price is not None:
+                out["alpha_price_tao"] = price
+            if tao_in is not None:
+                out["tao_in_emission_per_day"] = tao_in * BLOCKS_PER_DAY
+            return out
+        except Exception:  # noqa: BLE001 — telemetry only, never disturb callers
+            return None
+
     def uid_for_hotkey(self, hotkey: str) -> int | None:
         """Resolve a hotkey to its UID on the netuid, or None if absent."""
         sub = self.subtensor()

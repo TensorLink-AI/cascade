@@ -99,6 +99,25 @@ def test_token_eras_current_row_matches_training_contract(html: str):
     assert current["ref_tps"] == cfg.training.ref_throughput_tokens_per_s
     assert current["train_h"] == pytest.approx(cfg.training.target_train_hours)
     assert current["heat_h"] == pytest.approx(cfg.round.heat_train_hours)
+    # the pretraining-completion section divides the token budget by these
+    assert current["batch"] == cfg.training.batch_size
+    assert current["ctx"] == cfg.training.context_length
+
+
+def test_toto2_pretrain_targets_are_cited_or_null(html: str):
+    """The pretraining-completion target is transcribed from the official
+    release's published recipe. A filled step count without a citation (or a
+    zero/negative one) is an invented number — refuse it here, before it ships."""
+    m = re.search(r"var TOTO2_PRETRAIN = \{(.*?)\n\};", html, re.S)
+    assert m, "TOTO2_PRETRAIN table not found"
+    rows = re.findall(r'"([^"]+)":\s*\{\s*steps:\s*(null|[\d_.e]+),\s*source:\s*"([^"]*)"',
+                      m.group(1))
+    assert rows, "no TOTO2_PRETRAIN rows parsed"
+    for key, steps, source in rows:
+        if steps == "null":
+            continue
+        assert float(steps) > 0, f"{key}: non-positive step target"
+        assert source.strip(), f"{key}: step target filled without a citation"
 
 
 def test_page_reads_only_fields_the_summary_publishes(html: str):
@@ -109,7 +128,7 @@ def test_page_reads_only_fields_the_summary_publishes(html: str):
     consumed = {
         "status", "round_id", "epoch_start_block", "dethroned", "inconclusive",
         "king_geomean", "chal_geomean", "lcb", "margin", "sizes", "heat",
-        "king_hotkey", "king_uid", "king_gen_ref",
+        "king_hotkey", "king_uid", "king_gen_ref", "warm_start",
         "chal_hotkey", "chal_uid", "chal_gen_ref", "validator_hotkey",
     }
     missing = consumed - set(summary)
@@ -121,11 +140,12 @@ def test_page_reads_only_fields_the_summary_publishes(html: str):
 
 
 def test_pending_states_are_explicit(html: str):
-    """The three not-yet-measurable metrics must render an explicit pending
+    """Metrics that cannot be measured yet must render an explicit pending
     state rather than a placeholder number — the whole page's credibility rests
     on never showing a figure nobody can check."""
-    assert "Pending public benchmark" in html
-    assert "Not switched on yet" in html
+    lower = html.lower()
+    assert "awaiting first result" in lower, "public benchmark must pend explicitly"
+    assert "not active yet" in lower, "carry-forward must pend explicitly"
     for phrase in ("bench_scores", "warm_start_ckpt"):
         assert phrase in html, f"page must key its pending state off {phrase}"
 
