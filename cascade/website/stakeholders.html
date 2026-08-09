@@ -1390,14 +1390,13 @@ function scanRefs(retryMissing){
     fetchJSON("benchmarks/reference-" + pid + ".json", { bust:false })
       .then(function(d){
         delete _refInflight[pid]; delete _refMissing[pid];
-        _refBench[pid] = d; renderRef();
+        _refBench[pid] = d; renderRef(); renderBoard();
       })
       .catch(function(){ delete _refInflight[pid]; _refMissing[pid] = true; });
   });
 }
 
-function renderRef(){
-  var bv = benchView(), el = document.getElementById("ref-panel");
+function refDocs(){
   var refs = [];
   LADDER.forEach(function(r){
     var doc = _refBench["toto2-" + r.key];
@@ -1406,6 +1405,25 @@ function renderRef(){
     var g = six ? sixGeomean(six) : (typeof doc.geomean === "number" ? doc.geomean : null);
     if(g != null) refs.push({ rung:r, doc:doc, geomean:g });
   });
+  return refs;
+}
+// The headline bout: the largest rung where an official baseline AND a
+// comparable Cascade result both exist. This is what the scoreboard tile
+// leads with — the rallying number.
+function refPair(bv, refs){
+  var pair = null;
+  (refs || refDocs()).forEach(function(x){
+    var mine = bv.bySize[x.rung.key];
+    if(!mine) return;
+    var pct = x.geomean / mine.geomean * 100;
+    pair = { rung:x.rung, pct:pct, beaten:pct >= 100 };
+  });
+  return pair;
+}
+
+function renderRef(){
+  var bv = benchView(), el = document.getElementById("ref-panel");
+  var refs = refDocs();
 
   if(!refs.length){
     document.getElementById("ref-answer").innerHTML =
@@ -1421,13 +1439,12 @@ function renderRef(){
     return;
   }
 
-  var pair = null;   // largest rung where both sides exist — the headline bout
+  var pair = refPair(bv, refs);
   var cells = refs.map(function(x){
     var mine = bv.bySize[x.rung.key];
     if(!mine) return cell({ k:"vs official · " + x.rung.label, v:"&mdash;",
       q:"awaiting a Cascade result at this size", state:"off" });
     var pct = x.geomean / mine.geomean * 100, beaten = pct >= 100;
-    pair = { rung:x.rung, pct:pct, beaten:beaten };
     return cell({ k:"vs official · " + x.rung.label,
       v: num(pct,1) + '<span class="u">%</span>',
       q: beaten ? ("beats official by " + signedPct(pct/100 - 1, 1)) : "of the official score",
@@ -1503,11 +1520,24 @@ function renderBoard(){
       state: tr.top ? "live" : "pend" })
   ];
   var row2 = [
-    cell({ k:"Public benchmark",
-      v: bv.latest ? num(bv.latest.six.gifteval_mase,3) : "&mdash;",
-      q: bv.latest ? ((bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval")
-                   : "awaiting first result",
-      state: bv.latest ? (bv.latest.six.gifteval_mase<1 ? "live" : "warn") : "pend" }),
+    // The rallying metric leads the validation row: the head-to-head against
+    // the official Toto2 at the same size. Until an official baseline is
+    // benched, the cell falls back to the leader's GIFT-Eval score, then to
+    // an honest pending state. Full detail lives in the two bench sections.
+    (function(){
+      var pr = refPair(bv);
+      if(pr) return cell({ k:"Vs official Toto2",
+        v: num(pr.pct,1) + '<span class="u">%</span>',
+        q: pr.beaten ? ("beats official · " + pr.rung.label)
+                     : ("of official score · " + pr.rung.label),
+        state: pr.beaten ? "live" : "pend" });
+      if(bv.latest) return cell({ k:"Public benchmark",
+        v: num(bv.latest.six.gifteval_mase,3),
+        q: (bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval",
+        state: bv.latest.six.gifteval_mase<1 ? "live" : "warn" });
+      return cell({ k:"Public benchmark", v:"&mdash;",
+        q:"awaiting first result", state:"pend" });
+    })(),
     cell({ k:"Compute efficiency",
       v: eff!=null ? signedPct(eff,2) : "&mdash;",
       q: eff!=null ? "per trillion tokens" : "awaiting first verified gain",
