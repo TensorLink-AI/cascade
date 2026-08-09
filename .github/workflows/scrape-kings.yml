@@ -23,9 +23,16 @@
 #     Anonymous pull covers public repos only, and while king generators are
 #     public by design, the generators/ sweep archives EVERY participant ref
 #     from the round receipts — and miners do commit private Hub repos (e.g.
-#     cascade-private/*). Without the token each private ref fails on every
-#     run and the job exits 1.
+#     cascade-private/*). Without the token every private ref is unfetchable.
 #   HF_TOKEN (optional)                             same, for private `@hf:` refs.
+#
+# A RED run means something retryable broke (the Hub was down, R2 creds expired)
+# — act on it. Generators the miner has since DELETED or made private are not a
+# failure and do not fail the job: they can never be fetched again, so the
+# scraper records them in generators/index.json under `unavailable`, stops
+# retrying after a few runs, and prints a note on an otherwise green run. Re-run
+# via workflow_dispatch with retry_unavailable to give those refs another go
+# (e.g. after widening HIPPIUS_HUB_TOKEN, or when a miner republishes).
 #
 # Use ONE scraper only — two concurrent runs would race on the index.json dbs
 # (the concurrency group below already serialises this workflow's own runs).
@@ -43,6 +50,10 @@ on:
         default: mainnet
       dry_run:
         description: "List what would be archived without writing anything"
+        type: boolean
+        default: false
+      retry_unavailable:
+        description: "Re-try generators parked as deleted/private upstream"
         type: boolean
         default: false
 
@@ -83,6 +94,7 @@ jobs:
         env:
           NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          RETRY_UNAVAILABLE: ${{ github.event.inputs.retry_unavailable || 'false' }}
         run: |
           if [ -z "$BACKUP_S3_ACCESS_KEY" ]; then
             echo "::error::BACKUP_S3_ACCESS_KEY not set — cannot write the R2 king archive."
@@ -94,6 +106,7 @@ jobs:
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           FLAGS=""
-          [ "$DRY_RUN" = "true" ] && FLAGS="--dry-run"
+          [ "$DRY_RUN" = "true" ] && FLAGS="$FLAGS --dry-run"
+          [ "$RETRY_UNAVAILABLE" = "true" ] && FLAGS="$FLAGS --retry-unavailable"
           echo "scraping kings + generator snapshots with $TOML $FLAGS"
           python scripts/scrape_kings.py --chain-toml "$TOML" $FLAGS

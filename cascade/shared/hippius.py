@@ -356,6 +356,61 @@ def _is_retryable_hub_error(exc: BaseException) -> bool:
     return any(sub in text for sub in _RETRYABLE_HUB_ERROR_SUBSTRINGS)
 
 
+# ─────────────── will this ref EVER fetch? (archiver's question) ─────────────
+# `_is_retryable_hub_error` answers "should this call try again in two seconds?".
+# A long-lived archiver needs the coarser question: is the upstream object still
+# there at all? A miner may delete a Hub repo or flip it private at any moment,
+# and the content-addressed digest we hold is then unfetchable *forever* — so a
+# daily job that retries it every run burns network and, worse, fails every run
+# on a condition no operator can act on.
+FETCH_TRANSIENT = "transient"   # network blip / 5xx — retry, and stay loud
+FETCH_GONE = "gone"             # 404 / deleted revision — no credential recovers it
+FETCH_PRIVATE = "private"       # 401 / 403 — someone else's private repo
+
+# Matched against the lower-cased "Type: message". These carry their own quoting
+# or wording rather than a bare status number ON PURPOSE: HuggingFace error text
+# embeds a hex request id, and a bare "403" cheerfully matches inside
+# `Root=1-6a7810bf-202c13b5342efbca4385891c`.
+_GONE_ERROR_SUBSTRINGS = (
+    "not found in repository",      # hippius_hub: the revision was deleted
+    "repository not found", "revision not found",
+    "repositorynotfound", "revisionnotfound", "entrynotfound",
+    "404 client error",             # huggingface_hub
+    "'404 not found'",              # httpx: Client error '404 Not Found' for url '…'
+)
+_PRIVATE_ERROR_SUBSTRINGS = (
+    "'401 unauthorized'", "'403 forbidden'",   # httpx, via hippius_hub
+    "401 client error", "403 client error",    # huggingface_hub
+    "gatedrepo", "is gated", "awaiting a review",
+)
+
+
+def classify_fetch_failure(exc: BaseException) -> str:
+    """Coarse verdict on a failed Hub/HF fetch: is this ref worth retrying?
+
+    Returns :data:`FETCH_GONE` (the upstream object no longer resolves),
+    :data:`FETCH_PRIVATE` (it resolves, but not for the credentials we hold), or
+    :data:`FETCH_TRANSIENT` for everything else. An unrecognised error is
+    TRANSIENT deliberately: an archiver must keep retrying — and keep
+    complaining about — a failure it does not understand.
+
+    GONE means "unfetchable with the credentials we hold", not "provably
+    deleted": HuggingFace answers 404 for a private repo the caller cannot see,
+    so the two permanent verdicts differ only in which story upstream told. Both
+    are permanent as far as the archive is concerned.
+    """
+    if isinstance(exc, HubAuthError):
+        return FETCH_PRIVATE
+    if _is_retryable_hub_error(exc):
+        return FETCH_TRANSIENT
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(sub in text for sub in _PRIVATE_ERROR_SUBSTRINGS):
+        return FETCH_PRIVATE
+    if any(sub in text for sub in _GONE_ERROR_SUBSTRINGS):
+        return FETCH_GONE
+    return FETCH_TRANSIENT
+
+
 def _retry_hub_op(op, what: str, *, attempts: int = HUB_MAX_ATTEMPTS,
                   base_delay: float = HUB_BACKOFF_BASE_S, sleep=time.sleep):
     """Run ``op`` (a Hub upload/download), retrying transient network failures.
