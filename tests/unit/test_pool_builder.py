@@ -112,6 +112,25 @@ def test_collect_per_domain_cap():
     assert len(records) == 2 and drops["domain_cap"] == 3
 
 
+def test_collect_per_domain_freq_cell_cap():
+    """The cell cap is keyed on (domain, freq): an hourly flood hits the cap
+    while the same domain's daily series pass untouched."""
+    hourly = [
+        _series(f"h{i}", base=10 + np.sin(np.arange(600) / (5.0 + i))) for i in range(4)
+    ]
+    daily = [
+        _series(f"d{i}", freq="D", seasonal=7, base=20 + np.cos(np.arange(600) / (7.0 + i)))
+        for i in range(2)
+    ]
+    cfg = PoolBuildConfig(
+        context_length=512, horizon=16, min_context=64, max_series_per_domain_freq=2
+    )
+    records, drops = collect_records([_ListSource(hourly + daily)], CTX, cfg, fetch=None)
+    kept = sorted(r.series_id for r in records)
+    assert kept == ["d0", "d1", "h0", "h1"]  # 2 per cell; daily cell unaffected
+    assert drops["domain_freq_cap"] == 2
+
+
 # ── write + round-trip through the validator loader ─────────────────────────
 
 

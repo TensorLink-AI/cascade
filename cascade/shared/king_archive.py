@@ -50,11 +50,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .hippius import (
+    FETCH_GONE,
+    FETCH_PRIVATE,
+    FETCH_TRANSIENT,
     HubConfig,
     HubRef,
     S3Config,
     S3Store,
     StorageError,
+    classify_fetch_failure,
     fetch_from_hub,
     is_hub_ref,
     pack_dir_to_tar,
@@ -67,6 +71,18 @@ KING_INDEX_SCHEMA = 1
 
 GENERATOR_INDEX_KEY = "generators/index.json"
 GENERATOR_INDEX_SCHEMA = 1
+
+# How many runs a PERMANENTLY unfetchable generator is retried before the
+# archive parks it. Miners delete repos and flip them private, and the digest we
+# hold is then dead — but not always for good: identical content re-uploaded to
+# the Hub lands on the same content-addressed digest, and a private repo can be
+# made public again. So spend a few runs of grace, then stop. Without a stop the
+# daily job re-fails on a growing pile of tombstones every run and its exit code
+# stops carrying information. ``retry_unavailable=True`` un-parks them for a run.
+UNAVAILABLE_MAX_ATTEMPTS = 3
+
+# Cap on the stored error text: the db is a record, not a log.
+_MAX_ERROR_CHARS = 240
 
 
 # ───────────────────────────── who was king (pure) ──────────────────────────
@@ -433,13 +449,24 @@ def _merge_generator_attribution(old: dict, new: dict) -> dict:
 
 @dataclass
 class SyncResult:
-    """Outcome of a :func:`sync_kings` / :func:`sync_generators` run."""
+    """Outcome of a :func:`sync_kings` / :func:`sync_generators` run.
+
+    ``failed`` and ``unavailable`` split what used to be one bucket, because
+    they need opposite responses: ``failed`` is a RETRYABLE error (the Hub was
+    down, the network flaked) and should page someone; ``unavailable`` is a
+    generator whose upstream is gone or private, which no amount of re-running
+    fixes and which the archive simply records.
+    """
 
     archived: int = 0          # generators fetched + uploaded this run
     skipped: int = 0           # already-archived (metadata refreshed only)
     would_archive: int = 0     # dry-run: generators that WOULD be fetched + uploaded
     rounds_scanned: int = 0    # sync_generators: receipts newly read this run
-    failed: list[str] = field(default_factory=list)   # gen_refs that errored
+    failed: list[str] = field(default_factory=list)   # transient errors — retry, alarm
+    # Permanently unfetchable, one dict per ref: {ref, reason, error, attempts,
+    # first_failed_at, last_failed_at}. Includes refs already parked (not
+    # re-attempted this run) as well as ones that just turned permanent.
+    unavailable: list[dict] = field(default_factory=list)
     index: dict = field(default_factory=dict)         # the written index.json
 
     @property
@@ -449,6 +476,44 @@ class SyncResult:
     @property
     def total_generators(self) -> int:
         return len(self.index.get("generators", []))
+
+
+def _note_unavailable(entry: dict, reason: str, exc: BaseException, when: str) -> dict:
+    """Stamp (or refresh) an entry's ``unavailable`` tombstone and return it.
+
+    ``attempts`` counts RUNS this ref has failed on for THIS reason, not HTTP
+    attempts — it is what :func:`_is_parked` spends. A ref whose verdict changes
+    (a flaky Hub that later answers a clean 404) starts a fresh count, so the
+    grace period always measures the condition actually being waited out;
+    ``first_failed_at`` then dates that condition, not the first hiccup.
+    """
+    prior = entry.get("unavailable") or {}
+    if prior.get("reason") != reason:
+        prior = {}
+    error = " ".join(str(exc).split())[:_MAX_ERROR_CHARS]
+    note = {
+        "reason": reason,
+        "error": error,
+        "attempts": int(prior.get("attempts", 0) or 0) + 1,
+        "first_failed_at": prior.get("first_failed_at") or (when or None),
+        "last_failed_at": when or None,
+    }
+    entry["unavailable"] = note
+    return note
+
+
+def _is_parked(entry: dict, *, retry_unavailable: bool = False) -> bool:
+    """True when an entry's PERMANENT failure has been retried enough times.
+
+    A parked entry is skipped without a fetch. Transient failures never park —
+    they are the ones an operator can actually fix, so they keep retrying and
+    keep the run's exit code red.
+    """
+    if retry_unavailable or entry.get("tar_sha256"):
+        return False
+    note = entry.get("unavailable") or {}
+    return (note.get("reason") in (FETCH_GONE, FETCH_PRIVATE)
+            and int(note.get("attempts", 0) or 0) >= UNAVAILABLE_MAX_ATTEMPTS)
 
 
 def king_archive_config(storage: object) -> tuple[S3Config, str, str]:
@@ -492,6 +557,7 @@ def sync_kings(
     bucket: str,
     dry_run: bool = False,
     updated_at: str = "",
+    retry_unavailable: bool = False,
     fetch=fetch_from_hub,
     pack=pack_dir_to_tar,
     tmp_root: str | None = None,
@@ -505,6 +571,14 @@ def sync_kings(
     generator is fetched from the Hub, packed to a deterministic tar, and written
     to ``archive_store`` under a content-addressed key. Finally the merged
     ``kings/index.json`` "db" is written back (skipped on ``dry_run``).
+
+    A king whose upstream repo has been deleted or made private is recorded as a
+    TOMBSTONE — an index entry with no tar and an ``unavailable`` note — rather
+    than dropped: the db's job is to say who reigned, and "reigned, code lost"
+    is a fact worth keeping. It is retried :data:`UNAVAILABLE_MAX_ATTEMPTS`
+    times, then parked (``retry_unavailable=True`` un-parks it for one run). A
+    transient failure is never tombstoned: it lands in ``failed`` and retries
+    forever, because that one an operator can fix.
 
     ``fetch`` / ``pack`` are injectable so the whole flow unit-tests without a
     Hub or S3 endpoint. Returns a :class:`SyncResult`.
@@ -536,14 +610,27 @@ def sync_kings(
             base = _merge_attribution(old, base)
             base["archive_key"] = key
             base["archive_url"] = url
+            if old.get("unavailable"):
+                # _attribution_fields rebuilds the throne history from scratch;
+                # the tombstone is archive state and has to be carried across.
+                base["unavailable"] = dict(old["unavailable"])
         already = bool(old and old.get("tar_sha256"))
         if already:
             # Content-addressed ⇒ the tar is immutable; keep it, refresh metadata.
             base["tar_sha256"] = old.get("tar_sha256")
             base["size_bytes"] = old.get("size_bytes")
             base["archived_at"] = old.get("archived_at") or updated_at
+            base.pop("unavailable", None)
             merged[gen_ref] = base
             result.skipped += 1
+            continue
+
+        # Checked before the dry-run branch on purpose: a parked ref is not
+        # something the next real run "would archive", so a dry run must not
+        # claim it is.
+        if _is_parked(base, retry_unavailable=retry_unavailable):
+            merged[gen_ref] = base
+            result.unavailable.append({"ref": gen_ref, **base["unavailable"]})
             continue
 
         if dry_run:
@@ -564,14 +651,25 @@ def sync_kings(
             base["tar_sha256"] = sha
             base["size_bytes"] = len(tar_bytes)
             base["archived_at"] = updated_at
+            base.pop("unavailable", None)      # it fetched; the tombstone is stale
             merged[gen_ref] = base
             result.archived += 1
             log(f"archived {gen_ref} -> {key} ({len(tar_bytes)} bytes, sha256 {sha[:12]}…)")
         except (StorageError, OSError) as e:
-            log(f"FAILED {gen_ref}: {type(e).__name__}: {e}")
-            result.failed.append(gen_ref)
-            # A transient failure never drops a king already recorded in the db:
-            # its prior entry is still in `merged` from the seed above.
+            reason = classify_fetch_failure(e)
+            log(f"FAILED[{reason}] {gen_ref}: {type(e).__name__}: {e}")
+            if reason == FETCH_TRANSIENT:
+                result.failed.append(gen_ref)
+                # A transient failure never drops a king already recorded in the
+                # db: its prior entry is still in `merged` from the seed above,
+                # and no tombstone is written for a condition that may clear.
+                continue
+            note = _note_unavailable(base, reason, e, updated_at)
+            base.setdefault("tar_sha256", None)
+            base.setdefault("size_bytes", None)
+            base.setdefault("archived_at", None)
+            merged[gen_ref] = base
+            result.unavailable.append({"ref": gen_ref, **note})
 
     entries = sorted(merged.values(),
                      key=lambda e: (int(e.get("first_epoch_start_block", 0)),
@@ -606,6 +704,7 @@ def sync_generators(
     bucket: str,
     dry_run: bool = False,
     updated_at: str = "",
+    retry_unavailable: bool = False,
     fetch=fetch_from_hub,
     pack=pack_dir_to_tar,
     tmp_root: str | None = None,
@@ -619,10 +718,19 @@ def sync_generators(
     submissions group together. Walks the receipt index, follows each
     not-yet-scanned round's ``receipt_key`` to the full receipt, and archives
     every ``participants[].gen_ref`` — kings, challengers, and everyone the heat
-    screened out alike. Content-addressed and append-only like the kings dir; an
-    entry that previously failed to fetch (no ``tar_sha256``) is retried on
-    every run until it lands, and successfully scanned rounds are recorded in
-    the db so their receipts are never re-read.
+    screened out alike. Content-addressed and append-only like the kings dir,
+    and successfully scanned rounds are recorded in the db so their receipts are
+    never re-read.
+
+    An entry that failed to fetch (no ``tar_sha256``) is retried on every run
+    UNLESS the failure is permanent — a deleted repo, a private one — in which
+    case it carries an ``unavailable`` tombstone and is parked after
+    :data:`UNAVAILABLE_MAX_ATTEMPTS` runs. This is the common case at scale:
+    miners routinely delete or privatise old generator repos, and without
+    parking every later run re-fetches a growing pile of dead refs and reports
+    failure for something no operator can fix. ``retry_unavailable=True`` gives
+    the parked entries one more run (use it after a token widens, or when a
+    miner republishes).
 
     Writes ``generators/index.json`` (skipped on ``dry_run``; a dry run also
     leaves ``scanned_rounds`` unrecorded). Returns a :class:`SyncResult`.
@@ -657,6 +765,10 @@ def sync_generators(
             for k in ("tar_sha256", "size_bytes", "archived_at"):
                 if old.get(k) is not None:
                     base[k] = old[k]
+            if old.get("unavailable"):
+                # Archive state, not participation history — carry it across the
+                # rebuild or every run would look like the first failure.
+                base["unavailable"] = dict(old["unavailable"])
         merged[pair] = base
 
     for (hotkey, gen_ref), entry in merged.items():
@@ -668,7 +780,12 @@ def sync_generators(
         entry["archive_url"] = archive_url(endpoint, bucket, key)
 
         if entry.get("tar_sha256"):
+            entry.pop("unavailable", None)
             result.skipped += 1
+            continue
+
+        if _is_parked(entry, retry_unavailable=retry_unavailable):
+            result.unavailable.append({"ref": f"{hotkey}:{gen_ref}", **entry["unavailable"]})
             continue
 
         if dry_run:
@@ -688,12 +805,20 @@ def sync_generators(
             entry["tar_sha256"] = sha
             entry["size_bytes"] = len(tar_bytes)
             entry["archived_at"] = updated_at
+            entry.pop("unavailable", None)     # it fetched; the tombstone is stale
             result.archived += 1
             log(f"snapshotted {gen_ref} -> {key} ({len(tar_bytes)} bytes, sha256 {sha[:12]}…)")
         except (StorageError, OSError) as e:
-            log(f"FAILED {hotkey} {gen_ref}: {type(e).__name__}: {e}")
-            result.failed.append(f"{hotkey}:{gen_ref}")
-            # Entry stays in the db without tar_sha256 ⇒ retried next run.
+            reason = classify_fetch_failure(e)
+            log(f"FAILED[{reason}] {hotkey} {gen_ref}: {type(e).__name__}: {e}")
+            note = _note_unavailable(entry, reason, e, updated_at)
+            label = f"{hotkey}:{gen_ref}"
+            if reason == FETCH_TRANSIENT:
+                result.failed.append(label)
+            else:
+                result.unavailable.append({"ref": label, **note})
+            # Entry stays in the db without tar_sha256 ⇒ retried next run, until
+            # the tombstone's attempt budget runs out (permanent reasons only).
             entry.setdefault("tar_sha256", None)
             entry.setdefault("size_bytes", None)
             entry.setdefault("archived_at", None)
@@ -719,6 +844,7 @@ def sync_generators(
             content_type="application/json",
         )
         log(f"wrote {GENERATOR_INDEX_KEY}: {len(entries)} generator(s) "
-            f"({result.archived} new, {result.skipped} already snapshotted)")
+            f"({result.archived} new, {result.skipped} already snapshotted, "
+            f"{len(result.unavailable)} unavailable upstream)")
 
     return result

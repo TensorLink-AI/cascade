@@ -123,6 +123,18 @@ class RoundOutcome:
 # this much later.
 POOL_PIN_READ_GRACE_SECONDS = 1800.0
 
+# How many subsequent rounds the Cascade step keeps re-probing for a round's
+# missing bench report before writing that round off. The trainer publishes the
+# report ~30-60 min after the manifest (the bench runs post-publish), so it is
+# usually there by the time the NEXT round's cascade step runs — one retry
+# catches nearly everything. The budget is deliberately generous anyway (each
+# retry is one GET against an R2-backed store): a validator that misses a
+# report its peers recorded ends the reign with a DIFFERENT log, can select a
+# different promotion winner, and then rejects rounds at the warm-start pin
+# gate — so convergence is worth days of cheap re-probing, and 5 retries at
+# 12h rounds spans most of a 7-round reign.
+BENCH_REPORT_RETRY_ROUNDS = 5
+
 
 @dataclass
 class ValidatorRunner:
@@ -142,11 +154,18 @@ class ValidatorRunner:
     eval_host_fn: Callable[[], RemoteHost | None] | None = None
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
-    # the reign clock is reset on each dethrone, every reigning-king checkpoint is
-    # scored (GIFT-Eval + TIME) and logged, and once per round the clock is checked;
-    # a fired Cascade installs the promoted warm-start init and re-crowns the
-    # same king (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
+    # the reign clock is reset on each dethrone, every reigning-king checkpoint's
+    # public-benchmark numbers (GIFT-Eval/BOOM/TIME, read from the trainer's
+    # signed post-publish bench report, falling back to older manifests'
+    # in-entry bench_scores) are logged, and once per round the clock is
+    # checked; a fired Cascade installs the promoted warm-start init and
+    # re-crowns the same king (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
     cascade: CascadeController | None = None
+    # Cascade bench-report source (cascade.shared.bench_report): duck-types
+    # ``get_text``. ``None`` ⇒ opened lazily from [storage] through
+    # open_manifest_store, so the report reads ride the same R2/HF fallbacks
+    # as the manifest. Injected in tests.
+    bench_report_store: object | None = None
     # Block of the last successful (or attempted re-assert) weight-set; drives
     # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
     # never set this process, so the first live-loop tick re-asserts
@@ -158,6 +177,15 @@ class ValidatorRunner:
     # grace expires the reject goes through, loudly. In-memory on purpose: a
     # restart merely restarts the grace clock, which is harmless.
     _pin_read_first_failure: dict[str, float] = field(default_factory=dict, repr=False)
+    # Rounds whose reigning-king checkpoint is still awaiting its bench report:
+    # the report is published AFTER the manifest (the bench sweep runs
+    # post-publish and takes ~an hour), so it routinely lands between this
+    # round's cascade step and the next round's. Each entry retries at the
+    # following rounds' cascade steps and expires after
+    # BENCH_REPORT_RETRY_ROUNDS misses. In-memory on purpose: losing it on a
+    # restart just means those rounds contribute no bench numbers, which
+    # Cascade tolerates (promotion selects over the rounds that have them).
+    _pending_bench: list = field(default_factory=list, repr=False)
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -489,8 +517,9 @@ class ValidatorRunner:
     def _bench_scores_dict(entry: TrainedEntry) -> dict | None:
         """The six Cascade numbers off a manifest entry's trainer-signed
         ``bench_scores`` (GIFT-Eval / BOOM / TIME CRPS+MASE), or ``None`` when the
-        entry carries none. This is the authoritative, consensus-safe source: every
-        validator reads the identical signed numbers."""
+        entry carries none. The FALLBACK source, for rounds published before the
+        trainer moved the bench post-publish (those manifests carry the numbers
+        in-entry; new ones never do)."""
         bs = entry.bench_scores
         if bs is None:
             return None
@@ -500,64 +529,122 @@ class ValidatorRunner:
             "time_crps": bs.time_crps, "time_mase": bs.time_mase,
         }
 
-    def _bench_metrics_via_sidecar(self, entry: TrainedEntry) -> dict | None:  # pragma: no cover — sidecar glue
-        """Fallback: score one checkpoint on GIFT-Eval, BOOM, and TIME via the
-        out-of-process sidecar, returning the six numbers or ``None`` when any suite
-        is missing/errored. Used only when the manifest carries no ``bench_scores``
-        (e.g. a trainer that predates the Cascade hook). NOTE: independently-run GPU
-        sweeps are not bit-reproducible, so this path is not consensus-safe across
-        validators — prefer the trainer-signed numbers."""
-        from ..eval.benchmarks import extract_bench_scores, run_benchmarks
+    def _bench_store(self) -> object:
+        if self.bench_report_store is None:
+            from ..shared.hippius import open_manifest_store
 
-        ec = self.cfg.eval
-        ckpt = self._fetch_checkpoint_dir(entry)
-        num_samples = ec.benchmark_num_samples or ec.num_samples
-        eval_host = self._eval_host()
-        if eval_host is not None:
-            # Offload the cascade bench (GIFT-Eval+BOOM+TIME) to the GPU pod,
-            # same seam as the gift-eval gate; the wallet stays on this box.
-            from .eval_offload import bench_scores_via_host
+            self.bench_report_store = open_manifest_store(self.cfg.storage)
+        return self.bench_report_store
 
-            metrics = bench_scores_via_host(
-                eval_host, ckpt,
-                num_samples=num_samples,
-                max_series=ec.cascade_bench_max_series,  # 0 = full battery
-                data_dir=(ec.gift_gate_data_dir or None),
-                device="cuda",
-                timeout_s=ec.gift_gate_timeout_s,
-            )
-        else:
-            report = run_benchmarks(
-                ckpt,
-                project_dir=ec.benchmark_project_dir,
-                suites=("gift-eval", "boom", "time"),
-                num_samples=num_samples,
-                max_series=ec.cascade_bench_max_series,  # 0 = full battery
-                device=self.device,
-            )
-            metrics = extract_bench_scores(report)
-        if metrics is None:
-            log.warning("cascade: incomplete GIFT-Eval/BOOM/TIME metrics for king checkpoint %s; "
-                        "not recording this round", entry.trained_pointer)
-        return metrics
+    def _fetch_bench_report(self, round_id: str) -> object | None:
+        """The round's trainer-signed bench report
+        (:mod:`cascade.shared.bench_report`), or ``None`` — absent (the bench
+        runs post-publish, so "not there yet" is a normal state), unreadable,
+        malformed, or failing signature verification. Never raises: the report
+        is telemetry + promotion input, and a miss must never disturb a round."""
+        from ..shared.bench_report import (
+            bench_report_key,
+            load_bench_report,
+            verify_bench_report_signature,
+        )
 
-    def _record_king_checkpoint(
-        self, manifest: TrainingManifest, now: float
-    ) -> None:  # pragma: no cover — sidecar glue
+        try:
+            text = self._bench_store().get_text(bench_report_key(str(round_id)))
+        except Exception:  # noqa: BLE001 — not published yet, or store down
+            return None
+        try:
+            report = load_bench_report(text)
+        except (ValueError, KeyError, TypeError) as e:
+            log.warning("cascade: bench report for round=%s unparseable (%s); ignoring",
+                        round_id, e)
+            return None
+        if self.verify_signatures and not verify_bench_report_signature(
+            report, self.cfg.manifest.trainer_hotkey
+        ):
+            log.warning("cascade: bench report for round=%s failed signature "
+                        "verification; ignoring", round_id)
+            return None
+        return report
+
+    def _report_bench_scores(self, round_id: str, trained_pointer: str) -> dict | None:
+        """The six Cascade numbers for one checkpoint out of the round's signed
+        bench report — the AUTHORITATIVE source (every validator reads the same
+        signed set). Joined on the exact ``trained_pointer``, never role/UID."""
+        report = self._fetch_bench_report(round_id)
+        if report is None:
+            return None
+        be = report.entry_for_pointer(trained_pointer)
+        if be is None:
+            return None
+        s = be.scores
+        return {
+            "gifteval_crps": s.gifteval_crps, "gifteval_mase": s.gifteval_mase,
+            "boom_crps": s.boom_crps, "boom_mase": s.boom_mase,
+            "time_crps": s.time_crps, "time_mase": s.time_mase,
+        }
+
+    def _record_king_checkpoint(self, manifest: TrainingManifest, now: float) -> None:
         """Add the reigning king's checkpoint to the reign log so a later Cascade
-        selection is a lookup, not a re-eval. Prefers the trainer's signed
-        ``bench_scores`` on the manifest (consensus-safe); falls back to scoring via
-        the local sidecar only when the manifest carries none. Best-effort: a miss
-        just means this round's checkpoint isn't a promotion candidate."""
+        selection is a lookup, not a re-eval. Source order: the round's signed
+        bench report (authoritative; published after the manifest), then the
+        manifest entry's in-entry ``bench_scores`` (rounds from before the bench
+        moved post-publish). Neither yet ⇒ the round is queued and re-probed at
+        the next rounds' cascade steps (the report typically lands ~an hour
+        after the manifest); a round whose report never appears simply
+        contributes no bench numbers — promotion selects over the reign rounds
+        that have them."""
         if self.cascade is None or self.state.king_hotkey is None:
             return
         entry = self._current_king_entry(manifest)
         if entry is None:
             return
-        metrics = self._bench_scores_dict(entry) or self._bench_metrics_via_sidecar(entry)
+        metrics = (self._report_bench_scores(manifest.round_id, entry.trained_pointer)
+                   or self._bench_scores_dict(entry))
         if metrics is None:
+            self._queue_pending_bench(manifest.round_id, entry)
             return
         self.cascade.record_checkpoint(entry.trained_pointer, now=now, size=entry.size, **metrics)
+
+    def _queue_pending_bench(self, round_id: str, entry: TrainedEntry) -> None:
+        if any(p["round_id"] == str(round_id) for p in self._pending_bench):
+            return
+        self._pending_bench.append({
+            "round_id": str(round_id),
+            "trained_pointer": entry.trained_pointer,
+            "size": entry.size,
+            "king_hotkey": self.state.king_hotkey,
+            "tries": BENCH_REPORT_RETRY_ROUNDS,
+        })
+        log.info("cascade: no bench numbers yet for round=%s king checkpoint %s; "
+                 "will re-probe the bench report for up to %d round(s)",
+                 round_id, entry.trained_pointer, BENCH_REPORT_RETRY_ROUNDS)
+
+    def _drain_pending_bench(self, now: float) -> None:
+        """Re-probe queued rounds' bench reports and log any that landed.
+
+        A queued round whose king no longer reigns is dropped outright — the
+        reign log was cleared at the re-crown, and an old reign's checkpoint
+        must never leak into the new reign's promotion pool."""
+        if self.cascade is None or not self._pending_bench:
+            return
+        keep: list = []
+        for p in self._pending_bench:
+            if p["king_hotkey"] != self.cascade.state.king_hotkey:
+                log.info("cascade: dropping pending bench for round=%s (reign ended)",
+                         p["round_id"])
+                continue
+            metrics = self._report_bench_scores(p["round_id"], p["trained_pointer"])
+            if metrics is not None:
+                self.cascade.record_checkpoint(
+                    p["trained_pointer"], now=now, size=p["size"], **metrics)
+                continue
+            p["tries"] -= 1
+            if p["tries"] > 0:
+                keep.append(p)
+            else:
+                log.info("cascade: giving up on bench report for round=%s; the round "
+                         "contributes no bench numbers", p["round_id"])
+        self._pending_bench = keep
 
     def _cascade_round(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None
@@ -582,6 +669,10 @@ class ValidatorRunner:
                 self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block)
             elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
                 self.cascade.note_dethrone(self.state.king_hotkey, block=block)
+            # Earlier rounds first: reports published after those rounds'
+            # cascade steps (the bench runs post-publish) land in the reign log
+            # now, before this round's checkpoint is considered.
+            self._drain_pending_bench(now)
             self._record_king_checkpoint(manifest, now)
             event = self.cascade.cascade_check(block=block, now=now)
             if event is not None:
@@ -954,6 +1045,10 @@ class ValidatorRunner:
         from ..shared.manifest import load_manifest
 
         store = open_manifest_store(self.cfg.storage)
+        if self.bench_report_store is None:
+            # Bench reports live in the same bucket — reuse this store (and its
+            # R2/HF fallbacks) instead of lazily building a second client.
+            self.bench_report_store = store
         poll = self.cfg.manifest.poll_seconds
         # Dedup on CONTENT, not round_id: a re-published manifest for an
         # already-seen round id (same-round-id rerun, e.g. after a contract
@@ -1397,8 +1492,17 @@ def _load_state(path: str) -> ChampionState:
         return ChampionState()
 
 
-def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState | None:
-    """Champion inherited from the signed public receipt trail, or ``None``.
+# First-boot receipt walk: each verified receipt costs one storage GET, so the
+# court derivation is bounded — a trail whose king never changed stops here
+# rather than reading every indexed round. 64 rounds ≈ a month of 12h rounds,
+# far past any plausible run of consecutive same-king receipts hiding a court.
+_BOOTSTRAP_MAX_RECEIPT_READS = 64
+
+
+def _bootstrap_state_from_receipts(
+    store: object, anchor: str, *, keep_former_kings: int = 0
+) -> ChampionState | None:
+    """Champion (and court) inherited from the signed receipt trail, or ``None``.
 
     First-boot inheritance for a validator with no local state: the throne
     otherwise lives only in each validator's private state DB, so a validator
@@ -1418,10 +1522,30 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
     UNTRUSTED pointer to candidate round ids: nothing is adopted except from
     a per-round receipt whose signature verifies against the anchor.
 
-    Anything short of that — missing objects, unreadable JSON, a bad
-    signature, a genesis throne (``king_hotkey`` unset) — returns ``None``
-    and the caller proceeds with the stock blank-slate behaviour. Storage
-    faults must never block validator startup.
+    ``keep_former_kings`` (``[scoring] reward_prior_kings``) additionally
+    seeds ``former_kings``: walking the index newest-first, each *distinct*
+    king recorded by a verified scored receipt is a reign, in recency order —
+    exactly the court ``apply_round`` would have accumulated had this
+    validator witnessed the dethrones itself. Without it a joining validator
+    votes the whole reward mass on the current king while established
+    validators split it across the court, and its vtrust is capped at the
+    consensus share of the top slot (observed 2026-07-31: a converged
+    external validator pinned at vtrust 0.52 — the court head's exact
+    consensus weight). A trail too short to fill the court seeds what it has;
+    the rest accrues from live dethrones. The walk is bounded
+    (``_BOOTSTRAP_MAX_RECEIPT_READS``) so first boot cannot stall on a long
+    index.
+
+    Only a TRULY fresh validator reaches this path (see the caller's gate) —
+    deliberately. ``demote_to_trained`` clears ``former_kings`` because a
+    dropped champion is not an honourably retired one; a bootstrap that
+    re-seeded the court on a validator with existing state would resurrect
+    exactly what the demotion semantics erased.
+
+    Anything short of a verified scored receipt — missing objects, unreadable
+    JSON, a bad signature, a genesis throne (``king_hotkey`` unset) — yields
+    ``None`` for the champion and the caller proceeds with the stock
+    blank-slate behaviour. Storage faults must never block validator startup.
     """
     if not anchor:
         return None
@@ -1433,7 +1557,8 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
     )
     from ..shared.receipt import load_receipt, verify_receipt_signature
 
-    def _adopt_from(key: str) -> ChampionState | None:
+    def _verified_throne(key: str) -> tuple[str, int, str] | None:
+        """(king_hotkey, king_uid, round_id) from a verified scored receipt."""
         try:
             text = store.get_text(key)
         except Exception:  # noqa: BLE001 — absent/unreachable key ⇒ next candidate
@@ -1450,26 +1575,47 @@ def _bootstrap_state_from_receipts(store: object, anchor: str) -> ChampionState 
         v = receipt.verdict
         if receipt.status != "scored" or v is None or not v.king_hotkey or v.king_uid is None:
             return None
-        log.info("receipt bootstrap: adopting champion %s (uid %d) from signed scored "
-                 "receipt round=%s", v.king_hotkey, int(v.king_uid), receipt.round_id)
-        return ChampionState(king_hotkey=str(v.king_hotkey), king_uid=int(v.king_uid))
+        return str(v.king_hotkey), int(v.king_uid), str(receipt.round_id)
 
-    adopted = _adopt_from(receipt_latest_key(anchor)) or _adopt_from(RECEIPT_LATEST_KEY)
-    if adopted is not None:
-        return adopted
-    try:
-        rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
-    except Exception:  # noqa: BLE001 — no index ⇒ nothing more to try
-        rows = []
-    # Index rows are chronological (oldest first, capped at most-recent);
-    # walk newest-first and adopt the first scored round that verifies.
+    throne = (_verified_throne(receipt_latest_key(anchor))
+              or _verified_throne(RECEIPT_LATEST_KEY))
+    rows: list = []
+    if throne is None or keep_former_kings > 0:
+        try:
+            rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
+        except Exception:  # noqa: BLE001 — no index ⇒ nothing beyond latest.json
+            rows = []
+    # Index rows are chronological (oldest first, capped at most-recent); walk
+    # newest-first. The first verified scored round supplies the champion when
+    # latest.json did not; every older distinct king fills the court.
+    court: list[str] = []
+    reads = 0
     for row in reversed(rows):
+        if throne is not None and len(court) >= keep_former_kings:
+            break
         if str(row.get("status")) != "scored":
             continue
-        adopted = _adopt_from(receipt_round_key(str(row.get("round_id", "")), anchor))
-        if adopted is not None:
-            return adopted
-    return None
+        if reads >= _BOOTSTRAP_MAX_RECEIPT_READS:
+            log.warning("receipt bootstrap: stopping after %d receipt reads with "
+                        "%d/%d former kings seeded; the rest accrue from live "
+                        "dethrones", reads, len(court), keep_former_kings)
+            break
+        reads += 1
+        found = _verified_throne(receipt_round_key(str(row.get("round_id", "")), anchor))
+        if found is None:
+            continue
+        if throne is None:
+            throne = found
+        elif found[0] != throne[0] and found[0] not in court:
+            court.append(found[0])
+    if throne is None:
+        return None
+    king_hotkey, king_uid, round_id = throne
+    log.info("receipt bootstrap: adopting champion %s (uid %d) from signed scored "
+             "receipt round=%s; former_kings=%s", king_hotkey, king_uid, round_id,
+             court or "[]")
+    return ChampionState(king_hotkey=king_hotkey, king_uid=king_uid,
+                         former_kings=tuple(court))
 
 
 def _warm_start_installer(path: Path) -> Callable[[object], None]:
@@ -1548,7 +1694,8 @@ def build_runner(
         anchor = cfg.manifest.validator_hotkey or cfg.manifest.trainer_hotkey
         try:
             adopted = _bootstrap_state_from_receipts(
-                open_manifest_store(cfg.storage), anchor)
+                open_manifest_store(cfg.storage), anchor,
+                keep_former_kings=cfg.scoring.reward_prior_kings)
         except Exception as e:  # noqa: BLE001 — storage must never block startup
             log.warning("receipt bootstrap skipped (%s); starting blank", e)
             adopted = None

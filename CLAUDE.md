@@ -61,6 +61,21 @@ in-context.
   replays under both rules. Trainer + validator must deploy together.
   (`decisions/DEC-CA-0009-scale-invariant-crps-aggregation.md`)
 
+- **DEC-CA-0010** — Host variance is MEASURED, not normalized. Every run stamps a
+  `host` record (lane geometry, CPU/GPU capability, opaque pod + machine ids, and
+  a FIXED pre-stream calibration bench) into the public training log; nothing
+  consumes it. `[telemetry]`, not `[training]` — no `contract_digest` change, no
+  wire-format change. The bench cannot be resized (only disabled), or its numbers
+  stop being poolable across the fleet.
+  (`decisions/DEC-CA-0010-host-telemetry-measure-not-normalize.md`)
+- **DEC-CA-0011** — Heat standings publish when the HEAT settles (trainer →
+  `status/heat.json` + `heats/round-<id>.json` + `heats/index.json`), not when a
+  validator's receipt lands hours later — and they publish for a round rejected
+  at a gate, where the manifest copy never appears. Same field shape as the
+  manifest block, still unsigned/presentational; a no-screen round publishes its
+  reason so the live pointer can't serve the previous round's ranking.
+  (`decisions/DEC-CA-0011-heat-standings-published-at-heat-completion.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.
 

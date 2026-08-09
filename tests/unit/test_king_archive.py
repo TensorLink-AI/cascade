@@ -572,3 +572,206 @@ def test_king_archive_config_requires_an_endpoint():
     )
     with pytest.raises(StorageError):
         ka.king_archive_config(storage)
+
+
+# ─────────── permanently-gone generators: tombstone, park, stay green ────────
+
+
+def _gone(message):
+    """A fetch that fails the way a deleted/private upstream repo actually does."""
+    def fetch(ref, dest, hub):
+        from cascade.shared.hippius import StorageError
+        raise StorageError(f"fetch of {ref} failed after 1 attempt(s): {message}")
+    return fetch
+
+
+# The four shapes seen in production, verbatim from the scraper's logs.
+DELETED_HUB_REV = ("Revision 'sha256:dead' not found in repository 'miner/gen-a'",
+                   "gone")
+DELETED_HF_REPO = ("404 Client Error. (Request ID: Root=1-6a7810b7-3c2ef5c6)", "gone")
+PRIVATE_HUB_REPO = ("Client error '401 Unauthorized' for url "
+                    "'https://registry.hippius.com/v2/miner/gen-a/manifests/sha256:dead'",
+                    "private")
+PRIVATE_HF_REPO = ("403 Client Error. (Request ID: Root=1-6a7810bf-202c13b5)", "private")
+
+
+@pytest.mark.parametrize("message,reason",
+                         [DELETED_HUB_REV, DELETED_HF_REPO, PRIVATE_HUB_REPO, PRIVATE_HF_REPO])
+def test_permanent_fetch_failures_are_classified_not_blamed_on_the_network(message, reason):
+    from cascade.shared.hippius import StorageError, classify_fetch_failure
+
+    exc = StorageError(f"fetch of miner/gen-a@{SHA} failed after 1 attempt(s): {message}")
+    assert classify_fetch_failure(exc) == reason
+
+
+@pytest.mark.parametrize("message", [
+    "read operation timed out",
+    "503 Server Error: Service Unavailable",
+    "connection reset by peer",
+    "the registry said something nobody has seen before",   # unknown ⇒ keep retrying
+])
+def test_retryable_and_unknown_failures_stay_transient(message):
+    from cascade.shared.hippius import FETCH_TRANSIENT, StorageError, classify_fetch_failure
+
+    assert classify_fetch_failure(StorageError(message)) == FETCH_TRANSIENT
+
+
+def test_hf_request_id_hex_is_not_read_as_a_status_code():
+    """A bare '403'/'404' match would fire on the hex request id HF appends."""
+    from cascade.shared.hippius import FETCH_TRANSIENT, StorageError, classify_fetch_failure
+
+    exc = StorageError("connection reset (Request ID: Root=1-6a7810bf-403c13b5404efbca)")
+    assert classify_fetch_failure(exc) == FETCH_TRANSIENT
+
+
+def _one_gone_round():
+    return _manifest_store_with_receipts([
+        (_round("r1", 100, king_ref=f"cascade/a@{SHA}"),
+         [_participant("hk-a", 1, f"cascade/a@{SHA}", 40)]),
+    ])
+
+
+def test_gone_generator_is_tombstoned_and_kept_out_of_failed():
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t1",
+                             fetch=_gone(DELETED_HUB_REV[0]))
+
+    # NOT a failure: no re-run brings a deleted repo back, so the job stays green.
+    assert res.failed == []
+    assert [u["ref"] for u in res.unavailable] == [f"hk-a:cascade/a@{SHA}"]
+    assert res.unavailable[0]["reason"] == "gone"
+
+    entry = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())["generators"][0]
+    assert entry["tar_sha256"] is None
+    assert entry["unavailable"]["reason"] == "gone"
+    assert entry["unavailable"]["attempts"] == 1
+    assert entry["unavailable"]["first_failed_at"] == "t1"
+    assert "not found in repository" in entry["unavailable"]["error"]
+
+
+def test_gone_generator_parks_after_the_attempt_budget():
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    fetch = _gone(DELETED_HF_REPO[0])
+    attempted = []
+
+    def counting_fetch(ref, dest, hub):
+        attempted.append(ref)
+        return fetch(ref, dest, hub)
+
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS):
+        res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                                 endpoint="https://e", bucket="b",
+                                 updated_at=f"t{run}", fetch=counting_fetch)
+    assert len(attempted) == ka.UNAVAILABLE_MAX_ATTEMPTS
+    entry = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())["generators"][0]
+    assert entry["unavailable"]["attempts"] == ka.UNAVAILABLE_MAX_ATTEMPTS
+    assert entry["unavailable"]["first_failed_at"] == "t0"      # never overwritten
+    assert entry["unavailable"]["last_failed_at"] == f"t{ka.UNAVAILABLE_MAX_ATTEMPTS - 1}"
+
+    # budget spent: the next run skips the fetch entirely but still reports it
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t-later",
+                             fetch=counting_fetch)
+    assert len(attempted) == ka.UNAVAILABLE_MAX_ATTEMPTS      # no new network call
+    assert [u["ref"] for u in res.unavailable] == [f"hk-a:cascade/a@{SHA}"]
+    assert res.failed == [] and res.archived == 0
+
+
+def test_retry_unavailable_unparks_and_a_republished_generator_clears_its_tombstone():
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS):
+        ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                           endpoint="https://e", bucket="b", updated_at=f"t{run}",
+                           fetch=_gone(PRIVATE_HUB_REPO[0]))
+
+    # the miner made the repo public again — --retry-unavailable picks it back up
+    fetched: list[str] = []
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="t-fixed",
+                             retry_unavailable=True, fetch=_fake_fetch_factory(fetched))
+    assert fetched == [f"cascade/a@{SHA}"]
+    assert res.archived == 1 and not res.unavailable and not res.failed
+    entry = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())["generators"][0]
+    assert entry["tar_sha256"] and "unavailable" not in entry
+
+
+def test_transient_failures_never_park_and_keep_the_run_red():
+    from cascade.shared.hippius import StorageError
+
+    def boom(ref, dest, hub):
+        raise StorageError("read operation timed out")
+
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS + 2):
+        res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                                 endpoint="https://e", bucket="b",
+                                 updated_at=f"t{run}", fetch=boom)
+        # every single run retries it and reports it as a real failure
+        assert res.failed == [f"hk-a:cascade/a@{SHA}"] and res.unavailable == []
+
+
+def test_gone_king_is_tombstoned_in_the_db_rather_than_dropped():
+    manifest = _manifest_store([_round("r1", 100, king_ref=f"cascade/a@{SHA}")])
+    archive = _FakeS3Store()
+    res = ka.sync_kings(manifest_store=manifest, archive_store=archive, hub=HUB,
+                        endpoint="https://e", bucket="b", updated_at="t1",
+                        fetch=_gone(DELETED_HUB_REV[0]))
+
+    assert res.failed == [] and [u["ref"] for u in res.unavailable] == [f"cascade/a@{SHA}"]
+    # "reigned, code lost" is the record the archive exists to keep — the throne
+    # attribution is written even though there is no tar behind it.
+    kings = json.loads(archive.objects[ka.KING_INDEX_KEY].decode())["kings"]
+    assert [k["gen_ref"] for k in kings] == [f"cascade/a@{SHA}"]
+    assert kings[0]["tar_sha256"] is None and kings[0]["reign_rounds"] == 1
+    assert kings[0]["unavailable"]["reason"] == "gone"
+
+    # and it parks, exactly like a participant generator
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS):
+        res = ka.sync_kings(manifest_store=manifest, archive_store=archive, hub=HUB,
+                            endpoint="https://e", bucket="b", updated_at=f"t{run}",
+                            fetch=_gone(DELETED_HUB_REV[0]))
+    assert res.unavailable and res.failed == []
+    kings = json.loads(archive.objects[ka.KING_INDEX_KEY].decode())["kings"]
+    assert kings[0]["unavailable"]["attempts"] == ka.UNAVAILABLE_MAX_ATTEMPTS
+
+
+def test_a_changed_verdict_restarts_the_grace_period():
+    """A flaky Hub that later answers a clean 404 must not inherit the timeouts'
+    attempt count — the budget measures the condition being waited out."""
+    from cascade.shared.hippius import StorageError
+
+    def timeout(ref, dest, hub):
+        raise StorageError("read operation timed out")
+
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS + 1):
+        ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                           endpoint="https://e", bucket="b", updated_at=f"flaky{run}",
+                           fetch=timeout)
+
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", updated_at="gone0",
+                             fetch=_gone(DELETED_HUB_REV[0]))
+    entry = json.loads(archive.objects[ka.GENERATOR_INDEX_KEY].decode())["generators"][0]
+    assert entry["unavailable"] == {
+        "reason": "gone", "attempts": 1,
+        "first_failed_at": "gone0", "last_failed_at": "gone0",
+        "error": entry["unavailable"]["error"],
+    }
+    assert res.unavailable and res.failed == []
+
+
+def test_dry_run_does_not_claim_a_parked_ref_would_be_archived():
+    manifest, archive = _one_gone_round(), _FakeS3Store()
+    for run in range(ka.UNAVAILABLE_MAX_ATTEMPTS):
+        ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                           endpoint="https://e", bucket="b", updated_at=f"t{run}",
+                           fetch=_gone(DELETED_HF_REPO[0]))
+
+    fetched: list[str] = []
+    res = ka.sync_generators(manifest_store=manifest, archive_store=archive, hub=HUB,
+                             endpoint="https://e", bucket="b", dry_run=True,
+                             fetch=_fake_fetch_factory(fetched))
+    assert res.would_archive == 0 and fetched == []
+    assert [u["ref"] for u in res.unavailable] == [f"hk-a:cascade/a@{SHA}"]

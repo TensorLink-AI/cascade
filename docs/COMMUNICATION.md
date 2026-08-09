@@ -48,7 +48,9 @@ they gate, score, set weights, and publish receipts.
 | 7 | Round receipts | each validator → auditors, dashboard | `receipts/<hotkey>/round-<id>.json` + `receipts/<hotkey>/latest.json`, shared `receipts/latest.json` pointer | signed per validator hotkey; public-read | **single-writer prefixes** — validators cannot clobber each other; only the convenience pointer is last-writer-wins |
 | 8 | Receipts index | each validator → dashboard | `receipts/index.json`, entries keyed `(round_id, validator_hotkey)` | unsigned, presentational only | merge-keyed read-modify-write; a simultaneous write can drop one entry until that validator's next round — never audit- or weight-bearing |
 | 8b | Live chain status | validator (or `scripts/publish_chain_status.py`) → dashboard | `status/chain.json`: block anchor, epoch grid, stage windows, revealed submissions (see `cascade.shared.chain_status`) | unsigned, presentational only | last-writer-wins whole-object overwrite — honest publishers write near-identical chain state; never audit- or weight-bearing |
-| 9 | Training logs | trainer → observers | `logs/round-<id>/<role>.jsonl` (+ optional wandb) | none (observability) | read-only |
+| 8c | Live round stage | trainer → dashboards | `status/round.json`: stage (`heat`/`duel`/`validation`) + heat progress, keyed on `epoch_start_block` (see `cascade.shared.chain_status`) | unsigned, presentational only | single writer (the trainer); consumers ignore a doc that is stale or for another round |
+| 8d | Heat standings | trainer → dashboards, miners | `status/heat.json` (live pointer) + `heats/round-<id>.json` + `heats/index.json`, written when the **heat settles** — not with the round's receipt (see `cascade.shared.heat_status`) | unsigned, presentational only — an auditor cannot reproduce a discarded heat checkpoint | single writer (the trainer); per-round keys are immutable, only the live pointer is overwritten |
+| 9 | Training logs | trainer → observers | `logs/round-<id>/<role>.jsonl` (+ optional wandb) — per-step metrics, the closing `summary`, and one `host` record per run (`[telemetry]`, `cascade.trainer.host_probe`) | none (observability) | read-only |
 | 10 | Trainer ↔ GPU pods | trainer orchestrator ↔ rented pods | SSH, receipt-sentinel stdout | wallet never leaves the orchestrator | n/a |
 | 11 | Validator ↔ eval pod | validator ↔ its own GPU pod | SSH+scp (`--eval-hosts`) | only public checkpoint + report cross | per-validator, private |
 
@@ -82,9 +84,10 @@ The benchmark sidecar (`benchmarks/`, or an SSH eval pod via `--eval-hosts`) is
 `[eval] run_benchmarks` (log-only numbers on a dethrone), `[scoring]
 gift_gate_mode` (the gift-eval gate — the only mode in which the sidecar is
 load-bearing, since `enforce` turns a sidecar failure into an inconclusive
-round), and `[scoring] cascade_enabled` (warm-start promotion, which prefers
-the trainer-signed `bench_scores` on the manifest and touches the sidecar only
-as a non-consensus-safe fallback for manifests that carry none).
+round), and `[scoring] cascade_enabled` (warm-start promotion, which reads the
+trainer-signed per-round bench report — `benchmarks/round-<id>.json`, falling
+back to the in-entry `bench_scores` on older manifests — and never runs the
+sidecar itself; a round with neither simply contributes no bench numbers).
 
 Deliberately **not** on the list: the TSBench-Forge raw-data bucket. Validators
 consume forge data only through the built pool snapshots (channel 5). The raw

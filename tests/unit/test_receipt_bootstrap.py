@@ -124,3 +124,131 @@ def test_index_pointer_alone_grants_nothing():
 def test_empty_store_or_anchor_starts_blank():
     assert _bootstrap_state_from_receipts(FakeStore({}), ANCHOR) is None
     assert _bootstrap_state_from_receipts(FakeStore({}), "") is None
+
+
+# ── court (former_kings) seeding ─────────────────────────────────────────────
+#
+# A joining validator that adopts only the throne votes the whole reward mass
+# on one uid while established validators split it across the court, capping
+# its vtrust at the top slot's consensus share (observed live 2026-07-31:
+# an external validator converged on the right king yet pinned at 0.52 —
+# exactly the court head's consensus weight).
+
+
+def _signed_reign(king_hotkey: str, king_uid: int, round_id: str, kp=VALIDATOR_KP):
+    """A signed scored receipt recording ``king_hotkey`` on the throne."""
+    receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
+    receipt = replace(receipt, round_id=round_id,
+                      verdict=replace(receipt.verdict,
+                                      king_hotkey=king_hotkey, king_uid=king_uid))
+    return sign_receipt(receipt, kp)
+
+
+def _trail(*reigns, kp=VALIDATOR_KP, latest=True):
+    """Store holding a chronological reign trail (oldest first) + index.
+
+    ``reigns`` are ``(king_hotkey, king_uid)`` per round; round ids are
+    ``r0…rN`` in order. ``latest=True`` also writes the newest receipt to the
+    anchor's ``latest.json``.
+    """
+    anchor = kp.ss58_address
+    objects, rows = {}, []
+    receipts = [_signed_reign(hk, uid, f"r{i}", kp)
+                for i, (hk, uid) in enumerate(reigns)]
+    for r in receipts:
+        objects[receipt_round_key(r.round_id, anchor)] = dump_receipt(r)
+        rows.append({"round_id": r.round_id, "status": "scored",
+                     "validator_hotkey": anchor})
+    if latest and receipts:
+        objects[receipt_latest_key(anchor)] = dump_receipt(receipts[-1])
+    objects[RECEIPT_INDEX_KEY] = json.dumps({"schema": 2, "rounds": rows})
+    return FakeStore(objects)
+
+
+def test_court_seeded_by_recency_of_reign():
+    # Reigns A → B → C (chronological); a fresh validator should adopt C with
+    # the court [B, A] — the exact state apply_round would have accumulated.
+    store = _trail(("A_hk", 10), ("B_hk", 11), ("C_hk", 12))
+    state = _bootstrap_state_from_receipts(store, ANCHOR, keep_former_kings=4)
+    assert state is not None
+    assert (state.king_hotkey, state.king_uid) == ("C_hk", 12)
+    assert state.former_kings == ("B_hk", "A_hk")
+
+
+def test_court_capped_at_keep():
+    store = _trail(("A_hk", 10), ("B_hk", 11), ("C_hk", 12))
+    state = _bootstrap_state_from_receipts(store, ANCHOR, keep_former_kings=1)
+    assert state is not None and state.former_kings == ("B_hk",)
+
+
+def test_keep_zero_preserves_throne_only_adoption():
+    store = _trail(("A_hk", 10), ("B_hk", 11))
+    state = _bootstrap_state_from_receipts(store, ANCHOR)
+    assert state is not None
+    assert state.king_hotkey == "B_hk" and state.former_kings == ()
+
+
+def test_recrowned_king_appears_once():
+    # A reigned, was dethroned by B, retook the throne, then C won: the trail
+    # C, A, B, A (newest-first) must yield court [A, B] — A once, by its most
+    # recent reign, never duplicated and never listed as its own predecessor.
+    store = _trail(("A_hk", 10), ("B_hk", 11), ("A_hk", 10), ("C_hk", 12))
+    state = _bootstrap_state_from_receipts(store, ANCHOR, keep_former_kings=4)
+    assert state is not None
+    assert state.king_hotkey == "C_hk"
+    assert state.former_kings == ("A_hk", "B_hk")
+
+
+def test_unsigned_trail_rows_contribute_no_court():
+    # Mallory-signed receipts mid-trail are skipped: the court comes only from
+    # rounds that verify against the anchor.
+    anchor = VALIDATOR_KP.ss58_address
+    good = _trail(("A_hk", 10), ("C_hk", 12))
+    forged = _signed_reign("EVIL_hk", 66, "rF", kp=OTHER_KP)
+    good.objects[receipt_round_key("rF", anchor)] = dump_receipt(forged)
+    index = json.loads(good.objects[RECEIPT_INDEX_KEY])
+    index["rounds"].insert(1, {"round_id": "rF", "status": "scored",
+                               "validator_hotkey": anchor})
+    good.objects[RECEIPT_INDEX_KEY] = json.dumps(index)
+    state = _bootstrap_state_from_receipts(good, anchor, keep_former_kings=4)
+    assert state is not None
+    assert state.king_hotkey == "C_hk" and state.former_kings == ("A_hk",)
+
+
+def test_champion_and_court_both_from_index_when_latest_is_hold():
+    # latest.json holds a rejected (verdict-less) receipt — the resync shape.
+    # Champion AND court must still assemble from the indexed rounds.
+    store = _trail(("A_hk", 10), ("B_hk", 11), latest=False)
+    hold = make_rejected_receipt(reason="king_resyncing: champion x != trained y",
+                                 validator_hotkey=ANCHOR)
+    store.objects[receipt_latest_key(ANCHOR)] = dump_receipt(sign_receipt(hold, VALIDATOR_KP))
+    state = _bootstrap_state_from_receipts(store, ANCHOR, keep_former_kings=4)
+    assert state is not None
+    assert state.king_hotkey == "B_hk" and state.former_kings == ("A_hk",)
+
+
+def test_walk_is_bounded():
+    # An index of one long unchanged reign stops at the read cap instead of
+    # fetching every receipt; the champion still adopts.
+    from cascade.validator import loop as loop_mod
+
+    reads = 0
+    store = _trail(*[("A_hk", 10)] * 5, ("B_hk", 11))
+    real_get = store.get_text
+
+    def counting_get(key):
+        nonlocal reads
+        reads += 1
+        return real_get(key)
+
+    store.get_text = counting_get
+    old_cap = loop_mod._BOOTSTRAP_MAX_RECEIPT_READS
+    loop_mod._BOOTSTRAP_MAX_RECEIPT_READS = 2
+    try:
+        state = _bootstrap_state_from_receipts(store, ANCHOR, keep_former_kings=4)
+    finally:
+        loop_mod._BOOTSTRAP_MAX_RECEIPT_READS = old_cap
+    assert state is not None and state.king_hotkey == "B_hk"
+    # latest.json + index + at most 2 per-round receipts
+    assert reads <= 4
+    assert state.former_kings == ("A_hk",)

@@ -1103,8 +1103,8 @@ if(R2_PUBLIC_BASE){ ENDPOINTS.push(R2_PUBLIC_BASE.replace(/\/$/, "")); }
 var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
-var _index = null, _latest = null, _status = null, _roundStatus = null, _subsSeen = null,
-    _chartMode = "geomean", _smooth = 0, _dataState = "loading";
+var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
+    _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading";
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1279,30 +1279,59 @@ function renderField(){
 // Heat = the cheap screen that ranks every eligible challenger; only the top
 // `finalists` advance to the final vs the king. The trainer otherwise throws
 // these scores away, so this panel is a non-finalist miner's only feedback.
-// Standings ride the latest receipt's embedded manifest (_latest.manifest.heat).
+//
+// Two sources, same field shape (see cascade.shared.heat_status): the trainer's
+// LIVE mirror (status/heat.json), written the moment the heat settles, and the
+// settled round's receipt (_latest.manifest.heat). The live one is preferred
+// whenever it describes a round the receipt hasn't superseded — the duel and its
+// validation run for hours after the heat, and waiting for the receipt used to
+// hide a miner's placement until well past its next submission deadline.
 function heatStatusMeta(s){
   if(s==="advanced") return {cls:"adv",label:"▲ Advanced"};
   if(s==="screened") return {cls:"screened",label:"Screened"};
   if(s==="failed_train") return {cls:"nofit",label:"Did not train"};
   if(s==="failed_screen") return {cls:"nofit",label:"Screen error"};
+  if(s==="duplicate") return {cls:"nofit",label:"Duplicate"};
   return {cls:"screened",label:s||"--"};
+}
+function heatSource(){
+  var rec=_latest&&_latest.manifest&&_latest.manifest.heat;
+  var recSrc=rec?{doc:rec, round:_latest.round_id, esb:Number(_latest.epoch_start_block),
+                  live:false, asOf:_latest.published_at||null}:null;
+  var live=(_heat&&Array.isArray(_heat.entrants))
+    ?{doc:_heat, round:_heat.round_id, esb:Number(_heat.epoch_start_block),
+      live:true, asOf:_heat.as_of}:null;
+  if(!live) return recSrc;
+  if(!recSrc) return live;
+  // Both present: the newer round wins. An unparseable epoch block on either
+  // side falls back to the receipt — the signed source is the safer default.
+  return (isFinite(live.esb)&&isFinite(recSrc.esb)&&live.esb>=recSrc.esb)?live:recSrc;
+}
+// Whether a receipt for the standings' own round is already public: a live doc
+// for an unsettled round is labelled "duel in flight", which is the whole point.
+function heatRoundSettled(esb){
+  return (_index&&_index.rounds||[]).some(function(r){ return Number(r.epoch_start_block)===Number(esb); });
 }
 function renderHeat(){
   var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when");
-  var heat=_latest&&_latest.manifest&&_latest.manifest.heat;
+  var src=heatSource(), heat=src&&src.doc;
   var ents=(heat&&heat.entrants)||[];
   if(!heat||!ents.length){
-    when.textContent="";
+    when.textContent=src&&src.round?("round "+shortRoundId(src.round)):"";
+    var why=(heat&&heat.no_screen_reason)?esc(heat.no_screen_reason)
+      :"either a single eligible challenger, or a round that predates heat reporting";
     panel.innerHTML='<div class="heat-empty">'+
       '<div class="he-glyph">· · ·</div>'+
       '<div class="he-head">No heat screening this round</div>'+
-      '<p>The field advanced without a screen — either a single eligible challenger, or a round that predates heat reporting. The verdict and final scores are unaffected.</p>'+
+      '<p>The field advanced without a screen — '+why+'. The verdict and final scores are unaffected.</p>'+
       '</div>';
     return;
   }
-  var nf=heat.finalists;
-  when.textContent=ents.length+" entrants · "+(nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
-    (heat.screen_size?" · screened at "+esc(heat.screen_size):"");
+  var nf=heat.finalists, inFlight=src.live&&!heatRoundSettled(src.esb);
+  when.textContent="round "+shortRoundId(src.round)+" · "+ents.length+" entrants · "+
+    (nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
+    (heat.screen_size?" · screened at "+esc(heat.screen_size):"")+
+    (src.live&&src.asOf?" · published "+timeAgo(src.asOf):"");
   var rows=ents.slice().sort(function(a,b){
     var ra=a.rank==null?1e9:a.rank, rb=b.rank==null?1e9:b.rank;
     return (ra-rb)||((a.uid||0)-(b.uid||0));
@@ -1323,7 +1352,9 @@ function renderHeat(){
       '<td class="num">'+fmt(e.mase,3)+'</td>'+
       '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
   }).join("");
-  panel.innerHTML='<div class="heat-note">Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
+  panel.innerHTML='<div class="heat-note">'+
+    (inFlight?'<b>Live</b> — published by the trainer when this round’s heat settled; the duel (king vs finalists) is still training, so the round has no verdict yet. ':'')+
+    'Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
     (nf!=null?nf:"N")+' advance to the final. Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice.</div>'+
     '<div class="scroll-box scroll-field"><table><thead><tr>'+
     '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th class="num">CRPS</th><th class="num">MASE</th><th>Standing</th>'+
@@ -1554,6 +1585,11 @@ function poll(){
   }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
   fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); })
+    .catch(function(){});
+  // Live heat standings, published when the heat settles rather than with the
+  // round's receipt (status/heat.json). Best-effort: on failure the panel falls
+  // back to the settled receipt's embedded heat block.
+  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); })
     .catch(function(){});
 }
 poll();

@@ -15,6 +15,7 @@ from cascade.provision.policy import (
     ProvisionPolicy,
     StageFleet,
     StagePolicy,
+    bench_hold_active,
     should_trigger,
     size_fleet,
     teardown_due,
@@ -260,6 +261,51 @@ def test_eval_signals_never_kill_trainer_stages():
         assert not teardown_due(stage, heat_marker_seen=False, manifest_seen=False,
                                 receipt_seen=True, newer_manifest=True,
                                 rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+# ── the cascade duel-bench hold: final pods only, capped, TTL untouched ──────
+
+
+def test_bench_hold_suspends_final_teardown_on_manifest_only():
+    # The hold pauses exactly the manifest-driven final teardown — the bench
+    # runs on the final pod after the manifest (its normal death signal) lands.
+    assert not teardown_due("final", heat_marker_seen=False, manifest_seen=True,
+                            bench_hold=True, rented_at=0.0, now=100.0, ttl_hours=24.0)
+    # Hold released (report uploaded / bench failed / cap expired) ⇒ reap.
+    assert teardown_due("final", heat_marker_seen=False, manifest_seen=True,
+                        bench_hold=False, rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+def test_bench_hold_never_extends_other_pod_classes():
+    # Heat pods still die on their marker AND on the manifest; eval pods keep
+    # their own arm. Only the final class is ever held.
+    assert teardown_due("heat", heat_marker_seen=True, manifest_seen=False,
+                        bench_hold=True, rented_at=0.0, now=100.0, ttl_hours=24.0)
+    assert teardown_due("heat", heat_marker_seen=False, manifest_seen=True,
+                        bench_hold=True, rented_at=0.0, now=100.0, ttl_hours=24.0)
+    assert teardown_due("eval", heat_marker_seen=False, manifest_seen=False,
+                        receipt_seen=True, bench_hold=True,
+                        rented_at=0.0, now=100.0, ttl_hours=24.0)
+
+
+def test_bench_hold_never_outlives_the_ttl():
+    assert teardown_due("final", heat_marker_seen=False, manifest_seen=True,
+                        bench_hold=True, rented_at=0.0, now=24 * 3600.0, ttl_hours=24.0)
+
+
+def test_bench_hold_active_state_machine():
+    # No live marker observed / already complete / hold disabled ⇒ never active.
+    assert not bench_hold_active(held_since=None, bench_done=False,
+                                 now=100.0, hold_max_hours=2.0)
+    assert not bench_hold_active(held_since=0.0, bench_done=True,
+                                 now=100.0, hold_max_hours=2.0)
+    assert not bench_hold_active(held_since=0.0, bench_done=False,
+                                 now=100.0, hold_max_hours=0.0)
+    # Live marker within the cap ⇒ active; at/past the cap ⇒ reap regardless.
+    assert bench_hold_active(held_since=0.0, bench_done=False,
+                             now=2 * 3600.0 - 1, hold_max_hours=2.0)
+    assert not bench_hold_active(held_since=0.0, bench_done=False,
+                                 now=2 * 3600.0, hold_max_hours=2.0)
 
 
 # ── cadence change: epoch + trigger margin must both track the block ─────────
