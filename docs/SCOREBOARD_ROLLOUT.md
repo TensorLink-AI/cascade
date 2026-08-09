@@ -122,9 +122,9 @@ python scripts/publish_reference_bench.py /out/genesis-report.json \
 Until the genesis doc lands, the meter falls back to the earliest
 published round result at that size.
 
-## 5. Pretraining-completion target (one constant, with citation)
+## 5. Pretraining-progress targets (one constant, with citation)
 
-The "How much of a full pretraining has the champion had?" section computes
+The "How far along is the pretraining?" section computes
 the Cascade side entirely from the training contract and the signed
 warm-start record — nothing to operate. Its completion bar, however, needs
 the OFFICIAL release's per-size step count: fill `TOTO2_PRETRAIN` in
