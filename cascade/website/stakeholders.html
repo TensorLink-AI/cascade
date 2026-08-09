@@ -1414,20 +1414,34 @@ function benchView(){
 // ladder size, run through the identical benchmark battery and published by
 // scripts/publish_reference_bench.py. Probed per rung; a missing doc simply
 // means that size's official checkpoint hasn't been benched yet.
-var _refBench = {}, _refMissing = {}, _refInflight = {};
+// reference-<preset>.json = the OFFICIAL checkpoint (the target side);
+// genesis-<preset>.json = the day-one king's own checkpoint, benched by the
+// same battery — the completion meter's fixed anchor. The genesis checkpoint
+// is a normal cascade artifact, so it needs no wrapping before benching.
+var _refBench = {}, _genBench = {}, _refMissing = {}, _refInflight = {};
 function scanRefs(retryMissing){
   LADDER.forEach(function(r){
-    var pid = "toto2-" + r.key;
-    if(_refBench[pid] || _refInflight[pid]) return;
-    if(_refMissing[pid] && !retryMissing) return;
-    _refInflight[pid] = true;
-    fetchJSON("benchmarks/reference-" + pid + ".json", { bust:false })
-      .then(function(d){
-        delete _refInflight[pid]; delete _refMissing[pid];
-        _refBench[pid] = d; renderRef(); renderBoard();
-      })
-      .catch(function(){ delete _refInflight[pid]; _refMissing[pid] = true; });
+    ["reference", "genesis"].forEach(function(prefix){
+      var pid = prefix + "-toto2-" + r.key;
+      var store = prefix === "reference" ? _refBench : _genBench;
+      var skey = "toto2-" + r.key;
+      if(store[skey] || _refInflight[pid]) return;
+      if(_refMissing[pid] && !retryMissing) return;
+      _refInflight[pid] = true;
+      fetchJSON("benchmarks/" + pid + ".json", { bust:false })
+        .then(function(d){
+          delete _refInflight[pid]; delete _refMissing[pid];
+          store[skey] = d; renderRef(); renderBoard();
+        })
+        .catch(function(){ delete _refInflight[pid]; _refMissing[pid] = true; });
+    });
   });
+}
+function genesisGeomean(sizeKey){
+  var doc = _genBench["toto2-" + sizeKey];
+  if(!doc) return null;
+  var six = readSix(doc);
+  return six ? sixGeomean(six) : (typeof doc.geomean === "number" ? doc.geomean : null);
 }
 
 function refDocs(){
@@ -1582,21 +1596,27 @@ function renderBoard(){
   // the one headline number: where Cascade stands against the official Toto2
   var pr = refPair(bv), hero = document.getElementById("hero");
   if(pr){
-    // completion meter, anchored at the FIRST published result at this size
-    // so the fill shows ground actually gained. Skipped when degenerate
-    // (no earlier result, or the first result already met the target).
+    // completion meter, anchored at the GENESIS KING's benched score when
+    // published (the fixed day-one origin — it can't drift with the rolling
+    // index), else at the first published result at this size. Skipped when
+    // degenerate (no anchor, or the anchor already met the target).
     var meter = "";
     var refs = refDocs(), refG = null;
     refs.forEach(function(x){ if(x.rung.key === pr.rung.key) refG = x.geomean; });
-    var first = bv.firstBySize[pr.rung.key];
-    if(refG != null && first && first.geomean > 0){
-      var anchor = refG / first.geomean * 100;
+    var genG = genesisGeomean(pr.rung.key);
+    var anchorG = genG, anchorLabel = "genesis";
+    if(anchorG == null){
+      var first = bv.firstBySize[pr.rung.key];
+      if(first && first.geomean > 0){ anchorG = first.geomean; anchorLabel = "first result"; }
+    }
+    if(refG != null && anchorG != null && anchorG > 0){
+      var anchor = refG / anchorG * 100;
       if(anchor < 100 && anchor < pr.pct - 0.05){
         var fill = Math.max(0, Math.min(1, (pr.pct - anchor) / (100 - anchor))) * 100;
         meter =
           '<div class="meter">' +
             '<div class="mtrack"><i class="mfill" style="width:' + fill.toFixed(1) + '%"></i></div>' +
-            '<div class="mlabels"><span>first result ' + num(anchor,1) + '%</span>' +
+            '<div class="mlabels"><span>' + anchorLabel + ' ' + num(anchor,1) + '%</span>' +
               '<span>official 100%</span></div></div>';
       }
     }
@@ -2043,7 +2063,10 @@ function renderMethod(){
      "Reference docs (<code>benchmarks/reference-&lt;size&gt;.json</code>): the official Datadog " +
      "checkpoint of a ladder size, scored by the identical benchmark battery and published by " +
      "the operator — never a transcribed leaderboard number. The percentage compares six-score " +
-     "geometric means against Cascade&rsquo;s best published checkpoint at that size."],
+     "geometric means against Cascade&rsquo;s best published checkpoint at that size. The " +
+     "completion meter&rsquo;s origin is the <b>genesis king</b> benched the same way " +
+     "(<code>benchmarks/genesis-&lt;size&gt;.json</code>) — the fixed day-one anchor — falling " +
+     "back to the earliest published round result until that lands."],
     ["Compute",
      "Number of training runs times their published budgets. See the note under the chart."],
     ["Progress carried forward",

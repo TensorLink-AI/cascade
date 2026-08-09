@@ -90,6 +90,21 @@ Cascade's best published checkpoint at the same size. Until then the hero
 shows the target statement with an honest em-dash. Check which official
 sizes actually exist on Hugging Face before planning rungs beyond 4M.
 
+Also bench the GENESIS KING once per size — it anchors the hero's
+completion meter at the fixed day-one origin. Its checkpoint is a normal
+cascade artifact (fetch the day-one king's trained pointer from the
+earliest receipt), so steps (a)/wrapping are NOT needed — score it with
+the sidecar as-is, then:
+
+```bash
+python scripts/publish_reference_bench.py /out/genesis-report.json \
+    --preset toto2-4m --kind genesis \
+    --source "metro-v1:trained:hippius:cascade/<genesis-ckpt>@sha256:<digest>"
+```
+
+Until the genesis doc lands, the meter falls back to the earliest
+published round result at that size.
+
 ## 5. Verify
 
 Open the published page and check, in order:

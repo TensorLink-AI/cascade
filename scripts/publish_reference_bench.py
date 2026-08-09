@@ -64,9 +64,16 @@ def main() -> int:
     ap.add_argument("report", type=Path, help="Sidecar report.json for the official checkpoint.")
     ap.add_argument("--preset", required=True,
                     help="Ladder preset this references, e.g. toto2-4m.")
+    ap.add_argument("--kind", choices=("official", "genesis"), default="official",
+                    help="'official': the Datadog release (target side of the duel; "
+                         "published as reference-<preset>.json). 'genesis': the "
+                         "day-one king's own checkpoint (the completion meter's "
+                         "anchor; published as genesis-<preset>.json). The genesis "
+                         "checkpoint is already in cascade layout — no wrapping.")
     ap.add_argument("--source", required=True,
                     help="Exact provenance of the scored weights, e.g. "
-                         "'Datadog/Toto-2.0-4m@hf:<revision>'.")
+                         "'Datadog/Toto-2.0-4m@hf:<revision>' or the genesis "
+                         "checkpoint's registry pointer 'metro-v1:trained:…'.")
     ap.add_argument("--note", default="",
                     help="Optional free-text note (e.g. wrapper commit).")
     ap.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
@@ -85,7 +92,7 @@ def main() -> int:
 
     doc: dict = {
         "schema": REFERENCE_SCHEMA,
-        "kind": "reference_bench",
+        "kind": "reference_bench" if args.kind == "official" else "genesis_bench",
         "preset": args.preset,
         "source": args.source,
         "scores": {k: scores[k] for k in SIX_KEYS},
@@ -108,7 +115,8 @@ def main() -> int:
         doc["signer_hotkey"] = hotkey.ss58_address
         doc["signature"] = hotkey.sign(_canonical_body(doc)).hex()
 
-    key = f"benchmarks/reference-{args.preset}.json"
+    prefix = "reference" if args.kind == "official" else "genesis"
+    key = f"benchmarks/{prefix}-{args.preset}.json"
     text = json.dumps(doc, indent=1)
     if args.dry_run:
         print(f"[dry-run] would publish {len(text)} B to {key}:")
