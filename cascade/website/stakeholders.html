@@ -637,9 +637,21 @@ a:hover{text-decoration:underline}
   letter-spacing:.16em;color:var(--faint)}
 .hero .hbar{width:30px;height:3px;background:var(--saffron);border-radius:1px}
 .hero.beaten .hbar{background:var(--accent)}
+.hero .hrow{display:flex;align-items:center;gap:34px;flex-wrap:wrap}
 .hero .hv{font-family:var(--font-mono);font-weight:600;font-size:clamp(58px,7.2vw,92px);
   line-height:.95;color:var(--ink);letter-spacing:-.02em}
 .hero .hv .u{font-size:.38em;color:var(--muted);font-weight:500}
+/* completion meter: first published result → the official score. The track is
+   a lighter step of the fill's own ramp; endpoints labeled so the scale is
+   honest — it shows ground gained, not a 0-anchored almost-full bar. */
+.hero .meter{display:flex;flex-direction:column;gap:6px;min-width:210px}
+.hero .mtrack{position:relative;width:min(320px,36vw);height:6px;border-radius:3px;
+  background:rgba(126,155,126,.22)}
+.hero .mfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
+.hero.beaten .mfill{background:var(--accent)}
+.hero .mlabels{display:flex;justify-content:space-between;width:min(320px,36vw);
+  font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--faint)}
 .hero.pending .hv{color:var(--faint);font-weight:500;font-size:clamp(34px,3.6vw,46px)}
 .hero .hq{font-family:var(--font-mono);font-size:12px;color:var(--muted);line-height:1.6}
 .hero .hq b{color:var(--ink)}
@@ -1362,7 +1374,7 @@ function entrySizeKey(e, r){
 }
 
 function benchView(){
-  var rs = scoredRounds(), latest = null, best = null, bySize = {};
+  var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {};
   rs.forEach(function(r){
     var rep = _benchReports[String(r.round_id)];
     if(!rep) return;
@@ -1379,6 +1391,10 @@ function benchView(){
       if(g != null && sk && (!bySize[sk] || g < bySize[sk].geomean))
         bySize[sk] = { geomean:g, six:six, role:String(e.role||""),
                        round_id:r.round_id, at:r.published_at };
+      // rounds iterate oldest→newest: the first entry seen at a size is the
+      // earliest published result — the meter's honest starting anchor
+      if(g != null && sk && !firstBySize[sk])
+        firstBySize[sk] = { geomean:g, at:r.published_at };
       if(String(e && e.role || "") === wantRole)
         latest = { six:six, geomean:g, round_id:r.round_id, at:r.published_at, src:"report" };
     });
@@ -1390,7 +1406,7 @@ function benchView(){
       if(six) latest = { six:six, geomean:sixGeomean(six), round_id:null, at:null, src:"manifest" };
     }
   }
-  return { latest:latest, best:best, bySize:bySize };
+  return { latest:latest, best:best, bySize:bySize, firstBySize:firstBySize };
 }
 
 // ── official-Toto2 reference docs ───────────────────────────────────────────
@@ -1566,11 +1582,30 @@ function renderBoard(){
   // the one headline number: where Cascade stands against the official Toto2
   var pr = refPair(bv), hero = document.getElementById("hero");
   if(pr){
+    // completion meter, anchored at the FIRST published result at this size
+    // so the fill shows ground actually gained. Skipped when degenerate
+    // (no earlier result, or the first result already met the target).
+    var meter = "";
+    var refs = refDocs(), refG = null;
+    refs.forEach(function(x){ if(x.rung.key === pr.rung.key) refG = x.geomean; });
+    var first = bv.firstBySize[pr.rung.key];
+    if(refG != null && first && first.geomean > 0){
+      var anchor = refG / first.geomean * 100;
+      if(anchor < 100 && anchor < pr.pct - 0.05){
+        var fill = Math.max(0, Math.min(1, (pr.pct - anchor) / (100 - anchor))) * 100;
+        meter =
+          '<div class="meter">' +
+            '<div class="mtrack"><i class="mfill" style="width:' + fill.toFixed(1) + '%"></i></div>' +
+            '<div class="mlabels"><span>first result ' + num(anchor,1) + '%</span>' +
+              '<span>official 100%</span></div></div>';
+      }
+    }
     hero.className = "hero" + (pr.beaten ? " beaten" : "");
     hero.innerHTML =
       '<span class="hk">The target &middot; beat the official Toto2</span>' +
       '<span class="hbar"></span>' +
-      '<div class="hv">' + num(pr.pct,1) + '<span class="u">%</span></div>' +
+      '<div class="hrow"><div class="hv">' + num(pr.pct,1) + '<span class="u">%</span></div>' +
+        meter + '</div>' +
       '<div class="hq">' +
         (pr.beaten ? '<b>beats the official Toto2-' + esc(pr.rung.label) + '</b>'
                    : 'of the official Toto2-' + esc(pr.rung.label) + '&rsquo;s score') +
