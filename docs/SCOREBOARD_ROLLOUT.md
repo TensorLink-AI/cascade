@@ -54,6 +54,23 @@ as permanently absent — some rounds legitimately have no report). If the
 production pipeline already publishes these objects, nothing to do; the
 tile and section light up on their own.
 
+If it does not (nothing in this repo publishes them automatically — the
+trainer's `bench_hook` is log-only), publish per round from the sidecar
+reports:
+
+```bash
+python scripts/publish_round_bench.py --round-id <id> \
+    --entry role=king,size=toto2-4m,report=/out/king-report.json \
+    --entry role=challenger,size=toto2-4m,report=/out/chal-report.json \
+    --wallet-name trainer --wallet-hotkey default
+```
+
+The `size=` stamp per entry is required — it is what lets the page place
+each result on the ladder once rounds train at more than one size (and
+what advances the hero to the 22M bout when the time comes). Round docs
+are immutable once published; the script refuses to overwrite without
+`--force`.
+
 Verify: pick a `round_id` from `receipts/index.json` and
 `curl <endpoint>/<bucket>/benchmarks/round-<id>.json`.
 
