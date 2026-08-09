@@ -83,10 +83,12 @@ python scripts/publish_reference_bench.py /out/report.json \
     --wallet-name trainer --wallet-hotkey default
 ```
 
-Unlocks: the "Vs official Toto2" scoreboard cell and the "Is it catching
-the official Toto2?" section, computed against Cascade's best published
-checkpoint at the same size. Check which official sizes actually exist on
-Hugging Face before planning rungs beyond 4M.
+Unlocks: the HERO number above the scoreboard (the page's single headline:
+score-parity vs the official Toto2 at the largest shared size) and the
+"Is it catching the official Toto2?" section, both computed against
+Cascade's best published checkpoint at the same size. Until then the hero
+shows the target statement with an honest em-dash. Check which official
+sizes actually exist on Hugging Face before planning rungs beyond 4M.
 
 ## 5. Verify
 

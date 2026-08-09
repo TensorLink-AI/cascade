@@ -628,6 +628,23 @@ a:hover{text-decoration:underline}
   text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
 .header .sub{color:var(--muted);max-width:72ch;margin-top:8px;font-size:13.5px}
 
+/* ── the hero: the ONE headline number above the scoreboard — the score
+   against the official Toto2. Sage tick once beaten, saffron while
+   closing; a quiet em-dash until the official baseline is benched. ── */
+.hero{display:flex;flex-direction:column;align-items:center;text-align:center;gap:9px;
+  padding:2px 0 28px}
+.hero .hk{font-family:var(--font-mono);font-size:10px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.16em;color:var(--faint)}
+.hero .hbar{width:26px;height:3px;background:var(--saffron);border-radius:1px}
+.hero.beaten .hbar{background:var(--accent)}
+.hero .hv{font-family:var(--font-mono);font-weight:600;font-size:clamp(46px,5vw,64px);
+  line-height:1;color:var(--ink);letter-spacing:-.015em}
+.hero .hv .u{font-size:.42em;color:var(--muted);font-weight:500}
+.hero.pending .hv{color:var(--faint);font-weight:500;font-size:clamp(30px,3.2vw,40px)}
+.hero .hq{font-family:var(--font-mono);font-size:11.5px;color:var(--muted);line-height:1.6}
+.hero .hq b{color:var(--ink)}
+.hero.pending .hq{color:var(--faint)}
+
 /* ── the scoreboard: eight measures, two rows, one composition.
    No row captions — spacing and metric order carry the grouping;
    the numbers are the hero, labels and qualifiers recede. ── */
@@ -826,8 +843,9 @@ th.num{text-align:right}
     <p class="sub">Computed live from the subnet&rsquo;s public, signed record — nothing typed in by hand.</p>
   </div>
 
-  <!-- the scoreboard -->
+  <!-- the one headline number, then the scoreboard -->
   <section>
+    <div class="hero" id="hero"></div>
     <div class="board" id="board"></div>
   </section>
 
@@ -1520,24 +1538,13 @@ function renderBoard(){
       state: tr.top ? "live" : "pend" })
   ];
   var row2 = [
-    // The rallying metric leads the validation row: the head-to-head against
-    // the official Toto2 at the same size. Until an official baseline is
-    // benched, the cell falls back to the leader's GIFT-Eval score, then to
-    // an honest pending state. Full detail lives in the two bench sections.
-    (function(){
-      var pr = refPair(bv);
-      if(pr) return cell({ k:"Vs official Toto2",
-        v: num(pr.pct,1) + '<span class="u">%</span>',
-        q: pr.beaten ? ("beats official · " + pr.rung.label)
-                     : ("of official score · " + pr.rung.label),
-        state: pr.beaten ? "live" : "pend" });
-      if(bv.latest) return cell({ k:"Public benchmark",
-        v: num(bv.latest.six.gifteval_mase,3),
-        q: (bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval",
-        state: bv.latest.six.gifteval_mase<1 ? "live" : "warn" });
-      return cell({ k:"Public benchmark", v:"&mdash;",
-        q:"awaiting first result", state:"pend" });
-    })(),
+    // The vs-official score lives in the HERO above the board; this cell
+    // stays the public-benchmark reading so no number appears twice.
+    cell({ k:"Public benchmark",
+      v: bv.latest ? num(bv.latest.six.gifteval_mase,3) : "&mdash;",
+      q: bv.latest ? ((bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval")
+                   : "awaiting first result",
+      state: bv.latest ? (bv.latest.six.gifteval_mase<1 ? "live" : "warn") : "pend" }),
     cell({ k:"Compute efficiency",
       v: eff!=null ? signedPct(eff,2) : "&mdash;",
       q: eff!=null ? "per trillion tokens" : "awaiting first verified gain",
@@ -1555,6 +1562,28 @@ function renderBoard(){
   document.getElementById("board").innerHTML =
     '<div class="brow"><div class="bcells">' + row1.join("") + '</div></div>' +
     '<div class="brow"><div class="bcells">' + row2.join("") + '</div></div>';
+
+  // the one headline number: where Cascade stands against the official Toto2
+  var pr = refPair(bv), hero = document.getElementById("hero");
+  if(pr){
+    hero.className = "hero" + (pr.beaten ? " beaten" : "");
+    hero.innerHTML =
+      '<span class="hk">The target &middot; beat the official Toto2</span>' +
+      '<span class="hbar"></span>' +
+      '<div class="hv">' + num(pr.pct,1) + '<span class="u">%</span></div>' +
+      '<div class="hq">' +
+        (pr.beaten ? '<b>beats the official Toto2-' + esc(pr.rung.label) + '</b>'
+                   : 'of the official Toto2-' + esc(pr.rung.label) + '&rsquo;s score') +
+        ' &mdash; same architecture &middot; same size &middot; different data</div>';
+  } else {
+    hero.className = "hero pending";
+    hero.innerHTML =
+      '<span class="hk">The target &middot; beat the official Toto2</span>' +
+      '<span class="hbar"></span>' +
+      '<div class="hv">&mdash;</div>' +
+      '<div class="hq">awaiting the official baseline &mdash; same architecture &middot; ' +
+        'same size &middot; different data</div>';
+  }
 }
 
 function econCell(){
