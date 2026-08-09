@@ -121,11 +121,12 @@ def test_page_reads_only_fields_the_summary_publishes(html: str):
 
 
 def test_pending_states_are_explicit(html: str):
-    """The three not-yet-measurable metrics must render an explicit pending
+    """Metrics that cannot be measured yet must render an explicit pending
     state rather than a placeholder number — the whole page's credibility rests
     on never showing a figure nobody can check."""
-    assert "Pending public benchmark" in html
-    assert "Not switched on yet" in html
+    lower = html.lower()
+    assert "awaiting first result" in lower, "public benchmark must pend explicitly"
+    assert "not active yet" in lower, "carry-forward must pend explicitly"
     for phrase in ("bench_scores", "warm_start_ckpt"):
         assert phrase in html, f"page must key its pending state off {phrase}"
 
