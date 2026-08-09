@@ -1612,12 +1612,17 @@ function renderBoard(){
     if(refG != null && anchorG != null && anchorG > 0){
       var anchor = refG / anchorG * 100;
       if(anchor < 100 && anchor < pr.pct - 0.05){
+        // the anchor is the bar's ZERO point: the fill is the share of the
+        // genesis→official gap closed. Words on the endpoints, numbers in
+        // the tooltip — the hero carries the only on-screen percentage.
         var fill = Math.max(0, Math.min(1, (pr.pct - anchor) / (100 - anchor))) * 100;
         meter =
-          '<div class="meter">' +
+          '<div class="meter" title="' + esc(
+            anchorLabel + " " + num(anchor,1) + "% of the official score · today " +
+            num(pr.pct,1) + "% · gap closed " + num(fill,0) + "%") + '">' +
             '<div class="mtrack"><i class="mfill" style="width:' + fill.toFixed(1) + '%"></i></div>' +
-            '<div class="mlabels"><span>' + anchorLabel + ' ' + num(anchor,1) + '%</span>' +
-              '<span>official 100%</span></div></div>';
+            '<div class="mlabels"><span>' + esc(anchorLabel) + '</span>' +
+              '<span>official toto2</span></div></div>';
       }
     }
     hero.className = "hero" + (pr.beaten ? " beaten" : "");
