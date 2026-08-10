@@ -662,7 +662,7 @@ class ScoringConfig:
     # Threshold in ROUNDS ("survived N challenges"). Field name kept for
     # call-site compatibility; the config key is ``cascade_reign_rounds``.
     cascade_reign_days: int = 7
-    # Promotion ENVELOPE knobs (DEC-CA-0012, propose-and-verify). The trainer
+    # Promotion ENVELOPE knobs (DEC-CA-0013, propose-and-verify). The trainer
     # selects the promoted warm-start set; validators verify the signed
     # declaration against these bounds — so, like cascade_reign_rounds, they
     # are fleet-consensus values ([scoring] is not in contract_digest; keep

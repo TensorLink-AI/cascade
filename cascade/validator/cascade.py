@@ -7,7 +7,7 @@ top* of that loop and answers a different question — *when has one king held t
 throne long enough that its reign's best checkpoints should become the new floor
 the whole field trains up from?*
 
-Promotion is **propose-and-verify** (DEC-CA-0012). The trainer — which authors
+Promotion is **propose-and-verify** (DEC-CA-0013). The trainer — which authors
 the bench numbers, trains every model, and already declares each round's init in
 the signed manifest — *selects* the promoted member set and publishes a signed
 :class:`~cascade.shared.promotion.PromotionRecord`. The validator never selects:
@@ -544,7 +544,7 @@ class CascadeController:
         )
 
     def adopt_legacy_pointer(self, checkpoint_id: str) -> None:
-        """Migration shim: grandfather a pre-DEC-CA-0012 single-pointer install
+        """Migration shim: grandfather a pre-DEC-CA-0013 single-pointer install
         (the old ``warm_start_init.json`` this validator's own Cascade wrote) as
         generation 1. Runs once, only from the random-init era — after this the
         signed-record path owns all transitions."""

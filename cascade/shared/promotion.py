@@ -1,6 +1,6 @@
 """Promotion record — the trainer's signed warm-start promotion declaration.
 
-Cascade promotion is **propose-and-verify** (DEC-CA-0012): the trainer *selects*
+Cascade promotion is **propose-and-verify** (DEC-CA-0013): the trainer *selects*
 which reign checkpoints become the next warm-start init set (it authored the
 bench numbers selection runs on, so fleet re-derivation only ever re-checked the
 trainer's arithmetic on the trainer's own data), and every validator *verifies*

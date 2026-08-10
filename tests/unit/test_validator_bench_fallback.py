@@ -166,7 +166,7 @@ def test_unparseable_report_falls_back(cfg):
 
 
 def test_challenger_checkpoints_are_candidates_too(cfg):
-    # DEC-CA-0012: both duel roles land in the reign log — the challenger's
+    # DEC-CA-0013: both duel roles land in the reign log — the challenger's
     # checkpoint carries a different generator's data, the deepest diversity
     # the promoted set can draw on.
     size = cfg.throne_contracts()[0].arch_preset

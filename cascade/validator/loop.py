@@ -177,7 +177,7 @@ class ValidatorRunner:
     # manifests' in-entry bench_scores) are logged as promotion candidates. The
     # validator never selects: the trainer declares the promoted set in a
     # signed PromotionRecord and the warm-start gate verifies it against the
-    # envelope (DEC-CA-0012), re-crowning the same king on acceptance
+    # envelope (DEC-CA-0013), re-crowning the same king on acceptance
     # (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
     cascade: CascadeController | None = None
     # Cascade bench-report source (cascade.shared.bench_report): duck-types
@@ -240,7 +240,7 @@ class ValidatorRunner:
         return None
 
     def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
-        """Warm-start envelope gate (Cascade, DEC-CA-0012, propose-and-verify).
+        """Warm-start envelope gate (Cascade, DEC-CA-0013, propose-and-verify).
 
         The trainer SELECTS the promoted warm-start set and declares each
         round's init in the signed manifest (``warm_start_ckpt``); this gate
@@ -274,7 +274,7 @@ class ValidatorRunner:
         return self._verify_promotion(manifest, declared)
 
     def _adopt_legacy_warm_start(self) -> str | None:
-        """Migration shim (pre-DEC-CA-0012 states): grandfather the single
+        """Migration shim (pre-DEC-CA-0013 states): grandfather the single
         pointer this validator's own Cascade installed under the old
         select-and-install mechanism — or, on the owner box, the member set the
         co-hosted trainer's engine wrote — as the accepted generation, once,
@@ -799,7 +799,7 @@ class ValidatorRunner:
     def _record_duel_checkpoints(self, manifest: TrainingManifest, now: float) -> None:
         """Add the round's benched duel checkpoints — the king's AND every
         challenger's at the primary throne size — to the reign log. Both roles
-        are promotion candidates (DEC-CA-0012): challenger checkpoints carry
+        are promotion candidates (DEC-CA-0013): challenger checkpoints carry
         genuinely different generator data, the deepest diversity the promoted
         set can draw on, and the trainer benches both sides already. The log is
         the envelope's provenance/quality evidence, so a later verification is
@@ -886,7 +886,7 @@ class ValidatorRunner:
         """One Cascade step, run at the end of a round (after weights/receipts).
         Resets the reign clock on a dethrone, re-anchors a legacy clock, and
         records the round's benched duel checkpoints into the reign log. The
-        validator never fires a promotion (DEC-CA-0012): the trainer declares,
+        validator never fires a promotion (DEC-CA-0013): the trainer declares,
         and the warm-start gate verifies+adopts at manifest time — this step
         only maintains the clock and the evidence the gate verifies against.
         Fully guarded: Cascade never disturbs KOTH."""

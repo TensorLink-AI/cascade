@@ -1,4 +1,4 @@
-"""Trainer-side promotion (DEC-CA-0012): the signed PromotionRecord wire format
+"""Trainer-side promotion (DEC-CA-0013): the signed PromotionRecord wire format
 and the selection engine — quality-gated structural-diversity selection,
 reign tracking, candidate admissibility, rotation, migration, persistence.
 """
@@ -111,7 +111,7 @@ def test_quality_gate_excludes_off_frontier_candidates():
 
 
 def test_selection_prefers_a_different_generator():
-    # DEC-CA-0012: a challenger checkpoint (different generator = different
+    # DEC-CA-0013: a challenger checkpoint (different generator = different
     # data distribution) beats a same-generator sibling with wider spacing.
     got = select_members(
         [_cand("king1", 1.0, epoch=1, hotkey="hkKing"),

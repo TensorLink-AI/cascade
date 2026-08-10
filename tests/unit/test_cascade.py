@@ -1,7 +1,7 @@
 """Cascade validator half — reign clock, reign log, promotion adoption,
 persistence.
 
-Under propose-and-verify (DEC-CA-0012) the validator never fires or selects a
+Under propose-and-verify (DEC-CA-0013) the validator never fires or selects a
 promotion: the controller tracked here maintains the block-anchored reign clock
 (the envelope's ripeness predicate), the reign's benched-checkpoint log (the
 envelope's provenance/quality evidence), and the accepted generation + member

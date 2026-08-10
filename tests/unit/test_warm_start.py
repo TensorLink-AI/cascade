@@ -82,7 +82,7 @@ def test_pointer_file_without_size_defaults_to_primary(cfg, tmp_path):
 
 
 def test_member_set_rotates_by_epoch_index(cfg, tmp_path):
-    # DEC-CA-0012: a multi-member pointer file rotates deterministically —
+    # DEC-CA-0013: a multi-member pointer file rotates deterministically —
     # epoch N trains from members[N % len(members)].
     p = tmp_path / "ws.json"
     p.write_text(json.dumps({
@@ -390,7 +390,7 @@ def test_bootstrap_validator_skips_unverifiable_ripeness(cfg, tmp_path):
     assert ctl.state.generation == 3
 
 
-# ── migration: pre-DEC-CA-0012 pointer files ─────────────────────────────────
+# ── migration: pre-DEC-CA-0013 pointer files ─────────────────────────────────
 
 
 def test_legacy_single_pointer_file_is_grandfathered(cfg, tmp_path):

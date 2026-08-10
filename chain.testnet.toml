@@ -255,7 +255,7 @@ gift_gate_mode       = "shadow"  # TESTNET: log-only to calibrate tolerance, the
 gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
 gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
-# cascade.trainer.promotion, DEC-CA-0012 propose-and-verify). Enabled on
+# cascade.trainer.promotion, DEC-CA-0013 propose-and-verify). Enabled on
 # testnet with a shorter reign for iteration. After a ripe reign the TRAINER
 # selects up to cascade_top_k reign checkpoints as the next warm-start
 # generation (signed PromotionRecord) and rotates rounds across the members;

@@ -575,7 +575,7 @@ class TrainerRunner:
     # validators verify it against the envelope and cascade-audit re-derives
     # from it. None ⇒ random init always (cascade off / pre-warm-start deploy).
     warm_start_path: Path | None = None
-    # Cascade promotion engine (cascade.trainer.promotion, DEC-CA-0012): the
+    # Cascade promotion engine (cascade.trainer.promotion, DEC-CA-0013): the
     # trainer is the selection authority — the engine tracks the reign, logs
     # benched duel candidates, fires promotions (signed PromotionRecord to the
     # manifest bucket), and writes the pointer file above. None ⇒ the trainer
@@ -1624,7 +1624,7 @@ class TrainerRunner:
         ``None`` when no promotion has fired (file absent) or consumption isn't
         wired.
 
-        A multi-member pointer file (DEC-CA-0012) carries the live generation's
+        A multi-member pointer file (DEC-CA-0013) carries the live generation's
         ``members`` list; the round trains from the epoch-rotation member
         (``epoch_index % len(members)``; index ``None`` ⇒ the first member). A
         legacy single-pointer file reads as a one-member set. Validators accept
@@ -1774,7 +1774,7 @@ class TrainerRunner:
                         manifest.round_id, e)
         finally:
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
-        # Promotion candidates (DEC-CA-0012): both duel checkpoints' scores feed
+        # Promotion candidates (DEC-CA-0013): both duel checkpoints' scores feed
         # the engine's candidate log (thread-safe; this runs on the bench
         # thread). Guarded — candidate bookkeeping must never fail the bench.
         if report is not None and self.promotion is not None:
@@ -3022,7 +3022,7 @@ class TrainerRunner:
                 # an early next-round re-commit forfeit the current round.
                 commitments = client.poll_commitments(include_history=True)
                 king_hotkey = client.highest_incentive_hotkey()
-                # Cascade promotion (DEC-CA-0012): track the reign at the
+                # Cascade promotion (DEC-CA-0013): track the reign at the
                 # boundary and fire a promotion BEFORE the round trains, so the
                 # signed record is published (and fetchable by validators)
                 # before any manifest pins a new-generation member. The reign

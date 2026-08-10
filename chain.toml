@@ -335,7 +335,7 @@ gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
 gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
-# cascade.trainer.promotion, DEC-CA-0012 propose-and-verify). After a ripe
+# cascade.trainer.promotion, DEC-CA-0013 propose-and-verify). After a ripe
 # reign the TRAINER selects up to cascade_top_k reign checkpoints as the next
 # warm-start generation (signed PromotionRecord, promotions/gen-<n>.json) and
 # rotates rounds across the members; validators verify the declaration against
@@ -353,7 +353,7 @@ cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post
 # ≈ 2.5 days per promotion cycle. CONSENSUS-relevant — every validator must
 # run the same value or cascades fire at different rounds (divergent pins).
 cascade_reign_rounds = 5
-# Promotion ENVELOPE (DEC-CA-0012). CONSENSUS-relevant like the reign clock:
+# Promotion ENVELOPE (DEC-CA-0013). CONSENSUS-relevant like the reign clock:
 # every validator must run the same values or their accept/reject verdicts on
 # a declared promotion fork. cascade_top_k caps how many member checkpoints
 # one promotion may declare (the trainer may declare fewer — the selection

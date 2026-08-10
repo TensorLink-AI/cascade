@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0012
+id: DEC-CA-0013
 type: decision
 title: "Warm-start promotes a top-k member set; the trainer selects, validators verify an envelope"
 status: active

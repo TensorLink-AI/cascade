@@ -1,6 +1,6 @@
 """Trainer-side promotion engine — selection authority for Cascade warm-start.
 
-Under propose-and-verify (DEC-CA-0012) the TRAINER selects which reign
+Under propose-and-verify (DEC-CA-0013) the TRAINER selects which reign
 checkpoints become the next warm-start generation: it authors the bench numbers
 selection runs on, trains every model, and already declares each round's init in
 the signed manifest — fleet re-derivation only ever re-checked the trainer's
@@ -12,7 +12,7 @@ within ``cascade_quality_epsilon`` of the reign's best, at most
 ``cascade_top_k`` members, promoted only on a ripe reign clock).
 
 The v1 policy is structural diversity over a quality-gated candidate pool
-(DEC-CA-0012 discussion): the pool is every benched duel checkpoint of the reign
+(DEC-CA-0013 discussion): the pool is every benched duel checkpoint of the reign
 — the king's AND the challengers' (different generators are genuinely different
 data distributions, the deepest diversity available; the checkpoint's owner
 earns NOTHING from promotion, by design) — the geomean-best checkpoint anchors
@@ -31,7 +31,7 @@ The engine keys its reign clock off whatever king the runner resolves for it —
 the signed receipt trail's verdict king when readable (prompt: validators reset
 their clocks at the dethrone verdict), the on-chain incentive king as fallback
 (it lags a dethrone by 1-2 epochs). It persists across restarts and
-grandfathers a pre-DEC-CA-0012 pointer file (single winner OR member set) at
+grandfathers a pre-DEC-CA-0013 pointer file (single winner OR member set) at
 its recorded generation.
 """
 
@@ -170,7 +170,7 @@ class TrainerPromotion:
         min_round_spacing: int = 1,
     ) -> TrainerPromotion:
         """Restore the engine from ``state_path`` (fresh when absent/corrupt),
-        then grandfather a pre-DEC-CA-0012 pointer file — the single winner the
+        then grandfather a pre-DEC-CA-0013 pointer file — the single winner the
         old validator-side Cascade installed — as generation 1, so an armed
         deployment upgrades without a round of ``warm_start_mismatch``."""
         engine = cls(
@@ -217,7 +217,7 @@ class TrainerPromotion:
 
     def _adopt_legacy_pointer(self) -> None:
         """Grandfather a pre-existing pointer file when the engine has no state
-        of its own: the pre-DEC-CA-0012 single winner becomes generation 1, and
+        of its own: the pre-DEC-CA-0013 single winner becomes generation 1, and
         a member-set file (this engine's own schema — the state file was lost
         or corrupted while the pointer survived) is re-adopted at its recorded
         generation, so a state-file loss degrades to a resumable engine rather
