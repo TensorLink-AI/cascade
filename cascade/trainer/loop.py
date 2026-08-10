@@ -1631,7 +1631,21 @@ class TrainerRunner:
         promotion is live, training must never silently fall back to random
         init — the round's reproducibility contract pins the init
         (DEC-CA-0005). ``size`` defaults to the primary arch preset for pointer
-        files written before the field existed."""
+        files written before the field existed.
+
+        With the promotion engine wired it is the SINGLE source of the
+        allocation policy — the file (which the engine itself writes) is only
+        the fallback for engine-less runs, so a future policy change edits one
+        place, not two."""
+        if self.promotion is not None:
+            picked = self.promotion.init_for_epoch(int(epoch_index or 0))
+            if picked is None:
+                return None
+            ref, size = picked
+            if not ref or parse_trained_pointer(ref) is None:
+                raise RuntimeError(
+                    f"promotion engine returned no usable checkpoint_id: {ref!r}")
+            return ref, size or self.cfg.training.primary_size.arch_preset
         if self.warm_start_path is None:
             return None
         p = Path(self.warm_start_path)
@@ -1765,6 +1779,32 @@ class TrainerRunner:
                 log.warning("round=%s: promotion candidate recording failed (ignored): %s",
                             manifest.round_id, e)
         return report
+
+    def _receipt_king(self) -> str | None:
+        """The current king per the validators' signed receipt trail, or
+        ``None`` when no verifiable scored receipt is readable. This is the
+        prompt dethrone signal the reign clock needs: validators reset their
+        clocks at the dethrone verdict, while the on-chain incentive (the
+        trainer's fallback king source) lags it. Best-effort; never raises."""
+        try:
+            from ..shared.hippius import RECEIPT_LATEST_KEY, receipt_latest_key
+            from ..shared.receipt import load_receipt, verify_receipt_signature
+
+            anchor = self.cfg.manifest.validator_hotkey
+            store = self.manifest_store()
+            for key in (receipt_latest_key(anchor), RECEIPT_LATEST_KEY):
+                try:
+                    receipt = load_receipt(store.get_text(key))
+                except Exception:  # noqa: BLE001 — absent/unreadable ⇒ next candidate
+                    continue
+                if anchor and not verify_receipt_signature(receipt, anchor):
+                    continue
+                v = receipt.verdict
+                if receipt.status == "scored" and v is not None and v.king_hotkey:
+                    return str(v.king_hotkey)
+        except Exception:  # noqa: BLE001 — the incentive fallback covers a miss
+            pass
+        return None
 
     def _publish_promotion_record(self, record: object) -> None:
         """Sign and publish a fired promotion's record to the manifest bucket
@@ -2959,15 +2999,27 @@ class TrainerRunner:
                 # Cascade promotion (DEC-CA-0012): track the reign at the
                 # boundary and fire a promotion BEFORE the round trains, so the
                 # signed record is published (and fetchable by validators)
-                # before any manifest pins a new-generation member. Guarded:
-                # promotion must never sink a round.
+                # before any manifest pins a new-generation member. The reign
+                # clock keys off the signed receipt trail's verdict king when
+                # available — the on-chain incentive lags a dethrone by 1-2
+                # epochs, and a clock still anchored to the deposed reign would
+                # fire a promotion every validator judges premature — falling
+                # back to the incentive king when no receipt is readable.
+                # Guarded: promotion must never sink a round.
                 if self.promotion is not None:
                     try:
-                        self.promotion.note_round(king_hotkey, epoch_block=epoch_start)
-                        record = self.promotion.maybe_promote(
+                        self.promotion.note_round(self._receipt_king() or king_hotkey,
+                                                  epoch_block=epoch_start)
+                        self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
-                        if record is not None:
-                            self._publish_promotion_record(record)
+                        # Publish-with-retry: the record survives (persisted) as
+                        # pending until the publish lands, so a store outage
+                        # never orphans a generation the pointer file already
+                        # rotates over.
+                        pending = self.promotion.unpublished_record()
+                        if pending is not None:
+                            self._publish_promotion_record(pending)
+                            self.promotion.mark_record_published()
                     except Exception as e:  # noqa: BLE001
                         log.warning("promotion step failed for round=%s: %s", round_id, e)
                 self._reload_remote_hosts()  # per-round elastic fleet pickup

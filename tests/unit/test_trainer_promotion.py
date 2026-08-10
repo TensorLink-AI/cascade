@@ -80,6 +80,11 @@ def test_publish_writes_record_and_locator_index():
 def test_index_is_best_effort_on_garbage():
     assert load_promotion_index("{not json") == 0
     assert load_promotion_index("{}") == 0
+    # Valid JSON that is not a dict (partial write, error page) is equally
+    # "nothing located" — never an exception.
+    assert load_promotion_index("[]") == 0
+    assert load_promotion_index("3") == 0
+    assert load_promotion_index("null") == 0
 
 
 # ── selection: quality gate, then structural diversity ───────────────────────
@@ -291,6 +296,64 @@ def test_legacy_pointer_file_grandfathered_as_generation_one(tmp_path):
     # The pointer file was rewritten in the new schema (members + mirror).
     obj = json.loads((tmp_path / "warm_start_init.json").read_text(encoding="utf-8"))
     assert [m["checkpoint_id"] for m in obj["members"]] == ["old-winner"]
+
+
+def test_fired_record_pends_until_publish_confirmed(tmp_path):
+    # State advances at fire time, so the record must survive a publish
+    # failure (and a restart) until the caller confirms it landed — otherwise
+    # a store outage orphans a generation the pointer file already rotates on.
+    eng = _engine(tmp_path)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1"), _report("r1", 1 * DAY, {
+        "ptr-a": (1.0, "hkKing", "king")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert eng.unpublished_record() == rec
+
+    # A restart re-offers the same pending record.
+    again = TrainerPromotion.load(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+    )
+    assert again.unpublished_record() is not None
+    assert again.unpublished_record().generation == 1
+    assert again.unpublished_record().member_ids() == ("ptr-a",)
+
+    again.mark_record_published()
+    assert again.unpublished_record() is None
+    # ...and the confirmation persists too.
+    final = TrainerPromotion.load(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+    )
+    assert final.unpublished_record() is None
+
+
+def test_lost_state_file_readopts_member_pointer(tmp_path):
+    # Losing/corrupting trainer_promotion.json must degrade to a resumable
+    # engine: the surviving member-set pointer file is re-adopted at its
+    # recorded generation, so candidates keep accumulating and the generation
+    # counter never rolls back below what validators accepted.
+    eng = _engine(tmp_path)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1"), _report("r1", 1 * DAY, {
+        "ptr-a": (1.0, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is not None
+    (tmp_path / "trainer_promotion.json").unlink()
+
+    again = TrainerPromotion.load(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+    )
+    assert again.generation == 1
+    assert [m.checkpoint_id for m in again.members] == ["ptr-a"]
+    # Rounds pinning the live member are candidates again.
+    again.note_round("hkKing", epoch_block=6 * DAY)
+    assert again.record_bench(
+        _manifest("r6", warm_start_ckpt="ptr-a"),
+        _report("r6", 6 * DAY, {"ptr-b": (1.0, "hkKing", "king")})) == 1
 
 
 def test_ripe_clock_with_no_candidates_holds(tmp_path):

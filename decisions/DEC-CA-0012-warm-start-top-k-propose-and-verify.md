@@ -65,7 +65,24 @@ sides grandfather the legacy `warm_start_init.json` single pointer as
 generation 1 (trainer `TrainerPromotion.load`, validator
 `_adopt_legacy_warm_start`), so an armed fleet upgrades without a
 `warm_start_mismatch` round. The validator no longer writes the pointer file —
-the trainer's engine owns it. Trainer + validators deploy together.
+the trainer's engine owns it. Trainer + validators deploy together. Known
+bounded gap: the grandfathered generation has no published record, so a
+validator with NO local state joining during the grandfather window rejects
+rounds until the first real promotion publishes (≤ one reign; the old
+mechanism was worse — such a validator rejected until its OWN clock fired).
+
+HARDENING (post-review, same change): the trainer's reign clock keys off the
+signed RECEIPT trail's verdict king (falling back to on-chain incentive) —
+incentive lags a dethrone 1-2 epochs and a stale clock would fire promotions
+every validator judges premature; a fired record persists as
+`pending_record` until its publish is confirmed (a store outage never orphans
+a generation the pointer file already rotates on); the validator's
+pending-bench queue carries the reign ANCHOR, not just the king, so a
+promotion's re-crown (same king) drops stale entries instead of leaking a
+closed reign's scores into the fresh log's quality floor; and an attesting
+validator pins fetched member provenance to the current reign
+(`report.created_block >= reign_start`), closing the any-historical-report
+loophole.
 
 Kept from the prior design: the manifest's single per-round pin (no receipt
 or audit change — cascade-audit still re-derives from `warm_start_ckpt`,

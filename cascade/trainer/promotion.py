@@ -48,6 +48,19 @@ from ..validator.cascade import cascade_score, reign_rounds
 log = logging.getLogger("cascade.trainer.promotion")
 
 
+def _member_to_json(m: PromotedMember) -> dict:
+    return {"checkpoint_id": m.checkpoint_id, "size": m.size,
+            "source_round": m.source_round, "score": m.score}
+
+
+def _member_from_json(m: dict) -> PromotedMember:
+    return PromotedMember(
+        checkpoint_id=str(m["checkpoint_id"]), size=str(m.get("size", "")),
+        source_round=str(m.get("source_round", "")),
+        score=float(m.get("score", float("nan"))),
+    )
+
+
 @dataclass(frozen=True)
 class Candidate:
     """One benched duel checkpoint, eligible for promotion selection."""
@@ -140,6 +153,11 @@ class TrainerPromotion:
     king_hotkey: str | None = None
     reign_start_block: int | None = None
     candidates: tuple[Candidate, ...] = ()
+    # The last fired promotion's record, held (and persisted) until the caller
+    # confirms it published: state advances at fire time, so a publish failure
+    # must be retried from here — losing the record would leave the fleet with
+    # no way to verify the generation the pointer file already rotates over.
+    pending_record: PromotionRecord | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -177,12 +195,7 @@ class TrainerPromotion:
     def _restore(self, obj: dict) -> None:
         self.generation = int(obj.get("generation", 0) or 0)
         self.members = tuple(
-            PromotedMember(
-                checkpoint_id=str(m["checkpoint_id"]), size=str(m.get("size", "")),
-                source_round=str(m.get("source_round", "")),
-                score=float(m.get("score", float("nan"))),
-            )
-            for m in (obj.get("members") or ())
+            _member_from_json(m) for m in (obj.get("members") or ())
         )
         self.king_hotkey = obj.get("king_hotkey") or None
         rsb = obj.get("reign_start_block")
@@ -197,8 +210,23 @@ class TrainerPromotion:
             )
             for c in (obj.get("candidates") or ())
         )
+        pr = obj.get("pending_record")
+        if pr:
+            self.pending_record = PromotionRecord(
+                generation=int(pr["generation"]),
+                king_hotkey=str(pr.get("king_hotkey", "")),
+                fired_round=str(pr.get("fired_round", "")),
+                fired_block=int(pr.get("fired_block", 0)),
+                members=tuple(_member_from_json(m) for m in (pr.get("members") or ())),
+            )
 
     def _adopt_legacy_pointer(self) -> None:
+        """Grandfather a pre-existing pointer file when the engine has no state
+        of its own: the pre-DEC-CA-0012 single winner becomes generation 1, and
+        a member-set file (this engine's own schema — the state file was lost
+        or corrupted while the pointer survived) is re-adopted at its recorded
+        generation, so a state-file loss degrades to a resumable engine rather
+        than one that rejects every candidate forever."""
         if self.generation != 0 or self.pointer_path is None or not self.pointer_path.is_file():
             return
         try:
@@ -207,8 +235,17 @@ class TrainerPromotion:
             log.warning("legacy warm-start pointer %s unreadable (%s); NOT adopted — "
                         "the training loop will fail loud on it", self.pointer_path, e)
             return
+        members = [m for m in (obj.get("members") or ()) if m.get("checkpoint_id")]
+        if members:
+            self.generation = max(1, int(obj.get("generation", 1) or 1))
+            self.members = tuple(_member_from_json(m) for m in members)
+            self._persist()
+            log.info("trainer promotion: re-adopted member-set pointer file as "
+                     "generation %d (%d member(s); engine state was missing)",
+                     self.generation, len(self.members))
+            return
         cid = str(obj.get("checkpoint_id") or "")
-        if not cid or obj.get("members"):
+        if not cid:
             return
         self.generation = 1
         self.members = (PromotedMember(
@@ -283,10 +320,10 @@ class TrainerPromotion:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
         clock (the king persists — DEC-CA-0004), clear the candidate log, and
-        write the pointer file. Returns the UNSIGNED record for the caller to
-        sign and publish (a publish failure retries next round: the returned
-        record is rebuilt identically because the state advanced — callers must
-        publish before relying on validators accepting the new generation)."""
+        write the pointer file. The record is retained (persisted) as
+        :attr:`pending_record` until :meth:`mark_record_published` — state
+        advances at fire time, so the caller retries the publish from
+        :meth:`unpublished_record` every round until it lands."""
         with self._lock:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
@@ -320,6 +357,7 @@ class TrainerPromotion:
                 fired_block=int(epoch_block),
                 members=self.members,
             )
+            self.pending_record = record
             self._persist()
             self._write_pointer()
             log.info(
@@ -330,6 +368,18 @@ class TrainerPromotion:
                 (self.king_hotkey or "?")[:12],
             )
             return record
+
+    def unpublished_record(self) -> PromotionRecord | None:
+        """The fired-but-unpublished promotion record, or ``None``. The caller
+        publishes it (signed) and confirms with :meth:`mark_record_published`;
+        until then it survives restarts and is re-offered every round."""
+        with self._lock:
+            return self.pending_record
+
+    def mark_record_published(self) -> None:
+        with self._lock:
+            self.pending_record = None
+            self._persist()
 
     def init_for_epoch(self, epoch_index: int) -> tuple[str, str] | None:
         """The member this epoch's round trains from — deterministic rotation
@@ -356,11 +406,7 @@ class TrainerPromotion:
             return
         body = {
             "generation": self.generation,
-            "members": [
-                {"checkpoint_id": m.checkpoint_id, "size": m.size,
-                 "source_round": m.source_round, "score": m.score}
-                for m in self.members
-            ],
+            "members": [_member_to_json(m) for m in self.members],
             "king_hotkey": self.king_hotkey,
             "reign_start_block": self.reign_start_block,
             "candidates": [
@@ -369,10 +415,21 @@ class TrainerPromotion:
                  "epoch_index": c.epoch_index, "score": c.score}
                 for c in self.candidates
             ],
+            "pending_record": None if self.pending_record is None else {
+                "generation": self.pending_record.generation,
+                "king_hotkey": self.pending_record.king_hotkey,
+                "fired_round": self.pending_record.fired_round,
+                "fired_block": self.pending_record.fired_block,
+                "members": [_member_to_json(m) for m in self.pending_record.members],
+            },
         }
+        # Atomic (tmp + rename): a crash mid-write must not corrupt the state
+        # file — a corrupted file restarts the engine at generation 0.
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
+            tmp.replace(self.state_path)
         except Exception as e:  # noqa: BLE001 — persistence must never abort a round
             log.warning("trainer promotion: failed to persist state to %s: %s",
                         self.state_path, e)
@@ -399,7 +456,9 @@ class TrainerPromotion:
         }
         try:
             self.pointer_path.parent.mkdir(parents=True, exist_ok=True)
-            self.pointer_path.write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
+            tmp = self.pointer_path.with_suffix(self.pointer_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
+            tmp.replace(self.pointer_path)
             log.info("trainer promotion: warm-start pointer written to %s "
                      "(generation %d, %d member(s))",
                      self.pointer_path, self.generation, len(self.members))

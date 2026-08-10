@@ -191,9 +191,11 @@ def publish_promotion_record(store: object, record_text: str, generation: int) -
 
 
 def load_promotion_index(text: str) -> int:
-    """The latest published generation out of ``promotions/index.json`` (0 when
-    the index is empty/malformed — the locator is best-effort by design)."""
+    """The latest published generation out of ``promotions/index.json`` (0 on
+    ANY malformed content — the locator is best-effort by design; a non-dict
+    JSON body, a partial write, an error page all read as "nothing located")."""
     try:
-        return int(json.loads(text).get("latest_generation", 0))
-    except (ValueError, TypeError, KeyError):
+        obj = json.loads(text)
+        return int(obj.get("latest_generation", 0)) if isinstance(obj, dict) else 0
+    except Exception:  # noqa: BLE001 — best-effort locator, never raises
         return 0

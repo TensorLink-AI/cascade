@@ -141,6 +141,22 @@ def test_pending_dropped_when_reign_ends(cfg):
     assert runner.cascade.state.checkpoints == ()
 
 
+def test_pending_dropped_when_promotion_recrowns_same_king(cfg):
+    # An accepted promotion re-crowns the SAME king with a fresh clock and a
+    # cleared log; a pre-promotion checkpoint whose report lands afterwards
+    # must NOT drain into the new reign — it would corrupt the quality floor
+    # the next promotion is verified against.
+    store = _FakeStore()
+    runner = _runner(cfg, store)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)
+    assert len(runner._pending_bench) == 1
+    runner.cascade.note_promotion(generation=1, members=(PTR,), block=16200)
+    store.texts[bench_report_key("777")] = _report_text(cfg)
+    runner._drain_pending_bench(now=3000.0)
+    assert runner._pending_bench == []
+    assert runner.cascade.state.checkpoints == ()
+
+
 def test_unparseable_report_falls_back(cfg):
     store = _FakeStore({bench_report_key("777"): "{not json"})
     runner = _runner(cfg, store)
