@@ -216,14 +216,30 @@ def main(argv: list[str] | None = None) -> int:
     bench_eval_fn = None
     cascade_bench_plan = None
     warm_start_path = None
+    promotion = None
     if cfg.scoring.cascade_enabled:
-        # Warm-start consumption (DEC-CA-0005): read the promoted-init pointer
-        # the co-hosted validator's Cascade installs; every round then trains
-        # from that pinned checkpoint (and stamps it, signed, on the manifest).
+        # Warm-start promotion + consumption (DEC-CA-0005/0012): the trainer is
+        # the selection authority — its promotion engine tracks the reign, logs
+        # benched duel candidates, fires promotions (signed PromotionRecord),
+        # and writes the pointer file every round then trains from (stamping
+        # the pin, signed, on the manifest for the fleet's envelope gate).
         from pathlib import Path as _Path
 
+        from .promotion import TrainerPromotion
+
         warm_start_path = _Path(cfg.validator.warm_start_init_path)
-        log.info("cascade warm-start consumption enabled: pointer file %s", warm_start_path)
+        promotion = TrainerPromotion.load(
+            reign_threshold=cfg.scoring.cascade_reign_days,
+            k_max=cfg.scoring.cascade_top_k,
+            quality_epsilon=cfg.scoring.cascade_quality_epsilon,
+            state_path=_Path(args.work_root) / "trainer_promotion.json",
+            pointer_path=warm_start_path,
+            round_cfg=cfg.round,
+        )
+        log.info("cascade promotion engine enabled: generation=%d members=%d "
+                 "(pointer file %s, k_max=%d, epsilon=%.3f)",
+                 promotion.generation, len(promotion.members), warm_start_path,
+                 cfg.scoring.cascade_top_k, cfg.scoring.cascade_quality_epsilon)
         if remote_hosts or args.remote_hosts:
             # Preferred: bench each duel checkpoint on the pod that just trained
             # it — GPU, and the checkpoint is already at its _train_work path.
@@ -296,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         # wall-clock estimate. Off by default for offline runs and tests.
         publish_stage_status=True,
         warm_start_path=warm_start_path,
+        promotion=promotion,
         force_rerun_round=args.force_rerun_round,
     )
     log.info(

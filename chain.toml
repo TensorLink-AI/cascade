@@ -334,9 +334,13 @@ king_decay           = 0.5       # geometric decay across [king, prior kings]: k
 gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
 gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
-# Cascade — king-reign promotion / warm-start (cascade.validator.cascade). After
-# cascade_reign_days consecutive undethroned days, the reign's best checkpoint
-# becomes the warm-start init and the throne is vacated.
+# Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
+# cascade.trainer.promotion, DEC-CA-0012 propose-and-verify). After a ripe
+# reign the TRAINER selects up to cascade_top_k reign checkpoints as the next
+# warm-start generation (signed PromotionRecord, promotions/gen-<n>.json) and
+# rotates rounds across the members; validators verify the declaration against
+# the envelope below instead of re-deriving the selection. The king PERSISTS
+# on promotion (DEC-CA-0004); the throne is never vacated.
 cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post-publish duel bench live
 # Consecutive undethroned ROUNDS before a Cascade fires — "survived N
 # challenges". Renamed from cascade_reign_days on 2026-07-28 (the old key is
@@ -349,6 +353,16 @@ cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post
 # ≈ 2.5 days per promotion cycle. CONSENSUS-relevant — every validator must
 # run the same value or cascades fire at different rounds (divergent pins).
 cascade_reign_rounds = 5
+# Promotion ENVELOPE (DEC-CA-0012). CONSENSUS-relevant like the reign clock:
+# every validator must run the same values or their accept/reject verdicts on
+# a declared promotion fork. cascade_top_k caps how many member checkpoints
+# one promotion may declare (the trainer may declare fewer — the selection
+# policy is trainer-side and free to evolve); cascade_quality_epsilon is the
+# quality floor: every member's bench geomean must sit within (1 + epsilon)
+# of the best verifiable score in the reign, so diversity can never be bought
+# with a materially worse init.
+cascade_top_k          = 3
+cascade_quality_epsilon = 0.05
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely

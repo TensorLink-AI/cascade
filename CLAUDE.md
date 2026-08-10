@@ -91,6 +91,14 @@ in-context.
   cross-hardware bias, and u86 won with an 8.3% LCB from apparent hopelessness.
   Ships inert; validator/audit multi-challenger fix goes FIRST.
   (`decisions/DEC-CA-0012-tie-aware-finalists-cohort-duel.md`)
+- **DEC-CA-0012** — Warm-start promotes a TOP-K member set (parallel lineages,
+  zero extra GPU; rounds rotate across members) and flips to propose-and-verify:
+  the TRAINER selects (signed `PromotionRecord`, king+challenger candidate pool,
+  structural-diversity policy), validators verify an envelope (provenance +
+  quality floor `cascade_quality_epsilon` + reign-clock ripeness + `cascade_top_k`
+  cap) instead of re-deriving. Promotion pays the checkpoint's owner nothing.
+  Supersedes DEC-CA-0005's "validator promotes" framing.
+  (`decisions/DEC-CA-0012-warm-start-top-k-propose-and-verify.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here. Put the revisit condition in the node's `revisit_when:` key.

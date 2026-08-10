@@ -74,7 +74,7 @@ def test_report_wins_over_manifest_scores(cfg):
     # manifest entry that still carries (different) in-entry numbers.
     store = _FakeStore({bench_report_key("777"): _report_text(cfg)})
     runner = _runner(cfg, store)
-    runner._record_king_checkpoint(_manifest(cfg, with_manifest_scores=True), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg, with_manifest_scores=True), now=1000.0)
     (rec,) = runner.cascade.state.checkpoints
     assert rec.checkpoint_id == PTR
     assert rec.gifteval_crps == REPORT_SCORES.gifteval_crps
@@ -84,7 +84,7 @@ def test_manifest_scores_are_the_fallback(cfg):
     # No report (older round, or the trainer's bench died): the manifest
     # entry's in-entry bench_scores still feed the reign log.
     runner = _runner(cfg, _FakeStore())
-    runner._record_king_checkpoint(_manifest(cfg, with_manifest_scores=True), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg, with_manifest_scores=True), now=1000.0)
     (rec,) = runner.cascade.state.checkpoints
     assert rec.gifteval_crps == MANIFEST_SCORES.gifteval_crps
 
@@ -94,7 +94,7 @@ def test_report_joins_on_pointer_not_role(cfg):
     other = "metro-v1:trained:hippius:cascade/ckpt-other@sha256:" + "0" * 64
     store = _FakeStore({bench_report_key("777"): _report_text(cfg, pointer=other)})
     runner = _runner(cfg, store)
-    runner._record_king_checkpoint(_manifest(cfg), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)
     assert runner.cascade.state.checkpoints == ()            # nothing recorded…
     assert len(runner._pending_bench) == 1                   # …queued for the retry
 
@@ -102,7 +102,7 @@ def test_report_joins_on_pointer_not_role(cfg):
 def test_missing_both_queues_then_records_when_report_lands(cfg):
     store = _FakeStore()
     runner = _runner(cfg, store)
-    runner._record_king_checkpoint(_manifest(cfg), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)
     assert runner.cascade.state.checkpoints == ()
     assert len(runner._pending_bench) == 1
     # The report lands between rounds (the bench runs post-publish); the next
@@ -117,7 +117,7 @@ def test_missing_both_queues_then_records_when_report_lands(cfg):
 
 def test_missing_report_expires_after_retry_budget(cfg):
     runner = _runner(cfg, _FakeStore())
-    runner._record_king_checkpoint(_manifest(cfg), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)
     for _ in range(BENCH_REPORT_RETRY_ROUNDS):
         runner._drain_pending_bench(now=2000.0)
     # Written off: the round contributes no bench numbers, and Cascade simply
@@ -129,7 +129,7 @@ def test_missing_report_expires_after_retry_budget(cfg):
 def test_pending_dropped_when_reign_ends(cfg):
     store = _FakeStore()
     runner = _runner(cfg, store)
-    runner._record_king_checkpoint(_manifest(cfg), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)
     assert len(runner._pending_bench) == 1
     # Dethrone: the reign log was cleared at the re-crown, and the OLD reign's
     # checkpoint must never leak into the new reign's promotion pool — even if
@@ -144,6 +144,40 @@ def test_pending_dropped_when_reign_ends(cfg):
 def test_unparseable_report_falls_back(cfg):
     store = _FakeStore({bench_report_key("777"): "{not json"})
     runner = _runner(cfg, store)
-    runner._record_king_checkpoint(_manifest(cfg, with_manifest_scores=True), now=1000.0)
+    runner._record_duel_checkpoints(_manifest(cfg, with_manifest_scores=True), now=1000.0)
     (rec,) = runner.cascade.state.checkpoints
     assert rec.gifteval_crps == MANIFEST_SCORES.gifteval_crps
+
+
+def test_challenger_checkpoints_are_candidates_too(cfg):
+    # DEC-CA-0012: both duel roles land in the reign log — the challenger's
+    # checkpoint carries a different generator's data, the deepest diversity
+    # the promoted set can draw on.
+    size = cfg.throne_contracts()[0].arch_preset
+    chal_ptr = "metro-v1:trained:hippius:cascade/ckpt-r777-chal@sha256:" + "e" * 64
+    manifest = TrainingManifest(
+        round_id="777", created_block=9000,
+        contract_digest="c" * 64, base_arch_digest="a" * 64,
+        eval_dataset="cascade-private-v1",
+        entries=[
+            TrainedEntry(miner_hotkey="king_hk", miner_uid=1, role="king",
+                         gen_ref=REF, trained_pointer=PTR, corpus_digest="d",
+                         train_block=9000, size=size),
+            TrainedEntry(miner_hotkey="chal_hk", miner_uid=2, role="challenger",
+                         gen_ref=REF, trained_pointer=chal_ptr, corpus_digest="d",
+                         train_block=9000, size=size),
+        ],
+    )
+    report = dump_bench_report(BenchReport(
+        round_id="777", created_block=9000,
+        entries=(
+            BenchEntry(role="king", size=size, miner_hotkey="king_hk", miner_uid=1,
+                       trained_pointer=PTR, scores=REPORT_SCORES),
+            BenchEntry(role="challenger", size=size, miner_hotkey="chal_hk",
+                       miner_uid=2, trained_pointer=chal_ptr, scores=REPORT_SCORES),
+        ),
+    ))
+    runner = _runner(cfg, _FakeStore({bench_report_key("777"): report}))
+    runner._record_duel_checkpoints(manifest, now=1000.0)
+    assert [(r.checkpoint_id, r.role) for r in runner.cascade.state.checkpoints] == [
+        (PTR, "king"), (chal_ptr, "challenger")]

@@ -567,14 +567,21 @@ class TrainerRunner:
     # service. Best-effort everywhere — a publish failure must never disturb a
     # round.
     publish_stage_status: bool = False
-    # Cascade warm-start consumption (DEC-CA-0005): path of the promoted-init
-    # pointer file (``[validator] warm_start_init_path`` — the trainer runs
-    # co-hosted with the owner's validator and reads the same file its Cascade
-    # installs). When the file exists, every run this round initialises from
-    # the pinned checkpoint instead of random init, and the manifest records
-    # the pin (signed) so validators verify it and cascade-audit re-derives
+    # Cascade warm-start consumption (DEC-CA-0005/0012): path of the
+    # promoted-init pointer file (``[validator] warm_start_init_path``), written
+    # by the trainer's own promotion engine (below). When the file exists,
+    # every run this round initialises from this epoch's member of the promoted
+    # set instead of random init, and the manifest records the pin (signed) so
+    # validators verify it against the envelope and cascade-audit re-derives
     # from it. None ⇒ random init always (cascade off / pre-warm-start deploy).
     warm_start_path: Path | None = None
+    # Cascade promotion engine (cascade.trainer.promotion, DEC-CA-0012): the
+    # trainer is the selection authority — the engine tracks the reign, logs
+    # benched duel candidates, fires promotions (signed PromotionRecord to the
+    # manifest bucket), and writes the pointer file above. None ⇒ the trainer
+    # only CONSUMES a pointer file (or trains from random init) and never
+    # promotes.
+    promotion: object | None = None
     # Restart re-entry escape hatch (--force-rerun-round, Approve-tier): the ONE
     # round_id allowed past the already-published guard, for a legitimate
     # operator-driven re-train/re-publish of a finished round. None ⇒ the guard
@@ -1608,9 +1615,16 @@ class TrainerRunner:
             size=size,
         )
 
-    def _load_warm_start(self) -> tuple[str, str] | None:
-        """The live promoted init as ``(checkpoint pointer, size)``, or ``None``
-        when no promotion has fired (file absent) or consumption isn't wired.
+    def _load_warm_start(self, *, epoch_index: int | None = None) -> tuple[str, str] | None:
+        """This round's promoted init as ``(checkpoint pointer, size)``, or
+        ``None`` when no promotion has fired (file absent) or consumption isn't
+        wired.
+
+        A multi-member pointer file (DEC-CA-0012) carries the live generation's
+        ``members`` list; the round trains from the epoch-rotation member
+        (``epoch_index % len(members)``; index ``None`` ⇒ the first member). A
+        legacy single-pointer file reads as a one-member set. Validators accept
+        any live member, so the rotation itself is trainer policy.
 
         A pointer file that EXISTS but is unusable (unreadable JSON, missing or
         malformed ``checkpoint_id``) RAISES and aborts the round: once a
@@ -1625,14 +1639,21 @@ class TrainerRunner:
             return None
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
-            ref = str(obj.get("checkpoint_id") or "")
         except Exception as e:  # noqa: BLE001 — a live-but-broken pin must abort, not degrade
             raise RuntimeError(f"warm-start pointer {p} unreadable: {e}") from e
+        members = obj.get("members") or []
+        if members:
+            m = members[int(epoch_index or 0) % len(members)]
+            ref = str(m.get("checkpoint_id") or "")
+            size = str(m.get("size") or "")
+        else:
+            ref = str(obj.get("checkpoint_id") or "")
+            size = str(obj.get("size") or "")
         if not ref or parse_trained_pointer(ref) is None:
             raise RuntimeError(
                 f"warm-start pointer {p} carries no usable checkpoint_id: {ref!r}"
             )
-        size = str(obj.get("size") or "") or self.cfg.training.primary_size.arch_preset
+        size = size or self.cfg.training.primary_size.arch_preset
         return ref, size
 
     def _fetch_checkpoint_dir(self, trained_pointer: str) -> Path:
@@ -1734,7 +1755,39 @@ class TrainerRunner:
                         manifest.round_id, e)
         finally:
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
+        # Promotion candidates (DEC-CA-0012): both duel checkpoints' scores feed
+        # the engine's candidate log (thread-safe; this runs on the bench
+        # thread). Guarded — candidate bookkeeping must never fail the bench.
+        if report is not None and self.promotion is not None:
+            try:
+                self.promotion.record_bench(manifest, report)
+            except Exception as e:  # noqa: BLE001
+                log.warning("round=%s: promotion candidate recording failed (ignored): %s",
+                            manifest.round_id, e)
         return report
+
+    def _publish_promotion_record(self, record: object) -> None:
+        """Sign and publish a fired promotion's record to the manifest bucket
+        (``promotions/gen-<n>.json`` + locator index) — the declaration
+        validators verify the new generation against. Unsigned publishes are
+        possible (no wallet: offline runs) but rejected by verifying
+        validators, exactly like an unsigned bench report."""
+        from ..shared.promotion import (
+            dump_promotion_record,
+            publish_promotion_record,
+            sign_promotion_record,
+        )
+
+        if self.wallet is not None:
+            record = sign_promotion_record(record, self.wallet)
+        else:
+            log.warning("publishing an UNSIGNED promotion record (no wallet); "
+                        "validators will reject the new generation")
+        key = publish_promotion_record(
+            self.manifest_store(), dump_promotion_record(record), record.generation)
+        log.info("published promotion record generation=%d members=%d signed=%s → s3://%s/%s",
+                 record.generation, len(record.members),
+                 record.signature is not None, self.cfg.storage.manifest_bucket, key)
 
     def _post_publish_bench(self, manifest: TrainingManifest) -> object | None:
         from ..shared.bench_report import (
@@ -1967,14 +2020,6 @@ class TrainerRunner:
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
         self._final_role_hosts = {}
-        # Cascade warm-start: the live promoted init every run this round trains
-        # from (heat AND final — screening must rank on the same init the final
-        # trains at). Raises on a live-but-broken pointer; None ⇒ random init.
-        warm_start = self._load_warm_start()
-        if warm_start is not None:
-            log.info("round=%s warm-start init: %s (size=%s)",
-                     base_seed, warm_start[0], warm_start[1])
-
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
@@ -1984,6 +2029,17 @@ class TrainerRunner:
         if screen_block is None:
             epoch_blocks = effective_epoch_blocks(self.cfg.round, block)
             screen_block = (block // epoch_blocks) * epoch_blocks
+
+        # Cascade warm-start: this round's member of the live promoted set —
+        # ONE init for every run this round (heat AND final: screening must
+        # rank on the same init the final trains at, and the manifest carries a
+        # single signed pin). The epoch index drives the rotation across
+        # members. Raises on a live-but-broken pointer; None ⇒ random init.
+        epoch_idx = int(screen_block) // effective_epoch_blocks(self.cfg.round, int(screen_block))
+        warm_start = self._load_warm_start(epoch_index=epoch_idx)
+        if warm_start is not None:
+            log.info("round=%s warm-start init: %s (size=%s, epoch_index=%d)",
+                     base_seed, warm_start[0], warm_start[1], epoch_idx)
 
         eligible = self._filter_burned_challengers(plan.challengers)
         # Content-level duplicate screen ([round] dedup_mode): re-uploads and
@@ -2900,6 +2956,20 @@ class TrainerRunner:
                 # an early next-round re-commit forfeit the current round.
                 commitments = client.poll_commitments(include_history=True)
                 king_hotkey = client.highest_incentive_hotkey()
+                # Cascade promotion (DEC-CA-0012): track the reign at the
+                # boundary and fire a promotion BEFORE the round trains, so the
+                # signed record is published (and fetchable by validators)
+                # before any manifest pins a new-generation member. Guarded:
+                # promotion must never sink a round.
+                if self.promotion is not None:
+                    try:
+                        self.promotion.note_round(king_hotkey, epoch_block=epoch_start)
+                        record = self.promotion.maybe_promote(
+                            epoch_block=epoch_start, round_id=round_id)
+                        if record is not None:
+                            self._publish_promotion_record(record)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("promotion step failed for round=%s: %s", round_id, e)
                 self._reload_remote_hosts()  # per-round elastic fleet pickup
                 log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
                          round_id, epoch, epoch_start, king_hotkey,

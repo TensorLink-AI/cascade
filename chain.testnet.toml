@@ -254,15 +254,21 @@ king_decay           = 0.5       # TESTNET override (template default 1.0): geom
 gift_gate_mode       = "shadow"  # TESTNET: log-only to calibrate tolerance, then "enforce" (template default "off")
 gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
 gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
-# Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
-# Enabled on testnet with a shorter reign for iteration (mainnet defaults off,
-# reign 7). When the king holds this many consecutive undethroned wall-clock
-# days, the reign's best checkpoint (lowest geomean of the six GIFT-Eval / BOOM /
-# TIME CRPS/MASE numbers the trainer stamps onto the signed manifest) is installed
-# as the warm-start init and the throne is vacated so the field re-competes from
-# it.
+# Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
+# cascade.trainer.promotion, DEC-CA-0012 propose-and-verify). Enabled on
+# testnet with a shorter reign for iteration. After a ripe reign the TRAINER
+# selects up to cascade_top_k reign checkpoints as the next warm-start
+# generation (signed PromotionRecord) and rotates rounds across the members;
+# validators verify the declaration against the envelope (top_k cap + quality
+# epsilon + reign-clock ripeness) instead of re-deriving the selection. The
+# king PERSISTS on promotion (DEC-CA-0004); the throne is never vacated.
 cascade_enabled      = true      # TESTNET: armed 2026-08-05 for the PR-174 bench-pipeline drill (reports, hold, retry, promotion)
 cascade_reign_days   = 1         # consecutive undethroned days before a Cascade fires
+# Promotion envelope (fleet-consensus, like the reign clock): 2 members keeps
+# each lineage half the rounds of a 1-day testnet reign; epsilon 0.05 mirrors
+# mainnet.
+cascade_top_k          = 2
+cascade_quality_epsilon = 0.05
 
 [dependencies]
 # Allowlist for a generator's requirements.txt — supply-chain restriction.
