@@ -121,6 +121,41 @@ def select_members(
     return chosen
 
 
+def reign_tail(
+    rows: list, validator_hotkey: str = "",
+) -> tuple[str, int, list[str]] | None:
+    """The current reign per a receipts-index ``rounds`` list: ``(king_hotkey,
+    reign_start_block, round_ids oldest→newest)`` — the unbroken tail of scored
+    rounds whose ``post_round_king_hotkey`` is the newest round's king. Pure.
+
+    This is the deploy-time backfill's view of "how long has this king already
+    reigned": validators anchor their clocks at the dethrone verdict, and the
+    dethrone round is exactly where the tail breaks. Rows from other validators
+    are ignored when ``validator_hotkey`` is given (the index carries one row
+    per validator per round); rejected/incomplete rows never carry a
+    ``post_round_king_hotkey`` and are skipped. ``None`` when no usable row
+    exists — the caller falls back to anchoring at the next boundary.
+    """
+    usable = [
+        r for r in rows
+        if isinstance(r, dict) and r.get("status") == "scored"
+        and r.get("post_round_king_hotkey")
+        and int(r.get("epoch_start_block") or 0) > 0
+        and (not validator_hotkey or r.get("validator_hotkey") == validator_hotkey)
+    ]
+    usable.sort(key=lambda r: int(r["epoch_start_block"]), reverse=True)
+    if not usable:
+        return None
+    king = str(usable[0]["post_round_king_hotkey"])
+    tail = []
+    for r in usable:
+        if str(r["post_round_king_hotkey"]) != king:
+            break
+        tail.append(r)
+    start = int(tail[-1]["epoch_start_block"])
+    return king, start, [str(r.get("round_id") or "") for r in reversed(tail)]
+
+
 @dataclass
 class TrainerPromotion:
     """The engine: reign clock + candidate log + live member set, persisted.
@@ -250,6 +285,27 @@ class TrainerPromotion:
         self._write_pointer()
         log.info("trainer promotion: adopted legacy warm-start pointer %s as "
                  "generation 1", cid)
+
+    def seed_reign(self, king_hotkey: str, reign_start_block: int) -> bool:
+        """Anchor an engine that has never seen a king to an ALREADY-RUNNING
+        reign (deploy-time backfill). A first deployment mid-reign must count
+        the rounds the king has already survived: validators anchored their
+        clocks at the dethrone verdict and keep counting across our restarts,
+        so an engine that re-anchors "now" would fire the promotion
+        ``reign_threshold`` rounds later than every validator expects — and
+        the fleet, whose ripeness check uses ITS clock, would have accepted
+        the earlier fire. No-op (``False``) once the engine has a king: an
+        engine with history trusts its own persisted state, and
+        :meth:`note_round` owns the clock from then on."""
+        with self._lock:
+            if self.king_hotkey is not None or self.reign_start_block is not None:
+                return False
+            self.king_hotkey = str(king_hotkey)
+            self.reign_start_block = int(reign_start_block)
+            self._persist()
+            log.info("trainer promotion: seeded reign clock for king %s at block %d "
+                     "(deploy-time backfill)", king_hotkey[:12], int(reign_start_block))
+            return True
 
     # ── per-round hooks ──────────────────────────────────────────────────────
 

@@ -1816,6 +1816,75 @@ class TrainerRunner:
             pass
         return self._last_receipt_king
 
+    def _seed_promotion_reign(self) -> None:
+        """Deploy-time backfill (DEC-CA-0013): count the rounds the current
+        king has ALREADY reigned before this engine existed.
+
+        Runs once, at the first boundary where the engine has never seen a
+        king — after that the engine's own persisted clock owns the count.
+        Validators anchored their clocks at the dethrone verdict, possibly
+        rounds ago; an engine anchoring "now" would fire the promotion
+        ``reign_threshold`` rounds later than the fleet's ripeness check
+        requires it to be able to fire. The reign is reconstructed from the
+        same signed artifacts validators used: the receipt index's unbroken
+        tail of scored rounds held by the current king (``reign_tail``) seeds
+        the clock, and each reign round's published trainer-signed bench
+        report replays through :meth:`TrainerPromotion.record_bench` to
+        rebuild the candidate log — exactly the state the engine would hold
+        had it been running since the dethrone. Rounds whose bench report is
+        unpublished contribute no candidates (the same gap the validator's
+        reign log has). Best-effort: any miss falls back to ``note_round``'s
+        anchor-at-this-boundary behaviour."""
+        if self.promotion is None or getattr(self.promotion, "king_hotkey", None) is not None:
+            return
+        if getattr(self.promotion, "reign_start_block", None) is not None:
+            return
+        try:
+            from ..shared.bench_report import (
+                bench_report_key,
+                load_bench_report,
+                verify_bench_report_signature,
+            )
+            from ..shared.hippius import RECEIPT_INDEX_KEY
+            from ..shared.manifest import load_manifest, verify_signature
+            from .promotion import reign_tail
+
+            store = self.manifest_store()
+            idx = json.loads(store.get_text(RECEIPT_INDEX_KEY))
+            tail = reign_tail(idx.get("rounds") or [],
+                              self.cfg.manifest.validator_hotkey)
+            if tail is None:
+                return
+            king, start_block, round_ids = tail
+            if not self.promotion.seed_reign(king, start_block):
+                return
+            added = 0
+            for rid in round_ids:  # oldest → newest
+                try:
+                    manifest = load_manifest(
+                        store.get_text(manifest_round_key(rid)))
+                    report = load_bench_report(
+                        store.get_text(bench_report_key(rid)))
+                except Exception:  # noqa: BLE001 — no report yet ⇒ no candidates
+                    continue
+                trainer_hotkey = self.cfg.manifest.trainer_hotkey
+                if trainer_hotkey and not verify_bench_report_signature(
+                        report, trainer_hotkey):
+                    log.warning("promotion backfill: bench report for round=%s "
+                                "fails signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                if trainer_hotkey and not verify_signature(manifest, trainer_hotkey):
+                    log.warning("promotion backfill: manifest for round=%s fails "
+                                "signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                added += self.promotion.record_bench(manifest, report)
+            log.info("promotion: deploy backfill — king %s reign counted from "
+                     "block %d (%d round(s), %d candidate(s) recovered)",
+                     king[:12], start_block, len(round_ids), added)
+        except Exception as e:  # noqa: BLE001 — never sink a round on backfill
+            log.warning("promotion: deploy backfill failed (engine anchors at "
+                        "this boundary instead): %s", e)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -3034,6 +3103,11 @@ class TrainerRunner:
                 # Guarded: promotion must never sink a round.
                 if self.promotion is not None:
                     try:
+                        # First boundary of a never-anchored engine: count the
+                        # rounds the king already reigned (signed receipt tail
+                        # + published bench reports) before the clock ticks —
+                        # see _seed_promotion_reign. No-op ever after.
+                        self._seed_promotion_reign()
                         self.promotion.note_round(self._receipt_king() or king_hotkey,
                                                   epoch_block=epoch_start)
                         self.promotion.maybe_promote(

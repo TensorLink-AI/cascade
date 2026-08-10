@@ -371,3 +371,115 @@ def test_promoted_score_is_geomean_of_the_six(tmp_path):
     rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
     assert rec is not None
     assert math.isclose(rec.members[0].score, 0.8, rel_tol=1e-9)
+
+
+# ── deploy-time backfill: count the reign that predates the engine ───────────
+
+
+def test_seed_reign_anchors_a_fresh_engine_and_note_round_keeps_it(tmp_path):
+    eng = _engine(tmp_path)
+    assert eng.seed_reign("hkKing", 2 * DAY) is True
+    # The next boundary sees the same king: the seeded anchor must survive.
+    eng.note_round("hkKing", epoch_block=6 * DAY)
+    assert eng.reign_start_block == 2 * DAY
+    eng.record_bench(_manifest("r6"), _report("r6", 6 * DAY, {
+        "ptr-king6": (1.0, "hkKing", "king")}))
+    # 5 rounds elapsed since the SEEDED anchor -> ripe now, not 5 rounds hence.
+    rec = eng.maybe_promote(epoch_block=7 * DAY, round_id="r7")
+    assert rec is not None and rec.generation == 1
+
+
+def test_seed_reign_noop_once_anchored(tmp_path):
+    eng = _engine(tmp_path)
+    eng.note_round("hkKing", epoch_block=4 * DAY)
+    assert eng.seed_reign("hkKing", 0) is False      # engine has history
+    assert eng.reign_start_block == 4 * DAY
+    # And a reloaded engine keeps a seeded anchor rather than re-seeding.
+    eng2 = _engine(tmp_path)
+    eng2.seed_reign("hkKing", 1 * DAY)
+    reloaded = TrainerPromotion.load(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json")
+    assert reloaded.reign_start_block == 1 * DAY
+    assert reloaded.seed_reign("hkKing", 9 * DAY) is False
+
+
+def test_reign_tail_walks_back_to_the_dethrone():
+    from cascade.trainer.promotion import reign_tail
+
+    rows = [
+        {"round_id": "r1", "status": "scored", "epoch_start_block": 1 * DAY,
+         "post_round_king_hotkey": "hkOld", "validator_hotkey": "v1"},
+        {"round_id": "r2", "status": "scored", "epoch_start_block": 2 * DAY,
+         "post_round_king_hotkey": "hkNew", "validator_hotkey": "v1"},  # dethrone
+        {"round_id": "r3", "status": "rejected", "epoch_start_block": 3 * DAY,
+         "post_round_king_hotkey": None, "validator_hotkey": "v1"},    # no verdict
+        {"round_id": "r4", "status": "scored", "epoch_start_block": 4 * DAY,
+         "post_round_king_hotkey": "hkNew", "validator_hotkey": "v1"},  # defense
+        # another validator's row for r4 — dropped by the anchor filter
+        {"round_id": "r4", "status": "scored", "epoch_start_block": 4 * DAY,
+         "post_round_king_hotkey": "hkNew", "validator_hotkey": "v2"},
+    ]
+    assert reign_tail(rows, "v1") == ("hkNew", 2 * DAY, ["r2", "r4"])
+    # No anchor: both validators' rows survive (record_bench dedups pointers).
+    king, start, rounds = reign_tail(rows, "")
+    assert (king, start) == ("hkNew", 2 * DAY) and set(rounds) == {"r2", "r4"}
+    assert reign_tail([], "v1") is None
+    assert reign_tail([{"status": "scored"}], "") is None
+
+
+def test_runner_backfill_seeds_clock_and_candidates(cfg, tmp_path, monkeypatch):
+    from dataclasses import replace as _rp
+
+    from cascade.shared.bench_report import dump_bench_report
+    from cascade.shared.hippius import RECEIPT_INDEX_KEY
+    from cascade.shared.manifest import MANIFEST_VERSION
+    from cascade.trainer.loop import TrainerRunner
+
+    def _flat_manifest(rid):
+        return json.dumps({
+            "manifest_version": MANIFEST_VERSION, "round_id": rid,
+            "created_block": 2 * DAY, "contract_digest": "cd",
+            "base_arch_digest": "ad", "eval_dataset": "ds", "entries": [],
+        })
+
+    docs = {
+        RECEIPT_INDEX_KEY: json.dumps({"schema": 2, "rounds": [
+            {"round_id": "r-old", "status": "scored", "epoch_start_block": 1 * DAY,
+             "post_round_king_hotkey": "hkOld", "validator_hotkey": ""},
+            {"round_id": "r-dethrone", "status": "scored",
+             "epoch_start_block": 2 * DAY,
+             "post_round_king_hotkey": "hkNew", "validator_hotkey": ""},
+            {"round_id": "r-defense", "status": "scored",
+             "epoch_start_block": 3 * DAY,
+             "post_round_king_hotkey": "hkNew", "validator_hotkey": ""},
+        ]}),
+        "manifests/round-r-dethrone.json": _flat_manifest("r-dethrone"),
+        "manifests/round-r-defense.json": _flat_manifest("r-defense"),
+        "benchmarks/round-r-dethrone.json": dump_bench_report(_report(
+            "r-dethrone", 2 * DAY, {"ptr-chal": (1.0, "hkNew", "challenger")})),
+        # r-defense has NO published bench report -> contributes no candidates.
+    }
+
+    class _S:
+        def get_text(self, key):
+            if key not in docs:
+                raise KeyError(key)
+            return docs[key]
+
+    eng = _engine(tmp_path)
+    runner = TrainerRunner(
+        cfg=_rp(cfg, manifest=_rp(cfg.manifest, trainer_hotkey="",
+                                  validator_hotkey="")),
+        base_trainer=object(), work_root=tmp_path, promotion=eng)
+    monkeypatch.setattr(runner, "manifest_store", lambda: _S())
+
+    runner._seed_promotion_reign()
+    assert eng.king_hotkey == "hkNew"
+    assert eng.reign_start_block == 2 * DAY           # the dethrone round's epoch
+    assert [c.checkpoint_id for c in eng.candidates] == ["ptr-chal"]
+    # Second call is a no-op (engine now has history).
+    docs[RECEIPT_INDEX_KEY] = json.dumps({"schema": 2, "rounds": []})
+    runner._seed_promotion_reign()
+    assert eng.reign_start_block == 2 * DAY
