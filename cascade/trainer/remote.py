@@ -63,7 +63,8 @@ class RemoteHost:
     """One SSH-reachable GPU pod that can run a training worker.
 
     ``forward_env`` names env vars the orchestrator copies from its own
-    environment into the remote command (e.g. registry/S3 credentials) — use it
+    environment to the remote worker, piped over stdin per dispatch — never on
+    the remote command line (e.g. registry/S3 credentials) — use it
     only if you have not pre-seeded the pod's env; the bittensor wallet is never
     forwarded. ``WANDB_API_KEY`` need not be listed here: when [wandb] is enabled
     the trainer auto-forwards it (RemoteDispatcher.extra_forward_env) so pod-side
@@ -228,12 +229,24 @@ def pod_lane_count(host: RemoteHost, hosts: list[RemoteHost] | None) -> int:
 def build_remote_command(
     host: RemoteHost, argv: list[str], env: dict[str, str],
     *, lane_count: int | None = None,
-) -> str:
-    """The single shell string ssh runs on the pod: benchmark preemption, then
-    ``cd workdir && ENV… argv``.
+) -> tuple[str, str | None]:
+    """The shell string ssh runs on the pod plus the stdin payload that carries
+    the forwarded env: ``(command, stdin_env)``.
 
-    Everything is ``shlex.quote``d so credentials/paths with spaces or shell
-    metacharacters can't break out.
+    ``env`` (the forwarded credentials) is deliberately NOT embedded in the
+    command string: everything in the command lands in the remote shell's
+    ``/proc/<pid>/cmdline``, which any process on the pod can read for the
+    whole run — and heat pods execute miner-submitted generator code. Instead
+    the assignments travel on stdin and the command sources them
+    (``set -a && . /dev/stdin && set +a``) before exec'ing the worker; stdin
+    is visible only to the receiving process. ``stdin_env`` is ``None`` (and
+    the sourcing step absent) when there is nothing to forward. Values are
+    ``shlex.quote``d in both channels so paths/credentials with spaces or
+    shell metacharacters can't break out.
+
+    ``CUDA_VISIBLE_DEVICES`` and the lane stamps stay inline — they are not
+    secret, and on-cmdline visibility is what makes a pod's lane layout
+    readable in ``ps`` when debugging.
 
     ``lane_count`` (the pod's lane fan-out, see :func:`pod_lane_count`) stamps
     ``CASCADE_LANE_INDEX``/``CASCADE_LANE_COUNT`` into the lane's env — the
@@ -242,17 +255,24 @@ def build_remote_command(
     device ordinal, so local runs, single-lane pods, and non-lane masks keep
     today's behavior exactly.
     """
-    prefix = ""
-    full_env = dict(env)
+    lane_env: dict[str, str] = {}
     if host.cuda_device is not None:
-        full_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
+        lane_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
         device = str(host.cuda_device).strip()
         if lane_count is not None and lane_count > 1 and device.isdigit():
-            full_env["CASCADE_LANE_INDEX"] = device
-            full_env["CASCADE_LANE_COUNT"] = str(int(lane_count))
-    if full_env:
-        prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(full_env.items())) + " "
-    return f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {prefix}{shlex.join(argv)}"
+            lane_env["CASCADE_LANE_INDEX"] = device
+            lane_env["CASCADE_LANE_COUNT"] = str(int(lane_count))
+    prefix = ""
+    if lane_env:
+        prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(lane_env.items())) + " "
+    source = ""
+    stdin_env: str | None = None
+    if env:
+        stdin_env = "".join(f"{k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
+        source = "set -a && . /dev/stdin && set +a && "
+    command = (f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && "
+               f"{source}{prefix}{shlex.join(argv)}")
+    return command, stdin_env
 
 
 def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
@@ -345,12 +365,12 @@ class RemoteDispatcher:
         # dict.fromkeys de-dups while preserving order if a host lists one too.
         names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
         env = {k: os.environ[k] for k in names if k in os.environ}
-        remote_cmd = build_remote_command(host, argv, env, lane_count=lane_count)
+        remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
                  host.cuda_device)
         try:
-            proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds)
+            proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
         except subprocess.TimeoutExpired as e:
             raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
         if proc.returncode == 3:
@@ -373,9 +393,14 @@ class RemoteDispatcher:
         return entry
 
 
-def run_ssh(ssh_argv: list[str], timeout: int):
-    """Run the ssh command, returning the CompletedProcess (text mode)."""
-    return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout)
+def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):
+    """Run the ssh command, returning the CompletedProcess (text mode).
+
+    ``stdin_text`` (the credential payload from :func:`build_remote_command`)
+    is piped to the remote command's stdin. Always piped — even when empty —
+    so ssh never inherits the orchestrator's own stdin."""
+    return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout,
+                          input=stdin_text if stdin_text is not None else "")
 
 
 _HEAT_PROBE_TOKEN = "cascade-heat-probe-ok"

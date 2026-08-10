@@ -112,21 +112,35 @@ def test_worker_maps_train_hours_to_heat_label(cfg, tmp_path, monkeypatch):
 
 def test_build_remote_command_sets_cd_cuda_and_env():
     host = _host(workdir="/root/metro", cuda_device="1")
-    cmd = build_remote_command(host, ["python", "-m", "x"], {"HIPPIUS_S3_ACCESS_KEY": "ak"})
+    cmd, stdin_env = build_remote_command(
+        host, ["python", "-m", "x"], {"HIPPIUS_S3_ACCESS_KEY": "ak"})
     # training preempts any straggling log-only benchmark sweep before cd'ing in
     from cascade.trainer.remote import PREEMPT_BENCHMARKS
 
     assert cmd.startswith(PREEMPT_BENCHMARKS)
     assert "cd /root/metro && " in cmd
     assert "CUDA_VISIBLE_DEVICES=1" in cmd
-    assert "HIPPIUS_S3_ACCESS_KEY=ak" in cmd
+    # credentials ride stdin, NEVER the command string: the command lands in the
+    # remote shell's /proc/<pid>/cmdline, world-readable on pods running miner code
+    assert "ak" not in cmd
+    assert ". /dev/stdin" in cmd
+    assert stdin_env == "HIPPIUS_S3_ACCESS_KEY=ak\n"
     assert cmd.rstrip().endswith("python -m x")
 
 
+def test_build_remote_command_no_stdin_source_without_env():
+    host = _host(workdir="/root/metro", cuda_device="1")
+    cmd, stdin_env = build_remote_command(host, ["python", "-m", "x"], {})
+    assert stdin_env is None
+    assert "/dev/stdin" not in cmd        # empty env keeps the plain command
+
+
 def _capturing_runner(seen: dict):
-    """A dispatcher _runner that records the remote command and returns a receipt."""
-    def _run(argv, timeout):
+    """A dispatcher _runner that records the remote command + stdin payload and
+    returns a receipt."""
+    def _run(argv, timeout, stdin_env=None):
         seen["cmd"] = argv[-1]
+        seen["stdin"] = stdin_env
         return _fake_proc(stdout=f"{RECEIPT_SENTINEL}{json.dumps(_receipt_dict(role='king'))}")
     return _run
 
@@ -141,8 +155,10 @@ def test_dispatch_forwards_extra_env_on_top_of_host(monkeypatch):
                             _runner=_capturing_runner(seen))
     disp.dispatch(_host(forward_env=("HIPPIUS_HUB_TOKEN",)), gen_ref=REF_A, uid=0,
                   hotkey="hk", role="king", base_seed=1, block=10)
-    assert "WANDB_API_KEY=wbkey" in seen["cmd"]       # auto-forwarded extra
-    assert "HIPPIUS_HUB_TOKEN=tok" in seen["cmd"]      # host's own forward_env kept
+    assert "WANDB_API_KEY=wbkey" in seen["stdin"]      # auto-forwarded extra
+    assert "HIPPIUS_HUB_TOKEN=tok" in seen["stdin"]    # host's own forward_env kept
+    # neither value may leak into the command string (pod /proc/*/cmdline)
+    assert "wbkey" not in seen["cmd"] and "tok" not in seen["cmd"]
 
 
 def test_dispatch_omits_extra_env_when_absent_from_orchestrator(monkeypatch):
@@ -154,6 +170,7 @@ def test_dispatch_omits_extra_env_when_absent_from_orchestrator(monkeypatch):
     disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
                   base_seed=1, block=10)
     assert "WANDB_API_KEY" not in seen["cmd"]
+    assert seen["stdin"] is None          # nothing to forward -> no payload
 
 
 def test_trainer_forwards_wandb_key_only_when_enabled(cfg):
@@ -223,7 +240,7 @@ def _fake_proc(rc=0, stdout="", stderr=""):
 
 def test_dispatch_returns_entry_on_success():
     out = f"{RECEIPT_SENTINEL}{json.dumps(_receipt_dict(role='king'))}"
-    disp = RemoteDispatcher(trainer_spec="m:C", _runner=lambda argv, t: _fake_proc(stdout=out))
+    disp = RemoteDispatcher(trainer_spec="m:C", _runner=lambda argv, t, s=None: _fake_proc(stdout=out))
     entry = disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
                           base_seed=1, block=10)
     assert entry.role == "king" and entry.trained_pointer == format_trained_pointer(REF_T)
@@ -231,7 +248,7 @@ def test_dispatch_returns_entry_on_success():
 
 def test_dispatch_raises_on_nonzero_rc():
     disp = RemoteDispatcher(trainer_spec="m:C",
-                            _runner=lambda argv, t: _fake_proc(rc=1, stderr="boom"))
+                            _runner=lambda argv, t, s=None: _fake_proc(rc=1, stderr="boom"))
     with pytest.raises(RemoteDispatchError):
         disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
                       base_seed=1, block=10)
@@ -241,7 +258,7 @@ def test_dispatch_transport_failure_carries_returncode_255():
     # rc=255 is an SSH transport failure — the heat fan-out counts it to refuse
     # caching a fleet-wide dead-pod wipeout, so the error must carry the code.
     disp = RemoteDispatcher(trainer_spec="m:C",
-                            _runner=lambda argv, t: _fake_proc(rc=255, stderr="ssh: connect"))
+                            _runner=lambda argv, t, s=None: _fake_proc(rc=255, stderr="ssh: connect"))
     with pytest.raises(RemoteDispatchError) as ei:
         disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
                       base_seed=1, block=10)
@@ -279,7 +296,7 @@ def test_dispatch_rc3_relays_one_line_miner_rejection():
               "ERROR cascade.trainer.worker: miner submission rejected: "
               "generator_artifact_unreachable: HTTP 401 for ns/repo@sha256:aa\n")
     disp = RemoteDispatcher(trainer_spec="m:C",
-                            _runner=lambda argv, t: _fake_proc(rc=3, stderr=stderr))
+                            _runner=lambda argv, t, s=None: _fake_proc(rc=3, stderr=stderr))
     with pytest.raises(RemoteDispatchError) as ei:
         disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="challenger",
                       base_seed=1, block=10)
@@ -291,7 +308,7 @@ def test_dispatch_rc3_relays_one_line_miner_rejection():
 
 def test_dispatch_rejects_role_mismatch():
     out = f"{RECEIPT_SENTINEL}{json.dumps(_receipt_dict(role='challenger'))}"
-    disp = RemoteDispatcher(trainer_spec="m:C", _runner=lambda argv, t: _fake_proc(stdout=out))
+    disp = RemoteDispatcher(trainer_spec="m:C", _runner=lambda argv, t, s=None: _fake_proc(stdout=out))
     with pytest.raises(RemoteDispatchError):
         disp.dispatch(_host(), gen_ref=REF_A, uid=0, hotkey="hk", role="king",
                       base_seed=1, block=10)
