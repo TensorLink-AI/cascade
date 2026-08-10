@@ -59,6 +59,13 @@
   reads an archived round, ``--history`` lists what has been published.
   Read-only: no wallet, no chain call, no credentials.
 
+* ``cascade duel`` — the full verdict for a settled round, from the public
+  receipt index: dethrone margin (LCB vs required), both geomeans, win rate,
+  bootstrap quantiles, per-domain win rates, and per-validator agreement
+  (rejected validator rows are shown with their reason). ``--round`` reads an
+  archived round, ``--history`` lists every settled round's outcome.
+  Read-only: no wallet, no chain call, no credentials.
+
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
 """
