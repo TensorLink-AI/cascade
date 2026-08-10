@@ -159,18 +159,51 @@ good init.
 
 Two consequences to go in with eyes open:
 
-- **New attack surface.** A miner could aim not to win the duel but to land a
-  checkpoint in the pool that its *other* generator is co-adapted to — buying an
-  edge on the ~1/`K` of rounds that draw it. The cost gate is real (you must win
-  the heat to reach the duel and be benched), and the payoff is diluted by `K`,
-  but this attack does not exist today. A per-owner cap (§4b) is the direct
-  mitigation.
+- **A thin new attack surface — thinner than it first looks.** Pool membership
+  carries **no reward**: the weight vector is `decayed_share_vector` over the
+  current king and `former_kings` (`shared/chain.py:37`,
+  `[scoring] reward_prior_kings`), and nothing in it references the warm-start
+  pool. So there is no direct payoff for getting a checkpoint in. The residual
+  path is indirect: a generator co-adapted to init X wins duels it would
+  otherwise lose on the ~1/`K` of rounds that draw X, and collects through the
+  ordinary king/court channel. That path is mostly self-closing — the only way
+  into the pool is through the duel, the only way into the duel is winning the
+  heat, and the heat ranks on the same eval metric the duel decides on. A miner
+  cannot land a *deliberately odd* checkpoint while being odd; the mechanism
+  admits it only for being good, and a good checkpoint is a normal-good init.
+  Worth noting, not worth designing around.
 - **It makes the reign clock vestigial.** If membership is continuous admission
   from every benched checkpoint, nothing is left for the reign clock to decide —
   "when has a king reigned long enough to promote" stops being a question. That
   deletes the subject matter of a live, armed mechanism (DEC-CA-0004). It may
   well be a simplification worth having, but it must be decided deliberately,
   not absorbed as a side effect of a pool change.
+
+### 4a-bis. Should pool membership be rewarded at all?
+
+It isn't today, and that absence is doing real work. It is *why* §4a's attack
+surface is thin: with no payoff attached to membership, there is nothing to
+manipulate membership *for*. **The lack of a reward channel is a security
+property, not an oversight** — and any proposal to add one should be read as
+manufacturing the gaming pressure this whole design exists to remove.
+
+The argument on the other side is real enough to write down. Miners are paid
+purely for round-local duel wins; nobody is paid for producing a good *init*, and
+the init is the artifact that compounds into the thing the project measures
+itself on (a deep pretrained model). Pool quality is therefore an
+**unincentivised byproduct**. Mechanically, paying for it would be easy —
+`former_kings` already establishes a decayed multi-recipient court, so a "pool
+court" would slot straight into `decayed_share_vector`.
+
+**Lean: don't add it.** The correlation between "wins duels" and "is a good
+init" supplies the alignment for free, and paying for membership would trade that
+free alignment for a new gameable surface.
+
+But name the assumption, because it is load-bearing: **pool quality is free only
+while duel-winning and init-quality stay correlated.** If they diverge — if
+generators that win on the private eval pool start producing checkpoints that are
+poor bases for further training — the pool degrades silently, with no signal
+anywhere in the system. That is a thing to watch for, not a thing to fix now.
 
 ## 4b. What criterion picks members: rank, or metric orthogonality?
 
@@ -207,8 +240,10 @@ numbers is the wrong fix, for four reasons in ascending order of severity.
 (within x% of the best known) or top-`N` by `cascade_score` — then enforce
 diversity on axes that can be *checked* rather than *inferred*:
 
-- **per-owner cap** (1–2 members per miner hotkey) — delivers the multi-owner
-  property directly and mitigates §4a's attack;
+- **per-owner cap** (1–2 members per miner hotkey) — justified on *diversity*
+  grounds alone (a pool of near-clones from one owner defeats the marginalisation
+  that is B's entire point), not as an attack mitigation; per §4a there is
+  little to mitigate;
 - **per-generation / lineage cap** — members must trace to different warm-start
   ancestors. An init several generations back is genuinely a different model,
   and this is free;
