@@ -1,14 +1,20 @@
 #!/usr/bin/env python
-"""Publish the cascade dashboard ("notebook") to the manifest bucket, public-read.
+"""Publish the cascade dashboards to the manifest bucket, public-read.
 
-The dashboard is a single self-contained ``cascade/website/index.html`` that
-reads the validator's public-read receipts — ``receipts/index.json`` (the
-rolling round summary the validator maintains) and ``receipts/latest.json`` —
-plus the live ``status/*.json`` docs (chain anchor, round stage, and the heat
-standings the trainer publishes as soon as a heat settles) straight from the
-manifest bucket. Serving the page from that same bucket means
-one public origin for everything (mirrors teutonic, whose validator re-uploads
-its dashboard on restart).
+Two self-contained pages, both reading the validator's public-read receipts —
+``receipts/index.json`` (the rolling round summary the validator maintains) and
+``receipts/latest.json`` — plus the live ``status/*.json`` docs (chain anchor,
+round stage, and the heat standings the trainer publishes as soon as a heat
+settles) straight from the manifest bucket:
+
+* ``cascade/website/index.html`` — the technical dashboard ("notebook"): live
+  round, verdict, heat standings, per-round history.
+* ``cascade/website/stakeholders.html`` — the stakeholder scoreboard: dethrone
+  events, chained improvement over the launch baseline, scaling ladder,
+  training-token efficiency. Same data, no extra endpoints.
+
+Serving both from that same bucket means one public origin for everything
+(mirrors teutonic, whose validator re-uploads its dashboard on restart).
 
 Usage::
 
@@ -35,6 +41,7 @@ from pathlib import Path
 from cascade.shared.config import load_chain_config
 from cascade.shared.hippius import (
     WEBSITE_INDEX_KEY,
+    WEBSITE_STAKEHOLDERS_KEY,
     S3Config,
     S3Store,
     publish_website,
@@ -47,9 +54,11 @@ def _read_asset(name: str) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Publish the cascade dashboard to the manifest bucket.")
+    ap = argparse.ArgumentParser(description="Publish the cascade dashboards to the manifest bucket.")
     ap.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     ap.add_argument("--dry-run", action="store_true", help="Print what would be published and exit.")
+    ap.add_argument("--only", choices=("all", "dashboard", "stakeholders"), default="all",
+                    help="Publish just one page (default: both).")
     args = ap.parse_args()
 
     cfg = load_chain_config(args.chain_toml)
@@ -57,24 +66,31 @@ def main() -> None:
     s3cfg = S3Config.from_storage(cfg.storage, bucket=bucket)
     base = f"{s3cfg.endpoint.rstrip('/')}/{bucket}"
 
-    index_html = _read_asset(WEBSITE_INDEX_KEY)
+    pages: list[tuple[str, str]] = []
+    if args.only in ("all", "dashboard"):
+        pages.append((WEBSITE_INDEX_KEY, _read_asset(WEBSITE_INDEX_KEY)))
+    if args.only in ("all", "stakeholders"):
+        pages.append((WEBSITE_STAKEHOLDERS_KEY, _read_asset(WEBSITE_STAKEHOLDERS_KEY)))
     favicon = _read_asset("favicon.svg")
 
     if args.dry_run:
-        print(f"[dry-run] would publish {len(index_html)} B index.html + "
-              f"{len(favicon)} B favicon.svg to {base}/")
+        for key, html in pages:
+            print(f"[dry-run] would publish {len(html)} B {key} to {base}/")
+        print(f"[dry-run] would publish {len(favicon)} B favicon.svg to {base}/")
         return
 
     store = S3Store(s3cfg)
-    publish_website(store, index_html)
+    for key, html in pages:
+        publish_website(store, html, key=key)
     try:
         store.put_text("favicon.svg", favicon,
                        content_type="image/svg+xml", acl="public-read")
     except Exception:  # noqa: BLE001 — favicon is cosmetic; the page still works
         store.put_text("favicon.svg", favicon, content_type="image/svg+xml")
 
-    print(f"published dashboard → {base}/index.html")
-    print("it reads (public-read):")
+    for key, _ in pages:
+        print(f"published → {base}/{key}")
+    print("they read (public-read):")
     print(f"  {base}/receipts/index.json")
     print(f"  {base}/receipts/latest.json")
     print(f"  {base}/status/chain.json      (validator: live block anchor + submissions)")

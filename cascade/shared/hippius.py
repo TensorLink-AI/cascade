@@ -1241,6 +1241,10 @@ def update_receipt_index(
 # above. Mirrors teutonic, whose validator re-uploads its dashboard on restart.
 
 WEBSITE_INDEX_KEY = "index.html"
+# Second page, same bucket and same public receipts: a stakeholder-facing
+# scoreboard (dethrones, improvement vs the launch baseline, scaling ladder,
+# efficiency). Separate object so either page can be republished alone.
+WEBSITE_STAKEHOLDERS_KEY = "stakeholders.html"
 
 
 def publish_website(store: S3Store, html: str, *, key: str = WEBSITE_INDEX_KEY) -> str:

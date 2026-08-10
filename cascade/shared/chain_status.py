@@ -79,6 +79,7 @@ def build_chain_status(
     commitments: list,
     network: str = "",
     as_of: str = "",
+    economics: dict | None = None,
 ) -> dict:
     """Assemble the status document (pure — chain I/O stays with the caller).
 
@@ -87,6 +88,11 @@ def build_chain_status(
     pre-``commit_floor_block`` commits are dropped, mirroring the trainer's
     eligibility rules; the dashboard splits this-round vs next-round itself
     from each entry's ``commit_block`` against the epoch grid.
+
+    ``economics`` is ``ChainClient.subnet_economics()`` output (alpha price,
+    TAO emissions/day) and is included verbatim when provided — the
+    stakeholder scoreboard's Economics cell reads it. Like everything else
+    here it is presentational and unsigned.
     """
     from ..interface.validation import parse_commit
 
@@ -122,6 +128,7 @@ def build_chain_status(
         "block_time_s": block_time,
         "stage_windows": {"heat_seconds": heat_s, "duel_seconds": duel_s},
         "submissions": subs,
+        **({"economics": economics} if economics else {}),
     }
 
 

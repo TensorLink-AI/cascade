@@ -1,6 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
+    { "source": "/scoreboard", "destination": "/stakeholders.html" },
+    { "source": "/stakeholders", "destination": "/stakeholders.html" },
     {
       "source": "/receipts/:path*",
       "has": [{ "type": "host", "value": "testnet\\..*" }],
@@ -35,6 +37,12 @@
     },
     {
       "source": "/(index.html)?",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=60" }
+      ]
+    },
+    {
+      "source": "/stakeholders.html",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=60" }
       ]

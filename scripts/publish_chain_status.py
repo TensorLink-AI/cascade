@@ -41,6 +41,7 @@ def _publish_once(client: ChainClient, cfg, store) -> str:
         commitments=client.poll_commitments(),
         network=client.network,
         as_of=datetime.now(UTC).isoformat(timespec="seconds"),
+        economics=client.subnet_economics(),
     )
     key = publish_chain_status(store, status)
     print(f"published {key}: block {status['current_block']:,}, "

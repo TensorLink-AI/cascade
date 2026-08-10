@@ -1018,12 +1018,14 @@ class ValidatorRunner:
         from ..shared.chain_status import build_chain_status, publish_chain_status
 
         try:
+            econ = getattr(client, "subnet_economics", lambda: None)()
             status = build_chain_status(
                 self.cfg,
                 current_block=int(client.current_block()),  # type: ignore[attr-defined]
                 commitments=client.poll_commitments(),  # type: ignore[attr-defined]
                 network=str(getattr(client, "network", "")),
                 as_of=datetime.now(UTC).isoformat(timespec="seconds"),
+                economics=econ,
             )
             publish_chain_status(store, status)
         except Exception as e:  # noqa: BLE001 — telemetry only
