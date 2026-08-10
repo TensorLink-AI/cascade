@@ -71,7 +71,7 @@ def test_run_post_round_benchmark_never_raises():
 def test_training_dispatch_preempts_benchmarks():
     from cascade.trainer.remote import build_remote_command
 
-    cmd = build_remote_command(HOST, ["python", "-m", "cascade.trainer.worker"], {})
+    cmd, _ = build_remote_command(HOST, ["python", "-m", "cascade.trainer.worker"], {})
     assert cmd.startswith(PREEMPT_BENCHMARKS)  # training always wins
     assert "cd /root/cascade &&" in cmd
 

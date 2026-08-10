@@ -163,22 +163,23 @@ def test_pod_lane_count_counts_shared_endpoints():
 
 
 def test_build_remote_command_stamps_lane_env_quoted():
-    cmd = build_remote_command(_host("a-1", cuda="1"), ["python", "-m", "x"],
-                               {}, lane_count=4)
+    cmd, stdin_env = build_remote_command(_host("a-1", cuda="1"), ["python", "-m", "x"],
+                                          {}, lane_count=4)
     assert "CASCADE_LANE_INDEX=1" in cmd
     assert "CASCADE_LANE_COUNT=4" in cmd
     assert "CUDA_VISIBLE_DEVICES=1" in cmd
+    assert stdin_env is None              # lane env is inline, not a secret
 
 
 def test_build_remote_command_omits_lane_env_when_unavailable():
     # no lane_count (local/tests), single-lane pods, and non-ordinal masks all
     # keep today's command exactly.
     for kwargs in ({}, {"lane_count": None}, {"lane_count": 1}):
-        cmd = build_remote_command(_host("a", cuda="0"), ["python"], {}, **kwargs)
+        cmd, _ = build_remote_command(_host("a", cuda="0"), ["python"], {}, **kwargs)
         assert "CASCADE_LANE" not in cmd
-    cmd = build_remote_command(_host("a", cuda="0,1"), ["python"], {}, lane_count=2)
+    cmd, _ = build_remote_command(_host("a", cuda="0,1"), ["python"], {}, lane_count=2)
     assert "CASCADE_LANE" not in cmd      # multi-device mask is not a lane
-    cmd = build_remote_command(_host("a"), ["python"], {}, lane_count=2)
+    cmd, _ = build_remote_command(_host("a"), ["python"], {}, lane_count=2)
     assert "CASCADE_LANE" not in cmd      # no cuda_device at all
 
 
