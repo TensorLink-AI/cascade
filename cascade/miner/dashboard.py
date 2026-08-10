@@ -557,6 +557,190 @@ def render_heat_index(doc: dict | None, *, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+# ── duel breakdown (`cascade duel` — the verdict behind DETHRONED/held) ──────
+#
+# The receipt index carries one row per validator per settled round, and a
+# scored row already holds the full duel verdict: LCB vs margin, both
+# geomeans, win rate, per-domain win rates, bootstrap quantiles. `cascade
+# round` compresses all that into one outcome line; this section renders the
+# whole thing. Same trust model as the rest of the public docs: anonymous
+# GET, no wallet, no credentials.
+
+
+def duel_round_rows(index_doc: dict | None, round_id: str | None = None) -> list[dict]:
+    """Every index row for one round — the latest round with a scored row when
+    ``round_id`` is None. Scored rows carry the verdict; rejected rows for the
+    same round explain validators that sat the scoring out."""
+    rounds = _index_rounds(index_doc)
+    if round_id is not None:
+        return [r for r in rounds if str(r.get("round_id")) == str(round_id)]
+    scored = [r for r in rounds if str(r.get("status")) == "scored"
+              and _as_int(r.get("epoch_start_block")) is not None]
+    if not scored:
+        return []
+    latest = max(scored, key=lambda r: _as_int(r.get("epoch_start_block")))
+    return [r for r in rounds if str(r.get("round_id")) == str(latest.get("round_id"))]
+
+
+def _domain_bar(win_rate: float, width: int = 24) -> str:
+    """A bar centred on 0.50: right of centre = challenger ahead, left = king.
+    Reads at a glance whether a domain flipped against the overall verdict."""
+    half = width // 2
+    filled = round(abs(win_rate - 0.5) * 2 * half)
+    filled = min(filled, half)
+    if win_rate >= 0.5:
+        return "·" * half + "█" * filled + " " * (half - filled)
+    return " " * (half - filled) + "█" * filled + "·" * half
+
+
+def _duel_outcome(row: dict) -> str:
+    if row.get("inconclusive"):
+        return "INCONCLUSIVE — validators could not settle the duel"
+    chal = row.get("chal_uid")
+    who = f"challenger uid {chal}" if chal is not None else "the challenger"
+    if row.get("dethroned"):
+        return f"DETHRONED — {who} took the throne"
+    lcb, margin = _as_float(row.get("lcb")), _as_float(row.get("margin"))
+    if lcb is not None and margin is not None:
+        return (f"king held — {who} fell short: LCB {lcb:+.4f} vs "
+                f"{margin:+.4f} required")
+    return "king held"
+
+
+def _duel_validators_line(rows: list[dict]) -> str | None:
+    scored = [r for r in rows if str(r.get("status")) == "scored"]
+    rejected = [r for r in rows if str(r.get("status")) == "rejected"]
+    parts = []
+    if scored:
+        lcbs = "/".join(f"{lcb:+.4f}" for r in scored
+                        if (lcb := _as_float(r.get("lcb"))) is not None)
+        parts.append(f"{len(scored)} scored" + (f" (lcb {lcbs})" if lcbs else ""))
+    for r in rejected:
+        reason = str(r.get("reject_reason") or "unspecified").split(":")[0]
+        parts.append(f"{_short_hotkey(str(r.get('validator_hotkey') or ''))} "
+                     f"rejected ({reason})")
+    return "  validators     " + " · ".join(parts) if parts else None
+
+
+def render_duel(rows: list[dict]) -> str:
+    """The standalone ``cascade duel`` view of one settled round's index rows."""
+    if not rows:
+        return ("no settled round found in the public receipt index — receipts land "
+                "a few minutes after the duel manifest; try 'cascade round' for the "
+                "live stage")
+    scored = [r for r in rows if str(r.get("status")) == "scored"]
+    row = (scored or rows)[-1]
+    lines = [
+        f"cascade duel — round {row.get('round_id', '--')}"
+        f"  ·  epoch start block {row.get('epoch_start_block', '--')}",
+    ]
+    if not scored:
+        reasons = {str(r.get("reject_reason") or "unspecified") for r in rows}
+        lines.append("  outcome        rejected by every reporting validator")
+        lines += [f"    {reason[:96]}" for reason in sorted(reasons)]
+        return "\n".join(lines)
+    lines.append(f"  outcome        {_duel_outcome(row)}")
+    kg, cg = _as_float(row.get("king_geomean")), _as_float(row.get("chal_geomean"))
+    for role, uid, hotkey, geo, ref in (
+        ("king", row.get("king_uid"), row.get("king_hotkey"), kg, row.get("king_gen_ref")),
+        ("challenger", row.get("chal_uid"), row.get("chal_hotkey"), cg, row.get("chal_gen_ref")),
+    ):
+        if uid is None and hotkey is None:
+            continue
+        line = (f"  {role:<11}    uid {'--' if uid is None else uid:>4}  "
+                f"{_short_hotkey(str(hotkey or '')):<11}")
+        if geo is not None:
+            line += f"  geomean {geo:.5f}"
+        if role == "challenger" and kg and cg is not None:
+            word = "better than" if cg < kg else "worse than"
+            line += f"  ({abs(kg - cg) / kg * 100:.2f}% {word} the king)"
+        if ref:
+            line += f"  {_short_ref(str(ref))}"
+        lines.append(line)
+    lcb, margin = _as_float(row.get("lcb")), _as_float(row.get("margin"))
+    if lcb is not None:
+        bar = "cleared the bar" if margin is not None and lcb > margin else "did not clear the bar"
+        lines.append(f"  margin         LCB {lcb:+.4f} vs "
+                     + (f"{margin:+.4f} required — challenger {bar}" if margin is not None
+                        else "an unpublished margin"))
+    win, nw, nc = (_as_float(row.get("win_rate")), _as_int(row.get("n_windows")),
+                   _as_int(row.get("n_clusters")))
+    if win is not None:
+        ev = f"  evidence       challenger won {win * 100:.1f}% of windows"
+        if nw:
+            ev += f" ({nw} windows, {nc or '--'} feeds)"
+        p = _as_float(row.get("wilcoxon_p"))
+        if p is not None:
+            ev += f" · wilcoxon p={p:.2g}"
+        lines.append(ev)
+    p50, p95 = _as_float(row.get("boot_p50")), _as_float(row.get("boot_p95"))
+    if p50 is not None and p95 is not None:
+        lines.append(f"  bootstrap      Δ p50 {p50:+.4f} / p95 {p95:+.4f}")
+    gift = row.get("gift_gate_passed")
+    if gift is not None:
+        lines.append("  gift gate      " + ("passed" if gift else "BLOCKED the dethrone"))
+    heat = row.get("heat")
+    if isinstance(heat, dict) and heat.get("n_entrants") is not None:
+        lines.append(f"  heat           {heat.get('n_entrants')} entrants · "
+                     f"{heat.get('n_advanced', '--')} advanced"
+                     + (f" · leader p_best {pb:.3f}"
+                        if (pb := _as_float(heat.get("leader_p_best"))) is not None else ""))
+    uids = row.get("reward_uids")
+    if isinstance(uids, list) and uids:
+        lines.append(f"  rewards        uids {uids}")
+    domains = row.get("per_domain_win_rate")
+    if isinstance(domains, dict) and domains:
+        lines.append("  per-domain win rate  (right of centre = challenger ahead)")
+        ordered = sorted(domains.items(),
+                         key=lambda kv: -(_as_float(_domain_pair(kv[1])[0]) or 0.0))
+        for name, value in ordered:
+            rate, n = _domain_pair(value)
+            if rate is None:
+                continue
+            n_s = f"n={n:>5}" if n is not None else ""
+            lines.append(f"    {name:<14} {rate:.2f}  {n_s}  {_domain_bar(rate)}")
+    if (validators := _duel_validators_line(rows)) is not None:
+        lines.append(validators)
+    return "\n".join(lines)
+
+
+def _domain_pair(value: object) -> tuple[float | None, int | None]:
+    """A per-domain entry is ``[win_rate, n_windows]`` in the index; tolerate a
+    bare number from older writers."""
+    if isinstance(value, (list, tuple)) and value:
+        return _as_float(value[0]), _as_int(value[1]) if len(value) > 1 else None
+    return _as_float(value), None
+
+
+def render_duel_index(index_doc: dict | None, *, limit: int = 20) -> str:
+    """The ``cascade duel --history`` view: one line per settled round."""
+    by_round: dict[str, list[dict]] = {}
+    for r in _index_rounds(index_doc):
+        by_round.setdefault(str(r.get("round_id")), []).append(r)
+    groups = sorted(by_round.values(),
+                    key=lambda g: max((_as_int(r.get("epoch_start_block")) or 0) for r in g))
+    if not groups:
+        return "no settled rounds found (receipts/index.json is absent or empty)"
+    lines = [f"cascade duel — {len(groups)} settled round(s), newest last"]
+    for g in groups[-limit:]:
+        scored = [r for r in g if str(r.get("status")) == "scored"]
+        row = (scored or g)[-1]
+        if not scored:
+            what = "rejected"
+        elif row.get("dethroned"):
+            what = f"DETHRONED by uid {row.get('chal_uid', '--')}"
+        else:
+            what = f"king held (uid {row.get('king_uid', '--')})"
+        lcb = _as_float(row.get("lcb"))
+        lines.append(
+            f"  round {str(row.get('round_id', '--')):<22} "
+            f"block {row.get('epoch_start_block') or '--':>11}  "
+            + (f"lcb {lcb:+.4f}  " if lcb is not None else " " * 13) + what)
+    if len(groups) > limit:
+        lines.append(f"  … {len(groups) - limit} older not shown (--limit to widen)")
+    return "\n".join(lines)
+
+
 # ── live submissions (revealed on-chain commitments) ─────────────────────────
 
 

@@ -18,6 +18,7 @@ from cascade.miner.dashboard import (
     LiveFeed,
     PhaseEstimate,
     RoundTimeline,
+    duel_round_rows,
     fetch_public_heat,
     fetch_public_heat_index,
     fetch_public_heat_round,
@@ -32,6 +33,8 @@ from cascade.miner.dashboard import (
     phase_for,
     phase_from_live,
     render,
+    render_duel,
+    render_duel_index,
     render_heat,
     render_heat_index,
     round_status,
@@ -671,4 +674,125 @@ def test_cmd_heat_exits_1_when_nothing_is_published(monkeypatch, cfg, capsys):
 def test_heat_registered_in_parser():
     with pytest.raises(SystemExit) as e:
         cli.main(["heat", "--help"])
+    assert e.value.code == 0
+
+
+# ── `cascade duel` — settled-round breakdown ─────────────────────────────────
+
+
+def _duel_row(round_id="10", *, status="scored", epoch_start_block=8_809_200,
+              dethroned=True, validator_hotkey="5Valid" + "a" * 42, **extra):
+    row = {
+        "round_id": round_id, "status": status,
+        "epoch_start_block": epoch_start_block,
+        "validator_hotkey": validator_hotkey,
+        "king_uid": 31, "king_hotkey": "5King" + "k" * 43, "king_geomean": 0.24836,
+        "king_gen_ref": "ns/king-gen@sha256:" + "0" * 64,
+        "chal_uid": 124, "chal_hotkey": "5Chal" + "c" * 43, "chal_geomean": 0.23881,
+        "chal_gen_ref": "ns/chal-gen@sha256:" + "1" * 64,
+        "dethroned": dethroned, "inconclusive": False,
+        "lcb": 0.022, "margin": 0.02, "win_rate": 0.608,
+        "wilcoxon_p": 2.7e-27, "n_windows": 1945, "n_clusters": 852,
+        "boot_p50": 0.0376, "boot_p95": 0.0576, "gift_gate_passed": None,
+        "reward_uids": [124, 31], "reject_reason": None,
+        "heat": {"n_entrants": 25, "n_advanced": 1, "leader_p_best": 0.977},
+        "per_domain_win_rate": {"web_cloudops": [0.74, 440],
+                                "healthcare": [0.46, 147]},
+    }
+    row.update(extra)
+    return row
+
+
+def test_duel_round_rows_defaults_to_latest_scored_round():
+    doc = {"rounds": [
+        _duel_row("8", epoch_start_block=8_802_000),
+        _duel_row("10", status="rejected", lcb=None,
+                  reject_reason="contract_digest_mismatch: aa != bb"),
+        _duel_row("10"),
+        # a later rejected-only round must NOT displace the scored one
+        _duel_row("11", status="rejected", epoch_start_block=8_812_800, lcb=None,
+                  reject_reason="stale"),
+    ]}
+    rows = duel_round_rows(doc)
+    assert [r["round_id"] for r in rows] == ["10", "10"]
+    assert duel_round_rows(doc, "8")[0]["round_id"] == "8"
+    assert duel_round_rows(doc, "nope") == []
+    assert duel_round_rows(None) == []
+
+
+def test_render_duel_dethrone_breakdown():
+    text = render_duel([
+        _duel_row("10", status="rejected", lcb=None,
+                  validator_hotkey="5Rej" + "r" * 44,
+                  reject_reason="contract_digest_mismatch: aa != bb"),
+        _duel_row("10"),
+    ])
+    assert "DETHRONED — challenger uid 124 took the throne" in text
+    assert "LCB +0.0220 vs +0.0200 required — challenger cleared the bar" in text
+    assert "3.85% better than the king" in text
+    assert "60.8% of windows (1945 windows, 852 feeds)" in text
+    assert "web_cloudops" in text and "healthcare" in text
+    # sorted by challenger advantage: web_cloudops (0.74) above healthcare (0.46)
+    assert text.index("web_cloudops") < text.index("healthcare")
+    assert "1 scored (lcb +0.0220)" in text and "rejected (contract_digest_mismatch)" in text
+    assert "gift gate" not in text            # None → line omitted
+
+
+def test_render_duel_king_held_and_gift_gate():
+    text = render_duel([_duel_row(dethroned=False, lcb=-0.0022,
+                                  gift_gate_passed=False, reward_uids=[31])])
+    assert "king held — challenger uid 124 fell short: LCB -0.0022" in text
+    assert "did not clear the bar" in text
+    assert "gift gate      BLOCKED the dethrone" in text
+
+
+def test_render_duel_rejected_only_and_empty():
+    text = render_duel([_duel_row(status="rejected", lcb=None,
+                                  reject_reason="contract_digest_mismatch: aa != bb")])
+    assert "rejected by every reporting validator" in text
+    assert "contract_digest_mismatch" in text
+    assert "no settled round found" in render_duel([])
+
+
+def test_render_duel_index_history():
+    doc = {"rounds": [_duel_row("8", epoch_start_block=8_802_000, dethroned=False),
+                      _duel_row("10")]}
+    text = render_duel_index(doc)
+    assert "2 settled round(s)" in text
+    assert "king held (uid 31)" in text and "DETHRONED by uid 124" in text
+    assert text.index("round 8 ") < text.index("round 10")   # newest last
+    assert "no settled rounds found" in render_duel_index(None)
+
+
+def test_cmd_duel_prints_the_breakdown(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_receipt_index",
+                        lambda *_a, **_k: {"rounds": [_duel_row("10")]})
+    args = types.SimpleNamespace(chain_toml=None, round_id=None, history=False, limit=20)
+    assert cli._cmd_duel(args) == 0
+    assert "DETHRONED" in capsys.readouterr().out
+
+    args = types.SimpleNamespace(chain_toml=None, round_id=None, history=True, limit=20)
+    assert cli._cmd_duel(args) == 0
+    assert "settled round(s)" in capsys.readouterr().out
+
+
+def test_cmd_duel_exits_1_without_public_data(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_receipt_index",
+                        lambda *_a, **_k: None)
+    args = types.SimpleNamespace(chain_toml=None, round_id=None, history=False, limit=20)
+    assert cli._cmd_duel(args) == 1
+    assert "receipt index" in capsys.readouterr().err
+
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_receipt_index",
+                        lambda *_a, **_k: {"rounds": []})
+    args = types.SimpleNamespace(chain_toml=None, round_id="42", history=False, limit=20)
+    assert cli._cmd_duel(args) == 1
+    assert "round 42" in capsys.readouterr().err
+
+
+def test_duel_registered_in_parser():
+    with pytest.raises(SystemExit) as e:
+        cli.main(["duel", "--help"])
     assert e.value.code == 0

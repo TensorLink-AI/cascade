@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .hippius import StorageError
 from .manifest import VALID_ROLES, BenchScores
 
 BENCH_REPORT_VERSION = 1
@@ -199,7 +200,20 @@ def verify_bench_report_signature(report: BenchReport, trainer_hotkey: str) -> b
 def publish_bench_report(store: object, report_text: str, round_id: str) -> str:
     """Write the round's bench report to the manifest-bucket store and return its
     key. The store comes from ``open_manifest_store`` at every call site, so the
-    R2 dual-write (and HF failover) the manifest enjoys covers the report too."""
+    R2 dual-write (and HF failover) the manifest enjoys covers the report too.
+
+    Published PUBLIC-READ: the manifest bucket is private by default (only the
+    receipt trail, the status docs and the dashboards carry the canned ACL), and
+    the stakeholder scoreboard fetches this object anonymously from the browser.
+    Without the ACL the round doc is written but reads 403, which is
+    indistinguishable from "never benched" on the page. Same fallback as the
+    receipt publisher — a backend without canned ACLs publishes private rather
+    than not at all."""
     key = bench_report_key(round_id)
-    store.put_text(key, report_text, content_type="application/json")
+    try:
+        store.put_text(key, report_text, content_type="application/json",
+                       acl="public-read")
+    except StorageError:
+        # ACL unsupported on this backend: publish private rather than not at all.
+        store.put_text(key, report_text, content_type="application/json")
     return key

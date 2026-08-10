@@ -20,6 +20,15 @@
     {
       "source": "/status/:path*",
       "destination": "https://s3.hippius.com/cascade-manifests/status/:path*"
+    },
+    {
+      "source": "/benchmarks/:path*",
+      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/benchmarks/:path*"
+    },
+    {
+      "source": "/benchmarks/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/benchmarks/:path*"
     }
   ],
   "headers": [
@@ -33,6 +42,12 @@
       "source": "/status/(.*)",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20" }
+      ]
+    },
+    {
+      "source": "/benchmarks/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
       ]
     },
     {

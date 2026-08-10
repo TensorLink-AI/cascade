@@ -20,6 +20,7 @@ from cascade.shared.bench_report import (
     sign_bench_report,
     verify_bench_report_signature,
 )
+from cascade.shared.hippius import StorageError
 from cascade.shared.manifest import BenchScores
 
 PTR_K = "metro-v1:trained:hippius:cascade/ckpt-r1-king@sha256:" + "c" * 64
@@ -109,16 +110,43 @@ def test_verify_rejects_missing_signature_or_hotkey():
     assert verify_bench_report_signature(_report(sig="abcd"), "") is False
 
 
+class _Store:
+    """Minimal put_text sink recording the canned ACL each write carried."""
+
+    def __init__(self, acl_raises: bool = False):
+        self.texts: dict[str, str] = {}
+        self.acls: list[str | None] = []
+        self._acl_raises = acl_raises
+
+    def put_text(self, key, text, *, content_type="text/plain", acl=None):
+        self.acls.append(acl)
+        if acl is not None and self._acl_raises:
+            raise StorageError("acl unsupported")
+        self.texts[key] = text
+
+
 def test_publish_writes_the_round_key():
-    class _Store:
-        def __init__(self):
-            self.texts = {}
-
-        def put_text(self, key, text, *, content_type="text/plain", acl=None):
-            self.texts[key] = text
-
     store = _Store()
     text = dump_bench_report(_report())
     key = publish_bench_report(store, text, "777")
     assert key == bench_report_key("777") == "benchmarks/round-777.json"
+    assert store.texts[key] == text
+
+
+def test_publish_is_public_read():
+    """The scoreboard fetches this object anonymously from the browser, and the
+    manifest bucket is private by default — a report written without the canned
+    ACL reads 403, which the page cannot tell apart from "never benched"."""
+    store = _Store()
+    publish_bench_report(store, dump_bench_report(_report()), "777")
+    assert store.acls == ["public-read"]
+
+
+def test_publish_falls_back_to_private_when_acl_unsupported():
+    """Same fallback as the receipt publisher: a backend without canned ACLs
+    publishes private rather than not at all."""
+    store = _Store(acl_raises=True)
+    text = dump_bench_report(_report())
+    key = publish_bench_report(store, text, "777")
+    assert store.acls == ["public-read", None]
     assert store.texts[key] == text
