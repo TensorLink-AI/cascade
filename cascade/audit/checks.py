@@ -318,22 +318,186 @@ def _cutoff_chain_note(receipt: RoundReceipt, client: object) -> str:
 # ── verdict + weights ─────────────────────────────────────────────────────────
 
 
-def _pooled_scores(receipt: RoundReceipt, manifest: TrainingManifest):
+def _duelled_hotkeys(receipt: RoundReceipt) -> list[str]:
+    """Challenger hotkeys the validator actually evaluated, in record order.
+
+    Read off ``entry_scores`` rather than the manifest: the manifest lists what
+    the trainer *advanced*, but a challenger can be dropped before the duel (a
+    size the king does not cover), and an inconclusive round stops the cohort
+    early. ``entry_scores`` is the record of what was scored, and it is signed.
+    """
+    out: list[str] = []
+    for r in receipt.entry_scores:
+        if r.role == "challenger" and r.hotkey not in out:
+            out.append(r.hotkey)
+    return out
+
+
+def _pooled_scores(
+    receipt: RoundReceipt, manifest: TrainingManifest, *, hotkey: str | None = None
+):
     """Rebuild the pooled king/challenger score lists exactly as the validator
-    pooled them (paired sizes in manifest order, per-size scores concatenated)."""
+    pooled them (paired sizes in manifest order, per-size scores concatenated).
+
+    ``hotkey`` selects which challenger of a multi-finalist cohort to pool
+    (DEC-CA-0012); ``None`` takes the last one recorded, which is the challenger
+    the receipt's verdict belongs to under the cohort rule — the crowned clearer,
+    or the challenger that stopped an inconclusive cohort. Keying by ``(role,
+    size)`` alone would silently collapse the cohort to one arbitrary entrant,
+    which is the bug this parameter exists to prevent.
+    """
     king_by_size = {e.size: e for e in manifest.entries_for_role("king")}
-    chal_by_size = {e.size: e for e in manifest.entries_for_role("challenger")}
+    if hotkey is None:
+        duelled = _duelled_hotkeys(receipt)
+        hotkey = duelled[-1] if duelled else None
+    chal_by_size = {
+        e.size: e for e in manifest.entries_for_role("challenger")
+        if hotkey is None or e.miner_hotkey == hotkey
+    }
     paired = [s for s in manifest.sizes() if s in king_by_size and s in chal_by_size]
-    recs = {(r.role, r.size): r for r in receipt.entry_scores}
+    recs = {(r.role, r.size, r.hotkey): r for r in receipt.entry_scores}
     king, chal = [], []
     for size in paired:
-        k = recs.get(("king", size))
-        c = recs.get(("challenger", size))
+        k = recs.get(("king", size, king_by_size[size].miner_hotkey))
+        c = recs.get(("challenger", size, chal_by_size[size].miner_hotkey))
         if k is None or c is None:
             raise KeyError(f"entry_scores missing for size {size!r}")
         king += [w.to_score() for w in k.scores]
         chal += [w.to_score() for w in c.scores]
     return king, chal, paired
+
+
+def _cohort_params(params, manifest: TrainingManifest):
+    """``params`` with the duel's family-wise alpha applied (DEC-CA-0012).
+
+    ``bootstrap_alpha / k`` where ``k = len(manifest.duel_cohort())`` — the same
+    derivation the validator ran, off the same signed manifest. ``k <= 1`` returns
+    ``params`` unchanged, so a single-challenger round (every round before this
+    shipped) replays bit-identically.
+    """
+    from dataclasses import replace
+
+    k = len(manifest.duel_cohort()[0])
+    if k <= 1:
+        return params
+    return replace(params, bootstrap_alpha=params.bootstrap_alpha / k)
+
+
+def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
+    """Verify the cohort duel's SELECTION, not just its verdict (DEC-CA-0012).
+
+    With one challenger this is a no-op skip. With a cohort it replays every
+    recorded challenger against the king under the corrected alpha and checks the
+    two things the verdict alone cannot show:
+
+    1. Every duelled challenger reproduces a verdict at ``bootstrap_alpha / k``
+       — so no challenger was judged under a looser bound than the cohort earns.
+    2. The challenger the verdict belongs to is the best OBSERVED relative
+       improvement among those that cleared the margin (lowest ``chal_geomean``,
+       the king's being shared). This is what catches a validator crowning a
+       clearer that was not the best, which is exactly the artifact the rejected
+       sequential rule would have produced.
+    3. The receipt's PUBLISHED ``cohort_k`` and ``cohort_lcbs`` match what the
+       signed manifest implies and what the scores replay to. Those two fields are
+       the round's math in public form — with ``margin`` they are the complete
+       input to the selection rule — so anyone can check "who cleared and was the
+       crowned one the best" without re-running the bootstrap; this check
+       confirms the published numbers are the ones that actually decided.
+
+    Note the correction is applied to the bootstrap QUANTILE, not to the margin:
+    the LCB becomes the ``alpha/k`` percentile of the paired distribution while
+    ``margin`` stays flat. Replaying with a raised margin instead will not
+    reproduce these numbers, and is not the rule.
+
+    A gift-gate block legitimately moves the crown down the clearer list, so when
+    the recorded verdict shows the gate ran, requirement 2 is relaxed to "the
+    crowned challenger cleared" — the sidecar numbers are not recomputable at
+    Tier 0, the same limitation :func:`check_verdict` already documents.
+    """
+    name = "duel-cohort"
+    if receipt.verdict is None:
+        return _skip(name, "no verdict on this receipt")
+    try:
+        manifest = receipt.load_embedded_manifest()
+    except (ValueError, KeyError) as e:
+        return _fail(name, f"cannot load embedded manifest: {e}")
+    duelled = _duelled_hotkeys(receipt)
+    if len(duelled) <= 1:
+        return _skip(name, "single-challenger round; no cohort to verify")
+
+    from ..eval.koth import KothParams, evaluate_round
+
+    v = receipt.verdict
+    try:
+        params = KothParams(**v.params)
+    except TypeError as e:
+        return _fail(name, f"recorded params do not form a KothParams: {e}")
+    k = len(manifest.duel_cohort()[0])
+    if k < len(duelled):
+        return _fail(name, f"{len(duelled)} challengers were scored but the signed "
+                           f"manifest's cohort is {k} — the alpha correction the "
+                           f"round was judged under cannot be re-derived")
+    # The receipt PUBLISHES the k it used; it must equal the one the signed
+    # manifest implies, or the alpha the round was judged under is not the alpha
+    # it claims. (0 = a pre-cohort receipt, which never reaches here.)
+    if v.cohort_k and v.cohort_k != k:
+        return _fail(name, f"receipt records cohort_k={v.cohort_k} but the signed "
+                           f"manifest's cohort is {k}")
+    duel_params = _cohort_params(params, manifest)
+
+    replayed: list[tuple[str, object]] = []
+    for hk in duelled:
+        try:
+            king, chal, paired = _pooled_scores(receipt, manifest, hotkey=hk)
+        except (ValueError, KeyError) as e:
+            return _fail(name, f"cannot rebuild pooled scores for {hk}: {e}")
+        if not paired:
+            return _fail(name, f"challenger {hk} has no paired size")
+        res = evaluate_round(
+            king, chal, duel_params,
+            seed=_bootstrap_seed(v.bootstrap_seed),
+            king_tenure_rounds=v.king_tenure_rounds,
+        )
+        replayed.append((hk, res))
+
+    # The verdict belongs to the LAST challenger recorded (the validator appends
+    # in evaluation order and the crowned/​stopping challenger is scored last).
+    crowned = duelled[-1]
+    clearers = [(hk, r) for hk, r in replayed if r.challenger_wins_round]
+    problems = []
+    # Every published per-challenger LCB must be the one that replays. This is
+    # what lets a third party check the selection arithmetically — the recorded
+    # bounds and the recorded margin are the whole input to "who cleared" — so a
+    # published bound that does not reproduce is a hard failure, not a warning.
+    for hk, res in replayed:
+        recorded = (v.cohort_lcbs or {}).get(hk)
+        if recorded is None:
+            problems.append(f"no published LCB for duelled challenger {hk}")
+        elif not _close(recorded, None if math.isnan(res.lcb) else res.lcb):
+            problems.append(f"published LCB for {hk} is {recorded} but replays as "
+                            f"{res.lcb}")
+    for hk in (v.cohort_lcbs or {}):
+        if hk not in {h for h, _ in replayed}:
+            problems.append(f"published an LCB for {hk}, which was never scored")
+    if v.inconclusive:
+        if clearers:
+            problems.append(
+                f"round recorded inconclusive but {len(clearers)} challenger(s) "
+                f"replay as conclusive wins")
+    elif clearers:
+        gate_ran = v.gift_gate_passed is not None
+        best = min(clearers, key=lambda t: t[1].chal_geomean)[0]
+        if crowned not in {hk for hk, _ in clearers}:
+            problems.append(f"crowned {crowned} did not clear the margin on replay")
+        elif not gate_ran and crowned != best:
+            problems.append(
+                f"crowned {crowned} is not the best clearer; {best} has a better "
+                f"observed geomean and no public-benchmark gate is recorded")
+    if problems:
+        return _fail(name, "; ".join(problems))
+    return _ok(name, f"{len(duelled)} challengers replayed at alpha="
+                     f"{duel_params.bootstrap_alpha:.5f} (={params.bootstrap_alpha:.4f}/{k}); "
+                     f"{len(clearers)} cleared; crowned {crowned[:12]}")
 
 
 def check_koth_params(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
@@ -385,9 +549,17 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     # each known aggregation and take the one that reproduces the recorded LCB.
     # This is self-verifying: reproducing an LCB to 1e-9 under the wrong rule is
     # not something a mis-scored or tampered receipt does by accident.
+    # Family-wise alpha (DEC-CA-0012): the round was judged at
+    # ``bootstrap_alpha / k``, k = the advanced cohort size. The receipt records
+    # the UNMODIFIED config params on purpose — a mutated alpha there would fail
+    # ``check_koth_params`` against the published ``[scoring]`` — so re-derive the
+    # correction from the signed manifest, exactly as the validator did. k = 1
+    # leaves params untouched, so every pre-cohort receipt replays unchanged.
+    duel_params = _cohort_params(params, manifest)
+
     def _replay(mode: str):
         return evaluate_round(
-            king, chal, params,
+            king, chal, duel_params,
             seed=_bootstrap_seed(v.bootstrap_seed),
             king_tenure_rounds=v.king_tenure_rounds,
             wql_mode=mode,
@@ -459,7 +631,15 @@ def check_transition(receipt: RoundReceipt) -> CheckResult:
         manifest = receipt.load_embedded_manifest()
     except (ValueError, KeyError) as e:
         return _fail(name, f"embedded manifest unparseable: {e}")
-    chal = manifest.entry_for_role("challenger")
+    # The challenger the verdict belongs to — the last one scored, which under the
+    # cohort rule is the crowned clearer (DEC-CA-0012). Taking the manifest's
+    # FIRST challenger would misattribute the throne on any multi-finalist round.
+    duelled = _duelled_hotkeys(receipt)
+    chal = next(
+        (e for e in manifest.entries_for_role("challenger")
+         if duelled and e.miner_hotkey == duelled[-1]),
+        manifest.entry_for_role("challenger"),
+    )
     king = manifest.entry_for_role("king")
     if not v.challenger_wins_round and v.dethroned:
         return _fail(name, "dethroned recorded without a round win")
@@ -623,6 +803,7 @@ def run_tier0(
         check_commit_cutoff(receipt, client),
         check_koth_params(receipt, cfg),
         check_verdict(receipt),
+        check_duel_cohort(receipt),
         check_transition(receipt),
         check_weights(receipt, cfg, client),
     ]
