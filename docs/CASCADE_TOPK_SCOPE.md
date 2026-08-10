@@ -142,6 +142,102 @@ Recommendation on size: **`K` = 2–3, not 10.** Marginalising over three inits
 already breaks per-init specialisation — an exploit has to work on all of them —
 while `K` = 10 pays ~10× in depth for diminishing attribution return.
 
+## 4a. Who is eligible: king only, or challengers too?
+
+Today only the reigning king's checkpoint is logged (`_record_king_checkpoint`,
+`validator/loop.py:586`). But the trainer benches **both duel entries** each
+round and both land in the signed bench report, so challenger checkpoints are
+already available at no new compute.
+
+**Include them.** A pool drawn only from kings is, over a long reign, one
+miner's lineage — which is exactly the objection that sinks Variant A. Multi-owner
+membership is what gives the pool its anti-gaming property, and the duel verdict
+is answering a different question anyway: the duel ranks *generators* on the
+private eval pool, while pool membership asks "is this a good place to start
+from", measured on public suites. A challenger that lost its duel can still be a
+good init.
+
+Two consequences to go in with eyes open:
+
+- **New attack surface.** A miner could aim not to win the duel but to land a
+  checkpoint in the pool that its *other* generator is co-adapted to — buying an
+  edge on the ~1/`K` of rounds that draw it. The cost gate is real (you must win
+  the heat to reach the duel and be benched), and the payoff is diluted by `K`,
+  but this attack does not exist today. A per-owner cap (§4b) is the direct
+  mitigation.
+- **It makes the reign clock vestigial.** If membership is continuous admission
+  from every benched checkpoint, nothing is left for the reign clock to decide —
+  "when has a king reigned long enough to promote" stops being a question. That
+  deletes the subject matter of a live, armed mechanism (DEC-CA-0004). It may
+  well be a simplification worth having, but it must be decided deliberately,
+  not absorbed as a side effect of a pool change.
+
+## 4b. What criterion picks members: rank, or metric orthogonality?
+
+The tension is real: top-`N` by `cascade_score` gives `N` checkpoints that are
+similar *because* they were ranked on one aggregate, and B's whole argument
+needs them to differ. But selecting for orthogonality across the six bench
+numbers is the wrong fix, for four reasons in ascending order of severity.
+
+1. **The six numbers are not six dimensions.** They are a 3×2 grid — suite
+   (GIFT-Eval / BOOM / TIME) × metric type (CRPS = distributional calibration,
+   MASE = point accuracy) — and within a suite both are computed from the same
+   forecasts over the same datasets, so they move together. The honest axes are
+   "domain" and "calibration vs accuracy": two, and both sit under a dominant
+   overall-quality component.
+2. **The sample is too small to estimate what the method needs.** A covariance
+   structure in six dimensions from the ~10 candidates a pool would ever see is
+   not an estimate.
+3. **Selecting on the orthogonal residual selects on noise.** This is
+   [[DEC-CA-0006]]'s finding wearing different clothes: there, ~91% of marginal
+   variance was shared window difficulty and ranking on the residual penalised
+   dispersion the duel doesn't score. Here the leading component is "this
+   checkpoint is better"; what remains after removing it is largely bench noise —
+   and with one bench run per checkpoint there is no repeated measurement to
+   separate residual signal from residual noise.
+4. **Decisive: "be unusual" is far easier to game than "be good."** The criterion
+   is being chosen for anti-gaming reasons, and it is *more* gameable than the one
+   it replaces. Ranking top-`N` by score requires producing a good checkpoint;
+   being an outlier in metric space just requires being weird — a deliberately
+   narrow predictive distribution buys a strong MASE with a terrible CRPS for
+   free. An orthogonality rule pays miners to submit outliers and then seeds the
+   entire field from them.
+
+**Do diversity by construction, not by estimation.** Admit on quality — a floor
+(within x% of the best known) or top-`N` by `cascade_score` — then enforce
+diversity on axes that can be *checked* rather than *inferred*:
+
+- **per-owner cap** (1–2 members per miner hotkey) — delivers the multi-owner
+  property directly and mitigates §4a's attack;
+- **per-generation / lineage cap** — members must trace to different warm-start
+  ancestors. An init several generations back is genuinely a different model,
+  and this is free;
+- **recency weighting** — the §4 (ii) knob.
+
+These are exactly enforceable, they cost nothing to compute, and they are not
+gameable by manufacturing an odd bench profile. Registration cost makes a fake
+second hotkey expensive; a fake second lineage is not available at all.
+
+**If metric-space complementarity is still wanted**, the only tractable version
+is one interpretable bucket split — CRPS-leaning vs MASE-leaning (calibration vs
+point accuracy) — applied *under* the quality floor. One bit, checkable,
+explainable. Not a PCA over six aggregates.
+
+**Measure before deciding.** Compute the correlation matrix of the six metrics
+across the checkpoints already benched. If the first component explains the great
+majority of the variance — the expectation — the orthogonality idea is settled
+and this note should record it, the same way DEC-CA-0006 settled the LCB question
+by simulating it first.
+
+Worth knowing for the long run: the sidecar computes **per-dataset rows** (GIFT-Eval's
+configs, BOOM's datasets) and only then aggregates to the shifted geometric mean
+(`benchmarks/cascade_benchmark/aggregate.py`). A profile with real dimensionality
+therefore exists — it is just not published; only the six aggregates are signed
+into the bench report. If a genuine diversity signal is ever wanted, publishing
+per-dataset profiles in the bench report is the enabling change, and the bench
+report is a separate signed document, so it is far cheaper to extend than the
+receipt.
+
 ## 5. Consensus severity — a correction
 
 `_check_warm_start` is a **hard reject gate**, not an observation. A validator
@@ -254,7 +350,10 @@ length raised first.
    recency weights, and everything else follows.
 2. Does the pretraining-completion goal (per-size budget vs Toto2) bind? If it
    does, ancestral-with-recency is the only affordable family.
-3. Should the pool be capped per miner / per lineage, to stop one dominant king
-   filling it with near-clones?
+3. Are challenger checkpoints eligible (§4a)? It is the difference between a
+   multi-owner pool and one miner's lineage — and it makes the reign clock
+   vestigial, which is its own decision.
 4. Is the middle option (§7: A, with challenger checkpoints in the pool) enough
    for the anti-gaming goal at a fraction of the cost?
+5. Who runs the six-metric correlation check (§4b) — it settles the
+   orthogonality question one way or the other in an afternoon.
