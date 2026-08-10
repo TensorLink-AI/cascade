@@ -398,6 +398,54 @@ def _cmd_heat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_duel(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "duel",
+        help="Duel verdict for a settled round: dethrone margin, both geomeans, "
+        "per-domain win rates — the full breakdown behind DETHRONED/king-held.",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--round", dest="round_id", default=None,
+                   help="A specific round id (default: the latest settled round).")
+    p.add_argument("--history", action="store_true",
+                   help="One line per settled round instead of one round's detail.")
+    p.add_argument("--limit", type=int, default=20,
+                   help="Rounds listed by --history (default: 20).")
+    p.set_defaults(func=_cmd_duel)
+
+
+def _cmd_duel(args: argparse.Namespace) -> int:
+    """Print a settled round's full duel verdict — no wallet, no chain call, no
+    credentials. Everything comes from the public receipt index the validators
+    publish a few minutes after each duel; `cascade round` shows the same data
+    as a one-line outcome."""
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import (
+        duel_round_rows,
+        fetch_public_receipt_index,
+        render_duel,
+        render_duel_index,
+    )
+
+    doc = fetch_public_receipt_index(cfg.storage)
+    if doc is None:
+        print("could not fetch the public receipt index (receipts/index.json) — "
+              "offline, or the round has not settled yet; try 'cascade round'",
+              file=sys.stderr)
+        return 1
+    if args.history:
+        print(render_duel_index(doc, limit=args.limit))
+        return 0
+    rows = duel_round_rows(doc, args.round_id)
+    if not rows:
+        target = f"round {args.round_id}" if args.round_id else "any settled round"
+        print(f"no receipt-index rows for {target} — receipts land a few minutes "
+              "after the duel manifest; try 'cascade duel --history'", file=sys.stderr)
+        return 1
+    print(render_duel(rows))
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
@@ -716,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_reveal_status(sub)
     _add_round(sub)
     _add_heat(sub)
+    _add_duel(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

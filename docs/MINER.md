@@ -437,6 +437,38 @@ while the duel is still training. Everything here is informational and
 `status/heat.json` + `heats/round-<id>.json`), so it never affects the signed
 verdict.
 
+### The duel verdict — `cascade duel`
+
+Once a round settles, `cascade round` compresses the result into one line
+("DETHRONED" / "king held"). `cascade duel` prints the full verdict behind it,
+straight from the validators' public receipts:
+
+```bash
+cascade duel                       # latest settled round (--round <id> for an older one)
+# cascade duel — round 13527411684103147578  ·  epoch start block 8809200
+#   outcome        DETHRONED — challenger uid 124 took the throne
+#   king           uid   31  5HpRNH…tQeJ  geomean 0.24836  cascade-private/gen…@05e741f7…
+#   challenger     uid  124  5FdwqF…5scc  geomean 0.23881  (3.85% better than the king)  garuda-labs/gen-04f…@hf:1ebecb70…
+#   margin         LCB +0.0220 vs +0.0200 required — challenger cleared the bar
+#   evidence       challenger won 60.8% of windows (1945 windows, 852 feeds) · wilcoxon p=2.7e-27
+#   bootstrap      Δ p50 +0.0376 / p95 +0.0576
+#   heat           25 entrants · 1 advanced · leader p_best 0.977
+#   rewards        uids [124, 31, 49, 246, 158]
+#   per-domain win rate  (right of centre = challenger ahead)
+#     web_cloudops   0.74  n=  440  ············██████
+#     healthcare     0.46  n=  147             █············
+#   validators     2 scored (lcb +0.0220/+0.0220) · 5C8W9P…LJDD rejected (contract_digest_mismatch)
+```
+
+The dethrone rule in one line: the challenger takes the throne when the
+paired-bootstrap **LCB** of its advantage clears the configured **margin** —
+the per-domain table then shows *where* the duel was won or lost (a win rate
+above 0.50 means the challenger beat the king on that domain's windows).
+`--history` lists every settled round's outcome. Like `cascade heat` this is
+read-only — no wallet, no chain call, no credentials — but unlike the heat
+standings it reads the **signed** receipt index, one row per validator, so you
+also see whether the validators agreed.
+
 ### Reading the training log — was it your generator, or the pod?
 
 Every run streams a JSONL log to the public logs bucket at
