@@ -27,9 +27,12 @@ deterministically by epoch index. Validators accept ANY live member, so
 adaptive allocation (dropping a losing lineage mid-generation) is a pure
 engine change.
 
-The engine keys its reign clock off the on-chain king the trainer already
-trains as king (``highest_incentive_hotkey``), persists across restarts, and
-grandfathers a pre-DEC-CA-0012 single-pointer install as generation 1.
+The engine keys its reign clock off whatever king the runner resolves for it —
+the signed receipt trail's verdict king when readable (prompt: validators reset
+their clocks at the dethrone verdict), the on-chain incentive king as fallback
+(it lags a dethrone by 1-2 epochs). It persists across restarts and
+grandfathers a pre-DEC-CA-0012 pointer file (single winner OR member set) at
+its recorded generation.
 """
 
 from __future__ import annotations
@@ -41,24 +44,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..shared.promotion import PromotedMember, PromotionRecord
+from ..shared.promotion import (
+    PromotedMember,
+    PromotionRecord,
+    member_from_json,
+    member_to_json,
+)
 from ..validator.cascade import CascadeState as _ClockState
 from ..validator.cascade import cascade_score, reign_rounds
 
 log = logging.getLogger("cascade.trainer.promotion")
-
-
-def _member_to_json(m: PromotedMember) -> dict:
-    return {"checkpoint_id": m.checkpoint_id, "size": m.size,
-            "source_round": m.source_round, "score": m.score}
-
-
-def _member_from_json(m: dict) -> PromotedMember:
-    return PromotedMember(
-        checkpoint_id=str(m["checkpoint_id"]), size=str(m.get("size", "")),
-        source_round=str(m.get("source_round", "")),
-        score=float(m.get("score", float("nan"))),
-    )
 
 
 @dataclass(frozen=True)
@@ -195,7 +190,7 @@ class TrainerPromotion:
     def _restore(self, obj: dict) -> None:
         self.generation = int(obj.get("generation", 0) or 0)
         self.members = tuple(
-            _member_from_json(m) for m in (obj.get("members") or ())
+            member_from_json(m) for m in (obj.get("members") or ())
         )
         self.king_hotkey = obj.get("king_hotkey") or None
         rsb = obj.get("reign_start_block")
@@ -217,7 +212,7 @@ class TrainerPromotion:
                 king_hotkey=str(pr.get("king_hotkey", "")),
                 fired_round=str(pr.get("fired_round", "")),
                 fired_block=int(pr.get("fired_block", 0)),
-                members=tuple(_member_from_json(m) for m in (pr.get("members") or ())),
+                members=tuple(member_from_json(m) for m in (pr.get("members") or ())),
             )
 
     def _adopt_legacy_pointer(self) -> None:
@@ -238,7 +233,7 @@ class TrainerPromotion:
         members = [m for m in (obj.get("members") or ()) if m.get("checkpoint_id")]
         if members:
             self.generation = max(1, int(obj.get("generation", 1) or 1))
-            self.members = tuple(_member_from_json(m) for m in members)
+            self.members = tuple(member_from_json(m) for m in members)
             self._persist()
             log.info("trainer promotion: re-adopted member-set pointer file as "
                      "generation %d (%d member(s); engine state was missing)",
@@ -406,7 +401,7 @@ class TrainerPromotion:
             return
         body = {
             "generation": self.generation,
-            "members": [_member_to_json(m) for m in self.members],
+            "members": [member_to_json(m) for m in self.members],
             "king_hotkey": self.king_hotkey,
             "reign_start_block": self.reign_start_block,
             "candidates": [
@@ -420,7 +415,7 @@ class TrainerPromotion:
                 "king_hotkey": self.pending_record.king_hotkey,
                 "fired_round": self.pending_record.fired_round,
                 "fired_block": self.pending_record.fired_block,
-                "members": [_member_to_json(m) for m in self.pending_record.members],
+                "members": [member_to_json(m) for m in self.pending_record.members],
             },
         }
         # Atomic (tmp + rename): a crash mid-write must not corrupt the state

@@ -301,12 +301,8 @@ class ValidatorRunner:
         members = [str(m.get("checkpoint_id") or "") for m in (obj.get("members") or ())]
         members = [m for m in members if m]
         if members:
-            generation = int(obj.get("generation", 1) or 1)
-            self.cascade.state = replace(
-                self.cascade.state, generation=max(1, generation), members=tuple(members))
-            self.cascade._persist()
-            log.info("cascade: adopted trainer-written warm-start set (%d member(s)) "
-                     "as generation %d", len(members), max(1, generation))
+            self.cascade.adopt_member_set(
+                generation=int(obj.get("generation", 1) or 1), members=tuple(members))
         else:
             self.cascade.adopt_legacy_pointer(str(obj.get("checkpoint_id") or ""))
         return None
@@ -904,17 +900,30 @@ class ValidatorRunner:
             # validator (from the signed manifest), so ripeness verdicts agree.
             block = self._epoch_start_block(manifest)
             # Reuse KOTH's dethrone signal to reset the clock (never reimplement it);
-            # on genesis, crown the first champion so the reign clock starts ticking.
-            if outcome is not None and outcome.transition.dethroned and outcome.transition.new_king_hotkey:
+            # on adoption (no cascade king but a live champion — a validator
+            # joining or restarting mid-reign), crown WITHOUT attestation: an
+            # adopted clock must not judge reign timing.
+            dethroned = (outcome is not None and outcome.transition.dethroned
+                         and outcome.transition.new_king_hotkey)
+            if dethroned:
                 self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block)
             elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
-                self.cascade.note_dethrone(self.state.king_hotkey, block=block)
+                self.cascade.note_dethrone(self.state.king_hotkey, block=block,
+                                           observed=False)
             self.cascade.observe_round(block=block)
             # Earlier rounds first: reports published after those rounds'
             # cascade steps (the bench runs post-publish) land in the reign log
             # now, before this round's checkpoints are considered.
             self._drain_pending_bench(now)
-            self._record_duel_checkpoints(manifest, now)
+            # A DETHRONE round's checkpoints belong to the reign that just
+            # ended and are recorded NOWHERE: the trainer's candidate pool
+            # wipes them at its own re-crown, and logging them here (into the
+            # freshly cleared log) would give this validator evidence the
+            # trainer never selects against — a stricter quality floor that
+            # rejects honest promotions (the one-sidedness invariant of
+            # _verify_members).
+            if not dethroned:
+                self._record_duel_checkpoints(manifest, now)
         except Exception as e:  # noqa: BLE001 — Cascade must never disturb a round
             log.warning("cascade step failed for round=%s: %s", manifest.round_id, e)
 

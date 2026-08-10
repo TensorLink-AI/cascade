@@ -208,13 +208,36 @@ def test_promotion_survives_a_dethrone():
     assert ctl.state.king_hotkey == "kingB"
 
 
-def test_can_verify_ripeness_needs_anchor_and_generation():
+def test_can_verify_ripeness_needs_an_observed_anchor():
     ctl = CascadeController(reign_days=7)
-    assert not ctl.can_verify_ripeness()          # fresh state: no anchor, gen 0
+    assert not ctl.can_verify_ripeness()          # fresh state: no anchor
+    # A WATCHED dethrone verdict is an observed transition — the clock can
+    # attest even the first (generation 0 → 1) promotion.
     ctl.note_dethrone("kingA", block=0)
-    assert not ctl.can_verify_ripeness()          # anchored but still gen 0 (catch-up)
-    ctl.note_promotion(generation=1, members=("a",), block=7 * DAY)
     assert ctl.can_verify_ripeness()
+    # An ADOPTION (validator joined/restarted mid-reign) is not.
+    ctl2 = CascadeController(reign_days=7)
+    ctl2.note_dethrone("kingA", block=0, observed=False)
+    assert not ctl2.can_verify_ripeness()
+    # ...but an accepted promotion re-arms attestation for the next reign.
+    ctl2.note_promotion(generation=1, members=("a",), block=7 * DAY)
+    assert ctl2.can_verify_ripeness()
+    # A legacy re-anchor only measures its own uptime.
+    ctl3 = CascadeController(
+        reign_days=7, state=CascadeState(king_hotkey="k", reign_start_block=None))
+    ctl3.observe_round(block=1000)
+    assert not ctl3.can_verify_ripeness()
+
+
+def test_adopt_member_set_grandfathers_recorded_generation():
+    ctl = CascadeController(reign_days=7)
+    ctl.note_dethrone("kingA", block=0)
+    ctl.adopt_member_set(generation=2, members=("a", "b"))
+    assert ctl.state.generation == 2
+    assert ctl.state.members == ("a", "b")
+    # Once past the random-init era the shim never runs again.
+    ctl.adopt_member_set(generation=9, members=("z",))
+    assert ctl.state.generation == 2 and ctl.state.members == ("a", "b")
 
 
 def test_adopt_legacy_pointer_grandfathers_generation_one():
@@ -246,6 +269,7 @@ def test_state_round_trips_through_json():
         ),
         generation=3,
         members=("a", "b"),
+        clock_observed=True,
     )
     again = loads(dumps(st))
     assert again == st

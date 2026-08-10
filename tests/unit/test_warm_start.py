@@ -116,9 +116,26 @@ def test_engine_wins_over_pointer_file(cfg, tmp_path):
     # An empty member size falls back to the primary preset.
     assert t._load_warm_start(epoch_index=1) == (
         PTR2, cfg.training.primary_size.arch_preset)
-    # Random-init era: engine has no members.
+    # Random-init era: engine has no members and no file exists.
     eng.members = ()
     assert t._load_warm_start(epoch_index=0) is None
+
+
+def test_memberless_engine_falls_back_to_the_pointer_file(cfg, tmp_path):
+    # An engine whose state was lost while a live pointer file survives must
+    # NOT short-circuit to random init: a readable file still pins the round,
+    # and an unreadable one aborts it (the DEC-CA-0005 fail-loud contract).
+    from cascade.trainer.promotion import TrainerPromotion
+
+    eng = TrainerPromotion(reign_threshold=5, k_max=2, quality_epsilon=0.05)
+    p = tmp_path / "ws.json"
+    p.write_text(json.dumps({"checkpoint_id": PTR, "size": "toto2-4m"}), encoding="utf-8")
+    t = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
+                      warm_start_path=p, promotion=eng)
+    assert t._load_warm_start(epoch_index=0) == (PTR, "toto2-4m")
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        t._load_warm_start(epoch_index=0)
 
 
 def test_broken_pointer_file_raises_never_falls_back(cfg, tmp_path):
@@ -316,11 +333,13 @@ def test_member_without_bench_numbers_rejected(cfg, tmp_path):
 
 
 def test_premature_promotion_rejected_when_clock_can_attest(cfg, tmp_path):
-    # An anchored, generation≥1 validator enforces ripeness on the +1
-    # transition: reign 5 rounds, promotion declared 2 rounds in → early.
+    # A validator whose clock watched the reign (observed anchor) enforces
+    # ripeness on the +1 transition: reign 5 rounds, promotion declared 2
+    # rounds in → early.
     store = _promotion_store([(PTR2, 1.0)], generation=2)
     ctl = CascadeController(reign_days=5, state=CascadeState(
-        king_hotkey="hk0", reign_start_block=0, generation=1, members=(PTR,)))
+        king_hotkey="hk0", reign_start_block=0, generation=1, members=(PTR,),
+        clock_observed=True))
     r = _validator(cfg, tmp_path, cascade=ctl, store=store)
     reason = r.check_manifest(
         _manifest(cfg, warm_start_ckpt=PTR2, created_block=2 * DAY + 10))
@@ -337,11 +356,27 @@ def test_out_of_reign_member_rejected_when_clock_can_attest(cfg, tmp_path):
     # state, fabricated source_round) fails, even though the numbers verify.
     store = _promotion_store([(PTR2, 1.0)], generation=2)  # report created_block=10
     ctl = CascadeController(reign_days=5, state=CascadeState(
-        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,)))
+        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,),
+        clock_observed=True))
     r = _validator(cfg, tmp_path, cascade=ctl, store=store)
     reason = r.check_manifest(
         _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10))
     assert reason is not None and "warm_start_member_out_of_reign" in reason
+
+
+def test_genesis_validator_attests_the_first_promotion(cfg, tmp_path):
+    # A validator that WATCHED the whole random-init era (observed crowning at
+    # genesis) enforces ripeness even on generation 0 → 1 — the first
+    # promotion is not a free pass just because no generation was live yet.
+    store = _promotion_store([(PTR, 1.0)], generation=1)
+    ctl = CascadeController(reign_days=5)
+    ctl.note_dethrone("hk0", block=0)  # watched verdict ⇒ observed anchor
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    reason = r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR, created_block=1 * DAY + 10))
+    assert reason is not None and "warm_start_promotion_early" in reason
+    assert r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR, created_block=5 * DAY + 10)) is None
 
 
 def test_bootstrap_validator_skips_unverifiable_ripeness(cfg, tmp_path):

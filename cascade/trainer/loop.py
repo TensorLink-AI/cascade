@@ -611,6 +611,10 @@ class TrainerRunner:
     # _block_with_freeze_guard. Rebuilt naturally on the first read.
     _last_block: int | None = field(default=None, repr=False)
     _block_changed_at: float = field(default=0.0, repr=False)
+    # Last king a signed receipt named (see _receipt_king): sticky across
+    # transient fetch failures so the reign clock never flaps back to the
+    # lagging incentive king mid-dethrone.
+    _last_receipt_king: str | None = field(default=None, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -1634,18 +1638,19 @@ class TrainerRunner:
         files written before the field existed.
 
         With the promotion engine wired it is the SINGLE source of the
-        allocation policy — the file (which the engine itself writes) is only
-        the fallback for engine-less runs, so a future policy change edits one
-        place, not two."""
+        allocation policy — a future policy change edits one place, not two.
+        But an engine with NO members does not short-circuit: it falls through
+        to the pointer file, so an engine whose state was lost while a live
+        pointer file survives (readable ⇒ trains from it; unreadable ⇒ raises)
+        can never silently turn a live promotion back into random init."""
         if self.promotion is not None:
             picked = self.promotion.init_for_epoch(int(epoch_index or 0))
-            if picked is None:
-                return None
-            ref, size = picked
-            if not ref or parse_trained_pointer(ref) is None:
-                raise RuntimeError(
-                    f"promotion engine returned no usable checkpoint_id: {ref!r}")
-            return ref, size or self.cfg.training.primary_size.arch_preset
+            if picked is not None:
+                ref, size = picked
+                if not ref or parse_trained_pointer(ref) is None:
+                    raise RuntimeError(
+                        f"promotion engine returned no usable checkpoint_id: {ref!r}")
+                return ref, size or self.cfg.training.primary_size.arch_preset
         if self.warm_start_path is None:
             return None
         p = Path(self.warm_start_path)
@@ -1781,11 +1786,15 @@ class TrainerRunner:
         return report
 
     def _receipt_king(self) -> str | None:
-        """The current king per the validators' signed receipt trail, or
-        ``None`` when no verifiable scored receipt is readable. This is the
-        prompt dethrone signal the reign clock needs: validators reset their
-        clocks at the dethrone verdict, while the on-chain incentive (the
-        trainer's fallback king source) lags it. Best-effort; never raises."""
+        """The current king per the validators' signed receipt trail, or the
+        last king a receipt named when none is readable right now (``None``
+        only before any receipt was ever read). This is the prompt dethrone
+        signal the reign clock needs: validators reset their clocks at the
+        dethrone verdict, while the on-chain incentive (the caller's fallback
+        king source) lags it 1-2 epochs. The last-known value is STICKY across
+        transient fetch failures — during the lag window a blip that fell back
+        to the stale incentive king would flap the engine's king view and
+        reset the reign clock twice. Best-effort; never raises."""
         try:
             from ..shared.hippius import RECEIPT_LATEST_KEY, receipt_latest_key
             from ..shared.receipt import load_receipt, verify_receipt_signature
@@ -1801,10 +1810,27 @@ class TrainerRunner:
                     continue
                 v = receipt.verdict
                 if receipt.status == "scored" and v is not None and v.king_hotkey:
-                    return str(v.king_hotkey)
-        except Exception:  # noqa: BLE001 — the incentive fallback covers a miss
+                    self._last_receipt_king = str(v.king_hotkey)
+                    return self._last_receipt_king
+        except Exception:  # noqa: BLE001 — the sticky/incentive fallbacks cover a miss
             pass
-        return None
+        return self._last_receipt_king
+
+    def _flush_pending_promotion(self, round_id: str) -> None:
+        """Publish a fired-but-unpublished promotion record, if one is pending.
+        Guarded and idempotent — called at the round boundary AND right before
+        the manifest publishes, so a transient store outage at fire time heals
+        within the same round instead of costing the fleet the whole round."""
+        if self.promotion is None:
+            return
+        try:
+            pending = self.promotion.unpublished_record()
+            if pending is not None:
+                self._publish_promotion_record(pending)
+                self.promotion.mark_record_published()
+        except Exception as e:  # noqa: BLE001 — stays pending, retried next flush
+            log.warning("promotion record publish failed for round=%s "
+                        "(stays pending): %s", round_id, e)
 
     def _publish_promotion_record(self, record: object) -> None:
         """Sign and publish a fired promotion's record to the manifest bucket
@@ -3012,16 +3038,15 @@ class TrainerRunner:
                                                   epoch_block=epoch_start)
                         self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
-                        # Publish-with-retry: the record survives (persisted) as
-                        # pending until the publish lands, so a store outage
-                        # never orphans a generation the pointer file already
-                        # rotates over.
-                        pending = self.promotion.unpublished_record()
-                        if pending is not None:
-                            self._publish_promotion_record(pending)
-                            self.promotion.mark_record_published()
                     except Exception as e:  # noqa: BLE001
                         log.warning("promotion step failed for round=%s: %s", round_id, e)
+                    # Publish-with-retry: the record survives (persisted) as
+                    # pending until the publish lands, so a store outage never
+                    # orphans a generation the pointer file already rotates
+                    # over. Flushed again right before this round's manifest
+                    # publishes (below) — the record must be fetchable before
+                    # any validator gates the manifest that pins its member.
+                    self._flush_pending_promotion(round_id)
                 self._reload_remote_hosts()  # per-round elastic fleet pickup
                 log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
                          round_id, epoch, epoch_start, king_hotkey,
@@ -3036,6 +3061,12 @@ class TrainerRunner:
                 will_bench = self.will_run_post_publish_bench()
                 if will_bench:
                     self._mark_bench_pending(round_id)
+                # Last chance before validators gate this round's manifest: a
+                # promotion record whose boundary-time publish failed on a
+                # transient outage retries NOW, hours later — otherwise the
+                # manifest pins a member of a generation no validator can
+                # fetch, and the whole fleet rejects the round.
+                self._flush_pending_promotion(round_id)
                 self.publish(manifest)
                 if will_bench:
                     # Guarded separately (like the telemetry launch below): the

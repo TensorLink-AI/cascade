@@ -62,6 +62,22 @@ class PromotedMember:
     score: float
 
 
+def member_to_json(m: PromotedMember) -> dict:
+    """The ONE member JSON shape — shared by the record's canonical body, the
+    trainer engine's persisted state, and the warm-start pointer file, so a
+    field added to :class:`PromotedMember` changes exactly one encoder."""
+    return {"checkpoint_id": m.checkpoint_id, "size": m.size,
+            "source_round": m.source_round, "score": m.score}
+
+
+def member_from_json(m: dict) -> PromotedMember:
+    return PromotedMember(
+        checkpoint_id=str(m["checkpoint_id"]), size=str(m.get("size", "")),
+        source_round=str(m.get("source_round", "")),
+        score=float(m.get("score", float("nan"))),
+    )
+
+
 @dataclass(frozen=True)
 class PromotionRecord:
     """A fired promotion: the declared warm-start member set for a generation.
@@ -95,15 +111,7 @@ class PromotionRecord:
             "king_hotkey": self.king_hotkey,
             "fired_round": self.fired_round,
             "fired_block": self.fired_block,
-            "members": [
-                {
-                    "checkpoint_id": m.checkpoint_id,
-                    "size": m.size,
-                    "source_round": m.source_round,
-                    "score": m.score,
-                }
-                for m in self.members
-            ],
+            "members": [member_to_json(m) for m in self.members],
         }
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -122,15 +130,7 @@ def load_promotion_record(text: str) -> PromotionRecord:
     version = int(obj.get("record_version", 0))
     if version != PROMOTION_RECORD_VERSION:
         raise ValueError(f"unsupported record_version {version}; need {PROMOTION_RECORD_VERSION}")
-    members = tuple(
-        PromotedMember(
-            checkpoint_id=str(m["checkpoint_id"]),
-            size=str(m.get("size", "")),
-            source_round=str(m.get("source_round", "")),
-            score=float(m.get("score", float("nan"))),
-        )
-        for m in (obj.get("members") or ())
-    )
+    members = tuple(member_from_json(m) for m in (obj.get("members") or ()))
     return PromotionRecord(
         generation=int(obj["generation"]),
         king_hotkey=str(obj.get("king_hotkey", "")),

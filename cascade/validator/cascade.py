@@ -184,6 +184,12 @@ class CascadeState:
         members: the accepted generation's member checkpoint pointers — the set
             a manifest's ``warm_start_ckpt`` must come from. Survives re-crowns
             and dethrones: a promotion outlives the reign that produced it.
+        clock_observed: whether the reign anchor comes from an OBSERVED
+            transition (a scored dethrone verdict, or an accepted promotion)
+            rather than an adoption/re-anchor (validator joined or restarted
+            mid-reign, legacy state re-anchored). Only an observed anchor can
+            attest reign timing — an adopted clock measures its own uptime, and
+            treating it as authoritative would reject honest promotions.
     """
 
     king_hotkey: str | None = None
@@ -191,24 +197,29 @@ class CascadeState:
     checkpoints: tuple[CheckpointRecord, ...] = ()
     generation: int = 0
     members: tuple[str, ...] = ()
+    clock_observed: bool = False
 
 
 # ── pure transitions over CascadeState ───────────────────────────────────────
 
 
-def crown(state: CascadeState, *, king_hotkey: str, block: int) -> CascadeState:
+def crown(state: CascadeState, *, king_hotkey: str, block: int,
+          observed: bool = True) -> CascadeState:
     """Re-crown for a newly-throned king: start the reign clock at ``block`` and
     clear the previous reign's checkpoint log. Called on every dethrone (Cascade
     reuses KOTH's dethrone signal rather than reimplementing it) and on every
     accepted promotion (the persisting king starts a fresh reign). The accepted
     promotion (``generation``/``members``) is deliberately CARRIED OVER — the
-    field trains from the live set no matter who holds the throne."""
+    field trains from the live set no matter who holds the throne. ``observed``
+    records whether this crowning comes from a transition the validator actually
+    watched (attesting clock) or an adoption (mid-reign join/restart)."""
     return CascadeState(
         king_hotkey=king_hotkey,
         reign_start_block=int(block),
         checkpoints=(),
         generation=state.generation,
         members=state.members,
+        clock_observed=bool(observed),
     )
 
 
@@ -222,13 +233,16 @@ def accept_promotion(
 ) -> CascadeState:
     """Adopt a VERIFIED promotion: install the new generation + member set and
     re-crown the same king (fresh clock, cleared log) so the next generation
-    needs a fresh full reign. Pure — verification happened before this."""
+    needs a fresh full reign. Pure — verification happened before this. An
+    accepted promotion is an observed transition: the fresh clock can attest
+    the next generation's timing."""
     return CascadeState(
         king_hotkey=state.king_hotkey,
         reign_start_block=int(block),
         checkpoints=(),
         generation=int(generation),
         members=tuple(members),
+        clock_observed=True,
     )
 
 
@@ -309,6 +323,7 @@ def dumps(state: CascadeState) -> str:
             "reign_start_block": state.reign_start_block,
             "generation": state.generation,
             "members": list(state.members),
+            "clock_observed": state.clock_observed,
             "checkpoints": [
                 {
                     "checkpoint_id": r.checkpoint_id,
@@ -361,6 +376,10 @@ def loads(text: str) -> CascadeState:
         checkpoints=checkpoints,
         generation=int(obj.get("generation", 0) or 0),
         members=tuple(str(m) for m in (obj.get("members") or ())),
+        # Pre-upgrade states default to an UNOBSERVED clock: they skip ripeness
+        # attestation once, until the next watched dethrone/acceptance —
+        # conservative toward accepting an honest promotion, never rejecting one.
+        clock_observed=bool(obj.get("clock_observed", False)),
     )
 
 
@@ -390,16 +409,21 @@ class CascadeController:
     state_path: Path | None = None
     round_cfg: object | None = None   # RoundConfig; None ⇒ fixed 7200-block rounds
 
-    def note_dethrone(self, new_king: str, *, block: int) -> None:
+    def note_dethrone(self, new_king: str, *, block: int, observed: bool = True) -> None:
         """Reset the reign clock for a fresh king. Call this on — and only on — a
         KOTH dethrone (``StateTransition.dethroned``); it re-crowns Cascade's view
         so the reign starts at the epoch block the throne changed hands. The
         accepted promotion carries over — the field keeps training from the live
-        member set under the new king."""
-        self.state = crown(self.state, king_hotkey=new_king, block=block)
+        member set under the new king. Pass ``observed=False`` when the crowning
+        is an ADOPTION (validator joined/restarted mid-reign and inherited the
+        champion) rather than a watched verdict — an adopted clock measures its
+        own uptime and must not attest reign timing."""
+        self.state = crown(self.state, king_hotkey=new_king, block=block,
+                           observed=observed)
         self._persist()
-        log.info("cascade: reign clock reset for new king %s at block %d",
-                 (new_king or "?")[:12], int(block))
+        log.info("cascade: reign clock reset for new king %s at block %d (%s)",
+                 (new_king or "?")[:12], int(block),
+                 "observed" if observed else "adopted")
 
     def observe_round(self, *, block: int) -> None:
         """Re-anchor an unanchored reign at the observed round's epoch block.
@@ -411,7 +435,7 @@ class CascadeController:
         state = self.state
         if state.king_hotkey is None or state.reign_start_block is not None:
             return
-        self.state = replace(state, reign_start_block=int(block))
+        self.state = replace(state, reign_start_block=int(block), clock_observed=False)
         self._persist()
         log.info(
             "cascade: reign for king %s re-anchored at block %d (state had no "
@@ -477,14 +501,33 @@ class CascadeController:
         return elapsed is not None and elapsed >= self.reign_days
 
     def can_verify_ripeness(self) -> bool:
-        """Whether this validator's clock is in a position to judge ripeness at
-        all: an anchored reign with a nonzero accepted generation. A fresh or
-        legacy-unanchored state (or a validator still in the random-init era
-        catching up to live history) cannot distinguish "promotion too early"
-        from "my clock started late" — the envelope skips the timing check
+        """Whether this validator's clock is in a position to judge reign
+        timing at all: an anchored reign whose anchor comes from an OBSERVED
+        transition (a watched dethrone verdict or an accepted promotion). An
+        adopted or re-anchored clock — validator joined or restarted
+        mid-reign, legacy state — cannot distinguish "promotion too early"
+        from "my clock started late", so the envelope skips the timing checks
         rather than rejecting a whole reign's rounds on a clock that only
-        measures its own uptime."""
-        return self.state.reign_start_block is not None and self.state.generation >= 1
+        measures its own uptime. Unlike a generation gate, this lets a genesis
+        validator that watched the ENTIRE random-init era attest even the
+        first promotion (generation 0 → 1)."""
+        return self.state.reign_start_block is not None and self.state.clock_observed
+
+    def adopt_member_set(self, *, generation: int, members: tuple[str, ...]) -> None:
+        """Migration shim: adopt a member set recovered from a trainer-written
+        pointer file (owner box, pre-record deploys) as the accepted
+        generation. Runs only from the random-init era; the clock is untouched
+        (whatever its provenance), so this never manufactures attestation."""
+        if self.state.generation != 0 or not members:
+            return
+        self.state = replace(
+            self.state, generation=max(1, int(generation)),
+            members=tuple(str(m) for m in members))
+        self._persist()
+        log.info(
+            "cascade: adopted trainer-written warm-start set (%d member(s)) as "
+            "generation %d", len(members), max(1, int(generation)),
+        )
 
     def note_promotion(self, *, generation: int, members: tuple[str, ...], block: int) -> None:
         """Adopt a VERIFIED promotion (the validator loop verified the signed
