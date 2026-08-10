@@ -356,6 +356,7 @@ class Toto2Trainer:
                     "event": "step", "step": step, "loss": last_loss, "lr": lr,
                     "tokens": tokens, "tokens_frac": tokens / max(1, token_budget),
                     "throughput_tokens_per_s": tokens / elapsed,
+                    "steps_per_s": round(step / elapsed, 3),
                     # live starvation signal: rides the existing S3/wandb sink
                     "data_wait_frac": round(timed_stream.wait_s / elapsed, 3),
                 })
@@ -387,6 +388,12 @@ class Toto2Trainer:
             "final_loss": last_loss, "steps": step, "tokens_seen": tokens,
             "param_count": param_count,
             "throughput_tokens_per_s": tokens / max(1e-6, train_seconds),
+            # Steps/s alongside tokens/s: tokens per step vary with the bucketed
+            # batch shape (series shorter than the full context still train), so
+            # two runs at the same tokens/s can be doing very different numbers of
+            # optimizer steps — and step rate is what a per-step host cost
+            # (H2D copy, kernel launch, CPU-side batching) actually shows up in.
+            "steps_per_s": round(step / max(1e-6, train_seconds), 3),
             "gpu_name": gpu_name, "deterministic": self.deterministic,
             "deadline_hit": deadline_hit,
             # Starvation + budget telemetry: how long training sat blocked on

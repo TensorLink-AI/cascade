@@ -23,14 +23,25 @@ plenty, rounds are epoch-paced.
 Usage::
 
     # reads [storage] from chain.toml; needs S3 read creds for the manifest
-    # bucket (HIPPIUS_S3_ACCESS_KEY / _SECRET_KEY), Hub pull creds (public repos
-    # pull anonymously), and R2 write creds for the archive
+    # bucket (HIPPIUS_S3_ACCESS_KEY / _SECRET_KEY), Hub pull creds
+    # (HIPPIUS_HUB_TOKEN — public repos pull anonymously, but miners commit
+    # private Hub repos too, and those refs fail without a token; HF_TOKEN
+    # likewise for private `@hf:` refs), and R2 write creds for the archive
     # (KING_ARCHIVE_S3_ACCESS_KEY / _SECRET_KEY, or the BACKUP_S3_* pair).
     python scripts/scrape_kings.py
     python scripts/scrape_kings.py --chain-toml chain.testnet.toml
     python scripts/scrape_kings.py --dry-run          # list what would be archived
     python scripts/scrape_kings.py --kings-only       # skip the generators/ sweep
     python scripts/scrape_kings.py --generators-only  # skip the kings/ archive
+    python scripts/scrape_kings.py --retry-unavailable  # re-try parked tombstones
+
+Exit codes: 0 on success, 1 when a generator failed for a RETRYABLE reason (the
+Hub was down, the network flaked — worth looking at), 2/4 on config/storage
+errors. Generators whose upstream repo was deleted or made private are NOT a
+failure: miners delete repos routinely, no re-run recovers them, so they are
+recorded in the index with an ``unavailable`` note, parked after a few attempts,
+and reported as a note on a green run. Otherwise the daily job goes permanently
+red and stops telling anyone anything.
 
 Cron (hourly is ample — rounds are epoch-paced)::
 
@@ -41,8 +52,19 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
+
+_SAMPLE_N = 8
+
+
+def _sample(refs) -> str:
+    """A readable digest of a ref list — the full 80-odd refs are in the index."""
+    refs = [str(r) for r in refs]
+    head = ", ".join(refs[:_SAMPLE_N])
+    extra = len(refs) - _SAMPLE_N
+    return f"{head}, … and {extra} more" if extra > 0 else head
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,12 +78,21 @@ def main(argv: list[str] | None = None) -> int:
                        help="Only the kings/ throne archive.")
     scope.add_argument("--generators-only", action="store_true",
                        help="Only the generators/ every-participant snapshot.")
+    ap.add_argument("--retry-unavailable", action="store_true",
+                    help="Re-attempt generators parked as permanently unfetchable "
+                         "(deleted or private upstream). Use after a Hub/HF token "
+                         "widens, or when a miner republishes a repo.")
     args = ap.parse_args(argv)
 
     from cascade.shared.config import load_chain_config
     from cascade.shared.env import load_env_files
     from cascade.shared.hippius import HubConfig, S3Store, StorageError, open_manifest_store
-    from cascade.shared.king_archive import king_archive_config, sync_generators, sync_kings
+    from cascade.shared.king_archive import (
+        UNAVAILABLE_MAX_ATTEMPTS,
+        king_archive_config,
+        sync_generators,
+        sync_kings,
+    )
 
     load_env_files()
     cfg = load_chain_config(args.chain_toml)
@@ -83,11 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         endpoint=endpoint,
         bucket=bucket,
         dry_run=args.dry_run,
-        updated_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(UTC).isoformat(),
+        retry_unavailable=args.retry_unavailable,
         log=print,
     )
     tag = "[dry-run] " if args.dry_run else ""
     failed: list[str] = []
+    unavailable: list[dict] = []
 
     if not args.generators_only:
         print(f"{tag}king archive → {endpoint.rstrip('/')}/{bucket}/kings/")
@@ -103,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\ndone: {result.archived} archived, {result.skipped} already archived, "
                   f"{result.total_kings} total king(s) in {bucket}/kings/index.json")
         failed += result.failed
+        unavailable += result.unavailable
 
     if not args.kings_only:
         print(f"\n{tag}generator snapshots → {endpoint.rstrip('/')}/{bucket}/generators/")
@@ -121,10 +155,21 @@ def main(argv: list[str] | None = None) -> int:
                   f"{result.total_generators} total generator(s) in "
                   f"{bucket}/generators/index.json")
         failed += result.failed
+        unavailable += result.unavailable
+
+    if unavailable:
+        counts = Counter(str(u.get("reason", "?")) for u in unavailable)
+        detail = ", ".join(f"{n} {reason}" for reason, n in sorted(counts.items()))
+        print(f"\nnote: {len(unavailable)} generator(s) unavailable upstream "
+              f"({detail}) — the miner deleted or privatised the repo, so no re-run "
+              f"recovers them. Recorded in the index under 'unavailable'; parked "
+              f"after {UNAVAILABLE_MAX_ATTEMPTS} attempts. Re-run with "
+              f"--retry-unavailable to try them again.")
+        print(f"  {_sample(u.get('ref', '?') for u in unavailable)}")
 
     if failed:
-        print(f"warning: {len(failed)} generator(s) failed to archive: "
-              f"{', '.join(failed)}", file=sys.stderr)
+        print(f"error: {len(failed)} generator(s) failed to archive for a "
+              f"retryable reason: {_sample(failed)}", file=sys.stderr)
         return 1
     return 0
 

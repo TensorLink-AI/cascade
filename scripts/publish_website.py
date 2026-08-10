@@ -3,7 +3,9 @@
 
 Two self-contained pages, both reading the validator's public-read receipts —
 ``receipts/index.json`` (the rolling round summary the validator maintains) and
-``receipts/latest.json`` — straight from the manifest bucket:
+``receipts/latest.json`` — plus the live ``status/*.json`` docs (chain anchor,
+round stage, and the heat standings the trainer publishes as soon as a heat
+settles) straight from the manifest bucket:
 
 * ``cascade/website/index.html`` — the technical dashboard ("notebook"): live
   round, verdict, heat standings, per-round history.
@@ -91,6 +93,9 @@ def main() -> None:
     print("they read (public-read):")
     print(f"  {base}/receipts/index.json")
     print(f"  {base}/receipts/latest.json")
+    print(f"  {base}/status/chain.json      (validator: live block anchor + submissions)")
+    print(f"  {base}/status/round.json      (trainer: live round stage)")
+    print(f"  {base}/status/heat.json       (trainer: heat standings, at heat completion)")
 
 
 if __name__ == "__main__":

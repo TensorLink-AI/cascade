@@ -209,8 +209,9 @@ def main(argv: list[str] | None = None) -> int:
                 min_interval_seconds=args.bench_interval,
             )
 
-    # Cascade: score the king's checkpoint on GIFT-Eval/BOOM/TIME and stamp the
-    # numbers onto its signed manifest entry so validators promote off one
+    # Cascade: score BOTH duel checkpoints on GIFT-Eval/BOOM/TIME after each
+    # manifest publishes and ship the numbers in the round's separate signed
+    # bench report (cascade.shared.bench_report) so validators promote off one
     # authoritative set. Only wired when [scoring] cascade_enabled.
     bench_eval_fn = None
     cascade_bench_plan = None
@@ -223,23 +224,42 @@ def main(argv: list[str] | None = None) -> int:
 
         warm_start_path = _Path(cfg.validator.warm_start_init_path)
         log.info("cascade warm-start consumption enabled: pointer file %s", warm_start_path)
-        if remote_hosts:
-            # Preferred: bench the king on the pod that just trained it — GPU, and
-            # the checkpoint is already at its _train_work path. Reuses the
-            # post-round-benchmark remote path; the six numbers still land on the
-            # signed manifest via TrainerRunner._stamp_king_bench_scores.
+        if remote_hosts or args.remote_hosts:
+            # Preferred: bench each duel checkpoint on the pod that just trained
+            # it — GPU, and the checkpoint is already at its _train_work path.
+            # Reuses the post-round-benchmark remote path; the numbers land in
+            # the round's signed bench report via
+            # TrainerRunner.run_post_publish_bench (strictly after publish).
+            #
+            # Keyed on the hosts PATH, not the hosts present right now: the live
+            # service restarts in the between-rounds idle window, when the
+            # elastic fleet is torn down and hosts.toml is EMPTY — the loop
+            # re-reads it every round, but a plan wired off startup contents
+            # would silently latch the local fallback for the process lifetime
+            # (2026-08-05: a full round benched "skipped" on the GPU-less box).
             from .bench_hook import BenchPlan
 
-            wd = remote_hosts[0].workdir
+            # Elastic pods all publish the canonical workdir; fall back to it
+            # when the fleet is empty at startup (provisioner default,
+            # remote.py). A static heterogeneous-workdir fleet still resolves
+            # checkpoint paths per host at bench time — only data_dir uses this.
+            wd = remote_hosts[0].workdir if remote_hosts else "/root/cascade"
+            # Per-sweep guard: a capped battery is ~minutes on an L40; the full
+            # battery ([eval] cascade_bench_max_series = 0) gets the same
+            # ceiling as the provisioner's teardown hold — past that the pod is
+            # reaped anyway, so a longer timeout only leaks a dead SSH wait.
+            timeout_s = (int(cfg.eval.bench_hold_max_hours * 3600)
+                         if cfg.eval.cascade_bench_max_series == 0 else 1800)
             cascade_bench_plan = BenchPlan(
                 suites=args.bench_suites,
                 max_series=cfg.eval.cascade_bench_max_series,
                 device="cuda",
                 data_dir=f"{wd}/bench_data",
-                timeout_seconds=1800,  # guard: a capped battery is ~minutes on an L40
+                timeout_seconds=timeout_s,
             )
-            log.info("cascade king bench eval enabled on worker %s (device=cuda, max_series=%s)",
-                     remote_hosts[0].name, cfg.eval.cascade_bench_max_series)
+            log.info("cascade duel bench enabled on the final pods (device=cuda, "
+                     "max_series=%s, timeout=%ss)",
+                     cfg.eval.cascade_bench_max_series, timeout_s)
         else:
             from .loop import make_bench_eval_fn
 
@@ -253,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                     bench_device = "cuda" if torch.cuda.is_available() else "cpu"
                 except Exception:  # noqa: BLE001 — torch missing/broken ⇒ cpu
                     bench_device = "cpu"
-            log.info("cascade king bench eval enabled on device=%s (local, no remote host)",
+            log.info("cascade duel bench enabled on device=%s (local, no remote host)",
                      bench_device)
             bench_eval_fn = make_bench_eval_fn(cfg, device=bench_device)
 

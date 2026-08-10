@@ -585,13 +585,21 @@ class EvalConfig:
     gift_gate_num_samples: int = 0
     gift_gate_data_dir: str = ""
     gift_gate_timeout_s: int = 3600
-    # Cascade king-eval coverage (see cascade.validator.cascade). Cap on datasets
-    # per suite when the trainer scores the king's checkpoint on GIFT-Eval / BOOM /
+    # Cascade duel-eval coverage (see cascade.validator.cascade). Cap on datasets
+    # per suite when the trainer scores the duel checkpoints on GIFT-Eval / BOOM /
     # TIME. ``0`` = the FULL battery (all configs) — the default, since Cascade's
     # promotion should see the whole eval. Kept separate from the log-only
     # ``benchmark_max_series`` so tightening telemetry never quietly shrinks the
     # Cascade decision. Set a positive cap only to speed up testnet iteration.
     cascade_bench_max_series: int = 0
+    # Cascade post-publish bench hold (see provision.policy.bench_hold_active):
+    # how long the provisioner may keep the round's FINAL pod alive past its
+    # normal teardown signal while the duel bench runs, in hours. The hold ends
+    # the moment the trainer's bench_complete marker lands (report uploaded or
+    # bench failed); this cap only bounds a crashed/wedged bench. Inert while
+    # ``[scoring] cascade_enabled`` is off — the trainer never writes the
+    # pending marker and the provisioner never arms the hold.
+    bench_hold_max_hours: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -755,6 +763,31 @@ class WandbConfig:
 
 
 @dataclass(frozen=True)
+class TelemetryConfig:
+    """Host-side run telemetry (:mod:`cascade.trainer.host_probe`).
+
+    Observability only, and never part of ``contract_digest``: these fields ride
+    the training-log channel next to the per-step metrics and are read by nobody
+    in the scoring path. They exist because the heat prices generator speed
+    (DEC-CA-0001) on a fleet rented per round — so "was this run slow because of
+    the submission or because of the pod?" needs host-side evidence, and
+    ``data_wait_frac`` can only rule out the corpus.
+
+    ``host_probe`` gathers the free facts (lane geometry, CPU/GPU capability,
+    opaque pod + machine ids). ``host_bench`` additionally times the fixed
+    calibration workload before the corpus stream opens — a few seconds of GPU
+    per run, and the only field that is comparable ACROSS pods. Both default on;
+    turn ``host_bench`` off if a provider's pods are so slow to boot that the
+    extra seconds matter. There is deliberately no size knob: a resizable bench
+    produces numbers that cannot be pooled across the fleet (see
+    ``host_probe.HOST_BENCH_SPEC``).
+    """
+
+    host_probe: bool = True
+    host_bench: bool = True
+
+
+@dataclass(frozen=True)
 class ManifestConfig:
     """Where the trainer publishes training receipts and the validator reads
     them. Manifests live in the ``[storage] manifest_bucket`` S3 bucket;
@@ -814,6 +847,7 @@ class ChainConfig:
     manifest: ManifestConfig
     validator: ValidatorConfig
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -986,6 +1020,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     v = raw["validator"]
     r = raw.get("round", {})
     wb = raw.get("wandb", {})
+    tm = raw.get("telemetry", {})
 
     # Scheduled cadence change — reject a seam that would cut a round short.
     # Both grids must agree at the activation block, else the epoch containing
@@ -1138,6 +1173,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_data_dir=str(e.get("gift_gate_data_dir", "")),
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
             cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
+            bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),
@@ -1211,6 +1247,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             project=str(wb.get("project", "cascade")),
             entity=str(wb.get("entity", "")),
             mode=str(wb.get("mode", "online")),
+        ),
+        telemetry=TelemetryConfig(
+            host_probe=bool(tm.get("host_probe", True)),
+            host_bench=bool(tm.get("host_bench", True)),
         ),
         raw=raw,
     )

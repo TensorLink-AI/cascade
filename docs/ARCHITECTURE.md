@@ -61,6 +61,12 @@ round:
    per entrant and a `leader_lcb` against the runner-up on the manifest's heat
    block, saying how decisive the screen was. Those are **diagnostics only** —
    the finalists are the observed ranking, never a bounded one (DEC-CA-0006).
+   The standings are published the moment the heat settles — `status/heat.json`
+   plus a per-round `heats/round-<id>.json` and `heats/index.json`
+   (`cascade.shared.heat_status`) — so the dashboards and `cascade heat` show a
+   miner where it placed while the duel is still training, instead of waiting
+   for the round's receipt hours later. Presentational and unsigned, exactly
+   like the manifest's copy.
 5. **Final.** For the king and each surviving finalist, at **every configured
    size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
    **under that one shared seed pair**:
@@ -79,6 +85,14 @@ round:
      `[wandb] enabled`, mirroring the *same* records into a live wandb run — one
      per round/competitor/size, tagged with the miner hotkey — so miners can watch
      their generator train as it occurs; observability only, never fed to scoring),
+   - stamps one **host** record per run before the corpus stream opens
+     (`cascade.trainer.host_probe`, `[telemetry]`): lane geometry, CPU/GPU
+     capability, opaque pod + machine ids, and a *fixed* calibration bench
+     (`host_bench_tokens_per_s`) that is identical on every pod and independent of
+     the submission. It rides the same log channel and is what separates
+     pod-attributable slowness from generator-attributable slowness — the wall
+     prices generator speed deliberately (DEC-CA-0001), and `data_wait_frac` can
+     only rule the *corpus* out. Never signed, never scored,
    - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
      size-tagged ref.
 6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref
@@ -169,21 +183,38 @@ and checkpoint log persist next to the champion state, so Cascade survives
 validator restarts.
 
 Those six numbers are **authoritative from the trainer, not recomputed per
-validator**. The trainer (owner-operated, already the manifest trust anchor) runs
-the benchmark sidecar once on the king's checkpoint and stamps the numbers onto
-that entry in the *signed* manifest (`manifest.BenchScores`), so every validator
-records the identical values — Cascade selection is deterministic across
-validators rather than each re-running a non-bit-reproducible GPU sweep. A
-validator falls back to scoring the checkpoint itself only when the manifest
-carries no scores (e.g. a trainer predating the hook). The eval is the **full**
-GIFT-Eval + BOOM + TIME battery each round (`[eval] cascade_bench_max_series = 0`;
-BOOM full ≈ 26 min on an RTX 5090, run with `--bench-device cuda`), and TIME's
-Seasonal-Naive baseline — checkpoint-independent — is cached so only the model
-forward is paid per round. The dethrone verdict itself stays entirely on the
-private eval pool; these public-benchmark numbers drive only Cascade's warm-start
-promotion. Cascade is opt-in — `[scoring] cascade_enabled`
-(off by default) — and when off the trainer skips the eval and validators run pure
-KOTH.
+validator**. The trainer (owner-operated, already the manifest trust anchor)
+benchmarks **both final-duel checkpoints — the king's and the challenger's —
+strictly after the round's checkpoints are pushed and the manifest is
+published**: manifest publication never waits on a benchmark, so validators
+start scoring the duel the moment it lands, and a bench failure or timeout can
+never fail, delay, or modify the round. The numbers ship as a **separate
+trainer-signed artifact** — one JSON report per round at
+`benchmarks/round-<id>.json` in the manifest bucket (same hotkey signing scheme
+and same R2 dual-write as the manifest; `cascade.shared.bench_report`) — never
+inside the manifest entry, so every validator records the identical values and
+Cascade selection stays deterministic across validators rather than each
+re-running a non-bit-reproducible GPU sweep. The validator reads the king's set
+from the report into the reign log (the report lands ~30-60 min after the
+manifest, so it re-probes for a few rounds), falls back to the in-entry
+`bench_scores` older manifests carry, and tolerates a missing report — that
+round simply contributes no bench numbers, and promotion selects over the reign
+rounds that have them. The challenger's set is telemetry (and, when `[wandb]
+enabled`, the king/challenger pair is logged per round). The eval is the
+**full** GIFT-Eval + BOOM + TIME battery each round (`[eval]
+cascade_bench_max_series = 0`; BOOM full ≈ 26 min on an RTX 5090, run with
+`--bench-device cuda`), and TIME's Seasonal-Naive baseline —
+checkpoint-independent — is cached so only the model forward is paid per round.
+Because the sweep runs on the JIT-rented final pods *after* their normal
+teardown signal (the manifest), the trainer brackets it with
+`bench_pending.json` / `bench_complete.json` markers in the shared work root
+and the provisioner holds the **final** pods — only that class — until the
+report is uploaded or `[eval] bench_hold_max_hours` (default 2 h) expires, then
+reaps regardless. The dethrone verdict itself stays entirely on the private
+eval pool; these public-benchmark numbers drive only Cascade's warm-start
+promotion. Cascade is opt-in — `[scoring] cascade_enabled` (off by default) —
+and when off the trainer skips the eval, never writes the hold markers, and
+validators run pure KOTH.
 
 ## The controlled-experiment invariant
 

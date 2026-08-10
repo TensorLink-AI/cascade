@@ -6,9 +6,12 @@ a round's budget:
 
 * the public **GIFT-Eval gate** — gift-eval on BOTH king and challenger (a
   *paired* compare the validator must compute itself; see ``_gift_rows``), and
-* the **cascade bench** — GIFT-Eval + BOOM + TIME on the king checkpoint (the
-  validator-side fallback in ``_bench_metrics_via_sidecar`` when a manifest
-  carries no trainer-stamped ``bench_scores``).
+* an operator-driven **full-battery sweep** — GIFT-Eval + BOOM + TIME on one
+  checkpoint (:func:`bench_scores_via_host`). Cascade no longer runs this in a
+  round: the validator reads the trainer-signed bench report (falling back to
+  older manifests' in-entry ``bench_scores``) and never re-scores a checkpoint
+  itself — an independently-run GPU sweep is not bit-reproducible, so it was
+  never consensus-safe as a promotion input.
 
 Both funnel through one primitive here — :func:`run_bench_via_host` — which
 ``scp``-s an already-fetched checkpoint to a GPU pod, runs the ``cascade-benchmark``
@@ -217,7 +220,7 @@ def bench_scores_via_host(
     """Cascade bench (GIFT-Eval + BOOM + TIME) for one king checkpoint on ``host``
     (GPU), returning the six numbers or ``None`` when any suite is missing/errored.
     Semantics match the local :func:`cascade.eval.benchmarks.run_benchmarks` +
-    :func:`extract_bench_scores` path in ``_bench_metrics_via_sidecar``."""
+    local :func:`cascade.eval.benchmarks.extract_bench_scores` convention."""
     report = run_bench_via_host(
         host, ckpt_dir, suites="gift-eval,boom,time", num_samples=num_samples,
         max_series=max_series, batch_size=batch_size, data_dir=data_dir,

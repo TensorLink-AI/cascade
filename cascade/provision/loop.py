@@ -99,6 +99,7 @@ from .health import HealthReport
 from .hostsfile import clear_hosts, write_hosts
 from .policy import (
     ProvisionPolicy,
+    bench_hold_active,
     pods_for_slots,
     should_trigger,
     size_fleet,
@@ -301,6 +302,13 @@ class ProvisionerLoop:
     # finalist list and stops paying for a final pod that idles through the
     # whole heat.
     final_rent_on: str = "margin"
+    # Cascade post-publish duel bench hold ([eval] bench_hold_max_hours): keep
+    # the FINAL pods past the manifest-driven teardown while the trainer's
+    # bench_pending.json marker is live, up to this many hours, then reap
+    # regardless (see policy.bench_hold_active). Wired from chain.toml ONLY
+    # when [scoring] cascade_enabled; 0 (the default) disables the hold — no
+    # other pod class is ever held.
+    bench_hold_max_hours: float = 0.0
     dry_run: bool = False
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
@@ -330,6 +338,19 @@ class ProvisionerLoop:
     # answer (offline fakes) and the mtime heuristic stands in.
     _expected_seed: str | None = field(default=None, init=False, repr=False)
     _expected_seed_for: int | None = field(default=None, init=False, repr=False)
+    # One-shot log latch for the bench hold (the sweep runs every cycle;
+    # announcing the hold once per activation is enough), plus when the live
+    # pending marker was FIRST observed on the injected clock — the hold cap
+    # counts from there (file mtimes are wall-clock and would not compose
+    # with the injected clock). ``_bench_hold_for`` identifies WHICH marker
+    # the latch was armed for, as (round dir, marker mtime): a marker for a
+    # different round — or the same round republished — re-arms the latch,
+    # so one round's expired hold can never deny the next round's bench its
+    # own hold (the sweep stops calling _bench_hold once the ledger empties,
+    # so the latch cannot rely on being reset between rounds).
+    _bench_hold_logged: bool = field(default=False, init=False, repr=False)
+    _bench_hold_since: float | None = field(default=None, init=False, repr=False)
+    _bench_hold_for: tuple | None = field(default=None, init=False, repr=False)
     # The eval stage's rent-once latch (mirrors _provisioned_round for the
     # boundary stages): the manifest round an eval pod was last rented — or
     # deliberately skipped — for. Restored from the ledger so restarts never
@@ -763,11 +784,27 @@ class ProvisionerLoop:
 
     # ── within-round retry + JIT final (the late-rental phases) ──────────────
 
+    def _round_closes_at(self) -> int | None:
+        """The block at which the provisioned round ends.
+
+        ``_provisioned_round`` is the boundary NEXT after rent time, so its
+        meaning follows the trigger form: the post-boundary offset trigger
+        rents just after the round opens (boundary = END), while the
+        pre-boundary margin trigger rents just before it opens (boundary =
+        START, round closes one epoch later). Treating it as START under the
+        offset form double-counted the epoch (+12h, 2026-07-29)."""
+        if self._provisioned_round is None:
+            return None
+        if int(getattr(self.policy, "trigger_offset_blocks", 0) or 0) > 0:
+            return self._provisioned_round
+        return self._provisioned_round + self.epoch_at(self._provisioned_round)
+
     def _remaining_epoch_hours(self, block: int) -> float:
         """Hours left until the provisioned round's epoch boundary closes."""
-        if self._provisioned_round is None:
+        closes_at = self._round_closes_at()
+        if closes_at is None:
             return 0.0
-        return (self._provisioned_round + self.epoch_at(block) - block) * 12.0 / 3600.0
+        return (closes_at - block) * 12.0 / 3600.0
 
     def _final_primary_has_capacity(self, slots: int) -> bool:
         """Cheap availability pre-check — list offers, rent nothing.
@@ -1512,15 +1549,19 @@ class ProvisionerLoop:
             latest = self._latest_round_id()
             newer = (bool(self._last_evaled_round) and latest is not None
                      and latest != self._last_evaled_round)
+        # The bench hold only matters when the manifest is about to kill a
+        # final pod, and its marker scan is disk I/O — skip it otherwise.
+        bench_hold = (manifest and any(i.stage == "final" for i in self._state.instances)
+                      and self._bench_hold())
         dead: set[str] = set()
         for inst in self._state.instances:
             if teardown_due(inst.stage, heat_marker_seen=marker, manifest_seen=manifest,
                             receipt_seen=receipt, newer_manifest=newer,
                             rented_at=_iso_ts(inst.rented_at_iso), now=now,
-                            ttl_hours=self.ttl_hours):
+                            ttl_hours=self.ttl_hours, bench_hold=bench_hold):
                 log.info("tearing down %s pod %s (marker=%s manifest=%s receipt=%s "
-                         "newer=%s ttl=%.1fh)", inst.stage, inst.instance_id, marker,
-                         manifest, receipt, newer, self.ttl_hours)
+                         "newer=%s bench_hold=%s ttl=%.1fh)", inst.stage, inst.instance_id,
+                         marker, manifest, receipt, newer, bench_hold, self.ttl_hours)
                 prov = self.providers.get(inst.provider)
                 if prov is None:
                     log.error("no adapter for provider %r — pod %s may be LEAKED",
@@ -1561,10 +1602,16 @@ class ProvisionerLoop:
         boundary (the hash is immutable). Returns None when the client can't
         answer — boundary not yet finalised, no ``block_seed`` (offline fakes),
         or a chain hiccup — leaving the mtime heuristic as the fallback."""
-        boundary = self._provisioned_round
-        if boundary is None:
+        closes_at = self._round_closes_at()
+        if closes_at is None:
             return None
-        if self._expected_seed_for == boundary:
+        # The trainer seeds the round off the block that OPENS it. Under the
+        # offset trigger _provisioned_round is the END boundary — deriving
+        # from it named a marker that could never match, and mid-round its
+        # hash doesn't even exist yet (2026-07-29 JIT incident: the marker was
+        # skipped every cycle and the final fell back to heat 4090s).
+        boundary = closes_at - self.epoch_at(closes_at)
+        if boundary == self._expected_seed_for:
             return self._expected_seed
         seed_fn = getattr(self.chain_client, "block_seed", None)
         if seed_fn is None:
@@ -1573,6 +1620,13 @@ class ProvisionerLoop:
             # Under the same hard deadline as every other chain read: a hung
             # block_seed must not wedge the teardown sweep (this runs each cycle
             # until the boundary is on-chain and the seed caches).
+            hash_fn = getattr(self.chain_client, "block_hash", None)
+            if hash_fn is not None and not self._with_deadline(
+                    lambda: hash_fn(boundary), 30.0):
+                # No hash for the boundary (not on-chain / node behind):
+                # block_seed would silently hash None into a plausible garbage
+                # seed — never derive from a missing hash.
+                return None
             seed = str(int(self._with_deadline(lambda: seed_fn(boundary), 30.0)))
         except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down / hung
             return None
@@ -1619,6 +1673,71 @@ class ProvisionerLoop:
                 continue
         return False
 
+    def _bench_hold(self) -> bool:
+        """The Cascade post-publish duel bench is still running — hold the
+        FINAL pods (see ``policy.bench_hold_active`` / ``teardown_due``).
+
+        The trainer drops ``work_root/<round_id>/bench_pending.json`` just
+        before publishing the manifest and ``bench_complete.json`` (removing
+        the pending marker) when the bench report is uploaded or the bench
+        fails — the same shared-work-root marker mechanism as
+        ``heat_complete.json``, with the same anti-zombie guards: the marker
+        must postdate this round's earliest boundary rent AND (when the
+        expected base_seed is derivable) belong to the round being served, so
+        an old round's leftover marker can never hold a new fleet.
+        """
+        if self.bench_hold_max_hours <= 0 or self._state is None:
+            self._reset_bench_hold_latch()
+            return False
+        rents = [_iso_ts(i.rented_at_iso) for i in self._state.instances if i.stage != "eval"]
+        if not rents:
+            self._reset_bench_hold_latch()
+            return False
+        rent_ts = min(rents)
+        expected = self._expected_base_seed()
+        try:
+            markers = sorted(Path(self.work_root).glob("*/bench_pending.json"))
+        except OSError:
+            return False
+        now = self.clock()
+        for m in markers:
+            if expected is not None and m.parent.name != expected:
+                continue                        # a different round's marker
+            try:
+                mtime = m.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < rent_ts:
+                continue                        # stale marker from an earlier round
+            if (m.parent / "bench_complete.json").exists():
+                continue                        # bench finished: hold released
+            # Arm (or RE-arm) the cap clock when this is a different marker
+            # than the one the latch was armed for — a new round, or the same
+            # round republished. Without this, one round's expired hold would
+            # read every later round's marker as already-expired.
+            ident = (m.parent.name, mtime)
+            if self._bench_hold_since is None or self._bench_hold_for != ident:
+                self._bench_hold_since, self._bench_hold_for = now, ident
+                self._bench_hold_logged = False
+            if bench_hold_active(held_since=self._bench_hold_since, bench_done=False,
+                                 now=now, hold_max_hours=self.bench_hold_max_hours):
+                if not self._bench_hold_logged:
+                    self._bench_hold_logged = True
+                    log.info("final pod teardown held for the cascade duel bench "
+                             "(round=%s, cap %.1fh)", m.parent.name, self.bench_hold_max_hours)
+                return True
+            log.warning("cascade duel bench hold expired after %.1fh (round=%s); "
+                        "reaping the final pod regardless", self.bench_hold_max_hours,
+                        m.parent.name)
+            return False
+        self._reset_bench_hold_latch()
+        return False
+
+    def _reset_bench_hold_latch(self) -> None:
+        self._bench_hold_since = None
+        self._bench_hold_for = None
+        self._bench_hold_logged = False
+
     def _manifest_seen(self) -> bool:
         """The round's manifest is published — the round is over.
 
@@ -1663,8 +1782,16 @@ class ProvisionerLoop:
                 if digest != self._round_manifest_baseline:
                     return True
         current = self._latest_round_id()
-        return (self._manifest_baseline is not None and current is not None
-                and current != self._manifest_baseline)
+        if (self._manifest_baseline is None or current is None
+                or current == self._manifest_baseline):
+            return False
+        # latest.json moved — but only OUR round's publish ends this round. A
+        # PREVIOUS round's late manifest also moves the pointer, and reading
+        # that as "round over" swept a freshly rented next-round fleet
+        # (2026-07-29: round-8733600 final + eval pods killed 49min into
+        # their round by round-8730000's post-wall publish).
+        expected = self._expected_base_seed()
+        return expected is None or current == expected
 
     def _latest_round_id(self) -> str | None:
         if self.manifest_store is None:
