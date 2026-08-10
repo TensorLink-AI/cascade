@@ -91,9 +91,27 @@ in-context.
   cross-hardware bias, and u86 won with an 8.3% LCB from apparent hopelessness.
   Ships inert; validator/audit multi-challenger fix goes FIRST.
   (`decisions/DEC-CA-0012-tie-aware-finalists-cohort-duel.md`)
+- **DEC-CA-0013** — Warm-start promotes a TOP-K member set (parallel lineages,
+  zero extra GPU; rounds rotate across members) and flips to propose-and-verify:
+  the TRAINER selects (signed `PromotionRecord`, king+challenger candidate pool,
+  structural-diversity policy), validators verify an envelope (provenance +
+  quality floor `cascade_quality_epsilon` + reign-clock ripeness + `cascade_top_k`
+  cap) instead of re-deriving. Promotion pays the checkpoint's owner nothing.
+  Supersedes DEC-CA-0005's "validator promotes" framing.
+  (`decisions/DEC-CA-0013-warm-start-top-k-propose-and-verify.md`)
+- **DEC-CA-0014** — The from-scratch signal survives warm-start, STAGED:
+  (1) shadow scratch control — every M rounds the trainer also trains the
+  king's generator from scratch and publishes the bench numbers, telemetry
+  only; (2) reseed valve — scratch checkpoints enter the promotion pool via
+  the existing quality floor (auto-admitted exactly when the lineage stops
+  compounding; the one sanctioned crossing of DEC-CA-0013's generation band);
+  (3) a second random-init THRONE only if shadows show the two regimes crown
+  different generators. NOT built yet — Stage 1 is next.
+  (`decisions/DEC-CA-0014-scratch-control-staged.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
-pointer here. Put the revisit condition in the node's `revisit_when:` key.
+pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
+the revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 

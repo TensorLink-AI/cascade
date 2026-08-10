@@ -662,6 +662,18 @@ class ScoringConfig:
     # Threshold in ROUNDS ("survived N challenges"). Field name kept for
     # call-site compatibility; the config key is ``cascade_reign_rounds``.
     cascade_reign_days: int = 7
+    # Promotion ENVELOPE knobs (DEC-CA-0013, propose-and-verify). The trainer
+    # selects the promoted warm-start set; validators verify the signed
+    # declaration against these bounds — so, like cascade_reign_rounds, they
+    # are fleet-consensus values ([scoring] is not in contract_digest; keep
+    # them identical across validators or their accept/reject verdicts fork).
+    # cascade_top_k caps how many member checkpoints one promotion may declare
+    # (the trainer may declare fewer); cascade_quality_epsilon is the quality
+    # floor — every member's bench geomean must sit within (1 + epsilon) of
+    # the best verifiable score in the reign, so diversity can never be bought
+    # with a materially worse init.
+    cascade_top_k: int = 3
+    cascade_quality_epsilon: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1212,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             cascade_reign_days=int(
                 s.get("cascade_reign_rounds", s.get("cascade_reign_days", 7))
             ),
+            cascade_top_k=int(s.get("cascade_top_k", 3)),
+            cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

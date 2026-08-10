@@ -171,12 +171,14 @@ class ValidatorRunner:
     eval_host_fn: Callable[[], RemoteHost | None] | None = None
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
-    # the reign clock is reset on each dethrone, every reigning-king checkpoint's
-    # public-benchmark numbers (GIFT-Eval/BOOM/TIME, read from the trainer's
-    # signed post-publish bench report, falling back to older manifests'
-    # in-entry bench_scores) are logged, and once per round the clock is
-    # checked; a fired Cascade installs the promoted warm-start init and
-    # re-crowns the same king (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
+    # the reign clock is reset on each dethrone and every benched duel
+    # checkpoint's public-benchmark numbers (GIFT-Eval/BOOM/TIME, read from the
+    # trainer's signed post-publish bench report, falling back to older
+    # manifests' in-entry bench_scores) are logged as promotion candidates. The
+    # validator never selects: the trainer declares the promoted set in a
+    # signed PromotionRecord and the warm-start gate verifies it against the
+    # envelope (DEC-CA-0013), re-crowning the same king on acceptance
+    # (DEC-CA-0004). None ⇒ Cascade is disabled (pure KOTH).
     cascade: CascadeController | None = None
     # Cascade bench-report source (cascade.shared.bench_report): duck-types
     # ``get_text``. ``None`` ⇒ opened lazily from [storage] through
@@ -203,6 +205,13 @@ class ValidatorRunner:
     # restart just means those rounds contribute no bench numbers, which
     # Cascade tolerates (promotion selects over the rounds that have them).
     _pending_bench: list = field(default_factory=list, repr=False)
+    # Per-round cache of verified bench reports (positive results only, small
+    # FIFO): one round's cascade step joins several entries — and a promotion
+    # verification several members — against the SAME report, and each miss is
+    # a store GET + JSON parse + signature verification. Negative results are
+    # deliberately NOT cached: "not there yet" is the normal pre-publish state
+    # the pending-bench queue exists to re-probe.
+    _bench_report_cache: dict = field(default_factory=dict, repr=False)
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -231,29 +240,219 @@ class ValidatorRunner:
         return None
 
     def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
-        """Warm-start pin gate (Cascade, DEC-CA-0005): the manifest's signed
-        ``warm_start_ckpt`` must equal the init THIS validator's deterministic
-        promotion installed (its own ``warm_start_init_path`` file; "" before any
-        promotion). Every validator computes the same promotion (block-anchored
-        clock + trainer-signed bench scores), so agreement is fleet-wide. A
-        mismatch — trainer trained from random when a promotion is live, or from
-        a stale/foreign init — rejects the round rather than silently scoring
-        runs trained off-baseline; the trainer re-syncs by the next round. Only
-        enforced when Cascade is wired (off ⇒ pure KOTH, field ignored)."""
+        """Warm-start envelope gate (Cascade, DEC-CA-0013, propose-and-verify).
+
+        The trainer SELECTS the promoted warm-start set and declares each
+        round's init in the signed manifest (``warm_start_ckpt``); this gate
+        VERIFIES the declaration instead of re-deriving the selection:
+
+        * a declared init in the accepted generation's member set passes (any
+          member — rotation/allocation across members is trainer policy);
+        * an unseen init must be justified by a trainer-signed
+          :class:`~cascade.shared.promotion.PromotionRecord` for a NEWER
+          generation that survives the envelope (:meth:`_verify_promotion`):
+          provenance + quality floor against the reign log's signed bench
+          numbers, reign-clock ripeness, and the ``cascade_top_k`` set cap;
+        * random init ("") passes only in the random-init era (generation 0) —
+          once a promotion is live a round must never silently train unpinned.
+
+        Only enforced when Cascade is wired (off ⇒ pure KOTH, field ignored)."""
         if self.cascade is None:
             return None
-        expected = ""
+        legacy_reason = self._adopt_legacy_warm_start()
+        if legacy_reason is not None:
+            return legacy_reason
+        declared = manifest.warm_start_ckpt
+        state = self.cascade.state
+        if not declared:
+            if state.generation == 0:
+                return None
+            return ("warm_start_missing: manifest trained from <random init> but "
+                    f"promotion generation {state.generation} is live")
+        if declared in state.members:
+            return None
+        return self._verify_promotion(manifest, declared)
+
+    def _adopt_legacy_warm_start(self) -> str | None:
+        """Migration shim (pre-DEC-CA-0013 states): grandfather the single
+        pointer this validator's own Cascade installed under the old
+        select-and-install mechanism — or, on the owner box, the member set the
+        co-hosted trainer's engine wrote — as the accepted generation, once,
+        from the random-init era. Returns a rejection reason only for a
+        present-but-unreadable file (fail LOUD, never open).
+
+        Known bootstrap gap, accepted: the grandfathered generation has no
+        published PromotionRecord (the old winner has no ``source_round``
+        provenance to verify one against), so a validator with NO local state
+        at all — a fresh joiner during the grandfather window — rejects rounds
+        until the first post-upgrade promotion publishes a real record (≤ one
+        reign). Not a regression: under the old mechanism a fresh validator
+        without the pointer file rejected the same rounds for longer (until
+        its OWN promotion fired)."""
+        if self.cascade is None or self.cascade.state.generation != 0:
+            return None
         p = Path(self.cfg.validator.warm_start_init_path)
-        if p.is_file():
-            try:
-                expected = str(json.loads(p.read_text(encoding="utf-8")).get("checkpoint_id") or "")
-            except Exception as e:  # noqa: BLE001 — unreadable pin must fail LOUD, not open
-                return f"warm_start_state_unreadable: {p}: {e}"
-        if manifest.warm_start_ckpt != expected:
-            return (f"warm_start_mismatch: manifest trained from "
-                    f"{manifest.warm_start_ckpt or '<random init>'!r}, this validator "
-                    f"expects {expected or '<random init>'!r}")
+        if not p.is_file():
+            return None
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001 — unreadable pin must fail LOUD, not open
+            return f"warm_start_state_unreadable: {p}: {e}"
+        members = [str(m.get("checkpoint_id") or "") for m in (obj.get("members") or ())]
+        members = [m for m in members if m]
+        if members:
+            self.cascade.adopt_member_set(
+                generation=int(obj.get("generation", 1) or 1), members=tuple(members))
+        else:
+            self.cascade.adopt_legacy_pointer(str(obj.get("checkpoint_id") or ""))
         return None
+
+    def _verify_promotion(self, manifest: TrainingManifest, declared: str) -> str | None:
+        """Verify a declared-but-unseen init against the latest published
+        promotion record. Accepts (installs the new generation via
+        :meth:`CascadeController.note_promotion`) and returns ``None``, or
+        returns the rejection reason.
+
+        The envelope, in order: the record exists for a generation NEWER than
+        the accepted one and carries the declared init; it is trainer-signed;
+        its member set respects ``cascade_top_k``; the reign clock was ripe
+        (checked only when this validator's clock can attest timing at all —
+        an unanchored or catching-up clock only measures its own uptime, so it
+        skips the check rather than rejecting a whole reign's rounds); and
+        every member's provenance + quality holds against signed bench numbers
+        (:meth:`_verify_members`)."""
+        from ..shared.promotion import verify_promotion_record_signature
+
+        assert self.cascade is not None
+        state = self.cascade.state
+        record = self._fetch_latest_promotion_record()
+        if record is None:
+            return (f"warm_start_mismatch: manifest trained from {declared!r} but no "
+                    f"promotion record justifies it (accepted generation "
+                    f"{state.generation})")
+        if record.generation <= state.generation:
+            return (f"warm_start_mismatch: manifest trained from {declared!r} but the "
+                    f"latest promotion record is generation {record.generation} ≤ "
+                    f"accepted {state.generation} (stale or replayed)")
+        if self.verify_signatures and not verify_promotion_record_signature(
+            record, self.cfg.manifest.trainer_hotkey
+        ):
+            return (f"warm_start_promotion_unsigned: record generation "
+                    f"{record.generation} failed signature verification")
+        member_ids = record.member_ids()
+        if declared not in member_ids:
+            return (f"warm_start_mismatch: manifest trained from {declared!r}, not a "
+                    f"member of promotion generation {record.generation}")
+        k_max = max(1, int(self.cfg.scoring.cascade_top_k))
+        if not member_ids or len(member_ids) > k_max:
+            return (f"warm_start_promotion_invalid: generation {record.generation} "
+                    f"declares {len(member_ids)} member(s); cap is {k_max}")
+        block = self._epoch_start_block(manifest)
+        # The timing-and-scope checks apply when this validator's clock can
+        # attest at all (anchored, generation ≥ 1) and the record is the +1
+        # transition it watched — a bootstrap/catch-up validator's clock only
+        # measures its own uptime, so it verifies what its evidence supports.
+        attesting = (record.generation == state.generation + 1
+                     and self.cascade.can_verify_ripeness())
+        if attesting and not self.cascade.is_ripe(block=block):
+            return (f"warm_start_promotion_early: generation {record.generation} "
+                    f"declared before the reign clock ripened")
+        member_reason = self._verify_members(record, enforce_reign_scope=attesting)
+        if member_reason is not None:
+            return member_reason
+        self.cascade.note_promotion(
+            generation=record.generation, members=member_ids, block=block)
+        return None
+
+    def _verify_members(self, record: object, *, enforce_reign_scope: bool) -> str | None:
+        """Provenance + quality floor for every member of a promotion record.
+
+        Each member must have trainer-signed bench numbers: from this
+        validator's reign log when it recorded that round, else fetched on
+        demand from the member's ``source_round`` bench report — so
+        verification does not depend on this validator's log being complete. A
+        member with no verifiable score fails CLOSED (an init nobody can score
+        must not become the field's floor).
+
+        ``enforce_reign_scope`` additionally pins the fetched fallback to the
+        CURRENT reign: the report's ``created_block`` must not predate this
+        validator's reign anchor, so a checkpoint from a dead reign (stale
+        trainer state, fabricated ``source_round``) can't pass provenance just
+        because some old signed report once scored it. Only enforced when this
+        validator's clock watched the whole reign (the same condition as
+        ripeness) — a bootstrap clock would mis-scope honest early-reign
+        members. The reign-log path is reign-scoped by construction (the log
+        clears on every re-crown).
+
+        The floor is the best score across the reign log and the members
+        themselves; every member must sit within ``cascade_quality_epsilon``
+        of it. One-sided by construction: a validator's log is a subset of the
+        trainer's candidates (same signed reports), so a missing report can
+        only loosen this validator's floor — an honest trainer passes every
+        validator; only a cheating trainer splits the fleet, and splitting
+        loudly is the correct outcome there."""
+        from .cascade import best_score, cascade_score, log_record_for
+
+        assert self.cascade is not None
+        reign_start = self.cascade.state.reign_start_block
+        scores: dict[str, float] = {}
+        for m in getattr(record, "members", ()):
+            rec = log_record_for(self.cascade.state, m.checkpoint_id)
+            if rec is not None:
+                scores[m.checkpoint_id] = rec.score
+                continue
+            report = self._fetch_bench_report(m.source_round)
+            be = None if report is None else report.entry_for_pointer(m.checkpoint_id)
+            if be is None:
+                return (f"warm_start_member_unverifiable: {m.checkpoint_id} has no "
+                        f"signed bench numbers (source_round={m.source_round!r})")
+            if (enforce_reign_scope and reign_start is not None
+                    and int(getattr(report, "created_block", 0)) < int(reign_start)):
+                return (f"warm_start_member_out_of_reign: {m.checkpoint_id} was "
+                        f"benched in round {m.source_round!r} (block "
+                        f"{getattr(report, 'created_block', '?')}), before the "
+                        f"current reign anchored at block {reign_start}")
+            s = be.scores
+            scores[m.checkpoint_id] = cascade_score(
+                s.gifteval_crps, s.gifteval_mase, s.boom_crps,
+                s.boom_mase, s.time_crps, s.time_mase)
+        floor_candidates = list(scores.values())
+        log_best = best_score(self.cascade.state)
+        if log_best is not None:
+            floor_candidates.append(log_best)
+        floor = min(floor_candidates)
+        epsilon = float(self.cfg.scoring.cascade_quality_epsilon)
+        for cid, score in scores.items():
+            if score > floor * (1.0 + epsilon):
+                return (f"warm_start_member_below_floor: {cid} score {score:.5f} "
+                        f"exceeds quality floor {floor:.5f} × (1 + {epsilon})")
+        return None
+
+    def _fetch_latest_promotion_record(self) -> object | None:
+        """The latest published promotion record, located via the unsigned
+        ``promotions/index.json`` (trust comes from the record's signature,
+        checked by the caller — the index is a locator only). ``None`` when
+        absent/unreadable; never raises."""
+        from ..shared.promotion import (
+            load_promotion_index,
+            load_promotion_record,
+            promotion_index_key,
+            promotion_record_key,
+        )
+
+        try:
+            latest = load_promotion_index(
+                self._bench_store().get_text(promotion_index_key()))
+        except Exception:  # noqa: BLE001 — no promotions published yet, or store down
+            return None
+        if latest <= 0:
+            return None
+        try:
+            text = self._bench_store().get_text(promotion_record_key(latest))
+            return load_promotion_record(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cascade: promotion record gen=%d unreadable (%s)", latest, e)
+            return None
 
     @staticmethod
     def check_pool_pin(
@@ -522,22 +721,6 @@ class ValidatorRunner:
 
     # ── Cascade: king-reign promotion ────────────────────────────────────────
 
-    def _current_king_entry(self, manifest: TrainingManifest) -> TrainedEntry | None:
-        """The manifest checkpoint the reigning champion produced this round.
-
-        Cascade times the *validator's champion*, not the manifest's (lagging)
-        king role — so the checkpoint to score is the entry whose miner hotkey is
-        the champion. Prefers the primary throne size (what the benchmark sidecar
-        scores) and falls back to any size that hotkey trained."""
-        hk = self.state.king_hotkey
-        if hk is None:
-            return None
-        matches = [e for e in manifest.entries if e.miner_hotkey == hk]
-        if not matches:
-            return None
-        primary = self.cfg.throne_contracts()[0].arch_preset
-        return next((e for e in matches if e.size == primary), matches[0])
-
     @staticmethod
     def _bench_scores_dict(entry: TrainedEntry) -> dict | None:
         """The six Cascade numbers off a manifest entry's trainer-signed
@@ -573,6 +756,8 @@ class ValidatorRunner:
             verify_bench_report_signature,
         )
 
+        if str(round_id) in self._bench_report_cache:
+            return self._bench_report_cache[str(round_id)]
         try:
             text = self._bench_store().get_text(bench_report_key(str(round_id)))
         except Exception:  # noqa: BLE001 — not published yet, or store down
@@ -589,6 +774,9 @@ class ValidatorRunner:
             log.warning("cascade: bench report for round=%s failed signature "
                         "verification; ignoring", round_id)
             return None
+        self._bench_report_cache[str(round_id)] = report
+        while len(self._bench_report_cache) > 16:  # small FIFO, insertion-ordered
+            self._bench_report_cache.pop(next(iter(self._bench_report_cache)))
         return report
 
     def _report_bench_scores(self, round_id: str, trained_pointer: str) -> dict | None:
@@ -608,77 +796,100 @@ class ValidatorRunner:
             "time_crps": s.time_crps, "time_mase": s.time_mase,
         }
 
-    def _record_king_checkpoint(self, manifest: TrainingManifest, now: float) -> None:
-        """Add the reigning king's checkpoint to the reign log so a later Cascade
-        selection is a lookup, not a re-eval. Source order: the round's signed
-        bench report (authoritative; published after the manifest), then the
-        manifest entry's in-entry ``bench_scores`` (rounds from before the bench
-        moved post-publish). Neither yet ⇒ the round is queued and re-probed at
-        the next rounds' cascade steps (the report typically lands ~an hour
-        after the manifest); a round whose report never appears simply
-        contributes no bench numbers — promotion selects over the reign rounds
-        that have them."""
+    def _record_duel_checkpoints(self, manifest: TrainingManifest, now: float) -> None:
+        """Add the round's benched duel checkpoints — the king's AND every
+        challenger's at the primary throne size — to the reign log. Both roles
+        are promotion candidates (DEC-CA-0013): challenger checkpoints carry
+        genuinely different generator data, the deepest diversity the promoted
+        set can draw on, and the trainer benches both sides already. The log is
+        the envelope's provenance/quality evidence, so a later verification is
+        a lookup, not a re-eval.
+
+        Source order per checkpoint: the round's signed bench report
+        (authoritative; published after the manifest), then the manifest
+        entry's in-entry ``bench_scores`` (king-only, rounds from before the
+        bench moved post-publish). Neither yet ⇒ the checkpoint is queued and
+        re-probed at the next rounds' cascade steps (the report typically lands
+        ~an hour after the manifest); a checkpoint whose report never appears
+        simply contributes no bench numbers — the trainer selects (and this
+        validator verifies) over the reign checkpoints that have them."""
         if self.cascade is None or self.state.king_hotkey is None:
             return
-        entry = self._current_king_entry(manifest)
-        if entry is None:
-            return
-        metrics = (self._report_bench_scores(manifest.round_id, entry.trained_pointer)
-                   or self._bench_scores_dict(entry))
-        if metrics is None:
-            self._queue_pending_bench(manifest.round_id, entry)
-            return
-        self.cascade.record_checkpoint(entry.trained_pointer, now=now, size=entry.size, **metrics)
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        for entry in manifest.entries:
+            if (entry.size or primary) != primary:
+                continue
+            metrics = (self._report_bench_scores(manifest.round_id, entry.trained_pointer)
+                       or self._bench_scores_dict(entry))
+            if metrics is None:
+                self._queue_pending_bench(manifest.round_id, entry)
+                continue
+            self.cascade.record_checkpoint(
+                entry.trained_pointer, now=now, size=entry.size, role=entry.role, **metrics)
 
     def _queue_pending_bench(self, round_id: str, entry: TrainedEntry) -> None:
-        if any(p["round_id"] == str(round_id) for p in self._pending_bench):
+        if any(p["round_id"] == str(round_id)
+               and p["trained_pointer"] == entry.trained_pointer
+               for p in self._pending_bench):
             return
         self._pending_bench.append({
             "round_id": str(round_id),
             "trained_pointer": entry.trained_pointer,
             "size": entry.size,
+            "role": entry.role,
             "king_hotkey": self.state.king_hotkey,
+            # The reign identity at queue time: an accepted promotion re-crowns
+            # the SAME king with a new start block, so the king alone cannot
+            # tell "this reign" from "the reign the promotion just closed".
+            "reign_start": (None if self.cascade is None
+                            else self.cascade.state.reign_start_block),
             "tries": BENCH_REPORT_RETRY_ROUNDS,
         })
-        log.info("cascade: no bench numbers yet for round=%s king checkpoint %s; "
+        log.info("cascade: no bench numbers yet for round=%s %s checkpoint %s; "
                  "will re-probe the bench report for up to %d round(s)",
-                 round_id, entry.trained_pointer, BENCH_REPORT_RETRY_ROUNDS)
+                 round_id, entry.role, entry.trained_pointer, BENCH_REPORT_RETRY_ROUNDS)
 
     def _drain_pending_bench(self, now: float) -> None:
-        """Re-probe queued rounds' bench reports and log any that landed.
+        """Re-probe queued checkpoints' bench reports and log any that landed.
 
-        A queued round whose king no longer reigns is dropped outright — the
-        reign log was cleared at the re-crown, and an old reign's checkpoint
-        must never leak into the new reign's promotion pool."""
+        A queued checkpoint whose reign ended is dropped outright — whether by
+        a dethrone (new king) or by an accepted PROMOTION (same king, fresh
+        reign): the reign log was cleared at the re-crown, and a closed reign's
+        checkpoint leaking into the fresh log would corrupt the quality floor
+        the next promotion is verified against."""
         if self.cascade is None or not self._pending_bench:
             return
         keep: list = []
         for p in self._pending_bench:
-            if p["king_hotkey"] != self.cascade.state.king_hotkey:
+            if (p["king_hotkey"] != self.cascade.state.king_hotkey
+                    or p.get("reign_start") != self.cascade.state.reign_start_block):
                 log.info("cascade: dropping pending bench for round=%s (reign ended)",
                          p["round_id"])
                 continue
             metrics = self._report_bench_scores(p["round_id"], p["trained_pointer"])
             if metrics is not None:
                 self.cascade.record_checkpoint(
-                    p["trained_pointer"], now=now, size=p["size"], **metrics)
+                    p["trained_pointer"], now=now, size=p["size"],
+                    role=p.get("role", ""), **metrics)
                 continue
             p["tries"] -= 1
             if p["tries"] > 0:
                 keep.append(p)
             else:
-                log.info("cascade: giving up on bench report for round=%s; the round "
-                         "contributes no bench numbers", p["round_id"])
+                log.info("cascade: giving up on bench report for round=%s; the "
+                         "checkpoint contributes no bench numbers", p["round_id"])
         self._pending_bench = keep
 
     def _cascade_round(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None
     ) -> None:  # pragma: no cover — live-loop glue; the controller is unit-tested
         """One Cascade step, run at the end of a round (after weights/receipts).
-        Resets the reign clock on a dethrone, records the reigning king's
-        checkpoint, then checks the clock — a fired Cascade installs the promoted
-        init and re-crowns the SAME king (DEC-CA-0004: the champion throne is
-        never touched). Fully guarded: Cascade never disturbs KOTH."""
+        Resets the reign clock on a dethrone, re-anchors a legacy clock, and
+        records the round's benched duel checkpoints into the reign log. The
+        validator never fires a promotion (DEC-CA-0013): the trainer declares,
+        and the warm-start gate verifies+adopts at manifest time — this step
+        only maintains the clock and the evidence the gate verifies against.
+        Fully guarded: Cascade never disturbs KOTH."""
         if self.cascade is None:
             return
         import time
@@ -686,38 +897,35 @@ class ValidatorRunner:
         now = time.time()
         try:
             # The reign clock runs on the round's epoch block — identical for every
-            # validator (from the signed manifest), so all fire on the same round.
+            # validator (from the signed manifest), so ripeness verdicts agree.
             block = self._epoch_start_block(manifest)
             # Reuse KOTH's dethrone signal to reset the clock (never reimplement it);
-            # on genesis, crown the first champion so the reign clock starts ticking.
-            if outcome is not None and outcome.transition.dethroned and outcome.transition.new_king_hotkey:
+            # on adoption (no cascade king but a live champion — a validator
+            # joining or restarting mid-reign), crown WITHOUT attestation: an
+            # adopted clock must not judge reign timing.
+            dethroned = (outcome is not None and outcome.transition.dethroned
+                         and outcome.transition.new_king_hotkey)
+            if dethroned:
                 self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block)
             elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
-                self.cascade.note_dethrone(self.state.king_hotkey, block=block)
+                self.cascade.note_dethrone(self.state.king_hotkey, block=block,
+                                           observed=False)
+            self.cascade.observe_round(block=block)
             # Earlier rounds first: reports published after those rounds'
             # cascade steps (the bench runs post-publish) land in the reign log
-            # now, before this round's checkpoint is considered.
+            # now, before this round's checkpoints are considered.
             self._drain_pending_bench(now)
-            self._record_king_checkpoint(manifest, now)
-            event = self.cascade.cascade_check(block=block, now=now)
-            if event is not None:
-                self._apply_cascade(event)
+            # A DETHRONE round's checkpoints belong to the reign that just
+            # ended and are recorded NOWHERE: the trainer's candidate pool
+            # wipes them at its own re-crown, and logging them here (into the
+            # freshly cleared log) would give this validator evidence the
+            # trainer never selects against — a stricter quality floor that
+            # rejects honest promotions (the one-sidedness invariant of
+            # _verify_members).
+            if not dethroned:
+                self._record_duel_checkpoints(manifest, now)
         except Exception as e:  # noqa: BLE001 — Cascade must never disturb a round
             log.warning("cascade step failed for round=%s: %s", manifest.round_id, e)
-
-    def _apply_cascade(self, event: object) -> None:  # pragma: no cover — live-loop glue
-        """Log a fired Cascade. The champion throne is deliberately untouched
-        (DEC-CA-0004): the king persists — vacating had no benefit (both roles
-        train from the shared init) and a vacant throne refillable only via the
-        dethrone branch froze the reign clock when the incumbent kept winning."""
-        winner = getattr(event, "winner", None)
-        king = getattr(event, "old_king", None)
-        log.info(
-            "cascade: promotion installed (king %s persists); field trains from "
-            "checkpoint %s next round",
-            (king or "?")[:12],
-            getattr(winner, "checkpoint_id", "?"),
-        )
 
     def process_round(
         self,
@@ -1756,40 +1964,6 @@ def _bootstrap_state_from_receipts(
                          former_kings=tuple(court))
 
 
-def _warm_start_installer(path: Path) -> Callable[[object], None]:
-    """The default Cascade installer: promote the winning checkpoint by writing its
-    pointer (and its eval numbers) to ``warm_start_init_path`` — the seam the
-    trainer reads to warm-start every subsequent round from. Promotes AS-IS; no
-    retrain/fine-tune."""
-
-    def _install(winner: object) -> None:  # pragma: no cover — file glue
-        import time
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "checkpoint_id": getattr(winner, "checkpoint_id", None),
-                    "size": getattr(winner, "size", ""),
-                    "score": getattr(winner, "score", None),
-                    "gifteval_crps": getattr(winner, "gifteval_crps", None),
-                    "gifteval_mase": getattr(winner, "gifteval_mase", None),
-                    "boom_crps": getattr(winner, "boom_crps", None),
-                    "boom_mase": getattr(winner, "boom_mase", None),
-                    "time_crps": getattr(winner, "time_crps", None),
-                    "time_mase": getattr(winner, "time_mase", None),
-                    "installed_at": time.time(),
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        log.info("cascade: warm-start init written to %s (checkpoint %s)",
-                 path, getattr(winner, "checkpoint_id", "?"))
-
-    return _install
-
-
 def _build_cascade(cfg: ChainConfig) -> CascadeController:
     """Construct the Cascade controller from config, restoring the persisted reign
     clock + checkpoint log so it resumes across restarts."""
@@ -1799,7 +1973,6 @@ def _build_cascade(cfg: ChainConfig) -> CascadeController:
     return CascadeController(
         reign_days=cfg.scoring.cascade_reign_days,
         state=load_state(state_path),
-        install_fn=_warm_start_installer(Path(cfg.validator.warm_start_init_path)),
         state_path=state_path,
         # The clock divides by the ROUND length in force, not a fixed day, so
         # the threshold keeps meaning "survived N challenges" under any cadence.
