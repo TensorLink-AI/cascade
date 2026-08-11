@@ -105,7 +105,7 @@ the same news for people who already know the mechanism.
 ## Option B — investor single post
 
 > A 10,000-parameter forecasting model recently beat one ~1,000x its size. The
-> difference was training data, not architecture.
+> difference was the training data.
 >
 > cascade freezes the model and competes the data. Winners now carry forward —
 > three lineages in parallel, so progress compounds instead of restarting each
