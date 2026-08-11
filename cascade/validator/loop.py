@@ -1133,6 +1133,24 @@ class ValidatorRunner:
             result.challenger_wins_round, transition.note,
             self.state.king_hotkey, self.state.tenure_rounds,
         )
+        # The decided challenger's records go LAST (DEC-CA-0012 convention).
+        # Every consumer of the signed receipt resolves "which challenger does
+        # the verdict belong to" positionally — audit's _pooled_scores /
+        # check_duel_cohort / check_transition and the public summary all read
+        # the last-recorded challenger — but the eval loop above appends in
+        # cohort order and the crown (best clearer, or a gift-gate
+        # fallthrough) is only known now. Without this reorder any cohort
+        # whose winner is not ranked last publishes a receipt those consumers
+        # misattribute and the audit fails legitimately-crowned rounds.
+        # k <= 1 is untouched: a single challenger is trivially last, so
+        # pre-cohort receipts keep their exact signed bytes.
+        if k > 1:
+            decided = [r for r in score_records
+                       if r.role == "challenger" and r.hotkey == decided_hotkey]
+            others = [r for r in score_records
+                      if not (r.role == "challenger" and r.hotkey == decided_hotkey)]
+            score_records = others + decided
+            duelled = tuple(hk for hk in duelled if hk != decided_hotkey) + (decided_hotkey,)
         # Shadow diagnostics: never gate the verdict. A rank-based view that
         # disagrees with the LCB, or a per-domain win-rate sign flip, means the
         # pool composition is doing the deciding — alert-worthy, not decisive.
