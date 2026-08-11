@@ -166,7 +166,12 @@ epoch_activation_block = 8726400
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
                           # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
                           # ranking; watch p_best / leader_lcb to confirm it pays.
-heat_n_windows   = 256    # eval windows the heat screens on
+heat_n_windows   = 2000   # eval windows the heat screens on
+                          # 256 → 2000 on 2026-08-07 (owner): screen on the full
+                          # [eval] n_windows — two straight record-setting
+                          # challengers showed the 256-window screen is noisy
+                          # near the top. ~34s/ckpt CPU (vs ~4s), ~17min/wave,
+                          # still inside the 1h wave-training shadow.
 heat_num_samples = 100    # sample forecasts per window in the heat (0 = reuse [eval] num_samples)
                           # 20 → 100 on 2026-07-27 (owner): match the final's
                           # sample count so the screen ranks on the same
@@ -294,9 +299,11 @@ benchmark_max_series  = 0        # cap datasets/tasks for a fast smoke run; 0 = 
 # provisioner holds the round's FINAL pod for that sweep past its normal
 # teardown signal; the hold releases early when the bench_complete marker
 # lands. Inert while cascade_enabled = false.
-bench_hold_max_hours  = 3.0   # king+challenger bench SEQUENTIALLY on the one final pod
-                              # (same-pod parallel launches preempt each other) — ~1h each
-                              # + first-rental 4.4G data download needs headroom past 2h
+bench_hold_max_hours  = 6.0   # king+challenger bench SEQUENTIALLY on the one final pod
+                              # (same-pod parallel launches preempt each other) — sweep is
+                              # ~45-60min WITH data staged; raised 3.0→6.0 (2026-08-07) after
+                              # rate-limited HF downloads on token-less pods ate the 3h hold
+                              # twice. Data now pre-pushed from the box at final-rent time.
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators need the data pinned locally.
 gift_gate_datasets    = ""       # gift-eval config subset ("" = full 97 configs)
