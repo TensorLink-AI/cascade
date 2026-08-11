@@ -1655,3 +1655,89 @@ def test_scalar_screener_still_works_without_diagnostics(cfg, tmp_path, monkeypa
     assert {e.hotkey for e in heat.entrants if e.status == "advanced"} == {"c"}
     assert heat.leader_lcb is None and heat.n_clusters is None
     assert all(e.p_best is None for e in heat.entrants)
+
+
+# ── storage-fault classification: retry backoff + burn exemption ─────────────
+# 2026-08-11: a ~1-minute registry 401 blip hit a dispatch AND its instant
+# retry, dropping and burning two challengers whose artifacts were fine.
+
+
+def test_storage_failure_classifier():
+    from cascade.trainer.loop import _storage_failure
+
+    assert _storage_failure(StorageError("fetch of x failed: chunk 0 failed"))
+    assert _storage_failure(RuntimeError(
+        "remote challenger on pod-g2 failed (rc=1): .../hippius_hub/"
+        "file_download.py, line 424, in hf_hub_download"))
+    assert _storage_failure(RuntimeError("CorpusError: generator_artifact_unreachable: HTTP 401"))
+    assert not _storage_failure(RuntimeError("ImportError: no module named torch"))
+    assert not _storage_failure(RuntimeError("remote failed (rc=255): ssh timed out"))
+
+
+def test_dispatch_retry_backs_off_on_storage_failure(monkeypatch):
+    naps = []
+    monkeypatch.setattr(loop_mod.time, "sleep", lambda s: naps.append(s))
+
+    class _Disp:
+        calls = 0
+
+        def dispatch(self, host, lane_count=None, **kw):
+            _Disp.calls += 1
+            if _Disp.calls == 1:
+                raise RuntimeError("worker died in hippius_hub fetch: server returned 401")
+            return "entry"
+
+    out = TrainerRunner._dispatch_with_retry(_Disp(), ["h1", "h2"], 0, describe="heat challenger x")
+    assert out == "entry" and _Disp.calls == 2
+    assert naps == [loop_mod.STORAGE_RETRY_BACKOFF_SECONDS]
+
+
+def test_dispatch_retry_is_instant_for_non_storage_failures(monkeypatch):
+    naps = []
+    monkeypatch.setattr(loop_mod.time, "sleep", lambda s: naps.append(s))
+
+    class _Disp:
+        calls = 0
+
+        def dispatch(self, host, lane_count=None, **kw):
+            _Disp.calls += 1
+            if _Disp.calls == 1:
+                raise RuntimeError("boom: OOM on device 0")
+            return "entry"
+
+    assert TrainerRunner._dispatch_with_retry(_Disp(), ["h1", "h2"], 0, describe="x") == "entry"
+    assert naps == []
+
+
+def _burn_runner(cfg, tmp_path):
+    return TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                         use_sandbox=False)
+
+
+def test_storage_fault_drop_not_burned_when_artifact_recovers(cfg, tmp_path, monkeypatch):
+    runner = _burn_runner(cfg, tmp_path)
+    monkeypatch.setattr(TrainerRunner, "_artifact_fetchable_now", lambda self, ref: True)
+    field_ = [ResolvedGenerator("b", 1, REF_B), ResolvedGenerator("c", 2, REF_C)]
+    runner._storage_dropped["b"] = REF_B     # 'b' dropped at the storage layer
+    runner._burn_hotkeys(field_)
+    seen = set(json.loads(runner._submissions_path().read_text()))
+    assert seen == {"c"}                     # 'b' exempt, 'c' burned normally
+    # The exemption is once per hotkey: same story next round ⇒ 'b' burns.
+    runner._storage_dropped.clear()
+    runner._storage_dropped["b"] = REF_B
+    runner._burn_hotkeys([ResolvedGenerator("b", 1, REF_B)])
+    assert "b" in set(json.loads(runner._submissions_path().read_text()))
+
+
+def test_storage_fault_drop_burns_when_artifact_still_dead(cfg, tmp_path, monkeypatch):
+    runner = _burn_runner(cfg, tmp_path)
+    monkeypatch.setattr(TrainerRunner, "_artifact_fetchable_now", lambda self, ref: False)
+    runner._storage_dropped["b"] = REF_B
+    runner._burn_hotkeys([ResolvedGenerator("b", 1, REF_B)])
+    assert "b" in set(json.loads(runner._submissions_path().read_text()))
+
+
+def test_non_storage_drop_still_burns(cfg, tmp_path):
+    runner = _burn_runner(cfg, tmp_path)   # nothing in _storage_dropped
+    runner._burn_hotkeys([ResolvedGenerator("b", 1, REF_B)])
+    assert "b" in set(json.loads(runner._submissions_path().read_text()))

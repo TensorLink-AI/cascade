@@ -239,6 +239,33 @@ def _save_seen_hotkeys(path: Path, seen: set[str]) -> None:
         log.warning("could not persist submissions db to %s: %s", path, e)
 
 
+# Storage-layer failure fingerprints. A challenger whose run died inside the
+# artifact/checkpoint fetch path (registry 401/403, Hippius chunk errors)
+# failed at OUR storage boundary, not in its own generator (2026-08-11: a
+# ~1-minute registry auth blip 401'd two fetchable artifacts on dispatch AND
+# on the instant retry, dropping and burning both challengers). Two uses:
+# the dispatch retry backs off before its second attempt (registry blips are
+# global — an instant retry on another host hits the same blip), and a heat
+# drop that matches is exempt from the submission burn IF the artifact
+# fetches cleanly again at heat settle (see _burn_hotkeys). Matching is on
+# the remote stderr tail, which miner code can spoof — that only matters for
+# the burn exemption, which is therefore capped at one per hotkey lifetime.
+_STORAGE_FAILURE_MARKERS = (
+    "storageerror", "hippius", "hf_hub_download", "file_download",
+    "generator_artifact_unreachable",
+)
+STORAGE_RETRY_BACKOFF_SECONDS = 45.0
+
+
+def _storage_failure(exc: BaseException) -> bool:
+    """True when an exception (or, for remote failures, the stderr tail in its
+    message) points at the storage layer rather than the challenger's code."""
+    if isinstance(exc, StorageError):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _STORAGE_FAILURE_MARKERS)
+
+
 def _load_commit_witness(path: Path) -> dict[str, dict]:
     """Load the persisted commit-order witness (best-effort).
 
@@ -615,6 +642,9 @@ class TrainerRunner:
     # transient fetch failures so the reign clock never flaps back to the
     # lagging incentive king mid-dethrone.
     _last_receipt_king: str | None = field(default=None, repr=False)
+    # Heat drops whose failure matched the storage layer (hotkey → gen ref),
+    # reset each round: candidates for the burn exemption in _burn_hotkeys.
+    _storage_dropped: dict = field(default_factory=dict, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -788,12 +818,61 @@ class TrainerRunner:
         actually screened it. Entrants whose own generator failed to train or
         score DO burn (that was their shot); a round-level failure before this
         point burns no one and the field simply re-enters the retried round.
+
+        Storage-fault exemption: a challenger dropped by a failure that matched
+        the storage layer (``_storage_dropped``) is NOT burned when its artifact
+        fetches cleanly at settle time — that proves a transient registry fault
+        on our boundary, not a broken submission (2026-08-11: a ~1-min 401 blip
+        burned two fetchable challengers). The failure text comes from remote
+        stderr, which miner code can spoof to dodge its burn, so each hotkey
+        gets this exemption ONCE (persisted beside the burn set); a still-dead
+        artifact (private/missing repo) burns as before.
         """
         if not self.cfg.round.one_submission_per_hotkey or not challengers:
             return
+        exempt: set[str] = set()
+        casualties = {c.hotkey: self._storage_dropped[c.hotkey]
+                      for c in challengers if c.hotkey in self._storage_dropped}
+        if casualties:
+            ex_path = self._submissions_path().with_name("trainer_burn_exemptions.json")
+            already = _load_seen_hotkeys(ex_path)
+            for hk, ref in casualties.items():
+                if hk in already:
+                    log.warning("burning %s despite a storage-fault drop: its one "
+                                "lifetime exemption is used", hk)
+                elif self._artifact_fetchable_now(ref):
+                    exempt.add(hk)
+                    log.warning("not burning %s: dropped by a storage-layer fault but "
+                                "%s fetches cleanly at settle (transient registry "
+                                "error) — it re-enters next round", hk, ref[:48])
+                else:
+                    log.info("burning %s: artifact %s still unfetchable at settle "
+                             "(miner-side, not a transient fault)", hk, ref[:48])
+            if exempt:
+                _save_seen_hotkeys(ex_path, already | exempt)
         path = self._submissions_path()
         seen = _load_seen_hotkeys(path)
-        _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers})
+        _save_seen_hotkeys(path, seen | {c.hotkey for c in challengers
+                                         if c.hotkey not in exempt})
+
+    def _artifact_fetchable_now(self, ref: str) -> bool:
+        """Re-test a generator fetch from this box (burn-exemption evidence).
+
+        Best-effort and conservative: any failure — including a full storage
+        outage — reports unfetchable, so the exemption is only granted on
+        positive proof that the artifact serves cleanly."""
+        import shutil
+        import uuid
+
+        probe_dir = self.work_root / f"_burn_verify-{uuid.uuid4().hex[:8]}"
+        try:
+            fetch_from_hub(ref, probe_dir, self.hub())
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.info("burn re-verify: %s still failing (%s)", ref[:48], e)
+            return False
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
 
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
     # Probe concurrency: sandboxes are subprocesses, each holding up to
@@ -2176,6 +2255,7 @@ class TrainerRunner:
             log.info("round=%s warm-start init: %s (size=%s, epoch_index=%d)",
                      base_seed, warm_start[0], warm_start[1], epoch_idx)
 
+        self._storage_dropped.clear()   # per-round: see _burn_hotkeys exemption
         eligible = self._filter_burned_challengers(plan.challengers)
         # Content-level duplicate screen ([round] dedup_mode): re-uploads and
         # near-copies of the king or a lower-UID challenger lose their heat GPU
@@ -2570,6 +2650,13 @@ class TrainerRunner:
             entry = disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             retry_host = hosts[(i + 1) % len(hosts)]
+            if _storage_failure(e):
+                # Registry blips are global, not per-box: an instant retry on
+                # another host hits the same blip. Wait it out first.
+                log.warning("%s failed on %s at the storage layer (%s); backing off "
+                            "%.0fs before the retry", describe, getattr(host, "name", host),
+                            e, STORAGE_RETRY_BACKOFF_SECONDS)
+                time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e, getattr(retry_host, "name", retry_host))
             entry = disp.dispatch(retry_host, lane_count=pod_lane_count(retry_host, hosts), **kw)
@@ -2599,6 +2686,14 @@ class TrainerRunner:
             entry = disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             free_lanes.put(host)                 # failed lane rejoins the rotation
+            if _storage_failure(e):
+                # Same rationale as _dispatch_with_retry: registry blips are
+                # global, so wait before re-dispatching. Sleep BEFORE taking
+                # the retry lane so no idle GPU is held through the backoff.
+                log.warning("%s failed on %s at the storage layer; backing off "
+                            "%.0fs before the retry", describe,
+                            getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
+                time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
             retry_host = free_lanes.get()        # next idle lane; different when one exists
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
@@ -2698,6 +2793,10 @@ class TrainerRunner:
                 except Exception as e:  # noqa: BLE001
                     if getattr(e, "returncode", None) == 255:
                         transport_failures += 1
+                    if _storage_failure(e):
+                        # Candidate for the burn exemption — re-verified at
+                        # heat settle (see _burn_hotkeys).
+                        self._storage_dropped[c.hotkey] = c.ref
                     log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
                 self._note_heat_progress(done, len(challengers))
         # A heat where EVERY dispatch died at the transport level (rc=255) is a
