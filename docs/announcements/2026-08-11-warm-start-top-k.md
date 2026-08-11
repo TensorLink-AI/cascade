@@ -46,6 +46,14 @@ the same news for people who already know the mechanism.
 > Amazon trained a version of Chronos-2 on *purely synthetic* data. It landed
 > within ~1 point of the full model.
 
+**4b/** (the bridge — this post is load-bearing, don't cut it)
+
+> Here's the part that matters. That tiny model's entire training corpus was 34
+> chaotic dynamical systems.
+>
+> Nobody reasons their way to that recipe. It gets found by searching. The
+> winning data prior is not something you can pick in advance.
+
 **5/**
 
 > So cascade makes that the competition.
@@ -79,8 +87,10 @@ the same news for people who already know the mechanism.
 > With one trap we deliberately avoided.
 >
 > The easy build promotes the single best winner — and then every future model
-> descends from one ancestor. One lucky result and the network is locked into a
-> dead end, with nothing left to compare against.
+> descends from one ancestor.
+>
+> If nobody can pick the winning prior in advance, betting the whole network on
+> the current leader is the one move you can't take back.
 
 **9/**
 
@@ -182,4 +192,12 @@ max.
   incumbent.
 - Research claims (10k-parameter model, purely-synthetic Chronos-2 ablation) are
   cited with links in `README.md` — worth attaching as a reply if the thread
-  gets traction.
+  gets traction. DynaMix: ~10k params, ~0.1% of Chronos's, trained on 34 chaotic
+  dynamical systems, beats Chronos zero-shot on unseen traffic and weather
+  ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
+- **The hook only works because of 4b.** The 10k-parameter result argues
+  "data beats architecture" — cascade's founding premise, not this week's news.
+  Post 4b converts it into the argument for *this* change: if the winning prior
+  is unpredictable, collapsing to one lineage is the unrecoverable move. Drop 4b
+  and the thread has two halves with nothing joining them, and the obvious reply
+  is "what does the small model have to do with promoting three checkpoints?"
