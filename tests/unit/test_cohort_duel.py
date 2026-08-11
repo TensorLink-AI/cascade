@@ -434,8 +434,11 @@ def test_receipt_publishes_k_and_every_challenger_lcb(cfg):
     # Everything needed to re-check "who cleared" is present and self-consistent.
     cleared = {h for h, lcb in v.cohort_lcbs.items() if lcb >= v.margin}
     assert cleared == {"a_hk", "b_hk"}
-    assert v.cohort_lcbs[outcome.decided_hotkey] == max(
-        v.cohort_lcbs[h] for h in cleared) or outcome.decided_hotkey in cleared
+    # The crown went to a clearer, and the headline verdict numbers ARE that
+    # challenger's published bound. (The old assertion here short-circuited on
+    # membership via `or`, leaving the numeric half decorative.)
+    assert outcome.decided_hotkey in cleared
+    assert v.lcb == pytest.approx(v.cohort_lcbs[outcome.decided_hotkey])
 
 
 def test_alpha_over_k_moves_the_quantile_and_leaves_the_margin_alone(cfg):
@@ -530,3 +533,39 @@ def test_inconclusive_leaves_the_whole_cohort_untouched():
                                 lcb=float("nan")),
                     dethrone_cp=3, defeated_hotkeys=("a_hk", "b_hk"))
     assert t.state.streaks == {"a_hk": 1, "b_hk": 1}
+
+
+def test_mid_cohort_winner_is_recorded_last_and_every_consumer_agrees(cfg):
+    """THE decided-last regression (DEC-CA-0012 convention): when the crowned
+    challenger is not the last-ranked cohort member, the producer must move its
+    records to the end — audit's replay (check_verdict / check_duel_cohort),
+    the transition check, and the public summary all resolve "whose verdict is
+    this" positionally. Before the reorder existed, this exact receipt failed
+    check_verdict and check_duel_cohort and the summary credited the wrong
+    challenger."""
+    from cascade.audit import checks as C
+    from cascade.shared.receipt import summarize_receipt
+
+    king = _scores(1.0, 0)
+    # Cohort order a, b, c — the winner (b, best geomean) sits in the MIDDLE
+    # and a non-clearer (c) is ranked last.
+    receipt, outcome = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1), ("c_hk", 3, 2)],
+                                {"a_hk": _rescale(king, 0.7),
+                                 "b_hk": _rescale(king, 0.4),
+                                 "c_hk": _rescale(king, 1.2)}, king)
+    assert outcome.decided_hotkey == "b_hk"
+    # Producer honoured the convention: b's records are last, everyone else's
+    # relative order is preserved.
+    chal_order = [es.hotkey for es in receipt.entry_scores if es.role == "challenger"]
+    assert chal_order == ["a_hk", "c_hk", "b_hk"]
+    assert outcome.duelled_hotkeys[-1] == "b_hk"
+    # Every positional consumer now attributes the round to the crowned clearer.
+    r = C.check_verdict(receipt)
+    assert r.status == C.PASS, r.detail
+    r = C.check_duel_cohort(receipt)
+    assert r.status == C.PASS, r.detail
+    r = C.check_transition(receipt)
+    assert r.status in (C.PASS, C.WARN), r.detail
+    s = summarize_receipt(receipt)
+    assert s["chal_hotkey"] == "b_hk"
+    assert s["post_round_king_hotkey"] == "b_hk"
