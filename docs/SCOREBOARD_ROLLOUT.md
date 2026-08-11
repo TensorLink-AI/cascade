@@ -50,13 +50,29 @@ Verify: `curl <endpoint>/<bucket>/status/chain.json | jq .economics`
 
 The page probes `benchmarks/round-<round_id>.json` for the newest 48 scored
 rounds (misses among the newest 6 are re-probed; older misses are treated
-as permanently absent — some rounds legitimately have no report). If the
-production pipeline already publishes these objects, nothing to do; the
-tile and section light up on their own.
+as permanently absent — some rounds legitimately have no report).
 
-If it does not (nothing in this repo publishes them automatically — the
-trainer's `bench_hook` is log-only), publish per round from the sidecar
-reports:
+**Under `[scoring] cascade_enabled` this is automatic**: the trainer's
+post-publish duel bench (`TrainerRunner.run_post_publish_bench`) writes the
+signed round doc after every manifest, so the tile and section light up on
+their own. Nothing to operate. (Don't confuse it with the older
+`trainer/bench_hook.py` telemetry sweep, which is log-only and publishes
+nothing.) If the cell stays dashed while rounds are settling, check in this
+order:
+
+1. `curl -sI <endpoint>/<bucket>/benchmarks/round-<id>.json` — a **403** means
+   the doc is there but private (pre-fix reports were written without the
+   canned ACL; backfill with `scripts/make_bench_public.sh`), a **404** means
+   the bench never ran or never published — check the trainer log.
+2. On the Vercel origin, `curl -sI https://<domain>/benchmarks/round-<id>.json`
+   — a 404 there with a 200 at the bucket means the `/benchmarks/:path*`
+   rewrite is missing from `cascade/website/vercel.json`.
+3. The cell reads the **current leader's** latest entry (challenger on a
+   dethrone round, king otherwise) — a report covering only the other side
+   leaves it dashed.
+
+Where the post-publish bench is off (or for backfilling a round it missed),
+publish per round from the sidecar reports:
 
 ```bash
 python scripts/publish_round_bench.py --round-id <id> \
