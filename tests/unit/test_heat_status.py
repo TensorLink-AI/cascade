@@ -86,6 +86,19 @@ def test_build_heat_status_mirrors_the_manifest_heat_shape():
     assert "no_screen" not in doc
 
 
+def test_build_heat_status_carries_the_rounds_warm_start_init():
+    # Once a promotion is live every entrant trains from ONE promoted init;
+    # the dashboards surface which checkpoint that was. Absent (random-init
+    # era or pre-field publisher) the key is simply not there.
+    ws = {"init_checkpoint": "metro-v1:trained:hippius:cascade/k@sha256:ab",
+          "size": "toto2-4m", "generation": 1,
+          "next_scheduled_init": "metro-v1:trained:hippius:cascade/n@sha256:cd"}
+    doc = build_heat_status(_heat(), round_id="1", epoch_start_block=14_400,
+                            as_of=AS_OF, screened=3, netuid=91, warm_start=ws)
+    assert doc["warm_start"] == ws
+    assert "warm_start" not in _doc()  # random-init round: no key, not null
+
+
 def test_build_heat_status_publishes_a_no_screen_round_with_its_reason():
     # Without this the live pointer would keep serving the PREVIOUS round's
     # standings as if they were this round's.

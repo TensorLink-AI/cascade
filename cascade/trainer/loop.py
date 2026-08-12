@@ -1454,6 +1454,7 @@ class TrainerRunner:
                 netuid=self.cfg.subnet.netuid,
                 no_screen_reason="" if heat is not None else reason,
                 finalists=n,
+                warm_start=self._stage_ctx.get("warm_start"),
             )
             store = self.manifest_store()
             publish_heat_status(store, doc)
@@ -2264,8 +2265,25 @@ class TrainerRunner:
         screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed)
         # Stage reporting context for this round; the epoch boundary is the
         # dashboards' join key (they derive it from the same grid).
+        ws_info = None
+        if warm_start is not None:
+            ws_info = {"init_checkpoint": str(warm_start[0]),
+                       "size": str(warm_start[1])}
+            gen = int(getattr(self.promotion, "generation", 0) or 0)
+            if gen:
+                ws_info["generation"] = gen
+            # The rotation's pick for the NEXT round — a schedule, not a
+            # promise: a promotion firing at the boundary replaces the member
+            # set, and the next round then trains from the new generation.
+            try:
+                nxt = self._load_warm_start(epoch_index=epoch_idx + 1)
+            except RuntimeError:
+                nxt = None
+            if nxt is not None:
+                ws_info["next_scheduled_init"] = str(nxt[0])
         self._stage_ctx = {"round_id": str(base_seed),
-                           "epoch_start_block": int(screen_block)}
+                           "epoch_start_block": int(screen_block),
+                           "warm_start": ws_info}
         self._publish_stage("heat", heat_done=0, heat_total=len(screened))
         finalists, heat = self._run_heat(screened, seeds, block,
                                          screen_block=screen_block,

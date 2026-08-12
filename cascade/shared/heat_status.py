@@ -70,6 +70,7 @@ def build_heat_status(
     netuid: int | None = None,
     no_screen_reason: str = "",
     finalists: int | None = None,
+    warm_start: dict | None = None,
 ) -> dict:
     """Assemble the public heat document (pure — storage I/O stays with the caller).
 
@@ -84,6 +85,14 @@ def build_heat_status(
 
     ``epoch_start_block`` is the consumer's join key — dashboards derive the
     current epoch start from the chain grid and match it against this field.
+
+    ``warm_start`` is the round's promoted-init descriptor
+    (``{init_checkpoint, size[, generation[, next_scheduled_init]]}``) once a
+    cascade promotion is live, ``None`` in the random-init era. Every entrant
+    this round trained from that one init, so it rides the round document, not
+    the entrant rows. ``next_scheduled_init`` is the rotation's pick for the
+    FOLLOWING round — a schedule, not a promise: a promotion firing at the
+    boundary replaces the member set, and dashboards should caption it so.
     """
     from .manifest import heat_to_json
 
@@ -109,6 +118,8 @@ def build_heat_status(
         doc.update(body)
     if screened is not None:
         doc["screened"] = int(screened)
+    if warm_start:
+        doc["warm_start"] = dict(warm_start)
     if network:
         doc["network"] = str(network)
     if netuid is not None:
