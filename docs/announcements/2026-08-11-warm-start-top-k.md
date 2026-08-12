@@ -5,12 +5,70 @@ shipped in #191. Mainnet (netuid 91) is armed: `cascade_enabled = true`,
 `cascade_top_k = 3`, `cascade_reign_rounds = 5`, `cascade_quality_epsilon = 0.05`.
 Supporting research claims are sourced from `README.md`.
 
-Primary draft is the **investor thread**. The technical thread at the bottom is
-the same news for people who already know the mechanism.
+Primary draft is **Option A** — the mechanism stated plainly. The investor
+narrative and the dev-audience thread follow as alternatives.
 
 ---
 
-## Option A — investor thread (8 posts, zero assumed knowledge)
+## Option A — the mechanism, plainly (5 posts) [PRIMARY]
+
+**1/**
+
+> How do you keep training past a single run and actually end up with a properly
+> pretrained model?
+>
+> You stop starting from scratch. cascade now warm-starts every round from a
+> checkpoint the competition already produced.
+
+**2/**
+
+> We keep a pool of the strongest checkpoints of each reign — kings and
+> challengers both — scored on public benchmarks: CRPS and MASE across
+> GIFT-Eval, BOOM and TIME.
+>
+> The best three become the next generation's starting set.
+
+**3/**
+
+> Rounds then rotate across all three. The same generator gets trained from
+> every member of the set, not just one.
+>
+> Three lineages advance in parallel, at zero extra compute — the network was
+> training these models anyway.
+
+**4/**
+
+> That gives us a rich space of training curricula and trajectories to explore,
+> instead of one path chosen early and never revisited.
+
+**5/**
+
+> It also changes what miners have to build.
+>
+> A generator tuned to one particular checkpoint wins one round in three. To win
+> consistently, your data has to work from any starting point in the set.
+>
+> The pressure is toward truly generalist generators.
+
+**6/** (optional close)
+
+> Live on Bittensor subnet 91. Every round is signed and published — training
+> records, scores, checkpoints — so the rotation and the scoring are auditable
+> rather than asserted.
+
+---
+
+## Option A2 — mechanism, single post
+
+> cascade warm-starts. We keep the strongest checkpoints of each reign — kings
+> and challengers — scored on GIFT-Eval, BOOM and TIME, and the top three become
+> the next generation's starting set.
+>
+> Rounds rotate across all three, so a generator has to work from any of them.
+
+---
+
+## Option C — investor thread (8 posts, zero assumed knowledge)
 
 No third-party model is named in this thread. Outside research is backup for
 replies, not opening material — see the notes.
@@ -136,6 +194,18 @@ max.
 
 - **k is 3** on mainnet, 2 on testnet. "Lots of trajectories" overstates it; the
   drafts say three.
+- **Not a random draw.** `TrainerPromotion.init_for_epoch` is
+  `members[epoch_index % len(members)]` — deterministic round-robin. It has to
+  be: validators verify the declared init against the live member set, so the
+  allocation can't be a private coin flip. Saying "randomly drawn" is both wrong
+  and weaker — random lets a checkpoint-tuned generator dodge the other members,
+  rotation guarantees it faces all three. (Allocation is trainer policy, so it
+  can evolve — but say what it does today.)
+- **Not GIFT-Eval alone.** `cascade_score` is the geomean of six numbers: CRPS
+  and MASE across GIFT-Eval, BOOM and TIME. Naming one benchmark undersells the
+  screen and misstates it to anyone reading `trainer/promotion.py`.
+- "One round in three" (Option A, post 5) follows from round-robin over k=3 and
+  is exact only while k=3. If mainnet `cascade_top_k` changes, that line changes.
 - The lineages are parallel across **rounds**, not simultaneous within a round.
   Every round still pins one `warm_start_ckpt`. Don't let an edit blur this — it
   is the claim a technical reader will check.
