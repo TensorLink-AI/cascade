@@ -235,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             state_path=_Path(args.work_root) / "trainer_promotion.json",
             pointer_path=warm_start_path,
             round_cfg=cfg.round,
+            error_vectors_path=_Path(args.work_root) / "promotion_error_vectors.json",
         )
         log.info("cascade promotion engine enabled: generation=%d members=%d "
                  "(pointer file %s, k_max=%d, epsilon=%.3f)",

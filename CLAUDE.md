@@ -109,6 +109,14 @@ in-context.
   different generators. NOT built yet — Stage 1 is next.
   (`decisions/DEC-CA-0014-scratch-control-staged.md`)
 
+- **DEC-CA-0015** — Promotion members selected by MEASURED error decorrelation
+  (per-window residuals, log-centered per window) within the unchanged quality
+  frontier; structural spacing is the vectorless fallback. `cascade_top_k`
+  STAYS 3 — it is a consensus constant and netuid 91 has external validators;
+  k=5 needs release-then-activate. Correlation source is the private-pool
+  battery until raw GIFT rows are persisted beside bench reports.
+  (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.

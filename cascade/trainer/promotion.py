@@ -69,29 +69,77 @@ class Candidate:
     score: float
 
 
+def error_correlations(
+    vectors: dict[str, list[float]],
+) -> dict[tuple[str, str], float]:
+    """Pairwise Pearson correlation of per-window error RESIDUALS.
+
+    ``vectors`` maps checkpoint_id → per-window error scores (same battery,
+    same window order, all positive). Raw error vectors correlate near 1.0
+    for ANY two competent models because shared window difficulty dominates
+    (the same reason DEC-CA-0006 rejected UCB ranking), so each vector is
+    log-transformed and centered PER WINDOW across the pool first — what is
+    correlated is each checkpoint's relative strengths and weaknesses, the
+    trajectory-diversity signal promotion wants. Pairs are keyed both ways;
+    ids with mismatched lengths or degenerate residuals are simply absent.
+    """
+    import math
+
+    ids = [i for i, v in vectors.items() if v]
+    if len(ids) < 2:
+        return {}
+    n = min(len(vectors[i]) for i in ids)
+    logs = {i: [math.log(max(float(x), 1e-12)) for x in vectors[i][:n]] for i in ids}
+    col_mean = [sum(logs[i][w] for i in ids) / len(ids) for w in range(n)]
+    resid = {i: [logs[i][w] - col_mean[w] for w in range(n)] for i in ids}
+    out: dict[tuple[str, str], float] = {}
+    for a_pos, a in enumerate(ids):
+        for b in ids[a_pos + 1:]:
+            ra, rb = resid[a], resid[b]
+            ma, mb = sum(ra) / n, sum(rb) / n
+            da, db = [x - ma for x in ra], [x - mb for x in rb]
+            va = math.sqrt(sum(x * x for x in da))
+            vb = math.sqrt(sum(x * x for x in db))
+            if va <= 0.0 or vb <= 0.0:
+                continue
+            r = sum(x * y for x, y in zip(da, db)) / (va * vb)
+            out[(a, b)] = out[(b, a)] = r
+    return out
+
+
 def select_members(
     candidates: list[Candidate],
     *,
     k_max: int,
     quality_epsilon: float,
     min_round_spacing: int = 1,
+    error_vectors: dict[str, list[float]] | None = None,
 ) -> list[Candidate]:
-    """The v1 selection policy: quality gate, then structural diversity.
+    """Selection policy: quality gate, then error-decorrelation diversity.
 
     Eligible = candidates whose score sits within ``(1 + quality_epsilon)`` of
     the pool's best (lower is better) — diversity is only ever arbitrated
     WITHIN the near-frontier set, never against it. The geomean-best candidate
     anchors the set (top-k strictly contains top-1); each remaining slot
-    greedily picks the eligible candidate that (a) satisfies
-    ``min_round_spacing`` from every already-selected candidate of the SAME
-    generator — same-generator reign checkpoints are same-init same-step
-    siblings, so adjacent rounds are near-duplicates, while a different
-    generator's checkpoint from the very same round is genuinely different
-    data — preferring (b) a generator hotkey not yet in the set, then (c)
-    maximal minimum round distance, then (d) score, with ``checkpoint_id`` as
-    the final deterministic tie-break. Returns fewer than ``k_max`` when the
-    eligible pool can't fill the slots — the set is never padded with worse or
-    adjacent checkpoints.
+    greedily picks the eligible candidate that satisfies ``min_round_spacing``
+    from every already-selected candidate of the SAME generator (same-generator
+    adjacent reign checkpoints are same-init same-step near-duplicates).
+
+    Among spaced candidates the slot goes to, in order:
+
+    * When ``error_vectors`` covers the candidate AND at least one chosen
+      member: the candidate whose **maximum error correlation** against the
+      chosen set is lowest (see :func:`error_correlations`) — trajectory
+      diversity measured on errors, not inferred from structure. Ties break
+      by score then id.
+    * Otherwise (no vectors supplied, or this candidate/chosen pair not
+      covered): the v1 structural policy — prefer a generator hotkey not yet
+      in the set, then maximal minimum round distance, then score, then
+      ``checkpoint_id``. Vector-covered candidates always outrank vectorless
+      ones — measured diversity beats guessed diversity.
+
+    Returns fewer than ``k_max`` when the eligible pool can't fill the slots —
+    the set is never padded with worse or adjacent checkpoints.
     """
     if not candidates or k_max < 1:
         return []
@@ -102,6 +150,9 @@ def select_members(
         key=lambda c: (c.score, c.checkpoint_id),
     )
     chosen = [eligible[0]]
+    corr = error_correlations(
+        {c.checkpoint_id: (error_vectors or {}).get(c.checkpoint_id) or []
+         for c in eligible})
 
     def _spaced(c: Candidate) -> bool:
         same = [s for s in chosen if s.hotkey == c.hotkey]
@@ -113,10 +164,16 @@ def select_members(
         pool = [c for c in eligible if c.checkpoint_id not in taken and _spaced(c)]
         if not pool:
             break
+
         def _rank(c: Candidate):
+            pairs = [corr[(c.checkpoint_id, s.checkpoint_id)] for s in chosen
+                     if (c.checkpoint_id, s.checkpoint_id) in corr]
+            if pairs:  # measured trajectory diversity
+                return (0, max(pairs), c.score, c.checkpoint_id)
             new_generator = all(c.hotkey != s.hotkey for s in chosen)
             spacing = min(abs(c.epoch_index - s.epoch_index) for s in chosen)
-            return (0 if new_generator else 1, -spacing, c.score, c.checkpoint_id)
+            return (1, 0.0 if new_generator else 1.0, -spacing, c.score)
+
         chosen.append(min(pool, key=_rank))
     return chosen
 
@@ -177,6 +234,10 @@ class TrainerPromotion:
     state_path: Path | None = None
     pointer_path: Path | None = None
     round_cfg: object | None = None
+    # Optional {checkpoint_id: [per-window error scores]} JSON cache feeding
+    # select_members' error-decorrelation policy. Best-effort: absent/stale
+    # entries just fall back to structural diversity for those candidates.
+    error_vectors_path: Path | None = None
 
     generation: int = 0
     members: tuple[PromotedMember, ...] = ()
@@ -203,6 +264,7 @@ class TrainerPromotion:
         pointer_path: Path,
         round_cfg: object | None = None,
         min_round_spacing: int = 1,
+        error_vectors_path: Path | None = None,
     ) -> TrainerPromotion:
         """Restore the engine from ``state_path`` (fresh when absent/corrupt),
         then grandfather a pre-DEC-CA-0013 pointer file — the single winner the
@@ -212,6 +274,7 @@ class TrainerPromotion:
             reign_threshold=reign_threshold, k_max=k_max,
             quality_epsilon=quality_epsilon, min_round_spacing=min_round_spacing,
             state_path=state_path, pointer_path=pointer_path, round_cfg=round_cfg,
+            error_vectors_path=error_vectors_path,
         )
         if state_path.is_file():
             try:
@@ -392,6 +455,7 @@ class TrainerPromotion:
                 list(self.candidates), k_max=self.k_max,
                 quality_epsilon=self.quality_epsilon,
                 min_round_spacing=self.min_round_spacing,
+                error_vectors=self._load_error_vectors(),
             )
             self.generation += 1
             self.members = tuple(
@@ -419,6 +483,26 @@ class TrainerPromotion:
                 (self.king_hotkey or "?")[:12],
             )
             return record
+
+    def _load_error_vectors(self) -> dict[str, list[float]] | None:
+        """The error-vector cache for select_members, or ``None``. Best-effort:
+        selection must fire on a ripe clock whether or not vectors exist —
+        a missing/corrupt cache just means structural-diversity fallback."""
+        if self.error_vectors_path is None:
+            return None
+        try:
+            obj = json.loads(self.error_vectors_path.read_text(encoding="utf-8"))
+            vectors = {str(k): [float(x) for x in v]
+                       for k, v in obj.items() if isinstance(v, list) and v}
+            log.info("trainer promotion: error-vector cache %s covers %d checkpoint(s)",
+                     self.error_vectors_path, len(vectors))
+            return vectors or None
+        except FileNotFoundError:
+            return None
+        except Exception as e:  # noqa: BLE001 — never let the cache block a firing
+            log.warning("trainer promotion: error-vector cache %s unreadable (%s); "
+                        "structural fallback", self.error_vectors_path, e)
+            return None
 
     def unpublished_record(self) -> PromotionRecord | None:
         """The fired-but-unpublished promotion record, or ``None``. The caller

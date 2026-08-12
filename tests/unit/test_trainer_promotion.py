@@ -483,3 +483,99 @@ def test_runner_backfill_seeds_clock_and_candidates(cfg, tmp_path, monkeypatch):
     docs[RECEIPT_INDEX_KEY] = json.dumps({"schema": 2, "rounds": []})
     runner._seed_promotion_reign()
     assert eng.reign_start_block == 2 * DAY
+
+
+# ── error-decorrelation selection (trajectory diversity) ─────────────────────
+
+
+def _vec(base, bumps=()):
+    """A 12-window error vector: `base` everywhere, with (idx, value) bumps."""
+    v = [base] * 12
+    for i, x in bumps:
+        v[i] = x
+    return v
+
+
+def test_error_correlations_centers_out_shared_difficulty():
+    from cascade.trainer.promotion import error_correlations
+
+    # a and b are clones (identical residual shape); c inverts their bumps.
+    vecs = {
+        "a": _vec(0.2, [(0, 0.4), (1, 0.4)]),
+        "b": _vec(0.21, [(0, 0.42), (1, 0.42)]),
+        "c": _vec(0.2, [(6, 0.4), (7, 0.4)]),
+    }
+    corr = error_correlations(vecs)
+    assert corr[("a", "b")] > 0.9          # same weaknesses ⇒ high correlation
+    assert corr[("a", "c")] < 0.0          # opposite weaknesses ⇒ decorrelated
+    assert corr[("a", "b")] == corr[("b", "a")]
+
+
+def test_selection_prefers_decorrelated_over_near_duplicate():
+    # 'dup' is a hair better than 'div' by score, but its errors are a clone of
+    # the anchor's; 'div' fails where the anchor succeeds. Correlation policy
+    # must take 'div' — that is the whole point of trajectory diversity.
+    anchor = _cand("anchor", 0.90, hotkey="hkA", epoch=1)
+    dup = _cand("dup", 0.91, hotkey="hkB", epoch=3)
+    div = _cand("div", 0.92, hotkey="hkC", epoch=5)
+    vecs = {
+        "anchor": _vec(0.2, [(0, 0.5), (1, 0.5)]),
+        "dup": _vec(0.2, [(0, 0.52), (1, 0.49)]),
+        "div": _vec(0.2, [(8, 0.5), (9, 0.5)]),
+    }
+    got = select_members([anchor, dup, div], k_max=2, quality_epsilon=0.05,
+                         error_vectors=vecs)
+    assert [c.checkpoint_id for c in got] == ["anchor", "div"]
+    # Without vectors the same field falls back to structural policy (all
+    # different hotkeys, spacing ranks 'div' furthest → also div here, but via
+    # the fallback path; score-order tie-break proves the branch works).
+    got_v1 = select_members([anchor, dup, div], k_max=2, quality_epsilon=0.05)
+    assert got_v1[0].checkpoint_id == "anchor" and len(got_v1) == 2
+
+
+def test_selection_vectored_candidates_outrank_vectorless():
+    anchor = _cand("anchor", 0.90, hotkey="hkA", epoch=1)
+    seen = _cand("seen", 0.93, hotkey="hkB", epoch=2)      # has a vector
+    blind = _cand("blind", 0.91, hotkey="hkC", epoch=9)    # no vector
+    vecs = {
+        "anchor": _vec(0.2, [(0, 0.5)]),
+        "seen": _vec(0.2, [(5, 0.5)]),
+    }
+    got = select_members([anchor, seen, blind], k_max=2, quality_epsilon=0.05,
+                         error_vectors=vecs)
+    assert [c.checkpoint_id for c in got] == ["anchor", "seen"]
+
+
+def test_selection_quality_gate_still_rules_with_vectors():
+    # A decorrelated candidate OUTSIDE the epsilon frontier must never enter.
+    anchor = _cand("anchor", 0.90, hotkey="hkA", epoch=1)
+    far = _cand("far", 1.20, hotkey="hkB", epoch=5)
+    vecs = {"anchor": _vec(0.2, [(0, 0.5)]), "far": _vec(0.2, [(6, 0.5)])}
+    got = select_members([anchor, far], k_max=2, quality_epsilon=0.05,
+                         error_vectors=vecs)
+    assert [c.checkpoint_id for c in got] == ["anchor"]
+
+
+def test_fire_reads_error_vector_cache(tmp_path):
+    import json as _json
+
+    eng = TrainerPromotion(
+        reign_threshold=1.0, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "state.json", pointer_path=tmp_path / "ptr.json",
+        error_vectors_path=tmp_path / "vec.json",
+    )
+    eng.king_hotkey = "king"
+    eng.reign_start_block = 0
+    eng.candidates = (
+        _cand("anchor", 0.90, hotkey="hkA", epoch=1),
+        _cand("dup", 0.91, hotkey="hkB", epoch=3),
+        _cand("div", 0.92, hotkey="hkC", epoch=5),
+    )
+    (tmp_path / "vec.json").write_text(_json.dumps({
+        "anchor": _vec(0.2, [(0, 0.5), (1, 0.5)]),
+        "dup": _vec(0.2, [(0, 0.52), (1, 0.49)]),
+        "div": _vec(0.2, [(8, 0.5), (9, 0.5)]),
+    }))
+    rec = eng.maybe_promote(epoch_block=7200 * 400, round_id="r-test")
+    assert rec is not None
+    assert [m.checkpoint_id for m in rec.members] == ["anchor", "div"]
