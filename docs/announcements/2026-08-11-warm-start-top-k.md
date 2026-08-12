@@ -10,128 +10,90 @@ the same news for people who already know the mechanism.
 
 ---
 
-## Option A — investor thread (9 posts, zero assumed knowledge)
+## Option A — investor thread (8 posts, zero assumed knowledge)
+
+No third-party model is named in this thread. Outside research is backup for
+replies, not opening material — see the notes.
 
 **1/**
 
-> A forecasting model with about 10,000 parameters recently beat one roughly a
-> thousand times its size.
+> For months we've run an open competition to find the best training data for
+> forecasting AI.
 >
-> Not a better architecture. Better training data.
+> It had one flaw. Every round started from zero. Winners got paid, then the
+> next round began from a blank model. Nothing accumulated.
 >
-> That result is the whole thesis behind what we're building. This week it got
-> considerably more powerful.
+> That changed this week.
 
 **2/**
 
-> Start from the beginning.
+> Why this is worth caring about.
 >
 > Every company forecasts something: demand, load, prices, staffing, risk.
-> Almost all of it still runs on bespoke models, built one at a time, by hand,
-> by people who are expensive.
+> Nearly all of it still runs on models built one at a time, by hand, by
+> expensive people.
+>
+> The prize is one model that forecasts anything out of the box.
 
 **3/**
 
-> The prize is one model that forecasts anything out of the box — point it at a
-> series it has never seen and get a usable answer.
+> Our bet is that the winner won't be decided by architecture. It'll be decided
+> by what the model is trained on.
 >
-> The same shift LLMs brought to text, aimed at the numbers businesses actually
-> run on.
+> So we freeze the model — identical every time — and compete the data. Anyone
+> can submit a generator. We train that same model on each one and score the
+> forecasts.
 
 **4/**
 
-> The field has quietly converged on how you get there, and it isn't size or
-> architecture. It's the synthetic data you train on.
+> That gives a clean read on data quality, and it's been running and paying out.
 >
-> Amazon trained a version of Chronos-2 on *purely synthetic* data. It landed
-> within ~1 point of the full model.
-
-**4b/** (the bridge — this post is load-bearing, don't cut it)
-
-> Here's the part that matters. That tiny model's entire training corpus was 34
-> chaotic dynamical systems.
->
-> Nobody reasons their way to that recipe. It gets found by searching. The
-> winning data prior is not something you can pick in advance.
+> But with no memory, the competition could only measure. It couldn't build.
+> Round 100 started from the same blank model as round 1.
 
 **5/**
 
-> So cascade makes that the competition.
+> Now winners carry forward. The best models from each stretch become the
+> starting point for the next round of competition.
 >
-> We freeze the model. Identical architecture, identical training, every time.
-> Anyone can submit a data generator, and we train that same model on each one.
->
-> Only the data varies. A controlled experiment, with money on it.
+> Every generation of data begins from everything the last one learned. The
+> tournament became a compounding asset.
 
 **6/**
 
-> Until now there was a ceiling on it.
+> One trap to avoid: promote a single winner, and every future model descends
+> from one ancestor.
 >
-> Every round started from a blank model. Winners won, got paid, and the next
-> round began again from zero.
->
-> A tournament with no memory. The competition was real, but nothing
-> accumulated.
+> Nobody can tell in advance which direction is the right one. Betting the whole
+> network on the current leader is the move you can't reverse.
 
 **7/**
 
-> That's what changed this week.
->
-> Winning models now become the starting point for the next round. Each
-> generation of data begins from everything the last one learned.
->
-> The tournament became a compounding asset.
-
-**8/**
-
-> With one trap we deliberately avoided.
->
-> The easy build promotes the single best winner — and then every future model
-> descends from one ancestor.
->
-> If nobody can pick the winning prior in advance, betting the whole network on
-> the current leader is the one move you can't take back.
-
-**9/**
-
 > So we promote three, not one.
 >
-> Three lineages advance in parallel and later generations select across all of
-> them. It costs zero extra compute; the network was training these models
+> Three lineages advance in parallel, and later generations select across all of
+> them. It costs zero extra compute — the network was training these models
 > anyway.
 >
 > A portfolio, not a single bet.
 
-**10/** (close — optional, drop if the thread runs long)
+**8/**
 
 > Live now on Bittensor subnet 91. Every round is signed and published —
 > training records, scores, checkpoints — so the whole history is auditable
 > rather than asserted.
->
-> Open competition on the one input that decides who wins.
 
 ---
 
 ## Option B — investor single post
 
-> A 10,000-parameter forecasting model recently beat one ~1,000x its size. The
-> difference was the training data.
+> We've run an open competition for AI training data for months. It had one
+> flaw: every round started from zero. Nothing accumulated.
 >
-> cascade freezes the model and competes the data. Winners now carry forward —
-> three lineages in parallel, so progress compounds instead of restarting each
-> round.
-
----
-
-## Option C — investor single post, harder edge
-
-> We ran an open competition for AI training data for months. It had one flaw:
-> every round started from zero. Nothing accumulated.
+> Fixed this week. Winners now seed the next generation — three lineages in
+> parallel, no extra compute.
 >
-> That's fixed. Winners now seed the next generation — three parallel lineages,
-> no extra compute.
->
-> A tournament just became a compounding asset.
+> A tournament became a compounding asset.
 
 ---
 
@@ -190,14 +152,19 @@ max.
   every promoted member within 5% of the best score of the reign, and challenger
   models are in the candidate pool, so the lineages don't all descend from the
   incumbent.
-- Research claims (10k-parameter model, purely-synthetic Chronos-2 ablation) are
-  cited with links in `README.md` — worth attaching as a reply if the thread
-  gets traction. DynaMix: ~10k params, ~0.1% of Chronos's, trained on 34 chaotic
-  dynamical systems, beats Chronos zero-shot on unseen traffic and weather
-  ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
-- **The hook only works because of 4b.** The 10k-parameter result argues
-  "data beats architecture" — cascade's founding premise, not this week's news.
-  Post 4b converts it into the argument for *this* change: if the winning prior
-  is unpredictable, collapsing to one lineage is the unrecoverable move. Drop 4b
-  and the thread has two halves with nothing joining them, and the obvious reply
-  is "what does the small model have to do with promoting three checkpoints?"
+- **Outside research stays out of the thread.** Earlier drafts opened on DynaMix
+  (~10k params beating a model ~1,000x its size). Cut deliberately: it spends the
+  opening on someone else's model, argues a premise nobody has challenged, and
+  hands a skeptic the question "if a 10k-parameter model already wins, why do you
+  need a GPU fleet?" Post 3 states the data-over-architecture bet as ours and
+  moves on.
+- Keep that research as **reply ammunition** for the two challenges it actually
+  answers, both cited with links in `README.md`:
+  - *"Why believe data decides it?"* → Chronos-2's purely-synthetic ablation
+    lands within ~1 point of the full model; Toto 2.0 is 57.5% synthetic with
+    zero public series and tops GIFT-Eval.
+  - *"Why keep three lineages instead of backing the leader?"* → DynaMix trained
+    on nothing but 34 chaotic dynamical systems and beats Chronos zero-shot on
+    unseen traffic and weather ([arXiv 2505.13192](https://arxiv.org/abs/2505.13192)).
+    No one reasons their way to that recipe, which is the case for not
+    collapsing the search.
