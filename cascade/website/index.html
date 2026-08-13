@@ -1050,6 +1050,7 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
   <div>
     <div class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></div>
     <div id="warm-panel"></div>
+    <div id="warm-history"></div>
   </div>
 
   <div>
@@ -1109,7 +1110,8 @@ var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
-    _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading";
+    _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
+    _wsHist = null;
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1559,6 +1561,51 @@ function renderWarm(){
   panel.innerHTML=html;
   if(when) when.textContent = ws.size ? esc(ws.size) : "";
 }
+// Warm-start history: the last 10 rounds and the checkpoint each trained from,
+// so miners can see the trend (random init → warm-start → rotation). The per-round
+// init lives only in each round's signed manifest, not the index, so fetch each
+// round's receipt (receipt_key) once and cache in _wsHist. Empty warm_start_ckpt
+// ⇒ that round trained from random init.
+function loadWarmHistory(){
+  var rs=_index&&_index.rounds; if(!rs||!rs.length) return;
+  if(_wsHist===null) _wsHist={};
+  var last=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-10);
+  last.forEach(function(r){
+    var id=String(r.round_id);
+    if(_wsHist[id]) return;                                  // loaded or in-flight
+    if(!r.receipt_key){ _wsHist[id]={done:true, ckpt:"", at:r.published_at}; return; }
+    _wsHist[id]={done:false, at:r.published_at};             // mark in-flight
+    fetchJSON(r.receipt_key).then(function(d){
+      var m=(d&&d.manifest)||{};
+      _wsHist[id]={done:true, ckpt:m.warm_start_ckpt||"", at:r.published_at};
+      renderWarmHistory();
+    }).catch(function(){
+      _wsHist[id]={done:true, ckpt:"", at:r.published_at, err:true};
+      renderWarmHistory();
+    });
+  });
+  renderWarmHistory();
+}
+function renderWarmHistory(){
+  var el=document.getElementById("warm-history"); if(!el) return;
+  var rs=_index&&_index.rounds;
+  if(!rs||!rs.length||_wsHist===null){ el.innerHTML=""; return; }
+  function wsLabel(ref){ if(!ref) return null; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
+  var last=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-10).reverse();
+  var rows=last.map(function(r){
+    var id=String(r.round_id), h=_wsHist[id]||{}, cell;
+    if(!h.done) cell='<span class="muted">&hellip;</span>';
+    else if(h.err) cell='<span class="muted">unavailable</span>';
+    else if(h.ckpt) cell='<span title="'+esc(h.ckpt)+'">'+esc(wsLabel(h.ckpt))+'</span>';
+    else cell='<span class="muted">random init</span>';
+    return '<tr><td title="'+esc(id)+'">'+esc(shortRoundId(id))+'</td>'+
+      '<td>'+cell+'</td>'+
+      '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
+  }).join("");
+  el.innerHTML='<div class="section-label" style="margin-top:12px"><span>Recent rounds &mdash; warm-start init</span></div>'+
+    '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
+    '<tbody>'+rows+'</tbody></table></div>';
+}
 function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
@@ -1620,7 +1667,7 @@ _dataState="loading"; renderAll();
 // (same trail validator bootstrap trusts); shared stays as a fallback only.
 var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
