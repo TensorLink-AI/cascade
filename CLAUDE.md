@@ -117,9 +117,40 @@ in-context.
   battery until raw GIFT rows are persisted beside bench reports.
   (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
 
+## Proposed (design pass 2026-08-13 — miner submission surface; not yet owner-accepted)
+
+- **DEC-CA-0016** (proposed) — Carrier: `generate()` yields array OR named-field
+  record (`values` only accepted); canonical digest byte-identical for
+  values-only; reserved names hard-rejected; bytes budget; interface_version.
+  (`decisions/DEC-CA-0016-series-record-carrier.md`)
+- **DEC-CA-0017** (proposed) — `(start, freq)` reserved, consumed by nothing:
+  the pinned arch is calendar-free; payload waits on a measured ablation.
+  (`decisions/DEC-CA-0017-time-anchor-reserved-not-consumed.md`)
+- **DEC-CA-0018** (proposed) — Length cap: long-range priors are expressible
+  today via internal crops; `context_length` growth parks on the 22M seam.
+  (`decisions/DEC-CA-0018-length-cap-long-context.md`)
+- **DEC-CA-0019** (proposed) — Missingness: parallel `mask` field, filler
+  pinned 0.0, NaN rejected; eval-gated on a masked-history pool slice.
+  (`decisions/DEC-CA-0019-missingness-mask-field.md`)
+- **DEC-CA-0020** (proposed) — Panels ARE variate groups for this arch;
+  `group_id` reserved with no possible consumer under the pin.
+  (`decisions/DEC-CA-0020-panels-are-variates.md`)
+- **DEC-CA-0021** (proposed) — Corpus drift rides the time anchor and is
+  imperceptible to the fixed model; yield order is the real (existing) lever.
+  (`decisions/DEC-CA-0021-drift-rides-the-time-anchor.md`)
+- **DEC-CA-0022** (proposed) — Multivariate arms eval-first (variate-layer
+  regime mismatch makes MV self-sabotage under the univariate scorer);
+  per-series C bucketed; full-freight channel pricing; roles as record field;
+  channel-drop trap fixed before any cap raise.
+  (`decisions/DEC-CA-0022-multivariate-roles-covariates.md`)
+- Staged rollout + budget denomination + no-weights ceiling:
+  `docs/SUBMISSION_SURFACE_ROADMAP.md`.
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
-pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
-the revisit condition in the node's `revisit_when:` key.
+pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
+DEC-CA-0016..0022 are claimed by the 2026-08-13 submission-surface design
+pass, status proposed). Put the revisit condition in the node's
+`revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 
