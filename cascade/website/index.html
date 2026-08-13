@@ -1586,6 +1586,23 @@ function loadWarmHistory(){
   });
   renderWarmHistory();
 }
+// Derive the rotation cycle order from recent warm-start rounds: walk newest→
+// oldest collecting distinct checkpoints until one repeats (a full cycle) or a
+// random-init round ends the warm-start era. Returned oldest→newest = the order
+// rounds cycle through. No roster fetch (promotions/*.json isn't public-read).
+function rotationSeq(){
+  var rs=_index&&_index.rounds; if(!rs||!_wsHist) return null;
+  var ordered=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); });
+  var seq=[];
+  for(var i=ordered.length-1;i>=0;i--){
+    var h=_wsHist[String(ordered[i].round_id)];
+    if(!h||!h.done) continue;
+    if(!h.ckpt) break;                    // random-init round → before warm-start era
+    if(seq.indexOf(h.ckpt)!==-1) break;   // one full cycle collected
+    seq.push(h.ckpt);
+  }
+  return seq.length>=2 ? seq.reverse() : null;
+}
 function renderWarmHistory(){
   var el=document.getElementById("warm-history"); if(!el) return;
   var rs=_index&&_index.rounds;
@@ -1602,7 +1619,14 @@ function renderWarmHistory(){
       '<td>'+cell+'</td>'+
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
-  el.innerHTML='<div class="section-label" style="margin-top:12px"><span>Recent rounds &mdash; warm-start init</span></div>'+
+  var seq=rotationSeq(), seqHtml="";
+  if(seq){
+    seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation sequence (cycles each round): '+
+      seq.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
+      ' &rarr; &hellip;</div>';
+  }
+  el.innerHTML=seqHtml+
+    '<div class="section-label" style="margin-top:12px"><span>Recent rounds &mdash; warm-start init</span></div>'+
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
