@@ -39,6 +39,41 @@ def test_build_bench_remote_command():
     assert "--max-series 8" in capped and "--suites gift-eval" in capped
 
 
+def test_data_guard_tests_per_suite_markers_not_the_bare_dir():
+    # `test -d` turned ONE interrupted download into a permanent per-pod TIME
+    # skip (the r13–r15 bench-report drought): the dir existed, so the
+    # marker-aware resumable download never re-ran. The guard now demands every
+    # requested suite's completion marker, and the download runs under
+    # `timeout` so its wedge mode (2026-08-12: thread-pool deadlock, no open
+    # sockets) fails the sweep instead of eating the bench window.
+    cmd, _ = build_bench_remote_command(HOST, "42", "toto2-4m", BenchPlan())
+    assert "test -d" not in cmd
+    for suite in ("gift-eval", "boom", "time"):
+        assert f"/root/bench_data/{suite}/_cascade_revision.json" in cmd
+    assert "timeout 2700" in cmd
+    one, _ = build_bench_remote_command(
+        HOST, "42", "toto2-4m", BenchPlan(suites="gift-eval"))
+    assert "boom/_cascade_revision.json" not in one
+
+
+def test_uv_runs_carry_the_time_extra():
+    # timebench is an OPTIONAL extra and `uv run` syncs the env EXACTLY, so
+    # every invocation must ask for it — a single bare run uninstalls it again
+    # (its absence was the TIME-skip root cause, 2026-08-05 bootstrap rework).
+    cmd, _ = build_bench_remote_command(HOST, "42", "toto2-4m", BenchPlan())
+    runs = [seg for seg in cmd.split("&&") if " run " in seg]
+    assert runs and all("--extra time" in seg for seg in runs)
+
+
+def test_hf_token_arms_stdin_sourcing_but_never_enters_the_command():
+    plain, _ = build_bench_remote_command(HOST, "42", "toto2-4m", BenchPlan())
+    assert "/dev/stdin" not in plain
+    armed, _ = build_bench_remote_command(
+        HOST, "42", "toto2-4m", BenchPlan(), hf_token="hf_secret123")
+    assert "set -a && . /dev/stdin && set +a" in armed
+    assert "hf_secret123" not in armed  # credential travels on stdin only
+
+
 def test_run_post_round_benchmark_saves_and_returns_report(tmp_path: Path):
     report = {"checkpoint": "x", "suites": [
         {"suite": "gift-eval", "status": "ok", "metrics": {"crps": 0.5}, "n_series": 3}]}

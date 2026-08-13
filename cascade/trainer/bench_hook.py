@@ -35,6 +35,9 @@ from pathlib import Path
 from ..eval.benchmarks import format_report
 from .remote import PREEMPT_BENCHMARKS, RemoteHost, build_ssh_argv, run_ssh
 
+# a completed suite download's marker file (cascade_benchmark.datasets._MARKER)
+DATA_MARKER = "_cascade_revision.json"
+
 log = logging.getLogger("cascade.trainer.bench")
 
 
@@ -54,6 +57,9 @@ class BenchPlan:
     # installer path — override for a bootstrap-provisioned fleet.
     uv_bin: str = "/bin/uv"
     timeout_seconds: int = 2 * 3600
+    # fence for the dataset download's wedge mode (2026-08-12: unauthenticated
+    # HF pulls deadlocked twice); authenticated pulls finish in ~3 min.
+    download_timeout_seconds: int = 2700
     # Decouple telemetry cadence from round cadence: skip launching when the
     # last launch was under this many seconds ago (0 = benchmark every round).
     # The right setting when rounds are tighter than the sweep: pick an
@@ -77,9 +83,16 @@ def king_paths(host: RemoteHost, round_id: str, arch_preset: str) -> tuple[str, 
 
 
 def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str,
-                               plan: BenchPlan, *, role: str = "king") -> tuple[str, str]:
+                               plan: BenchPlan, *, role: str = "king",
+                               hf_token: str | None = None) -> tuple[str, str]:
     """The remote shell string that benchmarks the round's final ``role``
-    checkpoint, plus the report path it writes. Pure — safe to unit test."""
+    checkpoint, plus the report path it writes. Pure — safe to unit test.
+
+    ``hf_token`` arms the stdin-env sourcing prefix (the credential itself
+    NEVER enters the command string — it travels on stdin exactly like the
+    worker dispatch's forwarded creds, see ``remote.build_remote_command``):
+    unauthenticated HF dataset pulls are rate-limited and wedged two fresh-pod
+    downloads on 2026-08-12."""
     ckpt, report = role_paths(host, round_id, arch_preset, role)
     argv = [
         "cascade-benchmark", ckpt, report,
@@ -101,16 +114,34 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     # rather than benching against an empty data dir. Same-pod launches are
     # serialized by the caller (grouped by pod address), so the guard never
     # races itself.
+    #
+    # The guard tests each requested suite's COMPLETION marker, not the bare
+    # data dir: `test -d` turned one interrupted download into a permanent
+    # per-pod TIME skip (the dir existed, the download never re-ran — the
+    # r13–r15 bench drought). The download is marker-aware and resumable, so
+    # re-running over partial data is cheap; `timeout` fences the wedge mode
+    # (thread-pool deadlock with no sockets, seen twice on 2026-08-12) so a
+    # hung download fails this sweep instead of eating the bench window.
+    suites = [s.strip() for s in str(plan.suites).split(",") if s.strip()]
+    markers = " -a ".join(
+        f"-f {shlex.quote(f'{plan.data_dir}/{s}/{DATA_MARKER}')}" for s in suites)
     data_guard = (
-        f"{{ test -d {shlex.quote(plan.data_dir)} || "
-        f"{plan.uv_bin} run --project {project} cascade-benchmark-download "
+        f"{{ test {markers} || "
+        f"timeout {int(plan.download_timeout_seconds)} "
+        f"{plan.uv_bin} run --extra time --project {project} cascade-benchmark-download "
         f"--data-dir {shlex.quote(plan.data_dir)}; }} && "
     )
+    # --extra time on EVERY uv run: timebench is an optional extra, and uv run
+    # syncs the env exactly — a run without the flag would UNINSTALL it again
+    # (its absence on the pods was the root cause of the TIME-skip era,
+    # 2026-08-05 bootstrap rework).
+    env_source = "set -a && . /dev/stdin && set +a && " if hf_token else ""
     cmd = (
         PREEMPT_BENCHMARKS
+        + env_source
         + data_guard
         + prefix
-        + f"{plan.uv_bin} run --project {project} "
+        + f"{plan.uv_bin} run --extra time --project {project} "
         + quoted
     )
     return cmd, report
@@ -126,16 +157,22 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
     Returns ``None`` on any failure — this path must never raise into a round.
     """
     try:
+        import os
+
+        token = os.environ.get("HF_TOKEN") or None
         remote_cmd, report_path = build_bench_remote_command(
-            host, round_id, arch_preset, plan, role=role)
+            host, round_id, arch_preset, plan, role=role, hf_token=token)
         ssh = build_ssh_argv(host, remote_cmd)
-        run = runner or run_ssh
-        proc = run(ssh, plan.timeout_seconds)
+        if runner is not None:  # test seam: doubles take (argv, timeout) only
+            proc = runner(ssh, plan.timeout_seconds)
+        else:
+            payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
+            proc = run_ssh(ssh, plan.timeout_seconds, stdin_text=payload)
         if proc.returncode != 0:
             log.warning("post-round benchmark failed on %s (exit %s): %s",
                         host.name, proc.returncode, (proc.stderr or "")[-400:])
             return None
-        cat = run(build_ssh_argv(host, f"cat {shlex.quote(report_path)}"), 120)
+        cat = (runner or run_ssh)(build_ssh_argv(host, f"cat {shlex.quote(report_path)}"), 120)
         if cat.returncode != 0:
             log.warning("post-round benchmark report missing on %s: %s",
                         host.name, (cat.stderr or "")[-200:])

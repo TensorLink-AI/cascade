@@ -36,7 +36,9 @@ fi
 # first use (bench_hook data guard), since image-booted pods skip this script.
 if [[ "${POD_STAGE:-}" == "eval" && -d "$SRC_ROOT/bench_data" ]]; then
   rsync -a -e "ssh ${SSH_OPTS[*]}" "$SRC_ROOT/bench_data/" "$DEST:$POD_WORKDIR/bench_data/"
-  ssh "${SSH_OPTS[@]}" "$DEST" "cd $POD_WORKDIR/benchmarks 2>/dev/null && export PATH=\$HOME/.local/bin:\$PATH && uv sync --frozen 2>&1 | tail -1 || true"
+  # --extra time: timebench is an OPTIONAL extra; a bare sync leaves it out and
+  # the TIME suite silently skips (the 2026-08-05..12 bench-report drought).
+  ssh "${SSH_OPTS[@]}" "$DEST" "cd $POD_WORKDIR/benchmarks 2>/dev/null && export PATH=\$HOME/.local/bin:\$PATH && uv sync --frozen --extra time 2>&1 | tail -1 || true"
 fi
 
 ssh "${SSH_OPTS[@]}" "$DEST" bash -s <<REMOTE
