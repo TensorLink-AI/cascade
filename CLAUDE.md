@@ -109,6 +109,61 @@ in-context.
   different generators. NOT built yet — Stage 1 is next.
   (`decisions/DEC-CA-0014-scratch-control-staged.md`)
 
+- **DEC-CA-0015** — The miner submission CARRIER churns once: `generate()` may
+  yield a bare ndarray (forever valid) or a record with `values` required, a
+  CLOSED reserved namespace (`mask`, `group_id`, `start`, `freq`, `roles`,
+  `labels`, `quantiles`) accepting none of them yet and hard-rejecting unknown
+  keys; digest over a field-set-tagged canonical record (values-only hashes
+  byte-identically — needs a NEW golden test, the suite has none);
+  `interface_version`; budget in bytes. G1/G2/G3 are NOT irreversible as
+  claimed (`[generator]` is not in `contract_digest`; audit re-derives from
+  inputs; DEC-CA-0009's replay-mode precedent) — G6 is the least deferrable,
+  because `forecast_wrapper.py` ships inside every checkpoint.
+  (`decisions/DEC-CA-0015-submission-carrier-versioned-record.md`)
+- **DEC-CA-0016** — `start`/`freq` are RESERVED, not carried: `patch_embed` is
+  `Linear(patch_size*2, d_model)` (values‖mask) with no calendar path, so
+  consuming them bumps `base_arch_digest` and diverges from the pinned Toto2
+  reference — Toto 2.0 is timestamp-free by design. Corpus-frequency telemetry
+  meanwhile; a shadow arch experiment settles the payload.
+  (`decisions/DEC-CA-0016-time-anchor-reserved-not-carried.md`)
+- **DEC-CA-0017** — Long context splits: 2a decouple `max_length` from
+  `context_length` + SAMPLE windows (today the batcher discards the prefix the
+  stream budget charged for) under a named `[training] window_sampling` key —
+  do it; 2b raising `context_length` is gated on EVAL CPU (heat wave 17min →
+  ~85min at 4×) and pool supply, not FLOPs (+17% train at 16384).
+  (`decisions/DEC-CA-0017-long-context-decouple-length-from-context.md`)
+- **DEC-CA-0018** — Missing data rides an explicit `mask` key, NEVER a NaN
+  sentinel: `np.nan` and `0.0/0.0` differ in the sign bit, so a sentinel makes
+  `corpus_digest` depend on the arithmetic that produced the gap. Payload is
+  arch-free (`causal_standardize` + `forward` already take masks) but waits on a
+  gap-preserving pool — the builder interpolates every gap today.
+  (`decisions/DEC-CA-0018-missing-data-explicit-mask-never-nan.md`)
+- **DEC-CA-0019** — Panel IS the variate axis for this model (Chronos-2 group
+  attention == Toto2's variate layer), so NO `group_id` payload. The urgent
+  related fix is live: only `tsbench_forge` stamps `source`, so Open-Meteo —
+  ~all of the pool, and literally a panel — resamples as singleton clusters and
+  every published LCB over-counts.
+  (`decisions/DEC-CA-0019-panel-is-the-variate-axis-not-a-group-id.md`)
+- **DEC-CA-0020** — Non-stationarity is NOT a carrier gap: within-series drift
+  is expressible today, corpus-level drift has no consumer, and the model has no
+  absolute-time input to anchor to. All the work is pool-side; instrument a
+  drift bucket and read it through the existing `per_domain_win_rate`.
+  (`decisions/DEC-CA-0020-non-stationarity-is-not-a-carrier-gap.md`)
+- **DEC-CA-0021** — Multivariate: bucket by `(C, P)`, never pad the variate axis
+  (`axis="variate"` attention takes no `attn_mask`); `roles` is a per-series KEY,
+  not a positional convention; NO budget discount ever on a per-channel scorer —
+  which is also why the rank-collapse gate is a shadow diagnostic, not a bar
+  (temperature/dew-point and common-factor panels false-positive). Copy-the-
+  covariate is self-correcting only under conditions `EVAL_POOL.md` does not
+  guarantee; a minority capability needs ≥~10% of the pool to move the metric.
+  (`decisions/DEC-CA-0021-multivariate-bucket-by-C-roles-as-a-key-no-discount.md`)
+
+The staged rollout sequencing DEC-CA-0015…0021 (per-stage contract-digest impact
+and migration path) lives in `docs/SUBMISSION_SURFACE_ROADMAP.md`, together with
+the budget-denomination finding (`max_total_points` is dead on the live
+`stream_cpu` path; `train_tokens` is the real budget) and the permanent
+no-weights ceiling.
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.
