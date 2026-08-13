@@ -1516,6 +1516,16 @@ function renderSubs(){
       '<td>'+tag+(isNew?'<span class="sub-new">&#9679; new</span>':'')+'</td></tr>';
   }).join("");
 }
+// Map a checkpoint (or round_id) to its human round number "rN". The checkpoint
+// id embeds its origin round's seed (ckpt-r<seed>-…), which is a round_id in the
+// index carrying an epoch_start_block on the 3600-block epoch grid. Anchor on a
+// verified (round_id, number) pair — r17 = 3107676501688987439 — and count grid
+// steps; the anchor's block is read live from the index so it tracks whatever
+// block the index carries. Verified: r10/r11/r12/r15/r16/r17 all map correctly.
+var WS_ANCHOR_RID="3107676501688987439", WS_ANCHOR_NO=17;
+function roundBlockOf(rid){ var rs=_index&&_index.rounds; if(!rs) return null; for(var i=0;i<rs.length;i++) if(String(rs[i].round_id)===String(rid)) return rs[i].epoch_start_block; return null; }
+function roundNoOf(rid){ var b=roundBlockOf(rid), ab=roundBlockOf(WS_ANCHOR_RID); if(b==null||ab==null) return null; var n=Math.round(WS_ANCHOR_NO+(b-ab)/3600); return n>0?n:null; }
+function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
 function renderWarm(){
   var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
   if(!panel) return;
@@ -1525,7 +1535,7 @@ function renderWarm(){
     if(when) when.textContent = "";
     return;
   }
-  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
+  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
   // heat.json is written at HEAT SETTLE, so it describes the last SETTLED round:
   // init_checkpoint = that round's init, next_scheduled_init = the round after it.
   // If a newer round is already live (status/round.json), that live round IS the
@@ -1607,7 +1617,7 @@ function renderWarmHistory(){
   var el=document.getElementById("warm-history"); if(!el) return;
   var rs=_index&&_index.rounds;
   if(!rs||!rs.length||_wsHist===null){ el.innerHTML=""; return; }
-  function wsLabel(ref){ if(!ref) return null; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
+  function wsLabel(ref){ if(!ref) return null; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
   var last=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-10).reverse();
   var rows=last.map(function(r){
     var id=String(r.round_id), h=_wsHist[id]||{}, cell;
@@ -1615,7 +1625,8 @@ function renderWarmHistory(){
     else if(h.err) cell='<span class="muted">unavailable</span>';
     else if(h.ckpt) cell='<span title="'+esc(h.ckpt)+'">'+esc(wsLabel(h.ckpt))+'</span>';
     else cell='<span class="muted">random init</span>';
-    return '<tr><td title="'+esc(id)+'">'+esc(shortRoundId(id))+'</td>'+
+    var rn=roundNoOf(id), rlab=rn?("r"+rn):shortRoundId(id);
+    return '<tr><td title="'+esc(id)+'">'+esc(rlab)+'</td>'+
       '<td>'+cell+'</td>'+
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
