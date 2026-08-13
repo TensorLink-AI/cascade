@@ -1048,6 +1048,11 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
   </div>
 
   <div>
+    <div class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></div>
+    <div id="warm-panel"></div>
+  </div>
+
+  <div>
     <div class="section-label"><span>Rounds</span></div>
     <div class="scroll-box scroll-hist">
       <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
@@ -1509,7 +1514,33 @@ function renderSubs(){
       '<td>'+tag+(isNew?'<span class="sub-new">&#9679; new</span>':'')+'</td></tr>';
   }).join("");
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+function renderWarm(){
+  var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
+  if(!panel) return;
+  var ws = _heat && _heat.warm_start;
+  if(!ws || !ws.init_checkpoint){
+    panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
+    if(when) when.textContent = "";
+    return;
+  }
+  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
+  var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init, rid=_heat.round_id;
+  var html='<div style="display:flex;flex-direction:column;gap:6px">';
+  if(nxt){
+    html+='<div><span class="muted">Next round will warm-start from:</span> '
+        + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+  }
+  html+='<div><span class="muted">Current round ('+esc(shortRoundId(rid))+') warm-started from:</span> '
+      + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
+  html+='<div class="muted" style="font-size:.85em">Training rotates through the promoted set (generation '
+      + esc(ws.generation)+'), so the init changes each round by design &mdash; a new round starting from a '
+      + 'different promoted checkpoint is the rotation, not a skipped one. Each start is pinned in that '
+      + 'round&rsquo;s signed manifest.</div>';
+  html+='</div>';
+  panel.innerHTML=html;
+  if(when) when.textContent = ws.size ? esc(ws.size) : "";
+}
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1589,7 +1620,7 @@ function poll(){
   // Live heat standings, published when the heat settles rather than with the
   // round's receipt (status/heat.json). Best-effort: on failure the panel falls
   // back to the settled receipt's embedded heat block.
-  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); })
+  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); renderWarm(); })
     .catch(function(){});
 }
 poll();
