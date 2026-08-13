@@ -1524,18 +1524,37 @@ function renderWarm(){
     return;
   }
   function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
-  var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init, rid=_heat.round_id;
+  // heat.json is written at HEAT SETTLE, so it describes the last SETTLED round:
+  // init_checkpoint = that round's init, next_scheduled_init = the round after it.
+  // If a newer round is already live (status/round.json), that live round IS the
+  // "next" one and is training NOW from next_scheduled_init — so don't mislabel
+  // it as still-upcoming. The round after the live one needs the rotation roster
+  // (not published) and only becomes knowable when this heat settles.
+  var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init;
+  var settledRid=_heat.round_id, liveRid=_roundStatus && _roundStatus.round_id;
+  var running = liveRid && String(liveRid)!==String(settledRid);
   var html='<div style="display:flex;flex-direction:column;gap:6px">';
-  if(nxt){
-    html+='<div><span class="muted">Next round will warm-start from:</span> '
-        + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+  if(running){
+    if(nxt){
+      html+='<div><span class="muted">Current round ('+esc(shortRoundId(liveRid))+', running) is training from:</span> '
+          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+    }
+    html+='<div><span class="muted">Last completed round ('+esc(shortRoundId(settledRid))+') trained from:</span> '
+        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
+    html+='<div class="muted" style="font-size:.85em">The next round&rsquo;s init is drawn from the rotation '
+        + 'when this heat settles. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by '
+        + 'design; each start is pinned in that round&rsquo;s signed manifest.</div>';
+  } else {
+    if(nxt){
+      html+='<div><span class="muted">Next round will warm-start from:</span> '
+          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+    }
+    html+='<div><span class="muted">Current round ('+esc(shortRoundId(settledRid))+') warm-started from:</span> '
+        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
+    html+='<div class="muted" style="font-size:.85em">Next is a schedule &mdash; a promotion can change the '
+        + 'set. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by design; each start is '
+        + 'pinned in that round&rsquo;s signed manifest.</div>';
   }
-  html+='<div><span class="muted">Current round ('+esc(shortRoundId(rid))+') warm-started from:</span> '
-      + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
-  html+='<div class="muted" style="font-size:.85em">Training rotates through the promoted set (generation '
-      + esc(ws.generation)+'), so the init changes each round by design &mdash; a new round starting from a '
-      + 'different promoted checkpoint is the rotation, not a skipped one. Each start is pinned in that '
-      + 'round&rsquo;s signed manifest.</div>';
   html+='</div>';
   panel.innerHTML=html;
   if(when) when.textContent = ws.size ? esc(ws.size) : "";
@@ -1615,7 +1634,7 @@ function poll(){
     _status=d; renderStage(); renderSubs(); renderCountdown();
   }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
-  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); })
+  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
     .catch(function(){});
   // Live heat standings, published when the heat settles rather than with the
   // round's receipt (status/heat.json). Best-effort: on failure the panel falls
