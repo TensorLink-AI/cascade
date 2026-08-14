@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.scoring import (
-    ForecastFn,
     JointForecastFn,
     WindowScore,
     adapt_per_channel,

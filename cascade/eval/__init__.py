@@ -23,8 +23,8 @@ from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
 from .mase import mase
 from .scoring import (
     WindowScore,
-    global_geomean,
     adapt_per_channel,
+    global_geomean,
     score_forecaster_on_windows,
     score_joint_forecaster_on_windows,
     stack_components,
