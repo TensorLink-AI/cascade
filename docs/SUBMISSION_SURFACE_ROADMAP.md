@@ -122,6 +122,26 @@ sub-daily-only 8K-context windows.
 - **Contract digest: bumps regardless** (the 22M activation moves it anyway).
 - **Migration: none** — the length band widens, never narrows.
 
+### Stage 6 — scaling ladder: 313M+ on size-conditional silicon (DEC-CA-0023)
+
+Orthogonal to the submission-surface stages (it changes the model contract
+and the fleet, not the carrier). Owner-directed shape: **22M screen, duel at
+the large size on H100-class pods, small sizes keep their cheap ladders.**
+From-scratch-per-round dies between 22M and ~100M on any plausible SKU, so
+313M+ rounds are warm-start increments; the duel margin must be re-unitised
+from %-of-level to %-of-increment (baseline-referenced statistic — score the
+shared warm-start init as a third reference), or dethrones mechanically
+stop as the lineage compounds. Increment length (~6h candidate), margin
+form, and margin value are chosen jointly from the null-LCB noise-floor
+measurement, not by feel.
+
+- **Contract digest: bumps at arming** — new `[[training.sizes]]` block plus
+  `SizeSpec.expected_gpu` / `SizeSpec.target_train_hours` overrides; the
+  margin rework is a scoring-rule change (lockstep restart, receipt-recorded
+  mode, audit replays both rules).
+- **Migration: none for miners** — the submission surface is untouched; only
+  what happens to their data downstream scales.
+
 ### Never scheduled
 
 `start` / `freq` / `group_id` / `labels` / `quantiles` acceptance. Reserved

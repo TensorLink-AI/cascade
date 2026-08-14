@@ -143,6 +143,13 @@ in-context.
   per-series C bucketed; full-freight channel pricing; roles as record field;
   channel-drop trap fixed before any cap raise.
   (`decisions/DEC-CA-0022-multivariate-roles-covariates.md`)
+- **DEC-CA-0023** (proposed) — Scaling to 313M+/1B: per-size GPU pins
+  (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
+  provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage
+  option), warm-start duels with the margin re-unitised to %-of-increment
+  via a baseline-referenced statistic; decoupled flagship is the fallback if
+  the noise floor kills the at-size duel.
+  (`decisions/DEC-CA-0023-size-conditional-gpu-provisioning.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`.
 
