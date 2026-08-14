@@ -24,7 +24,9 @@ from .mase import mase
 from .scoring import (
     WindowScore,
     global_geomean,
+    adapt_per_channel,
     score_forecaster_on_windows,
+    score_joint_forecaster_on_windows,
     stack_components,
 )
 from .window import EvalWindow
@@ -48,7 +50,9 @@ __all__ = [
     "mase",
     "WindowScore",
     "global_geomean",
+    "adapt_per_channel",
     "score_forecaster_on_windows",
+    "score_joint_forecaster_on_windows",
     "stack_components",
     "EvalWindow",
 ]

@@ -45,7 +45,42 @@ from .window import EvalWindow
 WQL_MODES = ("geomean", "pooled")
 
 # A forecaster: ``f(history_1d, horizon, num_samples) -> (1, num_samples, H)``.
+# The archived-checkpoint contract — every 1-D wrapper ever shipped speaks it,
+# so it is kept forever (adapted below, never removed).
 ForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
+
+# A JOINT forecaster: ``f(history_2d, horizon, num_samples)`` with history
+# ``(C, L)`` returning ``(C, num_samples, H)`` — one call per window, all
+# channels together, so a multivariate-capable checkpoint can condition its
+# forecasts across the variate axis (DEC-CA-0022). At ``C = 1`` this is the
+# univariate contract with an extra leading axis.
+JointForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
+
+
+def adapt_per_channel(forecast_fn: ForecastFn) -> JointForecastFn:
+    """Lift a 1-D :data:`ForecastFn` to the joint ``(C, L)`` contract.
+
+    The permanent adapter for archived univariate wrappers: each channel is
+    forecast independently with the wrapped function and the results stacked.
+    At ``C = 1`` (every deployed checkpoint and eval window today) this calls
+    the wrapped forecaster exactly once with the identical 1-D history the old
+    scorer passed, so scores are byte-identical.
+    """
+
+    def joint(history: np.ndarray, horizon: int, num_samples: int) -> np.ndarray:
+        history = np.asarray(history, dtype=np.float64)
+        parts = []
+        for c in range(history.shape[0]):
+            samples = np.asarray(forecast_fn(history[c], horizon, num_samples))
+            if samples.shape != (1, num_samples, horizon):
+                raise ValueError(
+                    f"forecaster returned shape {samples.shape}; "
+                    f"expected (1, {num_samples}, {horizon})"
+                )
+            parts.append(samples[0])
+        return np.stack(parts, axis=0)
+
+    return joint
 
 
 @dataclass(frozen=True)
@@ -99,30 +134,54 @@ def score_forecaster_on_windows(
     num_samples: int,
     quantile_levels: Sequence[float] = DEFAULT_QUANTILE_LEVELS,
 ) -> list[WindowScore]:
-    """Score a numpy-I/O forecaster on each window.
+    """Score a numpy-I/O univariate forecaster on each window.
 
     ``forecast_fn(history_1d, horizon, num_samples)`` must return samples of
     shape ``(1, num_samples, horizon)``. Non-finite samples raise — a single
     numerical hiccup must not silently corrupt the comparison.
+
+    This is the archived-wrapper entry point: it lifts the 1-D forecaster
+    through :func:`adapt_per_channel` and scores it on the joint path, which
+    at ``C = 1`` reproduces the historical behaviour exactly.
+    """
+    return score_joint_forecaster_on_windows(
+        adapt_per_channel(forecast_fn), windows, num_samples, quantile_levels
+    )
+
+
+def score_joint_forecaster_on_windows(
+    forecast_fn: JointForecastFn,
+    windows: list[EvalWindow],
+    num_samples: int,
+    quantile_levels: Sequence[float] = DEFAULT_QUANTILE_LEVELS,
+) -> list[WindowScore]:
+    """Score a joint ``(C, L)`` forecaster on each window — ONE call per window.
+
+    ``forecast_fn(history_2d, horizon, num_samples)`` returns
+    ``(C, num_samples, horizon)``. Scoring stays per (window, channel): each
+    channel's samples produce one :class:`WindowScore` row, exactly as before —
+    only the forecast call is joint, so a multivariate checkpoint can condition
+    across channels while the round statistic and the bootstrap see the same
+    row shape they always did.
     """
     out: list[WindowScore] = []
     q_tuple = tuple(float(q) for q in quantile_levels)
     for w in windows:
         history = np.asarray(w.history, dtype=np.float64)   # (C, L)
         target = np.asarray(w.target, dtype=np.float64)     # (C, H)
+        n_channels = int(target.shape[0])
         horizon = int(target.shape[-1])
         period = _resolve_seasonal_period(w.metadata)
-        # Score each channel independently with the univariate forecaster
-        # contract. Univariate windows (C == 1) emit exactly one score.
-        for c in range(target.shape[0]):
+        samples_all = np.asarray(forecast_fn(history, horizon, num_samples))
+        if samples_all.shape != (n_channels, num_samples, horizon):
+            raise ValueError(
+                f"forecaster returned shape {samples_all.shape}; "
+                f"expected ({n_channels}, {num_samples}, {horizon})"
+            )
+        for c in range(n_channels):
             hist_c = history[c]                              # (L,)
             tgt_c = target[c]                                # (H,)
-            samples = forecast_fn(hist_c, horizon, num_samples)
-            if samples.shape != (1, num_samples, horizon):
-                raise ValueError(
-                    f"forecaster returned shape {samples.shape}; "
-                    f"expected (1, {num_samples}, {horizon})"
-                )
+            samples = samples_all[c : c + 1]                 # (1, ns, H)
             if not np.isfinite(samples).all():
                 raise ValueError(
                     f"forecaster produced non-finite samples on window "

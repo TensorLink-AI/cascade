@@ -151,12 +151,20 @@ def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
     """Cluster labels for the paired bootstrap, one per (window, channel) row.
 
     The cluster key is the upstream feed id (pool metadata ``source``) when
-    present; rows without one are their own singleton cluster, which degrades
-    exactly to the classic per-window bootstrap for legacy pools.
+    present; rows without one fall back to their ``series_id`` — i.e. their
+    window. For every univariate pool (one row per window, unique series ids)
+    that is exactly the classic per-window bootstrap, byte-identical to the
+    old per-row fallback. The distinction bites only when a window carries
+    several rows: a C-channel window's rows are near-perfectly correlated, and
+    a per-ROW fallback would resample them as C independent observations —
+    inflating the effective sample size precisely when multivariate windows
+    enter the pool (DEC-CA-0022 item 3). Keying on the window keeps a
+    12-channel window from voting 12 times even on a pool with no ``source``
+    metadata.
     """
     labels: list = []
-    for i, s in enumerate(scores):
-        labels.append(s.source if s.source else f"__row{i}")
+    for s in scores:
+        labels.append(s.source if s.source else f"__series:{s.series_id}")
     return labels, len(set(labels))
 
 
