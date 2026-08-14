@@ -148,6 +148,16 @@ class DataGenerator(ABC):
         use. Derive every RNG from it (``np.random.default_rng(seed)``); do not
         read the system clock, ``os.urandom``, or any un-seeded global RNG. The
         constructor MUST NOT touch the network.
+
+        Optional opt-in keyword (DEC-CA-0024, only while ``[training]
+        real_corpus_ref`` is armed — never passed today): a constructor that
+        declares ``real_corpus_dir=None`` additionally receives the local
+        read-only path of the owner-published shared real corpus, identical
+        bytes on every machine (content-pinned). Treat the PATH as opaque —
+        derive outputs from the corpus *contents* only; a generator that bakes
+        the path (which differs per machine) into its output is
+        non-deterministic across hosts and fails the audit. Constructors
+        without the keyword are unaffected under every config.
         """
 
     @abstractmethod

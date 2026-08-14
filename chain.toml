@@ -114,6 +114,14 @@ corpus_mode = "stream_cpu"
 # false until docs/EVAL_POOL.md carries the covariate exogeneity rule.
 accepted_fields    = []
 allow_future_known = false
+# Owner-published shared real corpus (DEC-CA-0024): immutable ref
+# ("repo@sha256:<64hex>") of the frozen, licensed real-data corpus generators
+# may READ (opt-in real_corpus_dir constructor kwarg; repos stay code-only).
+# DIGEST-BOUND via drop-when-default: "" is omitted from contract_digest, so
+# today's digest is untouched; setting it is the deliberate bump. Arming is
+# FORBIDDEN until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness
+# rule (provenance + time wall) and the DEC-CA-0024 pricing experiment has run.
+real_corpus_ref    = ""
 # Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
 # "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
 expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must

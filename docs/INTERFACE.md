@@ -67,13 +67,36 @@ config.json         # any JSON object; your generator may read it
 requirements.txt    # hash-locked, allowlisted, <= max_packages
 ```
 
-**No shipped weights — generators are code-only.** Weight files of any kind are
+**No shipped data — generators are code-only.** Weight files of any kind are
 rejected: pickle checkpoints (`*.bin`, `*.pt`, `*.pth`, `*.ckpt`, `*.pkl`, …)
 because loading them runs arbitrary code, *and* code-free containers
 (`*.safetensors`, `*.npy`, `*.npz`, `*.onnx`, …) because they'd let you distill a
-pretrained model into the generator. `torch`/`gpytorch` stay available as compute
-libraries for GP/kernel priors — just don't ship parameters. The whole repo must
-be `<= max_repo_mb` (small, since it's source + config).
+pretrained model into the generator. The same policy covers RAW DATA: bulk
+numeric payloads embedded in `config.json` or as python literals — real series
+included — are outside the design space, not a loophole (DEC-CA-0024; the repo
+byte cap is the wall). `torch`/`gpytorch` stay available as compute libraries
+for GP/kernel priors, and fitting parameters *inside the sandbox at round time*
+from your own procedural data is legal — just don't ship parameters or data.
+The whole repo must be `<= max_repo_mb` (small, since it's source + config).
+
+## Shared real corpus (reserved; NOT active)
+
+A future config arming (`[training] real_corpus_ref`, DEC-CA-0024) may give
+every generator read access to ONE owner-published, digest-pinned real-data
+corpus — identical bytes on every machine. Opt in by declaring the keyword:
+
+```python
+def __init__(self, config_dir: str, *, seed: int, real_corpus_dir: str | None = None):
+    ...
+```
+
+While unarmed (today) the kwarg is never passed, so it MUST default. When
+armed, `real_corpus_dir` is a read-only local directory; derive your output
+from the corpus *contents* only and treat the path itself as opaque — it
+differs per machine, so baking it into your output makes your corpus
+non-reproducible across hosts and fails the audit (entry lost). Constructors
+without the keyword keep working under every config; they simply don't see
+the corpus.
 
 ## The contract
 

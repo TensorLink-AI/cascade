@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,79 @@ def _corr_gate(cfg: GeneratorConfig):
 
 class CorpusError(RuntimeError):
     """Importing or running the generator failed, or its output was rejected."""
+
+
+# ─────────────── shared real corpus (DEC-CA-0024; inert until armed) ─────────
+
+# Override for the machine-local materialisation cache of the owner-published
+# shared real corpus. Default keeps one digest-keyed copy per machine, shared
+# by trainer, audit, and `cascade verify` alike.
+REAL_CORPUS_CACHE_ENV = "CASCADE_REAL_CORPUS_CACHE"
+
+# Completion marker inside a materialised corpus directory: fetch_from_hub
+# clears the destination before writing, so a directory that carries the
+# marker was fully fetched (partial fetches never gain one).
+_REAL_CORPUS_MARKER = ".cascade_real_corpus_ok"
+
+
+def real_corpus_cache_root() -> Path:
+    env = os.environ.get(REAL_CORPUS_CACHE_ENV, "")
+    return Path(env) if env else Path.home() / ".cache" / "cascade" / "real-corpus"
+
+
+def resolve_real_corpus(cfg: GeneratorConfig, *, fetch=None) -> GeneratorConfig:
+    """Return ``cfg`` with ``real_corpus_dir`` resolved, or unchanged when unarmed.
+
+    The PARENT side of every sandbox calls this before spawning (children are
+    network-isolated and cannot fetch); the in-process paths call it too, so
+    a run can never silently proceed without the pinned corpus while
+    ``real_corpus_ref`` is armed. Resolution is: an already-set dir is only
+    verified to exist; otherwise the ref is materialised once per digest into
+    the machine-local cache (fetched into a private temp dir, atomically
+    renamed into place, so concurrent lanes race safely). ``fetch`` is the
+    injectable fetcher for tests; the default is the digest-pinned
+    :func:`cascade.shared.hippius.fetch_from_hub`.
+    """
+    if not cfg.real_corpus_ref:
+        return cfg
+    if cfg.real_corpus_dir:
+        if not Path(cfg.real_corpus_dir).is_dir():
+            raise CorpusError(
+                f"real_corpus_missing: real_corpus_dir={cfg.real_corpus_dir!r} does "
+                "not exist (the parent must materialise the pinned corpus before "
+                "the sandbox runs)"
+            )
+        return cfg
+    from dataclasses import replace
+
+    digest_key = cfg.real_corpus_ref.rsplit("@", 1)[-1].replace(":", "-")
+    dest = real_corpus_cache_root() / digest_key
+    if not (dest / _REAL_CORPUS_MARKER).is_file():
+        if fetch is None:
+            from ..shared.hippius import fetch_from_hub as fetch
+        tmp = dest.parent / f".fetch-{os.getpid()}-{digest_key}"
+        try:
+            fetch(cfg.real_corpus_ref, tmp)
+        except Exception as e:  # noqa: BLE001 — a pinned-but-unfetchable corpus is loud
+            raise CorpusError(
+                f"real_corpus_unfetchable: {cfg.real_corpus_ref} "
+                f"({type(e).__name__}: {e})"
+            ) from e
+        (tmp / _REAL_CORPUS_MARKER).touch()
+        try:
+            tmp.rename(dest)
+        except OSError:
+            # Another process won the race; its rename only happens after a
+            # complete fetch, so the marker must be there.
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+            if not (dest / _REAL_CORPUS_MARKER).is_file():
+                raise CorpusError(
+                    f"real_corpus_cache_corrupt: {dest} exists without its "
+                    "completion marker — remove it and retry"
+                ) from None
+    return replace(cfg, real_corpus_dir=str(dest))
 
 
 def _check_declared_interface(
@@ -100,9 +174,26 @@ def _check_declared_interface(
         )
 
 
+def _ctor_accepts_real_corpus(generator_cls: type) -> bool:
+    """Whether the submitted constructor declares the opt-in ``real_corpus_dir``
+    keyword (named parameter or ``**kwargs``). Signature inspection, not a
+    TypeError retry — a constructor that raises TypeError for its own reasons
+    must stay a plain construct failure, never a silent no-corpus rerun."""
+    import inspect
+
+    try:
+        params = inspect.signature(generator_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "real_corpus_dir" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _load_generator(
     repo_dir: Path, generation_seed: int, *,
     interface_version: int = SUPPORTED_INTERFACE_VERSION,
+    real_corpus_dir: str = "",
 ) -> DataGenerator:
     wrapper_py = repo_dir / "generator.py"
     if not wrapper_py.is_file():
@@ -121,8 +212,15 @@ def _load_generator(
     Generator = getattr(module, "Generator", None)
     if Generator is None:
         raise CorpusError("generator_class_missing (expected `Generator` in generator.py)")
+    # DEC-CA-0024 opt-in: the shared-corpus path is passed ONLY when armed AND
+    # the constructor declares it — every deployed two-argument generator stays
+    # valid under an armed config, and while unarmed the call is byte-identical
+    # to the legacy form even for generators that declare the kwarg.
+    kwargs: dict[str, str] = {}
+    if real_corpus_dir and _ctor_accepts_real_corpus(Generator):
+        kwargs["real_corpus_dir"] = str(real_corpus_dir)
     try:
-        gen = Generator(str(repo_dir), seed=generation_seed)
+        gen = Generator(str(repo_dir), seed=generation_seed, **kwargs)
     except Exception as e:  # noqa: BLE001
         raise CorpusError(f"generator_construct_failed: {type(e).__name__}: {e}") from e
     if not isinstance(gen, DataGenerator):
@@ -144,8 +242,10 @@ def build_corpus(
     size = check_repo_size(repo_dir, cfg.max_repo_mb)
     if not size.ok:
         raise CorpusError(f"submission_too_large: {size.details}")
+    cfg = resolve_real_corpus(cfg)
     gen = _load_generator(
-        Path(repo_dir), generation_seed, interface_version=cfg.interface_version
+        Path(repo_dir), generation_seed, interface_version=cfg.interface_version,
+        real_corpus_dir=cfg.real_corpus_dir,
     )
     try:
         series = drain_generator(

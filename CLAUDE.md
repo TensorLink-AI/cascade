@@ -143,6 +143,13 @@ in-context.
   per-series C bucketed; full-freight channel pricing; roles as record field;
   channel-drop trap fixed before any cap raise.
   (`decisions/DEC-CA-0022-multivariate-roles-covariates.md`)
+- **DEC-CA-0024** (proposed) — Ceiling restated no-shipped-DATA (raw series =
+  the weights hole); real data enters (if ever) as ONE owner-pinned shared
+  corpus generators read (`[training] real_corpus_ref`, digest-bound
+  drop-when-default; opt-in `real_corpus_dir` ctor kwarg; parent-side cached
+  materialisation; container ro-mount). Machinery landed inert; arming waits
+  on the pricing experiment + EVAL_POOL disjointness rule + the corpus.
+  (`decisions/DEC-CA-0024-shared-real-corpus.md`)
 - **DEC-CA-0023** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage
@@ -163,8 +170,8 @@ in-context.
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0016..0022 are claimed by the 2026-08-13 submission-surface design
-pass, status proposed). Put the revisit condition in the node's
-`revisit_when:` key.
+pass, DEC-CA-0024 by the 2026-08-14 shared-real-corpus design, status
+proposed). Put the revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 

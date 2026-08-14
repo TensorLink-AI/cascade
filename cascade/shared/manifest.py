@@ -110,6 +110,10 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # DEC-CA-0022: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
     "allow_future_known": (False,),
+    # DEC-CA-0024: the owner-published shared real corpus pin. "" = none
+    # (every deployed config); setting it is the deliberate digest bump that
+    # arms the shared-corpus regime.
+    "real_corpus_ref": ("",),
 }
 
 

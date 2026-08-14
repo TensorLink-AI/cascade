@@ -52,7 +52,7 @@ import numpy as np
 
 from ..shared.config import GeneratorConfig
 from ..shared.manifest import corpus_digest
-from .corpus import CorpusError, CorpusResult, build_corpus
+from .corpus import CorpusError, CorpusResult, build_corpus, resolve_real_corpus
 
 log = logging.getLogger("cascade.trainer.sandbox")
 
@@ -445,6 +445,10 @@ def run_in_sandbox(
         return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked)
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    # DEC-CA-0024: materialise the pinned shared real corpus HERE, parent-side
+    # — the child is network-isolated and must find real_corpus_dir already
+    # resolved in its cfg JSON. A no-op while real_corpus_ref is unarmed.
+    cfg = resolve_real_corpus(cfg)
     use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
 
     with tempfile.TemporaryDirectory(prefix="metro-sbx-") as td:
@@ -660,6 +664,9 @@ def stream_series(
         return
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    # DEC-CA-0024: resolve the shared real corpus parent-side (the child
+    # cannot fetch); no-op while unarmed.
+    cfg = resolve_real_corpus(cfg)
     use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     argv = [
@@ -836,8 +843,14 @@ def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
         validator = SeriesValidator.from_config(
             cfg, extra_series_check=corr_enforce_gate(cfg)
         )
+        # An armed cfg arrives with real_corpus_dir pre-resolved by the parent;
+        # resolve here is verify-only (an empty dir would try to fetch and fail
+        # loudly on the network block — a misplumbed parent, never a silent
+        # no-corpus stream).
+        cfg = resolve_real_corpus(cfg)
         gen = _load_generator(Path(repo), int(seed),
-                              interface_version=cfg.interface_version)
+                              interface_version=cfg.interface_version,
+                              real_corpus_dir=cfg.real_corpus_dir)
         for i, item in enumerate(gen.generate(int(n_upper))):
             element = validator.process(item, i)
             if isinstance(element, dict):

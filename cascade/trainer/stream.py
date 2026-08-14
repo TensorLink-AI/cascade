@@ -86,13 +86,15 @@ def _inprocess_stream(
     """
     from ..interface.generator import SeriesValidator
     from .channel_stats import corr_enforce_gate
-    from .corpus import _load_generator
+    from .corpus import _load_generator, resolve_real_corpus
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
+    cfg = resolve_real_corpus(cfg)
     validator = SeriesValidator.from_config(
         cfg, extra_series_check=corr_enforce_gate(cfg)
     )
-    gen = _load_generator(repo, int(seed), interface_version=cfg.interface_version)
+    gen = _load_generator(repo, int(seed), interface_version=cfg.interface_version,
+                          real_corpus_dir=cfg.real_corpus_dir)
     for i, item in enumerate(gen.generate(n_upper)):
         yield validator.process(item, i)
 

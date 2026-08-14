@@ -294,6 +294,29 @@ Two honest riders:
   the seed, from its own procedurally generated data — that is code
   expressing a prior, and it is legal today.
 
+**Restated per DEC-CA-0024: the ceiling is no-shipped-DATA, not just
+no-shipped-weights.** Raw real series shipped as JSON/py literals are the
+same hole as weights (unauditable bulk numbers, distribution-matching against
+the eval pool's guessable upstreams, licensing the Hub then republishes) and
+are outside the design space by the same policy. The `max_repo_mb` reduction
+above is the wall for both.
+
+## Cross-cutting: shared real corpus (DEC-CA-0024; machinery landed, unarmed)
+
+If real data ever enters miner-side, it enters as ONE owner-published,
+frozen, licensed, digest-pinned corpus that every generator may READ
+(`[training] real_corpus_ref` → the opt-in `real_corpus_dir` constructor
+kwarg; repos stay code-only and miners compete on augmentation/synthesis
+CODE over the shared base — the TSMixup skill). Machinery is fully wired and
+inert: ref validation, drop-when-default digest binding (deployed digests
+untouched until set), parent-side digest-keyed materialisation cache,
+subprocess passthrough + container read-only mount, loud failure on an armed
+ref with no resolved corpus. Arming is config-only but FORBIDDEN until: (1)
+the pricing experiment runs (synthetic king vs base-verbatim via
+`genesis_generator_ref` vs base+naive-mixup); (2) `docs/EVAL_POOL.md` carries
+the corpus/eval-pool disjointness rule (provenance + time wall); (3) the
+licensed corpus artifact exists. See the decision node for the full analysis.
+
 ## What each stage must NOT do (standing tripwires)
 
 - Accept any reserved field without a consumer in the same release
