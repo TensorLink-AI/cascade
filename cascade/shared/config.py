@@ -154,6 +154,26 @@ class SizeSpec:
     # Exact FFN hidden width from the released config.json (0 ⇒ derive as
     # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
     d_ff: int = 0
+    # ── size-conditional silicon + budget (DEC-CA-0023) ──────────────────────
+    # ``expected_gpu``: this size's pinned duel GPU when it differs from the
+    # base [training] expected_gpu ("" = inherit). From-scratch economics die
+    # between 22M and ~100M params, and 300M+ trains on H100-class silicon by
+    # owner direction — so the SKU pin is a per-size contract term, checked by
+    # the validator's gpu_name gate through the per-size contract exactly like
+    # the base pin. ``ref_throughput_tokens_per_s`` above MUST be measured on
+    # THIS GPU (the token budget derives from it).
+    # ``target_train_hours``: this size's budget hours when they differ from
+    # the base (0.0 = inherit) — a 313M warm-start increment is ~6h, not the
+    # 4M's 3h; the value is chosen with the margin re-unitisation, from the
+    # null-LCB noise-floor measurement.
+    # Digest note: SizeSpec fields fold into contract_digest via extra_sizes,
+    # so ADDING these fields moves the digest only for configs that already
+    # carry a [[training.sizes]] block (none deployed — every shipped config
+    # has them commented out). For any future size block they are part of that
+    # size's identity, which is the point: silicon and budget are terms of the
+    # controlled experiment.
+    expected_gpu: str = ""
+    target_train_hours: float = 0.0
 
 
 # Screen-stage wall-clock guard (see TrainingContractConfig.for_hours): a heat
@@ -323,7 +343,14 @@ class TrainingContractConfig:
         """A per-size training contract: this base recipe with the width/depth,
         frozen-arch digest, and throughput swapped for ``spec``. The result has
         no nested ``extra_sizes`` (it IS a single concrete size), so its
-        ``contract_digest`` is the stable identity of that one size."""
+        ``contract_digest`` is the stable identity of that one size.
+
+        Size-conditional overrides (DEC-CA-0023): a spec with a non-empty
+        ``expected_gpu`` swaps the GPU pin (the validator's gpu_name gate then
+        asserts THIS size's silicon), and a positive ``target_train_hours``
+        swaps the budget hours (the token budget follows via ``train_tokens``,
+        at this size's measured throughput). Unset ⇒ inherit the base — every
+        existing config resolves exactly as before."""
         return replace(
             self,
             arch_preset=spec.arch_preset,
@@ -334,6 +361,11 @@ class TrainingContractConfig:
             mlp_expansion=spec.mlp_expansion,
             d_ff=spec.d_ff,
             ref_throughput_tokens_per_s=spec.ref_throughput_tokens_per_s,
+            expected_gpu=spec.expected_gpu or self.expected_gpu,
+            target_train_hours=(
+                spec.target_train_hours if spec.target_train_hours > 0
+                else self.target_train_hours
+            ),
             extra_sizes=(),
         )
 
@@ -1084,6 +1116,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             mlp_expansion=int(z["mlp_expansion"]),
             ref_throughput_tokens_per_s=int(z["ref_throughput_tokens_per_s"]),
             d_ff=int(z.get("d_ff", 0)),
+            expected_gpu=str(z.get("expected_gpu", "")),
+            target_train_hours=float(z.get("target_train_hours", 0.0)),
         )
         for z in t.get("sizes", [])
     )

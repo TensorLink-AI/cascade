@@ -153,6 +153,29 @@ market_sku   = "L40S"
 gpus_per_pod = 1
 max_price_hr = 1.30
 
+# ── FINAL (large sizes): size-conditional H100 stage — DEC-CA-0023 ───────────
+# DISABLED until a 300M+ [[training.sizes]] block exists. When [round]
+# throne_sizes points at a size whose SizeSpec pins expected_gpu to the sku
+# below, the provisioner rents THIS stage for the duel instead of the L40S one
+# (selected once at startup; see cascade.provision.policy.select_final_stage).
+# NOTE the device-string trap, same class as L40 vs L40S: "NVIDIA H100 80GB
+# HBM3" (SXM) and "NVIDIA H100 PCIe" are DIFFERENT pins with ~15-25% different
+# throughput — pin the exact string the rented pods' nvidia-smi reports, and
+# measure ref_throughput_tokens_per_s on that exact variant.
+# [provisioner.final.large]
+# sku          = "NVIDIA H100 80GB HBM3"
+# market_sku   = "H100"
+# gpus_per_pod = 2
+# max_pods     = 2
+# providers    = ["shadeform", "lium"]
+# max_price_hr = 6.00
+#
+# [[provisioner.final.large.candidate]]  # fallback: 1x H100 pods (2 rented)
+# sku          = "NVIDIA H100 80GB HBM3"
+# market_sku   = "H100"
+# gpus_per_pod = 1
+# max_price_hr = 3.00
+
 # ── EVAL: elastic validator GPU — priority ladder ────────────────────────────
 # Rented at each round manifest, torn down at the scored receipt. Priority:
 # 3090 (cheapest that fits the bench) → 4090. Caps reflect 2026-07 markets:

@@ -43,6 +43,7 @@ __all__ = [
     "ProvisionPolicy",
     "StageFleet",
     "StagePolicy",
+    "select_final_stage",
     "should_trigger",
     "size_fleet",
     "teardown_due",
@@ -143,6 +144,15 @@ class ProvisionPolicy:
     trigger_margin_blocks: int
     max_spend_per_round: float
     ttl_epochs: int = 1
+    # Size-conditional final stages (DEC-CA-0023): alternate final fleets keyed
+    # by the silicon they serve, parsed from named sub-tables of
+    # [provisioner.final] (e.g. [provisioner.final.large] renting H100s). At
+    # provisioner startup :func:`select_final_stage` swaps ``final`` for the
+    # alternate whose ``sku`` equals the throne size's per-size expected_gpu —
+    # so pointing [round] throne_sizes at a 300M+ size (whose SizeSpec pins an
+    # H100-class device) re-routes the duel rental with no code change. Empty
+    # (every deployed config) ⇒ ``final`` always, exact current behaviour.
+    final_alternates: tuple[StagePolicy, ...] = ()
     # Preferred, epoch-relative form of the same knob: blocks AFTER the
     # boundary at which to start renting. The loop derives
     # ``margin = epoch_blocks - trigger_offset_blocks`` per tick, so it tracks a
@@ -180,6 +190,29 @@ class FleetPlan:
 
     heat: StageFleet
     final: StageFleet
+
+
+def select_final_stage(policy: ProvisionPolicy, expected_gpu: str) -> StagePolicy:
+    """The final stage serving the round's pinned duel silicon (DEC-CA-0023).
+
+    ``expected_gpu`` is the throne size's resolved per-size GPU pin (the exact
+    nvidia-smi device string from the per-size training contract; ``""`` =
+    unpinned). Returns the alternate whose ``sku`` byte-equals it when one is
+    configured, else the base ``final`` stage — which covers every deployed
+    config (no alternates), an unpinned contract, and the base pin itself.
+
+    Deliberately resolved ONCE, at provisioner startup: a throne-size change
+    is release-then-activate (chain.toml edit + coordinated restart), so the
+    fleet choice never needs to move mid-service. Byte-equality mirrors the
+    health gate — "NVIDIA H100 PCIe" and "NVIDIA H100 80GB HBM3" are different
+    pins, exactly like L40 vs L40S.
+    """
+    if not expected_gpu or expected_gpu == policy.final.sku:
+        return policy.final
+    for alt in policy.final_alternates:
+        if alt.sku == expected_gpu:
+            return alt
+    return policy.final
 
 
 def pods_for_slots(slots: int, gpus_per_pod: int, max_pods: int) -> int:
