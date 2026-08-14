@@ -379,6 +379,16 @@ king_decay           = 0.5       # geometric decay across [king, prior kings]: k
 gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
 gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
+# Margin denomination (DEC-CA-0023): "level" = LCB of (king-chal)/king (the
+# from-scratch rule, exact current behaviour). "increment" = the warm-start-era
+# rule: the shared init is scored as a third paired reference and the margin
+# prices a fraction of a typical per-round improvement — flip it WITH the
+# warm-start era (E2), across all validators at once ([scoring] is
+# fleet-consensus). Random-init rounds are judged at "level" automatically.
+# margin_increment_floor floors the increment normaliser at this fraction of
+# the baseline level, so near-zero increments can't explode the statistic.
+margin_mode            = "level"
+margin_increment_floor = 0.01
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
 # cascade.trainer.promotion, DEC-CA-0013 propose-and-verify). After a ripe
 # reign the TRAINER selects up to cascade_top_k reign checkpoints as the next

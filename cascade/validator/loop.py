@@ -575,6 +575,52 @@ class ValidatorRunner:
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
         )
 
+    # Sentinel identity for the increment margin's third reference — the
+    # shared warm-start init checkpoint. Not a miner: uid −1 is out of range
+    # for every metagraph, and the audit locates its receipt rows by ROLE
+    # ("baseline"), not by this name.
+    BASELINE_HOTKEY = "__warm_start_init__"
+
+    def _score_increment_baseline(
+        self,
+        manifest: TrainingManifest,
+        paired_sizes: list[str],
+        windows: list[EvalWindow],
+        score_records: list[EntryScores],
+    ) -> list[WindowScore] | None:
+        """Score the shared warm-start init for the increment margin
+        (DEC-CA-0023), appending its rows to the receipt.
+
+        Returns ``None`` — judge at "level" — when the round has no baseline:
+        a random-init round (no ``warm_start_ckpt``; the E2 init-round
+        semantics), or a multi-size duel / size mismatch, where a single init
+        cannot reference every paired size (weights never cross sizes).
+        """
+        if not manifest.warm_start_ckpt:
+            log.info("round=%s margin_mode=increment on a random-init round; "
+                     "judging at level (the init-round rule)", manifest.round_id)
+            return None
+        if len(paired_sizes) != 1 or manifest.warm_start_size != paired_sizes[0]:
+            log.warning(
+                "round=%s margin_mode=increment needs a single-size duel at the "
+                "warm-start size (paired=%s, warm_start_size=%r); judging at level",
+                manifest.round_id, paired_sizes, manifest.warm_start_size)
+            return None
+        size = paired_sizes[0]
+        entry = TrainedEntry(
+            miner_hotkey=self.BASELINE_HOTKEY, miner_uid=-1, role="king",
+            gen_ref="", trained_pointer=manifest.warm_start_ckpt,
+            corpus_digest="", train_block=0, size=size,
+        )
+        scores = self._evaluate(entry, windows)
+        score_records.append(EntryScores(
+            role="baseline", size=size, hotkey=self.BASELINE_HOTKEY, uid=-1,
+            scores=tuple(WindowScoreRecord.from_score(s) for s in scores),
+        ))
+        log.info("round=%s increment baseline scored: %d rows from %s",
+                 manifest.round_id, len(scores), manifest.warm_start_ckpt)
+        return scores
+
     # ── public-benchmark no-regression gate ─────────────────────────────────
 
     def _eval_host(self) -> RemoteHost | None:
@@ -1010,6 +1056,19 @@ class ValidatorRunner:
         _t_king = _time.perf_counter() - _t0
 
         base_params = self.cfg.koth_params()
+        # Increment margin (DEC-CA-0023): score the shared warm-start init as
+        # the third paired reference, or fall back to the level rule for a
+        # round that has none (random init / multi-size duel). The fallback
+        # mutates only the JUDGED params — the receipt keeps recording the
+        # unmodified config params (check_koth_params compares them against
+        # chain.toml), and the audit detects the judged mode from whether
+        # baseline rows exist in the receipt.
+        baseline_scores: list[WindowScore] | None = None
+        if base_params.margin_mode == "increment":
+            baseline_scores = self._score_increment_baseline(
+                manifest, paired_sizes, windows, score_records)
+            if baseline_scores is None:
+                base_params = replace(base_params, margin_mode="level")
         k = len(cohort)
         # Family-wise (Bonferroni) correction. Conservative under the cohort's
         # real correlation — every challenger shares the king's scores and one
@@ -1049,6 +1108,7 @@ class ValidatorRunner:
             result = evaluate_round(
                 king_scores, chal_scores, duel_params,
                 seed=base_seed, king_tenure_rounds=tenure_at_decision,
+                baseline_scores=baseline_scores,
             )
             if result.inconclusive:
                 # ``min_windows``/``min_clusters`` are properties of the window

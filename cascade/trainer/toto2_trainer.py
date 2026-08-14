@@ -111,6 +111,32 @@ def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, r
     return masks
 
 
+def weighted_pinball_loss(pred_q, target, levels: tuple[float, ...], weight=None):
+    """Pinball loss with an optional per-element weight — the accepted-fields
+    consumption seam (DEC-CA-0019/0022): 0 excludes an element (a missing
+    target, a covariate channel) from the objective.
+
+    Lives HERE, not in ``toto2_model.py``: the model source's bytes are folded
+    into ``base_arch_digest`` (see ``contract.compute_base_arch_digest``), and
+    loss weighting is a trainer concern the checkpoint never uses at inference
+    — moving it into the model file would re-pin the arch for a change that
+    does not alter the architecture. ``weight=None`` delegates to the model's
+    own ``pinball_loss``, bit-for-bit.
+    """
+    import torch
+
+    from .toto2_model import pinball_loss
+
+    if weight is None:
+        return pinball_loss(pred_q, target, levels)
+    q = torch.tensor(levels, device=pred_q.device, dtype=pred_q.dtype)
+    err = target.unsqueeze(-1) - pred_q
+    loss = torch.maximum(q * err, (q - 1.0) * err)
+    w = weight.to(loss.dtype).unsqueeze(-1)
+    denom = (w.sum() * loss.shape[-1]).clamp_min(1e-9)
+    return (loss * w).sum() / denom
+
+
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
     """Yield ``(B, C, P*patch_size)`` float64 training batches from a series
     stream.
@@ -458,7 +484,7 @@ class Toto2Trainer:
                     ).to(w.dtype)                        # (B, C): 1 = target
                     w = w * rw[:, :, None, None]
                 weight = w
-            loss = pinball_loss(pred_q, target, tuple(levels), weight=weight)
+            loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
             for grp in optimizer.param_groups:

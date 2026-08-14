@@ -752,6 +752,16 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Margin denomination (DEC-CA-0023; see cascade.eval.koth.MARGIN_MODES).
+    # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
+    # "increment" = the warm-start-era rule: the shared init is scored as a
+    # third paired reference and the margin prices a fraction of a typical
+    # per-round increment. [scoring] is fleet-consensus (not digest-bound):
+    # keep identical across validators or verdicts fork. Arm together with the
+    # warm-start era flip; rounds with no warm_start_ckpt (random init) are
+    # judged at "level" automatically.
+    margin_mode: str = "level"
+    margin_increment_floor: float = 0.01
     # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
     # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
     # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
@@ -1004,6 +1014,8 @@ class ChainConfig:
             gift_gate_mode=self.scoring.gift_gate_mode,
             gift_gate_tolerance=self.scoring.gift_gate_tolerance,
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
+            margin_mode=self.scoring.margin_mode,
+            margin_increment_floor=self.scoring.margin_increment_floor,
         )
 
 
@@ -1089,6 +1101,18 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
         raise LaunchConfigError(
             "chain.toml is not launch-ready:\n  - " + "\n  - ".join(problems)
         )
+
+
+_MARGIN_MODES = ("level", "increment")
+
+
+def _margin_mode(value: object) -> str:
+    """Validate ``[scoring] margin_mode`` at load — a typo here would silently
+    judge every round under the wrong denomination."""
+    mode = str(value)
+    if mode not in _MARGIN_MODES:
+        raise ValueError(f"[scoring] margin_mode={mode!r} invalid; one of {_MARGIN_MODES}")
+    return mode
 
 
 _GIFT_GATE_MODES = ("off", "shadow", "enforce")
@@ -1320,6 +1344,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            margin_mode=_margin_mode(s.get("margin_mode", "level")),
+            margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
             # ``cascade_reign_rounds`` is the current name; ``cascade_reign_days``
             # is accepted as a legacy alias so deployed files keep loading. The

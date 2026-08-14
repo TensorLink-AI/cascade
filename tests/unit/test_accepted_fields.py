@@ -322,7 +322,7 @@ def test_drain_enforces_corr_gate():
 
 def test_pinball_weight_none_matches_mean_and_zero_excludes():
     torch = pytest.importorskip("torch")
-    from cascade.trainer.toto2_model import pinball_loss
+    from cascade.trainer.toto2_trainer import weighted_pinball_loss as pinball_loss
 
     g = torch.Generator().manual_seed(0)
     pred = torch.randn(2, 3, 4, 9, generator=g)
