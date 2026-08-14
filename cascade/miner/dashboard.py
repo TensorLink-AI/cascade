@@ -741,6 +741,183 @@ def render_duel_index(index_doc: dict | None, *, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+# ── eval-pool composition (`cascade pool` — what rounds are scored on) ───────
+#
+# Validators score every round on a private, rotating pool of real series; the
+# owner's daily publish cron mirrors each snapshot's AGGREGATE shape (series
+# counts per domain x granularity — never series identities) to the public
+# status/pool.json (see cascade.shared.pool_status). This section renders it:
+# the snapshot governing the current round, its breakdown, and the history of
+# prior pools as snapshots rotated.
+
+# History rows rendered before collapsing to a "… N more" line.
+POOL_HISTORY_SHOWN = 10
+
+
+def fetch_public_pool_status(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the eval-pool composition doc (``status/pool.json``).
+
+    None on any failure or a doc without a ``snapshots`` list — the caller
+    degrades (the composition is presentational, published by the owner's
+    daily pool cron)."""
+    from ..shared.pool_status import POOL_STATUS_KEY
+
+    doc = fetch_public_json(storage, POOL_STATUS_KEY, timeout=timeout)
+    return doc if doc is not None and isinstance(doc.get("snapshots"), list) else None
+
+
+def fetch_public_chain_status(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the live chain anchor (``status/chain.json``)."""
+    from ..shared.chain_status import CHAIN_STATUS_KEY
+
+    return fetch_public_json(storage, CHAIN_STATUS_KEY, timeout=timeout)
+
+
+def estimated_epoch_start(chain_doc: object, *, now_s: float | None = None) -> int | None:
+    """The current round's epoch-start block, estimated from ``status/chain.json``
+    without a chain connection: extrapolate the anchored block height at the
+    published cadence, then floor to the epoch grid (the trainer's own math).
+    None when the doc is missing the anchor fields."""
+    from datetime import datetime
+
+    if not isinstance(chain_doc, dict):
+        return None
+    block, eb = _as_int(chain_doc.get("current_block")), _as_int(chain_doc.get("epoch_blocks"))
+    if block is None or eb is None or eb <= 0:
+        return None
+    bt = _as_float(chain_doc.get("block_time_s")) or DEFAULT_SECONDS_PER_BLOCK
+    try:
+        as_of = datetime.fromisoformat(str(chain_doc.get("as_of", "")))
+        if as_of.tzinfo is not None:
+            now = time.time() if now_s is None else float(now_s)
+            block += int(max(0.0, now - as_of.timestamp()) / max(bt, 1e-9))
+    except (TypeError, ValueError):
+        pass  # no usable timestamp — the anchored height is close enough
+    return (block // eb) * eb
+
+
+# Granularity column order: sub-second → yearly. Pandas-style offsets ("30S",
+# "15T", "H", "D", …); unknown codes sort last, after everything parseable.
+_FREQ_UNIT_SECONDS = {
+    "S": 1.0, "T": 60.0, "MIN": 60.0, "H": 3600.0, "B": 86400.0, "D": 86400.0,
+    "W": 604800.0, "SM": 1_296_000.0, "M": 2_629_746.0, "MS": 2_629_746.0,
+    "ME": 2_629_746.0, "Q": 7_889_238.0, "A": 31_556_952.0, "Y": 31_556_952.0,
+}
+
+
+def freq_seconds(freq: str) -> float:
+    """Approximate seconds per step of a pandas-style frequency ("15T" → 900);
+    ``inf`` for anything unparseable (sorts last, still rendered)."""
+    import re
+
+    m = re.fullmatch(r"\s*(\d*)\s*([A-Za-z]+)\s*", str(freq or ""))
+    if not m:
+        return float("inf")
+    unit = _FREQ_UNIT_SECONDS.get(m.group(2).upper().split("-")[0])
+    if unit is None:
+        return float("inf")
+    return (int(m.group(1)) if m.group(1) else 1) * unit
+
+
+def _pool_breakdown(entry: dict) -> dict[str, dict[str, int]]:
+    bd = entry.get("breakdown")
+    if not isinstance(bd, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for dom, freqs in bd.items():
+        if not isinstance(freqs, dict):
+            continue
+        cells = {str(f): n for f, n in freqs.items() if _as_int(n) is not None}
+        if cells:
+            out[str(dom)] = {f: int(n) for f, n in cells.items()}
+    return out
+
+
+def pool_breakdown_lines(entry: dict) -> list[str]:
+    """The domain x granularity matrix of one snapshot entry, as table lines:
+    one row per domain (largest first), one column per granularity (finest
+    first), with row totals. Empty when the entry carries no breakdown (a doc
+    from a publisher predating the field)."""
+    bd = _pool_breakdown(entry)
+    if not bd:
+        return []
+    freqs = sorted({f for cells in bd.values() for f in cells},
+                   key=lambda f: (freq_seconds(f), f))
+    dom_w = max(len("domain"), *(len(d) for d in bd)) + 2
+    header = (f"    {'domain':<{dom_w}}{'series':>7}  "
+              + "  ".join(f"{f:>6}" for f in freqs))
+    lines = [header]
+    for dom, cells in sorted(bd.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
+        row = (f"    {dom:<{dom_w}}{sum(cells.values()):>7,}  "
+               + "  ".join(f"{cells[f]:>6,}" if f in cells else f"{'·':>6}" for f in freqs))
+        lines.append(row)
+    total = sum(sum(c.values()) for c in bd.values())
+    per_freq = {f: sum(c.get(f, 0) for c in bd.values()) for f in freqs}
+    lines.append(f"    {'total':<{dom_w}}{total:>7,}  "
+                 + "  ".join(f"{per_freq[f]:>6,}" for f in freqs))
+    return lines
+
+
+def _pool_history_line(entry: dict, *, active: bool) -> str:
+    bd = _pool_breakdown(entry)
+    shape = (f"{len(bd)} domains · "
+             f"{len({f for c in bd.values() for f in c})} granularities" if bd else "—")
+    return (f"    block {_as_int(entry.get('effective_block')) or 0:>11,}  "
+            f"cutoff {str(entry.get('as_of') or '--'):<10}  "
+            f"{_as_int(entry.get('n_series')) or 0:>6,} series  {shape}"
+            + ("   ← this round" if active else ""))
+
+
+def render_pool(
+    doc: dict | None,
+    *,
+    epoch_start: int | None = None,
+    history_limit: int = POOL_HISTORY_SHOWN,
+) -> str:
+    """The ``cascade pool`` view: the snapshot governing the current round (or
+    the newest, when no chain anchor is available), its domain x granularity
+    breakdown, and the history of prior pools."""
+    from ..shared.pool_status import active_snapshot, snapshots
+
+    snaps = snapshots(doc)
+    if not snaps:
+        return ("no eval-pool composition published yet — the owner's daily "
+                "`cascade-pool publish` cron writes it (status/pool.json)")
+    current = (active_snapshot(doc, epoch_start) if epoch_start is not None
+               else snaps[-1])
+    which = (f"effective from block {_as_int(current.get('effective_block')) or 0:,}"
+             + (" · governs the current round" if epoch_start is not None
+                else " · newest published (current-round mapping unavailable)"))
+    lines = [
+        "cascade pool — held-out eval-pool composition "
+        "(aggregate counts only; the series stay private)",
+        f"  active snapshot {which}",
+        f"  data cutoff     {current.get('as_of') or '--'}"
+        f"  ·  published {current.get('published_at') or '--'}",
+        f"  size            {_as_int(current.get('n_series')) or 0:,} series"
+        f"  ·  context {current.get('context_length') or '--'}"
+        f"  ·  horizon {current.get('horizon') or '--'}",
+    ]
+    sha = str(current.get("sha256") or "")
+    if sha:
+        lines.append(f"  integrity       tar sha256 {sha[:16]}… — must match the signed "
+                     "manifest's eval_pool_sha256 pin for its rounds")
+    body = pool_breakdown_lines(current)
+    if body:
+        lines.append("  breakdown       series per domain x granularity")
+        lines += body
+    else:
+        lines.append("  breakdown       not published for this snapshot")
+    lines.append(f"  history         {len(snaps)} snapshot(s), newest first")
+    newest_first = list(reversed(snaps))
+    for e in newest_first[:history_limit]:
+        lines.append(_pool_history_line(e, active=e is current))
+    if len(newest_first) > history_limit:
+        lines.append(f"    … {len(newest_first) - history_limit} older not shown "
+                     "(--limit to widen)")
+    return "\n".join(lines)
+
+
 # ── live submissions (revealed on-chain commitments) ─────────────────────────
 
 

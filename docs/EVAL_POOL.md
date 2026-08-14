@@ -114,6 +114,20 @@ Validators pick up new snapshots automatically (they re-read the index each
 round and fetch a snapshot once, cached by digest). No restart, no `chain.toml`
 change.
 
+### Public composition doc (`status/pool.json`)
+
+`cascade-pool publish` also mirrors each snapshot's **aggregate shape** to the
+public manifest bucket: a rolling window of per-snapshot summaries
+(`effective_block`, data cutoff, tar sha256, and series counts per domain ×
+granularity — `cascade.shared.pool_status`). This feeds the web dashboard's
+**Eval pool** tab and the `cascade pool` CLI, so miners can see the domain/
+granularity mix their submissions are scored on and how it drifts across
+snapshots. Aggregate counts only — never series identities, sources-per-series,
+or values, which would hand generators the distribution-matching target the
+pool's privacy exists to deny. The write is best-effort (a warning, never a
+failed publish): it needs the manifest-bucket `HIPPIUS_S3_*` credentials the
+orchestrator already holds for `--effective-block auto`.
+
 ### Backend: Hippius S3 or Cloudflare R2
 
 The publisher and validators talk to one S3-compatible bucket. Defaults use the

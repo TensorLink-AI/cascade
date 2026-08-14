@@ -302,7 +302,43 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     )
     print("validators score this pool for rounds whose epoch block >= effective_block "
           "(no chain.toml edit).")
+    _publish_pool_composition(cfg, summary, meta)
     return 0
+
+
+def _publish_pool_composition(cfg, summary, meta) -> None:
+    """Mirror the snapshot's aggregate composition to the public manifest bucket
+    (``status/pool.json``) for the miner dashboards.
+
+    Presentational, so strictly best-effort: the snapshot publish above is what
+    validators score on, and a composition hiccup (missing manifest-bucket
+    credentials, a storage flake) must degrade to a warning, never a non-zero
+    exit that pages the cron. Counts per domain x granularity only — no series
+    identities (see ``cascade.shared.pool_status``).
+    """
+    from ..shared.hippius import open_manifest_store
+    from ..shared.pool_status import (
+        POOL_STATUS_KEY,
+        build_pool_status_entry,
+        update_pool_status,
+    )
+
+    try:
+        entry = build_pool_status_entry(
+            effective_block=meta.effective_block,
+            as_of=meta.as_of,
+            published_at=dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+            n_series=meta.n_series,
+            context_length=meta.context_length,
+            horizon=meta.horizon,
+            sha256=meta.sha256,
+            breakdown=summary.per_domain_freq,
+        )
+        update_pool_status(open_manifest_store(cfg.storage), entry)
+    except Exception as e:  # noqa: BLE001 — presentational; never fail the publish
+        print(f"warning: pool composition doc not published ({e})", file=sys.stderr)
+        return
+    print(f"published pool composition to {POOL_STATUS_KEY} (dashboards' Eval pool tab).")
 
 
 def _resolve_effective_block(args: argparse.Namespace, cfg) -> int:

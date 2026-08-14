@@ -103,6 +103,9 @@ class BuildSummary:
     n_series: int = 0
     n_points: int = 0
     per_domain: dict = field(default_factory=dict)
+    # {domain: {freq: count}} — the granularity breakdown inside each domain,
+    # published to the miner dashboards (cascade.shared.pool_status).
+    per_domain_freq: dict = field(default_factory=dict)
     dropped: dict = field(default_factory=dict)
 
     def render(self) -> str:
@@ -114,6 +117,13 @@ class BuildSummary:
         if self.per_domain:
             by_dom = ", ".join(f"{k}={v}" for k, v in sorted(self.per_domain.items()))
             lines.append(f"  by domain: {by_dom}")
+        if self.per_domain_freq:
+            cells = ", ".join(
+                f"{dom}/{freq}={n}"
+                for dom, freqs in sorted(self.per_domain_freq.items())
+                for freq, n in sorted(freqs.items())
+            )
+            lines.append(f"  by domain x granularity: {cells}")
         if self.dropped:
             dr = ", ".join(f"{k}={v}" for k, v in sorted(self.dropped.items()))
             lines.append(f"  dropped: {dr}")
@@ -303,16 +313,22 @@ def write_pool(
 
     metadata: dict[str, dict] = {}
     per_domain: Counter = Counter()
+    per_cell: Counter = Counter()  # (domain, freq) — the published breakdown
     n_points = 0
     for rec in records:
         np.save(dest / f"{rec.series_id}.npy", rec.values, allow_pickle=False)
         metadata[rec.series_id] = rec.metadata
         per_domain[rec.domain] += 1
+        per_cell[(rec.domain, str(rec.metadata.get("freq", "")))] += 1
         n_points += int(rec.values.shape[-1])
 
     (dest / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
     )
+
+    per_domain_freq: dict[str, dict[str, int]] = {}
+    for (dom, freq), n in sorted(per_cell.items()):
+        per_domain_freq.setdefault(dom, {})[freq] = n
 
     summary = BuildSummary(
         out_dir=str(dest),
@@ -322,6 +338,7 @@ def write_pool(
         n_series=len(records),
         n_points=n_points,
         per_domain=dict(per_domain),
+        per_domain_freq=per_domain_freq,
         dropped=dict(drops or {}),
     )
     provenance = {

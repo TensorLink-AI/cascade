@@ -469,6 +469,41 @@ read-only — no wallet, no chain call, no credentials — but unlike the heat
 standings it reads the **signed** receipt index, one row per validator, so you
 also see whether the validators agreed.
 
+### What you're scored on — `cascade pool`
+
+Every round is scored on a **private, rotating pool** of real-world series
+(`docs/EVAL_POOL.md`). The series themselves are never published while a pool
+is live — fresh, unseen data is the anti-contamination lever — but the pool's
+*aggregate shape* is: the owner's daily publish cron mirrors each snapshot's
+series counts per **domain × granularity** to `status/pool.json`, and
+`cascade pool` renders it:
+
+```bash
+cascade pool                       # no wallet, no chain call, no credentials
+# cascade pool — held-out eval-pool composition (aggregate counts only; the series stay private)
+#   active snapshot effective from block 8,812,800 · governs the current round
+#   data cutoff     2026-08-13  ·  published 2026-08-13T03:12:04+00:00
+#   size            2,987 series  ·  context 4096  ·  horizon 64
+#   integrity       tar sha256 4f9c02ab6c11e5d0… — must match the signed manifest's eval_pool_sha256 pin for its rounds
+#   breakdown       series per domain x granularity
+#     domain          series     15T       H       D
+#     weather           2,532       ·   2,520      12
+#     energy              370     370       ·       ·
+#     web_traffic          85       ·       ·      85
+#     total             2,987     370   2,520      97
+#   history         14 snapshot(s), newest first
+#     block   8,812,800  cutoff 2026-08-13   2,987 series  3 domains · 3 granularities   ← this round
+#     block   8,805,600  cutoff 2026-08-12   2,943 series  3 domains · 3 granularities
+```
+
+The **current round maps to the snapshot with the greatest effective block ≤
+this round's epoch start** — the same deterministic rule every validator
+selects its scoring pool by, so this is genuinely the pool your submission is
+judged on, not just the latest build. The history shows how the mix drifts as
+snapshots rotate; if your generator's synthetic curriculum ignores a domain or
+granularity that is heavily represented here, that is where you are losing
+windows. The same view lives on the web dashboard's **Eval pool** tab.
+
 ### Reading the training log — was it your generator, or the pod?
 
 Every run streams a JSONL log to the public logs bucket at

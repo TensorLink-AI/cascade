@@ -453,6 +453,49 @@ def _cmd_duel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_pool(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "pool",
+        help="Eval-pool composition: the domain x granularity breakdown of the "
+        "pool the current round is scored on, plus the history of prior pools.",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--limit", type=int, default=None,
+                   help="History rows shown (default: 10).")
+    p.set_defaults(func=_cmd_pool)
+
+
+def _cmd_pool(args: argparse.Namespace) -> int:
+    """Print the public eval-pool composition — no wallet, no chain call, no
+    credentials.
+
+    The owner's daily `cascade-pool publish` cron mirrors each snapshot's
+    aggregate shape (series counts per domain x granularity, never the series
+    themselves) to status/pool.json; the current round is mapped to its
+    snapshot with the same effective_block rule validators select by, using
+    the public status/chain.json anchor instead of a chain connection.
+    """
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import (
+        POOL_HISTORY_SHOWN,
+        estimated_epoch_start,
+        fetch_public_chain_status,
+        fetch_public_pool_status,
+        render_pool,
+    )
+
+    doc = fetch_public_pool_status(cfg.storage)
+    if doc is None:
+        print("no published eval-pool composition (status/pool.json) — the owner's "
+              "daily pool publish writes it; the pool itself stays private",
+              file=sys.stderr)
+        return 1
+    epoch_start = estimated_epoch_start(fetch_public_chain_status(cfg.storage))
+    limit = args.limit if args.limit is not None else POOL_HISTORY_SHOWN
+    print(render_pool(doc, epoch_start=epoch_start, history_limit=limit))
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
@@ -772,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_round(sub)
     _add_heat(sub)
     _add_duel(sub)
+    _add_pool(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

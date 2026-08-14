@@ -160,6 +160,26 @@ def test_build_pool_round_trips_through_validator_loader(tmp_path):
     assert w.metadata["seasonal_period"] == 24
 
 
+def test_build_summary_carries_domain_freq_breakdown(tmp_path):
+    # per_domain_freq is what the public composition doc (status/pool.json)
+    # publishes — {domain: {freq: n}} for every kept series, nothing else.
+    items = [
+        _series("w1", freq="H", domain="weather",
+                base=10 + np.sin(np.arange(600) / 5.0)),
+        _series("w2", freq="H", domain="weather",
+                base=11 + np.cos(np.arange(600) / 7.0)),
+        _series("w3", freq="D", domain="weather", seasonal=7,
+                base=12 + np.sin(np.arange(600) / 9.0)),
+        _series("e1", freq="15T", domain="energy", seasonal=96,
+                base=13 + np.cos(np.arange(600) / 11.0)),
+    ]
+    summary = build_pool([_ListSource(items)], tmp_path / "pool", CTX, CFG, fetch=None)
+    assert summary.per_domain_freq == {"weather": {"H": 2, "D": 1}, "energy": {"15T": 1}}
+    assert summary.per_domain == {"weather": 3, "energy": 1}
+    rendered = summary.render()
+    assert "weather/H=2" in rendered and "energy/15T=1" in rendered
+
+
 def test_build_is_deterministic(tmp_path):
     items = [_series(f"s{i}", base=10 + np.sin(np.arange(600) / (5.0 + i))) for i in range(4)]
     a = tmp_path / "a"

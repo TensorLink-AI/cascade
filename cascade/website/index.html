@@ -870,6 +870,16 @@ a { color: var(--chal); text-decoration: none; }
   border-bottom: var(--line); padding-bottom: 9px; margin-bottom: 18px; color: var(--ink);
 }
 .section-label .muted { color: var(--muted); font-weight: 400; }
+
+/* tab bar — Live vs Eval pool */
+.tabs { display: flex; gap: 8px; border-bottom: var(--line); }
+.tab-btn { background: none; border: var(--line); border-bottom: none; color: var(--muted); font: 700 11px/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.08em; padding: 9px 16px; cursor: pointer; }
+.tab-btn:hover { color: var(--ink); }
+.tab-btn.on { color: var(--ink); background: var(--surface); box-shadow: inset 0 -2px 0 var(--chal); }
+/* tab bodies re-create .page's flex gap for the sections they wrap;
+   display:flex would defeat the hidden attribute, so restate it explicitly */
+.tab-body { display: flex; flex-direction: column; gap: 38px; }
+.tab-body[hidden] { display: none; }
 .controls { display: flex; gap: 8px; align-items: center; font-weight: 400; }
 .controls label { font-size: 10px; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; }
 .btn { background: none; border: var(--line); color: var(--ink); font: 600 10px/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; padding: 5px 9px; cursor: pointer; }
@@ -956,6 +966,7 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
 
 @media (max-width: 720px) {
   .page { padding: 22px 18px 56px; gap: 26px; }
+  .tab-body { gap: 26px; }
   .header .wordmark { font-size: 34px; }
   .chart-wrap { aspect-ratio: 3/2; }
   .scroll-box { overflow-x: auto; }
@@ -994,6 +1005,13 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
       <span><a href="https://github.com/TensorLink-AI/cascade" target="_blank">GitHub</a> · <span title="Verify any round with the audit CLI">AUDIT: <code>cascade-audit latest</code></span></span>
     </div>
   </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab-btn on" id="tab-btn-live" role="tab" onclick="selectTab('live')">Rounds</button>
+    <button class="tab-btn" id="tab-btn-pool" role="tab" onclick="selectTab('pool')">Eval pool</button>
+  </div>
+
+  <div id="tab-live" class="tab-body">
 
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
@@ -1060,6 +1078,27 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     </div>
   </div>
 
+  </div><!-- /tab-live -->
+
+  <div id="tab-pool" class="tab-body" hidden>
+
+  <div>
+    <div class="section-label"><span>This round&rsquo;s eval pool</span><span id="pool-when" class="muted"></span></div>
+    <div class="heat-note">Every round is scored on a private, rotating pool of real-world series.
+      The series themselves stay private (fresh, unpublished data is the anti-contamination lever) &mdash;
+      what is published is each daily snapshot&rsquo;s aggregate shape: how many series per domain, at which
+      granularity. A round maps to the snapshot with the greatest effective block &le; its epoch start &mdash;
+      the same deterministic rule validators score by, so this is the pool your submission is being judged on.</div>
+    <div id="pool-panel"></div>
+  </div>
+
+  <div>
+    <div class="section-label"><span>Pool history</span><span id="pool-hist-when" class="muted">prior snapshots, newest first</span></div>
+    <div id="pool-history"></div>
+  </div>
+
+  </div><!-- /tab-pool -->
+
 </div>
 
 <script>
@@ -1111,7 +1150,7 @@ var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
-    _wsHist = null;
+    _wsHist = null, _pool = null;
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1641,7 +1680,111 @@ function renderWarmHistory(){
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); renderPool(); }
+
+// ── eval pool tab: composition of the private eval pool (aggregate only) ────
+// The pool's SERIES stay private; status/pool.json carries each snapshot's
+// aggregate shape (series counts per domain x granularity) plus the history of
+// prior snapshots as the pool rotated (see cascade.shared.pool_status). The
+// current round maps to the snapshot with the greatest effective_block <= this
+// epoch's start block — the identical rule validators select their scoring
+// pool by, so the tab names the pool a validator would actually use.
+var FREQ_UNIT_S={S:1,T:60,MIN:60,H:3600,B:86400,D:86400,W:604800,SM:1296000,M:2629746,MS:2629746,ME:2629746,Q:7889238,A:31556952,Y:31556952};
+function freqSecs(f){ var m=/^\s*(\d*)\s*([A-Za-z]+)\s*$/.exec(String(f||"")); if(!m) return Infinity; var u=FREQ_UNIT_S[m[2].toUpperCase().split("-")[0]]; if(u==null) return Infinity; return (m[1]?parseInt(m[1],10):1)*u; }
+function poolSnaps(){
+  var s=(_pool&&_pool.snapshots||[]).filter(function(x){ return x&&isFinite(Number(x.effective_block)); });
+  s.sort(function(a,b){ return Number(a.effective_block)-Number(b.effective_block); });
+  return s;
+}
+// {snap, mapped}: mapped=false means no chain anchor yet — we show the newest
+// snapshot but say so, rather than mislabelling it "this round's".
+function poolActive(snaps){
+  if(!snaps.length) return {snap:null, mapped:false};
+  var cn=chainNow(); if(!cn) return {snap:snaps[snaps.length-1], mapped:false};
+  var el=null;
+  for(var i=0;i<snaps.length;i++){ if(Number(snaps[i].effective_block)<=cn.epochStart) el=snaps[i]; }
+  return {snap:el||snaps[0], mapped:true};
+}
+function poolBreakdown(s){
+  var bd=s&&s.breakdown, out={};
+  if(bd) for(var d in bd){ if(bd[d]&&typeof bd[d]==="object"){ out[d]={}; for(var f in bd[d]){ var n=Number(bd[d][f]); if(isFinite(n)) out[d][f]=n; } } }
+  return out;
+}
+function poolShapeCounts(s){
+  var bd=poolBreakdown(s), doms=0, freqs={};
+  for(var d in bd){ doms++; for(var f in bd[d]) freqs[f]=1; }
+  return {domains:doms, freqs:Object.keys(freqs).length};
+}
+function poolMatrixHTML(s){
+  var bd=poolBreakdown(s), doms=Object.keys(bd);
+  if(!doms.length) return '<div class="empty">breakdown not published for this snapshot</div>';
+  var freqs={}; doms.forEach(function(d){ for(var f in bd[d]) freqs[f]=1; });
+  var cols=Object.keys(freqs).sort(function(a,b){ var da=freqSecs(a)-freqSecs(b); return da||(a<b?-1:1); });
+  var totals=doms.map(function(d){ var t=0; for(var f in bd[d]) t+=bd[d][f]; return {d:d,t:t}; });
+  totals.sort(function(a,b){ return b.t-a.t||(a.d<b.d?-1:1); });
+  var grand=totals.reduce(function(a,x){ return a+x.t; },0)||1;
+  var head='<tr><th>Domain</th><th class="num">Series</th><th>Share</th>'+cols.map(function(c){ return '<th class="num">'+esc(c)+'</th>'; }).join("")+'</tr>';
+  var body=totals.map(function(x){
+    var share=x.t/grand;
+    return '<tr><td>'+esc(x.d)+'</td><td class="num">'+x.t.toLocaleString()+'</td>'+
+      '<td><span class="heat-bar-cell"><span class="heat-bar"><i style="width:'+(share*100).toFixed(1)+'%;background:var(--chal)"></i></span>'+
+      '<span class="heat-rel">'+(share*100).toFixed(1)+'%</span></span></td>'+
+      cols.map(function(c){ var n=bd[x.d][c]; return '<td class="num'+(n==null?' muted':'')+'">'+(n==null?"·":n.toLocaleString())+'</td>'; }).join("")+'</tr>';
+  }).join("");
+  var perCol=cols.map(function(c){ var t=0; doms.forEach(function(d){ t+=bd[d][c]||0; }); return t; });
+  var foot='<tr><td class="muted">total</td><td class="num">'+grand.toLocaleString()+'</td><td></td>'+
+    perCol.map(function(t){ return '<td class="num">'+t.toLocaleString()+'</td>'; }).join("")+'</tr>';
+  return '<div class="scroll-box"><table><thead>'+head+'</thead><tbody>'+body+foot+'</tbody></table></div>';
+}
+function renderPool(){
+  var panel=document.getElementById("pool-panel"), hist=document.getElementById("pool-history"),
+      when=document.getElementById("pool-when");
+  if(!panel||!hist) return;
+  var snaps=poolSnaps();
+  if(!snaps.length){
+    panel.innerHTML='<div class="heat-empty"><span class="he-glyph">&middot; &middot; &middot;</span>'+
+      '<span class="he-head">No pool composition published yet</span>'+
+      '<p>The owner&rsquo;s daily pool publish writes status/pool.json alongside each snapshot. '+
+      'Until it lands, the pool&rsquo;s shape is documented in docs/EVAL_POOL.md.</p></div>';
+    hist.innerHTML=""; if(when) when.textContent="";
+    return;
+  }
+  var act=poolActive(snaps), s=act.snap, shape=poolShapeCounts(s);
+  if(when) when.textContent=(act.mapped?"active from block "+Number(s.effective_block).toLocaleString():"newest published — current-round mapping needs the live chain feed")+
+    (s.published_at?" · published "+timeAgo(s.published_at):"");
+  var sha=String(s.sha256||"");
+  panel.innerHTML=
+    '<div class="heat-note">'+
+      'Data cutoff <b>'+esc(s.as_of||"--")+'</b> · <b>'+Number(s.n_series||0).toLocaleString()+'</b> series across <b>'+
+      shape.domains+'</b> domain(s) and <b>'+shape.freqs+'</b> granularit'+(shape.freqs===1?"y":"ies")+
+      ' · window geometry: context <b>'+esc(s.context_length!=null?s.context_length:"--")+'</b> / horizon <b>'+esc(s.horizon!=null?s.horizon:"--")+'</b>'+
+      (sha?' · tar sha256 <span title="'+esc(sha)+'">'+esc(sha.slice(0,16))+'…</span> (cross-check: the signed manifest pins eval_pool_sha256 per round)':'')+
+    '</div>'+poolMatrixHTML(s);
+  var rows=snaps.slice().reverse().map(function(e){
+    var sh=poolShapeCounts(e), active=(e===s);
+    return '<tr'+(active?' class="good"':'')+'><td class="num">'+Number(e.effective_block).toLocaleString()+'</td>'+
+      '<td>'+esc(e.as_of||"--")+'</td>'+
+      '<td class="muted">'+(e.published_at?timeAgo(e.published_at):"--")+'</td>'+
+      '<td class="num">'+Number(e.n_series||0).toLocaleString()+'</td>'+
+      '<td class="num">'+sh.domains+'</td><td class="num">'+sh.freqs+'</td>'+
+      '<td>'+(active?(act.mapped?"← this round":"← newest"):"")+'</td></tr>';
+  }).join("");
+  hist.innerHTML='<div class="scroll-box scroll-field"><table><thead><tr>'+
+    '<th class="num">Active from block</th><th>Data cutoff</th><th>Published</th>'+
+    '<th class="num">Series</th><th class="num">Domains</th><th class="num">Granularities</th><th></th>'+
+    '</tr></thead><tbody>'+rows+'</tbody></table></div>';
+}
+
+// ── tab switching (Rounds / Eval pool) ──────────────────────────────────────
+function selectTab(name){
+  var live=name!=="pool";
+  document.getElementById("tab-live").hidden=!live;
+  document.getElementById("tab-pool").hidden=live;
+  document.getElementById("tab-btn-live").className="tab-btn"+(live?" on":"");
+  document.getElementById("tab-btn-pool").className="tab-btn"+(live?"":" on");
+  if(history.replaceState) history.replaceState(null,"",live?location.pathname+location.search:"#pool");
+}
+if(location.hash==="#pool") selectTab("pool");
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1713,8 +1856,12 @@ function poll(){
   // empty state) — never fabricate submissions.
   fetchJSON("status/chain.json").then(function(d){
     if(_status===null){ _subsSeen=null; }
-    _status=d; renderStage(); renderSubs(); renderCountdown();
+    _status=d; renderStage(); renderSubs(); renderCountdown(); renderPool();
   }).catch(function(){});
+  // Eval-pool composition (status/pool.json, owner's daily publish cron).
+  // Best-effort: on failure the Eval pool tab keeps its explicit empty state.
+  fetchJSON("status/pool.json").then(function(d){ _pool=d; renderPool(); })
+    .catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
   fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
     .catch(function(){});

@@ -19,12 +19,15 @@ from cascade.miner.dashboard import (
     PhaseEstimate,
     RoundTimeline,
     duel_round_rows,
+    estimated_epoch_start,
     fetch_public_heat,
     fetch_public_heat_index,
     fetch_public_heat_round,
+    fetch_public_pool_status,
     fetch_public_receipt_index,
     fetch_public_round_status,
     format_duration,
+    freq_seconds,
     heat_block,
     heat_headline,
     heat_rows,
@@ -32,11 +35,13 @@ from cascade.miner.dashboard import (
     outcome_line,
     phase_for,
     phase_from_live,
+    pool_breakdown_lines,
     render,
     render_duel,
     render_duel_index,
     render_heat,
     render_heat_index,
+    render_pool,
     round_status,
     run_dashboard,
     seconds_per_block,
@@ -795,4 +800,134 @@ def test_cmd_duel_exits_1_without_public_data(monkeypatch, cfg, capsys):
 def test_duel_registered_in_parser():
     with pytest.raises(SystemExit) as e:
         cli.main(["duel", "--help"])
+    assert e.value.code == 0
+
+
+# ── `cascade pool` — eval-pool composition ───────────────────────────────────
+
+
+def _pool_doc():
+    return {
+        "schema": 1,
+        "snapshots": [
+            {"effective_block": 7_200, "as_of": "2026-08-12",
+             "published_at": "2026-08-12T03:00:00+00:00", "n_series": 2_400,
+             "context_length": 4096, "horizon": 64, "sha256": "cd" * 32,
+             "breakdown": {"weather": {"H": 2_300}, "web_traffic": {"D": 100}}},
+            {"effective_block": 14_400, "as_of": "2026-08-13",
+             "published_at": "2026-08-13T03:00:00+00:00", "n_series": 2_987,
+             "context_length": 4096, "horizon": 64, "sha256": "ab" * 32,
+             "breakdown": {"weather": {"H": 2_520, "D": 12},
+                           "energy": {"15T": 370}, "web_traffic": {"D": 85}}},
+        ],
+    }
+
+
+def test_freq_seconds_orders_granularities_finest_first():
+    freqs = ["D", "30S", "H", "15T", "W", "bogus"]
+    freqs.sort(key=freq_seconds)
+    assert freqs == ["30S", "15T", "H", "D", "W", "bogus"]  # unknown sorts last
+
+
+def test_pool_breakdown_lines_matrix_with_totals():
+    lines = pool_breakdown_lines(_pool_doc()["snapshots"][1])
+    head, *rows = lines
+    # columns finest→coarsest; rows largest domain first; totals close the table
+    assert head.split() == ["domain", "series", "15T", "H", "D"]
+    assert rows[0].split()[:2] == ["weather", "2,532"]
+    assert rows[-1].split() == ["total", "2,987", "370", "2,520", "97"]
+    # a snapshot without a breakdown renders nothing rather than a zero matrix
+    assert pool_breakdown_lines({"effective_block": 1}) == []
+
+
+def test_render_pool_maps_round_to_snapshot_and_lists_history():
+    # epoch 14_400 → the 14_400 snapshot governs (greatest effective_block <=)
+    text = render_pool(_pool_doc(), epoch_start=14_400)
+    assert "effective from block 14,400" in text
+    assert "governs the current round" in text
+    assert "2,987 series" in text and "context 4096" in text
+    assert "sha256 abababababababab…" in text
+    assert "← this round" in text
+    assert "block       7,200" in text  # prior pool in the history
+    # an earlier round maps to the earlier snapshot
+    assert "effective from block 7,200" in render_pool(_pool_doc(), epoch_start=7_300)
+    # no chain anchor → newest, explicitly labelled as unmapped
+    assert "current-round mapping unavailable" in render_pool(_pool_doc())
+    assert "no eval-pool composition published" in render_pool(None)
+
+
+def test_render_pool_history_collapses_beyond_limit():
+    text = render_pool(_pool_doc(), epoch_start=14_400, history_limit=1)
+    assert "… 1 older not shown" in text
+
+
+def test_estimated_epoch_start_extrapolates_the_public_anchor():
+    from datetime import datetime
+
+    now = datetime.fromisoformat("2026-08-13T00:01:00+00:00").timestamp()
+    doc = {"current_block": 14_395, "epoch_blocks": 7_200, "block_time_s": 12.0,
+           "as_of": "2026-08-13T00:00:00+00:00"}
+    # 60s at 12s/block = +5 blocks → exactly the 14_400 boundary
+    assert estimated_epoch_start(doc, now_s=now) == 14_400
+    # anchored height alone when the timestamp is unusable
+    assert estimated_epoch_start({"current_block": 14_395, "epoch_blocks": 7_200,
+                                  "as_of": "nope"}, now_s=now) == 7_200
+    assert estimated_epoch_start({"epoch_blocks": 7_200}, now_s=now) is None
+    assert estimated_epoch_start(None, now_s=now) is None
+
+
+def test_fetch_public_pool_status(monkeypatch):
+    import io as _io
+    import json as _json
+    import urllib.request
+
+    urls = []
+
+    class _Resp(_io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        urls.append(req.full_url)
+        return _Resp(_json.dumps(_pool_doc()).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    doc = fetch_public_pool_status(_Storage())
+    assert urls == ["https://s3.example.com/cascade-manifests/status/pool.json"]
+    assert len(doc["snapshots"]) == 2
+
+    # a doc without a snapshots list is not a composition doc
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(b'{"schema": 1}'))
+    assert fetch_public_pool_status(_Storage()) is None
+
+
+def test_cmd_pool_prints_composition(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_pool_status",
+                        lambda *_a, **_k: _pool_doc())
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_chain_status",
+                        lambda *_a, **_k: {"current_block": 14_500, "epoch_blocks": 7_200,
+                                           "block_time_s": 12.0, "as_of": "nope"})
+    args = types.SimpleNamespace(chain_toml=None, limit=None)
+    assert cli._cmd_pool(args) == 0
+    out = capsys.readouterr().out
+    assert "cascade pool" in out and "governs the current round" in out
+
+
+def test_cmd_pool_exits_1_without_public_doc(monkeypatch, cfg, capsys):
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_pool_status",
+                        lambda *_a, **_k: None)
+    args = types.SimpleNamespace(chain_toml=None, limit=None)
+    assert cli._cmd_pool(args) == 1
+    assert "status/pool.json" in capsys.readouterr().err
+
+
+def test_pool_registered_in_parser():
+    with pytest.raises(SystemExit) as e:
+        cli.main(["pool", "--help"])
     assert e.value.code == 0

@@ -117,6 +117,15 @@ in-context.
   battery until raw GIFT rows are persisted beside bench reports.
   (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
 
+- **DEC-CA-0016** — Eval-pool composition is PUBLISHED (`status/pool.json`,
+  dashboards' Eval pool tab + `cascade pool`): per-snapshot series counts per
+  domain × granularity, joined to rounds by the validators' own
+  `effective_block` rule. Aggregate counts ONLY — never series identities,
+  per-series sources, or values (that would hand generators the
+  distribution-matching target the pool's privacy denies). Unsigned,
+  best-effort, presentational; the manifest's pool pin stays the audit record.
+  (`decisions/DEC-CA-0016-eval-pool-composition-published-aggregate-only.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.
