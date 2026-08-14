@@ -53,10 +53,14 @@ class _TimedStream:
     the data path was starved. ``wait_s`` separates the two: it is exactly the
     time training spent waiting on the corpus, so ``wait_s / train_seconds``
     (``data_wait_frac``) reads directly as "fraction of the run starved".
+
+    ``observer`` (optional) sees every series as it passes — the shadow
+    channel-redundancy accumulator rides here (DEC-CA-0022; free at C = 1).
     """
 
-    def __init__(self, stream: Iterator[np.ndarray]) -> None:
+    def __init__(self, stream: Iterator[np.ndarray], observer=None) -> None:
         self._it = iter(stream)
+        self._observer = observer
         self.wait_s = 0.0
 
     def __iter__(self) -> _TimedStream:
@@ -65,9 +69,12 @@ class _TimedStream:
     def __next__(self) -> np.ndarray:
         t0 = time.perf_counter()
         try:
-            return next(self._it)
+            s = next(self._it)
         finally:
             self.wait_s += time.perf_counter() - t0
+        if self._observer is not None:
+            self._observer(s)
+        return s
 
 
 def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
@@ -299,8 +306,13 @@ class Toto2Trainer:
 
         # Timed corpus pulls: every second blocked in next() is starvation the
         # loss curve can't show (see _TimedStream) — surfaced as data_wait_s /
-        # data_wait_frac in the run's metrics and per-step records.
-        timed_stream = _TimedStream(stream)
+        # data_wait_frac in the run's metrics and per-step records. The shadow
+        # channel-redundancy accumulator observes each series in passing
+        # (DEC-CA-0022 telemetry; no-op at C = 1, never in any scoring path).
+        from .channel_stats import ChannelStatsAccumulator
+
+        channel_stats = ChannelStatsAccumulator()
+        timed_stream = _TimedStream(stream, observer=channel_stats.observe)
 
         # Bucketed batching: series shorter than the full context still train (the
         # generator's max_length can be < context_length). Each batch holds series
@@ -430,6 +442,13 @@ class Toto2Trainer:
             "data_wait_frac": round(timed_stream.wait_s / max(train_seconds, 1e-6), 3),
             "tokens_frac": round(tokens / max(1, token_budget), 3),
         }
+        # Shadow channel-redundancy summary — present ONLY when the corpus
+        # carried multichannel series, so univariate run metrics stay
+        # byte-identical to pre-telemetry builds. [telemetry]-class data: no
+        # consumer in any scoring path (DEC-CA-0022; DEC-CA-0010 precedent).
+        ch_summary = channel_stats.summary()
+        if ch_summary is not None:
+            metrics["channel_telemetry"] = ch_summary
         if logger is not None:
             logger({"event": "done", **metrics})
 
