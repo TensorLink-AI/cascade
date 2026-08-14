@@ -139,6 +139,13 @@ train_image_digest = "sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c
 # num_heads                   = 8       # head_dim stays 64 ⇒ d_model = num_heads × 64
 # mlp_expansion               = 2
 # ref_throughput_tokens_per_s = 90000   # MEASURE on the reference GPU for THIS size
+# Size-conditional overrides (DEC-CA-0023; unset = inherit [training]):
+# expected_gpu       = ""     # per-size duel GPU pin (exact nvidia-smi string;
+#                             # 300M+ pins H100-class — mind SXM vs PCIe variants,
+#                             # and measure ref throughput on THAT variant)
+# target_train_hours = 0.0    # per-size budget hours (313M increments ~6h; set
+#                             # jointly with the margin re-unitisation from the
+#                             # null-LCB noise-floor measurement)
 
 [round]
 # Twice-daily round cadence + two-stage (heat → final) selection. The base seed

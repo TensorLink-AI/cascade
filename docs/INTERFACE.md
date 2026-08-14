@@ -15,6 +15,36 @@ channel axis: `generate` may yield a 1-D `(L,)` array (treated as one channel) a
 the schema is ready for multivariate `(C, L)` priors the day the owner raises the
 cap — no interface change for you when that happens.
 
+## The record carrier (optional)
+
+Each `generate()` yield may be a **named-field record** instead of a bare array:
+
+```python
+yield {"values": arr}          # identical to `yield arr` — same corpus digest
+```
+
+At `interface_version = 1` (see `chain.toml [generator]`) the record form
+accepts **`values` only**. These names are **reserved** — they have published
+future semantics and any yield carrying one is rejected today: `mask`
+(observedness, DEC-CA-0019), `roles` (variate roles, DEC-CA-0022), `start` /
+`freq` (time anchor, DEC-CA-0017), `group_id` (panels, DEC-CA-0020), `labels`,
+`quantiles`. Unknown names are always rejected. When a field is later
+*accepted*, it is consumed by the trainer in the same release and
+`interface_version` bumps — your deployed bare-array (or values-only record)
+generator stays valid at every version, forever. You may declare
+`"interface_version": 1` in your `config.json`; declaring a version newer than
+the trainer supports fails your run early with a clear error.
+
+## Yield order is a training lever
+
+In the live `stream_cpu` feed the trainer consumes your series **in yield
+order** (bucketed by shape, no global shuffle) under a cosine LR schedule.
+Ordering easy→hard, stationary→shifted, or annealing your mixture over the
+stream is a curriculum you already control — it is the honest answer to "how
+do I express non-stationarity to this trainer": order, not timestamps
+(DEC-CA-0021). Both duel sides hold the same lever, and a pathological order
+only costs your own throughput (the wall is the law).
+
 ## Repo layout
 
 Your generator repo (a local directory `deploy` pushes to the Hippius Hub registry)

@@ -151,7 +151,13 @@ in-context.
   the noise floor kills the at-size duel.
   (`decisions/DEC-CA-0023-size-conditional-gpu-provisioning.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
-  `docs/SUBMISSION_SURFACE_ROADMAP.md`.
+  `docs/SUBMISSION_SURFACE_ROADMAP.md`. The inert code stages are IMPLEMENTED
+  (2026-08-14, this branch): Stage 0 (golden digest freeze, record carrier,
+  joint ForecastFn + series_id cluster fallback), Stage 1 code (channel-drop
+  fix, shadow channel telemetry, pool `require_source` knob), Stage 6 plumbing
+  (SizeSpec.expected_gpu/target_train_hours, provisioner final alternates).
+  All inert at today's config; arming and every measurement remain gated per
+  the roadmap.
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;

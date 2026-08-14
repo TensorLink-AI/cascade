@@ -1,6 +1,19 @@
 # Miner submission surface & scaling ladder — staged expansion roadmap
 
-Status: **proposed** (design pass 2026-08-13/14; no implementation).
+Status: **proposed** (design pass 2026-08-13/14), with the inert code stages
+**implemented on this branch** (2026-08-14): Stage 0 in full (golden-vector
+digest freeze → record carrier → joint `(C, L)` forecaster + `series_id`
+cluster fallback), Stage 1's code half (channel-drop fix with `(P, C)`
+bucketing; shadow channel-correlation/effective-rank telemetry), and Stage 6's
+plumbing (`SizeSpec.expected_gpu` / `target_train_hours`, size-conditional
+`[provisioner.final.<name>]` selection). Everything landed is inert at today's
+config (`max_channels = 1`, no `[[training.sizes]]` blocks): values-only
+corpora hash byte-identically (golden vectors enforce it) and no
+`contract_digest` moves. Still open — deliberately, per the gates below: the
+MV-vs-univariate ablation and every other measurement, all pool-builder work,
+every acceptance/arming step (Stages 2–5 arming, mask/roles consumption), and
+all deploys (the Stage 0c scoring change ships under the DEC-CA-0009 lockstep
+discipline).
 Companion decision records: DEC-CA-0016 (carrier), DEC-CA-0017…0022 (one per
 submission-surface gap), DEC-CA-0023 (scaling ladder). This document
 sequences them, states each stage's contract-digest impact and migration

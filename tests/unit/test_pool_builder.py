@@ -196,3 +196,19 @@ def test_source_label_lands_in_metadata():
     # Legacy sources without a label stay unchanged: no source key at all.
     rec2, _ = prepare_series(_series("s2"), cfg)
     assert "source" not in rec2.metadata
+
+
+def test_require_source_rejects_unlabeled_series():
+    # DEC-CA-0022 item 3: the strict knob for pools that will carry
+    # multichannel windows — every kept series must name its upstream feed.
+    cfg = PoolBuildConfig(context_length=512, horizon=16, require_source=True)
+    labeled = HarvestedSeries(
+        "s1", 10 + np.sin(np.arange(600) / 5.0), "H", "energy", 24, source="grid_load"
+    )
+    rec, reason = prepare_series(labeled, cfg)
+    assert reason is None and rec.metadata["source"] == "grid_load"
+    rec2, reason2 = prepare_series(_series("s2"), cfg)
+    assert rec2 is None and reason2 == "missing_source"
+    # Default stays permissive: same unlabeled series builds fine.
+    rec3, reason3 = prepare_series(_series("s3"), PoolBuildConfig(context_length=512, horizon=16))
+    assert reason3 is None and "source" not in rec3.metadata

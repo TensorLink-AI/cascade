@@ -71,6 +71,13 @@ class PoolBuildConfig:
     # hourly flood inside a domain can't crowd out that domain's daily series.
     max_series_per_domain_freq: int | None = None
     max_series_total: int | None = None
+    # Require an upstream feed id on every kept series (DEC-CA-0022 item 3):
+    # ``source`` is the KOTH cluster-bootstrap key, and multivariate windows
+    # must never enter a pool without it (their channels would otherwise lean
+    # on the series_id fallback alone). Off by default — existing sources that
+    # predate source stamping keep building — but flip it on before any pool
+    # carries multichannel windows.
+    require_source: bool = False
 
     @property
     def min_length(self) -> int:
@@ -156,6 +163,8 @@ def prepare_series(
     arr = _to_2d_float(hs.values)
     if arr is None:
         return None, "bad_shape"
+    if cfg.require_source and not hs.source:
+        return None, "missing_source"
     n_channels, length = arr.shape
     if n_channels > cfg.max_channels:
         return None, "too_many_channels"
