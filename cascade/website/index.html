@@ -1093,11 +1093,6 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
 
   <div>
     <div class="section-label"><span>This round&rsquo;s eval pool</span><span id="pool-when" class="muted"></span></div>
-    <div class="heat-note">Every round is scored on a private, rotating pool of real-world series.
-      The series themselves stay private (fresh, unpublished data is the anti-contamination lever) &mdash;
-      what is published is each daily snapshot&rsquo;s aggregate shape: how many series per domain, at which
-      granularity. A round maps to the snapshot with the greatest effective block &le; its epoch start &mdash;
-      the same deterministic rule validators score by, so this is the pool your submission is being judged on.</div>
     <div id="pool-panel"></div>
   </div>
 
@@ -1758,16 +1753,16 @@ function renderPool(){
     hist.innerHTML=""; if(when) when.textContent="";
     return;
   }
-  var act=poolActive(snaps), s=act.snap, shape=poolShapeCounts(s);
+  var act=poolActive(snaps), s=act.snap;
   if(when) when.textContent=(act.mapped?"active from block "+Number(s.effective_block).toLocaleString():"newest published — current-round mapping needs the live chain feed")+
     (s.published_at?" · published "+timeAgo(s.published_at):"");
   var sha=String(s.sha256||"");
   panel.innerHTML=
     '<div class="heat-note">'+
-      'Data cutoff <b>'+esc(s.as_of||"--")+'</b> · <b>'+Number(s.n_series||0).toLocaleString()+'</b> series across <b>'+
-      shape.domains+'</b> domain(s) and <b>'+shape.freqs+'</b> granularit'+(shape.freqs===1?"y":"ies")+
-      ' · window geometry: context <b>'+esc(s.context_length!=null?s.context_length:"--")+'</b> / horizon <b>'+esc(s.horizon!=null?s.horizon:"--")+'</b>'+
-      (sha?' · tar sha256 <span title="'+esc(sha)+'">'+esc(sha.slice(0,16))+'…</span> (cross-check: the signed manifest pins eval_pool_sha256 per round)':'')+
+      'Data cutoff <b>'+esc(s.as_of||"--")+'</b> · <b>'+Number(s.n_series||0).toLocaleString()+'</b> series'+
+      ' · context <b>'+esc(s.context_length!=null?s.context_length:"--")+'</b> / horizon <b>'+esc(s.horizon!=null?s.horizon:"--")+'</b>'+
+      (sha?' · sha256 <span title="Cross-check: the signed manifest pins this as eval_pool_sha256 for the rounds this snapshot governs.\n'+esc(sha)+'">'+esc(sha.slice(0,16))+'…</span>':'')+
+      ' · <span title="The series themselves stay private (fresh, unpublished data is the anti-contamination lever); only aggregate counts per domain and granularity are published. A round maps to the snapshot with the greatest effective block ≤ its epoch start — the same rule validators score by.">aggregate counts only</span>'+
     '</div>'+poolMatrixHTML(s);
   var rows=snaps.slice().reverse().map(function(e){
     var sh=poolShapeCounts(e), active=(e===s);
