@@ -164,6 +164,37 @@ on a trained model — the duel's actual question — at heat prices. The
 mirror checkpoint is shared by every entrant in the round, so the screen
 stays paired; `p_best`/`leader_lcb` diagnostics carry over unchanged.
 
+Mirror mechanics (owner-reviewed 2026-08-14):
+
+- **Weights cannot cross sizes** — a 22M cannot warm-start from a 313M
+  checkpoint (shape mismatch; the warm-start load is deliberately strict
+  and aborts). The mirror is therefore its OWN lineage at its own size:
+  random init from the round's shared seed the same round the flagship
+  generation starts, then one increment per round on the crowned corpus,
+  checkpoint pinned by ref exactly like `warm_start_init.json`.
+- **Maturity matching, not hours matching.** The mirror is a faithful
+  regime proxy when it sits at the flagship's training maturity — match
+  **tokens-per-param** per increment. At ~7 tok/param that is ~150M tokens
+  at 22M ≈ minutes on a heat SKU; the maintenance lane is nearly free. The
+  per-entrant SCREEN increment is a separate, larger knob (enough signal
+  per entrant), set by the same noise-floor measurement as the duel's.
+- **The screen needs no margin rework.** Every entrant shares one baseline
+  init, so ranking on the post-increment score IS ranking on the
+  increment — the inherited level cancels in comparison. The
+  baseline-referenced statistic is a duel-only need (a margin is an
+  absolute bar; a ranking is not).
+- **Lifecycle**: a dethrone just redirects next round's diet (mirror
+  follows the crown like the flagship); a DEC-CA-0014 reseed reseeds the
+  mirror the same round; a missed mirror round is reproducible
+  (prior checkpoint + corpus digest + seed) — retrain it or run one
+  increment stale, either is sound because every entrant in a heat shares
+  whatever the mirror state is.
+- **Rejected alternative, priced**: warm-start screening AT the flagship
+  size with tiny increments — ~20 entrants × 30min H100 ≈ $30-40/round on
+  an H100 heat fleet, for WORSE per-entrant signal than a 1h increment on
+  the 22M mirror. The mirror wins on cost and signal; what it cannot rule
+  out is a pure scale-transfer gap, which is settling measurement 2's job.
+
 **The decoupled-flagship fallback stays on the table.** If the noise-floor
 measurement says even 6h increments cannot separate honest corpus deltas at
 313M, dueling at size selects by noise — then the duel stays at 22M
