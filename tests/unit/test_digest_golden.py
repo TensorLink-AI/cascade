@@ -120,3 +120,47 @@ def test_stream_digest_prefix_property():
     d2 = _StreamDigest()
     d2.update(_canon(_a1()))
     assert d1.hexdigest() == d2.hexdigest() != GOLDEN_STREAM_2X1D
+
+
+# ── contract digest (frozen 2026-08-14, before drop-when-default fields) ─────
+
+GOLDEN_CONTRACT = "8fb51bb1d811dbdf7f90200aff921baaab91249b75cad65b8643b91fd05e4a9a"
+GOLDEN_DICT = "8baa73198470c7bb4c3ce142a8fd651affc0310d878bb9bd159e37a573fb4874"
+
+
+def _fixture_contract(**kw):
+    from cascade.shared.config import TrainingContractConfig
+
+    base = dict(
+        base_arch="toto2", arch_preset="toto2-4m", base_arch_digest="a" * 64,
+        d_model=256, num_layers=4, num_heads=4, head_dim=64, patch_size=32,
+        mlp_expansion=2, num_quantiles=9, masking="contiguous_patch",
+        cpm_c_max=16, cpm_p_max=0.4, input_transform="arcsinh_causal",
+        context_length=4096, horizon=64, target_train_hours=3.0,
+        ref_throughput_tokens_per_s=3_700_000, warmup_fraction=0.05,
+        batch_size=64, optimizer="normuon_adamw", base_lr=4e-3,
+        weight_decay=0.05, lr_schedule="warmup_cosine", umup_base_d_model=256,
+        train_seed_salt=1337, max_train_seconds=10800,
+        expected_gpu="NVIDIA L40S",
+    )
+    base.update(kw)
+    return TrainingContractConfig(**base)
+
+
+def test_contract_digest_golden():
+    from cascade.shared.manifest import contract_digest
+
+    assert contract_digest(_fixture_contract()) == GOLDEN_CONTRACT
+    assert contract_digest({"a": 1, "b": [1, 2]}) == GOLDEN_DICT
+
+
+def test_drop_when_default_fields_never_move_a_deployed_digest():
+    # A digest-bound field at its inert default is omitted from the hash —
+    # adding such fields to the dataclass is digest-invisible until SET.
+    from cascade.shared.manifest import _DIGEST_DROP_WHEN_DEFAULT, contract_digest
+
+    c = _fixture_contract()
+    for key in _DIGEST_DROP_WHEN_DEFAULT:
+        if hasattr(c, key):
+            # present on the dataclass at its default → golden must still hold
+            assert contract_digest(c) == GOLDEN_CONTRACT

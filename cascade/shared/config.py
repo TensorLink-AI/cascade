@@ -83,6 +83,26 @@ class GeneratorConfig:
     # inert today. 0 disables.
     interface_version: int = 1
     max_payload_bytes: int = 0
+    # Runtime mirrors of the DIGEST-BOUND [training] acceptance keys (the
+    # loader copies them in; there is no [generator] key for either — one
+    # config source). They ride here because this dataclass is what reaches
+    # the sandbox children and every drain/stream call site.
+    #   accepted_fields    — record fields to accept AND consume ("mask",
+    #                        "roles"); () = values-only (deployed default).
+    #   allow_future_known — admit roles value 2 (future-known covariates).
+    # Note: json round-trips turn the tuple into a list; treat as a container.
+    accepted_fields: tuple[str, ...] = ()
+    allow_future_known: bool = False
+    # Channel-redundancy gate (DEC-CA-0022; data-quality, not digest-bound).
+    #   channel_corr_mode — "off" (default) | "shadow" (telemetry only; the
+    #                       trainer's shadow accumulator already logs it) |
+    #                       "enforce" (reject a series whose max off-diagonal
+    #                       |Pearson| exceeds max_channel_corr).
+    #   max_channel_corr  — the near-identity bar; 0.999 targets the
+    #                       jitter-duplicate exploit only. Enforce ONLY after
+    #                       the shadow logs clear honest generators.
+    channel_corr_mode: str = "off"
+    max_channel_corr: float = 0.999
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -97,6 +117,27 @@ def validate_sandbox_mode(mode: str) -> str:
     if mode not in SANDBOX_MODES:
         raise ValueError(f"sandbox_mode={mode!r} invalid; expected one of {SANDBOX_MODES}")
     return mode
+
+
+# Record-carrier fields with a WIRED consumer (accept = consume, one release;
+# DEC-CA-0016's refuse-unconsumed rule made mechanical). [training]
+# accepted_fields may only name these; every other reserved name is still
+# rejected at load so a typo or a premature arming fails the boot, not a round.
+CONSUMABLE_FIELDS = ("mask", "roles")
+
+
+def validate_accepted_fields(value: object) -> tuple[str, ...]:
+    """Normalise ``[training] accepted_fields`` (sorted, deduped) and reject
+    names without a wired consumer."""
+    fields = tuple(sorted({str(v) for v in (value or ())}))
+    bad = [f for f in fields if f not in CONSUMABLE_FIELDS]
+    if bad:
+        raise ValueError(
+            f"[training] accepted_fields={bad} have no wired consumer; "
+            f"acceptable: {sorted(CONSUMABLE_FIELDS)} (a reserved field arms only "
+            "in the release that consumes it — DEC-CA-0016)"
+        )
+    return fields
 
 
 DEDUP_MODES = ("off", "shadow", "enforce")
@@ -284,6 +325,19 @@ class TrainingContractConfig:
     # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
     # contract_digest, so a validator's contract gate covers every size at once.
     extra_sizes: tuple[SizeSpec, ...] = ()
+    # ── accepted record-field set (DEC-CA-0016 layer 3; digest-bound) ────────
+    # The payload fields the carrier ACCEPTS and the trainer CONSUMES — one
+    # release ships both, and arming is this one [training] key (a deliberate
+    # contract_digest bump via the drop-when-default convention in
+    # cascade.shared.manifest: empty = omitted from the hash, so deployed
+    # digests are untouched until an operator sets it). Valid entries are
+    # reserved names with a wired consumer: "mask" (DEC-CA-0019), "roles"
+    # (DEC-CA-0022). Order-insensitive (normalised sorted at load).
+    accepted_fields: tuple[str, ...] = ()
+    # roles value 2 (future-known covariates) admission. Digest-bound and OFF
+    # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
+    # arming it before that rule exists is forbidden (DEC-CA-0022).
+    allow_future_known: bool = False
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -1143,6 +1197,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
             interface_version=int(g.get("interface_version", 1)),
             max_payload_bytes=int(g.get("max_payload_bytes", 0)),
+            # Mirrored from the digest-bound [training] keys — single source.
+            accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
+            allow_future_known=bool(t.get("allow_future_known", False)),
+            channel_corr_mode=validate_dedup_mode(
+                str(g.get("channel_corr_mode", "off")), "channel_corr_mode"),
+            max_channel_corr=float(g.get("max_channel_corr", 0.999)),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),
@@ -1181,6 +1241,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             expected_gpu=str(t.get("expected_gpu", "")),
             train_image_digest=str(t.get("train_image_digest", "")),
             extra_sizes=extra_sizes,
+            accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
+            allow_future_known=bool(t.get("allow_future_known", False)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
