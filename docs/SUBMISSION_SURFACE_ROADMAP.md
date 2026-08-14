@@ -1,10 +1,33 @@
-# Miner submission surface — staged expansion roadmap
+# Miner submission surface & scaling ladder — staged expansion roadmap
 
-Status: **proposed** (design pass 2026-08-13; no implementation). Companion
-decision records: DEC-CA-0016 (carrier) and DEC-CA-0017…0022 (one per gap).
-This document sequences them, states each stage's contract-digest impact and
-migration path, and settles the two cross-cutting questions (budget
-denomination, the no-weights ceiling).
+Status: **proposed** (design pass 2026-08-13/14; no implementation).
+Companion decision records: DEC-CA-0016 (carrier), DEC-CA-0017…0022 (one per
+submission-surface gap), DEC-CA-0023 (scaling ladder). This document
+sequences them, states each stage's contract-digest impact and migration
+path, and settles the cross-cutting questions (budget denomination, the
+no-weights ceiling).
+
+## The two workstreams
+
+The plan is two independent tracks that meet at the end:
+
+1. **The submission surface** (Stages 0–5): evolve *what miners can
+   express* — one extensible carrier settled up front (record-or-array
+   yield, canonical digest, reserved names, versioning), then payload
+   fields accepted one at a time, each strictly behind the eval work that
+   makes it measurable. Ranked by value-per-effort: multivariate (+ panels)
+   > missingness > time anchor > length.
+2. **The scaling ladder** (Stage 6 / the E0–E3 era map): evolve *what
+   miners' data trains* — from-scratch-per-round ends between 22M and
+   ~100M, so 313M+ rounds are warm-start increments on size-conditional
+   silicon (300M+ rents H100, owner-directed), screened at 22M, judged by a
+   margin re-unitised from %-of-level to %-of-increment.
+
+They interact only at E2+: the surface stages keep every deployed
+bare-array univariate generator valid throughout, and the ladder changes
+only what happens downstream of the corpus. The shared spine is the
+invariant list at the top and the measurement-before-arming discipline
+throughout.
 
 Binding constraints throughout (none are relaxed by any stage):
 
@@ -141,6 +164,41 @@ measurement, not by feel.
   mode, audit replays both rules).
 - **Migration: none for miners** — the submission surface is untouched; only
   what happens to their data downstream scales.
+
+#### The era ladder (the warm-stage map, from DEC-CA-0023)
+
+Weights never cross sizes (strict-load design): each trained size carries
+its own lineage; what flows up the ladder is the crowned-corpus diet. Each
+era transition is a contract change, release-then-activate.
+
+| era | screen | throne (duel) | regime | margin | silicon |
+|---|---|---|---|---|---|
+| E0 (live) | 4M heat, from-scratch | 4M, 3h from-scratch | from-scratch + cascade promotion | 2% of level | 4090 / L40S |
+| E1 — 22M shakeout | 4M unchanged | {4M, 22M} combined | both from-scratch | 2% of level | + L40S-class |
+| E2 — 313M ladder | 22M mirror lineage (warm-start) | 313M increments ~6h | compounding lineage | % of increment | 4090 heat / H100 final |
+| E3 — 1B | 22M mirror (or 313M mirror, open) | 1B increments | compounding lineage | % of increment | 8×H100 fleet |
+
+- **E1 is a machinery rehearsal, not a capability step**: the disabled 22M
+  size arms from-scratch (no warm-start or margin work needed at ~6B
+  tokens/round) purely to exercise per-size digests, throughput pins,
+  multi-size verdict pooling, and the new SizeSpec overrides on
+  mainnet-shaped rounds.
+- **E2 is the main act**: mirror screen (maturity-matched by
+  tokens-per-param, ~free to maintain; the screen needs no margin rework —
+  a shared baseline cancels in a ranking), increment duels, re-unitised
+  margin, 4M retires from scoring. Generation lifecycle: init round (random
+  init, WSD warmup) → compounding rounds (flat LR; each duel picks the next
+  increment's diet for throne and mirror) → release cuts (LR-decayed
+  *copies*; the lineage itself is never decayed) → reseed valve
+  (DEC-CA-0014 generalised; mirror reseeds the round the throne does).
+- **E3's hard gate**: deterministic multi-GPU or the bf16 recipe must land
+  first — single-GPU 1B is ~60 rounds to adequacy, a queue, not a ladder.
+- **Era boundaries — grow or reseed**: a new size starts from random init
+  (default) or is grown from the previous size's best checkpoint by a
+  deterministic function-preserving operator (μP-consistent width, depth
+  stacking; init provenance = grown-from ref + operator version). Option,
+  never default — settled at each era start by running both inits side by
+  side for the first k rounds and benching (DEC-CA-0014's instrument).
 
 ### Never scheduled
 
