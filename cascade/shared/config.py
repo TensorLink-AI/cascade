@@ -69,6 +69,20 @@ class GeneratorConfig:
     max_abs_value: float = 0.0
     reject_constant: bool = False
     max_dup_fraction: float = 1.0
+    # ── the record carrier (DEC-CA-0016; never part of contract_digest) ──────
+    # ``interface_version`` names which yield payloads the trainer accepts: 1 =
+    # record-or-array with ``values`` only (every reserved field hard-rejected).
+    # A generator repo may declare its own ``interface_version`` in config.json;
+    # one newer than this is rejected before the generator runs. Bumps ONLY
+    # when a new payload field is accepted+consumed in one release — at that
+    # point the accepted field set folds into [training] (one deliberate
+    # contract_digest bump, DEC-CA-0016 layer 3).
+    # ``max_payload_bytes`` is the carrier cap in canonical payload BYTES —
+    # the budget denomination that stays correct when non-values fields arrive.
+    # At 16e9 it equals max_total_points × 8 (float64), so it is numerically
+    # inert today. 0 disables.
+    interface_version: int = 1
+    max_payload_bytes: int = 0
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -1093,6 +1107,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_abs_value=float(g.get("max_abs_value", 0.0)),
             reject_constant=bool(g.get("reject_constant", False)),
             max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
+            interface_version=int(g.get("interface_version", 1)),
+            max_payload_bytes=int(g.get("max_payload_bytes", 0)),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),

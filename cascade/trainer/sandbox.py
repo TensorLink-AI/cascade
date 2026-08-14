@@ -738,7 +738,11 @@ def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int
 
 
 def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
-    from ..interface.generator import CAST_SAFE_MAX_FLOAT32, check_series
+    from ..interface.generator import (
+        CAST_SAFE_MAX_FLOAT32,
+        canonicalize_yield,
+        check_series,
+    )
     from .corpus import _load_generator
 
     out = sys.stdout.buffer
@@ -746,7 +750,13 @@ def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
         cfg = GeneratorConfig(**json.loads(cfg_json))
         _maybe_self_rlimit(cfg)
         gen = _load_generator(Path(repo), int(seed))
-        for i, arr in enumerate(gen.generate(int(n_upper))):
+        # Record yields (DEC-CA-0016) are normalised to their values array
+        # CHILD-side, so the parent-facing frame protocol stays plain .npy
+        # frames — byte-identical for values-only records. When the first
+        # payload field (mask, roles) is accepted, this is the seam that grows
+        # a record frame; until then nothing but values crosses the pipe.
+        for i, item in enumerate(gen.generate(int(n_upper))):
+            arr = canonicalize_yield(item, index=i)
             check_series(
                 arr, min_length=cfg.min_length, max_length=cfg.max_length,
                 max_channels=cfg.max_channels,

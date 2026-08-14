@@ -20,6 +20,16 @@ max_generate_seconds = 1800      # wall-clock budget for draining the generator
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
 max_channels         = 1         # per-series variates; 1 = univariate
+# The record carrier (DEC-CA-0016). interface_version 1 = record-or-array yield
+# with `values` only; every reserved field (mask, start, freq, group_id, roles,
+# labels, quantiles) is hard-rejected until the release that consumes it. Bumps
+# only when a field is accepted+consumed together (the accepted set then folds
+# into [training] — one deliberate contract_digest bump).
+interface_version    = 1
+# Carrier cap in canonical payload BYTES — the denomination that stays correct
+# when non-values fields arrive. 16e9 = max_total_points × 8 (float64): exactly
+# today's point cap, so it is numerically inert. 0 disables.
+max_payload_bytes    = 16_000_000_000
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
 reject_constant      = false     # reject flat (zero-range) series

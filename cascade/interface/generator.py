@@ -35,9 +35,81 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 
 import numpy as np
+
+# ── the record carrier (DEC-CA-0016) ─────────────────────────────────────────
+
+# The interface version this code accepts. A generator repo may declare
+# ``"interface_version"`` in its config.json; a declared version NEWER than
+# this is rejected before the generator runs (clear early error instead of a
+# mid-drain validation failure). Absent ⇒ 1. Bump only when a new payload
+# field is ACCEPTED (DEC-CA-0016's refuse-unconsumed rule).
+SUPPORTED_INTERFACE_VERSION = 1
+
+# The one field a record yield must carry at interface_version 1.
+VALUES_FIELD = "values"
+
+# Reserved payload names: published semantics, refused data. Each is claimed by
+# a decision record and waits for the release that CONSUMES it (trainer + eval
+# together); until then a yield carrying one is hard-rejected, so no miner can
+# squat a name and no accepted-but-ignored field can ever exist. The table is
+# the migration path: accepting a field later is additive and breaks nobody.
+RESERVED_FIELDS: dict[str, str] = {
+    "mask": "per-entry observedness mask parallel to values (DEC-CA-0019)",
+    "start": "absolute time anchor of the first step (DEC-CA-0017; no consumer under the calendar-free arch pin)",
+    "freq": "sampling frequency / calendar step (DEC-CA-0017)",
+    "group_id": "cross-series panel/group label (DEC-CA-0020; panels are variates for this arch)",
+    "roles": "per-channel variate roles: target / past-cov / future-known (DEC-CA-0022)",
+    "labels": "per-series free-form tags (no consumer scheduled)",
+    "quantiles": "per-step distributional payload (no consumer scheduled)",
+}
+
+
+def canonicalize_yield(item: object, *, index: int | None = None) -> object:
+    """Normalise one ``generate()`` yield to its values array.
+
+    The carrier accepts two shapes per DEC-CA-0016:
+
+    * a bare ``np.ndarray`` — the documented common case, passed through
+      untouched (zero cost, zero behaviour change for every deployed
+      generator);
+    * a named-field record (any ``Mapping``) — must carry exactly the
+      ``"values"`` key at ``interface_version`` 1. Reserved names
+      (:data:`RESERVED_FIELDS`) are hard-rejected with their semantics named,
+      unknown names are hard-rejected outright. Nothing else about the values
+      array changes: validation (:func:`check_series`), canonicalisation, and
+      digesting all see the identical array a bare yield would produce, so a
+      values-only record corpus hashes byte-for-byte the same as its
+      bare-array twin.
+
+    Returns the values object (validated downstream); raises ``ValueError``
+    on any malformed record.
+    """
+    if not isinstance(item, Mapping):
+        return item
+    where = "" if index is None else f" (series {index})"
+    for key in item:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"record field names must be strings{where}; got {type(key).__name__}"
+            )
+        if key == VALUES_FIELD:
+            continue
+        if key in RESERVED_FIELDS:
+            raise ValueError(
+                f"record field {key!r} is reserved but not yet accepted{where}: "
+                f"{RESERVED_FIELDS[key]}. interface_version "
+                f"{SUPPORTED_INTERFACE_VERSION} accepts {VALUES_FIELD!r} only."
+            )
+        raise ValueError(
+            f"unknown record field {key!r}{where}; interface_version "
+            f"{SUPPORTED_INTERFACE_VERSION} accepts {VALUES_FIELD!r} only"
+        )
+    if VALUES_FIELD not in item:
+        raise ValueError(f"record yield is missing the {VALUES_FIELD!r} field{where}")
+    return item[VALUES_FIELD]
 
 
 class DataGenerator(ABC):
@@ -66,10 +138,21 @@ class DataGenerator(ABC):
         """
 
     @abstractmethod
-    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+    def generate(self, n_series: int) -> Iterator[np.ndarray | Mapping]:
         """Yield exactly ``n_series`` training series.
 
-        Each yielded value is a ``float`` ``np.ndarray`` (finite, no NaN or
+        Each yield is EITHER a bare array — the documented common case — or a
+        named-field record (a ``dict``) whose ``"values"`` key carries that
+        same array (DEC-CA-0016). At ``interface_version`` 1 the record form
+        may carry the ``"values"`` field ONLY: reserved names
+        (:data:`RESERVED_FIELDS` — ``mask``, ``start``, ``freq``, ``group_id``,
+        ``roles``, ``labels``, ``quantiles``) have published semantics but are
+        hard-rejected until the release that consumes them, and unknown names
+        are always rejected. A values-only record corpus is byte-identical
+        (same digest) to its bare-array twin, so the two forms are freely
+        interchangeable.
+
+        The values array is a ``float`` ``np.ndarray`` (finite, no NaN or
         inf), either 1-D ``(L,)`` (univariate) or 2-D ``(C, L)`` (``C`` variates
         of length ``L``). A 1-D series is treated as a single channel ``(1, L)``.
         ``C`` must not exceed the configured ``max_channels`` (1 today), and the
@@ -193,6 +276,7 @@ def drain_generator(
     max_abs: float | None = None,
     reject_constant: bool = False,
     max_dup_fraction: float = 1.0,
+    max_payload_bytes: int = 0,
 ) -> list[np.ndarray]:
     """Pull ``n_series`` series from ``gen``, validating each one.
 
@@ -210,8 +294,20 @@ def drain_generator(
     zero-false-positive choice: honest seeded continuous-parameter generators
     never byte-collide, so a loose cap only trips lazy duplication (a determined
     adversary can still evade it with 1e-15 jitter — that's a v1 floor, not an
-    anti-adversary defence). All three gates default to no-op so existing callers
+    anti-adversary defence). All gates default to no-op so existing callers
     are unchanged; the trainer sets them from ``chain.toml [generator]``.
+
+    ``max_payload_bytes`` is the CARRIER's budget denomination (DEC-CA-0016 G3):
+    a cap on the total canonical payload bytes of the drained corpus. Today the
+    payload is the values arrays only, so at the shipped value (16e9 =
+    ``max_total_points`` × 8 bytes/float64) it is numerically identical to the
+    point cap and can never trip first; it exists so that future accepted
+    fields (a mask, roles) are priced in the same denomination automatically
+    instead of needing a second cap per field. ``0`` disables it.
+
+    Record yields (DEC-CA-0016) are normalised through
+    :func:`canonicalize_yield` before validation, so a values-only record
+    corpus digests byte-identically to its bare-array twin.
 
     Each series is canonicalised to a contiguous ``(C, L)`` float64 array (a 1-D
     series becomes ``(1, L)``), so the corpus the base trainer consumes always
@@ -227,11 +323,13 @@ def drain_generator(
     dups = 0
     out: list[np.ndarray] = []
     total = 0
-    for i, arr in enumerate(gen.generate(n_series)):
+    payload_bytes = 0
+    for i, item in enumerate(gen.generate(n_series)):
         if i >= n_series:
             raise ValueError(
                 f"generate yielded more than n_series={n_series} series"
             )
+        arr = canonicalize_yield(item, index=i)
         check_series(
             arr, min_length=min_length, max_length=max_length,
             max_channels=max_channels, max_abs=max_abs,
@@ -242,6 +340,11 @@ def drain_generator(
         if total > max_total_points:
             raise ValueError(
                 f"total emitted points {total} exceeds cap {max_total_points}"
+            )
+        payload_bytes += int(canon.nbytes)
+        if max_payload_bytes and payload_bytes > max_payload_bytes:
+            raise ValueError(
+                f"total payload bytes {payload_bytes} exceeds cap {max_payload_bytes}"
             )
         if dedup:
             key = _series_key(canon)

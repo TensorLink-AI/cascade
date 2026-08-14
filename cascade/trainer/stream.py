@@ -58,12 +58,17 @@ def _inprocess_stream(
     repo: Path, seed: int, cfg: GeneratorConfig, token_budget: int
 ) -> Iterator[np.ndarray]:
     """In-process fresh-series stream (no sandbox) for offline / test runs."""
-    from ..interface.generator import CAST_SAFE_MAX_FLOAT32, check_series
+    from ..interface.generator import (
+        CAST_SAFE_MAX_FLOAT32,
+        canonicalize_yield,
+        check_series,
+    )
     from .corpus import _load_generator
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     gen = _load_generator(repo, int(seed))
-    for i, arr in enumerate(gen.generate(n_upper)):
+    for i, item in enumerate(gen.generate(n_upper)):
+        arr = canonicalize_yield(item, index=i)
         check_series(
             arr, min_length=cfg.min_length, max_length=cfg.max_length,
             max_channels=cfg.max_channels,

@@ -15,13 +15,19 @@ with ``use_sandbox=True``, the default).
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from ..interface.generator import CAST_SAFE_MAX_FLOAT32, DataGenerator, drain_generator
+from ..interface.generator import (
+    CAST_SAFE_MAX_FLOAT32,
+    SUPPORTED_INTERFACE_VERSION,
+    DataGenerator,
+    drain_generator,
+)
 from ..interface.validation import check_repo_size
 from ..shared.config import GeneratorConfig
 from ..shared.manifest import corpus_digest
@@ -39,10 +45,44 @@ class CorpusError(RuntimeError):
     """Importing or running the generator failed, or its output was rejected."""
 
 
+def _check_declared_interface(repo_dir: Path) -> None:
+    """Reject a repo declaring an interface_version newer than this code.
+
+    DEC-CA-0016 layering: a generator MAY declare ``"interface_version"`` in
+    its config.json (absent ⇒ 1, the deployed fleet). A declared version this
+    code does not support fails HERE, before any miner code runs, with an
+    error naming the mismatch — instead of a confusing mid-drain rejection of
+    a record field the miner believed was accepted. An unparseable config.json
+    is ignored (the generator itself owns that file's schema).
+    """
+    cfg_p = repo_dir / "config.json"
+    if not cfg_p.is_file():
+        return
+    try:
+        declared = json.loads(cfg_p.read_text(encoding="utf-8")).get("interface_version")
+    except (OSError, ValueError):
+        return
+    if declared is None:
+        return
+    try:
+        version = int(declared)
+    except (TypeError, ValueError):
+        raise CorpusError(
+            f"generator_interface_invalid: config.json interface_version={declared!r} "
+            "is not an integer"
+        ) from None
+    if version > SUPPORTED_INTERFACE_VERSION:
+        raise CorpusError(
+            f"generator_interface_too_new: config.json declares interface_version="
+            f"{version}, but this trainer supports <= {SUPPORTED_INTERFACE_VERSION}"
+        )
+
+
 def _load_generator(repo_dir: Path, generation_seed: int) -> DataGenerator:
     wrapper_py = repo_dir / "generator.py"
     if not wrapper_py.is_file():
         raise CorpusError("missing generator.py")
+    _check_declared_interface(repo_dir)
     spec = importlib.util.spec_from_file_location("cascade_submitted_generator", wrapper_py)
     if spec is None or spec.loader is None:
         raise CorpusError("generator_spec_failed")
@@ -91,6 +131,7 @@ def build_corpus(
             max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
             reject_constant=cfg.reject_constant,
             max_dup_fraction=cfg.max_dup_fraction,
+            max_payload_bytes=cfg.max_payload_bytes,
         )
     except ValueError as e:
         raise CorpusError(f"generator_output_rejected: {e}") from e
