@@ -224,6 +224,70 @@ continuous; lineage auditability is per-round (prior checkpoint ref +
 corpus digest + seed + recorded `gpu_name`), so a mid-lineage SKU re-pin is
 legal but must be a deliberate epoch-boundary event like any other re-pin.
 
+## The warm-stage map: the era ladder
+
+Which size plays which role, era by era. Weights never cross sizes by
+strict-load design, so every size that trains carries its OWN lineage; what
+crosses eras is the crowned-corpus diet and (optionally, below) a growth
+operator. Each era transition is a contract change and follows
+release-then-activate (the DEC-CA-0015 discipline for consensus constants).
+
+| era | screen | throne (duel) | duel regime | margin rule | silicon |
+|---|---|---|---|---|---|
+| E0 (live) | 4M heat, 1h from-scratch | 4M, 3h from-scratch | from-scratch + DEC-CA-0013 cascade | 2% of level | 4090 heat / L40S final |
+| E1 — 22M shakeout | 4M (unchanged) | {4M, 22M} combined score | both from-scratch | 2% of level | + L40S-class for 22M |
+| E2 — 313M ladder | 22M **mirror lineage** (warm-start screen) | 313M warm-start increments (~6h) | compounding lineage | **%-of-increment** (baseline-referenced) | 4090 heat / H100 final |
+| E3 — 1B | 22M mirror (or 313M mirror — open, below) | 1B warm-start increments | compounding lineage | %-of-increment | H100 fleet (8x) final |
+
+**E1 exists to shake out machinery, not capability.** The disabled
+`[[training.sizes]]` 22M block (`chain.toml:124`) arms as a second
+from-scratch throne size — 22M at ~6B tokens/round is still healthily
+from-scratch, so no warm-start or margin work is needed. What it exercises
+on mainnet-shaped rounds: per-size digests, per-size measured throughput,
+multi-size verdict pooling, and (new) the per-size `expected_gpu` /
+`target_train_hours` overrides. Cheapest possible rehearsal of everything
+E2 depends on.
+
+**E2 is this node's main act**: screen moves to the 22M mirror
+(warm-start), throne moves to 313M increments, the baseline-referenced
+margin arms, 4M retires from scoring (it remains the dedup-probe and
+tooling workhorse). Within a 313M generation the round lifecycle is:
+
+1. **Init round** — random init from the round's shared seed (or a grown
+   init, below); WSD warmup.
+2. **Compounding rounds** — flat LR; each round's duel decides whose corpus
+   feeds the next increment of throne AND mirror.
+3. **Release cuts** — an LR-decayed COPY branched off the lineage at
+   chosen rounds (the WSD decay leg); the flat-LR lineage itself is never
+   decayed, so releases don't perturb compounding.
+4. **Reseed valve** — DEC-CA-0014 generalises to the flagship: shadow
+   scratch runs every M rounds at 313M (telemetry), quality-floor
+   admission if the lineage stops compounding; mirror reseeds the same
+   round the throne does.
+
+**E3 has one named hard gate**: deterministic multi-GPU (pinned topology
+all-reduce) or the bf16 recipe — one of the two must land first, because a
+single-GPU 1B round is ~60 rounds to adequacy, which is not a ladder, it
+is a queue. Whether the screen stays at 22M or moves to a 313M mirror is
+open: 313M mirror maintenance is H100-minutes per round (affordable) and a
+closer regime proxy for 1B; 22M is nearly free. Settled by re-running the
+screen-fidelity measurement (mirror ranking vs 1B duel outcomes) at E3
+testnet.
+
+**Era-boundary initialization — grow or reseed?** The new size's first
+lineage can start from random init (clean, the E1/E2 default) or be GROWN
+from the previous size's best checkpoint by a function-preserving operator
+(width expansion consistent with the u-μP parameterisation, depth via
+layer stacking). Growth is deterministic (a pinned transform of a pinned
+checkpoint — auditability survives: init provenance records grown-from ref
++ operator version instead of an init seed) and in the literature saves a
+large fraction of early compute; the cost is importing the small lineage's
+biases into a size that could have escaped them. Decision deferred to a
+measurement that reuses DEC-CA-0014's instrument at era start: run both
+inits side by side for the first k rounds of the new era on the same
+crowned diet, bench both, adopt the winner. Growth is an *option* the map
+carries, never a default.
+
 ## Deliberately NOT done
 
 - **No H100 for the small sizes.** The 4M/22M duels are the attribution
