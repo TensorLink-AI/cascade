@@ -102,7 +102,7 @@ def error_correlations(
             vb = math.sqrt(sum(x * x for x in db))
             if va <= 0.0 or vb <= 0.0:
                 continue
-            r = sum(x * y for x, y in zip(da, db)) / (va * vb)
+            r = sum(x * y for x, y in zip(da, db, strict=True)) / (va * vb)
             out[(a, b)] = out[(b, a)] = r
     return out
 
