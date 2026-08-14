@@ -408,3 +408,33 @@ def test_first_reached_stops_and_deadline_hit_is_flagged(tmp_path: Path):
                          token_budget=10**9, out_dir=tmp_path / "slow")
     assert 0 < slow.metrics["tokens_seen"] < 10**9
     assert slow.metrics["deadline_hit"] is True
+
+
+def test_trainer_end_to_end_multichannel_run(tmp_path: Path):
+    """A mixed univariate + (C, L) corpus trains through the model's variate
+    axis: every channel is consumed (tokens count C x L per series — the
+    DEC-CA-0022 channel-drop regression) and the checkpoint stays loadable."""
+    contract = SimpleNamespace(
+        context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
+        num_heads=1, head_dim=16, mlp_expansion=2, num_quantiles=9,
+        batch_size=2, max_train_seconds=30, base_lr=1e-3, weight_decay=0.0,
+        optimizer="adamw", warmup_tokens=0, input_transform="arcsinh_causal",
+    )
+    rng = np.random.default_rng(0)
+    series = (
+        [rng.normal(size=(3, 32)).cumsum(axis=-1) for _ in range(6)]
+        + [rng.normal(size=32).cumsum() for _ in range(4)]
+    )
+    # The carver keeps each series' last context_length steps (16 here), all
+    # channels: 6 × 3ch × 16 + 4 × 1ch × 16.
+    trained_points = 6 * 3 * 16 + 4 * 1 * 16
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    result = trainer.train(
+        iter(series), contract, training_seed=1, token_budget=10**6,
+        out_dir=tmp_path / "ckpt",
+    )
+    # Every channel's points were trained AND counted (stream drained fully) —
+    # under the old channel-drop, this would read one third of the MV share.
+    assert result.metrics["tokens_seen"] == trained_points
+    w = _load_wrapper(tmp_path / "ckpt")
+    assert w.forecast(np.arange(20, dtype=float), 8, 4).shape == (1, 4, 8)

@@ -105,28 +105,39 @@ def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, r
 
 
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
-    """Yield ``(B, P*patch_size)`` float64 training batches from a series stream.
+    """Yield ``(B, C, P*patch_size)`` float64 training batches from a series
+    stream.
 
     Pure numpy (no torch) so it is unit-testable. Each incoming ``(C, L)`` or
-    ``(L,)`` series is reduced to channel 0 and its last ``P`` patches are kept,
-    where ``P = min(L // patch_size, max_ctx_patches)``; series with fewer than 2
-    patches are skipped (a next-patch objective needs at least one input + one
-    target patch). Batches are **bucketed by ``P``** so all rows in a batch share
-    a length and stack without padding. Full buckets are emitted eagerly; partial
-    buckets are flushed when the stream ends. This is what lets the trainer learn
-    from realistic series whose length is below the full ``context_length``.
+    ``(L,)`` series keeps ALL its channels (a 1-D series is one channel) and its
+    last ``P`` patches per channel, where ``P = min(L // patch_size,
+    max_ctx_patches)``; series with fewer than 2 patches are skipped (a
+    next-patch objective needs at least one input + one target patch). Batches
+    are **bucketed by ``(P, C)``** so all rows in a batch share a shape and
+    stack without padding or a variate attention mask — the model's forward
+    takes a uniform channel count per batch. Full buckets are emitted eagerly;
+    partial buckets are flushed when the stream ends. A corpus may freely mix
+    channel counts; at ``C = 1`` throughout (today's cap) every batch is
+    ``(B, 1, L)`` carrying exactly the bytes the old channel-0 path carried.
+
+    History note (DEC-CA-0022): this used to reduce every series to channel 0
+    (``s = s[0]``) while the stream billed all ``C`` channels against the token
+    budget — a multivariate series paid ``C×`` for ``1×`` training signal. All
+    channels are consumed now, and the trainer's token accounting counts them,
+    so a channel costs exactly what it trains. Do not raise ``[generator]
+    max_channels`` on any build without this.
     """
-    buckets: dict[int, list[np.ndarray]] = {}
+    buckets: dict[tuple[int, int], list[np.ndarray]] = {}
     for series in stream:
-        s = np.asarray(series, dtype=np.float64)
-        if s.ndim == 2:
-            s = s[0]
-        p = min(int(s.shape[0]) // patch_size, max_ctx_patches)
+        s = np.atleast_2d(np.asarray(series, dtype=np.float64))   # (C, L)
+        c = int(s.shape[0])
+        p = min(int(s.shape[-1]) // patch_size, max_ctx_patches)
         if p < 2:
             continue
-        buckets.setdefault(p, []).append(s[-p * patch_size :])
-        if len(buckets[p]) >= batch_size:
-            yield np.stack(buckets.pop(p), axis=0)
+        key = (p, c)
+        buckets.setdefault(key, []).append(s[:, -p * patch_size :])
+        if len(buckets[key]) >= batch_size:
+            yield np.stack(buckets.pop(key), axis=0)
     for items in buckets.values():
         if items:
             yield np.stack(items, axis=0)
@@ -304,17 +315,26 @@ class Toto2Trainer:
             if deadline is None:             # first batch: training starts NOW
                 t0 = time.time()
                 deadline = t0 + contract.max_train_seconds
+            n_batch, n_ch, width = arr.shape                     # (B, C, P*ps)
+            rows = n_batch * n_ch
+            num_patches = width // cfg.patch_size
             # Standardize from float64: downcasting the raw series first would
             # quantize away small fluctuations at large levels (float32 has ~7
             # digits) before the scaler ever sees them. Only the O(1)-scale z
-            # and targets drop to the model dtype.
-            x = torch.as_tensor(arr, device=self.device, dtype=torch.float64)  # (B, P*ps)
-            num_patches = arr.shape[1] // cfg.patch_size
+            # and targets drop to the model dtype. The causal scaler and the
+            # CPM sampler are per-ROW (= per channel — Toto scales each variate
+            # on its own history), so channels flatten into the row axis here
+            # and fold back to (B, C, …) for the model's variate attention. At
+            # C = 1 every tensor below is byte-identical to the historical
+            # single-channel path (rows == B, same RNG draw sequence).
+            x = torch.as_tensor(
+                arr.reshape(rows, width), device=self.device, dtype=torch.float64
+            )
             cpm = sample_cpm_masks(
-                arr.shape[0], num_patches,
+                rows, num_patches,
                 c_max=cfg.cpm_c_max, p_max=cfg.cpm_p_max, rng=mask_rng,
             )
-            mask = torch.as_tensor(cpm, device=self.device)                 # (B, P)
+            mask = torch.as_tensor(cpm, device=self.device)      # (rows, P)
             step_mask = (
                 mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
             ).to(x.dtype)
@@ -322,20 +342,22 @@ class Toto2Trainer:
             # carry the last observed stats forward, exactly like the horizon
             # mask patches at inference.
             z, loc, scale = causal_standardize(x, mask=step_mask)
-            patches = z.to(self.dtype).view(x.shape[0], num_patches, cfg.patch_size)
-            pred = model(patches, mask=mask)            # (B, P, patch_size, num_q)
-            pred_q = pred[:, :-1]                        # (B, P-1, patch_size, num_q)
+            patches = z.to(self.dtype).view(n_batch, n_ch, num_patches, cfg.patch_size)
+            pred = model(patches, mask=mask.view(n_batch, n_ch, num_patches))
+            pred_q = pred[:, :, :-1]                 # (B, C, P-1, patch_size, num_q)
             # Target patch p+1 is scaled at the anchor closing patch p — the
             # stats known when that patch is forecast, so a target never leaks
             # into its own scaling.
             a_loc, a_scale = patch_anchors(loc, scale, cfg.patch_size)
-            raw = x.view(x.shape[0], num_patches, cfg.patch_size)
+            a_loc = a_loc.view(n_batch, n_ch, num_patches)
+            a_scale = a_scale.view(n_batch, n_ch, num_patches)
+            raw = x.view(n_batch, n_ch, num_patches, cfg.patch_size)
             # Clamp the target to the same bound as z (toto2_model.Z_CLAMP): the
             # model input and the loss target must share one range, and this is the
             # backstop that keeps a pathological jump from producing an inf/huge
             # target that NaNs or destabilizes the shared training step.
             target = torch.asinh(
-                (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
+                (raw[:, :, 1:] - a_loc[:, :, :-1, None]) / a_scale[:, :, :-1, None]
             ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
             loss = pinball_loss(pred_q, target, tuple(levels))
 
@@ -348,7 +370,10 @@ class Toto2Trainer:
             optimizer.step()
 
             last_loss = float(loss.detach().cpu())
-            tokens += arr.shape[0] * arr.shape[1]
+            # Every channel of every row counts: B × C × L point-passes, so a
+            # multivariate series' token cost equals its stream billing (the
+            # C×-billed-1×-trained mispricing is dead; DEC-CA-0022).
+            tokens += int(arr.size)
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)
