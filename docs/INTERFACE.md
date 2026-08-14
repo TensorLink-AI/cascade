@@ -24,16 +24,27 @@ yield {"values": arr}          # identical to `yield arr` — same corpus digest
 ```
 
 At `interface_version = 1` (see `chain.toml [generator]`) the record form
-accepts **`values` only**. These names are **reserved** — they have published
-future semantics and any yield carrying one is rejected today: `mask`
-(observedness, DEC-CA-0019), `roles` (variate roles, DEC-CA-0022), `start` /
-`freq` (time anchor, DEC-CA-0017), `group_id` (panels, DEC-CA-0020), `labels`,
-`quantiles`. Unknown names are always rejected. When a field is later
-*accepted*, it is consumed by the trainer in the same release and
-`interface_version` bumps — your deployed bare-array (or values-only record)
-generator stays valid at every version, forever. You may declare
-`"interface_version": 1` in your `config.json`; declaring a version newer than
-the trainer supports fails your run early with a clear error.
+accepts **`values` only** by default. These names are **reserved** — published
+semantics, rejected until the owner arms them via `[training]
+accepted_fields`: `mask` (observedness, DEC-CA-0019), `roles` (variate roles,
+DEC-CA-0022), `start` / `freq` (time anchor, DEC-CA-0017), `group_id` (panels,
+DEC-CA-0020), `labels`, `quantiles`. Unknown names are always rejected. The
+consumers for `mask` and `roles` are already wired, so arming is a config
+announcement, not a code release:
+
+* `mask` — `(C, L)` uint8 parallel to `values`, 1 = missing. Masked entries of
+  `values` must be pinned **exactly 0.0**; per-series missing fraction capped
+  by `max_missing_frac`. Consumed as unobserved input (like CPM masking) and
+  excluded from the training loss.
+* `roles` — `(C,)` uint8 per-channel: 0 = target, 1 = past covariate
+  (conditioning context, excluded from loss), 2 = future-known (visible over
+  the horizon; admitted only once `allow_future_known` arms, after the eval
+  pool's covariate-curation rule exists). At least one target channel required.
+
+Your deployed bare-array (or values-only record) generator stays valid at
+every version, forever. You may declare `"interface_version": 1` in your
+`config.json`; declaring a version newer than the trainer supports fails your
+run early with a clear error.
 
 ## Yield order is a training lever
 

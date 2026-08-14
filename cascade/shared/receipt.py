@@ -157,6 +157,18 @@ class EvalContext:
     num_samples: int
 
 
+# KothParams keys omitted from the recorded ``VerdictRecord.params`` dict while
+# at their inert defaults — so a receipt for a round judged under the
+# historical rules hashes byte-for-byte as before the fields existed (the
+# drop-when-default convention, applied INSIDE the params dict). NEVER change a
+# listed default once shipped; ``check_koth_params`` re-fills dropped keys via
+# ``KothParams`` defaults when comparing against chain.toml.
+_PARAMS_DROP_WHEN_DEFAULT: dict[str, object] = {
+    "margin_mode": "level",
+    "margin_increment_floor": 0.01,
+}
+
+
 @dataclass(frozen=True)
 class VerdictRecord:
     """The KOTH decision and the state transition it caused.
@@ -244,9 +256,19 @@ class VerdictRecord:
         round — ``check_koth_params`` asserts exactly that — so the per-challenger
         alpha is published as ``cohort_k`` and the resulting bounds as
         ``cohort_lcbs`` instead of by mutating ``params.bootstrap_alpha``.
+
+        Params keys at their inert defaults are DROPPED (the canonical-body
+        convention applied inside the params dict): a round judged under the
+        historical rules serialises byte-for-byte as it did before the fields
+        existed, and ``check_koth_params`` normalises through ``KothParams`` so
+        the dropped keys compare at their defaults.
         """
+        p = dict(asdict(params))
+        for key, default in _PARAMS_DROP_WHEN_DEFAULT.items():
+            if p.get(key) == default:
+                p.pop(key, None)
         return cls(
-            params=dict(asdict(params)),
+            params=p,
             bootstrap_seed=str(bootstrap_seed),
             king_tenure_rounds=int(king_tenure_rounds),
             lcb=_none_for_nan(result.lcb),

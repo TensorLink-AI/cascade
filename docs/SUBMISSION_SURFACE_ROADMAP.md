@@ -1,19 +1,32 @@
 # Miner submission surface & scaling ladder — staged expansion roadmap
 
-Status: **proposed** (design pass 2026-08-13/14), with the inert code stages
-**implemented on this branch** (2026-08-14): Stage 0 in full (golden-vector
-digest freeze → record carrier → joint `(C, L)` forecaster + `series_id`
-cluster fallback), Stage 1's code half (channel-drop fix with `(P, C)`
-bucketing; shadow channel-correlation/effective-rank telemetry), and Stage 6's
-plumbing (`SizeSpec.expected_gpu` / `target_train_hours`, size-conditional
-`[provisioner.final.<name>]` selection). Everything landed is inert at today's
-config (`max_channels = 1`, no `[[training.sizes]]` blocks): values-only
-corpora hash byte-identically (golden vectors enforce it) and no
-`contract_digest` moves. Still open — deliberately, per the gates below: the
-MV-vs-univariate ablation and every other measurement, all pool-builder work,
-every acceptance/arming step (Stages 2–5 arming, mask/roles consumption), and
-all deploys (the Stage 0c scoring change ships under the DEC-CA-0009 lockstep
-discipline).
+Status: **proposed** (design pass 2026-08-13/14), with the code **fully
+implemented on this branch** (2026-08-14) to the config-only-arming bar:
+every remaining arming step is a chain.toml edit against code already wired,
+inert at today's values. Landed: Stage 0 in full (golden-vector digest freeze
+→ record carrier → joint `(C, L)` forecaster + `series_id` cluster fallback);
+Stage 1's code (channel-drop fix with `(P, C)` bucketing; shadow
+channel-correlation/effective-rank telemetry; pool `require_source`); Stage 2's
+gate (`channel_corr_mode` off/shadow/enforce); Stage 3+4's acceptance AND
+consumption (`[training] accepted_fields` arms `mask` / `roles` — 0xFF-sentinel
+record digests, sandbox record frames, CPM/loss consumption, `max_missing_frac`,
+`allow_future_known` for roles=2 — via the contract-digest drop-when-default
+convention, so today's digests are untouched until an operator sets the key);
+Stage 6's plumbing (`SizeSpec.expected_gpu` / `target_train_hours`,
+size-conditional `[provisioner.final.<name>]` fleets, `lr_schedule =
+"warmup_flat"` honoured) and its scoring rework (`[scoring] margin_mode =
+"increment"` — baseline-referenced %-of-increment LCB, validator scores the
+warm-start init, receipts carry `baseline` rows, audit replays the judged
+mode). Golden vectors pin: values-only corpus/stream/series-key bytes, the
+contract digest, and the signed receipt fixture — all byte-identical.
+
+Still open — deliberately, and none of it is code: the measurements (the
+MV-vs-univariate ablation and the other six below), pool CONTENT (MV windows,
+the masked-history slice, covariate curation + the EVAL_POOL exogeneity rule
+in writing), per-size `base_arch_digest`/throughput pins at each size arming,
+and every deploy (digest bumps land by the routine re-pin + coordinated
+epoch-boundary restart; the Stage 0c scoring change ships under the
+DEC-CA-0009 lockstep discipline).
 Companion decision records: DEC-CA-0016 (carrier), DEC-CA-0017…0022 (one per
 submission-surface gap), DEC-CA-0023 (scaling ladder). This document
 sequences them, states each stage's contract-digest impact and migration

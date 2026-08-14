@@ -337,7 +337,6 @@ class Toto2Trainer:
             Toto2Model,
             causal_standardize,
             patch_anchors,
-            pinball_loss,
         )
 
         torch.manual_seed(training_seed)

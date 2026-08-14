@@ -86,9 +86,8 @@ def _inprocess_stream(
         check_record,
         check_series,
     )
-    from .corpus import _load_generator
-
     from .channel_stats import corr_enforce_gate
+    from .corpus import _load_generator
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     accepted = tuple(cfg.accepted_fields)
