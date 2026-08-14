@@ -880,6 +880,15 @@ a { color: var(--chal); text-decoration: none; }
    display:flex would defeat the hidden attribute, so restate it explicitly */
 .tab-body { display: flex; flex-direction: column; gap: 38px; }
 .tab-body[hidden] { display: none; }
+
+/* eval pool tab — share bars + totals row. The fill lives in CSS (not an
+   inline style) so the row-hover wash can recolor it; without this the
+   var(--chal) fill disappears into the var(--chal) hover background. */
+.pool-share > i { background: var(--chal); }
+tbody tr:hover td .pool-share > i { background: var(--bone-light); }
+tbody tr:hover td .heat-rel { color: var(--bone-light); }
+tr.pool-total { border-top: var(--line); }
+tr.pool-total td { color: var(--muted); }
 .controls { display: flex; gap: 8px; align-items: center; font-weight: 400; }
 .controls label { font-size: 10px; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; }
 .btn { background: none; border: var(--line); color: var(--ink); font: 600 10px/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; padding: 5px 9px; cursor: pointer; }
@@ -1727,12 +1736,12 @@ function poolMatrixHTML(s){
   var body=totals.map(function(x){
     var share=x.t/grand;
     return '<tr><td>'+esc(x.d)+'</td><td class="num">'+x.t.toLocaleString()+'</td>'+
-      '<td><span class="heat-bar-cell"><span class="heat-bar"><i style="width:'+(share*100).toFixed(1)+'%;background:var(--chal)"></i></span>'+
+      '<td><span class="heat-bar-cell"><span class="heat-bar pool-share"><i style="width:'+(share*100).toFixed(1)+'%"></i></span>'+
       '<span class="heat-rel">'+(share*100).toFixed(1)+'%</span></span></td>'+
       cols.map(function(c){ var n=bd[x.d][c]; return '<td class="num'+(n==null?' muted':'')+'">'+(n==null?"·":n.toLocaleString())+'</td>'; }).join("")+'</tr>';
   }).join("");
   var perCol=cols.map(function(c){ var t=0; doms.forEach(function(d){ t+=bd[d][c]||0; }); return t; });
-  var foot='<tr><td class="muted">total</td><td class="num">'+grand.toLocaleString()+'</td><td></td>'+
+  var foot='<tr class="pool-total"><td>total</td><td class="num">'+grand.toLocaleString()+'</td><td></td>'+
     perCol.map(function(t){ return '<td class="num">'+t.toLocaleString()+'</td>'; }).join("")+'</tr>';
   return '<div class="scroll-box"><table><thead>'+head+'</thead><tbody>'+body+foot+'</tbody></table></div>';
 }
@@ -1762,12 +1771,12 @@ function renderPool(){
     '</div>'+poolMatrixHTML(s);
   var rows=snaps.slice().reverse().map(function(e){
     var sh=poolShapeCounts(e), active=(e===s);
-    return '<tr'+(active?' class="good"':'')+'><td class="num">'+Number(e.effective_block).toLocaleString()+'</td>'+
+    return '<tr><td class="num">'+Number(e.effective_block).toLocaleString()+'</td>'+
       '<td>'+esc(e.as_of||"--")+'</td>'+
       '<td class="muted">'+(e.published_at?timeAgo(e.published_at):"--")+'</td>'+
       '<td class="num">'+Number(e.n_series||0).toLocaleString()+'</td>'+
       '<td class="num">'+sh.domains+'</td><td class="num">'+sh.freqs+'</td>'+
-      '<td>'+(active?(act.mapped?"← this round":"← newest"):"")+'</td></tr>';
+      '<td class="good">'+(active?(act.mapped?"← this round":"← newest"):"")+'</td></tr>';
   }).join("");
   hist.innerHTML='<div class="scroll-box scroll-field"><table><thead><tr>'+
     '<th class="num">Active from block</th><th>Data cutoff</th><th>Published</th>'+
