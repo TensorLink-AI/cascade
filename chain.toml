@@ -30,6 +30,16 @@ interface_version    = 1
 # when non-values fields arrive. 16e9 = max_total_points × 8 (float64): exactly
 # today's point cap, so it is numerically inert. 0 disables.
 max_payload_bytes    = 16_000_000_000
+# Per-series cap on the masked fraction, active only once "mask" is accepted
+# via [training] accepted_fields (DEC-CA-0019).
+max_missing_frac     = 0.5
+# Channel-redundancy gate (DEC-CA-0022): "off" | "shadow" | "enforce" against
+# max_channel_corr (max off-diagonal |Pearson| between standardized channels).
+# 0.999 targets ONLY the jitter-duplicate exploit. Keep off until the Stage 1
+# shadow telemetry (channel_telemetry.frac_over_0999) clears honest
+# generators; then shadow; enforce last. Meaningless at max_channels = 1.
+channel_corr_mode    = "off"
+max_channel_corr     = 0.999
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
 reject_constant      = false     # reject flat (zero-range) series
@@ -93,6 +103,17 @@ max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged d
 #   stream_gpu  — live-stream from a GPU generator; tolerance/same-hardware audit
 #   cache_reuse — draw a fixed corpus once, multi-pass under the budget; byte-exact
 corpus_mode = "stream_cpu"
+# Accepted record-field set (DEC-CA-0016 layer 3): the payload fields the
+# carrier accepts AND the trainer consumes — accept-equals-consume is enforced
+# in code (only fields with a wired consumer load). DIGEST-BOUND via the
+# drop-when-default convention: [] is omitted from contract_digest (today's
+# digest is untouched), setting it is a deliberate bump → coordinated
+# epoch-boundary restart, the routine re-pin protocol. Arming order per the
+# roadmap: "mask" needs the pool's masked-history eval slice first; "roles"
+# values 0/1 may arm with multivariate, allow_future_known (roles=2) stays
+# false until docs/EVAL_POOL.md carries the covariate exogeneity rule.
+accepted_fields    = []
+allow_future_known = false
 # Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
 # "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
 expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must

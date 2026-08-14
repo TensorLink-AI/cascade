@@ -35,10 +35,23 @@ from ..shared.manifest import corpus_digest
 
 @dataclass(frozen=True)
 class CorpusResult:
-    series: list[np.ndarray]
+    # Elements are canonical (C, L) float64 arrays, or — only when [training]
+    # accepted_fields is armed and a series carries an extra — extended-record
+    # dicts {"values": (C, L) f64, "mask": (C, L) u8, "roles": (C,) u8}.
+    series: list[np.ndarray | dict[str, np.ndarray]]
     digest: str
     n_series: int
     total_points: int
+
+
+def _values_of(element: np.ndarray | dict) -> np.ndarray:
+    return element["values"] if isinstance(element, dict) else element
+
+
+def _corr_gate(cfg: GeneratorConfig):
+    from .channel_stats import corr_enforce_gate
+
+    return corr_enforce_gate(cfg)
 
 
 class CorpusError(RuntimeError):
@@ -132,10 +145,14 @@ def build_corpus(
             reject_constant=cfg.reject_constant,
             max_dup_fraction=cfg.max_dup_fraction,
             max_payload_bytes=cfg.max_payload_bytes,
+            accepted_fields=tuple(cfg.accepted_fields),
+            max_missing_frac=cfg.max_missing_frac,
+            allow_future_known=cfg.allow_future_known,
+            extra_series_check=_corr_gate(cfg),
         )
     except ValueError as e:
         raise CorpusError(f"generator_output_rejected: {e}") from e
-    total = int(sum(int(s.size) for s in series))
+    total = int(sum(int(_values_of(s).size) for s in series))
     return CorpusResult(
         series=series,
         digest=corpus_digest(series),

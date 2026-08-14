@@ -133,21 +133,57 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batc
     channels are consumed now, and the trainer's token accounting counts them,
     so a channel costs exactly what it trains. Do not raise ``[generator]
     max_channels`` on any build without this.
+
+    Extended-record series (``{"values", "mask", "roles"}`` dicts, present only
+    when ``[training] accepted_fields`` is armed) ride the same buckets: the
+    mask is cropped alongside its values, roles are carried per row, and a
+    bucket whose rows carry ANY extra yields a dict batch (``values`` (B, C, L),
+    ``mask`` (B, C, L) uint8 — all-zeros rows for maskless series — and
+    ``roles`` (B, C) uint8 — all-targets rows for roleless series). A bucket of
+    purely bare series yields the bare ``(B, C, L)`` array, byte-identical to
+    the unarmed build.
     """
-    buckets: dict[tuple[int, int], list[np.ndarray]] = {}
+    buckets: dict[tuple[int, int], list[tuple]] = {}
+
+    def _stack(items: list[tuple]):
+        vals = np.stack([v for v, _, _ in items], axis=0)
+        if all(m is None for _, m, _ in items) and all(r is None for _, _, r in items):
+            return vals
+        _, n_ch, width = vals.shape
+        masks = np.stack([
+            m if m is not None else np.zeros((n_ch, width), dtype=np.uint8)
+            for _, m, _ in items
+        ], axis=0)
+        roles = np.stack([
+            r if r is not None else np.zeros(n_ch, dtype=np.uint8)
+            for _, _, r in items
+        ], axis=0)
+        return {"values": vals, "mask": masks, "roles": roles}
+
     for series in stream:
-        s = np.atleast_2d(np.asarray(series, dtype=np.float64))   # (C, L)
+        mask = roles = None
+        if isinstance(series, dict):
+            s = np.atleast_2d(np.asarray(series["values"], dtype=np.float64))
+            if series.get("mask") is not None:
+                mask = np.atleast_2d(np.asarray(series["mask"], dtype=np.uint8))
+            if series.get("roles") is not None:
+                roles = np.asarray(series["roles"], dtype=np.uint8)
+        else:
+            s = np.atleast_2d(np.asarray(series, dtype=np.float64))   # (C, L)
         c = int(s.shape[0])
         p = min(int(s.shape[-1]) // patch_size, max_ctx_patches)
         if p < 2:
             continue
         key = (p, c)
-        buckets.setdefault(key, []).append(s[:, -p * patch_size :])
+        w = p * patch_size
+        buckets.setdefault(key, []).append(
+            (s[:, -w:], None if mask is None else mask[:, -w:], roles)
+        )
         if len(buckets[key]) >= batch_size:
-            yield np.stack(buckets.pop(key), axis=0)
+            yield _stack(buckets.pop(key))
     for items in buckets.values():
         if items:
-            yield np.stack(items, axis=0)
+            yield _stack(items)
 
 
 # Polar Express (arXiv 2505.16932, Implementation 1): the minimax-optimal
@@ -327,7 +363,16 @@ class Toto2Trainer:
             if deadline is None:             # first batch: training starts NOW
                 t0 = time.time()
                 deadline = t0 + contract.max_train_seconds
-            n_batch, n_ch, width = arr.shape                     # (B, C, P*ps)
+            # Extended-record batches (mask/roles armed via [training]
+            # accepted_fields) arrive as dicts; bare batches (every corpus at
+            # today's config) keep the legacy ndarray path bit-for-bit.
+            if isinstance(arr, dict):
+                vals_np = arr["values"]                          # (B, C, P*ps)
+                data_mask_np = arr["mask"]                       # (B, C, P*ps) u8
+                roles_np = arr["roles"]                          # (B, C) u8
+            else:
+                vals_np, data_mask_np, roles_np = arr, None, None
+            n_batch, n_ch, width = vals_np.shape                 # (B, C, P*ps)
             rows = n_batch * n_ch
             num_patches = width // cfg.patch_size
             # Standardize from float64: downcasting the raw series first would
@@ -340,22 +385,45 @@ class Toto2Trainer:
             # C = 1 every tensor below is byte-identical to the historical
             # single-channel path (rows == B, same RNG draw sequence).
             x = torch.as_tensor(
-                arr.reshape(rows, width), device=self.device, dtype=torch.float64
+                vals_np.reshape(rows, width), device=self.device, dtype=torch.float64
             )
             cpm = sample_cpm_masks(
                 rows, num_patches,
                 c_max=cfg.cpm_c_max, p_max=cfg.cpm_p_max, rng=mask_rng,
             )
+            # Role-aware CPM (DEC-CA-0022): future-known channels (role 2)
+            # keep their values VISIBLE — their CPM rows are zeroed AFTER the
+            # draw, so the RNG stream (and every all-targets batch) is
+            # byte-identical to the unarmed build. Drawn-then-zeroed, never
+            # skipped.
+            if roles_np is not None and (roles_np == 2).any():
+                cpm[roles_np.reshape(rows) == 2] = False
             mask = torch.as_tensor(cpm, device=self.device)      # (rows, P)
             step_mask = (
                 mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
             ).to(x.dtype)
+            if data_mask_np is not None and data_mask_np.any():
+                # Missing-data consumption (DEC-CA-0019): OR the data mask
+                # into the input mask — a missing entry is unobserved exactly
+                # like a CPM-masked one, so the causal stats skip it and the
+                # model sees (0-fill, mask=1), the same encoding CPM uses.
+                data_step = torch.as_tensor(
+                    data_mask_np.reshape(rows, width), device=self.device
+                ).to(x.dtype)
+                step_mask = torch.clamp(step_mask + data_step, max=1.0)
+                entry_mask = step_mask.view(n_batch, n_ch, num_patches, cfg.patch_size)
+            else:
+                entry_mask = None
             # Per-step causal stats over unmasked entries only — masked spans
             # carry the last observed stats forward, exactly like the horizon
             # mask patches at inference.
             z, loc, scale = causal_standardize(x, mask=step_mask)
             patches = z.to(self.dtype).view(n_batch, n_ch, num_patches, cfg.patch_size)
-            pred = model(patches, mask=mask.view(n_batch, n_ch, num_patches))
+            pred = model(
+                patches,
+                mask=(entry_mask.to(self.dtype) if entry_mask is not None
+                      else mask.view(n_batch, n_ch, num_patches)),
+            )
             pred_q = pred[:, :, :-1]                 # (B, C, P-1, patch_size, num_q)
             # Target patch p+1 is scaled at the anchor closing patch p — the
             # stats known when that patch is forecast, so a target never leaks
@@ -371,7 +439,26 @@ class Toto2Trainer:
             target = torch.asinh(
                 (raw[:, :, 1:] - a_loc[:, :, :-1, None]) / a_scale[:, :, :-1, None]
             ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
-            loss = pinball_loss(pred_q, target, tuple(levels))
+            # Loss exclusion (DEC-CA-0019/0022): missing target entries carry
+            # no loss (their pinned-0.0 filler is not data), and covariate
+            # channels (role != 0) carry none either — they are conditioning
+            # context, bought at full freight, never scored. Bare batches take
+            # the exact unweighted mean of the unarmed build.
+            weight = None
+            if data_mask_np is not None or roles_np is not None:
+                w = torch.ones_like(target)
+                if data_mask_np is not None:
+                    dm = torch.as_tensor(
+                        data_mask_np, device=self.device
+                    ).view(n_batch, n_ch, num_patches, cfg.patch_size)
+                    w = w * (1.0 - dm[:, :, 1:].to(w.dtype))
+                if roles_np is not None:
+                    rw = torch.as_tensor(
+                        (roles_np == 0), device=self.device
+                    ).to(w.dtype)                        # (B, C): 1 = target
+                    w = w * rw[:, :, None, None]
+                weight = w
+            loss = pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
             lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
             for grp in optimizer.param_groups:
@@ -384,8 +471,10 @@ class Toto2Trainer:
             last_loss = float(loss.detach().cpu())
             # Every channel of every row counts: B × C × L point-passes, so a
             # multivariate series' token cost equals its stream billing (the
-            # C×-billed-1×-trained mispricing is dead; DEC-CA-0022).
-            tokens += int(arr.size)
+            # C×-billed-1×-trained mispricing is dead; DEC-CA-0022). Masked
+            # entries count too — the stream billed them and the model
+            # processed them (as masked inputs); only the LOSS excludes them.
+            tokens += int(vals_np.size)
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)

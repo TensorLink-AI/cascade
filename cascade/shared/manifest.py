@@ -59,21 +59,34 @@ def format_trained_pointer(ref: str) -> str:
     return payload
 
 
-def corpus_digest(series: Sequence[np.ndarray]) -> str:
+def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
     """Stable sha256 over a generated corpus.
 
-    Each series is canonicalised to ``(C, L)`` (a 1-D ``(L,)`` array is promoted
-    to ``(1, L)``), and the hash covers the count, every series' full ``(C, L)``
-    shape, and its raw float64 bytes in yield order. Carrying the channel count
-    in the digest keeps it stable as the corpus moves from univariate ``(1, L)``
-    to multivariate ``(C, L)`` — a univariate and a single-channel-of-multivariate
-    corpus never collide. Two trainers that draw the same corpus from the same
-    pinned generator + seed get the same digest, which is what makes a training
-    run auditable.
+    Each values-only series is canonicalised to ``(C, L)`` (a 1-D ``(L,)``
+    array is promoted to ``(1, L)``), and the hash covers the count, every
+    series' full ``(C, L)`` shape, and its raw float64 bytes in yield order.
+    Carrying the channel count in the digest keeps it stable as the corpus
+    moves from univariate ``(1, L)`` to multivariate ``(C, L)`` — a univariate
+    and a single-channel-of-multivariate corpus never collide. Two trainers
+    that draw the same corpus from the same pinned generator + seed get the
+    same digest, which is what makes a training run auditable.
+
+    An EXTENDED record element (a ``{"values": …, "mask"/"roles": …}`` dict
+    from an ``accepted_fields``-armed drain, DEC-CA-0016/0019/0022) hashes via
+    its 0xFF-sentinel frame (:func:`cascade.interface.generator.
+    record_frame_bytes`): a legacy element's bytes start with an 8-byte BE
+    channel count (first byte 0x00), so the two framings can never collide,
+    and every values-only corpus keeps its frozen bytes (golden-vector
+    enforced) forever.
     """
+    from ..interface.generator import canonicalize_record, record_frame_bytes
+
     h = hashlib.sha256()
     h.update(len(series).to_bytes(8, "big"))
     for arr in series:
+        if isinstance(arr, dict):
+            h.update(record_frame_bytes(canonicalize_record(arr)))
+            continue
         a = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
         h.update(a.shape[0].to_bytes(8, "big"))   # channels
         h.update(a.shape[1].to_bytes(8, "big"))   # length

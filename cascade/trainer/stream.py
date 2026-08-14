@@ -35,13 +35,25 @@ from .corpus import CorpusError, build_round_corpus
 
 
 class _StreamDigest:
-    """Rolling sha256 over canonical ``(C, L)`` float64 series; count finalised."""
+    """Rolling sha256 over canonical ``(C, L)`` float64 series; count finalised.
+
+    Extended record elements (``{"values", "mask"/"roles"}`` dicts, present
+    only when ``[training] accepted_fields`` is armed) hash via their
+    0xFF-sentinel frame — see :func:`cascade.shared.manifest.corpus_digest`
+    for the collision argument. Values-only streams keep their frozen bytes.
+    """
 
     def __init__(self) -> None:
         self._h = hashlib.sha256()
         self._n = 0
 
-    def update(self, arr: np.ndarray) -> None:
+    def update(self, arr: np.ndarray | dict) -> None:
+        if isinstance(arr, dict):
+            from ..interface.generator import canonicalize_record, record_frame_bytes
+
+            self._h.update(record_frame_bytes(canonicalize_record(arr)))
+            self._n += 1
+            return
         self._h.update(int(arr.shape[0]).to_bytes(8, "big"))
         self._h.update(int(arr.shape[1]).to_bytes(8, "big"))
         self._h.update(arr.tobytes())
@@ -54,28 +66,57 @@ class _StreamDigest:
         return h.hexdigest()
 
 
+def _element_points(arr: np.ndarray | dict) -> int:
+    """Token-budget points of one stream element: values entries only (a mask
+    marks points missing; it does not add points)."""
+    if isinstance(arr, dict):
+        return int(arr["values"].size)
+    return int(arr.size)
+
+
 def _inprocess_stream(
     repo: Path, seed: int, cfg: GeneratorConfig, token_budget: int
 ) -> Iterator[np.ndarray]:
     """In-process fresh-series stream (no sandbox) for offline / test runs."""
     from ..interface.generator import (
         CAST_SAFE_MAX_FLOAT32,
+        VALUES_FIELD,
+        canonicalize_record,
         canonicalize_yield,
+        check_record,
         check_series,
     )
     from .corpus import _load_generator
 
+    from .channel_stats import corr_enforce_gate
+
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
+    accepted = tuple(cfg.accepted_fields)
+    corr_gate = corr_enforce_gate(cfg)
     gen = _load_generator(repo, int(seed))
     for i, item in enumerate(gen.generate(n_upper)):
-        arr = canonicalize_yield(item, index=i)
+        rec = canonicalize_yield(item, accepted=accepted, index=i)
+        arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
         check_series(
             arr, min_length=cfg.min_length, max_length=cfg.max_length,
             max_channels=cfg.max_channels,
             max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
             reject_constant=cfg.reject_constant, index=i,
         )
-        yield np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
+        if isinstance(rec, dict):
+            canon_rec = canonicalize_record(rec)
+            check_record(
+                canon_rec, max_missing_frac=cfg.max_missing_frac,
+                allow_future_known=cfg.allow_future_known, index=i,
+            )
+            if corr_gate is not None:
+                corr_gate(canon_rec[VALUES_FIELD], i)
+            yield canon_rec
+            continue
+        canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
+        if corr_gate is not None:
+            corr_gate(canon, i)
+        yield canon
 
 
 class RoundStream:
@@ -125,7 +166,7 @@ class _CacheReuseStream(RoundStream):
         total = 0
         for arr in itertools.cycle(self._corpus.series):
             yield arr
-            total += int(arr.size)
+            total += _element_points(arr)
             self._consumed = total
             if total >= self._budget:
                 break
@@ -188,7 +229,7 @@ class _FreshSeriesStream(RoundStream):
             yield arr
             self._dig.update(arr)
             self._n += 1
-            total += int(arr.size)
+            total += _element_points(arr)
             self._points = total
             if total >= self._budget:
                 break

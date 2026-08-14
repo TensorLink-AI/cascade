@@ -60,6 +60,33 @@ def series_channel_stats(arr: np.ndarray) -> tuple[float, float] | None:
     return (max_abs_corr, effective_rank)
 
 
+def corr_enforce_gate(cfg):
+    """Per-series channel-correlation gate for the drain/stream paths, from
+    ``[generator] channel_corr_mode`` / ``max_channel_corr`` (DEC-CA-0022).
+
+    Returns ``None`` unless the mode is ``"enforce"`` — "off" does nothing and
+    "shadow" is already served by the trainer's always-on accumulator (the
+    telemetry IS the shadow log). The enforce bar targets near-identity only
+    (the jitter-duplicate exploit); arming it before the shadow distribution
+    clears honest generators is a config decision this code cannot stop, but
+    the roadmap forbids.
+    """
+    if getattr(cfg, "channel_corr_mode", "off") != "enforce":
+        return None
+    bar = float(cfg.max_channel_corr)
+
+    def gate(canon: np.ndarray, index: int | None = None) -> None:
+        stats = series_channel_stats(canon)
+        if stats is not None and stats[0] > bar:
+            where = "" if index is None else f" (series {index})"
+            raise ValueError(
+                f"max off-diagonal channel |corr| {stats[0]:.6f} exceeds "
+                f"max_channel_corr {bar:.6f}{where} (near-duplicate channels)"
+            )
+
+    return gate
+
+
 class ChannelStatsAccumulator:
     """Streaming aggregator: observe every corpus series, summarise once.
 
@@ -74,7 +101,9 @@ class ChannelStatsAccumulator:
         self._ranks: list[float] = []
         self._n_channels: list[int] = []
 
-    def observe(self, arr: np.ndarray) -> None:
+    def observe(self, arr: np.ndarray | dict) -> None:
+        if isinstance(arr, dict):             # extended record: stats on values
+            arr = arr["values"]
         a = np.asarray(arr)
         if a.ndim < 2 or a.shape[0] < 2:      # univariate: free, and silent
             return

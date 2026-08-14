@@ -385,9 +385,25 @@ class Toto2Model(nn.Module):
         return out[:, 0] if squeeze_variates else out
 
 
-def pinball_loss(pred_q: torch.Tensor, target: torch.Tensor, levels: tuple[float, ...]) -> torch.Tensor:
+def pinball_loss(
+    pred_q: torch.Tensor,
+    target: torch.Tensor,
+    levels: tuple[float, ...],
+    weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Mean pinball (quantile) loss. ``pred_q`` ``(..., num_q)``, ``target``
-    ``(...)`` broadcast over the quantile axis."""
+    ``(...)`` broadcast over the quantile axis.
+
+    ``weight`` (optional, shaped like ``target``) is a per-element loss
+    weight — 0 excludes an element (a missing/masked target, a covariate
+    channel) from the objective. ``None`` is the exact historical unweighted
+    mean, bit-for-bit.
+    """
     q = torch.tensor(levels, device=pred_q.device, dtype=pred_q.dtype)
     err = target.unsqueeze(-1) - pred_q
-    return torch.maximum(q * err, (q - 1.0) * err).mean()
+    loss = torch.maximum(q * err, (q - 1.0) * err)
+    if weight is None:
+        return loss.mean()
+    w = weight.to(loss.dtype).unsqueeze(-1)
+    denom = (w.sum() * loss.shape[-1]).clamp_min(1e-9)
+    return (loss * w).sum() / denom

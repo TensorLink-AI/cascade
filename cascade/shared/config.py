@@ -93,6 +93,10 @@ class GeneratorConfig:
     # Note: json round-trips turn the tuple into a list; treat as a container.
     accepted_fields: tuple[str, ...] = ()
     allow_future_known: bool = False
+    # Per-series cap on the masked fraction when "mask" is accepted
+    # (DEC-CA-0019's gate): a mostly-missing series is mostly filler bytes
+    # bought at full freight. Meaningless while accepted_fields is empty.
+    max_missing_frac: float = 0.5
     # Channel-redundancy gate (DEC-CA-0022; data-quality, not digest-bound).
     #   channel_corr_mode — "off" (default) | "shadow" (telemetry only; the
     #                       trainer's shadow accumulator already logs it) |
@@ -1200,6 +1204,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             # Mirrored from the digest-bound [training] keys — single source.
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
+            max_missing_frac=float(g.get("max_missing_frac", 0.5)),
             channel_corr_mode=validate_dedup_mode(
                 str(g.get("channel_corr_mode", "off")), "channel_corr_mode"),
             max_channel_corr=float(g.get("max_channel_corr", 0.999)),
