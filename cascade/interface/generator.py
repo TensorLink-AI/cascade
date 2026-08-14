@@ -401,6 +401,125 @@ def check_record(
             raise ValueError(f"roles must include at least one target channel{where}")
 
 
+class SeriesValidator:
+    """The one per-series validation + canonicalisation pipeline, shared by
+    every corpus producer — :func:`drain_generator` (cache_reuse), the
+    in-process stream, and the sandbox stream child — so the carrier rules can
+    never drift between feed modes.
+
+    ``process(item, index)`` runs the full chain: record carrier
+    (:func:`canonicalize_yield` with the accepted-field set) → values
+    validation (:func:`check_series`) → extended-record canonicalisation +
+    validation (:func:`check_record`) → the caller's ``extra_series_check``
+    (e.g. the trainer's channel-correlation enforce gate) → the cumulative
+    budgets, POINTS first (``max_total_points`` over values entries; 0
+    disables — streaming modes stop at the token budget instead) then BYTES
+    (``max_payload_bytes``: values at 8 B/point plus accepted extras at
+    1 B/entry; 0 disables). Returns the canonical element — a contiguous
+    ``(C, L)`` float64 array, or a canonical record dict when accepted extras
+    ride along. Raises ``ValueError`` on any violation.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_length: int,
+        max_length: int,
+        max_channels: int = 1,
+        max_abs: float | None = None,
+        reject_constant: bool = False,
+        accepted_fields: tuple[str, ...] | list[str] = (),
+        max_missing_frac: float = 1.0,
+        allow_future_known: bool = False,
+        max_total_points: int = 0,
+        max_payload_bytes: int = 0,
+        extra_series_check=None,
+    ) -> None:
+        self.min_length = int(min_length)
+        self.max_length = int(max_length)
+        self.max_channels = int(max_channels)
+        self.max_abs = max_abs
+        self.reject_constant = bool(reject_constant)
+        self.accepted_fields = tuple(accepted_fields)
+        self.max_missing_frac = float(max_missing_frac)
+        self.allow_future_known = bool(allow_future_known)
+        self.max_total_points = int(max_total_points)
+        self.max_payload_bytes = int(max_payload_bytes)
+        self.extra_series_check = extra_series_check
+        self.total_points = 0
+        self.payload_bytes = 0
+
+    @classmethod
+    def from_config(cls, cfg, extra_series_check=None) -> SeriesValidator:
+        """Build from a ``GeneratorConfig`` — the production wiring every
+        stream/sandbox path uses, so a new knob added here reaches all of them
+        at once. ``max_abs_value = 0.0`` maps to the cast-safe ceiling exactly
+        as the drain call sites always did."""
+        return cls(
+            min_length=cfg.min_length,
+            max_length=cfg.max_length,
+            max_channels=cfg.max_channels,
+            max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
+            reject_constant=cfg.reject_constant,
+            accepted_fields=tuple(cfg.accepted_fields),
+            max_missing_frac=cfg.max_missing_frac,
+            allow_future_known=cfg.allow_future_known,
+            # No point budget here: the streaming modes this constructor
+            # serves stop at the TOKEN budget; max_total_points binds the
+            # materialised drain, which builds its own validator.
+            max_payload_bytes=cfg.max_payload_bytes,
+            extra_series_check=extra_series_check,
+        )
+
+    def process(self, item: object, index: int) -> np.ndarray | dict[str, np.ndarray]:
+        rec = canonicalize_yield(item, accepted=self.accepted_fields, index=index)
+        arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
+        check_series(
+            arr, min_length=self.min_length, max_length=self.max_length,
+            max_channels=self.max_channels, max_abs=self.max_abs,
+            reject_constant=self.reject_constant, index=index,
+        )
+        if isinstance(rec, dict):
+            element: np.ndarray | dict[str, np.ndarray] = canonicalize_record(rec)
+            check_record(
+                element, max_missing_frac=self.max_missing_frac,
+                allow_future_known=self.allow_future_known, index=index,
+            )
+            canon = element[VALUES_FIELD]
+            elem_bytes = sum(int(a.nbytes) for a in element.values())
+        else:
+            canon = np.ascontiguousarray(
+                np.atleast_2d(np.asarray(arr, dtype=np.float64))
+            )
+            element = canon
+            elem_bytes = int(canon.nbytes)
+        if self.extra_series_check is not None:
+            self.extra_series_check(canon, index)
+        self.total_points += int(canon.size)
+        if self.max_total_points and self.total_points > self.max_total_points:
+            raise ValueError(
+                f"total emitted points {self.total_points} exceeds cap "
+                f"{self.max_total_points}"
+            )
+        self.payload_bytes += elem_bytes
+        if self.max_payload_bytes and self.payload_bytes > self.max_payload_bytes:
+            raise ValueError(
+                f"total payload bytes {self.payload_bytes} exceeds cap "
+                f"{self.max_payload_bytes}"
+            )
+        return element
+
+
+def element_dedup_key(element: np.ndarray | dict[str, np.ndarray]) -> bytes:
+    """Dedup key for a canonical element from :meth:`SeriesValidator.process` —
+    the legacy :func:`_series_key` for arrays, the 0xFF-framed
+    :func:`_record_key` for extended records (never collide; see the framing
+    note above)."""
+    if isinstance(element, dict):
+        return _record_key(element)
+    return _series_key(element)
+
+
 def drain_generator(
     gen: DataGenerator,
     n_series: int,
@@ -462,57 +581,26 @@ def drain_generator(
     """
     if n_series <= 0:
         raise ValueError(f"n_series must be positive; got {n_series}")
+    validator = SeriesValidator(
+        min_length=min_length, max_length=max_length, max_channels=max_channels,
+        max_abs=max_abs, reject_constant=reject_constant,
+        accepted_fields=accepted_fields, max_missing_frac=max_missing_frac,
+        allow_future_known=allow_future_known,
+        max_total_points=max_total_points, max_payload_bytes=max_payload_bytes,
+        extra_series_check=extra_series_check,
+    )
     dedup = max_dup_fraction < 1.0
     seen: set[bytes] = set()
     dups = 0
     out: list[np.ndarray | dict[str, np.ndarray]] = []
-    total = 0
-    payload_bytes = 0
     for i, item in enumerate(gen.generate(n_series)):
         if i >= n_series:
             raise ValueError(
                 f"generate yielded more than n_series={n_series} series"
             )
-        rec = canonicalize_yield(item, accepted=tuple(accepted_fields), index=i)
-        arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
-        check_series(
-            arr, min_length=min_length, max_length=max_length,
-            max_channels=max_channels, max_abs=max_abs,
-            reject_constant=reject_constant, index=i,
-        )
-        if isinstance(rec, dict):
-            canon_rec = canonicalize_record(rec)
-            check_record(
-                canon_rec, max_missing_frac=max_missing_frac,
-                allow_future_known=allow_future_known, index=i,
-            )
-            canon = canon_rec[VALUES_FIELD]
-            element: np.ndarray | dict[str, np.ndarray] = canon_rec
-            elem_bytes = sum(int(a.nbytes) for a in canon_rec.values())
-            key = _record_key(canon_rec) if dedup else b""
-        else:
-            canon = np.ascontiguousarray(
-                np.atleast_2d(np.asarray(arr, dtype=np.float64))
-            )
-            element = canon
-            elem_bytes = int(canon.nbytes)
-            key = _series_key(canon) if dedup else b""
-        if extra_series_check is not None:
-            # Caller-supplied per-series gate on the canonical values (e.g.
-            # the trainer's channel-correlation enforce gate, DEC-CA-0022).
-            # Must raise ValueError to reject.
-            extra_series_check(canon, i)
-        total += int(canon.size)
-        if total > max_total_points:
-            raise ValueError(
-                f"total emitted points {total} exceeds cap {max_total_points}"
-            )
-        payload_bytes += elem_bytes
-        if max_payload_bytes and payload_bytes > max_payload_bytes:
-            raise ValueError(
-                f"total payload bytes {payload_bytes} exceeds cap {max_payload_bytes}"
-            )
+        element = validator.process(item, i)
         if dedup:
+            key = element_dedup_key(element)
             if key in seen:
                 dups += 1
             else:

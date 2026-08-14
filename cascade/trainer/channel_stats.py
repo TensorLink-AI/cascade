@@ -100,6 +100,7 @@ class ChannelStatsAccumulator:
         self._corrs: list[float] = []
         self._ranks: list[float] = []
         self._n_channels: list[int] = []
+        self._seen: set[bytes] = set()
 
     def observe(self, arr: np.ndarray | dict) -> None:
         if isinstance(arr, dict):             # extended record: stats on values
@@ -107,6 +108,19 @@ class ChannelStatsAccumulator:
         a = np.asarray(arr)
         if a.ndim < 2 or a.shape[0] < 2:      # univariate: free, and silent
             return
+        # Dedup by content: in cache_reuse mode the training stream CYCLES the
+        # corpus under the token budget, and counting each pass would inflate
+        # n_multichannel_series and repeat every stat in the quantiles — the
+        # summary must describe the CORPUS, not the schedule. One 16-byte key
+        # per unique multichannel series; fresh streams never collide.
+        import hashlib
+
+        key = hashlib.blake2b(
+            np.ascontiguousarray(a).tobytes(), digest_size=16
+        ).digest()
+        if key in self._seen:
+            return
+        self._seen.add(key)
         stats = series_channel_stats(a)
         if stats is None:
             return

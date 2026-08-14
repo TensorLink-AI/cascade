@@ -817,54 +817,33 @@ def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int
 
 
 def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
-    from ..interface.generator import (
-        CAST_SAFE_MAX_FLOAT32,
-        VALUES_FIELD,
-        canonicalize_record,
-        canonicalize_yield,
-        check_record,
-        check_series,
-    )
+    from ..interface.generator import SeriesValidator
     from .corpus import _load_generator
 
     out = sys.stdout.buffer
     try:
         cfg = GeneratorConfig(**json.loads(cfg_json))
         _maybe_self_rlimit(cfg)
-        accepted = tuple(cfg.accepted_fields)
         from .channel_stats import corr_enforce_gate
 
-        corr_gate = corr_enforce_gate(cfg)
-        gen = _load_generator(Path(repo), int(seed))
-        # Record yields (DEC-CA-0016) are normalised CHILD-side. Values-only
-        # records collapse to their values array and cross as plain .npy
-        # frames — byte-identical to a bare-array stream. Series carrying an
-        # ACCEPTED extra (mask/roles, armed via [training] accepted_fields)
-        # cross as marker-introduced record frames (_write_record_frame).
+        # One validation pipeline shared with the drain and the in-process
+        # stream (SeriesValidator) — record fields, budgets, and gates cannot
+        # drift between feed modes. Values-only records collapse to their
+        # values array and cross as plain .npy frames — byte-identical to a
+        # bare-array stream; series carrying an ACCEPTED extra (mask/roles,
+        # armed via [training] accepted_fields) cross as marker-introduced
+        # record frames (_write_record_frame).
+        validator = SeriesValidator.from_config(
+            cfg, extra_series_check=corr_enforce_gate(cfg)
+        )
+        gen = _load_generator(Path(repo), int(seed),
+                              interface_version=cfg.interface_version)
         for i, item in enumerate(gen.generate(int(n_upper))):
-            rec = canonicalize_yield(item, accepted=accepted, index=i)
-            arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
-            check_series(
-                arr, min_length=cfg.min_length, max_length=cfg.max_length,
-                max_channels=cfg.max_channels,
-                max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
-                reject_constant=cfg.reject_constant, index=i,
-            )
-            if isinstance(rec, dict):
-                canon_rec = canonicalize_record(rec)
-                check_record(
-                    canon_rec, max_missing_frac=cfg.max_missing_frac,
-                    allow_future_known=cfg.allow_future_known, index=i,
-                )
-                if corr_gate is not None:
-                    corr_gate(canon_rec[VALUES_FIELD], i)
-                _write_record_frame(out, canon_rec)
-                out.flush()
-                continue
-            canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
-            if corr_gate is not None:
-                corr_gate(canon, i)
-            _write_frame(out, canon)
+            element = validator.process(item, i)
+            if isinstance(element, dict):
+                _write_record_frame(out, element)
+            else:
+                _write_frame(out, element)
             out.flush()
     except BrokenPipeError:
         return 0  # parent stopped reading once it had its budget — a normal stop

@@ -375,3 +375,102 @@ def test_trainer_consumes_masked_and_role_tagged_corpus(tmp_path):
     assert np.isfinite(result.metrics["final_loss"])
     # 4 record series (2ch x 16 kept) + 2 bare (1ch x 16): all channels count.
     assert result.metrics["tokens_seen"] == 4 * 2 * 16 + 2 * 16
+
+
+# ── audit-fix regressions (2026-08-14 review) ────────────────────────────────
+
+
+def test_stream_paths_enforce_payload_bytes_cap(tmp_path):
+    # The carrier cap must gate the LIVE (streaming) path, not just the
+    # materialised drain: 2 series x (800 values B + 100 mask B) = 1800 B.
+    import json as _json
+
+    from cascade.trainer.stream import _inprocess_stream
+
+    (tmp_path / "generator.py").write_text(
+        "from cascade.interface.generator import DataGenerator\n"
+        "import numpy as np\n"
+        "class Generator(DataGenerator):\n"
+        "    def __init__(self, config_dir, *, seed):\n"
+        "        self._seed = seed\n"
+        "    @property\n"
+        "    def name(self): return 'g'\n"
+        "    def generate(self, n_series):\n"
+        "        rng = np.random.default_rng(self._seed)\n"
+        "        for _ in range(n_series):\n"
+        "            v = rng.standard_normal(100)\n"
+        "            m = np.zeros(100, dtype=np.uint8)\n"
+        "            yield {'values': v, 'mask': m}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.json").write_text(_json.dumps({}))
+
+    def cfg(cap):
+        return GeneratorConfig(
+            corpus_n_series=4, min_length=10, max_length=200,
+            max_total_points=100_000, max_generate_seconds=60,
+            max_memory_mb=1024, accepted_fields=("mask",),
+            max_payload_bytes=cap,
+        )
+
+    from cascade.trainer.stream import open_round_stream
+
+    # 200-point token budget stops the stream after 2 series (100 pts each);
+    # 2 x 900 payload bytes fit a 1800 cap exactly.
+    with open_round_stream("stream_cpu", tmp_path, 7, cfg(1800),
+                           token_budget=200, use_sandbox=False) as s:
+        assert len(list(s.series())) == 2
+    with pytest.raises(ValueError, match="payload bytes"), \
+         open_round_stream("stream_cpu", tmp_path, 7, cfg(1799),
+                           token_budget=200, use_sandbox=False) as s:
+        list(s.series())
+    # And the raw producer enforces it even without the budget stop.
+    with pytest.raises(ValueError, match="payload bytes"):
+        list(_inprocess_stream(tmp_path, 7, cfg(2699), token_budget=100_000))
+
+
+def test_interface_version_config_knob_is_wired_and_capped(tmp_path):
+    import json as _json
+
+    from cascade.interface.generator import SUPPORTED_INTERFACE_VERSION
+    from cascade.trainer.corpus import CorpusError, _check_declared_interface
+
+    (tmp_path / "config.json").write_text(
+        _json.dumps({"interface_version": SUPPORTED_INTERFACE_VERSION + 1})
+    )
+    # Declared above the bar → rejected at the configured bar…
+    with pytest.raises(CorpusError, match="generator_interface_too_new"):
+        _check_declared_interface(tmp_path, SUPPORTED_INTERFACE_VERSION)
+    # …and a config bar ABOVE the code ceiling is capped, never honoured —
+    # the code cannot accept fields it does not implement.
+    with pytest.raises(CorpusError, match="generator_interface_too_new"):
+        _check_declared_interface(tmp_path, SUPPORTED_INTERFACE_VERSION + 5)
+
+
+def test_channel_telemetry_dedupes_cycled_passes():
+    # cache_reuse cycles the corpus through the training stream; the summary
+    # must describe the corpus, not the schedule.
+    from cascade.trainer.channel_stats import ChannelStatsAccumulator
+
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((3, 100))
+    b = rng.standard_normal((3, 100))
+    acc = ChannelStatsAccumulator()
+    for _ in range(5):        # five passes over a two-series corpus
+        acc.observe(a)
+        acc.observe(b)
+    assert acc.summary()["n_multichannel_series"] == 2
+
+
+def test_audit_baseline_rows_with_empty_scores_fail_cleanly():
+    from cascade.audit.checks import _baseline_pooled
+    from cascade.shared.receipt import EntryScores
+
+    class _R:
+        entry_scores = (
+            EntryScores(role="baseline", size="", hotkey="__warm_start_init__",
+                        uid=-1, scores=()),
+        )
+
+    with pytest.raises(ValueError, match="present but empty"):
+        _baseline_pooled(_R, [""])

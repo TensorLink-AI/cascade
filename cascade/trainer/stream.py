@@ -77,45 +77,24 @@ def _element_points(arr: np.ndarray | dict) -> int:
 def _inprocess_stream(
     repo: Path, seed: int, cfg: GeneratorConfig, token_budget: int
 ) -> Iterator[np.ndarray]:
-    """In-process fresh-series stream (no sandbox) for offline / test runs."""
-    from ..interface.generator import (
-        CAST_SAFE_MAX_FLOAT32,
-        VALUES_FIELD,
-        canonicalize_record,
-        canonicalize_yield,
-        check_record,
-        check_series,
-    )
+    """In-process fresh-series stream (no sandbox) for offline / test runs.
+
+    The full carrier pipeline (record fields, validation, budgets, the corr
+    gate) is :class:`~cascade.interface.generator.SeriesValidator` — one
+    implementation shared with the drain and the sandbox child, so the feed
+    modes cannot drift.
+    """
+    from ..interface.generator import SeriesValidator
     from .channel_stats import corr_enforce_gate
     from .corpus import _load_generator
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
-    accepted = tuple(cfg.accepted_fields)
-    corr_gate = corr_enforce_gate(cfg)
-    gen = _load_generator(repo, int(seed))
+    validator = SeriesValidator.from_config(
+        cfg, extra_series_check=corr_enforce_gate(cfg)
+    )
+    gen = _load_generator(repo, int(seed), interface_version=cfg.interface_version)
     for i, item in enumerate(gen.generate(n_upper)):
-        rec = canonicalize_yield(item, accepted=accepted, index=i)
-        arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
-        check_series(
-            arr, min_length=cfg.min_length, max_length=cfg.max_length,
-            max_channels=cfg.max_channels,
-            max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
-            reject_constant=cfg.reject_constant, index=i,
-        )
-        if isinstance(rec, dict):
-            canon_rec = canonicalize_record(rec)
-            check_record(
-                canon_rec, max_missing_frac=cfg.max_missing_frac,
-                allow_future_known=cfg.allow_future_known, index=i,
-            )
-            if corr_gate is not None:
-                corr_gate(canon_rec[VALUES_FIELD], i)
-            yield canon_rec
-            continue
-        canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
-        if corr_gate is not None:
-            corr_gate(canon, i)
-        yield canon
+        yield validator.process(item, i)
 
 
 class RoundStream:

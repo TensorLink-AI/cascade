@@ -529,21 +529,40 @@ class ValidatorRunner:
         )
 
     def _check_gpu(self, manifest: TrainingManifest) -> str | None:
-        """Matched-hardware gate for byte-exact re-derivation.
+        """Matched-hardware gate for byte-exact re-derivation — PER SIZE.
 
-        If ``[training] expected_gpu`` is pinned, every entry must report that GPU.
-        Otherwise require only that king and challenger ran the same GPU (when both
-        report one) — equal compute is already guaranteed by the token budget, but
-        a byte-exact audit needs the comparison run on one SKU.
+        Each entry is judged against ITS size's pin: the per-size contract's
+        ``expected_gpu`` (a ``SizeSpec.expected_gpu`` override, else the base
+        ``[training]`` pin — DEC-CA-0023's size-conditional silicon). A size
+        with no pin requires only that king and challenger ran the same GPU
+        within that size — equal compute is already guaranteed by the token
+        budget, but a byte-exact audit needs each comparison run on one SKU.
+        Different SIZES may legitimately run different silicon (a 313M duel on
+        H100 beside a 4M screen lineage on L40S); requiring one GPU across
+        sizes would deadlock exactly the configuration the per-size pin
+        exists for. Single-size manifests (every deployed round) are judged
+        identically to the old whole-manifest rule.
         """
-        pinned = self.cfg.training.expected_gpu
-        gpus = {e.gpu_name for e in manifest.entries if e.gpu_name}
-        if pinned:
-            bad = sorted(g for g in gpus if g != pinned)
-            if bad or any(not e.gpu_name for e in manifest.entries):
-                return f"gpu_mismatch: expected {pinned!r}, manifest has {sorted(gpus)!r}"
-        elif len(gpus) > 1:
-            return f"gpu_mismatch: king/challenger on different GPUs {sorted(gpus)!r}"
+        registry = self.cfg.training.size_registry
+        primary = self.cfg.training.arch_preset
+        by_size: dict[str, list[TrainedEntry]] = {}
+        for e in manifest.entries:
+            by_size.setdefault(e.size, []).append(e)
+        for size, entries in by_size.items():
+            preset = size or primary
+            # An unknown size tag falls back to the base pin — defensive only;
+            # the contract-digest gate rejects such a manifest anyway.
+            contract = registry.get(preset, self.cfg.training.primary_size)
+            pinned = contract.expected_gpu
+            gpus = {e.gpu_name for e in entries if e.gpu_name}
+            if pinned:
+                bad = sorted(g for g in gpus if g != pinned)
+                if bad or any(not e.gpu_name for e in entries):
+                    return (f"gpu_mismatch: size {preset!r} expected {pinned!r}, "
+                            f"manifest has {sorted(gpus)!r}")
+            elif len(gpus) > 1:
+                return (f"gpu_mismatch: size {preset!r} king/challenger on "
+                        f"different GPUs {sorted(gpus)!r}")
         return None
 
     # ── per-round decision ──────────────────────────────────────────────────

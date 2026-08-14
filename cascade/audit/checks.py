@@ -390,6 +390,12 @@ def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
         if r is None:
             raise KeyError(f"baseline entry_scores missing for size {size!r}")
         out += [w.to_score() for w in r.scores]
+    if not out:
+        # Baseline rows exist but carry no scores: a malformed receipt, not a
+        # level-judged round — raising here surfaces it as a check FAILURE
+        # (callers catch ValueError) instead of a truthiness slip that would
+        # replay under the wrong rule or crash evaluate_round.
+        raise ValueError("baseline entry_scores present but empty")
     return out
 
 
@@ -488,7 +494,7 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
         from dataclasses import replace as _dc_replace
 
         mode_params = _dc_replace(
-            duel_params, margin_mode="increment" if baseline else "level"
+            duel_params, margin_mode="increment" if baseline is not None else "level"
         )
         res = evaluate_round(
             king, chal, mode_params,
@@ -615,7 +621,7 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     from dataclasses import replace as _dc_replace
 
     duel_params = _dc_replace(
-        duel_params, margin_mode="increment" if baseline else "level"
+        duel_params, margin_mode="increment" if baseline is not None else "level"
     )
 
     def _replay(mode: str):
