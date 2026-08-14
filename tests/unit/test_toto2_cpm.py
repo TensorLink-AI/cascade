@@ -438,3 +438,31 @@ def test_trainer_end_to_end_multichannel_run(tmp_path: Path):
     assert result.metrics["tokens_seen"] == trained_points
     w = _load_wrapper(tmp_path / "ckpt")
     assert w.forecast(np.arange(20, dtype=float), 8, 4).shape == (1, 4, 8)
+
+
+def test_lr_schedule_honoured():
+    """lr_schedule used to be decorative — warmup_cosine ran regardless. Now
+    warmup_flat holds base_lr after warmup (the DEC-CA-0023 compounding-
+    lineage rule) and an unknown schedule fails the run's first second."""
+    from cascade.trainer.toto2_trainer import _lr_at
+
+    # warmup identical for both schedules
+    assert _lr_at(50, 1000, 100, 1.0) == _lr_at(50, 1000, 100, 1.0, "warmup_flat")
+    # cosine decays; flat holds
+    assert _lr_at(900, 1000, 100, 1.0) < 0.1
+    assert _lr_at(900, 1000, 100, 1.0, "warmup_flat") == 1.0
+    assert _lr_at(999, 1000, 0, 1.0, "warmup_flat") == 1.0
+
+    contract = SimpleNamespace(
+        context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
+        num_heads=1, head_dim=16, mlp_expansion=2, num_quantiles=9,
+        batch_size=4, max_train_seconds=30, base_lr=1e-3, weight_decay=0.0,
+        optimizer="adamw", warmup_tokens=0, input_transform="arcsinh_causal",
+        lr_schedule="warmup_wsd",   # not implemented
+    )
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    with pytest.raises(ValueError, match="lr_schedule"):
+        trainer.train(
+            iter([np.arange(32.0)]), contract, training_seed=1,
+            token_budget=64, out_dir=Path("/tmp/unused-lr-sched"),
+        )

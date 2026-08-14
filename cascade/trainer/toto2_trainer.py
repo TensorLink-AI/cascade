@@ -77,10 +77,27 @@ class _TimedStream:
         return s
 
 
-def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
-    """warmup_cosine over the token budget: linear warmup then cosine to 0."""
+# LR schedules the trainer honours ([training] lr_schedule; digest-bound, so a
+# schedule flip is a contract change — release-then-activate):
+#   warmup_cosine — linear warmup then cosine to 0. The from-scratch rule
+#                   (every deployed round).
+#   warmup_flat   — linear warmup then constant at base_lr. The compounding-
+#                   lineage rule (DEC-CA-0023 E2): a per-round cosine would
+#                   decay a lineage that must keep learning across rounds;
+#                   release checkpoints are LR-decayed COPIES, the lineage
+#                   itself never decays.
+LR_SCHEDULES = ("warmup_cosine", "warmup_flat")
+
+
+def _lr_at(
+    token_pos: int, total: int, warmup: int, base_lr: float,
+    schedule: str = "warmup_cosine",
+) -> float:
+    """The contract LR at ``token_pos`` of ``total`` (see LR_SCHEDULES)."""
     if warmup > 0 and token_pos < warmup:
         return base_lr * token_pos / max(1, warmup)
+    if schedule == "warmup_flat":
+        return base_lr
     if total <= warmup:
         return base_lr
     progress = (token_pos - warmup) / max(1, total - warmup)
@@ -349,6 +366,14 @@ class Toto2Trainer:
 
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
+        # The contract's LR schedule, honoured (it used to be decorative —
+        # warmup_cosine ran unconditionally). Validated up front so a typo'd
+        # digest-bound value fails the run's first second, not mid-round.
+        lr_schedule = str(getattr(contract, "lr_schedule", "warmup_cosine"))
+        if lr_schedule not in LR_SCHEDULES:
+            raise ValueError(
+                f"lr_schedule={lr_schedule!r} not implemented; one of {LR_SCHEDULES}"
+            )
 
         tokens = 0
         step = 0
@@ -486,7 +511,7 @@ class Toto2Trainer:
                 weight = w
             loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
-            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
+            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr, lr_schedule)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
