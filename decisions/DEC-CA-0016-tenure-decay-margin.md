@@ -34,9 +34,10 @@ change, so recorded LCBs are exactly the right statistic). All flips are
 loss→win by construction; the report also counts near-misses within 50bp of
 each candidate margin, and is explicit that it is FIRST-ORDER (a flip would
 have rewritten the subsequent throne history — counts measure how binding the
-flat margin was, not an alternate timeline). The owner picks the schedule from
-this report. Opening recommendation: end=0.008, warmup=12 (floor at 40% of
-the fresh-king bar, reached in ~6 days of 12h rounds).
+flat margin was, not an alternate timeline). The owner's working pick
+(2026-08-15): end=0.010, warmup=12 — the grid's most conservative floor, half
+the fresh-king bar, reached in ~6 days of 12h rounds; confirmed against the
+replay report before the mainnet release.
 
 **HARD GUARDRAIL: the floor stays > 0.** The margin is the improvement bar
 above the LCB noise gate; at 0 any statistically nonzero improvement

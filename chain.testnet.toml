@@ -230,15 +230,17 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 # a cascade warm-start promotion (only on a real dethrone/resync), so the
 # decay deepens across a whole hold.
 #
-# Candidate schedule under test: start=0.02, end=0.008, warmup=12 — the middle
-# of the replay grid (scripts/replay_margin_decay.py). The MAINNET schedule is
-# picked by the owner from the replay report over the real receipt trail and
-# ships release-then-activate (docs/MARGIN_DECAY_ROLLOUT.md) — never a local
-# flip: margin is judged per-validator, so a mixed fleet forks verdicts.
+# Candidate schedule under test: start=0.02, end=0.010, warmup=12 — the
+# owner's pick (2026-08-15): the most conservative floor in the replay grid
+# (scripts/replay_margin_decay.py), half the fresh-king margin. The MAINNET
+# schedule is CONFIRMED against the replay report over the real receipt trail
+# before it ships, release-then-activate (docs/MARGIN_DECAY_ROLLOUT.md) —
+# never a local flip: margin is judged per-validator, so a mixed fleet forks
+# verdicts.
 # HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
 # bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
 win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
-win_margin_end       = 0.008     # decayed floor at margin_warmup_rounds of tenure (> 0!)
+win_margin_end       = 0.010     # decayed floor at margin_warmup_rounds of tenure (> 0!)
 margin_warmup_rounds = 12        # rounds of tenure to reach the floor. Rounds, not days:
                                  # ~36h at the 3h testnet cadence (mainnet: ~6d at 12h),
                                  # so one testnet reign exercises the full ramp quickly

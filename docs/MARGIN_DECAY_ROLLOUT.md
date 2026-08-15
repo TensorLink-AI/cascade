@@ -61,10 +61,13 @@ candidate margin. **First-order caveat** (printed by the tool): a flip at
 round r would have changed the king/tenure/field for every later round —
 counts measure how binding the flat margin was, not an alternate timeline.
 
-The owner picks the schedule from this report. Recommendation to start the
-discussion: `end=0.008, warmup=12` (floor at 40% of the fresh-king margin,
-reached in ~6 days of 12h rounds — one full cascade promotion cycle is 5
-rounds, so a king past two promotion cycles defends the floor).
+The owner's working pick (2026-08-15): `end=0.010, warmup=12` — the most
+conservative floor in the grid, half the fresh-king margin, reached in ~6
+days of 12h rounds (one full cascade promotion cycle is 5 rounds, so a king
+past two promotion cycles defends the floor). Run the replay before the
+mainnet release anyway: it confirms the pick against the real trail (how many
+past verdicts flip, how many near-misses sit just under a 1% bar) and is the
+number the upgrade announcement should quote.
 
 ## Step 1 — testnet (netuid 259)
 
