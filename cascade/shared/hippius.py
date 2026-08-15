@@ -1176,6 +1176,7 @@ def update_receipt_index(
     updated_at: str = "",
     subnet: dict | None = None,
     chain: dict | None = None,
+    build: str | None = None,
     max_keep: int = RECEIPT_INDEX_MAX_KEEP,
 ) -> dict:
     """Append/replace one entry in ``receipts/index.json`` and write it public-read.
@@ -1188,11 +1189,17 @@ def update_receipt_index(
     ``updated_at`` (an ISO stamp), ``subnet`` (``{"netuid", "name"}``),
     and ``chain`` (schedule anchor for the next-round countdown:
     ``{as_of, current_block, epoch_start_block, epoch_blocks, block_time_s}``)
-    are optional header fields the dashboard shows. Returns the stored entry.
+    are optional header fields the dashboard shows. ``build`` is the publishing
+    validator's unsigned build stamp — the same value ``dump_receipt`` puts at
+    the receipt's top level — so "who has upgraded?" is one read of the index.
+    Returns the stored entry.
     """
     entry = dict(summary)
     hotkey = str(entry.get("validator_hotkey") or "")
     entry["receipt_key"] = receipt_round_key(str(entry.get("round_id", "")), hotkey)
+    # None marks an entry written by a pre-stamp validator; like the receipt's
+    # copy this is unsigned/presentational, never part of the audit trail.
+    entry["build"] = build if build is not None else entry.get("build")
     if updated_at:
         entry["published_at"] = updated_at
 

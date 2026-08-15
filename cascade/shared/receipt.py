@@ -24,9 +24,13 @@ sign/verify over :meth:`RoundReceipt.canonical_body` with a bittensor hotkey
 
 from __future__ import annotations
 
+import functools
 import json
 import math
+import os
+import subprocess
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from .manifest import TrainingManifest, dump_manifest, load_manifest
 
@@ -415,10 +419,37 @@ def build_receipt(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def running_build() -> str:
+    """Short git hash of the running tree; CASCADE_BUILD overrides; 'unknown' if neither.
+
+    The ``CASCADE_BUILD`` override covers rsync'd non-git deployments (pods are
+    rsync'd trees, not checkouts — external validators may deploy the same way).
+    """
+    env = os.environ.get("CASCADE_BUILD", "").strip()
+    if env:
+        return env
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parents[2]),
+             "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001 — a missing git must never block a receipt
+        return "unknown"
+
+
 def dump_receipt(receipt: RoundReceipt) -> str:
     """Serialise a receipt (including signature) to a JSON string."""
     body = json.loads(receipt.canonical_body().decode("utf-8"))
     body["signature"] = receipt.signature
+    # Unsigned, deliberately OUTSIDE canonical_body: an ops-observability
+    # stamp of the code the validator ran, so upgrade status is remotely
+    # checkable. Old readers ignore it; signatures are unaffected. A signed
+    # field would need every verifier updated before any validator stamps —
+    # exactly the coordination gap this exists to observe.
+    body["build"] = running_build()
     return json.dumps(body, indent=2, sort_keys=True)
 
 

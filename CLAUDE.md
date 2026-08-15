@@ -126,6 +126,12 @@ in-context.
   abort. Flip changed `contract_digest` — trainer+validator deploy together.
   (`decisions/DEC-CA-0016-wsd-schedule-optimizer-continuity.md`)
 
+- **DEC-CA-0017** — Receipts carry an UNSIGNED top-level `build` stamp (short
+  git hash; `CASCADE_BUILD` overrides), outside `canonical_body` so old readers
+  and signatures are untouched; the receipts index + dashboard surface it.
+  "Did you pull?", never attestation — a signed field needs every verifier
+  upgraded first. (`decisions/DEC-CA-0017-receipt-build-stamp-unsigned.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.

@@ -202,6 +202,31 @@ def test_update_receipt_index_rejected_never_erases_scored_entry():
     assert len(doc["rounds"]) == 1 and doc["rounds"][0]["status"] == "scored"
 
 
+def test_update_receipt_index_carries_build_stamp():
+    """The index carries the publishing validator's unsigned build stamp;
+    entries from pre-stamp validators read as an explicit None, and a rejected
+    re-judgement never overwrites the preserved scored entry's stamp."""
+    store = _FakeS3Store()
+    receipt, _, _ = make_scored_receipt()
+    summary = summarize_receipt(receipt)
+
+    entry = hippius.update_receipt_index(store, summary, build="abc1234")
+    assert entry["build"] == "abc1234"
+    doc = json.loads(store.objects[hippius.RECEIPT_INDEX_KEY])
+    assert doc["rounds"][0]["build"] == "abc1234"
+
+    # no stamp passed (pre-stamp validator) → explicit None, key still present
+    entry = hippius.update_receipt_index(
+        store, {**summary, "validator_hotkey": "5ValOld"})
+    assert entry["build"] is None
+
+    # rejected rerun of the scored round: the scored entry survives, stamp intact
+    rejected = make_rejected_receipt(reason="king_resyncing")
+    entry = hippius.update_receipt_index(
+        store, summarize_receipt(rejected), build="fff9999")
+    assert entry["status"] == "scored" and entry["build"] == "abc1234"
+
+
 def test_read_receipt_index_empty_when_absent_or_malformed():
     store = _FakeS3Store()
     assert hippius.read_receipt_index(store) == {"schema": hippius.RECEIPT_INDEX_SCHEMA, "rounds": []}

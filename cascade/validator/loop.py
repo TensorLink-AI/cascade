@@ -1274,7 +1274,12 @@ class ValidatorRunner:
             publish_receipt,
             update_receipt_index,
         )
-        from ..shared.receipt import dump_receipt, sign_receipt, summarize_receipt
+        from ..shared.receipt import (
+            dump_receipt,
+            running_build,
+            sign_receipt,
+            summarize_receipt,
+        )
 
         try:
             epoch_start = self._epoch_start_block(manifest)
@@ -1359,6 +1364,9 @@ class ValidatorRunner:
                     updated_at=now_iso,
                     subnet={"netuid": self.cfg.subnet.netuid, "name": self.cfg.subnet.name},
                     chain=chain,
+                    # Same unsigned stamp dump_receipt just wrote on the receipt,
+                    # carried into the index so upgrade status is one read.
+                    build=running_build(),
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("receipt index update failed for round=%s: %s",

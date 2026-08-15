@@ -132,7 +132,11 @@ def test_golden_fixture_matches_schema():
     """
     receipt, _, _ = make_scored_receipt()
     golden = GOLDEN_PATH.read_text(encoding="utf-8")
-    assert dump_receipt(receipt) == golden
+    # "build" is the unsigned, environment-dependent stamp of the running tree
+    # — the one key dump_receipt emits that a golden file cannot pin.
+    dumped = json.loads(dump_receipt(receipt))
+    dumped.pop("build", None)
+    assert json.dumps(dumped, indent=2, sort_keys=True) == golden
     assert load_receipt(golden) == receipt
 
 
@@ -239,3 +243,62 @@ def test_signature_survives_dump_load():
     signed = sign_receipt(receipt, kp)
     loaded = load_receipt(dump_receipt(signed))
     assert verify_receipt_signature(loaded, kp.ss58_address) is True
+
+
+# ── unsigned build stamp ──────────────────────────────────────────────────────
+#
+# The whole compat contract: "build" is present at the receipt's top level,
+# ABSENT from the signed canonical_body, and invisible to load/verify — so a
+# stamped receipt parses and verifies unchanged for every pre-stamp reader.
+
+
+def test_build_stamp_present_unsigned_and_round_trips(monkeypatch):
+    from cascade.shared.receipt import running_build
+
+    monkeypatch.setenv("CASCADE_BUILD", "abc1234")
+    running_build.cache_clear()
+    try:
+        receipt, _, _ = make_scored_receipt()
+        signed = sign_receipt(receipt, _FakeWallet())
+        dumped = dump_receipt(signed)
+        assert json.loads(dumped)["build"] == "abc1234"
+        assert b'"build"' not in signed.canonical_body()
+        # a load-dump cycle parses identically: the stamp never enters the schema
+        loaded = load_receipt(dumped)
+        assert loaded == signed
+        assert loaded.canonical_body() == signed.canonical_body()
+    finally:
+        running_build.cache_clear()
+
+
+def test_build_stamp_does_not_break_real_signature(monkeypatch):
+    bt = pytest.importorskip("bittensor")
+    from cascade.shared.receipt import running_build
+
+    monkeypatch.setenv("CASCADE_BUILD", "abc1234")
+    running_build.cache_clear()
+    try:
+        kp = bt.Keypair.create_from_uri("//Alice")
+        receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
+        signed = sign_receipt(receipt, kp)
+        loaded = load_receipt(dump_receipt(signed))
+        assert verify_receipt_signature(loaded, kp.ss58_address) is True
+    finally:
+        running_build.cache_clear()
+
+
+def test_running_build_env_override_and_fallback(monkeypatch):
+    from cascade.shared.receipt import running_build
+
+    monkeypatch.setenv("CASCADE_BUILD", "  deadbee  ")
+    running_build.cache_clear()
+    try:
+        assert running_build() == "deadbee"
+        # without the override it still returns SOMETHING — a git short hash in
+        # a checkout, "unknown" in an rsync'd tree — never an empty stamp
+        monkeypatch.delenv("CASCADE_BUILD")
+        running_build.cache_clear()
+        got = running_build()
+        assert isinstance(got, str) and got
+    finally:
+        running_build.cache_clear()

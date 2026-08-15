@@ -1060,6 +1060,13 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     </div>
   </div>
 
+  <div>
+    <div class="section-label"><span>Validators</span><span class="muted">latest receipt per validator</span></div>
+    <div class="scroll-box">
+      <table><thead><tr><th>Validator</th><th>Build</th><th>Last round</th><th>Status</th><th>When</th></tr></thead><tbody id="validators"></tbody></table>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1111,7 +1118,7 @@ var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
-    _wsHist = null;
+    _wsHist = null, _indexRaw = null;
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1386,6 +1393,34 @@ function renderRounds(){
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
 }
+// Per-validator upgrade status: each validator's newest index entry with its
+// unsigned build stamp (the receipt's top-level "build"). Reads the RAW index —
+// collapseByRound keeps one entry per round and would hide every peer that
+// lost the trust-order pick. "—" build = a receipt from code that predates
+// stamping (which cannot be dated further; that is the stamp's stated limit).
+function renderValidators(){
+  var tb=document.getElementById("validators");
+  if(!tb) return;
+  var rs=(_indexRaw&&_indexRaw.rounds)||[];
+  if(!rs.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No receipts published yet</td></tr>'; return; }
+  var by={};
+  rs.forEach(function(r){
+    var hk=String(r.validator_hotkey||"");
+    var cur=by[hk];
+    if(!cur || Number(r.epoch_start_block||0)>Number(cur.epoch_start_block||0) ||
+       (Number(r.epoch_start_block||0)===Number(cur.epoch_start_block||0) &&
+        String(r.published_at||"")>=String(cur.published_at||""))) by[hk]=r;
+  });
+  tb.innerHTML=Object.keys(by).sort().map(function(hk){
+    var r=by[hk], anchor=hk===RECEIPT_ANCHOR;
+    return '<tr><td title="'+esc(hk)+'">'+esc(shortHk(hk))+
+      (anchor?' <span class="muted">(anchor)</span>':'')+'</td>'+
+      '<td>'+(r.build?'<code>'+esc(r.build)+'</code>':'<span class="muted">—</span>')+'</td>'+
+      '<td title="'+esc(r.round_id)+'">'+esc(shortRoundId(r.round_id))+'</td>'+
+      '<td>'+esc(r.status||"--")+'</td>'+
+      '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
+  }).join("");
+}
 // The page ships NO sample data: panels render explicit loading/empty states
 // until the live endpoints respond. While loading, and especially when the
 // receipt fetch fails, show a banner so the empty panels read as "unavailable"
@@ -1641,7 +1676,7 @@ function renderWarmHistory(){
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderValidators(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1702,7 +1737,7 @@ _dataState="loading"; renderAll();
 // (same trail validator bootstrap trusts); shared stays as a fallback only.
 var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
+  fetchJSON("receipts/index.json").then(function(d){ _indexRaw=d; _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
