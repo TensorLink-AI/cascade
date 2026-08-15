@@ -61,13 +61,19 @@ candidate margin. **First-order caveat** (printed by the tool): a flip at
 round r would have changed the king/tenure/field for every later round —
 counts measure how binding the flat margin was, not an alternate timeline.
 
-The owner's working pick (2026-08-15): `end=0.010, warmup=12` — the most
-conservative floor in the grid, half the fresh-king margin, reached in ~6
-days of 12h rounds (one full cascade promotion cycle is 5 rounds, so a king
-past two promotion cycles defends the floor). Run the replay before the
-mainnet release anyway: it confirms the pick against the real trail (how many
-past verdicts flip, how many near-misses sit just under a 1% bar) and is the
-number the upgrade announcement should quote.
+The owner's working pick (2026-08-15): `end=0.005, warmup=8` — a steep
+straight-line ramp (~1.25% by round 4, ~2 days) to the grid's lowest floor,
+reached in ~4 days of 12h rounds and held forever after. The floor, not the
+ramp speed, carries the safety property: 0.5% stays above the bootstrap
+noise band, so a statistically tied challenger never wins by luck (a 0.1%
+floor was considered and rejected — inside noise, it becomes a slow
+term-limit lottery). A true two-phase throttle (fast to 1%, then a slow
+glide) was also considered and deferred: it needs new consensus-critical
+keys, and the single steep ramp approximates it with zero mechanism change.
+Run the replay before the mainnet release anyway: it confirms the pick
+against the real trail (how many past verdicts flip, how many near-misses
+sit just under the bar) and is the number the upgrade announcement should
+quote.
 
 ## Step 1 — testnet (netuid 259)
 

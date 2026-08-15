@@ -118,7 +118,7 @@ YYYY-MM-DD  DEC-CA-0014 Stage 1 BUILT (branch claude/margin-decay-dec-ca-0014-qo
 YYYY-MM-DD  OPEN DESIGN THREAD margin decay: replay harness landed
   (scripts/replay_margin_decay.py — pure margin_for_tenure replay over recorded
   tenure+LCBs, cohort-aware, floor>0 guardrail, near-miss report). Owner-picked
-  candidate staged in chain.testnet.toml (start=0.02 end=0.010 warmup=12);
+  candidate staged in chain.testnet.toml (start=0.02 end=0.005 warmup=8);
   DEC-CA-0016 node PROPOSED; mainnet plan is release-then-activate across all 6
   external validators (docs/MARGIN_DECAY_ROLLOUT.md — read the verdict-fork
   blast radius section before any deploy step). NEXT: run the harness over the

@@ -69,9 +69,11 @@ from cascade.shared.receipt import (  # noqa: E402
 
 # The candidate grid from the design thread (see the module docstring): keep the
 # fresh-king margin where it is, decay to end over warmup rounds of tenure.
+# warmup=4 is the owner's steep-ramp candidate (floor by ~2 days at 12h rounds;
+# in effect a flat `end` bar with a short fresh-king shield).
 DEFAULT_START = 0.02
 DEFAULT_ENDS = (0.005, 0.008, 0.010)
-DEFAULT_WARMUPS = (8, 12, 16)
+DEFAULT_WARMUPS = (4, 8, 12, 16)
 
 # "Near miss" band: a non-flipped loss whose LCB lands within this of the
 # candidate margin. These rounds are where one more schedule notch WOULD start

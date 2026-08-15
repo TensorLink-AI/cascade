@@ -35,9 +35,12 @@ loss→win by construction; the report also counts near-misses within 50bp of
 each candidate margin, and is explicit that it is FIRST-ORDER (a flip would
 have rewritten the subsequent throne history — counts measure how binding the
 flat margin was, not an alternate timeline). The owner's working pick
-(2026-08-15): end=0.010, warmup=12 — the grid's most conservative floor, half
-the fresh-king bar, reached in ~6 days of 12h rounds; confirmed against the
-replay report before the mainnet release.
+(2026-08-15): end=0.005, warmup=8 — a steep straight-line ramp (~1.25% by
+round 4) to the grid's lowest floor, ~4 days of 12h rounds, held after. The
+floor carries the safety property, not the ramp speed (a 0.001 floor was
+considered and rejected: inside the noise band it becomes a slow term-limit
+lottery; a two-phase throttle considered and deferred: needs new consensus
+keys). Confirmed against the replay report before the mainnet release.
 
 **HARD GUARDRAIL: the floor stays > 0.** The margin is the improvement bar
 above the LCB noise gate; at 0 any statistically nonzero improvement
