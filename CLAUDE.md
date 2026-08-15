@@ -121,12 +121,14 @@ in-context.
   (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
 
 - **DEC-CA-0016** — Dethrone margin DECAYS with king tenure (affine schedule in
-  reverse: end < start over `margin_warmup_rounds`; floor must stay > 0). Tenure
-  survives warm-start promotion, so decay deepens across a hold. Schedule picked
-  from receipt replay (`scripts/replay_margin_decay.py`); consensus-sensitive —
-  release-then-activate across all 6 external validators
-  (docs/MARGIN_DECAY_ROLLOUT.md), testnet first. PROPOSED: awaiting replay
-  evidence + owner sign-off. (`decisions/DEC-CA-0016-tenure-decay-margin.md`)
+  reverse: 2% → 0.5% over 8 rounds; floor must stay > 0 — it is the safety
+  property, above the bootstrap noise band). Tenure survives warm-start
+  promotion, so decay deepens across a hold. ACTIVE, ARMED AT RELEASE (owner
+  2026-08-15): chain.toml ships the live schedule, so the release IS the
+  activation — all 6 external validators upgrade in one coordinated window or
+  verdicts fork (docs/MARGIN_DECAY_ROLLOUT.md); receipt replay
+  (`scripts/replay_margin_decay.py`) runs pre-release for the announcement.
+  (`decisions/DEC-CA-0016-tenure-decay-margin.md`)
 
 - **DEC-CA-0017** — Promotion no-downgrade guard: a ripe reign whose best
   candidate benches WORSE than the live generation's best member HOLDS (clock

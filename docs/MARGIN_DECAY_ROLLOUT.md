@@ -1,19 +1,26 @@
-# Tenure-decaying dethrone margin — release-then-activate plan (DEC-CA-0016)
+# Tenure-decaying dethrone margin — coordinated activation plan (DEC-CA-0016)
 
-Status: **design approved; NOTHING deploys to mainnet without explicit owner
-sign-off.** The mechanism is pure config (`margin_for_tenure`,
-`cascade/eval/koth.py:79`, is already an affine schedule); this document is the
-rollout protocol that makes flipping the config safe on a subnet with 6
-EXTERNAL validators.
+Status: **ARMED AT RELEASE (owner decision 2026-08-15).** `chain.toml` on this
+branch carries the live schedule (`end=0.005, warmup=8`) — there is no
+separate activation flip: the release that ships this config IS the
+activation, so the coordinated upgrade window below is mandatory for the
+release itself. (The original plan was release-then-activate — ship inert,
+flip later; the owner chose to collapse the two steps. Everything that made
+the flip dangerous now applies to the release: read the verdict-fork section
+before tagging.) The mechanism is pure config (`margin_for_tenure`,
+`cascade/eval/koth.py:79`, is already an affine schedule); this document is
+the rollout protocol that makes shipping it safe on a subnet with 6 EXTERNAL
+validators.
 
 ## What changes
 
-`chain.toml [scoring]`, validator-side only:
+`chain.toml [scoring]`, validator-side only (the values below are LIVE in
+this branch's `chain.toml`):
 
 ```toml
 win_margin_start     = 0.02      # unchanged — a fresh king defends the full margin
-win_margin_end       = 0.00X     # NEW floor, reached at margin_warmup_rounds of tenure
-margin_warmup_rounds = N         # rounds of tenure over which the margin decays
+win_margin_end       = 0.005     # floor, reached at margin_warmup_rounds of tenure
+margin_warmup_rounds = 8         # rounds of tenure over which the margin decays
 ```
 
 With `end < start` the existing warmup schedule runs in reverse: an entrenched
@@ -92,7 +99,7 @@ full cycle before mainnet:
 4. Run the replay harness over the testnet trail as a sanity loop (recorded
    margins now vary with tenure; the consistency gate must stay quiet).
 
-## Step 2 — mainnet release-then-activate
+## Step 2 — mainnet coordinated activation (armed at release)
 
 **Verdict-fork blast radius — read before any deploy step.** The margin is
 computed independently by each validator from its own `chain.toml` at verdict
@@ -106,17 +113,21 @@ branches (or its state is manually resynced). Divergent kings mean divergent
 weight vectors (different reward sets on chain), a forked receipt trail, and a
 trainer whose receipt-anchored reign clock follows its pinned anchor validator
 while others disagree. This is the same class of hazard as the 2026-07-28
-`epoch_blocks` change and is why this is release-then-activate, never a local
-flip. The band is small (≤ `start − end` ≈ 120bp of LCB) and only exists for
-tenured kings, but the replay report quantifies exactly how often historic
-rounds landed in it — publish that number in the upgrade announcement so
-operators know the real per-round risk of lagging.
+`epoch_blocks` change. Because the config is armed at release, a validator
+upgrading EARLY (before the announced window) is exactly as dangerous as one
+lagging behind it — the announcement must say "do not upgrade before the
+window" as loudly as "do not lag past it". The band is bounded
+(`start − end` = 150bp of LCB) and only exists for tenured kings, but the
+replay report quantifies exactly how often historic rounds landed in it —
+publish that number in the upgrade announcement so operators know the real
+per-round risk of a mixed fleet.
 
 Sequence:
 
-1. **Ship**: the schedule lands in `chain.toml` in a tagged release
-   (`vX.Y.Z`). Release notes name the activation round and the disagreement
-   band, and state the guardrail (`end > 0`).
+1. **Ship**: this branch's `chain.toml` (schedule already armed) lands in a
+   tagged release (`vX.Y.Z`). Release notes name the activation round and the
+   disagreement band, state the guardrail (`end > 0`), and warn against
+   upgrading outside the window (early = lagging, see above).
 2. **Upgrade window**: all 6 external validators (plus the owner's) upgrade
    and restart within one announced round window. Config applies at process
    start, and a round's verdict is computed when its manifest lands — so the

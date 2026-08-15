@@ -1,11 +1,11 @@
 ---
 id: DEC-CA-0016
 type: decision
-title: "The dethrone margin decays with the king's tenure: reuse the affine warmup schedule in reverse, pick the floor from receipt replay, ship release-then-activate"
-status: proposed
+title: "The dethrone margin decays with the king's tenure: reuse the affine warmup schedule in reverse, armed at release (owner-collapsed from release-then-activate)"
+status: active
 date: 2026-08-15
 tags: [cascade, koth, margin, tenure, consensus, release]
-revisit_when: "The replay harness has run over the full mainnet receipt trail and the owner has picked (end, warmup) — flip status to active at sign-off; after activation, revisit when margin_warmup_rounds of live decayed verdicts exist: if decay-dethrones cluster on rounds the shadow diagnostics (win_rate, boot spread) call fragile, the floor is too low; if long holds still see zero flips and near-misses, the floor is too high; also revisit if a future decision makes tenure reset on warm-start promotion, which would silently defang the decay"
+revisit_when: "After activation, revisit when margin_warmup_rounds of live decayed verdicts exist: if decay-dethrones cluster on rounds the shadow diagnostics (win_rate, boot spread) call fragile, the floor is too low; if long holds still see zero flips and near-misses, the floor is too high; also revisit if a future decision makes tenure reset on warm-start promotion, which would silently defang the decay; run the receipt replay before the tagged release and publish its flip/near-miss counts in the upgrade announcement"
 relations: {depends_on: DEC-CA-0012, relates_to: DEC-CA-0013}
 ---
 A flat 2% margin makes an entrenched king cheaper to KEEP than to earn: every
@@ -47,8 +47,13 @@ above the LCB noise gate; at 0 any statistically nonzero improvement
 dethrones, and `bootstrap_alpha` alone does not price repeated attempts
 across rounds. The harness refuses `end <= 0` and the config review must too.
 
-**Rollout is release-then-activate, never a local flip** (netuid 91 has 6
-external validators; the margin is computed per-validator at verdict time).
+**Rollout is ARMED AT RELEASE under a coordinated upgrade window, never a
+local flip** (owner decision 2026-08-15, collapsing the original
+release-then-activate two-step: chain.toml ships the live schedule
+end=0.005/warmup=8, so the release IS the activation and upgrading outside
+the announced window — early or late — creates the mixed fleet; netuid 91
+has 6 external validators; the margin is computed per-validator at verdict
+time).
 During any config-mixed window, a round whose decided LCB lands in
 `[margin_decayed, margin_flat)` splits the fleet's verdicts, and champion
 state has NO automatic reconvergence — divergent kings mean divergent weight

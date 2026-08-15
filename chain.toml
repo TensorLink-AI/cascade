@@ -312,12 +312,24 @@ gift_gate_data_dir    = ""       # pinned benchmark data dir ("" = suite env var
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
 
 [scoring]
-# King-of-the-hill — single-round, flat-margin dethroning; the margin does not
-# ramp with tenure. For sticky/tenure behaviour set dethrone_cp > 1 and
-# win_margin_end > win_margin_start with margin_warmup_rounds > 0.
-win_margin_start     = 0.02
-win_margin_end       = 0.02      # == start ⇒ flat margin
-margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup
+# King-of-the-hill — tenure-DECAYING dethrone margin (DEC-CA-0016, armed at
+# release by owner decision 2026-08-15): the bar a challenger must clear
+# starts at win_margin_start for a fresh king and decays linearly to
+# win_margin_end over margin_warmup_rounds of tenure (~1.25% by round 4,
+# floor from round 8 ≈ 4 days at the 12h cadence, held forever). Tenure
+# survives warm-start promotion, so a long hold defends the floor.
+# CONSENSUS-SENSITIVE COORDINATED UPGRADE: margin is judged per-validator and
+# this config activates the decay AT release — every external validator (6)
+# and the trainer must upgrade in one coordinated window
+# (docs/MARGIN_DECAY_ROLLOUT.md). While the fleet is mixed, any round whose
+# challenger LCB lands between the decayed and flat margin FORKS verdicts.
+# HARD GUARDRAIL: win_margin_end must stay > 0 — the floor is the safety
+# property (0.5% sits above the bootstrap noise band, so a statistically
+# tied challenger never wins by luck; a 0 or sub-noise floor becomes a slow
+# term-limit lottery).
+win_margin_start     = 0.02      # fresh-king margin (tenure 0)
+win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
+margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool
