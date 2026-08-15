@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -83,8 +84,6 @@ def error_correlations(
     trajectory-diversity signal promotion wants. Pairs are keyed both ways;
     ids with mismatched lengths or degenerate residuals are simply absent.
     """
-    import math
-
     ids = [i for i, v in vectors.items() if v]
     if len(ids) < 2:
         return {}
@@ -102,7 +101,7 @@ def error_correlations(
             vb = math.sqrt(sum(x * x for x in db))
             if va <= 0.0 or vb <= 0.0:
                 continue
-            r = sum(x * y for x, y in zip(da, db)) / (va * vb)
+            r = sum(x * y for x, y in zip(da, db, strict=True)) / (va * vb)
             out[(a, b)] = out[(b, a)] = r
     return out
 
@@ -450,6 +449,32 @@ class TrainerPromotion:
                 log.warning("trainer promotion: clock ripe (%.2f ≥ %.2f rounds) but no "
                             "benched candidate this reign; holding", elapsed,
                             float(self.reign_threshold))
+                return None
+            # No-downgrade guard: a ripe clock says a promotion MAY fire, never
+            # that it must. If the best candidate this reign benches WORSE than
+            # the live generation's best member (lower = better), installing it
+            # would ratchet the whole field's shared init downhill — the basin
+            # DEC-CA-0014 exists to escape must never be entered by promotion
+            # itself. Hold instead: the live generation keeps training, the
+            # clock stays ripe, candidates keep accumulating, and the promotion
+            # fires the first round a candidate at least matches the incumbent
+            # init's bench. Pure trainer policy (DEC-CA-0013: declining to
+            # declare a generation is always envelope-legal); members without a
+            # finite recorded score — legacy pointer adoptions — cannot anchor
+            # the comparison and never block a firing.
+            best_member = min((m.score for m in self.members
+                               if math.isfinite(m.score) and m.score > 0),
+                              default=None)
+            best_candidate = min((c.score for c in self.candidates
+                                  if math.isfinite(c.score)), default=None)
+            if (best_member is not None and best_candidate is not None
+                    and best_candidate > best_member):
+                log.warning(
+                    "trainer promotion: clock ripe (%.2f rounds) but the best "
+                    "candidate benches %.5f vs the live generation's best member "
+                    "%.5f — holding the current generation (no-downgrade guard); "
+                    "%d candidate(s) logged, retrying as new rounds bench",
+                    elapsed, best_candidate, best_member, len(self.candidates))
                 return None
             selected = select_members(
                 list(self.candidates), k_max=self.k_max,

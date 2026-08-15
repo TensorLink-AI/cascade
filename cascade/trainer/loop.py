@@ -1891,24 +1891,288 @@ class TrainerRunner:
         not armed — the marker lifecycle exists only where the hold does."""
         if not self.will_run_post_publish_bench():
             return None
+        # Snapshot the round's final-pod assignments NOW, at thread start —
+        # still inside round N. The scratch shadow dispatches HOURS later, by
+        # which time run_round may have started round N+1 and repopulated
+        # _final_role_hosts with the SAME (role, size, hotkey) key pointing at
+        # N+1's live final pod; a late lookup would land an hours-long
+        # training run on the pod running the next round's consensus-relevant
+        # final.
+        final_hosts = dict(self._final_role_hosts)
         report = None
         try:
-            report = self._post_publish_bench(manifest)
-        except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
-            log.warning("round=%s: post-publish bench failed (ignored): %s",
-                        manifest.round_id, e)
+            try:
+                report = self._post_publish_bench(manifest)
+            except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
+                log.warning("round=%s: post-publish bench failed (ignored): %s",
+                            manifest.round_id, e)
+            # Promotion candidates (DEC-CA-0013): both duel checkpoints' scores
+            # feed the engine's candidate log (thread-safe; this runs on the
+            # bench thread). Guarded — candidate bookkeeping must never fail
+            # the bench. Recorded BEFORE the scratch shadow below: the shadow
+            # is an hours-long telemetry leg, and a promotion must never wait
+            # on telemetry.
+            if report is not None and self.promotion is not None:
+                try:
+                    self.promotion.record_bench(manifest, report)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("round=%s: promotion candidate recording failed (ignored): %s",
+                                manifest.round_id, e)
+            # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th
+            # warm-started round, train the king's generator from scratch and
+            # publish the labeled telemetry report. INSIDE the try so it runs
+            # under the provisioner's teardown hold (it needs the final pod),
+            # and after the duel bench + candidate recording so it never
+            # delays the reign log's numbers. Never raises; a duel-bench miss
+            # doesn't cancel it (the scratch curve alone is still a data
+            # point).
+            self._run_scratch_shadow(manifest, report, final_hosts=final_hosts)
         finally:
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
-        # Promotion candidates (DEC-CA-0013): both duel checkpoints' scores feed
-        # the engine's candidate log (thread-safe; this runs on the bench
-        # thread). Guarded — candidate bookkeeping must never fail the bench.
-        if report is not None and self.promotion is not None:
-            try:
-                self.promotion.record_bench(manifest, report)
-            except Exception as e:  # noqa: BLE001
-                log.warning("round=%s: promotion candidate recording failed (ignored): %s",
-                            manifest.round_id, e)
         return report
+
+    # ── shadow scratch control (DEC-CA-0014 Stage 1) ─────────────────────────
+
+    def _scratch_shadow_due(self, manifest: TrainingManifest) -> bool:
+        """Whether this round owes a scratch-shadow leg: ``[telemetry]
+        scratch_shadow_every_rounds`` armed, the round actually trained
+        warm-started (on a random-init round every run already IS the scratch
+        control), the epoch grid lands on the cadence, and a train+bench path
+        is wired. Pure telemetry predicate — nothing consensus-visible reads
+        it."""
+        every = int(getattr(self.cfg.telemetry, "scratch_shadow_every_rounds", 0) or 0)
+        if every <= 0:
+            return False
+        if not manifest.warm_start_ckpt:
+            log.info("round=%s: scratch shadow skipped — round trained from "
+                     "random init (nothing to contrast)", manifest.round_id)
+            return False
+        # Same epoch index the warm-start rotation uses, derived from the
+        # manifest alone so a restart (or the bench thread outliving the round
+        # context) computes the identical cadence.
+        eb = effective_epoch_blocks(self.cfg.round, int(manifest.created_block))
+        epoch_idx = int(manifest.created_block) // eb
+        if epoch_idx % every != 0:
+            return False
+        remote_ok = bool(self.remote_hosts and self.trainer_spec
+                         and self.cascade_bench_plan is not None)
+        local_ok = self.bench_eval_fn is not None
+        if not (remote_ok or local_ok):
+            log.warning("round=%s: scratch shadow due but no train+bench path "
+                        "wired (remote hosts+plan or local bench_eval_fn); skipped",
+                        manifest.round_id)
+            return False
+        return True
+
+    def _run_scratch_shadow(self, manifest: TrainingManifest,
+                            duel_report: object | None = None,
+                            final_hosts: dict | None = None) -> object | None:
+        """Train the king's generator FROM SCRATCH under the round's identical
+        contract + seeds, bench it, and publish the labeled telemetry report
+        (``benchmarks/scratch/round-<id>.json`` + trend index) beside the
+        round's signed bench report. DEC-CA-0014 Stage 1.
+
+        TELEMETRY ONLY, enforced structurally: the scratch entry is never a
+        manifest entry, never a ``BenchReport`` entry (validators parse that
+        schema on the promotion-provenance path), and is never handed to
+        ``promotion.record_bench`` — the promotion candidate pool cannot see
+        it. Best-effort throughout: returns the published report or ``None``,
+        never raises into the bench thread.
+
+        Runs strictly post-publish on the king's (now idle) final pod, under
+        the provisioner's bench hold — arming this requires sizing ``[eval]
+        bench_hold_max_hours`` for duel bench + a full training leg + one more
+        bench (see the DEC-CA-0014 node's Stage-1 budget note).
+        """
+        try:
+            if not self._scratch_shadow_due(manifest):
+                return None
+            from ..shared.scratch_report import (
+                ScratchBenchReport,
+                bench_geomean,
+                dump_scratch_report,
+                publish_scratch_report,
+                sign_scratch_report,
+                update_scratch_index,
+            )
+
+            primary = self.cfg.throne_contracts()[0]
+            size = primary.arch_preset
+            king = next((e for e in manifest.entries
+                         if e.role == "king" and (e.size or size) == size), None)
+            if king is None:
+                log.warning("round=%s: scratch shadow skipped — no king entry "
+                            "at the primary size", manifest.round_id)
+                return None
+            gen = ResolvedGenerator(hotkey=king.miner_hotkey, uid=king.miner_uid,
+                                    ref=king.gen_ref)
+            seeds = RoundSeeds.derive(int(manifest.round_id), self.cfg.training)
+            log.info("round=%s: scratch shadow leg starting — king generator %s "
+                     "from RANDOM INIT (lineage init this round: %s)",
+                     manifest.round_id, king.gen_ref[:48], manifest.warm_start_ckpt[:48])
+
+            if self.remote_hosts and self.trainer_spec and self.cascade_bench_plan is not None:
+                pointer, scores = self._scratch_shadow_remote(
+                    manifest, gen, primary, seeds, final_hosts=final_hosts)
+            else:
+                pointer, scores = self._scratch_shadow_local(
+                    manifest, gen, primary, seeds)
+            if scores is None:
+                log.warning("round=%s: scratch shadow produced no bench scores; "
+                            "no scratch report published", manifest.round_id)
+                return None
+
+            king_bench = None
+            if duel_report is not None:
+                king_bench = duel_report.entry_for("king", size=size)
+            report = ScratchBenchReport(
+                round_id=manifest.round_id,
+                created_block=manifest.created_block,
+                gen_ref=king.gen_ref,
+                miner_hotkey=king.miner_hotkey,
+                miner_uid=king.miner_uid,
+                trained_pointer=pointer or "",
+                scores=scores,
+                warm_start_ckpt=manifest.warm_start_ckpt,
+                generation=int(getattr(self.promotion, "generation", 0) or 0),
+                king_pointer=(king_bench.trained_pointer if king_bench else ""),
+                king_scores=(king_bench.scores if king_bench else None),
+            )
+            if self.wallet is not None:
+                report = sign_scratch_report(report, self.wallet)
+            store = self.manifest_store()
+            key = publish_scratch_report(store, dump_scratch_report(report),
+                                         manifest.round_id)
+            try:
+                update_scratch_index(store, report)
+            except Exception as e:  # noqa: BLE001 — the index is presentational
+                log.warning("scratch index update failed (report published): %s", e)
+            gap = (f"{bench_geomean(scores) - bench_geomean(king_bench.scores):+.4f}"
+                   if king_bench else "n/a (no king bench)")
+            log.info("published scratch report round=%s scratch_geomean=%.4f "
+                     "lineage_gap=%s signed=%s → s3://%s/%s",
+                     manifest.round_id, bench_geomean(scores), gap,
+                     report.signature is not None,
+                     self.cfg.storage.manifest_bucket, key)
+            self._log_scratch_wandb(report)
+            return report
+        except Exception as e:  # noqa: BLE001 — shadow telemetry must never raise
+            log.warning("round=%s: scratch shadow failed (ignored): %s",
+                        manifest.round_id, e)
+            return None
+
+    def _scratch_shadow_remote(self, manifest: TrainingManifest, gen: ResolvedGenerator,
+                               primary, seeds: RoundSeeds,
+                               final_hosts: dict | None = None) -> tuple[str | None, object | None]:
+        """Remote scratch leg on the king's final pod, through the PINNED
+        worker image's existing CLI — no pod-side code change, so this ships
+        trainer-side unilaterally (the whole point of Stage 1).
+
+        Dispatch shape, and why: ``role="king"`` with ``repo_suffix="-scratch"``
+        keeps the checkpoint repo distinct (``ckpt-r<seed>-king-<size>-scratch``)
+        while ``--train-hours <target_train_hours>`` routes through the
+        worker's screen path at the FULL budget — ``for_hours(target)`` yields
+        the byte-identical token count, and the wall guard
+        ``min(max(guard_factor×target, floor), max_train_seconds)`` equals
+        ``max_train_seconds`` at the shipped ``heat_guard_factor >= 1.0``. The
+        screen path is what gives the run its own telemetry key
+        (``heat-<king_hotkey>``, a key a king never otherwise uses) instead of
+        colliding with the real king's ``king-<size>`` S3 log + wandb run. Two
+        accepted asymmetries, both telemetry-grade: the worker skips
+        ``assert_train_image`` on the screen path (the pod was launched from
+        the pinned image regardless), and the run's log label says heat. No
+        ``warm_start_ref`` ⇒ random init.
+        """
+        from .bench_hook import run_post_round_benchmark
+        from .remote import RemoteDispatcher, pod_lane_count
+
+        size = primary.arch_preset
+        # ONLY the snapshot taken at bench-thread start may name the pod: a
+        # live _final_role_hosts / _hosts_for("final") lookup this many hours
+        # after publish can resolve to the NEXT round's freshly-dispatched
+        # final pod (same (role, size, hotkey) key, new fleet) and land a
+        # full training leg on top of a consensus-relevant run. No snapshot
+        # entry ⇒ skip the shadow this round — a missed telemetry point beats
+        # a contended final.
+        host = (final_hosts or {}).get(("king", size, gen.hotkey))
+        if host is None:
+            log.warning("round=%s: scratch shadow skipped — no snapshotted "
+                        "king final pod for this round (restart mid-round, or "
+                        "a fully local final)", manifest.round_id)
+            return None, None
+        disp = RemoteDispatcher(
+            trainer_spec=self.trainer_spec,
+            timeout_seconds=self.remote_timeout_seconds,
+            extra_forward_env=self._pod_extra_forward_env(),
+        )
+        entry = disp.dispatch(
+            host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey, role="king",
+            base_seed=seeds.base_seed, block=int(manifest.created_block),
+            arch_preset=size, train_hours=primary.target_train_hours,
+            repo_suffix="-scratch", warm_start_ref=None,
+            lane_count=pod_lane_count(host, [host]),
+        )
+        from ..eval.benchmarks import extract_bench_scores
+
+        bench = run_post_round_benchmark(
+            host, manifest.round_id, size, self.cascade_bench_plan,
+            work_root=self.work_root, role="king-scratch",
+        )
+        scores = extract_bench_scores(bench) if bench is not None else None
+        return entry.trained_pointer, (BenchScores(**scores) if scores else None)
+
+    def _scratch_shadow_local(self, manifest: TrainingManifest, gen: ResolvedGenerator,
+                              primary, seeds: RoundSeeds) -> tuple[str | None, object | None]:
+        """Local scratch leg (single-box / testnet): train on this box with a
+        first-class telemetry label (``scratch-king-<size>``; the local path
+        controls ``log_role`` directly, unlike the pinned remote worker),
+        upload the checkpoint, bench via ``bench_eval_fn``."""
+        size = primary.arch_preset
+        out_dir = (self.work_root / f"{seeds.base_seed}" / size
+                   / "king-scratch" / "checkpoint")
+        result, _, _, _ = self._train_checkpoint(
+            gen, seeds, primary, primary.train_tokens, out_dir,
+            log_role=f"scratch-king-{size}", warm_start_dir=None,
+        )
+        pointer = None
+        try:
+            ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-king-{size}-scratch"
+            up = upload_dir_to_hub_or_hf(result.local_dir, ckpt_repo, self.hub(),
+                                         hf_repo=self._hf_ckpt_repo(ckpt_repo))
+            pointer = format_trained_pointer(up.ref.immutable_ref)
+        except Exception as e:  # noqa: BLE001 — the bench numbers matter more than the upload
+            log.warning("round=%s: scratch checkpoint upload failed (benching "
+                        "the local dir anyway): %s", manifest.round_id, e)
+        scores = self.bench_eval_fn(result.local_dir) if self.bench_eval_fn else None
+        return pointer, scores
+
+    def _log_scratch_wandb(self, report: object) -> None:
+        """Mirror the scratch-vs-lineage pair to wandb — same swallow-everything
+        contract as every other observability path."""
+        try:
+            if not getattr(self.cfg.wandb, "enabled", False):
+                return
+            from ..shared.scratch_report import bench_geomean
+
+            sink = open_wandb_run(
+                self.cfg.wandb, round_id=str(report.round_id),
+                role="scratch-shadow", hotkey=report.miner_hotkey,
+                uid=report.miner_uid, size="",
+            )
+            if sink is None:
+                return
+            record = {
+                "event": "scratch_shadow", "generation": report.generation,
+                "scratch_geomean": bench_geomean(report.scores),
+            }
+            if report.king_scores is not None:
+                king_gm = bench_geomean(report.king_scores)
+                record["king_geomean"] = king_gm
+                record["gap"] = record["scratch_geomean"] - king_gm
+            sink.emit(record)
+            sink.finish()
+        except Exception as e:  # noqa: BLE001 — wandb must never disturb the shadow
+            log.debug("wandb scratch-shadow log failed (continuing): %s", e)
 
     def _receipt_king(self) -> str | None:
         """The current king per the validators' signed receipt trail, or the
