@@ -1,0 +1,56 @@
+# One-off diagnostic: does HarvestContext.max_series bind during a
+# tsbench_forge harvest, and at which catalog index?
+#
+# READ-ONLY: syncs the forge mirror down with the same scoped read key the
+# daily publish uses, runs scripts/measure_max_series_binding.py, and prints
+# the landmark summary. Publishes nothing — no bucket writes, no pool
+# snapshot, no index update. Safe to dispatch at any time.
+name: Measure max_series binding
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TSFORGE_BUCKET: ${{ vars.TSFORGE_BUCKET || 'tsbench-forge-sources' }}
+      S3_ENDPOINT: ${{ vars.HIPPIUS_S3_ENDPOINT || 'https://s3.hippius.com' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cascade (pool-forge extra)
+        run: pip install -e ".[pool-forge]"
+
+      - name: Sync forge mirror down  (FORGE READ key only)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TSFORGE_S3_SECRET_KEY }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::TSFORGE_S3_ACCESS_KEY not set — cannot read the forge bucket."
+            exit 1
+          fi
+          aws s3 sync "s3://${TSFORGE_BUCKET}" ./tsforge \
+            --endpoint-url "$S3_ENDPOINT" --exact-timestamps --only-show-errors
+          n=$(find ./tsforge/data -name '*.parquet' 2>/dev/null | wc -l)
+          echo "synced $n parquet files"
+          test "$n" -gt 0 || { echo "::error::forge mirror is empty"; exit 1; }
+
+      - name: Measure binding
+        run: |
+          TSFORGE_DIR=./tsforge python scripts/measure_max_series_binding.py \
+            --out max_series_binding_report.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: max-series-binding-report
+          path: max_series_binding_report.json
