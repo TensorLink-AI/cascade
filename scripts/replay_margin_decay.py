@@ -193,10 +193,21 @@ def replay_receipt(receipt: RoundReceipt, schedule: Schedule) -> RoundReplay | N
     )
 
 
-def load_receipts(paths: list[Path], *, verify_hotkey: str | None = None
+def load_receipts(paths: list[Path], *, verify_hotkey: str | None = None,
+                  filter_hotkey: str | None = None
                   ) -> tuple[list[RoundReceipt], list[str]]:
     """Load (and optionally signature-check) every receipt under ``paths``.
-    Returns ``(receipts sorted by epoch block, problem strings)``."""
+    Returns ``(receipts sorted by epoch block, problem strings)``.
+
+    ``filter_hotkey`` keeps only receipts whose self-declared
+    ``validator_hotkey`` matches — REQUIRED for a trustworthy replay over a
+    tree holding several validators' prefixes (``receipts/<hotkey>/…``):
+    without it, a round present under two signers would be replayed on
+    whichever file path sorts first, and around a scoring-rule seam two
+    honest validators can record opposite verdicts. Multi-signer trees
+    without a filter are flagged as problems and the conflicting rounds are
+    DROPPED rather than silently picked by path order.
+    """
     files: list[Path] = []
     for p in paths:
         if p.is_dir():
@@ -205,14 +216,16 @@ def load_receipts(paths: list[Path], *, verify_hotkey: str | None = None
             files.append(p)
         else:
             raise FileNotFoundError(p)
-    receipts: list[RoundReceipt] = []
+    by_round: dict[str, RoundReceipt] = {}
+    signers_seen: dict[str, set[str]] = {}
     problems: list[str] = []
-    seen: set[str] = set()
     for f in files:
         try:
             receipt = load_receipt(f.read_text(encoding="utf-8"))
         except (OSError, ValueError, KeyError) as e:
             problems.append(f"{f}: unreadable receipt ({e})")
+            continue
+        if filter_hotkey and receipt.validator_hotkey != filter_hotkey:
             continue
         if verify_hotkey:
             try:
@@ -222,10 +235,18 @@ def load_receipts(paths: list[Path], *, verify_hotkey: str | None = None
             if not ok:
                 problems.append(f"{f}: signature check FAILED vs {verify_hotkey}; skipped")
                 continue
-        if receipt.round_id in seen:  # latest.json duplicates the round file
-            continue
-        seen.add(receipt.round_id)
-        receipts.append(receipt)
+        signers_seen.setdefault(receipt.round_id, set()).add(
+            receipt.validator_hotkey or "<unsigned>")
+        # latest.json / mirror copies duplicate the round file — same signer,
+        # first copy wins; a DIFFERENT signer for the same round is a conflict.
+        by_round.setdefault(receipt.round_id, receipt)
+    conflicted = {rid for rid, s in signers_seen.items() if len(s) > 1}
+    for rid in sorted(conflicted):
+        problems.append(
+            f"round {rid}: receipts from multiple validators "
+            f"({', '.join(sorted(signers_seen[rid]))}); DROPPED — rerun with "
+            f"--validator-hotkey (or --verify) to select one trail")
+    receipts = [r for rid, r in by_round.items() if rid not in conflicted]
     receipts.sort(key=lambda r: r.epoch_start_block)
     return receipts, problems
 
@@ -374,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="check receipt signatures against the pinned validator hotkey; "
                          "failing receipts are skipped")
     ap.add_argument("--validator-hotkey", default=None,
-                    help="explicit ss58 for --verify (default: [manifest] validator_hotkey)")
+                    help="keep only this validator's receipts (also the --verify "
+                         "anchor; default for --verify: [manifest] validator_hotkey). "
+                         "Required for a tree holding several validators' prefixes.")
     ap.add_argument("--json", type=Path, default=None,
                     help="also write the full report as JSON")
     args = ap.parse_args(argv)
@@ -399,7 +422,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--verify: no validator hotkey (flag or [manifest] "
                              "validator_hotkey) to verify against")
 
-    receipts, problems = load_receipts(list(args.paths), verify_hotkey=verify_hotkey)
+    receipts, problems = load_receipts(list(args.paths), verify_hotkey=verify_hotkey,
+                                       filter_hotkey=args.validator_hotkey)
     for p in problems:
         print(f"  ! {p}")
     if not receipts:

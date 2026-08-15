@@ -33,7 +33,6 @@ with the trainer hotkey.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 
 from .hippius import StorageError
@@ -48,11 +47,14 @@ def scratch_report_key(round_id: str) -> str:
 
 
 def bench_geomean(s: BenchScores) -> float:
-    """The six-number geomean (same aggregate the reign log ranks on) — the
-    scalar each curve is plotted in."""
-    vals = [s.gifteval_crps, s.gifteval_mase, s.boom_crps,
-            s.boom_mase, s.time_crps, s.time_mase]
-    return math.exp(sum(math.log(max(v, 1e-12)) for v in vals) / len(vals))
+    """The six-number geomean — the scalar each curve is plotted in. Delegates
+    to :func:`cascade.validator.cascade.cascade_score` (imported locally to
+    keep ``shared``'s import surface stdlib-clean) so the scratch index and
+    the reign log agree on every input, clamp floor included."""
+    from ..validator.cascade import cascade_score
+
+    return cascade_score(s.gifteval_crps, s.gifteval_mase, s.boom_crps,
+                         s.boom_mase, s.time_crps, s.time_mase)
 
 
 def _scores_body(s: BenchScores | None) -> dict | None:
@@ -213,11 +215,24 @@ def update_scratch_index(store: object, report: ScratchBenchReport) -> str:
     one point on the two curves DEC-CA-0014 stages on: the scratch geomean,
     the lineage king's geomean (when the duel bench produced it), and their
     gap. Best-effort read-modify-write; the signed per-round reports remain
-    the source of truth."""
+    the source of truth.
+
+    A TRANSIENT read failure must not wipe the roll-up: only a genuinely
+    absent index (first report ever) starts from empty — any other read error
+    skips this round's index update (the per-round report is already
+    published; the row folds in on the next shadow). Raises on the skip so
+    the caller's guard logs it."""
     try:
         idx = json.loads(store.get_text(SCRATCH_INDEX_KEY))
         rows = list(idx.get("rounds") or [])
-    except Exception:  # noqa: BLE001 — first report, or unreadable index
+    except Exception as e:  # noqa: BLE001 — classify: absent-vs-transient
+        marker = f"{type(e).__name__}: {e}"
+        absent = isinstance(e, (KeyError, FileNotFoundError)) or any(
+            t in marker for t in ("404", "NoSuchKey", "Not Found", "NotFound"))
+        if not absent:
+            raise RuntimeError(
+                f"scratch index read failed ({marker}); skipping index update "
+                "rather than overwriting the trend roll-up") from e
         rows = []
     scratch_gm = bench_geomean(report.scores)
     king_gm = bench_geomean(report.king_scores) if report.king_scores else None

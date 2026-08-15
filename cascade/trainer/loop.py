@@ -1846,6 +1846,14 @@ class TrainerRunner:
         not armed — the marker lifecycle exists only where the hold does."""
         if not self.will_run_post_publish_bench():
             return None
+        # Snapshot the round's final-pod assignments NOW, at thread start —
+        # still inside round N. The scratch shadow dispatches HOURS later, by
+        # which time run_round may have started round N+1 and repopulated
+        # _final_role_hosts with the SAME (role, size, hotkey) key pointing at
+        # N+1's live final pod; a late lookup would land an hours-long
+        # training run on the pod running the next round's consensus-relevant
+        # final.
+        final_hosts = dict(self._final_role_hosts)
         report = None
         try:
             try:
@@ -1873,7 +1881,7 @@ class TrainerRunner:
             # delays the reign log's numbers. Never raises; a duel-bench miss
             # doesn't cancel it (the scratch curve alone is still a data
             # point).
-            self._run_scratch_shadow(manifest, report)
+            self._run_scratch_shadow(manifest, report, final_hosts=final_hosts)
         finally:
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
         return report
@@ -1912,7 +1920,8 @@ class TrainerRunner:
         return True
 
     def _run_scratch_shadow(self, manifest: TrainingManifest,
-                            duel_report: object | None = None) -> object | None:
+                            duel_report: object | None = None,
+                            final_hosts: dict | None = None) -> object | None:
         """Train the king's generator FROM SCRATCH under the round's identical
         contract + seeds, bench it, and publish the labeled telemetry report
         (``benchmarks/scratch/round-<id>.json`` + trend index) beside the
@@ -1959,7 +1968,7 @@ class TrainerRunner:
 
             if self.remote_hosts and self.trainer_spec and self.cascade_bench_plan is not None:
                 pointer, scores = self._scratch_shadow_remote(
-                    manifest, gen, primary, seeds)
+                    manifest, gen, primary, seeds, final_hosts=final_hosts)
             else:
                 pointer, scores = self._scratch_shadow_local(
                     manifest, gen, primary, seeds)
@@ -2008,7 +2017,8 @@ class TrainerRunner:
             return None
 
     def _scratch_shadow_remote(self, manifest: TrainingManifest, gen: ResolvedGenerator,
-                               primary, seeds: RoundSeeds) -> tuple[str | None, object | None]:
+                               primary, seeds: RoundSeeds,
+                               final_hosts: dict | None = None) -> tuple[str | None, object | None]:
         """Remote scratch leg on the king's final pod, through the PINNED
         worker image's existing CLI — no pod-side code change, so this ships
         trainer-side unilaterally (the whole point of Stage 1).
@@ -2032,13 +2042,19 @@ class TrainerRunner:
         from .remote import RemoteDispatcher, pod_lane_count
 
         size = primary.arch_preset
-        host = self._final_role_hosts.get(("king", size, gen.hotkey))
+        # ONLY the snapshot taken at bench-thread start may name the pod: a
+        # live _final_role_hosts / _hosts_for("final") lookup this many hours
+        # after publish can resolve to the NEXT round's freshly-dispatched
+        # final pod (same (role, size, hotkey) key, new fleet) and land a
+        # full training leg on top of a consensus-relevant run. No snapshot
+        # entry ⇒ skip the shadow this round — a missed telemetry point beats
+        # a contended final.
+        host = (final_hosts or {}).get(("king", size, gen.hotkey))
         if host is None:
-            hosts = self._hosts_for("final")
-            if not hosts:
-                log.warning("round=%s: scratch shadow has no final host", manifest.round_id)
-                return None, None
-            host = hosts[0]
+            log.warning("round=%s: scratch shadow skipped — no snapshotted "
+                        "king final pod for this round (restart mid-round, or "
+                        "a fully local final)", manifest.round_id)
+            return None, None
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec,
             timeout_seconds=self.remote_timeout_seconds,

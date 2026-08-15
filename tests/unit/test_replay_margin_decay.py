@@ -60,6 +60,7 @@ def make_receipt_with_verdict(
     *, lcb: float | None, margin: float, tenure: int, won: bool,
     inconclusive: bool = False, round_id: str = "1", cohort_k: int = 0,
     cohort_lcbs: dict | None = None, params: KothParams = PARAMS,
+    validator_hotkey: str = "",
 ):
     base_seed, seeds = _seeds()
     manifest = make_manifest(None, base_seed=base_seed)
@@ -86,7 +87,7 @@ def make_receipt_with_verdict(
     receipt = build_receipt(
         round_id=round_id, status="scored", epoch_start_block=EPOCH_START,
         epoch_block_hash=BLOCK_HASH, base_seed=base_seed, seeds=seeds,
-        manifest=manifest, verdict=verdict,
+        manifest=manifest, verdict=verdict, validator_hotkey=validator_hotkey,
     )
     # Round-trip through JSON so the tests exercise exactly what the harness
     # reads off disk.
@@ -194,6 +195,27 @@ def test_load_receipts_from_disk_dedupes_and_reports_problems(tmp_path):
     receipts, problems = replay.load_receipts([tmp_path])
     assert [x.round_id for x in receipts] == ["7"]
     assert len(problems) == 1 and "round-8" in problems[0]
+
+
+def test_multi_validator_trees_conflict_unless_filtered(tmp_path):
+    # A cache holding two validators' receipts for the SAME round must not be
+    # replayed on path-sort order — around a scoring-rule seam the two can
+    # record opposite verdicts. Unfiltered: the round is dropped with a loud
+    # problem; --validator-hotkey selects one trail.
+    r_a = make_receipt_with_verdict(lcb=0.012, margin=0.02, tenure=9, won=False,
+                                    round_id="7", validator_hotkey="hkA")
+    r_b = make_receipt_with_verdict(lcb=0.012, margin=0.02, tenure=9, won=True,
+                                    round_id="7", validator_hotkey="hkB")
+    for hk, r in (("hkA", r_a), ("hkB", r_b)):
+        d = tmp_path / hk
+        d.mkdir()
+        (d / "round-7.json").write_text(dump_receipt(r), encoding="utf-8")
+    receipts, problems = replay.load_receipts([tmp_path])
+    assert receipts == []
+    assert any("multiple validators" in p and "hkA" in p and "hkB" in p
+               for p in problems)
+    only_a, problems_a = replay.load_receipts([tmp_path], filter_hotkey="hkA")
+    assert [r.validator_hotkey for r in only_a] == ["hkA"] and problems_a == []
 
 
 def test_fixture_receipt_replays_cleanly():

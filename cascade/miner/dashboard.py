@@ -514,6 +514,18 @@ def heat_block(
     return lines
 
 
+def _short_pointer(pointer: str) -> str:
+    """A trained-checkpoint pointer, shortened for terminal display: drop the
+    scheme prefix and truncate the digest — ``cascade/ckpt-r…-king-toto2-4m
+    @sha256:ab12cdef…``. Unrecognized shapes pass through untouched."""
+    p = str(pointer)
+    tail = p.rsplit(":hippius:", 1)[-1]
+    if "@sha256:" in tail:
+        repo, digest = tail.rsplit("@sha256:", 1)
+        return f"{repo}@sha256:{digest[:12]}…" if len(digest) > 12 else tail
+    return tail
+
+
 def render_heat(doc: dict | None, *, me: str | None = None) -> str:
     """The standalone ``cascade heat`` view of one published heat document."""
     if not isinstance(doc, dict):
@@ -533,6 +545,21 @@ def render_heat(doc: dict | None, *, me: str | None = None) -> str:
         decisive = "separated 1st from 2nd" if float(lcb) > 0 else "did NOT separate 1st from 2nd"
         head.append(f"  decisiveness    leader LCB {float(lcb):+.4f} — the screen {decisive}"
                     + (f" (n_windows={nw}, feeds={nc})" if nw is not None else ""))
+    # Cascade warm-start: which promoted init THIS round's runs trained from,
+    # and the rotation's pick for the NEXT round — a schedule, not a promise
+    # (a promotion firing at the boundary replaces the member set; the round's
+    # signed manifest is always the ground truth for what actually trained).
+    ws = doc.get("warm_start")
+    if isinstance(ws, dict) and ws.get("init_checkpoint"):
+        gen = ws.get("generation")
+        head.append(f"  warm start      this round trained from "
+                    f"{_short_pointer(ws['init_checkpoint'])}"
+                    + (f"  (generation {gen})" if gen else ""))
+        nxt = ws.get("next_scheduled_init")
+        if nxt:
+            head.append(f"  next round      scheduled init {_short_pointer(nxt)} — "
+                        "a schedule, not a promise (a boundary promotion "
+                        "replaces the set; the manifest is ground truth)")
     body = heat_block(doc, me=me, limit=None)
     return "\n".join(head + ([""] + body[1:] if len(body) > 1 else []))
 

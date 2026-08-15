@@ -363,6 +363,76 @@ def test_shadow_without_scores_publishes_nothing(shadow_cfg, tmp_path, monkeypat
     assert SCRATCH_INDEX_KEY not in runner._manifest_store.texts
 
 
+def test_scratch_pod_snapshot_taken_before_the_duel_bench(shadow_cfg, tmp_path, monkeypatch):
+    # The scratch leg runs HOURS after publish; by then run_round may have
+    # started the next round and repointed _final_role_hosts' identical
+    # (role, size, hotkey) key at the NEW round's live final pod. The shadow
+    # must only ever see the snapshot taken at bench-thread start.
+    runner = _runner(shadow_cfg, tmp_path, monkeypatch)
+    manifest = _warm_manifest(runner)
+    size = shadow_cfg.throne_contracts()[0].arch_preset
+    runner._final_role_hosts = {("king", size, "a"): "pod-round-N"}
+
+    orig_bench = runner._post_publish_bench
+
+    def _bench_then_next_round_starts(m):
+        runner._final_role_hosts[("king", size, "a")] = "pod-round-N+1"
+        return orig_bench(m)
+
+    captured = {}
+
+    def _capture_shadow(m, report=None, final_hosts=None):
+        captured["final_hosts"] = final_hosts
+        return None
+
+    monkeypatch.setattr(runner, "_post_publish_bench", _bench_then_next_round_starts)
+    monkeypatch.setattr(runner, "_run_scratch_shadow", _capture_shadow)
+    runner.run_post_publish_bench(manifest)
+    assert captured["final_hosts"] == {("king", size, "a"): "pod-round-N"}
+
+
+def test_remote_scratch_skips_without_a_snapshotted_pod(shadow_cfg, tmp_path, monkeypatch):
+    # No snapshot entry for the king's pod ⇒ skip the leg (a missed telemetry
+    # point), never fall back to a live host lookup that could name the next
+    # round's fleet.
+    from cascade.trainer.contract import RoundSeeds
+    from cascade.trainer.loop import ResolvedGenerator
+
+    runner = _runner(shadow_cfg, tmp_path, monkeypatch)
+    manifest = _warm_manifest(runner)          # round itself trains locally
+    runner.remote_hosts = ["h"]                # remote wiring appears for the shadow
+    runner.trainer_spec = "mod:Cls"
+    runner.cascade_bench_plan = object()
+    gen = ResolvedGenerator(hotkey="a", uid=0, ref=REF_A)
+    seeds = RoundSeeds.derive(1, shadow_cfg.training)
+    primary = shadow_cfg.throne_contracts()[0]
+    assert runner._scratch_shadow_remote(manifest, gen, primary, seeds,
+                                         final_hosts={}) == (None, None)
+    assert runner._scratch_shadow_remote(manifest, gen, primary, seeds,
+                                         final_hosts=None) == (None, None)
+
+
+def test_scratch_index_survives_transient_read_failures():
+    # A flaky (non-404) index read must SKIP the update — not overwrite the
+    # published trend roll-up with a single-round index.
+    from cascade.shared.scratch_report import update_scratch_index
+
+    class _FlakyStore:
+        def __init__(self):
+            self.writes = {}
+
+        def get_text(self, key):
+            raise RuntimeError("503 service unavailable")
+
+        def put_text(self, key, text, **kw):
+            self.writes[key] = text
+
+    store = _FlakyStore()
+    with pytest.raises(RuntimeError, match="skipping index update"):
+        update_scratch_index(store, _report())
+    assert store.writes == {}
+
+
 def test_shadow_runs_even_when_the_duel_bench_missed(shadow_cfg, tmp_path, monkeypatch):
     # A duel-bench wipeout must not cancel the scratch point — the report just
     # carries no lineage reference.
