@@ -450,8 +450,10 @@ def test_alpha_over_k_moves_the_quantile_and_leaves_the_margin_alone(cfg):
     solo, _ = _receipt(cfg, [("a_hk", 1, 0)], {"a_hk": chal}, king)
     trio, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1), ("c_hk", 3, 2)],
                        {"a_hk": chal, "b_hk": chal, "c_hk": chal}, king)
-    # The margin is IDENTICAL — the correction did not touch it.
-    assert trio.verdict.margin == solo.verdict.margin == cfg.scoring.win_margin_end
+    # The margin is IDENTICAL — the correction did not touch it. (A fresh
+    # runner judges at tenure 0, so under DEC-CA-0016's decay the bar is the
+    # full win_margin_start.)
+    assert trio.verdict.margin == solo.verdict.margin == cfg.scoring.win_margin_start
     # The bound moved down: a lower quantile of the same paired distribution.
     assert trio.verdict.lcb < solo.verdict.lcb
     # And the published alpha is the quantile actually taken.
