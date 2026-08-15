@@ -106,7 +106,10 @@ in-context.
   the existing quality floor (auto-admitted exactly when the lineage stops
   compounding; the one sanctioned crossing of DEC-CA-0013's generation band);
   (3) a second random-init THRONE only if shadows show the two regimes crown
-  different generators. NOT built yet — Stage 1 is next.
+  different generators. Stage 1 BUILT 2026-08-15 (`[telemetry]
+  scratch_shadow_every_rounds`, signed `benchmarks/scratch/` reports,
+  consensus-inert, rides the pinned worker CLI; testnet armed M=2) — one-cycle
+  testnet validation (docs/SCRATCH_SHADOW.md) gates mainnet M=4.
   (`decisions/DEC-CA-0014-scratch-control-staged.md`)
 
 - **DEC-CA-0015** — Promotion members selected by MEASURED error decorrelation
@@ -116,6 +119,14 @@ in-context.
   k=5 needs release-then-activate. Correlation source is the private-pool
   battery until raw GIFT rows are persisted beside bench reports.
   (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
+
+- **DEC-CA-0016** — Dethrone margin DECAYS with king tenure (affine schedule in
+  reverse: end < start over `margin_warmup_rounds`; floor must stay > 0). Tenure
+  survives warm-start promotion, so decay deepens across a hold. Schedule picked
+  from receipt replay (`scripts/replay_margin_decay.py`); consensus-sensitive —
+  release-then-activate across all 6 external validators
+  (docs/MARGIN_DECAY_ROLLOUT.md), testnet first. PROPOSED: awaiting replay
+  evidence + owner sign-off. (`decisions/DEC-CA-0016-tenure-decay-margin.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
