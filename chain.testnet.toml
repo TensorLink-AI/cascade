@@ -93,7 +93,7 @@ batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate
 weight_decay       = 0.05
-lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0016): warmup only on a
+lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0018): warmup only on a
                                    # from-scratch run, flat base_lr on warm-started rounds;
                                    # wsd rounds also checkpoint optimizer state. [training]
                                    # edit ⇒ contract_digest changed: restart trainer AND

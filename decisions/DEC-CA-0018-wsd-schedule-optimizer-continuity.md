@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0016
+id: DEC-CA-0018
 type: decision
 title: "Warm-start recipe: WSD learning-rate schedule (warmup once per generation, flat across rounds) + optimizer-state continuity in the checkpoint"
 status: active

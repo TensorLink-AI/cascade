@@ -74,7 +74,7 @@ batch_size                  = 64       # Toto 2.0 global batch size
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
 weight_decay       = 0.05
-lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0016): warmup only on a
+lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only on a
                                   # from-scratch (generation-start) run; warm-started rounds
                                   # re-enter FLAT at base_lr — per-round cosine restarts
                                   # distort continued pretraining. No in-round decay (that

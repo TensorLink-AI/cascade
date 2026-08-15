@@ -396,7 +396,7 @@ def _tiny_stream(n=16):
     return (rng.normal(size=32).cumsum() for _ in range(n))
 
 
-# ── LR schedules: wsd vs warmup_cosine (DEC-CA-0016) ─────────────────────────
+# ── LR schedules: wsd vs warmup_cosine (DEC-CA-0018) ─────────────────────────
 
 
 def test_lr_schedule_semantics():
@@ -424,7 +424,7 @@ def test_unknown_lr_schedule_aborts(tmp_path: Path):
                       training_seed=1, token_budget=256, out_dir=tmp_path / "x")
 
 
-# ── optimizer-state continuity across warm-started rounds (DEC-CA-0016) ──────
+# ── optimizer-state continuity across warm-started rounds (DEC-CA-0018) ──────
 
 
 def test_wsd_round_writes_state_and_warm_start_resumes_it(tmp_path: Path):

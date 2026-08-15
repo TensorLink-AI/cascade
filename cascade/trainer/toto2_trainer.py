@@ -44,7 +44,7 @@ log = logging.getLogger("cascade.trainer.toto2")
 LOG_EVERY_STEPS = 50
 
 # Optimizer-state sidecar written beside weights.safetensors on wsd rounds
-# (DEC-CA-0016): Muon momentum + row EMA + AdamW moments, name-keyed, so the
+# (DEC-CA-0018): Muon momentum + row EMA + AdamW moments, name-keyed, so the
 # next warm-started round continues the optimiser instead of rebuilding it.
 OPTIM_STATE_FILE = "optimizer.safetensors"
 
@@ -84,7 +84,7 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
     warm-started lineage, where every round would re-warm and re-decay and the
     repeated cosine restarts distort continued pretraining.
 
-    ``wsd`` (warmup-stable-decay, DEC-CA-0016) — warmup happens ONCE per
+    ``wsd`` (warmup-stable-decay, DEC-CA-0018) — warmup happens ONCE per
     generation: the from-scratch run warms up over ``warmup`` tokens, and a
     warm-started round is a continuation, so it re-enters FLAT at ``base_lr``
     with no re-warmup and no restart. There is no in-round decay: decay
@@ -103,7 +103,7 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-# ── optimizer-state continuity (wsd rounds, DEC-CA-0016) ──────────────────────
+# ── optimizer-state continuity (wsd rounds, DEC-CA-0018) ──────────────────────
 # safetensors stores a flat name→tensor dict, so the state is flattened with
 # param NAMES as keys (never positions): a load into a freshly built
 # model+optimiser re-attaches each tensor to the right param or fails loudly.
@@ -372,7 +372,7 @@ class Toto2Trainer:
         levels = QUANTILE_LEVELS[: cfg.num_quantiles] if cfg.num_quantiles <= len(QUANTILE_LEVELS) else QUANTILE_LEVELS
         optimizer = self._build_optimizer(model, contract)
 
-        # LR schedule per the contract (DEC-CA-0016). Unknown values abort: a
+        # LR schedule per the contract (DEC-CA-0018). Unknown values abort: a
         # typo silently falling back to cosine would train the whole round on
         # the wrong recipe. warm_started keys the wsd warmup-once semantics —
         # it is shared king/challenger state (both roles get the same init).
@@ -527,7 +527,7 @@ class Toto2Trainer:
             "data_wait_s": round(timed_stream.wait_s, 1),
             "data_wait_frac": round(timed_stream.wait_s / max(train_seconds, 1e-6), 3),
             "tokens_frac": round(tokens / max(1, token_budget), 3),
-            # Recipe telemetry (DEC-CA-0016): which schedule ran, and whether a
+            # Recipe telemetry (DEC-CA-0018): which schedule ran, and whether a
             # warm-started run continued the promoted init's optimiser state or
             # rebuilt it fresh (a member promoted before state shipping).
             "lr_schedule": schedule,
@@ -661,7 +661,7 @@ class _MuonAdamW:
         if self.adamw is not None:
             self.adamw.zero_grad(set_to_none=set_to_none)
 
-    # ── state checkpointing (wsd rounds, DEC-CA-0016) ─────────────────────────
+    # ── state checkpointing (wsd rounds, DEC-CA-0018) ─────────────────────────
 
     def state_tensors(self, names: dict) -> dict:
         """Name-keyed CPU tensors of the full state — Muon momentum buffers +
