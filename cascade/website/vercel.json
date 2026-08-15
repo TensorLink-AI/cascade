@@ -29,6 +29,15 @@
     {
       "source": "/benchmarks/:path*",
       "destination": "https://s3.hippius.com/cascade-manifests/benchmarks/:path*"
+    },
+    {
+      "source": "/promotions/:path*",
+      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/promotions/:path*"
+    },
+    {
+      "source": "/promotions/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/promotions/:path*"
     }
   ],
   "headers": [
@@ -46,6 +55,12 @@
     },
     {
       "source": "/benchmarks/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+      ]
+    },
+    {
+      "source": "/promotions/(.*)",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
       ]

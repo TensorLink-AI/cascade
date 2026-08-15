@@ -60,9 +60,11 @@ def test_canonical_body_excludes_signature_and_is_stable():
 class _Store:
     def __init__(self):
         self.texts = {}
+        self.acls = {}
 
-    def put_text(self, key, text, content_type=""):
+    def put_text(self, key, text, content_type="", acl=None):
         self.texts[key] = text
+        self.acls[key] = acl
 
     def get_text(self, key):
         return self.texts[key]
@@ -75,6 +77,26 @@ def test_publish_writes_record_and_locator_index():
     assert key == promotion_record_key(3)
     assert load_promotion_record(store.get_text(key)).generation == 3
     assert load_promotion_index(store.get_text(promotion_index_key())) == 3
+    # Both objects publish public-read — the dashboard renders the rotation
+    # roster straight from the record (2026-08-15).
+    assert store.acls[key] == "public-read"
+    assert store.acls[promotion_index_key()] == "public-read"
+
+
+def test_publish_falls_back_to_private_when_acl_unsupported():
+    from cascade.shared.hippius import StorageError
+
+    class _NoAclStore(_Store):
+        def put_text(self, key, text, content_type="", acl=None):
+            if acl is not None:
+                raise StorageError("acl_unsupported")
+            super().put_text(key, text, content_type=content_type)
+
+    store = _NoAclStore()
+    rec = _record(generation=2)
+    key = publish_promotion_record(store, dump_promotion_record(rec), 2)
+    assert load_promotion_record(store.get_text(key)).generation == 2
+    assert load_promotion_index(store.get_text(promotion_index_key())) == 2
 
 
 def test_index_is_best_effort_on_garbage():

@@ -36,3 +36,6 @@ worker_manual.log
 
 # live per-box provisioner config (copy from deploy/provision.*.toml)
 /provision.toml
+
+# local proposal prompts (not for the repo)
+/PROPOSAL-*.md
