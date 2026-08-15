@@ -1541,7 +1541,7 @@ function renderWarm(){
   // If a newer round is already live (status/round.json), that live round IS the
   // "next" one and is training NOW from next_scheduled_init — so don't mislabel
   // it as still-upcoming. The round after the live one needs the rotation roster
-  // (not published) and only becomes knowable when this heat settles.
+  // (see loadPromotion) and only becomes knowable when this heat settles.
   var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init;
   var settledRid=_heat.round_id, liveRid=_roundStatus && _roundStatus.round_id;
   var running = liveRid && String(liveRid)!==String(settledRid);
@@ -1596,22 +1596,24 @@ function loadWarmHistory(){
   });
   renderWarmHistory();
 }
-// Derive the rotation cycle order from recent warm-start rounds: walk newest→
-// oldest collecting distinct checkpoints until one repeats (a full cycle) or a
-// random-init round ends the warm-start era. Returned oldest→newest = the order
-// rounds cycle through. No roster fetch (promotions/*.json isn't public-read).
-function rotationSeq(){
-  var rs=_index&&_index.rounds; if(!rs||!_wsHist) return null;
-  var ordered=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); });
-  var seq=[];
-  for(var i=ordered.length-1;i>=0;i--){
-    var h=_wsHist[String(ordered[i].round_id)];
-    if(!h||!h.done) continue;
-    if(!h.ckpt) break;                    // random-init round → before warm-start era
-    if(seq.indexOf(h.ckpt)!==-1) break;   // one full cycle collected
-    seq.push(h.ckpt);
-  }
-  return seq.length>=2 ? seq.reverse() : null;
+// The rotation roster comes from the trainer's signed promotion record
+// (promotions/index.json locates the latest generation; public-read since
+// 2026-08-15). Member ORDER is the cycle order — the trainer trains round N
+// from members[epoch_index % k]. Inferring the cycle from recent receipts was
+// tried and breaks at every generation boundary (the first gen-2 round glued
+// onto the gen-1 cycle, 2026-08-15): no record ⇒ no sequence line, never a
+// wrong one.
+var _promo=null;
+function loadPromotion(){
+  fetchJSON("promotions/index.json").then(function(d){
+    var gen=Number(d&&d.latest_generation);
+    if(!gen||gen<1){ _promo=null; renderWarmHistory(); return; }
+    if(_promo&&_promo.gen===gen) return;           // roster already loaded
+    fetchJSON("promotions/gen-"+gen+".json").then(function(rec){
+      _promo={gen:gen, members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
+      renderWarmHistory();
+    }).catch(function(){});
+  }).catch(function(){});
 }
 function renderWarmHistory(){
   var el=document.getElementById("warm-history"); if(!el) return;
@@ -1630,10 +1632,11 @@ function renderWarmHistory(){
       '<td>'+cell+'</td>'+
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
-  var seq=rotationSeq(), seqHtml="";
-  if(seq){
-    seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation sequence (cycles each round): '+
-      seq.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
+  var seqHtml="";
+  if(_promo&&_promo.members.length){
+    seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation roster &mdash; generation '+
+      _promo.gen+' (cycles each round): '+
+      _promo.members.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
       ' &rarr; &hellip;</div>';
   }
   el.innerHTML=seqHtml+
@@ -1704,6 +1707,7 @@ var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
 function poll(){
   fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
+  loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
     .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});

@@ -557,6 +557,30 @@ def test_render_heat_reports_decisiveness_and_missing_docs():
     assert "no heat standings published yet" in render_heat(None)
 
 
+def test_render_heat_shows_warm_start_and_next_scheduled_init():
+    from cascade.miner.dashboard import _short_pointer
+
+    this_ptr = "metro-v1:trained:hippius:cascade/ckpt-r9-king-toto2-4m@sha256:" + "a" * 64
+    next_ptr = "metro-v1:trained:hippius:cascade/ckpt-r9-chal-toto2-4m@sha256:" + "b" * 64
+    text = render_heat(_heat_doc(warm_start={
+        "init_checkpoint": this_ptr, "size": "toto2-4m", "generation": 3,
+        "next_scheduled_init": next_ptr,
+    }))
+    assert "this round trained from cascade/ckpt-r9-king-toto2-4m@sha256:aaaaaaaaaaaa…" in text
+    assert "(generation 3)" in text
+    assert "scheduled init cascade/ckpt-r9-chal-toto2-4m@sha256:bbbbbbbbbbbb…" in text
+    assert "a schedule, not a promise" in text
+    # No warm_start (random-init era) ⇒ no warm-start lines at all.
+    plain = render_heat(_heat_doc())
+    assert "warm start" not in plain and "scheduled init" not in plain
+    # No generation key (legacy pointer / engine-off) ⇒ no dangling "(generation )".
+    nogen = render_heat(_heat_doc(warm_start={"init_checkpoint": this_ptr,
+                                              "size": "toto2-4m"}))
+    assert "generation" not in nogen
+    # Shortener passes unrecognized shapes through untouched.
+    assert _short_pointer("weird-ref") == "weird-ref"
+
+
 def test_render_heat_index_lists_published_rounds():
     doc = {"heats": [
         {"round_id": "1", "epoch_start_block": 7_200, "n_entrants": 3,
