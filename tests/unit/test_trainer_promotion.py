@@ -363,6 +363,54 @@ def test_ripe_clock_with_no_candidates_holds(tmp_path):
     assert eng.generation == 0
 
 
+def test_no_downgrade_guard_holds_until_a_candidate_matches(tmp_path):
+    # Live generation's best member benches 1.0. A reign whose candidates all
+    # bench worse must NOT fire on the ripe clock — the shared init would
+    # ratchet downhill. Candidates stay logged, the generation holds, and the
+    # first at-least-as-good candidate fires the promotion.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "r0", 1.0),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-worse": (1.2, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is None
+    assert eng.generation == 1 and len(eng.candidates) == 1   # held, not cleared
+    assert eng.init_for_epoch(0) == ("live-a", "toto2-4m")    # field keeps training
+    # A later round produces a genuinely better checkpoint: fire on the still-
+    # ripe clock, anchored on it.
+    eng.record_bench(_manifest("r6", warm_start_ckpt="live-a"),
+                     _report("r6", 6 * DAY, {"ptr-better": (0.95, "hkChal", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=6 * DAY, round_id="r6")
+    assert rec is not None and rec.generation == 2
+    assert "ptr-better" in rec.member_ids()
+
+
+def test_no_downgrade_guard_fires_on_equal_bench(tmp_path):
+    # Equal is not a downgrade: a candidate matching the incumbent's bench
+    # still rotates fresh diversity in.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "r0", 1.0),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-equal": (1.0, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is not None
+
+
+def test_no_downgrade_guard_skips_scoreless_legacy_members(tmp_path):
+    # A grandfathered legacy pointer carries score=NaN — it cannot anchor the
+    # comparison, so it must never wedge every future promotion.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "", float("nan")),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-any": (5.0, "hkKing", "king")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert rec is not None and rec.generation == 2
+
+
 def test_promoted_score_is_geomean_of_the_six(tmp_path):
     eng = _engine(tmp_path, k_max=1)
     eng.note_round("hkKing", epoch_block=0)

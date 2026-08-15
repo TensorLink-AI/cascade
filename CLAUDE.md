@@ -128,6 +128,15 @@ in-context.
   (docs/MARGIN_DECAY_ROLLOUT.md), testnet first. PROPOSED: awaiting replay
   evidence + owner sign-off. (`decisions/DEC-CA-0016-tenure-decay-margin.md`)
 
+- **DEC-CA-0017** — Promotion no-downgrade guard: a ripe reign whose best
+  candidate benches WORSE than the live generation's best member HOLDS (clock
+  stays ripe, candidates accumulate, fires on the first equal-or-better) —
+  the shared init never ratchets downhill. Pure trainer policy (DEC-CA-0013),
+  zero consensus impact. Global all-time top-k pool considered and REJECTED
+  (winner's-curse freeze + Goodhart lock-in + envelope is reign-scoped);
+  basin escape stays with DEC-CA-0014's staged path.
+  (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.
