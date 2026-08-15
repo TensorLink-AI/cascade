@@ -141,7 +141,12 @@ def test_tokens_for_hours_uses_per_size_throughput(two_size_cfg):
 def test_koth_params_builds_from_scoring(cfg):
     params = cfg.koth_params()
     assert isinstance(params, KothParams)
-    assert params.win_margin_start <= params.win_margin_end
+    assert params.win_margin_start == cfg.scoring.win_margin_start
+    assert params.win_margin_end == cfg.scoring.win_margin_end
+    # DEC-CA-0016: the margin DECAYS with tenure (end < start), and the floor
+    # must stay strictly positive — the guardrail the config review enforces.
+    assert params.win_margin_end <= params.win_margin_start
+    assert params.win_margin_end > 0
     assert params.dethrone_cp == cfg.scoring.dethrone_cp
 
 
