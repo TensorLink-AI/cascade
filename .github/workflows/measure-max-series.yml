@@ -9,6 +9,9 @@ name: Measure max_series binding
 
 on:
   workflow_dispatch:
+  push:
+    branches: [claude/max-series-binding-measurement-4028ed]
+    paths: [".github/workflows/measure-max-series.yml"]
 
 permissions:
   contents: read
