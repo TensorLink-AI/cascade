@@ -793,10 +793,23 @@ class TelemetryConfig:
     extra seconds matter. There is deliberately no size knob: a resizable bench
     produces numbers that cannot be pooled across the fleet (see
     ``host_probe.HOST_BENCH_SPEC``).
+
+    ``scratch_shadow_every_rounds`` (DEC-CA-0014 Stage 1) arms the shadow
+    scratch control: every M-th warm-started round, the trainer additionally
+    trains the reigning king's generator FROM SCRATCH (random init, identical
+    contract) after the manifest publishes, benches it on the public suites,
+    and publishes the numbers as a clearly-labeled telemetry artifact
+    (``cascade.shared.scratch_report``) beside the round's signed bench
+    report. The scratch run never enters the manifest, the bench report, the
+    promotion candidate pool, or any scoring path — it exists to measure the
+    lineage-vs-scratch gap that decides whether DEC-CA-0014's Stage-2 reseed
+    valve is ever warranted. ``0`` (the default) = off. Deliberately a
+    ``[telemetry]`` key: it must never touch ``contract_digest``.
     """
 
     host_probe: bool = True
     host_bench: bool = True
+    scratch_shadow_every_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -1265,6 +1278,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         telemetry=TelemetryConfig(
             host_probe=bool(tm.get("host_probe", True)),
             host_bench=bool(tm.get("host_bench", True)),
+            scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
         ),
         raw=raw,
     )

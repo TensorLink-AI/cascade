@@ -517,3 +517,14 @@ mode    = "online"              # online | offline | disabled
 # first training batch), and is the one field comparable across pods.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round
+# the trainer ALSO trains the king's generator from scratch (random init,
+# identical contract + seeds) strictly post-publish on the idle final pod,
+# benches it, and publishes benchmarks/scratch/round-<id>.json — labeled
+# telemetry that never feeds scoring, selection, or promotion. [telemetry]
+# tier on purpose: must never touch contract_digest. 0 = off. MAINNET stays 0
+# until the owner arms it (DEC-CA-0014 says start M=4): arming costs a full
+# training leg every M rounds and needs [eval] bench_hold_max_hours sized for
+# duel bench + train leg + one more bench (~6-7h total at the 3h budget) — or
+# a dedicated pod. Testnet first, one full cycle.
+scratch_shadow_every_rounds = 0
