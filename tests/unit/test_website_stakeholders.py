@@ -168,8 +168,8 @@ def test_toto2_trajectory_picks_the_round_winner_by_uid(html: str):
     """A cohort duel (DEC-CA-0012) puts several challengers in one bench report
     and only one of them took the throne. Selecting the champion by ``role``
     alone would let a losing challenger's public score draw the line."""
-    fn = re.search(r"function roundBenchAt\(.*?\n\}", html, re.S)
-    assert fn, "roundBenchAt not found"
+    fn = re.search(r"function championGeomean\(.*?\n\}", html, re.S)
+    assert fn, "championGeomean not found"
     src = fn.group(0)
     assert "chal_uid" in src and "king_uid" in src, "champion must be matched by uid first"
     assert src.index("e.uid") < src.index("e.role"), "uid match must precede the role fallback"
@@ -185,7 +185,7 @@ def test_toto2_trajectory_frame_is_fixed_and_never_extrapolated(html: str):
     assert fn, "renderRefTrack not found"
     src = fn.group(0)
     assert "yZero:false" in src.replace(" ", ""), "the trajectory must not anchor at zero"
-    assert re.search(r"yInclude\s*:\s*inc", src), "parity must be pinned into the y-domain"
+    assert re.search(r"yInclude\s*:\s*\[1,", src), "parity must be pinned into the y-domain"
     assert re.search(r"\{\s*v:1,\s*label:\"official Toto2", src), "the 100% rule is missing"
     flat = re.sub(r"\s+", " ", re.sub(r"</?b>", "", html))
     assert "no date for reaching parity is predicted" in flat, "the explainer must refuse an ETA"

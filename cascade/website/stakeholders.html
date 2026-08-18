@@ -747,7 +747,6 @@ details summary:hover{color:var(--ink)}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .swatch{width:16px;height:4px;display:inline-block}
 .swatch.dashed{background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 7px)}
-.swatch.dotted{background:repeating-linear-gradient(90deg,currentColor 0 2px,transparent 2px 5px)}
 /* the head-to-head trajectory sits between the section's answer and its
    per-size cells: the shape of the climb first, the current numbers under it */
 #ref-track{margin:2px 0 30px}
@@ -973,15 +972,7 @@ th.num{text-align:right}
       <div class="figure-key" id="ref-key"></div>
       <div class="chart-wrap"><svg id="chart-ref" preserveAspectRatio="none" role="img"
         aria-label="Share of the official Toto2's score reached, round by round"></svg></div>
-      <div class="chart-meta">
-        <div class="legend">
-          <span><i class="swatch" style="background:var(--accent)"></i> Round&rsquo;s champion</span>
-          <span><i class="swatch dashed" style="color:var(--saffron)"></i> Best so far</span>
-          <span><i class="swatch dotted" style="color:var(--good)"></i> Official Toto2</span>
-          <span class="faint">| marks a change of lead</span>
-        </div>
-        <span id="ref-track-note">--</span>
-      </div>
+      <div class="chart-meta"><span id="ref-track-note">--</span></div>
     </div>
     <div id="ref-panel"></div>
     <details>
@@ -996,16 +987,15 @@ th.num{text-align:right}
         sidecar as every round checkpoint and published as a reference doc
         (<code>benchmarks/reference-&lt;size&gt;.json</code>), so no number here is transcribed
         from a leaderboard. The percentage compares six-score geometric means (lower is better).</p>
-        <p><b>The line over time</b> plots one point per round: that round&rsquo;s winning
-        checkpoint as a share of the official score, with the dashed line tracking the best
-        result recorded so far — the number in the headline. Round verdicts are fought on fresh
-        hidden data and can&rsquo;t be lined up across rounds; this battery is the opposite —
+        <p><b>The line over time</b> is one point per round: that round&rsquo;s winning
+        checkpoint as a share of the official score. Round verdicts are fought on fresh hidden
+        data and can&rsquo;t be lined up across rounds; this battery is the opposite &mdash;
         fixed public suites at pinned revisions, so the same ruler measures every point and the
-        slope is a real rate of improvement. The frame is fixed as well: the official checkpoint
-        at 100%, the genesis checkpoint at the bottom, never zoomed to make a small gain look
-        big. A round whose report hasn&rsquo;t landed leaves a gap rather than a guess, and the
-        pace figure is what has already happened over the plotted window &mdash; <b>no date for
-        reaching parity is predicted</b>, because progress here is not a straight line.</p>
+        slope is a real rate of improvement. The frame is fixed too: the official checkpoint at
+        100%, the start of the climb at the bottom, never zoomed to make a small gain look big.
+        A round whose report hasn&rsquo;t landed leaves a gap rather than a guess, and the pace
+        figure is what has already happened &mdash; <b>no date for reaching parity is
+        predicted</b>, because progress here is not a straight line.</p>
         <p>The fight is deliberately uneven: the official release was trained on its full corpus
         at full budget, while every Cascade checkpoint is trained under the round&rsquo;s fixed,
         published compute budget. And as everywhere on this page, these scores are
@@ -1615,33 +1605,28 @@ function refPair(bv, refs){
 // sidecar for every round checkpoint AND for the official baseline. Same ruler
 // every time, so the slope of this line is a real rate of improvement.
 //
-// Per round, at one ladder rung:
-//   champ — that round's WINNER (the challenger when it dethroned, else the
-//           king), matched by uid first: a cohort duel (DEC-CA-0012) puts
-//           several challengers in one report and only one took the throne.
-//   best  — the lowest geomean of any entry in the round, which is the rule the
-//           headline number uses; the running maximum of it is the record line,
-//           so the line's right-hand end and the hero percentage always agree.
-function roundBenchAt(r, rungK){
+// One value per round: that round's WINNER (the challenger when it dethroned,
+// else the king), matched by uid first — a cohort duel (DEC-CA-0012) puts
+// several challengers in one report and only one took the throne.
+function championGeomean(r, rungK){
   var rep = _benchReports[String(r.round_id)];
   if(!rep) return null;
   var entries = rep.entries || rep.checkpoints || [];
   var wantUid = r.dethroned ? r.chal_uid : r.king_uid;
   var wantRole = r.dethroned ? "challenger" : "king";
-  var champ = null, best = null;
+  var champ = null;
   entries.forEach(function(e){
     if(entrySizeKey(e, r) !== rungK) return;   // unattributable entries stay out
     var six = readSix(e);
     if(!six) return;
     var g = sixGeomean(six);
     if(!(g > 0)) return;
-    if(best == null || g < best) best = g;
     var isChamp = (wantUid != null && e.uid != null)
       ? String(e.uid) === String(wantUid)
       : String(e.role || "") === wantRole;
     if(isChamp && (champ == null || g < champ)) champ = g;
   });
-  return (champ == null && best == null) ? null : { champ:champ, best:best };
+  return champ;
 }
 
 function refTrack(){
@@ -1652,30 +1637,25 @@ function refTrack(){
   if(!(refG > 0)) return null;
 
   var rows = scoredRounds().map(function(r){
-    var b = roundBenchAt(r, pair.rung.key);
+    var g = championGeomean(r, pair.rung.key);
     return { round_id:r.round_id, at:r.published_at, dethroned:!!r.dethroned,
-             pct: (b && b.champ) ? refG/b.champ : null,
-             top: (b && b.best)  ? refG/b.best  : null };
+             pct: (g > 0) ? refG/g : null };
   });
   // Start at the first round that actually carries a report: the scan only
   // reaches back BENCH_SCAN_MAX rounds, and an empty left margin would read as
   // "no progress back then" when it means "not scanned".
   var s = -1, e = -1;
-  rows.forEach(function(p,i){ if(p.pct != null || p.top != null){ if(s < 0) s = i; e = i; } });
+  rows.forEach(function(p,i){ if(p.pct != null){ if(s < 0) s = i; e = i; } });
   if(s < 0) return null;
 
-  var pts = rows.slice(s, e + 1), run = null;
-  pts.forEach(function(p){
-    if(p.top != null && (run == null || p.top > run)) run = p.top;
-    p.rec = run;
-  });
+  var pts = rows.slice(s, e + 1);
   var seen = pts.filter(function(p){ return p.pct != null; });
   var first = seen[0] || null, last = seen[seen.length - 1] || null;
   var days = (first && last) ? (new Date(last.at) - new Date(first.at)) / 86400000 : 0;
   var genG = genesisGeomean(pair.rung.key);
   return {
     rung:pair.rung, pts:pts, seen:seen, first:first, last:last,
-    rounds:pts.length, covered:seen.length, record:run,
+    rounds:pts.length, covered:seen.length,
     anchor: (genG > 0) ? refG/genG : null,
     days: days,
     // gain and pace are in POINTS of the official score (0.01 = one point),
@@ -1697,30 +1677,25 @@ function renderRefTrack(){
   if(!t){ wrap.hidden = true; return null; }
   wrap.hidden = false;
 
-  // A FIXED frame, never zoomed to flatter: parity with the official
-  // checkpoint is pinned at the top and the genesis checkpoint (once benched)
-  // at the bottom, so a small gain always looks small and two visits to the
-  // page can be read against each other. Zero is not the floor — no forecaster
-  // sits at 0% of the target — so the zero anchor is dropped.
-  var rules = [{ v:1, label:"official Toto2 · 100%", color:"var(--good)", dash:"1 5",
-                 labelBelow:true }];
-  var inc = [1];
-  if(t.anchor != null && t.anchor < 1){
-    rules.push({ v:t.anchor, label:"genesis", color:"var(--faint)", dash:"5 4" });
-    inc.push(t.anchor);
-  }
+  // A FIXED frame, never zoomed to flatter: the official checkpoint is pinned
+  // at 100% and the floor is where the climb started (the genesis checkpoint's
+  // own benched score when it exists, else the first plotted round), so the
+  // frame is always "the whole climb, and what is left of it" and a small gain
+  // always looks small. Zero is not a floor — no forecaster sits at 0% of the
+  // target — so the zero anchor is dropped.
+  var floor = (t.anchor != null && t.anchor < 1) ? t.anchor
+            : (t.first ? t.first.pct : null);
 
   drawLines("chart-ref", [
     { data: t.pts.map(function(p){ return p.pct; }), color:"var(--accent)",
-      endTitle: t.last ? ("Champion today: " + num(t.last.pct*100,1) +
-        "% of the official Toto2-" + t.rung.label) : null },
-    { data: t.pts.map(function(p){ return p.rec; }), color:"var(--saffron)", width:2, dash:"5 4",
-      endTitle: t.record != null ? ("Best so far: " + num(t.record*100,1) + "%") : null }
+      endTitle: t.last ? ("Today: " + num(t.last.pct*100,1) +
+        "% of the official Toto2-" + t.rung.label) : null }
   ], {
-    fmtY: pctTick, yZero:false, yInclude:inc, rules:rules,
+    fmtY: pctTick, yZero:false, yInclude:[1, floor],
+    rules: [{ v:1, label:"official Toto2 · 100%", color:"var(--good)", dash:"1 5",
+              labelBelow:true }],
     ylab: "of the official Toto2 score",
     xticks: dateTicks(t.pts),
-    marks: t.pts.reduce(function(a,p,i){ if(p.dethroned) a.push(i); return a; }, []),
     pointTitles: t.pts.reduce(function(a,p,i){
       if(p.pct == null) return a;
       a.push({ i:i, title:"Round " + shortRound(p.round_id) + " · " + prettyDay(p.at) + " · " +
@@ -1730,29 +1705,15 @@ function renderRefTrack(){
     empty: "No published report at this size yet"
   });
 
-  var figs = [
-    { l:'<i class="swatch" style="background:var(--accent)"></i>Champion now',
-      v: t.last ? num(t.last.pct*100,1) + "%" : "&mdash;",
-      s: "of the official Toto2-" + esc(t.rung.label) + " score" },
-    { l:"Pace",
-      v: t.perWeek != null ? fmtPts(t.perWeek) : "&mdash;",
-      s: t.perWeek != null
-        ? ("per week, over " + num(t.days,0) + " days")
-        : "needs two reported rounds apart in time" }
-  ];
-  if(t.anchor != null && t.anchor < 1 && t.last){
-    figs.push({ l:"Gap closed",
-      v: num(Math.max(0, Math.min(1, (t.last.pct - t.anchor)/(1 - t.anchor)))*100, 0) + "%",
-      s: "of the genesis &rarr; official gap" });
-  }
-  document.getElementById("ref-key").innerHTML = figs.map(function(f){
-    return '<div class="fk"><span class="fkl">' + f.l + '</span>' +
-      '<div class="fkv">' + f.v + '</div><div class="fks">' + f.s + '</div></div>';
-  }).join("");
+  // One figure, and it is the one the chart exists to answer: how fast.
+  document.getElementById("ref-key").innerHTML =
+    '<div class="fk"><span class="fkl">Pace</span><div class="fkv">' +
+    (t.perWeek != null ? fmtPts(t.perWeek) : "&mdash;") + '</div><div class="fks">' +
+    (t.perWeek != null ? ("per week, over " + num(t.days,0) + " days")
+                       : "needs two reported rounds apart in time") + '</div></div>';
 
   document.getElementById("ref-track-note").innerHTML =
-    t.covered + " of " + t.rounds + " rounds shown have a published report" +
-    (t.record != null ? (" &middot; best " + num(t.record*100,1) + "%") : "");
+    t.covered + " of " + t.rounds + " rounds shown have a published report";
   return t;
 }
 
@@ -1794,11 +1755,9 @@ function renderRef(){
   if(track && track.gain != null){
     // the headline is the best result ever recorded; the pace is the champion
     // of each round, so name which figure is moving before quoting a rate
-    pace = " Round by round, the leading checkpoint has gone from <b>" +
-      num(track.first.pct*100,1) + "%</b> to <b>" + num(track.last.pct*100,1) + "%</b> of that " +
-      "score over the last " + num(track.days,0) + " days — " + fmtPts(track.gain) + " across " +
-      track.covered + " reported rounds" +
-      (track.perWeek != null ? (", about " + fmtPts(track.perWeek) + " a week") : "") + ".";
+    pace = " Round by round it has gone from <b>" + num(track.first.pct*100,1) + "%</b> to <b>" +
+      num(track.last.pct*100,1) + "%</b> of that score over the last " + num(track.days,0) +
+      " days" + (track.perWeek != null ? (", about " + fmtPts(track.perWeek) + " a week") : "") + ".";
   } else if(track){
     pace = " One round has published a report at this size so far; a rate of improvement " +
       "appears below once a second one lands.";
@@ -2054,7 +2013,8 @@ function drawLines(svgId, series, opts){
   // is read against); opts.yZero===false drops the zero anchor, for units where
   // zero is not a floor a series could ever sit at — anchoring there would
   // flatten every real move into a straight line.
-  var dom = all.concat(opts.yZero === false ? [] : [0]).concat(opts.yInclude || []);
+  var dom = all.concat(opts.yZero === false ? [] : [0]).concat(
+    (opts.yInclude || []).filter(function(v){ return v != null && isFinite(v); }));
   var dMin = Math.min.apply(null, dom), dMax = Math.max.apply(null, dom);
   if(dMax === dMin) dMax = dMin + 1;
   var raw = (dMax - dMin) / 4, mag = Math.pow(10, Math.floor(Math.log(raw)/Math.LN10));
