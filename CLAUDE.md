@@ -139,6 +139,15 @@ in-context.
   basin escape stays with DEC-CA-0014's staged path.
   (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
 
+- **DEC-CA-0018** — Warm-start recipe is WSD, not per-round cosine:
+  `lr_schedule = "wsd"` warms up once at generation start (the from-scratch
+  run), holds base_lr FLAT across warm-started rounds, and defers decay to a
+  release cut (not built). wsd rounds checkpoint optimizer state
+  (`optimizer.safetensors`, ~3×; Muon momentum + row-EMA + AdamW moments) and
+  warm starts re-attach it; missing file ⇒ fresh state, shape mismatch ⇒
+  abort. Flip changed `contract_digest` — trainer+validator deploy together.
+  (`decisions/DEC-CA-0018-wsd-schedule-optimizer-continuity.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.

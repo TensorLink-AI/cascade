@@ -74,7 +74,15 @@ batch_size                  = 64       # Toto 2.0 global batch size
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
 weight_decay       = 0.05
-lr_schedule        = "warmup_cosine"
+lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only on a
+                                  # from-scratch (generation-start) run; warm-started rounds
+                                  # re-enter FLAT at base_lr — per-round cosine restarts
+                                  # distort continued pretraining. No in-round decay (that
+                                  # belongs to a release cut, not built). wsd rounds also
+                                  # write optimizer.safetensors (~3x checkpoint size) so Muon
+                                  # momentum/row-EMA/AdamW moments survive the round boundary.
+                                  # [training] edit ⇒ contract_digest changed: restart trainer
+                                  # AND validator together (flipped from warmup_cosine 2026-08-14).
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit
