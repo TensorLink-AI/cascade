@@ -150,6 +150,48 @@ def test_pending_states_are_explicit(html: str):
         assert phrase in html, f"page must key its pending state off {phrase}"
 
 
+def test_toto2_trajectory_is_wired_into_both_render_paths(html: str):
+    """The head-to-head section carries a per-round trajectory as well as the
+    current percentage. It must be drawn on the populated path AND reset on the
+    pending one — a chart left on screen after the reference docs disappear
+    would show a stale climb next to "not yet measured"."""
+    assert 'id="chart-ref"' in html, "the trajectory chart is missing"
+    assert re.search(r"function renderRefTrack\(\)", html), "renderRefTrack not defined"
+    body = re.search(r"function renderRef\(\)\s*\{(.*?)\n\}", html, re.S)
+    assert body, "renderRef not found"
+    assert body.group(1).count("renderRefTrack()") == 2, (
+        "renderRefTrack must run on both the pending and the populated path"
+    )
+
+
+def test_toto2_trajectory_picks_the_round_winner_by_uid(html: str):
+    """A cohort duel (DEC-CA-0012) puts several challengers in one bench report
+    and only one of them took the throne. Selecting the champion by ``role``
+    alone would let a losing challenger's public score draw the line."""
+    fn = re.search(r"function roundBenchAt\(.*?\n\}", html, re.S)
+    assert fn, "roundBenchAt not found"
+    src = fn.group(0)
+    assert "chal_uid" in src and "king_uid" in src, "champion must be matched by uid first"
+    assert src.index("e.uid") < src.index("e.role"), "uid match must precede the role fallback"
+
+
+def test_toto2_trajectory_frame_is_fixed_and_never_extrapolated(html: str):
+    """The frame is the honesty property of this chart: parity with the
+    official checkpoint is pinned into the y-domain (``yInclude``) and zero is
+    dropped as a floor, so a small gain always looks small. Auto-zooming to the
+    data would make any move fill the frame. And the page states a pace, never
+    a date for reaching parity — progress here is not a straight line."""
+    fn = re.search(r"function renderRefTrack\(\).*?\n\}", html, re.S)
+    assert fn, "renderRefTrack not found"
+    src = fn.group(0)
+    assert "yZero:false" in src.replace(" ", ""), "the trajectory must not anchor at zero"
+    assert re.search(r"yInclude\s*:\s*inc", src), "parity must be pinned into the y-domain"
+    assert re.search(r"\{\s*v:1,\s*label:\"official Toto2", src), "the 100% rule is missing"
+    flat = re.sub(r"\s+", " ", re.sub(r"</?b>", "", html))
+    assert "no date for reaching parity is predicted" in flat, "the explainer must refuse an ETA"
+    assert "no date for reaching parity is extrapolated" in flat, "the method note must refuse an ETA"
+
+
 def test_links_to_and_from_the_technical_dashboard(html: str):
     """The two dashboards read the same trail; each must be reachable from the
     other so a stakeholder can drill into any headline number."""
