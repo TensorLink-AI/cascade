@@ -222,16 +222,30 @@ gift_gate_data_dir    = "/root/cascade/bench_data"   # TESTNET: pinned GIFT-Eval
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
-# King-of-the-hill — single-round, flat-margin dethroning (teutonic-style).
-# A challenger takes the throne the moment ONE round clears the win margin, and
-# the margin does NOT ramp with the king's tenure: every king is equally
-# challengeable (no "entrenched king" bonus). To restore the sticky/tenure
-# behaviour, set dethrone_cp > 1 and win_margin_end > win_margin_start with
-# margin_warmup_rounds > 0.
-win_margin_start     = 0.02      # flat win margin (kept == win_margin_end ⇒ no tenure ramp)
-win_margin_end       = 0.02      # equal to start; with margin_warmup_rounds = 0 the margin
-                                 # is constant at this value regardless of tenure
-margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup (flat margin)
+# King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
+# (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
+# 0) to end (at margin_warmup_rounds, clamped after); end < start makes the
+# margin DECAY with tenure: a fresh king defends the full 2%, an entrenched
+# king progressively less, floored at win_margin_end. Tenure does NOT reset on
+# a cascade warm-start promotion (only on a real dethrone/resync), so the
+# decay deepens across a whole hold.
+#
+# Candidate schedule under test: start=0.02, end=0.005, warmup=8 — the
+# owner's pick (2026-08-15): a STEEP straight-line ramp (~1.25% by round 4)
+# to the grid's lowest floor, held forever after. The floor, not the ramp
+# speed, is the safety property: 0.5% stays above the bootstrap noise band,
+# so a statistically tied challenger never wins by luck (0.001 was considered
+# and rejected — inside noise, it becomes a slow term-limit lottery). The
+# MAINNET schedule is CONFIRMED against the replay report over the real
+# receipt trail before it ships, release-then-activate
+# (docs/MARGIN_DECAY_ROLLOUT.md) — never a local flip: margin is judged
+# per-validator, so a mixed fleet forks verdicts.
+# HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
+# bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
+win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
+win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
+margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
+                                 # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)
 min_windows          = 80        # TESTNET override (template default 200)
 min_clusters         = 10        # TESTNET override (template default 0). Below this many distinct window clusters (upstream feeds,
                                  # pool metadata `source`), no decision. Windows from one feed
@@ -411,3 +425,10 @@ mode    = "online"              # online | offline | disabled
 # corpus stream opens — the one field that is comparable pod to pod.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round,
+# train the king's generator from scratch post-publish and publish the labeled
+# telemetry report (benchmarks/scratch/) — never feeds scoring/promotion.
+# TESTNET: armed at 2 for the Stage-1 validation cycle (a shadow every ~6h at
+# the 3h cadence; the 0.75h budget keeps the extra leg cheap). Mainnet ships 0
+# until this cycle passes and the owner arms M=4.
+scratch_shadow_every_rounds = 2

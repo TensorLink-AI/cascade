@@ -106,7 +106,10 @@ in-context.
   the existing quality floor (auto-admitted exactly when the lineage stops
   compounding; the one sanctioned crossing of DEC-CA-0013's generation band);
   (3) a second random-init THRONE only if shadows show the two regimes crown
-  different generators. NOT built yet — Stage 1 is next.
+  different generators. Stage 1 BUILT 2026-08-15 (`[telemetry]
+  scratch_shadow_every_rounds`, signed `benchmarks/scratch/` reports,
+  consensus-inert, rides the pinned worker CLI; testnet armed M=2) — one-cycle
+  testnet validation (docs/SCRATCH_SHADOW.md) gates mainnet M=4.
   (`decisions/DEC-CA-0014-scratch-control-staged.md`)
 
 - **DEC-CA-0015** — Promotion members selected by MEASURED error decorrelation
@@ -116,6 +119,25 @@ in-context.
   k=5 needs release-then-activate. Correlation source is the private-pool
   battery until raw GIFT rows are persisted beside bench reports.
   (`decisions/DEC-CA-0015-promotion-error-decorrelation-selection.md`)
+
+- **DEC-CA-0016** — Dethrone margin DECAYS with king tenure (affine schedule in
+  reverse: 2% → 0.5% over 8 rounds; floor must stay > 0 — it is the safety
+  property, above the bootstrap noise band). Tenure survives warm-start
+  promotion, so decay deepens across a hold. ACTIVE, ARMED AT RELEASE (owner
+  2026-08-15): chain.toml ships the live schedule, so the release IS the
+  activation — all 6 external validators upgrade in one coordinated window or
+  verdicts fork (docs/MARGIN_DECAY_ROLLOUT.md); receipt replay
+  (`scripts/replay_margin_decay.py`) runs pre-release for the announcement.
+  (`decisions/DEC-CA-0016-tenure-decay-margin.md`)
+
+- **DEC-CA-0017** — Promotion no-downgrade guard: a ripe reign whose best
+  candidate benches WORSE than the live generation's best member HOLDS (clock
+  stays ripe, candidates accumulate, fires on the first equal-or-better) —
+  the shared init never ratchets downhill. Pure trainer policy (DEC-CA-0013),
+  zero consensus impact. Global all-time top-k pool considered and REJECTED
+  (winner's-curse freeze + Goodhart lock-in + envelope is reign-scoped);
+  basin escape stays with DEC-CA-0014's staged path.
+  (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
