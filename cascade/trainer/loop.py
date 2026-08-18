@@ -86,6 +86,20 @@ ScreenFn = Callable[
     [Path, "ResolvedGenerator", int, int | None], "float | list[WindowScore]"
 ]
 
+# Scores the INCREMENTAL tie run-off windows for one heat checkpoint
+# (DEC-CA-0012): windows ``[start, stop)`` of the round's seeded window
+# permutation, on CPU, against the heat checkpoint still on local disk. The
+# round's window selection is a seeded permutation PREFIX, so the heat's slice
+# is a strict prefix of the run-off's larger slice for the same round seed —
+# the caller concatenates the returned scores onto the heat's and pairing
+# holds by construction (``joint_bag_geomeans`` raises on mismatched
+# ``abs_target``). Args mirror ScreenFn plus ``(start, stop)``. Injected so
+# the run-off stays a testable boundary; the default wiring (same pool source
+# as the screener) is attached in cascade.trainer.main.
+RunoffFn = Callable[
+    [Path, "ResolvedGenerator", int, int | None, int, int], "list[WindowScore]"
+]
+
 # Scores one final-duel checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
 # BenchScores the trainer publishes in the round's signed bench report
@@ -511,6 +525,29 @@ def _drop_final_content_clones(
     return kept
 
 
+def _final_repo_suffix(
+    jobs: list[tuple[ResolvedGenerator, str]],
+    gen: ResolvedGenerator,
+    role: str,
+) -> str:
+    """Checkpoint-repo/work-dir disambiguator for a final-stage run.
+
+    A final's checkpoint repo and work dir are keyed ``<seed>-<role>-<size>``,
+    which is unique only while at most ONE challenger trains per size. A
+    DEC-CA-0012 cohort puts several challengers in the final at the same size,
+    so — exactly like the remote heat's ``-heat-u<uid>`` — each cohort
+    challenger gets a per-uid suffix and cannot overwrite a peer's checkpoint
+    or repo. Empty for the king and for a single-challenger final, so every
+    pre-cohort round keeps its exact repo names and ``trained_pointer`` bytes
+    (the inert-default bit-identity DEC-CA-0012 requires).
+    """
+    if role != "challenger":
+        return ""
+    if sum(1 for _, r in jobs if r == "challenger") <= 1:
+        return ""
+    return f"-u{gen.uid}"
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -528,6 +565,14 @@ class TrainerRunner:
     # field down to [round] finalists before the expensive final. None ⇒ no
     # internal screen (the field's natural order is taken). Wired in trainer.main.
     screen_fn: ScreenFn | None = None
+    # Tie run-off screener (DEC-CA-0012): scores the incremental windows
+    # [start, stop) of the round's seeded window slice for one heat checkpoint,
+    # so a statistically tied heat top can be re-scored on a larger eval before
+    # GPU lanes are spent on it. Consulted only when [round] max_finalists > 1
+    # AND tie_runoff_windows > 0. None ⇒ no run-off (a tied top advances by the
+    # heat ranking, capped). Wired in trainer.main off the same pool source as
+    # screen_fn — same permutation, so the slices concatenate paired.
+    runoff_fn: RunoffFn | None = None
     # Eval-pool pin: ``(base_seed, block) -> (key, sha256)`` provenance of the
     # pool snapshot this round screens on, stamped (and therefore signed) into
     # the manifest so validators verify their own snapshot selection against it
@@ -1436,7 +1481,7 @@ class TrainerRunner:
             update_heat_index,
         )
 
-        n = max(0, self.cfg.round.finalists)
+        n = max(0, self.cfg.round.finalist_cap)
         if screened == 0:
             reason = "no eligible challengers entered the round"
         elif self.screen_fn is None:
@@ -2578,6 +2623,22 @@ class TrainerRunner:
         jobs += [(c, "challenger") for c in finalists]
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
+        if len(finalists) > 1:
+            # DEC-CA-0012: stamp the advancing cohort's record order — 0-based,
+            # best observed heat geomean first. Record order ONLY: the
+            # validator sorts on (duel_rank, hotkey), judges the WHOLE cohort,
+            # and crowns the best margin-clearer, so this never decides the
+            # throne. A single finalist keeps the field default (0, dropped
+            # from the canonical body), so those manifests hash exactly as
+            # before. Stamped before the content-clone drop below — a dropped
+            # clone leaves a non-contiguous rank, which consumers tolerate
+            # (they sort, never index).
+            order = {c.hotkey: i for i, c in enumerate(finalists)}
+            entries = [
+                replace(e, duel_rank=order[e.miner_hotkey])
+                if e.role == "challenger" and e.miner_hotkey in order else e
+                for e in entries
+            ]
         entries = _drop_final_content_clones(entries, jobs)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
@@ -2636,8 +2697,10 @@ class TrainerRunner:
 
         Each challenger is trained for ``[round] heat_train_hours`` on the primary
         (smallest) size and scored by the injected ``screen_fn`` (lower is
-        better); the cheapest ``finalists`` advance, UID breaking ties for
-        determinism. When the field already fits within ``finalists``, or no
+        better); the cheapest ``finalists`` advance, ``(reveal_block, uid)``
+        breaking ties for determinism (a UID is not a seniority claim — it
+        recycles; the reveal block is). When the field already fits within
+        the finalist cap, or no
         ``screen_fn`` is wired, the field's natural order (lowest UID first) is
         taken without spending heat compute. A challenger that fails to train or
         screen is dropped (it simply doesn't qualify).
@@ -2650,15 +2713,25 @@ class TrainerRunner:
         Returns ``(finalists, heat)`` where ``heat`` is the informational
         standings the dashboard shows every entrant (:class:`HeatResult`), or
         ``None`` when no screen actually ran (no compute was spent to rank).
+
+        With ``[round] max_finalists > 1`` the finalist count responds to the
+        screen's own decisiveness statistic instead (DEC-CA-0012): a leader the
+        screen separated advances alone; a statistically tied top is re-scored
+        on a larger eval slice (the tie run-off) and the survivors advance,
+        capped — see :meth:`_advance_cohort`. At the shipped default
+        (``max_finalists = 1``) that path never runs and the behaviour above is
+        bit-identical.
         """
         n = max(0, self.cfg.round.finalists)
-        if not challengers or n == 0:
+        armed = self.cfg.round.max_finalists > 1
+        cap = max(0, self.cfg.round.finalist_cap)
+        if not challengers or cap == 0:
             return [], None
-        if self.screen_fn is None or len(challengers) <= n:
-            if self.screen_fn is None and len(challengers) > n:
+        if self.screen_fn is None or len(challengers) <= cap:
+            if self.screen_fn is None and len(challengers) > cap:
                 log.warning("no screen_fn wired; taking %d of %d challengers by UID order",
-                            n, len(challengers))
-            return list(challengers[:n]), None
+                            cap, len(challengers))
+            return list(challengers[:cap]), None
 
         # for_hours scales the token budget AND the hard wall-clock cap to the
         # cheap heat budget — the run stops at whichever is reached first, so a
@@ -2721,16 +2794,146 @@ class TrainerRunner:
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
 
-        scored.sort(key=lambda t: (t[0], t[1]))  # lower score better; UID tiebreak
-        winners = [c for _, _, c in scored[:n]]
+        # Lower score better; ties break on (reveal_block, uid) — a UID is not
+        # a seniority claim (Bittensor recycles them), the reveal block is
+        # (DEC-CA-0012; NOTE-ca-operational-invariants).
+        scored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
+        if armed:
+            ckpt_dirs = {c.hotkey: d for c, d, _ in trained}
+            winners = self._advance_cohort(scored, components, diagnostics,
+                                           seeds, screen_block, cap, ckpt_dirs)
+        else:
+            winners = [c for _, _, c in scored[:n]]
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
-        diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         heat = self._heat_result(
-            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
+            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset,
+            len(winners) if armed else n,
             duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
         )
         return winners, heat
+
+    def _advance_cohort(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        components: dict[str, list],
+        diagnostics,
+        seeds: RoundSeeds,
+        screen_block: int | None,
+        cap: int,
+        ckpt_dirs: dict[str, Path],
+    ) -> list[ResolvedGenerator]:
+        """The DEC-CA-0012 advance rule, armed only (``max_finalists > 1``).
+
+        A leader the screen separated from every other entrant (paired LCB > 0
+        off the joint bootstrap, :func:`cascade.eval.heat.tied_set`) advances
+        ALONE, whatever the cap. A statistically tied top is re-scored on a
+        larger eval slice when the run-off is wired (:meth:`_tie_runoff`); the
+        survivors advance, capped at ``max_finalists``. With the run-off
+        disabled (or unable to finish) the pre-run-off tied set advances,
+        capped, in heat-rank order.
+
+        Degrades safely: a scalar-only screener or an unpaired field carries no
+        diagnostics, and ``tied_set`` then returns the leader alone — exactly
+        the pre-DEC-CA-0012 single-finalist behaviour.
+        """
+        from ..eval.heat import tied_set
+
+        ranked = [c for _, _, c in scored]
+        keys = [c.hotkey for c in ranked]
+        by_key = {c.hotkey: c for c in ranked}
+        runoff_on = self.runoff_fn is not None and self.cfg.round.tie_runoff_windows > 0
+        # The run-off re-scores the WHOLE tied set (CPU minutes, wall-clock
+        # capped), so it is derived uncapped; without a run-off the cap applies
+        # immediately. GPU spend is bounded by the cap either way.
+        tied = tied_set(diagnostics, keys, cap=(len(keys) if runoff_on else cap))
+        if len(tied) <= 1:
+            log.info("heat: screen separated the leader (%s); it advances alone",
+                     keys[0])
+            return ranked[:1]
+        if runoff_on:
+            survivors = self._tie_runoff(tied, by_key, components, seeds,
+                                         screen_block, cap, ckpt_dirs)
+            if survivors is not None:
+                return survivors
+        log.info("heat: tied top of %d advances capped at %d (no run-off verdict)",
+                 len(tied), cap)
+        return [by_key[k] for k in tied[:cap]]
+
+    def _tie_runoff(
+        self,
+        tied_keys: list[str],
+        by_key: dict[str, ResolvedGenerator],
+        components: dict[str, list],
+        seeds: RoundSeeds,
+        screen_block: int | None,
+        cap: int,
+        ckpt_dirs: dict[str, Path],
+    ) -> list[ResolvedGenerator] | None:
+        """Re-score the tied heat top on a larger eval slice (DEC-CA-0012).
+
+        CPU-only, on the orchestrator, against heat checkpoints still on local
+        disk — no retraining, no GPU rent. Scores only the windows the heat has
+        NOT already scored: the round's window selection is a seeded
+        permutation prefix, so the heat's slice is a strict prefix of the
+        ``[round] tie_runoff_windows`` slice for the same round seed; the
+        incremental scores are concatenated onto the heat's and pairing holds
+        by construction. The extended field is then re-ranked and the tied set
+        re-derived at the same uncorrected bar; the survivors (capped) are
+        returned best-first.
+
+        Runs under the ``tie_runoff_phase_seconds`` wall clock. Returns
+        ``None`` when the run-off cannot run or finish (no incremental windows,
+        clock expiry, a scoring failure) — the caller falls back to the
+        pre-run-off tied set, because a screen that cannot finish must not
+        sink the round it protects.
+        """
+        from ..eval.heat import screen_diagnostics, tied_set
+        from ..eval.scoring import global_geomean
+
+        rnd = self.cfg.round
+        n_heat = len(components[tied_keys[0]])
+        n_total = min(rnd.tie_runoff_windows, self.cfg.eval.n_windows)
+        if n_total <= n_heat:
+            log.info("heat: tie run-off skipped: tie_runoff_windows=%d adds no windows "
+                     "beyond the %d the heat already screened", rnd.tie_runoff_windows, n_heat)
+            return None
+        deadline = time.monotonic() + max(0, rnd.tie_runoff_phase_seconds)
+        extended: dict[str, list] = {}
+        for key in tied_keys:
+            if time.monotonic() >= deadline:
+                log.warning("heat: tie run-off wall clock (%ds) expired with %d/%d "
+                            "re-scored; falling back to the pre-run-off tied set",
+                            rnd.tie_runoff_phase_seconds, len(extended), len(tied_keys))
+                return None
+            try:
+                extra = self.runoff_fn(ckpt_dirs[key], by_key[key], seeds.base_seed,
+                                       screen_block, n_heat, n_total)
+                extended[key] = list(components[key]) + list(extra)
+            except Exception as e:  # noqa: BLE001 — the run-off must never sink a round
+                log.warning("heat: tie run-off failed on %s: %s; falling back to the "
+                            "pre-run-off tied set", key, e)
+                return None
+        rescored = [(global_geomean(extended[k]), by_key[k].uid, by_key[k])
+                    for k in tied_keys]
+        rescored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        ranked_keys = [c.hotkey for _, _, c in rescored]
+        try:
+            diag = screen_diagnostics(
+                [(k, extended[k]) for k in ranked_keys],
+                seed=seeds.base_seed,
+                B=self.cfg.scoring.bootstrap_B,
+                alpha=self.cfg.scoring.bootstrap_alpha,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("heat: tie run-off diagnostics unavailable: %s; falling back "
+                        "to the pre-run-off tied set", e)
+            return None
+        survivors = tied_set(diag, ranked_keys, cap=cap)
+        log.info("heat: tie run-off on %d windows: %d tied → %d advance: %s",
+                 n_total, len(tied_keys), len(survivors), survivors)
+        return [by_key[k] for k in survivors]
 
     @staticmethod
     def _screen_score(raw: object) -> float:
@@ -3137,6 +3340,7 @@ class TrainerRunner:
                 entries.append(
                     self.train_one(gen, role, seeds, block,
                                    contract=contract, token_budget=token_budget,
+                                   repo_suffix=_final_repo_suffix(jobs, gen, role),
                                    warm_start_ref=warm_start_ref)
                 )
             except Exception as e:  # noqa: BLE001
@@ -3174,6 +3378,10 @@ class TrainerRunner:
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
             used: list = []
+            # Cohort finals need per-uid checkpoint repos (see
+            # _final_repo_suffix); forwarded only when non-empty so a
+            # single-challenger round's dispatch stays byte-identical.
+            suffix = _final_repo_suffix(jobs, gen, role)
             entry = self._dispatch_with_retry(
                 disp, hosts, i, describe=f"final {role} {gen.hotkey}",
                 used_host=used,
@@ -3181,6 +3389,7 @@ class TrainerRunner:
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
                 warm_start_ref=warm_start_ref,
+                **({"repo_suffix": suffix} if suffix else {}),
             )
             if used:
                 # Post-publish bench target: the pod actually holding this

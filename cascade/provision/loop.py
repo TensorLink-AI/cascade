@@ -590,6 +590,10 @@ class ProvisionerLoop:
             self.epoch_hours_at(round_id),
             self.final_hours,
             self.policy,
+            # DEC-CA-0012: size the final off the tie-aware cohort CAP so the
+            # pre-phased fleet and the budget breaker cover the worst case
+            # (absent from a pre-cap plan payload ⇒ 0 ⇒ finalists alone).
+            max_finalists=int(payload.get("max_finalists", 0)),
         )
         log.info("round %d plan: eligible=%s screened=%s → heat %d pod(s)/%d slot(s), "
                  "final %d pod(s)/%d slot(s)",
@@ -861,7 +865,11 @@ class ProvisionerLoop:
         except Exception:  # noqa: BLE001 — a torn/odd marker falls back to the plan
             pass
         if self._round_plan is not None:
-            return 1 + int(self._round_plan["finalists"])
+            # Pre-marker prediction: cover the tie-aware cohort CAP
+            # (DEC-CA-0012) — the marker, once it fires, shrinks this to the
+            # actual finalist list.
+            return 1 + max(int(self._round_plan["finalists"]),
+                           int(self._round_plan.get("max_finalists", 0)))
         return 2
 
     def _maybe_rent_final_jit(self, block: int) -> None:
@@ -959,7 +967,8 @@ class ProvisionerLoop:
                     continue
                 refleet = size_fleet(_heat_field(plan),
                                      int(plan["finalists"]), heat_hours,
-                                     remaining, self.final_hours, self.policy)
+                                     remaining, self.final_hours, self.policy,
+                                     max_finalists=int(plan.get("max_finalists", 0)))
                 if refleet.heat.pods > 0:
                     wants["heat"] = refleet.heat.slots
                 else:

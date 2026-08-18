@@ -420,6 +420,29 @@ class RoundConfig:
     heat_guard_factor: float = 1.0
     heat_guard_floor_seconds: int = 900
     finalists: int = 1                # challengers promoted from the heat to the final
+    # ── Tie-aware finalists (DEC-CA-0012, trainer half) — inert at defaults ──
+    # ``max_finalists > 1`` arms the tie-aware advance rule: a leader the
+    # screen's own statistic separated from the runner-up (paired LCB > 0, the
+    # ``lcb_vs`` diagnostic in cascade.eval.heat) advances ALONE whatever the
+    # cap; a statistically tied top is re-scored on a larger eval slice (the
+    # run-off below) and whoever still cannot be separated advances too,
+    # capped here. The validator then duels the WHOLE cohort under a
+    # family-wise alpha/k. At the default 1 the tie logic never runs — exactly
+    # one finalist advances as before and every manifest hashes identically.
+    max_finalists: int = 1
+    # Total eval windows the tie run-off re-scores the tied set on (CPU-only,
+    # on the orchestrator, against heat checkpoints still on local disk).
+    # Only the INCREMENTAL windows beyond the heat's slice are scored — the
+    # round's window selection is a seeded permutation prefix, so the heat's
+    # slice is a strict prefix of this one and pairing holds by construction.
+    # Clamped to [eval] n_windows; must exceed the heat's actual window count
+    # to add evidence. 0 = no run-off: a tied top advances by the heat
+    # ranking, capped at ``max_finalists``.
+    tie_runoff_windows: int = 0
+    # Wall clock for the WHOLE run-off, mirroring ``dedup_phase_seconds``: on
+    # expiry the pre-run-off tied set advances (capped) — a screen that cannot
+    # finish must not sink the round it protects. Inert while max_finalists=1.
+    tie_runoff_phase_seconds: int = 900
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
@@ -541,6 +564,20 @@ class RoundConfig:
     # too short for a copier to fetch + re-commit + land their own reveal.
     # ~25 blocks ≈ 5 min at 12s blocks; tighten after measuring live jitter.
     reveal_margin_blocks: int = 25
+
+    @property
+    def finalist_cap(self) -> int:
+        """Upper bound on challengers the heat may advance (DEC-CA-0012).
+
+        The legacy constant while the tie logic is off (``max_finalists <= 1``),
+        else ``max(finalists, max_finalists)``. The heat's fast paths and the
+        provisioner's final-fleet sizing must share this bound so the
+        pre-phased fleet and the ``within_budget`` breaker always cover the
+        worst case the advance rule can produce.
+        """
+        if self.max_finalists > 1:
+            return max(self.finalists, self.max_finalists)
+        return self.finalists
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1193,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             heat_guard_factor=float(r.get("heat_guard_factor", 1.0)),
             heat_guard_floor_seconds=int(r.get("heat_guard_floor_seconds", 900)),
             finalists=int(r.get("finalists", 1)),
+            max_finalists=int(r.get("max_finalists", 1)),
+            tie_runoff_windows=int(r.get("tie_runoff_windows", 0)),
+            tie_runoff_phase_seconds=int(r.get("tie_runoff_phase_seconds", 900)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
