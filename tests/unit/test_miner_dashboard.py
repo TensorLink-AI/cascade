@@ -18,6 +18,8 @@ from cascade.miner.dashboard import (
     LiveFeed,
     PhaseEstimate,
     RoundTimeline,
+    current_king_tenure,
+    dethrone_bar_line,
     duel_round_rows,
     fetch_public_heat,
     fetch_public_heat_index,
@@ -699,6 +701,55 @@ def test_heat_registered_in_parser():
     with pytest.raises(SystemExit) as e:
         cli.main(["heat", "--help"])
     assert e.value.code == 0
+
+
+# ── dethrone bar (tenure-decayed margin, DEC-CA-0016) ────────────────────────
+
+
+def _scoring(start=0.02, end=0.005, warmup=8):
+    from cascade.shared.config import ScoringConfig
+    return ScoringConfig(
+        win_margin_start=start, win_margin_end=end, margin_warmup_rounds=warmup,
+        min_windows=64, bootstrap_B=1000, bootstrap_alpha=0.05, dethrone_cp=1,
+    )
+
+
+def _tenure_row(esb, king="5King" + "k" * 43, *, dethroned=False, status="scored"):
+    return {"status": status, "epoch_start_block": esb,
+            "post_round_king_hotkey": king, "dethroned": dethroned}
+
+
+def test_current_king_tenure_counts_consecutive_holds():
+    # crowned at 100 (dethroned row), then five holds → tenure 5 entering next
+    rows = [_tenure_row(100, dethroned=True)] + [
+        _tenure_row(100 + 10 * i) for i in range(1, 6)]
+    assert current_king_tenure({"rounds": rows}) == 5
+    # a fresh dethrone as the latest round → tenure 0
+    rows.append(_tenure_row(200, king="5New" + "n" * 44, dethroned=True))
+    assert current_king_tenure({"rounds": rows}) == 0
+    # rejected rows are ignored; empty/None index gives None
+    assert current_king_tenure({"rounds": [_tenure_row(1, status="rejected")]}) is None
+    assert current_king_tenure(None) is None
+
+
+def test_dethrone_bar_line_applies_the_affine_schedule():
+    doc = {"rounds": [_tenure_row(100, dethroned=True)] + [
+        _tenure_row(100 + 10 * i) for i in range(1, 7)]}   # tenure 6
+    line = dethrone_bar_line(doc, _scoring())
+    assert "LCB > 0.875%" in line and "tenure 6" in line and "floor 0.50%" in line
+    # at/past warmup the line says it sits at the floor
+    doc["rounds"] += [_tenure_row(200 + 10 * i) for i in range(3)]  # tenure 9
+    assert "at the 0.50% floor" in dethrone_bar_line(doc, _scoring())
+    # flat schedule (decay off) or no index → omitted
+    assert dethrone_bar_line(doc, _scoring(start=0.02, end=0.02)) is None
+    assert dethrone_bar_line(None, _scoring()) is None
+
+
+def test_render_includes_bar_line_only_when_given():
+    st = round_status(1_000, RoundConfig(epoch_blocks=7_200, round_hours=24.0))
+    bar = "  dethrone bar    LCB > 0.875% this round  (king tenure 6; floor 0.50% at tenure 8)"
+    assert bar in render(st, "finney", bar_line=bar)
+    assert "dethrone bar" not in render(st, "finney")
 
 
 # ── `cascade duel` — settled-round breakdown ─────────────────────────────────
