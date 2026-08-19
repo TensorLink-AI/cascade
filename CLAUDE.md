@@ -139,6 +139,19 @@ in-context.
   basin escape stays with DEC-CA-0014's staged path.
   (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
 
+- **DEC-CA-0018** (PROPOSED, not implemented) — Miner feedback breaks down by
+  facet: the heat score decomposed per entrant over `domain` / `freq` / computed
+  `shape` / quantile band, with `gap_share` (a cell's signed contribution to the
+  entrant's total deficit, sums to 1) as the prioritisation number and
+  `rel_median` separating a miner's weakness from a cell the whole field finds
+  hard. A pure reduction over scores `_run_heat` already holds (zero extra GPU);
+  exact only because DEC-CA-0009 made both halves per-window geomeans; rides
+  DEC-CA-0011's unsigned heat document. SHADOW ONLY — gates nothing, ever. No
+  `source`/`series_id`/`dgp_class` breakout. Staged: local `cascade score
+  --breakdown` first, publish second.
+  (`decisions/DEC-CA-0018-generator-weakness-profile.md`, spec
+  `docs/WEAKNESS_PROFILE.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.
