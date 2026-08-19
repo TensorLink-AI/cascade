@@ -255,6 +255,11 @@ _STORAGE_FAILURE_MARKERS = (
     "generator_artifact_unreachable",
 )
 STORAGE_RETRY_BACKOFF_SECONDS = 45.0
+# Cool-down before a re-queued heat challenger is dispatched again. Longer than
+# the in-dispatch storage backoff: a re-queue means the dispatch AND its retry
+# both died, so whatever ate them (registry brown-out, provider network blip)
+# gets time to pass while other lanes keep training.
+HEAT_REQUEUE_COOLDOWN_SECONDS = 120.0
 
 
 def _storage_failure(exc: BaseException) -> bool:
@@ -264,6 +269,74 @@ def _storage_failure(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return any(m in msg for m in _STORAGE_FAILURE_MARKERS)
+
+
+def _infra_failure(exc: BaseException) -> bool:
+    """True when a heat failure is the INFRASTRUCTURE's fault, not the
+    challenger's: the storage layer (Hippius fetch/push) or the SSH transport
+    (rc=255 — connection lost, never the remote command's own exit)."""
+    return _storage_failure(exc) or getattr(exc, "returncode", None) == 255
+
+
+def _run_heat_field(run_fn, challengers, *, max_workers: int, requeues: int,
+                    cooldown_seconds: float, note_progress, storage_dropped,
+                    sleep=time.sleep):
+    """Run every challenger through ``run_fn`` concurrently, re-queueing
+    infrastructure casualties in the SAME heat.
+
+    A challenger whose dispatch (and its in-dispatch retry) died on an infra
+    failure — storage layer or SSH transport — goes back into the pool up to
+    ``requeues`` times, after ``cooldown_seconds``; the 2026-08-19 datacenter
+    blip terminally dropped three challengers whose retries happened to be the
+    runs in flight. Challenger-fault failures (their generator raising, OOM,
+    the guard) never re-queue, so there is no free-retry surface for bad code.
+
+    Returns ``(out, terminal_transport_failures)`` — the latter feeds the
+    caller's dead-fleet wipeout check, counting only challengers that EXHAUSTED
+    their attempts at the transport level. ``storage_dropped`` maps hotkey→ref
+    for terminal storage drops (the burn-exemption candidates), matching the
+    old inline behaviour.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+    from concurrent.futures import wait as futures_wait
+
+    out = []
+    transport_failures = 0
+    requeues_left = {c.hotkey: max(0, int(requeues)) for c in challengers}
+    total = len(challengers)
+    done = 0
+
+    def _cooled_run(c):
+        sleep(cooldown_seconds)
+        return run_fn(c)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        pending = {ex.submit(run_fn, c): c for c in challengers}
+        while pending:
+            done_futs, _ = futures_wait(list(pending), return_when=FIRST_COMPLETED)
+            for fut in done_futs:
+                c = pending.pop(fut)
+                try:
+                    out.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    if _infra_failure(e) and requeues_left.get(c.hotkey, 0) > 0:
+                        requeues_left[c.hotkey] -= 1
+                        log.warning(
+                            "heat: challenger %s hit an infrastructure failure (%s); "
+                            "re-queueing after %.0fs cool-down (%d re-queue(s) left)",
+                            c.hotkey, e, cooldown_seconds, requeues_left[c.hotkey])
+                        pending[ex.submit(_cooled_run, c)] = c
+                        continue
+                    if getattr(e, "returncode", None) == 255:
+                        transport_failures += 1
+                    if _storage_failure(e):
+                        # Candidate for the burn exemption — re-verified at
+                        # heat settle (see _burn_hotkeys).
+                        storage_dropped[c.hotkey] = c.ref
+                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
+                done += 1
+                note_progress(done, total)
+    return out, transport_failures
 
 
 def _load_commit_witness(path: Path) -> dict[str, dict]:
@@ -3006,7 +3079,7 @@ class TrainerRunner:
         fetch is dropped. The pod's receipt carries the corpus digest, threaded
         through for the content-level duplicate drop."""
         import queue
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         from .remote import RemoteDispatcher, RemoteDispatchError, probe_host
 
@@ -3064,23 +3137,18 @@ class TrainerRunner:
             fetch_from_hub(ref, out_dir, hub)
             return c, out_dir, entry.corpus_digest
 
-        out: list[tuple[ResolvedGenerator, Path, str]] = []
-        transport_failures = 0
-        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-            futs = {ex.submit(_run, c): c for c in challengers}
-            for done, fut in enumerate(as_completed(futs), start=1):
-                c = futs[fut]
-                try:
-                    out.append(fut.result())
-                except Exception as e:  # noqa: BLE001
-                    if getattr(e, "returncode", None) == 255:
-                        transport_failures += 1
-                    if _storage_failure(e):
-                        # Candidate for the burn exemption — re-verified at
-                        # heat settle (see _burn_hotkeys).
-                        self._storage_dropped[c.hotkey] = c.ref
-                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
-                self._note_heat_progress(done, len(challengers))
+        # +2 executor headroom over the lane count: a re-queued challenger
+        # sleeps its cool-down inside a pool thread WITHOUT holding a lane
+        # (lane occupancy is the free_lanes queue), so sleepers must not
+        # starve dispatchable threads.
+        out, transport_failures = _run_heat_field(
+            _run, challengers,
+            max_workers=max(1, len(hosts)) + 2,
+            requeues=self.cfg.round.heat_infra_requeues,
+            cooldown_seconds=HEAT_REQUEUE_COOLDOWN_SECONDS,
+            note_progress=self._note_heat_progress,
+            storage_dropped=self._storage_dropped,
+        )
         # A heat where EVERY dispatch died at the transport level (rc=255) is a
         # dead-fleet wipeout, not a screened-out field: refuse to let the caller
         # cache a 0/N heat as complete (a king-only manifest would publish).
