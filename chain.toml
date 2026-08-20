@@ -185,6 +185,10 @@ heat_num_samples = 100    # sample forecasts per window in the heat (0 = reuse [
 # the reference box, else every heat time-truncates.
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 900
+# In-round re-queues for challengers whose heat dispatch died on an
+# INFRASTRUCTURE failure (storage layer / ssh transport) — miner-fault
+# failures never re-queue. 0 restores terminal drops.
+heat_infra_requeues      = 2
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
 # Anti-spam: a challenger hotkey that has entered a heat is burned and must
 # re-register to resubmit. Set false only on a throwaway testnet.
