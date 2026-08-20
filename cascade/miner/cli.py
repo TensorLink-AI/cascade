@@ -349,6 +349,7 @@ def _cmd_round(args: argparse.Namespace) -> int:
             status_fetch=lambda: fetch_public_round_status(cfg.storage),
             heat_fetch=lambda: fetch_public_heat(cfg.storage),
             me=args.hotkey,
+            scoring=cfg.scoring,
         )
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)
