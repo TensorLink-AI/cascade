@@ -29,6 +29,18 @@ REF_D = "dave/gen-d@sha256:" + "d" * 64
 REF_OUT = "cascade/ckpt-out@sha256:" + "e" * 64
 
 
+@pytest.fixture()
+def cfg(cfg):
+    """This module pins the LEGACY single-finalist screen mechanics, and its
+    fields are tiny (<= 3 challengers). The shipped toml arms the DEC-CA-0012
+    cohort cap (max_finalists = 3) since 2026-08-20, under which a field that
+    fits within the cap skips the screen entirely — so force the inert cap
+    here; the armed path is pinned in test_tie_aware_finalists.py."""
+    from dataclasses import replace
+
+    return replace(cfg, round=replace(cfg.round, max_finalists=1))
+
+
 class _FakeStream:
     n_series = 3
     total_points = 192

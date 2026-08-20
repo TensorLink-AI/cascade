@@ -171,20 +171,19 @@ heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [ev
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
-# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — SHIPS INERT here too;
-# this file is where it arms FIRST. With max_finalists > 1 a leader the screen
-# separated advances alone; a statistically tied top is re-scored on the larger
-# tie_runoff_windows slice (CPU-only, incremental windows via the seeded-prefix
-# property) and the survivors advance, capped. Full semantics + the two
+# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED here FIRST
+# (2026-08-20, DEC-CA-0012 rollout order). With max_finalists > 1 a leader the
+# screen separated advances alone; a statistically tied top advances capped.
+# The tie RUN-OFF stays 0: its incremental draw relies on the seeded-prefix
+# property, which the jittered mix (DEC-CA-0019, active here from block 1)
+# does not provide — see the NOTE in chain.toml. Full semantics + the two
 # pre-arm couplings (deployed-fleet check at 1 + max_finalists slots; [eval]
-# bench_hold_max_hours is sized for k = 1) are documented in chain.toml.
-# TO ARM ON TESTNET: max_finalists = 3, tie_runoff_windows > heat_n_windows
-# (e.g. 256 against the 64-window screen; clamped at [eval] n_windows), trainer
-# and validator restarted together. Mainnet stays unarmed until a full testnet
-# round has produced a genuine multi-finalist cohort duel AND cascade-audit has
-# replayed it (DEC-CA-0012 rollout order).
-max_finalists      = 1    # cap on the advancing tied cohort (1 = tie logic OFF)
-tie_runoff_windows = 0    # total windows the tie run-off re-scores on (0 = no run-off)
+# bench_hold_max_hours sizing) are documented in chain.toml.
+# GATE FOR MAINNET: a full testnet round producing a genuine multi-finalist
+# cohort duel AND a cascade-audit replay of it, trainer and validator
+# restarted together.
+max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20)
+tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see chain.toml NOTE
 tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)

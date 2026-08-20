@@ -94,20 +94,26 @@ def _commits(*blocks_by_hotkey: tuple[int, str, str, int]):
     return [_commit(uid, hk, ref, blk) for uid, hk, ref, blk in blocks_by_hotkey]
 
 
-# ── config: both shipped tomls stay inert ────────────────────────────────────
+# ── config: both shipped tomls arm the cap; the run-off MUST stay off ────────
 
 
-def test_new_round_keys_ship_inert_in_both_chain_tomls():
+def test_round_keys_ship_armed_cap_and_runoff_off():
+    """ARMED AT RELEASE (owner 2026-08-20): both tomls ship max_finalists = 3.
+    tie_runoff_windows staying 0 is load-bearing, not a default: the run-off's
+    incremental draw assumes the seeded-prefix property, which the jittered
+    mix (DEC-CA-0019) does not provide — see the NOTE in chain.toml."""
     for name in ("chain.toml", "chain.testnet.toml"):
         r = load_chain_config(REPO_ROOT / name).round
-        assert r.max_finalists == 1, f"{name} must ship the tie logic OFF"
-        assert r.tie_runoff_windows == 0, f"{name} must ship the run-off OFF"
+        assert r.max_finalists == 3, f"{name} must ship the tie cohort armed"
+        assert r.tie_runoff_windows == 0, f"{name} must ship the run-off OFF (jitter)"
 
 
-def test_finalist_cap_is_legacy_until_armed(cfg):
-    assert cfg.round.finalist_cap == cfg.round.finalists == 1
-    assert replace(cfg.round, max_finalists=3).finalist_cap == 3
+def test_finalist_cap_follows_max_finalists(cfg):
+    assert cfg.round.finalists == 1
+    assert cfg.round.max_finalists == 3          # armed in the shipped toml
+    assert cfg.round.finalist_cap == 3
     # max_finalists <= 1 is OFF: the legacy constant rules even if larger.
+    assert replace(cfg.round, max_finalists=1).finalist_cap == 1
     assert replace(cfg.round, finalists=2, max_finalists=1).finalist_cap == 2
     assert replace(cfg.round, finalists=2, max_finalists=3).finalist_cap == 3
 
@@ -119,8 +125,10 @@ def test_inert_defaults_advance_one_even_when_statistically_tied(cfg, tmp_path, 
     """max_finalists = 1 / tie_runoff_windows = 0: an exact statistical tie at
     the top still advances exactly ONE finalist, the run-off is never consulted,
     and duel_rank never reaches the serialised manifest — so these manifests
-    hash exactly as they did before the feature existed."""
+    hash exactly as they did before the feature existed. (The shipped toml is
+    armed since 2026-08-20, so inert is forced explicitly here.)"""
     _patch_train_boundaries(monkeypatch)
+    cfg = _round_cfg(cfg, max_finalists=1)
     scores = {"b": _pw(1.0, seed=1), "c": _pw(1.0, seed=1),   # exact tie
               "d": _pw(1.5, seed=3)}
     runner = _runner(cfg, tmp_path, _screen_for(scores), runoff_fn=_never_runoff)
@@ -285,8 +293,11 @@ def test_runoff_scoring_failure_falls_back_to_the_tied_set(cfg, tmp_path, monkey
 
 def test_heat_tiebreak_prefers_earlier_reveal_over_lower_uid(cfg, tmp_path, monkeypatch):
     """Equal scores: the LOWER-uid challenger loses to the EARLIER-revealed one
-    — a UID recycles, so it is not a seniority claim (DEC-CA-0012)."""
+    — a UID recycles, so it is not a seniority claim (DEC-CA-0012). Cap forced
+    to 1 so this small field is actually screened (a field <= finalist_cap
+    skips the heat and advances whole)."""
     _patch_train_boundaries(monkeypatch)
+    cfg = _round_cfg(cfg, max_finalists=1)
     scores = {"b": 0.5, "c": 0.5, "d": 0.9}
     runner = _runner(cfg, tmp_path,
                      lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
@@ -299,6 +310,7 @@ def test_heat_tiebreak_prefers_earlier_reveal_over_lower_uid(cfg, tmp_path, monk
 
 def test_heat_tiebreak_falls_to_uid_when_reveals_match(cfg, tmp_path, monkeypatch):
     _patch_train_boundaries(monkeypatch)
+    cfg = _round_cfg(cfg, max_finalists=1)   # force a real screen (see above)
     scores = {"b": 0.5, "c": 0.5}
     runner = _runner(cfg, tmp_path,
                      lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])

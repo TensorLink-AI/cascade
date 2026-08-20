@@ -244,8 +244,9 @@ heat_guard_floor_seconds = 900
 # failures never re-queue. 0 restores terminal drops.
 heat_infra_requeues      = 2
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
-# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — SHIPS INERT, DO NOT
-# ARM HERE FIRST. With max_finalists > 1 the finalist count responds to the
+# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED AT RELEASE
+# (owner 2026-08-20, max_finalists = 3). With max_finalists > 1 the finalist
+# count responds to the
 # screen's own statistic: a leader the screen separated from every other
 # entrant (the lcb_vs/leader_lcb diagnostic already logged on the heat block)
 # advances ALONE whatever the cap; a statistically tied top is re-scored on a
@@ -260,27 +261,31 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 # margin-clearer (that half shipped 2026-08-11 and is a no-op at k=1).
 # At these defaults everything is bit-identical to today: one finalist,
 # duel_rank stays 0 on every entry, manifests hash as before.
-# NOTE: tie_runoff_windows only adds evidence if it EXCEEDS the heat's actual
-# window count (clamped at [eval] n_windows). At the current heat_n_windows =
-# 2000 = full-pool screen there is NO headroom — arming the run-off means
-# first lowering heat_n_windows or growing the pool; a run-off with no
-# incremental windows is skipped and the tied set advances capped.
+# NOTE: tie_runoff_windows MUST STAY 0 while the jittered mix (DEC-CA-0019)
+# is active: the run-off scores windows_for_round(seed, stop)[start:], which
+# assumes the draw is a permutation PREFIX. The jittered draw is not — and
+# mix_target_windows overrides the requested size outright, so a "larger"
+# draw returns the same 1200-window list and the tail is overlap, not
+# incremental evidence. A run-off with no incremental windows is skipped and
+# the tied set advances capped (the supported path). Re-arming the run-off
+# needs a jitter-aware incremental draw first (revisit in DEC-CA-0012).
 # ARMING ORDER (not cosmetic; DEC-CA-0012 rollout): testnet arms FIRST
 # (chain.testnet.toml), trainer and validator restarting together. Mainnet
-# stays UNARMED until a full testnet round has produced a genuine
-# multi-finalist cohort duel AND cascade-audit has replayed it — the
-# 2026-07-30 JIT incident existed precisely because a config flip
-# live-exercised a never-run path. BEFORE arming, resize two couplings:
-# (1) run the pre-arm fleet check against the DEPLOYED provisioner config at
-#     1 + max_finalists slots — within_budget must pass at worst case and
-#     final_pods must NOT be clamped by max_pods (a clamped final completes
-#     serially, pushing 3h lanes into the round's tail);
-# (2) [eval] bench_hold_max_hours is sized for k = 1 — the post-publish bench
-#     is SEQUENTIAL per pod, so a cohort needs the hold scaled or the benched
-#     set capped (see DEC-CA-0013's revisit_when), or later cohort members
-#     silently drop out of the promotion candidate pool.
-max_finalists      = 1    # cap on the advancing tied cohort (1 = tie logic OFF)
-tie_runoff_windows = 0    # total windows the tie run-off re-scores on (0 = no run-off)
+# does NOT restart onto this config until a full testnet round has produced
+# a genuine multi-finalist cohort duel AND cascade-audit has replayed it —
+# the 2026-07-30 JIT incident existed precisely because a config flip
+# live-exercised a never-run path. Pre-arm couplings VERIFIED 2026-08-20
+# against the deployed provisioner config:
+# (1) fleet check at 1 + max_finalists = 4 slots: final = ceil(4/2) = 2 pods
+#     = max_pods exactly (NOT clamped); within_budget worst case = 12 heat
+#     pods x $2.60 x 12h + 2 final pods x $3.00 x 12h = $446.40 <= $500;
+# (2) [eval] bench_hold_max_hours raised 6.0 -> 9.0: the post-publish bench
+#     is SEQUENTIAL per pod, so a k=3 cohort is 4 legs; 9h covers them at 2x
+#     the observed ~1h/leg while staying inside the ttl_epochs=1 (12h) pod
+#     lifetime measured from the JIT final rent. Past the hold, later cohort
+#     members drop out of the promotion candidate pool (soft degradation).
+max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20; 1 = tie logic OFF)
+tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see NOTE above
 # Wall clock for the WHOLE run-off, mirroring dedup_phase_seconds: on expiry
 # the pre-run-off tied set advances (capped) — a screen that cannot finish
 # must not sink the round it protects. Inert while max_finalists = 1.
@@ -424,10 +429,13 @@ benchmark_max_series  = 0        # cap datasets/tasks for a fast smoke run; 0 = 
 # provisioner holds the round's FINAL pod for that sweep past its normal
 # teardown signal; the hold releases early when the bench_complete marker
 # lands. Inert while cascade_enabled = false.
-bench_hold_max_hours  = 6.0   # king+challenger bench SEQUENTIALLY on the one final pod
+bench_hold_max_hours  = 9.0   # king+challenger bench SEQUENTIALLY on the one final pod
                               # (same-pod parallel launches preempt each other) — sweep is
                               # ~45-60min WITH data staged; raised 3.0→6.0 (2026-08-07) after
-                              # rate-limited HF downloads on token-less pods ate the 3h hold
+                              # rate-limited HF downloads on token-less pods ate the 3h hold;
+                              # raised 6.0→9.0 (2026-08-20) for DEC-CA-0012 cohorts: a k=3
+                              # cohort benches 4 legs, and 9h stays inside the ttl_epochs=1
+                              # pod lifetime measured from the JIT final rent
                               # twice. Data now pre-pushed from the box at final-rent time.
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators need the data pinned locally.
