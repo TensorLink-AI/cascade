@@ -891,6 +891,21 @@ class ScoringConfig:
     # with a materially worse init.
     cascade_top_k: int = 3
     cascade_quality_epsilon: float = 0.05
+    # Block-gated contract transition (the DEC-CA-0016/0019 release-then-
+    # activate pattern applied to contract_digest itself). When BOTH are set,
+    # a manifest whose epoch-boundary block precedes ``contract_from_block``
+    # is accepted against ``prior_contract_digest`` instead of the digest
+    # recomputed from the local [training] — so validators can restart onto a
+    # release that changes the training contract WITHOUT sacrificing the
+    # round currently in flight under the old contract, and the fleet needs
+    # no synchronized restart window. Rounds at/after the block accept only
+    # the new digest. [scoring] lives outside contract_digest, so these keys
+    # never perturb the digest they gate. "" / 0 = gate off (legacy exact
+    # match). Fleet-consensus values like every [scoring] key: keep identical
+    # across validators. Retire the pin (back to ""/0) in the release AFTER
+    # the transition round is beyond every validator's scoring horizon.
+    prior_contract_digest: str = ""
+    contract_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -1484,6 +1499,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             ),
             cascade_top_k=int(s.get("cascade_top_k", 3)),
             cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
+            prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
+            contract_from_block=int(s.get("contract_from_block", 0) or 0),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

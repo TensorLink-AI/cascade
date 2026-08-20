@@ -200,11 +200,21 @@ def check_block_hash_onchain(receipt: RoundReceipt, client: object | None) -> Ch
 
 def check_contract_digest(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """The manifest's contract digest equals the one recomputed from the local
-    ``chain.toml`` — the round trained under the published contract."""
+    ``chain.toml`` — the round trained under the published contract. Mirrors
+    the validator's block-gated contract transition (ScoringConfig
+    ``prior_contract_digest`` / ``contract_from_block``): a round whose epoch
+    boundary precedes the flip block replays under the pinned prior digest."""
     name = "contract-digest"
     want = contract_digest(cfg.training)
     got = str(receipt.manifest.get("contract_digest", ""))
     if got != want:
+        prior = cfg.scoring.prior_contract_digest
+        from_block = int(cfg.scoring.contract_from_block)
+        if (prior and from_block and got == prior
+                and int(receipt.epoch_start_block) < from_block):
+            return _ok(name, f"contract_digest {got[:16]}… matches the pinned prior "
+                             f"contract (epoch {receipt.epoch_start_block} < "
+                             f"contract_from_block {from_block})")
         return _fail(name, f"manifest contract_digest {got[:16]}… != local chain.toml "
                            f"{want[:16]}… (different training contract)")
     return _ok(name, f"contract_digest {want[:16]}… matches chain.toml")

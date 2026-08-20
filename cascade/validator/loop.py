@@ -226,7 +226,17 @@ class ValidatorRunner:
             return "signature_invalid"
         want_contract = contract_digest(self.cfg.training)
         if manifest.contract_digest != want_contract:
-            return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
+            # Block-gated contract transition: a round whose epoch boundary
+            # precedes contract_from_block was trained under the pinned prior
+            # contract and is accepted against prior_contract_digest — so a
+            # validator restarted onto a contract-changing release still
+            # scores the round in flight (see ScoringConfig).
+            prior = self.cfg.scoring.prior_contract_digest
+            from_block = int(self.cfg.scoring.contract_from_block)
+            if not (prior and from_block
+                    and manifest.contract_digest == prior
+                    and self._epoch_start_block(manifest) < from_block):
+                return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
         if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
             return "base_arch_digest_mismatch"
         if manifest.eval_dataset != self.cfg.eval.eval_dataset:

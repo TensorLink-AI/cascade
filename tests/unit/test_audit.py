@@ -149,6 +149,26 @@ def test_tamper_contract_digest(audit_cfg, signed_receipt):
     assert C.check_contract_digest(tampered, audit_cfg).status == C.FAIL
 
 
+def test_contract_transition_gate_replays_prior_digest(audit_cfg, signed_receipt):
+    """Audit mirrors the validator's block-gated contract transition: a
+    pre-flip round replays OK under the pinned prior digest, everything else
+    still fails."""
+    prior = "a" * 64
+    old = _tamper_manifest(signed_receipt, contract_digest=prior)
+    gated = replace(audit_cfg, scoring=replace(
+        audit_cfg.scoring, prior_contract_digest=prior,
+        contract_from_block=EPOCH_START + 1))
+    assert C.check_contract_digest(old, gated).status == C.PASS
+    # at/after the flip block the prior digest is dead
+    expired = replace(audit_cfg, scoring=replace(
+        audit_cfg.scoring, prior_contract_digest=prior,
+        contract_from_block=EPOCH_START))
+    assert C.check_contract_digest(old, expired).status == C.FAIL
+    # a non-pinned digest fails even pre-flip
+    other = _tamper_manifest(signed_receipt, contract_digest="b" * 64)
+    assert C.check_contract_digest(other, gated).status == C.FAIL
+
+
 def test_tamper_base_arch_digest(audit_cfg, signed_receipt):
     tampered = _tamper_manifest(signed_receipt, base_arch_digest="0" * 64)
     assert C.check_base_arch_digest(tampered, audit_cfg).status == C.FAIL

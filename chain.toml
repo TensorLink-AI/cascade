@@ -527,6 +527,17 @@ cascade_reign_rounds = 5
 # with a materially worse init.
 cascade_top_k          = 3
 cascade_quality_epsilon = 0.05
+# Block-gated contract transition (2026-08-20, WSD flip — DEC-CA-0018): rounds
+# whose epoch boundary precedes contract_from_block score against the pinned
+# PRIOR contract digest (the warmup_cosine contract every round through
+# boundary 8892000 trained under), so validators restart onto this release at
+# any time without sacrificing the in-flight round; rounds from block 8895600
+# (2026-08-21 08:30 UTC) accept only the digest recomputed from [training]
+# above. Same activation block as mix_from_block — one flip boundary for the
+# whole release. Fleet-consensus values: keep identical across validators.
+# Retire (""/0) in the release after the transition round ages out.
+prior_contract_digest  = "6420f564f67f54034abbd8a382c771f58304229457ea6f9f11b889491800b9d6"
+contract_from_block    = 8895600
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely
