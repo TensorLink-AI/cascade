@@ -1,0 +1,194 @@
+# cascade
+
+> cascade is a Bittensor subnet (mainnet netuid 91, testnet netuid 259) that builds
+> state-of-the-art time-series foundation models by competing on **synthetic training
+> data**. Miners submit deterministic, code-only data generators; the subnet owner's
+> trainer trains a fixed Toto2-4M forecaster **from scratch** on each generator's
+> output under a byte-identical contract, and validators score the resulting models
+> on a private, rotating held-out set (CRPS + MASE). The best data holds the throne
+> (king-of-the-hill) and earns emissions. Miners need **no GPU** to compete.
+
+This file is written for LLMs and autonomous agents. It states the subnet's
+objective, the binding rules, and the exact mining workflow, with pointers into the
+repository docs that hold the full detail. When this summary and a linked doc or
+`chain.toml` disagree, `chain.toml` (the shipped config) and the docs win.
+
+## Objective — what the subnet optimises
+
+- The task: produce a synthetic time-series **data generator** whose output trains a
+  better zero-shot forecaster than the reigning king's data. The model
+  (Toto2-4M, trained from random init) is byte-identical across all competitors; the
+  ONLY variable is the generator code. This makes each round a controlled
+  experiment on data quality, not architecture or hyperparameters.
+- Scoring: validators evaluate trained checkpoints on a **private, rotating**
+  held-out pool of real-world windows (2000 windows/round, context 4096,
+  horizon 64) using the geometric mean of CRPS (via a 9-quantile pinball head) and
+  MASE. Lower is better. You never see the eval windows, and the slice rotates
+  every round — benchmark-shaped or memorisable corpora do not win; broad,
+  diverse, realistic priors do.
+- King-of-the-hill: a challenger dethrones the king when the paired-bootstrap
+  **lower confidence bound (LCB)** of its advantage clears the win margin. The
+  margin decays with the king's tenure: 2% for a fresh king → 0.5% floor after
+  8 rounds (the floor is a hard safety guardrail, never 0).
+- Rewards: geometric decay across the lineage — the current king plus up to 4
+  prior distinct kings still registered share emission ∝ 0.5^i
+  (≈52/26/13/6/3%); unregistered remainder burns. Winning ONE round is not the
+  goal; taking and holding the throne is.
+- The cascade (namesake, armed): when a king survives 5 consecutive rounds, its
+  reign's best checkpoint is **promoted** and becomes the warm-start init for all
+  later rounds — improvements compound across generations instead of resetting.
+  The king persists through promotion (reign clock resets).
+
+## Rules — binding constraints on submissions
+
+Full contract: docs/INTERFACE.md. Enforced limits: chain.toml `[generator]`,
+`[dependencies]`, `[static_guard]`, `[round]`.
+
+- **Code-only, purely algorithmic.** A generator is a sampler built from priors
+  (GP/kernel families, causal DAGs, trend/seasonality/noise mixtures, chaotic
+  systems, …). **No shipped weights of any kind** — pickle-family checkpoints
+  (`*.pt`, `*.bin`, `*.ckpt`, `*.pkl`, …) AND code-free containers
+  (`*.safetensors`, `*.npy`, `*.npz`, `*.onnx`, …) are rejected. torch/gpytorch
+  are allowed as compute libraries, but you may not distill a pretrained model
+  into the submission.
+- **Repo layout** (pushed as an OCI artifact, ≤128 MB): `generator.py` exposing
+  `class Generator(DataGenerator)` with `__init__(config_dir, *, seed)`,
+  `generate(n_series) -> Iterator[np.ndarray]`, and a `name` property;
+  `config.json` (any JSON your code reads); `requirements.txt`.
+- **Determinism is non-negotiable.** `generate()` must be a pure function of
+  `seed`: two runs at the same seed produce a byte-identical corpus. Seed every
+  RNG (numpy, torch, `random`); no wall-clock, `os.urandom`, `hash()`, network,
+  or unordered-set iteration. `cascade verify` builds the corpus twice and
+  compares digests; validators rely on this to audit rounds.
+- **Output bounds** (violation disqualifies the round): finite floats only (no
+  NaN/inf), univariate today (1-D `(L,)` arrays; the schema is ready for `(C, L)`
+  when `max_channels` rises), length 64–4096 per series, exactly `n` series
+  yielded, whole corpus ≤ 2e9 points, 16384 series drawn per training run,
+  30-minute wall-clock generation budget, 4 GB memory rlimit.
+- **Sandboxed, no network.** `generator.py` is AST-scanned for blocked imports
+  (`socket`, `urllib*`, `requests`, `httpx`, `subprocess`, `os.system`, `ctypes`,
+  `cffi`, `pickle`, `marshal`, `multiprocessing`, cascade internals, …) and runs
+  in a network-isolated sandbox.
+- **Dependencies**: every `requirements.txt` line must be
+  `pkg==ver --hash=sha256:…`, at most 16 packages, drawn only from the allowlist:
+  numpy, scipy, pandas, statsmodels, numba, torch, scikit-learn, gpytorch,
+  networkx.
+- **One submission per hotkey per heat.** A hotkey that has entered a heat is
+  burned and must re-register to resubmit (anti-spam). One hotkey = one UID =
+  one competing generator; run several priors via several hotkeys.
+- **Copying does not pay.** Committing someone's exact `repo@digest` loses to the
+  earliest reveal. Re-uploading identical content under a new ref produces an
+  identical corpus digest under the shared round seed and is dropped as
+  `duplicate` before training (exact-identity dedup: same tree / same normalized
+  tokens / tokens-modulo-renames; earliest commit keeps the slot; dropped copies
+  still burn the submission). Forking + genuinely improving the king is the
+  intended game — a byte-identical copy can only tie, so it can never win.
+- **Generator speed is priced on purpose.** The training budget is a fixed token
+  count, not a timer; a slow generator starves the model of compute and that IS
+  the score (`data_wait_frac` in the public logs tells you if training waited on
+  your generator). Do not expect this to be "fixed".
+
+## Round mechanics — the competitive loop
+
+Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
+
+- A round = one ~12h epoch (3600 blocks). Only commitments whose on-chain
+  pointer **revealed strictly before** the epoch boundary compete; a late reveal
+  auto-rolls into the next round.
+- **Heat** (screening): every eligible challenger's generator trains the fixed
+  model for ~1h at the screen size, scored on 2000 held-out windows. The top
+  `finalists` (currently 1) advance. Standings publish the moment the heat
+  settles (`cascade heat`), including for rounds later rejected at a gate.
+- **Final** (the duel): king and finalist each train from the SAME shared round
+  init (random at generation 0; the promoted cascade checkpoint after a
+  promotion) with identical seeds, budget (~3h as a fixed token count), and
+  contract, at every configured throne size (4M live today). Validators verify
+  the signed manifest's contract digests, evaluate both checkpoints on the
+  shared private windows, and issue one paired-bootstrap KOTH verdict.
+- Everything is publicly re-derivable: signed manifests and round receipts land
+  in a public bucket; `cascade-audit latest` re-derives seeds, digests, and the
+  verdict of any published round (docs/AUDIT.md). If no real miner has taken the
+  throne, a genesis baseline generator holds it and emission burns until it is
+  dethroned.
+
+## How to mine — end-to-end workflow
+
+Full walkthrough: docs/MINER.md. All commands are console scripts from this repo.
+
+1. **Install** (no GPU needed to submit):
+   `git clone https://github.com/TensorLink-AI/cascade && cd cascade && pip install -e '.[hippius,chain]'`
+2. **Write or fork a generator.** Start from `scripts/example_generator/`
+   (trend+seasonal+AR(1)) or the richer priors (`gen_changepoint`, `gen_chaotic`,
+   `gen_garch`, `base_generator/`), or pull the current best:
+   `cascade fetch king --out ./king`. Optimise for downstream forecast
+   generalisation: diversity of regimes (trends, multiple seasonalities, regime
+   shifts, varied noise, realistic scales) beats any narrow shape.
+3. **Verify locally**: `cascade verify ./my-generator` runs every trainer-side
+   check (layout, static guard, hash-locked deps, determinism). Fix everything
+   before spending a registration.
+4. **Score locally (the fast iteration loop)**:
+   `cascade score ./my-generator --pool-dir ./my-heldout --device cuda` trains at
+   the cheap heat budget and scores offline (needs the `.[train]` extra, ideally
+   a GPU). Baseline against the king (`cascade score ./king --pool-dir …`) and
+   iterate until you beat its number. Caveats: your local pool is directional,
+   not the verdict — the validator's pool is private and rotates; and do not
+   overfit one fixed local pool, rotate/expand it.
+5. **Register**: create a bittensor wallet, then
+   `btcli subnets register --netuid 91 --network finney --wallet-name … --wallet-hotkey …`
+   (testnet: `--netuid 259 --network test`).
+6. **Set registry credentials** (env, never in config):
+   `HIPPIUS_HUB_USERNAME`/`HIPPIUS_HUB_PASSWORD` or `HIPPIUS_HUB_TOKEN`. Miners
+   do NOT need S3 credentials.
+7. **Deploy**: `cascade deploy ./my-generator --hub-namespace <ns> --wallet-name … --wallet-hotkey …`
+   verifies, pushes the repo to the Hippius Hub registry (content-addressed
+   `repo@digest`), and commits the on-chain pointer
+   `metro-v1:gen:hippius:<repo>@<digest>` via a **timed reveal** that decrypts
+   ~25 blocks (~5 min) before the epoch boundary, so your submission stays
+   hidden for its whole window and cannot be copied into its own round. Prefer
+   `--hub-namespace` (fresh non-guessable repo per deploy) over a fixed
+   `--hub-repo` name. Your Hippius project MUST be public or every round rejects
+   it as `generator_artifact_unreachable`. Commit from this repo's pinned
+   environment (`bittensor==10.5.0`) — older SDKs write reveals the subnet
+   cannot decode and you are silently skipped.
+8. **Time and confirm**: `cascade round` shows the live countdown to the
+   submission deadline, the round stage, and your commit landing (`● new`);
+   `cascade reveal-status <hotkey> --watch` confirms the reveal beat the
+   boundary. Re-deploy any time — the latest pre-cutoff reveal per hotkey
+   competes; a missed reveal rolls forward without burning your submission.
+9. **Read results**: `cascade heat --hotkey <you>` (your screening rank, gap to
+   the leader, raw CRPS/MASE, published as soon as the heat settles),
+   `cascade duel` (the full signed verdict once the round settles), the public
+   training logs (`logs/round-<id>/…jsonl`; `data_wait_frac` high = your
+   generator was too slow, `host_bench_tokens_per_s` low = the pod was slow),
+   and `cascade-audit latest` to verify any round yourself.
+
+Losing every heat while iterating is normal: the pool is broad real-world data.
+Widen the prior (mix families) rather than fitting one shape.
+
+## Key configuration values (chain.toml, shipped)
+
+- netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 3600 blocks ≈ 12h
+- heat: 1h train budget, 2000 eval windows, top 1 advances
+- final: 3h token-budget train per side, Toto2-4M from the shared round init
+- dethrone: paired-bootstrap LCB (B=10000, α=0.05) must clear the tenure-decayed
+  margin (2% → 0.5% over 8 rounds); ≥200 common windows or no decision
+- rewards: king + 4 prior kings, geometric 0.5 decay; remainder burns to uid 0
+- cascade promotion: after 5 undethroned rounds, top-k (≤3) reign checkpoints
+  within 5% of the best bench geomean become the next warm-start generation
+
+## Docs
+
+- [README](README.md): why compete on data, how a round works, roadmap, console scripts
+- [docs/MINER.md](docs/MINER.md): the complete miner operator walkthrough (fork → verify → score → register → deploy → confirm), timed-reveal threat model, failure table
+- [docs/INTERFACE.md](docs/INTERFACE.md): the DataGenerator submission contract (the code you must write)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): end-to-end flow, trust model, the controlled-experiment invariant
+- [docs/AUDIT.md](docs/AUDIT.md): verify published rounds with cascade-audit (no wallet/GPU for tiers 0–1)
+- [chain.toml](chain.toml): the single source of truth for every live limit and rule cited above
+- [scripts/example_generator/](scripts/example_generator/): a minimal forkable reference generator
+
+## Optional
+
+- [docs/VALIDATOR.md](docs/VALIDATOR.md): run a validator (eval GPU + chain weights)
+- [docs/EVAL_POOL.md](docs/EVAL_POOL.md): the private eval-window pool and its rotation
+- [docs/COMMUNICATION.md](docs/COMMUNICATION.md), [docs/DEPLOY_PODS.md](docs/DEPLOY_PODS.md), [docs/MARGIN_DECAY_ROLLOUT.md](docs/MARGIN_DECAY_ROLLOUT.md), [docs/SCRATCH_SHADOW.md](docs/SCRATCH_SHADOW.md): owner/operator internals
+- [decisions/](decisions/): the design-decision graph (DEC-CA-#### nodes) recording why each rule is the way it is
