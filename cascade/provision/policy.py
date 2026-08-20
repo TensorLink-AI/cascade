@@ -263,6 +263,8 @@ def size_fleet(
     epoch_hours: float,
     final_hours: float,
     policy: ProvisionPolicy,
+    *,
+    max_finalists: int = 0,
 ) -> FleetPlan:
     """Size both fleets off the revealed field — SLOT-based for multi-GPU pods.
 
@@ -288,12 +290,23 @@ def size_fleet(
     in-between shapes take ``⌈slots / gpus_per_pod⌉`` pods. ``max_pods`` clamps
     here too — a clamped final still completes (the trainer round-robins),
     just serially.
+
+    ``max_finalists`` is the DEC-CA-0012 tie-aware cohort cap (``[round]
+    max_finalists``): with it armed the heat may advance up to
+    ``max(finalists, max_finalists)`` challengers, so the final is sized off
+    that CAP — the pre-phased fleet and the ``within_budget`` breaker must
+    cover the worst case the advance rule can produce, while JIT rental
+    (``final_rent_on = "heat_complete"``) adapts to the marker's actual
+    finalist list for free. ``0`` (the default, and what a pre-DEC-CA-0012
+    plan payload implies) keeps the plan byte-identical to sizing off
+    ``finalists`` alone.
     """
-    if n_eligible < 0 or finalists < 0:
-        raise ValueError("n_eligible and finalists must be non-negative")
+    if n_eligible < 0 or finalists < 0 or max_finalists < 0:
+        raise ValueError("n_eligible/finalists/max_finalists must be non-negative")
     if heat_hours <= 0 or epoch_hours <= 0 or final_hours < 0:
         raise ValueError("heat_hours/epoch_hours must be positive, final_hours >= 0")
 
+    finalists = max(finalists, max_finalists)
     n_to_screen = n_eligible if n_eligible > finalists else 0
     if n_to_screen > 0:
         window = max(epoch_hours - final_hours, heat_hours)

@@ -93,7 +93,11 @@ batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate
 weight_decay       = 0.05
-lr_schedule        = "warmup_cosine"
+lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0018): warmup only on a
+                                   # from-scratch run, flat base_lr on warm-started rounds;
+                                   # wsd rounds also checkpoint optimizer state. [training]
+                                   # edit ⇒ contract_digest changed: restart trainer AND
+                                   # validator together (flipped 2026-08-14).
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 2700        # TESTNET: cap = the 45-min final budget itself, measured
@@ -167,6 +171,20 @@ heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [ev
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
+# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED here FIRST
+# (2026-08-20, DEC-CA-0012 rollout order). With max_finalists > 1 a leader the
+# screen separated advances alone; a statistically tied top advances capped.
+# The tie RUN-OFF stays 0: its incremental draw relies on the seeded-prefix
+# property, which the jittered mix (DEC-CA-0019, active here from block 1)
+# does not provide — see the NOTE in chain.toml. Full semantics + the two
+# pre-arm couplings (deployed-fleet check at 1 + max_finalists slots; [eval]
+# bench_hold_max_hours sizing) are documented in chain.toml.
+# GATE FOR MAINNET: a full testnet round producing a genuine multi-finalist
+# cohort duel AND a cascade-audit replay of it, trainer and validator
+# restarted together.
+max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20)
+tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see chain.toml NOTE
+tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)

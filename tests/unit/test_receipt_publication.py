@@ -409,3 +409,44 @@ def test_publish_receipt_namespaced_per_validator():
     # everything audit-facing is world-readable
     assert store.acls[key_a] == "public-read"
     assert store.acls["receipts/5ValA/latest.json"] == "public-read"
+
+
+# ── block-gated contract transition ──────────────────────────────────────────
+
+
+def test_contract_transition_gate(cfg):
+    """A restart onto a contract-changing release must still score the round
+    in flight: a manifest carrying the pinned prior digest is accepted exactly
+    when its epoch boundary precedes contract_from_block."""
+    from dataclasses import replace
+
+    prior = "a" * 64
+    base_seed = seed_from_block_hash(BLOCK_HASH)
+    good = make_manifest(cfg, base_seed=base_seed)
+    old = TrainingManifest(
+        round_id=good.round_id, created_block=CREATED_BLOCK,
+        contract_digest=prior, base_arch_digest=good.base_arch_digest,
+        eval_dataset=good.eval_dataset, entries=good.entries,
+    )
+
+    def gated(prior_digest, from_block):
+        return replace(cfg, scoring=replace(
+            cfg.scoring, prior_contract_digest=prior_digest,
+            contract_from_block=from_block))
+
+    # pre-flip epoch + pinned prior digest → the one accepted combination
+    assert _runner(gated(prior, EPOCH_START + 1),
+                   lambda e, w: []).check_manifest(old) is None
+    # the round AT the flip block is new-contract territory
+    r = _runner(gated(prior, EPOCH_START), lambda e, w: []).check_manifest(old)
+    assert r is not None and r.startswith("contract_digest_mismatch")
+    # a digest that is not the pinned prior never passes
+    r = _runner(gated("b" * 64, EPOCH_START + 1),
+                lambda e, w: []).check_manifest(old)
+    assert r is not None and r.startswith("contract_digest_mismatch")
+    # gate off (defaults) → legacy exact match
+    r = _runner(cfg, lambda e, w: []).check_manifest(old)
+    assert r is not None and r.startswith("contract_digest_mismatch")
+    # the current-contract manifest is untouched by an armed gate
+    assert _runner(gated(prior, EPOCH_START + 1),
+                   lambda e, w: []).check_manifest(good) is None

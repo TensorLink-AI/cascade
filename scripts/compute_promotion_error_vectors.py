@@ -58,7 +58,7 @@ def main() -> int:
         epoch = cfg.round.epoch_blocks if hasattr(cfg.round, "epoch_blocks") else 3600
         block = (blk // epoch) * epoch
 
-    screen, _, _ = _build_screen_fn(cfg, cache_dir=args.work_root)
+    screen, _, _, _ = _build_screen_fn(cfg, cache_dir=args.work_root)
     out_path = args.work_root / "promotion_error_vectors.json"
     vectors: dict[str, list[float]] = {}
     if out_path.is_file():

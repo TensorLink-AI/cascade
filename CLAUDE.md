@@ -89,7 +89,10 @@ in-context.
   survive). Screen's drop bar stays 0 and uncorrected (field-size-dependent bars
   are padding-gameable). No heat-based dethrone-hopelessness gate, ever —
   cross-hardware bias, and u86 won with an 8.3% LCB from apparent hopelessness.
-  Ships inert; validator/audit multi-challenger fix goes FIRST.
+  ARMED 2026-08-20 (`max_finalists = 3`, owner; testnet multi-cohort duel
+  validated). The tie RUN-OFF stays 0 under the jittered draw (DEC-CA-0019):
+  its incremental windows assume the seeded-prefix property the jitter does
+  not provide — re-arming needs a jitter-aware incremental draw first.
   (`decisions/DEC-CA-0012-tie-aware-finalists-cohort-duel.md`)
 - **DEC-CA-0013** — Warm-start promotes a TOP-K member set (parallel lineages,
   zero extra GPU; rounds rotate across members) and flips to propose-and-verify:
@@ -139,14 +142,22 @@ in-context.
   basin escape stays with DEC-CA-0014's staged path.
   (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
 
+- **DEC-CA-0018** — Warm-start recipe is WSD, not per-round cosine:
+  `lr_schedule = "wsd"` warms up once at generation start (the from-scratch
+  run), holds base_lr FLAT across warm-started rounds, and defers decay to a
+  release cut (not built). wsd rounds checkpoint optimizer state
+  (`optimizer.safetensors`, ~3×; Muon momentum + row-EMA + AdamW moments) and
+  warm starts re-attach it; missing file ⇒ fresh state, shape mismatch ⇒
+  abort. Flip changed `contract_digest` — trainer+validator deploy together.
+  (`decisions/DEC-CA-0018-wsd-schedule-optimizer-continuity.md`)
 - **DEC-CA-0019** — The per-round eval draw is jittered (TB:DEC-TB-0003 port):
   Dirichlet domain mix around uniform (alpha=4, block=8, capacity-capped,
   without-replacement always), salted-hash series bag, class rotation inert
   until pool snapshots carry `dgp_class`. Draw size 1200 (`mix_target_windows`)
   — at 2000 the caps crush the jitter. Block-gated activation, ARMED AT
-  RELEASE (mainnet `mix_from_block = 8892000` = 2026-08-20 20:30 UTC,
-  IMMEDIATE by owner decision — externals diverge until upgraded;
-  testnet = 1): audit replays each round's own rule.
+  RELEASE (mainnet `mix_from_block = 8895600` = 2026-08-21 08:30 UTC, the
+  single coordinated fleet-deploy boundary — externals diverge from that
+  block until upgraded; testnet = 1): audit replays each round's own rule.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 

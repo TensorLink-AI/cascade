@@ -56,13 +56,17 @@ tripwire.
 
 **Consensus: block-gated, ARMED AT RELEASE** (owner decision 2026-08-20,
 the DEC-CA-0016 pattern — the release IS the activation). chain.toml ships
-`mix_from_block = 8892000` (epoch boundary 2026-08-20 20:30 UTC — IMMEDIATE, owner-accepted external-validator divergence until they upgrade);
+`mix_from_block = 8895600` (epoch boundary 2026-08-21 08:30 UTC — the single
+coordinated fleet-deploy boundary, moved from 8892000 on 2026-08-20 when the
+deploy plan collapsed to one all-at-once restart window and the 8892000
+round was already in flight; owner-accepted external-validator divergence
+until they upgrade);
 chain.testnet.toml ships `mix_from_block = 1` (live immediately on the
 owner-only testnet fleet, one full cycle of soak before the mainnet block
 arrives). Every round before the activation block keeps the legacy
 permutation byte-identically (pinned by test), so the fleet upgrades on a
 DEADLINE, not in a window: all 6 external validators and the trainer must
-be running this release before block 8892000 or their verdicts fork from
+be running this release before block 8895600 or their verdicts fork from
 that block on (owner accepted this fork window 2026-08-20). Audit replay applies each round's own rule via the receipt's
 `epoch_start_block`. The realised composition publishes post-hoc as an
 UNSIGNED `composition` manifest block (the `heat` pattern — old signatures

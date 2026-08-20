@@ -573,6 +573,29 @@ class RoundConfig:
     # (the pre-2026-08-19 behaviour: infra casualties drop terminally).
     heat_infra_requeues: int = 2
     finalists: int = 1                # challengers promoted from the heat to the final
+    # ── Tie-aware finalists (DEC-CA-0012, trainer half) — inert at defaults ──
+    # ``max_finalists > 1`` arms the tie-aware advance rule: a leader the
+    # screen's own statistic separated from the runner-up (paired LCB > 0, the
+    # ``lcb_vs`` diagnostic in cascade.eval.heat) advances ALONE whatever the
+    # cap; a statistically tied top is re-scored on a larger eval slice (the
+    # run-off below) and whoever still cannot be separated advances too,
+    # capped here. The validator then duels the WHOLE cohort under a
+    # family-wise alpha/k. At the default 1 the tie logic never runs — exactly
+    # one finalist advances as before and every manifest hashes identically.
+    max_finalists: int = 1
+    # Total eval windows the tie run-off re-scores the tied set on (CPU-only,
+    # on the orchestrator, against heat checkpoints still on local disk).
+    # Only the INCREMENTAL windows beyond the heat's slice are scored — the
+    # round's window selection is a seeded permutation prefix, so the heat's
+    # slice is a strict prefix of this one and pairing holds by construction.
+    # Clamped to [eval] n_windows; must exceed the heat's actual window count
+    # to add evidence. 0 = no run-off: a tied top advances by the heat
+    # ranking, capped at ``max_finalists``.
+    tie_runoff_windows: int = 0
+    # Wall clock for the WHOLE run-off, mirroring ``dedup_phase_seconds``: on
+    # expiry the pre-run-off tied set advances (capped) — a screen that cannot
+    # finish must not sink the round it protects. Inert while max_finalists=1.
+    tie_runoff_phase_seconds: int = 900
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
@@ -694,6 +717,20 @@ class RoundConfig:
     # too short for a copier to fetch + re-commit + land their own reveal.
     # ~25 blocks ≈ 5 min at 12s blocks; tighten after measuring live jitter.
     reveal_margin_blocks: int = 25
+
+    @property
+    def finalist_cap(self) -> int:
+        """Upper bound on challengers the heat may advance (DEC-CA-0012).
+
+        The legacy constant while the tie logic is off (``max_finalists <= 1``),
+        else ``max(finalists, max_finalists)``. The heat's fast paths and the
+        provisioner's final-fleet sizing must share this bound so the
+        pre-phased fleet and the ``within_budget`` breaker always cover the
+        worst case the advance rule can produce.
+        """
+        if self.max_finalists > 1:
+            return max(self.finalists, self.max_finalists)
+        return self.finalists
 
 
 @dataclass(frozen=True)
@@ -854,6 +891,21 @@ class ScoringConfig:
     # with a materially worse init.
     cascade_top_k: int = 3
     cascade_quality_epsilon: float = 0.05
+    # Block-gated contract transition (the DEC-CA-0016/0019 release-then-
+    # activate pattern applied to contract_digest itself). When BOTH are set,
+    # a manifest whose epoch-boundary block precedes ``contract_from_block``
+    # is accepted against ``prior_contract_digest`` instead of the digest
+    # recomputed from the local [training] — so validators can restart onto a
+    # release that changes the training contract WITHOUT sacrificing the
+    # round currently in flight under the old contract, and the fleet needs
+    # no synchronized restart window. Rounds at/after the block accept only
+    # the new digest. [scoring] lives outside contract_digest, so these keys
+    # never perturb the digest they gate. "" / 0 = gate off (legacy exact
+    # match). Fleet-consensus values like every [scoring] key: keep identical
+    # across validators. Retire the pin (back to ""/0) in the release AFTER
+    # the transition round is beyond every validator's scoring horizon.
+    prior_contract_digest: str = ""
+    contract_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -1365,6 +1417,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             heat_guard_factor=float(r.get("heat_guard_factor", 1.0)),
             heat_guard_floor_seconds=int(r.get("heat_guard_floor_seconds", 900)),
             finalists=int(r.get("finalists", 1)),
+            max_finalists=int(r.get("max_finalists", 1)),
+            tie_runoff_windows=int(r.get("tie_runoff_windows", 0)),
+            tie_runoff_phase_seconds=int(r.get("tie_runoff_phase_seconds", 900)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
@@ -1444,6 +1499,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             ),
             cascade_top_k=int(s.get("cascade_top_k", 3)),
             cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
+            prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
+            contract_from_block=int(s.get("contract_from_block", 0) or 0),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
