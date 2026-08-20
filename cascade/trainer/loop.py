@@ -2302,6 +2302,67 @@ class TrainerRunner:
             log.warning("promotion: deploy backfill failed (engine anchors at "
                         "this boundary instead): %s", e)
 
+    def _replay_reign_bench_reports(self) -> None:
+        """Re-ingest the CURRENT reign's published bench reports at the
+        boundary. The candidate pool otherwise only sees reports the
+        in-process bench thread publishes — an out-of-band report (a mop-up
+        after a failed leg, a report that landed while the trainer was down)
+        never yields candidates, and a promotion then fires off an incomplete
+        reign (observed 2026-08-18: r26's better leg, 0.64149, missed the
+        gen-3 member set because its mop-up report was published externally).
+
+        Cheap and idempotent by construction: ``record_bench`` dedupes on
+        ``trained_pointer`` and gates on the live generation, so replaying
+        every reign round each boundary is a handful of small S3 reads a day
+        that add nothing when nothing is missing. Runs BEFORE
+        ``maybe_promote`` so a fire-time selection sees the full reign.
+        Same signature discipline as the deploy backfill: both the report
+        and the manifest must verify against the pinned trainer hotkey."""
+        if self.promotion is None or getattr(self.promotion, "king_hotkey", None) is None:
+            return
+        try:
+            from ..shared.bench_report import (
+                bench_report_key,
+                load_bench_report,
+                verify_bench_report_signature,
+            )
+            from ..shared.hippius import RECEIPT_INDEX_KEY
+            from ..shared.manifest import load_manifest, verify_signature
+            from .promotion import reign_tail
+
+            store = self.manifest_store()
+            idx = json.loads(store.get_text(RECEIPT_INDEX_KEY))
+            tail = reign_tail(idx.get("rounds") or [],
+                              self.cfg.manifest.validator_hotkey)
+            if tail is None:
+                return
+            _king, _start_block, round_ids = tail
+            trainer_hotkey = self.cfg.manifest.trainer_hotkey
+            added = 0
+            for rid in round_ids:
+                try:
+                    manifest = load_manifest(
+                        store.get_text(manifest_round_key(rid)))
+                    report = load_bench_report(
+                        store.get_text(bench_report_key(rid)))
+                except Exception:  # noqa: BLE001 — no report yet ⇒ nothing to replay
+                    continue
+                if trainer_hotkey and not verify_bench_report_signature(
+                        report, trainer_hotkey):
+                    log.warning("promotion replay: bench report for round=%s "
+                                "fails signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                if trainer_hotkey and not verify_signature(manifest, trainer_hotkey):
+                    log.warning("promotion replay: manifest for round=%s fails "
+                                "signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                added += self.promotion.record_bench(manifest, report)
+            if added:
+                log.info("promotion: boundary replay recovered %d candidate(s) "
+                         "from published bench report(s)", added)
+        except Exception as e:  # noqa: BLE001 — replay must never sink a round
+            log.warning("promotion: bench-report replay failed (ignored): %s", e)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -3559,6 +3620,11 @@ class TrainerRunner:
                         self._seed_promotion_reign()
                         self.promotion.note_round(self._receipt_king() or king_hotkey,
                                                   epoch_block=epoch_start)
+                        # Out-of-band bench reports (mop-ups, trainer-downtime
+                        # publishes) enter the pool here — before maybe_promote,
+                        # so a promotion that fires NOW selects from the full
+                        # reign, not just what the in-process bench thread saw.
+                        self._replay_reign_bench_reports()
                         self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
                     except Exception as e:  # noqa: BLE001
