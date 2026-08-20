@@ -210,7 +210,7 @@ def test_capped_jittered_split_conserves_floors_and_caps():
         caps = [60, 50, 44, 16, 10]
         counts = _capped_jittered_split(100, caps, 4.0, 4, rng)
         assert sum(counts) == 100
-        for c, cap in zip(counts, caps):
+        for c, cap in zip(counts, caps, strict=True):
             assert 0 < c <= cap
             assert c >= min(4, cap)
 

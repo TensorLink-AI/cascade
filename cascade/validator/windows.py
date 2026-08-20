@@ -137,10 +137,7 @@ def _capped_jittered_split(
             if left <= 0:
                 break
         return counts
-    if alpha is not None:
-        w = rng.dirichlet(np.full(k, float(alpha)))
-    else:
-        w = np.full(k, 1.0 / k)
+    w = rng.dirichlet(np.full(k, float(alpha))) if alpha is not None else np.full(k, 1.0 / k)
     for _ in range(64):  # water-filling: the open set shrinks; terminates early
         left = n - sum(counts)
         if left <= 0:
@@ -217,14 +214,14 @@ def _jittered_pick(
     per_domain = _capped_jittered_split(n, dom_caps, mix.jitter_alpha, block, rng)
 
     picks: list[str] = []
-    for dom, n_dom in zip(domains, per_domain):
+    for dom, n_dom in zip(domains, per_domain, strict=True):
         if n_dom == 0:
             continue
         all_classes = sorted({c for d, c in by_cell if d == dom})
         classes = list(all_classes)
         if has_classes and mix.class_keep_frac < 1.0 and len(classes) > 1:
             mask = rng.random(len(classes)) < mix.class_keep_frac
-            kept = [c for c, keep in zip(classes, mask) if keep]
+            kept = [c for c, keep in zip(classes, mask, strict=True) if keep]
             classes = kept or [classes[int(rng.integers(0, len(classes)))]]
             # Rotation must never make the domain quota unfillable (cascade
             # cannot duplicate-fill): extend the kept set in seeded order over
@@ -256,7 +253,7 @@ def _jittered_pick(
                     classes = trimmed
         cls_caps = [len(by_cell[(dom, c)]) for c in classes]
         per_class = _capped_jittered_split(n_dom, cls_caps, None, block, rng)
-        for cls, n_cls in zip(classes, per_class):
+        for cls, n_cls in zip(classes, per_class, strict=True):
             cell = by_cell[(dom, cls)]
             if n_cls >= len(cell):
                 picks.extend(cell)  # without replacement, cell exhausted
