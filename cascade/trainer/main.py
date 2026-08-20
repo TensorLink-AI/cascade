@@ -190,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     log = logging.getLogger("cascade.trainer")
-    screen_fn, pool_provenance_fn = _build_screen_fn(cfg, cache_dir=args.work_root)
+    screen_fn, pool_provenance_fn, composition_fn = _build_screen_fn(
+        cfg, cache_dir=args.work_root
+    )
 
     bench_plan = None
     if args.post_round_benchmarks:
@@ -305,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
         pool_provenance_fn=pool_provenance_fn,
+        composition_fn=composition_fn,
         bench_plan=bench_plan,
         bench_eval_fn=bench_eval_fn,
         cascade_bench_plan=cascade_bench_plan,
@@ -388,11 +391,13 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
 def _build_screen_fn(cfg, *, cache_dir: Path | None):
     """The heat screener plus the eval-pool pin, off one shared pool source.
 
-    Returns ``(screen_fn, pool_provenance_fn)``: the screener ranks heat
-    checkpoints on the held-out pool, and the provenance hook reports the
-    ``(key, sha256)`` of the snapshot a round screens on so the runner can
+    Returns ``(screen_fn, pool_provenance_fn, composition_fn)``: the screener
+    ranks heat checkpoints on the held-out pool, the provenance hook reports
+    the ``(key, sha256)`` of the snapshot a round screens on so the runner can
     stamp it — signed — into the manifest (validators then verify their own
-    snapshot selection against it; see docs/EVAL_POOL.md).
+    snapshot selection against it; see docs/EVAL_POOL.md), and the composition
+    hook reports the realised jittered-mix breakdown of the round's verdict
+    draw for the unsigned manifest block (None while the mix is inactive).
 
     Loads the same private eval pool the validators use (owner-controlled) and
     scores each heat checkpoint on a per-round-rotated slice, returning the
@@ -434,7 +439,22 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
         key, sha = window_source.provenance_for_round(base_seed, block=block)
         return (str(key or ""), str(sha or ""))
 
-    return screen, pool_provenance
+    def composition(base_seed: int, block: int | None = None) -> dict | None:
+        """Realised composition of the round's VERDICT draw (n_windows, not the
+        heat's smaller slice) — None while the jittered mix is inactive, so
+        pre-activation manifests carry no new field."""
+        from ..validator.pool import mix_params_from_config
+        from ..validator.windows import round_composition
+
+        mix = mix_params_from_config(cfg)
+        if mix is None or not mix.active(block):
+            return None
+        windows = window_source.windows_for_round(
+            base_seed, cfg.eval.n_windows, block=block
+        )
+        return round_composition(windows, mix)
+
+    return screen, pool_provenance, composition
 
 
 if __name__ == "__main__":

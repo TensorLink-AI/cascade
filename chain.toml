@@ -285,6 +285,27 @@ n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
+# Jittered round mix (DEC-TB-0003 port) — SHIPPED OFF. The per-round window
+# draw stays the legacy uniform permutation until mix_from_block is set to an
+# epoch-boundary block. CONSENSUS + COORDINATED: every external validator and
+# the trainer must run mix-capable code with the SAME mix_from_block before
+# that block arrives, or verdicts fork from it on (the block gate means a
+# mixed fleet agrees on every round while upgrading — activation day needs no
+# simultaneity, only "everyone upgraded by block X"). Expected mix stays
+# equal-weight per domain (capacity-capped); realised mix is unpredictable.
+# mix_target_windows: the jittered draw size (0 = n_windows). Calibrated on
+# the 2026-08-19 production snapshot: 1200 of ~2400 rotates the mix hard
+# (per-domain p1–p99 spans ~6x) with effective domains ≥ 5.0 and P(<4.0)=0
+# over 2k simulated rounds; at 2000 the caps crush the jitter (~±7%).
+# class rotation (mix_class_keep_frac) is inert until pool snapshots carry
+# dgp_class labels (pool builder change in the same release).
+mix_from_block       = 0         # 0 = off; set to a FUTURE epoch boundary to arm
+mix_jitter_alpha     = 4.0       # symmetric Dirichlet over domains (expectation uniform)
+mix_block_slots      = 8         # allocation unit: a cell is absent or gets >= 1 block
+mix_class_keep_frac  = 0.7       # per-round dgp_class activation fraction
+mix_series_bag_frac  = 0.7       # per-round series eligibility (salted-hash bag)
+mix_target_windows   = 1200      # jittered draw size; inert until mix_from_block is set
+
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
 run_benchmarks        = false    # off by default — opt in per validator

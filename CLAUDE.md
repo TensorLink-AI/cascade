@@ -139,6 +139,16 @@ in-context.
   basin escape stays with DEC-CA-0014's staged path.
   (`decisions/DEC-CA-0017-promotion-no-downgrade-guard.md`)
 
+- **DEC-CA-0018** — The per-round eval draw is jittered (TB:DEC-TB-0003 port):
+  Dirichlet domain mix around uniform (alpha=4, block=8, capacity-capped,
+  without-replacement always), salted-hash series bag, class rotation inert
+  until pool snapshots carry `dgp_class`. Draw size 1200 (`mix_target_windows`)
+  — at 2000 the caps crush the jitter. Block-gated activation
+  (`mix_from_block`, shipped 0=OFF): everyone upgrades before the block, no
+  simultaneity needed; audit replays each round's own rule. Realised mix
+  publishes as an unsigned `composition` manifest block.
+  (`decisions/DEC-CA-0018-jittered-round-mix.md`)
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
 the revisit condition in the node's `revisit_when:` key.
