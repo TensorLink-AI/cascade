@@ -281,7 +281,7 @@ def increment_bootstrap_rel(
     floor_frac: float = 0.01,
 ) -> np.ndarray:
     """The ``(B,)`` baseline-referenced (%-of-increment) bootstrap distribution
-    — DEC-CA-0023's margin re-unitisation for warm-start eras.
+    — DEC-CA-0027's margin re-unitisation for warm-start eras.
 
     Under a compounding lineage the level statistic ``(king − chal) / king``
     strangles itself: both models start from the SAME warm-start init, their

@@ -1,4 +1,4 @@
-"""Size-conditional GPU provisioning + per-size budget overrides (DEC-CA-0023
+"""Size-conditional GPU provisioning + per-size budget overrides (DEC-CA-0027
 Stage 6 plumbing — inert for every deployed config)."""
 
 from __future__ import annotations

@@ -71,7 +71,7 @@ class PoolBuildConfig:
     # hourly flood inside a domain can't crowd out that domain's daily series.
     max_series_per_domain_freq: int | None = None
     max_series_total: int | None = None
-    # Require an upstream feed id on every kept series (DEC-CA-0022 item 3):
+    # Require an upstream feed id on every kept series (DEC-CA-0026 item 3):
     # ``source`` is the KOTH cluster-bootstrap key, and multivariate windows
     # must never enter a pool without it (their channels would otherwise lean
     # on the series_id fallback alone). Off by default — existing sources that
@@ -198,6 +198,11 @@ def prepare_series(
     metadata = {"freq": hs.freq, "seasonal_period": seasonal, "domain": hs.domain}
     if hs.source:
         metadata["source"] = hs.source
+    # DGP class label (tsbench-forge catalog) — drives the jittered mix's
+    # class-rotation tier (cascade.validator.windows). Absent for sources
+    # without one; the sampler degrades to domain-level jitter only.
+    if hs.attrs and hs.attrs.get("dgp_class"):
+        metadata["dgp_class"] = str(hs.attrs["dgp_class"])
 
     values = cleaned.astype(np.float32)
     if values.shape[0] == 1:  # store univariate as 1-D; loader promotes to (1, L)

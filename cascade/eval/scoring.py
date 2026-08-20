@@ -52,7 +52,7 @@ ForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
 # A JOINT forecaster: ``f(history_2d, horizon, num_samples)`` with history
 # ``(C, L)`` returning ``(C, num_samples, H)`` — one call per window, all
 # channels together, so a multivariate-capable checkpoint can condition its
-# forecasts across the variate axis (DEC-CA-0022). At ``C = 1`` this is the
+# forecasts across the variate axis (DEC-CA-0026). At ``C = 1`` this is the
 # univariate contract with an extra leading axis.
 JointForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
 

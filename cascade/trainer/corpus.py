@@ -59,7 +59,7 @@ class CorpusError(RuntimeError):
     """Importing or running the generator failed, or its output was rejected."""
 
 
-# ─────────────── shared real corpus (DEC-CA-0024; inert until armed) ─────────
+# ─────────────── shared real corpus (DEC-CA-0028; inert until armed) ─────────
 
 # Override for the machine-local materialisation cache of the owner-published
 # shared real corpus. Default keeps one digest-keyed copy per machine, shared
@@ -137,7 +137,7 @@ def _check_declared_interface(
 ) -> None:
     """Reject a repo declaring an interface_version newer than ``supported``.
 
-    DEC-CA-0016 layering: a generator MAY declare ``"interface_version"`` in
+    DEC-CA-0020 layering: a generator MAY declare ``"interface_version"`` in
     its config.json (absent ⇒ 1, the deployed fleet). A declared version above
     the bar fails HERE, before any miner code runs, with an error naming the
     mismatch — instead of a confusing mid-drain rejection of a record field
@@ -212,7 +212,7 @@ def _load_generator(
     Generator = getattr(module, "Generator", None)
     if Generator is None:
         raise CorpusError("generator_class_missing (expected `Generator` in generator.py)")
-    # DEC-CA-0024 opt-in: the shared-corpus path is passed ONLY when armed AND
+    # DEC-CA-0028 opt-in: the shared-corpus path is passed ONLY when armed AND
     # the constructor declares it — every deployed two-argument generator stays
     # valid under an armed config, and while unarmed the call is byte-identical
     # to the legacy form even for generators that declare the kwarg.

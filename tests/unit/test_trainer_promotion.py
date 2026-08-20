@@ -60,9 +60,11 @@ def test_canonical_body_excludes_signature_and_is_stable():
 class _Store:
     def __init__(self):
         self.texts = {}
+        self.acls = {}
 
-    def put_text(self, key, text, content_type=""):
+    def put_text(self, key, text, content_type="", acl=None):
         self.texts[key] = text
+        self.acls[key] = acl
 
     def get_text(self, key):
         return self.texts[key]
@@ -75,6 +77,26 @@ def test_publish_writes_record_and_locator_index():
     assert key == promotion_record_key(3)
     assert load_promotion_record(store.get_text(key)).generation == 3
     assert load_promotion_index(store.get_text(promotion_index_key())) == 3
+    # Both objects publish public-read — the dashboard renders the rotation
+    # roster straight from the record (2026-08-15).
+    assert store.acls[key] == "public-read"
+    assert store.acls[promotion_index_key()] == "public-read"
+
+
+def test_publish_falls_back_to_private_when_acl_unsupported():
+    from cascade.shared.hippius import StorageError
+
+    class _NoAclStore(_Store):
+        def put_text(self, key, text, content_type="", acl=None):
+            if acl is not None:
+                raise StorageError("acl_unsupported")
+            super().put_text(key, text, content_type=content_type)
+
+    store = _NoAclStore()
+    rec = _record(generation=2)
+    key = publish_promotion_record(store, dump_promotion_record(rec), 2)
+    assert load_promotion_record(store.get_text(key)).generation == 2
+    assert load_promotion_index(store.get_text(promotion_index_key())) == 2
 
 
 def test_index_is_best_effort_on_garbage():
@@ -361,6 +383,54 @@ def test_ripe_clock_with_no_candidates_holds(tmp_path):
     eng.note_round("hkKing", epoch_block=0)
     assert eng.maybe_promote(epoch_block=30 * DAY, round_id="r30") is None
     assert eng.generation == 0
+
+
+def test_no_downgrade_guard_holds_until_a_candidate_matches(tmp_path):
+    # Live generation's best member benches 1.0. A reign whose candidates all
+    # bench worse must NOT fire on the ripe clock — the shared init would
+    # ratchet downhill. Candidates stay logged, the generation holds, and the
+    # first at-least-as-good candidate fires the promotion.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "r0", 1.0),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-worse": (1.2, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is None
+    assert eng.generation == 1 and len(eng.candidates) == 1   # held, not cleared
+    assert eng.init_for_epoch(0) == ("live-a", "toto2-4m")    # field keeps training
+    # A later round produces a genuinely better checkpoint: fire on the still-
+    # ripe clock, anchored on it.
+    eng.record_bench(_manifest("r6", warm_start_ckpt="live-a"),
+                     _report("r6", 6 * DAY, {"ptr-better": (0.95, "hkChal", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=6 * DAY, round_id="r6")
+    assert rec is not None and rec.generation == 2
+    assert "ptr-better" in rec.member_ids()
+
+
+def test_no_downgrade_guard_fires_on_equal_bench(tmp_path):
+    # Equal is not a downgrade: a candidate matching the incumbent's bench
+    # still rotates fresh diversity in.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "r0", 1.0),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-equal": (1.0, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is not None
+
+
+def test_no_downgrade_guard_skips_scoreless_legacy_members(tmp_path):
+    # A grandfathered legacy pointer carries score=NaN — it cannot anchor the
+    # comparison, so it must never wedge every future promotion.
+    eng = _engine(tmp_path)
+    eng.generation = 1
+    eng.members = (PromotedMember("live-a", "toto2-4m", "", float("nan")),)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="live-a"),
+                     _report("r1", 1 * DAY, {"ptr-any": (5.0, "hkKing", "king")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert rec is not None and rec.generation == 2
 
 
 def test_promoted_score_is_geomean_of_the_six(tmp_path):

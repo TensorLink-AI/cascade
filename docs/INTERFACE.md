@@ -26,9 +26,9 @@ yield {"values": arr}          # identical to `yield arr` — same corpus digest
 At `interface_version = 1` (see `chain.toml [generator]`) the record form
 accepts **`values` only** by default. These names are **reserved** — published
 semantics, rejected until the owner arms them via `[training]
-accepted_fields`: `mask` (observedness, DEC-CA-0019), `roles` (variate roles,
-DEC-CA-0022), `start` / `freq` (time anchor, DEC-CA-0017), `group_id` (panels,
-DEC-CA-0020), `labels`, `quantiles`. Unknown names are always rejected. The
+accepted_fields`: `mask` (observedness, DEC-CA-0023), `roles` (variate roles,
+DEC-CA-0026), `start` / `freq` (time anchor, DEC-CA-0021), `group_id` (panels,
+DEC-CA-0024), `labels`, `quantiles`. Unknown names are always rejected. The
 consumers for `mask` and `roles` are already wired, so arming is a config
 announcement, not a code release:
 
@@ -53,7 +53,7 @@ order** (bucketed by shape, no global shuffle) under a cosine LR schedule.
 Ordering easy→hard, stationary→shifted, or annealing your mixture over the
 stream is a curriculum you already control — it is the honest answer to "how
 do I express non-stationarity to this trainer": order, not timestamps
-(DEC-CA-0021). Both duel sides hold the same lever, and a pathological order
+(DEC-CA-0025). Both duel sides hold the same lever, and a pathological order
 only costs your own throughput (the wall is the law).
 
 ## Repo layout
@@ -73,7 +73,7 @@ because loading them runs arbitrary code, *and* code-free containers
 (`*.safetensors`, `*.npy`, `*.npz`, `*.onnx`, …) because they'd let you distill a
 pretrained model into the generator. The same policy covers RAW DATA: bulk
 numeric payloads embedded in `config.json` or as python literals — real series
-included — are outside the design space, not a loophole (DEC-CA-0024; the repo
+included — are outside the design space, not a loophole (DEC-CA-0028; the repo
 byte cap is the wall). `torch`/`gpytorch` stay available as compute libraries
 for GP/kernel priors, and fitting parameters *inside the sandbox at round time*
 from your own procedural data is legal — just don't ship parameters or data.
@@ -81,7 +81,7 @@ The whole repo must be `<= max_repo_mb` (small, since it's source + config).
 
 ## Shared real corpus (reserved; NOT active)
 
-A future config arming (`[training] real_corpus_ref`, DEC-CA-0024) may give
+A future config arming (`[training] real_corpus_ref`, DEC-CA-0028) may give
 every generator read access to ONE owner-published, digest-pinned real-data
 corpus — identical bytes on every machine. Opt in by declaring the keyword:
 

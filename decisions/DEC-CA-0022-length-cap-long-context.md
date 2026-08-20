@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0018
+id: DEC-CA-0022
 type: decision
 title: "The length cap does not foreclose long-range priors — long CONTEXT is deferred to the 22M size seam and costed there"
 status: proposed
 date: 2026-08-13
 tags: [generator, training, eval, config, provision]
 revisit_when: "the 22M size activates (bundle context growth with the recalibration that seam already forces); or measured L40S throughput at context 8192 contradicts the ~10% per-token estimate below by enough to change the trade; or the eval-pool sources can demonstrably supply 8192+horizon fresh points across enough domains that the pool-composition shift stops being a cost"
-relations: {depends_on: DEC-CA-0016, constrained_by: DEC-CA-0002}
+relations: {depends_on: DEC-CA-0020, constrained_by: DEC-CA-0002}
 ---
 
 Gap 2 as framed: `max_length = 4096` forecloses competition on long context,

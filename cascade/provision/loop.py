@@ -249,6 +249,11 @@ class ProvisionerLoop:
     # gate — the testnet path while no digest-pinned worker image is published.
     # Returns False on failure (the pod is treated like a health-gate dud).
     bootstrap: Callable[[PodAddress, str], bool] | None = None
+    # Fired once per healthy pod AFTER the health gate (addr, stage, provider):
+    # best-effort warm-up work that must never gate the pod — today the final
+    # pods' detached benchmark-data download (make_bench_prewarm), so the cold
+    # pull overlaps training instead of eating the bench window.
+    prewarm: Callable[[PodAddress, str, str], None] | None = None
     # Raw [[host]] TOML appended verbatim to EVERY hosts.toml publish — the
     # operator's static pods (e.g. a long-lived final pod) that the provisioner
     # must never drop. clear/teardown re-renders keep it too: "no dynamic pods"
@@ -590,6 +595,10 @@ class ProvisionerLoop:
             self.epoch_hours_at(round_id),
             self.final_hours,
             self.policy,
+            # DEC-CA-0012: size the final off the tie-aware cohort CAP so the
+            # pre-phased fleet and the budget breaker cover the worst case
+            # (absent from a pre-cap plan payload ⇒ 0 ⇒ finalists alone).
+            max_finalists=int(payload.get("max_finalists", 0)),
         )
         log.info("round %d plan: eligible=%s screened=%s → heat %d pod(s)/%d slot(s), "
                  "final %d pod(s)/%d slot(s)",
@@ -861,7 +870,11 @@ class ProvisionerLoop:
         except Exception:  # noqa: BLE001 — a torn/odd marker falls back to the plan
             pass
         if self._round_plan is not None:
-            return 1 + int(self._round_plan["finalists"])
+            # Pre-marker prediction: cover the tie-aware cohort CAP
+            # (DEC-CA-0012) — the marker, once it fires, shrinks this to the
+            # actual finalist list.
+            return 1 + max(int(self._round_plan["finalists"]),
+                           int(self._round_plan.get("max_finalists", 0)))
         return 2
 
     def _maybe_rent_final_jit(self, block: int) -> None:
@@ -959,7 +972,8 @@ class ProvisionerLoop:
                     continue
                 refleet = size_fleet(_heat_field(plan),
                                      int(plan["finalists"]), heat_hours,
-                                     remaining, self.final_hours, self.policy)
+                                     remaining, self.final_hours, self.policy,
+                                     max_finalists=int(plan.get("max_finalists", 0)))
                 if refleet.heat.pods > 0:
                     wants["heat"] = refleet.heat.slots
                 else:
@@ -1277,6 +1291,11 @@ class ProvisionerLoop:
         except Exception as e:  # noqa: BLE001 — any boot fault is a failed pod, not a dead loop
             log.warning("pod %s boot/health errored: %s", pid, e)
             return None
+        if self.prewarm is not None:
+            try:
+                self.prewarm(addr, stage, prov.name)
+            except Exception as e:  # noqa: BLE001 — pre-warm never gates a healthy pod
+                log.warning("pod %s pre-warm hook errored (ignored): %s", pid, e)
         self._addrs[pid] = addr
         return addr
 

@@ -73,7 +73,7 @@ def test_manifest_roundtrips_gpu_name(cfg):
     assert again.entry_for_role("king").gpu_name == "NVIDIA H100"
 
 
-# ── per-size pins (DEC-CA-0023 size-conditional silicon) ─────────────────────
+# ── per-size pins (DEC-CA-0027 size-conditional silicon) ─────────────────────
 
 H100 = "NVIDIA H100 80GB HBM3"
 
@@ -106,7 +106,7 @@ def _sized_manifest(cfg, entries):
 
 
 def test_per_size_pins_each_size_judged_against_its_own_silicon(cfg):
-    # The DEC-CA-0023 deadlock regression: a 313M duel on H100 beside a 4M
+    # The DEC-CA-0027 deadlock regression: a 313M duel on H100 beside a 4M
     # lineage on L40S must PASS — each size against its own pin — while the
     # old whole-manifest rule rejected any manifest not uniformly on the base
     # pin.

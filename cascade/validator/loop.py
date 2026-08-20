@@ -533,7 +533,7 @@ class ValidatorRunner:
 
         Each entry is judged against ITS size's pin: the per-size contract's
         ``expected_gpu`` (a ``SizeSpec.expected_gpu`` override, else the base
-        ``[training]`` pin — DEC-CA-0023's size-conditional silicon). A size
+        ``[training]`` pin — DEC-CA-0027's size-conditional silicon). A size
         with no pin requires only that king and challenger ran the same GPU
         within that size — equal compute is already guaranteed by the token
         budget, but a byte-exact audit needs each comparison run on one SKU.
@@ -608,7 +608,7 @@ class ValidatorRunner:
         score_records: list[EntryScores],
     ) -> list[WindowScore] | None:
         """Score the shared warm-start init for the increment margin
-        (DEC-CA-0023), appending its rows to the receipt.
+        (DEC-CA-0027), appending its rows to the receipt.
 
         Returns ``None`` — judge at "level" — when the round has no baseline:
         a random-init round (no ``warm_start_ckpt``; the E2 init-round
@@ -1075,7 +1075,7 @@ class ValidatorRunner:
         _t_king = _time.perf_counter() - _t0
 
         base_params = self.cfg.koth_params()
-        # Increment margin (DEC-CA-0023): score the shared warm-start init as
+        # Increment margin (DEC-CA-0027): score the shared warm-start init as
         # the third paired reference, or fall back to the level rule for a
         # round that has none (random init / multi-size duel). The fallback
         # mutates only the JUDGED params — the receipt keeps recording the

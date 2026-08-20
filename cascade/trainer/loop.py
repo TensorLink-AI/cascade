@@ -86,6 +86,20 @@ ScreenFn = Callable[
     [Path, "ResolvedGenerator", int, int | None], "float | list[WindowScore]"
 ]
 
+# Scores the INCREMENTAL tie run-off windows for one heat checkpoint
+# (DEC-CA-0012): windows ``[start, stop)`` of the round's seeded window
+# permutation, on CPU, against the heat checkpoint still on local disk. The
+# round's window selection is a seeded permutation PREFIX, so the heat's slice
+# is a strict prefix of the run-off's larger slice for the same round seed —
+# the caller concatenates the returned scores onto the heat's and pairing
+# holds by construction (``joint_bag_geomeans`` raises on mismatched
+# ``abs_target``). Args mirror ScreenFn plus ``(start, stop)``. Injected so
+# the run-off stays a testable boundary; the default wiring (same pool source
+# as the screener) is attached in cascade.trainer.main.
+RunoffFn = Callable[
+    [Path, "ResolvedGenerator", int, int | None, int, int], "list[WindowScore]"
+]
+
 # Scores one final-duel checkpoint on the public suites (GIFT-Eval / BOOM /
 # TIME) for Cascade, given its local checkpoint dir. Returns the six-number
 # BenchScores the trainer publishes in the round's signed bench report
@@ -255,6 +269,11 @@ _STORAGE_FAILURE_MARKERS = (
     "generator_artifact_unreachable",
 )
 STORAGE_RETRY_BACKOFF_SECONDS = 45.0
+# Cool-down before a re-queued heat challenger is dispatched again. Longer than
+# the in-dispatch storage backoff: a re-queue means the dispatch AND its retry
+# both died, so whatever ate them (registry brown-out, provider network blip)
+# gets time to pass while other lanes keep training.
+HEAT_REQUEUE_COOLDOWN_SECONDS = 120.0
 
 
 def _storage_failure(exc: BaseException) -> bool:
@@ -264,6 +283,74 @@ def _storage_failure(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return any(m in msg for m in _STORAGE_FAILURE_MARKERS)
+
+
+def _infra_failure(exc: BaseException) -> bool:
+    """True when a heat failure is the INFRASTRUCTURE's fault, not the
+    challenger's: the storage layer (Hippius fetch/push) or the SSH transport
+    (rc=255 — connection lost, never the remote command's own exit)."""
+    return _storage_failure(exc) or getattr(exc, "returncode", None) == 255
+
+
+def _run_heat_field(run_fn, challengers, *, max_workers: int, requeues: int,
+                    cooldown_seconds: float, note_progress, storage_dropped,
+                    sleep=time.sleep):
+    """Run every challenger through ``run_fn`` concurrently, re-queueing
+    infrastructure casualties in the SAME heat.
+
+    A challenger whose dispatch (and its in-dispatch retry) died on an infra
+    failure — storage layer or SSH transport — goes back into the pool up to
+    ``requeues`` times, after ``cooldown_seconds``; the 2026-08-19 datacenter
+    blip terminally dropped three challengers whose retries happened to be the
+    runs in flight. Challenger-fault failures (their generator raising, OOM,
+    the guard) never re-queue, so there is no free-retry surface for bad code.
+
+    Returns ``(out, terminal_transport_failures)`` — the latter feeds the
+    caller's dead-fleet wipeout check, counting only challengers that EXHAUSTED
+    their attempts at the transport level. ``storage_dropped`` maps hotkey→ref
+    for terminal storage drops (the burn-exemption candidates), matching the
+    old inline behaviour.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+    from concurrent.futures import wait as futures_wait
+
+    out = []
+    transport_failures = 0
+    requeues_left = {c.hotkey: max(0, int(requeues)) for c in challengers}
+    total = len(challengers)
+    done = 0
+
+    def _cooled_run(c):
+        sleep(cooldown_seconds)
+        return run_fn(c)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        pending = {ex.submit(run_fn, c): c for c in challengers}
+        while pending:
+            done_futs, _ = futures_wait(list(pending), return_when=FIRST_COMPLETED)
+            for fut in done_futs:
+                c = pending.pop(fut)
+                try:
+                    out.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    if _infra_failure(e) and requeues_left.get(c.hotkey, 0) > 0:
+                        requeues_left[c.hotkey] -= 1
+                        log.warning(
+                            "heat: challenger %s hit an infrastructure failure (%s); "
+                            "re-queueing after %.0fs cool-down (%d re-queue(s) left)",
+                            c.hotkey, e, cooldown_seconds, requeues_left[c.hotkey])
+                        pending[ex.submit(_cooled_run, c)] = c
+                        continue
+                    if getattr(e, "returncode", None) == 255:
+                        transport_failures += 1
+                    if _storage_failure(e):
+                        # Candidate for the burn exemption — re-verified at
+                        # heat settle (see _burn_hotkeys).
+                        storage_dropped[c.hotkey] = c.ref
+                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
+                done += 1
+                note_progress(done, total)
+    return out, transport_failures
 
 
 def _load_commit_witness(path: Path) -> dict[str, dict]:
@@ -511,6 +598,29 @@ def _drop_final_content_clones(
     return kept
 
 
+def _final_repo_suffix(
+    jobs: list[tuple[ResolvedGenerator, str]],
+    gen: ResolvedGenerator,
+    role: str,
+) -> str:
+    """Checkpoint-repo/work-dir disambiguator for a final-stage run.
+
+    A final's checkpoint repo and work dir are keyed ``<seed>-<role>-<size>``,
+    which is unique only while at most ONE challenger trains per size. A
+    DEC-CA-0012 cohort puts several challengers in the final at the same size,
+    so — exactly like the remote heat's ``-heat-u<uid>`` — each cohort
+    challenger gets a per-uid suffix and cannot overwrite a peer's checkpoint
+    or repo. Empty for the king and for a single-challenger final, so every
+    pre-cohort round keeps its exact repo names and ``trained_pointer`` bytes
+    (the inert-default bit-identity DEC-CA-0012 requires).
+    """
+    if role != "challenger":
+        return ""
+    if sum(1 for _, r in jobs if r == "challenger") <= 1:
+        return ""
+    return f"-u{gen.uid}"
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -528,12 +638,26 @@ class TrainerRunner:
     # field down to [round] finalists before the expensive final. None ⇒ no
     # internal screen (the field's natural order is taken). Wired in trainer.main.
     screen_fn: ScreenFn | None = None
+    # Tie run-off screener (DEC-CA-0012): scores the incremental windows
+    # [start, stop) of the round's seeded window slice for one heat checkpoint,
+    # so a statistically tied heat top can be re-scored on a larger eval before
+    # GPU lanes are spent on it. Consulted only when [round] max_finalists > 1
+    # AND tie_runoff_windows > 0. None ⇒ no run-off (a tied top advances by the
+    # heat ranking, capped). Wired in trainer.main off the same pool source as
+    # screen_fn — same permutation, so the slices concatenate paired.
+    runoff_fn: RunoffFn | None = None
     # Eval-pool pin: ``(base_seed, block) -> (key, sha256)`` provenance of the
     # pool snapshot this round screens on, stamped (and therefore signed) into
     # the manifest so validators verify their own snapshot selection against it
     # rather than trusting the unsigned pool index. None ⇒ manifests go out
     # unpinned (legacy). Wired in trainer.main from the screen pool source.
     pool_provenance_fn: object | None = None
+    # Realised round composition: ``(base_seed, block) -> dict | None`` — the
+    # jittered mix's post-hoc domain/class breakdown of the round's eval draw
+    # (None while the mix is inactive). Attached to the manifest UNSIGNED (like
+    # ``heat``) for the public feed. Wired in trainer.main from the same pool
+    # source the screen uses.
+    composition_fn: object | None = None
     # Cascade: scores a duel checkpoint on GIFT-Eval / BOOM / TIME for the round's
     # POST-PUBLISH signed bench report (cascade.shared.bench_report) — validators
     # read one authoritative signed set per role, so promotion stays consensus-
@@ -1436,7 +1560,7 @@ class TrainerRunner:
             update_heat_index,
         )
 
-        n = max(0, self.cfg.round.finalists)
+        n = max(0, self.cfg.round.finalist_cap)
         if screened == 0:
             reason = "no eligible challengers entered the round"
         elif self.screen_fn is None:
@@ -1846,24 +1970,288 @@ class TrainerRunner:
         not armed — the marker lifecycle exists only where the hold does."""
         if not self.will_run_post_publish_bench():
             return None
+        # Snapshot the round's final-pod assignments NOW, at thread start —
+        # still inside round N. The scratch shadow dispatches HOURS later, by
+        # which time run_round may have started round N+1 and repopulated
+        # _final_role_hosts with the SAME (role, size, hotkey) key pointing at
+        # N+1's live final pod; a late lookup would land an hours-long
+        # training run on the pod running the next round's consensus-relevant
+        # final.
+        final_hosts = dict(self._final_role_hosts)
         report = None
         try:
-            report = self._post_publish_bench(manifest)
-        except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
-            log.warning("round=%s: post-publish bench failed (ignored): %s",
-                        manifest.round_id, e)
+            try:
+                report = self._post_publish_bench(manifest)
+            except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
+                log.warning("round=%s: post-publish bench failed (ignored): %s",
+                            manifest.round_id, e)
+            # Promotion candidates (DEC-CA-0013): both duel checkpoints' scores
+            # feed the engine's candidate log (thread-safe; this runs on the
+            # bench thread). Guarded — candidate bookkeeping must never fail
+            # the bench. Recorded BEFORE the scratch shadow below: the shadow
+            # is an hours-long telemetry leg, and a promotion must never wait
+            # on telemetry.
+            if report is not None and self.promotion is not None:
+                try:
+                    self.promotion.record_bench(manifest, report)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("round=%s: promotion candidate recording failed (ignored): %s",
+                                manifest.round_id, e)
+            # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th
+            # warm-started round, train the king's generator from scratch and
+            # publish the labeled telemetry report. INSIDE the try so it runs
+            # under the provisioner's teardown hold (it needs the final pod),
+            # and after the duel bench + candidate recording so it never
+            # delays the reign log's numbers. Never raises; a duel-bench miss
+            # doesn't cancel it (the scratch curve alone is still a data
+            # point).
+            self._run_scratch_shadow(manifest, report, final_hosts=final_hosts)
         finally:
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
-        # Promotion candidates (DEC-CA-0013): both duel checkpoints' scores feed
-        # the engine's candidate log (thread-safe; this runs on the bench
-        # thread). Guarded — candidate bookkeeping must never fail the bench.
-        if report is not None and self.promotion is not None:
-            try:
-                self.promotion.record_bench(manifest, report)
-            except Exception as e:  # noqa: BLE001
-                log.warning("round=%s: promotion candidate recording failed (ignored): %s",
-                            manifest.round_id, e)
         return report
+
+    # ── shadow scratch control (DEC-CA-0014 Stage 1) ─────────────────────────
+
+    def _scratch_shadow_due(self, manifest: TrainingManifest) -> bool:
+        """Whether this round owes a scratch-shadow leg: ``[telemetry]
+        scratch_shadow_every_rounds`` armed, the round actually trained
+        warm-started (on a random-init round every run already IS the scratch
+        control), the epoch grid lands on the cadence, and a train+bench path
+        is wired. Pure telemetry predicate — nothing consensus-visible reads
+        it."""
+        every = int(getattr(self.cfg.telemetry, "scratch_shadow_every_rounds", 0) or 0)
+        if every <= 0:
+            return False
+        if not manifest.warm_start_ckpt:
+            log.info("round=%s: scratch shadow skipped — round trained from "
+                     "random init (nothing to contrast)", manifest.round_id)
+            return False
+        # Same epoch index the warm-start rotation uses, derived from the
+        # manifest alone so a restart (or the bench thread outliving the round
+        # context) computes the identical cadence.
+        eb = effective_epoch_blocks(self.cfg.round, int(manifest.created_block))
+        epoch_idx = int(manifest.created_block) // eb
+        if epoch_idx % every != 0:
+            return False
+        remote_ok = bool(self.remote_hosts and self.trainer_spec
+                         and self.cascade_bench_plan is not None)
+        local_ok = self.bench_eval_fn is not None
+        if not (remote_ok or local_ok):
+            log.warning("round=%s: scratch shadow due but no train+bench path "
+                        "wired (remote hosts+plan or local bench_eval_fn); skipped",
+                        manifest.round_id)
+            return False
+        return True
+
+    def _run_scratch_shadow(self, manifest: TrainingManifest,
+                            duel_report: object | None = None,
+                            final_hosts: dict | None = None) -> object | None:
+        """Train the king's generator FROM SCRATCH under the round's identical
+        contract + seeds, bench it, and publish the labeled telemetry report
+        (``benchmarks/scratch/round-<id>.json`` + trend index) beside the
+        round's signed bench report. DEC-CA-0014 Stage 1.
+
+        TELEMETRY ONLY, enforced structurally: the scratch entry is never a
+        manifest entry, never a ``BenchReport`` entry (validators parse that
+        schema on the promotion-provenance path), and is never handed to
+        ``promotion.record_bench`` — the promotion candidate pool cannot see
+        it. Best-effort throughout: returns the published report or ``None``,
+        never raises into the bench thread.
+
+        Runs strictly post-publish on the king's (now idle) final pod, under
+        the provisioner's bench hold — arming this requires sizing ``[eval]
+        bench_hold_max_hours`` for duel bench + a full training leg + one more
+        bench (see the DEC-CA-0014 node's Stage-1 budget note).
+        """
+        try:
+            if not self._scratch_shadow_due(manifest):
+                return None
+            from ..shared.scratch_report import (
+                ScratchBenchReport,
+                bench_geomean,
+                dump_scratch_report,
+                publish_scratch_report,
+                sign_scratch_report,
+                update_scratch_index,
+            )
+
+            primary = self.cfg.throne_contracts()[0]
+            size = primary.arch_preset
+            king = next((e for e in manifest.entries
+                         if e.role == "king" and (e.size or size) == size), None)
+            if king is None:
+                log.warning("round=%s: scratch shadow skipped — no king entry "
+                            "at the primary size", manifest.round_id)
+                return None
+            gen = ResolvedGenerator(hotkey=king.miner_hotkey, uid=king.miner_uid,
+                                    ref=king.gen_ref)
+            seeds = RoundSeeds.derive(int(manifest.round_id), self.cfg.training)
+            log.info("round=%s: scratch shadow leg starting — king generator %s "
+                     "from RANDOM INIT (lineage init this round: %s)",
+                     manifest.round_id, king.gen_ref[:48], manifest.warm_start_ckpt[:48])
+
+            if self.remote_hosts and self.trainer_spec and self.cascade_bench_plan is not None:
+                pointer, scores = self._scratch_shadow_remote(
+                    manifest, gen, primary, seeds, final_hosts=final_hosts)
+            else:
+                pointer, scores = self._scratch_shadow_local(
+                    manifest, gen, primary, seeds)
+            if scores is None:
+                log.warning("round=%s: scratch shadow produced no bench scores; "
+                            "no scratch report published", manifest.round_id)
+                return None
+
+            king_bench = None
+            if duel_report is not None:
+                king_bench = duel_report.entry_for("king", size=size)
+            report = ScratchBenchReport(
+                round_id=manifest.round_id,
+                created_block=manifest.created_block,
+                gen_ref=king.gen_ref,
+                miner_hotkey=king.miner_hotkey,
+                miner_uid=king.miner_uid,
+                trained_pointer=pointer or "",
+                scores=scores,
+                warm_start_ckpt=manifest.warm_start_ckpt,
+                generation=int(getattr(self.promotion, "generation", 0) or 0),
+                king_pointer=(king_bench.trained_pointer if king_bench else ""),
+                king_scores=(king_bench.scores if king_bench else None),
+            )
+            if self.wallet is not None:
+                report = sign_scratch_report(report, self.wallet)
+            store = self.manifest_store()
+            key = publish_scratch_report(store, dump_scratch_report(report),
+                                         manifest.round_id)
+            try:
+                update_scratch_index(store, report)
+            except Exception as e:  # noqa: BLE001 — the index is presentational
+                log.warning("scratch index update failed (report published): %s", e)
+            gap = (f"{bench_geomean(scores) - bench_geomean(king_bench.scores):+.4f}"
+                   if king_bench else "n/a (no king bench)")
+            log.info("published scratch report round=%s scratch_geomean=%.4f "
+                     "lineage_gap=%s signed=%s → s3://%s/%s",
+                     manifest.round_id, bench_geomean(scores), gap,
+                     report.signature is not None,
+                     self.cfg.storage.manifest_bucket, key)
+            self._log_scratch_wandb(report)
+            return report
+        except Exception as e:  # noqa: BLE001 — shadow telemetry must never raise
+            log.warning("round=%s: scratch shadow failed (ignored): %s",
+                        manifest.round_id, e)
+            return None
+
+    def _scratch_shadow_remote(self, manifest: TrainingManifest, gen: ResolvedGenerator,
+                               primary, seeds: RoundSeeds,
+                               final_hosts: dict | None = None) -> tuple[str | None, object | None]:
+        """Remote scratch leg on the king's final pod, through the PINNED
+        worker image's existing CLI — no pod-side code change, so this ships
+        trainer-side unilaterally (the whole point of Stage 1).
+
+        Dispatch shape, and why: ``role="king"`` with ``repo_suffix="-scratch"``
+        keeps the checkpoint repo distinct (``ckpt-r<seed>-king-<size>-scratch``)
+        while ``--train-hours <target_train_hours>`` routes through the
+        worker's screen path at the FULL budget — ``for_hours(target)`` yields
+        the byte-identical token count, and the wall guard
+        ``min(max(guard_factor×target, floor), max_train_seconds)`` equals
+        ``max_train_seconds`` at the shipped ``heat_guard_factor >= 1.0``. The
+        screen path is what gives the run its own telemetry key
+        (``heat-<king_hotkey>``, a key a king never otherwise uses) instead of
+        colliding with the real king's ``king-<size>`` S3 log + wandb run. Two
+        accepted asymmetries, both telemetry-grade: the worker skips
+        ``assert_train_image`` on the screen path (the pod was launched from
+        the pinned image regardless), and the run's log label says heat. No
+        ``warm_start_ref`` ⇒ random init.
+        """
+        from .bench_hook import run_post_round_benchmark
+        from .remote import RemoteDispatcher, pod_lane_count
+
+        size = primary.arch_preset
+        # ONLY the snapshot taken at bench-thread start may name the pod: a
+        # live _final_role_hosts / _hosts_for("final") lookup this many hours
+        # after publish can resolve to the NEXT round's freshly-dispatched
+        # final pod (same (role, size, hotkey) key, new fleet) and land a
+        # full training leg on top of a consensus-relevant run. No snapshot
+        # entry ⇒ skip the shadow this round — a missed telemetry point beats
+        # a contended final.
+        host = (final_hosts or {}).get(("king", size, gen.hotkey))
+        if host is None:
+            log.warning("round=%s: scratch shadow skipped — no snapshotted "
+                        "king final pod for this round (restart mid-round, or "
+                        "a fully local final)", manifest.round_id)
+            return None, None
+        disp = RemoteDispatcher(
+            trainer_spec=self.trainer_spec,
+            timeout_seconds=self.remote_timeout_seconds,
+            extra_forward_env=self._pod_extra_forward_env(),
+        )
+        entry = disp.dispatch(
+            host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey, role="king",
+            base_seed=seeds.base_seed, block=int(manifest.created_block),
+            arch_preset=size, train_hours=primary.target_train_hours,
+            repo_suffix="-scratch", warm_start_ref=None,
+            lane_count=pod_lane_count(host, [host]),
+        )
+        from ..eval.benchmarks import extract_bench_scores
+
+        bench = run_post_round_benchmark(
+            host, manifest.round_id, size, self.cascade_bench_plan,
+            work_root=self.work_root, role="king-scratch",
+        )
+        scores = extract_bench_scores(bench) if bench is not None else None
+        return entry.trained_pointer, (BenchScores(**scores) if scores else None)
+
+    def _scratch_shadow_local(self, manifest: TrainingManifest, gen: ResolvedGenerator,
+                              primary, seeds: RoundSeeds) -> tuple[str | None, object | None]:
+        """Local scratch leg (single-box / testnet): train on this box with a
+        first-class telemetry label (``scratch-king-<size>``; the local path
+        controls ``log_role`` directly, unlike the pinned remote worker),
+        upload the checkpoint, bench via ``bench_eval_fn``."""
+        size = primary.arch_preset
+        out_dir = (self.work_root / f"{seeds.base_seed}" / size
+                   / "king-scratch" / "checkpoint")
+        result, _, _, _ = self._train_checkpoint(
+            gen, seeds, primary, primary.train_tokens, out_dir,
+            log_role=f"scratch-king-{size}", warm_start_dir=None,
+        )
+        pointer = None
+        try:
+            ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-king-{size}-scratch"
+            up = upload_dir_to_hub_or_hf(result.local_dir, ckpt_repo, self.hub(),
+                                         hf_repo=self._hf_ckpt_repo(ckpt_repo))
+            pointer = format_trained_pointer(up.ref.immutable_ref)
+        except Exception as e:  # noqa: BLE001 — the bench numbers matter more than the upload
+            log.warning("round=%s: scratch checkpoint upload failed (benching "
+                        "the local dir anyway): %s", manifest.round_id, e)
+        scores = self.bench_eval_fn(result.local_dir) if self.bench_eval_fn else None
+        return pointer, scores
+
+    def _log_scratch_wandb(self, report: object) -> None:
+        """Mirror the scratch-vs-lineage pair to wandb — same swallow-everything
+        contract as every other observability path."""
+        try:
+            if not getattr(self.cfg.wandb, "enabled", False):
+                return
+            from ..shared.scratch_report import bench_geomean
+
+            sink = open_wandb_run(
+                self.cfg.wandb, round_id=str(report.round_id),
+                role="scratch-shadow", hotkey=report.miner_hotkey,
+                uid=report.miner_uid, size="",
+            )
+            if sink is None:
+                return
+            record = {
+                "event": "scratch_shadow", "generation": report.generation,
+                "scratch_geomean": bench_geomean(report.scores),
+            }
+            if report.king_scores is not None:
+                king_gm = bench_geomean(report.king_scores)
+                record["king_geomean"] = king_gm
+                record["gap"] = record["scratch_geomean"] - king_gm
+            sink.emit(record)
+            sink.finish()
+        except Exception as e:  # noqa: BLE001 — wandb must never disturb the shadow
+            log.debug("wandb scratch-shadow log failed (continuing): %s", e)
 
     def _receipt_king(self) -> str | None:
         """The current king per the validators' signed receipt trail, or the
@@ -1964,6 +2352,67 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — never sink a round on backfill
             log.warning("promotion: deploy backfill failed (engine anchors at "
                         "this boundary instead): %s", e)
+
+    def _replay_reign_bench_reports(self) -> None:
+        """Re-ingest the CURRENT reign's published bench reports at the
+        boundary. The candidate pool otherwise only sees reports the
+        in-process bench thread publishes — an out-of-band report (a mop-up
+        after a failed leg, a report that landed while the trainer was down)
+        never yields candidates, and a promotion then fires off an incomplete
+        reign (observed 2026-08-18: r26's better leg, 0.64149, missed the
+        gen-3 member set because its mop-up report was published externally).
+
+        Cheap and idempotent by construction: ``record_bench`` dedupes on
+        ``trained_pointer`` and gates on the live generation, so replaying
+        every reign round each boundary is a handful of small S3 reads a day
+        that add nothing when nothing is missing. Runs BEFORE
+        ``maybe_promote`` so a fire-time selection sees the full reign.
+        Same signature discipline as the deploy backfill: both the report
+        and the manifest must verify against the pinned trainer hotkey."""
+        if self.promotion is None or getattr(self.promotion, "king_hotkey", None) is None:
+            return
+        try:
+            from ..shared.bench_report import (
+                bench_report_key,
+                load_bench_report,
+                verify_bench_report_signature,
+            )
+            from ..shared.hippius import RECEIPT_INDEX_KEY
+            from ..shared.manifest import load_manifest, verify_signature
+            from .promotion import reign_tail
+
+            store = self.manifest_store()
+            idx = json.loads(store.get_text(RECEIPT_INDEX_KEY))
+            tail = reign_tail(idx.get("rounds") or [],
+                              self.cfg.manifest.validator_hotkey)
+            if tail is None:
+                return
+            _king, _start_block, round_ids = tail
+            trainer_hotkey = self.cfg.manifest.trainer_hotkey
+            added = 0
+            for rid in round_ids:
+                try:
+                    manifest = load_manifest(
+                        store.get_text(manifest_round_key(rid)))
+                    report = load_bench_report(
+                        store.get_text(bench_report_key(rid)))
+                except Exception:  # noqa: BLE001 — no report yet ⇒ nothing to replay
+                    continue
+                if trainer_hotkey and not verify_bench_report_signature(
+                        report, trainer_hotkey):
+                    log.warning("promotion replay: bench report for round=%s "
+                                "fails signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                if trainer_hotkey and not verify_signature(manifest, trainer_hotkey):
+                    log.warning("promotion replay: manifest for round=%s fails "
+                                "signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                added += self.promotion.record_bench(manifest, report)
+            if added:
+                log.info("promotion: boundary replay recovered %d candidate(s) "
+                         "from published bench report(s)", added)
+        except Exception as e:  # noqa: BLE001 — replay must never sink a round
+            log.warning("promotion: bench-report replay failed (ignored): %s", e)
 
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
@@ -2314,6 +2763,22 @@ class TrainerRunner:
         jobs += [(c, "challenger") for c in finalists]
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
+        if len(finalists) > 1:
+            # DEC-CA-0012: stamp the advancing cohort's record order — 0-based,
+            # best observed heat geomean first. Record order ONLY: the
+            # validator sorts on (duel_rank, hotkey), judges the WHOLE cohort,
+            # and crowns the best margin-clearer, so this never decides the
+            # throne. A single finalist keeps the field default (0, dropped
+            # from the canonical body), so those manifests hash exactly as
+            # before. Stamped before the content-clone drop below — a dropped
+            # clone leaves a non-contiguous rank, which consumers tolerate
+            # (they sort, never index).
+            order = {c.hotkey: i for i, c in enumerate(finalists)}
+            entries = [
+                replace(e, duel_rank=order[e.miner_hotkey])
+                if e.role == "challenger" and e.miner_hotkey in order else e
+                for e in entries
+            ]
         entries = _drop_final_content_clones(entries, jobs)
         if not any(e.role == "king" for e in entries):
             raise RuntimeError("king training produced no entry; aborting round")
@@ -2336,6 +2801,15 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — pinning must never sink a round
                 log.warning("eval-pool pin unavailable for round=%s: %s", base_seed, e)
 
+        # Post-hoc realised mix of the round's eval draw (unsigned, like heat).
+        # Best-effort: a miss just publishes without the block.
+        composition = None
+        if self.composition_fn is not None:
+            try:
+                composition = self.composition_fn(base_seed, screen_block)
+            except Exception as e:  # noqa: BLE001 — never sinks a round
+                log.warning("round composition unavailable for round=%s: %s", base_seed, e)
+
         return TrainingManifest(
             round_id=str(base_seed),
             created_block=block,
@@ -2344,6 +2818,7 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
             heat=heat,
+            composition=composition,
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
@@ -2372,8 +2847,10 @@ class TrainerRunner:
 
         Each challenger is trained for ``[round] heat_train_hours`` on the primary
         (smallest) size and scored by the injected ``screen_fn`` (lower is
-        better); the cheapest ``finalists`` advance, UID breaking ties for
-        determinism. When the field already fits within ``finalists``, or no
+        better); the cheapest ``finalists`` advance, ``(reveal_block, uid)``
+        breaking ties for determinism (a UID is not a seniority claim — it
+        recycles; the reveal block is). When the field already fits within
+        the finalist cap, or no
         ``screen_fn`` is wired, the field's natural order (lowest UID first) is
         taken without spending heat compute. A challenger that fails to train or
         screen is dropped (it simply doesn't qualify).
@@ -2386,15 +2863,25 @@ class TrainerRunner:
         Returns ``(finalists, heat)`` where ``heat`` is the informational
         standings the dashboard shows every entrant (:class:`HeatResult`), or
         ``None`` when no screen actually ran (no compute was spent to rank).
+
+        With ``[round] max_finalists > 1`` the finalist count responds to the
+        screen's own decisiveness statistic instead (DEC-CA-0012): a leader the
+        screen separated advances alone; a statistically tied top is re-scored
+        on a larger eval slice (the tie run-off) and the survivors advance,
+        capped — see :meth:`_advance_cohort`. At the shipped default
+        (``max_finalists = 1``) that path never runs and the behaviour above is
+        bit-identical.
         """
         n = max(0, self.cfg.round.finalists)
-        if not challengers or n == 0:
+        armed = self.cfg.round.max_finalists > 1
+        cap = max(0, self.cfg.round.finalist_cap)
+        if not challengers or cap == 0:
             return [], None
-        if self.screen_fn is None or len(challengers) <= n:
-            if self.screen_fn is None and len(challengers) > n:
+        if self.screen_fn is None or len(challengers) <= cap:
+            if self.screen_fn is None and len(challengers) > cap:
                 log.warning("no screen_fn wired; taking %d of %d challengers by UID order",
-                            n, len(challengers))
-            return list(challengers[:n]), None
+                            cap, len(challengers))
+            return list(challengers[:cap]), None
 
         # for_hours scales the token budget AND the hard wall-clock cap to the
         # cheap heat budget — the run stops at whichever is reached first, so a
@@ -2457,16 +2944,146 @@ class TrainerRunner:
             log.info("heat: challenger %s score=%.5f", c.hotkey, score)
             scored.append((score, c.uid, c))
 
-        scored.sort(key=lambda t: (t[0], t[1]))  # lower score better; UID tiebreak
-        winners = [c for _, _, c in scored[:n]]
+        # Lower score better; ties break on (reveal_block, uid) — a UID is not
+        # a seniority claim (Bittensor recycles them), the reveal block is
+        # (DEC-CA-0012; NOTE-ca-operational-invariants).
+        scored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
+        if armed:
+            ckpt_dirs = {c.hotkey: d for c, d, _ in trained}
+            winners = self._advance_cohort(scored, components, diagnostics,
+                                           seeds, screen_block, cap, ckpt_dirs)
+        else:
+            winners = [c for _, _, c in scored[:n]]
         log.info("heat: %d/%d advance to the final: %s",
                  len(winners), len(challengers), [c.hotkey for c in winners])
-        diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         heat = self._heat_result(
-            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset, n,
+            challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset,
+            len(winners) if armed else n,
             duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
         )
         return winners, heat
+
+    def _advance_cohort(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        components: dict[str, list],
+        diagnostics,
+        seeds: RoundSeeds,
+        screen_block: int | None,
+        cap: int,
+        ckpt_dirs: dict[str, Path],
+    ) -> list[ResolvedGenerator]:
+        """The DEC-CA-0012 advance rule, armed only (``max_finalists > 1``).
+
+        A leader the screen separated from every other entrant (paired LCB > 0
+        off the joint bootstrap, :func:`cascade.eval.heat.tied_set`) advances
+        ALONE, whatever the cap. A statistically tied top is re-scored on a
+        larger eval slice when the run-off is wired (:meth:`_tie_runoff`); the
+        survivors advance, capped at ``max_finalists``. With the run-off
+        disabled (or unable to finish) the pre-run-off tied set advances,
+        capped, in heat-rank order.
+
+        Degrades safely: a scalar-only screener or an unpaired field carries no
+        diagnostics, and ``tied_set`` then returns the leader alone — exactly
+        the pre-DEC-CA-0012 single-finalist behaviour.
+        """
+        from ..eval.heat import tied_set
+
+        ranked = [c for _, _, c in scored]
+        keys = [c.hotkey for c in ranked]
+        by_key = {c.hotkey: c for c in ranked}
+        runoff_on = self.runoff_fn is not None and self.cfg.round.tie_runoff_windows > 0
+        # The run-off re-scores the WHOLE tied set (CPU minutes, wall-clock
+        # capped), so it is derived uncapped; without a run-off the cap applies
+        # immediately. GPU spend is bounded by the cap either way.
+        tied = tied_set(diagnostics, keys, cap=(len(keys) if runoff_on else cap))
+        if len(tied) <= 1:
+            log.info("heat: screen separated the leader (%s); it advances alone",
+                     keys[0])
+            return ranked[:1]
+        if runoff_on:
+            survivors = self._tie_runoff(tied, by_key, components, seeds,
+                                         screen_block, cap, ckpt_dirs)
+            if survivors is not None:
+                return survivors
+        log.info("heat: tied top of %d advances capped at %d (no run-off verdict)",
+                 len(tied), cap)
+        return [by_key[k] for k in tied[:cap]]
+
+    def _tie_runoff(
+        self,
+        tied_keys: list[str],
+        by_key: dict[str, ResolvedGenerator],
+        components: dict[str, list],
+        seeds: RoundSeeds,
+        screen_block: int | None,
+        cap: int,
+        ckpt_dirs: dict[str, Path],
+    ) -> list[ResolvedGenerator] | None:
+        """Re-score the tied heat top on a larger eval slice (DEC-CA-0012).
+
+        CPU-only, on the orchestrator, against heat checkpoints still on local
+        disk — no retraining, no GPU rent. Scores only the windows the heat has
+        NOT already scored: the round's window selection is a seeded
+        permutation prefix, so the heat's slice is a strict prefix of the
+        ``[round] tie_runoff_windows`` slice for the same round seed; the
+        incremental scores are concatenated onto the heat's and pairing holds
+        by construction. The extended field is then re-ranked and the tied set
+        re-derived at the same uncorrected bar; the survivors (capped) are
+        returned best-first.
+
+        Runs under the ``tie_runoff_phase_seconds`` wall clock. Returns
+        ``None`` when the run-off cannot run or finish (no incremental windows,
+        clock expiry, a scoring failure) — the caller falls back to the
+        pre-run-off tied set, because a screen that cannot finish must not
+        sink the round it protects.
+        """
+        from ..eval.heat import screen_diagnostics, tied_set
+        from ..eval.scoring import global_geomean
+
+        rnd = self.cfg.round
+        n_heat = len(components[tied_keys[0]])
+        n_total = min(rnd.tie_runoff_windows, self.cfg.eval.n_windows)
+        if n_total <= n_heat:
+            log.info("heat: tie run-off skipped: tie_runoff_windows=%d adds no windows "
+                     "beyond the %d the heat already screened", rnd.tie_runoff_windows, n_heat)
+            return None
+        deadline = time.monotonic() + max(0, rnd.tie_runoff_phase_seconds)
+        extended: dict[str, list] = {}
+        for key in tied_keys:
+            if time.monotonic() >= deadline:
+                log.warning("heat: tie run-off wall clock (%ds) expired with %d/%d "
+                            "re-scored; falling back to the pre-run-off tied set",
+                            rnd.tie_runoff_phase_seconds, len(extended), len(tied_keys))
+                return None
+            try:
+                extra = self.runoff_fn(ckpt_dirs[key], by_key[key], seeds.base_seed,
+                                       screen_block, n_heat, n_total)
+                extended[key] = list(components[key]) + list(extra)
+            except Exception as e:  # noqa: BLE001 — the run-off must never sink a round
+                log.warning("heat: tie run-off failed on %s: %s; falling back to the "
+                            "pre-run-off tied set", key, e)
+                return None
+        rescored = [(global_geomean(extended[k]), by_key[k].uid, by_key[k])
+                    for k in tied_keys]
+        rescored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        ranked_keys = [c.hotkey for _, _, c in rescored]
+        try:
+            diag = screen_diagnostics(
+                [(k, extended[k]) for k in ranked_keys],
+                seed=seeds.base_seed,
+                B=self.cfg.scoring.bootstrap_B,
+                alpha=self.cfg.scoring.bootstrap_alpha,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("heat: tie run-off diagnostics unavailable: %s; falling back "
+                        "to the pre-run-off tied set", e)
+            return None
+        survivors = tied_set(diag, ranked_keys, cap=cap)
+        log.info("heat: tie run-off on %d windows: %d tied → %d advance: %s",
+                 n_total, len(tied_keys), len(survivors), survivors)
+        return [by_key[k] for k in survivors]
 
     @staticmethod
     def _screen_score(raw: object) -> float:
@@ -2742,7 +3359,7 @@ class TrainerRunner:
         fetch is dropped. The pod's receipt carries the corpus digest, threaded
         through for the content-level duplicate drop."""
         import queue
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         from .remote import RemoteDispatcher, RemoteDispatchError, probe_host
 
@@ -2800,23 +3417,18 @@ class TrainerRunner:
             fetch_from_hub(ref, out_dir, hub)
             return c, out_dir, entry.corpus_digest
 
-        out: list[tuple[ResolvedGenerator, Path, str]] = []
-        transport_failures = 0
-        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-            futs = {ex.submit(_run, c): c for c in challengers}
-            for done, fut in enumerate(as_completed(futs), start=1):
-                c = futs[fut]
-                try:
-                    out.append(fut.result())
-                except Exception as e:  # noqa: BLE001
-                    if getattr(e, "returncode", None) == 255:
-                        transport_failures += 1
-                    if _storage_failure(e):
-                        # Candidate for the burn exemption — re-verified at
-                        # heat settle (see _burn_hotkeys).
-                        self._storage_dropped[c.hotkey] = c.ref
-                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
-                self._note_heat_progress(done, len(challengers))
+        # +2 executor headroom over the lane count: a re-queued challenger
+        # sleeps its cool-down inside a pool thread WITHOUT holding a lane
+        # (lane occupancy is the free_lanes queue), so sleepers must not
+        # starve dispatchable threads.
+        out, transport_failures = _run_heat_field(
+            _run, challengers,
+            max_workers=max(1, len(hosts)) + 2,
+            requeues=self.cfg.round.heat_infra_requeues,
+            cooldown_seconds=HEAT_REQUEUE_COOLDOWN_SECONDS,
+            note_progress=self._note_heat_progress,
+            storage_dropped=self._storage_dropped,
+        )
         # A heat where EVERY dispatch died at the transport level (rc=255) is a
         # dead-fleet wipeout, not a screened-out field: refuse to let the caller
         # cache a 0/N heat as complete (a king-only manifest would publish).
@@ -2873,6 +3485,7 @@ class TrainerRunner:
                 entries.append(
                     self.train_one(gen, role, seeds, block,
                                    contract=contract, token_budget=token_budget,
+                                   repo_suffix=_final_repo_suffix(jobs, gen, role),
                                    warm_start_ref=warm_start_ref)
                 )
             except Exception as e:  # noqa: BLE001
@@ -2910,6 +3523,10 @@ class TrainerRunner:
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
             used: list = []
+            # Cohort finals need per-uid checkpoint repos (see
+            # _final_repo_suffix); forwarded only when non-empty so a
+            # single-challenger round's dispatch stays byte-identical.
+            suffix = _final_repo_suffix(jobs, gen, role)
             entry = self._dispatch_with_retry(
                 disp, hosts, i, describe=f"final {role} {gen.hotkey}",
                 used_host=used,
@@ -2917,6 +3534,7 @@ class TrainerRunner:
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
                 warm_start_ref=warm_start_ref,
+                **({"repo_suffix": suffix} if suffix else {}),
             )
             if used:
                 # Post-publish bench target: the pod actually holding this
@@ -3227,6 +3845,11 @@ class TrainerRunner:
                         self._seed_promotion_reign()
                         self.promotion.note_round(self._receipt_king() or king_hotkey,
                                                   epoch_block=epoch_start)
+                        # Out-of-band bench reports (mop-ups, trainer-downtime
+                        # publishes) enter the pool here — before maybe_promote,
+                        # so a promotion that fires NOW selects from the full
+                        # reign, not just what the in-process bench thread saw.
+                        self._replay_reign_bench_reports()
                         self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
                     except Exception as e:  # noqa: BLE001

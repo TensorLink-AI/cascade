@@ -1,4 +1,4 @@
-"""The record carrier (DEC-CA-0016): record-or-array yields, reserved-name
+"""The record carrier (DEC-CA-0020): record-or-array yields, reserved-name
 rejection, byte-identity of values-only records, interface_version gating, and
 the bytes-denominated carrier cap."""
 

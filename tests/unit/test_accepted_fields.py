@@ -1,5 +1,5 @@
-"""Config-gated payload acceptance: mask + roles end to end (DEC-CA-0019 /
-DEC-CA-0022 consumption, DEC-CA-0016 layer 3 arming)."""
+"""Config-gated payload acceptance: mask + roles end to end (DEC-CA-0023 /
+DEC-CA-0026 consumption, DEC-CA-0020 layer 3 arming)."""
 
 from __future__ import annotations
 

@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0016
+id: DEC-CA-0020
 type: decision
 title: "The submission carrier becomes an extensible series record — settled once, payload-free, before any gap opens"
 status: proposed
 date: 2026-08-13
 tags: [interface, generator, corpus, digest, dedup, budget, eval, audit]
 revisit_when: "the first payload field arms (mask or roles) and the interface_version fold into [training] is due; or a proposed capability cannot be expressed as an added named field of per-series parallel-array shape (ragged channels, event streams, within-series streaming) — the record's one structural commitment; or the golden-vector digest test ever has to change, which means the byte-identity guarantee this node rests on was broken"
-relations: {enables: [DEC-CA-0017, DEC-CA-0019, DEC-CA-0020, DEC-CA-0022], refines: DEC-CA-0008}
+relations: {enables: [DEC-CA-0021, DEC-CA-0023, DEC-CA-0024, DEC-CA-0026], refines: DEC-CA-0008}
 ---
 
 `generate()` today yields bare float arrays; four of the six capability gaps

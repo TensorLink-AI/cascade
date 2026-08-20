@@ -43,6 +43,11 @@ log = logging.getLogger("cascade.trainer.toto2")
 
 LOG_EVERY_STEPS = 50
 
+# Optimizer-state sidecar written beside weights.safetensors on wsd rounds
+# (DEC-CA-0018): Muon momentum + row EMA + AdamW moments, name-keyed, so the
+# next warm-started round continues the optimiser instead of rebuilding it.
+OPTIM_STATE_FILE = "optimizer.safetensors"
+
 
 class _TimedStream:
     """Iterator shim that accumulates seconds spent blocked in ``next()``.
@@ -55,7 +60,7 @@ class _TimedStream:
     (``data_wait_frac``) reads directly as "fraction of the run starved".
 
     ``observer`` (optional) sees every series as it passes — the shadow
-    channel-redundancy accumulator rides here (DEC-CA-0022; free at C = 1).
+    channel-redundancy accumulator rides here (DEC-CA-0026; free at C = 1).
     """
 
     def __init__(self, stream: Iterator[np.ndarray], observer=None) -> None:
@@ -79,21 +84,31 @@ class _TimedStream:
 
 # LR schedules the trainer honours ([training] lr_schedule; digest-bound, so a
 # schedule flip is a contract change — release-then-activate):
-#   warmup_cosine — linear warmup then cosine to 0. The from-scratch rule
-#                   (every deployed round).
-#   warmup_flat   — linear warmup then constant at base_lr. The compounding-
-#                   lineage rule (DEC-CA-0023 E2): a per-round cosine would
-#                   decay a lineage that must keep learning across rounds;
-#                   release checkpoints are LR-decayed COPIES, the lineage
-#                   itself never decays.
-LR_SCHEDULES = ("warmup_cosine", "warmup_flat")
+#   warmup_cosine — linear warmup then cosine to 0 over the round's token
+#                   budget. The from-scratch rule; wrong for a warm-started
+#                   lineage, where every round would re-warm and re-decay and
+#                   the repeated cosine restarts distort continued pretraining.
+#   wsd           — warmup-stable-decay (DEC-CA-0018, the armed lineage rule):
+#                   warmup happens ONCE per generation (the from-scratch run);
+#                   a warm-started round is a continuation and re-enters FLAT
+#                   at base_lr with no re-warmup. No in-round decay: decay
+#                   belongs to cutting a release checkpoint, not the round
+#                   loop. Pairs with optimizer-state continuity below.
+#   warmup_flat   — linear warmup EVERY round then constant at base_lr. The
+#                   earlier compounding-lineage sketch (scaling-ladder E2);
+#                   superseded by wsd (warmup-once + optimizer continuity)
+#                   but kept as a valid contract value.
+LR_SCHEDULES = ("warmup_cosine", "wsd", "warmup_flat")
 
 
-def _lr_at(
-    token_pos: int, total: int, warmup: int, base_lr: float,
-    schedule: str = "warmup_cosine",
-) -> float:
-    """The contract LR at ``token_pos`` of ``total`` (see LR_SCHEDULES)."""
+def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
+           schedule: str = "warmup_cosine", warm_started: bool = False) -> float:
+    """LR at ``token_pos`` under the contract's ``lr_schedule`` (see
+    LR_SCHEDULES). ``warm_started`` keys wsd's warmup-once semantics."""
+    if schedule == "wsd":
+        if not warm_started and warmup > 0 and token_pos < warmup:
+            return base_lr * token_pos / max(1, warmup)
+        return base_lr
     if warmup > 0 and token_pos < warmup:
         return base_lr * token_pos / max(1, warmup)
     if schedule == "warmup_flat":
@@ -103,6 +118,89 @@ def _lr_at(
     progress = (token_pos - warmup) / max(1, total - warmup)
     progress = min(1.0, max(0.0, progress))
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+# ── optimizer-state continuity (wsd rounds, DEC-CA-0018) ──────────────────────
+# safetensors stores a flat name→tensor dict, so the state is flattened with
+# param NAMES as keys (never positions): a load into a freshly built
+# model+optimiser re-attaches each tensor to the right param or fails loudly.
+
+
+def _adamw_state_tensors(adamw, names: dict, out: dict, prefix: str = "adamw") -> None:
+    """Flatten a ``torch.optim.AdamW``'s state into ``out`` as CPU tensors:
+    ``<prefix>.<param>.step`` / ``.exp_avg`` / ``.exp_avg_sq``. The step count
+    is saved too — without it AdamW's bias correction restarts and inflates
+    the first resumed steps."""
+    import torch
+
+    for group in adamw.param_groups:
+        for p in group["params"]:
+            st = adamw.state.get(p)
+            if not st:
+                continue
+            n = names[id(p)]
+            step = st.get("step", 0)
+            out[f"{prefix}.{n}.step"] = (
+                step.detach().cpu().clone() if torch.is_tensor(step)
+                else torch.tensor(float(step))
+            )
+            # copy=True: on a CPU device .cpu()/.to() would ALIAS the live
+            # buffer, and the next step() mutates it in place under the saved
+            # dict's feet — the state must be a snapshot.
+            out[f"{prefix}.{n}.exp_avg"] = (
+                st["exp_avg"].detach().to("cpu", copy=True).contiguous())
+            out[f"{prefix}.{n}.exp_avg_sq"] = (
+                st["exp_avg_sq"].detach().to("cpu", copy=True).contiguous())
+
+
+def _apply_adamw_state(adamw, names: dict, flat: dict, prefix: str = "adamw") -> int:
+    """Re-attach ``_adamw_state_tensors`` output (matched by param name).
+    Returns how many params found no entry (they keep fresh state); a PRESENT
+    entry with a mismatched shape raises — never silently train on garbage."""
+    import torch
+
+    missing = 0
+    for group in adamw.param_groups:
+        for p in group["params"]:
+            n = names[id(p)]
+            ea = flat.get(f"{prefix}.{n}.exp_avg")
+            eas = flat.get(f"{prefix}.{n}.exp_avg_sq")
+            if ea is None or eas is None:
+                missing += 1
+                continue
+            if tuple(ea.shape) != tuple(p.shape) or tuple(eas.shape) != tuple(p.shape):
+                raise ValueError(
+                    f"optimizer state shape mismatch for {n!r}: exp_avg {tuple(ea.shape)}"
+                    f" / exp_avg_sq {tuple(eas.shape)} vs param {tuple(p.shape)}"
+                )
+            step = flat.get(f"{prefix}.{n}.step")
+            adamw.state[p] = {
+                "step": (step.detach().clone().to(torch.float32) if step is not None
+                         else torch.tensor(0.0)),
+                "exp_avg": ea.detach().clone().to(device=p.device, dtype=p.dtype),
+                "exp_avg_sq": eas.detach().clone().to(device=p.device, dtype=p.dtype),
+            }
+    return missing
+
+
+def _optim_state_tensors(optimizer, model) -> dict:
+    """Name-keyed CPU tensors of an optimiser's full state, for either backend
+    (:class:`_MuonAdamW` or plain ``torch.optim.AdamW``)."""
+    names = {id(p): n for n, p in model.named_parameters()}
+    if isinstance(optimizer, _MuonAdamW):
+        return optimizer.state_tensors(names)
+    out: dict = {}
+    _adamw_state_tensors(optimizer, names, out)
+    return out
+
+
+def _apply_optim_state(optimizer, model, flat: dict) -> int:
+    """Inverse of :func:`_optim_state_tensors`. Returns the number of params
+    with no saved entry (fresh state); raises on a shape mismatch."""
+    names = {id(p): n for n, p in model.named_parameters()}
+    if isinstance(optimizer, _MuonAdamW):
+        return optimizer.load_state_tensors(flat, names)
+    return _apply_adamw_state(optimizer, names, flat)
 
 
 def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, rng) -> np.ndarray:
@@ -130,7 +228,7 @@ def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, r
 
 def weighted_pinball_loss(pred_q, target, levels: tuple[float, ...], weight=None):
     """Pinball loss with an optional per-element weight — the accepted-fields
-    consumption seam (DEC-CA-0019/0022): 0 excludes an element (a missing
+    consumption seam (DEC-CA-0023/0022): 0 excludes an element (a missing
     target, a covariate channel) from the objective.
 
     Lives HERE, not in ``toto2_model.py``: the model source's bytes are folded
@@ -170,7 +268,7 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batc
     channel counts; at ``C = 1`` throughout (today's cap) every batch is
     ``(B, 1, L)`` carrying exactly the bytes the old channel-0 path carried.
 
-    History note (DEC-CA-0022): this used to reduce every series to channel 0
+    History note (DEC-CA-0026): this used to reduce every series to channel 0
     (``s = s[0]``) while the stream billed all ``C`` channels against the token
     budget — a multivariate series paid ``C×`` for ``1×`` training signal. All
     channels are consumed now, and the trainer's token accounting counts them,
@@ -363,16 +461,25 @@ class Toto2Trainer:
         levels = QUANTILE_LEVELS[: cfg.num_quantiles] if cfg.num_quantiles <= len(QUANTILE_LEVELS) else QUANTILE_LEVELS
         optimizer = self._build_optimizer(model, contract)
 
+        # LR schedule per the contract (DEC-CA-0018). Unknown values abort: a
+        # typo silently falling back to cosine would train the whole round on
+        # the wrong recipe. warm_started keys the wsd warmup-once semantics —
+        # it is shared king/challenger state (both roles get the same init).
+        schedule = str(getattr(contract, "lr_schedule", "warmup_cosine") or "warmup_cosine")
+        if schedule not in LR_SCHEDULES:
+            raise ValueError(
+                f"unknown [training] lr_schedule {schedule!r}; expected one of "
+                f"{LR_SCHEDULES}"
+            )
+        warm_started = warm_start_dir is not None
+        optim_resumed = False
+        if warm_started:
+            optim_resumed = self._load_optimizer_state(
+                Path(warm_start_dir), optimizer, model
+            )
+
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
-        # The contract's LR schedule, honoured (it used to be decorative —
-        # warmup_cosine ran unconditionally). Validated up front so a typo'd
-        # digest-bound value fails the run's first second, not mid-round.
-        lr_schedule = str(getattr(contract, "lr_schedule", "warmup_cosine"))
-        if lr_schedule not in LR_SCHEDULES:
-            raise ValueError(
-                f"lr_schedule={lr_schedule!r} not implemented; one of {LR_SCHEDULES}"
-            )
 
         tokens = 0
         step = 0
@@ -394,7 +501,7 @@ class Toto2Trainer:
         # loss curve can't show (see _TimedStream) — surfaced as data_wait_s /
         # data_wait_frac in the run's metrics and per-step records. The shadow
         # channel-redundancy accumulator observes each series in passing
-        # (DEC-CA-0022 telemetry; no-op at C = 1, never in any scoring path).
+        # (DEC-CA-0026 telemetry; no-op at C = 1, never in any scoring path).
         from .channel_stats import ChannelStatsAccumulator
 
         channel_stats = ChannelStatsAccumulator()
@@ -441,7 +548,7 @@ class Toto2Trainer:
                 rows, num_patches,
                 c_max=cfg.cpm_c_max, p_max=cfg.cpm_p_max, rng=mask_rng,
             )
-            # Role-aware CPM (DEC-CA-0022): future-known channels (role 2)
+            # Role-aware CPM (DEC-CA-0026): future-known channels (role 2)
             # keep their values VISIBLE — their CPM rows are zeroed AFTER the
             # draw, so the RNG stream (and every all-targets batch) is
             # byte-identical to the unarmed build. Drawn-then-zeroed, never
@@ -453,7 +560,7 @@ class Toto2Trainer:
                 mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
             ).to(x.dtype)
             if data_mask_np is not None and data_mask_np.any():
-                # Missing-data consumption (DEC-CA-0019): OR the data mask
+                # Missing-data consumption (DEC-CA-0023): OR the data mask
                 # into the input mask — a missing entry is unobserved exactly
                 # like a CPM-masked one, so the causal stats skip it and the
                 # model sees (0-fill, mask=1), the same encoding CPM uses.
@@ -489,7 +596,7 @@ class Toto2Trainer:
             target = torch.asinh(
                 (raw[:, :, 1:] - a_loc[:, :, :-1, None]) / a_scale[:, :, :-1, None]
             ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
-            # Loss exclusion (DEC-CA-0019/0022): missing target entries carry
+            # Loss exclusion (DEC-CA-0023/0022): missing target entries carry
             # no loss (their pinned-0.0 filler is not data), and covariate
             # channels (role != 0) carry none either — they are conditioning
             # context, bought at full freight, never scored. Bare batches take
@@ -510,7 +617,8 @@ class Toto2Trainer:
                 weight = w
             loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
-            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr, lr_schedule)
+            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
+                        schedule=schedule, warm_started=warm_started)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
@@ -521,7 +629,7 @@ class Toto2Trainer:
             last_loss = float(loss.detach().cpu())
             # Every channel of every row counts: B × C × L point-passes, so a
             # multivariate series' token cost equals its stream billing (the
-            # C×-billed-1×-trained mispricing is dead; DEC-CA-0022). Masked
+            # C×-billed-1×-trained mispricing is dead; DEC-CA-0026). Masked
             # entries count too — the stream billed them and the model
             # processed them (as masked inputs); only the LOSS excludes them.
             tokens += int(vals_np.size)
@@ -580,11 +688,16 @@ class Toto2Trainer:
             "data_wait_s": round(timed_stream.wait_s, 1),
             "data_wait_frac": round(timed_stream.wait_s / max(train_seconds, 1e-6), 3),
             "tokens_frac": round(tokens / max(1, token_budget), 3),
+            # Recipe telemetry (DEC-CA-0018): which schedule ran, and whether a
+            # warm-started run continued the promoted init's optimiser state or
+            # rebuilt it fresh (a member promoted before state shipping).
+            "lr_schedule": schedule,
+            "optim_state_resumed": optim_resumed,
         }
         # Shadow channel-redundancy summary — present ONLY when the corpus
         # carried multichannel series, so univariate run metrics stay
         # byte-identical to pre-telemetry builds. [telemetry]-class data: no
-        # consumer in any scoring path (DEC-CA-0022; DEC-CA-0010 precedent).
+        # consumer in any scoring path (DEC-CA-0026; DEC-CA-0010 precedent).
         ch_summary = channel_stats.summary()
         if ch_summary is not None:
             metrics["channel_telemetry"] = ch_summary
@@ -592,6 +705,8 @@ class Toto2Trainer:
             logger({"event": "done", **metrics})
 
         self._save_checkpoint(out_dir, model, cfg, tuple(levels), contract)
+        if schedule == "wsd":
+            self._save_optimizer_state(out_dir, optimizer, model)
         log.info("trained toto2: params=%d steps=%d tokens=%d final_loss=%.4f in %.0fs",
                  param_count, step, tokens, last_loss, train_seconds)
         return TrainResult(
@@ -615,6 +730,44 @@ class Toto2Trainer:
                 adamw.append(p)
         # Muon params are stepped manually in _MuonAdamW; AdamW handles the rest.
         return _MuonAdamW(muon, adamw, lr=contract.base_lr, weight_decay=contract.weight_decay)
+
+    # ── optimizer state (round-to-round continuity under wsd) ─────────────────
+
+    def _save_optimizer_state(self, out_dir: Path, optimizer, model) -> None:
+        """Write the optimiser's full state beside the weights so the next
+        warm-started round continues it. Only wsd rounds write the file (~3x
+        the checkpoint upload); under warmup_cosine each round's schedule is
+        self-contained and the state would be dead weight."""
+        from safetensors.torch import save_file
+
+        flat = _optim_state_tensors(optimizer, model)
+        save_file(flat, str(Path(out_dir) / OPTIM_STATE_FILE))
+        log.info("saved optimizer state (%d tensors) to %s", len(flat), OPTIM_STATE_FILE)
+
+    def _load_optimizer_state(self, warm_dir: Path, optimizer, model) -> bool:
+        """Re-attach the promoted init's optimiser state when its checkpoint
+        carries one; returns whether state was loaded. A missing file starts
+        fresh (momentum rebuilds in ~hundreds of steps — the sanctioned
+        crossing for members promoted before optimizer-state shipping, or a
+        generation whose contract ran warmup_cosine). A PRESENT file whose
+        shapes mismatch raises, like the strict weights load — the run must
+        never silently continue from garbage state."""
+        path = Path(warm_dir) / OPTIM_STATE_FILE
+        if not path.is_file():
+            log.info("warm-start: no %s in init checkpoint — optimizer state "
+                     "starts fresh (momentum rebuilds)", OPTIM_STATE_FILE)
+            return False
+        from safetensors.torch import load_file
+
+        flat = load_file(str(path))
+        missing = _apply_optim_state(optimizer, model, flat)
+        if missing:
+            log.warning("warm-start: optimizer state loaded but %d param(s) had "
+                        "no saved entry (fresh state for those)", missing)
+        else:
+            log.info("warm-start: resumed optimizer state (%d tensors) from %s",
+                     len(flat), path)
+        return True
 
     # ── checkpoint ────────────────────────────────────────────────────────────
 
@@ -675,6 +828,56 @@ class _MuonAdamW:
             p.grad = None if set_to_none else (p.grad.zero_() if p.grad is not None else None)
         if self.adamw is not None:
             self.adamw.zero_grad(set_to_none=set_to_none)
+
+    # ── state checkpointing (wsd rounds, DEC-CA-0018) ─────────────────────────
+
+    def state_tensors(self, names: dict) -> dict:
+        """Name-keyed CPU tensors of the full state — Muon momentum buffers +
+        per-row second-moment EMAs (``muon.<param>.momentum`` / ``.row_v``)
+        plus the inner AdamW moments — for round-to-round continuity."""
+        out: dict = {}
+        for p in self.muon_params:
+            n = names[id(p)]
+            # copy=True: never alias the live buffers (see _adamw_state_tensors)
+            if p in self._bufs:
+                out[f"muon.{n}.momentum"] = (
+                    self._bufs[p].detach().to("cpu", copy=True).contiguous())
+            if p in self._row_v:
+                out[f"muon.{n}.row_v"] = (
+                    self._row_v[p].detach().to("cpu", copy=True).contiguous())
+        if self.adamw is not None:
+            _adamw_state_tensors(self.adamw, names, out)
+        return out
+
+    def load_state_tensors(self, flat: dict, names: dict) -> int:
+        """Re-attach :meth:`state_tensors` output (matched by param name).
+        Returns how many params found no entry (they keep fresh state); a
+        present entry with a mismatched shape raises."""
+        missing = 0
+        for p in self.muon_params:
+            n = names[id(p)]
+            buf = flat.get(f"muon.{n}.momentum")
+            v = flat.get(f"muon.{n}.row_v")
+            if buf is None and v is None:
+                missing += 1
+                continue
+            if buf is not None:
+                if tuple(buf.shape) != tuple(p.shape):
+                    raise ValueError(
+                        f"optimizer state shape mismatch for {n!r}: momentum "
+                        f"{tuple(buf.shape)} vs param {tuple(p.shape)}"
+                    )
+                self._bufs[p] = buf.detach().clone().to(device=p.device, dtype=p.dtype)
+            if v is not None:
+                if tuple(v.shape) != (p.shape[0], 1):
+                    raise ValueError(
+                        f"optimizer state shape mismatch for {n!r}: row_v "
+                        f"{tuple(v.shape)} vs expected {(p.shape[0], 1)}"
+                    )
+                self._row_v[p] = v.detach().clone().to(device=p.device, dtype=p.dtype)
+        if self.adamw is not None:
+            missing += _apply_adamw_state(self.adamw, names, flat)
+        return missing
 
     def step(self) -> None:
         lr = self.param_groups[0]["lr"]

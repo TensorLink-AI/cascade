@@ -93,7 +93,11 @@ batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate
 weight_decay       = 0.05
-lr_schedule        = "warmup_cosine"
+lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0018): warmup only on a
+                                   # from-scratch run, flat base_lr on warm-started rounds;
+                                   # wsd rounds also checkpoint optimizer state. [training]
+                                   # edit ⇒ contract_digest changed: restart trainer AND
+                                   # validator together (flipped 2026-08-14).
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 2700        # TESTNET: cap = the 45-min final budget itself, measured
@@ -167,6 +171,21 @@ heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [ev
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
 finalists        = 1      # challengers promoted from the heat to the final
+# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — SHIPS INERT here too;
+# this file is where it arms FIRST. With max_finalists > 1 a leader the screen
+# separated advances alone; a statistically tied top is re-scored on the larger
+# tie_runoff_windows slice (CPU-only, incremental windows via the seeded-prefix
+# property) and the survivors advance, capped. Full semantics + the two
+# pre-arm couplings (deployed-fleet check at 1 + max_finalists slots; [eval]
+# bench_hold_max_hours is sized for k = 1) are documented in chain.toml.
+# TO ARM ON TESTNET: max_finalists = 3, tie_runoff_windows > heat_n_windows
+# (e.g. 256 against the 64-window screen; clamped at [eval] n_windows), trainer
+# and validator restarted together. Mainnet stays unarmed until a full testnet
+# round has produced a genuine multi-finalist cohort duel AND cascade-audit has
+# replayed it (DEC-CA-0012 rollout order).
+max_finalists      = 1    # cap on the advancing tied cohort (1 = tie logic OFF)
+tie_runoff_windows = 0    # total windows the tie run-off re-scores on (0 = no run-off)
+tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
@@ -203,6 +222,18 @@ num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
 n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
+
+# Jittered round mix (DEC-CA-0019) — TESTNET: armed from block 1, i.e. LIVE
+# for every round the moment this release deploys (the testnet fleet is
+# owner-only; no coordination needed). mix_target_windows = 0 keeps the draw
+# at n_windows (300) — the testnet pool is small; the jitter room comes from
+# the bag and the Dirichlet, and the mainnet 1200 calibration doesn't apply.
+mix_from_block       = 1
+mix_jitter_alpha     = 4.0
+mix_block_slots      = 8
+mix_class_keep_frac  = 0.7
+mix_series_bag_frac  = 0.7
+mix_target_windows   = 0
 # TESTNET: cap datasets per suite for the Cascade duel bench. With
 # cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on BOTH duel
 # checkpoints every round, AFTER the manifest publishes (the signed
@@ -222,16 +253,30 @@ gift_gate_data_dir    = "/root/cascade/bench_data"   # TESTNET: pinned GIFT-Eval
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
-# King-of-the-hill — single-round, flat-margin dethroning (teutonic-style).
-# A challenger takes the throne the moment ONE round clears the win margin, and
-# the margin does NOT ramp with the king's tenure: every king is equally
-# challengeable (no "entrenched king" bonus). To restore the sticky/tenure
-# behaviour, set dethrone_cp > 1 and win_margin_end > win_margin_start with
-# margin_warmup_rounds > 0.
-win_margin_start     = 0.02      # flat win margin (kept == win_margin_end ⇒ no tenure ramp)
-win_margin_end       = 0.02      # equal to start; with margin_warmup_rounds = 0 the margin
-                                 # is constant at this value regardless of tenure
-margin_warmup_rounds = 0         # 0 ⇒ no tenure warmup (flat margin)
+# King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
+# (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
+# 0) to end (at margin_warmup_rounds, clamped after); end < start makes the
+# margin DECAY with tenure: a fresh king defends the full 2%, an entrenched
+# king progressively less, floored at win_margin_end. Tenure does NOT reset on
+# a cascade warm-start promotion (only on a real dethrone/resync), so the
+# decay deepens across a whole hold.
+#
+# Candidate schedule under test: start=0.02, end=0.005, warmup=8 — the
+# owner's pick (2026-08-15): a STEEP straight-line ramp (~1.25% by round 4)
+# to the grid's lowest floor, held forever after. The floor, not the ramp
+# speed, is the safety property: 0.5% stays above the bootstrap noise band,
+# so a statistically tied challenger never wins by luck (0.001 was considered
+# and rejected — inside noise, it becomes a slow term-limit lottery). The
+# MAINNET schedule is CONFIRMED against the replay report over the real
+# receipt trail before it ships, release-then-activate
+# (docs/MARGIN_DECAY_ROLLOUT.md) — never a local flip: margin is judged
+# per-validator, so a mixed fleet forks verdicts.
+# HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
+# bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
+win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
+win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
+margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
+                                 # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)
 min_windows          = 80        # TESTNET override (template default 200)
 min_clusters         = 10        # TESTNET override (template default 0). Below this many distinct window clusters (upstream feeds,
                                  # pool metadata `source`), no decision. Windows from one feed
@@ -411,3 +456,10 @@ mode    = "online"              # online | offline | disabled
 # corpus stream opens — the one field that is comparable pod to pod.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round,
+# train the king's generator from scratch post-publish and publish the labeled
+# telemetry report (benchmarks/scratch/) — never feeds scoring/promotion.
+# TESTNET: armed at 2 for the Stage-1 validation cycle (a shadow every ~6h at
+# the 3h cadence; the 0.75h budget keeps the extra leg cheap). Mainnet ships 0
+# until this cycle passes and the owner arms M=4.
+scratch_shadow_every_rounds = 2

@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0024
+id: DEC-CA-0028
 type: decision
 title: "Real data enters (if ever) as ONE owner-pinned shared corpus generators read — the ceiling is restated no-shipped-DATA, and the machinery ships inert so arming is a config edit"
 status: proposed
 date: 2026-08-14
 tags: [interface, generator, corpus, real-data, augmentation, digest, sandbox, eval, contamination]
 revisit_when: "the pricing experiment runs (synthetic king vs base-corpus-verbatim vs base+naive-mixup on the private pool) and its deltas say whether real_corpus_ref ever arms; or docs/EVAL_POOL.md gains the corpus/eval-pool disjointness rule, unblocking the arming checklist; or a miner is caught shipping bulk real data as config.json/py literals at scale, which forces the max_repo_mb reduction and possibly an entropy screen ahead of schedule"
-relations: {refines: DEC-CA-0016, enables: [], depends_on: DEC-CA-0008}
+relations: {refines: DEC-CA-0020, enables: [], depends_on: DEC-CA-0008}
 ---
 
 Every SOTA time-series foundation model — Chronos, TimesFM, Toto itself —
@@ -67,7 +67,7 @@ standing invariant simultaneously:
   corpus/eval-pool disjointness by provenance and time (base frozen at T, no
   shared upstream series; eval windows harvested after T with a horizon gap),
   written into `docs/EVAL_POOL.md` as a curation rule exactly like the
-  covariate exogeneity rule (DEC-CA-0022).
+  covariate exogeneity rule (DEC-CA-0026).
 
 Rejected alternatives: miner-shipped real data with declared provenance
 (unauditable at scale, contamination unmanageable, licensing on the miner's
@@ -102,7 +102,7 @@ network-isolated; runtime fetching is not negotiable).
   mount, so cfg JSON stays host-independent.
 - No carrier change: augmented series leave the generator as ordinary
   `values` yields; digests, budgets, dedup, and the record carrier
-  (DEC-CA-0016) are untouched.
+  (DEC-CA-0020) are untouched.
 
 ## Arming checklist (config-only when its gates clear — none cleared today)
 

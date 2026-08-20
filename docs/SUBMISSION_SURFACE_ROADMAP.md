@@ -27,8 +27,8 @@ in writing), per-size `base_arch_digest`/throughput pins at each size arming,
 and every deploy (digest bumps land by the routine re-pin + coordinated
 epoch-boundary restart; the Stage 0c scoring change ships under the
 DEC-CA-0009 lockstep discipline).
-Companion decision records: DEC-CA-0016 (carrier), DEC-CA-0017…0022 (one per
-submission-surface gap), DEC-CA-0023 (scaling ladder). This document
+Companion decision records: DEC-CA-0020 (carrier), DEC-CA-0021…0022 (one per
+submission-surface gap), DEC-CA-0027 (scaling ladder). This document
 sequences them, states each stage's contract-digest impact and migration
 path, and settles the cross-cutting questions (budget denomination, the
 no-weights ceiling).
@@ -67,7 +67,7 @@ Binding constraints throughout (none are relaxed by any stage):
 
 ## The ordering, and why the carrier goes first
 
-The carrier (DEC-CA-0016) lands first and almost independently — confirmed,
+The carrier (DEC-CA-0020) lands first and almost independently — confirmed,
 not assumed: it touches the interface, the digests, the sandbox frame
 protocol, and the eval-side shapes, all in ways that are behaviour-preserving
 at today's payload (values-only corpora hash byte-identically; `C = 1`
@@ -88,7 +88,7 @@ prompt's ordering; the argument for each is in its record):
 
 ## Stages
 
-### Stage 0 — carrier, payload-free (DEC-CA-0016; land now)
+### Stage 0 — carrier, payload-free (DEC-CA-0020; land now)
 
 Record-or-array yield with `values` only; canonical digest with golden-vector
 tests frozen **before** the canonicaliser merges; reserved-name table with
@@ -117,24 +117,24 @@ per-series channel-correlation / effective-rank telemetry.
 - **Contract digest: none.** All code + pool content.
 - **Migration: none** (max_channels still 1; every path exercised at C = 1
   is behaviour-identical).
-- Run the **MV-under-univariate-eval ablation** (DEC-CA-0022) on testnet
+- Run the **MV-under-univariate-eval ablation** (DEC-CA-0026) on testnet
   here — its result gates Stage 2's shape.
 
-### Stage 2 — arm multivariate targets (DEC-CA-0022, DEC-CA-0020)
+### Stage 2 — arm multivariate targets (DEC-CA-0026, DEC-CA-0024)
 
 Raise `max_channels` (4–8, per the cost measurement), with multivariate eval
 windows live in the pool first. Panels ride as `(C, L)` groups
-(DEC-CA-0020); `max_channel_corr = 0.999` arms only after its shadow logs
+(DEC-CA-0024); `max_channel_corr = 0.999` arms only after its shadow logs
 clear honest generators.
 
 - **Contract digest: nominally none** (`max_channels` is `[generator]`) —
-  but this stage should decide open question 4 of DEC-CA-0022: whether to
+  but this stage should decide open question 4 of DEC-CA-0026: whether to
   mirror the cap into `[training]` so the digest gate can detect a
   cap-divergent trainer. If mirrored, one planned bump.
 - **Migration: none** for univariate generators; multivariate is opt-in.
 - **Testnet-first**, full cascade, per the DEC-CA-0005/0012 precedent.
 
-### Stage 3 — missingness (DEC-CA-0019)
+### Stage 3 — missingness (DEC-CA-0023)
 
 Pool masked-history slice first (real gaps preserved, `history_mask` in
 window metadata, mask-aware wrapper contract); then accept the `mask` field
@@ -142,13 +142,13 @@ window metadata, mask-aware wrapper contract); then accept the `mask` field
 loss exclusion).
 
 - **Contract digest: one deliberate bump** — acceptance folds the accepted
-  field set / `interface_version = 2` into `[training]` (DEC-CA-0016 G2
+  field set / `interface_version = 2` into `[training]` (DEC-CA-0020 G2
   layer 3), making corpus-semantics drift visible to the existing
   `contract_digest_mismatch` gate. Coordinated epoch-boundary restart, the
   routine re-pin protocol.
 - **Migration: none**; maskless generators are the unchanged default.
 
-### Stage 4 — roles and future-known covariates (DEC-CA-0022 back half)
+### Stage 4 — roles and future-known covariates (DEC-CA-0026 back half)
 
 Accept `roles` (per-channel, record field — positional convention rejected);
 role-aware CPM mask construction; eval covariate windows **only after** the
@@ -160,7 +160,7 @@ refused until then even if 0/1 arm earlier.
   if timelines allow, so the fleet restarts once).
 - **Migration: none**; roles absent = all targets.
 
-### Stage 5 — long context (DEC-CA-0018; parked on the 22M seam)
+### Stage 5 — long context (DEC-CA-0022; parked on the 22M seam)
 
 `context_length` (and `max_length` in lockstep) rise when the 22M size
 activates — that seam already forces throughput re-measurement, arch-digest
@@ -171,7 +171,7 @@ sub-daily-only 8K-context windows.
 - **Contract digest: bumps regardless** (the 22M activation moves it anyway).
 - **Migration: none** — the length band widens, never narrows.
 
-### Stage 6 — scaling ladder: 313M+ on size-conditional silicon (DEC-CA-0023)
+### Stage 6 — scaling ladder: 313M+ on size-conditional silicon (DEC-CA-0027)
 
 Orthogonal to the submission-surface stages (it changes the model contract
 and the fleet, not the carrier). Owner-directed shape: **22M screen, duel at
@@ -191,7 +191,7 @@ measurement, not by feel.
 - **Migration: none for miners** — the submission surface is untouched; only
   what happens to their data downstream scales.
 
-#### The era ladder (the warm-stage map, from DEC-CA-0023)
+#### The era ladder (the warm-stage map, from DEC-CA-0027)
 
 Weights never cross sizes (strict-load design): each trained size carries
 its own lineage; what flows up the ladder is the crowned-corpus diet. Each
@@ -232,7 +232,7 @@ era transition is a contract change, release-then-activate.
 names with published semantics, refused data — each waits for a consumer,
 and for `start`/`freq`/`group_id` the analysis says no consumer can exist
 under the pinned calendar-free, batch-independent architecture
-(DEC-CA-0017, DEC-CA-0020, DEC-CA-0021). They are carried in the reserved
+(DEC-CA-0021, DEC-CA-0024, DEC-CA-0025). They are carried in the reserved
 table so no miner can squat them and no future migration is needed to accept
 them.
 
@@ -294,14 +294,14 @@ Two honest riders:
   the seed, from its own procedurally generated data — that is code
   expressing a prior, and it is legal today.
 
-**Restated per DEC-CA-0024: the ceiling is no-shipped-DATA, not just
+**Restated per DEC-CA-0028: the ceiling is no-shipped-DATA, not just
 no-shipped-weights.** Raw real series shipped as JSON/py literals are the
 same hole as weights (unauditable bulk numbers, distribution-matching against
 the eval pool's guessable upstreams, licensing the Hub then republishes) and
 are outside the design space by the same policy. The `max_repo_mb` reduction
 above is the wall for both.
 
-## Cross-cutting: shared real corpus (DEC-CA-0024; machinery landed, unarmed)
+## Cross-cutting: shared real corpus (DEC-CA-0028; machinery landed, unarmed)
 
 If real data ever enters miner-side, it enters as ONE owner-published,
 frozen, licensed, digest-pinned corpus that every generator may READ
@@ -320,7 +320,7 @@ licensed corpus artifact exists. See the decision node for the full analysis.
 ## What each stage must NOT do (standing tripwires)
 
 - Accept any reserved field without a consumer in the same release
-  (DEC-CA-0016's refuse-unconsumed rule).
+  (DEC-CA-0020's refuse-unconsumed rule).
 - Move `corpus_digest` bytes for values-only corpora (golden vectors are the
   guard).
 - Arm `roles = 2` before the EVAL_POOL exogeneity rule exists in writing.
@@ -331,19 +331,19 @@ licensed corpus artifact exists. See the decision node for the full analysis.
 ## Open questions (consolidated; each with its settling measurement)
 
 1. **MV-vs-univariate ablation** under the current eval — paired testnet
-   round, one `RoundSeeds` (gates Stage 2 sequencing). DEC-CA-0022.
+   round, one `RoundSeeds` (gates Stage 2 sequencing). DEC-CA-0026.
 2. **Context-8192 throughput** on the reference L40S — replaces the ~10%
-   per-token estimate with a measurement (prices Stage 5). DEC-CA-0018.
+   per-token estimate with a measurement (prices Stage 5). DEC-CA-0022.
 3. **Calendar-feature ablation at 4M** on GIFT frequency slices — decides
-   whether `freq` payload is ever worth an arch divergence. DEC-CA-0017.
+   whether `freq` payload is ever worth an arch divergence. DEC-CA-0021.
 4. **Pool gap-rate measurement** (pre-interpolation missing-fraction per
    source) — decides real-gaps vs injected-gaps for the masked eval slice.
-   DEC-CA-0019.
+   DEC-CA-0023.
 5. **Exogenous-covariate informativeness distribution** — sets the R² bar
-   for the covariate curation screen. DEC-CA-0022.
+   for the covariate curation screen. DEC-CA-0026.
 6. **Honest effective-rank distribution** from Stage 1 shadow telemetry —
-   validates (or kills) the 0.999 channel-correlation gate. DEC-CA-0022.
+   validates (or kills) the 0.999 channel-correlation gate. DEC-CA-0026.
 7. **Digest-visible `[generator]` mirror**: whether `max_channels` (and the
    accepted field set) should be mirrored into `[training]` so validators
    mechanically detect a divergent trainer — decide at Stage 2 arming.
-   DEC-CA-0022 / DEC-CA-0016.
+   DEC-CA-0026 / DEC-CA-0020.

@@ -1,5 +1,5 @@
 """Joint (C, L) forecaster contract + the series_id cluster fallback
-(DEC-CA-0016 G6 / DEC-CA-0022 Stage 0)."""
+(DEC-CA-0020 G6 / DEC-CA-0026 Stage 0)."""
 
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def test_sourceless_univariate_rows_stay_one_cluster_per_window():
 
 
 def test_sourceless_multichannel_window_is_one_cluster_not_c():
-    # The DEC-CA-0022 item-3 defence: 4 channels of one window must bootstrap
+    # The DEC-CA-0026 item-3 defence: 4 channels of one window must bootstrap
     # as ONE observation, not four.
     rows = [_row("mv0", channel=c) for c in range(4)] + [_row("w1")]
     labels, n = _window_clusters(rows)

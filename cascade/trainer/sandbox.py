@@ -445,7 +445,7 @@ def run_in_sandbox(
         return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked)
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
-    # DEC-CA-0024: materialise the pinned shared real corpus HERE, parent-side
+    # DEC-CA-0028: materialise the pinned shared real corpus HERE, parent-side
     # — the child is network-isolated and must find real_corpus_dir already
     # resolved in its cfg JSON. A no-op while real_corpus_ref is unarmed.
     cfg = resolve_real_corpus(cfg)
@@ -528,7 +528,7 @@ def _read_exact(rd: io.BufferedReader, n: int) -> bytes | None:
     return b"".join(chunks)
 
 
-# Record-frame marker (DEC-CA-0016): a plain frame's 8-byte BE length prefix
+# Record-frame marker (DEC-CA-0020): a plain frame's 8-byte BE length prefix
 # can never be all-0xFF (that would be a ~2^64-byte frame), so this header
 # unambiguously introduces an extended record — n_fields (8B BE), then per
 # field in sorted order: name length (8B BE), name utf-8, and a normal
@@ -664,7 +664,7 @@ def stream_series(
         return
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
-    # DEC-CA-0024: resolve the shared real corpus parent-side (the child
+    # DEC-CA-0028: resolve the shared real corpus parent-side (the child
     # cannot fetch); no-op while unarmed.
     cfg = resolve_real_corpus(cfg)
     use_netns = _assert_isolation(cfg, allow_netns=allow_netns)

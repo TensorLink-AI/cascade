@@ -79,7 +79,7 @@ def load_forecaster(
             )
         return arr
 
-    # Joint (C, L) contract (DEC-CA-0022): a wrapper that exposes
+    # Joint (C, L) contract (DEC-CA-0026): a wrapper that exposes
     # ``forecast_joint(history_2d, horizon, num_samples) -> (C, ns, H)`` is
     # called once per window with all channels; every archived 1-D wrapper is
     # lifted through the per-channel adapter instead — kept forever, so old

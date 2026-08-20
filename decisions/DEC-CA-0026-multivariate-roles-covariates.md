@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0022
+id: DEC-CA-0026
 type: decision
 title: "Multivariate arms eval-first: per-series C with bucketed batching, full-freight channel pricing, roles as a record field — and the channel-drop trap is fixed before any cap raise"
 status: proposed
 date: 2026-08-13
 tags: [interface, generator, trainer, eval, scoring, koth, pool, dedup]
 revisit_when: "the MV-under-univariate-eval ablation (below) shows multivariate training HELPS the current univariate eval — then the strict eval-first sequencing can relax to eval-parallel; or honest generators trip the shadow-logged channel-correlation diagnostic at material rates — then the proposed 0.999 bar is wrong and the gate design reopens; or future-known covariates are to be armed before the pool has a written exogeneity curation rule — which this node forbids"
-relations: {depends_on: DEC-CA-0016, subsumes: DEC-CA-0020, constrained_by: DEC-CA-0012}
+relations: {depends_on: DEC-CA-0020, subsumes: DEC-CA-0024, constrained_by: DEC-CA-0012}
 ---
 
 Gap 6 is where the dormant capacity is: the variate-attention layers exist,
@@ -68,7 +68,7 @@ emitting coupled C = 4 groups — and score both on the *current* univariate
 eval. If B ≥ A, the sequencing can relax; if B < A (expected), the eval
 lands first and the result is the number quoted to miners for why.
 
-## The eval work that gates arming (with DEC-CA-0016 G6 already in place)
+## The eval work that gates arming (with DEC-CA-0020 G6 already in place)
 
 1. **Joint forecaster.** `ForecastFn` `(C, L) → (C, ns, H)` and
    `score_forecaster_on_windows` calling it once per window — shipped
@@ -130,7 +130,7 @@ Proposal, in the DEC-CA-0010 shape (measure first):
 
 **Roles ship as a record field, not positional convention + config.** The
 positional proposal (`n_targets`/`n_past_cov`/`n_future_cov`, channels
-ordered) was motivated by needing no schema change — but DEC-CA-0016 removes
+ordered) was motivated by needing no schema change — but DEC-CA-0020 removes
 that motivation, and positional+config is strictly worse on its own terms:
 it splits one fact across two files, forces every series in a corpus to
 share one role split (no mixed corpora), and creates an ordering invariant
@@ -177,7 +177,7 @@ self-correcting under our eval?
 - `chain.toml`: `max_channels` raise (`[generator]`, **not** digest-bound —
   verified against `TrainingContractConfig`); `max_channel_corr` +
   shadow flags; at roles arming, the accepted-field fold into `[training]`
-  (one digest bump, shared with DEC-CA-0019's if co-scheduled).
+  (one digest bump, shared with DEC-CA-0023's if co-scheduled).
 - Interface: record fields `roles` (this node) — `values` at `(C, L)` needs
   nothing new; validation of roles vocabulary and shape.
 - Trainer: channel-drop fix + `(P, C)` bucketing (inert at C = 1, lockstep);

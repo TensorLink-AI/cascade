@@ -32,7 +32,23 @@ import numpy as np
 
 from ..shared.config import ChainConfig
 from ..shared.hippius import HubConfig, HubRef, fetch_from_hub, is_hub_ref
-from .windows import RotatingWindowSource, build_windows_from_series
+from .windows import MixParams, RotatingWindowSource, build_windows_from_series
+
+
+def mix_params_from_config(cfg: ChainConfig) -> MixParams | None:
+    """The jittered-mix knobs from ``[eval]``, or ``None`` when disabled
+    (``mix_from_block = 0``) so a legacy config carries zero new state."""
+    e = cfg.eval
+    if not getattr(e, "mix_from_block", 0):
+        return None
+    return MixParams(
+        from_block=int(e.mix_from_block),
+        jitter_alpha=float(e.mix_jitter_alpha),
+        block_slots=int(e.mix_block_slots),
+        class_keep_frac=float(e.mix_class_keep_frac),
+        series_bag_frac=float(e.mix_series_bag_frac),
+        target_windows=int(e.mix_target_windows),
+    )
 
 log = logging.getLogger("cascade.validator")
 
@@ -124,7 +140,9 @@ def window_source_from_dir(
             f"horizon={cfg.eval.horizon}+context (need >= horizon+1 steps)"
         )
     log.info("loaded eval pool %s series=%d windows=%d", label, len(series), len(windows))
-    return RotatingWindowSource(pool=tuple(windows), provenance=provenance)
+    return RotatingWindowSource(
+        pool=tuple(windows), provenance=provenance, mix=mix_params_from_config(cfg)
+    )
 
 
 # ───────────────────────── daily bucket-published pool ──────────────────────
@@ -196,7 +214,9 @@ class BucketWindowSource:
                 f"no eval-pool snapshot published in {self.cfg.storage.pool_bucket}; "
                 "run `cascade-pool publish` from the owner orchestrator"
             )
-        return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows)
+        # Forward the epoch block: it selected the snapshot above AND gates the
+        # jittered mix inside the snapshot's RotatingWindowSource.
+        return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows, block=block)
 
     def provenance_for_round(self, round_seed, *, block=None) -> tuple[str, str]:
         """``(snapshot_key, tar_sha256)`` of the snapshot active for the round —

@@ -179,14 +179,22 @@ def verify_promotion_record_signature(record: PromotionRecord, trainer_hotkey: s
 def publish_promotion_record(store: object, record_text: str, generation: int) -> str:
     """Write a generation's promotion record to the manifest-bucket store (the
     R2 dual-write / HF failover the manifest enjoys covers it too) and refresh
-    the unsigned locator index. Returns the record's key."""
+    the unsigned locator index. Returns the record's key.
+
+    Both objects publish public-read — the dashboard renders the rotation
+    roster from the record (inferring the cycle from receipts breaks at every
+    generation boundary), and trust comes from the record's signature, not the
+    ACL. Same fallback as the receipt publisher: a backend without canned ACLs
+    publishes private rather than not at all."""
+    from .hippius import StorageError
+
     key = promotion_record_key(generation)
-    store.put_text(key, record_text, content_type="application/json")
-    store.put_text(
-        promotion_index_key(),
-        json.dumps({"latest_generation": int(generation)}, sort_keys=True),
-        content_type="application/json",
-    )
+    index_text = json.dumps({"latest_generation": int(generation)}, sort_keys=True)
+    for k, text in ((key, record_text), (promotion_index_key(), index_text)):
+        try:
+            store.put_text(k, text, content_type="application/json", acl="public-read")
+        except StorageError:
+            store.put_text(k, text, content_type="application/json")
     return key
 
 

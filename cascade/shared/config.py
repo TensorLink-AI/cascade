@@ -70,14 +70,14 @@ class GeneratorConfig:
     max_abs_value: float = 0.0
     reject_constant: bool = False
     max_dup_fraction: float = 1.0
-    # ── the record carrier (DEC-CA-0016; never part of contract_digest) ──────
+    # ── the record carrier (DEC-CA-0020; never part of contract_digest) ──────
     # ``interface_version`` names which yield payloads the trainer accepts: 1 =
     # record-or-array with ``values`` only (every reserved field hard-rejected).
     # A generator repo may declare its own ``interface_version`` in config.json;
     # one newer than this is rejected before the generator runs. Bumps ONLY
     # when a new payload field is accepted+consumed in one release — at that
     # point the accepted field set folds into [training] (one deliberate
-    # contract_digest bump, DEC-CA-0016 layer 3).
+    # contract_digest bump, DEC-CA-0020 layer 3).
     # ``max_payload_bytes`` is the carrier cap in canonical payload BYTES —
     # the budget denomination that stays correct when non-values fields arrive.
     # At 16e9 it equals max_total_points × 8 (float64), so it is numerically
@@ -92,7 +92,7 @@ class GeneratorConfig:
     #                        "roles"); () = values-only (deployed default).
     #   allow_future_known — admit roles value 2 (future-known covariates).
     #   real_corpus_ref    — the owner-published shared real corpus pin
-    #                        (DEC-CA-0024); "" = none (deployed default).
+    #                        (DEC-CA-0028); "" = none (deployed default).
     # Note: json round-trips turn the tuple into a list; treat as a container.
     accepted_fields: tuple[str, ...] = ()
     allow_future_known: bool = False
@@ -105,10 +105,10 @@ class GeneratorConfig:
     # armed is a loud error at generator load, never a silent no-corpus run.
     real_corpus_dir: str = ""
     # Per-series cap on the masked fraction when "mask" is accepted
-    # (DEC-CA-0019's gate): a mostly-missing series is mostly filler bytes
+    # (DEC-CA-0023's gate): a mostly-missing series is mostly filler bytes
     # bought at full freight. Meaningless while accepted_fields is empty.
     max_missing_frac: float = 0.5
-    # Channel-redundancy gate (DEC-CA-0022; data-quality, not digest-bound).
+    # Channel-redundancy gate (DEC-CA-0026; data-quality, not digest-bound).
     #   channel_corr_mode — "off" (default) | "shadow" (telemetry only; the
     #                       trainer's shadow accumulator already logs it) |
     #                       "enforce" (reject a series whose max off-diagonal
@@ -135,7 +135,7 @@ def validate_sandbox_mode(mode: str) -> str:
 
 
 # Record-carrier fields with a WIRED consumer (accept = consume, one release;
-# DEC-CA-0016's refuse-unconsumed rule made mechanical). [training]
+# DEC-CA-0020's refuse-unconsumed rule made mechanical). [training]
 # accepted_fields may only name these; every other reserved name is still
 # rejected at load so a typo or a premature arming fails the boot, not a round.
 CONSUMABLE_FIELDS = ("mask", "roles")
@@ -150,12 +150,12 @@ def validate_accepted_fields(value: object) -> tuple[str, ...]:
         raise ValueError(
             f"[training] accepted_fields={bad} have no wired consumer; "
             f"acceptable: {sorted(CONSUMABLE_FIELDS)} (a reserved field arms only "
-            "in the release that consumes it — DEC-CA-0016)"
+            "in the release that consumes it — DEC-CA-0020)"
         )
     return fields
 
 
-# Immutable-ref shape for [training] real_corpus_ref (DEC-CA-0024) — mirrors
+# Immutable-ref shape for [training] real_corpus_ref (DEC-CA-0028) — mirrors
 # cascade.shared.hippius.DIGEST_RE without importing the storage stack at
 # config-load time. Only content-pinned refs are expressible: a branch or tag
 # would let the corpus bytes move under a fixed contract_digest.
@@ -171,7 +171,7 @@ def validate_real_corpus_ref(value: object) -> str:
         raise ValueError(
             f"[training] real_corpus_ref={ref!r} is not an immutable ref; expected "
             "\"repo@sha256:<64 hex>\" (or \"repo@hf:<40 hex>\") — the shared real "
-            "corpus must be content-pinned (DEC-CA-0024)"
+            "corpus must be content-pinned (DEC-CA-0028)"
         )
     return ref
 
@@ -231,7 +231,7 @@ class SizeSpec:
     # Exact FFN hidden width from the released config.json (0 ⇒ derive as
     # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
     d_ff: int = 0
-    # ── size-conditional silicon + budget (DEC-CA-0023) ──────────────────────
+    # ── size-conditional silicon + budget (DEC-CA-0027) ──────────────────────
     # ``expected_gpu``: this size's pinned duel GPU when it differs from the
     # base [training] expected_gpu ("" = inherit). From-scratch economics die
     # between 22M and ~100M params, and 300M+ trains on H100-class silicon by
@@ -361,20 +361,20 @@ class TrainingContractConfig:
     # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
     # contract_digest, so a validator's contract gate covers every size at once.
     extra_sizes: tuple[SizeSpec, ...] = ()
-    # ── accepted record-field set (DEC-CA-0016 layer 3; digest-bound) ────────
+    # ── accepted record-field set (DEC-CA-0020 layer 3; digest-bound) ────────
     # The payload fields the carrier ACCEPTS and the trainer CONSUMES — one
     # release ships both, and arming is this one [training] key (a deliberate
     # contract_digest bump via the drop-when-default convention in
     # cascade.shared.manifest: empty = omitted from the hash, so deployed
     # digests are untouched until an operator sets it). Valid entries are
-    # reserved names with a wired consumer: "mask" (DEC-CA-0019), "roles"
-    # (DEC-CA-0022). Order-insensitive (normalised sorted at load).
+    # reserved names with a wired consumer: "mask" (DEC-CA-0023), "roles"
+    # (DEC-CA-0026). Order-insensitive (normalised sorted at load).
     accepted_fields: tuple[str, ...] = ()
     # roles value 2 (future-known covariates) admission. Digest-bound and OFF
     # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
-    # arming it before that rule exists is forbidden (DEC-CA-0022).
+    # arming it before that rule exists is forbidden (DEC-CA-0026).
     allow_future_known: bool = False
-    # ── owner-published shared real corpus (DEC-CA-0024; digest-bound) ───────
+    # ── owner-published shared real corpus (DEC-CA-0028; digest-bound) ───────
     # Immutable ref ("repo@sha256:<64hex>" or "repo@hf:<40hex>") of the frozen,
     # licensed real-data corpus every generator may READ (mounted/passed
     # read-only into the sandbox as the optional ``real_corpus_dir``
@@ -382,7 +382,7 @@ class TrainingContractConfig:
     # the drop-when-default convention the field is absent from contract_digest
     # until set, so arming is the deliberate digest bump. Arming is FORBIDDEN
     # until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness rule
-    # (provenance + time wall) and the DEC-CA-0024 pricing experiment has run.
+    # (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
     real_corpus_ref: str = ""
 
     def tokens_for_hours(self, hours: float) -> int:
@@ -445,7 +445,7 @@ class TrainingContractConfig:
         no nested ``extra_sizes`` (it IS a single concrete size), so its
         ``contract_digest`` is the stable identity of that one size.
 
-        Size-conditional overrides (DEC-CA-0023): a spec with a non-empty
+        Size-conditional overrides (DEC-CA-0027): a spec with a non-empty
         ``expected_gpu`` swaps the GPU pin (the validator's gpu_name gate then
         asserts THIS size's silicon), and a positive ``target_train_hours``
         swaps the budget hours (the token budget follows via ``train_tokens``,
@@ -565,7 +565,37 @@ class RoundConfig:
     # screen starts rewarding fast-to-generate data over good data.
     heat_guard_factor: float = 1.0
     heat_guard_floor_seconds: int = 900
+    # In-round re-queues for a heat challenger whose dispatch (and its
+    # in-dispatch retry) died on an INFRASTRUCTURE failure — storage layer or
+    # SSH transport (rc=255). Challenger-fault failures never re-queue. Each
+    # re-queue is one more full heat run in the worst case, so the added
+    # wall-clock is bounded by this × the per-dispatch timeout. 0 ⇒ off
+    # (the pre-2026-08-19 behaviour: infra casualties drop terminally).
+    heat_infra_requeues: int = 2
     finalists: int = 1                # challengers promoted from the heat to the final
+    # ── Tie-aware finalists (DEC-CA-0012, trainer half) — inert at defaults ──
+    # ``max_finalists > 1`` arms the tie-aware advance rule: a leader the
+    # screen's own statistic separated from the runner-up (paired LCB > 0, the
+    # ``lcb_vs`` diagnostic in cascade.eval.heat) advances ALONE whatever the
+    # cap; a statistically tied top is re-scored on a larger eval slice (the
+    # run-off below) and whoever still cannot be separated advances too,
+    # capped here. The validator then duels the WHOLE cohort under a
+    # family-wise alpha/k. At the default 1 the tie logic never runs — exactly
+    # one finalist advances as before and every manifest hashes identically.
+    max_finalists: int = 1
+    # Total eval windows the tie run-off re-scores the tied set on (CPU-only,
+    # on the orchestrator, against heat checkpoints still on local disk).
+    # Only the INCREMENTAL windows beyond the heat's slice are scored — the
+    # round's window selection is a seeded permutation prefix, so the heat's
+    # slice is a strict prefix of this one and pairing holds by construction.
+    # Clamped to [eval] n_windows; must exceed the heat's actual window count
+    # to add evidence. 0 = no run-off: a tied top advances by the heat
+    # ranking, capped at ``max_finalists``.
+    tie_runoff_windows: int = 0
+    # Wall clock for the WHOLE run-off, mirroring ``dedup_phase_seconds``: on
+    # expiry the pre-run-off tied set advances (capped) — a screen that cannot
+    # finish must not sink the round it protects. Inert while max_finalists=1.
+    tie_runoff_phase_seconds: int = 900
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
@@ -688,6 +718,20 @@ class RoundConfig:
     # ~25 blocks ≈ 5 min at 12s blocks; tighten after measuring live jitter.
     reveal_margin_blocks: int = 25
 
+    @property
+    def finalist_cap(self) -> int:
+        """Upper bound on challengers the heat may advance (DEC-CA-0012).
+
+        The legacy constant while the tie logic is off (``max_finalists <= 1``),
+        else ``max(finalists, max_finalists)``. The heat's fast paths and the
+        provisioner's final-fleet sizing must share this bound so the
+        pre-phased fleet and the ``within_budget`` breaker always cover the
+        worst case the advance rule can produce.
+        """
+        if self.max_finalists > 1:
+            return max(self.finalists, self.max_finalists)
+        return self.finalists
+
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -746,6 +790,23 @@ class EvalConfig:
     # ``[scoring] cascade_enabled`` is off — the trainer never writes the
     # pending marker and the provisioner never arms the hold.
     bench_hold_max_hours: float = 2.0
+    # ── Jittered round mix (DEC-TB-0003 port; CONSENSUS, block-gated) ────────
+    # ``mix_from_block = 0`` keeps the legacy uniform permutation everywhere
+    # (byte-identical history). When set to an epoch-boundary block, rounds at
+    # or after that block draw a Dirichlet-jittered, class-rotated,
+    # bag-filtered mix instead — every validator AND the trainer must run this
+    # code (with the same value) before the activation block, or verdicts fork
+    # from that block on. Audit replay applies each round's own rule via the
+    # receipt's epoch_start_block. ``mix_target_windows`` (0 = n_windows) is
+    # the jittered draw size — smaller than the pool is what gives the
+    # Dirichlet room (calibration: 1200 of a ~2400 pool rotates the mix hard;
+    # 2000 barely moves it).
+    mix_from_block: int = 0
+    mix_jitter_alpha: float = 4.0
+    mix_block_slots: int = 8
+    mix_class_keep_frac: float = 0.7
+    mix_series_bag_frac: float = 0.7
+    mix_target_windows: int = 0
 
 
 @dataclass(frozen=True)
@@ -794,7 +855,7 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
-    # Margin denomination (DEC-CA-0023; see cascade.eval.koth.MARGIN_MODES).
+    # Margin denomination (DEC-CA-0027; see cascade.eval.koth.MARGIN_MODES).
     # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
     # "increment" = the warm-start-era rule: the shared init is scored as a
     # third paired reference and the margin prices a fraction of a typical
@@ -949,10 +1010,23 @@ class TelemetryConfig:
     extra seconds matter. There is deliberately no size knob: a resizable bench
     produces numbers that cannot be pooled across the fleet (see
     ``host_probe.HOST_BENCH_SPEC``).
+
+    ``scratch_shadow_every_rounds`` (DEC-CA-0014 Stage 1) arms the shadow
+    scratch control: every M-th warm-started round, the trainer additionally
+    trains the reigning king's generator FROM SCRATCH (random init, identical
+    contract) after the manifest publishes, benches it on the public suites,
+    and publishes the numbers as a clearly-labeled telemetry artifact
+    (``cascade.shared.scratch_report``) beside the round's signed bench
+    report. The scratch run never enters the manifest, the bench report, the
+    promotion candidate pool, or any scoring path — it exists to measure the
+    lineage-vs-scratch gap that decides whether DEC-CA-0014's Stage-2 reseed
+    valve is ever warranted. ``0`` (the default) = off. Deliberately a
+    ``[telemetry]`` key: it must never touch ``contract_digest``.
     """
 
     host_probe: bool = True
     host_bench: bool = True
+    scratch_shadow_every_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -1328,6 +1402,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             heat_guard_factor=float(r.get("heat_guard_factor", 1.0)),
             heat_guard_floor_seconds=int(r.get("heat_guard_floor_seconds", 900)),
             finalists=int(r.get("finalists", 1)),
+            max_finalists=int(r.get("max_finalists", 1)),
+            tie_runoff_windows=int(r.get("tie_runoff_windows", 0)),
+            tie_runoff_phase_seconds=int(r.get("tie_runoff_phase_seconds", 900)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
@@ -1371,6 +1448,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
             cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
+            mix_from_block=int(e.get("mix_from_block", 0)),
+            mix_jitter_alpha=float(e.get("mix_jitter_alpha", 4.0)),
+            mix_block_slots=int(e.get("mix_block_slots", 8)),
+            mix_class_keep_frac=float(e.get("mix_class_keep_frac", 0.7)),
+            mix_series_bag_frac=float(e.get("mix_series_bag_frac", 0.7)),
+            mix_target_windows=int(e.get("mix_target_windows", 0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),
@@ -1452,6 +1535,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         telemetry=TelemetryConfig(
             host_probe=bool(tm.get("host_probe", True)),
             host_bench=bool(tm.get("host_bench", True)),
+            scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
         ),
         raw=raw,
     )

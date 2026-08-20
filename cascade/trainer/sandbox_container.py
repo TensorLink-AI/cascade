@@ -59,7 +59,7 @@ CONTAINER_TMPFS = "/tmp:rw,noexec,nosuid,size=256m"
 _REPO_MNT = "/sandbox/repo"
 _SRC_MNT = "/sandbox/src"
 _OUT_MNT = "/sandbox/out"
-_REAL_MNT = "/sandbox/real"  # shared real corpus, read-only (DEC-CA-0024)
+_REAL_MNT = "/sandbox/real"  # shared real corpus, read-only (DEC-CA-0028)
 
 _RUNTIME: str | None | bool = False  # False = unprobed
 
@@ -145,7 +145,7 @@ def container_argv(
         for key in _BLAS_ENV_KEYS:
             argv += ["-e", f"{key}={len(lane_cores)}"]
     if real_dir is not None:
-        # The owner-published shared real corpus (DEC-CA-0024): read-only, at a
+        # The owner-published shared real corpus (DEC-CA-0028): read-only, at a
         # fixed mount so the cfg JSON's real_corpus_dir is host-independent.
         argv += ["-v", f"{real_dir}:{_REAL_MNT}:ro"]
     if out_dir is not None:
@@ -182,7 +182,7 @@ def run_in_container(
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
     runtime = _require_runtime(cfg)
-    # DEC-CA-0024: materialise host-side, mount read-only at the fixed
+    # DEC-CA-0028: materialise host-side, mount read-only at the fixed
     # in-container path, and hand the child a cfg whose real_corpus_dir IS
     # that mount. No-op while unarmed.
     cfg = resolve_real_corpus(cfg)
@@ -255,7 +255,7 @@ def stream_series_container(
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
     runtime = _require_runtime(cfg)
-    # DEC-CA-0024: same host-side materialise + read-only mount as batch mode.
+    # DEC-CA-0028: same host-side materialise + read-only mount as batch mode.
     cfg = resolve_real_corpus(cfg)
     real_host = Path(cfg.real_corpus_dir).resolve() if cfg.real_corpus_dir else None
     child_cfg = replace(cfg, real_corpus_dir=_REAL_MNT) if real_host else cfg

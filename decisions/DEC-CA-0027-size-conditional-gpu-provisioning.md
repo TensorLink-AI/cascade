@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0023
+id: DEC-CA-0027
 type: decision
 title: "Scaling past ~300M params: per-size GPU pins, size-conditional provisioning (300M+ rents H100), and a warm-start round pipeline — from-scratch-per-round ends between 22M and 100M"
 status: proposed

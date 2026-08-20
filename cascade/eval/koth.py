@@ -34,7 +34,7 @@ from .scoring import WindowScore, global_geomean, stack_components
 #   "enforce" — gate is AND-ed into the dethrone decision.
 GIFT_GATE_MODES = ("off", "shadow", "enforce")
 
-# Margin denomination (``[scoring] margin_mode``; DEC-CA-0023):
+# Margin denomination (``[scoring] margin_mode``; DEC-CA-0027):
 #   "level"     — LCB of (king − chal) / king vs the margin. The from-scratch
 #                 rule, exact historical behaviour (default).
 #   "increment" — LCB of (king − chal) / unit, unit = the floored mean
@@ -183,7 +183,7 @@ def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
     several rows: a C-channel window's rows are near-perfectly correlated, and
     a per-ROW fallback would resample them as C independent observations —
     inflating the effective sample size precisely when multivariate windows
-    enter the pool (DEC-CA-0022 item 3). Keying on the window keeps a
+    enter the pool (DEC-CA-0026 item 3). Keying on the window keeps a
     12-channel window from voting 12 times even on a pool with no ``source``
     metadata.
     """

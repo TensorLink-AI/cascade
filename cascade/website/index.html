@@ -1048,6 +1048,12 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
   </div>
 
   <div>
+    <div class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></div>
+    <div id="warm-panel"></div>
+    <div id="warm-history"></div>
+  </div>
+
+  <div>
     <div class="section-label"><span>Rounds</span></div>
     <div class="scroll-box scroll-hist">
       <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
@@ -1104,7 +1110,8 @@ var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
-    _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading";
+    _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
+    _wsHist = null;
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1509,7 +1516,135 @@ function renderSubs(){
       '<td>'+tag+(isNew?'<span class="sub-new">&#9679; new</span>':'')+'</td></tr>';
   }).join("");
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+// Map a checkpoint (or round_id) to its human round number "rN". The checkpoint
+// id embeds its origin round's seed (ckpt-r<seed>-…), which is a round_id in the
+// index carrying an epoch_start_block on the 3600-block epoch grid. Anchor on a
+// verified (round_id, number) pair — r17 = 3107676501688987439 — and count grid
+// steps; the anchor's block is read live from the index so it tracks whatever
+// block the index carries. Verified: r10/r11/r12/r15/r16/r17 all map correctly.
+var WS_ANCHOR_RID="3107676501688987439", WS_ANCHOR_NO=17;
+function roundBlockOf(rid){ var rs=_index&&_index.rounds; if(!rs) return null; for(var i=0;i<rs.length;i++) if(String(rs[i].round_id)===String(rid)) return rs[i].epoch_start_block; return null; }
+function roundNoOf(rid){ var b=roundBlockOf(rid), ab=roundBlockOf(WS_ANCHOR_RID); if(b==null||ab==null) return null; var n=Math.round(WS_ANCHOR_NO+(b-ab)/3600); return n>0?n:null; }
+function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
+function renderWarm(){
+  var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
+  if(!panel) return;
+  var ws = _heat && _heat.warm_start;
+  if(!ws || !ws.init_checkpoint){
+    panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
+    if(when) when.textContent = "";
+    return;
+  }
+  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
+  // heat.json is written at HEAT SETTLE, so it describes the last SETTLED round:
+  // init_checkpoint = that round's init, next_scheduled_init = the round after it.
+  // If a newer round is already live (status/round.json), that live round IS the
+  // "next" one and is training NOW from next_scheduled_init — so don't mislabel
+  // it as still-upcoming. The round after the live one needs the rotation roster
+  // (see loadPromotion) and only becomes knowable when this heat settles.
+  var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init;
+  var settledRid=_heat.round_id, liveRid=_roundStatus && _roundStatus.round_id;
+  var running = liveRid && String(liveRid)!==String(settledRid);
+  var html='<div style="display:flex;flex-direction:column;gap:6px">';
+  if(running){
+    if(nxt){
+      html+='<div><span class="muted">Current round ('+esc(shortRoundId(liveRid))+', running) is training from:</span> '
+          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+    }
+    html+='<div><span class="muted">Last completed round ('+esc(shortRoundId(settledRid))+') trained from:</span> '
+        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
+    html+='<div class="muted" style="font-size:.85em">The next round&rsquo;s init is drawn from the rotation '
+        + 'when this heat settles. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by '
+        + 'design; each start is pinned in that round&rsquo;s signed manifest.</div>';
+  } else {
+    if(nxt){
+      html+='<div><span class="muted">Next round will warm-start from:</span> '
+          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
+    }
+    html+='<div><span class="muted">Current round ('+esc(shortRoundId(settledRid))+') warm-started from:</span> '
+        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
+    html+='<div class="muted" style="font-size:.85em">Next is a schedule &mdash; a promotion can change the '
+        + 'set. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by design; each start is '
+        + 'pinned in that round&rsquo;s signed manifest.</div>';
+  }
+  html+='</div>';
+  panel.innerHTML=html;
+  if(when) when.textContent = ws.size ? esc(ws.size) : "";
+}
+// Warm-start history: the last 10 rounds and the checkpoint each trained from,
+// so miners can see the trend (random init → warm-start → rotation). The per-round
+// init lives only in each round's signed manifest, not the index, so fetch each
+// round's receipt (receipt_key) once and cache in _wsHist. Empty warm_start_ckpt
+// ⇒ that round trained from random init.
+function loadWarmHistory(){
+  var rs=_index&&_index.rounds; if(!rs||!rs.length) return;
+  if(_wsHist===null) _wsHist={};
+  var last=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-10);
+  last.forEach(function(r){
+    var id=String(r.round_id);
+    if(_wsHist[id]) return;                                  // loaded or in-flight
+    if(!r.receipt_key){ _wsHist[id]={done:true, ckpt:"", at:r.published_at}; return; }
+    _wsHist[id]={done:false, at:r.published_at};             // mark in-flight
+    fetchJSON(r.receipt_key).then(function(d){
+      var m=(d&&d.manifest)||{};
+      _wsHist[id]={done:true, ckpt:m.warm_start_ckpt||"", at:r.published_at};
+      renderWarmHistory();
+    }).catch(function(){
+      _wsHist[id]={done:true, ckpt:"", at:r.published_at, err:true};
+      renderWarmHistory();
+    });
+  });
+  renderWarmHistory();
+}
+// The rotation roster comes from the trainer's signed promotion record
+// (promotions/index.json locates the latest generation; public-read since
+// 2026-08-15). Member ORDER is the cycle order — the trainer trains round N
+// from members[epoch_index % k]. Inferring the cycle from recent receipts was
+// tried and breaks at every generation boundary (the first gen-2 round glued
+// onto the gen-1 cycle, 2026-08-15): no record ⇒ no sequence line, never a
+// wrong one.
+var _promo=null;
+function loadPromotion(){
+  fetchJSON("promotions/index.json").then(function(d){
+    var gen=Number(d&&d.latest_generation);
+    if(!gen||gen<1){ _promo=null; renderWarmHistory(); return; }
+    if(_promo&&_promo.gen===gen) return;           // roster already loaded
+    fetchJSON("promotions/gen-"+gen+".json").then(function(rec){
+      _promo={gen:gen, members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
+      renderWarmHistory();
+    }).catch(function(){});
+  }).catch(function(){});
+}
+function renderWarmHistory(){
+  var el=document.getElementById("warm-history"); if(!el) return;
+  var rs=_index&&_index.rounds;
+  if(!rs||!rs.length||_wsHist===null){ el.innerHTML=""; return; }
+  function wsLabel(ref){ if(!ref) return null; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
+  var last=rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-10).reverse();
+  var rows=last.map(function(r){
+    var id=String(r.round_id), h=_wsHist[id]||{}, cell;
+    if(!h.done) cell='<span class="muted">&hellip;</span>';
+    else if(h.err) cell='<span class="muted">unavailable</span>';
+    else if(h.ckpt) cell='<span title="'+esc(h.ckpt)+'">'+esc(wsLabel(h.ckpt))+'</span>';
+    else cell='<span class="muted">random init</span>';
+    var rn=roundNoOf(id), rlab=rn?("r"+rn):shortRoundId(id);
+    return '<tr><td title="'+esc(id)+'">'+esc(rlab)+'</td>'+
+      '<td>'+cell+'</td>'+
+      '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
+  }).join("");
+  var seqHtml="";
+  if(_promo&&_promo.members.length){
+    seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation roster &mdash; generation '+
+      _promo.gen+' (cycles each round): '+
+      _promo.members.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
+      ' &rarr; &hellip;</div>';
+  }
+  el.innerHTML=seqHtml+
+    '<div class="section-label" style="margin-top:12px"><span>Recent rounds &mdash; warm-start init</span></div>'+
+    '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
+    '<tbody>'+rows+'</tbody></table></div>';
+}
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1570,8 +1705,9 @@ _dataState="loading"; renderAll();
 // (same trail validator bootstrap trusts); shared stays as a fallback only.
 var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
+  loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
     .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
@@ -1584,12 +1720,12 @@ function poll(){
     _status=d; renderStage(); renderSubs(); renderCountdown();
   }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
-  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); })
+  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
     .catch(function(){});
   // Live heat standings, published when the heat settles rather than with the
   // round's receipt (status/heat.json). Best-effort: on failure the panel falls
   // back to the settled receipt's embedded heat block.
-  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); })
+  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); renderWarm(); })
     .catch(function(){});
 }
 poll();

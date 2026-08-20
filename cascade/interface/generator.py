@@ -39,13 +39,13 @@ from collections.abc import Iterator, Mapping
 
 import numpy as np
 
-# ── the record carrier (DEC-CA-0016) ─────────────────────────────────────────
+# ── the record carrier (DEC-CA-0020) ─────────────────────────────────────────
 
 # The interface version this code accepts. A generator repo may declare
 # ``"interface_version"`` in its config.json; a declared version NEWER than
 # this is rejected before the generator runs (clear early error instead of a
 # mid-drain validation failure). Absent ⇒ 1. Bump only when a new payload
-# field is ACCEPTED (DEC-CA-0016's refuse-unconsumed rule).
+# field is ACCEPTED (DEC-CA-0020's refuse-unconsumed rule).
 SUPPORTED_INTERFACE_VERSION = 1
 
 # The one field a record yield must carry at interface_version 1.
@@ -57,11 +57,11 @@ VALUES_FIELD = "values"
 # squat a name and no accepted-but-ignored field can ever exist. The table is
 # the migration path: accepting a field later is additive and breaks nobody.
 RESERVED_FIELDS: dict[str, str] = {
-    "mask": "per-entry observedness mask parallel to values (DEC-CA-0019)",
-    "start": "absolute time anchor of the first step (DEC-CA-0017; no consumer under the calendar-free arch pin)",
-    "freq": "sampling frequency / calendar step (DEC-CA-0017)",
-    "group_id": "cross-series panel/group label (DEC-CA-0020; panels are variates for this arch)",
-    "roles": "per-channel variate roles: target / past-cov / future-known (DEC-CA-0022)",
+    "mask": "per-entry observedness mask parallel to values (DEC-CA-0023)",
+    "start": "absolute time anchor of the first step (DEC-CA-0021; no consumer under the calendar-free arch pin)",
+    "freq": "sampling frequency / calendar step (DEC-CA-0021)",
+    "group_id": "cross-series panel/group label (DEC-CA-0024; panels are variates for this arch)",
+    "roles": "per-channel variate roles: target / past-cov / future-known (DEC-CA-0026)",
     "labels": "per-series free-form tags (no consumer scheduled)",
     "quantiles": "per-step distributional payload (no consumer scheduled)",
 }
@@ -75,7 +75,7 @@ def canonicalize_yield(
 ) -> object:
     """Normalise one ``generate()`` yield.
 
-    The carrier accepts two shapes per DEC-CA-0016:
+    The carrier accepts two shapes per DEC-CA-0020:
 
     * a bare ``np.ndarray`` — the documented common case, passed through
       untouched (zero cost, zero behaviour change for every deployed
@@ -149,7 +149,7 @@ class DataGenerator(ABC):
         read the system clock, ``os.urandom``, or any un-seeded global RNG. The
         constructor MUST NOT touch the network.
 
-        Optional opt-in keyword (DEC-CA-0024, only while ``[training]
+        Optional opt-in keyword (DEC-CA-0028, only while ``[training]
         real_corpus_ref`` is armed — never passed today): a constructor that
         declares ``real_corpus_dir=None`` additionally receives the local
         read-only path of the owner-published shared real corpus, identical
@@ -166,7 +166,7 @@ class DataGenerator(ABC):
 
         Each yield is EITHER a bare array — the documented common case — or a
         named-field record (a ``dict``) whose ``"values"`` key carries that
-        same array (DEC-CA-0016). At ``interface_version`` 1 the record form
+        same array (DEC-CA-0020). At ``interface_version`` 1 the record form
         may carry the ``"values"`` field ONLY: reserved names
         (:data:`RESERVED_FIELDS` — ``mask``, ``start``, ``freq``, ``group_id``,
         ``roles``, ``labels``, ``quantiles``) have published semantics but are
@@ -290,7 +290,7 @@ def _series_key(canon: np.ndarray) -> bytes:
 
 # ── extended records: canonical form, validation, digest framing ─────────────
 #
-# The DEC-CA-0016 sentinel scheme. A values-only series' digest bytes begin
+# The DEC-CA-0020 sentinel scheme. A values-only series' digest bytes begin
 # with an 8-byte (corpus/stream) or 4-byte (series key) big-endian channel
 # count — first byte 0x00 for any realistic C — so the extended-record frame
 # claims the one lead byte no legacy frame can produce:
@@ -354,14 +354,14 @@ def check_record(
 
     ``values`` is assumed already validated by :func:`check_series`. Rules:
 
-    * ``mask`` (DEC-CA-0019): same ``(C, L)`` shape as values; entries in
+    * ``mask`` (DEC-CA-0023): same ``(C, L)`` shape as values; entries in
       {0, 1} (1 = missing/unobserved); every masked entry of ``values``
       pinned EXACTLY 0.0 (one canonical byte encoding per missingness
       pattern — a free-valued filler would be a hidden data channel and
       would randomise the dup gate); overall missing fraction ≤
       ``max_missing_frac``; no fully-masked channel (nothing observed to
       scale from).
-    * ``roles`` (DEC-CA-0022): shape ``(C,)``; entries in {0=target,
+    * ``roles`` (DEC-CA-0026): shape ``(C,)``; entries in {0=target,
       1=past-covariate, 2=future-known}; value 2 admitted only when
       ``allow_future_known`` (armed only after the EVAL_POOL exogeneity rule
       exists); at least one target channel (an all-covariate series carries
@@ -566,14 +566,14 @@ def drain_generator(
     anti-adversary defence). All gates default to no-op so existing callers
     are unchanged; the trainer sets them from ``chain.toml [generator]``.
 
-    ``max_payload_bytes`` is the CARRIER's budget denomination (DEC-CA-0016 G3):
+    ``max_payload_bytes`` is the CARRIER's budget denomination (DEC-CA-0020 G3):
     a cap on the total canonical payload bytes of the drained corpus — values
     at 8 bytes/point plus any accepted extras (mask/roles at 1 byte/entry). At
     the shipped value (16e9 = ``max_total_points`` × 8) it is numerically
     identical to the point cap for a values-only corpus and can never trip
     first there; extras are priced automatically. ``0`` disables it.
 
-    Record yields (DEC-CA-0016) are normalised through
+    Record yields (DEC-CA-0020) are normalised through
     :func:`canonicalize_yield`: a values-only record corpus digests
     byte-identically to its bare-array twin, and ``accepted_fields`` extras
     (``mask``, ``roles`` — armed only via ``[training] accepted_fields``) are

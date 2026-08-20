@@ -380,6 +380,147 @@ def test_trainer_end_to_end_tiny_run(tmp_path: Path):
     assert w.forecast_quantiles_batch([np.arange(20, dtype=float)], 8).shape == (1, 8, 9)
 
 
+def _tiny_contract(**overrides):
+    base = dict(
+        context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
+        num_heads=1, head_dim=16, mlp_expansion=2, num_quantiles=9,
+        batch_size=4, max_train_seconds=30, base_lr=1e-3, weight_decay=0.0,
+        optimizer="adamw", warmup_tokens=0, input_transform="arcsinh_causal",
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _tiny_stream(n=16):
+    rng = np.random.default_rng(0)
+    return (rng.normal(size=32).cumsum() for _ in range(n))
+
+
+# ── LR schedules: wsd vs warmup_cosine (DEC-CA-0018) ─────────────────────────
+
+
+def test_lr_schedule_semantics():
+    from cascade.trainer.toto2_trainer import _lr_at
+
+    # warmup_cosine (default): linear warmup, then cosine all the way to 0.
+    assert _lr_at(0, 1000, 100, 1.0) == 0.0
+    assert _lr_at(50, 1000, 100, 1.0) == pytest.approx(0.5)
+    assert _lr_at(550, 1000, 100, 1.0) == pytest.approx(0.5)
+    assert _lr_at(1000, 1000, 100, 1.0) == pytest.approx(0.0)
+    # wsd from scratch (generation start): same warmup, then FLAT — no decay.
+    assert _lr_at(50, 1000, 100, 1.0, schedule="wsd") == pytest.approx(0.5)
+    assert _lr_at(100, 1000, 100, 1.0, schedule="wsd") == 1.0
+    assert _lr_at(999, 1000, 100, 1.0, schedule="wsd") == 1.0
+    # wsd warm-started (mid-generation): flat from token 0 — the generation
+    # already warmed up; a re-warmup or cosine restart would distort it.
+    assert _lr_at(0, 1000, 100, 1.0, schedule="wsd", warm_started=True) == 1.0
+    assert _lr_at(999, 1000, 100, 1.0, schedule="wsd", warm_started=True) == 1.0
+
+
+def test_unknown_lr_schedule_aborts(tmp_path: Path):
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    with pytest.raises(ValueError, match="lr_schedule"):
+        trainer.train(_tiny_stream(), _tiny_contract(lr_schedule="cosine"),
+                      training_seed=1, token_budget=256, out_dir=tmp_path / "x")
+
+
+# ── optimizer-state continuity across warm-started rounds (DEC-CA-0018) ──────
+
+
+def test_wsd_round_writes_state_and_warm_start_resumes_it(tmp_path: Path):
+    from cascade.trainer.toto2_trainer import OPTIM_STATE_FILE
+
+    contract = _tiny_contract(optimizer="normuon_adamw", lr_schedule="wsd")
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    r1 = trainer.train(_tiny_stream(), contract, training_seed=1,
+                       token_budget=512, out_dir=tmp_path / "gen0")
+    assert r1.metrics["lr_schedule"] == "wsd"
+    assert r1.metrics["optim_state_resumed"] is False
+    state_file = tmp_path / "gen0" / OPTIM_STATE_FILE
+    assert state_file.is_file()
+    from safetensors.torch import load_file
+    flat = load_file(str(state_file))
+    # both halves of the optimiser landed: Muon momentum/row EMA + AdamW moments
+    assert any(k.startswith("muon.") and k.endswith(".momentum") for k in flat)
+    assert any(k.startswith("muon.") and k.endswith(".row_v") for k in flat)
+    assert any(k.startswith("adamw.") and k.endswith(".exp_avg") for k in flat)
+    assert any(k.startswith("adamw.") and k.endswith(".step") for k in flat)
+
+    # the next round continues from the checkpoint AND its optimizer state
+    r2 = trainer.train(_tiny_stream(), contract, training_seed=2,
+                       token_budget=512, out_dir=tmp_path / "gen0r2",
+                       warm_start_dir=tmp_path / "gen0")
+    assert r2.metrics["optim_state_resumed"] is True
+    assert (tmp_path / "gen0r2" / OPTIM_STATE_FILE).is_file()
+
+
+def test_warm_start_without_state_file_starts_fresh(tmp_path: Path):
+    """A promoted member from before optimizer-state shipping (or a cosine-era
+    generation) has no optimizer.safetensors: the run must proceed with fresh
+    state, never abort."""
+    from cascade.trainer.toto2_trainer import OPTIM_STATE_FILE
+
+    contract = _tiny_contract(optimizer="normuon_adamw", lr_schedule="wsd")
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    trainer.train(_tiny_stream(), contract, training_seed=1,
+                  token_budget=512, out_dir=tmp_path / "gen0")
+    (tmp_path / "gen0" / OPTIM_STATE_FILE).unlink()
+    r2 = trainer.train(_tiny_stream(), contract, training_seed=2,
+                      token_budget=512, out_dir=tmp_path / "r2",
+                      warm_start_dir=tmp_path / "gen0")
+    assert r2.metrics["optim_state_resumed"] is False
+
+
+def test_cosine_round_writes_no_optimizer_state(tmp_path: Path):
+    from cascade.trainer.toto2_trainer import OPTIM_STATE_FILE
+
+    trainer = Toto2Trainer(device="cpu", deterministic=False)
+    trainer.train(_tiny_stream(), _tiny_contract(), training_seed=1,
+                  token_budget=256, out_dir=tmp_path / "ckpt")
+    assert not (tmp_path / "ckpt" / OPTIM_STATE_FILE).exists()
+
+
+def test_muon_adamw_state_roundtrips_exactly():
+    """state_tensors → load_state_tensors must reproduce the optimiser's state
+    byte-exactly in a fresh process-alike (fresh optimiser over cloned params),
+    and a shape mismatch must raise rather than silently re-attach."""
+    from cascade.trainer.toto2_trainer import _MuonAdamW
+
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(6, 4))
+    b = torch.nn.Parameter(torch.randn(4))
+    opt = _MuonAdamW([w], [b], lr=0.05, weight_decay=0.01)
+    for _ in range(3):
+        opt.zero_grad()
+        loss = (w.sum() - b.sum()) ** 2
+        loss.backward()
+        opt.step()
+    names = {id(w): "w", id(b): "b"}
+    flat = opt.state_tensors(names)
+
+    w2 = torch.nn.Parameter(w.detach().clone())
+    b2 = torch.nn.Parameter(b.detach().clone())
+    opt2 = _MuonAdamW([w2], [b2], lr=0.05, weight_decay=0.01)
+    assert opt2.load_state_tensors(flat, {id(w2): "w", id(b2): "b"}) == 0
+    assert torch.equal(opt2._bufs[w2], opt._bufs[w])
+    assert torch.equal(opt2._row_v[w2], opt._row_v[w])
+    st, st2 = opt.adamw.state[b], opt2.adamw.state[b2]
+    assert torch.equal(st2["exp_avg"], st["exp_avg"])
+    assert torch.equal(st2["exp_avg_sq"], st["exp_avg_sq"])
+    assert float(st2["step"]) == float(st["step"])
+    # one more identical step on both must produce identical params
+    for o, pw, pb in ((opt, w, b), (opt2, w2, b2)):
+        o.zero_grad()
+        ((pw.sum() - pb.sum()) ** 2).backward()
+        o.step()
+    assert torch.equal(w2, w) and torch.equal(b2, b)
+
+    wrong = torch.nn.Parameter(torch.randn(5, 3))
+    opt3 = _MuonAdamW([wrong], [], lr=0.05, weight_decay=0.0)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        opt3.load_state_tensors(flat, {id(wrong): "w"})
+
+
 def test_first_reached_stops_and_deadline_hit_is_flagged(tmp_path: Path):
     """First-reached-stops: the run ends on the token budget OR the wall-clock
     deadline. A budget stop reports deadline_hit=False; a deadline stop (compute
@@ -413,7 +554,7 @@ def test_first_reached_stops_and_deadline_hit_is_flagged(tmp_path: Path):
 def test_trainer_end_to_end_multichannel_run(tmp_path: Path):
     """A mixed univariate + (C, L) corpus trains through the model's variate
     axis: every channel is consumed (tokens count C x L per series — the
-    DEC-CA-0022 channel-drop regression) and the checkpoint stays loadable."""
+    DEC-CA-0026 channel-drop regression) and the checkpoint stays loadable."""
     contract = SimpleNamespace(
         context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
         num_heads=1, head_dim=16, mlp_expansion=2, num_quantiles=9,
@@ -442,7 +583,7 @@ def test_trainer_end_to_end_multichannel_run(tmp_path: Path):
 
 def test_lr_schedule_honoured():
     """lr_schedule used to be decorative — warmup_cosine ran regardless. Now
-    warmup_flat holds base_lr after warmup (the DEC-CA-0023 compounding-
+    warmup_flat holds base_lr after warmup (the DEC-CA-0027 compounding-
     lineage rule) and an unknown schedule fails the run's first second."""
     from cascade.trainer.toto2_trainer import _lr_at
 

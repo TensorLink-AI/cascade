@@ -72,7 +72,7 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
     same digest, which is what makes a training run auditable.
 
     An EXTENDED record element (a ``{"values": …, "mask"/"roles": …}`` dict
-    from an ``accepted_fields``-armed drain, DEC-CA-0016/0019/0022) hashes via
+    from an ``accepted_fields``-armed drain, DEC-CA-0020/0019/0022) hashes via
     its 0xFF-sentinel frame (:func:`cascade.interface.generator.
     record_frame_bytes`): a legacy element's bytes start with an 8-byte BE
     channel count (first byte 0x00), so the two framings can never collide,
@@ -104,13 +104,13 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
 # that would move digests for configs relying on the drop; the golden-vector
 # test freezes the behaviour.
 _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
-    # DEC-CA-0016 layer 3: the accepted record-field set ([training]
+    # DEC-CA-0020 layer 3: the accepted record-field set ([training]
     # accepted_fields). Empty = values-only (every deployed config).
     "accepted_fields": ((), []),
-    # DEC-CA-0022: future-known covariate admission (roles value 2). False
+    # DEC-CA-0026: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
     "allow_future_known": (False,),
-    # DEC-CA-0024: the owner-published shared real corpus pin. "" = none
+    # DEC-CA-0028: the owner-published shared real corpus pin. "" = none
     # (every deployed config); setting it is the deliberate digest bump that
     # arms the shared-corpus regime.
     "real_corpus_ref": ("",),
@@ -396,6 +396,14 @@ class TrainingManifest:
     # init (no promotion yet, or a pre-warm-start trainer).
     warm_start_ckpt: str = ""
     warm_start_size: str = ""
+    # Realised round composition (jittered mix, DEC-TB-0003 port): domain
+    # counts, effective domains, cadences, class count of the round's served
+    # eval windows. Informational and UNSIGNED like ``heat`` — never enters
+    # :meth:`canonical_body` (post-hoc: each round's Dirichlet draw is
+    # independent, so it predicts nothing about the next round). ``None`` while
+    # the mix is inactive, so pre-activation manifests serialise byte-for-byte
+    # as before.
+    composition: dict | None = None
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -543,6 +551,10 @@ def dump_manifest(manifest: TrainingManifest) -> str:
     # byte-for-byte as before — no wire-format break, no version bump.
     if manifest.heat is not None:
         body["heat"] = heat_to_json(manifest.heat)
+    # Same pattern as ``heat``: only present when the jittered mix served the
+    # round, so every earlier manifest serialises byte-for-byte as before.
+    if manifest.composition is not None:
+        body["composition"] = manifest.composition
     return json.dumps(body, indent=2, sort_keys=True)
 
 
@@ -577,6 +589,7 @@ def load_manifest(text: str) -> TrainingManifest:
         entries=entries,
         manifest_version=version,
         heat=_heat_from_json(obj.get("heat")),
+        composition=obj.get("composition"),
         eval_pool_key=str(obj.get("eval_pool_key", "") or ""),
         eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
         warm_start_ckpt=str(obj.get("warm_start_ckpt", "") or ""),

@@ -1,7 +1,7 @@
-"""DEC-CA-0024 — the owner-pinned shared real corpus, inert until armed.
+"""DEC-CA-0028 — the owner-pinned shared real corpus, inert until armed.
 
 Everything here holds the two load-bearing promises: (1) an UNARMED config is
-byte-identical to pre-DEC-CA-0024 behaviour (no kwarg passed, no digest moved,
+byte-identical to pre-DEC-CA-0028 behaviour (no kwarg passed, no digest moved,
 no fetch attempted); (2) an ARMED config either runs with the pinned corpus
 resolved or fails loudly — never silently without it.
 """
@@ -188,7 +188,7 @@ def test_opted_in_generator_gets_no_kwarg_while_unarmed(cfg, tmp_path):
 
 
 def test_two_argument_generator_stays_valid_under_armed_config(cfg, tmp_path):
-    # DEC-CA-0024's compatibility promise: arming strands no deployed generator.
+    # DEC-CA-0028's compatibility promise: arming strands no deployed generator.
     repo, d = _repo(tmp_path, _PLAIN_GEN), _corpus_dir(tmp_path)
     gen = _load_generator(repo, 0, real_corpus_dir=str(d))
     assert next(iter(gen.generate(1))).shape == (256,)

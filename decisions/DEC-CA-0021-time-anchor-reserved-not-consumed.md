@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0017
+id: DEC-CA-0021
 type: decision
 title: "Time anchor (start, freq): reserved in the carrier now, consumed by nothing — the fixed model is calendar-free by pinned architecture"
 status: proposed
 date: 2026-08-13
 tags: [interface, generator, eval, scoring, trainer, seasonality]
 revisit_when: "the calendar-feature ablation (below) shows a material GIFT-Eval gain at 4M — at which point consuming freq becomes an architecture decision with measured value; or a trainer-side consumer that needs no arch change is identified (none is known today); or the arch pin moves off released Toto-2.0 (whose input is values-and-mask only), which removes the structural blocker"
-relations: {depends_on: DEC-CA-0016, enables: DEC-CA-0021}
+relations: {depends_on: DEC-CA-0020, enables: DEC-CA-0025}
 ---
 
 Gap 1 as framed: "a generator cannot say *hourly, starting Monday, with
@@ -15,7 +15,7 @@ reads out of window metadata — miners are scored on frequency-dependent
 behaviour they cannot generate. Largest hole, close to free."
 
 **The framing is disputed on both halves, from the code.** The carrier field
-lands (via DEC-CA-0016's reservation); the payload has no consumer in Phase 1
+lands (via DEC-CA-0020's reservation); the payload has no consumer in Phase 1
 and is deliberately not accepted.
 
 ## Why "scored on behaviour they cannot generate" doesn't hold
@@ -46,14 +46,14 @@ and is deliberately not accepted.
    today the label would reach nothing.
 
 So the hole is real but its edges are elsewhere than claimed: `(start, freq)`
-matters for panel alignment (DEC-CA-0020), drift anchoring (DEC-CA-0021),
-future-known covariates (DEC-CA-0022's calendars), and any future arch
+matters for panel alignment (DEC-CA-0024), drift anchoring (DEC-CA-0025),
+future-known covariates (DEC-CA-0026's calendars), and any future arch
 generation that takes exogenous features. All of those are payload decisions
 gated on consumers.
 
 ## The mechanism (settled now, via the carrier)
 
-Named record fields, not positional convention — DEC-CA-0016 makes this the
+Named record fields, not positional convention — DEC-CA-0020 makes this the
 only shape in town:
 
 - `start`: scalar int64, UTC epoch-seconds of the first timestep. No
@@ -65,15 +65,15 @@ only shape in town:
 
 Both optional; absent means what today means (no anchor). One channel-shared
 anchor per series — per-channel timestamps are ragged data and out of the
-carrier's shape (DEC-CA-0016 forecloses that knowingly).
+carrier's shape (DEC-CA-0020 forecloses that knowingly).
 
 ## Change surface, migration, digest
 
 - `chain.toml`: nothing until acceptance; at acceptance, the field joins the
-  `[training]`-folded accepted set (DEC-CA-0016 G2 layer 3) → one digest bump.
+  `[training]`-folded accepted set (DEC-CA-0020 G2 layer 3) → one digest bump.
 - `cascade/interface/`: reservation now (rejected); validation rules above at
   acceptance.
-- Trainer/eval: **nothing** — no consumer exists, and per DEC-CA-0016's
+- Trainer/eval: **nothing** — no consumer exists, and per DEC-CA-0020's
   refuse-unconsumed-payload rule that is exactly why acceptance waits.
 - Migration: none, ever — deployed generators never carry the fields.
 - Gaming surface at acceptance: `freq` is a self-declared label the data need

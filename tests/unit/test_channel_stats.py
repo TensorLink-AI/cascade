@@ -1,4 +1,4 @@
-"""Shadow channel-redundancy telemetry (DEC-CA-0022; measure-first)."""
+"""Shadow channel-redundancy telemetry (DEC-CA-0026; measure-first)."""
 
 from __future__ import annotations
 

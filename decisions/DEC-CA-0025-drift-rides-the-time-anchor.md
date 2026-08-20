@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0021
+id: DEC-CA-0025
 type: decision
 title: "Corpus-level non-stationarity needs nothing beyond the time anchor — and the model cannot perceive it anyway; yield order is the one drift lever miners already hold"
 status: proposed
 date: 2026-08-13
 tags: [interface, generator, trainer]
 revisit_when: "an arch generation consumes absolute time (then cross-series drift becomes perceivable and start's payload decision reopens); or the training recipe adds any corpus-order-dependent element beyond SGD ordering (curriculum, annealed mixing), which would turn the yield-order lever below into a scored surface needing its own rules"
-relations: {depends_on: DEC-CA-0017}
+relations: {depends_on: DEC-CA-0021}
 ---
 
 Gap 5: with no time anchor there is no way to express concept drift — the
@@ -22,7 +22,7 @@ gap 1?
 
 2. **Cross-series drift is imperceptible to the fixed model, anchor or not.**
    Batch elements are independent; positions are relative (xPos); there is
-   no absolute-time input (DEC-CA-0017). A corpus whose series are stamped
+   no absolute-time input (DEC-CA-0021). A corpus whose series are stamped
    `start` values spanning a decade of simulated drift trains identically to
    the same series shuffled — the model has no mechanism that could tell.
    So gap 5's payload is inert for the same structural reason as gap 1's,
@@ -44,8 +44,8 @@ gap 1?
 
 ## Decision
 
-No changes of its own: no `chain.toml`, no interface beyond DEC-CA-0017's
+No changes of its own: no `chain.toml`, no interface beyond DEC-CA-0021's
 reservation, no trainer, no eval, no digest movement, no migration, no new
 gaming surface (yield-order control is pre-existing, symmetric, and already
 priced by the wall — a pathological order costs the miner's own throughput).
-Document the yield-order lever. Close the gap into DEC-CA-0017.
+Document the yield-order lever. Close the gap into DEC-CA-0021.

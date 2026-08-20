@@ -2,7 +2,7 @@
 
 Regression for the config-mismatch where full-context windows (context_length)
 exceeded the generator's max series length, yielding zero training batches —
-and for the DEC-CA-0022 channel-drop trap, where a (C, L) series was billed
+and for the DEC-CA-0026 channel-drop trap, where a (C, L) series was billed
 C× against the stream budget but reduced to channel 0 before training."""
 
 from __future__ import annotations

@@ -1044,7 +1044,13 @@ th.num{text-align:right}
       <div class="detail-body">
         <p>GIFT-Eval, BOOM and TIME — three open forecasting benchmarks anyone can run, scored the
         same way their public leaderboards do, so the numbers are directly comparable to published
-        results. <b>1.00 is the standard reference model; below 1.00 beats it.</b></p>
+        results. <b>1.00 is the Seasonal-Naive baseline</b> — the standard yardstick these
+        leaderboards divide by: a forecast that simply repeats the most recent seasonal pattern.
+        <b>Below 1.00 beats it.</b></p>
+        <p>Each benchmark reports two scores. <b>MASE</b> measures how accurate the central
+        forecast is; <b>CRPS</b> measures how well the model&rsquo;s uncertainty range matched what
+        actually happened. Both are relative to the baseline at 1.00, and lower is better for
+        both. The large number in each tile is the MASE.</p>
         <p>These scores are <b>reported only</b>. They never decide who wins a round. The benchmark
         data is public, so scoring on it would just reward entries tuned to it; the competition is
         settled on hidden data instead.</p>
@@ -2048,15 +2054,12 @@ function renderBench(){
   var L = bv.latest;
   var ans = !L
     ? "No qualifying public result yet."
-    : "The current leader&rsquo;s latest published checkpoint scores <b>" +
-      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval — " +
-      (L.six.gifteval_mase<1 ? "<b>beating</b>" : "trailing") +
-      " the standard reference model (1.00).";
-  if(L && bv.best && bv.best.geomean != null &&
-     (L.geomean == null || bv.best.geomean < L.geomean - 1e-9)){
-    ans += " The best checkpoint published so far sits at <b>" + num(bv.best.geomean,3) +
-      "</b> across all six public scores.";
-  }
+    : "Every score is a ratio against a naive baseline forecast, which sits at 1.00 — " +
+      "<b>lower is better</b>. The current leader&rsquo;s latest published checkpoint scores <b>" +
+      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval accuracy (MASE)" +
+      (L.six.gifteval_mase<1
+        ? ": <b>" + num((1-L.six.gifteval_mase)*100,1) + "% better</b> than the baseline."
+        : " — not yet beating the baseline.");
   document.getElementById("bench-answer").innerHTML = ans;
   if(!L){
     el.innerHTML = '<div class="pending-panel">' +
@@ -2075,13 +2078,15 @@ function renderBench(){
   ];
   var bestLine = "";
   if(bv.best && bv.best.geomean != null){
-    bestLine = '<p class="lede" style="margin:14px 0 0">Best published to date: <b>' +
-      num(bv.best.geomean,3) + '</b> — the geometric mean of all six scores (lower is better), a ' +
-      esc(bv.best.role || "leading") + ' checkpoint from ' + esc(prettyDay(bv.best.at)) + '.</p>';
+    bestLine = '<p class="lede" style="margin:14px 0 0">Best combined score to date: <b>' +
+      num(bv.best.geomean,3) + '</b> — all six numbers above folded into one (a geometric ' +
+      'mean; lower is better), set by a ' + esc(bv.best.role || "leading") +
+      ' checkpoint on ' + esc(prettyDay(bv.best.at)) +
+      '. A combined score is its own scale — don&rsquo;t compare it to a single benchmark.</p>';
   }
   el.innerHTML = '<div class="bcells bench-cells">' + suites.map(function(x){
     return cell({ k:x.n, v:num(x.m,3),
-      q:(x.m<1 ? "beats" : "trails") + " reference · CRPS " + num(x.c,3),
+      q:"MASE — " + (x.m<1 ? "beats" : "trails") + " 1.00 baseline · CRPS " + num(x.c,3),
       state:(x.m<1 ? "live" : "warn") });
   }).join("") + '</div>' + bestLine;
   document.getElementById("bench-when").textContent = L.src === "report"
@@ -2113,7 +2118,7 @@ function renderLadder(){
 function renderWarm(){
   var ws = warmStart(), el = document.getElementById("warm-panel");
   document.getElementById("warm-answer").innerHTML = ws
-    ? "The carry-forward mechanism has just switched on; the first retention reading arrives at the next handover."
+    ? "Yes. Rounds no longer start from random initialisation &mdash; the strongest checkpoints earned in earlier rounds are <b>promoted</b> to become the starting point for new training, so each round builds on accumulated progress instead of starting from scratch."
     : "Not active yet — every round starts from scratch, so nothing has been handed forward.";
   if(!ws){
     el.innerHTML = '<div class="pending-panel">' +
@@ -2126,9 +2131,14 @@ function renderWarm(){
     return;
   }
   el.innerHTML = '<div class="pending-panel">' +
-    '<span class="ph">Just switched on</span>' +
-    '<p>Everyone now starts from <b>' + esc(shortRef(ws.ckpt)) + '</b>, the best model so far. ' +
-    'The first retention reading arrives at the next handover.</p></div>';
+    '<span class="ph">Active &mdash; rotating starts</span>' +
+    '<p>This round started training from <b>' + esc(shortRef(ws.ckpt)) + '</b>, one of a set of ' +
+    'promoted checkpoints. Because more than one has been promoted, training <b>rotates through the ' +
+    'set</b>: each round starts from a different promoted checkpoint in turn, so the starting point ' +
+    '<b>changes from one round to the next by design</b>. A round starting from a different promoted ' +
+    'model than the round before it is the rotation working as intended, not a checkpoint being ' +
+    'skipped. Each round&rsquo;s start is recorded in its <b>signed manifest</b>, so which checkpoint ' +
+    'a round trained from is verifiable after the fact.</p></div>';
   document.getElementById("warm-when").textContent = "Active";
 }
 
@@ -2232,7 +2242,7 @@ function renderMethod(){
     ["Public benchmark",
      "Trainer-signed per-round reports (<code>benchmarks/round-&lt;id&gt;.json</code>): GIFT-Eval, " +
      "BOOM and TIME, CRPS + MASE, scored as their public leaderboards do. The headline is the " +
-     "current leader&rsquo;s most recent report; &ldquo;best published&rdquo; is the lowest " +
+     "current leader&rsquo;s most recent report; &ldquo;best combined score&rdquo; is the lowest " +
      "six-score geometric mean in the scanned recent record. Not every round has a report. " +
      "Reported only — they never decide who wins."],
     ["Biggest model proven",

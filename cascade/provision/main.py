@@ -103,7 +103,7 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     # (or max_pods = 0) the stage does not exist: pre-eval configs keep their
     # exact behaviour, which is why it is not in the required loop above.
     eval_sp = build_stage_policy(top["eval"], "eval") if "eval" in top else None
-    # Size-conditional final stages (DEC-CA-0023): any NAMED sub-table of
+    # Size-conditional final stages (DEC-CA-0027): any NAMED sub-table of
     # [provisioner.final] carrying a "sku" key (e.g. [provisioner.final.large])
     # is an alternate final fleet, selected at startup when the throne size's
     # per-size expected_gpu names its silicon (see policy.select_final_stage).
@@ -312,6 +312,47 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     return bootstrap
 
 
+def make_bench_prewarm(render: RenderSettings, *, pod_user: str) -> callable:
+    """The bench-data PRE-WARM hook: fire a detached benchmark-data download on
+    a freshly gated FINAL pod, so the multi-hour final training — not the bench
+    window — absorbs the cold ~4.4G pull (the exit-124 king-leg failure mode,
+    three rounds running). Best-effort and fast: the SSH only LAUNCHES the
+    detached download (60s cap); any failure is logged and ignored — the
+    bench's own marker-guarded download remains the backstop, exactly as
+    before this hook existed."""
+    import os
+
+    def prewarm(addr, stage: str, provider: str = "") -> None:
+        if stage != "final":
+            return
+        token = os.environ.get("HF_TOKEN") or None
+        prof = render.profile_for(provider)
+        user = prof.user if provider else pod_user
+        from ..trainer.bench_hook import build_prewarm_remote_command
+
+        cmd = build_prewarm_remote_command(prof.workdir, hf_token=token is not None)
+        argv = ["ssh", "-p", str(addr.ssh_port), "-i", os.path.expanduser(render.key_path),
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=15", f"{user}@{addr.ip}", cmd]
+        payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
+        try:
+            proc = subprocess.run(argv, input=payload, capture_output=True,
+                                  text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            log.warning("bench pre-warm launch timed out on %s:%s (ignored)",
+                        addr.ip, addr.ssh_port)
+            return
+        if proc.returncode != 0:
+            log.warning("bench pre-warm launch failed on %s:%s (rc=%d, ignored): %s",
+                        addr.ip, addr.ssh_port, proc.returncode,
+                        (proc.stderr or "")[-300:])
+        else:
+            log.info("bench pre-warm launched on final pod %s:%s",
+                     addr.ip, addr.ssh_port)
+
+    return prewarm
+
+
 def make_hippius_probe(storage) -> callable:
     """A reachability probe for the manifest store (health check #6).
 
@@ -438,7 +479,7 @@ def _run(args) -> int:
     top = raw.get("provisioner", {})
     policy = build_policy(raw, epoch_blocks=cfg.round.epoch_blocks)
 
-    # Size-conditional final fleet (DEC-CA-0023): resolve the throne sizes'
+    # Size-conditional final fleet (DEC-CA-0027): resolve the throne sizes'
     # per-size GPU pin against the configured final stages, once, at startup —
     # a throne-size change is release-then-activate (chain.toml edit +
     # restart), so this never needs to move mid-service. A multi-size throne
@@ -604,7 +645,7 @@ def _run(args) -> int:
         epoch_blocks=cfg.round.epoch_blocks,
         epoch_blocks_prev=cfg.round.epoch_blocks_prev,
         epoch_activation_block=cfg.round.epoch_activation_block,
-        # Per-size budget hours (DEC-CA-0023): the final's time envelope is the
+        # Per-size budget hours (DEC-CA-0027): the final's time envelope is the
         # longest throne size's target_train_hours (SizeSpec override or the
         # base) — with a single primary-size throne this is exactly the old
         # cfg.training.target_train_hours.
@@ -619,6 +660,9 @@ def _run(args) -> int:
             hippius_probe=hippius_probe,
         ),
         bootstrap=bootstrap,
+        prewarm=(make_bench_prewarm(render,
+                                    pod_user=str(top.get("pod_user", "root")))
+                 if cfg.scoring.cascade_enabled else None),
         static_hosts_text=static_hosts_text,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),

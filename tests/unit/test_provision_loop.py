@@ -196,6 +196,50 @@ def test_happy_path_rents_publishes_and_records(tmp_path):
     assert plan_calls == [1] and prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
 
 
+def test_prewarm_hook_fires_per_healthy_pod_and_never_gates(tmp_path):
+    # The hook runs AFTER the health gate for every healthy pod (it filters
+    # stage itself); a raising hook must cost nothing — the pod stays healthy
+    # and publishes, because pre-warm is an optimization, never a gate.
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov})
+    calls = []
+
+    def prewarm(addr, stage, provider=""):
+        calls.append((stage, provider))
+        raise RuntimeError("boom")
+
+    loop.prewarm = prewarm
+    cycle(loop)
+    assert ("final", "lium") in calls and ("heat", "lium") in calls
+    assert prov.terminated == []                            # nothing gated out
+    hosts = load_hosts(tmp_path / "hosts.toml")
+    assert [h for h in hosts if h.stage == "final"]         # final still published
+
+
+def test_make_bench_prewarm_launches_only_on_final_pods(monkeypatch, tmp_path):
+    import cascade.provision.main as pmain
+
+    ran = []
+    monkeypatch.setattr(pmain.subprocess, "run",
+                        lambda argv, **kw: ran.append((argv, kw.get("input")))
+                        or type("P", (), {"returncode": 0, "stderr": ""})())
+    monkeypatch.setenv("HF_TOKEN", "hf_secret456")
+    render = RenderSettings(image=IMG, ssh_pubkey="ssh-ed25519 AAAA orch",
+                            key_path="~/.ssh/cascade_ed25519")
+    hook = pmain.make_bench_prewarm(render, pod_user="root")
+    hook(PodAddress("10.0.0.9", 2222), "heat", "lium")
+    assert ran == []                                        # heat pods: no-op
+    hook(PodAddress("10.0.0.9", 2222), "final", "lium")
+    assert len(ran) == 1
+    argv, payload = ran[0]
+    remote_cmd = argv[-1]
+    assert "root@10.0.0.9" in argv and "2222" in argv
+    assert "cascade-benchmark-download" in remote_cmd and "nohup" in remote_cmd
+    # the credential travels on stdin, never inside the command string
+    assert "hf_secret456" not in remote_cmd
+    assert payload == "HF_TOKEN=hf_secret456\n"
+
+
 def test_no_trigger_outside_margin(tmp_path):
     prov = FakeProvider("lium")
     loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, block=800)

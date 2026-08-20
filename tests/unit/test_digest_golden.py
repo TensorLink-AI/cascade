@@ -1,4 +1,4 @@
-"""Golden-vector digest tests — the byte-freeze guard for DEC-CA-0016.
+"""Golden-vector digest tests — the byte-freeze guard for DEC-CA-0020.
 
 Every digest below is pinned to the EXACT hex the deployed code produces
 today (frozen 2026-08-14, before the record-carrier canonicaliser landed).
@@ -10,7 +10,7 @@ and audit re-derivation, and MUST fail here first.
 
 If one of these assertions ever fails, the fix is to restore the bytes — not
 to update the constant. The only sanctioned way these constants change is a
-deliberate, announced digest-scheme migration (none is planned; DEC-CA-0016
+deliberate, announced digest-scheme migration (none is planned; DEC-CA-0020
 explicitly requires values-only corpora to hash byte-identically forever).
 """
 
@@ -83,7 +83,7 @@ def test_series_key_golden():
 
 
 def test_series_key_first_bytes_are_channel_count():
-    # The carrier's canonical-digest sentinel scheme (DEC-CA-0016) relies on
+    # The carrier's canonical-digest sentinel scheme (DEC-CA-0020) relies on
     # this structural fact: a legacy series key starts with the 4-byte
     # big-endian channel count, so its first byte is 0x00 for any realistic C
     # (< 2^24). A future extended-record key claims a first byte no legacy key

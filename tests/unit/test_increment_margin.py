@@ -1,4 +1,4 @@
-"""The baseline-referenced (%-of-increment) margin — DEC-CA-0023's E2 scoring
+"""The baseline-referenced (%-of-increment) margin — DEC-CA-0027's E2 scoring
 rule behind [scoring] margin_mode."""
 
 from __future__ import annotations

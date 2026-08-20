@@ -1,4 +1,4 @@
-"""Shadow channel-redundancy telemetry (DEC-CA-0022, in the DEC-CA-0010 shape:
+"""Shadow channel-redundancy telemetry (DEC-CA-0026, in the DEC-CA-0010 shape:
 MEASURE first, gate later — or never).
 
 The feared multivariate exploit is C near-duplicate channels filling the token
@@ -20,7 +20,7 @@ trainer folds into its run metrics (→ the public training log). SHADOW ONLY:
 nothing reads these values in any scoring or acceptance path, and at ``C = 1``
 (today's cap) the accumulator observes nothing and the metrics are unchanged.
 The proposed ``max_channel_corr = 0.999`` gate arms only after these logs
-clear honest generators (DEC-CA-0022 open question 6).
+clear honest generators (DEC-CA-0026 open question 6).
 
 Cost: O(C²L) per multichannel series, zero for univariate.
 """
@@ -62,7 +62,7 @@ def series_channel_stats(arr: np.ndarray) -> tuple[float, float] | None:
 
 def corr_enforce_gate(cfg):
     """Per-series channel-correlation gate for the drain/stream paths, from
-    ``[generator] channel_corr_mode`` / ``max_channel_corr`` (DEC-CA-0022).
+    ``[generator] channel_corr_mode`` / ``max_channel_corr`` (DEC-CA-0026).
 
     Returns ``None`` unless the mode is ``"enforce"`` — "off" does nothing and
     "shadow" is already served by the trainer's always-on accumulator (the

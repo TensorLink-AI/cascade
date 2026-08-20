@@ -199,7 +199,7 @@ def test_source_label_lands_in_metadata():
 
 
 def test_require_source_rejects_unlabeled_series():
-    # DEC-CA-0022 item 3: the strict knob for pools that will carry
+    # DEC-CA-0026 item 3: the strict knob for pools that will carry
     # multichannel windows — every kept series must name its upstream feed.
     cfg = PoolBuildConfig(context_length=512, horizon=16, require_source=True)
     labeled = HarvestedSeries(

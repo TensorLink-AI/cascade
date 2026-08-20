@@ -1,12 +1,12 @@
 ---
-id: DEC-CA-0019
+id: DEC-CA-0023
 type: decision
 title: "Missingness is a parallel mask field with pinned filler — never NaN — and it is eval-gated: the pool must carry real gaps before the field is accepted"
 status: proposed
 date: 2026-08-13
 tags: [interface, generator, trainer, eval, pool, digest, dedup]
 revisit_when: "the pool gap-rate measurement (below) shows real missingness is too rare in our sources to build a credible masked-eval slice — then the eval gate cannot be satisfied and the field stays reserved; or the masked-history eval ships and a mask-trained model shows no gain on it — then the capability itself is dead at 4M and acceptance waits for a bigger size"
-relations: {depends_on: DEC-CA-0016, informs: DEC-CA-0022}
+relations: {depends_on: DEC-CA-0020, informs: DEC-CA-0026}
 ---
 
 Gap 3: `check_series`'s finiteness gate (`interface/generator.py:159`) means
@@ -35,7 +35,7 @@ everything:
   `iter_training_batches`. Each fork is a place the univariate path can
   regress.
 
-**Parallel `mask` field, adopted** (the DEC-CA-0016 reservation, made
+**Parallel `mask` field, adopted** (the DEC-CA-0020 reservation, made
 concrete):
 
 - shape `(C, L)` uint8 (or bool), 1 = unobserved; shape/dtype-validated
@@ -71,7 +71,7 @@ expands patch masks to entries (`toto2_trainer.py:318`). Consumption is:
 Contract churn, stated precisely: this consumption rule is trainer *code*,
 which `contract_digest` cannot see (the digest hashes config fields,
 `shared/manifest.py:84`). Arming therefore folds the accepted-field set into
-`[training]` (DEC-CA-0016 G2 layer 3) so the change is digest-visible and
+`[training]` (DEC-CA-0020 G2 layer 3) so the change is digest-visible and
 king/challenger/validator move in lockstep — one deliberate bump.
 
 ## The eval gate — this gap does NOT escape Part C
