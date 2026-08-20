@@ -269,6 +269,55 @@ def paired_bootstrap_lcb_aggregated(
     return float(np.quantile(rel, alpha))
 
 
+def increment_bootstrap_rel(
+    king: tuple[np.ndarray, np.ndarray, np.ndarray],
+    chal: tuple[np.ndarray, np.ndarray, np.ndarray],
+    baseline: tuple[np.ndarray, np.ndarray, np.ndarray],
+    *,
+    B: int = 10_000,
+    seed: int | str = 42,
+    clusters: list | np.ndarray | None = None,
+    wql_mode: str = "geomean",
+    floor_frac: float = 0.01,
+) -> np.ndarray:
+    """The ``(B,)`` baseline-referenced (%-of-increment) bootstrap distribution
+    — DEC-CA-0027's margin re-unitisation for warm-start eras.
+
+    Under a compounding lineage the level statistic ``(king − chal) / king``
+    strangles itself: both models start from the SAME warm-start init, their
+    scores converge toward it, and a fixed %-of-level margin becomes
+    mechanically unclearable however good a challenger's increment is. The fix
+    scores the shared init as a third paired reference and re-units the
+    comparison to the size of the per-round improvement:
+
+        Δ_king = base − king      (each model's improvement over the init)
+        Δ_chal = base − chal
+        unit   = max((|Δ_king| + |Δ_chal|) / 2, floor_frac × base)
+        stat   = (Δ_chal − Δ_king) / unit  =  (king − chal) / unit
+
+    — the SAME numerator as the level rule with the increment as denominator,
+    so "margin 0.02" reads as "2% of a typical increment". The floored
+    normaliser (``floor_frac`` of the baseline level, scale-free) is the
+    DEC-CA-0009 degeneracy lesson: with both increments ≈ 0 an unfloored unit
+    divides by noise and the statistic explodes exactly when the evidence is
+    weakest. All three competitors ride ONE shared cluster resample
+    (:func:`joint_bag_geomeans`), so window difficulty cancels three ways.
+    """
+    rows = joint_bag_geomeans(
+        [king, chal, baseline], B=B, seed=seed, clusters=clusters, wql_mode=wql_mode
+    )
+    if rows.size == 0:
+        return np.empty(0, dtype=np.float64)
+    king_geo, chal_geo, base_geo = rows
+    d_king = base_geo - king_geo
+    d_chal = base_geo - chal_geo
+    unit = np.maximum(
+        (np.abs(d_king) + np.abs(d_chal)) / 2.0,
+        floor_frac * np.maximum(base_geo, 1e-12),
+    )
+    return (d_chal - d_king) / np.maximum(unit, 1e-12)
+
+
 def joint_bag_geomeans(
     components: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
     *,

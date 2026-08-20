@@ -7,6 +7,7 @@ file, deployed by hand alongside the binaries — the same policy horizon uses).
 
 from __future__ import annotations
 
+import re
 import sys
 import tomllib  # py311+
 from dataclasses import dataclass, field, replace
@@ -69,6 +70,54 @@ class GeneratorConfig:
     max_abs_value: float = 0.0
     reject_constant: bool = False
     max_dup_fraction: float = 1.0
+    # ── the record carrier (DEC-CA-0020; never part of contract_digest) ──────
+    # ``interface_version`` names which yield payloads the trainer accepts: 1 =
+    # record-or-array with ``values`` only (every reserved field hard-rejected).
+    # A generator repo may declare its own ``interface_version`` in config.json;
+    # one newer than this is rejected before the generator runs. Bumps ONLY
+    # when a new payload field is accepted+consumed in one release — at that
+    # point the accepted field set folds into [training] (one deliberate
+    # contract_digest bump, DEC-CA-0020 layer 3).
+    # ``max_payload_bytes`` is the carrier cap in canonical payload BYTES —
+    # the budget denomination that stays correct when non-values fields arrive.
+    # At 16e9 it equals max_total_points × 8 (float64), so it is numerically
+    # inert today. 0 disables.
+    interface_version: int = 1
+    max_payload_bytes: int = 0
+    # Runtime mirrors of the DIGEST-BOUND [training] acceptance keys (the
+    # loader copies them in; there is no [generator] key for either — one
+    # config source). They ride here because this dataclass is what reaches
+    # the sandbox children and every drain/stream call site.
+    #   accepted_fields    — record fields to accept AND consume ("mask",
+    #                        "roles"); () = values-only (deployed default).
+    #   allow_future_known — admit roles value 2 (future-known covariates).
+    #   real_corpus_ref    — the owner-published shared real corpus pin
+    #                        (DEC-CA-0028); "" = none (deployed default).
+    # Note: json round-trips turn the tuple into a list; treat as a container.
+    accepted_fields: tuple[str, ...] = ()
+    allow_future_known: bool = False
+    real_corpus_ref: str = ""
+    # RUNTIME-resolved local path of the materialised shared real corpus —
+    # never read from chain.toml (paths are machine-local). The PARENT side of
+    # each sandbox resolves it (fetch + verify against real_corpus_ref, see
+    # cascade.trainer.corpus.resolve_real_corpus) before spawning, and it rides
+    # into the child via this dataclass's JSON. Empty while real_corpus_ref is
+    # armed is a loud error at generator load, never a silent no-corpus run.
+    real_corpus_dir: str = ""
+    # Per-series cap on the masked fraction when "mask" is accepted
+    # (DEC-CA-0023's gate): a mostly-missing series is mostly filler bytes
+    # bought at full freight. Meaningless while accepted_fields is empty.
+    max_missing_frac: float = 0.5
+    # Channel-redundancy gate (DEC-CA-0026; data-quality, not digest-bound).
+    #   channel_corr_mode — "off" (default) | "shadow" (telemetry only; the
+    #                       trainer's shadow accumulator already logs it) |
+    #                       "enforce" (reject a series whose max off-diagonal
+    #                       |Pearson| exceeds max_channel_corr).
+    #   max_channel_corr  — the near-identity bar; 0.999 targets the
+    #                       jitter-duplicate exploit only. Enforce ONLY after
+    #                       the shadow logs clear honest generators.
+    channel_corr_mode: str = "off"
+    max_channel_corr: float = 0.999
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -83,6 +132,48 @@ def validate_sandbox_mode(mode: str) -> str:
     if mode not in SANDBOX_MODES:
         raise ValueError(f"sandbox_mode={mode!r} invalid; expected one of {SANDBOX_MODES}")
     return mode
+
+
+# Record-carrier fields with a WIRED consumer (accept = consume, one release;
+# DEC-CA-0020's refuse-unconsumed rule made mechanical). [training]
+# accepted_fields may only name these; every other reserved name is still
+# rejected at load so a typo or a premature arming fails the boot, not a round.
+CONSUMABLE_FIELDS = ("mask", "roles")
+
+
+def validate_accepted_fields(value: object) -> tuple[str, ...]:
+    """Normalise ``[training] accepted_fields`` (sorted, deduped) and reject
+    names without a wired consumer."""
+    fields = tuple(sorted({str(v) for v in (value or ())}))
+    bad = [f for f in fields if f not in CONSUMABLE_FIELDS]
+    if bad:
+        raise ValueError(
+            f"[training] accepted_fields={bad} have no wired consumer; "
+            f"acceptable: {sorted(CONSUMABLE_FIELDS)} (a reserved field arms only "
+            "in the release that consumes it — DEC-CA-0020)"
+        )
+    return fields
+
+
+# Immutable-ref shape for [training] real_corpus_ref (DEC-CA-0028) — mirrors
+# cascade.shared.hippius.DIGEST_RE without importing the storage stack at
+# config-load time. Only content-pinned refs are expressible: a branch or tag
+# would let the corpus bytes move under a fixed contract_digest.
+_REAL_CORPUS_REF_RE = re.compile(r"^\S+@(sha256:[0-9a-f]{64}|hf:[0-9a-f]{40})$")
+
+
+def validate_real_corpus_ref(value: object) -> str:
+    """Normalise ``[training] real_corpus_ref``; "" (unarmed) or an immutable
+    ``repo@digest`` ref. A mutable or malformed ref fails the boot, not a
+    round."""
+    ref = str(value or "")
+    if ref and not _REAL_CORPUS_REF_RE.match(ref):
+        raise ValueError(
+            f"[training] real_corpus_ref={ref!r} is not an immutable ref; expected "
+            "\"repo@sha256:<64 hex>\" (or \"repo@hf:<40 hex>\") — the shared real "
+            "corpus must be content-pinned (DEC-CA-0028)"
+        )
+    return ref
 
 
 DEDUP_MODES = ("off", "shadow", "enforce")
@@ -140,6 +231,26 @@ class SizeSpec:
     # Exact FFN hidden width from the released config.json (0 ⇒ derive as
     # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
     d_ff: int = 0
+    # ── size-conditional silicon + budget (DEC-CA-0027) ──────────────────────
+    # ``expected_gpu``: this size's pinned duel GPU when it differs from the
+    # base [training] expected_gpu ("" = inherit). From-scratch economics die
+    # between 22M and ~100M params, and 300M+ trains on H100-class silicon by
+    # owner direction — so the SKU pin is a per-size contract term, checked by
+    # the validator's gpu_name gate through the per-size contract exactly like
+    # the base pin. ``ref_throughput_tokens_per_s`` above MUST be measured on
+    # THIS GPU (the token budget derives from it).
+    # ``target_train_hours``: this size's budget hours when they differ from
+    # the base (0.0 = inherit) — a 313M warm-start increment is ~6h, not the
+    # 4M's 3h; the value is chosen with the margin re-unitisation, from the
+    # null-LCB noise-floor measurement.
+    # Digest note: SizeSpec fields fold into contract_digest via extra_sizes,
+    # so ADDING these fields moves the digest only for configs that already
+    # carry a [[training.sizes]] block (none deployed — every shipped config
+    # has them commented out). For any future size block they are part of that
+    # size's identity, which is the point: silicon and budget are terms of the
+    # controlled experiment.
+    expected_gpu: str = ""
+    target_train_hours: float = 0.0
 
 
 # Screen-stage wall-clock guard (see TrainingContractConfig.for_hours): a heat
@@ -250,6 +361,29 @@ class TrainingContractConfig:
     # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
     # contract_digest, so a validator's contract gate covers every size at once.
     extra_sizes: tuple[SizeSpec, ...] = ()
+    # ── accepted record-field set (DEC-CA-0020 layer 3; digest-bound) ────────
+    # The payload fields the carrier ACCEPTS and the trainer CONSUMES — one
+    # release ships both, and arming is this one [training] key (a deliberate
+    # contract_digest bump via the drop-when-default convention in
+    # cascade.shared.manifest: empty = omitted from the hash, so deployed
+    # digests are untouched until an operator sets it). Valid entries are
+    # reserved names with a wired consumer: "mask" (DEC-CA-0023), "roles"
+    # (DEC-CA-0026). Order-insensitive (normalised sorted at load).
+    accepted_fields: tuple[str, ...] = ()
+    # roles value 2 (future-known covariates) admission. Digest-bound and OFF
+    # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
+    # arming it before that rule exists is forbidden (DEC-CA-0026).
+    allow_future_known: bool = False
+    # ── owner-published shared real corpus (DEC-CA-0028; digest-bound) ───────
+    # Immutable ref ("repo@sha256:<64hex>" or "repo@hf:<40hex>") of the frozen,
+    # licensed real-data corpus every generator may READ (mounted/passed
+    # read-only into the sandbox as the optional ``real_corpus_dir``
+    # constructor kwarg). "" = no shared corpus — the deployed default, and via
+    # the drop-when-default convention the field is absent from contract_digest
+    # until set, so arming is the deliberate digest bump. Arming is FORBIDDEN
+    # until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness rule
+    # (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
+    real_corpus_ref: str = ""
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -309,7 +443,14 @@ class TrainingContractConfig:
         """A per-size training contract: this base recipe with the width/depth,
         frozen-arch digest, and throughput swapped for ``spec``. The result has
         no nested ``extra_sizes`` (it IS a single concrete size), so its
-        ``contract_digest`` is the stable identity of that one size."""
+        ``contract_digest`` is the stable identity of that one size.
+
+        Size-conditional overrides (DEC-CA-0027): a spec with a non-empty
+        ``expected_gpu`` swaps the GPU pin (the validator's gpu_name gate then
+        asserts THIS size's silicon), and a positive ``target_train_hours``
+        swaps the budget hours (the token budget follows via ``train_tokens``,
+        at this size's measured throughput). Unset ⇒ inherit the base — every
+        existing config resolves exactly as before."""
         return replace(
             self,
             arch_preset=spec.arch_preset,
@@ -320,6 +461,11 @@ class TrainingContractConfig:
             mlp_expansion=spec.mlp_expansion,
             d_ff=spec.d_ff,
             ref_throughput_tokens_per_s=spec.ref_throughput_tokens_per_s,
+            expected_gpu=spec.expected_gpu or self.expected_gpu,
+            target_train_hours=(
+                spec.target_train_hours if spec.target_train_hours > 0
+                else self.target_train_hours
+            ),
             extra_sizes=(),
         )
 
@@ -709,6 +855,16 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Margin denomination (DEC-CA-0027; see cascade.eval.koth.MARGIN_MODES).
+    # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
+    # "increment" = the warm-start-era rule: the shared init is scored as a
+    # third paired reference and the margin prices a fraction of a typical
+    # per-round increment. [scoring] is fleet-consensus (not digest-bound):
+    # keep identical across validators or verdicts fork. Arm together with the
+    # warm-start era flip; rounds with no warm_start_ckpt (random init) are
+    # judged at "level" automatically.
+    margin_mode: str = "level"
+    margin_increment_floor: float = 0.01
     # Cascade — king-reign promotion / warm-start (see cascade.validator.cascade).
     # ``cascade_enabled`` is the master switch: off (default) ⇒ pure KOTH, no
     # reign clock, no public-benchmark scoring, no warm-start promotion. When on,
@@ -974,6 +1130,8 @@ class ChainConfig:
             gift_gate_mode=self.scoring.gift_gate_mode,
             gift_gate_tolerance=self.scoring.gift_gate_tolerance,
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
+            margin_mode=self.scoring.margin_mode,
+            margin_increment_floor=self.scoring.margin_increment_floor,
         )
 
 
@@ -1061,6 +1219,18 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
         )
 
 
+_MARGIN_MODES = ("level", "increment")
+
+
+def _margin_mode(value: object) -> str:
+    """Validate ``[scoring] margin_mode`` at load — a typo here would silently
+    judge every round under the wrong denomination."""
+    mode = str(value)
+    if mode not in _MARGIN_MODES:
+        raise ValueError(f"[scoring] margin_mode={mode!r} invalid; one of {_MARGIN_MODES}")
+    return mode
+
+
 _GIFT_GATE_MODES = ("off", "shadow", "enforce")
 
 
@@ -1144,6 +1314,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             mlp_expansion=int(z["mlp_expansion"]),
             ref_throughput_tokens_per_s=int(z["ref_throughput_tokens_per_s"]),
             d_ff=int(z.get("d_ff", 0)),
+            expected_gpu=str(z.get("expected_gpu", "")),
+            target_train_hours=float(z.get("target_train_hours", 0.0)),
         )
         for z in t.get("sizes", [])
     )
@@ -1167,6 +1339,16 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_abs_value=float(g.get("max_abs_value", 0.0)),
             reject_constant=bool(g.get("reject_constant", False)),
             max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
+            interface_version=int(g.get("interface_version", 1)),
+            max_payload_bytes=int(g.get("max_payload_bytes", 0)),
+            # Mirrored from the digest-bound [training] keys — single source.
+            accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
+            allow_future_known=bool(t.get("allow_future_known", False)),
+            real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
+            max_missing_frac=float(g.get("max_missing_frac", 0.5)),
+            channel_corr_mode=validate_dedup_mode(
+                str(g.get("channel_corr_mode", "off")), "channel_corr_mode"),
+            max_channel_corr=float(g.get("max_channel_corr", 0.999)),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),
@@ -1205,6 +1387,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             expected_gpu=str(t.get("expected_gpu", "")),
             train_image_digest=str(t.get("train_image_digest", "")),
             extra_sizes=extra_sizes,
+            accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
+            allow_future_known=bool(t.get("allow_future_known", False)),
+            real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
@@ -1286,6 +1471,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            margin_mode=_margin_mode(s.get("margin_mode", "level")),
+            margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
             # ``cascade_reign_rounds`` is the current name; ``cascade_reign_days``
             # is accepted as a legacy alias so deployed files keep loading. The

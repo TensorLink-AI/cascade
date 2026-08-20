@@ -71,3 +71,65 @@ def test_pinned_gpu_enforced(cfg):
 def test_manifest_roundtrips_gpu_name(cfg):
     again = load_manifest(dump_manifest(_manifest(cfg, "NVIDIA H100", "NVIDIA H100")))
     assert again.entry_for_role("king").gpu_name == "NVIDIA H100"
+
+
+# ── per-size pins (DEC-CA-0027 size-conditional silicon) ─────────────────────
+
+H100 = "NVIDIA H100 80GB HBM3"
+
+
+def _sized_entry(role, uid, gpu, size):
+    return TrainedEntry(f"hk{uid}", uid, role, REF, format_trained_pointer(REF_T),
+                        "d", 10, gpu_name=gpu, size=size)
+
+
+def _sized_cfg(cfg):
+    from cascade.shared.config import SizeSpec
+
+    big = SizeSpec(
+        arch_preset="toto2-313m", base_arch_digest="c" * 64, d_model=1024,
+        num_layers=16, num_heads=16, mlp_expansion=2,
+        ref_throughput_tokens_per_s=100_000, expected_gpu=H100,
+    )
+    return replace(cfg, training=replace(
+        cfg.training, expected_gpu="NVIDIA L40S", extra_sizes=(big,)))
+
+
+def _sized_manifest(cfg, entries):
+    return TrainingManifest(
+        round_id="1", created_block=10,
+        contract_digest=contract_digest(cfg.training),
+        base_arch_digest=cfg.training.base_arch_digest,
+        eval_dataset=cfg.eval.eval_dataset,
+        entries=entries,
+    )
+
+
+def test_per_size_pins_each_size_judged_against_its_own_silicon(cfg):
+    # The DEC-CA-0027 deadlock regression: a 313M duel on H100 beside a 4M
+    # lineage on L40S must PASS — each size against its own pin — while the
+    # old whole-manifest rule rejected any manifest not uniformly on the base
+    # pin.
+    sized = _sized_cfg(cfg)
+    runner = _runner(sized)
+    good = _sized_manifest(sized, [
+        _sized_entry("king", 0, "NVIDIA L40S", ""),
+        _sized_entry("challenger", 1, "NVIDIA L40S", ""),
+        _sized_entry("king", 0, H100, "toto2-313m"),
+        _sized_entry("challenger", 1, H100, "toto2-313m"),
+    ])
+    assert runner.check_manifest(good) is None
+
+    # The large size on the WRONG silicon is rejected, naming the size.
+    bad = runner.check_manifest(_sized_manifest(sized, [
+        _sized_entry("king", 0, "NVIDIA L40S", ""),
+        _sized_entry("king", 0, "NVIDIA H100 PCIe", "toto2-313m"),
+    ]))
+    assert bad is not None and "gpu_mismatch" in bad and "toto2-313m" in bad
+
+    # And the base size still enforces the base pin.
+    bad2 = runner.check_manifest(_sized_manifest(sized, [
+        _sized_entry("king", 0, H100, ""),
+        _sized_entry("king", 0, H100, "toto2-313m"),
+    ]))
+    assert bad2 is not None and "gpu_mismatch" in bad2

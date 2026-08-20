@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from .bootstrap import (
+    increment_bootstrap_rel,
     paired_bootstrap_lcb_aggregated,
     paired_bootstrap_quantiles_aggregated,
 )
@@ -32,6 +33,18 @@ from .scoring import WindowScore, global_geomean, stack_components
 #               verdict is NOT changed (calibrate tolerance against real noise).
 #   "enforce" — gate is AND-ed into the dethrone decision.
 GIFT_GATE_MODES = ("off", "shadow", "enforce")
+
+# Margin denomination (``[scoring] margin_mode``; DEC-CA-0027):
+#   "level"     — LCB of (king − chal) / king vs the margin. The from-scratch
+#                 rule, exact historical behaviour (default).
+#   "increment" — LCB of (king − chal) / unit, unit = the floored mean
+#                 |improvement over the shared warm-start init| — the margin
+#                 then prices a fraction of a typical per-round increment, so
+#                 dethrones stay clearable as a compounding lineage converges.
+#                 Needs the baseline (init) checkpoint scored as a third paired
+#                 reference; a random-init round has no baseline and is judged
+#                 at "level" regardless (the E2 init-round semantics).
+MARGIN_MODES = ("level", "increment")
 
 
 @dataclass(frozen=True)
@@ -74,6 +87,14 @@ class KothParams:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Margin denomination (see MARGIN_MODES). "level" is bit-identical to the
+    # pre-field behaviour; receipts record these via the params dict, so an
+    # increment round replays under the rule that decided it.
+    margin_mode: str = "level"
+    # Floor on the increment normaliser, as a fraction of the baseline level
+    # (scale-free): with both increments ≈ 0 an unfloored unit divides by
+    # noise exactly when the evidence is weakest (the DEC-CA-0009 lesson).
+    margin_increment_floor: float = 0.01
 
 
 def margin_for_tenure(params: KothParams, king_tenure_rounds: int) -> float:
@@ -145,18 +166,30 @@ class RoundResult:
     # Recorded on the receipt so an auditor replays a round under the rule that
     # actually decided it; see :func:`cascade.eval.scoring.global_geomean`.
     wql_mode: str = "geomean"
+    # Which margin denomination judged this round (see MARGIN_MODES) and, for
+    # "increment", the shared warm-start init's observed geomean (logging).
+    margin_mode: str = "level"
+    baseline_geomean: float | None = None
 
 
 def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
     """Cluster labels for the paired bootstrap, one per (window, channel) row.
 
     The cluster key is the upstream feed id (pool metadata ``source``) when
-    present; rows without one are their own singleton cluster, which degrades
-    exactly to the classic per-window bootstrap for legacy pools.
+    present; rows without one fall back to their ``series_id`` — i.e. their
+    window. For every univariate pool (one row per window, unique series ids)
+    that is exactly the classic per-window bootstrap, byte-identical to the
+    old per-row fallback. The distinction bites only when a window carries
+    several rows: a C-channel window's rows are near-perfectly correlated, and
+    a per-ROW fallback would resample them as C independent observations —
+    inflating the effective sample size precisely when multivariate windows
+    enter the pool (DEC-CA-0026 item 3). Keying on the window keeps a
+    12-channel window from voting 12 times even on a pool with no ``source``
+    metadata.
     """
     labels: list = []
-    for i, s in enumerate(scores):
-        labels.append(s.source if s.source else f"__row{i}")
+    for s in scores:
+        labels.append(s.source if s.source else f"__series:{s.series_id}")
     return labels, len(set(labels))
 
 
@@ -207,6 +240,7 @@ def evaluate_round(
     seed: int | str,
     king_tenure_rounds: int = 0,
     wql_mode: str = "geomean",
+    baseline_scores: list[WindowScore] | None = None,
 ) -> RoundResult:
     """Judge one round. ``king_scores`` and ``chal_scores`` must be paired:
     same windows, same order. Raises ``ValueError`` if lengths disagree.
@@ -215,14 +249,41 @@ def evaluate_round(
     :func:`cascade.eval.scoring.global_geomean`). Live rounds use the default
     ``"geomean"``; pass ``"pooled"`` only when replaying a receipt written
     before 2026-07-28, which recorded its own mode for exactly this purpose.
+
+    ``baseline_scores`` (the shared warm-start init scored on the same
+    windows, in the same order) is REQUIRED when ``params.margin_mode ==
+    "increment"`` and forbidden otherwise — the caller (validator loop /
+    audit) owns the fall-back-to-level decision for rounds with no baseline
+    (random init), so an armed increment mode with no baseline here is a
+    wiring bug and raises rather than silently judging under the wrong rule.
     """
     if len(king_scores) != len(chal_scores):
         raise ValueError(
             f"unpaired scores: king {len(king_scores)} vs challenger {len(chal_scores)}"
         )
+    if params.margin_mode not in MARGIN_MODES:
+        raise ValueError(
+            f"margin_mode must be one of {MARGIN_MODES}; got {params.margin_mode!r}"
+        )
+    increment = params.margin_mode == "increment"
+    if increment and baseline_scores is None:
+        raise ValueError(
+            "margin_mode='increment' needs baseline_scores (the shared warm-start "
+            "init scored on the same windows); judge a random-init round under "
+            "'level' instead"
+        )
+    if not increment and baseline_scores is not None:
+        raise ValueError("baseline_scores given but margin_mode is 'level'")
+    if increment and len(baseline_scores) != len(king_scores):
+        raise ValueError(
+            f"unpaired baseline: {len(baseline_scores)} vs king {len(king_scores)}"
+        )
     n = len(king_scores)
     margin = margin_for_tenure(params, king_tenure_rounds)
     clusters, n_clusters = _window_clusters(king_scores)
+    base_geo = (
+        global_geomean(baseline_scores, wql_mode=wql_mode) if increment else None
+    )
 
     if n < params.min_windows or (params.min_clusters > 0 and n_clusters < params.min_clusters):
         return RoundResult(
@@ -235,32 +296,52 @@ def evaluate_round(
             inconclusive=True,
             n_clusters=n_clusters,
             wql_mode=wql_mode,
+            margin_mode=params.margin_mode,
+            baseline_geomean=base_geo,
         )
 
     k_qloss, k_abs, k_mase = stack_components(king_scores)
     c_qloss, c_abs, c_mase = stack_components(chal_scores)
-    lcb = paired_bootstrap_lcb_aggregated(
-        k_qloss, k_abs, k_mase,
-        c_qloss, c_abs, c_mase,
-        alpha=params.bootstrap_alpha,
-        B=params.bootstrap_B,
-        seed=seed,
-        clusters=clusters,
-        wql_mode=wql_mode,
-    )
-    win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
     boot_p50 = boot_p95 = None
-    try:
-        # Same B/seed/clusters as the LCB above ⇒ the 5th-pct here == lcb; we keep
-        # the median and 95th pct for display. A diagnostic must never fail a round.
-        qs = paired_bootstrap_quantiles_aggregated(
-            k_qloss, k_abs, k_mase, c_qloss, c_abs, c_mase,
-            quantiles=(0.5, 0.95), B=params.bootstrap_B, seed=seed, clusters=clusters,
+    if increment:
+        b_qloss, b_abs, b_mase = stack_components(baseline_scores)
+        rel = increment_bootstrap_rel(
+            (k_qloss, k_abs, k_mase),
+            (c_qloss, c_abs, c_mase),
+            (b_qloss, b_abs, b_mase),
+            B=params.bootstrap_B, seed=seed, clusters=clusters,
+            wql_mode=wql_mode, floor_frac=params.margin_increment_floor,
+        )
+        lcb = (
+            float(np.quantile(rel, params.bootstrap_alpha))
+            if rel.size else float("nan")
+        )
+        if rel.size:
+            boot_p50 = float(np.quantile(rel, 0.5))
+            boot_p95 = float(np.quantile(rel, 0.95))
+    else:
+        lcb = paired_bootstrap_lcb_aggregated(
+            k_qloss, k_abs, k_mase,
+            c_qloss, c_abs, c_mase,
+            alpha=params.bootstrap_alpha,
+            B=params.bootstrap_B,
+            seed=seed,
+            clusters=clusters,
             wql_mode=wql_mode,
         )
-        boot_p50, boot_p95 = qs.get(0.5), qs.get(0.95)
-    except Exception:  # noqa: BLE001 — spread is display-only
-        pass
+        try:
+            # Same B/seed/clusters as the LCB above ⇒ the 5th-pct here == lcb; we
+            # keep the median and 95th pct for display. A diagnostic must never
+            # fail a round.
+            qs = paired_bootstrap_quantiles_aggregated(
+                k_qloss, k_abs, k_mase, c_qloss, c_abs, c_mase,
+                quantiles=(0.5, 0.95), B=params.bootstrap_B, seed=seed,
+                clusters=clusters, wql_mode=wql_mode,
+            )
+            boot_p50, boot_p95 = qs.get(0.5), qs.get(0.95)
+        except Exception:  # noqa: BLE001 — spread is display-only
+            pass
+    win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
     return RoundResult(
         challenger_wins_round=bool(lcb >= margin),
         lcb=lcb,
@@ -271,6 +352,8 @@ def evaluate_round(
         inconclusive=False,
         n_clusters=n_clusters,
         wql_mode=wql_mode,
+        margin_mode=params.margin_mode,
+        baseline_geomean=base_geo,
         win_rate=win_rate,
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,

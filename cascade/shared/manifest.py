@@ -59,21 +59,34 @@ def format_trained_pointer(ref: str) -> str:
     return payload
 
 
-def corpus_digest(series: Sequence[np.ndarray]) -> str:
+def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
     """Stable sha256 over a generated corpus.
 
-    Each series is canonicalised to ``(C, L)`` (a 1-D ``(L,)`` array is promoted
-    to ``(1, L)``), and the hash covers the count, every series' full ``(C, L)``
-    shape, and its raw float64 bytes in yield order. Carrying the channel count
-    in the digest keeps it stable as the corpus moves from univariate ``(1, L)``
-    to multivariate ``(C, L)`` — a univariate and a single-channel-of-multivariate
-    corpus never collide. Two trainers that draw the same corpus from the same
-    pinned generator + seed get the same digest, which is what makes a training
-    run auditable.
+    Each values-only series is canonicalised to ``(C, L)`` (a 1-D ``(L,)``
+    array is promoted to ``(1, L)``), and the hash covers the count, every
+    series' full ``(C, L)`` shape, and its raw float64 bytes in yield order.
+    Carrying the channel count in the digest keeps it stable as the corpus
+    moves from univariate ``(1, L)`` to multivariate ``(C, L)`` — a univariate
+    and a single-channel-of-multivariate corpus never collide. Two trainers
+    that draw the same corpus from the same pinned generator + seed get the
+    same digest, which is what makes a training run auditable.
+
+    An EXTENDED record element (a ``{"values": …, "mask"/"roles": …}`` dict
+    from an ``accepted_fields``-armed drain, DEC-CA-0020/0023/0026) hashes via
+    its 0xFF-sentinel frame (:func:`cascade.interface.generator.
+    record_frame_bytes`): a legacy element's bytes start with an 8-byte BE
+    channel count (first byte 0x00), so the two framings can never collide,
+    and every values-only corpus keeps its frozen bytes (golden-vector
+    enforced) forever.
     """
+    from ..interface.generator import canonicalize_record, record_frame_bytes
+
     h = hashlib.sha256()
     h.update(len(series).to_bytes(8, "big"))
     for arr in series:
+        if isinstance(arr, dict):
+            h.update(record_frame_bytes(canonicalize_record(arr)))
+            continue
         a = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
         h.update(a.shape[0].to_bytes(8, "big"))   # channels
         h.update(a.shape[1].to_bytes(8, "big"))   # length
@@ -81,18 +94,52 @@ def corpus_digest(series: Sequence[np.ndarray]) -> str:
     return h.hexdigest()
 
 
+# Contract fields dropped from the digest payload while they hold their inert
+# default — the contract-side twin of canonical_body's drop-when-unset
+# convention (bench_scores, duel_rank, the eval-pool pin). This is what lets a
+# release ADD a digest-bound [training] key without moving any deployed
+# fleet's contract_digest: the field enters the hash only when an operator
+# actually sets it, which is a deliberate, coordinated digest bump (the
+# routine re-pin protocol). NEVER remove or change an entry once shipped —
+# that would move digests for configs relying on the drop; the golden-vector
+# test freezes the behaviour.
+_DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
+    # DEC-CA-0020 layer 3: the accepted record-field set ([training]
+    # accepted_fields). Empty = values-only (every deployed config).
+    "accepted_fields": ((), []),
+    # DEC-CA-0026: future-known covariate admission (roles value 2). False
+    # until the EVAL_POOL exogeneity rule exists in writing.
+    "allow_future_known": (False,),
+    # DEC-CA-0028: the owner-published shared real corpus pin. "" = none
+    # (every deployed config); setting it is the deliberate digest bump that
+    # arms the shared-corpus regime.
+    "real_corpus_ref": ("",),
+}
+
+
 def contract_digest(contract: object) -> str:
     """Stable sha256 over the fields of a training contract dataclass.
 
     Used to assert king and challenger were trained under byte-identical terms.
-    Accepts any dataclass (typically ``TrainingContractConfig``).
+    Accepts any dataclass (typically ``TrainingContractConfig``). Fields listed
+    in :data:`_DIGEST_DROP_WHEN_DEFAULT` are omitted while they hold their
+    inert default, so adding such a field to the dataclass never moves a
+    deployed digest — setting it is the digest bump.
     """
     if hasattr(contract, "__dataclass_fields__"):
         payload = asdict(contract)  # type: ignore[arg-type]
     elif isinstance(contract, dict):
-        payload = contract
+        payload = dict(contract)
     else:
         raise TypeError(f"contract_digest expects a dataclass or dict; got {type(contract)}")
+    for key, defaults in _DIGEST_DROP_WHEN_DEFAULT.items():
+        if key not in payload:
+            continue
+        val = payload[key]
+        if isinstance(val, list):
+            val = tuple(val)      # asdict/json round-trips lose tuple-ness
+        if val in defaults:
+            payload.pop(key)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 

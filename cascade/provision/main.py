@@ -103,6 +103,17 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     # (or max_pods = 0) the stage does not exist: pre-eval configs keep their
     # exact behaviour, which is why it is not in the required loop above.
     eval_sp = build_stage_policy(top["eval"], "eval") if "eval" in top else None
+    # Size-conditional final stages (DEC-CA-0027): any NAMED sub-table of
+    # [provisioner.final] carrying a "sku" key (e.g. [provisioner.final.large])
+    # is an alternate final fleet, selected at startup when the throne size's
+    # per-size expected_gpu names its silicon (see policy.select_final_stage).
+    # [[provisioner.final.candidate]] is an array (not a dict), so the SKU
+    # ladder never parses as an alternate.
+    final_alternates = tuple(
+        build_stage_policy(sub, f"final.{name}")
+        for name, sub in top["final"].items()
+        if isinstance(sub, dict) and "sku" in sub
+    )
     offset = int(top.get("trigger_offset_blocks", 0))
     if offset:
         if not 0 < offset < epoch_blocks:
@@ -126,6 +137,7 @@ def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
     return ProvisionPolicy(
         heat=build_stage_policy(top["heat"], "heat"),
         final=build_stage_policy(top["final"], "final"),
+        final_alternates=final_alternates,
         eval=eval_sp,
         trigger_margin_blocks=margin,
         trigger_offset_blocks=offset,
@@ -467,6 +479,36 @@ def _run(args) -> int:
     top = raw.get("provisioner", {})
     policy = build_policy(raw, epoch_blocks=cfg.round.epoch_blocks)
 
+    # Size-conditional final fleet (DEC-CA-0027): resolve the throne sizes'
+    # per-size GPU pin against the configured final stages, once, at startup —
+    # a throne-size change is release-then-activate (chain.toml edit +
+    # restart), so this never needs to move mid-service. A multi-size throne
+    # duels on ONE fleet, so mixed per-size pins are unsupportable — the
+    # LAST throne size (the largest, by convention) wins with a loud warning.
+    throne = cfg.throne_contracts()
+    throne_pins = [c.expected_gpu for c in throne if c.expected_gpu]
+    if len(set(throne_pins)) > 1:
+        log.warning(
+            "throne sizes pin DIFFERENT GPUs %s — one final fleet cannot serve "
+            "both; renting for %r (the last throne size). Split the sizes "
+            "across rounds or align their pins.", throne_pins, throne_pins[-1])
+    from dataclasses import replace as _dc_replace
+
+    from .policy import select_final_stage
+
+    final_sp = select_final_stage(policy, throne_pins[-1] if throne_pins else "")
+    if final_sp is not policy.final:
+        log.info("size-conditional final: throne pins %r -> [provisioner.final] "
+                 "alternate %d×%s(%dx)", throne_pins[-1], final_sp.max_pods,
+                 final_sp.sku, final_sp.gpus_per_pod)
+        policy = _dc_replace(policy, final=final_sp)
+    elif throne_pins and throne_pins[-1] != policy.final.sku:
+        log.warning(
+            "throne size pins %r but no [provisioner.final] stage serves it "
+            "(base final rents %r and its pods will FAIL the health gate) — "
+            "add a [provisioner.final.<name>] alternate with sku = %r",
+            throne_pins[-1], policy.final.sku, throne_pins[-1])
+
     image = str(top.get("image", ""))
     if not top.get("bootstrap_script"):
         # Image-boot mode: the pod IS the image, so a moving tag breaks the
@@ -603,7 +645,11 @@ def _run(args) -> int:
         epoch_blocks=cfg.round.epoch_blocks,
         epoch_blocks_prev=cfg.round.epoch_blocks_prev,
         epoch_activation_block=cfg.round.epoch_activation_block,
-        final_hours=cfg.training.target_train_hours,
+        # Per-size budget hours (DEC-CA-0027): the final's time envelope is the
+        # longest throne size's target_train_hours (SizeSpec override or the
+        # base) — with a single primary-size throne this is exactly the old
+        # cfg.training.target_train_hours.
+        final_hours=max(c.target_train_hours for c in throne),
         manifest_store=manifest_store,
         eval_hosts_path=eval_hosts_path,
         receipt_prefix=receipt_prefix,

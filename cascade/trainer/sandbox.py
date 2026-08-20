@@ -52,7 +52,7 @@ import numpy as np
 
 from ..shared.config import GeneratorConfig
 from ..shared.manifest import corpus_digest
-from .corpus import CorpusError, CorpusResult, build_corpus
+from .corpus import CorpusError, CorpusResult, build_corpus, resolve_real_corpus
 
 log = logging.getLogger("cascade.trainer.sandbox")
 
@@ -370,9 +370,21 @@ def _preflight(repo: Path, cfg: GeneratorConfig, blocked: tuple[str, ...]) -> No
         raise CorpusError(f"blocked_import: {guard.blocked_module} ({guard.reason})")
 
 
-def _load_series(path: Path, n: int) -> list[np.ndarray]:
+def _load_series(path: Path, n: int) -> list:
+    """Load a materialised corpus; ``s<i>__<field>`` keys rebuild extended
+    records (dict elements), plain ``s<i>`` keys stay bare arrays."""
     with np.load(path, allow_pickle=False) as z:
-        return [np.ascontiguousarray(z[f"s{i}"]) for i in range(n)]
+        keys = set(z.files)
+        out: list = []
+        for i in range(n):
+            extras = {
+                k.split("__", 1)[1]: np.ascontiguousarray(z[k])
+                for k in keys
+                if k.startswith(f"s{i}__")
+            }
+            values = np.ascontiguousarray(z[f"s{i}"])
+            out.append({"values": values, **extras} if extras else values)
+        return out
 
 
 def _assert_isolation(cfg: GeneratorConfig, *, allow_netns: bool) -> bool:
@@ -433,6 +445,10 @@ def run_in_sandbox(
         return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked)
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    # DEC-CA-0028: materialise the pinned shared real corpus HERE, parent-side
+    # — the child is network-isolated and must find real_corpus_dir already
+    # resolved in its cfg JSON. A no-op while real_corpus_ref is unarmed.
+    cfg = resolve_real_corpus(cfg)
     use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
 
     with tempfile.TemporaryDirectory(prefix="metro-sbx-") as td:
@@ -490,7 +506,9 @@ def run_in_sandbox(
         digest = corpus_digest(series)
         if digest != meta.get("digest"):
             raise CorpusError("sandbox_digest_mismatch: corpus altered in transit")
-        total = int(sum(int(s.size) for s in series))
+        total = int(sum(
+            int((s["values"] if isinstance(s, dict) else s).size) for s in series
+        ))
         return CorpusResult(series=series, digest=digest, n_series=len(series), total_points=total)
 
 
@@ -510,8 +528,30 @@ def _read_exact(rd: io.BufferedReader, n: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def _frame_iter(proc: subprocess.Popen, inactivity_timeout: int) -> Iterator[np.ndarray]:
-    """Yield arrays from the child's length-prefixed .npy frames on stdout."""
+# Record-frame marker (DEC-CA-0020): a plain frame's 8-byte BE length prefix
+# can never be all-0xFF (that would be a ~2^64-byte frame), so this header
+# unambiguously introduces an extended record — n_fields (8B BE), then per
+# field in sorted order: name length (8B BE), name utf-8, and a normal
+# length-prefixed .npy frame. Emitted ONLY for series that actually carry
+# accepted extras; values-only series keep the byte-identical plain framing.
+_RECORD_MARKER = b"\xff" * 8
+
+
+def _read_frame_body(rd: io.BufferedReader) -> bytes | None:
+    header = _read_exact(rd, 8)
+    if not header or len(header) < 8:
+        return None
+    body = _read_exact(rd, int.from_bytes(header, "big"))
+    if body is None or len(body) < int.from_bytes(header, "big"):
+        return None
+    return body
+
+
+def _frame_iter(
+    proc: subprocess.Popen, inactivity_timeout: int
+) -> Iterator[np.ndarray | dict]:
+    """Yield series from the child's stdout: plain length-prefixed .npy frames,
+    or marker-introduced record frames (see :data:`_RECORD_MARKER`)."""
     rd = proc.stdout
     timeout = max(int(inactivity_timeout), 1)
     while True:
@@ -521,6 +561,29 @@ def _frame_iter(proc: subprocess.Popen, inactivity_timeout: int) -> Iterator[np.
         header = _read_exact(rd, 8)
         if not header or len(header) < 8:
             break  # clean EOF: child finished its prefix (or died — checked below)
+        if header == _RECORD_MARKER:
+            count_b = _read_exact(rd, 8)
+            if not count_b or len(count_b) < 8:
+                break
+            rec: dict[str, np.ndarray] = {}
+            broken = False
+            for _ in range(int.from_bytes(count_b, "big")):
+                name_len_b = _read_exact(rd, 8)
+                if not name_len_b or len(name_len_b) < 8:
+                    broken = True
+                    break
+                name_b = _read_exact(rd, int.from_bytes(name_len_b, "big"))
+                body = None if name_b is None else _read_frame_body(rd)
+                if name_b is None or body is None:
+                    broken = True
+                    break
+                rec[name_b.decode("utf-8")] = np.ascontiguousarray(
+                    np.lib.format.read_array(io.BytesIO(body), allow_pickle=False)
+                )
+            if broken:
+                break  # child died mid-record
+            yield rec
+            continue
         body = _read_exact(rd, int.from_bytes(header, "big"))
         if body is None or len(body) < int.from_bytes(header, "big"):
             break  # child died mid-frame
@@ -601,6 +664,9 @@ def stream_series(
         return
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
+    # DEC-CA-0028: resolve the shared real corpus parent-side (the child
+    # cannot fetch); no-op while unarmed.
+    cfg = resolve_real_corpus(cfg)
     use_netns = _assert_isolation(cfg, allow_netns=allow_netns)
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     argv = [
@@ -705,8 +771,17 @@ def _maybe_self_rlimit(cfg: GeneratorConfig) -> None:
     )
 
 
-def _save_series(path: Path, series: list[np.ndarray]) -> None:
-    np.savez(path, **{f"s{i}": a for i, a in enumerate(series)})
+def _save_series(path: Path, series: list) -> None:
+    """Materialise a corpus to .npz — extended-record extras ride as
+    ``s<i>__<field>`` keys next to their ``s<i>`` values array."""
+    payload: dict[str, np.ndarray] = {}
+    for i, a in enumerate(series):
+        if isinstance(a, dict):
+            for name, arr in a.items():
+                payload[f"s{i}" if name == "values" else f"s{i}__{name}"] = arr
+        else:
+            payload[f"s{i}"] = a
+    np.savez(path, **payload)
 
 
 def _write_frame(out: io.BufferedWriter, arr: np.ndarray) -> None:
@@ -715,6 +790,17 @@ def _write_frame(out: io.BufferedWriter, arr: np.ndarray) -> None:
     data = buf.getvalue()
     out.write(len(data).to_bytes(8, "big"))
     out.write(data)
+
+
+def _write_record_frame(out: io.BufferedWriter, rec: dict) -> None:
+    """Stream one extended record (see :data:`_RECORD_MARKER`)."""
+    out.write(_RECORD_MARKER)
+    out.write(len(rec).to_bytes(8, "big"))
+    for name in sorted(rec):
+        nb = name.encode("utf-8")
+        out.write(len(nb).to_bytes(8, "big"))
+        out.write(nb)
+        _write_frame(out, rec[name])
 
 
 def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int:
@@ -738,23 +824,39 @@ def _child_materialize(repo: str, seed: str, cfg_json: str, out_dir: str) -> int
 
 
 def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
-    from ..interface.generator import CAST_SAFE_MAX_FLOAT32, check_series
+    from ..interface.generator import SeriesValidator
     from .corpus import _load_generator
 
     out = sys.stdout.buffer
     try:
         cfg = GeneratorConfig(**json.loads(cfg_json))
         _maybe_self_rlimit(cfg)
-        gen = _load_generator(Path(repo), int(seed))
-        for i, arr in enumerate(gen.generate(int(n_upper))):
-            check_series(
-                arr, min_length=cfg.min_length, max_length=cfg.max_length,
-                max_channels=cfg.max_channels,
-                max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
-                reject_constant=cfg.reject_constant, index=i,
-            )
-            canon = np.ascontiguousarray(np.atleast_2d(np.asarray(arr, dtype=np.float64)))
-            _write_frame(out, canon)
+        from .channel_stats import corr_enforce_gate
+
+        # One validation pipeline shared with the drain and the in-process
+        # stream (SeriesValidator) — record fields, budgets, and gates cannot
+        # drift between feed modes. Values-only records collapse to their
+        # values array and cross as plain .npy frames — byte-identical to a
+        # bare-array stream; series carrying an ACCEPTED extra (mask/roles,
+        # armed via [training] accepted_fields) cross as marker-introduced
+        # record frames (_write_record_frame).
+        validator = SeriesValidator.from_config(
+            cfg, extra_series_check=corr_enforce_gate(cfg)
+        )
+        # An armed cfg arrives with real_corpus_dir pre-resolved by the parent;
+        # resolve here is verify-only (an empty dir would try to fetch and fail
+        # loudly on the network block — a misplumbed parent, never a silent
+        # no-corpus stream).
+        cfg = resolve_real_corpus(cfg)
+        gen = _load_generator(Path(repo), int(seed),
+                              interface_version=cfg.interface_version,
+                              real_corpus_dir=cfg.real_corpus_dir)
+        for i, item in enumerate(gen.generate(int(n_upper))):
+            element = validator.process(item, i)
+            if isinstance(element, dict):
+                _write_record_frame(out, element)
+            else:
+                _write_frame(out, element)
             out.flush()
     except BrokenPipeError:
         return 0  # parent stopped reading once it had its budget — a normal stop

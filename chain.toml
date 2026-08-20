@@ -20,6 +20,26 @@ max_generate_seconds = 1800      # wall-clock budget for draining the generator
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
 max_channels         = 1         # per-series variates; 1 = univariate
+# The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
+# with `values` only; every reserved field (mask, start, freq, group_id, roles,
+# labels, quantiles) is hard-rejected until the release that consumes it. Bumps
+# only when a field is accepted+consumed together (the accepted set then folds
+# into [training] — one deliberate contract_digest bump).
+interface_version    = 1
+# Carrier cap in canonical payload BYTES — the denomination that stays correct
+# when non-values fields arrive. 16e9 = max_total_points × 8 (float64): exactly
+# today's point cap, so it is numerically inert. 0 disables.
+max_payload_bytes    = 16_000_000_000
+# Per-series cap on the masked fraction, active only once "mask" is accepted
+# via [training] accepted_fields (DEC-CA-0023).
+max_missing_frac     = 0.5
+# Channel-redundancy gate (DEC-CA-0026): "off" | "shadow" | "enforce" against
+# max_channel_corr (max off-diagonal |Pearson| between standardized channels).
+# 0.999 targets ONLY the jitter-duplicate exploit. Keep off until the Stage 1
+# shadow telemetry (channel_telemetry.frac_over_0999) clears honest
+# generators; then shadow; enforce last. Meaningless at max_channels = 1.
+channel_corr_mode    = "off"
+max_channel_corr     = 0.999
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
 reject_constant      = false     # reject flat (zero-range) series
@@ -91,6 +111,25 @@ max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged d
 #   stream_gpu  — live-stream from a GPU generator; tolerance/same-hardware audit
 #   cache_reuse — draw a fixed corpus once, multi-pass under the budget; byte-exact
 corpus_mode = "stream_cpu"
+# Accepted record-field set (DEC-CA-0020 layer 3): the payload fields the
+# carrier accepts AND the trainer consumes — accept-equals-consume is enforced
+# in code (only fields with a wired consumer load). DIGEST-BOUND via the
+# drop-when-default convention: [] is omitted from contract_digest (today's
+# digest is untouched), setting it is a deliberate bump → coordinated
+# epoch-boundary restart, the routine re-pin protocol. Arming order per the
+# roadmap: "mask" needs the pool's masked-history eval slice first; "roles"
+# values 0/1 may arm with multivariate, allow_future_known (roles=2) stays
+# false until docs/EVAL_POOL.md carries the covariate exogeneity rule.
+accepted_fields    = []
+allow_future_known = false
+# Owner-published shared real corpus (DEC-CA-0028): immutable ref
+# ("repo@sha256:<64hex>") of the frozen, licensed real-data corpus generators
+# may READ (opt-in real_corpus_dir constructor kwarg; repos stay code-only).
+# DIGEST-BOUND via drop-when-default: "" is omitted from contract_digest, so
+# today's digest is untouched; setting it is the deliberate bump. Arming is
+# FORBIDDEN until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness
+# rule (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
+real_corpus_ref    = ""
 # Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
 # "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
 expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must
@@ -137,6 +176,13 @@ train_image_digest = "sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c
 # num_heads                   = 8       # head_dim stays 64 ⇒ d_model = num_heads × 64
 # mlp_expansion               = 2
 # ref_throughput_tokens_per_s = 90000   # MEASURE on the reference GPU for THIS size
+# Size-conditional overrides (DEC-CA-0027; unset = inherit [training]):
+# expected_gpu       = ""     # per-size duel GPU pin (exact nvidia-smi string;
+#                             # 300M+ pins H100-class — mind SXM vs PCIe variants,
+#                             # and measure ref throughput on THAT variant)
+# target_train_hours = 0.0    # per-size budget hours (313M increments ~6h; set
+#                             # jointly with the margin re-unitisation from the
+#                             # null-LCB noise-floor measurement)
 
 [round]
 # Twice-daily round cadence + two-stage (heat → final) selection. The base seed
@@ -432,6 +478,16 @@ king_decay           = 0.5       # geometric decay across [king, prior kings]: k
 gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
 gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
+# Margin denomination (DEC-CA-0027): "level" = LCB of (king-chal)/king (the
+# from-scratch rule, exact current behaviour). "increment" = the warm-start-era
+# rule: the shared init is scored as a third paired reference and the margin
+# prices a fraction of a typical per-round improvement — flip it WITH the
+# warm-start era (E2), across all validators at once ([scoring] is
+# fleet-consensus). Random-init rounds are judged at "level" automatically.
+# margin_increment_floor floors the increment normaliser at this fraction of
+# the baseline level, so near-zero increments can't explode the statistic.
+margin_mode            = "level"
+margin_increment_floor = 0.01
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
 # cascade.trainer.promotion, DEC-CA-0013 propose-and-verify). After a ripe
 # reign the TRAINER selects up to cascade_top_k reign checkpoints as the next

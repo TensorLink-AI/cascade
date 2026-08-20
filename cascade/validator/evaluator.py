@@ -21,7 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.scoring import ForecastFn, WindowScore, score_forecaster_on_windows
+from ..eval.scoring import (
+    JointForecastFn,
+    WindowScore,
+    adapt_per_channel,
+    score_joint_forecaster_on_windows,
+)
 from ..eval.window import EvalWindow
 
 
@@ -29,9 +34,15 @@ class EvaluatorError(RuntimeError):
     """Loading or running a trained checkpoint failed."""
 
 
-def load_forecaster(checkpoint_dir: Path | str, *, device: str = "cpu") -> ForecastFn:
+def load_forecaster(
+    checkpoint_dir: Path | str, *, device: str = "cpu"
+) -> JointForecastFn:
     """Import ``forecast_wrapper.Wrapper`` from a trained checkpoint and return
-    a numpy forecaster ``f(history_1d, horizon, num_samples) -> (1, m, H)``.
+    a numpy JOINT forecaster ``f(history_2d, horizon, num_samples) -> (C, m, H)``.
+
+    Wrappers exposing ``forecast_joint`` are called once per window with all
+    channels; archived 1-D wrappers (``forecast`` only) are lifted through the
+    permanent per-channel adapter — numerically identical at ``C = 1``.
 
     The wrapper is owner-produced and trusted; no static guard or sandbox is
     applied here (unlike the miner-controlled generators on the trainer side).
@@ -68,7 +79,26 @@ def load_forecaster(checkpoint_dir: Path | str, *, device: str = "cpu") -> Forec
             )
         return arr
 
-    return forecast_fn
+    # Joint (C, L) contract (DEC-CA-0026): a wrapper that exposes
+    # ``forecast_joint(history_2d, horizon, num_samples) -> (C, ns, H)`` is
+    # called once per window with all channels; every archived 1-D wrapper is
+    # lifted through the per-channel adapter instead — kept forever, so old
+    # checkpoints stay scoreable without resubmission. At C = 1 (every window
+    # today) the two paths are numerically identical.
+    joint_raw = getattr(wrapper, "forecast_joint", None)
+    if joint_raw is None:
+        return adapt_per_channel(forecast_fn)
+
+    def joint_fn(history: np.ndarray, horizon: int, num_samples: int) -> np.ndarray:
+        arr = np.asarray(joint_raw(history, horizon, num_samples), dtype=np.float64)
+        expect = (int(np.atleast_2d(history).shape[0]), num_samples, horizon)
+        if arr.shape != expect:
+            raise EvaluatorError(
+                f"wrapper.forecast_joint returned {arr.shape}; expected {expect}"
+            )
+        return arr
+
+    return joint_fn
 
 
 def evaluate_checkpoint(
@@ -79,6 +109,6 @@ def evaluate_checkpoint(
     device: str = "cpu",
 ) -> list[WindowScore]:
     """Load the checkpoint and score it on ``windows``. Convenience wrapper over
-    :func:`load_forecaster` + :func:`score_forecaster_on_windows`."""
+    :func:`load_forecaster` + :func:`score_joint_forecaster_on_windows`."""
     forecast_fn = load_forecaster(checkpoint_dir, device=device)
-    return score_forecaster_on_windows(forecast_fn, windows, num_samples)
+    return score_joint_forecaster_on_windows(forecast_fn, windows, num_samples)
