@@ -150,9 +150,63 @@ in-context.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 
+## Proposed (design pass 2026-08-13 — miner submission surface; not yet owner-accepted;
+## renumbered 2026-08-20: original 0016-0024 collided with the accepted decay/guard/wsd/jitter nodes)
+
+- **DEC-CA-0020** (proposed) — Carrier: `generate()` yields array OR named-field
+  record (`values` only accepted); canonical digest byte-identical for
+  values-only; reserved names hard-rejected; bytes budget; interface_version.
+  (`decisions/DEC-CA-0020-series-record-carrier.md`)
+- **DEC-CA-0021** (proposed) — `(start, freq)` reserved, consumed by nothing:
+  the pinned arch is calendar-free; payload waits on a measured ablation.
+  (`decisions/DEC-CA-0021-time-anchor-reserved-not-consumed.md`)
+- **DEC-CA-0022** (proposed) — Length cap: long-range priors are expressible
+  today via internal crops; `context_length` growth parks on the 22M seam.
+  (`decisions/DEC-CA-0022-length-cap-long-context.md`)
+- **DEC-CA-0023** (proposed) — Missingness: parallel `mask` field, filler
+  pinned 0.0, NaN rejected; eval-gated on a masked-history pool slice.
+  (`decisions/DEC-CA-0023-missingness-mask-field.md`)
+- **DEC-CA-0024** (proposed) — Panels ARE variate groups for this arch;
+  `group_id` reserved with no possible consumer under the pin.
+  (`decisions/DEC-CA-0024-panels-are-variates.md`)
+- **DEC-CA-0025** (proposed) — Corpus drift rides the time anchor and is
+  imperceptible to the fixed model; yield order is the real (existing) lever.
+  (`decisions/DEC-CA-0025-drift-rides-the-time-anchor.md`)
+- **DEC-CA-0026** (proposed) — Multivariate arms eval-first (variate-layer
+  regime mismatch makes MV self-sabotage under the univariate scorer);
+  per-series C bucketed; full-freight channel pricing; roles as record field;
+  channel-drop trap fixed before any cap raise.
+  (`decisions/DEC-CA-0026-multivariate-roles-covariates.md`)
+- **DEC-CA-0028** (proposed) — Ceiling restated no-shipped-DATA (raw series =
+  the weights hole); real data enters (if ever) as ONE owner-pinned shared
+  corpus generators read (`[training] real_corpus_ref`, digest-bound
+  drop-when-default; opt-in `real_corpus_dir` ctor kwarg; parent-side cached
+  materialisation; container ro-mount). Machinery landed inert; arming waits
+  on the pricing experiment + EVAL_POOL disjointness rule + the corpus.
+  (`decisions/DEC-CA-0028-shared-real-corpus.md`)
+- **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
+  (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
+  provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage
+  option), warm-start duels with the margin re-unitised to %-of-increment
+  via a baseline-referenced statistic; decoupled flagship is the fallback if
+  the noise floor kills the at-size duel.
+  (`decisions/DEC-CA-0027-size-conditional-gpu-provisioning.md`)
+- Staged rollout + budget denomination + no-weights ceiling:
+  `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
+  config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
+  corr gate; mask/roles acceptance AND consumption behind `[training]
+  accepted_fields` (contract-digest drop-when-default keeps today's digests
+  untouched); Stage 6 plumbing + the increment margin (`[scoring]
+  margin_mode`) + `warmup_flat`. Golden vectors pin corpus/stream/series-key
+  bytes, the contract digest, and the signed receipt fixture. What remains is
+  measurements, pool content, per-size pins, and deploys — never code.
+
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
-pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
-the revisit condition in the node's `revisit_when:` key.
+pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
+DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
+pass, renumbered +4 on 2026-08-20 after colliding with the accepted
+decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
+condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 
