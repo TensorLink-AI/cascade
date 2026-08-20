@@ -203,6 +203,18 @@ num_samples    = 40              # TESTNET: reduced for CPU eval speed (was 100)
 n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusive, tractable on CPU (was 2000)
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
+
+# Jittered round mix (DEC-CA-0019) — TESTNET: armed from block 1, i.e. LIVE
+# for every round the moment this release deploys (the testnet fleet is
+# owner-only; no coordination needed). mix_target_windows = 0 keeps the draw
+# at n_windows (300) — the testnet pool is small; the jitter room comes from
+# the bag and the Dirichlet, and the mainnet 1200 calibration doesn't apply.
+mix_from_block       = 1
+mix_jitter_alpha     = 4.0
+mix_block_slots      = 8
+mix_class_keep_frac  = 0.7
+mix_series_bag_frac  = 0.7
+mix_target_windows   = 0
 # TESTNET: cap datasets per suite for the Cascade duel bench. With
 # cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on BOTH duel
 # checkpoints every round, AFTER the manifest publishes (the signed

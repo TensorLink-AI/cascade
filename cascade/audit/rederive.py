@@ -306,7 +306,11 @@ def _tier2_score_compare(
 
         source = load_pool(cfg)
         n = receipt.eval_context.n_windows if receipt.eval_context else cfg.eval.n_windows
-        windows = source.windows_for_round(receipt.base_seed, n)
+        # The epoch block gates the jittered mix: replay applies the selection
+        # rule that was active AT the audited round, not today's.
+        windows = source.windows_for_round(
+            receipt.base_seed, n, block=receipt.epoch_start_block
+        )
         ours = global_geomean(evaluate_checkpoint(
             retrained, windows, num_samples=cfg.eval.num_samples, device=device))
         theirs = global_geomean(evaluate_checkpoint(

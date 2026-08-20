@@ -607,6 +607,23 @@ class EvalConfig:
     # ``[scoring] cascade_enabled`` is off — the trainer never writes the
     # pending marker and the provisioner never arms the hold.
     bench_hold_max_hours: float = 2.0
+    # ── Jittered round mix (DEC-TB-0003 port; CONSENSUS, block-gated) ────────
+    # ``mix_from_block = 0`` keeps the legacy uniform permutation everywhere
+    # (byte-identical history). When set to an epoch-boundary block, rounds at
+    # or after that block draw a Dirichlet-jittered, class-rotated,
+    # bag-filtered mix instead — every validator AND the trainer must run this
+    # code (with the same value) before the activation block, or verdicts fork
+    # from that block on. Audit replay applies each round's own rule via the
+    # receipt's epoch_start_block. ``mix_target_windows`` (0 = n_windows) is
+    # the jittered draw size — smaller than the pool is what gives the
+    # Dirichlet room (calibration: 1200 of a ~2400 pool rotates the mix hard;
+    # 2000 barely moves it).
+    mix_from_block: int = 0
+    mix_jitter_alpha: float = 4.0
+    mix_block_slots: int = 8
+    mix_class_keep_frac: float = 0.7
+    mix_series_bag_frac: float = 0.7
+    mix_target_windows: int = 0
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1223,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
             cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
+            mix_from_block=int(e.get("mix_from_block", 0)),
+            mix_jitter_alpha=float(e.get("mix_jitter_alpha", 4.0)),
+            mix_block_slots=int(e.get("mix_block_slots", 8)),
+            mix_class_keep_frac=float(e.get("mix_class_keep_frac", 0.7)),
+            mix_series_bag_frac=float(e.get("mix_series_bag_frac", 0.7)),
+            mix_target_windows=int(e.get("mix_target_windows", 0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),

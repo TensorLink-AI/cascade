@@ -349,6 +349,14 @@ class TrainingManifest:
     # init (no promotion yet, or a pre-warm-start trainer).
     warm_start_ckpt: str = ""
     warm_start_size: str = ""
+    # Realised round composition (jittered mix, DEC-TB-0003 port): domain
+    # counts, effective domains, cadences, class count of the round's served
+    # eval windows. Informational and UNSIGNED like ``heat`` — never enters
+    # :meth:`canonical_body` (post-hoc: each round's Dirichlet draw is
+    # independent, so it predicts nothing about the next round). ``None`` while
+    # the mix is inactive, so pre-activation manifests serialise byte-for-byte
+    # as before.
+    composition: dict | None = None
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -496,6 +504,10 @@ def dump_manifest(manifest: TrainingManifest) -> str:
     # byte-for-byte as before — no wire-format break, no version bump.
     if manifest.heat is not None:
         body["heat"] = heat_to_json(manifest.heat)
+    # Same pattern as ``heat``: only present when the jittered mix served the
+    # round, so every earlier manifest serialises byte-for-byte as before.
+    if manifest.composition is not None:
+        body["composition"] = manifest.composition
     return json.dumps(body, indent=2, sort_keys=True)
 
 
@@ -530,6 +542,7 @@ def load_manifest(text: str) -> TrainingManifest:
         entries=entries,
         manifest_version=version,
         heat=_heat_from_json(obj.get("heat")),
+        composition=obj.get("composition"),
         eval_pool_key=str(obj.get("eval_pool_key", "") or ""),
         eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
         warm_start_ckpt=str(obj.get("warm_start_ckpt", "") or ""),

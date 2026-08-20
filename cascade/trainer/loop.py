@@ -607,6 +607,12 @@ class TrainerRunner:
     # rather than trusting the unsigned pool index. None ⇒ manifests go out
     # unpinned (legacy). Wired in trainer.main from the screen pool source.
     pool_provenance_fn: object | None = None
+    # Realised round composition: ``(base_seed, block) -> dict | None`` — the
+    # jittered mix's post-hoc domain/class breakdown of the round's eval draw
+    # (None while the mix is inactive). Attached to the manifest UNSIGNED (like
+    # ``heat``) for the public feed. Wired in trainer.main from the same pool
+    # source the screen uses.
+    composition_fn: object | None = None
     # Cascade: scores a duel checkpoint on GIFT-Eval / BOOM / TIME for the round's
     # POST-PUBLISH signed bench report (cascade.shared.bench_report) — validators
     # read one authoritative signed set per role, so promotion stays consensus-
@@ -2734,6 +2740,15 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — pinning must never sink a round
                 log.warning("eval-pool pin unavailable for round=%s: %s", base_seed, e)
 
+        # Post-hoc realised mix of the round's eval draw (unsigned, like heat).
+        # Best-effort: a miss just publishes without the block.
+        composition = None
+        if self.composition_fn is not None:
+            try:
+                composition = self.composition_fn(base_seed, screen_block)
+            except Exception as e:  # noqa: BLE001 — never sinks a round
+                log.warning("round composition unavailable for round=%s: %s", base_seed, e)
+
         return TrainingManifest(
             round_id=str(base_seed),
             created_block=block,
@@ -2742,6 +2757,7 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
             heat=heat,
+            composition=composition,
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
