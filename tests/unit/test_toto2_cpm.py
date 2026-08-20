@@ -588,11 +588,11 @@ def test_lr_schedule_honoured():
     from cascade.trainer.toto2_trainer import _lr_at
 
     # warmup identical for both schedules
-    assert _lr_at(50, 1000, 100, 1.0) == _lr_at(50, 1000, 100, 1.0, "warmup_flat")
+    assert _lr_at(50, 1000, 100, 1.0) == _lr_at(50, 1000, 100, 1.0, schedule="warmup_flat")
     # cosine decays; flat holds
     assert _lr_at(900, 1000, 100, 1.0) < 0.1
-    assert _lr_at(900, 1000, 100, 1.0, "warmup_flat") == 1.0
-    assert _lr_at(999, 1000, 0, 1.0, "warmup_flat") == 1.0
+    assert _lr_at(900, 1000, 100, 1.0, schedule="warmup_flat") == 1.0
+    assert _lr_at(999, 1000, 0, 1.0, schedule="warmup_flat") == 1.0
 
     contract = SimpleNamespace(
         context_length=16, horizon=8, patch_size=4, d_model=16, num_layers=1,
