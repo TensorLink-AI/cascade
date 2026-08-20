@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0018
+id: DEC-CA-0019
 type: decision
 title: "The per-round eval draw is jittered — composition unpredictable, equal-weight per domain in expectation, block-gated activation"
 status: active

@@ -285,7 +285,7 @@ n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
-# Jittered round mix (DEC-TB-0003 port, DEC-CA-0018) — ARMED AT RELEASE
+# Jittered round mix (DEC-TB-0003 port, DEC-CA-0019) — ARMED AT RELEASE
 # (owner decision 2026-08-20, the DEC-CA-0016 pattern): this config ships the
 # live activation block, so the release IS the activation. Rounds whose epoch
 # boundary is >= mix_from_block draw the jittered mix; every earlier round

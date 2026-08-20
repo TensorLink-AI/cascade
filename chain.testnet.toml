@@ -204,7 +204,7 @@ n_windows      = 300             # TESTNET: 300 > min_windows(200) → conclusiv
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
 
-# Jittered round mix (DEC-CA-0018) — TESTNET: armed from block 1, i.e. LIVE
+# Jittered round mix (DEC-CA-0019) — TESTNET: armed from block 1, i.e. LIVE
 # for every round the moment this release deploys (the testnet fleet is
 # owner-only; no coordination needed). mix_target_windows = 0 keeps the draw
 # at n_windows (300) — the testnet pool is small; the jitter room comes from
