@@ -155,9 +155,9 @@ in-context.
   without-replacement always), salted-hash series bag, class rotation inert
   until pool snapshots carry `dgp_class`. Draw size 1200 (`mix_target_windows`)
   — at 2000 the caps crush the jitter. Block-gated activation, ARMED AT
-  RELEASE (mainnet `mix_from_block = 8892000` = 2026-08-20 20:30 UTC,
-  IMMEDIATE by owner decision — externals diverge until upgraded;
-  testnet = 1): audit replays each round's own rule.
+  RELEASE (mainnet `mix_from_block = 8895600` = 2026-08-21 08:30 UTC, the
+  single coordinated fleet-deploy boundary — externals diverge from that
+  block until upgraded; testnet = 1): audit replays each round's own rule.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 
