@@ -419,6 +419,13 @@ class RoundConfig:
     # screen starts rewarding fast-to-generate data over good data.
     heat_guard_factor: float = 1.0
     heat_guard_floor_seconds: int = 900
+    # In-round re-queues for a heat challenger whose dispatch (and its
+    # in-dispatch retry) died on an INFRASTRUCTURE failure — storage layer or
+    # SSH transport (rc=255). Challenger-fault failures never re-queue. Each
+    # re-queue is one more full heat run in the worst case, so the added
+    # wall-clock is bounded by this × the per-dispatch timeout. 0 ⇒ off
+    # (the pre-2026-08-19 behaviour: infra casualties drop terminally).
+    heat_infra_requeues: int = 2
     finalists: int = 1                # challengers promoted from the heat to the final
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])

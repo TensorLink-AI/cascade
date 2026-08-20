@@ -42,6 +42,7 @@ import re
 import shutil
 import tarfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -337,6 +338,10 @@ _RETRYABLE_HUB_ERROR_SUBSTRINGS = (
     # must stay non-retryable.
     "http transport error", "error decoding response body",
     "error reading a body", "end of file before message length reached",
+    # Observed 2026-08-15..19 as the cause under "chunk 0 failed" on transient
+    # registry drops (retry always succeeded). A genuinely-local cause (disk
+    # full) just burns the 3 extra attempts (~14s) before the same failure.
+    "local i/o error",
 )
 
 
@@ -350,10 +355,25 @@ def _is_retryable_hub_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, HubAuthError):
         return False
-    if isinstance(exc, (TimeoutError, ConnectionError)):
-        return True
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(sub in text for sub in _RETRYABLE_HUB_ERROR_SUBSTRINGS)
+    # Walk the cause chain: hippius_hub wraps transport failures as bare
+    # RuntimeError("chunk N failed") / RuntimeError("local I/O error") with the
+    # retryable detail ("http transport error", "error decoding response body",
+    # ...) buried in __cause__/__context__. Matching only the top exception
+    # classified those as permanent, so _retry_hub_op gave up after 1 of its 4
+    # attempts on every transient chunk drop (observed 6×, 2026-08-15..19).
+    # Auth stays non-retryable: a 401-wrapped chunk failure carries no
+    # transport substring at any level of the chain.
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, (TimeoutError, ConnectionError)):
+            return True
+        text = f"{type(node).__name__}: {node}".lower()
+        if any(sub in text for sub in _RETRYABLE_HUB_ERROR_SUBSTRINGS):
+            return True
+        node = node.__cause__ or node.__context__
+    return False
 
 
 # ─────────────── will this ref EVER fetch? (archiver's question) ─────────────
@@ -556,57 +576,84 @@ def upload_dir_to_hub_or_hf(
         return upload_dir_to_hf(local_dir, hf_repo, token=hf_token)
 
 
+# Written into a snapshot dir as the LAST step before the atomic rename into
+# place, so its presence proves the dir holds a complete verified snapshot.
+FETCH_COMPLETE_MARKER = ".fetch_complete"
+
+
 def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None) -> Path:
     """Download an immutable Hub (or ``hf:``) snapshot into ``dest_dir``.
 
     ``ref`` may be a :class:`HubRef` or a ``repo@digest`` string. The OCI digest
     pins the content, so no separate integrity check is needed on fetch — a Hub
     that served the wrong bytes for a digest would fail the layer verification.
+
+    Concurrency-safe against sibling processes fetching the same digest into the
+    same ``dest_dir`` (heat lanes on one pod all warm-start from one checkpoint):
+    the download lands in a private temp dir that is renamed into place only once
+    complete, and a dir already carrying :data:`FETCH_COMPLETE_MARKER` is reused
+    as-is — the digest pins the bytes, so a completed snapshot never goes stale.
+    (The old unconditional rmtree+redownload deleted the dir out from under
+    sibling lanes mid-read: 2026-08-19 r29 heat drops.)
     """
     ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
     dest = Path(dest_dir)
-    if dest.exists():
-        shutil.rmtree(dest)
+    if (dest / FETCH_COMPLETE_MARKER).exists():
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if ref.digest.startswith("hf:"):
-        from huggingface_hub import snapshot_download as hf_snapshot_download
+    tmp = dest.parent / f".{dest.name}.fetch-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        if ref.digest.startswith("hf:"):
+            from huggingface_hub import snapshot_download as hf_snapshot_download
 
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
-        path = _retry_hub_op(
-            lambda: hf_snapshot_download(
-                repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(dest),
-                allow_patterns=ALLOW_PATTERNS, token=hf_token,
-            ),
-            f"fetch of {ref.immutable_ref}",
-        )
-    else:
-        try:
-            from hippius_hub import snapshot_download
-        except ImportError as e:
-            raise StorageError(
-                "hippius-hub not installed; install the [hippius] extra to use the registry"
-            ) from e
-        hub_token = _resolve_hub_token_for_pull(f"Downloading {ref.immutable_ref}")
-        try:
-            path = _retry_hub_op(
-                lambda: snapshot_download(
-                    repo_id=ref.repo, revision=ref.digest, local_dir=str(dest),
-                    allow_patterns=ALLOW_PATTERNS, token=hub_token,
+            hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY")
+            _retry_hub_op(
+                lambda: hf_snapshot_download(
+                    repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(tmp),
+                    allow_patterns=ALLOW_PATTERNS, token=hf_token,
                 ),
                 f"fetch of {ref.immutable_ref}",
             )
-        except Exception as e:
-            denied = any(s in str(e).lower()
-                         for s in ("401", "403", "unauthorized", "forbidden"))
-            if hub_token is False and denied:
-                raise HubAuthError(
-                    f"Anonymous pull of {ref.immutable_ref} was refused (private "
-                    f"repo?): set a token ({', '.join(HUB_TOKEN_ENV_NAMES)}) or "
-                    f"username+password ({HUB_USERNAME_ENV_NAMES[0]} + "
-                    f"{HUB_PASSWORD_ENV_NAMES[0]})."
+        else:
+            try:
+                from hippius_hub import snapshot_download
+            except ImportError as e:
+                raise StorageError(
+                    "hippius-hub not installed; install the [hippius] extra to use the registry"
                 ) from e
-            raise
-    return Path(path)
+            hub_token = _resolve_hub_token_for_pull(f"Downloading {ref.immutable_ref}")
+            try:
+                _retry_hub_op(
+                    lambda: snapshot_download(
+                        repo_id=ref.repo, revision=ref.digest, local_dir=str(tmp),
+                        allow_patterns=ALLOW_PATTERNS, token=hub_token,
+                    ),
+                    f"fetch of {ref.immutable_ref}",
+                )
+            except Exception as e:
+                denied = any(s in str(e).lower()
+                             for s in ("401", "403", "unauthorized", "forbidden"))
+                if hub_token is False and denied:
+                    raise HubAuthError(
+                        f"Anonymous pull of {ref.immutable_ref} was refused (private "
+                        f"repo?): set a token ({', '.join(HUB_TOKEN_ENV_NAMES)}) or "
+                        f"username+password ({HUB_USERNAME_ENV_NAMES[0]} + "
+                        f"{HUB_PASSWORD_ENV_NAMES[0]})."
+                    ) from e
+                raise
+        (tmp / FETCH_COMPLETE_MARKER).touch()
+        try:
+            os.rename(tmp, dest)
+        except OSError:
+            if (dest / FETCH_COMPLETE_MARKER).exists():
+                pass  # a sibling completed first — its snapshot is identical
+            else:
+                # dest holds a legacy or partial dir (no marker): replace it.
+                shutil.rmtree(dest, ignore_errors=True)
+                os.rename(tmp, dest)
+        return dest
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ─────────────────────────────────── S3 ─────────────────────────────────────
