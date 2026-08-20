@@ -34,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..shared.chain_status import STAGE_OVERHEAD_SECONDS, stage_windows
-from ..shared.config import RoundConfig, effective_epoch_blocks
+from ..shared.config import RoundConfig, ScoringConfig, effective_epoch_blocks
 
 DEFAULT_SECONDS_PER_BLOCK = 12.0
 BAR_WIDTH = 28
@@ -360,6 +360,70 @@ def outcome_line(entry: dict) -> str:
     king = entry.get("post_round_king_uid")
     held = f"king held (uid {king})" if king is not None else "king held"
     return f"round settled — {held}"
+
+
+# ── current dethrone bar (the tenure-decayed margin, DEC-CA-0016) ────────────
+#
+# The margin a challenger must clear DECAYS with the king's tenure, so the
+# number in the last settled receipt is already one decay step stale for the
+# round in flight. The receipt index carries everything needed to derive the
+# live bar without validator state: walk the settled rounds newest-first and
+# count consecutive holds by the current king (the crowning round — its
+# ``dethroned`` row — ends the walk and is not a hold), then apply the same
+# affine schedule the validator uses (``eval.koth.margin_for_tenure``,
+# replicated here so the dashboard stays free of the eval package).
+
+
+def current_king_tenure(index_doc: dict | None) -> int | None:
+    """The king's tenure ENTERING the round in flight, derived from the public
+    receipt index — the tenure the next verdict will be judged at. None when
+    no settled round is available."""
+    per_round: dict[int, dict] = {}
+    for r in _index_rounds(index_doc):
+        if str(r.get("status")) != "scored":
+            continue
+        esb = _as_int(r.get("epoch_start_block"))
+        if esb is not None:
+            per_round[esb] = r
+    if not per_round:
+        return None
+    ordered = [per_round[esb] for esb in sorted(per_round)]
+    king = ordered[-1].get("post_round_king_hotkey")
+    if not king:
+        return None
+    tenure = 0
+    for row in reversed(ordered):
+        if row.get("post_round_king_hotkey") != king or row.get("dethroned"):
+            break
+        tenure += 1
+    return tenure
+
+
+def margin_for_tenure_cfg(scoring: ScoringConfig, tenure: int) -> float:
+    """The validator's affine margin schedule (``eval.koth.margin_for_tenure``)
+    computed from ``[scoring]`` directly."""
+    if scoring.margin_warmup_rounds <= 0:
+        return scoring.win_margin_end
+    frac = min(max(tenure, 0) / scoring.margin_warmup_rounds, 1.0)
+    return scoring.win_margin_start + frac * (scoring.win_margin_end - scoring.win_margin_start)
+
+
+def dethrone_bar_line(index_doc: dict | None, scoring: ScoringConfig | None) -> str | None:
+    """The forward-looking margin line for the round in flight, or None when
+    the schedule is flat (no decay configured) or the index gives no tenure."""
+    if scoring is None or scoring.win_margin_start == scoring.win_margin_end:
+        return None
+    tenure = current_king_tenure(index_doc)
+    if tenure is None:
+        return None
+    margin = margin_for_tenure_cfg(scoring, tenure)
+    floor_at = scoring.margin_warmup_rounds
+    if tenure >= floor_at:
+        tail = f"at the {scoring.win_margin_end * 100:.2f}% floor"
+    else:
+        tail = f"floor {scoring.win_margin_end * 100:.2f}% at tenure {floor_at}"
+    return (f"  dethrone bar    LCB > {margin * 100:.3f}% this round"
+            f"  (king tenure {tenure}; {tail})")
 
 
 # ── heat standings (public heat mirror; no credentials needed) ───────────────
@@ -896,6 +960,7 @@ def render(
     submissions: list[SubmissionRow] | None = None,
     last_outcome: str | None = None,
     heat_lines: list[str] | None = None,
+    bar_line: str | None = None,
 ) -> str:
     """The dashboard frame. ``drift_seconds`` is the wall-clock time elapsed
     since ``st.block`` was fetched, so watch mode can tick the countdown every
@@ -923,6 +988,8 @@ def render(
         lines.append(f"                  {phase.detail}")
     if last_outcome:
         lines.append(f"  last round      {last_outcome}")
+    if bar_line:
+        lines.append(bar_line)
     if heat_lines:
         lines += heat_lines
     if submissions is not None:
@@ -952,6 +1019,7 @@ def compose_frame(
     *,
     drift_seconds: float = 0.0,
     me: str | None = None,
+    scoring: ScoringConfig | None = None,
 ) -> str:
     """Assemble one full frame from the chain snapshot + the live feed.
 
@@ -985,9 +1053,13 @@ def compose_frame(
                          now_s=time.time())
     heat_lines = heat_block(heat_doc, me=me) if heat_doc is not None else None
     submissions = feed.rows(st.epoch_start, floor_block=round_cfg.commit_floor_block)
+    # Forward-looking bar only while the round is in flight — once this round
+    # settles its receipt states the margin it was actually judged at.
+    bar_line = (dethrone_bar_line(feed.index_doc, scoring)
+                if entry is None else None)
     return render(st, network, drift_seconds=drift_seconds, phase=phase,
                   submissions=submissions, last_outcome=last_outcome,
-                  heat_lines=heat_lines)
+                  heat_lines=heat_lines, bar_line=bar_line)
 
 
 def run_dashboard(
@@ -1003,6 +1075,7 @@ def run_dashboard(
     status_fetch: Callable[[], dict | None] | None = None,
     heat_fetch: Callable[[], dict | None] | None = None,
     me: str | None = None,
+    scoring: ScoringConfig | None = None,
 ) -> int:
     """Print the round dashboard; in watch mode, keep it live until Ctrl+C.
 
@@ -1025,7 +1098,8 @@ def run_dashboard(
                     heat_fetch=heat_fetch)
     st = round_status(client.current_block(), round_cfg)
     feed.poll()
-    frame = compose_frame(st, network, round_cfg, feed, timeline, me=me)
+    frame = compose_frame(st, network, round_cfg, feed, timeline, me=me,
+                          scoring=scoring)
     print(frame, file=out)
     if once or not getattr(out, "isatty", lambda: False)():
         return 0
@@ -1044,7 +1118,7 @@ def run_dashboard(
                 feed.poll()
                 feed_at = time.monotonic()
             frame = compose_frame(st, network, round_cfg, feed, timeline,
-                                  drift_seconds=drift, me=me)
+                                  drift_seconds=drift, me=me, scoring=scoring)
             # move to the top of the previous frame, clear below, redraw
             print(f"\x1b[{lines}F\x1b[J" + frame, file=out)
             lines = frame.count("\n") + 1  # the feed can grow/shrink the frame
