@@ -39,3 +39,4 @@ worker_manual.log
 
 # local proposal prompts (not for the repo)
 /PROPOSAL-*.md
+receipts_cache/
