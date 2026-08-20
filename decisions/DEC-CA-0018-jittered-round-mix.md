@@ -54,14 +54,19 @@ window difficulty. The floor margin (`win_margin_end > 0`, DEC-CA-0016)
 stays the backstop against mix-luck dethrones; `per_domain_win_rate` is the
 tripwire.
 
-**Consensus: block-gated, shipped OFF.** `[eval] mix_from_block = 0` keeps
-the legacy permutation byte-identical everywhere (pinned by test). Arming =
-setting it to a future epoch boundary: every external validator and the
-trainer must run mix-capable code with the same value BEFORE that block —
-mixed fleets agree on every round while upgrading (no simultaneity needed,
-unlike the DEC-CA-0016 rollout), and audit replay applies each round's own
-rule via the receipt's `epoch_start_block`. The realised composition
-publishes post-hoc as an UNSIGNED `composition` manifest block (the `heat`
-pattern — old signatures survive; each round's Dirichlet draw is
-independent, so it predicts nothing). Testnet-first, one full round cycle,
-before any mainnet `mix_from_block` is set.
+**Consensus: block-gated, ARMED AT RELEASE** (owner decision 2026-08-20,
+the DEC-CA-0016 pattern — the release IS the activation). chain.toml ships
+`mix_from_block = 8935200` (epoch boundary ~2026-08-26 20:30 UTC);
+chain.testnet.toml ships `mix_from_block = 1` (live immediately on the
+owner-only testnet fleet, one full cycle of soak before the mainnet block
+arrives). Every round before the activation block keeps the legacy
+permutation byte-identically (pinned by test), so the fleet upgrades on a
+DEADLINE, not in a window: all 6 external validators and the trainer must
+be running this release before block 8935200 or their verdicts fork from
+that block on. Audit replay applies each round's own rule via the receipt's
+`epoch_start_block`. The realised composition publishes post-hoc as an
+UNSIGNED `composition` manifest block (the `heat` pattern — old signatures
+survive; each round's Dirichlet draw is independent, so it predicts
+nothing). A stale TRAINER past the block is not a fork (the manifest pins
+snapshots, not slices) — it just heat-screens on the legacy mix and omits
+the composition block; still upgrade it with the fleet.
