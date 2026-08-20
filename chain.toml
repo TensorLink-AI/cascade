@@ -138,10 +138,13 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-# worker-v0.5.0 (2026-08-05, CI run 30974674919): bakes DEC-CA-0010 host
-# telemetry + PR-174 bench pipeline tree. v0.4.0 retired:
-# sha256:f73c77276b80942c61e7c5570bbbafbd69c8fd15e79cffbbcf75c8855715c9a0
-train_image_digest = "sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c91303163b6f57"
+# worker-v0.6.0 (2026-08-20, CI run 32427927572, built from main@b42f768 —
+# the full 8-PR go-live stack): bakes WSD + optimizer-state sidecar
+# (DEC-CA-0018), tie-aware cohort trainer (DEC-CA-0012), hub-fetch hardening
+# (#206, ends per-pod hippius patching), heat infra requeues (#207), bench
+# prewarm (#204). v0.5.0 retired:
+# sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c91303163b6f57
+train_image_digest = "sha256:68cea71927df0b348fdca0c6420960a6e2ae15806fe063023b59b03e6ac17267"
 # ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.4.0 (2026-07-23, built from
 # 1325409 — [wandb] extra baked, warm-start worker plumbing, incident-hardening
 # trainer code; torch/generator-dependency stack unchanged from v0.3.1).
