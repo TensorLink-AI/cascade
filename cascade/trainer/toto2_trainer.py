@@ -53,10 +53,14 @@ class _TimedStream:
     the data path was starved. ``wait_s`` separates the two: it is exactly the
     time training spent waiting on the corpus, so ``wait_s / train_seconds``
     (``data_wait_frac``) reads directly as "fraction of the run starved".
+
+    ``observer`` (optional) sees every series as it passes — the shadow
+    channel-redundancy accumulator rides here (DEC-CA-0026; free at C = 1).
     """
 
-    def __init__(self, stream: Iterator[np.ndarray]) -> None:
+    def __init__(self, stream: Iterator[np.ndarray], observer=None) -> None:
         self._it = iter(stream)
+        self._observer = observer
         self.wait_s = 0.0
 
     def __iter__(self) -> _TimedStream:
@@ -65,15 +69,35 @@ class _TimedStream:
     def __next__(self) -> np.ndarray:
         t0 = time.perf_counter()
         try:
-            return next(self._it)
+            s = next(self._it)
         finally:
             self.wait_s += time.perf_counter() - t0
+        if self._observer is not None:
+            self._observer(s)
+        return s
 
 
-def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float) -> float:
-    """warmup_cosine over the token budget: linear warmup then cosine to 0."""
+# LR schedules the trainer honours ([training] lr_schedule; digest-bound, so a
+# schedule flip is a contract change — release-then-activate):
+#   warmup_cosine — linear warmup then cosine to 0. The from-scratch rule
+#                   (every deployed round).
+#   warmup_flat   — linear warmup then constant at base_lr. The compounding-
+#                   lineage rule (DEC-CA-0027 E2): a per-round cosine would
+#                   decay a lineage that must keep learning across rounds;
+#                   release checkpoints are LR-decayed COPIES, the lineage
+#                   itself never decays.
+LR_SCHEDULES = ("warmup_cosine", "warmup_flat")
+
+
+def _lr_at(
+    token_pos: int, total: int, warmup: int, base_lr: float,
+    schedule: str = "warmup_cosine",
+) -> float:
+    """The contract LR at ``token_pos`` of ``total`` (see LR_SCHEDULES)."""
     if warmup > 0 and token_pos < warmup:
         return base_lr * token_pos / max(1, warmup)
+    if schedule == "warmup_flat":
+        return base_lr
     if total <= warmup:
         return base_lr
     progress = (token_pos - warmup) / max(1, total - warmup)
@@ -104,32 +128,105 @@ def sample_cpm_masks(n_rows: int, n_patches: int, *, c_max: int, p_max: float, r
     return masks
 
 
+def weighted_pinball_loss(pred_q, target, levels: tuple[float, ...], weight=None):
+    """Pinball loss with an optional per-element weight — the accepted-fields
+    consumption seam (DEC-CA-0023/0026): 0 excludes an element (a missing
+    target, a covariate channel) from the objective.
+
+    Lives HERE, not in ``toto2_model.py``: the model source's bytes are folded
+    into ``base_arch_digest`` (see ``contract.compute_base_arch_digest``), and
+    loss weighting is a trainer concern the checkpoint never uses at inference
+    — moving it into the model file would re-pin the arch for a change that
+    does not alter the architecture. ``weight=None`` delegates to the model's
+    own ``pinball_loss``, bit-for-bit.
+    """
+    import torch
+
+    from .toto2_model import pinball_loss
+
+    if weight is None:
+        return pinball_loss(pred_q, target, levels)
+    q = torch.tensor(levels, device=pred_q.device, dtype=pred_q.dtype)
+    err = target.unsqueeze(-1) - pred_q
+    loss = torch.maximum(q * err, (q - 1.0) * err)
+    w = weight.to(loss.dtype).unsqueeze(-1)
+    denom = (w.sum() * loss.shape[-1]).clamp_min(1e-9)
+    return (loss * w).sum() / denom
+
+
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
-    """Yield ``(B, P*patch_size)`` float64 training batches from a series stream.
+    """Yield ``(B, C, P*patch_size)`` float64 training batches from a series
+    stream.
 
     Pure numpy (no torch) so it is unit-testable. Each incoming ``(C, L)`` or
-    ``(L,)`` series is reduced to channel 0 and its last ``P`` patches are kept,
-    where ``P = min(L // patch_size, max_ctx_patches)``; series with fewer than 2
-    patches are skipped (a next-patch objective needs at least one input + one
-    target patch). Batches are **bucketed by ``P``** so all rows in a batch share
-    a length and stack without padding. Full buckets are emitted eagerly; partial
-    buckets are flushed when the stream ends. This is what lets the trainer learn
-    from realistic series whose length is below the full ``context_length``.
+    ``(L,)`` series keeps ALL its channels (a 1-D series is one channel) and its
+    last ``P`` patches per channel, where ``P = min(L // patch_size,
+    max_ctx_patches)``; series with fewer than 2 patches are skipped (a
+    next-patch objective needs at least one input + one target patch). Batches
+    are **bucketed by ``(P, C)``** so all rows in a batch share a shape and
+    stack without padding or a variate attention mask — the model's forward
+    takes a uniform channel count per batch. Full buckets are emitted eagerly;
+    partial buckets are flushed when the stream ends. A corpus may freely mix
+    channel counts; at ``C = 1`` throughout (today's cap) every batch is
+    ``(B, 1, L)`` carrying exactly the bytes the old channel-0 path carried.
+
+    History note (DEC-CA-0026): this used to reduce every series to channel 0
+    (``s = s[0]``) while the stream billed all ``C`` channels against the token
+    budget — a multivariate series paid ``C×`` for ``1×`` training signal. All
+    channels are consumed now, and the trainer's token accounting counts them,
+    so a channel costs exactly what it trains. Do not raise ``[generator]
+    max_channels`` on any build without this.
+
+    Extended-record series (``{"values", "mask", "roles"}`` dicts, present only
+    when ``[training] accepted_fields`` is armed) ride the same buckets: the
+    mask is cropped alongside its values, roles are carried per row, and a
+    bucket whose rows carry ANY extra yields a dict batch (``values`` (B, C, L),
+    ``mask`` (B, C, L) uint8 — all-zeros rows for maskless series — and
+    ``roles`` (B, C) uint8 — all-targets rows for roleless series). A bucket of
+    purely bare series yields the bare ``(B, C, L)`` array, byte-identical to
+    the unarmed build.
     """
-    buckets: dict[int, list[np.ndarray]] = {}
+    buckets: dict[tuple[int, int], list[tuple]] = {}
+
+    def _stack(items: list[tuple]):
+        vals = np.stack([v for v, _, _ in items], axis=0)
+        if all(m is None for _, m, _ in items) and all(r is None for _, _, r in items):
+            return vals
+        _, n_ch, width = vals.shape
+        masks = np.stack([
+            m if m is not None else np.zeros((n_ch, width), dtype=np.uint8)
+            for _, m, _ in items
+        ], axis=0)
+        roles = np.stack([
+            r if r is not None else np.zeros(n_ch, dtype=np.uint8)
+            for _, _, r in items
+        ], axis=0)
+        return {"values": vals, "mask": masks, "roles": roles}
+
     for series in stream:
-        s = np.asarray(series, dtype=np.float64)
-        if s.ndim == 2:
-            s = s[0]
-        p = min(int(s.shape[0]) // patch_size, max_ctx_patches)
+        mask = roles = None
+        if isinstance(series, dict):
+            s = np.atleast_2d(np.asarray(series["values"], dtype=np.float64))
+            if series.get("mask") is not None:
+                mask = np.atleast_2d(np.asarray(series["mask"], dtype=np.uint8))
+            if series.get("roles") is not None:
+                roles = np.asarray(series["roles"], dtype=np.uint8)
+        else:
+            s = np.atleast_2d(np.asarray(series, dtype=np.float64))   # (C, L)
+        c = int(s.shape[0])
+        p = min(int(s.shape[-1]) // patch_size, max_ctx_patches)
         if p < 2:
             continue
-        buckets.setdefault(p, []).append(s[-p * patch_size :])
-        if len(buckets[p]) >= batch_size:
-            yield np.stack(buckets.pop(p), axis=0)
+        key = (p, c)
+        w = p * patch_size
+        buckets.setdefault(key, []).append(
+            (s[:, -w:], None if mask is None else mask[:, -w:], roles)
+        )
+        if len(buckets[key]) >= batch_size:
+            yield _stack(buckets.pop(key))
     for items in buckets.values():
         if items:
-            yield np.stack(items, axis=0)
+            yield _stack(items)
 
 
 # Polar Express (arXiv 2505.16932, Implementation 1): the minimax-optimal
@@ -240,7 +337,6 @@ class Toto2Trainer:
             Toto2Model,
             causal_standardize,
             patch_anchors,
-            pinball_loss,
         )
 
         torch.manual_seed(training_seed)
@@ -269,6 +365,14 @@ class Toto2Trainer:
 
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
+        # The contract's LR schedule, honoured (it used to be decorative —
+        # warmup_cosine ran unconditionally). Validated up front so a typo'd
+        # digest-bound value fails the run's first second, not mid-round.
+        lr_schedule = str(getattr(contract, "lr_schedule", "warmup_cosine"))
+        if lr_schedule not in LR_SCHEDULES:
+            raise ValueError(
+                f"lr_schedule={lr_schedule!r} not implemented; one of {LR_SCHEDULES}"
+            )
 
         tokens = 0
         step = 0
@@ -288,8 +392,13 @@ class Toto2Trainer:
 
         # Timed corpus pulls: every second blocked in next() is starvation the
         # loss curve can't show (see _TimedStream) — surfaced as data_wait_s /
-        # data_wait_frac in the run's metrics and per-step records.
-        timed_stream = _TimedStream(stream)
+        # data_wait_frac in the run's metrics and per-step records. The shadow
+        # channel-redundancy accumulator observes each series in passing
+        # (DEC-CA-0026 telemetry; no-op at C = 1, never in any scoring path).
+        from .channel_stats import ChannelStatsAccumulator
+
+        channel_stats = ChannelStatsAccumulator()
+        timed_stream = _TimedStream(stream, observer=channel_stats.observe)
 
         # Bucketed batching: series shorter than the full context still train (the
         # generator's max_length can be < context_length). Each batch holds series
@@ -304,42 +413,104 @@ class Toto2Trainer:
             if deadline is None:             # first batch: training starts NOW
                 t0 = time.time()
                 deadline = t0 + contract.max_train_seconds
+            # Extended-record batches (mask/roles armed via [training]
+            # accepted_fields) arrive as dicts; bare batches (every corpus at
+            # today's config) keep the legacy ndarray path bit-for-bit.
+            if isinstance(arr, dict):
+                vals_np = arr["values"]                          # (B, C, P*ps)
+                data_mask_np = arr["mask"]                       # (B, C, P*ps) u8
+                roles_np = arr["roles"]                          # (B, C) u8
+            else:
+                vals_np, data_mask_np, roles_np = arr, None, None
+            n_batch, n_ch, width = vals_np.shape                 # (B, C, P*ps)
+            rows = n_batch * n_ch
+            num_patches = width // cfg.patch_size
             # Standardize from float64: downcasting the raw series first would
             # quantize away small fluctuations at large levels (float32 has ~7
             # digits) before the scaler ever sees them. Only the O(1)-scale z
-            # and targets drop to the model dtype.
-            x = torch.as_tensor(arr, device=self.device, dtype=torch.float64)  # (B, P*ps)
-            num_patches = arr.shape[1] // cfg.patch_size
+            # and targets drop to the model dtype. The causal scaler and the
+            # CPM sampler are per-ROW (= per channel — Toto scales each variate
+            # on its own history), so channels flatten into the row axis here
+            # and fold back to (B, C, …) for the model's variate attention. At
+            # C = 1 every tensor below is byte-identical to the historical
+            # single-channel path (rows == B, same RNG draw sequence).
+            x = torch.as_tensor(
+                vals_np.reshape(rows, width), device=self.device, dtype=torch.float64
+            )
             cpm = sample_cpm_masks(
-                arr.shape[0], num_patches,
+                rows, num_patches,
                 c_max=cfg.cpm_c_max, p_max=cfg.cpm_p_max, rng=mask_rng,
             )
-            mask = torch.as_tensor(cpm, device=self.device)                 # (B, P)
+            # Role-aware CPM (DEC-CA-0026): future-known channels (role 2)
+            # keep their values VISIBLE — their CPM rows are zeroed AFTER the
+            # draw, so the RNG stream (and every all-targets batch) is
+            # byte-identical to the unarmed build. Drawn-then-zeroed, never
+            # skipped.
+            if roles_np is not None and (roles_np == 2).any():
+                cpm[roles_np.reshape(rows) == 2] = False
+            mask = torch.as_tensor(cpm, device=self.device)      # (rows, P)
             step_mask = (
                 mask[:, :, None].expand(-1, -1, cfg.patch_size).reshape(x.shape)
             ).to(x.dtype)
+            if data_mask_np is not None and data_mask_np.any():
+                # Missing-data consumption (DEC-CA-0023): OR the data mask
+                # into the input mask — a missing entry is unobserved exactly
+                # like a CPM-masked one, so the causal stats skip it and the
+                # model sees (0-fill, mask=1), the same encoding CPM uses.
+                data_step = torch.as_tensor(
+                    data_mask_np.reshape(rows, width), device=self.device
+                ).to(x.dtype)
+                step_mask = torch.clamp(step_mask + data_step, max=1.0)
+                entry_mask = step_mask.view(n_batch, n_ch, num_patches, cfg.patch_size)
+            else:
+                entry_mask = None
             # Per-step causal stats over unmasked entries only — masked spans
             # carry the last observed stats forward, exactly like the horizon
             # mask patches at inference.
             z, loc, scale = causal_standardize(x, mask=step_mask)
-            patches = z.to(self.dtype).view(x.shape[0], num_patches, cfg.patch_size)
-            pred = model(patches, mask=mask)            # (B, P, patch_size, num_q)
-            pred_q = pred[:, :-1]                        # (B, P-1, patch_size, num_q)
+            patches = z.to(self.dtype).view(n_batch, n_ch, num_patches, cfg.patch_size)
+            pred = model(
+                patches,
+                mask=(entry_mask.to(self.dtype) if entry_mask is not None
+                      else mask.view(n_batch, n_ch, num_patches)),
+            )
+            pred_q = pred[:, :, :-1]                 # (B, C, P-1, patch_size, num_q)
             # Target patch p+1 is scaled at the anchor closing patch p — the
             # stats known when that patch is forecast, so a target never leaks
             # into its own scaling.
             a_loc, a_scale = patch_anchors(loc, scale, cfg.patch_size)
-            raw = x.view(x.shape[0], num_patches, cfg.patch_size)
+            a_loc = a_loc.view(n_batch, n_ch, num_patches)
+            a_scale = a_scale.view(n_batch, n_ch, num_patches)
+            raw = x.view(n_batch, n_ch, num_patches, cfg.patch_size)
             # Clamp the target to the same bound as z (toto2_model.Z_CLAMP): the
             # model input and the loss target must share one range, and this is the
             # backstop that keeps a pathological jump from producing an inf/huge
             # target that NaNs or destabilizes the shared training step.
             target = torch.asinh(
-                (raw[:, 1:] - a_loc[:, :-1, None]) / a_scale[:, :-1, None]
+                (raw[:, :, 1:] - a_loc[:, :, :-1, None]) / a_scale[:, :, :-1, None]
             ).clamp_(-Z_CLAMP, Z_CLAMP).to(self.dtype)
-            loss = pinball_loss(pred_q, target, tuple(levels))
+            # Loss exclusion (DEC-CA-0023/0026): missing target entries carry
+            # no loss (their pinned-0.0 filler is not data), and covariate
+            # channels (role != 0) carry none either — they are conditioning
+            # context, bought at full freight, never scored. Bare batches take
+            # the exact unweighted mean of the unarmed build.
+            weight = None
+            if data_mask_np is not None or roles_np is not None:
+                w = torch.ones_like(target)
+                if data_mask_np is not None:
+                    dm = torch.as_tensor(
+                        data_mask_np, device=self.device
+                    ).view(n_batch, n_ch, num_patches, cfg.patch_size)
+                    w = w * (1.0 - dm[:, :, 1:].to(w.dtype))
+                if roles_np is not None:
+                    rw = torch.as_tensor(
+                        (roles_np == 0), device=self.device
+                    ).to(w.dtype)                        # (B, C): 1 = target
+                    w = w * rw[:, :, None, None]
+                weight = w
+            loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
-            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr)
+            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr, lr_schedule)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
@@ -348,7 +519,12 @@ class Toto2Trainer:
             optimizer.step()
 
             last_loss = float(loss.detach().cpu())
-            tokens += arr.shape[0] * arr.shape[1]
+            # Every channel of every row counts: B × C × L point-passes, so a
+            # multivariate series' token cost equals its stream billing (the
+            # C×-billed-1×-trained mispricing is dead; DEC-CA-0026). Masked
+            # entries count too — the stream billed them and the model
+            # processed them (as masked inputs); only the LOSS excludes them.
+            tokens += int(vals_np.size)
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)
@@ -405,6 +581,13 @@ class Toto2Trainer:
             "data_wait_frac": round(timed_stream.wait_s / max(train_seconds, 1e-6), 3),
             "tokens_frac": round(tokens / max(1, token_budget), 3),
         }
+        # Shadow channel-redundancy summary — present ONLY when the corpus
+        # carried multichannel series, so univariate run metrics stay
+        # byte-identical to pre-telemetry builds. [telemetry]-class data: no
+        # consumer in any scoring path (DEC-CA-0026; DEC-CA-0010 precedent).
+        ch_summary = channel_stats.summary()
+        if ch_summary is not None:
+            metrics["channel_telemetry"] = ch_summary
         if logger is not None:
             logger({"event": "done", **metrics})
 

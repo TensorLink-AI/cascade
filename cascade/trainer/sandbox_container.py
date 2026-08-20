@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +59,7 @@ CONTAINER_TMPFS = "/tmp:rw,noexec,nosuid,size=256m"
 _REPO_MNT = "/sandbox/repo"
 _SRC_MNT = "/sandbox/src"
 _OUT_MNT = "/sandbox/out"
+_REAL_MNT = "/sandbox/real"  # shared real corpus, read-only (DEC-CA-0028)
 
 _RUNTIME: str | None | bool = False  # False = unprobed
 
@@ -96,6 +97,7 @@ def container_argv(
     gpu: bool = False,
     cpu_seconds: int | None = None,
     lane_cores: tuple[int, ...] | None = None,
+    real_dir: Path | None = None,
 ) -> list[str]:
     """The full ``docker run`` argv for one sandboxed generator run.
 
@@ -142,6 +144,10 @@ def container_argv(
         argv += ["--cpuset-cpus", ",".join(str(c) for c in sorted(lane_cores))]
         for key in _BLAS_ENV_KEYS:
             argv += ["-e", f"{key}={len(lane_cores)}"]
+    if real_dir is not None:
+        # The owner-published shared real corpus (DEC-CA-0028): read-only, at a
+        # fixed mount so the cfg JSON's real_corpus_dir is host-independent.
+        argv += ["-v", f"{real_dir}:{_REAL_MNT}:ro"]
     if out_dir is not None:
         argv += ["-v", f"{out_dir}:{_OUT_MNT}:rw"]
     if gpu:
@@ -170,11 +176,18 @@ def run_in_container(
     Same contract: pre-flight → run the child → load + digest-verify the
     returned arrays. Raises :class:`CorpusError` on any failure.
     """
+    from .corpus import resolve_real_corpus
     from .sandbox import _lane_cpu_slice, _load_series, _preflight
 
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
     runtime = _require_runtime(cfg)
+    # DEC-CA-0028: materialise host-side, mount read-only at the fixed
+    # in-container path, and hand the child a cfg whose real_corpus_dir IS
+    # that mount. No-op while unarmed.
+    cfg = resolve_real_corpus(cfg)
+    real_host = Path(cfg.real_corpus_dir).resolve() if cfg.real_corpus_dir else None
+    child_cfg = replace(cfg, real_corpus_dir=_REAL_MNT) if real_host else cfg
 
     with tempfile.TemporaryDirectory(prefix="metro-csbx-") as td:
         out_dir = Path(td)
@@ -184,8 +197,9 @@ def run_in_container(
         argv = container_argv(
             cfg, runtime=runtime, name=name, repo=repo, out_dir=out_dir,
             child_args=[_REPO_MNT, str(int(generation_seed)),
-                        json.dumps(asdict(cfg)), _OUT_MNT],
+                        json.dumps(asdict(child_cfg)), _OUT_MNT],
             lane_cores=tuple(sorted(lane[0])) if lane is not None else None,
+            real_dir=real_host,
         )
         timeout = int(cfg.max_generate_seconds) + 120  # + container startup slack
         try:
@@ -229,6 +243,7 @@ def stream_series_container(
     stdout; the caller stops at its budget and the container is always killed
     on exit.
     """
+    from .corpus import resolve_real_corpus
     from .sandbox import (
         _frame_iter,
         _lane_cpu_slice,
@@ -240,6 +255,10 @@ def stream_series_container(
     repo = Path(repo_dir).resolve()
     _preflight(repo, cfg, tuple(blocked))
     runtime = _require_runtime(cfg)
+    # DEC-CA-0028: same host-side materialise + read-only mount as batch mode.
+    cfg = resolve_real_corpus(cfg)
+    real_host = Path(cfg.real_corpus_dir).resolve() if cfg.real_corpus_dir else None
+    child_cfg = replace(cfg, real_corpus_dir=_REAL_MNT) if real_host else cfg
 
     n_upper = int(token_budget) // max(int(cfg.min_length), 1) + 2
     name = f"cascade-sbx-{os.urandom(6).hex()}"
@@ -253,8 +272,9 @@ def stream_series_container(
     argv = container_argv(
         cfg, runtime=runtime, name=name, repo=repo, gpu=gpu, cpu_seconds=cpu_cap,
         child_args=["--stream", _REPO_MNT, str(int(generation_seed)),
-                    json.dumps(asdict(cfg)), str(n_upper)],
+                    json.dumps(asdict(child_cfg)), str(n_upper)],
         lane_cores=tuple(sorted(lane[0])) if lane is not None else None,
+        real_dir=real_host,
     )
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
