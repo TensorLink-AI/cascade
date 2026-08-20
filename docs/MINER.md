@@ -334,6 +334,7 @@ cascade round --network test --chain-toml chain.testnet.toml
 #   stage           heat ▸ [DUEL] ▸ validation ▸ settled
 #                   king vs finalists training at the full budget — 3h 20m 48s into the round (est.)
 #   last round      king held (uid 3)
+#   dethrone bar    LCB > 0.875% this round  (king tenure 6; floor 0.50% at tenure 8)
 #   submissions     4 in this round · 1 committed for the next
 #     uid   47  5F3sab…8kQz  my-ns/my-generator@ab12cd34…      block 4,320,100  → next round   ● new
 #     uid   12  5DkPcd…1mVx  other/gen@77aabb01…               block 4,319,882  in this round
@@ -359,6 +360,14 @@ What the live sections mean:
   configured budgets (marked `est.`); `settled` is confirmed from the public
   receipt index and needs no credentials. `last round` shows the previous
   round's verdict while the current one is still in flight.
+- **dethrone bar** — the LCB margin a challenger must clear to take the throne
+  **this round**. The margin decays with the king's tenure (an affine ramp from
+  `[scoring] win_margin_start` to `win_margin_end` over `margin_warmup_rounds`
+  held rounds, then floored), so the number in the last settled receipt is
+  already one step stale — this line derives the live bar from the public
+  receipt index (consecutive holds by the current king) and the configured
+  schedule. Shown only while the round is in flight; once it settles, the
+  receipt states the margin it was actually judged at.
 - **heat** — this round's screening standings, shown from the moment the heat
   settles (the trainer publishes them then, not with the round's receipt): every
   entrant's rank, its gap to the best entrant, its raw CRPS/MASE, and whether it
@@ -461,8 +470,13 @@ cascade duel                       # latest settled round (--round <id> for an o
 ```
 
 The dethrone rule in one line: the challenger takes the throne when the
-paired-bootstrap **LCB** of its advantage clears the configured **margin** —
-the per-domain table then shows *where* the duel was won or lost (a win rate
+paired-bootstrap **LCB** of its advantage clears the round's **margin** —
+which is not flat: it decays with the king's tenure (2% against a fresh king,
+ramping to a 0.5% floor over 8 held rounds under the default `[scoring]`
+schedule), so an entrenched king is progressively cheaper to challenge. Each
+receipt records the margin *that round* was judged at plus the king's tenure,
+and `cascade round` shows the live bar for the round in flight. The
+per-domain table then shows *where* the duel was won or lost (a win rate
 above 0.50 means the challenger beat the king on that domain's windows).
 `--history` lists every settled round's outcome. Like `cascade heat` this is
 read-only — no wallet, no chain call, no credentials — but unlike the heat
@@ -527,6 +541,17 @@ This is the game: the best generator is visible, and you win by **improving**
 on it, not hiding — a byte-identical copy of the king is dropped before it
 trains (it can only tie), so you have to genuinely beat it. Read-only; no wallet
 needed, just Hub read credentials.
+
+**Prior eval windows are public too.** The private eval pool rotates every
+round; once a round's windows have rotated out they are published (on a lag,
+so nothing live is ever revealed) to the
+[`Tensor-Link/cascade-eval-pool`](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
+dataset on HuggingFace. Use them to see exactly what past duels were scored
+on, replay a verdict against your own generator locally (download a round's
+windows and point `cascade score --pool-dir` at them), or study which domains
+and horizons the pool actually exercises.
+Training against them directly is pointless by design — the live rounds are
+always scored on windows that have never been published.
 
 ## Common failures
 

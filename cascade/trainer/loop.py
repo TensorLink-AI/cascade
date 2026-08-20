@@ -269,6 +269,11 @@ _STORAGE_FAILURE_MARKERS = (
     "generator_artifact_unreachable",
 )
 STORAGE_RETRY_BACKOFF_SECONDS = 45.0
+# Cool-down before a re-queued heat challenger is dispatched again. Longer than
+# the in-dispatch storage backoff: a re-queue means the dispatch AND its retry
+# both died, so whatever ate them (registry brown-out, provider network blip)
+# gets time to pass while other lanes keep training.
+HEAT_REQUEUE_COOLDOWN_SECONDS = 120.0
 
 
 def _storage_failure(exc: BaseException) -> bool:
@@ -278,6 +283,74 @@ def _storage_failure(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return any(m in msg for m in _STORAGE_FAILURE_MARKERS)
+
+
+def _infra_failure(exc: BaseException) -> bool:
+    """True when a heat failure is the INFRASTRUCTURE's fault, not the
+    challenger's: the storage layer (Hippius fetch/push) or the SSH transport
+    (rc=255 — connection lost, never the remote command's own exit)."""
+    return _storage_failure(exc) or getattr(exc, "returncode", None) == 255
+
+
+def _run_heat_field(run_fn, challengers, *, max_workers: int, requeues: int,
+                    cooldown_seconds: float, note_progress, storage_dropped,
+                    sleep=time.sleep):
+    """Run every challenger through ``run_fn`` concurrently, re-queueing
+    infrastructure casualties in the SAME heat.
+
+    A challenger whose dispatch (and its in-dispatch retry) died on an infra
+    failure — storage layer or SSH transport — goes back into the pool up to
+    ``requeues`` times, after ``cooldown_seconds``; the 2026-08-19 datacenter
+    blip terminally dropped three challengers whose retries happened to be the
+    runs in flight. Challenger-fault failures (their generator raising, OOM,
+    the guard) never re-queue, so there is no free-retry surface for bad code.
+
+    Returns ``(out, terminal_transport_failures)`` — the latter feeds the
+    caller's dead-fleet wipeout check, counting only challengers that EXHAUSTED
+    their attempts at the transport level. ``storage_dropped`` maps hotkey→ref
+    for terminal storage drops (the burn-exemption candidates), matching the
+    old inline behaviour.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+    from concurrent.futures import wait as futures_wait
+
+    out = []
+    transport_failures = 0
+    requeues_left = {c.hotkey: max(0, int(requeues)) for c in challengers}
+    total = len(challengers)
+    done = 0
+
+    def _cooled_run(c):
+        sleep(cooldown_seconds)
+        return run_fn(c)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        pending = {ex.submit(run_fn, c): c for c in challengers}
+        while pending:
+            done_futs, _ = futures_wait(list(pending), return_when=FIRST_COMPLETED)
+            for fut in done_futs:
+                c = pending.pop(fut)
+                try:
+                    out.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    if _infra_failure(e) and requeues_left.get(c.hotkey, 0) > 0:
+                        requeues_left[c.hotkey] -= 1
+                        log.warning(
+                            "heat: challenger %s hit an infrastructure failure (%s); "
+                            "re-queueing after %.0fs cool-down (%d re-queue(s) left)",
+                            c.hotkey, e, cooldown_seconds, requeues_left[c.hotkey])
+                        pending[ex.submit(_cooled_run, c)] = c
+                        continue
+                    if getattr(e, "returncode", None) == 255:
+                        transport_failures += 1
+                    if _storage_failure(e):
+                        # Candidate for the burn exemption — re-verified at
+                        # heat settle (see _burn_hotkeys).
+                        storage_dropped[c.hotkey] = c.ref
+                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
+                done += 1
+                note_progress(done, total)
+    return out, transport_failures
 
 
 def _load_commit_witness(path: Path) -> dict[str, dict]:
@@ -579,6 +652,12 @@ class TrainerRunner:
     # rather than trusting the unsigned pool index. None ⇒ manifests go out
     # unpinned (legacy). Wired in trainer.main from the screen pool source.
     pool_provenance_fn: object | None = None
+    # Realised round composition: ``(base_seed, block) -> dict | None`` — the
+    # jittered mix's post-hoc domain/class breakdown of the round's eval draw
+    # (None while the mix is inactive). Attached to the manifest UNSIGNED (like
+    # ``heat``) for the public feed. Wired in trainer.main from the same pool
+    # source the screen uses.
+    composition_fn: object | None = None
     # Cascade: scores a duel checkpoint on GIFT-Eval / BOOM / TIME for the round's
     # POST-PUBLISH signed bench report (cascade.shared.bench_report) — validators
     # read one authoritative signed set per role, so promotion stays consensus-
@@ -2274,6 +2353,67 @@ class TrainerRunner:
             log.warning("promotion: deploy backfill failed (engine anchors at "
                         "this boundary instead): %s", e)
 
+    def _replay_reign_bench_reports(self) -> None:
+        """Re-ingest the CURRENT reign's published bench reports at the
+        boundary. The candidate pool otherwise only sees reports the
+        in-process bench thread publishes — an out-of-band report (a mop-up
+        after a failed leg, a report that landed while the trainer was down)
+        never yields candidates, and a promotion then fires off an incomplete
+        reign (observed 2026-08-18: r26's better leg, 0.64149, missed the
+        gen-3 member set because its mop-up report was published externally).
+
+        Cheap and idempotent by construction: ``record_bench`` dedupes on
+        ``trained_pointer`` and gates on the live generation, so replaying
+        every reign round each boundary is a handful of small S3 reads a day
+        that add nothing when nothing is missing. Runs BEFORE
+        ``maybe_promote`` so a fire-time selection sees the full reign.
+        Same signature discipline as the deploy backfill: both the report
+        and the manifest must verify against the pinned trainer hotkey."""
+        if self.promotion is None or getattr(self.promotion, "king_hotkey", None) is None:
+            return
+        try:
+            from ..shared.bench_report import (
+                bench_report_key,
+                load_bench_report,
+                verify_bench_report_signature,
+            )
+            from ..shared.hippius import RECEIPT_INDEX_KEY
+            from ..shared.manifest import load_manifest, verify_signature
+            from .promotion import reign_tail
+
+            store = self.manifest_store()
+            idx = json.loads(store.get_text(RECEIPT_INDEX_KEY))
+            tail = reign_tail(idx.get("rounds") or [],
+                              self.cfg.manifest.validator_hotkey)
+            if tail is None:
+                return
+            _king, _start_block, round_ids = tail
+            trainer_hotkey = self.cfg.manifest.trainer_hotkey
+            added = 0
+            for rid in round_ids:
+                try:
+                    manifest = load_manifest(
+                        store.get_text(manifest_round_key(rid)))
+                    report = load_bench_report(
+                        store.get_text(bench_report_key(rid)))
+                except Exception:  # noqa: BLE001 — no report yet ⇒ nothing to replay
+                    continue
+                if trainer_hotkey and not verify_bench_report_signature(
+                        report, trainer_hotkey):
+                    log.warning("promotion replay: bench report for round=%s "
+                                "fails signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                if trainer_hotkey and not verify_signature(manifest, trainer_hotkey):
+                    log.warning("promotion replay: manifest for round=%s fails "
+                                "signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                added += self.promotion.record_bench(manifest, report)
+            if added:
+                log.info("promotion: boundary replay recovered %d candidate(s) "
+                         "from published bench report(s)", added)
+        except Exception as e:  # noqa: BLE001 — replay must never sink a round
+            log.warning("promotion: bench-report replay failed (ignored): %s", e)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -2661,6 +2801,15 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — pinning must never sink a round
                 log.warning("eval-pool pin unavailable for round=%s: %s", base_seed, e)
 
+        # Post-hoc realised mix of the round's eval draw (unsigned, like heat).
+        # Best-effort: a miss just publishes without the block.
+        composition = None
+        if self.composition_fn is not None:
+            try:
+                composition = self.composition_fn(base_seed, screen_block)
+            except Exception as e:  # noqa: BLE001 — never sinks a round
+                log.warning("round composition unavailable for round=%s: %s", base_seed, e)
+
         return TrainingManifest(
             round_id=str(base_seed),
             created_block=block,
@@ -2669,6 +2818,7 @@ class TrainerRunner:
             eval_dataset=self.cfg.eval.eval_dataset,
             entries=entries,
             heat=heat,
+            composition=composition,
             eval_pool_key=str(pool_key or ""),
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
@@ -3209,7 +3359,7 @@ class TrainerRunner:
         fetch is dropped. The pod's receipt carries the corpus digest, threaded
         through for the content-level duplicate drop."""
         import queue
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         from .remote import RemoteDispatcher, RemoteDispatchError, probe_host
 
@@ -3267,23 +3417,18 @@ class TrainerRunner:
             fetch_from_hub(ref, out_dir, hub)
             return c, out_dir, entry.corpus_digest
 
-        out: list[tuple[ResolvedGenerator, Path, str]] = []
-        transport_failures = 0
-        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
-            futs = {ex.submit(_run, c): c for c in challengers}
-            for done, fut in enumerate(as_completed(futs), start=1):
-                c = futs[fut]
-                try:
-                    out.append(fut.result())
-                except Exception as e:  # noqa: BLE001
-                    if getattr(e, "returncode", None) == 255:
-                        transport_failures += 1
-                    if _storage_failure(e):
-                        # Candidate for the burn exemption — re-verified at
-                        # heat settle (see _burn_hotkeys).
-                        self._storage_dropped[c.hotkey] = c.ref
-                    log.warning("heat: challenger %s failed on remote: %s", c.hotkey, e)
-                self._note_heat_progress(done, len(challengers))
+        # +2 executor headroom over the lane count: a re-queued challenger
+        # sleeps its cool-down inside a pool thread WITHOUT holding a lane
+        # (lane occupancy is the free_lanes queue), so sleepers must not
+        # starve dispatchable threads.
+        out, transport_failures = _run_heat_field(
+            _run, challengers,
+            max_workers=max(1, len(hosts)) + 2,
+            requeues=self.cfg.round.heat_infra_requeues,
+            cooldown_seconds=HEAT_REQUEUE_COOLDOWN_SECONDS,
+            note_progress=self._note_heat_progress,
+            storage_dropped=self._storage_dropped,
+        )
         # A heat where EVERY dispatch died at the transport level (rc=255) is a
         # dead-fleet wipeout, not a screened-out field: refuse to let the caller
         # cache a 0/N heat as complete (a king-only manifest would publish).
@@ -3700,6 +3845,11 @@ class TrainerRunner:
                         self._seed_promotion_reign()
                         self.promotion.note_round(self._receipt_king() or king_hotkey,
                                                   epoch_block=epoch_start)
+                        # Out-of-band bench reports (mop-ups, trainer-downtime
+                        # publishes) enter the pool here — before maybe_promote,
+                        # so a promotion that fires NOW selects from the full
+                        # reign, not just what the in-process bench thread saw.
+                        self._replay_reign_bench_reports()
                         self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
                     except Exception as e:  # noqa: BLE001

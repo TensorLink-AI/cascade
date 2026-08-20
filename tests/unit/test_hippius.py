@@ -4,6 +4,8 @@ boto3 endpoint needed."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from cascade.shared import hippius
@@ -61,6 +63,79 @@ def test_unpack_rejects_path_traversal(tmp_path):
         hippius.unpack_tar_to_dir(buf.getvalue(), tmp_path / "dest")
 
 
+_FETCH_REF = "cascade/ckpt-test@sha256:" + "b" * 64
+
+
+def _fake_hub(monkeypatch, downloader):
+    """Install a fake ``hippius_hub`` module whose snapshot_download is ``downloader``."""
+    import sys
+    import types
+
+    mod = types.ModuleType("hippius_hub")
+    mod.snapshot_download = downloader
+    monkeypatch.setitem(sys.modules, "hippius_hub", mod)
+    monkeypatch.setattr(hippius, "_resolve_hub_token_for_pull", lambda _msg: "tok")
+
+
+def test_fetch_from_hub_is_atomic_reused_and_marked_complete(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+        calls["n"] += 1
+        p = Path(local_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "weights.safetensors").write_bytes(b"w")
+
+    _fake_hub(monkeypatch, dl)
+    dest = tmp_path / "sha256-b"
+    out = hippius.fetch_from_hub(_FETCH_REF, dest)
+    assert out == dest
+    assert (dest / "weights.safetensors").read_bytes() == b"w"
+    assert (dest / hippius.FETCH_COMPLETE_MARKER).exists()
+    # The private download dir is gone whether the rename won or lost.
+    assert not list(tmp_path.glob(".sha256-b.fetch-*"))
+    # A digest-pinned snapshot is immutable: the second fetch must reuse it
+    # (the old rmtree+redownload deleted it out from under sibling lanes).
+    hippius.fetch_from_hub(_FETCH_REF, dest)
+    assert calls["n"] == 1
+
+
+def test_fetch_from_hub_replaces_unmarked_partial_dir(tmp_path, monkeypatch):
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+        p = Path(local_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "config.json").write_text("{}")
+
+    _fake_hub(monkeypatch, dl)
+    dest = tmp_path / "sha256-b"
+    dest.mkdir()
+    (dest / "stale.bin").write_bytes(b"partial download, no marker")
+    hippius.fetch_from_hub(_FETCH_REF, dest)
+    assert (dest / "config.json").exists()
+    assert not (dest / "stale.bin").exists()
+
+
+def test_fetch_from_hub_yields_to_sibling_completed_snapshot(tmp_path, monkeypatch):
+    dest = tmp_path / "sha256-b"
+
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+        p = Path(local_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "ours.bin").write_bytes(b"x")
+        # While we were downloading, a sibling lane completed the same digest.
+        dest.mkdir()
+        (dest / "theirs.bin").write_bytes(b"y")
+        (dest / hippius.FETCH_COMPLETE_MARKER).touch()
+
+    _fake_hub(monkeypatch, dl)
+    out = hippius.fetch_from_hub(_FETCH_REF, dest)
+    assert out == dest
+    # The sibling's snapshot (identical bytes by digest) is kept untouched.
+    assert (dest / "theirs.bin").exists()
+    assert not (dest / "ours.bin").exists()
+    assert not list(tmp_path.glob(".sha256-b.fetch-*"))
+
+
 def test_is_retryable_hub_error_classifies_transient_vs_permanent():
     # The exact message from the failing miner upload is a transient read stall.
     assert hippius._is_retryable_hub_error(RuntimeError("The read operation timed out"))
@@ -70,6 +145,40 @@ def test_is_retryable_hub_error_classifies_transient_vs_permanent():
     # Deterministic failures must not be retried.
     assert not hippius._is_retryable_hub_error(hippius.HubAuthError("no token"))
     assert not hippius._is_retryable_hub_error(RuntimeError("404 repo not found"))
+
+
+def test_is_retryable_hub_error_walks_the_cause_chain():
+    # hippius_hub wraps transport drops as bare RuntimeError("chunk N failed")
+    # with the retryable detail in __cause__ — the classifier must walk it
+    # (2026-08-19: six transient chunk-0 drops each burned a whole dispatch
+    # because the top-level message matched nothing).
+    transport = RuntimeError("HTTP transport error: error decoding response body")
+    chunk = RuntimeError("chunk 0 failed")
+    chunk.__cause__ = transport
+    assert hippius._is_retryable_hub_error(chunk)
+
+    # The observed mainnet shape: chunk failure caused by a local I/O error.
+    io_err = RuntimeError("local I/O error")
+    chunk2 = RuntimeError("chunk 0 failed")
+    chunk2.__cause__ = io_err
+    assert hippius._is_retryable_hub_error(chunk2)
+    assert hippius._is_retryable_hub_error(RuntimeError("local I/O error"))
+
+    # Implicit chaining (__context__) counts too.
+    ctx = RuntimeError("chunk 3 failed")
+    ctx.__context__ = TimeoutError()
+    assert hippius._is_retryable_hub_error(ctx)
+
+    # A 401-wrapped chunk failure has no transport substring anywhere in the
+    # chain — stays permanent (the deliberate carve-out).
+    denied = RuntimeError("chunk 0 failed")
+    denied.__cause__ = RuntimeError("server returned 401 (Failed chunk bytes)")
+    assert not hippius._is_retryable_hub_error(denied)
+
+    # Self-referential chains must not loop forever.
+    loop_exc = RuntimeError("chunk 1 failed")
+    loop_exc.__cause__ = loop_exc
+    assert not hippius._is_retryable_hub_error(loop_exc)
 
 
 def test_retry_hub_op_recovers_after_transient_timeouts():

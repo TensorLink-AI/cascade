@@ -189,6 +189,11 @@ def prepare_series(
     metadata = {"freq": hs.freq, "seasonal_period": seasonal, "domain": hs.domain}
     if hs.source:
         metadata["source"] = hs.source
+    # DGP class label (tsbench-forge catalog) — drives the jittered mix's
+    # class-rotation tier (cascade.validator.windows). Absent for sources
+    # without one; the sampler degrades to domain-level jitter only.
+    if hs.attrs and hs.attrs.get("dgp_class"):
+        metadata["dgp_class"] = str(hs.attrs["dgp_class"])
 
     values = cleaned.astype(np.float32)
     if values.shape[0] == 1:  # store univariate as 1-D; loader promotes to (1, L)

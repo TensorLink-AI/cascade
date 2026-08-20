@@ -48,8 +48,10 @@ The fixed process is a Toto2-4M backbone trained from random initialisation
 2605.20119), *not* a fine-tune of released weights. Training from scratch is the
 point: the corpus is then the only source of learned signal, so the downstream
 forecast skill measures the *data*, not what some pretrained checkpoint already
-knew. Toto 2.0 itself is 57.5% synthetic data with zero public series in
-pretraining and still tops GIFT-Eval, and cascade turns that synthetic-prior
+knew. (Once the [cascade](#the-cascade-promoted-generations) promotes a
+generation, rounds warm-start from the promoted checkpoint instead — a lineage
+the competition itself produced, still never anyone's released weights.)
+Toto 2.0 itself is 57.5% synthetic data with zero public series in pretraining and still tops GIFT-Eval, and cascade turns that synthetic-prior
 design into an open competition.
 
 ```mermaid
@@ -64,8 +66,8 @@ flowchart TD
     subgraph trainer["Trainer: owner-operated (the GPU boundary)"]
         resolve["resolve commitments before the<br/>12h epoch cutoff → king + field"]
         seeds["derive one shared RoundSeeds<br/>from epoch-boundary block hash<br/>(generation_seed + training_seed)"]
-        heat["HEAT: train every challenger<br/>~30min (primary size) → screen<br/>→ top finalist"]
-        trainK["FINAL: train king + finalist<br/>from random init at EVERY size<br/>(Toto2-4M, Toto2-22M)"]
+        heat["HEAT: train every challenger<br/>~1h (screen size) → screen<br/>→ top finalist"]
+        trainK["FINAL: train king + finalist<br/>from the shared round init at every<br/>throne size (Toto2-4M live)"]
         upK["push ckpts → Hippius Hub registry<br/>logs/metrics → Hippius S3"]
         manifest["sign + publish TrainingManifest<br/>to Hippius S3 (size-tagged ckpt refs + digests)"]
         resolve --> seeds --> heat --> trainK --> upK --> manifest
@@ -75,7 +77,7 @@ flowchart TD
         gate["verify signature +<br/>matching contract / base-arch digests<br/>(controlled-experiment gate)"]
         eval["pull king + finalist ckpts per size →<br/>score on shared held-out windows<br/>(CRPS/MWSQL + MASE)"]
         koth["paired-bootstrap LCB of<br/>geomean(CRPS, MASE) POOLED across sizes,<br/>finalist vs king → one KOTH verdict"]
-        weights["equal-share weights<br/>(king + recent kings)"]
+        weights["geometric-decay weights<br/>(king + prior kings)"]
         gate --> eval --> koth --> weights
     end
 
@@ -98,15 +100,18 @@ generators whose on-chain pointer *revealed* strictly before the epoch boundary
 compete in that round — deploy defaults to a timed reveal targeting just before
 the boundary (docs/MINER.md §5a), and a reveal that lands late rolls into the
 next one. Each round has two stages: a cheap
-**heat** trains every eligible challenger for `[round] heat_train_hours` (~30min,
-primary size) and the owner screens them down to the top `[round] finalists`; the
-**final** then trains the king and the surviving finalist to the full
-`[training] target_train_hours` (~3h) at *every* configured size (the 4M primary
-plus each `[[training.sizes]]`, e.g. 22M).
+**heat** trains every eligible challenger for `[round] heat_train_hours` (~1h,
+on `screen_size`) and the owner screens them down to the top `[round] finalists`;
+the **final** then trains the king and the surviving finalist to the full
+`[training] target_train_hours` (~3h) at every configured `throne_sizes` entry.
+The shipped config runs the 4M alone — the 22M rung is a built, dormant seam
+(commented-out `[[training.sizes]]`) that Phase 2 arms.
 
 The central invariant: in a round, the king's generator and the
 challenger's generator are trained into models under a *byte-identical* contract
-*at each size*: the same Toto2 architecture and random initialisation, same
+*at each size*: the same Toto2 architecture and identical initialisation
+(random at generation 0; the promoted cascade checkpoint once a generation has
+been promoted — see [the cascade](#the-cascade-promoted-generations)), same
 compute budget, optimiser, generation seed, and training seed. The only thing
 that differs is the generator code. So the downstream eval is a controlled
 measurement of data quality, not a confound of data + luck + hyperparameters.
@@ -119,17 +124,37 @@ emitting cheap-to-step data rather than better data, and wouldn't reproduce on a
 re-derived audit run.
 
 The throne is decided on the **combined** score across sizes: the validator pools
-the king-vs-finalist per-window scores from every size into one paired bootstrap,
-so there is a single king judged on both the 4M and 22M models (a scaling-aware
-KOTH, not a per-size leaderboard). A challenger takes the throne by winning `dethrone_cp` round(s) by a
-confidence-bounded margin (paired bootstrap LCB clears the win margin). The
-shipped `chain.toml` sets `dethrone_cp = 1` with a flat, no-tenure margin
-(`win_margin_start == win_margin_end`, `margin_warmup_rounds = 0`), so a single
-decisive round dethrones and every king is equally challengeable; raise
-`dethrone_cp` and re-enable the warmup for the sticky, tenure-weighted variant.
-Weights are split equally across the current king plus up to `reward_prior_kings`
-recent distinct kings still registered (burning to `burn_uid` if none are), with
-`reward_prior_kings = 0` collapsing to pure winner-take-all.
+the king-vs-finalist per-window scores from every `throne_sizes` entry into one
+paired bootstrap, so there is a single king judged across the whole size ladder
+(a scaling-aware KOTH, not a per-size leaderboard; with only the 4M live today
+that is a single-size duel — the pooling seam is what Phase 2 arms). A challenger
+takes the throne by winning `dethrone_cp` round(s) (shipped: 1) by a
+confidence-bounded margin: the paired-bootstrap LCB must clear the win margin.
+The shipped `chain.toml` arms **tenure decay** on that margin: a fresh king
+defends at `win_margin_start` (2%) and the requirement decays linearly to the
+`win_margin_end` floor (0.5%) over `margin_warmup_rounds` (8) of tenure — young
+kings are protected from eval-noise churn while entrenched kings stay honestly
+dethronable (the floor is a hard guardrail and must stay > 0). Weights follow
+**geometric decay** across the lineage: the current king plus up to
+`reward_prior_kings` (4) prior distinct kings still registered, share ∝
+`king_decay**i` with `king_decay = 0.5` (≈52 / 26 / 13 / 6 / 3%), any
+unregistered remainder burning to `burn_uid`; `reward_prior_kings = 0` collapses
+to pure winner-take-all and `king_decay = 1.0` to an equal split.
+
+## The cascade: promoted generations
+
+The subnet's namesake, armed since 2026-08-05 (`[scoring] cascade_enabled`).
+When a king survives `cascade_reign_rounds` (5) consecutive rounds undethroned,
+its reign's best checkpoint is **promoted**: it becomes the warm-start
+initialisation for all subsequent rounds, and competition continues *on top of*
+it. The best-of-reign pick uses the geometric mean of six signed
+public-benchmark numbers (GIFT-Eval / BOOM / TIME × CRPS / MASE) from each
+round's benchmark report — telemetry that never feeds scoring, so it can't be
+Goodharted — and the checkpoint is promoted as-is, never re-evaluated. The king
+persists through promotion (same hotkey, reign clock reset); stagnation at
+generation N is converted into the launchpad for generation N+1, so proven data
+improvements compound across generations instead of resetting every round. Each
+promotion is a signed public record under `promotions/` in the manifest bucket.
 
 ## Why Toto2-4M
 
@@ -183,6 +208,9 @@ cascade/
   trainer/     owner GPU service: corpus build, fixed contract, train+upload, manifest
   validator/   manifest gate, checkpoint evaluator, KOTH state machine, weights
   miner/       miner CLI: verify, deploy (push to Hippius Hub registry + commit)
+  audit/       cascade-audit: re-derive published rounds from public artifacts
+  pool/        held-out eval-window pool build + rotation
+  provision/   GPU pod provisioner (rent, bootstrap, recycle)
   shared/      config loader, Hippius Hub registry/S3, chain client, manifest schema
   website/     the public dashboard ("notebook"): a self-contained index.html
 
@@ -192,6 +220,9 @@ docs/
   VALIDATOR.md      run a validator end to end: register → configure → score → set weights
   INTERFACE.md      the DataGenerator submission contract for miners
   AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
+  DEPLOY_PODS.md    pod bootstrap + provisioner service for the GPU fleet
+  EVAL_POOL.md      the private eval-window pool and its rotation
+  MARGIN_DECAY_ROLLOUT.md   the tenure-decay margin: design + rollout record
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)
   publish_website.py   upload the dashboard to the manifest bucket (public-read)

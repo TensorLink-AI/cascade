@@ -10,6 +10,7 @@ from subprocess import CompletedProcess
 from cascade.trainer.bench_hook import (
     BenchPlan,
     build_bench_remote_command,
+    build_prewarm_remote_command,
     king_paths,
     launch_post_round_benchmark,
     run_post_round_benchmark,
@@ -72,6 +73,31 @@ def test_hf_token_arms_stdin_sourcing_but_never_enters_the_command():
         HOST, "42", "toto2-4m", BenchPlan(), hf_token="hf_secret123")
     assert "set -a && . /dev/stdin && set +a" in armed
     assert "hf_secret123" not in armed  # credential travels on stdin only
+
+
+def test_prewarm_command_is_detached_marker_guarded_and_fenced():
+    # The pre-warm exists so a JIT final pod's cold 4.4G pull overlaps the
+    # final TRAINING, not the bench window (the exit-124 king-leg mode).
+    cmd = build_prewarm_remote_command("/root/cascade")
+    # same per-suite completion markers as the bench's data guard — a
+    # half-warmed pod resumes, a warm pod is a no-op
+    for suite in ("gift-eval", "boom", "time"):
+        assert f"/root/cascade/bench_data/{suite}/_cascade_revision.json" in cmd
+    # detached: the launching ssh must return immediately, and the child must
+    # survive the session (all three stdio detached)
+    assert "nohup" in cmd and cmd.rstrip().endswith("& }")
+    assert "< /dev/null" in cmd and "bench_prewarm.log" in cmd
+    # wedge-mode fence + the mandatory time extra, like every other download
+    assert "timeout 2700" in cmd and "--extra time" in cmd
+    assert "--data-dir /root/cascade/bench_data" in cmd
+    assert "--project /root/cascade/benchmarks" in cmd
+
+
+def test_prewarm_hf_token_arms_stdin_sourcing_only():
+    plain = build_prewarm_remote_command("/root/cascade")
+    assert "/dev/stdin" not in plain
+    armed = build_prewarm_remote_command("/root/cascade", hf_token=True)
+    assert armed.startswith("set -a && . /dev/stdin && set +a && ")
 
 
 def test_run_post_round_benchmark_saves_and_returns_report(tmp_path: Path):

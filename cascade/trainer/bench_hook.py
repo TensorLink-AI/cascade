@@ -68,6 +68,47 @@ class BenchPlan:
     min_interval_seconds: int = 0
 
 
+def build_prewarm_remote_command(workdir: str, *,
+                                 suites: str = "gift-eval,boom,time",
+                                 uv_bin: str = "/bin/uv",
+                                 download_timeout_seconds: int = 2700,
+                                 hf_token: bool = False) -> str:
+    """The remote shell string that pre-warms a fresh FINAL pod's benchmark
+    data in the background. Pure — safe to unit test.
+
+    JIT-rented final pods boot from the worker image, which deliberately bakes
+    no benchmark data — the bench's data guard downloads on first use, which
+    put a cold ~4.4G pull inside the bench window and cost the king leg its
+    report three rounds running (r18, r26, r27: exit 124 mid-download). Fired
+    right after the health gate, the download overlaps the multi-hour final
+    training instead, and the guard's marker test finds warm data at bench
+    time. Detached (``nohup``/``&`` with all stdio redirected) so the
+    launching SSH returns immediately; marker-guarded so a re-boot of a
+    half-warmed pod resumes rather than restarts; ``timeout``-fenced against
+    the download's wedge mode exactly like the guard. Targets
+    ``<workdir>/bench_data`` — the same path the trainer's bench plan derives
+    (main.py builds ``data_dir=f"{wd}/bench_data"`` from the fleet workdir).
+
+    ``hf_token`` arms the stdin-env sourcing prefix (the credential itself
+    never enters the command string — it travels on stdin like every other
+    forwarded cred); the exported var is inherited by the detached child.
+    """
+    data_dir = f"{workdir}/bench_data"
+    project = shlex.quote(f"{workdir}/benchmarks")
+    suite_list = [s.strip() for s in str(suites).split(",") if s.strip()]
+    markers = " -a ".join(
+        f"-f {shlex.quote(f'{data_dir}/{s}/{DATA_MARKER}')}" for s in suite_list)
+    inner = (f"timeout {int(download_timeout_seconds)} "
+             f"{uv_bin} run --extra time --project {project} "
+             f"cascade-benchmark-download --data-dir {shlex.quote(data_dir)}")
+    env_source = "set -a && . /dev/stdin && set +a && " if hf_token else ""
+    return (
+        env_source
+        + f"test {markers} || {{ nohup sh -c {shlex.quote(inner)} "
+        + f">> {shlex.quote(f'{workdir}/bench_prewarm.log')} 2>&1 < /dev/null & }}"
+    )
+
+
 def role_paths(host: RemoteHost, round_id: str, arch_preset: str,
                role: str = "king") -> tuple[str, str]:
     """(checkpoint dir, report path) of a round's final ``role`` on the pod —

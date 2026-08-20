@@ -193,6 +193,10 @@ heat_num_samples = 100    # sample forecasts per window in the heat (0 = reuse [
 # the reference box, else every heat time-truncates.
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 900
+# In-round re-queues for challengers whose heat dispatch died on an
+# INFRASTRUCTURE failure (storage layer / ssh transport) — miner-fault
+# failures never re-queue. 0 restores terminal drops.
+heat_infra_requeues      = 2
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
 # Tie-aware finalist cohort (DEC-CA-0012, trainer half) — SHIPS INERT, DO NOT
 # ARM HERE FIRST. With max_finalists > 1 the finalist count responds to the
@@ -333,6 +337,32 @@ num_samples    = 100             # sample forecasts drawn per window
 n_windows      = 2000            # eval windows drawn per round from the pool
 context_length = 4096            # must match [training]; pool must supply >=4096+horizon windows
 horizon        = 64
+
+# Jittered round mix (DEC-TB-0003 port, DEC-CA-0019) — ARMED AT RELEASE
+# (owner decision 2026-08-20, the DEC-CA-0016 pattern): this config ships the
+# live activation block, so the release IS the activation. Rounds whose epoch
+# boundary is >= mix_from_block draw the jittered mix; every earlier round
+# keeps the legacy uniform permutation byte-identically (pinned by test).
+# CONSENSUS + DEADLINE UPGRADE: every external validator and the trainer must
+# be running this release BEFORE block 8935200 (epoch boundary ~2026-08-26
+# 20:30 UTC) — a mixed fleet agrees on every round until then (no
+# simultaneity window, only the deadline), but any validator still on old
+# code when the block arrives forks every verdict from it on. Audit replay
+# applies each round's own rule via the receipt's epoch_start_block.
+# Expected mix stays equal-weight per domain (capacity-capped); realised mix
+# is unpredictable. mix_target_windows: the jittered draw size (0 =
+# n_windows). Calibrated on the 2026-08-19 production snapshot: 1200 of
+# ~2400 rotates the mix hard (per-domain p1–p99 spans ~6x) with effective
+# domains ≥ 5.0 and P(<4.0)=0 over 2k simulated rounds; at 2000 the caps
+# crush the jitter (~±7%). Class rotation (mix_class_keep_frac) is inert
+# until pool snapshots carry dgp_class labels (builder change in this
+# release; arm by republishing the pool).
+mix_from_block       = 8935200   # ACTIVATION epoch boundary (~2026-08-26 20:30 UTC); 0 = off
+mix_jitter_alpha     = 4.0       # symmetric Dirichlet over domains (expectation uniform)
+mix_block_slots      = 8         # allocation unit: a cell is absent or gets >= 1 block
+mix_class_keep_frac  = 0.7       # per-round dgp_class activation fraction
+mix_series_bag_frac  = 0.7       # per-round series eligibility (salted-hash bag)
+mix_target_windows   = 1200      # jittered draw size; inert until mix_from_block is set
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

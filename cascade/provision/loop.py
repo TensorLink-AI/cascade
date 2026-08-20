@@ -249,6 +249,11 @@ class ProvisionerLoop:
     # gate — the testnet path while no digest-pinned worker image is published.
     # Returns False on failure (the pod is treated like a health-gate dud).
     bootstrap: Callable[[PodAddress, str], bool] | None = None
+    # Fired once per healthy pod AFTER the health gate (addr, stage, provider):
+    # best-effort warm-up work that must never gate the pod — today the final
+    # pods' detached benchmark-data download (make_bench_prewarm), so the cold
+    # pull overlaps training instead of eating the bench window.
+    prewarm: Callable[[PodAddress, str, str], None] | None = None
     # Raw [[host]] TOML appended verbatim to EVERY hosts.toml publish — the
     # operator's static pods (e.g. a long-lived final pod) that the provisioner
     # must never drop. clear/teardown re-renders keep it too: "no dynamic pods"
@@ -1286,6 +1291,11 @@ class ProvisionerLoop:
         except Exception as e:  # noqa: BLE001 — any boot fault is a failed pod, not a dead loop
             log.warning("pod %s boot/health errored: %s", pid, e)
             return None
+        if self.prewarm is not None:
+            try:
+                self.prewarm(addr, stage, prov.name)
+            except Exception as e:  # noqa: BLE001 — pre-warm never gates a healthy pod
+                log.warning("pod %s pre-warm hook errored (ignored): %s", pid, e)
         self._addrs[pid] = addr
         return addr
 

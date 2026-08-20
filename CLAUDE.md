@@ -147,6 +147,16 @@ in-context.
   warm starts re-attach it; missing file ⇒ fresh state, shape mismatch ⇒
   abort. Flip changed `contract_digest` — trainer+validator deploy together.
   (`decisions/DEC-CA-0018-wsd-schedule-optimizer-continuity.md`)
+- **DEC-CA-0019** — The per-round eval draw is jittered (TB:DEC-TB-0003 port):
+  Dirichlet domain mix around uniform (alpha=4, block=8, capacity-capped,
+  without-replacement always), salted-hash series bag, class rotation inert
+  until pool snapshots carry `dgp_class`. Draw size 1200 (`mix_target_windows`)
+  — at 2000 the caps crush the jitter. Block-gated activation, ARMED AT
+  RELEASE (mainnet `mix_from_block = 8935200` ≈ 2026-08-26 20:30 UTC;
+  testnet = 1): every validator upgrades before that block (a deadline, not
+  a window) or verdicts fork from it; audit replays each round's own rule.
+  Realised mix publishes as an unsigned `composition` manifest block.
+  (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel). Put
