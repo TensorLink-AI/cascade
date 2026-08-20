@@ -214,9 +214,10 @@ in-context.
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
-DEC-CA-0016..0022 are claimed by the 2026-08-13 submission-surface design
-pass, DEC-CA-0024 by the 2026-08-14 shared-real-corpus design, status
-proposed). Put the revisit condition in the node's `revisit_when:` key.
+DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
+pass, renumbered +4 on 2026-08-20 after colliding with the accepted
+decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
+condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 
