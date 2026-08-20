@@ -339,13 +339,15 @@ horizon        = 64
 # IMMEDIATE activation (owner decision 2026-08-20, fork risk explicitly
 # accepted): rounds whose epoch boundary is >= mix_from_block draw the
 # jittered mix; every earlier round keeps the legacy uniform permutation
-# byte-identically (pinned by test). Block 8892000 = the 2026-08-20 20:30 UTC
-# boundary — the first boundary not yet scored at arming time (the block must
+# byte-identically (pinned by test). Block 8895600 = the 2026-08-21 08:30 UTC
+# boundary — the first boundary not yet scored at deploy time (the block must
 # NEVER be set in the past: audit replay and resync re-derive earlier rounds
 # under each round's own rule via the receipt's epoch_start_block, so a past
-# block would contradict already-published receipts). External validators
-# DIVERGE on every verdict from this block until they run this release —
-# announce loudly, upgrade ASAP.
+# block would contradict already-published receipts). Moved 8892000 → 8895600
+# on 2026-08-20 22:30: the fleet deploys in one coordinated event AFTER the
+# 8892000 round is already in flight, so 8892000 would have been in the past.
+# ALL validators must restart on this release before the 8895600 round's
+# manifest is scored, or verdicts fork from that block until they do.
 # Expected mix stays equal-weight per domain (capacity-capped); realised mix
 # is unpredictable. mix_target_windows: the jittered draw size (0 =
 # n_windows). Calibrated on the 2026-08-19 production snapshot: 1200 of
@@ -354,7 +356,7 @@ horizon        = 64
 # crush the jitter (~±7%). Class rotation (mix_class_keep_frac) is inert
 # until pool snapshots carry dgp_class labels (builder change in this
 # release; arm by republishing the pool).
-mix_from_block       = 8892000   # ACTIVATION epoch boundary (2026-08-20 20:30 UTC); 0 = off
+mix_from_block       = 8895600   # ACTIVATION epoch boundary (2026-08-21 08:30 UTC); 0 = off
 mix_jitter_alpha     = 4.0       # symmetric Dirichlet over domains (expectation uniform)
 mix_block_slots      = 8         # allocation unit: a cell is absent or gets >= 1 block
 mix_class_keep_frac  = 0.7       # per-round dgp_class activation fraction
