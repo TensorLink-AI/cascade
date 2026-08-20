@@ -300,6 +300,47 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     return bootstrap
 
 
+def make_bench_prewarm(render: RenderSettings, *, pod_user: str) -> callable:
+    """The bench-data PRE-WARM hook: fire a detached benchmark-data download on
+    a freshly gated FINAL pod, so the multi-hour final training — not the bench
+    window — absorbs the cold ~4.4G pull (the exit-124 king-leg failure mode,
+    three rounds running). Best-effort and fast: the SSH only LAUNCHES the
+    detached download (60s cap); any failure is logged and ignored — the
+    bench's own marker-guarded download remains the backstop, exactly as
+    before this hook existed."""
+    import os
+
+    def prewarm(addr, stage: str, provider: str = "") -> None:
+        if stage != "final":
+            return
+        token = os.environ.get("HF_TOKEN") or None
+        prof = render.profile_for(provider)
+        user = prof.user if provider else pod_user
+        from ..trainer.bench_hook import build_prewarm_remote_command
+
+        cmd = build_prewarm_remote_command(prof.workdir, hf_token=token is not None)
+        argv = ["ssh", "-p", str(addr.ssh_port), "-i", os.path.expanduser(render.key_path),
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=15", f"{user}@{addr.ip}", cmd]
+        payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
+        try:
+            proc = subprocess.run(argv, input=payload, capture_output=True,
+                                  text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            log.warning("bench pre-warm launch timed out on %s:%s (ignored)",
+                        addr.ip, addr.ssh_port)
+            return
+        if proc.returncode != 0:
+            log.warning("bench pre-warm launch failed on %s:%s (rc=%d, ignored): %s",
+                        addr.ip, addr.ssh_port, proc.returncode,
+                        (proc.stderr or "")[-300:])
+        else:
+            log.info("bench pre-warm launched on final pod %s:%s",
+                     addr.ip, addr.ssh_port)
+
+    return prewarm
+
+
 def make_hippius_probe(storage) -> callable:
     """A reachability probe for the manifest store (health check #6).
 
@@ -573,6 +614,9 @@ def _run(args) -> int:
             hippius_probe=hippius_probe,
         ),
         bootstrap=bootstrap,
+        prewarm=(make_bench_prewarm(render,
+                                    pod_user=str(top.get("pod_user", "root")))
+                 if cfg.scoring.cascade_enabled else None),
         static_hosts_text=static_hosts_text,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),
