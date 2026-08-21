@@ -553,6 +553,82 @@ and horizons the pool actually exercises.
 Training against them directly is pointless by design — the live rounds are
 always scored on windows that have never been published.
 
+## Sampling a GP/kernel prior efficiently
+
+GP and kernel-composite priors are a natural fit for this game — but the
+obvious way to sample them pays a 6–9× speed tax that makes them look
+policy-blocked when they aren't. The budget is `corpus_n_series = 16384`
+series inside `max_generate_seconds = 1800`, i.e. **~110 ms per series**; the
+difference between the naive and the efficient draw is the difference between
+"GP priors are impossible" and "GP priors fit comfortably at length ≤ 1024".
+
+The tax comes from the libraries, not the math:
+
+- **sklearn**: `GaussianProcessRegressor.sample_y` draws through
+  `np.random.multivariate_normal`, which factorises the covariance by **SVD**.
+  A Cholesky of the same covariance is an *exact* draw from the same
+  distribution and far cheaper.
+- **gpytorch**: its jitter escalation is **absolute** (1e-8 … 1e-1), so on a
+  kernel with a large diagonal every attempt fails and it silently falls back
+  to a full eigendecomposition.
+
+Measured on CPU, single-threaded, over random composites of up to 5 base
+kernels combined with `+` and `*`:
+
+| length | sklearn `sample_y` | relative-jitter Cholesky | speedup |
+|---|---|---|---|
+| 256 | 0.023 s | 0.003 s | 8.6× |
+| 512 | 0.087 s | 0.015 s | 5.7× |
+| 1024 | 0.472 s | 0.060 s | 7.9× |
+| 2048 | 4.026 s | 0.432 s | 9.3× |
+| 4096 | 31.295 s | 3.357 s | 9.3× |
+
+Concretely: at weights where the GP family is ~23% of your series, generating
+those at length 1024 costs ~223 s and the remaining 77% ~207 s — **~430 s
+against the 1800 s budget**, GP family included. On the gpytorch side,
+replacing the absolute jitter with a relative one eliminated 47
+eigendecomposition fallbacks per 10 batches and made a GP prior 5× faster
+(1.73 s → 0.34 s per batch of 8).
+
+The pattern — build the covariance yourself, symmetrise, add jitter **relative
+to the diagonal's scale**, and Cholesky:
+
+```python
+K = kernel(X)
+K = 0.5 * (K + K.T)                                         # symmetrise
+K[np.diag_indices_from(K)] += 1e-8 * np.mean(np.diag(K))    # RELATIVE jitter
+L = np.linalg.cholesky(K)
+y = L @ rng.standard_normal(len(X))
+```
+
+If the Cholesky raises, escalate the jitter on a **fixed ladder**
+(1e-8 → 1e-1) and retry.
+
+Determinism notes — the part that interacts with the submission contract:
+
+- A Cholesky is deterministic on CPU. Switching to this pattern does **not**
+  weaken the byte-identical guarantee `cascade verify` checks.
+- It **does** change the realised values for a given seed: a Cholesky factor
+  and an SVD factor of the same covariance give different samples from the
+  same distribution. Fine for a new submission; it would invalidate a cached
+  digest.
+- The jitter ladder must be **fixed**, never terminated on wall-clock — a
+  time-based cutoff makes the output depend on host speed and fails
+  determinism.
+- **Pin your BLAS thread count.** It varies by deployment:
+  `cascade/trainer/sandbox.py` sets the OMP/MKL/OPENBLAS caps only when a
+  lane slice is active, so a generator whose output depends on reduction
+  order could pass verify on one host and fail on another. Pin it yourself at
+  the very top of `generator.py`, *before* importing numpy:
+
+  ```python
+  import os
+  os.environ.setdefault("OMP_NUM_THREADS", "1")
+  ```
+
+  `import os` is permitted — the static guard blocks `os.system` and matches
+  exact-or-dotted-prefix, so bare `os` is not blocked.
+
 ## Common failures
 
 | symptom | cause |

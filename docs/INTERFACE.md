@@ -78,6 +78,8 @@ byte cap is the wall). `torch`/`gpytorch` stay available as compute libraries
 for GP/kernel priors, and fitting parameters *inside the sandbox at round time*
 from your own procedural data is legal — just don't ship parameters or data.
 The whole repo must be `<= max_repo_mb` (small, since it's source + config).
+(Sampling a GP/kernel prior *fast enough* is a solved problem — see
+[MINER.md § Sampling a GP/kernel prior efficiently](MINER.md#sampling-a-gpkernel-prior-efficiently).)
 
 ## Shared real corpus (reserved; NOT active)
 
