@@ -27,9 +27,16 @@ max_channels         = 1         # per-series variates; 1 = univariate
 # into [training] — one deliberate contract_digest bump).
 interface_version    = 1
 # Carrier cap in canonical payload BYTES — the denomination that stays correct
-# when non-values fields arrive. 16e9 = max_total_points × 8 (float64): exactly
-# today's point cap, so it is numerically inert. 0 disables.
-max_payload_bytes    = 16_000_000_000
+# when non-values fields arrive. Originally 16e9 = max_total_points × 8
+# (float64), calibrated to the MATERIALISED DRAIN and "numerically inert" by
+# design. v0.6.0 (d4141d8) armed it on the cumulative live STREAM, where a
+# full-budget run legitimately serves token_budget × 8 bytes (finals: 40B
+# tokens ≈ 320 GB) — every r33 run silently stopped at ~2.0B tokens (~5-15%
+# of budget; OPSLOG 2026-08-21). HOTFIX: raised above the largest stream
+# budget so the consumer's token-budget stop binds again (pre-v0.6.0
+# semantics); drains stay memory-guarded by max_total_points. Restore a
+# stream-shaped cap (per-corpus, cycling-aware) in v0.6.1. 0 disables.
+max_payload_bytes    = 400_000_000_000
 # Per-series cap on the masked fraction, active only once "mask" is accepted
 # via [training] accepted_fields (DEC-CA-0023).
 max_missing_frac     = 0.5
