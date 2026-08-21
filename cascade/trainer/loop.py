@@ -1233,9 +1233,13 @@ class TrainerRunner:
                     rnd.dedup_probe_budget_seconds, grace)
                 probe_mode, probe_enforce, probe_n, per_draw = "off", False, 0, 0
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
+            # corpus_target_points is zeroed: the probe compares SMALL
+            # fixed-count draws across entrants, so it must stay count-
+            # denominated even when the materialised drain is armed points-
+            # denominated (DEC-CA-0029).
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
-                max_generate_seconds=per_draw)
+                max_generate_seconds=per_draw, corpus_target_points=0)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
             log.info("dedup-probe[%s]: %d survivor(s), %d wave(s), %ss per draw "
                      "(stage budget %ss)", probe_mode, len(survivors), waves,

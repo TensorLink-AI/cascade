@@ -67,6 +67,26 @@ def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
     assert len(res.digest) == 64
 
 
+def test_build_corpus_points_denominated_drain(small_cfg, example_generator_dir):
+    """DEC-CA-0029: with corpus_target_points armed, the drain stops at the
+    points target and the series count is free — corpus_n_series is ignored."""
+    from dataclasses import replace
+
+    gen_cfg = replace(small_cfg.generator, corpus_target_points=2000)
+    res = build_corpus(example_generator_dir, generation_seed=0, cfg=gen_cfg)
+    assert res.total_points >= 2000
+    # The last series is the one that reached the target: without it the
+    # corpus is below target, so the stop is as-early-as-possible.
+    last = res.series[-1]
+    last_pts = int((last["values"] if isinstance(last, dict) else last).size)
+    assert res.total_points - last_pts < 2000
+    # Count-free: n_series reflects the drawn prefix, not corpus_n_series (6).
+    assert res.n_series == len(res.series)
+    # Deterministic under the same seed + config.
+    res2 = build_corpus(example_generator_dir, generation_seed=0, cfg=gen_cfg)
+    assert res2.digest == res.digest
+
+
 def test_build_round_corpus_rejects_stream_modes(small_cfg, example_generator_dir):
     # build_round_corpus is the materialised helper; streaming goes through
     # stream.open_round_stream. It rejects stream modes so a miswired caller fails.

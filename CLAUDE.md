@@ -161,6 +161,17 @@ in-context.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 
+- **DEC-CA-0029** — GP-prior generation economics: the MATERIALISED corpus
+  budget is points-denominated (`corpus_target_points`, armed at 16384×4096;
+  count free, cubic-in-length GP draws escape their worst corner), batch drain
+  budget 1800 → 7200 CPU-s with the streaming stall window split into
+  `stream_stall_seconds` and PINNED at the old values (a stalled generator
+  must not idle a lane longer), relative-jitter Cholesky documented in
+  MINER.md §1a. All `[generator]`-side: no digest bump, no coordinated
+  restart. Wall stays the law (DEC-CA-0001); `stream_gpu` remains its own
+  digest-bound decision.
+  (`decisions/DEC-CA-0029-gp-prior-generation-budget.md`)
+
 ## Proposed (design pass 2026-08-13 — miner submission surface; not yet owner-accepted;
 ## renumbered 2026-08-20: original 0016-0024 collided with the accepted decay/guard/wsd/jitter nodes)
 

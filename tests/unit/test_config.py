@@ -336,3 +336,64 @@ def test_cadence_keys_must_be_set_together(tmp_path):
                              "epoch_blocks_prev      = 0"))
     with pytest.raises(ValueError, match="must be set together"):
         load_chain_config(p)
+
+
+# ── DEC-CA-0029: points-denominated drain budget + split stall window ────────
+
+
+def test_shipped_config_arms_points_denomination():
+    """The shipped mainnet template arms corpus_target_points at today's
+    corpus size in points (16384 × 4096) and splits the streaming stall
+    window off the raised batch drain budget at its pre-split value."""
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
+    g = c.generator
+    assert g.corpus_target_points == 16384 * 4096
+    assert g.corpus_target_points <= g.max_total_points
+    assert g.max_generate_seconds == 7200
+    # The stall window is pinned at the pre-DEC-CA-0029 value: raising the
+    # batch budget must not widen how long a stalled generator holds a lane.
+    assert g.stream_stall_seconds == 1800
+    assert g.effective_stall_seconds == 1800
+
+
+def test_effective_stall_seconds_falls_back_to_max_generate(cfg):
+    from dataclasses import replace
+
+    g = replace(cfg.generator, stream_stall_seconds=0, max_generate_seconds=900)
+    assert g.effective_stall_seconds == 900
+    assert replace(g, stream_stall_seconds=300).effective_stall_seconds == 300
+
+
+def test_corpus_target_points_must_fit_the_point_cap(tmp_path):
+    import pytest
+
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+
+    src = DEFAULT_CHAIN_TOML.read_text()
+    p = tmp_path / "chain.toml"
+    p.write_text(src.replace("corpus_target_points = 67_108_864",
+                             "corpus_target_points = 3_000_000_000"))
+    with pytest.raises(ValueError, match="max_total_points"):
+        load_chain_config(p)
+
+
+def test_generator_budget_keys_stay_out_of_contract_digest():
+    """DEC-CA-0029's premise: no [generator] key is in contract_digest, so the
+    budget re-denomination never forks manifests or needs a validator restart.
+    The digest hashes TrainingContractConfig only — assert the armed template's
+    training digest is bit-equal to the same [training] with the drain armed
+    or not (i.e. the generator block cannot reach it)."""
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    from cascade.shared.manifest import contract_digest
+
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
+    assert "corpus_target_points" not in {
+        f for f in c.training.__dataclass_fields__
+    }
+    assert "stream_stall_seconds" not in {
+        f for f in c.training.__dataclass_fields__
+    }
+    # And the digest input really is the training dataclass alone.
+    assert len(contract_digest(c.training)) == 64

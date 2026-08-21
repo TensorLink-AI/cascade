@@ -12,11 +12,38 @@ description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Tot
 [generator]
 # Bounds the trainer enforces on every generator's output; a violation
 # disqualifies the generator for the round.
-corpus_n_series      = 16384     # series drawn from each generator per training run
+corpus_n_series      = 16384     # legacy exact-count drain; superseded while corpus_target_points
+                                 # is armed (below), still the probe/off-switch denomination
 min_length           = 64        # per-series length band (timesteps)
 max_length           = 4096      # keep in lockstep with [training] context_length
 max_total_points     = 2_000_000_000
-max_generate_seconds = 1800      # wall-clock budget for draining the generator
+# Points-denominated materialised drain (DEC-CA-0029): the cache_reuse /
+# `cascade verify` drain stops at this many cumulative values-points instead of
+# at a fixed series count — 67_108_864 = 16384 × 4096, today's corpus size, but
+# a miner may now spend it as 65k×1024 (or any shape inside the length band).
+# GP/kernel draws scale ~cubically in length, so the fixed count pinned those
+# priors into their worst corner; freeing the count is what makes them
+# affordable inside max_generate_seconds. Inert for the live stream_cpu feed
+# (which already stops at the training token budget) and for the dedup probe
+# (count-denominated by construction). Not in contract_digest — no [generator]
+# key is — so this is an operational (trainer-side) knob, no coordinated
+# restart. 0 = legacy exactly-corpus_n_series drain.
+corpus_target_points = 67_108_864
+max_generate_seconds = 7200      # batch-drain budget: RLIMIT_CPU + wall for a materialised
+                                 # (cache_reuse / verify) generator run. 1800 → 7200
+                                 # (DEC-CA-0029): at 1800 every measured GP-prior was 13–116×
+                                 # over budget; 7200 admits the gp prior at L=4096 with the
+                                 # relative-jitter Cholesky (docs/MINER.md) and the cheaper
+                                 # priors at reduced length under corpus_target_points.
+                                 # RLIMIT_CPU sums across threads (multiprocessing is a
+                                 # blocked import), so multi-core BLAS burns it faster —
+                                 # single-thread your linear algebra.
+# Streaming per-frame stall window (seconds between series before the child is
+# killed). Split out of max_generate_seconds (DEC-CA-0029) so the batch-budget
+# raise above does NOT widen how long a stalled generator can idle a heat/final
+# lane — 1800 preserves the pre-split streaming behaviour exactly. 0 = fall
+# back to max_generate_seconds.
+stream_stall_seconds = 1800
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
 max_channels         = 1         # per-series variates; 1 = univariate

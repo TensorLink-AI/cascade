@@ -112,9 +112,12 @@ class Generator(DataGenerator):
         ...
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-        # Yield EXACTLY n_series float arrays: 1-D (L,) today, or (C, L) once the
+        # Yield UP TO n_series float arrays: 1-D (L,) today, or (C, L) once the
         # owner raises max_channels. Each length L must fall in the configured
         # [min_length, max_length] band; total emitted points (C*L) are capped.
+        # The trainer may stop consuming early — at the training token budget
+        # (streaming) or at [generator] corpus_target_points (materialised
+        # drain) — so the consumed PREFIX must be deterministic in (seed, n).
         ...
 
     @property
@@ -133,7 +136,16 @@ class Generator(DataGenerator):
 * **Bounds.** Each series is finite (no NaN/inf), 1-D, floating dtype, with
   length in `[generator.min_length, generator.max_length]`. The whole corpus is
   capped at `generator.max_total_points`.
-* **Count.** `generate(n)` yields exactly `n` series.
+* **Count / budget.** The corpus budget is denominated in **points**: with
+  `[generator] corpus_target_points` armed (it ships armed), the materialised
+  drain (`cascade verify`, `cache_reuse`) stops once your corpus reaches the
+  target points, and the series count is yours to choose — many short series
+  or fewer long ones (DEC-CA-0029; compute-heavy GP/kernel priors want short —
+  see MINER.md §1a). The streaming feed likewise stops at the training token
+  budget. `generate(n)` may therefore be stopped before `n`; if the owner
+  disarms the target (`corpus_target_points = 0`) the legacy rule returns:
+  exactly `n` series are required. Yielding *more* than `n` is always an
+  error, and exhausting your iterator below the points target rejects the run.
 * **No network / no escape.** `generator.py` is AST-scanned for blocked imports
   (sockets, subprocess, the cascade internals, etc.) and run in a
   network-isolated sandbox. See `chain.toml [static_guard]`.

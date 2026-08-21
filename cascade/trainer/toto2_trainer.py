@@ -489,7 +489,8 @@ class Toto2Trainer:
         # init never eat the budget (material at testnet-scale budgets). Waits
         # for data DURING training do count — that is the anti-trickler bound —
         # and a first batch that never arrives is killed by the sandbox's
-        # max_generate_seconds inactivity timeout, not this deadline.
+        # stall window (stream_stall_seconds, falling back to
+        # max_generate_seconds — DEC-CA-0029), not this deadline.
         t0 = time.time()                     # provisional (re-anchored at first batch)
         deadline: float | None = None
 
