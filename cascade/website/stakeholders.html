@@ -1453,8 +1453,16 @@ function sixGeomean(s){
   return Math.exp(sum/6);
 }
 
+// The scan starts at the newest BENCH_SCAN_MAX rounds (fast first paint) and
+// deepens by BENCH_SCAN_MAX each poll until the whole public record is
+// covered — so "best seen" converges to the best of every round still listed,
+// not just the recent window. Misses are cached (_benchMissing), so the
+// deepening only ever fetches each round's report once.
+var _benchDepth = 0;
 function scanBench(){
-  var rs = scoredRounds(), recent = rs.slice(-BENCH_SCAN_MAX);
+  var rs = scoredRounds();
+  _benchDepth = Math.min(rs.length, (_benchDepth || 0) + BENCH_SCAN_MAX);
+  var recent = rs.slice(-_benchDepth);
   var newest = {};
   rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)] = 1; });
   recent.forEach(function(r){
