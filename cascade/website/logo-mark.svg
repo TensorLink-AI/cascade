@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 281">
+  <defs>
+    <mask id="m-red"><rect width="340" height="281" fill="white"/>
+      <path fill="none" stroke="black" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"
+        d="M332,150 L168,20 L16,98 L16,166 L170,252 C192,250 216,246 232,240"/></mask>
+    <mask id="m-navy"><rect width="340" height="281" fill="white"/>
+      <path fill="none" stroke="black" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"
+        d="M330,184 L168,58 L44,120"/></mask>
+    <mask id="m-steel"><rect width="340" height="281" fill="white"/>
+      <path fill="none" stroke="black" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"
+        d="M320,212 L168,95 L56,150"/></mask>
+    <mask id="m-sage"><rect width="340" height="281" fill="white"/>
+      <g fill="none" stroke="black" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M168,131 L56,184 L170,230 L284,177 Z"/>
+        <path d="M284,177 C304,192 298,218 264,231 C246,238 242,226 256,221"/>
+      </g></mask>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="27">
+    <g stroke="#7C9C85" mask="url(#m-sage)">
+      <path d="M168,131 L56,184 L170,230 L284,177 Z"/>
+      <path d="M284,177 C304,192 298,218 264,231 C246,238 242,226 256,221"/>
+    </g>
+    <path stroke="#5E82A8" mask="url(#m-steel)" d="M320,212 L168,95 L56,150"/>
+    <path stroke="#2E4A66" mask="url(#m-navy)"  d="M330,184 L168,58 L44,120"/>
+    <path stroke="#E9584F" mask="url(#m-red)"   d="M332,150 L168,20 L16,98 L16,166 L170,252 C192,250 216,246 232,240"/>
+  </g>
+</svg>
