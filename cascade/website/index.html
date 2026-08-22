@@ -1284,7 +1284,7 @@ function renderVerdict(){
       // Bootstrap spread of the relative improvement; LCB is the 5th pct. A large
       // gap between a positive median and a negative LCB = a fragile verdict.
       cells.push(stat("Bootstrap spread",
-        fmt(r.lcb,3)+'<span class="sub">p5</span> · <b>'+fmt(r.boot_p50,3)+'</b><span class="sub">p50</span> · '+fmt(r.boot_p95,3)+'<span class="sub">p95</span>',
+        '<span class="sub">p5&nbsp;</span>'+fmt(r.lcb,3)+' · <span class="sub">p50&nbsp;</span><b>'+fmt(r.boot_p50,3)+'</b> · <span class="sub">p95&nbsp;</span>'+fmt(r.boot_p95,3),
         {wide:true, range:true,
          title:"Bootstrap spread of the relative improvement; p5 is the LCB. A median far above a negative p5 = a fragile verdict."}));
     }
