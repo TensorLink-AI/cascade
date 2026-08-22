@@ -38,6 +38,15 @@
     {
       "source": "/promotions/:path*",
       "destination": "https://s3.hippius.com/cascade-manifests/promotions/:path*"
+    },
+    {
+      "source": "/mix/:path*",
+      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/mix/:path*"
+    },
+    {
+      "source": "/mix/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/mix/:path*"
     }
   ],
   "headers": [
@@ -61,6 +70,12 @@
     },
     {
       "source": "/promotions/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+      ]
+    },
+    {
+      "source": "/mix/(.*)",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
       ]
