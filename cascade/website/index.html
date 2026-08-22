@@ -830,7 +830,20 @@ body {
   -webkit-font-smoothing: antialiased;
   transition: background .2s, color .2s;
 }
-.page { width: 100%; max-width: 1200px; padding: 30px 44px 72px; display: flex; flex-direction: column; gap: 32px; }
+.page { width: 100%; max-width: 1200px; padding: 30px 44px 72px; display: flex; flex-direction: column; gap: 46px; }
+/* the tab panes hold the actual sections — without their own flex gap the
+   sections stack edge-to-edge (the page-level gap can't reach inside them) */
+#page-main, #page-mix { display: flex; flex-direction: column; gap: 46px; }
+#page-main[hidden], #page-mix[hidden] { display: none; }
+/* two narrow tables share a row on desktop so the page scrolls shorter */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 46px 44px; align-items: start; min-width: 0; }
+.grid-2 > div { min-width: 0; }
+@media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
+/* collapsible secondary sections */
+details.sec > summary.section-label { cursor: pointer; list-style: none; }
+details.sec > summary.section-label::-webkit-details-marker { display: none; }
+details.sec > summary.section-label > span:first-child::before { content: "\25B8\00a0"; color: var(--muted); }
+details.sec[open] > summary.section-label > span:first-child::before { content: "\25BE\00a0"; }
 a { color: var(--chal); text-decoration: none; }
 
 #top-bar {
@@ -879,9 +892,16 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 /* verdict panel */
 .verdict {
   border: var(--line); padding: 18px 22px; position: relative;
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px 26px;
+  /* Explicit column counts (not auto-fit) so the cells land on a natural,
+     fully-filled grid: 11 cells + the 2-wide bootstrap cell = 12 units,
+     which divides evenly at 6, 4, 3 and 2 columns. dense backfills any hole. */
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-auto-flow: dense;
+  gap: 16px 26px;
   background: var(--surface);
 }
+@media (max-width: 1000px) { .verdict { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 640px)  { .verdict { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 440px)  { .verdict { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .verdict::before { content: ""; position: absolute; inset: 4px; border: var(--line-faint); pointer-events: none; }
 .stat { position: relative; z-index: 1; min-width: 0; }
 .stat .k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -960,11 +980,12 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
 .subs-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
 
 @media (max-width: 380px) {
-  .verdict .stat.wide { grid-column: auto; }
+  /* wide cell = the full 2-col row here; just let the value wrap if it must */
   .stat .v.range { white-space: normal; }
 }
 @media (max-width: 720px) {
-  .page { padding: 22px 18px 56px; gap: 26px; }
+  .page { padding: 22px 18px 56px; gap: 30px; }
+  #page-main, #page-mix { gap: 30px; }
   .header .wordmark { font-size: 34px; }
   .chart-wrap { aspect-ratio: 3/2; }
   .scroll-box { overflow-x: auto; }
@@ -1049,17 +1070,18 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     </div>
   </div>
 
-  <div>
-    <div class="section-label"><span>Reigns</span></div>
-    <div class="scroll-box scroll-reigns">
-      <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned round</th><th class="num">Block</th></tr></thead><tbody id="reigns"></tbody></table>
+  <div class="grid-2">
+    <div>
+      <div class="section-label"><span>Reigns</span></div>
+      <div class="scroll-box scroll-reigns">
+        <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned round</th><th class="num">Block</th></tr></thead><tbody id="reigns"></tbody></table>
+      </div>
     </div>
-  </div>
-
-  <div>
-    <div class="section-label"><span>Field</span><span id="field-when" class="muted"></span></div>
-    <div class="scroll-box scroll-field">
-      <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th></tr></thead><tbody id="field"></tbody></table>
+    <div>
+      <div class="section-label"><span>Field</span><span id="field-when" class="muted"></span></div>
+      <div class="scroll-box scroll-field">
+        <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th></tr></thead><tbody id="field"></tbody></table>
+      </div>
     </div>
   </div>
 
@@ -1068,11 +1090,11 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     <div id="heat-panel"></div>
   </div>
 
-  <div>
-    <div class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></div>
+  <details class="sec">
+    <summary class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></summary>
     <div id="warm-panel"></div>
     <div id="warm-history"></div>
-  </div>
+  </details>
 
   <div>
     <div class="section-label"><span>Rounds</span></div>
@@ -1252,6 +1274,7 @@ function renderVerdict(){
     }
     cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>',
       {title:"Bootstrap lower confidence bound on the improvement vs the margin required to dethrone"}));
+    cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
     if(r.boot_p50!=null){
       // Bootstrap spread of the relative improvement; LCB is the 5th pct. A large
       // gap between a positive median and a negative LCB = a fragile verdict.
@@ -1260,7 +1283,6 @@ function renderVerdict(){
         {wide:true, range:true,
          title:"Bootstrap spread of the relative improvement; p5 is the LCB. A median far above a negative p5 = a fragile verdict."}));
     }
-    cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
     if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">eff. n</span>',
       {title:"Independent feed clusters — the effective sample size behind the windows"}));
     if(r.wilcoxon_p!=null) cells.push(stat("Wilcoxon p",pval(r.wilcoxon_p)));
