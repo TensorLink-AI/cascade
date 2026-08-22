@@ -818,7 +818,10 @@ th.num{text-align:right}
 }
 
 /* benchmark result cells reuse the scoreboard anatomy */
-.bench-cells{max-width:820px}
+.bench-cells{max-width:820px;grid-template-columns:repeat(3,1fr)}
+.bench-cells .bv{font-size:clamp(26px,2.6vw,34px)}
+@media (max-width:700px){.bench-cells{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:430px){.bench-cells{grid-template-columns:1fr}}
 
 /* method */
 .method{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px 32px}
@@ -856,7 +859,8 @@ th.num{text-align:right}
       <span id="tb-live" hidden><i class="ldot"></i>LIVE</span>
       <span>SUBNET <b id="tb-netuid">--</b></span>
       <span>ROUNDS <b id="tb-rounds">--</b></span>
-      <span>UPDATED <b id="tb-updated">--</b></span>
+      <span title="When the last round&#39;s signed verdict was published — rounds settle roughly every 12 hours, so this stamp normally sits hours old between settlements">LAST ROUND <b id="tb-updated">--</b></span>
+      <span title="Freshness of the live chain feed — this should always read minutes">CHAIN <b id="tb-chain">--</b></span>
     </div>
     <div class="tb-group">
       <span class="soc" id="soc-links"></span>
@@ -1050,7 +1054,10 @@ th.num{text-align:right}
         <p>Each benchmark reports two scores. <b>MASE</b> measures how accurate the central
         forecast is; <b>CRPS</b> measures how well the model&rsquo;s uncertainty range matched what
         actually happened. Both are relative to the baseline at 1.00, and lower is better for
-        both. The large number in each tile is the MASE.</p>
+        both. The top row of tiles is accuracy (MASE), the bottom row is uncertainty
+        (CRPS), one column per benchmark. The big number is the current
+        leader&rsquo;s latest published checkpoint; <b>best seen</b> is the lowest value in
+        any published report still in the public record, whichever checkpoint set it.</p>
         <p>These scores are <b>reported only</b>. They never decide who wins a round. The benchmark
         data is public, so scoring on it would just reward entries tuned to it; the competition is
         settled on hidden data instead.</p>
@@ -1446,8 +1453,16 @@ function sixGeomean(s){
   return Math.exp(sum/6);
 }
 
+// The scan starts at the newest BENCH_SCAN_MAX rounds (fast first paint) and
+// deepens by BENCH_SCAN_MAX each poll until the whole public record is
+// covered — so "best seen" converges to the best of every round still listed,
+// not just the recent window. Misses are cached (_benchMissing), so the
+// deepening only ever fetches each round's report once.
+var _benchDepth = 0;
 function scanBench(){
-  var rs = scoredRounds(), recent = rs.slice(-BENCH_SCAN_MAX);
+  var rs = scoredRounds();
+  _benchDepth = Math.min(rs.length, (_benchDepth || 0) + BENCH_SCAN_MAX);
+  var recent = rs.slice(-_benchDepth);
   var newest = {};
   rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)] = 1; });
   recent.forEach(function(r){
@@ -1481,7 +1496,7 @@ function entrySizeKey(e, r){
 }
 
 function benchView(){
-  var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {};
+  var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {}, bestSix = {};
   rs.forEach(function(r){
     var rep = _benchReports[String(r.round_id)];
     if(!rep) return;
@@ -1490,6 +1505,9 @@ function benchView(){
     entries.forEach(function(e){
       var six = readSix(e);
       if(!six) return;
+      SIX_KEYS.forEach(function(k){
+        if(bestSix[k] == null || six[k] < bestSix[k]) bestSix[k] = six[k];
+      });
       var g = sixGeomean(six);
       if(g != null && (!best || g < best.geomean))
         best = { geomean:g, six:six, role:String(e.role||""), uid:e.uid,
@@ -1513,7 +1531,7 @@ function benchView(){
       if(six) latest = { six:six, geomean:sixGeomean(six), round_id:null, at:null, src:"manifest" };
     }
   }
-  return { latest:latest, best:best, bySize:bySize, firstBySize:firstBySize };
+  return { latest:latest, best:best, bestSix:bestSix, bySize:bySize, firstBySize:firstBySize };
 }
 
 // ── official-Toto2 reference docs ───────────────────────────────────────────
@@ -2056,9 +2074,10 @@ function renderBench(){
     ? "No qualifying public result yet."
     : "Every score is a ratio against a naive baseline forecast, which sits at 1.00 — " +
       "<b>lower is better</b>. The current leader&rsquo;s latest published checkpoint scores <b>" +
-      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval accuracy (MASE)" +
+      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval accuracy (MASE) and <b>" +
+      num(L.six.gifteval_crps,3) + "</b> on its uncertainty score (CRPS)" +
       (L.six.gifteval_mase<1
-        ? ": <b>" + num((1-L.six.gifteval_mase)*100,1) + "% better</b> than the baseline."
+        ? " — accuracy <b>" + num((1-L.six.gifteval_mase)*100,1) + "% better</b> than the baseline."
         : " — not yet beating the baseline.");
   document.getElementById("bench-answer").innerHTML = ans;
   if(!L){
@@ -2072,25 +2091,31 @@ function renderBench(){
   }
   var s = L.six;
   var suites = [
-    { n:"GIFT-Eval", c:s.gifteval_crps, m:s.gifteval_mase },
-    { n:"BOOM",      c:s.boom_crps,     m:s.boom_mase },
-    { n:"TIME",      c:s.time_crps,     m:s.time_mase }
+    { n:"GIFT-Eval", key:"gifteval", c:s.gifteval_crps, m:s.gifteval_mase },
+    { n:"BOOM",      key:"boom",     c:s.boom_crps,     m:s.boom_mase },
+    { n:"TIME",      key:"time",     c:s.time_crps,     m:s.time_mase }
   ];
-  var bestLine = "";
-  if(bv.best && bv.best.geomean != null){
-    bestLine = '<p class="lede" style="margin:14px 0 0">Best combined score to date: <b>' +
-      num(bv.best.geomean,3) + '</b> — all six numbers above folded into one (a geometric ' +
-      'mean; lower is better), set by a ' + esc(bv.best.role || "leading") +
-      ' checkpoint on ' + esc(prettyDay(bv.best.at)) +
-      '. A combined score is its own scale — don&rsquo;t compare it to a single benchmark.</p>';
-  }
-  el.innerHTML = '<div class="bcells bench-cells">' + suites.map(function(x){
-    return cell({ k:x.n, v:num(x.m,3),
-      q:"MASE — " + (x.m<1 ? "beats" : "trails") + " 1.00 baseline · CRPS " + num(x.c,3),
+  var bs = bv.bestSix || {};
+  var tiles = suites.map(function(x){
+    var b = bs[x.key+"_mase"];
+    return cell({ k:x.n+" · MASE", v:num(x.m,3),
+      q:(x.m<1 ? "beats" : "trails")+" 1.00 baseline" +
+        (b!=null ? " · best seen "+num(b,3) : ""),
       state:(x.m<1 ? "live" : "warn") });
-  }).join("") + '</div>' + bestLine;
+  }).concat(suites.map(function(x){
+    var b = bs[x.key+"_crps"];
+    return cell({ k:x.n+" · CRPS", v:num(x.c,3),
+      q:(x.c<1 ? "beats" : "trails")+" 1.00 baseline" +
+        (b!=null ? " · best seen "+num(b,3) : ""),
+      state:(x.c<1 ? "live" : "warn") });
+  }));
+  el.innerHTML = '<div class="bcells bench-cells">' + tiles.join("") + '</div>';
+  var rsAll = scoredRounds(), newestScored = rsAll.length ? rsAll[rsAll.length-1] : null;
+  var benchLag = L.src === "report" && L.round_id != null && newestScored &&
+    String(newestScored.round_id) !== String(L.round_id);
   document.getElementById("bench-when").textContent = L.src === "report"
-    ? ("Report " + prettyDay(L.at)) : "Current leader";
+    ? ("Report " + prettyDay(L.at) + (benchLag ? " — newer rounds have no report yet" : ""))
+    : "Current leader";
 }
 
 function renderLadder(){
@@ -2310,6 +2335,8 @@ function renderChrome(){
   document.getElementById("tb-rounds").textContent = allRounds().length || "--";
   document.getElementById("tb-updated").textContent =
     _index && _index.updated_at ? timeAgo(_index.updated_at) : "--";
+  document.getElementById("tb-chain").textContent =
+    _chain && _chain.as_of ? timeAgo(_chain.as_of) : "--";
   document.getElementById("tb-live").hidden = _state !== "live";
   var el = document.getElementById("net-badge");
   el.textContent = IS_TESTNET ? "TESTNET" : "MAINNET";
@@ -2360,7 +2387,7 @@ function poll(){
     .catch(function(){});
   // Live chain view (unsigned, presentational): feeds the Economics cell.
   fetchJSON("status/chain.json")
-    .then(function(d){ _chain = d; renderBoard(); })
+    .then(function(d){ _chain = d; renderBoard(); renderChrome(); })
     .catch(function(){});
 }
 renderAll();
