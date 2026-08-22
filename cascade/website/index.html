@@ -807,6 +807,7 @@ code, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
   --line-faint: 1px dotted rgba(51,64,78,0.16);
   --king: var(--slate);
   --chal: var(--sage);
+  --chal-line: var(--sage-600); /* chart strokes: sage is 2.9:1 on the card — one step darker for 3:1+ */
   --good: var(--sage-700);
   --hatch: rgba(126,155,126,0.08);
 }
@@ -819,18 +820,34 @@ code, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
   --line-faint: 1px dotted rgba(229,219,201,0.14);
   --king: var(--bone-light);
   --chal: var(--sage-300);
+  --chal-line: var(--sage-300);
   --good: var(--sage-300);
   --hatch: rgba(169,193,169,0.12);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   background: var(--paper); color: var(--ink);
-  font: 13px/1.5 var(--font-sans);
+  font: 13.5px/1.5 var(--font-sans);
   display: flex; justify-content: center; min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   transition: background .2s, color .2s;
 }
-.page { width: 100%; max-width: 1200px; padding: 34px 44px 80px; display: flex; flex-direction: column; gap: 38px; }
+.page { width: 100%; max-width: 1200px; padding: 30px 44px 88px; display: flex; flex-direction: column; gap: 52px; }
+/* the tab panes hold the actual sections — without their own flex gap the
+   sections stack edge-to-edge (the page-level gap can't reach inside them) */
+#page-main, #page-mix { display: flex; flex-direction: column; gap: 68px; }
+#page-main[hidden], #page-mix[hidden] { display: none; }
+/* two narrow tables share a row on desktop so the page scrolls shorter */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 68px 44px; align-items: stretch; min-width: 0; }
+.grid-2 > div { min-width: 0; display: flex; flex-direction: column; }
+.grid-2 .panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.grid-2 .panel .scroll-box { flex: 1; max-height: 268px; }
+@media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
+/* collapsible secondary sections */
+details.sec > summary.section-label { cursor: pointer; list-style: none; }
+details.sec > summary.section-label::-webkit-details-marker { display: none; }
+details.sec > summary.section-label > span:first-child::before { content: "\25B8\00a0"; color: var(--muted); }
+details.sec[open] > summary.section-label > span:first-child::before { content: "\25BE\00a0"; }
 a { color: var(--chal); text-decoration: none; }
 
 #top-bar {
@@ -853,11 +870,11 @@ a { color: var(--chal); text-decoration: none; }
 #theme-toggle:hover, .btn:hover { background: var(--chal); color: var(--bone-light); border-color: var(--chal); }
 
 /* masthead */
-.header { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 6px 0 4px; }
+.header { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 2px 0 0; }
 .header .mark { display: flex; align-items: baseline; gap: 16px; }
 .header .wordmark { font-family: var(--font-display); font-weight: 900; font-size: 44px; letter-spacing: -0.03em; color: var(--chal); line-height: 1; }
 .header .tagline { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 6px; }
-.header .meta { font-family: var(--font-mono); font-size: 11px; margin-top: 15px; display: flex; flex-direction: column; gap: 6px; align-items: center; text-transform: uppercase; color: var(--muted); }
+.header .meta { font-family: var(--font-mono); font-size: 11px; margin-top: 10px; display: flex; flex-direction: column; gap: 6px; align-items: center; text-transform: uppercase; color: var(--muted); }
 .header .meta b { color: var(--ink); font-weight: 600; }
 .header .meta a { color: var(--ink); border-bottom: var(--line); }
 .header .meta .crown { color: var(--chal); }
@@ -867,7 +884,7 @@ a { color: var(--chal); text-decoration: none; }
 .section-label {
   display: flex; justify-content: space-between; align-items: center; gap: 8px;
   text-transform: uppercase; font-family: var(--font-mono); font-weight: 700; font-size: 11px; letter-spacing: 0.08em;
-  border-bottom: var(--line); padding-bottom: 9px; margin-bottom: 18px; color: var(--ink);
+  border-bottom: var(--line); padding-bottom: 9px; margin-bottom: 22px; color: var(--ink);
 }
 .section-label .muted { color: var(--muted); font-weight: 400; }
 .controls { display: flex; gap: 8px; align-items: center; font-weight: 400; }
@@ -878,15 +895,27 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 
 /* verdict panel */
 .verdict {
-  border: var(--line); padding: 24px 26px; position: relative;
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 22px 30px;
+  border: var(--line); padding: 18px 22px; position: relative;
+  /* Explicit column counts (not auto-fit) so the cells land on a natural,
+     fully-filled grid: 11 cells + the 2-wide bootstrap cell = 12 units,
+     which divides evenly at 6, 4, 3 and 2 columns. dense backfills any hole. */
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-auto-flow: dense;
+  gap: 16px 26px;
   background: var(--surface);
 }
+@media (max-width: 1000px) { .verdict { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 640px)  { .verdict { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 440px)  { .verdict { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .verdict::before { content: ""; position: absolute; inset: 4px; border: var(--line-faint); pointer-events: none; }
-.stat { position: relative; z-index: 1; }
-.stat .k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; }
-.stat .v { font-family: var(--font-mono); font-size: clamp(17px, 2.1vw, 23px); line-height: 1.2; margin-top: 4px; color: var(--ink); }
-.stat .v .sub { font-size: 12px; color: var(--muted); }
+.stat { position: relative; z-index: 1; min-width: 0; }
+.stat .k { font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat[title] .k { cursor: help; border-bottom: 1px dotted var(--muted); display: inline-block; max-width: 100%; }
+.stat .v { font-family: var(--font-mono); font-size: clamp(16px, 1.9vw, 21px); line-height: 1.2; margin-top: 4px; color: var(--ink); }
+.stat .v .sub { font-size: 11px; color: var(--muted); }
+/* multi-part values (e.g. bootstrap percentiles): keep on ONE line, span wider */
+.stat.wide { grid-column: span 2; }
+.stat .v.range { font-size: 15px; white-space: nowrap; }
+.stat .v.range .sub { font-size: 10px; }
 .badge { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 9px; border: 1px solid var(--ink); }
 .badge.win { background: var(--chal); color: var(--bone-light); border-color: var(--chal); }
 .badge.hold { background: var(--slate); color: var(--bone-light); border-color: var(--slate); }
@@ -901,19 +930,27 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .swatch { width: 15px; height: 3px; display: inline-block; }
 
+/* dashed panel around a section's body — same card language as the verdict */
+.panel { border: var(--line); background: var(--surface); padding: 16px 20px; }
+.panel th { background: var(--surface); }
+
 /* tables */
-.scroll-box { overflow: auto; scrollbar-width: thin; }
+.scroll-box { overflow: auto; scrollbar-width: thin; scrollbar-color: var(--chal) transparent; }
 .scroll-box::-webkit-scrollbar { width: 5px; height: 5px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--chal); }
+/* generator refs can be arbitrarily long — cap the link and ellipsise (the
+   full ref lives in the title tooltip); tighter cap in half-width tables */
+table a { display: inline-block; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.grid-2 table a { max-width: 170px; }
+.grid-2 th, .grid-2 td { padding-right: 12px; }
 .scroll-reigns { max-height: 268px; }
 .scroll-field { max-height: 248px; }
 .scroll-hist { max-height: 392px; }
-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; }
-th { text-transform: uppercase; font-weight: 700; font-size: 10px; letter-spacing: 0.05em; text-align: left; padding: 9px 16px 9px 0; border-bottom: var(--line); background: var(--paper); position: sticky; top: 0; z-index: 1; white-space: nowrap; color: var(--muted); }
-td { padding: 8px 16px 8px 0; white-space: nowrap; color: var(--ink); }
+table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12.5px; }
+th { text-transform: uppercase; font-weight: 700; font-size: 10.5px; letter-spacing: 0.05em; text-align: left; padding: 10px 14px 10px 0; border-bottom: var(--line); background: var(--paper); position: sticky; top: 0; z-index: 1; white-space: nowrap; color: var(--muted); }
+td { padding: 10px 14px 10px 0; white-space: nowrap; color: var(--ink); }
 tr { border-bottom: var(--line-faint); }
-tbody tr:hover td { background: var(--chal); color: var(--bone-light); cursor: crosshair; }
-tbody tr:hover td a { color: var(--bone-light); }
+tbody tr:hover td { background: var(--hatch); }
 .num { text-align: right; }
 th.num { text-align: right; }
 .muted { color: var(--muted); }
@@ -923,39 +960,44 @@ th.num { text-align: right; }
 .crown { font-weight: 700; color: var(--chal); }
 
 /* heat screen — informational standings for every entrant */
-.heat-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-bottom: 14px; max-width: 84ch; line-height: 1.6; }
+.heat-note { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin-bottom: 14px; max-width: 84ch; line-height: 1.6; }
 .heat-bar-cell { display: flex; align-items: center; gap: 8px; min-width: 130px; }
 .heat-bar { flex: 1; height: 6px; background: var(--surface); border: var(--line-faint); border-radius: 3px; overflow: hidden; min-width: 56px; }
 .heat-bar > i { display: block; height: 100%; }
 .heat-rel { font-family: var(--font-mono); font-size: 11px; color: var(--muted); min-width: 46px; text-align: right; }
-.heat-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.heat-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 9px; border-radius: 2px; border: 1px dashed currentColor; white-space: nowrap; }
 .heat-pill.adv { color: var(--good); }
 .heat-pill.screened { color: var(--muted); }
 .heat-pill.nofit { color: #BF5B3D; }
-tbody tr:hover td .heat-pill { color: var(--bone-light); }
 .heat-empty { border: var(--line); background: var(--surface); padding: 26px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .heat-empty .he-glyph { font-family: var(--font-mono); font-size: 18px; color: var(--muted); letter-spacing: 0.3em; }
 .heat-empty .he-head { font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
 .heat-empty p { font-size: 12px; color: var(--muted); max-width: 58ch; margin: 0; }
 
 /* live round panel — stage strip + revealed submissions */
-.stage-strip { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 2px 0 4px; }
-.stage-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 11px; border: 1px solid var(--muted); color: var(--muted); border-radius: 999px; white-space: nowrap; }
+.stage-strip { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 4px 0 16px; }
+.stage-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 11px; border: 1px dashed var(--muted); color: var(--muted); border-radius: 2px; white-space: nowrap; }
 .stage-pill.done { border-color: var(--chal); color: var(--chal); opacity: 0.7; }
+.stage-pill.on { border-style: solid; }
 .stage-pill.on { background: var(--chal); border-color: var(--chal); color: var(--bone-light); }
 .stage-sep { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
-.stage-detail { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+.stage-detail { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); margin: 2px 0 16px; }
 .stage-detail b { color: var(--ink); }
-.sub-tag { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 9px; border-radius: 999px; border: 1px solid currentColor; color: var(--muted); white-space: nowrap; }
+.sub-tag { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 9px; border-radius: 2px; border: 1px dashed currentColor; color: var(--muted); white-space: nowrap; }
 .sub-tag.next { color: var(--chal); }
 .sub-new { font-family: var(--font-mono); font-weight: 700; font-size: 10px; text-transform: uppercase; color: var(--good); margin-left: 7px; animation: subpulse 1.4s ease-in-out 5; }
 @keyframes subpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 tr.is-new td { background: rgba(126, 155, 126, 0.13); }
-tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light); }
-.subs-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
+.subs-note { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin-top: 8px; }
 
+@media (max-width: 380px) {
+  /* wide cell = the full 2-col row here; just let the value wrap if it must */
+  .stat .v.range { white-space: normal; }
+}
 @media (max-width: 720px) {
-  .page { padding: 22px 18px 56px; gap: 26px; }
+  .page { padding: 22px 18px 64px; gap: 34px; }
+  .panel { padding: 12px 14px; }
+  #page-main, #page-mix { gap: 44px; }
   .header .wordmark { font-size: 34px; }
   .chart-wrap { aspect-ratio: 3/2; }
   .scroll-box { overflow-x: auto; }
@@ -989,7 +1031,7 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
 
   <div class="header">
     <div class="mark">
-      <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA4OCA0MCIgd2lkdGg9Ijg4IiBoZWlnaHQ9IjQwIiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IkNhc2NhZGUgbWFyayI+CiAgPGxpbmUgeDE9IjQiIHkxPSIzOCIgeDI9Ijg0IiB5Mj0iMzgiIHN0cm9rZT0iI0JGNUIzRCIgc3Ryb2tlLXdpZHRoPSIxLjUiIG9wYWNpdHk9IjAuMyI+PC9saW5lPgogIDxwb2x5bGluZSBwb2ludHM9IjQsMzMgMTYsMjcgMjgsMzQgNDAsMjUgNTIsMzEgNjQsMjYgNzYsMzIgODIsMjgiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzdFOUI3RSIgc3Ryb2tlLXdpZHRoPSIzIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjwvcG9seWxpbmU+CiAgPGNpcmNsZSBjeD0iODIiIGN5PSIyOCIgcj0iMi44IiBmaWxsPSIjN0U5QjdFIj48L2NpcmNsZT4KICA8cG9seWxpbmUgcG9pbnRzPSI0LDI5IDE2LDIxIDI4LDMwIDQwLDE3IDUyLDI1IDY0LDE5IDc2LDI4IDgyLDIyIiBmaWxsPSJub25lIiBzdHJva2U9IiMzMzQwNEUiIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48L3BvbHlsaW5lPgogIDxjaXJjbGUgY3g9IjgyIiBjeT0iMjIiIHI9IjIuOCIgZmlsbD0iIzMzNDA0RSI+PC9jaXJjbGU+CiAgPHBvbHlsaW5lIHBvaW50cz0iNCwyNSAxNiwxMyAyOCwyNyA0MCw5IDUyLDIxIDY0LDE0IDc2LDI1IDgyLDE2IiBmaWxsPSJub25lIiBzdHJva2U9IiNCRjVCM0QiIHN0cm9rZS13aWR0aD0iMy41IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjwvcG9seWxpbmU+CiAgPGNpcmNsZSBjeD0iODIiIGN5PSIxNiIgcj0iMyIgZmlsbD0iI0JGNUIzRCI+PC9jaXJjbGU+Cjwvc3ZnPg==" width="66" height="30" alt="" style="align-self:center">
+      <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzNDcgMjg4IiB3aWR0aD0iMzQ3IiBoZWlnaHQ9IjI4OCI+CjxwYXRoIGZpbGw9IiNFODU3NEYiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTEyOC43LDdMMTQzLjcsN0wxNDUuMyw4TDE0OSw4TDE1OS43LDEyLjNMMTY5LjMsMTlMMTcwLjcsMTlMMTg0LjMsMjhMMTg3LjcsMjlMMTg4LDMwTDE5Mi43LDMyTDE5MywzM0wyOTUuMyw5NEwyOTYuNyw5NEwzMjMuNywxMTFMMzMxLDEyMC43TDMzNCwxMzFMMzM0LDE3MC4zTDMzMCwxNjEuM0wzMjIsMTUzTDMyMiwxMzEuN0wzMjAsMTI1LjdMMzE1LjcsMTIwTDMwOC43LDExNUwyOTguNywxMTBMMjU5LjcsODZMMjU4LjMsODZMMTk1LjcsNDhMMTk0LjMsNDhMMTgwLjcsMzlMMTcyLjMsMzVMMTYyLDI4TDE1MSwyMkwxNDUsMjBMMTI4LjMsMjBMMTIyLjMsMjJMNTkuNyw1OUw1OC4zLDU5TDU0LjcsNjJMMzQuMyw3M0wyMyw4MS4zTDIwLDg3LjNMMjAsOTMuM0wyNSwxMDBMMzMuMywxMDVMMzQuNywxMDdMMzYuNywxMDdMNDYsMTExLjdMNjUuMywxMjMuN0w2Ny43LDEyNEw3OC43LDEzMUw4NCwxMzNMOTIuMywxMzlMMTEwLDE0OC4zTDExMS4zLDE1MEwxMjEsMTU0TDEyNC4zLDE1N0wxMjcuNywxNThMMTI4LDE1OUwxNTksMTc3TDE2MywxODEuM0wxNjYsMTg3LjNMMTY3LDE5MkwxNjcsMjI2LjdMMTY2LDIyOS4zTDE2NSwyMjlMMTY0LDIyNkwxNTUsMjE4LjdMMTU1LDE5NEwxNTMsMTg5LjNMMTQ4LDE4NEwxMjEuMywxNjlMMTE3LjcsMTY2TDkzLjMsMTUzTDg5LjcsMTUwTDc5LjMsMTQ1TDc1LjcsMTQyTDU2LjMsMTMyTDQ1LjcsMTI1TDQyLjMsMTI0TDM4LjcsMTIxTDI1LjMsMTE0TDIwLjMsMTEwTDE5LDExMEwxOSwxMzQuN0wyMSwxMzkuN0wyNS4zLDE0NC43TDIzLjcsMTQ1LjdMMTkuMywxNDUuN0wxOC43LDE0Ni43TDEyLjcsMTQ1TDkuMywxNDFMOC43LDEzNi43TDcsMTM2LjNMNyw4Ny4zTDksODAuM0wxMyw3My4zTDI0LjcsNjRMNzksMzNMODQuMywyOUw5MywyNUw5My4zLDI0TDExOC4zLDEwTDEyOC43LDdaIj48L3BhdGg+CjxwYXRoIGZpbGw9IiMzRDYwODgiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTEzMSw1MUwxNDMsNTFMMTU3LjcsNTZMMjgzLjMsMTMxTDI4Ni43LDEzMkwzMjAuMywxNTNMMzIyLjMsMTUzTDMzMCwxNjEuM0wzMzQsMTcwLjNMMzM0LDIzOUwzMzMsMjAzLjNMMzMyLDIwMUwzMjksMTk4LjNMMzIxLjMsMTkzLjdMMzIyLjcsMTgzLjdMMzIyLDE3My4zTDMxOSwxNjYuM0wzMTYsMTYzTDI1OC43LDEyOUwyNTcuMywxMjlMMjUyLDEyNUwyNDUuMywxMjJMMjM1LDExNUwyMjMuMywxMDlMMjEzLDEwMkwyMDEuMyw5NkwxNTMuNyw2N0wxNDYuNyw2NEwxMzkuNyw2M0wxMjksNjRMMTE2LjMsNzBMMTA3LjcsNzZMMTA0LjMsNzdMNjcuNyw5OUw0NywxMTBMNDUuNywxMTJMMzMuMywxMDUuN0wzOS4zLDEwMUw0Niw5OEw1Ni43LDkxTDYwLDkwTDYwLjMsODlMODAuNyw3OEw4NC4zLDc1TDg3LjcsNzRMMTE1LjMsNTdMMTIzLjMsNTNMMTMxLDUxWk0xMzQsOTVMMTQ0LjMsOTUuN0wxMjYuNyw5N0wxMzQsOTVaTTE1NSw5OEwxNjIuNywxMDFMMTczLjMsMTA4TDE3MCwxMDdMMTY5LjcsMTA2TDE1NSw5OFpNMTE5LjMsOTlMMTIwLjMsOTkuN0w5Mi43LDExNUwxMTkuMyw5OVpNMTczLjcsMTA4TDIwOS4zLDEyOC43TDIwOC4zLDEyOUwyMDgsMTI4TDE5OSwxMjMuN0wxOTgsMTIyTDE3Ni4zLDExMC43TDE3My43LDEwOFpNMTYwLjMsMTEzTDE2Ni4zLDExN0wxNjEuMywxMTQuN0wxNjAuMywxMTNaTTkxLjMsMTE1TDkyLjMsMTE1LjdMODUuMywxMTlMODUsMTIwTDgzLjMsMTIwTDc4LjcsMTIzLjdMNzcsMTIzLjdMOTEuMywxMTVaTTEwMC4zLDEyM0wxMDAuNywxMjRMOTQuNywxMjdMMTAwLjMsMTIzWk0xNzcsMTIzTDE3OC43LDEyM0wxODUuMywxMjhMMTc3LjMsMTI0TDE3NywxMjNaTTIwOS43LDEyOUwyMTQuNywxMzFMMjUxLjMsMTUzTDI0MS4zLDE0OEwyMzYsMTQ0TDIzNC4zLDE0NEwyMzAuNywxNDFMMjI1LjMsMTM5TDIyMC4zLDEzNUwyMTUuMywxMzNMMjA5LjcsMTI5Wk0xOTQuNywxMzNMMjA2LjMsMTQwTDE5Ni4zLDEzNUwxOTQuMywxMzMuN0wxOTQuNywxMzNaTTIxMiwxNDNMMjQxLjcsMTYwTDIzOC4zLDE1OUwyMzQuNywxNTZMMjE3LjMsMTQ3TDIxMiwxNDNaTTE4LjMsMTU0LjNMMTkuMywxNTQuN0wxOSwxNzkuN0wxOCwxNzZMMTguMywxNTQuM1pNMjU2LjcsMTU2TDI2OC43LDE2Mi43TDI2My4zLDE2MC43TDI1Ni43LDE1NlpNMjQ3LDE2M0wyNTEuNywxNjVMMjYwLjMsMTcxTDI1Mi4zLDE2N0wyNDcsMTYzWk0yNjkuMywxNjNMMzA4LjcsMTg1TDMyMSwxOTNMMzEwLjMsMTg3LjdMMzA5LDE4NkwyOTcsMTc5TDI5NS4zLDE3OUwyOTEuNywxNzZMMjkwLDE3NkwyODQuNywxNzJMMjgzLDE3MkwyNjkuMywxNjNaTTI2Ny43LDE3NS4zTDI3MSwxNzYuM0wyNzQuMywxNzlMMjY3LjcsMTc1LjNaTTI3NC43LDE3OUwyODAuMywxODEuM0wyODMsMTg0TDI3NC43LDE3OVpNMzA0LDE5NUwzMTYuNywyMDJMMzE5LjcsMjA2TDMxNS43LDIwMkwzMDcuMywxOThMMzA0LDE5NVpNMzIwLDIwNi43TDMyMywyMTEuN0wzMjIuNywyMjdMMzIyLDIxMUwzMjAsMjA2LjdaTTMwNy43LDIyNEwzMTQuMywyMjcuN0wzMDcuNywyMjRaTTE2Ni4zLDIyNi43TDE2Ni43LDI0Ni4zTDE2NS43LDIzMC43TDE2Ni4zLDIyNi43Wk0zMjguMywyNzBMMzI5LDI3MC4zTDMyOCwyNzEuN0wzMjMuMywyNzVMMzI4LjMsMjcwWk0yOTYsMjgxLjNMMzA4LjcsMjgxLjdMMjk2LDI4MS4zWiI+PC9wYXRoPgo8cGF0aCBmaWxsPSIjNkE4RkI1IiBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMzgsOTUuN0wxNTEsOTYuN0wxNTkuMywxMDBMMTg1LjcsMTE2TDE5OCwxMjJMMTk5LDEyMy43TDIwMSwxMjRMMjA4LjMsMTI5TDIwOS43LDEyOC43TDIxMS4zLDEzMC43TDIyMC4zLDEzNUwyMjUuMywxMzlMMjMwLjcsMTQxTDIzNC4zLDE0NEwyMzYsMTQ0TDI0MS4zLDE0OEwyNDQuNywxNDlMMjY3LDE2Mi43TDI2OSwxNjIuN0wyODMsMTcyTDI4NC43LDE3MkwyOTAsMTc2TDI5MS43LDE3NkwyOTUuMywxNzlMMjk3LDE3OUwzMDQsMTgzTDMxMC4zLDE4Ny43TDMyMS4zLDE5M0wzMjMsMTk1TDMyOSwxOTguM0wzMzIsMjAxTDMzMywyMDMuM0wzMzQsMjM5TDMzMy4zLDI0Mi43TDMzMiwyNDIuN0wzMzAsMjM4TDMyMi43LDIzMS43TDMyMywyMTEuN0wzMTkuNywyMDVMMzE2LjcsMjAyTDMwOC4zLDE5OEwzMDUsMTk1TDMwMi43LDE5NUwyOTgsMTkxLjNMMjk0LjMsMTkwLjNMMjkwLjcsMTg3TDI4OC4zLDE4N0wyODYuNywxODVMMjgzLjMsMTg0LjNMMjgyLDE4Mi4zTDI3OCwxODBMMjc0LjMsMTc5TDI2OSwxNzUuM0wyNjcuMywxNzUuM0wyNjUuNywxNzMuM0wyNjQsMTczLjNMMjY0LDE3Mi4zTDI2Mi4zLDE3Mi4zTDI2Mi4zLDE3MS4zTDI2MC4zLDE3MUwyNTEuNywxNjVMMjQzLjMsMTYxLjdMMjQzLDE2MC4zTDI0MS4zLDE2MC4zTDI0MS43LDE1OS4zTDI0MCwxNTguM0wyMzUuNywxNTZMMjM0LjMsMTU2LjNMMjM0LjcsMTU1LjNMMjIyLDE0OUwyMTQuNywxNDRMMjExLjcsMTQzLjNMMjA4LDE0MC4zTDIwNi4zLDE0MC4zTDIwNi4zLDEzOS4zTDE5NS43LDEzM0wxOTQsMTMzLjNMMTkzLjcsMTMyTDE4NywxMjkuM0wxODYuNywxMjhMMTg1LjcsMTI4LjNMMTc4LjcsMTIzTDE3Ni43LDEyMy4zTDE3NC43LDEyMUwxNzMuMywxMjEuM0wxNjkuNywxMThMMTY2LjMsMTE3LjNMMTY2LDExNkwxNjMuMywxMTUuM0wxNjAuNywxMTNMMTU5LjcsMTEzLjNMMTU5LjMsMTEyLjNMMTU3LjcsMTEyLjNMMTU3LjcsMTExLjNMMTU1LjcsMTExLjNMMTU1LjMsMTEwLjNMMTUzLjMsMTEwTDE1My43LDEwOS4zTDE1MS43LDEwOS4zTDE1MS4zLDEwOC4zTDE0OC4zLDEwNy4zTDE0MC43LDEwNi4zTDEzMCwxMDdMMTI5LjMsMTA4LjNMMTI3LDEwOC4zTDEyNC43LDExMC4zTDEyMS4zLDExMUwxMjAuNywxMTIuM0wxMTksMTEyLjNMMTE2LDExNUwxMTQuMywxMTVMMTEzLjcsMTE2LjNMMTEyLjMsMTE2TDEwMy4zLDEyMi4zTDEwMC4zLDEyM0w5NC43LDEyN0w5Mi43LDEyNy4zTDkyLjcsMTI4LjNMODcsMTMwTDg0LjcsMTMyLjdMNzkuMywxMzFMNzIuMywxMjYuN0w5MiwxMTZMOTIuMywxMTVMOTQsMTE1TDk0LjMsMTE0TDEwMi43LDExMEwxMjEsOTguN0wxMjIuNyw5OUwxMjYuMyw5N0wxMzgsOTUuN1oiPjwvcGF0aD4KPHBhdGggZmlsbD0iIzdCQTM5MSIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNy43LDEzNi4zTDksMTM3LjNMOS4zLDE0MUwxMi43LDE0NUwxOC43LDE0Ni43TDE5LjMsMTQ1LjdMMjYsMTQ0LjdMMjksMTQ2LjdMMjksMTQ3LjdMMzEsMTQ3LjdMMzAuNywxNDguN0wzNiwxNTAuN0w0Ni43LDE1Ny43TDQ4LjMsMTU3LjdMNDguMywxNTguN0w1MCwxNTguN0w1MCwxNTkuN0w1MS43LDE1OS43TDU1LDE2Mi43TDU3LDE2Mi43TDY0LjMsMTY3LjdMNjYsMTY3LjdMNzMsMTcyLjdMNzUsMTczTDc0LjcsMTczLjdMNzYuMywxNzMuN0w3Ni4zLDE3NC43TDgxLjMsMTc2LjdMODIsMTc4TDg1LDE3OC43TDkyLjMsMTgzLjdMOTQsMTgzLjdMOTcuMywxODYuN0wxMDEsMTg3LjdMMTAyLjMsMTg5LjdMMTA2LDE5MC43TDEwNiwxOTEuN0wxMDcuNywxOTEuN0wxMTEuMywxOTQuN0wxMTMsMTk0LjdMMTE1LDE5Ni43TDExOC4zLDE5Ny43TDExOC4zLDE5OC43TDEyNCwyMDFMMTI1LjMsMjAyLjdMMTI3LDIwMi43TDEzNC4zLDIwNy43TDEzNiwyMDcuN0wxMzYsMjA4LjdMMTQwLjMsMjEwTDE0MS4zLDIxMS43TDE0NC43LDIxMi43TDE0Ni4zLDIxNC43TDE0OC4zLDIxNC43TDE1MC4zLDIxNi43TDE1NSwyMThMMTU2LDIyMEwxNjQsMjI2TDE2NiwyMzAuN0wxNjYuNywyNDYuN0wxNjUuMywyNTUuM0wxNjQuMywyNTZMMTYzLDI2MS4zTDE1OS4zLDI2NS4zTDE1NC43LDI2OEwxNDcuMywyNjguN0wxNDEuNywyNjdMMTQyLDI2Ni4zTDE0MC4zLDI2Ni4zTDE0MCwyNjUuM0wxMzcuNywyNjVMMTMwLjcsMjYwLjNMMTI2LjcsMjU5TDEyNSwyNThMMTI1LjMsMjU3LjNMMTIxLDI1NkwxMjEuMywyNTUuM0wxMjAsMjU1LjNMMTE5LjcsMjU0LjNMMTE0LjcsMjUyLjNMMTE0LjcsMjUxLjNMMTEyLDI1MUwxMTAuNywyNDkuM0wxMDksMjQ5LjNMMTA4LjcsMjQ4LjNMOTYuNywyNDIuM0w5Ni4zLDI0MS4zTDk0LjcsMjQxLjNMOTQuNywyNDAuM0w5MywyNDAuM0w5MSwyMzguM0w4OC43LDIzOEw4NS43LDIzNS4zTDgwLDIzM0w3OC43LDIzMS4zTDczLjMsMjI5LjNMNzEuNywyMjcuM0w2NS43LDIyNUw1NywyMTkuM0w1NC43LDIxOUw0OCwyMTQuM0w0NiwyMTRMNDYuMywyMTMuM0w0NC43LDIxMy4zTDQ0LjcsMjEyLjNMNDQsMjEzTDQyLjcsMjExLjNMNDEuMywyMTEuN0wzOC43LDIwOS4zTDIzLjcsMjAyTDE1LDE5Ni4zTDEzLDE5NC4zTDEyLjcsMTkyLjNMMTEuNywxOTIuM0wxMS43LDE5MUwxMCwxOTBMNy43LDE4M0w3LjcsMTM2LjNaTTE0MSwxMzhMMTU2LjcsMTM5TDE1OC4zLDE0MC43TDE2NC4zLDE0Mi43TDE2NC4zLDE0My43TDE2OS43LDE0NS43TDE2OS43LDE0Ni43TDE3MS43LDE0Ni43TDE3MS43LDE0Ny43TDE3OC43LDE1MC43TDE3OC43LDE1MS43TDE4My4zLDE1My43TDE4My4zLDE1NC43TDE4NywxNTUuN0wxODcuMywxNTYuN0wxODguNywxNTYuM0wxOTIuNywxNTkuN0wxOTQuMywxNTkuN0wxOTQuMywxNjAuN0wxOTkuMywxNjIuN0wxOTkuMywxNjMuN0wyMDMsMTY0LjdMMjAzLDE2NS43TDIwNi43LDE2Ni43TDIwOC43LDE2OC43TDIxMC4zLDE2OC43TDIxMiwxNzAuN0wyMTQsMTcwLjdMMjE0LDE3MS43TDIxOC43LDE3My43TDIxOC43LDE3NC43TDIyMSwxNzQuN0wyMzMuMywxODIuN0wyMzcsMTgzLjdMMjM4LjcsMTg1LjdMMjQyLDE4Ni43TDI0NywxOTAuN0wyNDksMTkwLjdMMjQ5LDE5MS43TDI1MC43LDE5MS43TDI1MSwxOTIuN0wyNTQuMywxOTMuN0wyNTQuMywxOTQuN0wyNTYsMTk0LjdMMjU2LDE5NS43TDI2My4zLDE5OC43TDI2My4zLDE5OS43TDI2NC43LDE5OS4zTDI2NS4zLDIwMC43TDI2Ni4zLDIwMC4zTDI3MiwyMDQuN0wyNzQsMjA0LjdMMjc0LDIwNS43TDI3Ny4zLDIwNi43TDI3Ny4zLDIwNy43TDI4Mi43LDIwOS43TDI4My4zLDIxMUwyODUuMywyMTFMMjkwLDIxMy43TDI5MCwyMTQuN0wyOTcsMjE3LjdMMjk3LDIxOC43TDI5OC43LDIxOC43TDMwOS4zLDIyNS43TDMxNi4zLDIyOC43TDMxNi4zLDIyOS43TDMxOCwyMjkuN0wzMjEuMywyMzJMMzIyLjcsMjMxTDMyMy4zLDIzMi43TDMzMCwyMzhMMzMyLDI0Mi43TDMzNCwyNDNMMzM0LDI1OS4zTDMzMy4zLDI1OUwzMzMsMjYzLjNMMzMwLjMsMjY4LjNMMzI5LjMsMjY4LjNMMzI5LjMsMjY5LjdMMzIyLDI3Ni4zTDMxMy4zLDI4MC4zTDMwOS4zLDI4MS4zTDI5NS4zLDI4MS4zTDI5My43LDI4MC4zTDI5MCwyODAuM0wyODkuMywyNzkuM0wyODQsMjc4TDI4My43LDI3N0wyODIuMywyNzcuN0wyNzcuNywyNzQuM0wyNzYuMywyNzQuN0wyNzUuNywyNzMuM0wyNzQsMjczLjNMMjc0LDI3Mi4zTDI2NiwyNjlMMjY0LjcsMjY3LjNMMjU3LDI2NEwyNTcuMywyNjMuM0wyNTYsMjYzLjNMMjU1LjcsMjYyLjNMMjU0LDI2Mi4zTDI0Ni4zLDI1Ny4zTDI0NC43LDI1Ny4zTDI0MywyNTUuM0wyNDEuMywyNTUuM0wyNDEsMjU0LjNMMjI2LDI0N0wyMjYuMywyNDYuM0wyMjUsMjQ2LjNMMjI0LjcsMjQ1LjNMMjIwLjcsMjQ0TDIxOS43LDI0Mi4zTDIxOCwyNDJMMjE3LDIzOS43TDIxNy43LDIzNS43TDIyMC4zLDIzMy43TDIzMS4zLDIzMi43TDIzMi43LDIzMS43TDIzNiwyMzJMMjM3LjcsMjMwLjdMMjQxLjMsMjMwLjdMMjQxLjMsMjI5LjdMMjUwLjMsMjI3LjdMMjUwLjMsMjI2LjdMMjUzLjcsMjI2LjdMMjUzLjcsMjI1LjdMMjYwLjcsMjIzLjdMMjYxLDIyMi43TDI2NC43LDIyMS43TDI3MywyMTYuM0wyNzAsMjE1LjNMMjY5LjcsMjE0TDI2OCwyMTRMMjY4LjMsMjEzLjNMMjY2LjcsMjEzLjNMMjY2LjcsMjEyLjNMMjY1LDIxMi4zTDI2NC43LDIxMUwyNjMuMywyMTEuN0wyNjIuNywyMTAuM0wyNTUuNywyMDcuM0wyNTUuNywyMDYuM0wyNTQsMjA2LjNMMjUzLjcsMjA1LjNMMjUwLjcsMjA0LjNMMjUwLjcsMjAzLjNMMjQ4LjcsMjAzLjNMMjQ1LDIwMC4zTDIzOS43LDE5OC4zTDIzOCwxOTYuM0wyMzIuMywxOTQuM0wyMzAuNywxOTIuM0wyMjcuMywxOTEuN0wyMjcsMTkwLjNMMjE1LjcsMTg1TDIxNC43LDE4My4zTDIwNy43LDE4MC4zTDIwNy43LDE3OS4zTDIwMiwxNzcuM0wyMDEuNywxNzYuM0wxOTguNywxNzUuM0wxOTguNywxNzQuM0wxOTUuMywxNzMuN0wxOTMuNywxNzEuM0wxOTAuNywxNzFMMTg5LjcsMTY5LjNMMTg4LDE2OS4zTDE4OCwxNjguM0wxODYuMywxNjguM0wxODYsMTY3LjNMMTgyLjcsMTY2LjNMMTgyLjcsMTY1LjNMMTc2LjMsMTYzTDE2OS43LDE1OC4zTDE1NiwxNTEuM0wxNDcuMywxNTBMMTQ3LjcsMTQ5LjNMMTQwLjcsMTQ5LjNMMTQxLDE1MEwxMzAsMTUyLjNMMTIzLjcsMTU2TDExNiwxNTEuM0wxMTEuMywxNTBMMTEzLjMsMTQ3LjNMMTE2LjcsMTQ2LjdMMTE3LjMsMTQ1LjNMMTI0LjcsMTQyLjdMMTI1LjcsMTQxLjNMMTI3LDE0MS43TDEyOCwxNDAuM0wxMzMuNywxMzkuN0wxMzUuMywxMzguM0wxNDEuMywxMzguN0wxNDEsMTM4Wk0xOC43LDE1NC4zTDE4LjMsMTc5LjdMMjAuMywxODUuM0wyNi4zLDE5MUwyOCwxOTAuN0wzMS4zLDE5My43TDM2LjMsMTk1LjdMMzgsMTk3LjdMNDMuNywxOTkuN0w0NS4zLDIwMS43TDUwLjMsMjAzLjdMNTAuMywyMDQuN0w1Mi4zLDIwNC43TDUyLjMsMjA1LjdMNTUuMywyMDYuM0w1NiwyMDcuN0w2MywyMTAuN0w2Ni43LDIxMy43TDY4LjMsMjEzLjdMNjguMywyMTQuN0w3Ni4zLDIxOEw3Ny43LDIxOS43TDgzLDIyMkw4Mi43LDIyMi43TDg4LDIyNC43TDkwLjMsMjI3TDkyLjMsMjI3TDk3LDIzMC43TDk4LjcsMjMwLjdMOTksMjMxLjdMMTA0LDIzMy43TDEwNC4zLDIzNC43TDEwNi4zLDIzNUwxMDYsMjM1LjdMMTA3LjcsMjM1LjdMMTExLjMsMjM4LjdMMTE0LjMsMjM5LjNMMTE1LDI0MC43TDExOC4zLDI0MS43TDEyMC4zLDI0My43TDEyNCwyNDQuN0wxMjkuMywyNDguN0wxMzYuMywyNTEuN0wxMzYuMywyNTIuN0wxMzcuNywyNTIuM0wxMzguMywyNTMuN0wxNDAsMjUzLjdMMTQwLjMsMjU0LjdMMTQ2LjMsMjU3LjdMMTUxLDI1Ni43TDE1My43LDI1M0wxNTQuMywyNDFMMTUzLjcsMjM0TDE0OS43LDIyOC4zTDEzOC43LDIyMS4zTDEzNywyMjEuM0wxMzMsMjE4LjNMMTI4LDIxNi4zTDEyNy43LDIxNS4zTDEyNC43LDIxNC4zTDEyNC43LDIxMy4zTDEyMS4zLDIxMi4zTDEyMS4zLDIxMS4zTDExNi43LDIxMEwxMTMuNywyMDcuM0wxMTAuNywyMDYuM0wxMTAuNywyMDUuM0wxMDksMjA1LjNMMTA4LjcsMjA0LjNMMTA4LDIwNUwxMDEuNywyMDAuM0w5OCwxOTkuM0w5OC4zLDE5OC4zTDk2LjcsMTk4LjNMOTQuNywxOTYuM0w5MS43LDE5NS43TDkxLDE5NC4zTDg1LDE5Mkw4My43LDE5MC4zTDc1LDE4Nkw3NS4zLDE4NS4zTDczLDE4NUw3MS43LDE4My4zTDcwLjcsMTgzLjdMNjUuMywxODAuN0w2NC43LDE3OS4zTDU5LDE3N0w1OS4zLDE3Ni4zTDU0LDE3NC4zTDUwLjcsMTcxLjNMNDUuNywxNjkuM0w0NS43LDE2OC4zTDQzLDE2OEwzOS43LDE2NUwzOC43LDE2NS4zTDM2LjMsMTYzLjNMMzIuNywxNjIuM0wzMi43LDE2MS4zTDMxLDE2MS4zTDMwLjcsMTYwLjNMMTguNywxNTQuM1pNMjgzLjcsMjI0TDI3OSwyMjdMMjc4LjMsMjI2LjNMMjc1LjMsMjI5TDI2NywyMzIuM0wyNjcuMywyMzNMMjY1LDIzNEwyNjQuMywyMzMuM0wyNjMuNywyMzQuN0wyNTMuMywyMzcuM0wyNTMsMjM4LjNMMjQ2LDIzOS4zTDI0NS4zLDI0MC4zTDI0MS4zLDI0MEwyMzguMywyNDEuN0wyNDAsMjQxLjdMMjQyLDI0NEwyNDQuNywyNDQuM0wyNDcsMjQ2LjdMMjQ4LjMsMjQ2LjdMMjQ4LjMsMjQ3LjdMMjQ5LjcsMjQ3LjNMMjUwLjMsMjQ4LjdMMjUyLDI0OC43TDI1MiwyNDkuN0wyNTUuMywyNTAuN0wyNTUuMywyNTEuN0wyNTksMjUyLjdMMjU5LDI1My43TDI2Ni4zLDI1Ni43TDI2Ni4zLDI1Ny43TDI3MiwyNTkuN0wyNzIuMywyNjAuN0wyNzUuMywyNjEuN0wyNzUuMywyNjIuN0wyNzcuMywyNjIuN0wyNzcuMywyNjMuN0wyNzkuMywyNjMuN0wyNzkuMywyNjQuN0wyODEuMywyNjQuN0wyODEuMywyNjUuN0wyODcuNywyNjcuN0wyODgsMjY4LjdMMjkwLjMsMjY4LjdMMjkxLDI2OS43TDMwNS4zLDI3MC43TDMwNS43LDI2OS43TDMxMS43LDI2OUwzMTIuNywyNjcuN0wzMTcuNywyNjUuN0wzMTguNywyNjMuN0wzMTkuNywyNjMuN0wzMjIuNywyNTcuM0wzMjEuNywyNDcuM0wzMjAuNywyNDdMMzE5LjcsMjQ0TDMxNS43LDI0MC4zTDMxNC4zLDI0MC43TDMxMy43LDIzOS4zTDMxMi43LDIzOS43TDMwNi43LDIzNS4zTDMwNS43LDIzNS43TDMwMi43LDIzMy4zTDI5NC43LDIzMEwyOTAsMjI2LjNMMjgzLjcsMjI0WiI+PC9wYXRoPgo8L3N2Zz4=" width="50" height="41" alt="" style="align-self:center">
       <span class="wordmark" id="chain-name">cascade</span>
     </div>
     <div class="tagline">King-of-the-hill · compete on synthetic data · Bittensor</div>
@@ -1014,12 +1056,21 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
 
   <div>
     <div class="section-label"><span>This round &mdash; live</span><span id="live-when" class="muted"></span></div>
-    <div class="stage-strip" id="stage-strip"></div>
-    <div class="stage-detail" id="stage-detail">--</div>
-    <div class="scroll-box scroll-field">
-      <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th><th>Enters</th></tr></thead><tbody id="subs"></tbody></table>
+    <div class="panel">
+      <div class="stage-strip" id="stage-strip"></div>
+      <div class="stage-detail" id="stage-detail">--</div>
+      <div class="scroll-box scroll-field">
+        <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th><th>Enters</th></tr></thead><tbody id="subs"></tbody></table>
+      </div>
+      <div class="subs-note" id="subs-note" hidden></div>
     </div>
-    <div class="subs-note" id="subs-note" hidden></div>
+  </div>
+
+  <!-- section order is the read order: NOW (verdict, live round, this round's
+       heat) → TREND (error chart) → REFERENCE (reigns/field, warm-start, history) -->
+  <div>
+    <div class="section-label"><span>Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
+    <div id="heat-panel"></div>
   </div>
 
   <div>
@@ -1034,42 +1085,40 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     <div class="chart-meta">
       <span class="legend">
         <span><i class="swatch" style="background:var(--king)"></i>King</span>
-        <span><i class="swatch" style="background:var(--chal)"></i>Challenger</span>
+        <span><i class="swatch" style="background:var(--chal-line)"></i>Challenger</span>
       </span>
       <span id="chart-note">--</span>
     </div>
   </div>
 
-  <div>
-    <div class="section-label"><span>Reigns</span></div>
-    <div class="scroll-box scroll-reigns">
-      <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned round</th><th class="num">Block</th></tr></thead><tbody id="reigns"></tbody></table>
+  <div class="grid-2">
+    <div>
+      <div class="section-label"><span>Reigns</span></div>
+      <div class="panel"><div class="scroll-box scroll-reigns">
+        <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned</th></tr></thead><tbody id="reigns"></tbody></table>
+      </div></div>
+    </div>
+    <div>
+      <div class="section-label"><span>Field</span><span id="field-when" class="muted"></span></div>
+      <div class="panel"><div class="scroll-box scroll-field">
+        <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th></tr></thead><tbody id="field"></tbody></table>
+      </div></div>
     </div>
   </div>
 
-  <div>
-    <div class="section-label"><span>Field</span><span id="field-when" class="muted"></span></div>
-    <div class="scroll-box scroll-field">
-      <table><thead><tr><th class="num">UID</th><th>Hotkey</th><th>Generator</th><th class="num">Commit block</th></tr></thead><tbody id="field"></tbody></table>
+  <details class="sec">
+    <summary class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></summary>
+    <div class="panel">
+      <div id="warm-panel"></div>
+      <div id="warm-history"></div>
     </div>
-  </div>
-
-  <div>
-    <div class="section-label"><span>Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
-    <div id="heat-panel"></div>
-  </div>
-
-  <div>
-    <div class="section-label"><span>Warm-start init</span><span id="warm-when" class="muted"></span></div>
-    <div id="warm-panel"></div>
-    <div id="warm-history"></div>
-  </div>
+  </details>
 
   <div>
     <div class="section-label"><span>Rounds</span></div>
-    <div class="scroll-box scroll-hist">
-      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
-    </div>
+    <div class="panel"><div class="scroll-box scroll-hist">
+      <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
+    </div></div>
   </div>
 
   </div><!-- /page-main -->
@@ -1079,16 +1128,16 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     <div>
       <div class="section-label"><span>Eval mix &mdash; latest round</span><span id="mix-when" class="muted"></span></div>
       <div id="mix-latest" class="muted">Loading&hellip;</div>
-      <div class="scroll-box"><table id="mix-domains-table" hidden><thead><tr><th>Domain</th><th class="num">Windows</th><th class="num">Share</th><th>&nbsp;</th><th class="num">&Delta; vs prev</th></tr></thead><tbody id="mix-domains"></tbody></table></div>
+      <div class="panel"><div class="scroll-box"><table id="mix-domains-table" hidden><thead><tr><th>Domain</th><th class="num">Windows</th><th class="num">Share</th><th>&nbsp;</th><th class="num">&Delta; vs prev</th></tr></thead><tbody id="mix-domains"></tbody></table></div></div>
       <div id="mix-cadences" class="mix-note"></div>
       <div class="mix-note">Each round's eval draw is a Dirichlet jitter around the pool mix (salted by block hash) &mdash; the realised composition publishes unsigned in that round's manifest at round end. Rounds before the jitter activation drew uniformly from the pool and published no composition block.</div>
     </div>
 
     <div>
       <div class="section-label"><span>Mix history</span><span class="muted">domain share per round</span></div>
-      <div class="scroll-box scroll-hist">
+      <div class="panel"><div class="scroll-box scroll-hist">
         <table><thead id="mix-hist-head"></thead><tbody id="mix-hist"></tbody></table>
-      </div>
+      </div></div>
     </div>
 
   </div><!-- /page-mix -->
@@ -1162,7 +1211,7 @@ function hubUrl(repo){ return repo ? HUB_BASE+repo+"/"+HUB_REF : "#"; }
 // A generator ref is either Hub-hosted (@sha256:) or HuggingFace-mirrored (@hf:,
 // the Hub-outage fallback). Route each to the host that actually serves it.
 function genUrl(ref){ var p=splitRef(ref); if(!p.repo) return "#"; return p.digest.indexOf("hf:")===0 ? "https://huggingface.co/"+p.repo : hubUrl(p.repo); }
-function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):""; return d?p.repo+"@"+d:p.repo; }
+function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var repo=p.repo.length>24?p.repo.slice(0,23)+"…":p.repo; var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):""; return d?repo+"@"+d:repo; }
 function refLink(ref,k){ var p=splitRef(ref); if(!p.repo) return '<span class="muted">--</span>'; return '<a class="'+(k||"")+'" href="'+genUrl(ref)+'" target="_blank" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
 function shortHk(hk){ return hk?hk.slice(0,8)+"\u2026"+hk.slice(-4):"--"; }
 function fmt(x,dp){ if(x==null||!isFinite(x)) return "--"; return Number(x).toFixed(dp==null?4:dp); }
@@ -1211,37 +1260,52 @@ function renderHeader(){
   for(var i=rs.length-1;i>=0&&!sizes;i--){ if(rs[i].sizes&&rs[i].sizes.length) sizes=rs[i].sizes.filter(Boolean).join(" · "); }
   document.getElementById("sizes").textContent=sizes||"--";
 }
-function stat(k,v){ return '<div class="stat"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div></div>'; }
+// o.title = hover tooltip (the long explanation lives there, not in the label);
+// o.wide  = span two grid columns; o.range = compact one-line multi-part value.
+function stat(k,v,o){
+  o=o||{};
+  return '<div class="stat'+(o.wide?' wide':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'>'+
+    '<div class="k">'+esc(k)+'</div><div class="v'+(o.range?' range':'')+'">'+v+'</div></div>';
+}
 function renderVerdict(){
   var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
   if(!r){ el.innerHTML='<div class="empty">Waiting for the first published round…</div>'; return; }
   document.getElementById("verdict-title").textContent="Round "+shortRoundId(r.round_id);
-  document.getElementById("verdict-when").textContent=r.published_at?timeAgo(r.published_at):"";
+  document.getElementById("verdict-when").textContent=r.published_at?"settled "+timeAgo(r.published_at):"";
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
   if(r.status==="rejected"){
-    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans)">'+esc(r.reject_reason||"--")+'</span>'));
+    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans);white-space:normal">'+esc(r.reject_reason||"--")+'</span>'));
   } else {
     var betterV=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
-    cells.push(stat("King error (lower better)",fmt(r.king_geomean)));
-    cells.push(stat("Challenger error (lower better)",'<span class="'+(betterV?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
+    var ERR_TIP="geomean(CRPS · MASE) — lower is better";
+    cells.push(stat("King error",fmt(r.king_geomean),{title:ERR_TIP}));
+    cells.push(stat("Chal. error",'<span class="'+(betterV?"good":"")+'">'+fmt(r.chal_geomean)+'</span>',{title:ERR_TIP}));
     if(r.win_rate!=null){
       // Win rate next to the error tiles: a low win rate under a better geomean
       // is the rare-but-big signal that the LCB (below) then prices as fragile.
       var wcls=r.win_rate>=0.5?"good":(betterV?"warn":"");
-      var wnote=betterV&&r.win_rate<0.5?'<span class="sub">rare&#8209;but&#8209;big &mdash; geomean carried by few windows</span>':'<span class="sub">of windows</span>';
-      cells.push(stat("Win rate",'<span class="'+wcls+'">'+pct(r.win_rate)+'</span> '+wnote));
+      var rareBig=betterV&&r.win_rate<0.5;
+      var wnote=rareBig?' <span class="sub">rare&#8209;but&#8209;big</span>':'';
+      cells.push(stat("Win rate",'<span class="'+wcls+'">'+pct(r.win_rate)+'</span>'+wnote,
+        {title:"Share of eval windows the challenger won"+(rareBig?" — geomean favours the challenger but few windows do; the LCB prices this as fragile":"")}));
     }
-    cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>'));
+    cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>',
+      {title:"Bootstrap lower confidence bound on the improvement vs the margin required to dethrone"}));
+    cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
     if(r.boot_p50!=null){
       // Bootstrap spread of the relative improvement; LCB is the 5th pct. A large
       // gap between a positive median and a negative LCB = a fragile verdict.
-      cells.push(stat("Bootstrap spread",fmt(r.lcb,2)+' <span class="sub">p5</span> · <b>'+fmt(r.boot_p50,2)+'</b> <span class="sub">p50</span> · '+fmt(r.boot_p95,2)+' <span class="sub">p95</span>'));
+      cells.push(stat("Bootstrap spread",
+        '<span class="sub">p5&nbsp;</span>'+fmt(r.lcb,3)+' · <span class="sub">p50&nbsp;</span><b>'+fmt(r.boot_p50,3)+'</b> · <span class="sub">p95&nbsp;</span>'+fmt(r.boot_p95,3),
+        {wide:true, range:true,
+         title:"Bootstrap spread of the relative improvement; p5 is the LCB. A median far above a negative p5 = a fragile verdict."}));
     }
-    cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
-    if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">clusters (eff. n)</span>'));
+    if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">eff. n</span>',
+      {title:"Independent feed clusters — the effective sample size behind the windows"}));
     if(r.wilcoxon_p!=null) cells.push(stat("Wilcoxon p",pval(r.wilcoxon_p)));
-    cells.push(stat("Field",(r.n_participants!=null?r.n_participants:"--")+' <span class="sub">entrants</span>'));
+    cells.push(stat("Entrants",r.n_participants!=null?r.n_participants:"--",
+      {title:"Miners in the field this round"}));
     if(r.gift_gate_passed!=null) cells.push(stat("GIFT gate",r.gift_gate_passed?"pass":"fail"));
     cells.push(stat("Rewarded",r.n_rewarded!=null?r.n_rewarded:"--"));
   }
@@ -1254,9 +1318,9 @@ function renderChart(){
   var rounds=scoredRounds();
   var series;
   if(_chartMode==="lcb"){
-    series=[{key:"lcb",color:"var(--chal)",get:function(r){return r.lcb;}},{key:"margin",color:"var(--king)",get:function(r){return r.margin;}}];
+    series=[{key:"lcb",color:"var(--chal-line)",get:function(r){return r.lcb;}},{key:"margin",color:"var(--king)",get:function(r){return r.margin;}}];
   } else {
-    series=[{key:"king",color:"var(--king)",get:function(r){return r.king_geomean;}},{key:"chal",color:"var(--chal)",get:function(r){return r.chal_geomean;}}];
+    series=[{key:"king",color:"var(--king)",get:function(r){return r.king_geomean;}},{key:"chal",color:"var(--chal-line)",get:function(r){return r.chal_geomean;}}];
   }
   var alpha=_smooth<=0?1:1/(1+_smooth*12), all=[];
   var lines=series.map(function(s){
@@ -1264,7 +1328,7 @@ function renderChart(){
     var idx=vals.map(function(v,i){ return v==null?-1:i; }).filter(function(i){ return i>=0; });
     var clean=idx.map(function(i){ return vals[i]; }), sm=ema(clean,alpha);
     idx.forEach(function(i,j){ all.push(sm[j]); });
-    return {color:s.color,idx:idx,vals:sm};
+    return {color:s.color,key:s.key,idx:idx,vals:sm};
   });
   if(!all.length){ svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="14">no scored rounds yet</text>'; document.getElementById("chart-note").textContent="--"; return; }
   var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
@@ -1274,10 +1338,14 @@ function renderChart(){
   function X(i){ return PAD_L+(n<=1?0.5:i/(n-1))*(W-PAD_L-PAD_R); }
   function Y(v){ return PAD_T+(1-(v-min)/(max-min))*(H-PAD_T-PAD_B); }
   var out="";
+  // enough tick precision that adjacent gridline labels never collide into
+  // the same rounded number on a narrow range
+  var tickStep=(max-min)/4;
+  var tickDp=Math.min(6,Math.max(2,Math.ceil(-Math.log10(tickStep||1))));
   for(var g=0;g<=4;g++){
     var val=min+(max-min)*g/4, y=Y(val);
     out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14" stroke-dasharray="2 6"/>';
-    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+val.toFixed(2)+'</text>';
+    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="12">'+val.toFixed(tickDp)+'</text>';
   }
   rounds.forEach(function(r,i){
     if(r.dethroned){ var x=X(i); out+='<line x1="'+x.toFixed(1)+'" y1="'+PAD_T+'" x2="'+x.toFixed(1)+'" y2="'+(H-PAD_B)+'" stroke="var(--chal)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"><title>dethrone @ round '+esc(shortRoundId(r.round_id))+'</title></line>'; }
@@ -1285,23 +1353,34 @@ function renderChart(){
   lines.forEach(function(L){
     var pts=L.idx.map(function(i,j){ return X(i).toFixed(1)+","+Y(L.vals[j]).toFixed(1); });
     if(pts.length>1) out+='<polyline points="'+pts.join(" ")+'" fill="none" stroke="'+L.color+'" stroke-width="2" stroke-linejoin="round"/>';
-    L.idx.forEach(function(i,j){ out+='<circle cx="'+X(i).toFixed(1)+'" cy="'+Y(L.vals[j]).toFixed(1)+'" r="2.8" fill="'+L.color+'"/>'; });
+    L.idx.forEach(function(i,j){
+      var cx=X(i).toFixed(1), cy=Y(L.vals[j]).toFixed(1);
+      out+='<circle cx="'+cx+'" cy="'+cy+'" r="2.8" fill="'+L.color+'"/>'+
+        '<circle cx="'+cx+'" cy="'+cy+'" r="9" fill="transparent"><title>'+
+        esc(shortRoundId(rounds[i].round_id))+' \u00b7 '+esc(L.key)+' '+fmt(L.vals[j])+'</title></circle>';
+    });
   });
+  if(n>1){
+    out+='<text x="'+PAD_L+'" y="'+(H-8)+'" fill="var(--muted)" font-size="12">'+esc(shortRoundId(rounds[0].round_id))+'</text>'+
+      '<text x="'+(W-PAD_R)+'" y="'+(H-8)+'" text-anchor="end" fill="var(--muted)" font-size="12">'+esc(shortRoundId(rounds[n-1].round_id))+'</text>';
+  }
   svg.innerHTML=out;
   var last=rounds[rounds.length-1];
   document.getElementById("chart-note").textContent=n+" rounds · latest "+(_chartMode==="lcb"?("LCB "+fmt(last.lcb,3)):("king "+fmt(last.king_geomean)+" · chal "+fmt(last.chal_geomean)));
 }
 function renderReigns(){
   var rg=reigns().slice().reverse(), tb=document.getElementById("reigns");
-  if(!rg.length){ tb.innerHTML='<tr><td colspan="6" class="empty">No reigns yet</td></tr>'; return; }
+  if(!rg.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No reigns yet</td></tr>'; return; }
   tb.innerHTML=rg.map(function(r,i){
     var cur=i===0;
+    // the crowning block is tooltip detail — a 6th column made the half-width
+    // table scroll sideways, and the round id already identifies the crowning
     return '<tr><td>'+(cur?'<span class="crown">&#9819;</span> ':'')+'#'+r.n+'</td>'+
       '<td title="'+esc(r.hotkey||"")+'">'+esc(shortHk(r.hotkey))+'</td>'+
       '<td class="num">'+(r.uid!=null?r.uid:"--")+'</td>'+
       '<td>'+refLink(r.gen_ref)+'</td>'+
-      '<td>'+(r.round?esc(shortRoundId(r.round)):'<span class="muted">genesis</span>')+'</td>'+
-      '<td class="num">'+(r.block!=null?r.block:"--")+'</td></tr>';
+      '<td'+(r.block!=null?' title="block '+esc(r.block)+'"':'')+'>'+
+      (r.round?esc(shortRoundId(r.round)):'<span class="muted">genesis</span>')+'</td></tr>';
   }).join("");
 }
 function renderField(){
@@ -1357,6 +1436,7 @@ function renderHeat(){
   var src=heatSource(), heat=src&&src.doc;
   var ents=(heat&&heat.entrants)||[];
   if(!heat||!ents.length){
+    panel.className="";
     when.textContent=src&&src.round?("round "+shortRoundId(src.round)):"";
     var why=(heat&&heat.no_screen_reason)?esc(heat.no_screen_reason)
       :"either a single eligible challenger, or a round that predates heat reporting";
@@ -1368,6 +1448,7 @@ function renderHeat(){
     return;
   }
   var nf=heat.finalists, inFlight=src.live&&!heatRoundSettled(src.esb);
+  panel.className="panel";
   when.textContent="round "+shortRoundId(src.round)+" · "+ents.length+" entrants · "+
     (nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
     (heat.screen_size?" · screened at "+esc(heat.screen_size):"")+
@@ -1392,17 +1473,17 @@ function renderHeat(){
       '<td class="num">'+fmt(e.mase,3)+'</td>'+
       '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
   }).join("");
-  panel.innerHTML='<div class="heat-note">'+
-    (inFlight?'<b>Live</b> — published by the trainer when this round’s heat settled; the duel (king vs finalists) is still training, so the round has no verdict yet. ':'')+
-    'Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
-    (nf!=null?nf:"N")+' advance to the final. Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice.</div>'+
+  panel.innerHTML='<div class="heat-note" title="Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice. Published by the trainer the moment the heat settles — hours before the round’s receipt.">'+
+    (inFlight?'<b>Live</b> — heat settled, duel still training; no verdict yet. ':'')+
+    'Ranked by heat score = geomean(CRPS · MASE), lower is better; top '+
+    (nf!=null?nf:"N")+' advance to the duel vs the king.</div>'+
     '<div class="scroll-box scroll-field"><table><thead><tr>'+
     '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th class="num">CRPS</th><th class="num">MASE</th><th>Standing</th>'+
     '</tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 function renderRounds(){
   var rs=(_index&&_index.rounds||[]).slice().reverse(), tb=document.getElementById("rounds");
-  if(!rs.length){ tb.innerHTML='<tr><td colspan="11" class="empty">No rounds published yet</td></tr>'; return; }
+  if(!rs.length){ tb.innerHTML='<tr><td colspan="10" class="empty">No rounds published yet</td></tr>'; return; }
   tb.innerHTML=rs.map(function(r){
     var cls=verdictClass(r);
     var better=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
@@ -1415,7 +1496,6 @@ function renderRounds(){
       '<td class="num'+(better?' good':'')+'">'+fmt(r.chal_geomean)+'</td>'+
       '<td class="num '+wcls+'">'+pct(r.win_rate)+'</td>'+
       '<td class="num">'+fmt(r.lcb,3)+'</td><td class="num">'+fmt(r.margin,3)+'</td>'+
-      '<td class="num">'+(r.n_windows!=null?r.n_windows:"--")+'</td>'+
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
 }
