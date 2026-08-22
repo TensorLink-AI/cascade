@@ -3570,6 +3570,7 @@ class TrainerRunner:
             manifest.round_id, len(manifest.entries), manifest.signature is not None,
             self.cfg.storage.manifest_bucket, key,
         )
+        self._publish_mix(manifest)
         # The manifest is out: validators take over. Guard on the round context
         # matching so a direct publish() of some other round's manifest never
         # mislabels the live one.
@@ -3579,6 +3580,31 @@ class TrainerRunner:
         # round across a process restart (and through a store too flaky to
         # answer the guard's manifest probe).
         self._persist_last_round(manifest.round_id)
+
+    def _publish_mix(self, manifest: TrainingManifest) -> None:
+        """Mirror the manifest's unsigned ``composition`` block to
+        ``mix/round-<id>.json`` + ``mix/latest.json``, public-read.
+
+        The dashboard's Eval-mix tab reads these: the manifest itself is not
+        anonymously readable, so the presentational copy needs its own public
+        key (the copy validators audit stays in the signed manifest). Absent
+        on a pre-jitter round — the tab renders the absence, never a
+        fabricated mix. Best-effort like the heat standings: a storage
+        failure must not disturb the round just published.
+        """
+        if manifest.composition is None:
+            return
+        from ..shared.heat_status import _publish_public_json
+
+        doc = {"round_id": str(manifest.round_id), "composition": manifest.composition}
+        try:
+            store = self.manifest_store()
+            for key in (f"mix/round-{manifest.round_id}.json", "mix/latest.json"):
+                _publish_public_json(store, key, doc)
+            log.info("round=%s: published eval mix to mix/round-%s.json",
+                     manifest.round_id, manifest.round_id)
+        except Exception as e:  # noqa: BLE001 — presentational, never sinks a round
+            log.warning("eval-mix publish failed (ignored): %s", e)
 
     # ── restart re-entry guard (already-published rounds) ────────────────────
 

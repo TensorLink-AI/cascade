@@ -961,6 +961,11 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
   .scroll-box { overflow-x: auto; }
   table { min-width: 640px; }
 }
+.page-tabs { display:flex; gap:8px; margin:0 0 12px; }
+.page-tabs .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
+.mixbar { height:8px; min-width:120px; background:rgba(127,127,127,.15); border-radius:4px; overflow:hidden; }
+.mixbar i { display:block; height:100%; background:#7E9B7E; }
+.mix-note { font-size:12px; opacity:.7; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -994,6 +999,13 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
       <span><a href="https://github.com/TensorLink-AI/cascade" target="_blank">GitHub</a> · <span title="Verify any round with the audit CLI">AUDIT: <code>cascade-audit latest</code></span></span>
     </div>
   </div>
+
+  <div class="page-tabs">
+    <button class="btn active" data-ptab="main">Dashboard</button>
+    <button class="btn" data-ptab="mix">Eval mix</button>
+  </div>
+
+  <div id="page-main">
 
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
@@ -1059,6 +1071,27 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
       <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th class="num">Windows</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
     </div>
   </div>
+
+  </div><!-- /page-main -->
+
+  <div id="page-mix" hidden>
+
+    <div>
+      <div class="section-label"><span>Eval mix &mdash; latest round</span><span id="mix-when" class="muted"></span></div>
+      <div id="mix-latest" class="muted">Loading&hellip;</div>
+      <div class="scroll-box"><table id="mix-domains-table" hidden><thead><tr><th>Domain</th><th class="num">Windows</th><th class="num">Share</th><th>&nbsp;</th><th class="num">&Delta; vs prev</th></tr></thead><tbody id="mix-domains"></tbody></table></div>
+      <div id="mix-cadences" class="mix-note"></div>
+      <div class="mix-note">Each round's eval draw is a Dirichlet jitter around the pool mix (salted by block hash) &mdash; the realised composition publishes unsigned in that round's manifest at round end. Rounds before the jitter activation drew uniformly from the pool and published no composition block.</div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Mix history</span><span class="muted">domain share per round</span></div>
+      <div class="scroll-box scroll-hist">
+        <table><thead id="mix-hist-head"></thead><tbody id="mix-hist"></tbody></table>
+      </div>
+    </div>
+
+  </div><!-- /page-mix -->
 
 </div>
 
@@ -1704,8 +1737,104 @@ _dataState="loading"; renderAll();
 // (2026-07-21). The anchored prefix is single-writer and signature-anchored
 // (same trail validator bootstrap trusts); shared stays as a fallback only.
 var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
+// ── eval-mix page (DEC-CA-0019 jittered draw) ─────────────────────────────
+// Composition is an unsigned block in each round's published manifest; fetch
+// per round (cached — manifests are immutable once published) for the last N
+// rounds in the receipts index. Pre-jitter rounds have no block: rendered as
+// "uniform" rows, never fabricated.
+var _page="main", _mixCache={}, _MIX_N=10;
+function setPage(p){
+  _page=p;
+  var tabs=document.querySelectorAll(".page-tabs .btn");
+  for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle("active", tabs[i].dataset.ptab===p);
+  document.getElementById("page-main").hidden = p!=="main";
+  document.getElementById("page-mix").hidden = p!=="mix";
+  if(p==="mix") loadMix();
+}
+(function(){
+  var tabs=document.querySelectorAll(".page-tabs .btn");
+  for(var i=0;i<tabs.length;i++) tabs[i].addEventListener("click", function(){ setPage(this.dataset.ptab); });
+})();
+function mixRounds(){
+  var rs=(_index&&_index.rounds||[]).slice();
+  return rs.slice(-_MIX_N).reverse();  // newest first
+}
+function loadMix(){
+  var rs=mixRounds();
+  if(!rs.length){ renderMix(); return; }
+  var pending=0;
+  rs.forEach(function(r){
+    var id=String(r.round_id||"");
+    if(!id || _mixCache[id]!==undefined) return;
+    pending++;
+    // mix/round-<id>.json is the composition block re-published public-read
+    // (the manifest itself is not anonymously readable). 404 ⇒ no composition
+    // for that round (pre-jitter uniform draw, or doc not yet published).
+    fetchJSON("mix/round-"+id+".json")
+      .then(function(m){ _mixCache[id]=(m&&m.composition)||null; })
+      .catch(function(){ _mixCache[id]=null; })
+      .then(function(){ if(--pending===0) renderMix(); });
+  });
+  renderMix();
+}
+function mixShares(comp){
+  var doms=comp&&comp.domains||{}, total=0, k;
+  for(k in doms) total+=doms[k];
+  var out={};
+  for(k in doms) out[k]=total?doms[k]/total:0;
+  return out;
+}
+function renderMix(){
+  var rs=mixRounds();
+  var latest=null, latestId=null, prev=null;
+  for(var i=0;i<rs.length;i++){
+    var id=String(rs[i].round_id||""), c=_mixCache[id];
+    if(c){ if(!latest){ latest=c; latestId=id; } else if(!prev){ prev=c; break; } }
+  }
+  var el=document.getElementById("mix-latest"), tbl=document.getElementById("mix-domains-table");
+  document.getElementById("mix-when").textContent = latestId?("round "+shortRoundId(latestId)):"";
+  if(!latest){
+    el.textContent = rs.length?"No composition published yet — rounds so far drew uniformly from the pool.":"Waiting for round data…";
+    tbl.hidden=true; document.getElementById("mix-cadences").textContent="";
+  } else {
+    var m=latest.mix||{};
+    el.innerHTML = "<b>"+esc(latest.n_windows)+"</b> windows · <b>"+esc(latest.n_clusters)+"</b> clusters · effective domains <b>"+fmt(latest.effective_domains,2)+"</b>"
+      + ' <span class="muted">· jitter &alpha;='+esc(m.jitter_alpha)+" · block slots "+esc(m.block_slots)+" · series bag "+pct(m.series_bag_frac)+" · from block "+esc(m.from_block)+"</span>";
+    var shares=mixShares(latest), pshares=prev?mixShares(prev):null;
+    var doms=Object.keys(shares).sort(function(a,b){ return shares[b]-shares[a]; });
+    var maxShare=doms.length?shares[doms[0]]:1, rows="";
+    doms.forEach(function(d){
+      var s=shares[d], dd=pshares&&pshares[d]!=null?(s-pshares[d])*100:null;
+      rows+="<tr><td>"+esc(d)+'</td><td class="num">'+esc((latest.domains||{})[d])+'</td><td class="num">'+(s*100).toFixed(1)+"%</td>"
+        + '<td><div class="mixbar"><i style="width:'+Math.round(s/maxShare*100)+'%"></i></div></td>'
+        + '<td class="num">'+(dd==null?'<span class="muted">--</span>':(dd>0?"+":"")+dd.toFixed(1)+"pp")+"</td></tr>";
+    });
+    document.getElementById("mix-domains").innerHTML=rows; tbl.hidden=false;
+    var cads=latest.cadences||{}, ck=Object.keys(cads).sort(function(a,b){ return cads[b]-cads[a]; });
+    document.getElementById("mix-cadences").textContent = ck.length ? ("Cadences: "+ck.map(function(k){ return k+" ×"+cads[k]; }).join(" · ")) : "";
+  }
+  // history: one row per round, share % per domain (union of seen domains)
+  var seen={}, haveAny=false;
+  rs.forEach(function(r){ var c=_mixCache[String(r.round_id||"")]; if(c){ haveAny=true; Object.keys(c.domains||{}).forEach(function(d){ seen[d]=1; }); } });
+  var cols=Object.keys(seen).sort();
+  var head="<tr><th>Round</th><th class=\"num\">Windows</th><th class=\"num\">Eff. dom</th>"+cols.map(function(d){ return '<th class="num">'+esc(d)+"</th>"; }).join("")+"</tr>";
+  document.getElementById("mix-hist-head").innerHTML = haveAny?head:"";
+  var body="";
+  rs.forEach(function(r){
+    var id=String(r.round_id||""), c=_mixCache[id];
+    if(c){
+      var sh=mixShares(c);
+      body+="<tr><td>"+esc(shortRoundId(id))+'</td><td class="num">'+esc(c.n_windows)+'</td><td class="num">'+fmt(c.effective_domains,2)+"</td>"
+        + cols.map(function(d){ return '<td class="num">'+(sh[d]!=null?(sh[d]*100).toFixed(1)+"%":"--")+"</td>"; }).join("")+"</tr>";
+    } else if(c===null){
+      body+="<tr><td>"+esc(shortRoundId(id))+'</td><td colspan="'+(cols.length+2)+'" class="muted">no composition published (uniform pre-jitter draw)</td></tr>';
+    }
+  });
+  document.getElementById("mix-hist").innerHTML = body || '<tr><td class="muted" colspan="3">No rounds yet.</td></tr>';
+}
+
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="mix") loadMix(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
