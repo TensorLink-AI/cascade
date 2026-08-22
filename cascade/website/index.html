@@ -927,9 +927,14 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 .swatch { width: 15px; height: 3px; display: inline-block; }
 
 /* tables */
-.scroll-box { overflow: auto; scrollbar-width: thin; }
+.scroll-box { overflow: auto; scrollbar-width: thin; scrollbar-color: var(--chal) transparent; }
 .scroll-box::-webkit-scrollbar { width: 5px; height: 5px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--chal); }
+/* generator refs can be arbitrarily long — cap the link and ellipsise (the
+   full ref lives in the title tooltip); tighter cap in half-width tables */
+table a { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.grid-2 table a { max-width: 170px; }
+.grid-2 th, .grid-2 td { padding-right: 12px; }
 .scroll-reigns { max-height: 268px; }
 .scroll-field { max-height: 248px; }
 .scroll-hist { max-height: 392px; }
@@ -1074,7 +1079,7 @@ tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light
     <div>
       <div class="section-label"><span>Reigns</span></div>
       <div class="scroll-box scroll-reigns">
-        <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned round</th><th class="num">Block</th></tr></thead><tbody id="reigns"></tbody></table>
+        <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned</th></tr></thead><tbody id="reigns"></tbody></table>
       </div>
     </div>
     <div>
@@ -1193,7 +1198,7 @@ function hubUrl(repo){ return repo ? HUB_BASE+repo+"/"+HUB_REF : "#"; }
 // A generator ref is either Hub-hosted (@sha256:) or HuggingFace-mirrored (@hf:,
 // the Hub-outage fallback). Route each to the host that actually serves it.
 function genUrl(ref){ var p=splitRef(ref); if(!p.repo) return "#"; return p.digest.indexOf("hf:")===0 ? "https://huggingface.co/"+p.repo : hubUrl(p.repo); }
-function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):""; return d?p.repo+"@"+d:p.repo; }
+function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--"; var repo=p.repo.length>24?p.repo.slice(0,23)+"…":p.repo; var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):""; return d?repo+"@"+d:repo; }
 function refLink(ref,k){ var p=splitRef(ref); if(!p.repo) return '<span class="muted">--</span>'; return '<a class="'+(k||"")+'" href="'+genUrl(ref)+'" target="_blank" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
 function shortHk(hk){ return hk?hk.slice(0,8)+"\u2026"+hk.slice(-4):"--"; }
 function fmt(x,dp){ if(x==null||!isFinite(x)) return "--"; return Number(x).toFixed(dp==null?4:dp); }
@@ -1339,15 +1344,17 @@ function renderChart(){
 }
 function renderReigns(){
   var rg=reigns().slice().reverse(), tb=document.getElementById("reigns");
-  if(!rg.length){ tb.innerHTML='<tr><td colspan="6" class="empty">No reigns yet</td></tr>'; return; }
+  if(!rg.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No reigns yet</td></tr>'; return; }
   tb.innerHTML=rg.map(function(r,i){
     var cur=i===0;
+    // the crowning block is tooltip detail — a 6th column made the half-width
+    // table scroll sideways, and the round id already identifies the crowning
     return '<tr><td>'+(cur?'<span class="crown">&#9819;</span> ':'')+'#'+r.n+'</td>'+
       '<td title="'+esc(r.hotkey||"")+'">'+esc(shortHk(r.hotkey))+'</td>'+
       '<td class="num">'+(r.uid!=null?r.uid:"--")+'</td>'+
       '<td>'+refLink(r.gen_ref)+'</td>'+
-      '<td>'+(r.round?esc(shortRoundId(r.round)):'<span class="muted">genesis</span>')+'</td>'+
-      '<td class="num">'+(r.block!=null?r.block:"--")+'</td></tr>';
+      '<td'+(r.block!=null?' title="block '+esc(r.block)+'"':'')+'>'+
+      (r.round?esc(shortRoundId(r.round)):'<span class="muted">genesis</span>')+'</td></tr>';
   }).join("");
 }
 function renderField(){
@@ -1438,10 +1445,10 @@ function renderHeat(){
       '<td class="num">'+fmt(e.mase,3)+'</td>'+
       '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
   }).join("");
-  panel.innerHTML='<div class="heat-note">'+
-    (inFlight?'<b>Live</b> — published by the trainer when this round’s heat settled; the duel (king vs finalists) is still training, so the round has no verdict yet. ':'')+
-    'Ranked by heat score = geomean(CRPS, MASE), lower is better; the top '+
-    (nf!=null?nf:"N")+' advance to the final. Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice.</div>'+
+  panel.innerHTML='<div class="heat-note" title="Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice. Published by the trainer the moment the heat settles — hours before the round’s receipt.">'+
+    (inFlight?'<b>Live</b> — heat settled, duel still training; no verdict yet. ':'')+
+    'Ranked by heat score = geomean(CRPS · MASE), lower is better; top '+
+    (nf!=null?nf:"N")+' advance to the duel vs the king.</div>'+
     '<div class="scroll-box scroll-field"><table><thead><tr>'+
     '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th class="num">CRPS</th><th class="num">MASE</th><th>Standing</th>'+
     '</tr></thead><tbody>'+body+'</tbody></table></div>';
