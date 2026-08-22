@@ -1029,7 +1029,8 @@ class ProvisionerLoop:
                     log.warning("provider %s availability probe failed (%s); skipping",
                                 name, e)
                     continue
-                price = self._offer_price(prov, cand.marketplace_sku)
+                price = self._offer_price(prov, cand.marketplace_sku,
+                                          cand.gpus_per_pod)
                 if price is None:
                     # Unknown price ⇒ assume the candidate cap: the budget
                     # breaker then projects at the worst price we accepted.
@@ -1174,12 +1175,25 @@ class ProvisionerLoop:
         return True
 
     @staticmethod
-    def _offer_price(prov: object, sku: str) -> float | None:
+    def _offer_price(prov: object, sku: str, gpus: int = 1) -> float | None:
+        """The chosen candidate's PER-POD USD/hr, or ``None`` to assume the cap.
+
+        ``gpus`` is the candidate's pod shape and matters twice over: a
+        marketplace that lists per-INSTANCE prices (shadeform, vast) must scan
+        only that shape or it returns the 1× price for a 4× rung, and one that
+        lists per-GPU prices (runpod) must multiply. Both are silent
+        UNDER-projections of the round breaker, so adapters take it explicitly.
+        Older adapters without the kwarg still work — they are called the old
+        way and simply price at any shape.
+        """
         fn = getattr(prov, "offer_price", None)
         if fn is None:
             return None
         try:
-            return fn(sku)
+            try:
+                return fn(sku, gpus=gpus)
+            except TypeError:                 # adapter predates the shape kwarg
+                return fn(sku)
         except Exception as e:  # noqa: BLE001 — pricing is advisory, capacity was probed
             log.warning("provider %s offer_price failed (%s); assuming stage cap",
                         getattr(prov, "name", prov), e)
@@ -1849,7 +1863,18 @@ class ProvisionerLoop:
             if lister is None:
                 continue
             try:
-                live = {p for p in lister(POD_TAG) if is_provisioner_pod_name(p)}
+                # (name, handle): the naming scheme decides WHAT is ours, the
+                # handle is what terminate takes. On every id-addressed
+                # marketplace those differ, and matching the scheme against an
+                # opaque id silently reaps nothing — see filter_tagged_pods.
+                # A bare string (legacy adapter / test fake) is name-is-handle.
+                live = {
+                    handle
+                    for pod_name, handle in (
+                        e if isinstance(e, tuple) else (e, e) for e in lister(POD_TAG)
+                    )
+                    if is_provisioner_pod_name(pod_name)
+                }
             except Exception as e:  # noqa: BLE001 — a down adapter reconciles next cycle
                 log.warning("provider %s list_tagged failed (%s); skipping reconcile", name, e)
                 continue

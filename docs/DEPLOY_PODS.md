@@ -272,3 +272,137 @@ compromised provisioner can spend your provider balance (bounded by the budget
 breaker) but cannot sign a manifest, and the systemd unit deliberately has no
 dependency on any trainer unit — either service restarts freely without the
 other.
+
+## Marketplace adapters
+
+Four are registered (`cascade.provision.core._PROVIDER_FACTORIES`); a stage's
+`providers = [...]` names them in priority order and the ladder walks
+`(candidate × provider)` until one has capacity for the **whole** fleet.
+
+| adapter | API key | boot | pod shape | notes |
+|---|---|---|---|---|
+| `lium` | `LIUM_API_KEY` | CLI, docker template | multi-GPU executors | Bittensor-native; mostly lists `L40`, which **fails** an `L40S` pin |
+| `shadeform` | `SHADEFORM_API_KEY` | docker or bare VM | `configuration.num_gpus` | a **broker** — it resells other clouds, so the offer you get is whichever backend was cheapest |
+| `runpod` | `RUNPOD_API_KEY` | docker (REST v1) | `gpuCount` | defaults to **Secure Cloud** (RunPod's own/partner DCs) |
+| `vast` | `VAST_API_KEY` | docker (REST) | `num_gpus` | cheapest consumer silicon; a marketplace of individual hosts |
+
+**Pick per stage, not globally.** The `final` stage rents the pinned SKU for the
+duel and a zombie rental costs the round, so it wants a real operator:
+`runpod` (Secure Cloud) or `shadeform`. The `heat` stage screens the field on
+disposable silicon and absorbs a dud through the replacement path, so it can
+chase price.
+
+**RunPod.** GPU-type ids *are* the nvidia-smi device strings (`NVIDIA L40S`,
+`NVIDIA GeForce RTX 4090`), so a stage needs no `market_sku`. Prices are quoted
+**per GPU-hour** and the adapter multiplies by the pod shape before handing the
+number to the budget breaker, which bills per pod-hour. Availability is a
+"sold on this tier" probe — RunPod publishes no per-shape stock — so the dud
+counter and replacement path, not the probe, are what bound a bad round. There
+is no `machine_of`: RunPod picks the machine, so a lemon cannot be excluded
+from a replacement the way it can on lium and vast.
+
+**Vast.** The most heterogeneous supply in the ladder, which is a real hazard
+for the **heat**: the screen ranks runs across pods, so machine-to-machine
+spread becomes rank spread (`decisions/DEC-CA-0010`). The adapter therefore
+carries quality floors as part of its contract, not as tuning:
+
+```toml
+[provisioner.provider_options.vast]
+verified_only         = true   # datacenter-verified hosts only
+min_reliability       = 0.98   # vast's own reliability2 score
+min_cpu_cores_per_gpu = 4.0    # the corpus streams from a CPU generator
+disk_gb               = 60
+```
+
+`min_cpu_cores_per_gpu` is the one that bites: `corpus_mode = "stream_cpu"`
+means each lane's generator is a CPU process whose threads are capped to its
+slice of the box (`trainer.sandbox._lane_cpu_slice`), so a CPU-thin machine
+starves training and reads as a slow *generator* in the heat. Loosen these and
+the heat inherits the variance.
+
+**Naming.** `providers` is a *stage*-level list but each marketplace spells the
+same silicon differently — shadeform `RTX4090`, vast `RTX 4090`, runpod
+`NVIDIA GeForce RTX 4090`. Matching folds whitespace and case, so those three
+collide correctly, but it will never merge genuinely different devices (`L40`
+vs `L40S`). Where a name differs by more than spacing, give the rung its own
+`[[provisioner.<stage>.candidate]]` with that marketplace's `market_sku` —
+`SkuCandidate` carries one per rung. The `sku` field stays the exact
+nvidia-smi string in every case; that is what the health gate asserts on the
+pod that actually booted.
+
+Vast rents at most one pod per `machine_id` — two lanes on one physical box are
+co-tenants, and a "2-pod" fleet that lands twice on the same machine bills
+double while sharing a memory bus. It also supports `machine_of`, so the
+replacement path can exclude a machine that just failed its boot gate.
+
+```toml
+[provisioner.provider_options.runpod]
+cloud_type = "SECURE"   # or "COMMUNITY" for the cheaper host marketplace
+disk_gb    = 60
+```
+
+Unknown keys in these tables are rejected at config load against the adapter's
+own field list — a silently-ignored `min_reliabilty` would rent the heat off
+unvetted machines while the config claims otherwise.
+
+### What every adapter owes the loop
+
+Beyond the five protocol verbs, the loop duck-types four optional methods, and
+two of them are load-bearing for money:
+
+- **`list_tagged(prefix) -> [(name, handle)]`.** Both halves, always. The
+  orphan reaper decides *what* is ours by matching the pod NAME against
+  `cascade-<round>-<stage>`, then terminates by the provider's HANDLE — an
+  opaque id on every marketplace except lium. Returning bare handles makes
+  `is_provisioner_pod_name` see a uuid, judge it "not ours", and skip it, so
+  orphans bill until someone notices by hand. Use `filter_tagged_pods`.
+- **`offer_price(sku, *, gpus) -> USD per POD-hour.`** Not per GPU-hour. The
+  round breaker bills pods, so an adapter quoting per-GPU must multiply and one
+  listing per-instance must scan the right shape. Getting it wrong
+  under-projects `max_spend_per_round` silently, in the permissive direction.
+- `machine_of(handle)` enables lemon exclusion on the replacement path; omit it
+  where the marketplace picks the machine (runpod).
+- `launched_image_digest(handle)` is the provider-side attestation the health
+  gate falls back to when the pod cannot report its own launch env.
+
+Batch launches must be **atomic**: `_rent_stage` records the ledger only after
+`launch` returns, so an adapter that raises mid-batch strands whatever it
+already rented. Both REST adapters unwind on failure rather than leaving it to
+the reaper.
+
+Transport retries are bounded and apply to `GET`/`DELETE` only. A create that
+appears to fail may still have been accepted upstream, so retrying `POST`/`PUT`
+risks double-renting a fleet the ledger never learns about.
+
+### Preflight before arming a rung
+
+```bash
+cascade-provisioner --config provision.toml --chain-toml chain.toml --check-providers
+```
+
+Walks every configured `(stage × rung × provider)` against the live APIs and
+**rents nothing**. It exists because an adapter's real risk is not its control
+flow — that is unit-tested — but its assumptions about somebody else's JSON:
+endpoint paths, auth header, response field names, whether a price is dollars
+or cents and per-GPU or per-pod, and whether the pod listing carries the name
+the orphan reaper matches on. Every one of those fails looking like "no
+capacity" rather than "misconfigured", which is exactly the kind of fault that
+hides for weeks.
+
+```
+ok  heat[0] 4×NVIDIA GeForce RTX 4090 (RTX4090) on vast: capacity, $1.10/pod-hr (cap $2.60)
+--  heat[1] 4×NVIDIA RTX A6000 (A6000) on vast: no capacity, price unknown (rung would bill at its cap)
+ok  final[0] 2×NVIDIA L40S (NVIDIA L40S) on runpod: capacity, $2.40/pod-hr (cap $2.60)
+ok   runpod: list_tagged → 0 tagged pod(s)
+```
+
+It runs before the chain client and manifest store are opened, so it works on
+a box with marketplace credentials and nothing else — including before the
+service has ever been armed. Exit status is non-zero only for a hard fault
+(auth failure, a raising adapter, a listing in the wrong shape); no-capacity
+and over-cap are reported, not failed.
+
+**Both new adapters still need a live run before they carry a `final`.** Their
+response parsing is unit-tested against recorded shapes and preflight checks
+the rest against real credentials, but no cascade round has rented through
+them. Preflight, then a single heat rung on testnet, then the duel.

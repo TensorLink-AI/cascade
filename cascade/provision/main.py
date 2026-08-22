@@ -16,6 +16,7 @@ what it WOULD rent, renting nothing.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import shlex
 import subprocess
@@ -43,6 +44,110 @@ log = logging.getLogger("cascade.provision.main")
 
 
 # ── config (pure parse + validation; tested) ─────────────────────────────────
+
+
+def _validate_provider_opts(opts: dict[str, dict]) -> None:
+    """Reject provider kwargs the named adapter does not accept.
+
+    ``build_providers`` would raise a bare ``TypeError`` from the dataclass
+    constructor; this turns it into the same actionable ProvisionError as every
+    other config mistake, and names the accepted keys. Unknown PROVIDER names
+    are left to ``build_providers`` (which already lists the known adapters).
+    """
+    import dataclasses
+
+    from .core import _PROVIDER_FACTORIES
+
+    for name, kwargs in opts.items():
+        factory = _PROVIDER_FACTORIES.get(name)
+        if factory is None or not dataclasses.is_dataclass(factory):
+            continue
+        known = {f.name for f in dataclasses.fields(factory) if f.init
+                 and not f.name.startswith("_")}
+        unknown = sorted(set(kwargs) - known)
+        if unknown:
+            raise ProvisionError(
+                f"[provisioner.provider_options.{name}] unknown key(s) "
+                f"{', '.join(unknown)}; {name} accepts: {', '.join(sorted(known))}")
+
+
+def check_providers(policy: ProvisionPolicy, providers: dict, *,
+                    pod_tag: str = "cascade-") -> tuple[bool, list[str]]:
+    """Preflight every configured rung against the live marketplace APIs.
+
+    An adapter's real risk is not its control flow — that is unit-tested — but
+    the handful of assumptions it makes about somebody else's JSON: endpoint
+    paths, auth header, response field names, whether a price is dollars or
+    cents and per-GPU or per-pod, and whether the pod listing carries the name
+    the orphan reaper matches on. None of those can be checked without
+    credentials, and all of them fail in ways that look like "no capacity"
+    rather than "misconfigured".
+
+    So probe them explicitly, with real keys, renting NOTHING: build the
+    session (auth), ``available`` (endpoint + SKU naming), ``offer_price``
+    (units, against the rung's own cap), and ``list_tagged`` (the reaper's
+    input shape). Returns ``(ok, report_lines)``; ``ok`` is False only for a
+    hard fault — no-capacity is reported, not failed, because a quiet
+    marketplace is a normal Tuesday.
+    """
+    lines: list[str] = []
+    ok = True
+    stages = [("heat", policy.heat), ("final", policy.final)]
+    if policy.eval is not None:
+        stages.append(("eval", policy.eval))
+    for stage, sp in stages:
+        if sp.max_pods == 0:
+            lines.append(f"{stage}: unmanaged (max_pods = 0) — skipped")
+            continue
+        for rung, cand in enumerate(sp.sku_candidates):
+            for pname in sp.providers:
+                prov = providers.get(pname)
+                label = (f"{stage}[{rung}] {cand.gpus_per_pod}×{cand.sku} "
+                         f"({cand.marketplace_sku}) on {pname}")
+                if prov is None:
+                    lines.append(f"FAIL {label}: adapter not built")
+                    ok = False
+                    continue
+                try:
+                    have = prov.available(cand.marketplace_sku, 1,
+                                          gpus=cand.gpus_per_pod)
+                except Exception as e:  # noqa: BLE001 — one bad adapter must not hide the rest
+                    lines.append(f"FAIL {label}: availability probe raised: {e}")
+                    ok = False
+                    continue
+                price = None
+                with contextlib.suppress(Exception):
+                    fn = getattr(prov, "offer_price", None)
+                    price = fn(cand.marketplace_sku, gpus=cand.gpus_per_pod) if fn else None
+                if price is None:
+                    note = "price unknown (rung would bill at its cap)"
+                elif price > cand.max_price_hr:
+                    note = (f"${price:.2f}/pod-hr OVER cap ${cand.max_price_hr:.2f} "
+                            f"— rung would be skipped")
+                else:
+                    note = f"${price:.2f}/pod-hr (cap ${cand.max_price_hr:.2f})"
+                lines.append(f"{'ok  ' if have else '--  '}{label}: "
+                             f"{'capacity' if have else 'no capacity'}, {note}")
+    for pname, prov in providers.items():
+        lister = getattr(prov, "list_tagged", None)
+        if lister is None:
+            lines.append(f"WARN {pname}: no list_tagged — orphans are NEVER reaped")
+            continue
+        try:
+            rows = list(lister(pod_tag))
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"FAIL {pname}: list_tagged raised: {e}")
+            ok = False
+            continue
+        bad = [r for r in rows if not (isinstance(r, tuple) and len(r) == 2)]
+        if bad:
+            # The exact defect that silently disabled the reaper on shadeform.
+            lines.append(f"FAIL {pname}: list_tagged must yield (name, handle) "
+                         f"pairs; got {bad[0]!r}")
+            ok = False
+        else:
+            lines.append(f"ok   {pname}: list_tagged → {len(rows)} tagged pod(s)")
+    return ok, lines
 
 
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
@@ -392,6 +497,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="Walk trigger→count→size→budget and log intended rentals; rent nothing.")
     p.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
+    p.add_argument("--check-providers", action="store_true",
+                   help="Preflight every configured (stage × rung × provider) against "
+                        "the live marketplace APIs — auth, capacity, price, listing "
+                        "shape — then exit. RENTS NOTHING.")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -620,7 +729,33 @@ def _run(args) -> int:
     provider_opts: dict[str, dict] = {}
     if top.get("shadeform_ssh_key_id"):
         provider_opts["shadeform"] = {"ssh_key_id": str(top["shadeform_ssh_key_id"])}
+    # Generic per-adapter knobs: [provisioner.provider_options.<name>]. Keys map
+    # straight onto the adapter's constructor (e.g. runpod's cloud_type, vast's
+    # min_cpu_cores_per_gpu), so a typo is caught HERE against the adapter's own
+    # field list — not swallowed as a silently-ignored quality floor, which on
+    # the vast adapter would mean renting the heat off unvetted machines.
+    for pname, opts in (top.get("provider_options", {}) or {}).items():
+        if not isinstance(opts, dict):
+            raise ProvisionError(
+                f"[provisioner.provider_options.{pname}] must be a table of "
+                f"constructor kwargs; got {type(opts).__name__}")
+        provider_opts.setdefault(pname, {}).update(opts)
+    _validate_provider_opts(provider_opts)
     providers = {p.name: p for p in build_providers(provider_names, provider_opts)}
+
+    if args.check_providers:
+        # Deliberately BEFORE the chain client and manifest store are opened:
+        # preflight is for validating marketplace credentials and API shapes,
+        # and must work on a box that has neither chain access nor Hippius
+        # keys — including before the service has ever been armed.
+        from .loop import POD_TAG
+
+        ok, lines = check_providers(policy, providers, pod_tag=POD_TAG)
+        for line in lines:
+            print(line)
+        print("\npreflight:", "PASS" if ok else "FAIL",
+              "— nothing was rented.")
+        return 0 if ok else 1
 
     hippius_probe = None
     manifest_store = None
