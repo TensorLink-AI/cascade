@@ -830,7 +830,7 @@ body {
   -webkit-font-smoothing: antialiased;
   transition: background .2s, color .2s;
 }
-.page { width: 100%; max-width: 1200px; padding: 34px 44px 80px; display: flex; flex-direction: column; gap: 38px; }
+.page { width: 100%; max-width: 1200px; padding: 30px 44px 72px; display: flex; flex-direction: column; gap: 32px; }
 a { color: var(--chal); text-decoration: none; }
 
 #top-bar {
@@ -878,15 +878,20 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 
 /* verdict panel */
 .verdict {
-  border: var(--line); padding: 24px 26px; position: relative;
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 22px 30px;
+  border: var(--line); padding: 18px 22px; position: relative;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px 26px;
   background: var(--surface);
 }
 .verdict::before { content: ""; position: absolute; inset: 4px; border: var(--line-faint); pointer-events: none; }
-.stat { position: relative; z-index: 1; }
-.stat .k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; }
-.stat .v { font-family: var(--font-mono); font-size: clamp(17px, 2.1vw, 23px); line-height: 1.2; margin-top: 4px; color: var(--ink); }
-.stat .v .sub { font-size: 12px; color: var(--muted); }
+.stat { position: relative; z-index: 1; min-width: 0; }
+.stat .k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat[title] .k { cursor: help; border-bottom: 1px dotted var(--muted); display: inline-block; max-width: 100%; }
+.stat .v { font-family: var(--font-mono); font-size: clamp(16px, 1.9vw, 21px); line-height: 1.2; margin-top: 4px; color: var(--ink); }
+.stat .v .sub { font-size: 11px; color: var(--muted); }
+/* multi-part values (e.g. bootstrap percentiles): keep on ONE line, span wider */
+.stat.wide { grid-column: span 2; }
+.stat .v.range { font-size: 15px; white-space: nowrap; }
+.stat .v.range .sub { font-size: 10px; }
 .badge { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 9px; border: 1px solid var(--ink); }
 .badge.win { background: var(--chal); color: var(--bone-light); border-color: var(--chal); }
 .badge.hold { background: var(--slate); color: var(--bone-light); border-color: var(--slate); }
@@ -954,6 +959,10 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 tbody tr:hover td .sub-tag, tbody tr:hover td .sub-new { color: var(--bone-light); }
 .subs-note { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 8px; }
 
+@media (max-width: 380px) {
+  .verdict .stat.wide { grid-column: auto; }
+  .stat .v.range { white-space: normal; }
+}
 @media (max-width: 720px) {
   .page { padding: 22px 18px 56px; gap: 26px; }
   .header .wordmark { font-size: 34px; }
@@ -1211,37 +1220,52 @@ function renderHeader(){
   for(var i=rs.length-1;i>=0&&!sizes;i--){ if(rs[i].sizes&&rs[i].sizes.length) sizes=rs[i].sizes.filter(Boolean).join(" · "); }
   document.getElementById("sizes").textContent=sizes||"--";
 }
-function stat(k,v){ return '<div class="stat"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div></div>'; }
+// o.title = hover tooltip (the long explanation lives there, not in the label);
+// o.wide  = span two grid columns; o.range = compact one-line multi-part value.
+function stat(k,v,o){
+  o=o||{};
+  return '<div class="stat'+(o.wide?' wide':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'>'+
+    '<div class="k">'+esc(k)+'</div><div class="v'+(o.range?' range':'')+'">'+v+'</div></div>';
+}
 function renderVerdict(){
   var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
   if(!r){ el.innerHTML='<div class="empty">Waiting for the first published round…</div>'; return; }
   document.getElementById("verdict-title").textContent="Round "+shortRoundId(r.round_id);
-  document.getElementById("verdict-when").textContent=r.published_at?timeAgo(r.published_at):"";
+  document.getElementById("verdict-when").textContent=r.published_at?"settled "+timeAgo(r.published_at):"";
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
   if(r.status==="rejected"){
-    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans)">'+esc(r.reject_reason||"--")+'</span>'));
+    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans);white-space:normal">'+esc(r.reject_reason||"--")+'</span>'));
   } else {
     var betterV=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
-    cells.push(stat("King error (lower better)",fmt(r.king_geomean)));
-    cells.push(stat("Challenger error (lower better)",'<span class="'+(betterV?"good":"")+'">'+fmt(r.chal_geomean)+'</span>'));
+    var ERR_TIP="geomean(CRPS · MASE) — lower is better";
+    cells.push(stat("King error",fmt(r.king_geomean),{title:ERR_TIP}));
+    cells.push(stat("Chal. error",'<span class="'+(betterV?"good":"")+'">'+fmt(r.chal_geomean)+'</span>',{title:ERR_TIP}));
     if(r.win_rate!=null){
       // Win rate next to the error tiles: a low win rate under a better geomean
       // is the rare-but-big signal that the LCB (below) then prices as fragile.
       var wcls=r.win_rate>=0.5?"good":(betterV?"warn":"");
-      var wnote=betterV&&r.win_rate<0.5?'<span class="sub">rare&#8209;but&#8209;big &mdash; geomean carried by few windows</span>':'<span class="sub">of windows</span>';
-      cells.push(stat("Win rate",'<span class="'+wcls+'">'+pct(r.win_rate)+'</span> '+wnote));
+      var rareBig=betterV&&r.win_rate<0.5;
+      var wnote=rareBig?' <span class="sub">rare&#8209;but&#8209;big</span>':'';
+      cells.push(stat("Win rate",'<span class="'+wcls+'">'+pct(r.win_rate)+'</span>'+wnote,
+        {title:"Share of eval windows the challenger won"+(rareBig?" — geomean favours the challenger but few windows do; the LCB prices this as fragile":"")}));
     }
-    cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>'));
+    cells.push(stat("LCB vs margin",fmt(r.lcb,3)+' <span class="sub">/ '+fmt(r.margin,3)+'</span>',
+      {title:"Bootstrap lower confidence bound on the improvement vs the margin required to dethrone"}));
     if(r.boot_p50!=null){
       // Bootstrap spread of the relative improvement; LCB is the 5th pct. A large
       // gap between a positive median and a negative LCB = a fragile verdict.
-      cells.push(stat("Bootstrap spread",fmt(r.lcb,2)+' <span class="sub">p5</span> · <b>'+fmt(r.boot_p50,2)+'</b> <span class="sub">p50</span> · '+fmt(r.boot_p95,2)+' <span class="sub">p95</span>'));
+      cells.push(stat("Bootstrap spread",
+        fmt(r.lcb,3)+'<span class="sub">p5</span> · <b>'+fmt(r.boot_p50,3)+'</b><span class="sub">p50</span> · '+fmt(r.boot_p95,3)+'<span class="sub">p95</span>',
+        {wide:true, range:true,
+         title:"Bootstrap spread of the relative improvement; p5 is the LCB. A median far above a negative p5 = a fragile verdict."}));
     }
     cells.push(stat("Windows",r.n_windows!=null?r.n_windows:"--"));
-    if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">clusters (eff. n)</span>'));
+    if(r.n_clusters!=null) cells.push(stat("Feeds",r.n_clusters+' <span class="sub">eff. n</span>',
+      {title:"Independent feed clusters — the effective sample size behind the windows"}));
     if(r.wilcoxon_p!=null) cells.push(stat("Wilcoxon p",pval(r.wilcoxon_p)));
-    cells.push(stat("Field",(r.n_participants!=null?r.n_participants:"--")+' <span class="sub">entrants</span>'));
+    cells.push(stat("Entrants",r.n_participants!=null?r.n_participants:"--",
+      {title:"Miners in the field this round"}));
     if(r.gift_gate_passed!=null) cells.push(stat("GIFT gate",r.gift_gate_passed?"pass":"fail"));
     cells.push(stat("Rewarded",r.n_rewarded!=null?r.n_rewarded:"--"));
   }
