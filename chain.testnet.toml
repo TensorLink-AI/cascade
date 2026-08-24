@@ -98,6 +98,12 @@ lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0018): warmup on
                                    # wsd rounds also checkpoint optimizer state. [training]
                                    # edit ⇒ contract_digest changed: restart trainer AND
                                    # validator together (flipped 2026-08-14).
+# anneal_fraction  = 0.15          # fork-anneal (DEC-CA-0029): TESTNET ARMS FIRST — set here,
+                                   # run a full round cycle (heat + duel + warm-start resume),
+                                   # verify the scored checkpoint is the annealed fork and the
+                                   # next round resumes from weights_stable + optimizer, THEN
+                                   # take the mainnet contract cut. Digest-bound: setting this
+                                   # recomputes contract_digest (restart trainer + validator).
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 2700        # TESTNET: cap = the 45-min final budget itself, measured

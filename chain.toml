@@ -103,6 +103,17 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
                                   # momentum/row-EMA/AdamW moments survive the round boundary.
                                   # [training] edit ⇒ contract_digest changed: restart trainer
                                   # AND validator together (flipped from warmup_cosine 2026-08-14).
+# anneal_fraction  = 0.15         # fork-anneal (DEC-CA-0029, wsd's deferred "D"): each run ends
+                                  # with a cosine decay base_lr -> 0 over this fraction of extra
+                                  # tokens; the ANNEALED weights become the scored checkpoint
+                                  # (weights.safetensors) and the mid-stable branch rides beside
+                                  # it (weights_stable.safetensors + optimizer.safetensors) for
+                                  # warm-start continuity. Wall stretches by the same fraction.
+                                  # OFF (0.0) = today's mid-stable artifacts, digest untouched.
+                                  # ARMING CHECKLIST (a contract cut, the 2026-08-14 playbook):
+                                  # testnet full cycle first; recompute contract_digest
+                                  # (cascade-trainer --offline); coordinated release-then-activate
+                                  # with ALL external validators; OPSLOG entry.
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit

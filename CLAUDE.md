@@ -202,6 +202,16 @@ in-context.
   via a baseline-referenced statistic; decoupled flagship is the fallback if
   the noise floor kills the at-size duel.
   (`decisions/DEC-CA-0027-size-conditional-gpu-provisioning.md`)
+- **DEC-CA-0029** (proposed) — Fork-anneal (wsd's deferred "D", the
+  DEC-CA-0018 revisit): each run ends with a cosine decay branch; the ANNEALED
+  weights are the scored checkpoint, the mid-stable branch
+  (`weights_stable.safetensors` + optimizer) carries the lineage for
+  warm-starts. `[training] anneal_fraction`, digest-bound drop-when-default
+  (0.0 = off, shipped inert); arming is a contract cut — testnet cycle first,
+  release-then-activate. Fixes the mid-stable recipe artifact in every
+  absolute-number consumer (public bench stream, DEC-CA-0017 guard,
+  promotion picks).
+  (`decisions/DEC-CA-0029-fork-anneal-finished-form-checkpoints.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

@@ -384,6 +384,24 @@ class TrainingContractConfig:
     # until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness rule
     # (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
     real_corpus_ref: str = ""
+    # ── fork-anneal: finished-form duel checkpoints (DEC-CA-0029; digest-bound)
+    # The deferred "D" of the wsd schedule (DEC-CA-0018's anticipated decay
+    # branch). When > 0 (requires lr_schedule = "wsd"), every training run
+    # FORKS at the end of its stable phase: the mid-stable weights + optimizer
+    # state are retained in the checkpoint as ``weights_stable.safetensors`` +
+    # ``optimizer.safetensors`` (the lineage branch — warm-starts resume from
+    # THESE, never from a decayed endpoint), then training continues for
+    # ``anneal_fraction × train_tokens`` more tokens under a cosine decay of
+    # base_lr → 0, and the ANNEALED weights become ``weights.safetensors`` —
+    # the artifact every scoring layer (duel eval, benchmark sidecar,
+    # promotion BenchScores) loads. Identical for king and challenger, so the
+    # controlled experiment is preserved; the wall-clock guard stretches by
+    # the same fraction (total wall = max_train_seconds × (1 + fraction)).
+    # 0.0 = off — the deployed default, absent from contract_digest via
+    # drop-when-default, so shipping this field moves no deployed digest;
+    # setting it is the deliberate contract cut (release-then-activate,
+    # trainer + validators together, testnet first).
+    anneal_fraction: float = 0.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -1405,6 +1423,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
+            anneal_fraction=float(t.get("anneal_fraction", 0.0)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
