@@ -92,6 +92,25 @@ jobs:
       - name: Install cascade (pool-forge + hippius extras)
         run: pip install -e ".[pool-forge,hippius]"
 
+      # The forge mirror is date-partitioned parquet (<feed>/<date>.parquet,
+      # immutable once written), but the runner is ephemeral — without a cache
+      # every run re-downloads the ENTIRE bucket (2026-08-24: 63,183 files,
+      # 85 minutes, latency-bound on small objects; this is what killed the job
+      # daily at the old 60m wall from 2026-08-18). Restoring yesterday's
+      # mirror turns the sync into a delta pull of just the new partitions.
+      # Key is per-run so the post-job save always stores the updated mirror;
+      # restore-keys falls back to the newest prior save. FAIL-OPEN: a cache
+      # miss (eviction, first run) or a failed save (mirror outgrows the repo's
+      # 10 GB cache quota) degrades to today's full sync under the 120m wall —
+      # the sync step itself is unchanged and remains the source of truth.
+      - name: Restore forge mirror cache
+        uses: actions/cache@v4
+        with:
+          path: ./tsforge
+          key: tsforge-mirror-${{ github.run_id }}
+          restore-keys: |
+            tsforge-mirror-
+
       - name: Sync forge mirror down  (FORGE READ key only)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
@@ -107,6 +126,8 @@ jobs:
           n=$(find ./tsforge/data -name '*.parquet' 2>/dev/null | wc -l)
           newest=$(ls -1 ./tsforge/data/*/*.parquet 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)
           echo "synced $n parquet files; newest partition: ${newest:-none}"
+          # mirror size, for watching growth against the 10 GB cache quota
+          du -sh ./tsforge || true
           test "$n" -gt 0 || { echo "::error::forge mirror is empty"; exit 1; }
 
       - name: Build + publish snapshot  (CASCADE key)
