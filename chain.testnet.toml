@@ -462,3 +462,7 @@ host_bench = true               # + the fixed calibration bench (host_bench_toke
 # the 3h cadence; the 0.75h budget keeps the extra leg cheap). Mainnet ships 0
 # until this cycle passes and the owner arms M=4.
 scratch_shadow_every_rounds = 2
+# bench_anneal_fraction = 0.15  # bench-anneal (DEC-CA-0030): bench the annealed copy of each duel
+                                # checkpoint (see mainnet chain.toml for the full note). Trainer
+                                # restart only; arm here first and check the round's BenchScores
+                                # step down (finished form scores lower) before mainnet.

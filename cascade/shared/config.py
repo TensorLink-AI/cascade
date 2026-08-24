@@ -1037,11 +1037,28 @@ class TelemetryConfig:
     lineage-vs-scratch gap that decides whether DEC-CA-0014's Stage-2 reseed
     valve is ever warranted. ``0`` (the default) = off. Deliberately a
     ``[telemetry]`` key: it must never touch ``contract_digest``.
+
+    ``bench_anneal_fraction`` (DEC-CA-0030) arms bench-anneal: before the
+    post-round benchmark sweep, each duel checkpoint is resumed on the pod
+    that trained it (weights + optimizer state, fresh salted corpus) under a
+    pure cosine decay base_lr → 0 for this fraction of the full token budget,
+    and the sweep scores the ANNEALED copy — so the signed BenchScores (the
+    public bench stream, promotion picks, the DEC-CA-0017 guard) read
+    finished-form numbers instead of wsd's mid-stable artifacts. The
+    canonical duel checkpoint, the manifest, the bench-report wire format,
+    and every validator-verified byte are untouched — validators keep
+    consuming the same signed six numbers; only what the trainer benches
+    changes. Any anneal-leg failure falls back to benching the raw
+    checkpoint (a mid-stable number beats a missing one). ``0.0`` = off.
+    Deliberately a ``[telemetry]`` key: it must never touch
+    ``contract_digest`` — the digest-bound path to finished-form DUEL
+    artifacts is [training] anneal_fraction (DEC-CA-0029), a contract cut.
     """
 
     host_probe: bool = True
     host_bench: bool = True
     scratch_shadow_every_rounds: int = 0
+    bench_anneal_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1553,6 +1570,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             host_probe=bool(tm.get("host_probe", True)),
             host_bench=bool(tm.get("host_bench", True)),
             scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
+            bench_anneal_fraction=float(tm.get("bench_anneal_fraction", 0.0)),
         ),
         raw=raw,
     )

@@ -112,6 +112,14 @@ BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
 
+# Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
+# a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
+# never re-fits the round's exact training draw, and the salted seed keys the
+# leg's _train_work dir + checkpoint repo away from every canonical name.
+# Value matches the 2026-08-23 offline calibration runs, so their published
+# -anneal-u<uid> artifacts stay reproducible under the production leg.
+BENCH_ANNEAL_SALT = 0xA11EA1A11EA1
+
 # Dedup probe stage: concurrent sandboxes, and the floor under the per-draw
 # wall clock derived from [round] dedup_probe_budget_seconds (a budget so tight
 # that no generator could start would fail the whole field, not screen it).
@@ -2574,16 +2582,87 @@ class TrainerRunner:
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str
     ) -> BenchScores | None:
-        """One remote sweep → six numbers, or ``None`` on any miss."""
+        """One remote sweep → six numbers, or ``None`` on any miss.
+
+        With ``[telemetry] bench_anneal_fraction`` armed (DEC-CA-0030) the
+        sweep scores an ANNEALED copy of the checkpoint — finished-form
+        numbers for the signed BenchScores — falling back to the raw
+        checkpoint on any anneal-leg failure."""
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import run_post_round_benchmark
 
+        bench_round, bench_role = round_id, entry.role
+        frac = float(getattr(self.cfg.telemetry, "bench_anneal_fraction", 0.0) or 0.0)
+        if frac > 0.0:
+            annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac)
+            if annealed is not None:
+                bench_round, bench_role = annealed
         report = run_post_round_benchmark(
-            host, round_id, entry.size or primary, self.cascade_bench_plan,
-            work_root=self.work_root, role=entry.role,
+            host, bench_round, entry.size or primary, self.cascade_bench_plan,
+            work_root=self.work_root, role=bench_role,
         )
         scores = extract_bench_scores(report) if report is not None else None
         return BenchScores(**scores) if scores is not None else None
+
+    def _dispatch_bench_anneal(
+        self, host: object, entry: TrainedEntry, round_id: str, primary: str,
+        frac: float,
+    ) -> tuple[str, str] | None:
+        """Run the bench-anneal leg (DEC-CA-0030) for one duel checkpoint on
+        the pod that trained it, returning the ``(round_dir, role_dir)`` pair
+        naming the annealed checkpoint's ``_train_work`` location for the
+        bench sweep — or ``None`` on any failure (the caller benches the raw
+        checkpoint instead; log-only telemetry must never lose the sweep).
+
+        The leg is a stock worker run: resume ``entry.trained_pointer``
+        (weights + optimizer state) on a FRESH salted corpus for
+        ``frac × target_train_hours`` under the pure-decay recipe
+        (``--anneal``). The salt keys the work dir + checkpoint repo away
+        from every canonical name, so nothing this leg writes can collide
+        with a consensus artifact."""
+        from .remote import RemoteDispatcher, pod_lane_count
+
+        if not self.trainer_spec:
+            log.warning("round=%s: bench-anneal skipped (no trainer_spec — "
+                        "benching the raw checkpoint)", round_id)
+            return None
+        size = entry.size or primary
+        contract = self.cfg.training.primary_size
+        if size != contract.arch_preset:
+            spec = next((sp for sp in self.cfg.training.extra_sizes
+                         if sp.arch_preset == size), None)
+            if spec is None:
+                log.warning("round=%s: bench-anneal skipped for unknown size %r",
+                            round_id, size)
+                return None
+            contract = self.cfg.training.for_size(spec)
+        salted = (int(round_id) ^ BENCH_ANNEAL_SALT) & ((1 << 63) - 1)
+        suffix = f"-anneal-u{entry.miner_uid}"
+        try:
+            disp = RemoteDispatcher(
+                trainer_spec=self.trainer_spec,
+                timeout_seconds=self.remote_timeout_seconds,
+                extra_forward_env=self._pod_extra_forward_env(),
+            )
+            disp.dispatch(
+                host, gen_ref=entry.gen_ref, uid=entry.miner_uid,
+                hotkey=entry.miner_hotkey, role=entry.role,
+                base_seed=salted, block=entry.train_block,
+                arch_preset=size, train_hours=contract.target_train_hours * frac,
+                repo_suffix=suffix, warm_start_ref=entry.trained_pointer,
+                lane_count=pod_lane_count(host, [host]), anneal=True,
+            )
+        except Exception as e:  # noqa: BLE001 — telemetry: fall back, never raise
+            log.warning("round=%s: bench-anneal leg failed for %s %s (benching "
+                        "the raw checkpoint instead): %s",
+                        round_id, entry.role, entry.miner_hotkey, e)
+            return None
+        log.info("round=%s: bench-anneal leg done for %s %s (frac=%.2f) — "
+                 "benching the annealed copy", round_id, entry.role,
+                 entry.miner_hotkey, frac)
+        # The worker wrote _train_work/<salted>/<size>/<role><suffix>/checkpoint
+        # (dir = role + repo suffix, same layout the scratch shadow benches).
+        return str(salted), f"{entry.role}{suffix}"
 
     def _log_bench_pair_wandb(self, report: object) -> None:
         """Mirror the round's king/challenger bench pair to wandb when
