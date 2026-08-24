@@ -202,6 +202,15 @@ in-context.
   via a baseline-referenced statistic; decoupled flagship is the fallback if
   the noise floor kills the at-size duel.
   (`decisions/DEC-CA-0027-size-conditional-gpu-provisioning.md`)
+- **DEC-CA-0029** (proposed) — Dual-throne interleave (DEC-CA-0014 Stage 3
+  specified): regime from the epoch grid (`round_index % b < a`, block-gated),
+  two ChampionStates with per-throne tenure/margin-decay/courts (`king_decay`
+  geometric within each), ONE blended emission vector every round (never
+  alternating — incentive-based king resolution breaks at z=0.5 and must go
+  receipt-trail + throne-tagged), scratch king feeds the warm promotion pool
+  via the existing quality floor (Stage 2's valve, live). Armed ONLY on
+  divergent-winners shadow evidence; same winners ⇒ node dies.
+  (`decisions/DEC-CA-0029-dual-throne-interleave.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
@@ -216,7 +225,8 @@ New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
-decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
+decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0029 is claimed by the
+2026-08-24 dual-throne interleave design; status proposed). Put the revisit
 condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
