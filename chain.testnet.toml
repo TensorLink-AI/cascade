@@ -24,11 +24,11 @@ min_length           = 64        # per-series length band (timesteps)
 max_length           = 4096      # = [training] context_length (train on the full context,
                                  # as Toto 2.0 does — see chain.toml); keep in lockstep
 max_total_points     = 2_000_000_000 # raised off 64M; real corpus size is set by the points target + memory/streaming (see notes)
-# Points-denominated materialised drain (DEC-CA-0029; see chain.toml for the
+# Points-denominated materialised drain (DEC-CA-0031; see chain.toml for the
 # full rationale): 67_108_864 = 16384 × 4096 — today's corpus size, count free.
 corpus_target_points = 67_108_864
 max_generate_seconds = 7200      # batch-drain budget (RLIMIT_CPU + wall for a materialised
-                                 # cache_reuse / verify run) — DEC-CA-0029 split this off
+                                 # cache_reuse / verify run) — DEC-CA-0031 split this off
                                  # the streaming stall window, which is now the key below;
                                  # 7200 admits GP/kernel priors (see chain.toml).
 stream_stall_seconds = 600       # TESTNET streaming stall window (max seconds between

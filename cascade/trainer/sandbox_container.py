@@ -280,7 +280,7 @@ def stream_series_container(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
     try:
-        # Same stall-window rule as the subprocess stream (DEC-CA-0029):
+        # Same stall-window rule as the subprocess stream (DEC-CA-0031):
         # stream_stall_seconds when set, else max_generate_seconds.
         yield _frame_iter(proc, cfg.effective_stall_seconds)
     finally:

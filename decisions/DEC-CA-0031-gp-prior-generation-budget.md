@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0029
+id: DEC-CA-0031
 type: decision
 title: "GP-prior generation economics: the materialised corpus budget is denominated in POINTS (count free), the batch drain budget rises 1800 → 7200 CPU-s with the streaming stall window split off and pinned, and the relative-jitter Cholesky is documented miner-side"
 status: accepted

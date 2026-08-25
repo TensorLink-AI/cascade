@@ -84,7 +84,7 @@ def test_drain_generator_rejects_wrong_count():
         drain_generator(_WrongCount(), 5, min_length=10, max_length=200, max_total_points=10_000)
 
 
-# ── points-denominated drain (DEC-CA-0029) ──────────────────────────────────
+# ── points-denominated drain (DEC-CA-0031) ──────────────────────────────────
 
 
 def test_drain_target_points_stops_at_target_count_free():

@@ -1236,7 +1236,7 @@ class TrainerRunner:
             # corpus_target_points is zeroed: the probe compares SMALL
             # fixed-count draws across entrants, so it must stay count-
             # denominated even when the materialised drain is armed points-
-            # denominated (DEC-CA-0029).
+            # denominated (DEC-CA-0031).
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
                 max_generate_seconds=per_draw, corpus_target_points=0)

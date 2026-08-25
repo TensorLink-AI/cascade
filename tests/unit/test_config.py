@@ -338,7 +338,7 @@ def test_cadence_keys_must_be_set_together(tmp_path):
         load_chain_config(p)
 
 
-# ── DEC-CA-0029: points-denominated drain budget + split stall window ────────
+# ── DEC-CA-0031: points-denominated drain budget + split stall window ────────
 
 
 def test_shipped_config_arms_points_denomination():
@@ -352,7 +352,7 @@ def test_shipped_config_arms_points_denomination():
     assert g.corpus_target_points == 16384 * 4096
     assert g.corpus_target_points <= g.max_total_points
     assert g.max_generate_seconds == 7200
-    # The stall window is pinned at the pre-DEC-CA-0029 value: raising the
+    # The stall window is pinned at the pre-DEC-CA-0031 value: raising the
     # batch budget must not widen how long a stalled generator holds a lane.
     assert g.stream_stall_seconds == 1800
     assert g.effective_stall_seconds == 1800
@@ -380,7 +380,7 @@ def test_corpus_target_points_must_fit_the_point_cap(tmp_path):
 
 
 def test_generator_budget_keys_stay_out_of_contract_digest():
-    """DEC-CA-0029's premise: no [generator] key is in contract_digest, so the
+    """DEC-CA-0031's premise: no [generator] key is in contract_digest, so the
     budget re-denomination never forks manifests or needs a validator restart.
     The digest hashes TrainingContractConfig only — assert the armed template's
     training digest is bit-equal to the same [training] with the drain armed

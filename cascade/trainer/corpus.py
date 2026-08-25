@@ -3,7 +3,7 @@
 Given a materialised generator repo, import ``generator.Generator``, construct
 it with the round's generation seed, and drain the corpus: exactly
 ``corpus_n_series`` validated series, or — with ``corpus_target_points`` armed
-(DEC-CA-0029) — a free number of series up to that many points. The result is a
+(DEC-CA-0031) — a free number of series up to that many points. The result is a
 list of float64 arrays plus its digest — the auditable record of what the model
 was trained on.
 
@@ -241,7 +241,7 @@ def build_corpus(
     offending generator simply fails to qualify this round (a bad generator can
     never affect the king's run).
 
-    With ``cfg.corpus_target_points`` armed (DEC-CA-0029) the drain is
+    With ``cfg.corpus_target_points`` armed (DEC-CA-0031) the drain is
     points-denominated: the generator is asked for the same prefix upper bound
     the streaming feed would use (``target // min_length + 2``) and the drain
     stops once the corpus reaches the target points — count free, budget

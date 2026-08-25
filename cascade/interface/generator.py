@@ -555,7 +555,7 @@ def drain_generator(
     few enormous series). Raises ``ValueError`` if the generator yields the wrong
     count, a malformed series, or blows the point budget.
 
-    ``target_points`` (DEC-CA-0029) switches the drain to a POINTS
+    ``target_points`` (DEC-CA-0031) switches the drain to a POINTS
     denomination: when > 0, ``n_series`` is only the upper bound handed to
     ``generate`` (callers size it like the stream's prefix bound) and the
     drain stops at the first series that brings cumulative values-points to

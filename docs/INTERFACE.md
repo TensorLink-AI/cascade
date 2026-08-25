@@ -140,7 +140,7 @@ class Generator(DataGenerator):
   `[generator] corpus_target_points` armed (it ships armed), the materialised
   drain (`cascade verify`, `cache_reuse`) stops once your corpus reaches the
   target points, and the series count is yours to choose — many short series
-  or fewer long ones (DEC-CA-0029; compute-heavy GP/kernel priors want short —
+  or fewer long ones (DEC-CA-0031; compute-heavy GP/kernel priors want short —
   see MINER.md §1a). The streaming feed likewise stops at the training token
   budget. `generate(n)` may therefore be stopped before `n`; if the owner
   disarms the target (`corpus_target_points = 0`) the legacy rule returns:

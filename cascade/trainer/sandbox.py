@@ -707,7 +707,7 @@ def stream_series(
     )
     try:
         # Per-frame stall window: [generator] stream_stall_seconds when set,
-        # else max_generate_seconds (DEC-CA-0029 decoupled the two so raising
+        # else max_generate_seconds (DEC-CA-0031 decoupled the two so raising
         # the batch drain budget cannot widen how long a stalled generator
         # holds a lane).
         yield _frame_iter(proc, cfg.effective_stall_seconds)

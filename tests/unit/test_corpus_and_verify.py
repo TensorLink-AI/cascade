@@ -68,7 +68,7 @@ def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
 
 
 def test_build_corpus_points_denominated_drain(small_cfg, example_generator_dir):
-    """DEC-CA-0029: with corpus_target_points armed, the drain stops at the
+    """DEC-CA-0031: with corpus_target_points armed, the drain stops at the
     points target and the series count is free — corpus_n_series is ignored."""
     from dataclasses import replace
 

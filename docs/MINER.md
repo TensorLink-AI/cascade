@@ -53,7 +53,7 @@ the dependency allowlist (`chain.toml [dependencies]`).
 
 `gpytorch`, `scikit-learn`, and `networkx` are on the dependency allowlist
 precisely so GP/kernel/graph priors can compete — but a naive implementation
-prices itself out. Three facts to design around (DEC-CA-0029):
+prices itself out. Three facts to design around (DEC-CA-0031):
 
 * **The generation budget is CPU-seconds, and threads sum into it.** The
   sandbox enforces `max_generate_seconds` as `RLIMIT_CPU`, which accumulates

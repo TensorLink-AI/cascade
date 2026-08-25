@@ -34,7 +34,7 @@ class GeneratorConfig:
     points exceed ``max_total_points`` or generation runs past
     ``max_generate_seconds``.
 
-    ``corpus_target_points`` (DEC-CA-0029) re-denominates the MATERIALISED
+    ``corpus_target_points`` (DEC-CA-0031) re-denominates the MATERIALISED
     drain (``cache_reuse`` / ``cascade verify``) in points instead of series:
     when > 0, the drain stops at the first series that reaches this many
     cumulative values-points and the series COUNT is free — a generator may
@@ -49,7 +49,7 @@ class GeneratorConfig:
     long the trainer waits between series before killing the child — split
     out from ``max_generate_seconds`` so the batch drain budget can be raised
     without letting a stalled generator idle a heat slot for the same, larger
-    window (the two roles were one knob before DEC-CA-0029). 0 (default)
+    window (the two roles were one knob before DEC-CA-0031). 0 (default)
     falls back to ``max_generate_seconds``, byte-identical to the old
     behaviour for configs without the key.
 
@@ -80,7 +80,7 @@ class GeneratorConfig:
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
     # Points-denominated materialised drain + decoupled streaming stall window
-    # (DEC-CA-0029; see the class docstring). Both default inert.
+    # (DEC-CA-0031; see the class docstring). Both default inert.
     corpus_target_points: int = 0
     stream_stall_seconds: int = 0
     # Cheap data-quality gates on generator output (see cascade.interface.generator).
@@ -149,7 +149,7 @@ class GeneratorConfig:
     @property
     def effective_stall_seconds(self) -> int:
         """The streaming per-frame stall window: ``stream_stall_seconds`` when
-        set, else ``max_generate_seconds`` (the pre-DEC-CA-0029 single-knob
+        set, else ``max_generate_seconds`` (the pre-DEC-CA-0031 single-knob
         behaviour). Every streaming consumer goes through here so the two
         knobs can never drift apart at a call site."""
         return int(self.stream_stall_seconds) or int(self.max_generate_seconds)
@@ -222,7 +222,7 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
 
 
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
-    """Normalise ``[generator] corpus_target_points`` (DEC-CA-0029).
+    """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
 
     0 = off (the legacy exactly-``corpus_n_series`` drain). A positive target
     above ``max_total_points`` would make every materialised drain abort at
