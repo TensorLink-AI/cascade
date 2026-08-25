@@ -117,7 +117,6 @@ def test_bench_scores_bench_annealed_dir_when_armed(cfg, monkeypatch):
         benched.update(rid=rid, role=role)
         return None  # report contents are not under test
 
-    import cascade.trainer.loop as loop_mod
     monkeypatch.setattr("cascade.trainer.remote.RemoteDispatcher.dispatch",
                         _fake_dispatch)
     monkeypatch.setattr("cascade.trainer.bench_hook.run_post_round_benchmark",
