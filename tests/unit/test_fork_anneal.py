@@ -64,7 +64,7 @@ def test_anneal_lr_cosine_from_base_to_zero():
     assert _anneal_lr(1000, 1000, 4e-3) == pytest.approx(0.0, abs=1e-12)
     assert _anneal_lr(2000, 1000, 4e-3) == pytest.approx(0.0, abs=1e-12)  # clamped
     lrs = [_anneal_lr(p, 1000, 4e-3) for p in range(0, 1001, 50)]
-    assert all(x >= y for x, y in zip(lrs, lrs[1:]))  # monotone decay
+    assert all(x >= y for x, y in zip(lrs, lrs[1:], strict=False))  # monotone decay
 
 
 # ── the fork ──────────────────────────────────────────────────────────────────
