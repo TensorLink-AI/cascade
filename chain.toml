@@ -472,11 +472,7 @@ mix_target_windows   = 1200
 # — i.e. converges to uniform as pool capacity floors (300/domain) land.
 # CONSENSUS: all validators must flip at the same boundary — set
 # mix_tier_from_block only in a coordinated release (0 = flat split).
-mix_tier_from_block  = 8971200   # ARMED AT RELEASE (owner 2026-08-25): activation boundary
-                                 # 2026-09-01 08:30 UTC — 14 rounds after r41, ~7 days of
-                                 # upgrade lead. EVERY external validator must run this
-                                 # release BEFORE block 8971200 or their verdicts fork from
-                                 # that boundary (DEC-CA-0016/0019 armed-at-release pattern).
+mix_tier_from_block  = 0         # MAINNET: OFF until the coordinated release pins a boundary
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
