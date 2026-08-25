@@ -1019,6 +1019,25 @@ def open_manifest_store(storage: object) -> S3Store | HFFallbackStore | S3Mirror
 
 MANIFEST_LATEST_KEY = "manifests/latest.json"
 
+# Audit archive of miner generator code (OPSLOG 2026-08-25: miners routinely
+# delete their repos post-round — three deletions in one night broke an anneal
+# and the audit replay of two duel legs). The round's own resolve-time fetch is
+# the one guaranteed moment the code exists, so the trainer tars each fetched
+# tree here, keyed by its commit reference (which pins the content digest).
+# Immutable + tiny (code-only, max_repo_mb-bounded); R2 dual-write rides the
+# mirror store like every other manifest-bucket put.
+GENERATOR_ARCHIVE_PREFIX = "generators/"
+
+
+def generator_archive_key(ref: str) -> str:
+    """Bucket key of a generator ref's audit archive.
+
+    The ref (``repo@sha256:<hex>`` or ``repo@hf:<rev>``) already pins content,
+    so a filesystem-safe transliteration of it is content-addressed enough —
+    and keeps the key greppable back to the manifest's ``gen_ref``."""
+    safe = ref.strip().replace("/", "--").replace("@", "--").replace(":", "-")
+    return f"{GENERATOR_ARCHIVE_PREFIX}{safe[:200]}.tar"
+
 
 def manifest_round_key(round_id: str) -> str:
     return f"manifests/round-{round_id}.json"

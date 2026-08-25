@@ -40,6 +40,7 @@ from ..shared.hippius import (
     S3Store,
     StorageError,
     fetch_from_hub,
+    generator_archive_key,
     manifest_round_key,
     publish_manifest,
     upload_dir_to_hub_or_hf,
@@ -1006,6 +1007,35 @@ class TrainerRunner:
         finally:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
+    def _archive_generator_tree(self, ref: str, d: Path) -> None:
+        """Best-effort audit archive of a fetched generator tree.
+
+        Miners routinely delete their repos post-round (OPSLOG 2026-08-25:
+        three deletions in one night broke an anneal and two legs' audit
+        replay); the resolve-time fetch is the one guaranteed moment the code
+        exists. Tar the tree to the manifest bucket under its ref key — the
+        mirror store dual-writes to R2 like every other put. Skip-if-present
+        keeps it idempotent across retries; ANY failure is swallowed — the
+        archive must never disturb the round it is recording.
+        """
+        import io
+        import tarfile
+        try:
+            store = self.manifest_store()
+            key = generator_archive_key(ref)
+            try:
+                store.get_bytes(key)
+                return  # already archived (tars are KBs; a GET probe is fine)
+            except Exception:  # noqa: BLE001 — missing/unreadable ⇒ (re)write
+                pass
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                tar.add(str(d), arcname=".")
+            store.put_bytes(key, buf.getvalue())
+            log.info("archived generator %s (%d bytes)", ref[:60], buf.tell())
+        except Exception as e:  # noqa: BLE001 — never sink a round for the archive
+            log.warning("generator archive failed for %s (ignored): %s", ref[:60], e)
+
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
     # Probe concurrency: sandboxes are subprocesses, each holding up to
     # [generator] max_memory_mb, so this also bounds the stage's peak RSS.
@@ -1099,6 +1129,7 @@ class TrainerRunner:
             try:
                 king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
                                                hub=self.hub()))
+                self._archive_generator_tree(king.ref, king_dir)
                 king_fp = fingerprint_dir(king_dir, **fp_kwargs)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
@@ -1113,6 +1144,7 @@ class TrainerRunner:
         for c in entrants:
             try:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+                self._archive_generator_tree(c.ref, d)
                 # A repo over [generator] max_repo_mb fails its heat run anyway
                 # (build_round_corpus checks the same bound), so there is no
                 # reason to spend fingerprint time on it — and skipping it
