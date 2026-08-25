@@ -710,3 +710,15 @@ host_bench = true               # + the fixed calibration bench (host_bench_toke
 # duel bench + train leg + one more bench (~6-7h total at the 3h budget) — or
 # a dedicated pod. Testnet first, one full cycle.
 scratch_shadow_every_rounds = 0
+# bench_anneal_fraction = 0.15  # bench-anneal (DEC-CA-0030): before the post-round bench sweep,
+                                # resume each duel checkpoint (weights + optimizer, fresh salted
+                                # corpus) under a pure cosine decay base_lr -> 0 for this fraction
+                                # of the full budget, and bench the ANNEALED copy — the signed
+                                # BenchScores (public bench stream, promotion picks, DEC-CA-0017
+                                # guard) then read finished form instead of wsd's mid-stable
+                                # artifacts. Canonical checkpoints, manifest, bench-report wire
+                                # format, and every validator-verified byte untouched — TRAINER
+                                # RESTART ONLY, no validator involvement. Anneal-leg failure falls
+                                # back to benching the raw checkpoint. Costs ~fraction x one
+                                # training leg per benched checkpoint on the same pod; size
+                                # [eval] bench_hold_max_hours accordingly. 0.0/absent = off.

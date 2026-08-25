@@ -212,6 +212,15 @@ in-context.
   absolute-number consumer (public bench stream, DEC-CA-0017 guard,
   promotion picks).
   (`decisions/DEC-CA-0029-fork-anneal-finished-form-checkpoints.md`)
+- **DEC-CA-0030** (proposed) — Bench-anneal: `[telemetry]
+  bench_anneal_fraction` makes the post-round bench sweep score an ANNEALED
+  copy of each duel checkpoint (worker `--anneal` leg: resume weights +
+  optimizer on a salted corpus, cosine base_lr→0) so the signed BenchScores
+  (public bench stream, promotion picks, DEC-CA-0017 guard) read finished
+  form under wsd. Trainer restart only — canonical checkpoints, manifest,
+  bench-report wire format, and duel verdicts untouched; leg failure falls
+  back to the raw bench. Interim for the DEC-CA-0029 contract cut — never
+  arm both. (`decisions/DEC-CA-0030-bench-anneal-finished-form-benchscores.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
