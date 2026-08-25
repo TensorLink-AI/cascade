@@ -75,9 +75,20 @@ class MixParams:
     class_keep_frac: float = 0.7  # per-round dgp_class activation (needs dgp_class pool labels)
     series_bag_frac: float = 0.7  # per-round series eligibility (salted-hash bag)
     target_windows: int = 0       # jittered draw size; 0 = caller's n_windows
+    # Two-tier domain split (DEC-CA-0032): domains too small to fill an even
+    # share always draw AT their full capacity; the survivors split the
+    # remainder evenly under a much tighter Dirichlet. Separate activation
+    # block — the tier rule changes every validator's window set, so a mixed
+    # fleet must flip together, exactly like ``from_block``. 0 = flat split.
+    tier_from_block: int = 0
+    tier_jitter_alpha: float = 75.0  # ±2–3pp over a ~4-domain residual tier
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
+
+    def tier_active(self, block: int | None) -> bool:
+        return (self.tier_from_block > 0 and block is not None
+                and int(block) >= self.tier_from_block)
 
 
 def _bag_keep(salt: int, key: str, frac: float) -> bool:
@@ -171,11 +182,61 @@ def _capped_jittered_split(
     return counts
 
 
+def _tiered_split(
+    n: int,
+    caps: list[int],
+    alpha: float | None,
+    block: int,
+    rng: np.random.Generator,
+) -> list[int]:
+    """Two-tier variant of :func:`_capped_jittered_split` (DEC-CA-0032).
+
+    Domains whose capacity cannot fill an even share of the (shrinking)
+    remainder are SCARCE: they draw at full capacity, deterministically, every
+    round — the flat split's jitter could previously starve them below even
+    their caps (r40: web_cloudops drew 48 of ~300 available). The surviving
+    domains split the remaining budget with the jittered capped split under
+    ``alpha`` (much tighter than the flat split's — fewer groups spread wider
+    at equal alpha). When every domain can fill an even share the scarce set
+    is empty and this degenerates to a tight jittered split over all domains —
+    i.e. the design converges to uniform ±jitter as pool capacity grows.
+
+    Deterministic given (caps, rng): the scarce classification consumes no
+    randomness and iterates in index order; only the residual split draws
+    from ``rng``.
+    """
+    k = len(caps)
+    if k == 0:
+        return []
+    n = min(int(n), int(sum(caps)))
+    assigned: list[int | None] = [None] * k
+    open_idx = list(range(k))
+    remaining = n
+    changed = True
+    while changed and open_idx:
+        changed = False
+        share = remaining / len(open_idx)
+        for i in list(open_idx):
+            if caps[i] <= share:
+                assigned[i] = caps[i]
+                remaining -= caps[i]
+                open_idx.remove(i)
+                changed = True
+    if open_idx:
+        sub = _capped_jittered_split(remaining, [caps[i] for i in open_idx],
+                                     alpha, block, rng)
+        for i, v in zip(open_idx, sub, strict=True):
+            assigned[i] = v
+    return [a if a is not None else 0 for a in assigned]
+
+
 def _jittered_pick(
     pool: tuple[EvalWindow, ...],
     n: int,
     rng: np.random.Generator,
     mix: MixParams,
+    *,
+    tiered: bool = False,
 ) -> list[EvalWindow]:
     """The jittered round draw: bag → Dirichlet domain mix → class rotation →
     capped even class split → without-replacement picks.
@@ -211,7 +272,10 @@ def _jittered_pick(
         sum(len(v) for (d, _), v in by_cell.items() if d == dom) for dom in domains
     ]
     block = max(1, int(mix.block_slots))
-    per_domain = _capped_jittered_split(n, dom_caps, mix.jitter_alpha, block, rng)
+    if tiered:
+        per_domain = _tiered_split(n, dom_caps, mix.tier_jitter_alpha, block, rng)
+    else:
+        per_domain = _capped_jittered_split(n, dom_caps, mix.jitter_alpha, block, rng)
 
     picks: list[str] = []
     for dom, n_dom in zip(domains, per_domain, strict=True):
@@ -297,6 +361,9 @@ def round_composition(windows: list[EvalWindow], mix: MixParams | None = None) -
             "series_bag_frac": mix.series_bag_frac,
             "target_windows": mix.target_windows,
         }
+        if mix.tier_from_block:
+            out["mix"]["tier_from_block"] = mix.tier_from_block
+            out["mix"]["tier_jitter_alpha"] = mix.tier_jitter_alpha
     return out
 
 
@@ -359,7 +426,8 @@ class RotatingWindowSource:
         if self.mix is not None and self.mix.active(block):
             n = self.mix.target_windows or n_windows
             rng = np.random.default_rng(_seed_to_int(round_seed))
-            return _jittered_pick(self.pool, min(n, len(self.pool)), rng, self.mix)
+            return _jittered_pick(self.pool, min(n, len(self.pool)), rng, self.mix,
+                                  tiered=self.mix.tier_active(block))
         rng = np.random.default_rng(_seed_to_int(round_seed))
         perm = rng.permutation(len(self.pool))
         take = min(n_windows, len(self.pool))

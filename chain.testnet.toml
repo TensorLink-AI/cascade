@@ -225,6 +225,16 @@ horizon        = 64
 # Jittered round mix (DEC-CA-0019) — TESTNET: armed from block 1, i.e. LIVE
 # for every round the moment this release deploys (the testnet fleet is
 # owner-only; no coordination needed). mix_target_windows = 0 keeps the draw
+# DEC-CA-0032 two-tier domain split: domains too small to fill an even share
+# of the draw always draw AT capacity (the flat jitter could starve them
+# below even their caps); the remaining domains split the rest evenly under
+# the tight tier alpha (+/-2-3pp on a ~4-domain residual set). Degenerates to
+# a tight even split over ALL domains once every domain clears an even share
+# — i.e. converges to uniform as pool capacity floors (300/domain) land.
+# CONSENSUS: all validators must flip at the same boundary — set
+# mix_tier_from_block only in a coordinated release (0 = flat split).
+mix_tier_from_block  = 1         # testnet: armed from genesis of the next cycle
+mix_tier_jitter_alpha = 75.0
 # at n_windows (300) — the testnet pool is small; the jitter room comes from
 # the bag and the Dirichlet, and the mainnet 1200 calibration doesn't apply.
 mix_from_block       = 1

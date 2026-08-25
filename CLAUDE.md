@@ -195,6 +195,15 @@ in-context.
   materialisation; container ro-mount). Machinery landed inert; arming waits
   on the pricing experiment + EVAL_POOL disjointness rule + the corpus.
   (`decisions/DEC-CA-0028-shared-real-corpus.md`)
+- **DEC-CA-0032** — Even-by-domain eval draws (ACCEPTED 2026-08-25): realized
+  mixes were heavily uneven (r40: nature 30.5% vs web 4.0%). Two-part fix:
+  pool capacity floors >= 300 windows/domain + deliberate snapshot-marginal
+  drift (owner-side); and the TWO-TIER split — scarce domains draw at
+  capacity, the rest split evenly under `mix_tier_jitter_alpha = 75`
+  (+/-2-3pp), degenerating to uniform as floors land. CONSENSUS: activates at
+  `mix_tier_from_block` via release-then-activate (testnet armed, mainnet 0
+  until the coordinated release). Granularity axis deferred until snapshots
+  carry cadence labels. (`decisions/DEC-CA-0032-even-domain-mix.md`)
 - **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage

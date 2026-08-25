@@ -807,6 +807,11 @@ class EvalConfig:
     mix_class_keep_frac: float = 0.7
     mix_series_bag_frac: float = 0.7
     mix_target_windows: int = 0
+    # DEC-CA-0032 two-tier domain split: scarce domains draw at capacity, the
+    # rest split evenly under a tight Dirichlet. Consensus constants — flip
+    # only via release-then-activate at mix_tier_from_block (0 = flat split).
+    mix_tier_from_block: int = 0
+    mix_tier_jitter_alpha: float = 75.0
 
 
 @dataclass(frozen=True)
@@ -1469,6 +1474,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             mix_class_keep_frac=float(e.get("mix_class_keep_frac", 0.7)),
             mix_series_bag_frac=float(e.get("mix_series_bag_frac", 0.7)),
             mix_target_windows=int(e.get("mix_target_windows", 0)),
+            mix_tier_from_block=int(e.get("mix_tier_from_block", 0)),
+            mix_tier_jitter_alpha=float(e.get("mix_tier_jitter_alpha", 75.0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),

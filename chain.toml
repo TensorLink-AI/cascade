@@ -418,7 +418,17 @@ mix_jitter_alpha     = 4.0       # symmetric Dirichlet over domains (expectation
 mix_block_slots      = 8         # allocation unit: a cell is absent or gets >= 1 block
 mix_class_keep_frac  = 0.7       # per-round dgp_class activation fraction
 mix_series_bag_frac  = 0.7       # per-round series eligibility (salted-hash bag)
-mix_target_windows   = 1200      # jittered draw size; inert until mix_from_block is set
+mix_target_windows   = 1200
+# DEC-CA-0032 two-tier domain split: domains too small to fill an even share
+# of the draw always draw AT capacity (the flat jitter could starve them
+# below even their caps); the remaining domains split the rest evenly under
+# the tight tier alpha (+/-2-3pp on a ~4-domain residual set). Degenerates to
+# a tight even split over ALL domains once every domain clears an even share
+# — i.e. converges to uniform as pool capacity floors (300/domain) land.
+# CONSENSUS: all validators must flip at the same boundary — set
+# mix_tier_from_block only in a coordinated release (0 = flat split).
+mix_tier_from_block  = 0         # MAINNET: OFF until the coordinated release pins a boundary
+mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
