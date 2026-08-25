@@ -158,6 +158,7 @@ def worker_argv(
     train_hours: float | None = None,
     repo_suffix: str = "",
     warm_start_ref: str | None = None,
+    anneal: bool = False,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -189,6 +190,9 @@ def worker_argv(
         argv.append(f"--repo-suffix={repo_suffix}")
     if warm_start_ref:
         argv += ["--warm-start-ref", warm_start_ref]
+    if anneal:
+        # bench-anneal telemetry leg (DEC-CA-0030): pure cosine decay resume
+        argv.append("--anneal")
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -352,6 +356,7 @@ class RemoteDispatcher:
         repo_suffix: str = "",
         warm_start_ref: str | None = None,
         lane_count: int | None = None,
+        anneal: bool = False,
     ) -> TrainedEntry:
         import os
 
@@ -359,7 +364,7 @@ class RemoteDispatcher:
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
-            warm_start_ref=warm_start_ref,
+            warm_start_ref=warm_start_ref, anneal=anneal,
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.

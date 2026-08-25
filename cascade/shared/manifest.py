@@ -114,6 +114,10 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # (every deployed config); setting it is the deliberate digest bump that
     # arms the shared-corpus regime.
     "real_corpus_ref": ("",),
+    # DEC-CA-0029: the fork-anneal fraction (finished-form duel checkpoints —
+    # the deferred "D" of wsd). 0.0 = off (every deployed config); setting it
+    # is the deliberate digest bump that arms the anneal cut.
+    "anneal_fraction": (0.0, 0),
 }
 
 

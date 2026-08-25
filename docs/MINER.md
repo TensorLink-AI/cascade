@@ -49,6 +49,68 @@ produce byte-identical corpora. Seed every RNG (numpy, torch, `random`) from it,
 avoid `hash()`/wall-clock/network. See `INTERFACE.md` for the full contract and
 the dependency allowlist (`chain.toml [dependencies]`).
 
+## 1a. Compute-heavy priors (GP / kernel families): making them affordable
+
+`gpytorch`, `scikit-learn`, and `networkx` are on the dependency allowlist
+precisely so GP/kernel/graph priors can compete — but a naive implementation
+prices itself out. Three facts to design around (DEC-CA-0031):
+
+* **The generation budget is CPU-seconds, and threads sum into it.** The
+  sandbox enforces `max_generate_seconds` as `RLIMIT_CPU`, which accumulates
+  across every thread; `multiprocessing` is a blocked import. A multi-core
+  BLAS therefore burns the budget *faster* instead of buying you more — pin
+  your linear algebra to one thread (`OMP_NUM_THREADS=1` is set for you on
+  lane-pinned pods; do not fight it) and spend the cores you don't have on a
+  cheaper factorisation instead.
+
+* **The corpus budget is denominated in points, not series.** With
+  `[generator] corpus_target_points` armed (it ships armed at 67,108,864 =
+  16384 × 4096), the materialised drain stops when your corpus reaches the
+  target points — the series *count* is free. GP draws scale roughly
+  cubically in series length, so this is the lever that matters: at L=1024
+  instead of 4096 a kernel-synthesis prior costs ~64× less per series, and
+  the same total corpus lands near the time budget instead of two orders of
+  magnitude over it. Emit as many shorter series as your prior can afford;
+  the length band `[min_length, max_length]` is the only shape constraint.
+  (In the live `stream_cpu` feed the same freedom has always existed — the
+  stream stops at the training token budget, not at a series count.)
+
+* **Factorise with relative jitter, not SVD fallbacks.** The standard
+  "Cholesky, and on failure fall back to SVD" pattern is the single biggest
+  cost in a GP draw: the fallback is ~an order of magnitude slower and fires
+  constantly on near-singular kernels (long lengthscales, periodic kernels at
+  short lengths). Replace it with a *relative*-jitter Cholesky — scale the
+  diagonal nudge to the kernel's own magnitude and escalate until it
+  factorises:
+
+  ```python
+  def stable_cholesky(K, rng_dtype=np.float64, max_tries=6):
+      # jitter proportional to the mean diagonal — an absolute epsilon is
+      # either uselessly small or distribution-warping, depending on scale
+      base = np.mean(np.diag(K))
+      for i in range(max_tries):
+          try:
+              return np.linalg.cholesky(K + (1e-9 * 10**i) * base * np.eye(len(K)))
+          except np.linalg.LinAlgError:
+              continue
+      raise np.linalg.LinAlgError("kernel not factorisable at max jitter")
+  ```
+
+  Measured on our GP priors this alone was ~5× per draw and took SVD
+  fallbacks from 47 per corpus to 0. It is pure CPU-side algorithm choice —
+  no contract implication, and the jitter is deterministic, so your digest
+  stays reproducible.
+
+One honest caveat on the live economics: in the deployed `stream_cpu` feed
+your generator streams *during* training, and throughput is a compute
+multiplier (DEC-CA-0001 — "the wall is the law"). A prior that generates
+slowly feeds the trainer less data inside the round's wall regardless of the
+drain budgets above, so the per-series cost you save with shorter lengths and
+a better factorisation converts directly into more training data for your own
+run. Budget accordingly: measure `seconds/series × (points needed / points
+per series)` against the round budget before you deploy, with
+`cascade score` as the ground truth.
+
 ## 2. Verify locally
 
 `cascade verify` runs **every check the trainer runs** — layout, the static

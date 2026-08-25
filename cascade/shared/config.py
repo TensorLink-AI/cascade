@@ -34,6 +34,25 @@ class GeneratorConfig:
     points exceed ``max_total_points`` or generation runs past
     ``max_generate_seconds``.
 
+    ``corpus_target_points`` (DEC-CA-0031) re-denominates the MATERIALISED
+    drain (``cache_reuse`` / ``cascade verify``) in points instead of series:
+    when > 0, the drain stops at the first series that reaches this many
+    cumulative values-points and the series COUNT is free — a generator may
+    spend the same corpus as 65k×1024 instead of 16k×4096, which is what makes
+    compute-heavy priors (GP/kernel draws scale ~cubically in length)
+    affordable inside ``max_generate_seconds``. 0 (default) keeps the legacy
+    exactly-``corpus_n_series`` drain. Inert for the streaming feed modes,
+    which already stop at the round's token budget. Never part of
+    ``contract_digest`` (no [generator] key is).
+
+    ``stream_stall_seconds`` is the STREAMING per-frame stall window — how
+    long the trainer waits between series before killing the child — split
+    out from ``max_generate_seconds`` so the batch drain budget can be raised
+    without letting a stalled generator idle a heat slot for the same, larger
+    window (the two roles were one knob before DEC-CA-0031). 0 (default)
+    falls back to ``max_generate_seconds``, byte-identical to the old
+    behaviour for configs without the key.
+
     ``max_channels`` is the per-series variate cap. cascade trains a Toto2
     backbone from scratch — a multivariate architecture — so the corpus schema
     carries a channel axis. ``max_channels = 1`` keeps submissions univariate
@@ -60,6 +79,10 @@ class GeneratorConfig:
     max_memory_mb: int
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
+    # Points-denominated materialised drain + decoupled streaming stall window
+    # (DEC-CA-0031; see the class docstring). Both default inert.
+    corpus_target_points: int = 0
+    stream_stall_seconds: int = 0
     # Cheap data-quality gates on generator output (see cascade.interface.generator).
     #   max_abs_value       — reject a series whose peak |value| exceeds this; 0.0
     #                         means "cast-safe default" (the float32 ceiling), which
@@ -122,6 +145,14 @@ class GeneratorConfig:
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
     sandbox_strict: bool = False       # refuse to run without hard network isolation
+
+    @property
+    def effective_stall_seconds(self) -> int:
+        """The streaming per-frame stall window: ``stream_stall_seconds`` when
+        set, else ``max_generate_seconds`` (the pre-DEC-CA-0031 single-knob
+        behaviour). Every streaming consumer goes through here so the two
+        knobs can never drift apart at a call site."""
+        return int(self.stream_stall_seconds) or int(self.max_generate_seconds)
 
 
 SANDBOX_MODES = ("subprocess", "container")
@@ -188,6 +219,25 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     if mode not in DEDUP_MODES:
         raise ValueError(f"{key}={mode!r} invalid; expected one of {DEDUP_MODES}")
     return mode
+
+
+def validate_corpus_target_points(target: object, max_total_points: int) -> int:
+    """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
+
+    0 = off (the legacy exactly-``corpus_n_series`` drain). A positive target
+    above ``max_total_points`` would make every materialised drain abort at
+    the point cap before reaching its target — a config error, failed at boot
+    rather than at the first round."""
+    t = int(target or 0)
+    if t < 0:
+        raise ValueError(f"[generator] corpus_target_points={t} must be >= 0")
+    if t > int(max_total_points):
+        raise ValueError(
+            f"[generator] corpus_target_points={t} exceeds max_total_points="
+            f"{int(max_total_points)} — the drain would hit the point cap before "
+            "its target on every run"
+        )
+    return t
 
 
 # Corpus feed modes — how a generator's data reaches the trainer. Identical for
@@ -384,6 +434,24 @@ class TrainingContractConfig:
     # until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness rule
     # (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
     real_corpus_ref: str = ""
+    # ── fork-anneal: finished-form duel checkpoints (DEC-CA-0029; digest-bound)
+    # The deferred "D" of the wsd schedule (DEC-CA-0018's anticipated decay
+    # branch). When > 0 (requires lr_schedule = "wsd"), every training run
+    # FORKS at the end of its stable phase: the mid-stable weights + optimizer
+    # state are retained in the checkpoint as ``weights_stable.safetensors`` +
+    # ``optimizer.safetensors`` (the lineage branch — warm-starts resume from
+    # THESE, never from a decayed endpoint), then training continues for
+    # ``anneal_fraction × train_tokens`` more tokens under a cosine decay of
+    # base_lr → 0, and the ANNEALED weights become ``weights.safetensors`` —
+    # the artifact every scoring layer (duel eval, benchmark sidecar,
+    # promotion BenchScores) loads. Identical for king and challenger, so the
+    # controlled experiment is preserved; the wall-clock guard stretches by
+    # the same fraction (total wall = max_train_seconds × (1 + fraction)).
+    # 0.0 = off — the deployed default, absent from contract_digest via
+    # drop-when-default, so shipping this field moves no deployed digest;
+    # setting it is the deliberate contract cut (release-then-activate,
+    # trainer + validators together, testnet first).
+    anneal_fraction: float = 0.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -807,6 +875,11 @@ class EvalConfig:
     mix_class_keep_frac: float = 0.7
     mix_series_bag_frac: float = 0.7
     mix_target_windows: int = 0
+    # DEC-CA-0032 two-tier domain split: scarce domains draw at capacity, the
+    # rest split evenly under a tight Dirichlet. Consensus constants — flip
+    # only via release-then-activate at mix_tier_from_block (0 = flat split).
+    mix_tier_from_block: int = 0
+    mix_tier_jitter_alpha: float = 75.0
 
 
 @dataclass(frozen=True)
@@ -1037,11 +1110,28 @@ class TelemetryConfig:
     lineage-vs-scratch gap that decides whether DEC-CA-0014's Stage-2 reseed
     valve is ever warranted. ``0`` (the default) = off. Deliberately a
     ``[telemetry]`` key: it must never touch ``contract_digest``.
+
+    ``bench_anneal_fraction`` (DEC-CA-0030) arms bench-anneal: before the
+    post-round benchmark sweep, each duel checkpoint is resumed on the pod
+    that trained it (weights + optimizer state, fresh salted corpus) under a
+    pure cosine decay base_lr → 0 for this fraction of the full token budget,
+    and the sweep scores the ANNEALED copy — so the signed BenchScores (the
+    public bench stream, promotion picks, the DEC-CA-0017 guard) read
+    finished-form numbers instead of wsd's mid-stable artifacts. The
+    canonical duel checkpoint, the manifest, the bench-report wire format,
+    and every validator-verified byte are untouched — validators keep
+    consuming the same signed six numbers; only what the trainer benches
+    changes. Any anneal-leg failure falls back to benching the raw
+    checkpoint (a mid-stable number beats a missing one). ``0.0`` = off.
+    Deliberately a ``[telemetry]`` key: it must never touch
+    ``contract_digest`` — the digest-bound path to finished-form DUEL
+    artifacts is [training] anneal_fraction (DEC-CA-0029), a contract cut.
     """
 
     host_probe: bool = True
     host_bench: bool = True
     scratch_shadow_every_rounds: int = 0
+    bench_anneal_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1351,6 +1441,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             max_memory_mb=int(g["max_memory_mb"]),
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
+            corpus_target_points=validate_corpus_target_points(
+                g.get("corpus_target_points", 0), int(g["max_total_points"])),
+            stream_stall_seconds=int(g.get("stream_stall_seconds", 0)),
             max_abs_value=float(g.get("max_abs_value", 0.0)),
             reject_constant=bool(g.get("reject_constant", False)),
             max_dup_fraction=float(g.get("max_dup_fraction", 1.0)),
@@ -1405,6 +1498,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
+            anneal_fraction=float(t.get("anneal_fraction", 0.0)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
@@ -1469,6 +1563,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             mix_class_keep_frac=float(e.get("mix_class_keep_frac", 0.7)),
             mix_series_bag_frac=float(e.get("mix_series_bag_frac", 0.7)),
             mix_target_windows=int(e.get("mix_target_windows", 0)),
+            mix_tier_from_block=int(e.get("mix_tier_from_block", 0)),
+            mix_tier_jitter_alpha=float(e.get("mix_tier_jitter_alpha", 75.0)),
         ),
         scoring=ScoringConfig(
             win_margin_start=float(s["win_margin_start"]),
@@ -1553,6 +1649,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             host_probe=bool(tm.get("host_probe", True)),
             host_bench=bool(tm.get("host_bench", True)),
             scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
+            bench_anneal_fraction=float(tm.get("bench_anneal_fraction", 0.0)),
         ),
         raw=raw,
     )
