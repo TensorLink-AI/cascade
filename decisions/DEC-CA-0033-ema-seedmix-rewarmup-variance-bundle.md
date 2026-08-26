@@ -50,7 +50,14 @@ release-then-activate, trainer + all validators together, testnet first):
 3. `rewarmup_fraction` (0.0 = off) — warm-started wsd runs get a short
    linear LR ramp over this fraction of train_tokens instead of full
    base_lr against fresh optimizer state on step 1. From-scratch runs keep
-   warmup-once semantics untouched.
+   warmup-once semantics untouched. MEASURED 2026-08-26 (paired A/B,
+   4×L40S): re-warmup does NOT improve end-of-run quality — slightly worse
+   at full LR, a wash at ¼-LR; the first-step kick is a transient that
+   constant-LR training re-perturbs past anyway. The knob ships inert and
+   should STAY unarmed on current evidence; its only value is protecting
+   very-early-truncated runs. The measured recipe that matters is
+   base_lr→0.001 + ema_decay=0.999 (EMA-999 0.2114–0.2119 vs current
+   0.2188, init 0.2086, r41 slice).
 
 Deployment coupling: `tie_runoff_windows` stays 0 regardless — DEC-CA-0019's
 jittered EVAL draw already forces it (an eval-window property; the corpus
