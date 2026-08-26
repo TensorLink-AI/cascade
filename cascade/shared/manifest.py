@@ -298,6 +298,11 @@ class HeatResult:
     leader_lcb: float | None = None   # leader-vs-runner-up paired LCB; diagnostic only
     n_windows: int | None = None      # eval windows the screen ranked on
     n_clusters: int | None = None     # distinct upstream feeds behind those windows
+    # The round's warm-start init scored on the same heat slice — the null
+    # baseline ([round] init_gate_mode, shadow/enforce). None = gate off or
+    # no warm start; dropped from the JSON when None so pre-gate standings
+    # stay byte-identical.
+    init_baseline: float | None = None
 
 
 def _entry_body(e: TrainedEntry) -> dict:
@@ -334,7 +339,7 @@ def heat_to_json(heat: HeatResult | None) -> dict | None:
     a live heat and a settled round's heat with one code path."""
     if heat is None:
         return None
-    return {
+    d = {
         "screen_size": heat.screen_size,
         "finalists": heat.finalists,
         "entrants": [asdict(e) for e in heat.entrants],
@@ -342,6 +347,9 @@ def heat_to_json(heat: HeatResult | None) -> dict | None:
         "n_windows": heat.n_windows,
         "n_clusters": heat.n_clusters,
     }
+    if heat.init_baseline is not None:
+        d["init_baseline"] = heat.init_baseline
+    return d
 
 
 def _heat_from_json(obj: object) -> HeatResult | None:
@@ -367,6 +375,8 @@ def _heat_from_json(obj: object) -> HeatResult | None:
         leader_lcb=(None if obj.get("leader_lcb") is None else float(obj["leader_lcb"])),
         n_windows=(None if obj.get("n_windows") is None else int(obj["n_windows"])),
         n_clusters=(None if obj.get("n_clusters") is None else int(obj["n_clusters"])),
+        init_baseline=(None if obj.get("init_baseline") is None
+                       else float(obj["init_baseline"])),
     )
 
 

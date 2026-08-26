@@ -145,7 +145,9 @@ in-context.
 - **DEC-CA-0018** — Warm-start recipe is WSD, not per-round cosine:
   `lr_schedule = "wsd"` warms up once at generation start (the from-scratch
   run), holds base_lr FLAT across warm-started rounds, and defers decay to a
-  release cut (not built). wsd rounds checkpoint optimizer state
+  finished-form mechanism (built since: fork-anneal DEC-CA-0029 or EMA
+  DEC-CA-0033, both shipped inert — arm at most one). wsd rounds checkpoint
+  optimizer state
   (`optimizer.safetensors`, ~3×; Muon momentum + row-EMA + AdamW moments) and
   warm starts re-attach it; missing file ⇒ fresh state, shape mismatch ⇒
   abort. Flip changed `contract_digest` — trainer+validator deploy together.

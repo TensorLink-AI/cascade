@@ -52,8 +52,12 @@ release-then-activate, trainer + all validators together, testnet first):
    base_lr against fresh optimizer state on step 1. From-scratch runs keep
    warmup-once semantics untouched.
 
-Deployment coupling: `tie_runoff_windows` stays 0 under the mix (same
-seeded-prefix caveat as DEC-CA-0019). EMA changes which artifact external
+Deployment coupling: `tie_runoff_windows` stays 0 regardless — DEC-CA-0019's
+jittered EVAL draw already forces it (an eval-window property; the corpus
+seed mix itself does not touch the run-off's prefix assumption). EMA also
+excludes `[telemetry] bench_anneal_fraction` (DEC-CA-0030) — the worker's
+`anneal_recipe` refuses an EMA-armed contract; one finished-form mechanism
+at a time, everywhere. EMA changes which artifact external
 validators score, so score reuse across the activation boundary is invalid
 for one round. The `base_lr` level itself (¼-LR dominated at every measured
 checkpoint) is deliberately NOT part of this node — an LR retune under µP
