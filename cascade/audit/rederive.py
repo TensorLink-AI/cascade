@@ -66,16 +66,19 @@ def _rederive_digest(
     mode: str,
     token_budget: int,
     max_wall_seconds: int | None = None,
+    seed_mix: int = 1,
 ) -> str:
     """Re-derive one corpus digest exactly as the trainer derived it."""
-    if mode == "cache_reuse":
+    if mode == "cache_reuse" and int(seed_mix or 1) == 1:
         from ..trainer.corpus import build_round_corpus
 
         return build_round_corpus(
             repo_dir, generation_seed, cfg.generator, "cache_reuse",
             use_sandbox=True, blocked=cfg.static_guard.blocked,
         ).digest
-    # stream_cpu: drain the same budget-capped stream and read the rolling digest.
+    # stream_cpu — or ANY mode under a seed mix (DEC-CA-0033), where the
+    # trainer's digest is the rolling digest of the interleaved sequence:
+    # drain the same budget-capped stream and read the same rolling digest.
     from ..trainer.stream import open_round_stream
 
     with open_round_stream(
@@ -83,6 +86,7 @@ def _rederive_digest(
         token_budget=token_budget, use_sandbox=True,
         blocked=cfg.static_guard.blocked,
         max_wall_seconds=max_wall_seconds,
+        seed_mix=seed_mix,
     ) as rs:
         for _ in rs.series():
             pass
@@ -138,6 +142,7 @@ def run_tier1(
                     gen_dir, receipt.generation_seed, cfg,
                     mode=mode, token_budget=contract.train_tokens,
                     max_wall_seconds=contract.max_train_seconds,
+                    seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
                 )
                 digest_cache[cache_key] = digest
         except Exception as e:  # noqa: BLE001 — fetch/build failure is a WARN, not proof
@@ -258,6 +263,7 @@ def run_tier2(
                 token_budget=contract.train_tokens, use_sandbox=True,
                 blocked=cfg.static_guard.blocked,
                 max_wall_seconds=contract.max_train_seconds,
+                seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
             ) as rs:
                 base_trainer.train(
                     rs.series(), contract,
