@@ -55,9 +55,11 @@ release-then-activate, trainer + all validators together, testnet first):
    at full LR, a wash at ¼-LR; the first-step kick is a transient that
    constant-LR training re-perturbs past anyway. The knob ships inert and
    should STAY unarmed on current evidence; its only value is protecting
-   very-early-truncated runs. The measured recipe that matters is
-   base_lr→0.001 + ema_decay=0.999 (EMA-999 0.2114–0.2119 vs current
-   0.2188, init 0.2086, r41 slice).
+   very-early-truncated runs. SUPERSEDED MEASUREMENT (2026-08-27, see
+   [[DEC-CA-0035]]): the recipe that matters is the full Toto2 constants
+   bundle + warm_lr_scale 0.125 + ema_decay=0.999 — EMA-999 0.20483,
+   BELOW the 0.20864 init (this node's earlier "¼-LR + EMA" candidate
+   never crossed it).
 
 Deployment coupling: `tie_runoff_windows` stays 0 regardless — DEC-CA-0019's
 jittered EVAL draw already forces it (an eval-window property; the corpus

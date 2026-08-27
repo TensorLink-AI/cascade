@@ -153,6 +153,24 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
                                   # with ema_decay (DEC-CA-0033 — the trainer refuses) or with
                                   # [telemetry] bench_anneal_fraction: one finished-form
                                   # mechanism at a time.
+# Toto2-aligned optimizer constants (DEC-CA-0035, all digest-bound
+# drop-when-default; defaults = the previously hardcoded trainer behavior).
+# MEASURED 2026-08-27 (docs/notes/2026-08-27-toto2-alignment.md): the full
+# bundle @ warm_lr_scale 0.125 BEATS the converged warm-start init by
+# 0.0038 — the arming candidate. ARMING CHECKLIST: set ALL of the block
+# below + weight_decay -> 2e-8 as ONE cut (the constants were swept
+# together, arXiv 2605.20119); wave-3 cross-generator separation check
+# first; then testnet full cycle, contract_digest recompute
+# (cascade-trainer --offline), coordinated release-then-activate with ALL
+# external validators, OPSLOG entry.
+# muon_momentum   = 0.96          # Muon Nesterov momentum (default 0.95)
+# muon_row_beta2  = 0.999         # NorMuon row second-moment EMA (default 0.95)
+# grad_clip       = 7.0           # train-loop grad-norm clip (default 1.0)
+# adamw_beta1     = 0.91          # AdamW group betas (defaults 0.9/0.999)
+# adamw_beta2     = 0.972
+# adamw_lr_scale  = 0.018518518518518517   # 1/54 matrix:AdamW split (default 1.0)
+# warm_lr_scale   = 0.125         # warm-started runs train at base_lr x this;
+                                  # from-scratch keeps full base_lr (default 1.0)
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit

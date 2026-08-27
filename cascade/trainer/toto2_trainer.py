@@ -565,6 +565,27 @@ class Toto2Trainer:
             if (rewarmup_frac and warm_started and schedule == "wsd") else 0
         )
 
+        # Warm-start LR scale (DEC-CA-0035): a converged init tolerates far
+        # less LR than a random one — measured, full base_lr costs +0.11
+        # geomean on step 1 and the run never recovers, while the aligned
+        # constants at base_lr×0.125 BEAT the init
+        # (docs/notes/2026-08-27-toto2-alignment.md). Scales the whole
+        # warm-started run, every schedule branch (the fork-anneal decays
+        # from the scaled level too — one stable phase, one finished form);
+        # a from-scratch generation start keeps full base_lr.
+        _wls = getattr(contract, "warm_lr_scale", None)
+        warm_lr_scale = 1.0 if _wls is None else float(_wls)
+        if not 0.0 < warm_lr_scale <= 1.0:
+            raise ValueError(
+                f"[training] warm_lr_scale must be in (0, 1]; got {warm_lr_scale}"
+            )
+        eff_base_lr = contract.base_lr * (warm_lr_scale if warm_started else 1.0)
+
+        _gc = getattr(contract, "grad_clip", None)
+        grad_clip = 1.0 if _gc is None else float(_gc)
+        if grad_clip <= 0.0:
+            raise ValueError(f"[training] grad_clip must be > 0; got {grad_clip}")
+
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
@@ -706,16 +727,16 @@ class Toto2Trainer:
             loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
             if anneal_tokens and tokens >= token_budget:
-                lr = _anneal_lr(tokens - token_budget, anneal_tokens, contract.base_lr)
+                lr = _anneal_lr(tokens - token_budget, anneal_tokens, eff_base_lr)
             else:
-                lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
+                lr = _lr_at(tokens, token_budget, warmup, eff_base_lr,
                             schedule=schedule, warm_started=warm_started,
                             rewarmup=rewarmup)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             if ema_state is not None:
                 with torch.no_grad():
@@ -818,6 +839,8 @@ class Toto2Trainer:
             metrics["ema_decay"] = ema_decay
         if rewarmup:
             metrics["rewarmup_tokens"] = rewarmup
+        if warm_started and warm_lr_scale != 1.0:
+            metrics["warm_lr_scale"] = warm_lr_scale
         # Shadow channel-redundancy summary — present ONLY when the corpus
         # carried multichannel series, so univariate run metrics stay
         # byte-identical to pre-telemetry builds. [telemetry]-class data: no
@@ -883,6 +906,26 @@ class Toto2Trainer:
             return torch.optim.AdamW(
                 model.parameters(), lr=contract.base_lr, weight_decay=contract.weight_decay
             )
+        # DEC-CA-0035 constants (defaults = the previously hardcoded values,
+        # digest-inert until set; measured Toto2 targets in the config
+        # comments). Validated here — this is the single construction site.
+        def _knob(name: str, dflt: float) -> float:
+            v = getattr(contract, name, None)      # NOT `or dflt`: 0.0 must
+            return dflt if v is None else float(v)  # reach validation, not
+                                                    # silently become default
+        momentum = _knob("muon_momentum", 0.95)
+        row_beta2 = _knob("muon_row_beta2", 0.95)
+        adamw_b1 = _knob("adamw_beta1", 0.9)
+        adamw_b2 = _knob("adamw_beta2", 0.999)
+        adamw_lr_scale = _knob("adamw_lr_scale", 1.0)
+        for name, val in (("muon_momentum", momentum), ("muon_row_beta2", row_beta2),
+                          ("adamw_beta1", adamw_b1), ("adamw_beta2", adamw_b2)):
+            if not 0.0 < val < 1.0:
+                raise ValueError(f"[training] {name} must be in (0, 1); got {val}")
+        if not 0.0 < adamw_lr_scale <= 1.0:
+            raise ValueError(
+                f"[training] adamw_lr_scale must be in (0, 1]; got {adamw_lr_scale}"
+            )
         muon, adamw = [], []
         for name, p in model.named_parameters():
             if p.ndim >= 2 and "embed" not in name and "head" not in name and "pos" not in name:
@@ -890,7 +933,17 @@ class Toto2Trainer:
             else:
                 adamw.append(p)
         # Muon params are stepped manually in _MuonAdamW; AdamW handles the rest.
-        return _MuonAdamW(muon, adamw, lr=contract.base_lr, weight_decay=contract.weight_decay)
+        opt = _MuonAdamW(muon, adamw, lr=contract.base_lr,
+                         weight_decay=contract.weight_decay,
+                         momentum=momentum, beta2=row_beta2)
+        if opt.adamw is not None:
+            # The AdamW groups ride opt.param_groups[1:]; the train loop
+            # multiplies each group's lr by lr_scale every step, so the
+            # matrix:AdamW split persists under the schedule.
+            for grp in opt.adamw.param_groups:
+                grp["betas"] = (adamw_b1, adamw_b2)
+                grp["lr_scale"] = adamw_lr_scale
+        return opt
 
     # ── optimizer state (round-to-round continuity under wsd) ─────────────────
 

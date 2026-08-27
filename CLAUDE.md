@@ -236,6 +236,16 @@ in-context.
   params AND row presence. Does NOT catch a pristine-init upload (scores
   equal) — that's the separate zero-train trainer guard.
   (`decisions/DEC-CA-0034-init-baseline-floor.md`)
+- **DEC-CA-0035** (proposed) — Toto2-aligned optimizer constants: seven
+  `[training]` knobs (muon momentum/row-β₂, grad clip, AdamW betas, the
+  54:1 matrix:AdamW LR split, `warm_lr_scale`) defaulting to the previously
+  hardcoded behavior, digest-bound drop-when-default. MEASURED: the full
+  bundle @ warm LR 5e-4 BEATS the converged warm-start init by 0.0038
+  (campaign best; docs/notes/2026-08-27-toto2-alignment.md) — LR values
+  don't transfer across parametrization conventions, dimensionless
+  constants + the ratio do. Also fixed DEC-CA-0033's fields never being
+  loader-parsed. Arming gate: wave-3 cross-generator separation + testnet.
+  (`decisions/DEC-CA-0035-toto2-aligned-constants.md`)
 - **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage

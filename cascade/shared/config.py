@@ -481,6 +481,30 @@ class TrainingContractConfig:
     # costs +0.11 geomean at base_lr (the u158 probe, reproduced in-run).
     # The from-scratch run's warmup-once semantics are untouched.
     rewarmup_fraction: float = 0.0
+    # ── Toto2-aligned optimizer constants (DEC-CA-0035; digest-bound) ────────
+    # Datadog's Toto 2.0 recipe (arXiv 2605.20119) was HP-swept once at 4M
+    # under u-µP; its DIMENSIONLESS constants transfer directly, its LR
+    # VALUES do not (different parametrization convention — only the
+    # matrix:AdamW ratio carries). Defaults below are today's deployed
+    # behavior, so every knob is drop-when-default digest-inert. Measured
+    # targets (docs/notes/2026-08-27-toto2-alignment.md — the full bundle
+    # @ warm LR 5e-4 BEAT the converged warm-start init by 0.0038, the
+    # campaign best): muon_momentum 0.96, muon_row_beta2 0.999, grad_clip
+    # 7.0, adamw betas (0.91, 0.972), adamw_lr_scale 1/54 ≈ 0.0185, plus
+    # weight_decay → 2e-8 (already a field above — no new knob needed).
+    muon_momentum: float = 0.95    # Muon Nesterov momentum
+    muon_row_beta2: float = 0.95   # NorMuon per-row second-moment EMA decay
+    grad_clip: float = 1.0         # global grad-norm clip in the train loop
+    adamw_beta1: float = 0.9       # AdamW group (embeddings/heads/biases)
+    adamw_beta2: float = 0.999
+    adamw_lr_scale: float = 1.0    # AdamW group LR = base_lr × this (Toto2
+                                   # runs the matrix:AdamW split at 54:1)
+    # warm_lr_scale < 1: WARM-STARTED runs train at base_lr × warm_lr_scale,
+    # keyed off the same warm_started signal wsd's warmup-once already uses;
+    # from-scratch (generation-start) runs keep full base_lr. Measured
+    # target 0.125 (→ 5e-4): a converged init tolerates far less LR than a
+    # random one, and no re-warmup trick substitutes (DEC-CA-0033 verdict).
+    warm_lr_scale: float = 1.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -1558,6 +1582,20 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
             anneal_fraction=float(t.get("anneal_fraction", 0.0)),
+            # DEC-CA-0033 knobs (parsing added with DEC-CA-0035 — the fields
+            # landed with dataclass defaults only, so a TOML arming would
+            # have silently no-oped)
+            ema_decay=float(t.get("ema_decay", 0.0)),
+            gen_seed_mix=int(t.get("gen_seed_mix", 1)),
+            rewarmup_fraction=float(t.get("rewarmup_fraction", 0.0)),
+            # DEC-CA-0035 Toto2-aligned constants
+            muon_momentum=float(t.get("muon_momentum", 0.95)),
+            muon_row_beta2=float(t.get("muon_row_beta2", 0.95)),
+            grad_clip=float(t.get("grad_clip", 1.0)),
+            adamw_beta1=float(t.get("adamw_beta1", 0.9)),
+            adamw_beta2=float(t.get("adamw_beta2", 0.999)),
+            adamw_lr_scale=float(t.get("adamw_lr_scale", 1.0)),
+            warm_lr_scale=float(t.get("warm_lr_scale", 1.0)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
