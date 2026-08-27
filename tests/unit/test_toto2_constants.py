@@ -202,9 +202,9 @@ def test_loader_round_trips_bundle_and_constants(tmp_path: Path):
     # the round trip is proven by REPLACING each armed line with a different
     # value and reading it back; the two still-absent knobs are inserted.
     swaps = {
-        "ema_decay": "0.5", "muon_momentum": "0.97", "muon_row_beta2": "0.998",
-        "grad_clip": "5.0", "adamw_beta1": "0.92", "adamw_beta2": "0.973",
-        "adamw_lr_scale": "0.02", "warm_lr_scale": "0.25",
+        "ema_decay": "0.5", "gen_seed_mix": "5", "muon_momentum": "0.97",
+        "muon_row_beta2": "0.998", "grad_clip": "5.0", "adamw_beta1": "0.92",
+        "adamw_beta2": "0.973", "adamw_lr_scale": "0.02", "warm_lr_scale": "0.25",
     }
     patched = text
     for key, val in swaps.items():
@@ -212,12 +212,12 @@ def test_loader_round_trips_bundle_and_constants(tmp_path: Path):
         assert n == 1, f"expected exactly one armed {key} line in chain.toml"
     assert "\nbase_lr" in patched
     patched = patched.replace(
-        "\nbase_lr", "\ngen_seed_mix = 3\nrewarmup_fraction = 0.02\nbase_lr", 1)
+        "\nbase_lr", "\nrewarmup_fraction = 0.02\nbase_lr", 1)
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     t = load_chain_config(p).training
     assert t.ema_decay == 0.5
-    assert t.gen_seed_mix == 3
+    assert t.gen_seed_mix == 5
     assert t.rewarmup_fraction == 0.02
     assert t.muon_momentum == 0.97
     assert t.muon_row_beta2 == 0.998

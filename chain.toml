@@ -170,6 +170,11 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
 # refuses). NOTE: armed ahead of the wave-3 cross-generator separation check
 # on owner direction — watch the first armed rounds for separation loss.
 ema_decay       = 0.999         # EMA finished form (DEC-CA-0033; the scored artifact)
+gen_seed_mix    = 3             # DEC-CA-0033 N-seed generation mix (owner-armed
+                                # 2026-08-27: measured working at 3 seeds) — corpus
+                                # digest = rolling digest of the interleaved stream
+                                # (~1/3 budget per derived seed, ~sqrt(3) less
+                                # generation-seed noise)
 muon_momentum   = 0.96          # Muon Nesterov momentum (default 0.95)
 muon_row_beta2  = 0.999         # NorMuon row second-moment EMA (default 0.95)
 grad_clip       = 7.0           # train-loop grad-norm clip (default 1.0)

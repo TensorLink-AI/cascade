@@ -30,7 +30,9 @@ def _entry(role="king", uid=7):
 
 
 def test_anneal_recipe_swaps_only_the_decay_fields(cfg):
-    c = cfg.training.primary_size
+    # Shipped file arms ema_decay (2026-08-27); a bench-anneal leg refuses an
+    # EMA-armed contract by design — disarm it for this recipe-shape test.
+    c = replace(cfg.training.primary_size, ema_decay=0.0)
     a = worker_mod.anneal_recipe(c)
     assert a.lr_schedule == "warmup_cosine"
     assert a.warmup_fraction == 0.0
