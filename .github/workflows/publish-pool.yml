@@ -115,14 +115,30 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TSFORGE_S3_SECRET_KEY }}
+          # Per-request retries inside the CLI (throttles, connection resets).
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
         run: |
           aws --version   # pre-installed AWS CLI v2; fail loudly if the image drops it
           if [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo "::error::TSFORGE_S3_ACCESS_KEY not set — cannot read the forge bucket."
             exit 1
           fi
-          aws s3 sync "s3://${TSFORGE_BUCKET}" ./tsforge \
-            --endpoint-url "$S3_ENDPOINT" --exact-timestamps
+          # `aws s3 sync` exits 1 if ANY file fails, but sync is resumable —
+          # a repeat pass only fetches the un-synced remainder. Three passes
+          # ride through transient Hippius resets (2026-08-27: two
+          # IncompleteReads killed a 64m sync at the finish line, so the
+          # snapshot never built and pool rotation missed a day).
+          ok=""
+          for pass in 1 2 3; do
+            if aws s3 sync "s3://${TSFORGE_BUCKET}" ./tsforge \
+                 --endpoint-url "$S3_ENDPOINT" --exact-timestamps; then
+              ok=1; break
+            fi
+            echo "::warning::forge sync pass $pass failed; retrying the remainder"
+            sleep 30
+          done
+          test -n "$ok" || { echo "::error::forge sync failed after 3 passes"; exit 1; }
           n=$(find ./tsforge/data -name '*.parquet' 2>/dev/null | wc -l)
           newest=$(ls -1 ./tsforge/data/*/*.parquet 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)
           echo "synced $n parquet files; newest partition: ${newest:-none}"
