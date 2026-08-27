@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -596,6 +598,61 @@ def _drop_final_content_clones(
             continue
         kept.append(e)
     return kept
+
+
+class _FinalLanePool(queue.Queue):
+    """Lane queue for the FINAL stage that discovers pods rented mid-final.
+
+    ``get()`` (the blocking, no-timeout form the dispatch path uses) refreshes
+    membership from a ``refresh_fn`` on a timeout loop: hosts whose NAMES are
+    new enter the rotation, so a slot lost at rental (the provisioner's
+    replace-once-then-drop) can be topped up by re-renting while the duel is
+    already running. Before this, the fleet was snapshotted once at final
+    start and a queued job was bound to it forever — r44 2026-08-27: four jobs
+    serialized two-at-a-time on the surviving pod while a replacement pod
+    would have sat invisible. Removal stays FAILURE-driven (a dead lane fails
+    its dispatch and the retry policy moves on): the hosts file is
+    authoritative for membership, never for liveness.
+    """
+
+    REFRESH_INTERVAL_S = 60.0
+
+    def __init__(self, initial_hosts: list, refresh_fn):
+        super().__init__()
+        self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
+        self._absorb_lock = threading.Lock()
+        self._known: dict[str, object] = {}
+        for h in initial_hosts:
+            self._known[getattr(h, "name", str(h))] = h
+            super().put(h)
+
+    def known_hosts(self) -> list:
+        """Current membership (for lane-count geometry) — grows, never shrinks."""
+        return list(self._known.values())
+
+    def _absorb_new(self) -> None:
+        try:
+            fresh = self._refresh_fn()
+        except Exception as e:  # noqa: BLE001 — a torn/absent file keeps the last set
+            log.debug("final lane pool refresh failed (keeping current set): %s", e)
+            return
+        with self._absorb_lock:
+            for h in fresh:
+                name = getattr(h, "name", None)
+                if name and name not in self._known:
+                    self._known[name] = h
+                    super().put(h)
+                    log.info("final lane pool: new lane %s joined mid-final", name)
+
+    def get(self, block: bool = True, timeout: float | None = None):
+        if not block or timeout is not None:
+            return super().get(block=block, timeout=timeout)
+        while True:
+            self._absorb_new()
+            try:
+                return super().get(timeout=self.REFRESH_INTERVAL_S)
+            except queue.Empty:
+                continue
 
 
 def _final_repo_suffix(
@@ -1795,20 +1852,40 @@ class TrainerRunner:
         size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
         log_role = f"heat-{gen.hotkey}" if heat else f"{role}-{size}"
-        # Cascade warm-start: fetch the pinned promoted init (content-addressed;
-        # the OCI digest verifies the bytes). A fetch failure RAISES — the run
-        # must never silently fall back to random init (DEC-CA-0005).
-        ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
-        result, corpus_digest, _, _ = self._train_checkpoint(
-            gen, seeds, contract, token_budget, out_dir, log_role=log_role,
-            warm_start_dir=ws_dir,
-        )
+        # Retry-without-retrain: if a PRIOR run of this exact job already trained
+        # a complete checkpoint here (marker written post-train, pre-upload) and
+        # only the upload failed, reuse it instead of burning the budget again.
+        # Sound because training is deterministic — same generator/seeds/contract
+        # rederives byte-identical weights (r44 2026-08-27: an upload flap after
+        # a finished 3h final run triggered a full retrain of the SAME bytes).
+        reused = self._reusable_checkpoint(out_dir, contract, gen)
+        if reused is not None:
+            log.warning(
+                "round=%s %s %s: COMPLETE checkpoint already at %s (prior run "
+                "trained it; only its upload failed) — skipping straight to "
+                "upload", seeds.base_seed, role, gen.hotkey, out_dir,
+            )
+            corpus_digest = str(reused["corpus_digest"])
+            gpu_name = str(reused.get("gpu_name", ""))
+        else:
+            # Cascade warm-start: fetch the pinned promoted init (content-addressed;
+            # the OCI digest verifies the bytes). A fetch failure RAISES — the run
+            # must never silently fall back to random init (DEC-CA-0005).
+            ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
+            result, corpus_digest, _, _ = self._train_checkpoint(
+                gen, seeds, contract, token_budget, out_dir, log_role=log_role,
+                warm_start_dir=ws_dir,
+            )
+            gpu_name = str(result.metrics.get("gpu_name", ""))
+            self._write_train_complete_marker(
+                out_dir, contract, gen, corpus_digest=corpus_digest, gpu_name=gpu_name,
+            )
 
         ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
         # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
         # alive through a Hub outage instead of failing the checkpoint upload).
         up = upload_dir_to_hub_or_hf(
-            result.local_dir, ckpt_repo, self.hub(),
+            out_dir, ckpt_repo, self.hub(),
             hf_repo=self._hf_ckpt_repo(ckpt_repo),
         )
         return TrainedEntry(
@@ -1819,9 +1896,57 @@ class TrainerRunner:
             trained_pointer=format_trained_pointer(up.ref.immutable_ref),
             corpus_digest=corpus_digest,
             train_block=block,
-            gpu_name=str(result.metrics.get("gpu_name", "")),
+            gpu_name=gpu_name,
             size=size,
         )
+
+    # ── retry-without-retrain (the .train_complete marker) ────────────────────
+
+    TRAIN_COMPLETE_MARKER = ".train_complete"
+
+    def _write_train_complete_marker(
+        self, out_dir: Path, contract: TrainingContractConfig,
+        gen: ResolvedGenerator, *, corpus_digest: str, gpu_name: str,
+    ) -> None:
+        """Stamp ``out_dir`` as a COMPLETE training product (written after
+        training returns, before the upload is attempted) so an upload-failure
+        retry can skip the retrain. Atomic (tmp + rename); best-effort — a
+        marker miss just costs the old retrain-on-retry behaviour."""
+        try:
+            payload = json.dumps({
+                "contract_digest": contract_digest(contract),
+                "gen_ref": gen.ref,
+                "corpus_digest": corpus_digest,
+                "gpu_name": gpu_name,
+            }, sort_keys=True)
+            tmp = out_dir / (self.TRAIN_COMPLETE_MARKER + ".tmp")
+            tmp.write_text(payload)
+            tmp.rename(out_dir / self.TRAIN_COMPLETE_MARKER)
+        except Exception as e:  # noqa: BLE001 — never sink a finished run
+            log.warning("train-complete marker write failed for %s: %s", out_dir, e)
+
+    def _reusable_checkpoint(
+        self, out_dir: Path, contract: TrainingContractConfig, gen: ResolvedGenerator,
+    ) -> dict | None:
+        """The marker payload iff ``out_dir`` holds a complete checkpoint for
+        EXACTLY this job (same contract digest + same generator ref, weights
+        present) — else None. ``out_dir`` is already round/size/role-scoped, so
+        the digest+ref match is a belt-and-braces identity check, not the only
+        one. A torn/stale/mismatched marker reads as None (retrain, the safe
+        direction)."""
+        marker = out_dir / self.TRAIN_COMPLETE_MARKER
+        try:
+            if not marker.exists() or not (out_dir / "weights.safetensors").exists():
+                return None
+            payload = json.loads(marker.read_text())
+            if (payload.get("contract_digest") == contract_digest(contract)
+                    and payload.get("gen_ref") == gen.ref
+                    and payload.get("corpus_digest")):
+                return payload
+        except Exception as e:  # noqa: BLE001 — unreadable marker ⇒ retrain
+            log.warning("train-complete marker unreadable at %s (%s); retraining",
+                        out_dir, e)
+        return None
 
     def _load_warm_start(self, *, epoch_index: int | None = None) -> tuple[str, str] | None:
         """This round's promoted init as ``(checkpoint pointer, size)``, or
@@ -3301,7 +3426,8 @@ class TrainerRunner:
         return entry
 
     @staticmethod
-    def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str, **kw):
+    def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str,
+                               used_host: list | None = None, **kw):
         """Dispatch on the next IDLE lane, retrying once on whichever lane is
         free after a failure (a different one whenever one is available).
 
@@ -3334,12 +3460,17 @@ class TrainerRunner:
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
             try:
-                return disp.dispatch(retry_host,
-                                     lane_count=pod_lane_count(retry_host, hosts), **kw)
+                entry = disp.dispatch(retry_host,
+                                      lane_count=pod_lane_count(retry_host, hosts), **kw)
+                if used_host is not None:
+                    used_host.append(retry_host)
+                return entry
             finally:
                 free_lanes.put(retry_host)
         else:
             free_lanes.put(host)
+            if used_host is not None:
+                used_host.append(host)
             return entry
 
     def _heat_train_remote(
@@ -3521,14 +3652,28 @@ class TrainerRunner:
             extra_forward_env=self._pod_extra_forward_env(),
         )
 
-        def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+        def _fresh_final_hosts() -> list:
+            if self.remote_hosts_path is None:
+                return []
+            from .remote import load_hosts
+
+            now = load_hosts(self.remote_hosts_path)
+            return [h for h in now if getattr(h, "stage", "any") in ("any", "final")]
+
+        # Lane pool over the free-lane dispatch (the heat's anti-double-booking
+        # pattern) PLUS mid-final membership refresh: a top-up pod rented after
+        # a boot-failure drop joins the rotation while queued jobs wait.
+        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts)
+
+        def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:  # noqa: ARG001
             used: list = []
             # Cohort finals need per-uid checkpoint repos (see
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
-            entry = self._dispatch_with_retry(
-                disp, hosts, i, describe=f"final {role} {gen.hotkey}",
+            entry = self._dispatch_on_free_lane(
+                disp, lane_pool, lane_pool.known_hosts(),
+                describe=f"final {role} {gen.hotkey}",
                 used_host=used,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
@@ -3543,7 +3688,7 @@ class TrainerRunner:
             return entry
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
-        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
             futs = {ex.submit(_run, i, gen, role): (i, gen, role)
                     for i, (gen, role) in enumerate(jobs)}
             for fut in as_completed(futs):
