@@ -30,7 +30,10 @@ def _entry(role="king", uid=7):
 
 
 def test_anneal_recipe_swaps_only_the_decay_fields(cfg):
-    c = cfg.training.primary_size
+    # The shipped file arms ema_decay (2026-08-27); anneal_recipe refuses an
+    # EMA-armed contract by design (asserted below) — disarm it here, this
+    # test is about the pure-decay field swap itself.
+    c = replace(cfg.training.primary_size, ema_decay=0.0)
     a = worker_mod.anneal_recipe(c)
     assert a.lr_schedule == "warmup_cosine"
     assert a.warmup_fraction == 0.0
