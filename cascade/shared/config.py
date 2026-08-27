@@ -452,6 +452,35 @@ class TrainingContractConfig:
     # setting it is the deliberate contract cut (release-then-activate,
     # trainer + validators together, testnet first).
     anneal_fraction: float = 0.0
+    # ── measured variance bundle (DEC-CA-0033; digest-bound) ─────────────────
+    # Three knobs from the 2026-08-26 seed-variance measurement
+    # (docs/notes/2026-08-26-seed-variance-ema.md); each ships inert via
+    # drop-when-default, and setting any is a deliberate contract cut
+    # (release-then-activate, trainer + validators together, testnet first).
+    #
+    # ema_decay > 0: maintain an exponential moving average of the weights
+    # (per optimizer step) and ship the EMA as ``weights.safetensors`` — the
+    # artifact every scoring layer loads — while the raw endpoint rides
+    # beside it as ``weights_stable.safetensors`` (the lineage branch
+    # warm-starts resume from; DEC-CA-0029's file convention, reused so the
+    # loader needs no new case). Measured at 0.999 on heat-length runs:
+    # shrinks entrant-specific generation-seed noise 4–11× and improves the
+    # absolute geomean ~7% (12/12 runs). The cheap alternative to
+    # fork-anneal for finished form — never arm both (the trainer refuses).
+    ema_decay: float = 0.0
+    # gen_seed_mix > 1: invoke the generator N times with N derived
+    # generation seeds (each ~1/N of the token budget, series interleaved
+    # round-robin), so an entrant's score averages N corpus realizations and
+    # the residual seed-noise term drops ~√N. Nothing in the miner interface
+    # changes — generators must already be pure functions of the passed seed
+    # (sandbox contract). 1 = single invocation (deployed default).
+    gen_seed_mix: int = 1
+    # rewarmup_fraction > 0: WARM-STARTED wsd runs get a short linear LR
+    # warmup over this fraction of train_tokens instead of hitting base_lr
+    # on step 1 with fresh optimizer state — the measured first-step kick
+    # costs +0.11 geomean at base_lr (the u158 probe, reproduced in-run).
+    # The from-scratch run's warmup-once semantics are untouched.
+    rewarmup_fraction: float = 0.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's

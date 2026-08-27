@@ -215,6 +215,15 @@ in-context.
   `mix_tier_from_block` via release-then-activate (testnet armed, mainnet 0
   until the coordinated release). Granularity axis deferred until snapshots
   carry cadence labels. (`decisions/DEC-CA-0032-even-domain-mix.md`)
+- **DEC-CA-0033** (proposed) — The measured variance bundle: `ema_decay`
+  (EMA weights are the scored artifact; raw endpoint = lineage branch via
+  DEC-CA-0029's stable-file convention; the cheap fork-anneal alternative —
+  never arm both), `gen_seed_mix` (N derived generation seeds, interleaved,
+  ~√N residual noise; audit replays the interleaved rolling digest), and
+  `rewarmup_fraction` (kills the measured +0.11 warm-start first-step kick).
+  All digest-bound drop-when-default, shipped inert; arming is a contract
+  cut. Measured basis: docs/notes/2026-08-26-seed-variance-ema.md.
+  (`decisions/DEC-CA-0033-ema-seedmix-rewarmup-variance-bundle.md`)
 - **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage

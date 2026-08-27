@@ -110,12 +110,18 @@ LR_SCHEDULES = ("warmup_cosine", "wsd", "warmup_flat")
 
 
 def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
-           schedule: str = "warmup_cosine", warm_started: bool = False) -> float:
+           schedule: str = "warmup_cosine", warm_started: bool = False,
+           rewarmup: int = 0) -> float:
     """LR at ``token_pos`` under the contract's ``lr_schedule`` (see
-    LR_SCHEDULES). ``warm_started`` keys wsd's warmup-once semantics."""
+    LR_SCHEDULES). ``warm_started`` keys wsd's warmup-once semantics;
+    ``rewarmup`` (DEC-CA-0033, tokens) gives a warm-started wsd run a short
+    linear ramp instead of full base_lr against fresh optimizer state on
+    step 1 — 0 preserves the deployed no-re-warmup behaviour exactly."""
     if schedule == "wsd":
         if not warm_started and warmup > 0 and token_pos < warmup:
             return base_lr * token_pos / max(1, warmup)
+        if warm_started and rewarmup > 0 and token_pos < rewarmup:
+            return base_lr * token_pos / max(1, rewarmup)
         return base_lr
     if warmup > 0 and token_pos < warmup:
         return base_lr * token_pos / max(1, warmup)
@@ -522,6 +528,43 @@ class Toto2Trainer:
         anneal_tokens = int(round(token_budget * anneal_frac))
         stable_state: dict | None = None
 
+        # EMA finished-form (DEC-CA-0033): the scored artifact is a running
+        # average of the weights; the raw endpoint stays the lineage branch.
+        # Seeded from the starting weights (the warm-start init, when one
+        # loaded), so a run stopped after few steps averages near its init
+        # rather than near zero.
+        ema_decay = float(getattr(contract, "ema_decay", 0.0) or 0.0)
+        if ema_decay:
+            if not 0.0 < ema_decay < 1.0:
+                raise ValueError(
+                    f"[training] ema_decay must be in (0, 1); got {ema_decay}"
+                )
+            if anneal_frac:
+                raise ValueError(
+                    "[training] ema_decay and anneal_fraction are both set — "
+                    "competing finished-form mechanisms; arm exactly one "
+                    "(DEC-CA-0033)"
+                )
+        ema_state: dict | None = None
+        if ema_decay:
+            with torch.no_grad():
+                ema_state = {
+                    k: v.detach().clone() for k, v in model.state_dict().items()
+                }
+
+        # Warm-started re-warmup (DEC-CA-0033): only meaningful under wsd
+        # (the schedule whose warmup-once semantics skip the ramp) and only
+        # on a warm-started run — a from-scratch run keeps its full warmup.
+        rewarmup_frac = float(getattr(contract, "rewarmup_fraction", 0.0) or 0.0)
+        if rewarmup_frac and not 0.0 < rewarmup_frac < 1.0:
+            raise ValueError(
+                f"[training] rewarmup_fraction must be in (0, 1); got {rewarmup_frac}"
+            )
+        rewarmup = (
+            int(round(token_budget * rewarmup_frac))
+            if (rewarmup_frac and warm_started and schedule == "wsd") else 0
+        )
+
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
@@ -666,13 +709,22 @@ class Toto2Trainer:
                 lr = _anneal_lr(tokens - token_budget, anneal_tokens, contract.base_lr)
             else:
                 lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
-                            schedule=schedule, warm_started=warm_started)
+                            schedule=schedule, warm_started=warm_started,
+                            rewarmup=rewarmup)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if ema_state is not None:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        e = ema_state[k]
+                        if e.dtype.is_floating_point:
+                            e.mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                        else:
+                            e.copy_(v)
 
             last_loss = float(loss.detach().cpu())
             # Every channel of every row counts: B × C × L point-passes, so a
@@ -760,6 +812,12 @@ class Toto2Trainer:
         if anneal_tokens:
             metrics["anneal_tokens"] = anneal_tokens
             metrics["anneal_tokens_seen"] = max(0, tokens - token_budget)
+        # DEC-CA-0033 telemetry — armed-only keys, so unarmed run metrics
+        # stay byte-identical (the anneal/channel-telemetry convention).
+        if ema_decay:
+            metrics["ema_decay"] = ema_decay
+        if rewarmup:
+            metrics["rewarmup_tokens"] = rewarmup
         # Shadow channel-redundancy summary — present ONLY when the corpus
         # carried multichannel series, so univariate run metrics stay
         # byte-identical to pre-telemetry builds. [telemetry]-class data: no
@@ -770,6 +828,25 @@ class Toto2Trainer:
         if logger is not None:
             logger({"event": "done", **metrics})
 
+        if ema_state is not None:
+            # EMA finished-form: the raw endpoint becomes the lineage branch
+            # beside the EMA eval artifact — the fork-anneal file convention,
+            # so the warm-start loader (stable file first) needs no new case.
+            from safetensors.torch import save_file
+
+            out = Path(out_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            save_file(
+                {k: v.detach().cpu().contiguous()
+                 for k, v in model.state_dict().items()},
+                str(out / STABLE_WEIGHTS_FILE),
+            )
+            with torch.no_grad():
+                model.load_state_dict(ema_state)
+            log.info(
+                "ema: raw endpoint saved as %s; weights.safetensors carries "
+                "the EMA (decay=%s) eval artifact", STABLE_WEIGHTS_FILE, ema_decay,
+            )
         self._save_checkpoint(out_dir, model, cfg, tuple(levels), contract)
         if anneal_tokens:
             # weights.safetensors above is the ANNEALED model (finished form —

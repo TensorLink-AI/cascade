@@ -1722,6 +1722,7 @@ class TrainerRunner:
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,
             max_wall_seconds=contract.max_train_seconds,
+            seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),

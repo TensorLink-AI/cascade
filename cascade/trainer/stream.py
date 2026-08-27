@@ -240,6 +240,62 @@ class _FreshSeriesStream(RoundStream):
         return self._points
 
 
+class _SeedMixStream(RoundStream):
+    """Interleave N single-seed streams (``gen_seed_mix``, DEC-CA-0033).
+
+    Each child runs the generator under its own derived generation seed with
+    ~1/N of the token budget; series are yielded round-robin, one per child
+    per turn, skipping exhausted children. The digest is a rolling digest of
+    the INTERLEAVED sequence actually consumed — the same rule for training
+    and for an audit re-derivation, whatever the child mode's own digest
+    semantics.
+    """
+
+    def __init__(self, children: list[RoundStream]) -> None:
+        self._children = children
+        self._dig = _StreamDigest()
+        self._n = 0
+        self._points = 0
+
+    def series(self) -> Iterator[np.ndarray]:
+        iters = [c.series() for c in self._children]
+        while iters:
+            live = []
+            for it in iters:
+                try:
+                    arr = next(it)
+                except StopIteration:
+                    continue
+                yield arr
+                self._dig.update(arr)
+                self._n += 1
+                self._points += _element_points(arr)
+                live.append(it)
+            iters = live
+
+    def close(self) -> None:
+        first_err: Exception | None = None
+        for c in self._children:
+            try:
+                c.close()
+            except Exception as e:  # noqa: BLE001 - close every child first
+                first_err = first_err or e
+        if first_err is not None:
+            raise first_err
+
+    @property
+    def digest(self) -> str:
+        return self._dig.hexdigest()
+
+    @property
+    def n_series(self) -> int:
+        return self._n
+
+    @property
+    def total_points(self) -> int:
+        return self._points
+
+
 def open_round_stream(
     mode: str,
     repo_dir: Path | str,
@@ -251,6 +307,7 @@ def open_round_stream(
     blocked: tuple[str, ...] = (),
     allow_netns: bool = True,
     max_wall_seconds: int | None = None,
+    seed_mix: int = 1,
 ) -> RoundStream:
     """Open the round's corpus stream for ``mode`` (see module docstring).
 
@@ -258,7 +315,30 @@ def open_round_stream(
     the stream will be consumed — pass the contract's ``max_train_seconds`` so
     the sandbox child's cumulative CPU rlimit scales with the training budget
     instead of the per-frame stall window (see ``sandbox.stream_cpu_rlimit``).
+
+    ``seed_mix`` > 1 ([training] gen_seed_mix, DEC-CA-0033) opens N child
+    streams — one per derived generation seed (``_mix(generation_seed,
+    "seed-mix", i)``), each with ~1/N of the token budget (the first child
+    absorbs the remainder) — and interleaves them round-robin. Callers pass
+    the contract's value so the trainer, the audit re-derivation, and the
+    miner's local scorer all replay the same rule.
     """
+    n_mix = 1 if seed_mix is None else int(seed_mix)
+    if n_mix < 1:
+        raise CorpusError(f"seed_mix must be >= 1; got {seed_mix}")
+    if n_mix > 1:
+        from .contract import _mix
+
+        share = int(token_budget) // n_mix
+        budgets = [int(token_budget) - share * (n_mix - 1)] + [share] * (n_mix - 1)
+        return _SeedMixStream([
+            open_round_stream(
+                mode, repo_dir, _mix(generation_seed, "seed-mix", i), cfg,
+                token_budget=b, use_sandbox=use_sandbox, blocked=tuple(blocked),
+                allow_netns=allow_netns, max_wall_seconds=max_wall_seconds,
+            )
+            for i, b in enumerate(budgets)
+        ])
     if mode == "cache_reuse":
         return _CacheReuseStream(
             repo_dir, generation_seed, cfg, token_budget,

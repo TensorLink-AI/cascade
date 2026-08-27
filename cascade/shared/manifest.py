@@ -118,6 +118,13 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # the deferred "D" of wsd). 0.0 = off (every deployed config); setting it
     # is the deliberate digest bump that arms the anneal cut.
     "anneal_fraction": (0.0, 0),
+    # DEC-CA-0033: the measured variance bundle. EMA finished-form artifact
+    # (0.0 = off), N-seed generation mix (1 = single invocation), and the
+    # warm-started re-warmup (0.0 = off) — each inert at its default on
+    # every deployed config; setting one is the deliberate digest bump.
+    "ema_decay": (0.0, 0),
+    "gen_seed_mix": (1,),
+    "rewarmup_fraction": (0.0, 0),
 }
 
 

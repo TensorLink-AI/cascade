@@ -138,6 +138,7 @@ def score_generator(
             contract.corpus_mode, repo, seeds.generation_seed, cfg.generator,
             token_budget=token_budget, use_sandbox=False,      # local, trusted-own-code path
             blocked=cfg.static_guard.blocked,
+            seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
         ) as rs:
             result = base_trainer.train(
                 rs.series(), contract,
