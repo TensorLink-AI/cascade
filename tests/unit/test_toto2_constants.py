@@ -193,9 +193,9 @@ def test_loader_round_trips_bundle_and_constants(tmp_path: Path):
     """Regression: the DEC-CA-0033 fields landed with dataclass defaults but
     no loader parsing — arming them in chain.toml silently no-oped. Every
     armable [training] knob must survive load_chain_config."""
-    from cascade.shared.config import load_chain_config
-
     import re
+
+    from cascade.shared.config import load_chain_config
 
     text = (REPO_ROOT / "chain.toml").read_text()
     # The shipped file ARMS the DEC-CA-0035 constants (2026-08-27 release), so
