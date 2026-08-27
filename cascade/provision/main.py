@@ -312,6 +312,70 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     return bootstrap
 
 
+def _compose_pod_hooks(*hooks) -> callable | None:
+    """Run several post-health-gate pod hooks in order, isolating failures —
+    one hook's error must never eat the next (each is independently
+    best-effort). None entries drop; all-None composes to None."""
+    live = [h for h in hooks if h is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+
+    def run(addr, stage: str, provider: str = "") -> None:
+        for h in live:
+            try:
+                h(addr, stage, provider)
+            except Exception as e:  # noqa: BLE001 — hooks never gate a healthy pod
+                log.warning("pod hook %s errored on %s (ignored): %s",
+                            getattr(h, "__name__", h), addr.ip, e)
+
+    return run
+
+
+def make_config_push(render: RenderSettings, *, box_chain_toml: str,
+                     pod_user: str) -> callable:
+    """Post-health-gate hook: push the BOX's deployed chain.toml onto every
+    freshly gated pod (all stages), replacing the image-baked copy.
+
+    Image-boot pods carry the chain.toml the worker image was BUILT with,
+    while the box's deployed copy is the operational authority and drifts
+    legitimately between image rotations — [storage] hf_backup_repo arming
+    (2026-08-27) being the live example: the checkpoint-upload HF fallback
+    stayed silently dark on every new pod because the baked copy still said
+    "". [training] is identical in both by invariant (a divergence would
+    break the round's contract digest before this hook could matter); the
+    push keeps the OTHER sections honest without an image rotation.
+    Best-effort: a failed push leaves the baked copy — exactly the pre-hook
+    behaviour."""
+    import os
+
+    def config_push(addr, stage: str, provider: str = "") -> None:  # noqa: ARG001
+        prof = render.profile_for(provider)
+        user = prof.user if provider else pod_user
+        dest = render.chain_toml or f"{prof.workdir}/chain.toml"
+        argv = ["scp", "-P", str(addr.ssh_port),
+                "-i", os.path.expanduser(render.key_path),
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=15",
+                box_chain_toml, f"{user}@{addr.ip}:{dest}"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except Exception as e:  # noqa: BLE001 — best-effort: never gate a healthy pod
+            log.warning("chain.toml push errored on %s:%s (pod keeps the "
+                        "image-baked copy): %s", addr.ip, addr.ssh_port, e)
+            return
+        if proc.returncode != 0:
+            log.warning("chain.toml push failed on %s:%s (rc=%d, pod keeps the "
+                        "image-baked copy): %s", addr.ip, addr.ssh_port,
+                        proc.returncode, (proc.stderr or "")[-300:])
+        else:
+            log.info("deployed chain.toml pushed to %s pod %s:%s",
+                     stage, addr.ip, addr.ssh_port)
+
+    return config_push
+
+
 def make_bench_prewarm(render: RenderSettings, *, pod_user: str) -> callable:
     """The bench-data PRE-WARM hook: fire a detached benchmark-data download on
     a freshly gated FINAL pod, so the multi-hour final training — not the bench
@@ -660,9 +724,13 @@ def _run(args) -> int:
             hippius_probe=hippius_probe,
         ),
         bootstrap=bootstrap,
-        prewarm=(make_bench_prewarm(render,
-                                    pod_user=str(top.get("pod_user", "root")))
-                 if cfg.scoring.cascade_enabled else None),
+        prewarm=_compose_pod_hooks(
+            make_config_push(render, box_chain_toml=str(args.chain_toml),
+                             pod_user=str(top.get("pod_user", "root"))),
+            (make_bench_prewarm(render,
+                                pod_user=str(top.get("pod_user", "root")))
+             if cfg.scoring.cascade_enabled else None),
+        ),
         static_hosts_text=static_hosts_text,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),
