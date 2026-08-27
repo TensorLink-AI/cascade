@@ -110,12 +110,18 @@ LR_SCHEDULES = ("warmup_cosine", "wsd", "warmup_flat")
 
 
 def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
-           schedule: str = "warmup_cosine", warm_started: bool = False) -> float:
+           schedule: str = "warmup_cosine", warm_started: bool = False,
+           rewarmup: int = 0) -> float:
     """LR at ``token_pos`` under the contract's ``lr_schedule`` (see
-    LR_SCHEDULES). ``warm_started`` keys wsd's warmup-once semantics."""
+    LR_SCHEDULES). ``warm_started`` keys wsd's warmup-once semantics;
+    ``rewarmup`` (DEC-CA-0033, tokens) gives a warm-started wsd run a short
+    linear ramp instead of full base_lr against fresh optimizer state on
+    step 1 — 0 preserves the deployed no-re-warmup behaviour exactly."""
     if schedule == "wsd":
         if not warm_started and warmup > 0 and token_pos < warmup:
             return base_lr * token_pos / max(1, warmup)
+        if warm_started and rewarmup > 0 and token_pos < rewarmup:
+            return base_lr * token_pos / max(1, rewarmup)
         return base_lr
     if warmup > 0 and token_pos < warmup:
         return base_lr * token_pos / max(1, warmup)
@@ -522,6 +528,64 @@ class Toto2Trainer:
         anneal_tokens = int(round(token_budget * anneal_frac))
         stable_state: dict | None = None
 
+        # EMA finished-form (DEC-CA-0033): the scored artifact is a running
+        # average of the weights; the raw endpoint stays the lineage branch.
+        # Seeded from the starting weights (the warm-start init, when one
+        # loaded), so a run stopped after few steps averages near its init
+        # rather than near zero.
+        ema_decay = float(getattr(contract, "ema_decay", 0.0) or 0.0)
+        if ema_decay:
+            if not 0.0 < ema_decay < 1.0:
+                raise ValueError(
+                    f"[training] ema_decay must be in (0, 1); got {ema_decay}"
+                )
+            if anneal_frac:
+                raise ValueError(
+                    "[training] ema_decay and anneal_fraction are both set — "
+                    "competing finished-form mechanisms; arm exactly one "
+                    "(DEC-CA-0033)"
+                )
+        ema_state: dict | None = None
+        if ema_decay:
+            with torch.no_grad():
+                ema_state = {
+                    k: v.detach().clone() for k, v in model.state_dict().items()
+                }
+
+        # Warm-started re-warmup (DEC-CA-0033): only meaningful under wsd
+        # (the schedule whose warmup-once semantics skip the ramp) and only
+        # on a warm-started run — a from-scratch run keeps its full warmup.
+        rewarmup_frac = float(getattr(contract, "rewarmup_fraction", 0.0) or 0.0)
+        if rewarmup_frac and not 0.0 < rewarmup_frac < 1.0:
+            raise ValueError(
+                f"[training] rewarmup_fraction must be in (0, 1); got {rewarmup_frac}"
+            )
+        rewarmup = (
+            int(round(token_budget * rewarmup_frac))
+            if (rewarmup_frac and warm_started and schedule == "wsd") else 0
+        )
+
+        # Warm-start LR scale (DEC-CA-0035): a converged init tolerates far
+        # less LR than a random one — measured, full base_lr costs +0.11
+        # geomean on step 1 and the run never recovers, while the aligned
+        # constants at base_lr×0.125 BEAT the init
+        # (docs/notes/2026-08-27-toto2-alignment.md). Scales the whole
+        # warm-started run, every schedule branch (the fork-anneal decays
+        # from the scaled level too — one stable phase, one finished form);
+        # a from-scratch generation start keeps full base_lr.
+        _wls = getattr(contract, "warm_lr_scale", None)
+        warm_lr_scale = 1.0 if _wls is None else float(_wls)
+        if not 0.0 < warm_lr_scale <= 1.0:
+            raise ValueError(
+                f"[training] warm_lr_scale must be in (0, 1]; got {warm_lr_scale}"
+            )
+        eff_base_lr = contract.base_lr * (warm_lr_scale if warm_started else 1.0)
+
+        _gc = getattr(contract, "grad_clip", None)
+        grad_clip = 1.0 if _gc is None else float(_gc)
+        if grad_clip <= 0.0:
+            raise ValueError(f"[training] grad_clip must be > 0; got {grad_clip}")
+
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
@@ -663,16 +727,25 @@ class Toto2Trainer:
             loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
             if anneal_tokens and tokens >= token_budget:
-                lr = _anneal_lr(tokens - token_budget, anneal_tokens, contract.base_lr)
+                lr = _anneal_lr(tokens - token_budget, anneal_tokens, eff_base_lr)
             else:
-                lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
-                            schedule=schedule, warm_started=warm_started)
+                lr = _lr_at(tokens, token_budget, warmup, eff_base_lr,
+                            schedule=schedule, warm_started=warm_started,
+                            rewarmup=rewarmup)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema_state is not None:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        e = ema_state[k]
+                        if e.dtype.is_floating_point:
+                            e.mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                        else:
+                            e.copy_(v)
 
             last_loss = float(loss.detach().cpu())
             # Every channel of every row counts: B × C × L point-passes, so a
@@ -760,6 +833,14 @@ class Toto2Trainer:
         if anneal_tokens:
             metrics["anneal_tokens"] = anneal_tokens
             metrics["anneal_tokens_seen"] = max(0, tokens - token_budget)
+        # DEC-CA-0033 telemetry — armed-only keys, so unarmed run metrics
+        # stay byte-identical (the anneal/channel-telemetry convention).
+        if ema_decay:
+            metrics["ema_decay"] = ema_decay
+        if rewarmup:
+            metrics["rewarmup_tokens"] = rewarmup
+        if warm_started and warm_lr_scale != 1.0:
+            metrics["warm_lr_scale"] = warm_lr_scale
         # Shadow channel-redundancy summary — present ONLY when the corpus
         # carried multichannel series, so univariate run metrics stay
         # byte-identical to pre-telemetry builds. [telemetry]-class data: no
@@ -770,6 +851,25 @@ class Toto2Trainer:
         if logger is not None:
             logger({"event": "done", **metrics})
 
+        if ema_state is not None:
+            # EMA finished-form: the raw endpoint becomes the lineage branch
+            # beside the EMA eval artifact — the fork-anneal file convention,
+            # so the warm-start loader (stable file first) needs no new case.
+            from safetensors.torch import save_file
+
+            out = Path(out_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            save_file(
+                {k: v.detach().cpu().contiguous()
+                 for k, v in model.state_dict().items()},
+                str(out / STABLE_WEIGHTS_FILE),
+            )
+            with torch.no_grad():
+                model.load_state_dict(ema_state)
+            log.info(
+                "ema: raw endpoint saved as %s; weights.safetensors carries "
+                "the EMA (decay=%s) eval artifact", STABLE_WEIGHTS_FILE, ema_decay,
+            )
         self._save_checkpoint(out_dir, model, cfg, tuple(levels), contract)
         if anneal_tokens:
             # weights.safetensors above is the ANNEALED model (finished form —
@@ -802,9 +902,46 @@ class Toto2Trainer:
     def _build_optimizer(self, model, contract: TrainingContractConfig):
         import torch
 
+        # DEC-CA-0035 constants (defaults = the previously hardcoded values,
+        # digest-inert until set; measured Toto2 targets in the config
+        # comments). Validated here — this is the single construction site.
+        def _knob(name: str, dflt: float) -> float:
+            v = getattr(contract, name, None)      # NOT `or dflt`: 0.0 must
+            return dflt if v is None else float(v)  # reach validation, not
+                                                    # silently become default
+        momentum = _knob("muon_momentum", 0.95)
+        row_beta2 = _knob("muon_row_beta2", 0.95)
+        adamw_b1 = _knob("adamw_beta1", 0.9)
+        adamw_b2 = _knob("adamw_beta2", 0.999)
+        adamw_lr_scale = _knob("adamw_lr_scale", 1.0)
+
         if contract.optimizer != "normuon_adamw":
+            # The constants only have a consumer on the normuon path. An armed
+            # knob here would bump contract_digest while changing NO numerics —
+            # a contract lie — so refuse instead of silently ignoring.
+            armed = {n: v for n, v in (("muon_momentum", momentum),
+                                       ("muon_row_beta2", row_beta2),
+                                       ("adamw_beta1", adamw_b1),
+                                       ("adamw_beta2", adamw_b2),
+                                       ("adamw_lr_scale", adamw_lr_scale))
+                     if v != {"muon_momentum": 0.95, "muon_row_beta2": 0.95,
+                              "adamw_beta1": 0.9, "adamw_beta2": 0.999,
+                              "adamw_lr_scale": 1.0}[n]}
+            if armed:
+                raise ValueError(
+                    f"[training] {sorted(armed)} require optimizer="
+                    f"'normuon_adamw'; got {contract.optimizer!r}"
+                )
             return torch.optim.AdamW(
                 model.parameters(), lr=contract.base_lr, weight_decay=contract.weight_decay
+            )
+        for name, val in (("muon_momentum", momentum), ("muon_row_beta2", row_beta2),
+                          ("adamw_beta1", adamw_b1), ("adamw_beta2", adamw_b2)):
+            if not 0.0 < val < 1.0:
+                raise ValueError(f"[training] {name} must be in (0, 1); got {val}")
+        if not 0.0 < adamw_lr_scale <= 1.0:
+            raise ValueError(
+                f"[training] adamw_lr_scale must be in (0, 1]; got {adamw_lr_scale}"
             )
         muon, adamw = [], []
         for name, p in model.named_parameters():
@@ -813,7 +950,17 @@ class Toto2Trainer:
             else:
                 adamw.append(p)
         # Muon params are stepped manually in _MuonAdamW; AdamW handles the rest.
-        return _MuonAdamW(muon, adamw, lr=contract.base_lr, weight_decay=contract.weight_decay)
+        opt = _MuonAdamW(muon, adamw, lr=contract.base_lr,
+                         weight_decay=contract.weight_decay,
+                         momentum=momentum, beta2=row_beta2)
+        if opt.adamw is not None:
+            # The AdamW groups ride opt.param_groups[1:]; the train loop
+            # multiplies each group's lr by lr_scale every step, so the
+            # matrix:AdamW split persists under the schedule.
+            for grp in opt.adamw.param_groups:
+                grp["betas"] = (adamw_b1, adamw_b2)
+                grp["lr_scale"] = adamw_lr_scale
+        return opt
 
     # ── optimizer state (round-to-round continuity under wsd) ─────────────────
 

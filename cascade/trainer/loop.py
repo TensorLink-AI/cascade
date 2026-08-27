@@ -52,6 +52,7 @@ from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    contract_payload,
     dump_manifest,
     format_trained_pointer,
     parse_trained_pointer,
@@ -1722,6 +1723,7 @@ class TrainerRunner:
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,
             max_wall_seconds=contract.max_train_seconds,
+            seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),
@@ -2680,6 +2682,13 @@ class TrainerRunner:
                 timeout_seconds=self.remote_timeout_seconds,
                 extra_forward_env=self._pod_extra_forward_env(),
             )
+            # warm_start_ref makes the leg warm_started=True in the trainer, so
+            # under an armed [training] warm_lr_scale (DEC-CA-0035) its cosine
+            # decays from base_lr × scale. Exactly right for warm-started duel
+            # checkpoints (matches their stable-phase LR); for a generation-
+            # start checkpoint (stable phase ran full base_lr) the leg starts
+            # one notch low — accepted: telemetry-only, errs conservative, and
+            # all legs stay mutually comparable at the same start LR.
             disp.dispatch(
                 host, gen_ref=entry.gen_ref, uid=entry.miner_uid,
                 hotkey=entry.miner_hotkey, role=entry.role,
@@ -2938,6 +2947,11 @@ class TrainerRunner:
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
             warm_start_size=warm_start[1] if warm_start else "",
+            # Publish the round's full training contract (DEC-CA-0036). Signed
+            # with the rest of the manifest, so the terms a round trained under
+            # are pinned to the round itself rather than inferred from whatever
+            # chain.toml says whenever someone later reads it.
+            contract_body=contract_payload(self.cfg.training),
         )
 
     def _log_telemetry_rollup(self, base_seed: int) -> None:
@@ -3063,6 +3077,12 @@ class TrainerRunner:
         # a seniority claim (Bittensor recycles them), the reveal block is
         # (DEC-CA-0012; NOTE-ca-operational-invariants).
         scored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        # Init-baseline shadow ([round] init_gate_mode = "shadow"): score the
+        # very init this heat trained from, on the same slice — the null
+        # baseline KOTH otherwise never sees. NEVER shapes advancement (the
+        # enforcing gate lives in the validator's duel, [scoring]
+        # init_gate_mode); here it is a published standings row only.
+        init_score = self._init_baseline(scored, ws_ref, seeds, screen_block)
         diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         if armed:
             ckpt_dirs = {c.hotkey: d for c, d, _ in trained}
@@ -3076,8 +3096,54 @@ class TrainerRunner:
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset,
             len(winners) if armed else n,
             duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
+            init_baseline=init_score,
         )
         return winners, heat
+
+    def _init_baseline(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        ws_ref: str | None,
+        seeds: RoundSeeds,
+        screen_block: int | None,
+    ) -> float | None:
+        """Score the round's warm-start init on the heat's own slice (shadow).
+
+        Every entrant trained from this checkpoint's lineage branch, so its
+        score on the same windows is the round's "did training add value?"
+        null baseline. Precisely: what is scored is the init checkpoint's
+        SCORED face (``weights.safetensors`` via the wrapper) — the same
+        artifact form every entrant is scored on — which under an armed
+        finished-form mechanism (fork-anneal / EMA) is not byte-identical to
+        the stable branch entrants resume from. Score-vs-score is the
+        apples-to-apples comparison; just don't read the row as "the exact
+        tensor state training started from". Logged
+        and published on the standings; it never changes who advances — the
+        enforcing floor is the validator's duel-side gate. Fails OPEN on any
+        scoring error: a baseline hiccup must never sink the round.
+        """
+        rnd = self.cfg.round
+        mode = str(rnd.init_gate_mode or "off").lower()
+        if mode != "shadow":
+            if mode not in ("off", "shadow"):
+                log.warning("[round] init_gate_mode=%r not supported at the heat "
+                            "(only 'off'/'shadow'; enforcement is [scoring]-side); "
+                            "treating as 'off'", rnd.init_gate_mode)
+            return None
+        if not ws_ref or not scored or self.screen_fn is None:
+            return None
+        try:
+            init_dir = self._fetch_checkpoint_dir(ws_ref)
+            score = self._screen_score(
+                self.screen_fn(init_dir, None, seeds.base_seed, screen_block))
+        except Exception as e:  # noqa: BLE001 — fail open, loudly
+            log.error("heat: init-baseline scoring failed (%s: %s); shadow row "
+                      "omitted this round", type(e).__name__, e)
+            return None
+        beat = sum(1 for s, _, _ in scored if s <= score)
+        log.info("heat: init baseline score=%.5f — %d/%d entrants beat it",
+                 score, beat, len(scored))
+        return score
 
     def _advance_cohort(
         self,
@@ -3256,6 +3322,7 @@ class TrainerRunner:
         duplicates: set[str] = frozenset(),
         diagnostics=None,
         components: dict[str, tuple[float | None, float | None]] | None = None,
+        init_baseline: float | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
@@ -3309,6 +3376,7 @@ class TrainerRunner:
             leader_lcb=(diagnostics.leader_lcb if diagnostics is not None else None),
             n_windows=(diagnostics.n_windows if diagnostics is not None else None),
             n_clusters=(diagnostics.n_clusters if diagnostics is not None else None),
+            init_baseline=init_baseline,
         )
 
     def _heat_train(

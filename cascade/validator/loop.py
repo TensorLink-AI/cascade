@@ -39,6 +39,7 @@ from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    locked_contract_terms,
     parse_trained_pointer,
     verify_signature,
 )
@@ -218,12 +219,65 @@ class ValidatorRunner:
     def check_manifest(self, manifest: TrainingManifest) -> str | None:
         """Return a rejection reason string, or None if the manifest is usable.
 
-        Enforces (1) the trainer-hotkey signature, (2) the contract-digest match
-        (king and challenger trained under the same terms), and (3) that the
-        manifest targets our configured base architecture and eval dataset.
+        Enforces (1) the trainer-hotkey signature, (2) the training-contract
+        gate (see :meth:`_check_contract`), and (3) that the manifest targets
+        our configured base architecture and eval dataset.
         """
         if self.verify_signatures and not verify_signature(manifest, self.cfg.manifest.trainer_hotkey):
             return "signature_invalid"
+        contract_reason = self._check_contract(manifest)
+        if contract_reason is not None:
+            return contract_reason
+        if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
+            return "base_arch_digest_mismatch"
+        if manifest.eval_dataset != self.cfg.eval.eval_dataset:
+            return "eval_dataset_mismatch"
+        gpu_reason = self._check_gpu(manifest)
+        if gpu_reason is not None:
+            return gpu_reason
+        ws_reason = self._check_warm_start(manifest)
+        if ws_reason is not None:
+            return ws_reason
+        return None
+
+    def _check_contract(self, manifest: TrainingManifest) -> str | None:
+        """Gate the round's training contract. Two regimes, block-selected.
+
+        **Declared** (DEC-CA-0036; from ``[scoring] declared_contract_from_block``,
+        and only for a manifest that actually publishes a ``contract_body``):
+        the trainer ships the round's full contract in the signed manifest and
+        this checks two things — that the body re-hashes to the
+        ``contract_digest`` it declares, and that the body's LOCKED projection
+        (:func:`locked_contract_terms`) matches ours. The locked terms are the
+        only ones this validator consumes with its own local value — including
+        ``train_seed_salt``, which the receipt assembler folds into the round's
+        published ``training_seed`` via ``RoundSeeds.derive``; every other
+        ``[training]`` term is recorded and audited but never gates, so the
+        trainer ships runtime and recipe fixes without a fleet restart.
+
+        **Strict** (legacy, and always for a body-less manifest): full digest
+        equality against the local ``[training]``, with the block-gated
+        ``prior_contract_digest`` transition for the round in flight across a
+        contract-changing release.
+
+        Note the asymmetry in where each side is read from: the digest
+        self-consistency check reads the DECLARED body (it proves the trainer's
+        own two statements agree), while the locked comparison comes from LOCAL
+        config on our side — a pin sourced from the declaration would be the
+        trainer gating itself.
+        """
+        declared_from = int(self.cfg.scoring.declared_contract_from_block)
+        if (declared_from and manifest.contract_body is not None
+                and self._epoch_start_block(manifest) >= declared_from):
+            declared = contract_digest(manifest.contract_body)
+            if declared != manifest.contract_digest:
+                return (f"contract_body_mismatch: body hashes to {declared} "
+                        f"but manifest declares {manifest.contract_digest}")
+            want = locked_contract_terms(self.cfg.training)
+            got = locked_contract_terms(manifest.contract_body)
+            if got != want:
+                return f"contract_locked_mismatch: {got} != {want}"
+            return None
         want_contract = contract_digest(self.cfg.training)
         if manifest.contract_digest != want_contract:
             # Block-gated contract transition: a round whose epoch boundary
@@ -237,16 +291,6 @@ class ValidatorRunner:
                     and manifest.contract_digest == prior
                     and self._epoch_start_block(manifest) < from_block):
                 return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
-        if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
-            return "base_arch_digest_mismatch"
-        if manifest.eval_dataset != self.cfg.eval.eval_dataset:
-            return "eval_dataset_mismatch"
-        gpu_reason = self._check_gpu(manifest)
-        if gpu_reason is not None:
-            return gpu_reason
-        ws_reason = self._check_warm_start(manifest)
-        if ws_reason is not None:
-            return ws_reason
         return None
 
     def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
@@ -560,8 +604,12 @@ class ValidatorRunner:
             by_size.setdefault(e.size, []).append(e)
         for size, entries in by_size.items():
             preset = size or primary
-            # An unknown size tag falls back to the base pin — defensive only;
-            # the contract-digest gate rejects such a manifest anyway.
+            # An unknown size tag falls back to the base pin. Defensive: both
+            # contract regimes pin the legal preset set before we get here —
+            # strict by full digest equality, declared by the locked projection
+            # (which carries every extra size's preset) — so a tag outside the
+            # registry means the trainer mislabelled its own entry, and the
+            # base pin is the conservative reading.
             contract = registry.get(preset, self.cfg.training.primary_size)
             pinned = contract.expected_gpu
             gpus = {e.gpu_name for e in entries if e.gpu_name}
@@ -617,17 +665,22 @@ class ValidatorRunner:
         windows: list[EvalWindow],
         score_records: list[EntryScores],
     ) -> list[WindowScore] | None:
-        """Score the shared warm-start init for the increment margin
-        (DEC-CA-0027), appending its rows to the receipt.
+        """Score the shared warm-start init on the verdict windows.
 
-        Returns ``None`` — judge at "level" — when the round has no baseline:
+        Serves both consumers of the baseline: the increment margin
+        (DEC-CA-0027) and the init-baseline floor ([scoring] init_gate_mode).
+        Appends the init's rows to the receipt either way (role="baseline").
+
+        Returns ``None`` — judge at "level" / floor not applied — when the
+        round has no baseline:
         a random-init round (no ``warm_start_ckpt``; the E2 init-round
         semantics), or a multi-size duel / size mismatch, where a single init
         cannot reference every paired size (weights never cross sizes).
         """
         if not manifest.warm_start_ckpt:
-            log.info("round=%s margin_mode=increment on a random-init round; "
-                     "judging at level (the init-round rule)", manifest.round_id)
+            log.info("round=%s baseline eval on a random-init round: no init "
+                     "to score (increment judges at level; init floor skips)",
+                     manifest.round_id)
             return None
         if len(paired_sizes) != 1 or manifest.warm_start_size != paired_sizes[0]:
             log.warning(
@@ -1085,19 +1138,27 @@ class ValidatorRunner:
         _t_king = _time.perf_counter() - _t0
 
         base_params = self.cfg.koth_params()
-        # Increment margin (DEC-CA-0027): score the shared warm-start init as
-        # the third paired reference, or fall back to the level rule for a
-        # round that has none (random init / multi-size duel). The fallback
-        # mutates only the JUDGED params — the receipt keeps recording the
-        # unmodified config params (check_koth_params compares them against
-        # chain.toml), and the audit detects the judged mode from whether
-        # baseline rows exist in the receipt.
+        # Score the shared warm-start init when either consumer needs it: the
+        # increment margin (DEC-CA-0027) or the init-baseline floor
+        # ([scoring] init_gate_mode). The increment fallback mutates only the
+        # JUDGED params — the receipt keeps recording the unmodified config
+        # params (check_koth_params compares them against chain.toml) — and
+        # the audit re-derives the judged margin rule as "params say
+        # increment AND baseline rows exist" (rows alone no longer imply
+        # increment: a level round with the floor on records them too).
         baseline_scores: list[WindowScore] | None = None
-        if base_params.margin_mode == "increment":
+        if (base_params.margin_mode == "increment"
+                or base_params.init_gate_mode != "off"):
             baseline_scores = self._score_increment_baseline(
                 manifest, paired_sizes, windows, score_records)
-            if baseline_scores is None:
+            if baseline_scores is None and base_params.margin_mode == "increment":
                 base_params = replace(base_params, margin_mode="level")
+            if baseline_scores is None and base_params.init_gate_mode != "off":
+                # No baseline (random-init round / size mismatch): the floor
+                # cannot run this round — recorded None, judged as if off.
+                log.info("round=%s init-baseline floor (%s): no baseline this "
+                         "round; floor not applied",
+                         manifest.round_id, base_params.init_gate_mode)
         k = len(cohort)
         # Family-wise (Bonferroni) correction. Conservative under the cohort's
         # real correlation — every challenger shares the king's scores and one
@@ -1153,6 +1214,17 @@ class ValidatorRunner:
             log.info("round=%s duel %s lcb=%.4f margin=%.4f clears=%s",
                      manifest.round_id, hk, result.lcb, result.margin,
                      result.challenger_wins_round)
+            if result.init_floor_passed is not None:
+                log.info(
+                    "round=%s init-baseline floor (%s) %s: chal=%.5f vs "
+                    "init=%.5f (tol=%.3f) — %s%s",
+                    manifest.round_id, base_params.init_gate_mode, hk,
+                    result.chal_geomean, result.baseline_geomean,
+                    base_params.init_gate_tolerance,
+                    "passes" if result.init_floor_passed else "WORSE THAN INIT",
+                    ("" if base_params.init_gate_mode == "enforce"
+                     or result.init_floor_passed else " (shadow: not gating)"),
+                )
 
         if inconclusive is not None:
             decided_hotkey, chal_entry, result = (

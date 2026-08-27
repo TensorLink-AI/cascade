@@ -87,6 +87,17 @@ class KothParams:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Init-baseline floor ([scoring] init_gate_mode): the shared warm-start
+    # init, scored on the SAME duel windows, as an absolute floor under the
+    # crown — "nobody takes the throne who's worse than doing nothing".
+    # Same rollout shape as the gift gate: "off" → "shadow" (floor computed
+    # and recorded, never gates) → "enforce" (a challenger whose observed
+    # geomean is worse than ``baseline × (1 + init_gate_tolerance)`` cannot
+    # win the round). It can only BLOCK a dethrone, never grant one; king
+    # retention is untouched. Consensus-relevant: every validator must run
+    # the same mode or verdicts fork (release-then-activate, shadow first).
+    init_gate_mode: str = "off"
+    init_gate_tolerance: float = 0.0
     # Margin denomination (see MARGIN_MODES). "level" is bit-identical to the
     # pre-field behaviour; receipts record these via the params dict, so an
     # increment round replays under the rule that decided it.
@@ -166,10 +177,17 @@ class RoundResult:
     # Recorded on the receipt so an auditor replays a round under the rule that
     # actually decided it; see :func:`cascade.eval.scoring.global_geomean`.
     wql_mode: str = "geomean"
-    # Which margin denomination judged this round (see MARGIN_MODES) and, for
-    # "increment", the shared warm-start init's observed geomean (logging).
+    # Which margin denomination judged this round (see MARGIN_MODES), and the
+    # shared warm-start init's observed geomean whenever the init was scored
+    # this round — for the "increment" margin and/or the init-baseline floor.
+    # The baseline is the init checkpoint's SCORED face (its published
+    # weights.safetensors), the same artifact form challengers are scored on.
     margin_mode: str = "level"
     baseline_geomean: float | None = None
+    # Init-baseline floor verdict (``KothParams.init_gate_mode``): None = gate
+    # off or no baseline this round; under "enforce" a False has already been
+    # folded into ``challenger_wins_round``; under "shadow" it is logged only.
+    init_floor_passed: bool | None = None
 
 
 def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
@@ -266,14 +284,18 @@ def evaluate_round(
             f"margin_mode must be one of {MARGIN_MODES}; got {params.margin_mode!r}"
         )
     increment = params.margin_mode == "increment"
+    init_gate = str(params.init_gate_mode or "off") != "off"
     if increment and baseline_scores is None:
         raise ValueError(
             "margin_mode='increment' needs baseline_scores (the shared warm-start "
             "init scored on the same windows); judge a random-init round under "
             "'level' instead"
         )
-    if not increment and baseline_scores is not None:
-        raise ValueError("baseline_scores given but margin_mode is 'level'")
+    if not increment and not init_gate and baseline_scores is not None:
+        raise ValueError(
+            "baseline_scores given but margin_mode is 'level' and the "
+            "init-baseline gate is off"
+        )
     if increment and len(baseline_scores) != len(king_scores):
         raise ValueError(
             f"unpaired baseline: {len(baseline_scores)} vs king {len(king_scores)}"
@@ -282,7 +304,8 @@ def evaluate_round(
     margin = margin_for_tenure(params, king_tenure_rounds)
     clusters, n_clusters = _window_clusters(king_scores)
     base_geo = (
-        global_geomean(baseline_scores, wql_mode=wql_mode) if increment else None
+        global_geomean(baseline_scores, wql_mode=wql_mode)
+        if baseline_scores is not None else None
     )
 
     if n < params.min_windows or (params.min_clusters > 0 and n_clusters < params.min_clusters):
@@ -342,18 +365,33 @@ def evaluate_round(
         except Exception:  # noqa: BLE001 — spread is display-only
             pass
     win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
+    chal_geo = global_geomean(chal_scores, wql_mode=wql_mode)
+    # Init-baseline floor (KothParams.init_gate_mode): the challenger's
+    # observed geomean against the shared init's, on these very windows.
+    # Enforce AND-s it into the win — the gift-gate shape: it can only BLOCK
+    # a dethrone, never grant one. No baseline this round ⇒ the floor cannot
+    # run (None), whatever the mode.
+    init_floor_passed: bool | None = None
+    if init_gate and base_geo is not None:
+        init_floor_passed = bool(
+            chal_geo <= base_geo * (1.0 + max(0.0, params.init_gate_tolerance))
+        )
+    wins = bool(lcb >= margin)
+    if params.init_gate_mode == "enforce" and init_floor_passed is False:
+        wins = False
     return RoundResult(
-        challenger_wins_round=bool(lcb >= margin),
+        challenger_wins_round=wins,
         lcb=lcb,
         margin=margin,
         n_windows=n,
         king_geomean=global_geomean(king_scores, wql_mode=wql_mode),
-        chal_geomean=global_geomean(chal_scores, wql_mode=wql_mode),
+        chal_geomean=chal_geo,
         inconclusive=False,
         n_clusters=n_clusters,
         wql_mode=wql_mode,
         margin_mode=params.margin_mode,
         baseline_geomean=base_geo,
+        init_floor_passed=init_floor_passed,
         win_rate=win_rate,
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,

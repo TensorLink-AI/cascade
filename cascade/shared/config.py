@@ -452,6 +452,59 @@ class TrainingContractConfig:
     # setting it is the deliberate contract cut (release-then-activate,
     # trainer + validators together, testnet first).
     anneal_fraction: float = 0.0
+    # ── measured variance bundle (DEC-CA-0033; digest-bound) ─────────────────
+    # Three knobs from the 2026-08-26 seed-variance measurement
+    # (docs/notes/2026-08-26-seed-variance-ema.md); each ships inert via
+    # drop-when-default, and setting any is a deliberate contract cut
+    # (release-then-activate, trainer + validators together, testnet first).
+    #
+    # ema_decay > 0: maintain an exponential moving average of the weights
+    # (per optimizer step) and ship the EMA as ``weights.safetensors`` — the
+    # artifact every scoring layer loads — while the raw endpoint rides
+    # beside it as ``weights_stable.safetensors`` (the lineage branch
+    # warm-starts resume from; DEC-CA-0029's file convention, reused so the
+    # loader needs no new case). Measured at 0.999 on heat-length runs:
+    # shrinks entrant-specific generation-seed noise 4–11× and improves the
+    # absolute geomean ~7% (12/12 runs). The cheap alternative to
+    # fork-anneal for finished form — never arm both (the trainer refuses).
+    ema_decay: float = 0.0
+    # gen_seed_mix > 1: invoke the generator N times with N derived
+    # generation seeds (each ~1/N of the token budget, series interleaved
+    # round-robin), so an entrant's score averages N corpus realizations and
+    # the residual seed-noise term drops ~√N. Nothing in the miner interface
+    # changes — generators must already be pure functions of the passed seed
+    # (sandbox contract). 1 = single invocation (deployed default).
+    gen_seed_mix: int = 1
+    # rewarmup_fraction > 0: WARM-STARTED wsd runs get a short linear LR
+    # warmup over this fraction of train_tokens instead of hitting base_lr
+    # on step 1 with fresh optimizer state — the measured first-step kick
+    # costs +0.11 geomean at base_lr (the u158 probe, reproduced in-run).
+    # The from-scratch run's warmup-once semantics are untouched.
+    rewarmup_fraction: float = 0.0
+    # ── Toto2-aligned optimizer constants (DEC-CA-0035; digest-bound) ────────
+    # Datadog's Toto 2.0 recipe (arXiv 2605.20119) was HP-swept once at 4M
+    # under u-µP; its DIMENSIONLESS constants transfer directly, its LR
+    # VALUES do not (different parametrization convention — only the
+    # matrix:AdamW ratio carries). Defaults below are today's deployed
+    # behavior, so every knob is drop-when-default digest-inert. Measured
+    # targets (docs/notes/2026-08-27-toto2-alignment.md — the full bundle
+    # @ warm LR 5e-4 BEAT the converged warm-start init by 0.0038, the
+    # campaign best): muon_momentum 0.96, muon_row_beta2 0.999, grad_clip
+    # 7.0, adamw betas (0.91, 0.972), adamw_lr_scale 1/54 ≈ 0.0185, plus
+    # weight_decay → 2e-8 (already a field above — no new knob needed).
+    muon_momentum: float = 0.95    # Muon Nesterov momentum
+    muon_row_beta2: float = 0.95   # NorMuon per-row second-moment EMA decay
+    grad_clip: float = 1.0         # global grad-norm clip in the train loop
+    adamw_beta1: float = 0.9       # AdamW group (embeddings/heads/biases)
+    adamw_beta2: float = 0.999
+    adamw_lr_scale: float = 1.0    # AdamW group LR = base_lr × this (Toto2
+                                   # runs the matrix:AdamW split at 54:1)
+    # warm_lr_scale < 1: WARM-STARTED runs train at base_lr × warm_lr_scale,
+    # keyed off the same warm_started signal wsd's warmup-once already uses;
+    # from-scratch (generation-start) runs keep full base_lr. Measured
+    # target 0.125 (→ 5e-4): a converged init tolerates far less LR than a
+    # random one, and no re-warmup trick substitutes (DEC-CA-0033 verdict).
+    warm_lr_scale: float = 1.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -664,6 +717,19 @@ class RoundConfig:
     # expiry the pre-run-off tied set advances (capped) — a screen that cannot
     # finish must not sink the round it protects. Inert while max_finalists=1.
     tie_runoff_phase_seconds: int = 900
+    # ── Init-baseline SHADOW row (trainer-side; observability only) ──────────
+    # The measured 2026-08-26 blind spot: KOTH compares entrants to each other
+    # and to the king, never to "do nothing" — and the raw warm-start init
+    # currently outscores every trained entrant on the post-mix windows.
+    # "shadow": the round's warm-start init is scored on the SAME heat slice
+    # as every entrant, logged, and published on the heat standings as an
+    # ``init_baseline`` row. It NEVER changes who advances — deliberately (a
+    # heat-side filter would gate short-budget checkpoints on a small slice,
+    # and could empty a whole heat). The ENFORCING floor lives in the
+    # validator's duel instead: ``[scoring] init_gate_mode`` — final-budget
+    # checkpoints, full verdict windows, gift-gate rollout discipline.
+    # Init scoring failure fails OPEN (loud log, row omitted).
+    init_gate_mode: str = "off"       # "off" | "shadow" (heat-side has no enforce)
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
@@ -928,6 +994,21 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Init-baseline floor (see cascade.eval.koth.KothParams.init_gate_mode):
+    # the shared warm-start init scored on the SAME duel windows as an absolute
+    # floor under the crown — a challenger that beat the king but is worse than
+    # "do nothing" cannot be crowned. Same progression as the gift gate:
+    # "off" (default) | "shadow" (floor computed + recorded on the receipt,
+    # verdict unchanged) | "enforce" (AND-ed into the win; can only BLOCK a
+    # dethrone, never grant one — king retention untouched, worst case = king
+    # holds). The measured motivation (2026-08-26): the raw init outscored
+    # every trained entrant post-mix-change, invisibly, because KOTH has no
+    # null baseline. Rounds with no warm_start_ckpt have no baseline — the
+    # floor simply cannot run (recorded None). [scoring] is fleet-consensus:
+    # identical across all validators or verdicts fork — release-then-activate,
+    # shadow first, never straight to enforce.
+    init_gate_mode: str = "off"
+    init_gate_tolerance: float = 0.0
     # Margin denomination (DEC-CA-0027; see cascade.eval.koth.MARGIN_MODES).
     # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
     # "increment" = the warm-start-era rule: the shared init is scored as a
@@ -979,6 +1060,26 @@ class ScoringConfig:
     # the transition round is beyond every validator's scoring horizon.
     prior_contract_digest: str = ""
     contract_from_block: int = 0
+    # Declared-contract gating (DEC-CA-0036). From this block on, a manifest is
+    # gated on the LOCKED terms only — the trainer publishes its full training
+    # contract in the signed manifest (``contract_body``), the validator checks
+    # that body re-hashes to the declared ``contract_digest`` and that its
+    # locked projection (:func:`~cascade.shared.manifest.locked_contract_terms`
+    # — arch_preset, base_arch_digest, expected_gpu, train_seed_salt, and each
+    # extra size's preset/GPU pin) equals the local one. Every other [training]
+    # term is RECORDED, not gated, so a trainer-side fix (runtime image,
+    # recipe, budget) ships the same day instead of waiting on a fleet restart.
+    #
+    # 0 = off: the legacy strict gate (full digest equality against the local
+    # [training]) applies to every round. Flipping this on is the LAST
+    # contract change that needs a coordinated deploy — after it, [training]
+    # edits never again reject a round on an un-upgraded validator. Rounds
+    # before the block still take the strict path, so the flip is replayable
+    # and cascade-audit judges each round under its own rule.
+    #
+    # A manifest with no published body always takes the strict path, whatever
+    # this says — the gate can only relax once the trainer actually declares.
+    declared_contract_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1338,8 @@ class ChainConfig:
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
             margin_mode=self.scoring.margin_mode,
             margin_increment_floor=self.scoring.margin_increment_floor,
+            init_gate_mode=self.scoring.init_gate_mode,
+            init_gate_tolerance=self.scoring.init_gate_tolerance,
         )
 
 
@@ -1346,6 +1449,22 @@ def _gift_gate_mode(value: object) -> str:
     if mode not in _GIFT_GATE_MODES:
         raise ValueError(
             f"[scoring] gift_gate_mode={mode!r} invalid; one of {_GIFT_GATE_MODES}"
+        )
+    return mode
+
+
+_INIT_GATE_MODES = ("off", "shadow", "enforce")
+
+
+def _init_gate_mode(value: object) -> str:
+    """Validate ``[scoring] init_gate_mode`` at load time (gift-gate rule: a
+    typo must fail fast, not silently un-enforce the floor). The heat-side
+    ``[round] init_gate_mode`` is deliberately NOT run through this — its
+    unknown-value semantics are warn-and-off at the use site (DEC-CA-0034)."""
+    mode = str(value)
+    if mode not in _INIT_GATE_MODES:
+        raise ValueError(
+            f"[scoring] init_gate_mode={mode!r} invalid; one of {_INIT_GATE_MODES}"
         )
     return mode
 
@@ -1499,6 +1618,20 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
             anneal_fraction=float(t.get("anneal_fraction", 0.0)),
+            # DEC-CA-0033 knobs (parsing added with DEC-CA-0035 — the fields
+            # landed with dataclass defaults only, so a TOML arming would
+            # have silently no-oped)
+            ema_decay=float(t.get("ema_decay", 0.0)),
+            gen_seed_mix=int(t.get("gen_seed_mix", 1)),
+            rewarmup_fraction=float(t.get("rewarmup_fraction", 0.0)),
+            # DEC-CA-0035 Toto2-aligned constants
+            muon_momentum=float(t.get("muon_momentum", 0.95)),
+            muon_row_beta2=float(t.get("muon_row_beta2", 0.95)),
+            grad_clip=float(t.get("grad_clip", 1.0)),
+            adamw_beta1=float(t.get("adamw_beta1", 0.9)),
+            adamw_beta2=float(t.get("adamw_beta2", 0.999)),
+            adamw_lr_scale=float(t.get("adamw_lr_scale", 1.0)),
+            warm_lr_scale=float(t.get("warm_lr_scale", 1.0)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
@@ -1519,6 +1652,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
+            # DEC-CA-0034 heat shadow row (raw string: unknown values are
+            # warn-and-off at the use site, not a load failure)
+            init_gate_mode=str(r.get("init_gate_mode", "off")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
@@ -1582,6 +1718,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            # DEC-CA-0034 (parsing added with DEC-CA-0035's loader sweep —
+            # same landed-without-parsing defect as the [training] knobs)
+            init_gate_mode=_init_gate_mode(s.get("init_gate_mode", "off")),
+            init_gate_tolerance=float(s.get("init_gate_tolerance", 0.0)),
             margin_mode=_margin_mode(s.get("margin_mode", "level")),
             margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
@@ -1597,6 +1737,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
             prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
             contract_from_block=int(s.get("contract_from_block", 0) or 0),
+            declared_contract_from_block=int(s.get("declared_contract_from_block", 0) or 0),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

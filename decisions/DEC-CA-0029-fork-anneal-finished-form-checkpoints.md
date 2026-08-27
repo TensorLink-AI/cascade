@@ -6,7 +6,7 @@ status: proposed
 date: 2026-08-24
 tags: [cascade, training-recipe, lr-schedule, wsd, anneal, contract-digest, benchmarks]
 revisit_when: "A testnet cascade has run a full round cycle with anneal_fraction armed (gate for the mainnet cut); or measured anneal cost on the reference GPU materially exceeds the budgeted fraction (then revisit the wall stretch); or the 22M size seam arms (re-measure the anneal fraction at size — 15% was calibrated at 4M)"
-relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017}
+relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017, alternative: DEC-CA-0033}
 ---
 This is DEC-CA-0018's anticipated decay branch, built. WSD deliberately
 deferred the "D": rounds hold base_lr flat so the lineage compounds, and no

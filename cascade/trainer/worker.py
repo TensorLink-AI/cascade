@@ -41,7 +41,28 @@ def anneal_recipe(contract):
     which is DEC-CA-0018's deferred decay shape applied post-hoc. Only these
     two recipe fields move; budget, arch, masking, and objective stay the
     leg's own. Never digest-relevant: this contract exists only inside the
-    telemetry leg's process."""
+    telemetry leg's process.
+
+    Refuses an EMA-armed contract (DEC-CA-0033): with ``ema_decay`` set the
+    scored artifact is already finished form, and an anneal leg would bench
+    an EMA-of-a-decay-branch — a recipe nobody calibrated (the DEC-CA-0030
+    "never both" rule extends to EMA, same as fork-anneal)."""
+    if float(getattr(contract, "ema_decay", 0.0) or 0.0):
+        raise ValueError(
+            "bench-anneal leg refused: [training] ema_decay is armed — EMA is "
+            "the finished-form mechanism; never arm bench_anneal_fraction "
+            "with it (DEC-CA-0030 / DEC-CA-0033)"
+        )
+    if float(getattr(contract, "anneal_fraction", 0.0) or 0.0):
+        # Fail fast and clearly: the replaced warmup_cosine contract would
+        # otherwise survive to Toto2Trainer.train and die mid-leg with the
+        # (accurate but misleading) "anneal_fraction requires wsd" error
+        # AFTER the fetch + corpus build were paid.
+        raise ValueError(
+            "bench-anneal leg refused: [training] anneal_fraction is armed — "
+            "fork-anneal already cuts finished-form checkpoints; never arm "
+            "bench_anneal_fraction with it (DEC-CA-0030 / DEC-CA-0029)"
+        )
     return dataclasses.replace(
         contract, lr_schedule="warmup_cosine", warmup_fraction=0.0
     )
