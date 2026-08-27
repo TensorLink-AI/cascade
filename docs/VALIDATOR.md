@@ -111,6 +111,16 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   computed at startup; a validator running across the owner's `[training]` edit
   rejects every round (`contract_digest_mismatch`) until restarted. Owner
   announcements of a re-pin = pull + restart.
+  *Once `[scoring] declared_contract_from_block` is armed (DEC-CA-0036) this
+  shrinks to almost nothing.* The trainer then publishes its full training
+  contract inside each signed manifest, and you gate only the terms you
+  actually consume — `base_arch_digest`, `arch_preset`, `expected_gpu`,
+  `train_seed_salt`, and each extra size's GPU pin. A worker-image re-pin, an
+  optimizer or schedule change, a budget change: your validator keeps scoring
+  straight through, no restart, no announcement to wait on. Run
+  `cascade-audit` as usual — a round trained under terms your `chain.toml`
+  doesn't describe shows up as a `contract-declaration` WARN listing every
+  field that moved, which is the intended way to notice.
 - **Restart in LOCKSTEP after any announced scoring-rule change.** A change to
   how the duel is decided (the aggregation behind `geomean(CRPS, MASE)` — e.g.
   DEC-CA-0009) is a *network* change, not a local one, and unlike a `[training]`
@@ -140,6 +150,8 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
 | symptom | cause |
 |---|---|
 | `rejecting manifest … contract_digest_mismatch` | your file's `[training]` differs from the trainer's — pull the current file AND restart |
+| `rejecting manifest … contract_locked_mismatch` | a LOCKED contract term (arch, size, GPU pin, seed salt) differs — pull + restart; unlike the declared terms these are never waved through |
+| `rejecting manifest … contract_body_mismatch` | the trainer's published contract doesn't hash to the digest it declared — do NOT restart into this; report it, the two claims disagree |
 | `rejecting manifest … signature_invalid` | wrong `[manifest] trainer_hotkey` (don't edit it), or the trainer published unsigned |
 | `no eval-pool snapshot published` | owner hasn't published a snapshot, or wrong pool creds |
 | weights never set | no validator permit (insufficient stake), or the extrinsic fails — check `btcli` and `weight set failed` log lines |

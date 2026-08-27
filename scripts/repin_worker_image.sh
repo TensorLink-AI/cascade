@@ -30,6 +30,23 @@ open(toml, "w").write(s2)
 print(f"pinned {digest} in {toml}")
 PY
 
+DECLARED=$(grep -E '^declared_contract_from_block' "$TOML" | tr -dc '0-9')
+
+if [[ -n "${DECLARED:-}" && "${DECLARED}" != "0" ]]; then
+cat <<PROTO
+
+Re-pin deploy protocol (DEC-CA-0036 declared contract, armed from block ${DECLARED}):
+  1. commit + merge this toml change
+  2. restart the TRAINER. That's it — the image digest is a declared term, not
+     a locked one, so validators keep scoring across the change with no restart
+     and nothing to announce.
+  3. pods: fresh rentals pull the image automatically; static pods must
+     pull ${DIGEST} before the next round
+  4. expect a 'contract-declaration' WARN in cascade-audit naming
+     train_image_digest until the fleet's chain.toml catches up. That WARN is
+     the change being visible, not a fault.
+PROTO
+else
 cat <<PROTO
 
 Re-pin deploy protocol (the digest folds into contract_digest):
@@ -38,4 +55,9 @@ Re-pin deploy protocol (the digest folds into contract_digest):
      (a digest mismatch rejects every manifest until both sides agree)
   3. pods: fresh rentals pull the image automatically; static pods must
      pull ${DIGEST} before the next round
+
+  NOTE: this lockstep step exists only because [scoring]
+  declared_contract_from_block is 0 in ${TOML}. Arming it (DEC-CA-0036) makes
+  an image re-pin a trainer-only deploy.
 PROTO
+fi

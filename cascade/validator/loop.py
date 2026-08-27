@@ -39,6 +39,7 @@ from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    locked_contract_terms,
     parse_trained_pointer,
     verify_signature,
 )
@@ -218,12 +219,65 @@ class ValidatorRunner:
     def check_manifest(self, manifest: TrainingManifest) -> str | None:
         """Return a rejection reason string, or None if the manifest is usable.
 
-        Enforces (1) the trainer-hotkey signature, (2) the contract-digest match
-        (king and challenger trained under the same terms), and (3) that the
-        manifest targets our configured base architecture and eval dataset.
+        Enforces (1) the trainer-hotkey signature, (2) the training-contract
+        gate (see :meth:`_check_contract`), and (3) that the manifest targets
+        our configured base architecture and eval dataset.
         """
         if self.verify_signatures and not verify_signature(manifest, self.cfg.manifest.trainer_hotkey):
             return "signature_invalid"
+        contract_reason = self._check_contract(manifest)
+        if contract_reason is not None:
+            return contract_reason
+        if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
+            return "base_arch_digest_mismatch"
+        if manifest.eval_dataset != self.cfg.eval.eval_dataset:
+            return "eval_dataset_mismatch"
+        gpu_reason = self._check_gpu(manifest)
+        if gpu_reason is not None:
+            return gpu_reason
+        ws_reason = self._check_warm_start(manifest)
+        if ws_reason is not None:
+            return ws_reason
+        return None
+
+    def _check_contract(self, manifest: TrainingManifest) -> str | None:
+        """Gate the round's training contract. Two regimes, block-selected.
+
+        **Declared** (DEC-CA-0036; from ``[scoring] declared_contract_from_block``,
+        and only for a manifest that actually publishes a ``contract_body``):
+        the trainer ships the round's full contract in the signed manifest and
+        this checks two things — that the body re-hashes to the
+        ``contract_digest`` it declares, and that the body's LOCKED projection
+        (:func:`locked_contract_terms`) matches ours. The locked terms are the
+        only ones this validator consumes with its own local value — including
+        ``train_seed_salt``, which the receipt assembler folds into the round's
+        published ``training_seed`` via ``RoundSeeds.derive``; every other
+        ``[training]`` term is recorded and audited but never gates, so the
+        trainer ships runtime and recipe fixes without a fleet restart.
+
+        **Strict** (legacy, and always for a body-less manifest): full digest
+        equality against the local ``[training]``, with the block-gated
+        ``prior_contract_digest`` transition for the round in flight across a
+        contract-changing release.
+
+        Note the asymmetry in where each side is read from: the digest
+        self-consistency check reads the DECLARED body (it proves the trainer's
+        own two statements agree), while the locked comparison comes from LOCAL
+        config on our side — a pin sourced from the declaration would be the
+        trainer gating itself.
+        """
+        declared_from = int(self.cfg.scoring.declared_contract_from_block)
+        if (declared_from and manifest.contract_body is not None
+                and self._epoch_start_block(manifest) >= declared_from):
+            declared = contract_digest(manifest.contract_body)
+            if declared != manifest.contract_digest:
+                return (f"contract_body_mismatch: body hashes to {declared} "
+                        f"but manifest declares {manifest.contract_digest}")
+            want = locked_contract_terms(self.cfg.training)
+            got = locked_contract_terms(manifest.contract_body)
+            if got != want:
+                return f"contract_locked_mismatch: {got} != {want}"
+            return None
         want_contract = contract_digest(self.cfg.training)
         if manifest.contract_digest != want_contract:
             # Block-gated contract transition: a round whose epoch boundary
@@ -237,16 +291,6 @@ class ValidatorRunner:
                     and manifest.contract_digest == prior
                     and self._epoch_start_block(manifest) < from_block):
                 return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
-        if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
-            return "base_arch_digest_mismatch"
-        if manifest.eval_dataset != self.cfg.eval.eval_dataset:
-            return "eval_dataset_mismatch"
-        gpu_reason = self._check_gpu(manifest)
-        if gpu_reason is not None:
-            return gpu_reason
-        ws_reason = self._check_warm_start(manifest)
-        if ws_reason is not None:
-            return ws_reason
         return None
 
     def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
@@ -560,8 +604,12 @@ class ValidatorRunner:
             by_size.setdefault(e.size, []).append(e)
         for size, entries in by_size.items():
             preset = size or primary
-            # An unknown size tag falls back to the base pin — defensive only;
-            # the contract-digest gate rejects such a manifest anyway.
+            # An unknown size tag falls back to the base pin. Defensive: both
+            # contract regimes pin the legal preset set before we get here —
+            # strict by full digest equality, declared by the locked projection
+            # (which carries every extra size's preset) — so a tag outside the
+            # registry means the trainer mislabelled its own entry, and the
+            # base pin is the conservative reading.
             contract = registry.get(preset, self.cfg.training.primary_size)
             pinned = contract.expected_gpu
             gpus = {e.gpu_name for e in entries if e.gpu_name}
