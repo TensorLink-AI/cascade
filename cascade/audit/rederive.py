@@ -20,13 +20,54 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import MISSING
+from dataclasses import fields as dc_fields
 from pathlib import Path
 
-from ..shared.config import ChainConfig
+from ..shared.config import ChainConfig, SizeSpec, TrainingContractConfig
 from ..shared.receipt import RoundReceipt
 from .checks import FAIL, PASS, SKIP, WARN, CheckResult
 
 log = logging.getLogger("cascade.audit")
+
+
+def contract_for_replay(receipt: RoundReceipt, cfg: ChainConfig) -> TrainingContractConfig:
+    """The ``[training]`` contract tiers 1–2 replay under.
+
+    Declared regime (DEC-CA-0036 — gate armed, epoch past it, body published):
+    the round's OWN ``contract_body``, reconstructed into a
+    :class:`TrainingContractConfig`. This is the point of the declared split
+    for auditing: the auditor's local chain.toml is WRONG the first time a
+    declared term moves (a re-pinned image, a recipe change), and a replay
+    against it would re-train the wrong thing. Keys absent from the body are
+    digest-dropped inert defaults, so they take the dataclass default — never
+    the auditor's local value, which may have armed them since.
+
+    Strict regime (gate off, early round, or a body-less manifest): the local
+    ``cfg.training``, exactly as before — where the strict digest gate already
+    guarantees local config IS the round's contract.
+    """
+    body = receipt.manifest.get("contract_body")
+    declared_from = int(cfg.scoring.declared_contract_from_block)
+    if not (declared_from and isinstance(body, dict)
+            and int(receipt.epoch_start_block) >= declared_from):
+        return cfg.training
+    kwargs = {}
+    for f in dc_fields(cfg.training):
+        if f.name in body:
+            val = body[f.name]
+            if f.name == "extra_sizes":
+                val = tuple(SizeSpec(**dict(v)) for v in (val or ()))
+            elif isinstance(getattr(cfg.training, f.name), tuple) and isinstance(val, list):
+                val = tuple(val)  # JSON has no tuples
+            kwargs[f.name] = val
+        elif f.default is not MISSING:
+            kwargs[f.name] = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            kwargs[f.name] = f.default_factory()
+        else:
+            kwargs[f.name] = getattr(cfg.training, f.name)
+    return type(cfg.training)(**kwargs)
 
 # Relative tolerance on geomean(CRPS, MASE) for Tier 2's score comparison on
 # mismatched hardware. Deterministic kernels on a different GPU SKU reorder
@@ -108,12 +149,16 @@ def run_tier1(
     except (ValueError, KeyError) as e:
         return [CheckResult("corpus", FAIL, f"embedded manifest unparseable: {e}")]
 
-    registry = cfg.training.size_registry
+    # DEC-CA-0036: replay under the round's own declared contract when the
+    # declared regime covers it — the local chain.toml stops being the
+    # authority the moment a declared term legitimately moves.
+    training = contract_for_replay(receipt, cfg)
+    registry = training.size_registry
     results: list[CheckResult] = []
     digest_cache: dict[tuple, str] = {}
     for entry in manifest.entries:
-        name = f"corpus:{entry.role}:{entry.size or cfg.training.arch_preset}"
-        contract = registry.get(entry.size) if entry.size else cfg.training.primary_size
+        name = f"corpus:{entry.role}:{entry.size or training.arch_preset}"
+        contract = registry.get(entry.size) if entry.size else training.primary_size
         if contract is None:
             results.append(CheckResult(
                 name, FAIL, f"entry size {entry.size!r} is not a configured size"))
@@ -210,11 +255,16 @@ def run_tier2(
     from ..trainer.stream import open_round_stream
 
     local_gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
-    pinned_img = _image_sha256(cfg.training.train_image_digest)
+    # DEC-CA-0036: the round replays under its own declared contract — the
+    # image pin compared here is the one the ROUND trained under, which is the
+    # whole point (an auditor's re-pinned chain.toml would otherwise flip
+    # image_matched and silently change byte-exact into tolerance comparison).
+    training = contract_for_replay(receipt, cfg)
+    pinned_img = _image_sha256(training.train_image_digest)
     runtime_img = _image_sha256(os.environ.get(TRAIN_IMAGE_DIGEST_ENV, ""))
     image_matched = pinned_img is not None and runtime_img == pinned_img
 
-    registry = cfg.training.size_registry
+    registry = training.size_registry
     base_trainer = _load_trainer(trainer_spec)
     results: list[CheckResult] = []
     # Warm-start pin (DEC-CA-0005): when the signed manifest records a promoted
@@ -234,8 +284,8 @@ def run_tier2(
             return [CheckResult("retrain", FAIL,
                                 f"pinned warm-start init unfetchable ({type(e).__name__}: {e})")]
     for entry in manifest.entries:
-        name = f"retrain:{entry.role}:{entry.size or cfg.training.arch_preset}"
-        contract = registry.get(entry.size) if entry.size else cfg.training.primary_size
+        name = f"retrain:{entry.role}:{entry.size or training.arch_preset}"
+        contract = registry.get(entry.size) if entry.size else training.primary_size
         if contract is None:
             results.append(CheckResult(name, FAIL, f"unknown size {entry.size!r}"))
             continue
@@ -256,8 +306,8 @@ def run_tier2(
             # The pinned init applies to the size it was trained at; other sizes
             # trained (and re-derive) from random init.
             entry_warm = (warm_dir if warm_dir is not None
-                          and (entry.size or cfg.training.arch_preset) ==
-                          (manifest.warm_start_size or cfg.training.arch_preset) else None)
+                          and (entry.size or training.arch_preset) ==
+                          (manifest.warm_start_size or training.arch_preset) else None)
             with open_round_stream(
                 contract.corpus_mode, gen_dir, receipt.generation_seed, cfg.generator,
                 token_budget=contract.train_tokens, use_sandbox=True,
