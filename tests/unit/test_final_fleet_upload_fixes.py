@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from cascade.shared import hippius as hippius_mod
-from cascade.trainer.loop import _FinalLanePool, ResolvedGenerator, TrainerRunner
+from cascade.trainer.loop import ResolvedGenerator, TrainerRunner, _FinalLanePool
 
 
 class _Host:
