@@ -541,6 +541,24 @@ cascade_quality_epsilon = 0.05
 # Retire (""/0) in the release after the transition round ages out.
 prior_contract_digest  = "6420f564f67f54034abbd8a382c771f58304229457ea6f9f11b889491800b9d6"
 contract_from_block    = 8895600
+# Declared-contract gating (DEC-CA-0029). From this block a manifest is gated on
+# the LOCKED terms only — arch_preset, base_arch_digest, expected_gpu, and each
+# extra size's preset/GPU pin — verified against the full training contract the
+# trainer now publishes and signs inside the manifest (`contract_body`). Every
+# other [training] term is recorded and audited but never rejects a round, so a
+# trainer-side fix (runtime image re-pin, recipe change, budget change) ships the
+# same day instead of waiting on six external validators to restart.
+#
+# 0 = OFF, the deployed value: every round takes the legacy strict path (full
+# digest equality against the local [training]). Arming this is the LAST
+# [training]-driven change that needs a coordinated fleet deploy — after it,
+# [training] edits never again reject a round on an un-upgraded validator, and
+# validator restarts are reserved for actual scoring-rule changes ([scoring],
+# [eval], the cascade envelope). Ship the release first, let the fleet upgrade at
+# its own pace, THEN set the block: rounds before it replay strict, rounds after
+# replay declared, and cascade-audit judges each round under its own rule.
+# Fleet-consensus value like every [scoring] key: keep identical across validators.
+declared_contract_from_block = 0
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely

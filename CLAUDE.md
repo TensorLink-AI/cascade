@@ -161,6 +161,21 @@ in-context.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
 
+- **DEC-CA-0029** — The training contract is DECLARED per round (trainer publishes
+  the full `[training]` body in the signed manifest), and validators gate the
+  LOCKED projection only: `base_arch_digest`, `arch_preset`, `expected_gpu` (+ each
+  extra size's preset/GPU pin) — empirically the only `[training]` terms any
+  validator consumes. Everything else (runtime image, recipe, budget, corpus mode,
+  submission surface) is recorded + audited, never a reject. Owner policy: **a
+  validator restart is for an actual scoring change** — `[scoring]`/`[eval]`/the
+  cascade envelope still deploy in lockstep; `[training]` no longer does.
+  `contract_digest` was always an ADMISSION gate, never a scoring input, so
+  widening it is monotonically safe. Audit gets STRONGER (a round replays against
+  its own declared terms, not today's chain.toml); drift surfaces as a
+  `contract-declaration` WARN. Ships OFF (`declared_contract_from_block = 0`);
+  arming it is the last `[training]`-driven coordinated deploy.
+  (`decisions/DEC-CA-0029-declared-training-contract.md`)
+
 ## Proposed (design pass 2026-08-13 — miner submission surface; not yet owner-accepted;
 ## renumbered 2026-08-20: original 0016-0024 collided with the accepted decay/guard/wsd/jitter nodes)
 
@@ -224,7 +239,12 @@ condition in the node's `revisit_when:` key.
 Canonical node: `decisions/NOTE-ca-operational-invariants.md`.
 
 - `[training]` edits change `contract_digest` → the VALIDATOR must restart too,
-  or it rejects every manifest (`contract_digest_mismatch`).
+  or it rejects every manifest (`contract_digest_mismatch`). Held only while
+  `declared_contract_from_block = 0` (the shipped value); once armed
+  (DEC-CA-0029) this narrows to the three LOCKED terms — `base_arch_digest`,
+  `arch_preset`, `expected_gpu` — and every other `[training]` edit ships
+  trainer-side. `[scoring]`/`[eval]`/cascade-envelope changes still need the
+  lockstep window, always.
 - Pods are rsync'd trees, not git checkouts; `uv sync` needs `--all-extras`
   (torch lives behind the `train` extra).
 - Never restart the provisioner inside its pre-boundary trigger window.

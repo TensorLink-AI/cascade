@@ -906,6 +906,26 @@ class ScoringConfig:
     # the transition round is beyond every validator's scoring horizon.
     prior_contract_digest: str = ""
     contract_from_block: int = 0
+    # Declared-contract gating (DEC-CA-0029). From this block on, a manifest is
+    # gated on the LOCKED terms only — the trainer publishes its full training
+    # contract in the signed manifest (``contract_body``), the validator checks
+    # that body re-hashes to the declared ``contract_digest`` and that its
+    # locked projection (:func:`~cascade.shared.manifest.locked_contract_terms`
+    # — arch_preset, base_arch_digest, expected_gpu, and each extra size's
+    # preset/GPU pin) equals the local one. Every other [training] term is
+    # RECORDED, not gated, so a trainer-side fix (runtime image, recipe,
+    # budget) ships the same day instead of waiting on a fleet restart.
+    #
+    # 0 = off: the legacy strict gate (full digest equality against the local
+    # [training]) applies to every round. Flipping this on is the LAST
+    # contract change that needs a coordinated deploy — after it, [training]
+    # edits never again reject a round on an un-upgraded validator. Rounds
+    # before the block still take the strict path, so the flip is replayable
+    # and cascade-audit judges each round under its own rule.
+    #
+    # A manifest with no published body always takes the strict path, whatever
+    # this says — the gate can only relax once the trainer actually declares.
+    declared_contract_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -1501,6 +1521,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
             prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
             contract_from_block=int(s.get("contract_from_block", 0) or 0),
+            declared_contract_from_block=int(s.get("declared_contract_from_block", 0) or 0),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

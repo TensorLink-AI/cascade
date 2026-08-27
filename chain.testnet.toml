@@ -252,6 +252,18 @@ gift_gate_data_dir    = "/root/cascade/bench_data"   # TESTNET: pinned GIFT-Eval
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
+# Declared-contract gating (DEC-CA-0029) — TESTNET: armed from block 1, i.e. LIVE
+# for every round as soon as this release deploys (owner-only fleet; nothing to
+# coordinate). Manifests are gated on the LOCKED terms (arch_preset,
+# base_arch_digest, expected_gpu, per-size pins) against the contract body the
+# trainer now publishes and signs; every other [training] term is recorded, not
+# gated. This is where the mainnet arming gets proved out: change
+# train_image_digest or an optimizer knob on the TRAINER only, leave the
+# validator running, and the round must still score — with `cascade-audit`
+# reporting the drift as a contract-declaration WARN rather than a rejected
+# round.
+declared_contract_from_block = 1
+
 # King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
 # (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
 # 0) to end (at margin_warmup_rounds, clamped after); end < start makes the

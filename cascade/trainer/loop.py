@@ -51,6 +51,7 @@ from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    contract_payload,
     dump_manifest,
     format_trained_pointer,
     parse_trained_pointer,
@@ -2823,6 +2824,11 @@ class TrainerRunner:
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
             warm_start_size=warm_start[1] if warm_start else "",
+            # Publish the round's full training contract (DEC-CA-0029). Signed
+            # with the rest of the manifest, so the terms a round trained under
+            # are pinned to the round itself rather than inferred from whatever
+            # chain.toml says whenever someone later reads it.
+            contract_body=contract_payload(self.cfg.training),
         )
 
     def _log_telemetry_rollup(self, base_seed: int) -> None:
