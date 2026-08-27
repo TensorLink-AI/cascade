@@ -248,6 +248,16 @@ in-context.
   constants + the ratio do. Also fixed DEC-CA-0033's fields never being
   loader-parsed. Arming gate: wave-3 cross-generator separation + testnet.
   (`decisions/DEC-CA-0035-toto2-aligned-constants.md`)
+- **DEC-CA-0036** (proposed, plan-only) — Declared training contract:
+  validators verify self-consistency + a LOCKED projection (arch digest,
+  presets, expected_gpu, train_seed_salt — from LOCAL config) instead of
+  full digest equality; the manifest carries `contract_body` (drop-when-
+  unset, archived signatures survive). `[training]` recipe edits + image
+  re-pins become trainer-restart-only; `[scoring]`/`[eval]`/arch stay
+  lockstep forever. One final coordinated window arms it
+  (`declared_contract_from_block`); first dividend = DEC-CA-0035's cut.
+  Audit Tier-2 must replay FROM the declared body (rederive touchpoint).
+  (`decisions/DEC-CA-0036-declared-training-contract.md`)
 - **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage
