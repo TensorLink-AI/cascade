@@ -125,6 +125,18 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     "ema_decay": (0.0, 0),
     "gen_seed_mix": (1,),
     "rewarmup_fraction": (0.0, 0),
+    # DEC-CA-0035: Toto2-aligned optimizer constants + the warm-start LR
+    # scale. Defaults are the deployed trainer's hardcoded behavior, so
+    # every knob is inert until set; the arming (measured targets: 0.96 /
+    # 0.999 / 7.0 / 0.91,0.972 / 1/54 / 0.125 with weight_decay 2e-8) is
+    # one deliberate contract cut — see the decision node.
+    "muon_momentum": (0.95,),
+    "muon_row_beta2": (0.95,),
+    "grad_clip": (1.0, 1),
+    "adamw_beta1": (0.9,),
+    "adamw_beta2": (0.999,),
+    "adamw_lr_scale": (1.0, 1),
+    "warm_lr_scale": (1.0, 1),
 }
 
 

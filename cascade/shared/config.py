@@ -481,6 +481,30 @@ class TrainingContractConfig:
     # costs +0.11 geomean at base_lr (the u158 probe, reproduced in-run).
     # The from-scratch run's warmup-once semantics are untouched.
     rewarmup_fraction: float = 0.0
+    # ── Toto2-aligned optimizer constants (DEC-CA-0035; digest-bound) ────────
+    # Datadog's Toto 2.0 recipe (arXiv 2605.20119) was HP-swept once at 4M
+    # under u-µP; its DIMENSIONLESS constants transfer directly, its LR
+    # VALUES do not (different parametrization convention — only the
+    # matrix:AdamW ratio carries). Defaults below are today's deployed
+    # behavior, so every knob is drop-when-default digest-inert. Measured
+    # targets (docs/notes/2026-08-27-toto2-alignment.md — the full bundle
+    # @ warm LR 5e-4 BEAT the converged warm-start init by 0.0038, the
+    # campaign best): muon_momentum 0.96, muon_row_beta2 0.999, grad_clip
+    # 7.0, adamw betas (0.91, 0.972), adamw_lr_scale 1/54 ≈ 0.0185, plus
+    # weight_decay → 2e-8 (already a field above — no new knob needed).
+    muon_momentum: float = 0.95    # Muon Nesterov momentum
+    muon_row_beta2: float = 0.95   # NorMuon per-row second-moment EMA decay
+    grad_clip: float = 1.0         # global grad-norm clip in the train loop
+    adamw_beta1: float = 0.9       # AdamW group (embeddings/heads/biases)
+    adamw_beta2: float = 0.999
+    adamw_lr_scale: float = 1.0    # AdamW group LR = base_lr × this (Toto2
+                                   # runs the matrix:AdamW split at 54:1)
+    # warm_lr_scale < 1: WARM-STARTED runs train at base_lr × warm_lr_scale,
+    # keyed off the same warm_started signal wsd's warmup-once already uses;
+    # from-scratch (generation-start) runs keep full base_lr. Measured
+    # target 0.125 (→ 5e-4): a converged init tolerates far less LR than a
+    # random one, and no re-warmup trick substitutes (DEC-CA-0033 verdict).
+    warm_lr_scale: float = 1.0
 
     def tokens_for_hours(self, hours: float) -> int:
         """Point-pass budget for ``hours`` on the reference GPU at this size's
@@ -1409,6 +1433,22 @@ def _gift_gate_mode(value: object) -> str:
     return mode
 
 
+_INIT_GATE_MODES = ("off", "shadow", "enforce")
+
+
+def _init_gate_mode(value: object) -> str:
+    """Validate ``[scoring] init_gate_mode`` at load time (gift-gate rule: a
+    typo must fail fast, not silently un-enforce the floor). The heat-side
+    ``[round] init_gate_mode`` is deliberately NOT run through this — its
+    unknown-value semantics are warn-and-off at the use site (DEC-CA-0034)."""
+    mode = str(value)
+    if mode not in _INIT_GATE_MODES:
+        raise ValueError(
+            f"[scoring] init_gate_mode={mode!r} invalid; one of {_INIT_GATE_MODES}"
+        )
+    return mode
+
+
 def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     """Load and parse ``chain.toml``. Raises on a missing file or unsupported
     (too-old) schema; warns and proceeds on a newer schema."""
@@ -1558,6 +1598,20 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
             anneal_fraction=float(t.get("anneal_fraction", 0.0)),
+            # DEC-CA-0033 knobs (parsing added with DEC-CA-0035 — the fields
+            # landed with dataclass defaults only, so a TOML arming would
+            # have silently no-oped)
+            ema_decay=float(t.get("ema_decay", 0.0)),
+            gen_seed_mix=int(t.get("gen_seed_mix", 1)),
+            rewarmup_fraction=float(t.get("rewarmup_fraction", 0.0)),
+            # DEC-CA-0035 Toto2-aligned constants
+            muon_momentum=float(t.get("muon_momentum", 0.95)),
+            muon_row_beta2=float(t.get("muon_row_beta2", 0.95)),
+            grad_clip=float(t.get("grad_clip", 1.0)),
+            adamw_beta1=float(t.get("adamw_beta1", 0.9)),
+            adamw_beta2=float(t.get("adamw_beta2", 0.999)),
+            adamw_lr_scale=float(t.get("adamw_lr_scale", 1.0)),
+            warm_lr_scale=float(t.get("warm_lr_scale", 1.0)),
         ),
         round=RoundConfig(
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
@@ -1578,6 +1632,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
+            # DEC-CA-0034 heat shadow row (raw string: unknown values are
+            # warn-and-off at the use site, not a load failure)
+            init_gate_mode=str(r.get("init_gate_mode", "off")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
@@ -1641,6 +1698,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            # DEC-CA-0034 (parsing added with DEC-CA-0035's loader sweep —
+            # same landed-without-parsing defect as the [training] knobs)
+            init_gate_mode=_init_gate_mode(s.get("init_gate_mode", "off")),
+            init_gate_tolerance=float(s.get("init_gate_tolerance", 0.0)),
             margin_mode=_margin_mode(s.get("margin_mode", "level")),
             margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),

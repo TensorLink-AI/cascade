@@ -53,6 +53,16 @@ def anneal_recipe(contract):
             "the finished-form mechanism; never arm bench_anneal_fraction "
             "with it (DEC-CA-0030 / DEC-CA-0033)"
         )
+    if float(getattr(contract, "anneal_fraction", 0.0) or 0.0):
+        # Fail fast and clearly: the replaced warmup_cosine contract would
+        # otherwise survive to Toto2Trainer.train and die mid-leg with the
+        # (accurate but misleading) "anneal_fraction requires wsd" error
+        # AFTER the fetch + corpus build were paid.
+        raise ValueError(
+            "bench-anneal leg refused: [training] anneal_fraction is armed — "
+            "fork-anneal already cuts finished-form checkpoints; never arm "
+            "bench_anneal_fraction with it (DEC-CA-0030 / DEC-CA-0029)"
+        )
     return dataclasses.replace(
         contract, lr_schedule="warmup_cosine", warmup_fraction=0.0
     )

@@ -176,3 +176,10 @@ def test_bench_unarmed_is_byte_identical_to_before(cfg, monkeypatch):
                         _fake_bench)
     r._remote_bench_scores(host, entry, "42", "toto2-4m")
     assert benched["rid"] == "42" and benched["role"] == "king"
+
+
+def test_anneal_recipe_refuses_fork_anneal_armed(cfg):
+    """Fail fast at the recipe, not mid-leg after fetch + corpus build."""
+    c = replace(cfg.training.primary_size, anneal_fraction=0.15)
+    with pytest.raises(ValueError, match="anneal_fraction is armed"):
+        worker_mod.anneal_recipe(c)

@@ -2681,6 +2681,13 @@ class TrainerRunner:
                 timeout_seconds=self.remote_timeout_seconds,
                 extra_forward_env=self._pod_extra_forward_env(),
             )
+            # warm_start_ref makes the leg warm_started=True in the trainer, so
+            # under an armed [training] warm_lr_scale (DEC-CA-0035) its cosine
+            # decays from base_lr × scale. Exactly right for warm-started duel
+            # checkpoints (matches their stable-phase LR); for a generation-
+            # start checkpoint (stable phase ran full base_lr) the leg starts
+            # one notch low — accepted: telemetry-only, errs conservative, and
+            # all legs stay mutually comparable at the same start LR.
             disp.dispatch(
                 host, gen_ref=entry.gen_ref, uid=entry.miner_uid,
                 hotkey=entry.miner_hotkey, role=entry.role,
