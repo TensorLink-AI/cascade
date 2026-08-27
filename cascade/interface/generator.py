@@ -545,6 +545,7 @@ def drain_generator(
     accepted_fields: tuple[str, ...] | list[str] = (),
     max_missing_frac: float = 1.0,
     allow_future_known: bool = False,
+    target_points: int = 0,
     extra_series_check=None,
 ) -> list[np.ndarray | dict[str, np.ndarray]]:
     """Pull ``n_series`` series from ``gen``, validating each one.
@@ -553,6 +554,16 @@ def drain_generator(
     total emitted points (a memory / time guard against a generator that emits a
     few enormous series). Raises ``ValueError`` if the generator yields the wrong
     count, a malformed series, or blows the point budget.
+
+    ``target_points`` (DEC-CA-0031) switches the drain to a POINTS
+    denomination: when > 0, ``n_series`` is only the upper bound handed to
+    ``generate`` (callers size it like the stream's prefix bound) and the
+    drain stops at the first series that brings cumulative values-points to
+    at least the target — the series count is free, so a generator may trade
+    length against count under one corpus size. The consumed prefix is
+    deterministic in (seed, ``n_series``), exactly like the streaming feed's
+    early stop. A generator that exhausts its yields below the target is
+    rejected. 0 keeps the legacy exact-count contract.
 
     ``max_abs`` and ``reject_constant`` are forwarded to :func:`check_series` as
     per-series data-quality gates (see there). ``max_dup_fraction`` is a
@@ -603,6 +614,7 @@ def drain_generator(
     seen: set[bytes] = set()
     dups = 0
     out: list[np.ndarray | dict[str, np.ndarray]] = []
+    points = 0
     for i, item in enumerate(gen.generate(n_series)):
         if i >= n_series:
             raise ValueError(
@@ -616,7 +628,18 @@ def drain_generator(
             else:
                 seen.add(key)
         out.append(element)
-    if len(out) != n_series:
+        if target_points > 0:
+            values = element["values"] if isinstance(element, dict) else element
+            points += int(values.size)
+            if points >= target_points:
+                break
+    if target_points > 0:
+        if points < target_points:
+            raise ValueError(
+                f"generate exhausted after {len(out)} series / {points} points; "
+                f"corpus_target_points={target_points} not reached"
+            )
+    elif len(out) != n_series:
         raise ValueError(
             f"generate yielded {len(out)} series; expected exactly {n_series}"
         )

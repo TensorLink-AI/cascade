@@ -54,6 +54,11 @@ def cfg() -> ChainConfig:
     c = load_chain_config(REPO_ROOT / "chain.toml")
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
+                   # corpus_target_points ships ARMED (DEC-CA-0031): a points-
+                   # denominated drain would override every fixture's small
+                   # corpus_n_series with a 67M-point draw. Tests that exercise
+                   # the points path arm it explicitly via replace().
+                   generator=replace(c.generator, corpus_target_points=0),
                    round=replace(c.round, commit_floor_block=0, dedup_mode="off"),
                    manifest=replace(c.manifest, validator_hotkey=""))
 

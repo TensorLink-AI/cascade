@@ -12,11 +12,38 @@ description = "Synthetic time-series training data, KOTH on CRPS + MASE of a Tot
 [generator]
 # Bounds the trainer enforces on every generator's output; a violation
 # disqualifies the generator for the round.
-corpus_n_series      = 16384     # series drawn from each generator per training run
+corpus_n_series      = 16384     # legacy exact-count drain; superseded while corpus_target_points
+                                 # is armed (below), still the probe/off-switch denomination
 min_length           = 64        # per-series length band (timesteps)
 max_length           = 4096      # keep in lockstep with [training] context_length
 max_total_points     = 2_000_000_000
-max_generate_seconds = 1800      # wall-clock budget for draining the generator
+# Points-denominated materialised drain (DEC-CA-0031): the cache_reuse /
+# `cascade verify` drain stops at this many cumulative values-points instead of
+# at a fixed series count — 67_108_864 = 16384 × 4096, today's corpus size, but
+# a miner may now spend it as 65k×1024 (or any shape inside the length band).
+# GP/kernel draws scale ~cubically in length, so the fixed count pinned those
+# priors into their worst corner; freeing the count is what makes them
+# affordable inside max_generate_seconds. Inert for the live stream_cpu feed
+# (which already stops at the training token budget) and for the dedup probe
+# (count-denominated by construction). Not in contract_digest — no [generator]
+# key is — so this is an operational (trainer-side) knob, no coordinated
+# restart. 0 = legacy exactly-corpus_n_series drain.
+corpus_target_points = 67_108_864
+max_generate_seconds = 7200      # batch-drain budget: RLIMIT_CPU + wall for a materialised
+                                 # (cache_reuse / verify) generator run. 1800 → 7200
+                                 # (DEC-CA-0031): at 1800 every measured GP-prior was 13–116×
+                                 # over budget; 7200 admits the gp prior at L=4096 with the
+                                 # relative-jitter Cholesky (docs/MINER.md) and the cheaper
+                                 # priors at reduced length under corpus_target_points.
+                                 # RLIMIT_CPU sums across threads (multiprocessing is a
+                                 # blocked import), so multi-core BLAS burns it faster —
+                                 # single-thread your linear algebra.
+# Streaming per-frame stall window (seconds between series before the child is
+# killed). Split out of max_generate_seconds (DEC-CA-0031) so the batch-budget
+# raise above does NOT widen how long a stalled generator can idle a heat/final
+# lane — 1800 preserves the pre-split streaming behaviour exactly. 0 = fall
+# back to max_generate_seconds.
+stream_stall_seconds = 1800
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
 max_channels         = 1         # per-series variates; 1 = univariate
@@ -27,9 +54,16 @@ max_channels         = 1         # per-series variates; 1 = univariate
 # into [training] — one deliberate contract_digest bump).
 interface_version    = 1
 # Carrier cap in canonical payload BYTES — the denomination that stays correct
-# when non-values fields arrive. 16e9 = max_total_points × 8 (float64): exactly
-# today's point cap, so it is numerically inert. 0 disables.
-max_payload_bytes    = 16_000_000_000
+# when non-values fields arrive. Originally 16e9 = max_total_points × 8
+# (float64), calibrated to the MATERIALISED DRAIN and "numerically inert" by
+# design. v0.6.0 (d4141d8) armed it on the cumulative live STREAM, where a
+# full-budget run legitimately serves token_budget × 8 bytes (finals: 40B
+# tokens ≈ 320 GB) — every r33 run silently stopped at ~2.0B tokens (~5-15%
+# of budget; OPSLOG 2026-08-21). HOTFIX: raised above the largest stream
+# budget so the consumer's token-budget stop binds again (pre-v0.6.0
+# semantics); drains stay memory-guarded by max_total_points. Restore a
+# stream-shaped cap (per-corpus, cycling-aware) in v0.6.1. 0 disables.
+max_payload_bytes    = 400_000_000_000
 # Per-series cap on the masked fraction, active only once "mask" is accepted
 # via [training] accepted_fields (DEC-CA-0023).
 max_missing_frac     = 0.5
@@ -103,6 +137,17 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
                                   # momentum/row-EMA/AdamW moments survive the round boundary.
                                   # [training] edit ⇒ contract_digest changed: restart trainer
                                   # AND validator together (flipped from warmup_cosine 2026-08-14).
+# anneal_fraction  = 0.15         # fork-anneal (DEC-CA-0029, wsd's deferred "D"): each run ends
+                                  # with a cosine decay base_lr -> 0 over this fraction of extra
+                                  # tokens; the ANNEALED weights become the scored checkpoint
+                                  # (weights.safetensors) and the mid-stable branch rides beside
+                                  # it (weights_stable.safetensors + optimizer.safetensors) for
+                                  # warm-start continuity. Wall stretches by the same fraction.
+                                  # OFF (0.0) = today's mid-stable artifacts, digest untouched.
+                                  # ARMING CHECKLIST (a contract cut, the 2026-08-14 playbook):
+                                  # testnet full cycle first; recompute contract_digest
+                                  # (cascade-trainer --offline); coordinated release-then-activate
+                                  # with ALL external validators; OPSLOG entry.
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit
@@ -418,7 +463,17 @@ mix_jitter_alpha     = 4.0       # symmetric Dirichlet over domains (expectation
 mix_block_slots      = 8         # allocation unit: a cell is absent or gets >= 1 block
 mix_class_keep_frac  = 0.7       # per-round dgp_class activation fraction
 mix_series_bag_frac  = 0.7       # per-round series eligibility (salted-hash bag)
-mix_target_windows   = 1200      # jittered draw size; inert until mix_from_block is set
+mix_target_windows   = 1200
+# DEC-CA-0032 two-tier domain split: domains too small to fill an even share
+# of the draw always draw AT capacity (the flat jitter could starve them
+# below even their caps); the remaining domains split the rest evenly under
+# the tight tier alpha (+/-2-3pp on a ~4-domain residual set). Degenerates to
+# a tight even split over ALL domains once every domain clears an even share
+# — i.e. converges to uniform as pool capacity floors (300/domain) land.
+# CONSENSUS: all validators must flip at the same boundary — set
+# mix_tier_from_block only in a coordinated release (0 = flat split).
+mix_tier_from_block  = 0         # MAINNET: OFF until the coordinated release pins a boundary
+mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -699,3 +754,15 @@ host_bench = true               # + the fixed calibration bench (host_bench_toke
 # duel bench + train leg + one more bench (~6-7h total at the 3h budget) — or
 # a dedicated pod. Testnet first, one full cycle.
 scratch_shadow_every_rounds = 0
+# bench_anneal_fraction = 0.15  # bench-anneal (DEC-CA-0030): before the post-round bench sweep,
+                                # resume each duel checkpoint (weights + optimizer, fresh salted
+                                # corpus) under a pure cosine decay base_lr -> 0 for this fraction
+                                # of the full budget, and bench the ANNEALED copy — the signed
+                                # BenchScores (public bench stream, promotion picks, DEC-CA-0017
+                                # guard) then read finished form instead of wsd's mid-stable
+                                # artifacts. Canonical checkpoints, manifest, bench-report wire
+                                # format, and every validator-verified byte untouched — TRAINER
+                                # RESTART ONLY, no validator involvement. Anneal-leg failure falls
+                                # back to benching the raw checkpoint. Costs ~fraction x one
+                                # training leg per benched checkpoint on the same pod; size
+                                # [eval] bench_hold_max_hours accordingly. 0.0/absent = off.

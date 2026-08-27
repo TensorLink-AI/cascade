@@ -40,6 +40,7 @@ from ..shared.hippius import (
     S3Store,
     StorageError,
     fetch_from_hub,
+    generator_archive_key,
     manifest_round_key,
     publish_manifest,
     upload_dir_to_hub_or_hf,
@@ -111,6 +112,14 @@ RunoffFn = Callable[
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+# Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
+# a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
+# never re-fits the round's exact training draw, and the salted seed keys the
+# leg's _train_work dir + checkpoint repo away from every canonical name.
+# Value matches the 2026-08-23 offline calibration runs, so their published
+# -anneal-u<uid> artifacts stay reproducible under the production leg.
+BENCH_ANNEAL_SALT = 0xA11EA1A11EA1
 
 # Dedup probe stage: concurrent sandboxes, and the floor under the per-draw
 # wall clock derived from [round] dedup_probe_budget_seconds (a budget so tight
@@ -998,6 +1007,35 @@ class TrainerRunner:
         finally:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
+    def _archive_generator_tree(self, ref: str, d: Path) -> None:
+        """Best-effort audit archive of a fetched generator tree.
+
+        Miners routinely delete their repos post-round (OPSLOG 2026-08-25:
+        three deletions in one night broke an anneal and two legs' audit
+        replay); the resolve-time fetch is the one guaranteed moment the code
+        exists. Tar the tree to the manifest bucket under its ref key — the
+        mirror store dual-writes to R2 like every other put. Skip-if-present
+        keeps it idempotent across retries; ANY failure is swallowed — the
+        archive must never disturb the round it is recording.
+        """
+        import io
+        import tarfile
+        try:
+            store = self.manifest_store()
+            key = generator_archive_key(ref)
+            try:
+                store.get_bytes(key)
+                return  # already archived (tars are KBs; a GET probe is fine)
+            except Exception:  # noqa: BLE001 — missing/unreadable ⇒ (re)write
+                pass
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                tar.add(str(d), arcname=".")
+            store.put_bytes(key, buf.getvalue())
+            log.info("archived generator %s (%d bytes)", ref[:60], buf.tell())
+        except Exception as e:  # noqa: BLE001 — never sink a round for the archive
+            log.warning("generator archive failed for %s (ignored): %s", ref[:60], e)
+
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
     # Probe concurrency: sandboxes are subprocesses, each holding up to
     # [generator] max_memory_mb, so this also bounds the stage's peak RSS.
@@ -1091,6 +1129,7 @@ class TrainerRunner:
             try:
                 king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
                                                hub=self.hub()))
+                self._archive_generator_tree(king.ref, king_dir)
                 king_fp = fingerprint_dir(king_dir, **fp_kwargs)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
@@ -1105,6 +1144,7 @@ class TrainerRunner:
         for c in entrants:
             try:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+                self._archive_generator_tree(c.ref, d)
                 # A repo over [generator] max_repo_mb fails its heat run anyway
                 # (build_round_corpus checks the same bound), so there is no
                 # reason to spend fingerprint time on it — and skipping it
@@ -1233,9 +1273,13 @@ class TrainerRunner:
                     rnd.dedup_probe_budget_seconds, grace)
                 probe_mode, probe_enforce, probe_n, per_draw = "off", False, 0, 0
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
+            # corpus_target_points is zeroed: the probe compares SMALL
+            # fixed-count draws across entrants, so it must stay count-
+            # denominated even when the materialised drain is armed points-
+            # denominated (DEC-CA-0031).
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
-                max_generate_seconds=per_draw)
+                max_generate_seconds=per_draw, corpus_target_points=0)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
             log.info("dedup-probe[%s]: %d survivor(s), %d wave(s), %ss per draw "
                      "(stage budget %ss)", probe_mode, len(survivors), waves,
@@ -2574,16 +2618,87 @@ class TrainerRunner:
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str
     ) -> BenchScores | None:
-        """One remote sweep → six numbers, or ``None`` on any miss."""
+        """One remote sweep → six numbers, or ``None`` on any miss.
+
+        With ``[telemetry] bench_anneal_fraction`` armed (DEC-CA-0030) the
+        sweep scores an ANNEALED copy of the checkpoint — finished-form
+        numbers for the signed BenchScores — falling back to the raw
+        checkpoint on any anneal-leg failure."""
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import run_post_round_benchmark
 
+        bench_round, bench_role = round_id, entry.role
+        frac = float(getattr(self.cfg.telemetry, "bench_anneal_fraction", 0.0) or 0.0)
+        if frac > 0.0:
+            annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac)
+            if annealed is not None:
+                bench_round, bench_role = annealed
         report = run_post_round_benchmark(
-            host, round_id, entry.size or primary, self.cascade_bench_plan,
-            work_root=self.work_root, role=entry.role,
+            host, bench_round, entry.size or primary, self.cascade_bench_plan,
+            work_root=self.work_root, role=bench_role,
         )
         scores = extract_bench_scores(report) if report is not None else None
         return BenchScores(**scores) if scores is not None else None
+
+    def _dispatch_bench_anneal(
+        self, host: object, entry: TrainedEntry, round_id: str, primary: str,
+        frac: float,
+    ) -> tuple[str, str] | None:
+        """Run the bench-anneal leg (DEC-CA-0030) for one duel checkpoint on
+        the pod that trained it, returning the ``(round_dir, role_dir)`` pair
+        naming the annealed checkpoint's ``_train_work`` location for the
+        bench sweep — or ``None`` on any failure (the caller benches the raw
+        checkpoint instead; log-only telemetry must never lose the sweep).
+
+        The leg is a stock worker run: resume ``entry.trained_pointer``
+        (weights + optimizer state) on a FRESH salted corpus for
+        ``frac × target_train_hours`` under the pure-decay recipe
+        (``--anneal``). The salt keys the work dir + checkpoint repo away
+        from every canonical name, so nothing this leg writes can collide
+        with a consensus artifact."""
+        from .remote import RemoteDispatcher, pod_lane_count
+
+        if not self.trainer_spec:
+            log.warning("round=%s: bench-anneal skipped (no trainer_spec — "
+                        "benching the raw checkpoint)", round_id)
+            return None
+        size = entry.size or primary
+        contract = self.cfg.training.primary_size
+        if size != contract.arch_preset:
+            spec = next((sp for sp in self.cfg.training.extra_sizes
+                         if sp.arch_preset == size), None)
+            if spec is None:
+                log.warning("round=%s: bench-anneal skipped for unknown size %r",
+                            round_id, size)
+                return None
+            contract = self.cfg.training.for_size(spec)
+        salted = (int(round_id) ^ BENCH_ANNEAL_SALT) & ((1 << 63) - 1)
+        suffix = f"-anneal-u{entry.miner_uid}"
+        try:
+            disp = RemoteDispatcher(
+                trainer_spec=self.trainer_spec,
+                timeout_seconds=self.remote_timeout_seconds,
+                extra_forward_env=self._pod_extra_forward_env(),
+            )
+            disp.dispatch(
+                host, gen_ref=entry.gen_ref, uid=entry.miner_uid,
+                hotkey=entry.miner_hotkey, role=entry.role,
+                base_seed=salted, block=entry.train_block,
+                arch_preset=size, train_hours=contract.target_train_hours * frac,
+                repo_suffix=suffix, warm_start_ref=entry.trained_pointer,
+                lane_count=pod_lane_count(host, [host]), anneal=True,
+            )
+        except Exception as e:  # noqa: BLE001 — telemetry: fall back, never raise
+            log.warning("round=%s: bench-anneal leg failed for %s %s (benching "
+                        "the raw checkpoint instead): %s",
+                        round_id, entry.role, entry.miner_hotkey, e)
+            return None
+        log.info("round=%s: bench-anneal leg done for %s %s (frac=%.2f) — "
+                 "benching the annealed copy", round_id, entry.role,
+                 entry.miner_hotkey, frac)
+        # The worker wrote _train_work/<salted>/<size>/<role><suffix>/checkpoint
+        # (dir = role + repo suffix, same layout the scratch shadow benches).
+        return str(salted), f"{entry.role}{suffix}"
 
     def _log_bench_pair_wandb(self, report: object) -> None:
         """Mirror the round's king/challenger bench pair to wandb when

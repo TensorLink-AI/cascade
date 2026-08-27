@@ -34,6 +34,19 @@ from .main import _load_trainer
 from .remote import RECEIPT_SENTINEL
 
 
+def anneal_recipe(contract):
+    """The bench-anneal recipe (DEC-CA-0030): the same contract with the LR
+    schedule swapped to a pure cosine decay — ``warmup_cosine`` with
+    ``warmup_fraction = 0`` decays base_lr → 0 across the (reduced) budget,
+    which is DEC-CA-0018's deferred decay shape applied post-hoc. Only these
+    two recipe fields move; budget, arch, masking, and objective stay the
+    leg's own. Never digest-relevant: this contract exists only inside the
+    telemetry leg's process."""
+    return dataclasses.replace(
+        contract, lr_schedule="warmup_cosine", warmup_fraction=0.0
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cascade-train-worker",
                                 description="Train one generator for one round (remote worker).")
@@ -57,6 +70,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Fetched from the registry (digest-verified) and loaded as the run's "
                         "init weights; a fetch/load failure fails the run — it never falls "
                         "back to random init. Omitted ⇒ random init.")
+    p.add_argument("--anneal", action="store_true",
+                   help="Bench-anneal leg (telemetry, DEC-CA-0030): resume --warm-start-ref "
+                        "(weights + optimizer state) under a pure cosine decay base_lr -> 0 "
+                        "across the --train-hours budget, no warmup. A trainer-LOCAL recipe "
+                        "override — the [training] contract and every canonical checkpoint "
+                        "are untouched; requires --warm-start-ref and --train-hours.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -97,6 +116,10 @@ def main(argv: list[str] | None = None) -> int:
     # dispatch the cheap screen budget, finals don't. One flag drives both the
     # wall-clock scaling and the telemetry label, so they never drift.
     is_heat = args.train_hours is not None
+    if args.anneal and not (args.warm_start_ref and is_heat):
+        log.error("--anneal requires --warm-start-ref (the checkpoint to finish) "
+                  "and --train-hours (the decay budget)")
+        return 2
     if is_heat:
         # Heat/screen run: scale the token budget AND the hard wall-clock cap
         # to the cheap budget, so a stalling generator costs this pod minutes,
@@ -107,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
             guard_factor=cfg.round.heat_guard_factor,
             guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
         )
+    if args.anneal:
+        contract = anneal_recipe(contract)
     token_budget = contract.train_tokens
     if not is_heat:
         # Full-budget run ⇒ this is a FINAL: this pod is the runtime, so the

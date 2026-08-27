@@ -48,6 +48,14 @@ LOG_EVERY_STEPS = 50
 # next warm-started round continues the optimiser instead of rebuilding it.
 OPTIM_STATE_FILE = "optimizer.safetensors"
 
+# Mid-stable lineage branch written beside the annealed weights on fork-anneal
+# runs (DEC-CA-0029): when [training] anneal_fraction > 0 the checkpoint's
+# ``weights.safetensors`` is the ANNEALED (finished-form) model that every
+# scoring layer loads, and this file + OPTIM_STATE_FILE carry the undecayed
+# stable-phase state the next warm-started round resumes from — a lineage must
+# continue mid-stable, never from a decayed-to-zero endpoint.
+STABLE_WEIGHTS_FILE = "weights_stable.safetensors"
+
 
 class _TimedStream:
     """Iterator shim that accumulates seconds spent blocked in ``next()``.
@@ -117,6 +125,15 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
         return base_lr
     progress = (token_pos - warmup) / max(1, total - warmup)
     progress = min(1.0, max(0.0, progress))
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _anneal_lr(anneal_pos: int, anneal_total: int, base_lr: float) -> float:
+    """LR during the fork-anneal phase (DEC-CA-0029): cosine from ``base_lr``
+    at the fork down to 0 at ``anneal_total`` tokens. Separate from
+    :func:`_lr_at` — the stable phase's schedule semantics (warmup-once,
+    flat) stay byte-identical, and this decay applies only past the fork."""
+    progress = min(1.0, max(0.0, anneal_pos / max(1, anneal_total)))
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -451,7 +468,13 @@ class Toto2Trainer:
             # size/architecture mismatch must abort the run, never silently
             # train from partial or random weights.
             from safetensors.torch import load_file
-            weights = Path(warm_start_dir) / "weights.safetensors"
+            # A fork-annealed init (DEC-CA-0029) carries the mid-stable
+            # lineage branch beside its annealed eval weights; the lineage
+            # resumes from THAT, never from the decayed endpoint. Pre-anneal
+            # checkpoints have no stable file and load their only weights.
+            weights = Path(warm_start_dir) / STABLE_WEIGHTS_FILE
+            if not weights.is_file():
+                weights = Path(warm_start_dir) / "weights.safetensors"
             state = load_file(str(weights))
             model.load_state_dict(
                 {k: v.to(self.device, self.dtype) for k, v in state.items()}
@@ -478,6 +501,27 @@ class Toto2Trainer:
                 Path(warm_start_dir), optimizer, model
             )
 
+        # Fork-anneal (DEC-CA-0029): past the stable budget the run forks —
+        # mid-stable weights + optimizer state are snapshotted for the lineage,
+        # then training continues for anneal_tokens under a cosine decay to 0
+        # and the ANNEALED weights become the checkpoint's eval artifact. Only
+        # meaningful under wsd (the other schedules already end decayed or are
+        # self-contained); a mis-config aborts loudly, like an unknown schedule.
+        anneal_frac = float(getattr(contract, "anneal_fraction", 0.0) or 0.0)
+        if anneal_frac:
+            if not 0.0 < anneal_frac < 1.0:
+                raise ValueError(
+                    f"[training] anneal_fraction must be in (0, 1); got {anneal_frac}"
+                )
+            if schedule != "wsd":
+                raise ValueError(
+                    f"[training] anneal_fraction={anneal_frac} requires "
+                    f"lr_schedule='wsd'; got {schedule!r} (cosine already decays; "
+                    "warmup_flat has no decay branch defined)"
+                )
+        anneal_tokens = int(round(token_budget * anneal_frac))
+        stable_state: dict | None = None
+
         max_ctx_patches = max(2, cfg.context_length // cfg.patch_size)
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
@@ -489,7 +533,8 @@ class Toto2Trainer:
         # init never eat the budget (material at testnet-scale budgets). Waits
         # for data DURING training do count — that is the anti-trickler bound —
         # and a first batch that never arrives is killed by the sandbox's
-        # max_generate_seconds inactivity timeout, not this deadline.
+        # stall window (stream_stall_seconds, falling back to
+        # max_generate_seconds — DEC-CA-0031), not this deadline.
         t0 = time.time()                     # provisional (re-anchored at first batch)
         deadline: float | None = None
 
@@ -617,8 +662,11 @@ class Toto2Trainer:
                 weight = w
             loss = weighted_pinball_loss(pred_q, target, tuple(levels), weight=weight)
 
-            lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
-                        schedule=schedule, warm_started=warm_started)
+            if anneal_tokens and tokens >= token_budget:
+                lr = _anneal_lr(tokens - token_budget, anneal_tokens, contract.base_lr)
+            else:
+                lr = _lr_at(tokens, token_budget, warmup, contract.base_lr,
+                            schedule=schedule, warm_started=warm_started)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr * grp.get("lr_scale", 1.0)
             optimizer.zero_grad(set_to_none=True)
@@ -644,7 +692,19 @@ class Toto2Trainer:
                     # live starvation signal: rides the existing S3/wandb sink
                     "data_wait_frac": round(timed_stream.wait_s / elapsed, 3),
                 })
-            if tokens >= token_budget or time.time() > deadline:
+            if anneal_tokens and stable_state is None and tokens >= token_budget:
+                # The fork: the stable phase just completed. Snapshot the
+                # lineage branch (weights + optimizer, CPU copies) BEFORE any
+                # decayed step touches the live model, and stretch the wall by
+                # the anneal's share so the decay isn't eaten by the stable
+                # phase's guard.
+                stable_state = self._stable_snapshot(model, optimizer)
+                if deadline is not None:
+                    deadline += anneal_frac * contract.max_train_seconds
+                log.info("fork-anneal: stable phase complete at %d tokens; "
+                         "annealing %d tokens (cosine base_lr -> 0)",
+                         tokens, anneal_tokens)
+            if tokens >= token_budget + anneal_tokens or time.time() > deadline:
                 break
 
         train_seconds = time.time() - t0     # actual training time (from first batch)
@@ -694,6 +754,12 @@ class Toto2Trainer:
             "lr_schedule": schedule,
             "optim_state_resumed": optim_resumed,
         }
+        # Fork-anneal telemetry (DEC-CA-0029) — present only when armed, so
+        # unarmed run metrics stay byte-identical. A partial anneal (wall hit
+        # mid-decay) shows as anneal_tokens_seen < anneal_tokens.
+        if anneal_tokens:
+            metrics["anneal_tokens"] = anneal_tokens
+            metrics["anneal_tokens_seen"] = max(0, tokens - token_budget)
         # Shadow channel-redundancy summary — present ONLY when the corpus
         # carried multichannel series, so univariate run metrics stay
         # byte-identical to pre-telemetry builds. [telemetry]-class data: no
@@ -705,7 +771,25 @@ class Toto2Trainer:
             logger({"event": "done", **metrics})
 
         self._save_checkpoint(out_dir, model, cfg, tuple(levels), contract)
-        if schedule == "wsd":
+        if anneal_tokens:
+            # weights.safetensors above is the ANNEALED model (finished form —
+            # what every scoring layer loads). The lineage branch rides beside
+            # it: mid-stable weights + the optimizer state AS OF THE FORK, so
+            # a warm-start continues the undecayed line. A run whose wall
+            # expired inside the stable phase never forked — its endpoint IS
+            # mid-stable, snapshot it now (the two weight files then match,
+            # and deadline_hit already marks the run as under-budget).
+            if stable_state is None:
+                stable_state = self._stable_snapshot(model, optimizer)
+            from safetensors.torch import save_file
+
+            out = Path(out_dir)
+            save_file(stable_state["weights"], str(out / STABLE_WEIGHTS_FILE))
+            save_file(stable_state["optim"], str(out / OPTIM_STATE_FILE))
+            log.info("fork-anneal: saved lineage branch (%s + %s, state as of "
+                     "the fork) beside the annealed weights",
+                     STABLE_WEIGHTS_FILE, OPTIM_STATE_FILE)
+        elif schedule == "wsd":
             self._save_optimizer_state(out_dir, optimizer, model)
         log.info("trained toto2: params=%d steps=%d tokens=%d final_loss=%.4f in %.0fs",
                  param_count, step, tokens, last_loss, train_seconds)
@@ -732,6 +816,17 @@ class Toto2Trainer:
         return _MuonAdamW(muon, adamw, lr=contract.base_lr, weight_decay=contract.weight_decay)
 
     # ── optimizer state (round-to-round continuity under wsd) ─────────────────
+
+    def _stable_snapshot(self, model, optimizer) -> dict:
+        """CPU copies of the model weights + full optimizer state at the
+        fork (DEC-CA-0029). copy=True everywhere: the anneal phase keeps
+        stepping the live tensors, so the lineage branch must be a snapshot,
+        never an alias (same rule as :func:`_adamw_state_tensors`)."""
+        weights = {
+            k: v.detach().to("cpu", copy=True).contiguous()
+            for k, v in model.state_dict().items()
+        }
+        return {"weights": weights, "optim": _optim_state_tensors(optimizer, model)}
 
     def _save_optimizer_state(self, out_dir: Path, optimizer, model) -> None:
         """Write the optimiser's full state beside the weights so the next

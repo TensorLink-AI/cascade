@@ -84,6 +84,47 @@ def test_drain_generator_rejects_wrong_count():
         drain_generator(_WrongCount(), 5, min_length=10, max_length=200, max_total_points=10_000)
 
 
+# ── points-denominated drain (DEC-CA-0031) ──────────────────────────────────
+
+
+def test_drain_target_points_stops_at_target_count_free():
+    # _Good yields 100-point series; a 250-point target consumes exactly 3 of
+    # the up-to-10 offered — the count responds to the points, not vice versa.
+    out = drain_generator(
+        _Good(seed=1), 10, min_length=10, max_length=200,
+        max_total_points=10_000, target_points=250,
+    )
+    assert len(out) == 3
+    assert sum(a.size for a in out) == 300  # first series to REACH the target is kept
+
+
+def test_drain_target_points_is_prefix_deterministic():
+    a = drain_generator(_Good(seed=7), 10, min_length=10, max_length=200,
+                        max_total_points=10_000, target_points=250)
+    b = drain_generator(_Good(seed=7), 10, min_length=10, max_length=200,
+                        max_total_points=10_000, target_points=250)
+    for x, y in zip(a, b, strict=True):
+        assert np.array_equal(x, y)
+
+
+def test_drain_target_points_rejects_exhaustion_below_target():
+    # _WrongCount yields one 50-point series then stops: under the points
+    # denomination that is an under-delivery, rejected with the points named.
+    with pytest.raises(ValueError, match="corpus_target_points"):
+        drain_generator(_WrongCount(), 5, min_length=10, max_length=200,
+                        max_total_points=10_000, target_points=500)
+
+
+def test_drain_target_points_zero_keeps_exact_count_rule():
+    # target_points=0 is the legacy contract: exactly n_series, or rejected.
+    out = drain_generator(_Good(seed=1), 5, min_length=10, max_length=200,
+                          max_total_points=10_000, target_points=0)
+    assert len(out) == 5
+    with pytest.raises(ValueError):
+        drain_generator(_WrongCount(), 5, min_length=10, max_length=200,
+                        max_total_points=10_000, target_points=0)
+
+
 # ── MV-ready schema (channel axis, default univariate) ──────────────────────
 
 
