@@ -693,6 +693,19 @@ class RoundConfig:
     # expiry the pre-run-off tied set advances (capped) — a screen that cannot
     # finish must not sink the round it protects. Inert while max_finalists=1.
     tie_runoff_phase_seconds: int = 900
+    # ── Init-baseline SHADOW row (trainer-side; observability only) ──────────
+    # The measured 2026-08-26 blind spot: KOTH compares entrants to each other
+    # and to the king, never to "do nothing" — and the raw warm-start init
+    # currently outscores every trained entrant on the post-mix windows.
+    # "shadow": the round's warm-start init is scored on the SAME heat slice
+    # as every entrant, logged, and published on the heat standings as an
+    # ``init_baseline`` row. It NEVER changes who advances — deliberately (a
+    # heat-side filter would gate short-budget checkpoints on a small slice,
+    # and could empty a whole heat). The ENFORCING floor lives in the
+    # validator's duel instead: ``[scoring] init_gate_mode`` — final-budget
+    # checkpoints, full verdict windows, gift-gate rollout discipline.
+    # Init scoring failure fails OPEN (loud log, row omitted).
+    init_gate_mode: str = "off"       # "off" | "shadow" (heat-side has no enforce)
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
@@ -957,6 +970,21 @@ class ScoringConfig:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Init-baseline floor (see cascade.eval.koth.KothParams.init_gate_mode):
+    # the shared warm-start init scored on the SAME duel windows as an absolute
+    # floor under the crown — a challenger that beat the king but is worse than
+    # "do nothing" cannot be crowned. Same progression as the gift gate:
+    # "off" (default) | "shadow" (floor computed + recorded on the receipt,
+    # verdict unchanged) | "enforce" (AND-ed into the win; can only BLOCK a
+    # dethrone, never grant one — king retention untouched, worst case = king
+    # holds). The measured motivation (2026-08-26): the raw init outscored
+    # every trained entrant post-mix-change, invisibly, because KOTH has no
+    # null baseline. Rounds with no warm_start_ckpt have no baseline — the
+    # floor simply cannot run (recorded None). [scoring] is fleet-consensus:
+    # identical across all validators or verdicts fork — release-then-activate,
+    # shadow first, never straight to enforce.
+    init_gate_mode: str = "off"
+    init_gate_tolerance: float = 0.0
     # Margin denomination (DEC-CA-0027; see cascade.eval.koth.MARGIN_MODES).
     # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
     # "increment" = the warm-start-era rule: the shared init is scored as a
@@ -1266,6 +1294,8 @@ class ChainConfig:
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
             margin_mode=self.scoring.margin_mode,
             margin_increment_floor=self.scoring.margin_increment_floor,
+            init_gate_mode=self.scoring.init_gate_mode,
+            init_gate_tolerance=self.scoring.init_gate_tolerance,
         )
 
 

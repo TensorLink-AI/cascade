@@ -131,8 +131,10 @@ weight_decay       = 0.05
 lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only on a
                                   # from-scratch (generation-start) run; warm-started rounds
                                   # re-enter FLAT at base_lr — per-round cosine restarts
-                                  # distort continued pretraining. No in-round decay (that
-                                  # belongs to a release cut, not built). wsd rounds also
+                                  # distort continued pretraining. No in-round decay by
+                                  # default; finished form is a separate armable mechanism
+                                  # (fork-anneal below, DEC-CA-0029 — or EMA, ema_decay,
+                                  # DEC-CA-0033; arm at most ONE). wsd rounds also
                                   # write optimizer.safetensors (~3x checkpoint size) so Muon
                                   # momentum/row-EMA/AdamW moments survive the round boundary.
                                   # [training] edit ⇒ contract_digest changed: restart trainer
@@ -147,7 +149,10 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
                                   # ARMING CHECKLIST (a contract cut, the 2026-08-14 playbook):
                                   # testnet full cycle first; recompute contract_digest
                                   # (cascade-trainer --offline); coordinated release-then-activate
-                                  # with ALL external validators; OPSLOG entry.
+                                  # with ALL external validators; OPSLOG entry. NEVER together
+                                  # with ema_decay (DEC-CA-0033 — the trainer refuses) or with
+                                  # [telemetry] bench_anneal_fraction: one finished-form
+                                  # mechanism at a time.
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit

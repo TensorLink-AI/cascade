@@ -5,8 +5,8 @@ title: "Bench-anneal: the benchmark sidecar scores an annealed copy of each duel
 status: proposed
 date: 2026-08-24
 tags: [cascade, benchmarks, telemetry, wsd, anneal, promotion, guard]
-revisit_when: "DEC-CA-0029 (fork-anneal, the contract cut) arms on mainnet — bench-anneal then benches an already-finished artifact and must be DISARMED in the same window (double-annealing is a different recipe); or a testnet cycle shows the anneal leg regularly missing its wall (then raise the leg's guard, not the fraction); or bench_hold_max_hours proves too small for duel bench + anneal legs"
-relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017, superseded_by_when_armed: DEC-CA-0029}
+revisit_when: "DEC-CA-0029 (fork-anneal) OR DEC-CA-0033 (ema_decay) arms on mainnet — bench-anneal then benches an already-finished artifact and must be DISARMED in the same window (double-annealing / EMA-of-anneal is a different recipe; the worker's anneal_recipe refuses an EMA-armed contract); or a testnet cycle shows the anneal leg regularly missing its wall (then raise the leg's guard, not the fraction); or bench_hold_max_hours proves too small for duel bench + anneal legs"
+relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017, superseded_by_when_armed: DEC-CA-0029, superseded_by_when_armed_alt: DEC-CA-0033}
 ---
 Same problem as DEC-CA-0029, different deployment constraint. Under wsd
 (DEC-CA-0018) every scored artifact is mid-stable — the offline calibration

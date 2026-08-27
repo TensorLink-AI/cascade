@@ -166,6 +166,9 @@ class EvalContext:
 _PARAMS_DROP_WHEN_DEFAULT: dict[str, object] = {
     "margin_mode": "level",
     "margin_increment_floor": 0.01,
+    # Init-baseline floor: off on every archived round.
+    "init_gate_mode": "off",
+    "init_gate_tolerance": 0.0,
 }
 
 
@@ -223,6 +226,14 @@ class VerdictRecord:
     # round, i.e. every round before this shipped.
     cohort_k: int = 0
     cohort_lcbs: dict | None = None   # {challenger_hotkey: lcb at alpha/k}
+
+    # ── init-baseline floor ([scoring] init_gate_mode) ──────────────────────
+    # The shared warm-start init's observed geomean on the verdict windows and
+    # the floor verdict for the decided challenger. Both None on every round
+    # judged with the gate off — and DROPPED from the canonical body then
+    # (see ``_verdict_body``), so archived receipt signatures survive.
+    init_baseline_geomean: float | None = None
+    init_floor_passed: bool | None = None
 
     # NOTE on adding fields here. ``asdict`` of this dataclass goes into
     # ``RoundReceipt.canonical_body`` — the SIGNED bytes — so a field that always
@@ -295,6 +306,9 @@ class VerdictRecord:
                 {str(h): _none_for_nan(float(v)) for h, v in cohort_lcbs.items()}
                 if cohort_lcbs else None
             ),
+            init_baseline_geomean=_none_for_nan(
+                getattr(result, "baseline_geomean", None)),
+            init_floor_passed=getattr(result, "init_floor_passed", None),
         )
 
 
@@ -315,6 +329,12 @@ def _verdict_body(v: VerdictRecord | None) -> dict | None:
         d.pop("cohort_k", None)
     if not d.get("cohort_lcbs"):
         d.pop("cohort_lcbs", None)
+    # Init-baseline floor fields: absent ⇒ dropped, so a receipt from a
+    # gate-off round serialises byte-for-byte as before the fields existed.
+    if d.get("init_baseline_geomean") is None:
+        d.pop("init_baseline_geomean", None)
+    if d.get("init_floor_passed") is None:
+        d.pop("init_floor_passed", None)
     return d
 
 
@@ -532,6 +552,11 @@ def load_receipt(text: str) -> RoundReceipt:
                  for h, v in verdict["cohort_lcbs"].items()}
                 if verdict.get("cohort_lcbs") else None
             ),
+            init_baseline_geomean=(
+                None if verdict.get("init_baseline_geomean") is None
+                else float(verdict["init_baseline_geomean"])
+            ),
+            init_floor_passed=verdict.get("init_floor_passed"),
         ) if verdict else None,
         reward_uids=tuple(int(u) for u in obj.get("reward_uids", ())),
         weights=tuple(float(w) for w in obj.get("weights", ())),

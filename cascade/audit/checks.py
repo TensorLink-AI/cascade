@@ -378,17 +378,22 @@ def _pooled_scores(
 
 
 def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
-    """The increment margin's baseline (warm-start init) scores from the
-    receipt, pooled over ``paired`` — or ``None`` for a round judged at
-    "level" (no ``role == "baseline"`` rows recorded).
+    """The shared warm-start init's scores from the receipt, pooled over
+    ``paired`` — or ``None`` when no ``role == "baseline"`` rows were
+    recorded.
 
-    Presence of baseline rows IS the record of which margin denomination the
-    validator judged under: it appends them exactly when it judged at
-    "increment" (a random-init or multi-size round falls back to "level" and
-    records none). Like ``wql_mode``, the mode itself cannot ride the signed
-    ``VerdictRecord`` without invalidating archived receipts — the replay is
-    self-verifying instead (reproducing the recorded LCB under the wrong rule
-    is not something a tampered receipt does by accident).
+    Baseline rows are appended whenever the validator scored the init — for
+    the increment margin AND/OR the init-baseline floor ([scoring]
+    init_gate_mode), so their presence alone no longer names the margin
+    denomination. The judged rule is the conjunction the caller applies:
+    "increment" ⟺ the receipt's params say ``margin_mode = "increment"``
+    (the unmodified config params) AND baseline rows exist (the validator's
+    in-round fallback to "level" — random-init round, size mismatch —
+    records none). A level-mode round with the floor on has rows but keeps
+    the level rule; the floor itself replays through the recorded
+    ``init_gate_mode`` param. Like ``wql_mode``, the judged mode cannot ride
+    the signed ``VerdictRecord`` without invalidating archived receipts —
+    the replay is self-verifying instead.
     """
     rows = [r for r in receipt.entry_scores if r.role == "baseline"]
     if not rows:
@@ -495,22 +500,31 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
             return _fail(name, f"cannot rebuild pooled scores for {hk}: {e}")
         if not paired:
             return _fail(name, f"challenger {hk} has no paired size")
-        # Margin denomination: baseline rows in the receipt mean the round was
-        # judged at "increment" (see _baseline_pooled); none mean "level".
+        # Margin denomination: "increment" ⟺ the recorded params say so AND
+        # baseline rows exist (the in-round fallback records none). Baseline
+        # rows on a level round belong to the init floor (see
+        # _baseline_pooled) — level rule, rows passed through for the floor.
         try:
             baseline = _baseline_pooled(receipt, paired)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot rebuild baseline scores: {e}")
         from dataclasses import replace as _dc_replace
 
+        judged_increment = (
+            duel_params.margin_mode == "increment" and baseline is not None
+        )
+        gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
         mode_params = _dc_replace(
-            duel_params, margin_mode="increment" if baseline is not None else "level"
+            duel_params, margin_mode="increment" if judged_increment else "level"
         )
         res = evaluate_round(
             king, chal, mode_params,
             seed=_bootstrap_seed(v.bootstrap_seed),
             king_tenure_rounds=v.king_tenure_rounds,
-            baseline_scores=baseline,
+            baseline_scores=(
+                baseline if (judged_increment or (gate_on and baseline is not None))
+                else None
+            ),
         )
         replayed.append((hk, res))
 
@@ -620,18 +634,27 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     # leaves params untouched, so every pre-cohort receipt replays unchanged.
     duel_params = _cohort_params(params, manifest)
 
-    # Margin denomination: baseline rows in the receipt mean the round was
-    # judged at "increment" (see _baseline_pooled); none mean "level". Forced
-    # onto the replayed params so a config file whose margin_mode has since
-    # changed still replays the rule that actually decided the round.
+    # Margin denomination: "increment" ⟺ the recorded params say so AND
+    # baseline rows exist (the validator's in-round fallback to "level"
+    # records none). Rows on a level round belong to the init floor
+    # ([scoring] init_gate_mode, replayed via the recorded param) — level
+    # rule, rows passed through so the floor replays identically.
     try:
         baseline = _baseline_pooled(receipt, paired)
     except (ValueError, KeyError) as e:
         return _fail(name, f"cannot rebuild baseline scores: {e}")
     from dataclasses import replace as _dc_replace
 
+    judged_increment = (
+        duel_params.margin_mode == "increment" and baseline is not None
+    )
+    gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
     duel_params = _dc_replace(
-        duel_params, margin_mode="increment" if baseline is not None else "level"
+        duel_params, margin_mode="increment" if judged_increment else "level"
+    )
+    replay_baseline = (
+        baseline if (judged_increment or (gate_on and baseline is not None))
+        else None
     )
 
     def _replay(mode: str):
@@ -640,7 +663,7 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
             seed=_bootstrap_seed(v.bootstrap_seed),
             king_tenure_rounds=v.king_tenure_rounds,
             wql_mode=mode,
-            baseline_scores=baseline,
+            baseline_scores=replay_baseline,
         )
 
     result = _replay("geomean")
