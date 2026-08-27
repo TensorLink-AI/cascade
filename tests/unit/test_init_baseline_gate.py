@@ -86,8 +86,12 @@ def test_heat_shadow_off_is_inert(cfg, tmp_path, monkeypatch):
 
 
 def test_default_config_ships_shadow_off(cfg):
-    assert cfg.round.init_gate_mode == "off"
-    assert cfg.scoring.init_gate_mode == "off"
+    # ARMED 2026-08-27 (owner, the r47 all-live release): both gates ship in
+    # SHADOW — visibility rows only, verdicts untouched. Enforce remains a
+    # later, separate coordinated decision; this test pins that the shipped
+    # file never silently escalates past shadow.
+    assert cfg.round.init_gate_mode == "shadow"
+    assert cfg.scoring.init_gate_mode == "shadow"
     assert cfg.scoring.init_gate_tolerance == 0.0
 
 
@@ -265,22 +269,25 @@ def test_loader_round_trips_init_gate_fields(tmp_path):
 
     repo_root = Path(__file__).resolve().parents[2]
     text = (repo_root / "chain.toml").read_text()
-    assert "\nwin_margin_start" in text and "\nheat_train_hours" in text
+    # The shipped file arms shadow/shadow (the 2026-08-27 release), so the
+    # round trip is proven by REPLACING the shipped lines with different
+    # values and reading them back. The [round] key uses distinct spacing.
+    assert 'init_gate_mode = "shadow"' in text          # [scoring]
+    assert 'init_gate_mode     = "shadow"' in text      # [round]
     patched = text.replace(
-        "\nwin_margin_start",
-        '\ninit_gate_mode = "shadow"\ninit_gate_tolerance = 0.05\nwin_margin_start',
-        1,
-    ).replace("\nheat_train_hours",
-              '\ninit_gate_mode = "shadow"\nheat_train_hours', 1)
+        'init_gate_mode = "shadow"',
+        'init_gate_mode = "enforce"\ninit_gate_tolerance = 0.05', 1,
+    ).replace('init_gate_mode     = "shadow"',
+              'init_gate_mode     = "off"', 1)
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     c = load_chain_config(p)
-    assert c.scoring.init_gate_mode == "shadow"
+    assert c.scoring.init_gate_mode == "enforce"
     assert c.scoring.init_gate_tolerance == 0.05
-    assert c.round.init_gate_mode == "shadow"
+    assert c.round.init_gate_mode == "off"
     # and the koth params carry them through
     kp = c.koth_params()
-    assert kp.init_gate_mode == "shadow"
+    assert kp.init_gate_mode == "enforce"
     assert kp.init_gate_tolerance == 0.05
 
 
@@ -296,7 +303,7 @@ def test_loader_rejects_scoring_init_gate_typo(tmp_path):
     repo_root = Path(__file__).resolve().parents[2]
     text = (repo_root / "chain.toml").read_text()
     patched = text.replace(
-        "\nwin_margin_start", '\ninit_gate_mode = "enforcee"\nwin_margin_start', 1)
+        'init_gate_mode = "shadow"', 'init_gate_mode = "enforcee"', 1)
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     with _pytest.raises(ValueError, match=r"init_gate_mode='enforcee' invalid"):

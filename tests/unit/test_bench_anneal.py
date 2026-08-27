@@ -62,6 +62,10 @@ def test_worker_rejects_anneal_without_resume_or_budget(cfg, tmp_path, monkeypat
 
 
 def test_worker_anneal_applies_pure_decay_contract(cfg, tmp_path, monkeypatch):
+    # The shipped file arms ema_decay (2026-08-27) and a bench-anneal leg on an
+    # EMA-armed contract is refused by design (covered below) — this test is
+    # about the pure-decay recipe itself, so disarm EMA for the scenario.
+    cfg = replace(cfg, training=replace(cfg.training, ema_decay=0.0))
     monkeypatch.setattr(worker_mod, "load_chain_config", lambda p: cfg)
     monkeypatch.setattr(worker_mod, "_load_trainer", lambda spec: object())
     captured: dict = {}
@@ -180,6 +184,9 @@ def test_bench_unarmed_is_byte_identical_to_before(cfg, monkeypatch):
 
 def test_anneal_recipe_refuses_fork_anneal_armed(cfg):
     """Fail fast at the recipe, not mid-leg after fetch + corpus build."""
-    c = replace(cfg.training.primary_size, anneal_fraction=0.15)
+    c = replace(cfg.training.primary_size, anneal_fraction=0.15, ema_decay=0.0)
     with pytest.raises(ValueError, match="anneal_fraction is armed"):
         worker_mod.anneal_recipe(c)
+    # And the shipped file's EMA arming trips the EMA refusal on its own.
+    with pytest.raises(ValueError, match="ema_decay is armed"):
+        worker_mod.anneal_recipe(cfg.training.primary_size)

@@ -99,10 +99,11 @@ def _gate(cfg, manifest):
     ("optimizer", "adamw"),
     ("warmup_fraction", 0.10),
     ("batch_size", 128),
-    # The DEC-CA-0035 recipe cut — the first planned dividend of this node.
-    ("ema_decay", 0.999),
-    ("warm_lr_scale", 0.125),
-    ("weight_decay", 2e-8),
+    # DEC-CA-0035/0033-class recipe knobs (values deliberately differ from the
+    # shipped armed cut so the digest actually moves against the fixture).
+    ("ema_decay", 0.99),
+    ("warm_lr_scale", 0.25),
+    ("weight_decay", 1e-3),
     # Compute budget / economics.
     ("target_train_hours", 6.0),
     ("ref_throughput_tokens_per_s", 90_000),
@@ -289,10 +290,13 @@ def test_tier2_replay_contract_comes_from_the_body(armed):
     sizes and image pin — and falls back to local config outside the regime."""
     from cascade.audit.rederive import contract_for_replay
 
+    # ema_decay 0.0 ⇒ digest-dropped from the published body (the round
+    # predates the EMA arming, whatever the auditor's file says today).
     trained = replace(
         armed.training,
         train_image_digest="sha256:" + "c" * 64,
         base_lr=8e-3,
+        ema_decay=0.0,
         extra_sizes=(_size("toto2-22m", expected_gpu="L40S"),),
     )
     m = _manifest(armed, trained_under=trained)
@@ -308,9 +312,10 @@ def test_tier2_replay_contract_comes_from_the_body(armed):
     assert [s.arch_preset for s in replay.extra_sizes] == ["toto2-22m"]
     assert contract_digest(replay) == m.contract_digest
     # A digest-dropped key absent from the body reads as the INERT default,
-    # even when the auditor's local config has since armed it.
-    armed_local = replace(armed, training=replace(armed.training, ema_decay=0.999))
-    assert contract_for_replay(_Receipt(), armed_local).ema_decay == 0.0
+    # even when the auditor's local config has armed it (as the shipped
+    # 2026-08-27 file does: ema_decay 0.999).
+    assert armed.training.ema_decay != 0.0
+    assert replay.ema_decay == 0.0
 
     # Outside the declared regime the local contract is the authority.
     class _EarlyReceipt:

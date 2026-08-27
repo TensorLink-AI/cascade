@@ -127,8 +127,8 @@ batch_size                  = 64       # Toto 2.0 global batch size
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
-weight_decay       = 0.05        # part of the DEC-CA-0035 cut: -> 2e-8 at arming
-                                  # (see the commented block below)
+weight_decay       = 2e-8        # ARMED 2026-08-27: part of the DEC-CA-0035 cut
+                                  # (see the armed block below; was 0.05)
 lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only on a
                                   # from-scratch (generation-start) run; warm-started rounds
                                   # re-enter FLAT at base_lr — per-round cosine restarts
@@ -160,22 +160,24 @@ lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup onl
 # bundle @ warm_lr_scale 0.125 BEATS the converged warm-start init by
 # 0.0038 ON THE EMA-999 ARTIFACT — the raw endpoint stays slightly above
 # init, so the cut only delivers its headline WITH the EMA finished form.
-# ARMING CHECKLIST: set ALL of the block below + weight_decay -> 2e-8
-# + ema_decay = 0.999 (DEC-CA-0033 — the artifact the measurement scored)
-# as ONE cut (the constants were swept together, arXiv 2605.20119);
-# wave-3 cross-generator separation check first; then testnet full cycle,
-# contract_digest recompute (cascade-trainer --offline), coordinated
-# release-then-activate with ALL external validators, OPSLOG entry.
-# ema_decay       = 0.999         # EMA finished form (DEC-CA-0033; default 0.0
-                                  # = off; NEVER together with anneal_fraction)
-# muon_momentum   = 0.96          # Muon Nesterov momentum (default 0.95)
-# muon_row_beta2  = 0.999         # NorMuon row second-moment EMA (default 0.95)
-# grad_clip       = 7.0           # train-loop grad-norm clip (default 1.0)
-# adamw_beta1     = 0.91          # AdamW group betas (defaults 0.9/0.999)
-# adamw_beta2     = 0.972
-# adamw_lr_scale  = 0.018518518518518517   # 1/54 matrix:AdamW split (default 1.0)
-# warm_lr_scale   = 0.125         # warm-started runs train at base_lr x this;
-                                  # from-scratch keeps full base_lr (default 1.0)
+# ARMED 2026-08-27 (owner): the full DEC-CA-0035 cut, one contract cut for
+# rounds from block 8942400 (see [scoring] contract_from_block — rounds
+# before it verify against prior_contract_digest). The constants were swept
+# together (arXiv 2605.20119); ema_decay 0.999 is the DEC-CA-0033 artifact
+# the measurement scored — the cut only delivers its headline WITH it.
+# weight_decay is set to 2e-8 above as part of this same cut. NEVER together
+# with anneal_fraction or [telemetry] bench_anneal_fraction (the trainer
+# refuses). NOTE: armed ahead of the wave-3 cross-generator separation check
+# on owner direction — watch the first armed rounds for separation loss.
+ema_decay       = 0.999         # EMA finished form (DEC-CA-0033; the scored artifact)
+muon_momentum   = 0.96          # Muon Nesterov momentum (default 0.95)
+muon_row_beta2  = 0.999         # NorMuon row second-moment EMA (default 0.95)
+grad_clip       = 7.0           # train-loop grad-norm clip (default 1.0)
+adamw_beta1     = 0.91          # AdamW group betas (defaults 0.9/0.999)
+adamw_beta2     = 0.972
+adamw_lr_scale  = 0.018518518518518517   # 1/54 matrix:AdamW split (default 1.0)
+warm_lr_scale   = 0.125         # warm-started runs train at base_lr x this;
+                                # from-scratch keeps full base_lr (default 1.0)
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
 max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit
@@ -361,6 +363,11 @@ finalists        = 1      # challengers promoted from the heat to the final (top
 #     lifetime measured from the JIT final rent. Past the hold, later cohort
 #     members drop out of the promotion candidate pool (soft degradation).
 max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20; 1 = tie logic OFF)
+# Init-baseline heat SHADOW row (DEC-CA-0034; armed 2026-08-27, owner): the
+# warm-start init is scored on the heat slice and published as
+# HeatResult.init_baseline. Visibility only — never filters the heat
+# (heat-side has no enforce). Trainer-only key, no consensus surface.
+init_gate_mode     = "shadow"
 tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see NOTE above
 # Wall clock for the WHOLE run-off, mirroring dedup_phase_seconds: on expiry
 # the pre-run-off tied set advances (capped) — a screen that cannot finish
@@ -500,7 +507,9 @@ mix_target_windows   = 1200
 # — i.e. converges to uniform as pool capacity floors (300/domain) land.
 # CONSENSUS: all validators must flip at the same boundary — set
 # mix_tier_from_block only in a coordinated release (0 = flat split).
-mix_tier_from_block  = 0         # MAINNET: OFF until the coordinated release pins a boundary
+mix_tier_from_block  = 8942400   # ARMED 2026-08-27 (owner): two-tier even-domain
+                                 # split live from r47's epoch — same boundary as
+                                 # the recipe cut, one coordinated validator update
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
@@ -622,8 +631,15 @@ cascade_quality_epsilon = 0.05
 # above. Same activation block as mix_from_block — one flip boundary for the
 # whole release. Fleet-consensus values: keep identical across validators.
 # Retire (""/0) in the release after the transition round ages out.
-prior_contract_digest  = "6420f564f67f54034abbd8a382c771f58304229457ea6f9f11b889491800b9d6"
-contract_from_block    = 8895600
+# ARMED 2026-08-27 (owner): the DEC-CA-0035+0033 recipe cut takes effect for
+# rounds from block 8942400 (r47's epoch, boundary 2026-08-28 ~08:25 UTC).
+# Rounds whose epoch precedes it (r45/r46 in flight) verify against the pinned
+# PRIOR digest below — the unarmed contract every round through epoch 8938800
+# trained under — so validators restart onto this release ANY TIME before
+# block 8942400 without sacrificing an in-flight round. (This retires the
+# aged-out 6420f564…/8895600 warmup_cosine transition pair.)
+prior_contract_digest  = "c6d2462135198c36eefc009ea0f945957e647c20bf521a1fbc9d721a4324f3af"
+contract_from_block    = 8942400
 # Declared-contract gating (DEC-CA-0036). From this block a manifest is gated on
 # the LOCKED terms only — arch_preset, base_arch_digest, expected_gpu,
 # train_seed_salt, and each extra size's preset/GPU pin — verified against the
@@ -642,7 +658,16 @@ contract_from_block    = 8895600
 # its own pace, THEN set the block: rounds before it replay strict, rounds after
 # replay declared, and cascade-audit judges each round under its own rule.
 # Fleet-consensus value like every [scoring] key: keep identical across validators.
-declared_contract_from_block = 0
+# ARMED 2026-08-27 (owner): live for rounds from r47's epoch, same boundary as
+# the recipe cut — one validator update before block 8942400 covers both.
+declared_contract_from_block = 8942400
+# Init-baseline duel gate (DEC-CA-0034) in SHADOW (armed 2026-08-27, owner):
+# the validator scores the warm-start init on the verdict windows and records
+# init_baseline_geomean / init_floor_passed in the receipt (drop-when-None —
+# archived signatures survive) but the verdict is UNCHANGED. Log-only, so
+# validators may enable it at their own pace; enforce is a later, separate
+# coordinated decision once the shadow verdicts calibrate init_gate_tolerance.
+init_gate_mode = "shadow"
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely

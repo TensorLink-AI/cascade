@@ -195,27 +195,36 @@ def test_loader_round_trips_bundle_and_constants(tmp_path: Path):
     armable [training] knob must survive load_chain_config."""
     from cascade.shared.config import load_chain_config
 
+    import re
+
     text = (REPO_ROOT / "chain.toml").read_text()
-    knobs = (
-        "ema_decay = 0.999\ngen_seed_mix = 3\nrewarmup_fraction = 0.02\n"
-        "muon_momentum = 0.96\nmuon_row_beta2 = 0.999\ngrad_clip = 7.0\n"
-        "adamw_beta1 = 0.91\nadamw_beta2 = 0.972\n"
-        "adamw_lr_scale = 0.018518518518518517\nwarm_lr_scale = 0.125\n"
-    )
-    assert "\nbase_lr" in text
-    patched = text.replace("\nbase_lr", "\n" + knobs + "base_lr", 1)
+    # The shipped file ARMS the DEC-CA-0035 constants (2026-08-27 release), so
+    # the round trip is proven by REPLACING each armed line with a different
+    # value and reading it back; the two still-absent knobs are inserted.
+    swaps = {
+        "ema_decay": "0.5", "muon_momentum": "0.97", "muon_row_beta2": "0.998",
+        "grad_clip": "5.0", "adamw_beta1": "0.92", "adamw_beta2": "0.973",
+        "adamw_lr_scale": "0.02", "warm_lr_scale": "0.25",
+    }
+    patched = text
+    for key, val in swaps.items():
+        patched, n = re.subn(rf"(?m)^{key}\s*=\s*\S+", f"{key} = {val}", patched, count=1)
+        assert n == 1, f"expected exactly one armed {key} line in chain.toml"
+    assert "\nbase_lr" in patched
+    patched = patched.replace(
+        "\nbase_lr", "\ngen_seed_mix = 3\nrewarmup_fraction = 0.02\nbase_lr", 1)
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     t = load_chain_config(p).training
-    assert t.ema_decay == 0.999
+    assert t.ema_decay == 0.5
     assert t.gen_seed_mix == 3
     assert t.rewarmup_fraction == 0.02
-    assert t.muon_momentum == 0.96
-    assert t.muon_row_beta2 == 0.999
-    assert t.grad_clip == 7.0
-    assert (t.adamw_beta1, t.adamw_beta2) == (0.91, 0.972)
-    assert t.adamw_lr_scale == pytest.approx(1.0 / 54.0)
-    assert t.warm_lr_scale == 0.125
+    assert t.muon_momentum == 0.97
+    assert t.muon_row_beta2 == 0.998
+    assert t.grad_clip == 5.0
+    assert (t.adamw_beta1, t.adamw_beta2) == (0.92, 0.973)
+    assert t.adamw_lr_scale == 0.02
+    assert t.warm_lr_scale == 0.25
 
 
 def test_armed_constants_refuse_non_normuon_optimizer():
