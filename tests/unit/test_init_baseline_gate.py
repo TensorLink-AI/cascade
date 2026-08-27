@@ -250,3 +250,54 @@ def test_verdict_body_drops_absent_floor_fields():
                                      init_floor_passed=False))
     assert on["init_baseline_geomean"] == 0.82
     assert on["init_floor_passed"] is False
+
+
+# ── loader round-trip (the DEC-CA-0035 sweep's regression class) ─────────────
+
+
+def test_loader_round_trips_init_gate_fields(tmp_path):
+    """Regression: like the DEC-CA-0033 [training] knobs, these fields landed
+    with dataclass defaults but no load_chain_config parsing — arming the
+    shadow gate in chain.toml silently no-oped."""
+    from pathlib import Path
+
+    from cascade.shared.config import load_chain_config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / "chain.toml").read_text()
+    assert "\nwin_margin_start" in text and "\nheat_train_hours" in text
+    patched = text.replace(
+        "\nwin_margin_start",
+        '\ninit_gate_mode = "shadow"\ninit_gate_tolerance = 0.05\nwin_margin_start',
+        1,
+    ).replace("\nheat_train_hours",
+              '\ninit_gate_mode = "shadow"\nheat_train_hours', 1)
+    p = tmp_path / "chain.toml"
+    p.write_text(patched)
+    c = load_chain_config(p)
+    assert c.scoring.init_gate_mode == "shadow"
+    assert c.scoring.init_gate_tolerance == 0.05
+    assert c.round.init_gate_mode == "shadow"
+    # and the koth params carry them through
+    kp = c.koth_params()
+    assert kp.init_gate_mode == "shadow"
+    assert kp.init_gate_tolerance == 0.05
+
+
+def test_loader_rejects_scoring_init_gate_typo(tmp_path):
+    """[scoring] is strict (gift-gate rule: a typo must not silently
+    un-enforce the floor); [round] stays warn-and-off at the use site."""
+    from pathlib import Path
+
+    import pytest as _pytest
+
+    from cascade.shared.config import load_chain_config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / "chain.toml").read_text()
+    patched = text.replace(
+        "\nwin_margin_start", '\ninit_gate_mode = "enforcee"\nwin_margin_start', 1)
+    p = tmp_path / "chain.toml"
+    p.write_text(patched)
+    with _pytest.raises(ValueError, match=r"init_gate_mode='enforcee' invalid"):
+        load_chain_config(p)

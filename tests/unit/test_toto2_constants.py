@@ -216,3 +216,13 @@ def test_loader_round_trips_bundle_and_constants(tmp_path: Path):
     assert (t.adamw_beta1, t.adamw_beta2) == (0.91, 0.972)
     assert t.adamw_lr_scale == pytest.approx(1.0 / 54.0)
     assert t.warm_lr_scale == 0.125
+
+
+def test_armed_constants_refuse_non_normuon_optimizer():
+    """An armed optimizer knob on the plain-AdamW fallback path would bump
+    contract_digest while changing no numerics — refused instead."""
+    with pytest.raises(ValueError, match="require optimizer="):
+        Toto2Trainer(device="cpu")._build_optimizer(
+            _TinyNet(), _contract(optimizer="adamw", muon_momentum=0.96))
+    opt = Toto2Trainer(device="cpu")._build_optimizer(_TinyNet(), _contract())
+    assert isinstance(opt, torch.optim.AdamW)   # defaults: fallback still fine

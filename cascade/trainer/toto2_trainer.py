@@ -902,10 +902,6 @@ class Toto2Trainer:
     def _build_optimizer(self, model, contract: TrainingContractConfig):
         import torch
 
-        if contract.optimizer != "normuon_adamw":
-            return torch.optim.AdamW(
-                model.parameters(), lr=contract.base_lr, weight_decay=contract.weight_decay
-            )
         # DEC-CA-0035 constants (defaults = the previously hardcoded values,
         # digest-inert until set; measured Toto2 targets in the config
         # comments). Validated here — this is the single construction site.
@@ -918,6 +914,27 @@ class Toto2Trainer:
         adamw_b1 = _knob("adamw_beta1", 0.9)
         adamw_b2 = _knob("adamw_beta2", 0.999)
         adamw_lr_scale = _knob("adamw_lr_scale", 1.0)
+
+        if contract.optimizer != "normuon_adamw":
+            # The constants only have a consumer on the normuon path. An armed
+            # knob here would bump contract_digest while changing NO numerics —
+            # a contract lie — so refuse instead of silently ignoring.
+            armed = {n: v for n, v in (("muon_momentum", momentum),
+                                       ("muon_row_beta2", row_beta2),
+                                       ("adamw_beta1", adamw_b1),
+                                       ("adamw_beta2", adamw_b2),
+                                       ("adamw_lr_scale", adamw_lr_scale))
+                     if v != {"muon_momentum": 0.95, "muon_row_beta2": 0.95,
+                              "adamw_beta1": 0.9, "adamw_beta2": 0.999,
+                              "adamw_lr_scale": 1.0}[n]}
+            if armed:
+                raise ValueError(
+                    f"[training] {sorted(armed)} require optimizer="
+                    f"'normuon_adamw'; got {contract.optimizer!r}"
+                )
+            return torch.optim.AdamW(
+                model.parameters(), lr=contract.base_lr, weight_decay=contract.weight_decay
+            )
         for name, val in (("muon_momentum", momentum), ("muon_row_beta2", row_beta2),
                           ("adamw_beta1", adamw_b1), ("adamw_beta2", adamw_b2)):
             if not 0.0 < val < 1.0:

@@ -222,7 +222,9 @@ in-context.
   DEC-CA-0029's stable-file convention; the cheap fork-anneal alternative —
   never arm both), `gen_seed_mix` (N derived generation seeds, interleaved,
   ~√N residual noise; audit replays the interleaved rolling digest), and
-  `rewarmup_fraction` (kills the measured +0.11 warm-start first-step kick).
+  `rewarmup_fraction` (softens the +0.11 first-step kick but measured A/B
+  verdict: NO end-of-run benefit — stays unarmed; DEC-CA-0035's
+  warm_lr_scale is the real lever).
   All digest-bound drop-when-default, shipped inert; arming is a contract
   cut. Measured basis: docs/notes/2026-08-26-seed-variance-ema.md.
   (`decisions/DEC-CA-0033-ema-seedmix-rewarmup-variance-bundle.md`)

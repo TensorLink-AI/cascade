@@ -1433,6 +1433,22 @@ def _gift_gate_mode(value: object) -> str:
     return mode
 
 
+_INIT_GATE_MODES = ("off", "shadow", "enforce")
+
+
+def _init_gate_mode(value: object) -> str:
+    """Validate ``[scoring] init_gate_mode`` at load time (gift-gate rule: a
+    typo must fail fast, not silently un-enforce the floor). The heat-side
+    ``[round] init_gate_mode`` is deliberately NOT run through this — its
+    unknown-value semantics are warn-and-off at the use site (DEC-CA-0034)."""
+    mode = str(value)
+    if mode not in _INIT_GATE_MODES:
+        raise ValueError(
+            f"[scoring] init_gate_mode={mode!r} invalid; one of {_INIT_GATE_MODES}"
+        )
+    return mode
+
+
 def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     """Load and parse ``chain.toml``. Raises on a missing file or unsupported
     (too-old) schema; warns and proceeds on a newer schema."""
@@ -1616,6 +1632,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
+            # DEC-CA-0034 heat shadow row (raw string: unknown values are
+            # warn-and-off at the use site, not a load failure)
+            init_gate_mode=str(r.get("init_gate_mode", "off")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
@@ -1679,6 +1698,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_mode=_gift_gate_mode(s.get("gift_gate_mode", "off")),
             gift_gate_tolerance=float(s.get("gift_gate_tolerance", 0.03)),
             gift_gate_min_configs=int(s.get("gift_gate_min_configs", 15)),
+            # DEC-CA-0034 (parsing added with DEC-CA-0035's loader sweep —
+            # same landed-without-parsing defect as the [training] knobs)
+            init_gate_mode=_init_gate_mode(s.get("init_gate_mode", "off")),
+            init_gate_tolerance=float(s.get("init_gate_tolerance", 0.0)),
             margin_mode=_margin_mode(s.get("margin_mode", "level")),
             margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),

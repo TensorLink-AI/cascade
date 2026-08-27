@@ -48,8 +48,11 @@ first):
 | `adamw_lr_scale` | 1.0 (shared LR) | 1/54 |
 | `warm_lr_scale` | 1.0 | 0.125 (→ 5e-4) |
 
-plus `weight_decay` → 2e-8 at arming (already a config field; its VALUE
-change is part of the same cut). `warm_lr_scale` keys off the same
+plus `weight_decay` → 2e-8 AND `ema_decay` → 0.999 ([[DEC-CA-0033]]) at
+arming — both existing fields whose VALUE change is part of the same cut.
+The −0.0038 headline is the **EMA-999 artifact's** score; the raw endpoint
+at the same settings is +0.0002 (≈init), so the cut without EMA does not
+deliver the measured result. One cut, all nine values. `warm_lr_scale` keys off the same
 `warm_started` signal as wsd's warmup-once: the whole warm-started run
 (fork-anneal branch included) trains at `base_lr × warm_lr_scale`;
 from-scratch generation starts keep full `base_lr` — the constants were
