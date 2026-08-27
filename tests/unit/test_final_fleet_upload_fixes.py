@@ -174,3 +174,69 @@ def test_upload_dir_to_hub_uses_the_patient_window(monkeypatch, tmp_path):
         hippius_mod.upload_dir_to_hub(d, "cascade/x")
     assert seen.get("attempts") == hippius_mod.UPLOAD_MAX_ATTEMPTS
     assert seen.get("base_delay") == hippius_mod.UPLOAD_BACKOFF_BASE_S
+
+
+# ── deployed-config push to image-boot pods ──────────────────────────────────
+
+
+def test_config_push_scps_box_chain_toml_to_pod(monkeypatch):
+    from types import SimpleNamespace
+
+    from cascade.provision import main as pmain
+
+    calls = {}
+
+    def fake_run(argv, **kw):
+        calls["argv"] = argv
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(pmain.subprocess, "run", fake_run)
+    render = SimpleNamespace(
+        chain_toml="/root/cascade/chain.toml", key_path="~/.ssh/k",
+        profile_for=lambda p: SimpleNamespace(user="root", workdir="/root/cascade"),
+    )
+    push = pmain.make_config_push(render, box_chain_toml="/box/chain.toml",
+                                  pod_user="root")
+    push(SimpleNamespace(ip="1.2.3.4", ssh_port=2222), "heat", "shadeform")
+    argv = calls["argv"]
+    assert argv[0] == "scp" and "/box/chain.toml" in argv
+    assert argv[-1] == "root@1.2.3.4:/root/cascade/chain.toml"
+
+
+def test_config_push_failure_is_swallowed(monkeypatch):
+    from types import SimpleNamespace
+
+    from cascade.provision import main as pmain
+
+    def fake_run(argv, **kw):
+        raise OSError("scp missing")
+
+    monkeypatch.setattr(pmain.subprocess, "run", fake_run)
+    render = SimpleNamespace(
+        chain_toml=None, key_path="~/.ssh/k",
+        profile_for=lambda p: SimpleNamespace(user="root", workdir="/wd"),
+    )
+    push = pmain.make_config_push(render, box_chain_toml="/box/chain.toml",
+                                  pod_user="root")
+    hooks = pmain._compose_pod_hooks(push, None)
+    # composed runner isolates the failure — no raise
+    hooks(SimpleNamespace(ip="1.2.3.4", ssh_port=22), "final", "")
+
+
+def test_compose_pod_hooks_runs_all_and_isolates_failures():
+    from cascade.provision.main import _compose_pod_hooks
+
+    seen = []
+
+    def a(addr, stage, provider=""):
+        seen.append("a")
+        raise RuntimeError("boom")
+
+    def b(addr, stage, provider=""):
+        seen.append("b")
+
+    run = _compose_pod_hooks(a, b)
+    run(type("A", (), {"ip": "x"})(), "heat")
+    assert seen == ["a", "b"]              # a's failure never eats b
+    assert _compose_pod_hooks(None, None) is None
+    assert _compose_pod_hooks(b, None) is b
