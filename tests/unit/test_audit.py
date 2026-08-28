@@ -389,9 +389,14 @@ def tier1_setup(small_cfg, example_generator_dir, monkeypatch, tmp_path):
     # runners with no unprivileged userns, where strict mode correctly refuses.
     # run_tier1 → _rederive_digest runs its own sandbox off this same cfg, so
     # the flag has to live here rather than at the call below.
+    # gen_seed_mix pinned to 1: the shipped file arms 3 (2026-08-28), which
+    # correctly routes _rederive_digest through the seed-mix interleave — but
+    # this fixture's reference digest comes from a single-seed
+    # build_round_corpus, so the scenario must stay single-seed.
     cfg = replace(small_cfg,
                   generator=replace(small_cfg.generator, sandbox_strict=False),
-                  training=replace(small_cfg.training, corpus_mode="cache_reuse"),
+                  training=replace(small_cfg.training, corpus_mode="cache_reuse",
+                                   gen_seed_mix=1),
                   manifest=replace(small_cfg.manifest,
                                    trainer_hotkey=TRAINER_KP.ss58_address,
                                    validator_hotkey=VALIDATOR_KP.ss58_address))
