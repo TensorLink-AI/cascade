@@ -224,7 +224,7 @@ expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challeng
 # (#206, ends per-pod hippius patching), heat infra requeues (#207), bench
 # prewarm (#204). v0.5.0 retired:
 # sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c91303163b6f57
-train_image_digest = "sha256:68cea71927df0b348fdca0c6420960a6e2ae15806fe063023b59b03e6ac17267"
+train_image_digest = "sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"
 # ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.4.0 (2026-07-23, built from
 # 1325409 — [wandb] extra baked, warm-start worker plumbing, incident-hardening
 # trainer code; torch/generator-dependency stack unchanged from v0.3.1).
