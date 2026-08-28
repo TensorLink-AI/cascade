@@ -190,6 +190,21 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     return mode
 
 
+# Miner-funded compute modes (DEC-CA-0029) — see RoundConfig.funded_mode.
+FUNDED_MODES = ("off", "shadow", "required")
+
+
+def validate_funded_mode(mode: str) -> str:
+    """Return ``mode`` if it is a known funded mode, else raise ValueError.
+
+    Same rationale as dedup: "required" silently degrading to "off" would put
+    unfunded entries back on the operator's GPU bill without anyone noticing.
+    """
+    if mode not in FUNDED_MODES:
+        raise ValueError(f"funded_mode={mode!r} invalid; expected one of {FUNDED_MODES}")
+    return mode
+
+
 # Corpus feed modes — how a generator's data reaches the trainer. Identical for
 # king and challenger (folded into contract_digest via TrainingContractConfig).
 #   stream_cpu  — live-stream fresh series from a CPU generator, no reuse.
@@ -623,6 +638,34 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # ── Miner-funded compute (DEC-CA-0029) — inert at defaults ───────────────
+    # "off"      — legacy behaviour, the funded queue is never read.
+    # "shadow"   — the field is unchanged; funding status is only logged, so an
+    #              operator can watch adoption before flipping the switch.
+    # "required" — the round's challenger field IS the funded queue: at most
+    #              ``finalist_cap`` funded entries enter, earliest reveal block
+    #              first, and everyone who enters duels (the heat's fits-the-cap
+    #              fast path short-circuits the screen — no GPU is spent on
+    #              screening a field that already fits). Unfunded reveals wait,
+    #              unburned, until their owner funds them.
+    # [round] is not part of contract_digest, so none of these move deployed
+    # digests; "required" IS a change to who competes, so arming follows the
+    # release-then-activate discipline like every other mode flag here.
+    funded_mode: str = "off"
+    # The funded queue file shared with cascade-intake and the provisioner.
+    # Relative paths resolve under work_root (like submissions_db_path).
+    funded_queue_path: str = "funded_queue.json"
+    # With funded_mode = "required": a boundary whose funded queue is empty
+    # skips the ENTIRE round — no king leg, no pods, no manifest; validators
+    # simply see no manifest and idle (they score what publishes; they never
+    # schedule). This is the elastic-cadence lower bound: rounds fire only
+    # when someone has paid for one.
+    skip_unfunded_rounds: bool = False
+    # Elastic-cadence ceiling (informational for the operator's grid choice:
+    # the epoch grid itself is [round] epoch_blocks — set THAT to the max
+    # cadence and let skip_unfunded_rounds provide the scale-down; this knob
+    # only feeds cascade.funding.rounds_needed sizing/telemetry).
+    max_rounds_per_day: int = 1
     # Commit-order witness: {hotkey: {pending, committed}} block numbers, written
     # every poll tick. The chain deletes a commit's block when drand reveals it,
     # so the evidence of who submitted a generator FIRST exists only for whoever
@@ -1426,6 +1469,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
+            funded_mode=validate_funded_mode(str(r.get("funded_mode", "off"))),
+            funded_queue_path=str(r.get("funded_queue_path", "funded_queue.json")),
+            skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
+            max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),

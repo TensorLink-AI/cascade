@@ -186,6 +186,12 @@ max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20)
 tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see chain.toml NOTE
 tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
+# Miner-funded compute (DEC-CA-0029): testnet is where "shadow" → "required"
+# gets exercised first (cascade-intake may run --trust-refs here). Inert now.
+funded_mode = "off"
+funded_queue_path = "funded_queue.json"
+skip_unfunded_rounds = false
+max_rounds_per_day = 1
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps

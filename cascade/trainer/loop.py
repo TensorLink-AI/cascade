@@ -933,6 +933,115 @@ class TrainerRunner:
                          "(re-register to resubmit)", c.hotkey)
         return [c for c in challengers if c.hotkey not in seen]
 
+    # ── miner-funded compute (DEC-CA-0029) ───────────────────────────────────
+
+    def _funded_queue(self):
+        """The funded queue, or ``None`` while ``[round] funded_mode = "off"``.
+
+        A fresh file-backed instance per call (single-writer process; the
+        intake service appends via its own instance and atomic replace, so the
+        newest state is always one load away). Relative paths resolve under
+        ``work_root``, like ``submissions_db_path``.
+        """
+        if self.cfg.round.funded_mode == "off":
+            return None
+        from ..funding.queue import FundedQueue
+
+        p = Path(self.cfg.round.funded_queue_path)
+        return FundedQueue(p if p.is_absolute() else (self.work_root / p))
+
+    def _filter_funded_challengers(
+        self, challengers: list[ResolvedGenerator]
+    ) -> list[ResolvedGenerator]:
+        """Apply ``[round] funded_mode`` to the eligible field.
+
+        ``"shadow"`` only reports: the field is untouched and the queue is
+        never mutated, so an operator can watch adoption. ``"required"``
+        makes the funded queue THE field: at most ``finalist_cap`` funded
+        entries enter, earliest reveal block first (queue seniority), and a
+        funded entry only matches when its ref equals the challenger's
+        revealed ref — funding one reveal never covers a different one.
+        Selected entries are marked ``in_round``; a torn round's leftovers
+        are recovered to ``queued`` first (never burned — the same rule as
+        the submission burn). Runs BEFORE the burn filter's output is burned,
+        so an unfunded reveal waits without consuming its one submission.
+        """
+        mode = self.cfg.round.funded_mode
+        queue = self._funded_queue()
+        if queue is None or not challengers:
+            return challengers
+        queue.recover_in_round()
+        funded = {e.hotkey: e for e in queue.entries() if e.status == "queued"}
+        if mode == "shadow":
+            n_funded = sum(1 for c in challengers
+                           if c.hotkey in funded and funded[c.hotkey].ref == c.ref)
+            log.info("funded shadow: %d/%d eligible challengers are funded",
+                     n_funded, len(challengers))
+            return challengers
+        # required: the funded queue decides who enters, in queue seniority
+        # order, capped at the duel cohort the round can actually judge.
+        by_hotkey = {c.hotkey: c for c in challengers}
+        kept: list[ResolvedGenerator] = []
+        for entry in sorted(funded.values(), key=lambda e: (e.reveal_block, e.hotkey)):
+            c = by_hotkey.get(entry.hotkey)
+            if c is None:
+                continue                      # funded but not revealed/eligible: waits
+            if entry.ref != c.ref:
+                log.info("funded entry for %s covers ref %s, but the eligible reveal "
+                         "is %s — not entering (re-fund the new ref)",
+                         entry.hotkey, entry.ref, c.ref)
+                continue
+            kept.append(c)
+            if len(kept) >= max(1, self.cfg.round.finalist_cap):
+                break
+        dropped = len(challengers) - len(kept)
+        if dropped:
+            log.info("funded_mode=required: %d unfunded/over-cap challenger(s) wait "
+                     "for a later round (unburned)", dropped)
+        queue.mark_in_round([c.hotkey for c in kept])
+        return kept
+
+    def _mark_funded_done(self, challengers: list[ResolvedGenerator]) -> None:
+        """Settle funded entries whose round consumed them (required mode only).
+
+        Called at the same moment the submission burn fires — after the heat
+        stage completes — for the same reason: an entry is spent only by a
+        round that actually judged it. Requeue-on-infra during the round rides
+        the existing heat machinery; entries a torn round left ``in_round``
+        are recovered by the NEXT round's filter instead.
+        """
+        if self.cfg.round.funded_mode != "required" or not challengers:
+            return
+        queue = self._funded_queue()
+        if queue is None:
+            return
+        for c in challengers:
+            entry = queue.get(c.hotkey)
+            if entry is not None and entry.status == "in_round":
+                queue.mark_done(c.hotkey)
+
+    def _skip_unfunded_round(self, round_id: str) -> bool:
+        """True when this boundary should not run at all (elastic-cadence floor).
+
+        Only with ``funded_mode = "required"`` and ``skip_unfunded_rounds``:
+        an empty funded queue means nobody paid for this round — no king leg,
+        no pods, no manifest. Validators score what publishes and never
+        schedule (they poll ``read_latest_manifest``), so a skipped boundary
+        is consensus-invisible: the king simply holds.
+        """
+        rnd = self.cfg.round
+        if rnd.funded_mode != "required" or not rnd.skip_unfunded_rounds:
+            return False
+        queue = self._funded_queue()
+        queue.recover_in_round()
+        depth = queue.queued_depth()
+        if depth == 0:
+            log.info("round %s: funded queue empty — skipping the boundary "
+                     "(skip_unfunded_rounds)", round_id)
+            return True
+        log.info("round %s: %d funded challenger(s) queued", round_id, depth)
+        return False
+
     def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:
         """Burn the challengers that got their shot: 1 hotkey = 1 submission.
 
@@ -2707,6 +2816,10 @@ class TrainerRunner:
 
         self._storage_dropped.clear()   # per-round: see _burn_hotkeys exemption
         eligible = self._filter_burned_challengers(plan.challengers)
+        # Miner-funded gate BEFORE anything burns or trains: an unfunded reveal
+        # in required mode waits outside the round — never burned, never
+        # screened — until its owner funds it (DEC-CA-0029).
+        eligible = self._filter_funded_challengers(eligible)
         # Content-level duplicate screen ([round] dedup_mode): re-uploads and
         # near-copies of the king or a lower-UID challenger lose their heat GPU
         # slot before any pod is dispatched. They stay in ``eligible`` — entering
@@ -2742,6 +2855,7 @@ class TrainerRunner:
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
         # submission is consumed by a round that never judged it.
         self._burn_hotkeys(eligible)
+        self._mark_funded_done(eligible)   # same settle moment, same rationale
         # Heat settled (screened + burned + finalists chosen): signal external
         # watchers (the provisioner) that heat-stage pods are now safe to release.
         self._mark_heat_complete(base_seed, eligible, finalists)
@@ -3843,6 +3957,14 @@ class TrainerRunner:
                     # thread died with the old process) — release the hold
                     # rather than bill the final pod to the cap.
                     self._release_stale_bench_hold(round_id)
+                    last_round = round_id
+                    time.sleep(poll)
+                    continue
+                # Elastic-cadence floor (DEC-CA-0029): an unfunded boundary in
+                # required mode runs nothing — no king leg, no pods, no
+                # manifest. Checked before ANY round work (commitment polls,
+                # promotion, hosts waits) so a quiet day costs nothing.
+                if self._skip_unfunded_round(round_id):
                     last_round = round_id
                     time.sleep(poll)
                     continue

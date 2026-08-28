@@ -302,6 +302,20 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
+# ── Miner-funded compute (DEC-CA-0029) — SHIPPED INERT ───────────────────────
+# "off" (this) / "shadow" (log funding status, change nothing) / "required"
+# (the round's field IS the funded queue: at most finalist_cap funded entries
+# per round, earliest reveal first; the heat's fits-the-cap fast path then
+# short-circuits the screen, so every funded entrant duels). Arming is a mode
+# flip AFTER the intake service (cascade-intake) and per-payer provisioning
+# are deployed — release-then-activate, like dedup_mode/gift_gate_mode.
+funded_mode = "off"
+funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
+# With funded_mode = "required": an unfunded boundary runs NOTHING (no king
+# leg, no pods, no manifest — validators just see no manifest and hold).
+# This is the elastic-cadence floor; the ceiling is the epoch grid itself.
+skip_unfunded_rounds = false
+max_rounds_per_day = 1                    # cadence sizing/telemetry only (grid = epoch_blocks)
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never

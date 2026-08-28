@@ -169,6 +169,22 @@ class FundedQueue:
                 self._entries[hk] = replace(e, status="in_round")
         self._save()
 
+    def recover_in_round(self) -> int:
+        """Return every ``in_round`` entry to ``queued``; count recovered.
+
+        Called by the trainer at round START, before selection: a completed
+        round marks its entries ``done``, so anything still ``in_round`` at
+        the next round's entry is a torn round (crash/restart mid-round) —
+        the entries re-enter the field un-burned, mirroring the trainer's
+        burn-after-heat rule ("the field simply re-enters the retried round").
+        """
+        stale = [hk for hk, e in self._entries.items() if e.status == "in_round"]
+        for hk in stale:
+            self._entries[hk] = replace(self._entries[hk], status="queued")
+        if stale:
+            self._save()
+        return len(stale)
+
     def mark_done(self, hotkey: str) -> None:
         e = self._entries.get(hotkey)
         if e is not None:
