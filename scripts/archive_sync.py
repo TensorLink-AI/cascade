@@ -38,7 +38,7 @@ import boto3
 from botocore.config import Config
 
 IMMUTABLE_PATTERNS = ("manifests/round-*.json", "receipts/*/round-*.json",
-                      "receipts/round-*.json")
+                      "receipts/round-*.json", "generators/*.tar")
 CFG = Config(connect_timeout=10, read_timeout=60,
              retries={"max_attempts": 3, "mode": "standard"})
 

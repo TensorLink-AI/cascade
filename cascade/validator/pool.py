@@ -48,6 +48,8 @@ def mix_params_from_config(cfg: ChainConfig) -> MixParams | None:
         class_keep_frac=float(e.mix_class_keep_frac),
         series_bag_frac=float(e.mix_series_bag_frac),
         target_windows=int(e.mix_target_windows),
+        tier_from_block=int(getattr(e, "mix_tier_from_block", 0)),
+        tier_jitter_alpha=float(getattr(e, "mix_tier_jitter_alpha", 75.0)),
     )
 
 log = logging.getLogger("cascade.validator")

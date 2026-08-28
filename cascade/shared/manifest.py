@@ -114,24 +114,55 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # (every deployed config); setting it is the deliberate digest bump that
     # arms the shared-corpus regime.
     "real_corpus_ref": ("",),
+    # DEC-CA-0029: the fork-anneal fraction (finished-form duel checkpoints —
+    # the deferred "D" of wsd). 0.0 = off (every deployed config); setting it
+    # is the deliberate digest bump that arms the anneal cut.
+    "anneal_fraction": (0.0, 0),
+    # DEC-CA-0033: the measured variance bundle. EMA finished-form artifact
+    # (0.0 = off), N-seed generation mix (1 = single invocation), and the
+    # warm-started re-warmup (0.0 = off) — each inert at its default on
+    # every deployed config; setting one is the deliberate digest bump.
+    "ema_decay": (0.0, 0),
+    "gen_seed_mix": (1,),
+    "rewarmup_fraction": (0.0, 0),
+    # DEC-CA-0035: Toto2-aligned optimizer constants + the warm-start LR
+    # scale. Defaults are the deployed trainer's hardcoded behavior, so
+    # every knob is inert until set; the arming (measured targets: 0.96 /
+    # 0.999 / 7.0 / 0.91,0.972 / 1/54 / 0.125 with weight_decay 2e-8) is
+    # one deliberate contract cut — see the decision node.
+    "muon_momentum": (0.95,),
+    "muon_row_beta2": (0.95,),
+    "grad_clip": (1.0, 1),
+    "adamw_beta1": (0.9,),
+    "adamw_beta2": (0.999,),
+    "adamw_lr_scale": (1.0, 1),
+    "warm_lr_scale": (1.0, 1),
 }
 
 
-def contract_digest(contract: object) -> str:
-    """Stable sha256 over the fields of a training contract dataclass.
+def contract_payload(contract: object) -> dict:
+    """The exact dict :func:`contract_digest` hashes, as data.
 
-    Used to assert king and challenger were trained under byte-identical terms.
-    Accepts any dataclass (typically ``TrainingContractConfig``). Fields listed
-    in :data:`_DIGEST_DROP_WHEN_DEFAULT` are omitted while they hold their
-    inert default, so adding such a field to the dataclass never moves a
-    deployed digest — setting it is the digest bump.
+    Accepts a training-contract dataclass (typically
+    :class:`~cascade.shared.config.TrainingContractConfig`) or an
+    already-built payload dict. Fields listed in
+    :data:`_DIGEST_DROP_WHEN_DEFAULT` are omitted while they hold their inert
+    default. Idempotent: a payload round-tripped through JSON and passed back
+    in returns unchanged (already-dropped keys are simply absent), so
+    ``contract_digest(contract_payload(c)) == contract_digest(c)`` and a
+    manifest's published body re-hashes to the digest it declares.
+
+    This is what makes the training contract publishable per round
+    (DEC-CA-0036): the trainer ships the body in the signed manifest, and a
+    validator or auditor recomputes the digest from the round's OWN terms
+    instead of from whatever its local ``chain.toml`` happens to say today.
     """
     if hasattr(contract, "__dataclass_fields__"):
         payload = asdict(contract)  # type: ignore[arg-type]
     elif isinstance(contract, dict):
         payload = dict(contract)
     else:
-        raise TypeError(f"contract_digest expects a dataclass or dict; got {type(contract)}")
+        raise TypeError(f"contract_payload expects a dataclass or dict; got {type(contract)}")
     for key, defaults in _DIGEST_DROP_WHEN_DEFAULT.items():
         if key not in payload:
             continue
@@ -140,8 +171,64 @@ def contract_digest(contract: object) -> str:
             val = tuple(val)      # asdict/json round-trips lose tuple-ness
         if val in defaults:
             payload.pop(key)
+    return payload
+
+
+def contract_digest(contract: object) -> str:
+    """Stable sha256 over the fields of a training contract dataclass.
+
+    Used to assert king and challenger were trained under byte-identical terms.
+    Accepts any dataclass (typically ``TrainingContractConfig``) or a payload
+    dict from :func:`contract_payload`. Fields listed in
+    :data:`_DIGEST_DROP_WHEN_DEFAULT` are omitted while they hold their inert
+    default, so adding such a field to the dataclass never moves a deployed
+    digest — setting it is the digest bump.
+    """
+    payload = contract_payload(contract)
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
+
+
+# ── the locked (consensus) projection of a training contract — DEC-CA-0036 ───
+# The ONLY contract terms a validator gates a manifest on. Everything else in
+# [training] is trainer-DECLARED: published in the signed manifest, recorded in
+# the receipt, replayed by cascade-audit — but never a reason to reject a round,
+# so the trainer ships recipe/runtime/budget changes without a fleet deploy.
+#
+# The four that stay locked are exactly the terms this validator CONSUMES with
+# its own local value (grep cfg.training under cascade/validator and
+# cascade/eval — there is nothing else): ``base_arch_digest`` gates the
+# architecture the eval assumes, ``arch_preset`` names the sizes entries are
+# bucketed into, ``expected_gpu`` is the matched-hardware pin — which must come
+# from local config, since a pin read out of the declaration the trainer wrote
+# would gate the trainer against itself — and ``train_seed_salt`` feeds
+# ``RoundSeeds.derive``, from which the receipt publishes the round's
+# ``training_seed``: a declared salt change would make every receipt publish a
+# wrong seed and break audit replay (the fifth read the original draft missed).
+LOCKED_CONTRACT_FIELDS = (
+    "arch_preset", "base_arch_digest", "expected_gpu", "train_seed_salt",
+)
+
+
+def locked_contract_terms(contract: object) -> dict:
+    """The consensus projection of a contract: :data:`LOCKED_CONTRACT_FIELDS`
+    at the base size, plus each extra size's ``(arch_preset, expected_gpu)``.
+
+    Per-size entries carry only the locked pair — a ``[[training.sizes]]``
+    block's architecture and budget are declared like any other term. Sizes are
+    sorted by preset so declaration order never changes the comparison.
+    """
+    payload = contract_payload(contract)
+    terms = {k: payload.get(k, "") for k in LOCKED_CONTRACT_FIELDS}
+    sizes = []
+    for spec in payload.get("extra_sizes", ()) or ():
+        spec = dict(spec) if isinstance(spec, dict) else asdict(spec)
+        sizes.append({
+            "arch_preset": spec.get("arch_preset", ""),
+            "expected_gpu": spec.get("expected_gpu", ""),
+        })
+    terms["extra_sizes"] = sorted(sizes, key=lambda s: s["arch_preset"])
+    return terms
 
 
 @dataclass(frozen=True)
@@ -287,6 +374,11 @@ class HeatResult:
     leader_lcb: float | None = None   # leader-vs-runner-up paired LCB; diagnostic only
     n_windows: int | None = None      # eval windows the screen ranked on
     n_clusters: int | None = None     # distinct upstream feeds behind those windows
+    # The round's warm-start init scored on the same heat slice — the null
+    # baseline ([round] init_gate_mode, shadow/enforce). None = gate off or
+    # no warm start; dropped from the JSON when None so pre-gate standings
+    # stay byte-identical.
+    init_baseline: float | None = None
 
 
 def _entry_body(e: TrainedEntry) -> dict:
@@ -323,7 +415,7 @@ def heat_to_json(heat: HeatResult | None) -> dict | None:
     a live heat and a settled round's heat with one code path."""
     if heat is None:
         return None
-    return {
+    d = {
         "screen_size": heat.screen_size,
         "finalists": heat.finalists,
         "entrants": [asdict(e) for e in heat.entrants],
@@ -331,6 +423,9 @@ def heat_to_json(heat: HeatResult | None) -> dict | None:
         "n_windows": heat.n_windows,
         "n_clusters": heat.n_clusters,
     }
+    if heat.init_baseline is not None:
+        d["init_baseline"] = heat.init_baseline
+    return d
 
 
 def _heat_from_json(obj: object) -> HeatResult | None:
@@ -356,6 +451,8 @@ def _heat_from_json(obj: object) -> HeatResult | None:
         leader_lcb=(None if obj.get("leader_lcb") is None else float(obj["leader_lcb"])),
         n_windows=(None if obj.get("n_windows") is None else int(obj["n_windows"])),
         n_clusters=(None if obj.get("n_clusters") is None else int(obj["n_clusters"])),
+        init_baseline=(None if obj.get("init_baseline") is None
+                       else float(obj["init_baseline"])),
     )
 
 
@@ -404,6 +501,17 @@ class TrainingManifest:
     # the mix is inactive, so pre-activation manifests serialise byte-for-byte
     # as before.
     composition: dict | None = None
+    # The round's FULL training contract, as published by the trainer
+    # (DEC-CA-0036). Exactly the payload ``contract_digest`` hashes, so
+    # ``contract_digest(contract_body) == contract_digest`` is a self-consistency
+    # check any validator or auditor can run without holding the trainer's
+    # chain.toml. SIGNED (see canonical_body) — it is the round's auditable
+    # record of the terms it actually trained under, which is strictly better
+    # provenance than a local config file that a later re-pin rewrites in place.
+    # Signed under the drop-when-unset convention, so a manifest without it
+    # hashes exactly as it did before the field existed. ``None`` ⇒ the trainer
+    # predates the field (validators fall back to the legacy strict gate).
+    contract_body: dict | None = None
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -534,6 +642,11 @@ class TrainingManifest:
         if self.warm_start_ckpt:
             body["warm_start_ckpt"] = self.warm_start_ckpt
             body["warm_start_size"] = self.warm_start_size
+        # Same drop-when-unset convention (DEC-CA-0036): a manifest from a
+        # trainer that publishes no contract body hashes exactly as it did
+        # before the field existed, so every archived signature stays valid.
+        if self.contract_body is not None:
+            body["contract_body"] = self.contract_body
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -594,6 +707,8 @@ def load_manifest(text: str) -> TrainingManifest:
         eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
         warm_start_ckpt=str(obj.get("warm_start_ckpt", "") or ""),
         warm_start_size=str(obj.get("warm_start_size", "") or ""),
+        contract_body=(obj["contract_body"]
+                       if isinstance(obj.get("contract_body"), dict) else None),
         signature=obj.get("signature"),
     )
 

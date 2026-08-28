@@ -538,7 +538,7 @@ class LiumProvider:
     Auth is the CLI's own (``LIUM_API_KEY`` / ``~/.lium/config.ini``) — unless
     ``api_key`` is set, in which case EVERY CLI call this instance makes runs
     with that key in its child environment instead (the miner-funded rental
-    path, DEC-CA-0029: one provider instance per payer, mirroring PRISM's
+    path, DEC-CA-0036: one provider instance per payer, mirroring PRISM's
     per-submission ``LiumClient``). The key never enters this process's own
     environ, never appears in argv (world-readable in ``/proc``), and the
     dataclass repr excludes it.
@@ -565,7 +565,7 @@ class LiumProvider:
         """Child env for CLI calls: the payer's key layered over ours, or None.
 
         ``None`` (no per-payer key) inherits the process environment untouched
-        — the operator-account path, bit-identical to pre-DEC-CA-0029
+        — the operator-account path, bit-identical to pre-DEC-CA-0036
         behaviour. With a key set we copy the environment and override
         ``LIUM_API_KEY`` so the CLI bills the payer; the copy also guards
         against the CLI falling back to ``~/.lium/config.ini`` *and* against

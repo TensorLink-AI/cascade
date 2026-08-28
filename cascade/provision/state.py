@@ -53,7 +53,7 @@ class PodInstance:
     # pre-fallback ledgers loading.
     sku: str = ""
     gpus: int = 1
-    # Miner-funded pods (DEC-CA-0029): the hotkey whose Lium key was billed.
+    # Miner-funded pods (DEC-CA-0036): the hotkey whose Lium key was billed.
     # "" = operator account (every pre-funding ledger loads unchanged). This is
     # ALSO the teardown routing key — a pod on a miner's account can only be
     # terminated/listed with that miner's key (from the payer vault), so a

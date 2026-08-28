@@ -145,7 +145,9 @@ in-context.
 - **DEC-CA-0018** — Warm-start recipe is WSD, not per-round cosine:
   `lr_schedule = "wsd"` warms up once at generation start (the from-scratch
   run), holds base_lr FLAT across warm-started rounds, and defers decay to a
-  release cut (not built). wsd rounds checkpoint optimizer state
+  finished-form mechanism (built since: fork-anneal DEC-CA-0029 or EMA
+  DEC-CA-0033, both shipped inert — arm at most one). wsd rounds checkpoint
+  optimizer state
   (`optimizer.safetensors`, ~3×; Muon momentum + row-EMA + AdamW moments) and
   warm starts re-attach it; missing file ⇒ fresh state, shape mismatch ⇒
   abort. Flip changed `contract_digest` — trainer+validator deploy together.
@@ -160,6 +162,17 @@ in-context.
   block until upgraded; testnet = 1): audit replays each round's own rule.
   Realised mix publishes as an unsigned `composition` manifest block.
   (`decisions/DEC-CA-0019-jittered-round-mix.md`)
+
+- **DEC-CA-0031** — GP-prior generation economics: the MATERIALISED corpus
+  budget is points-denominated (`corpus_target_points`, armed at 16384×4096;
+  count free, cubic-in-length GP draws escape their worst corner), batch drain
+  budget 1800 → 7200 CPU-s with the streaming stall window split into
+  `stream_stall_seconds` and PINNED at the old values (a stalled generator
+  must not idle a lane longer), relative-jitter Cholesky documented in
+  MINER.md §1a. All `[generator]`-side: no digest bump, no coordinated
+  restart. Wall stays the law (DEC-CA-0001); `stream_gpu` remains its own
+  digest-bound decision.
+  (`decisions/DEC-CA-0031-gp-prior-generation-budget.md`)
 
 ## Proposed (design pass 2026-08-13 — miner submission surface; not yet owner-accepted;
 ## renumbered 2026-08-20: original 0016-0024 collided with the accepted decay/guard/wsd/jitter nodes)
@@ -195,6 +208,46 @@ in-context.
   materialisation; container ro-mount). Machinery landed inert; arming waits
   on the pricing experiment + EVAL_POOL disjointness rule + the corpus.
   (`decisions/DEC-CA-0028-shared-real-corpus.md`)
+- **DEC-CA-0032** — Even-by-domain eval draws (ACCEPTED 2026-08-25): realized
+  mixes were heavily uneven (r40: nature 30.5% vs web 4.0%). Two-part fix:
+  pool capacity floors >= 300 windows/domain + deliberate snapshot-marginal
+  drift (owner-side); and the TWO-TIER split — scarce domains draw at
+  capacity, the rest split evenly under `mix_tier_jitter_alpha = 75`
+  (+/-2-3pp), degenerating to uniform as floors land. CONSENSUS: activates at
+  `mix_tier_from_block` via release-then-activate (testnet armed, mainnet 0
+  until the coordinated release). Granularity axis deferred until snapshots
+  carry cadence labels. (`decisions/DEC-CA-0032-even-domain-mix.md`)
+- **DEC-CA-0033** (proposed) — The measured variance bundle: `ema_decay`
+  (EMA weights are the scored artifact; raw endpoint = lineage branch via
+  DEC-CA-0029's stable-file convention; the cheap fork-anneal alternative —
+  never arm both), `gen_seed_mix` (N derived generation seeds, interleaved,
+  ~√N residual noise; audit replays the interleaved rolling digest), and
+  `rewarmup_fraction` (softens the +0.11 first-step kick but measured A/B
+  verdict: NO end-of-run benefit — stays unarmed; DEC-CA-0035's
+  warm_lr_scale is the real lever).
+  All digest-bound drop-when-default, shipped inert; arming is a contract
+  cut. Measured basis: docs/notes/2026-08-26-seed-variance-ema.md.
+  (`decisions/DEC-CA-0033-ema-seedmix-rewarmup-variance-bundle.md`)
+- **DEC-CA-0034** (proposed) — Init-baseline: KOTH gets a null baseline.
+  Heat publishes the init's score as a SHADOW standings row ([round]
+  init_gate_mode, never filters); the enforcing floor is duel-side
+  ([scoring] init_gate_mode off→shadow→enforce + tolerance, gift-gate
+  shaped: blocks dethrones only, king retention untouched,
+  release-then-activate). Receipt fields + recorded params drop-when-default
+  so archived signatures survive; audit derives the judged margin rule from
+  params AND row presence. Does NOT catch a pristine-init upload (scores
+  equal) — that's the separate zero-train trainer guard.
+  (`decisions/DEC-CA-0034-init-baseline-floor.md`)
+- **DEC-CA-0035** (proposed) — Toto2-aligned optimizer constants: seven
+  `[training]` knobs (muon momentum/row-β₂, grad clip, AdamW betas, the
+  54:1 matrix:AdamW LR split, `warm_lr_scale`) defaulting to the previously
+  hardcoded behavior, digest-bound drop-when-default. MEASURED: the full
+  bundle @ warm LR 5e-4 BEATS the converged warm-start init by 0.0038
+  (campaign best; docs/notes/2026-08-27-toto2-alignment.md) — LR values
+  don't transfer across parametrization conventions, dimensionless
+  constants + the ratio do. Also fixed DEC-CA-0033's fields never being
+  loader-parsed. Arming gate: wave-3 cross-generator separation + testnet.
+  (`decisions/DEC-CA-0035-toto2-aligned-constants.md`)
 - **DEC-CA-0027** (proposed) — Scaling to 313M+/1B: per-size GPU pins
   (`SizeSpec.expected_gpu` / `target_train_hours`), size-conditional
   provisioning (300M+ rents H100, owner-directed), 22M screen (mirror-lineage
@@ -202,7 +255,26 @@ in-context.
   via a baseline-referenced statistic; decoupled flagship is the fallback if
   the noise floor kills the at-size duel.
   (`decisions/DEC-CA-0027-size-conditional-gpu-provisioning.md`)
-- **DEC-CA-0029** (proposed) — Miner-funded challenger legs (PRISM/sn100 port:
+- **DEC-CA-0029** (proposed) — Fork-anneal (wsd's deferred "D", the
+  DEC-CA-0018 revisit): each run ends with a cosine decay branch; the ANNEALED
+  weights are the scored checkpoint, the mid-stable branch
+  (`weights_stable.safetensors` + optimizer) carries the lineage for
+  warm-starts. `[training] anneal_fraction`, digest-bound drop-when-default
+  (0.0 = off, shipped inert); arming is a contract cut — testnet cycle first,
+  release-then-activate. Fixes the mid-stable recipe artifact in every
+  absolute-number consumer (public bench stream, DEC-CA-0017 guard,
+  promotion picks).
+  (`decisions/DEC-CA-0029-fork-anneal-finished-form-checkpoints.md`)
+- **DEC-CA-0030** (proposed) — Bench-anneal: `[telemetry]
+  bench_anneal_fraction` makes the post-round bench sweep score an ANNEALED
+  copy of each duel checkpoint (worker `--anneal` leg: resume weights +
+  optimizer on a salted corpus, cosine base_lr→0) so the signed BenchScores
+  (public bench stream, promotion picks, DEC-CA-0017 guard) read finished
+  form under wsd. Trainer restart only — canonical checkpoints, manifest,
+  bench-report wire format, and duel verdicts untouched; leg failure falls
+  back to the raw bench. Interim for the DEC-CA-0029 contract cut — never
+  arm both. (`decisions/DEC-CA-0030-bench-anneal-finished-form-benchscores.md`)
+- **DEC-CA-0036** (proposed) — Miner-funded challenger legs (PRISM/sn100 port:
   signed `X-Lium-Api-Key` intake → sealed vault → per-payer `LiumProvider`;
   infra faults requeue, never burn) under ELASTIC-cadence rounds: funded
   queue IS the field (`[round] funded_mode`, ≤ finalist_cap per round by
@@ -213,7 +285,7 @@ in-context.
   account before it crowns (miner-account pods are console-accessible to
   their payer). Landed inert 2026-08-28; arming gates: scoped pod creds,
   confirmation wiring, DEC-CA-0016 wall-clock tenure, retrain-noise
-  measurement. (`decisions/DEC-CA-0029-miner-funded-elastic-rounds.md`,
+  measurement. (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
@@ -229,9 +301,10 @@ New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
-decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0029 is claimed by the
-2026-08-28 miner-funded elastic-rounds pass; status proposed). Put the
-revisit condition in the node's `revisit_when:` key.
+decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0036 is claimed by the
+2026-08-28 miner-funded elastic-rounds pass, renumbered from 0029 after
+colliding with the accepted anneal/mix/init nodes 0029..0035; status
+proposed). Put the revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 

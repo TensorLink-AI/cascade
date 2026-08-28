@@ -1,9 +1,11 @@
 """Build a training corpus by running a miner's generator.
 
 Given a materialised generator repo, import ``generator.Generator``, construct
-it with the round's generation seed, and drain exactly ``corpus_n_series``
-validated series. The result is a list of float64 arrays plus its digest — the
-auditable record of what the model was trained on.
+it with the round's generation seed, and drain the corpus: exactly
+``corpus_n_series`` validated series, or — with ``corpus_target_points`` armed
+(DEC-CA-0031) — a free number of series up to that many points. The result is a
+list of float64 arrays plus its digest — the auditable record of what the model
+was trained on.
 
 Isolation boundary: the generator is miner-controlled code. :func:`build_corpus`
 runs it IN-PROCESS — fine for tests, ``cascade verify``, and trusted offline
@@ -238,6 +240,13 @@ def build_corpus(
     Raises :class:`CorpusError` on any failure; the trainer catches it and the
     offending generator simply fails to qualify this round (a bad generator can
     never affect the king's run).
+
+    With ``cfg.corpus_target_points`` armed (DEC-CA-0031) the drain is
+    points-denominated: the generator is asked for the same prefix upper bound
+    the streaming feed would use (``target // min_length + 2``) and the drain
+    stops once the corpus reaches the target points — count free, budget
+    fixed. At the default 0 the legacy exactly-``corpus_n_series`` drain runs
+    byte-identically.
     """
     size = check_repo_size(repo_dir, cfg.max_repo_mb)
     if not size.ok:
@@ -247,10 +256,15 @@ def build_corpus(
         Path(repo_dir), generation_seed, interface_version=cfg.interface_version,
         real_corpus_dir=cfg.real_corpus_dir,
     )
+    target = int(cfg.corpus_target_points)
+    n_request = (
+        target // max(int(cfg.min_length), 1) + 2 if target > 0
+        else cfg.corpus_n_series
+    )
     try:
         series = drain_generator(
             gen,
-            cfg.corpus_n_series,
+            n_request,
             min_length=cfg.min_length,
             max_length=cfg.max_length,
             max_total_points=cfg.max_total_points,
@@ -262,6 +276,7 @@ def build_corpus(
             accepted_fields=tuple(cfg.accepted_fields),
             max_missing_frac=cfg.max_missing_frac,
             allow_future_known=cfg.allow_future_known,
+            target_points=target,
             extra_series_check=_corr_gate(cfg),
         )
     except ValueError as e:

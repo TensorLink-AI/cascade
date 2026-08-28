@@ -320,6 +320,13 @@ def _dir_size_bytes(local_dir: Path | str) -> int:
 # invalid ref, or a genuine "not found" is deterministic and surfaces at once.
 HUB_MAX_ATTEMPTS = 4
 HUB_BACKOFF_BASE_S = 2.0
+# Checkpoint UPLOADS retry much longer than fetches: an upload sits at the end
+# of a 3h training run, so waiting out a network flap is strictly cheaper than
+# failing the entry (r44 2026-08-27: a ~10-min pod-side route flap outlived the
+# 4×2s window and cost a full retrain). 8 × 5s doubling ≈ 10.6 min of patience
+# before the HF mirror fallback (upload_dir_to_hub_or_hf) takes over.
+UPLOAD_MAX_ATTEMPTS = 8
+UPLOAD_BACKOFF_BASE_S = 5.0
 
 # Substrings (lower-cased) that mark a Hub error as a transient network blip
 # worth retrying. reqwest/requests timeouts surface as "read operation timed
@@ -476,6 +483,7 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
             repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
         ),
         f"upload of {d} to {repo}",
+        attempts=UPLOAD_MAX_ATTEMPTS, base_delay=UPLOAD_BACKOFF_BASE_S,
     )
     digest = str(getattr(result, "oid", "") or "")
     if not DIGEST_RE.match(digest):
@@ -1018,6 +1026,25 @@ def open_manifest_store(storage: object) -> S3Store | HFFallbackStore | S3Mirror
 # ───────────────────────── manifests + logs over S3 ─────────────────────────
 
 MANIFEST_LATEST_KEY = "manifests/latest.json"
+
+# Audit archive of miner generator code (OPSLOG 2026-08-25: miners routinely
+# delete their repos post-round — three deletions in one night broke an anneal
+# and the audit replay of two duel legs). The round's own resolve-time fetch is
+# the one guaranteed moment the code exists, so the trainer tars each fetched
+# tree here, keyed by its commit reference (which pins the content digest).
+# Immutable + tiny (code-only, max_repo_mb-bounded); R2 dual-write rides the
+# mirror store like every other manifest-bucket put.
+GENERATOR_ARCHIVE_PREFIX = "generators/"
+
+
+def generator_archive_key(ref: str) -> str:
+    """Bucket key of a generator ref's audit archive.
+
+    The ref (``repo@sha256:<hex>`` or ``repo@hf:<rev>``) already pins content,
+    so a filesystem-safe transliteration of it is content-addressed enough —
+    and keeps the key greppable back to the manifest's ``gen_ref``."""
+    safe = ref.strip().replace("/", "--").replace("@", "--").replace(":", "-")
+    return f"{GENERATOR_ARCHIVE_PREFIX}{safe[:200]}.tar"
 
 
 def manifest_round_key(round_id: str) -> str:

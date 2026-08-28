@@ -67,7 +67,7 @@
   Read-only: no wallet, no chain call, no credentials.
 
 * ``cascade fund <intake_url> --ref <repo@digest>`` — fund your revealed
-  submission's training leg with YOUR Lium API key (DEC-CA-0029). The key is
+  submission's training leg with YOUR Lium API key (DEC-CA-0036). The key is
   read from the environment (``$LIUM_API_KEY`` by default; never pass it on
   the command line — argv is world-readable) and travels only as the
   ``X-Lium-Api-Key`` header of one authenticated POST to the operator's

@@ -1,4 +1,4 @@
-"""Miner-funded compute (DEC-CA-0029): the BYOK plumbing.
+"""Miner-funded compute (DEC-CA-0036): the BYOK plumbing.
 
 Miners fund their own challenger training leg by handing the operator a Lium
 API key; the operator keeps full control of the rental, the image, and the

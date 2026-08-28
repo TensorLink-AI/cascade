@@ -1,7 +1,7 @@
 """Per-payer rentals: one pod, one challenger, one miner's Lium key.
 
 The stage fleets (``loop.ProvisionerLoop``) rent homogeneous batches on the
-OPERATOR's account. Funded challenger legs (DEC-CA-0029) are the opposite
+OPERATOR's account. Funded challenger legs (DEC-CA-0036) are the opposite
 shape: each pod is billed to its miner's own key, so every rental gets its own
 :class:`~cascade.provision.core.LiumProvider` bound to that key — the port of
 PRISM's per-submission backend (``PayerBackendFactory.resolve``). Three

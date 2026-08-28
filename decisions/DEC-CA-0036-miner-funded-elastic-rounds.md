@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0029
+id: DEC-CA-0036
 type: decision
 title: "Miner-funded challenger legs under elastic-cadence rounds; king and confirmation legs stay operator-funded"
 status: proposed

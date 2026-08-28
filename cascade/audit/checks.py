@@ -20,7 +20,13 @@ from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
 from ..shared.config import ChainConfig, effective_epoch_blocks
-from ..shared.manifest import TrainingManifest, contract_digest
+from ..shared.manifest import (
+    LOCKED_CONTRACT_FIELDS,
+    TrainingManifest,
+    contract_digest,
+    contract_payload,
+    locked_contract_terms,
+)
 from ..shared.receipt import RoundReceipt
 
 PASS, FAIL, WARN, SKIP = "PASS", "FAIL", "WARN", "SKIP"
@@ -199,14 +205,41 @@ def check_block_hash_onchain(receipt: RoundReceipt, client: object | None) -> Ch
 
 
 def check_contract_digest(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
-    """The manifest's contract digest equals the one recomputed from the local
-    ``chain.toml`` — the round trained under the published contract. Mirrors
-    the validator's block-gated contract transition (ScoringConfig
-    ``prior_contract_digest`` / ``contract_from_block``): a round whose epoch
-    boundary precedes the flip block replays under the pinned prior digest."""
+    """The round trained under a contract this auditor accepts.
+
+    Replays each round under its OWN rule, matching the validator
+    (:meth:`~cascade.validator.loop.ValidatorRunner._check_contract`):
+
+    * **Declared** (DEC-CA-0036) — from ``declared_contract_from_block``, for a
+      receipt carrying a published ``contract_body``: the body must re-hash to
+      the declared digest, and its locked projection must equal the local one.
+      The non-locked terms are reported by :func:`check_contract_declaration`,
+      not gated here.
+    * **Strict** — full equality against the local ``chain.toml``, with the
+      block-gated ``prior_contract_digest`` transition.
+
+    The declared path is what makes a historical replay honest: a round's terms
+    come from the round, so re-pinning ``chain.toml`` no longer silently
+    changes what an audit of an older round compares against.
+    """
     name = "contract-digest"
     want = contract_digest(cfg.training)
     got = str(receipt.manifest.get("contract_digest", ""))
+    body = receipt.manifest.get("contract_body")
+    declared_from = int(cfg.scoring.declared_contract_from_block)
+    if (declared_from and isinstance(body, dict)
+            and int(receipt.epoch_start_block) >= declared_from):
+        rehashed = contract_digest(body)
+        if rehashed != got:
+            return _fail(name, f"published contract_body hashes to {rehashed[:16]}… "
+                               f"but the manifest declares {got[:16]}…")
+        want_locked = locked_contract_terms(cfg.training)
+        got_locked = locked_contract_terms(body)
+        if got_locked != want_locked:
+            return _fail(name, f"locked contract terms differ from chain.toml: "
+                               f"{got_locked} != {want_locked}")
+        return _ok(name, f"contract_body hashes to the declared {got[:16]}… and its "
+                         "locked terms match chain.toml")
     if got != want:
         prior = cfg.scoring.prior_contract_digest
         from_block = int(cfg.scoring.contract_from_block)
@@ -218,6 +251,46 @@ def check_contract_digest(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResul
         return _fail(name, f"manifest contract_digest {got[:16]}… != local chain.toml "
                            f"{want[:16]}… (different training contract)")
     return _ok(name, f"contract_digest {want[:16]}… matches chain.toml")
+
+
+def check_contract_declaration(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
+    """Report how the round's DECLARED contract differs from the local one.
+
+    Under DEC-CA-0036 the non-locked ``[training]`` terms — recipe, budget,
+    runtime image, submission surface — are trainer-declared: they are signed
+    and recorded but never reject a round, so a trainer-side fix ships without
+    a validator deploy. That trade only holds if the drift is *visible*, which
+    is this check's whole job. It never FAILs (the terms are not consensus);
+    it WARNs when the round trained under terms this chain.toml does not
+    describe, and names every field so a reader can see exactly what moved.
+    """
+    name = "contract-declaration"
+    body = receipt.manifest.get("contract_body")
+    if not isinstance(body, dict):
+        return _skip(name, "manifest publishes no contract_body (pre-DEC-CA-0036 trainer)")
+    local = contract_payload(cfg.training)
+    locked = set(LOCKED_CONTRACT_FIELDS) | {"extra_sizes"}
+    drift = sorted(
+        k for k in set(body) | set(local)
+        if k not in locked and _jsonable(body.get(k)) != _jsonable(local.get(k))
+    )
+    if not drift:
+        return _ok(name, "declared contract matches chain.toml on every term")
+    detail = ", ".join(
+        f"{k}: declared {body.get(k)!r} vs local {local.get(k)!r}" for k in drift
+    )
+    return _warn(name, f"round trained under {len(drift)} declared term(s) that differ "
+                       f"from this chain.toml — recorded, not gated ({detail})")
+
+
+def _jsonable(value: object) -> object:
+    """Normalise for cross-source comparison: a contract read back from JSON has
+    lists where the dataclass had tuples, so compare both as lists."""
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
 
 
 def check_base_arch_digest(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
@@ -378,17 +451,22 @@ def _pooled_scores(
 
 
 def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
-    """The increment margin's baseline (warm-start init) scores from the
-    receipt, pooled over ``paired`` — or ``None`` for a round judged at
-    "level" (no ``role == "baseline"`` rows recorded).
+    """The shared warm-start init's scores from the receipt, pooled over
+    ``paired`` — or ``None`` when no ``role == "baseline"`` rows were
+    recorded.
 
-    Presence of baseline rows IS the record of which margin denomination the
-    validator judged under: it appends them exactly when it judged at
-    "increment" (a random-init or multi-size round falls back to "level" and
-    records none). Like ``wql_mode``, the mode itself cannot ride the signed
-    ``VerdictRecord`` without invalidating archived receipts — the replay is
-    self-verifying instead (reproducing the recorded LCB under the wrong rule
-    is not something a tampered receipt does by accident).
+    Baseline rows are appended whenever the validator scored the init — for
+    the increment margin AND/OR the init-baseline floor ([scoring]
+    init_gate_mode), so their presence alone no longer names the margin
+    denomination. The judged rule is the conjunction the caller applies:
+    "increment" ⟺ the receipt's params say ``margin_mode = "increment"``
+    (the unmodified config params) AND baseline rows exist (the validator's
+    in-round fallback to "level" — random-init round, size mismatch —
+    records none). A level-mode round with the floor on has rows but keeps
+    the level rule; the floor itself replays through the recorded
+    ``init_gate_mode`` param. Like ``wql_mode``, the judged mode cannot ride
+    the signed ``VerdictRecord`` without invalidating archived receipts —
+    the replay is self-verifying instead.
     """
     rows = [r for r in receipt.entry_scores if r.role == "baseline"]
     if not rows:
@@ -495,22 +573,31 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
             return _fail(name, f"cannot rebuild pooled scores for {hk}: {e}")
         if not paired:
             return _fail(name, f"challenger {hk} has no paired size")
-        # Margin denomination: baseline rows in the receipt mean the round was
-        # judged at "increment" (see _baseline_pooled); none mean "level".
+        # Margin denomination: "increment" ⟺ the recorded params say so AND
+        # baseline rows exist (the in-round fallback records none). Baseline
+        # rows on a level round belong to the init floor (see
+        # _baseline_pooled) — level rule, rows passed through for the floor.
         try:
             baseline = _baseline_pooled(receipt, paired)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot rebuild baseline scores: {e}")
         from dataclasses import replace as _dc_replace
 
+        judged_increment = (
+            duel_params.margin_mode == "increment" and baseline is not None
+        )
+        gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
         mode_params = _dc_replace(
-            duel_params, margin_mode="increment" if baseline is not None else "level"
+            duel_params, margin_mode="increment" if judged_increment else "level"
         )
         res = evaluate_round(
             king, chal, mode_params,
             seed=_bootstrap_seed(v.bootstrap_seed),
             king_tenure_rounds=v.king_tenure_rounds,
-            baseline_scores=baseline,
+            baseline_scores=(
+                baseline if (judged_increment or (gate_on and baseline is not None))
+                else None
+            ),
         )
         replayed.append((hk, res))
 
@@ -620,18 +707,27 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
     # leaves params untouched, so every pre-cohort receipt replays unchanged.
     duel_params = _cohort_params(params, manifest)
 
-    # Margin denomination: baseline rows in the receipt mean the round was
-    # judged at "increment" (see _baseline_pooled); none mean "level". Forced
-    # onto the replayed params so a config file whose margin_mode has since
-    # changed still replays the rule that actually decided the round.
+    # Margin denomination: "increment" ⟺ the recorded params say so AND
+    # baseline rows exist (the validator's in-round fallback to "level"
+    # records none). Rows on a level round belong to the init floor
+    # ([scoring] init_gate_mode, replayed via the recorded param) — level
+    # rule, rows passed through so the floor replays identically.
     try:
         baseline = _baseline_pooled(receipt, paired)
     except (ValueError, KeyError) as e:
         return _fail(name, f"cannot rebuild baseline scores: {e}")
     from dataclasses import replace as _dc_replace
 
+    judged_increment = (
+        duel_params.margin_mode == "increment" and baseline is not None
+    )
+    gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
     duel_params = _dc_replace(
-        duel_params, margin_mode="increment" if baseline is not None else "level"
+        duel_params, margin_mode="increment" if judged_increment else "level"
+    )
+    replay_baseline = (
+        baseline if (judged_increment or (gate_on and baseline is not None))
+        else None
     )
 
     def _replay(mode: str):
@@ -640,7 +736,7 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
             seed=_bootstrap_seed(v.bootstrap_seed),
             king_tenure_rounds=v.king_tenure_rounds,
             wql_mode=mode,
-            baseline_scores=baseline,
+            baseline_scores=replay_baseline,
         )
 
     result = _replay("geomean")
@@ -877,6 +973,7 @@ def run_tier0(
         check_epoch_alignment(receipt, cfg),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),
+        check_contract_declaration(receipt, cfg),
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),
         check_koth_params(receipt, cfg),

@@ -62,9 +62,12 @@ Full contract: docs/INTERFACE.md. Enforced limits: chain.toml `[generator]`,
   compares digests; validators rely on this to audit rounds.
 - **Output bounds** (violation disqualifies the round): finite floats only (no
   NaN/inf), univariate today (1-D `(L,)` arrays; the schema is ready for `(C, L)`
-  when `max_channels` rises), length 64–4096 per series, exactly `n` series
-  yielded, whole corpus ≤ 2e9 points, 16384 series drawn per training run,
-  30-minute wall-clock generation budget, 4 GB memory rlimit.
+  when `max_channels` rises), length 64–4096 per series, whole corpus ≤ 2e9
+  points. The corpus budget is points-denominated (DEC-CA-0029): the
+  materialised drain stops at `corpus_target_points` (67,108,864 = 16384×4096)
+  and the series count is free — many short series or fewer long ones; the live
+  stream stops at the training token budget. 2-hour CPU generation budget
+  (RLIMIT_CPU — threads sum into it), 4 GB memory rlimit.
 - **Sandboxed, no network.** `generator.py` is AST-scanned for blocked imports
   (`socket`, `urllib*`, `requests`, `httpx`, `subprocess`, `os.system`, `ctypes`,
   `cffi`, `pickle`, `marshal`, `multiprocessing`, cascade internals, …) and runs

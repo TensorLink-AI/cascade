@@ -140,12 +140,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.plan_only:
         import json
+        import os
+        import sys
 
         from ..shared.chain import ChainClient
 
         client = ChainClient.from_config(cfg, network=args.network)
         print(json.dumps(_plan_payload(cfg, client, args.work_root), sort_keys=True))
-        return 0
+        # os._exit, not return: the dedup screen's abandoned deadline worker is
+        # a non-daemon executor thread, and the atexit join would hold this
+        # process open past the provisioner's 600s subprocess timeout (r44
+        # 2026-08-26: five consecutive plan timeouts from finished plans that
+        # could not exit).
+        sys.stdout.flush()
+        os._exit(0)
 
     if not args.trainer:
         print("--trainer module:Class is required for a live run", flush=True)

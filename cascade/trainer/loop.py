@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -40,6 +42,7 @@ from ..shared.hippius import (
     S3Store,
     StorageError,
     fetch_from_hub,
+    generator_archive_key,
     manifest_round_key,
     publish_manifest,
     upload_dir_to_hub_or_hf,
@@ -51,6 +54,7 @@ from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    contract_payload,
     dump_manifest,
     format_trained_pointer,
     parse_trained_pointer,
@@ -111,6 +115,14 @@ RunoffFn = Callable[
 BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
+
+# Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
+# a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
+# never re-fits the round's exact training draw, and the salted seed keys the
+# leg's _train_work dir + checkpoint repo away from every canonical name.
+# Value matches the 2026-08-23 offline calibration runs, so their published
+# -anneal-u<uid> artifacts stay reproducible under the production leg.
+BENCH_ANNEAL_SALT = 0xA11EA1A11EA1
 
 # Dedup probe stage: concurrent sandboxes, and the floor under the per-draw
 # wall clock derived from [round] dedup_probe_budget_seconds (a budget so tight
@@ -598,6 +610,61 @@ def _drop_final_content_clones(
     return kept
 
 
+class _FinalLanePool(queue.Queue):
+    """Lane queue for the FINAL stage that discovers pods rented mid-final.
+
+    ``get()`` (the blocking, no-timeout form the dispatch path uses) refreshes
+    membership from a ``refresh_fn`` on a timeout loop: hosts whose NAMES are
+    new enter the rotation, so a slot lost at rental (the provisioner's
+    replace-once-then-drop) can be topped up by re-renting while the duel is
+    already running. Before this, the fleet was snapshotted once at final
+    start and a queued job was bound to it forever — r44 2026-08-27: four jobs
+    serialized two-at-a-time on the surviving pod while a replacement pod
+    would have sat invisible. Removal stays FAILURE-driven (a dead lane fails
+    its dispatch and the retry policy moves on): the hosts file is
+    authoritative for membership, never for liveness.
+    """
+
+    REFRESH_INTERVAL_S = 60.0
+
+    def __init__(self, initial_hosts: list, refresh_fn):
+        super().__init__()
+        self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
+        self._absorb_lock = threading.Lock()
+        self._known: dict[str, object] = {}
+        for h in initial_hosts:
+            self._known[getattr(h, "name", str(h))] = h
+            super().put(h)
+
+    def known_hosts(self) -> list:
+        """Current membership (for lane-count geometry) — grows, never shrinks."""
+        return list(self._known.values())
+
+    def _absorb_new(self) -> None:
+        try:
+            fresh = self._refresh_fn()
+        except Exception as e:  # noqa: BLE001 — a torn/absent file keeps the last set
+            log.debug("final lane pool refresh failed (keeping current set): %s", e)
+            return
+        with self._absorb_lock:
+            for h in fresh:
+                name = getattr(h, "name", None)
+                if name and name not in self._known:
+                    self._known[name] = h
+                    super().put(h)
+                    log.info("final lane pool: new lane %s joined mid-final", name)
+
+    def get(self, block: bool = True, timeout: float | None = None):
+        if not block or timeout is not None:
+            return super().get(block=block, timeout=timeout)
+        while True:
+            self._absorb_new()
+            try:
+                return super().get(timeout=self.REFRESH_INTERVAL_S)
+            except queue.Empty:
+                continue
+
+
 def _final_repo_suffix(
     jobs: list[tuple[ResolvedGenerator, str]],
     gen: ResolvedGenerator,
@@ -933,7 +1000,7 @@ class TrainerRunner:
                          "(re-register to resubmit)", c.hotkey)
         return [c for c in challengers if c.hotkey not in seen]
 
-    # ── miner-funded compute (DEC-CA-0029) ───────────────────────────────────
+    # ── miner-funded compute (DEC-CA-0036) ───────────────────────────────────
 
     def _funded_queue(self):
         """The funded queue, or ``None`` while ``[round] funded_mode = "off"``.
@@ -1107,6 +1174,35 @@ class TrainerRunner:
         finally:
             shutil.rmtree(probe_dir, ignore_errors=True)
 
+    def _archive_generator_tree(self, ref: str, d: Path) -> None:
+        """Best-effort audit archive of a fetched generator tree.
+
+        Miners routinely delete their repos post-round (OPSLOG 2026-08-25:
+        three deletions in one night broke an anneal and two legs' audit
+        replay); the resolve-time fetch is the one guaranteed moment the code
+        exists. Tar the tree to the manifest bucket under its ref key — the
+        mirror store dual-writes to R2 like every other put. Skip-if-present
+        keeps it idempotent across retries; ANY failure is swallowed — the
+        archive must never disturb the round it is recording.
+        """
+        import io
+        import tarfile
+        try:
+            store = self.manifest_store()
+            key = generator_archive_key(ref)
+            try:
+                store.get_bytes(key)
+                return  # already archived (tars are KBs; a GET probe is fine)
+            except Exception:  # noqa: BLE001 — missing/unreadable ⇒ (re)write
+                pass
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                tar.add(str(d), arcname=".")
+            store.put_bytes(key, buf.getvalue())
+            log.info("archived generator %s (%d bytes)", ref[:60], buf.tell())
+        except Exception as e:  # noqa: BLE001 — never sink a round for the archive
+            log.warning("generator archive failed for %s (ignored): %s", ref[:60], e)
+
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
     # Probe concurrency: sandboxes are subprocesses, each holding up to
     # [generator] max_memory_mb, so this also bounds the stage's peak RSS.
@@ -1200,6 +1296,7 @@ class TrainerRunner:
             try:
                 king_dir = Path(fetch_from_hub(king.ref, fetch_root / "king",
                                                hub=self.hub()))
+                self._archive_generator_tree(king.ref, king_dir)
                 king_fp = fingerprint_dir(king_dir, **fp_kwargs)
             except Exception as e:  # noqa: BLE001 — king trains later regardless
                 log.warning("dedup: king repo %s unfetchable (%s); screening "
@@ -1214,6 +1311,7 @@ class TrainerRunner:
         for c in entrants:
             try:
                 d = Path(fetch_from_hub(c.ref, fetch_root / f"u{c.uid}", hub=self.hub()))
+                self._archive_generator_tree(c.ref, d)
                 # A repo over [generator] max_repo_mb fails its heat run anyway
                 # (build_round_corpus checks the same bound), so there is no
                 # reason to spend fingerprint time on it — and skipping it
@@ -1342,9 +1440,13 @@ class TrainerRunner:
                     rnd.dedup_probe_budget_seconds, grace)
                 probe_mode, probe_enforce, probe_n, per_draw = "off", False, 0, 0
         if probe_n > 0 and probe_mode in ("shadow", "enforce"):
+            # corpus_target_points is zeroed: the probe compares SMALL
+            # fixed-count draws across entrants, so it must stay count-
+            # denominated even when the materialised drain is armed points-
+            # denominated (DEC-CA-0031).
             probe_cfg = replace(
                 self.cfg.generator, corpus_n_series=probe_n,
-                max_generate_seconds=per_draw)
+                max_generate_seconds=per_draw, corpus_target_points=0)
             gen_seed = RoundSeeds.derive(base_seed, self.cfg.training).generation_seed
             log.info("dedup-probe[%s]: %d survivor(s), %d wave(s), %ss per draw "
                      "(stage budget %ss)", probe_mode, len(survivors), waves,
@@ -1787,6 +1889,7 @@ class TrainerRunner:
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,
             max_wall_seconds=contract.max_train_seconds,
+            seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),
@@ -1904,20 +2007,40 @@ class TrainerRunner:
         size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
         log_role = f"heat-{gen.hotkey}" if heat else f"{role}-{size}"
-        # Cascade warm-start: fetch the pinned promoted init (content-addressed;
-        # the OCI digest verifies the bytes). A fetch failure RAISES — the run
-        # must never silently fall back to random init (DEC-CA-0005).
-        ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
-        result, corpus_digest, _, _ = self._train_checkpoint(
-            gen, seeds, contract, token_budget, out_dir, log_role=log_role,
-            warm_start_dir=ws_dir,
-        )
+        # Retry-without-retrain: if a PRIOR run of this exact job already trained
+        # a complete checkpoint here (marker written post-train, pre-upload) and
+        # only the upload failed, reuse it instead of burning the budget again.
+        # Sound because training is deterministic — same generator/seeds/contract
+        # rederives byte-identical weights (r44 2026-08-27: an upload flap after
+        # a finished 3h final run triggered a full retrain of the SAME bytes).
+        reused = self._reusable_checkpoint(out_dir, contract, gen)
+        if reused is not None:
+            log.warning(
+                "round=%s %s %s: COMPLETE checkpoint already at %s (prior run "
+                "trained it; only its upload failed) — skipping straight to "
+                "upload", seeds.base_seed, role, gen.hotkey, out_dir,
+            )
+            corpus_digest = str(reused["corpus_digest"])
+            gpu_name = str(reused.get("gpu_name", ""))
+        else:
+            # Cascade warm-start: fetch the pinned promoted init (content-addressed;
+            # the OCI digest verifies the bytes). A fetch failure RAISES — the run
+            # must never silently fall back to random init (DEC-CA-0005).
+            ws_dir = self._fetch_checkpoint_dir(warm_start_ref) if warm_start_ref else None
+            result, corpus_digest, _, _ = self._train_checkpoint(
+                gen, seeds, contract, token_budget, out_dir, log_role=log_role,
+                warm_start_dir=ws_dir,
+            )
+            gpu_name = str(result.metrics.get("gpu_name", ""))
+            self._write_train_complete_marker(
+                out_dir, contract, gen, corpus_digest=corpus_digest, gpu_name=gpu_name,
+            )
 
         ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
         # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
         # alive through a Hub outage instead of failing the checkpoint upload).
         up = upload_dir_to_hub_or_hf(
-            result.local_dir, ckpt_repo, self.hub(),
+            out_dir, ckpt_repo, self.hub(),
             hf_repo=self._hf_ckpt_repo(ckpt_repo),
         )
         return TrainedEntry(
@@ -1928,9 +2051,57 @@ class TrainerRunner:
             trained_pointer=format_trained_pointer(up.ref.immutable_ref),
             corpus_digest=corpus_digest,
             train_block=block,
-            gpu_name=str(result.metrics.get("gpu_name", "")),
+            gpu_name=gpu_name,
             size=size,
         )
+
+    # ── retry-without-retrain (the .train_complete marker) ────────────────────
+
+    TRAIN_COMPLETE_MARKER = ".train_complete"
+
+    def _write_train_complete_marker(
+        self, out_dir: Path, contract: TrainingContractConfig,
+        gen: ResolvedGenerator, *, corpus_digest: str, gpu_name: str,
+    ) -> None:
+        """Stamp ``out_dir`` as a COMPLETE training product (written after
+        training returns, before the upload is attempted) so an upload-failure
+        retry can skip the retrain. Atomic (tmp + rename); best-effort — a
+        marker miss just costs the old retrain-on-retry behaviour."""
+        try:
+            payload = json.dumps({
+                "contract_digest": contract_digest(contract),
+                "gen_ref": gen.ref,
+                "corpus_digest": corpus_digest,
+                "gpu_name": gpu_name,
+            }, sort_keys=True)
+            tmp = out_dir / (self.TRAIN_COMPLETE_MARKER + ".tmp")
+            tmp.write_text(payload)
+            tmp.rename(out_dir / self.TRAIN_COMPLETE_MARKER)
+        except Exception as e:  # noqa: BLE001 — never sink a finished run
+            log.warning("train-complete marker write failed for %s: %s", out_dir, e)
+
+    def _reusable_checkpoint(
+        self, out_dir: Path, contract: TrainingContractConfig, gen: ResolvedGenerator,
+    ) -> dict | None:
+        """The marker payload iff ``out_dir`` holds a complete checkpoint for
+        EXACTLY this job (same contract digest + same generator ref, weights
+        present) — else None. ``out_dir`` is already round/size/role-scoped, so
+        the digest+ref match is a belt-and-braces identity check, not the only
+        one. A torn/stale/mismatched marker reads as None (retrain, the safe
+        direction)."""
+        marker = out_dir / self.TRAIN_COMPLETE_MARKER
+        try:
+            if not marker.exists() or not (out_dir / "weights.safetensors").exists():
+                return None
+            payload = json.loads(marker.read_text())
+            if (payload.get("contract_digest") == contract_digest(contract)
+                    and payload.get("gen_ref") == gen.ref
+                    and payload.get("corpus_digest")):
+                return payload
+        except Exception as e:  # noqa: BLE001 — unreadable marker ⇒ retrain
+            log.warning("train-complete marker unreadable at %s (%s); retraining",
+                        out_dir, e)
+        return None
 
     def _load_warm_start(self, *, epoch_index: int | None = None) -> tuple[str, str] | None:
         """This round's promoted init as ``(checkpoint pointer, size)``, or
@@ -2683,16 +2854,94 @@ class TrainerRunner:
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str
     ) -> BenchScores | None:
-        """One remote sweep → six numbers, or ``None`` on any miss."""
+        """One remote sweep → six numbers, or ``None`` on any miss.
+
+        With ``[telemetry] bench_anneal_fraction`` armed (DEC-CA-0030) the
+        sweep scores an ANNEALED copy of the checkpoint — finished-form
+        numbers for the signed BenchScores — falling back to the raw
+        checkpoint on any anneal-leg failure."""
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import run_post_round_benchmark
 
+        bench_round, bench_role = round_id, entry.role
+        frac = float(getattr(self.cfg.telemetry, "bench_anneal_fraction", 0.0) or 0.0)
+        if frac > 0.0:
+            annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac)
+            if annealed is not None:
+                bench_round, bench_role = annealed
         report = run_post_round_benchmark(
-            host, round_id, entry.size or primary, self.cascade_bench_plan,
-            work_root=self.work_root, role=entry.role,
+            host, bench_round, entry.size or primary, self.cascade_bench_plan,
+            work_root=self.work_root, role=bench_role,
         )
         scores = extract_bench_scores(report) if report is not None else None
         return BenchScores(**scores) if scores is not None else None
+
+    def _dispatch_bench_anneal(
+        self, host: object, entry: TrainedEntry, round_id: str, primary: str,
+        frac: float,
+    ) -> tuple[str, str] | None:
+        """Run the bench-anneal leg (DEC-CA-0030) for one duel checkpoint on
+        the pod that trained it, returning the ``(round_dir, role_dir)`` pair
+        naming the annealed checkpoint's ``_train_work`` location for the
+        bench sweep — or ``None`` on any failure (the caller benches the raw
+        checkpoint instead; log-only telemetry must never lose the sweep).
+
+        The leg is a stock worker run: resume ``entry.trained_pointer``
+        (weights + optimizer state) on a FRESH salted corpus for
+        ``frac × target_train_hours`` under the pure-decay recipe
+        (``--anneal``). The salt keys the work dir + checkpoint repo away
+        from every canonical name, so nothing this leg writes can collide
+        with a consensus artifact."""
+        from .remote import RemoteDispatcher, pod_lane_count
+
+        if not self.trainer_spec:
+            log.warning("round=%s: bench-anneal skipped (no trainer_spec — "
+                        "benching the raw checkpoint)", round_id)
+            return None
+        size = entry.size or primary
+        contract = self.cfg.training.primary_size
+        if size != contract.arch_preset:
+            spec = next((sp for sp in self.cfg.training.extra_sizes
+                         if sp.arch_preset == size), None)
+            if spec is None:
+                log.warning("round=%s: bench-anneal skipped for unknown size %r",
+                            round_id, size)
+                return None
+            contract = self.cfg.training.for_size(spec)
+        salted = (int(round_id) ^ BENCH_ANNEAL_SALT) & ((1 << 63) - 1)
+        suffix = f"-anneal-u{entry.miner_uid}"
+        try:
+            disp = RemoteDispatcher(
+                trainer_spec=self.trainer_spec,
+                timeout_seconds=self.remote_timeout_seconds,
+                extra_forward_env=self._pod_extra_forward_env(),
+            )
+            # warm_start_ref makes the leg warm_started=True in the trainer, so
+            # under an armed [training] warm_lr_scale (DEC-CA-0035) its cosine
+            # decays from base_lr × scale. Exactly right for warm-started duel
+            # checkpoints (matches their stable-phase LR); for a generation-
+            # start checkpoint (stable phase ran full base_lr) the leg starts
+            # one notch low — accepted: telemetry-only, errs conservative, and
+            # all legs stay mutually comparable at the same start LR.
+            disp.dispatch(
+                host, gen_ref=entry.gen_ref, uid=entry.miner_uid,
+                hotkey=entry.miner_hotkey, role=entry.role,
+                base_seed=salted, block=entry.train_block,
+                arch_preset=size, train_hours=contract.target_train_hours * frac,
+                repo_suffix=suffix, warm_start_ref=entry.trained_pointer,
+                lane_count=pod_lane_count(host, [host]), anneal=True,
+            )
+        except Exception as e:  # noqa: BLE001 — telemetry: fall back, never raise
+            log.warning("round=%s: bench-anneal leg failed for %s %s (benching "
+                        "the raw checkpoint instead): %s",
+                        round_id, entry.role, entry.miner_hotkey, e)
+            return None
+        log.info("round=%s: bench-anneal leg done for %s %s (frac=%.2f) — "
+                 "benching the annealed copy", round_id, entry.role,
+                 entry.miner_hotkey, frac)
+        # The worker wrote _train_work/<salted>/<size>/<role><suffix>/checkpoint
+        # (dir = role + repo suffix, same layout the scratch shadow benches).
+        return str(salted), f"{entry.role}{suffix}"
 
     def _log_bench_pair_wandb(self, report: object) -> None:
         """Mirror the round's king/challenger bench pair to wandb when
@@ -2818,7 +3067,7 @@ class TrainerRunner:
         eligible = self._filter_burned_challengers(plan.challengers)
         # Miner-funded gate BEFORE anything burns or trains: an unfunded reveal
         # in required mode waits outside the round — never burned, never
-        # screened — until its owner funds it (DEC-CA-0029).
+        # screened — until its owner funds it (DEC-CA-0036).
         eligible = self._filter_funded_challengers(eligible)
         # Content-level duplicate screen ([round] dedup_mode): re-uploads and
         # near-copies of the king or a lower-UID challenger lose their heat GPU
@@ -2937,6 +3186,11 @@ class TrainerRunner:
             eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=warm_start[0] if warm_start else "",
             warm_start_size=warm_start[1] if warm_start else "",
+            # Publish the round's full training contract (DEC-CA-0036). Signed
+            # with the rest of the manifest, so the terms a round trained under
+            # are pinned to the round itself rather than inferred from whatever
+            # chain.toml says whenever someone later reads it.
+            contract_body=contract_payload(self.cfg.training),
         )
 
     def _log_telemetry_rollup(self, base_seed: int) -> None:
@@ -3062,6 +3316,12 @@ class TrainerRunner:
         # a seniority claim (Bittensor recycles them), the reveal block is
         # (DEC-CA-0012; NOTE-ca-operational-invariants).
         scored.sort(key=lambda t: (t[0], t[2].reveal_block, t[1]))
+        # Init-baseline shadow ([round] init_gate_mode = "shadow"): score the
+        # very init this heat trained from, on the same slice — the null
+        # baseline KOTH otherwise never sees. NEVER shapes advancement (the
+        # enforcing gate lives in the validator's duel, [scoring]
+        # init_gate_mode); here it is a published standings row only.
+        init_score = self._init_baseline(scored, ws_ref, seeds, screen_block)
         diagnostics = self._screen_diagnostics(scored, components, seeds.base_seed)
         if armed:
             ckpt_dirs = {c.hotkey: d for c, d, _ in trained}
@@ -3075,8 +3335,54 @@ class TrainerRunner:
             challengers, scored, winners, trained_hotkeys, heat_contract.arch_preset,
             len(winners) if armed else n,
             duplicates=duplicates, diagnostics=diagnostics, components=raw_components,
+            init_baseline=init_score,
         )
         return winners, heat
+
+    def _init_baseline(
+        self,
+        scored: list[tuple[float, int, ResolvedGenerator]],
+        ws_ref: str | None,
+        seeds: RoundSeeds,
+        screen_block: int | None,
+    ) -> float | None:
+        """Score the round's warm-start init on the heat's own slice (shadow).
+
+        Every entrant trained from this checkpoint's lineage branch, so its
+        score on the same windows is the round's "did training add value?"
+        null baseline. Precisely: what is scored is the init checkpoint's
+        SCORED face (``weights.safetensors`` via the wrapper) — the same
+        artifact form every entrant is scored on — which under an armed
+        finished-form mechanism (fork-anneal / EMA) is not byte-identical to
+        the stable branch entrants resume from. Score-vs-score is the
+        apples-to-apples comparison; just don't read the row as "the exact
+        tensor state training started from". Logged
+        and published on the standings; it never changes who advances — the
+        enforcing floor is the validator's duel-side gate. Fails OPEN on any
+        scoring error: a baseline hiccup must never sink the round.
+        """
+        rnd = self.cfg.round
+        mode = str(rnd.init_gate_mode or "off").lower()
+        if mode != "shadow":
+            if mode not in ("off", "shadow"):
+                log.warning("[round] init_gate_mode=%r not supported at the heat "
+                            "(only 'off'/'shadow'; enforcement is [scoring]-side); "
+                            "treating as 'off'", rnd.init_gate_mode)
+            return None
+        if not ws_ref or not scored or self.screen_fn is None:
+            return None
+        try:
+            init_dir = self._fetch_checkpoint_dir(ws_ref)
+            score = self._screen_score(
+                self.screen_fn(init_dir, None, seeds.base_seed, screen_block))
+        except Exception as e:  # noqa: BLE001 — fail open, loudly
+            log.error("heat: init-baseline scoring failed (%s: %s); shadow row "
+                      "omitted this round", type(e).__name__, e)
+            return None
+        beat = sum(1 for s, _, _ in scored if s <= score)
+        log.info("heat: init baseline score=%.5f — %d/%d entrants beat it",
+                 score, beat, len(scored))
+        return score
 
     def _advance_cohort(
         self,
@@ -3255,6 +3561,7 @@ class TrainerRunner:
         duplicates: set[str] = frozenset(),
         diagnostics=None,
         components: dict[str, tuple[float | None, float | None]] | None = None,
+        init_baseline: float | None = None,
     ) -> HeatResult:
         """Assemble the informational standings from a completed heat.
 
@@ -3308,6 +3615,7 @@ class TrainerRunner:
             leader_lcb=(diagnostics.leader_lcb if diagnostics is not None else None),
             n_windows=(diagnostics.n_windows if diagnostics is not None else None),
             n_clusters=(diagnostics.n_clusters if diagnostics is not None else None),
+            init_baseline=init_baseline,
         )
 
     def _heat_train(
@@ -3415,7 +3723,8 @@ class TrainerRunner:
         return entry
 
     @staticmethod
-    def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str, **kw):
+    def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str,
+                               used_host: list | None = None, **kw):
         """Dispatch on the next IDLE lane, retrying once on whichever lane is
         free after a failure (a different one whenever one is available).
 
@@ -3448,12 +3757,17 @@ class TrainerRunner:
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
             try:
-                return disp.dispatch(retry_host,
-                                     lane_count=pod_lane_count(retry_host, hosts), **kw)
+                entry = disp.dispatch(retry_host,
+                                      lane_count=pod_lane_count(retry_host, hosts), **kw)
+                if used_host is not None:
+                    used_host.append(retry_host)
+                return entry
             finally:
                 free_lanes.put(retry_host)
         else:
             free_lanes.put(host)
+            if used_host is not None:
+                used_host.append(host)
             return entry
 
     def _heat_train_remote(
@@ -3635,14 +3949,28 @@ class TrainerRunner:
             extra_forward_env=self._pod_extra_forward_env(),
         )
 
-        def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+        def _fresh_final_hosts() -> list:
+            if self.remote_hosts_path is None:
+                return []
+            from .remote import load_hosts
+
+            now = load_hosts(self.remote_hosts_path)
+            return [h for h in now if getattr(h, "stage", "any") in ("any", "final")]
+
+        # Lane pool over the free-lane dispatch (the heat's anti-double-booking
+        # pattern) PLUS mid-final membership refresh: a top-up pod rented after
+        # a boot-failure drop joins the rotation while queued jobs wait.
+        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts)
+
+        def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:  # noqa: ARG001
             used: list = []
             # Cohort finals need per-uid checkpoint repos (see
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
-            entry = self._dispatch_with_retry(
-                disp, hosts, i, describe=f"final {role} {gen.hotkey}",
+            entry = self._dispatch_on_free_lane(
+                disp, lane_pool, lane_pool.known_hosts(),
+                describe=f"final {role} {gen.hotkey}",
                 used_host=used,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
@@ -3657,7 +3985,7 @@ class TrainerRunner:
             return entry
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
-        with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
             futs = {ex.submit(_run, i, gen, role): (i, gen, role)
                     for i, (gen, role) in enumerate(jobs)}
             for fut in as_completed(futs):
@@ -3960,7 +4288,7 @@ class TrainerRunner:
                     last_round = round_id
                     time.sleep(poll)
                     continue
-                # Elastic-cadence floor (DEC-CA-0029): an unfunded boundary in
+                # Elastic-cadence floor (DEC-CA-0036): an unfunded boundary in
                 # required mode runs nothing — no king leg, no pods, no
                 # manifest. Checked before ANY round work (commitment polls,
                 # promotion, hosts waits) so a quiet day costs nothing.

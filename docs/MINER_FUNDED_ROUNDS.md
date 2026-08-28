@@ -1,11 +1,11 @@
-# Miner-funded rounds (DEC-CA-0029) — rollout runbook
+# Miner-funded rounds (DEC-CA-0036) — rollout runbook
 
 Challenger training legs billed to the submitting miner's own Lium API key;
 king, confirmation, and eval legs stay on the operator's account. Rounds stay
 rounds; cadence becomes elastic (fire only funded boundaries, up to the epoch
 grid). Everything below shipped **inert** — `[round] funded_mode = "off"` —
 and arms in the order given. The decision node
-(`decisions/DEC-CA-0029-miner-funded-elastic-rounds.md`) carries the design
+(`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`) carries the design
 rationale; this file is the how.
 
 ## Pieces

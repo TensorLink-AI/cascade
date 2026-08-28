@@ -1,6 +1,6 @@
 """The funded-challenger queue: who has paid for a lane, in what order.
 
-The queue is the demand signal for elastic rounds (DEC-CA-0029): entries are
+The queue is the demand signal for elastic rounds (DEC-CA-0036): entries are
 drained into round fields ``cap`` at a time, ordered by **reveal block** —
 earliest commit first, the one seniority claim the repo trusts (a UID is not
 one; see NOTE-ca-operational-invariants). Queue depth divided by the cap is
