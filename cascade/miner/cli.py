@@ -66,6 +66,16 @@
   archived round, ``--history`` lists every settled round's outcome.
   Read-only: no wallet, no chain call, no credentials.
 
+* ``cascade fund <intake_url> --ref <repo@digest>`` — fund your revealed
+  submission's training leg with YOUR Lium API key (DEC-CA-0029). The key is
+  read from the environment (``$LIUM_API_KEY`` by default; never pass it on
+  the command line — argv is world-readable) and travels only as the
+  ``X-Lium-Api-Key`` header of one authenticated POST to the operator's
+  intake; the request is signed by your hotkey, so nobody can fund (or
+  withdraw) on your behalf. ``--withdraw`` exits a still-queued entry and
+  makes the operator forget your key. Needs the ``[chain]`` extra (wallet
+  signing only — no chain connection is made).
+
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
 """
@@ -760,6 +770,105 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_fund(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "fund",
+        help="Fund your revealed submission's training leg with YOUR Lium API key.",
+    )
+    p.add_argument("intake_url",
+                   help="Operator intake base URL (https://…; TLS protects the key in transit).")
+    p.add_argument("--ref", required=True,
+                   help="The revealed generator ref this funds (repo@digest — what you deployed).")
+    p.add_argument("--wallet-name", required=True, help="Bittensor wallet (coldkey) name.")
+    p.add_argument("--wallet-hotkey", required=True, help="Bittensor wallet hotkey name.")
+    p.add_argument("--wallet-path", default=None, help="Optional non-default wallet root.")
+    p.add_argument("--lium-key-env", default="LIUM_API_KEY",
+                   help="Environment variable holding your Lium API key (default "
+                        "LIUM_API_KEY). The key is NEVER accepted on the command line.")
+    p.add_argument("--withdraw", action="store_true",
+                   help="Withdraw a still-queued entry (the operator forgets your key).")
+    p.set_defaults(func=_cmd_fund)
+
+
+def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
+                       sign_fn, *, now=None) -> dict[str, str]:
+    """The signed header set for one intake request (pure; testable).
+
+    ``sign_fn(message: bytes) -> bytes`` is the hotkey's sr25519 signer. The
+    canonical message binds action + hotkey + ref + timestamp, so a captured
+    fund request cannot be replayed as a withdraw (or vice versa), and none of
+    it can be replayed at all past the intake's freshness window.
+    """
+    import time as _time
+
+    from ..funding.intake import canonical_fund_message
+
+    ts = str(int((now or _time.time)()))
+    headers = {
+        "X-Miner-Hotkey": hotkey_ss58,
+        "X-Commit-Ref": ref,
+        "X-Timestamp": ts,
+        "X-Signature": sign_fn(canonical_fund_message(action, hotkey_ss58, ref, ts)).hex(),
+    }
+    if action == "fund":
+        headers["X-Lium-Api-Key"] = api_key
+    return headers
+
+
+def _cmd_fund(args: argparse.Namespace) -> int:
+    import json as _json
+    import os
+    import urllib.error
+    import urllib.request
+
+    action = "withdraw" if args.withdraw else "fund"
+    api_key = ""
+    if action == "fund":
+        api_key = (os.environ.get(args.lium_key_env) or "").strip()
+        if not api_key:
+            print(f"no Lium API key in ${args.lium_key_env} — export it first "
+                  f"(never pass the key itself as an argument)", file=sys.stderr)
+            return 2
+    base = args.intake_url.rstrip("/")
+    if base.startswith("http://") and "://127.0.0.1" not in base and "://localhost" not in base:
+        print("refusing to send your Lium key over plain http to a non-local intake; "
+              "use https", file=sys.stderr)
+        return 2
+
+    try:
+        import bittensor  # the [chain] extra; signing only — no connection
+        wallet = bittensor.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey,
+                                  path=args.wallet_path)
+        hotkey_ss58 = wallet.hotkey.ss58_address
+        sign_fn = wallet.hotkey.sign
+    except Exception as e:  # noqa: BLE001 — wallet errors are usage errors here
+        print(f"could not load wallet for signing: {e}", file=sys.stderr)
+        return 2
+
+    headers = build_fund_headers(action, hotkey_ss58, args.ref, api_key, sign_fn)
+    req = urllib.request.Request(f"{base}/v1/{action}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _json.loads(resp.read() or b"{}")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        body, status = _json.loads(e.read() or b"{}"), e.code
+    except (urllib.error.URLError, OSError) as e:
+        print(f"intake unreachable: {e}", file=sys.stderr)
+        return 3
+
+    if 200 <= status < 300:
+        print(f"{action}: {body.get('status', 'ok')} (hotkey {hotkey_ss58})")
+        if action == "fund":
+            print("your entry queues by reveal block; watch it via the intake's "
+                  "/v1/queue or `cascade round`. An infra failure on your pod "
+                  "re-queues you without burning the entry.")
+        return 0
+    print(f"{action} rejected ({status}): {body.get('code', '?')} — "
+          f"{body.get('message', '')}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     from ..shared.env import load_env_files
     load_env_files()
@@ -773,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_round(sub)
     _add_heat(sub)
     _add_duel(sub)
+    _add_fund(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 
