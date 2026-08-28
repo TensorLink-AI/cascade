@@ -122,11 +122,12 @@ log = logging.getLogger("cascade.provision.loop")
 POD_TAG = "cascade-"                       # every rented pod's name starts with this
 
 # The FULL naming scheme of pods this service rents: cascade-<round_id>-<stage>
-# (+ optional -rN replacement / -gN lane suffixes). The orphan reaper matches on
+# (+ optional -rN replacement / -gN lane suffixes; funded pods add the payer's
+# hotkey slug: cascade-<round_id>-funded-<slug>). The orphan reaper matches on
 # this — never on the bare POD_TAG prefix, which operators' hand-rented pods
 # (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share. Reaping
 # by bare prefix terminated a live hand-rented final pod on 2026-07-13.
-_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
+_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval|funded)(-|$)")
 
 # Boot slack folded into the "is there still time?" checks for late rentals
 # (JIT final rental and within-round retries). Sized from the REAL delivery

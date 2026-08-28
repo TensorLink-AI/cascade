@@ -472,9 +472,15 @@ SHADEFORM_CONTAINER_BAD = {"failed", "error", "stopped"}
 # ── side-effecting helpers (adapter surface, not unit-tested) ─────────────────
 
 
-def _run_cli(argv: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess:
-    """Run a CLI command and capture output (text mode)."""
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+def _run_cli(argv: list[str], timeout: float = 120.0,
+             env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run a CLI command and capture output (text mode).
+
+    ``env`` (full environment, not a delta) overrides the child's environment —
+    the per-payer rental path uses it to point the ``lium`` CLI at a miner's
+    API key without ever mutating this process's environ.
+    """
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _default_lium_bin() -> str:
@@ -490,7 +496,8 @@ def _default_lium_bin() -> str:
     return shutil.which("lium") or "lium"
 
 
-def _spawn_cli(argv: list[str], log_path: Path | None = None) -> subprocess.Popen:
+def _spawn_cli(argv: list[str], log_path: Path | None = None,
+               env: dict[str, str] | None = None) -> subprocess.Popen:
     """Fire-and-forget a CLI command (e.g. ``lium up``, which attaches/streams).
 
     We don't wait on it — pod readiness is observed via ``lium ps`` polling, and
@@ -501,9 +508,10 @@ def _spawn_cli(argv: list[str], log_path: Path | None = None) -> subprocess.Pope
     a DEVNULL'd spawn leaves a 900s ghost hunt with zero diagnostics).
     """
     if log_path is None:
-        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=env)
     with open(log_path, "ab") as f:
-        return subprocess.Popen(argv, stdout=f, stderr=f)
+        return subprocess.Popen(argv, stdout=f, stderr=f, env=env)
 
 
 def wait_ssh_reachable(ip: str, port: int, *, timeout: float, interval: float = 5.0,
@@ -527,14 +535,23 @@ def wait_ssh_reachable(ip: str, port: int, *, timeout: float, interval: float = 
 class LiumProvider:
     """Lium marketplace via its ``lium`` CLI (``--format json`` for machine output).
 
-    Auth is the CLI's own (``LIUM_API_KEY`` / ``~/.lium/config.ini``). Each pod is
-    one ``lium up`` on a distinct executor; SSH is injected via the container's
-    ``SSH_PUBKEY`` env (the CLI has no direct pubkey flag). Pods are addressed by
-    the ``--name`` we assign (Lium's ``ps``/``rm`` accept name, huid, or id).
+    Auth is the CLI's own (``LIUM_API_KEY`` / ``~/.lium/config.ini``) — unless
+    ``api_key`` is set, in which case EVERY CLI call this instance makes runs
+    with that key in its child environment instead (the miner-funded rental
+    path, DEC-CA-0029: one provider instance per payer, mirroring PRISM's
+    per-submission ``LiumClient``). The key never enters this process's own
+    environ, never appears in argv (world-readable in ``/proc``), and the
+    dataclass repr excludes it.
+
+    Each pod is one ``lium up`` on a distinct executor; SSH is injected via the
+    container's ``SSH_PUBKEY`` env (the CLI has no direct pubkey flag). Pods are
+    addressed by the ``--name`` we assign (Lium's ``ps``/``rm`` accept name,
+    huid, or id).
     """
 
     name: str = "lium"
     bin: str = field(default_factory=_default_lium_bin)
+    api_key: str = field(default="", repr=False)
     poll_interval: float = POD_POLL_INTERVAL
     _run: Callable[[list[str]], subprocess.CompletedProcess] | None = field(default=None, repr=False)
     _spawn: Callable[[list[str]], object] | None = field(default=None, repr=False)
@@ -544,9 +561,25 @@ class LiumProvider:
     # exclude a failed pod's machine when renting its replacement.
     _executor_by_name: dict = field(default_factory=dict, repr=False)
 
+    def _subprocess_env(self) -> dict[str, str] | None:
+        """Child env for CLI calls: the payer's key layered over ours, or None.
+
+        ``None`` (no per-payer key) inherits the process environment untouched
+        — the operator-account path, bit-identical to pre-DEC-CA-0029
+        behaviour. With a key set we copy the environment and override
+        ``LIUM_API_KEY`` so the CLI bills the payer; the copy also guards
+        against the CLI falling back to ``~/.lium/config.ini`` *and* against
+        us ever exporting the key to our own environ.
+        """
+        if not self.api_key:
+            return None
+        return {**os.environ, "LIUM_API_KEY": self.api_key}
+
     def _cli(self, args: list[str]) -> subprocess.CompletedProcess:
         try:
-            proc = (self._run or _run_cli)([self.bin, *args])
+            runner = self._run or (
+                lambda argv: _run_cli(argv, env=self._subprocess_env()))
+            proc = runner([self.bin, *args])
         except FileNotFoundError as e:
             # A missing binary is a config error, not "no capacity" — surface it
             # loudly instead of silently falling through to another provider.
@@ -554,9 +587,13 @@ class LiumProvider:
                 f"lium CLI not found at {self.bin!r}; install it (pip install lium.io)"
             ) from e
         if proc.returncode != 0:
+            detail = (proc.stderr or "")[-500:]
+            if self.api_key:
+                # A CLI must never echo its key, but the one place it could
+                # land is stderr — scrub before it can reach a log line.
+                detail = detail.replace(self.api_key, "<redacted>")
             raise ProvisionError(
-                f"`{self.bin} {' '.join(args)}` failed (rc={proc.returncode}): "
-                f"{(proc.stderr or '')[-500:]}"
+                f"`{self.bin} {' '.join(args)}` failed (rc={proc.returncode}): {detail}"
             )
         return proc
 
@@ -607,7 +644,8 @@ class LiumProvider:
             if self._spawn is not None:
                 self._spawn(argv)
             else:
-                _spawn_cli(argv, log_path=self._up_log_path(name))
+                _spawn_cli(argv, log_path=self._up_log_path(name),
+                           env=self._subprocess_env())
             log.info("lium up → executor %s as %s", ex.get("id"), name)
             self._executor_by_name[name] = str(ex.get("id"))
             names.append(name)
