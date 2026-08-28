@@ -202,6 +202,19 @@ in-context.
   via a baseline-referenced statistic; decoupled flagship is the fallback if
   the noise floor kills the at-size duel.
   (`decisions/DEC-CA-0027-size-conditional-gpu-provisioning.md`)
+- **DEC-CA-0029** (proposed) — Miner-funded challenger legs (PRISM/sn100 port:
+  signed `X-Lium-Api-Key` intake → sealed vault → per-payer `LiumProvider`;
+  infra faults requeue, never burn) under ELASTIC-cadence rounds: funded
+  queue IS the field (`[round] funded_mode`, ≤ finalist_cap per round by
+  reveal-block seniority ⇒ heat fast-path, everyone duels), unfunded
+  boundaries skip (validators poll manifests, never schedule; scale-up = the
+  existing scheduled `epoch_blocks` switch). King + confirmation legs stay
+  operator-funded — a provisional dethrone is re-trained on the operator's
+  account before it crowns (miner-account pods are console-accessible to
+  their payer). Landed inert 2026-08-28; arming gates: scoped pod creds,
+  confirmation wiring, DEC-CA-0016 wall-clock tenure, retrain-noise
+  measurement. (`decisions/DEC-CA-0029-miner-funded-elastic-rounds.md`,
+  `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
@@ -216,8 +229,9 @@ New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
-decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
-condition in the node's `revisit_when:` key.
+decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0029 is claimed by the
+2026-08-28 miner-funded elastic-rounds pass; status proposed). Put the
+revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 
