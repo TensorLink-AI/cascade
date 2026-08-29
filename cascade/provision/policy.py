@@ -299,7 +299,10 @@ def size_fleet(
     (``final_rent_on = "heat_complete"``) adapts to the marker's actual
     finalist list for free. ``0`` (the default, and what a pre-DEC-CA-0012
     plan payload implies) keeps the plan byte-identical to sizing off
-    ``finalists`` alone.
+    ``finalists`` alone. Either way the cohort is capped by the revealed
+    field itself: ``n_eligible`` challengers can produce at most
+    ``n_eligible`` finalists, so a king-only round (zero fresh submissions)
+    sizes the final at exactly 1 slot (r48, 2026-08-28).
     """
     if n_eligible < 0 or finalists < 0 or max_finalists < 0:
         raise ValueError("n_eligible/finalists/max_finalists must be non-negative")
@@ -307,6 +310,16 @@ def size_fleet(
         raise ValueError("heat_hours/epoch_hours must be positive, final_hours >= 0")
 
     finalists = max(finalists, max_finalists)
+    # Cohort-aware final sizing (r48, 2026-08-28): the heat can never advance
+    # more challengers than the revealed field contains, so the duel cohort is
+    # capped at ``n_eligible``. The plan's ``finalists``/``max_finalists`` are
+    # config constants, not observations — sizing off them alone rented the
+    # full 1 + cap final fleet (2 pods / 4 slots, ~$10) for a king-only round
+    # with ZERO fresh submissions. The rental-time signal is reliable: the
+    # margin trigger fires only after timed reveals land and the field is
+    # countable, and ``n_eligible`` is the post-dedup screened count the loop
+    # feeds in. The king always trains, so the final floor stays 1 slot.
+    finalists = min(finalists, n_eligible)
     n_to_screen = n_eligible if n_eligible > finalists else 0
     if n_to_screen > 0:
         window = max(epoch_hours - final_hours, heat_hours)

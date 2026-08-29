@@ -35,7 +35,7 @@ from .core import (
     validate_digest_pinned,
     wait_ssh_reachable,
 )
-from .health import HealthGate, HealthReport
+from .health import HealthGate, HealthReport, _sha256_of
 from .loop import PodProfile, ProvisionerLoop, RenderSettings, parse_plan_output
 from .policy import ProvisionPolicy, SkuCandidate, StagePolicy
 
@@ -333,10 +333,54 @@ def _compose_pod_hooks(*hooks) -> callable | None:
     return run
 
 
+def digest_env_command(digest: str, *, user: str = "root") -> str:
+    """The remote ``sh`` payload that PINS ``CASCADE_TRAIN_IMAGE_DIGEST`` on a pod.
+
+    Idempotent by construction: any existing assignment line is sed-deleted
+    before the fresh one appends, so re-running (re-gated pod, provisioner
+    restart, next round on a survivor) converges instead of accumulating.
+    Two targets, both needed:
+
+    * ``/etc/environment`` — pam_env applies it to every new SSH session, so
+      the trainer's per-dispatch ``remote_python`` invocations (and the health
+      gate's ``printenv`` probe) see the pin. Needs root: prefixed ``sudo -n``
+      when the pod user isn't root (shadeform VM-boot lands as ``shadeform``).
+    * ``$HOME/.bashrc`` ``export`` — interactive/debug shells, and images
+      whose sshd skips pam_env.
+
+    ``digest`` must be a bare ``sha256:<64hex>`` (callers normalise via the
+    same ``_sha256_of`` the health gate uses); the charset is [a-f0-9:], so
+    the string is quote-safe inside the single-quoted sh -c payload.
+    """
+    line = f"CASCADE_TRAIN_IMAGE_DIGEST={digest}"
+    sudo = "" if user == "root" else "sudo -n "
+    env_part = (
+        f"{sudo}sh -c 'touch /etc/environment && "
+        'sed -i "/^CASCADE_TRAIN_IMAGE_DIGEST=/d" /etc/environment && '
+        f"echo {line} >> /etc/environment'"
+    )
+    rc_part = (
+        'touch "$HOME/.bashrc" && '
+        'sed -i "/^export CASCADE_TRAIN_IMAGE_DIGEST=/d" "$HOME/.bashrc" && '
+        f'echo "export {line}" >> "$HOME/.bashrc"'
+    )
+    return f"{env_part} && {rc_part}"
+
+
 def make_config_push(render: RenderSettings, *, box_chain_toml: str,
-                     pod_user: str) -> callable:
+                     pod_user: str, image_digest: str = "") -> callable:
     """Post-health-gate hook: push the BOX's deployed chain.toml onto every
-    freshly gated pod (all stages), replacing the image-baked copy.
+    freshly gated pod (all stages), replacing the image-baked copy — and pin
+    ``CASCADE_TRAIN_IMAGE_DIGEST`` into the pod's ``/etc/environment`` +
+    ``.bashrc`` over the same SSH channel (``image_digest``, the chain.toml
+    ``[training] train_image_digest`` pin; empty ⇒ skipped).
+
+    The env pin is the permanent fix for the r47/r48 shadeform VM-boot
+    failure: the launch-time ``CASCADE_TRAIN_IMAGE_DIGEST`` env never lands
+    in ``/etc/environment`` on VM-boot pods, so SSH dispatches inherited the
+    STALE digest the image baked at CI time and final-mode workers refused
+    the round (TrainImageMismatch) — worked around by a manual ssh patcher
+    script every round until this hook.
 
     Image-boot pods carry the chain.toml the worker image was BUILT with,
     while the box's deployed copy is the operational authority and drifts
@@ -349,6 +393,31 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
     Best-effort: a failed push leaves the baked copy — exactly the pre-hook
     behaviour."""
     import os
+
+    pinned = _sha256_of(image_digest)
+
+    def _push_digest_env(addr, stage: str, user: str) -> None:
+        """Best-effort env pin — a failure leaves the pod exactly pre-hook
+        (the manual ssh patcher remains the operator fallback)."""
+        argv = ["ssh", "-p", str(addr.ssh_port),
+                "-i", os.path.expanduser(render.key_path),
+                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=15",
+                f"{user}@{addr.ip}", digest_env_command(pinned, user=user)]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except Exception as e:  # noqa: BLE001 — best-effort: never gate a healthy pod
+            log.warning("digest env pin errored on %s:%s (pod keeps its baked "
+                        "digest): %s", addr.ip, addr.ssh_port, e)
+            return
+        if proc.returncode != 0:
+            log.warning("digest env pin failed on %s:%s (rc=%d, pod keeps its "
+                        "baked digest): %s", addr.ip, addr.ssh_port,
+                        proc.returncode, (proc.stderr or "")[-300:])
+        else:
+            log.info("CASCADE_TRAIN_IMAGE_DIGEST=%s pinned into /etc/environment "
+                     "+ .bashrc on %s pod %s:%s", pinned, stage, addr.ip,
+                     addr.ssh_port)
 
     def config_push(addr, stage: str, provider: str = "") -> None:  # noqa: ARG001
         prof = render.profile_for(provider)
@@ -364,14 +433,18 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
         except Exception as e:  # noqa: BLE001 — best-effort: never gate a healthy pod
             log.warning("chain.toml push errored on %s:%s (pod keeps the "
                         "image-baked copy): %s", addr.ip, addr.ssh_port, e)
-            return
-        if proc.returncode != 0:
-            log.warning("chain.toml push failed on %s:%s (rc=%d, pod keeps the "
-                        "image-baked copy): %s", addr.ip, addr.ssh_port,
-                        proc.returncode, (proc.stderr or "")[-300:])
         else:
-            log.info("deployed chain.toml pushed to %s pod %s:%s",
-                     stage, addr.ip, addr.ssh_port)
+            if proc.returncode != 0:
+                log.warning("chain.toml push failed on %s:%s (rc=%d, pod keeps the "
+                            "image-baked copy): %s", addr.ip, addr.ssh_port,
+                            proc.returncode, (proc.stderr or "")[-300:])
+            else:
+                log.info("deployed chain.toml pushed to %s pod %s:%s",
+                         stage, addr.ip, addr.ssh_port)
+        # The env pin rides the same hook but is independent of the scp's
+        # fate — a failed chain.toml copy must not strand the digest fix.
+        if pinned is not None:
+            _push_digest_env(addr, stage, user)
 
     return config_push
 
@@ -726,7 +799,8 @@ def _run(args) -> int:
         bootstrap=bootstrap,
         prewarm=_compose_pod_hooks(
             make_config_push(render, box_chain_toml=str(args.chain_toml),
-                             pod_user=str(top.get("pod_user", "root"))),
+                             pod_user=str(top.get("pod_user", "root")),
+                             image_digest=cfg.training.train_image_digest),
             (make_bench_prewarm(render,
                                 pod_user=str(top.get("pod_user", "root")))
              if cfg.scoring.cascade_enabled else None),

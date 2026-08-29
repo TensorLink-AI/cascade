@@ -872,9 +872,14 @@ class ProvisionerLoop:
         if self._round_plan is not None:
             # Pre-marker prediction: cover the tie-aware cohort CAP
             # (DEC-CA-0012) — the marker, once it fires, shrinks this to the
-            # actual finalist list.
-            return 1 + max(int(self._round_plan["finalists"]),
-                           int(self._round_plan.get("max_finalists", 0)))
+            # actual finalist list. The cap is itself capped by the revealed
+            # field (r48, 2026-08-28): zero fresh submissions can only ever
+            # produce a king-only duel, so never rent beyond 1 + the field.
+            cohort = max(int(self._round_plan["finalists"]),
+                         int(self._round_plan.get("max_finalists", 0)))
+            with contextlib.suppress(Exception):
+                cohort = min(cohort, _heat_field(self._round_plan))
+            return 1 + cohort
         return 2
 
     def _maybe_rent_final_jit(self, block: int) -> None:
