@@ -195,3 +195,53 @@ def test_live_heat_rejects_other_rounds_stale_and_malformed():
     assert live_heat({"epoch_start_block": 14_400, "as_of": fresh}, **ok) is None  # no entrants
     assert live_heat(None, **ok) is None
     assert live_heat("garbage", **ok) is None
+
+
+# ── skipped commitments (why isn't my hotkey listed?) ────────────────────────
+# r48 (2026-08-28): 328 burned hotkeys with standing commitments were skipped
+# pre-eligibility and the round published as an unexplained "0 entrants".
+
+
+def _skips(n, reason="already_submitted"):
+    return [{"hotkey": f"hk{i}", "uid": i, "reason": reason} for i in range(n)]
+
+
+def test_build_heat_status_carries_skip_reasons_additively():
+    doc = build_heat_status(_heat(), round_id="1", epoch_start_block=14_400,
+                            as_of=AS_OF, screened=3, netuid=91,
+                            skipped=_skips(2))
+    assert doc["skipped"]["total"] == 2
+    assert doc["skipped"]["by_reason"] == {"already_submitted": 2}
+    assert doc["skipped"]["entries"] == [
+        {"hotkey": "hk0", "uid": 0, "reason": "already_submitted"},
+        {"hotkey": "hk1", "uid": 1, "reason": "already_submitted"}]
+    assert doc["skipped"]["entries_truncated"] is False
+    # ADDITIVE: every pre-existing field is untouched, and a round without
+    # skips has no key at all (not an empty block) — dashboards that never
+    # heard of it see exactly the old document.
+    base = _doc()
+    assert "skipped" not in base
+    assert {k: doc[k] for k in base} == base
+
+
+def test_skipped_block_is_bounded_but_counts_are_complete():
+    from cascade.shared.heat_status import SKIPPED_ENTRIES_MAX
+
+    doc = build_heat_status(None, round_id="8", epoch_start_block=28_800,
+                            as_of=AS_OF, screened=0, finalists=1,
+                            no_screen_reason="no eligible challengers",
+                            skipped=_skips(328))
+    blk = doc["skipped"]
+    assert blk["total"] == 328                       # aggregate always complete
+    assert blk["by_reason"] == {"already_submitted": 328}
+    assert len(blk["entries"]) == SKIPPED_ENTRIES_MAX  # rows are a sample
+    assert blk["entries_truncated"] is True
+    assert len(json.dumps(doc)) < 20_000             # 328 skips stay a small doc
+
+
+def test_heat_summary_carries_the_skip_count():
+    doc = build_heat_status(_heat(), round_id="1", epoch_start_block=14_400,
+                            as_of=AS_OF, screened=3, netuid=91,
+                            skipped=_skips(7))
+    assert heat_summary(doc)["n_skipped"] == 7
+    assert heat_summary(_doc())["n_skipped"] == 0
