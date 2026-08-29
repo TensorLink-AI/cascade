@@ -110,7 +110,17 @@ class ChampionPublisher:
         state = self._load_state()
         published: list[str] = []
         backlog: list[dict] = list(state.get("unpublished", []))
-        if state.get("king_hotkey") != king_hotkey or state.get("king_ref") != king_ref:
+        king_changed = (state.get("king_hotkey") != king_hotkey
+                        or state.get("king_ref") != king_ref)
+        # Per-round idempotency: the round path can call this more than once
+        # for one round_id (a mid-round retry). Only the FIRST call for a
+        # round advances the reign counter, or a double-count would fire the
+        # "delay" reveal a round early and expose a live king's private code
+        # (review 2026-08-29). A king change is always processed (it may carry
+        # a new hand-off to publish); publication itself is idempotent.
+        same_round = (not king_changed
+                      and str(state.get("last_round", "")) == str(round_id))
+        if king_changed:
             prev_ref = state.get("king_ref", "")
             prev_digest = parse_vault_ref(prev_ref) if prev_ref else None
             # The reveal of last resort must SURVIVE a failed publish: a
@@ -123,8 +133,9 @@ class ChampionPublisher:
                                 "hotkey": str(state.get("king_hotkey", ""))})
             state = {"king_hotkey": king_hotkey, "king_ref": king_ref,
                      "reign_rounds": 0, "published": False}
-        else:
+        elif not same_round:
             state["reign_rounds"] = int(state.get("reign_rounds", 0)) + 1
+        state["last_round"] = str(round_id)
         still_unpublished: list[dict] = []
         for item in backlog:
             if self._publish(str(item["digest"]), str(item.get("hotkey", "")),

@@ -107,13 +107,24 @@ def champion_zip_key(digest_hex: str) -> str:
     return f"champions/{digest_hex}.zip"
 
 
+# Decompression-bomb guard: a submission is generator SOURCE (a few MB of code
+# + config), so a full extraction has no legitimate reason to exceed this. A
+# ~128MB deflate stream can expand to 100+GB; the operator box holds the eval
+# pool and the trainer wallet, so refuse before it fills the disk. Generous
+# next to any real generator; well under the smallest cloud volume.
+MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
+
+
 def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
     """Extract hostile ZIP bytes: regular files only, strictly inside ``dest``.
 
     Mirrors ``unpack_tar_to_dir``'s posture: no symlinks (a ZIP "symlink" is
     an external-attr trick — everything is written as a plain file from the
     member's bytes), no absolute paths, no ``..`` escapes, and the resolved
-    parent of every write must stay inside the destination.
+    parent of every write must stay inside the destination. A cumulative
+    decompressed-size cap (:data:`MAX_EXTRACTED_BYTES`) refuses a compression
+    bomb before it fills the operator's disk — checked against the declared
+    sizes first (cheap) and enforced on the bytes actually written.
     """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -123,6 +134,12 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
     except zipfile.BadZipFile as e:
         raise StorageError(f"not a valid zip: {e}") from e
     with zf:
+        declared_total = sum(max(0, i.file_size) for i in zf.infolist())
+        if declared_total > MAX_EXTRACTED_BYTES:
+            raise StorageError(
+                f"zip_too_large: declared decompressed size {declared_total} "
+                f"exceeds cap {MAX_EXTRACTED_BYTES}")
+        written = 0
         for info in zf.infolist():
             name = info.filename
             if name.endswith("/"):
@@ -140,7 +157,18 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             # returns a clean 400 bad_zip, never a 500 (review 2026-08-29).
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(zf.read(info))
+                payload = zf.read(info)       # deflate happens here
+            except OSError as e:
+                raise StorageError(f"zip member {name!r} not extractable: {e}") from e
+            written += len(payload)
+            if written > MAX_EXTRACTED_BYTES:
+                # A lying header (small file_size, large deflate) is caught by
+                # the running total, not just the declared sum above.
+                raise StorageError(
+                    f"zip_too_large: decompressed bytes exceed cap "
+                    f"{MAX_EXTRACTED_BYTES} (compression bomb?)")
+            try:
+                target.write_bytes(payload)
             except OSError as e:
                 raise StorageError(f"zip member {name!r} not extractable: {e}") from e
     return dest

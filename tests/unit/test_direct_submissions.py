@@ -83,6 +83,22 @@ def test_extract_converts_clashing_member_paths_to_storageerror(tmp_path):
         store.put(clash, HK)
 
 
+def test_extract_refuses_decompression_bomb(tmp_path):
+    # A small DEFLATE stream that expands past the cap is refused before it
+    # can fill the operator's disk (the box holds the eval pool + wallet).
+    from cascade.funding.store import MAX_EXTRACTED_BYTES
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.py", b"\x00" * (MAX_EXTRACTED_BYTES + 1))
+    bomb = buf.getvalue()
+    assert len(bomb) < MAX_EXTRACTED_BYTES        # zeros compress tiny
+    with pytest.raises(StorageError, match="zip_too_large"):
+        extract_zip_safely(bomb, tmp_path / "x")
+    with pytest.raises(StorageError, match="zip_too_large"):
+        SubmissionStore(tmp_path / "vault").put(bomb, HK)
+
+
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):
     store = SubmissionStore(tmp_path / "vault", max_bytes=64)
     with pytest.raises(StorageError, match="zip_too_large"):
@@ -280,6 +296,17 @@ def test_delay_policy_publishes_after_reign(tmp_path):
     assert pub.note_king(HK, vault_ref(digest), "r1") == []   # reign_rounds=0
     assert pub.note_king(HK, vault_ref(digest), "r2") == []   # 1
     assert pub.note_king(HK, vault_ref(digest), "r3") == [digest]  # 2 ≥ delay
+
+
+def test_delay_reign_counter_is_per_round_idempotent(tmp_path):
+    # A double call for the SAME round (mid-round retry) must NOT inflate the
+    # reign counter and reveal a live king's private code a round early.
+    pub, public, digest = _publisher(tmp_path, "delay", delay_rounds=2)
+    assert pub.note_king(HK, vault_ref(digest), "r1") == []
+    assert pub.note_king(HK, vault_ref(digest), "r1") == []   # retry, no advance
+    assert pub.note_king(HK, vault_ref(digest), "r2") == []   # still only 1 real round
+    assert not public.objects                                  # private at 1 reign
+    assert pub.note_king(HK, vault_ref(digest), "r3") == [digest]
 
 
 def test_dethrone_policy_reveals_only_at_handoff(tmp_path):
