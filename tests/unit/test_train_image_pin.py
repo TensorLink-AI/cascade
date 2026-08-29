@@ -46,9 +46,21 @@ def test_unpinned_contract_never_refuses(cfg, monkeypatch):
 
 
 def test_pinned_contract_refuses_without_runtime_digest(cfg, monkeypatch):
+    # The image bakes no self-digest (it cannot know its own post-push digest),
+    # so a missing env must read as "provisioner never injected it" — a clear
+    # delivery failure, not a confusing digest mismatch.
     monkeypatch.delenv(TRAIN_IMAGE_DIGEST_ENV, raising=False)
     pinned = replace(cfg.training, train_image_digest=PINNED_REF)
-    with pytest.raises(TrainImageMismatch, match="unset"):
+    with pytest.raises(TrainImageMismatch, match="unset.*provisioner must inject"):
+        assert_train_image(pinned)
+
+
+def test_pinned_contract_refuses_malformed_runtime_digest(cfg, monkeypatch):
+    # A present-but-undigested env value is a distinct failure from unset: it
+    # names the bad value so a hand-patched or truncated injection is visible.
+    monkeypatch.setenv(TRAIN_IMAGE_DIGEST_ENV, "not-a-digest")
+    pinned = replace(cfg.training, train_image_digest=PINNED_REF)
+    with pytest.raises(TrainImageMismatch, match="carries no\\s+sha256.*malformed"):
         assert_train_image(pinned)
 
 
