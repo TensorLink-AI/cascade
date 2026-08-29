@@ -185,8 +185,11 @@ def test_fetch_vault_snapshot_wraps_operator_oserror_as_storageerror(tmp_path, m
         with mock.patch.object(zipfile.ZipExtFile, "read", side_effect=fault), \
                 pytest.raises(StorageError) as ei:
             fetch_from_hub(vault_ref(digest), tmp_path / f"f-{type(fault).__name__}")
-        # The fetch-path failure reason must not echo operator-internal paths.
-        assert "/srv/vault" not in str(ei.value)
+        # Assert the EXACT wrapped message (not just absence of one path string):
+        # str(MemoryError()) is "", which would make a substring check vacuous —
+        # exact equality proves the reason carries no operator detail for either
+        # fault type.
+        assert str(ei.value) == f"vault snapshot of {digest} failed"
 
 
 def test_intake_status_not_hijacked_by_member_name(tmp_path):
