@@ -140,6 +140,18 @@ _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 # for.
 BOOT_MARGIN_HOURS = 1.0
 
+# Adopted-pod re-gate (the restart path): a pod resumed from the ledger passed
+# its health gate under the config of WHOEVER rented it — possibly a stale
+# image pin (2026-08-28: a zombie provisioner gated pods against its own stale
+# pin; adoption honored those passes and wrong-image pods reached the final
+# fleet, whose workers refused to run). The old pass is therefore worthless:
+# every adopted pod re-runs the SAME gate against the config loaded at THIS
+# startup before it stays in the published fleet. The bounded retry exists for
+# the mid-training pod: an ssh blip during the re-gate must not read as a bad
+# pod, while a deterministic mismatch (wrong digest) fails every attempt.
+ADOPT_REGATE_ATTEMPTS = 3
+ADOPT_REGATE_RETRY_S = 30.0
+
 
 def _heat_field(payload: dict) -> int:
     """How many challengers the heat will actually train.
@@ -390,6 +402,11 @@ class ProvisionerLoop:
     _retry_backoff: dict = field(default_factory=dict, init=False, repr=False)
     _dud_pods: dict = field(default_factory=dict, init=False, repr=False)
     _pending_logged_at: float = field(default=0.0, init=False, repr=False)
+    # Ledger-adopted pods awaiting their re-gate against the CURRENT config
+    # (see _maybe_regate_adopted): set on resume, cleared when the re-gate
+    # worker is spawned on the first cycle.
+    _adopt_pending: bool = field(default=False, init=False, repr=False)
+    _adopt_thread: object = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._state = load_state(self.state_path)
@@ -406,6 +423,12 @@ class ProvisionerLoop:
             # the marker scan anchors on heat rent times we no longer have.
             self._heat_marker_latched = self._final_pending and not any(
                 i.stage == "heat" for i in self._state.instances)
+            # Adoption is NOT trust: these pods passed the gate under the
+            # config of the run that RENTED them, which may have carried a
+            # different image pin. Flag them for a re-gate against the config
+            # loaded at THIS startup (first cycle, off-thread — see
+            # _maybe_regate_adopted).
+            self._adopt_pending = bool(self._state.instances)
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -475,6 +498,7 @@ class ProvisionerLoop:
                      self._last_block if self._last_block is not None else "?",
                      len(self._state.instances) if self._state else 0)
             self._last_heartbeat_at = now
+        self._maybe_regate_adopted()
         self._reconcile_orphans()
         self._teardown_due_pods()
         block = self._current_block()
@@ -1298,6 +1322,113 @@ class ProvisionerLoop:
                 log.warning("pod %s pre-warm hook errored (ignored): %s", pid, e)
         self._addrs[pid] = addr
         return addr
+
+    # ── ADOPTION RE-GATE (the restart path) ──────────────────────────────────
+
+    def _maybe_regate_adopted(self) -> None:
+        """Re-gate every ledger-adopted pod against the CURRENT config, once.
+
+        A restart adopts still-running rentals from the ledger instead of
+        re-renting — but their health-gate pass belongs to the run that rented
+        them, possibly under a stale image pin (the 2026-08-28 incident: see
+        ``ADOPT_REGATE_ATTEMPTS``). The re-gate runs the SAME injected
+        ``health_check`` fresh rentals use — bound at startup to the current
+        pin — in a daemon worker like the rent/eval legs, so gate ssh
+        round-trips never block the poll loop. A pod that fails gets the dud
+        treatment (terminate, drop from the ledger) and the affected hosts
+        file re-renders without it. Skipped when the gate itself is disabled
+        (``health_check is None``) and in dry-run (which mutates nothing).
+        """
+        if not self._adopt_pending:
+            return
+        self._adopt_pending = False
+        if self.dry_run or self.health_check is None or self._state is None:
+            return
+        insts = tuple(self._state.instances)
+        if not insts:
+            return
+        log.info("re-gating %d adopted pod(s) against the current config "
+                 "(a previous run's gate pass is not trusted across a restart)",
+                 len(insts))
+
+        def _worker() -> None:
+            try:
+                self._regate_adopted(insts)
+            except Exception as e:  # noqa: BLE001 — a failed re-gate never kills the loop
+                log.exception("adopted-pod re-gate failed: %s", e)
+
+        t = threading.Thread(target=_worker, name="adopt-regate", daemon=True)
+        self._adopt_thread = t                   # tests join() for determinism
+        t.start()
+
+    def _regate_adopted(self, insts: tuple[PodInstance, ...]) -> None:
+        dropped_fleet = dropped_eval = False
+        for inst in insts:
+            prov = self.providers.get(inst.provider)
+            if prov is None:
+                log.error("adopted pod %s: no adapter for provider %r — cannot "
+                          "re-gate; leaving it to the TTL backstop",
+                          inst.instance_id, inst.provider)
+                continue
+            if self._regate_one(prov, inst):
+                log.info("adopted %s pod %s re-passed the health gate",
+                         inst.stage, inst.instance_id)
+                continue
+            log.error("adopted %s pod %s FAILED the re-gate against the current "
+                      "config; terminating and dropping it from the fleet",
+                      inst.stage, inst.instance_id)
+            self._terminate_and_drop(prov, inst.instance_id)
+            if inst.stage == "eval":
+                dropped_eval = True
+            else:
+                dropped_fleet = True
+        # Same split as the teardown sweep: each hosts file re-renders only
+        # when ITS pods died — the trainer's file is never touched by eval
+        # churn, and vice versa.
+        if dropped_fleet:
+            self._republish_from_ledger()
+        if dropped_eval:
+            self._clear_eval_hosts()
+
+    def _regate_one(self, prov: object, inst: PodInstance) -> bool:
+        """One adopted pod through the existing gate, with a bounded retry.
+
+        A fresh rental absorbs transient faults in the boot path (ready-wait,
+        auth-injection polling) before its gate runs; an adopted pod is probed
+        cold and may be MID-TRAINING — one ssh blip must not kill it, so a
+        failed attempt retries up to ``ADOPT_REGATE_ATTEMPTS`` times,
+        ``ADOPT_REGATE_RETRY_S`` apart (worker thread — startup never blocks).
+        A deterministic mismatch (wrong image digest, wrong SKU) fails every
+        attempt and the pod is declared bad.
+        """
+        for attempt in range(1, ADOPT_REGATE_ATTEMPTS + 1):
+            if attempt > 1:
+                self.sleep(ADOPT_REGATE_RETRY_S)
+            try:
+                addr = self._addr_for(inst)
+                if addr is None:
+                    detail = "provider reports no address"
+                else:
+                    # Provider-echoed digest: the gate's fallback attestation
+                    # for sshd-as-PID-1 images (same as _boot_and_gate).
+                    attest_fn = getattr(prov, "launched_image_digest", None)
+                    attested = ((attest_fn(inst.instance_id) or "")
+                                if attest_fn is not None else "")
+                    # The ledgered sku/gpus assert what was ACTUALLY rented
+                    # (SKU fallback); a pre-fallback ledger without them falls
+                    # back to the stage policy inside the gate factory.
+                    shape = ({"sku": inst.sku, "gpus": inst.gpus}
+                             if inst.sku else {})
+                    report = self.health_check(addr, inst.stage, inst.provider,
+                                               attested_digest=attested, **shape)
+                    if report.ok:
+                        return True
+                    detail = report.summary()
+            except Exception as e:  # noqa: BLE001 — a dead transport is a failed attempt
+                detail = f"re-gate errored: {e}"
+            log.warning("adopted pod %s re-gate attempt %d/%d failed: %s",
+                        inst.instance_id, attempt, ADOPT_REGATE_ATTEMPTS, detail)
+        return False
 
     # ── PUBLISH ──────────────────────────────────────────────────────────────
 
