@@ -134,13 +134,17 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
     except zipfile.BadZipFile as e:
         raise StorageError(f"not a valid zip: {e}") from e
     with zf:
-        declared_total = sum(max(0, i.file_size) for i in zf.infolist())
+        try:
+            infos = zf.infolist()
+        except zipfile.BadZipFile as e:
+            raise StorageError(f"not a valid zip: {e}") from e
+        declared_total = sum(max(0, i.file_size) for i in infos)
         if declared_total > MAX_EXTRACTED_BYTES:
             raise StorageError(
                 f"zip_too_large: declared decompressed size {declared_total} "
                 f"exceeds cap {MAX_EXTRACTED_BYTES}")
         written = 0
-        for info in zf.infolist():
+        for info in infos:
             name = info.filename
             if name.endswith("/"):
                 continue                      # directories materialise via parents
@@ -158,12 +162,20 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 payload = zf.read(info)       # deflate happens here
-            except OSError as e:
+            except (OSError, zipfile.BadZipFile) as e:
+                # A corrupt/truncated member, a mismatched CRC, or a member
+                # whose real deflate exceeds its declared file_size all raise
+                # BadZipFile here (NOT an OSError) — convert them, so the
+                # intake returns a clean 400 bad_zip rather than a 500 on a
+                # hostile upload (review 2026-08-29).
                 raise StorageError(f"zip member {name!r} not extractable: {e}") from e
             written += len(payload)
             if written > MAX_EXTRACTED_BYTES:
-                # A lying header (small file_size, large deflate) is caught by
-                # the running total, not just the declared sum above.
+                # Backstop: today's CPython caps read() at file_size, so the
+                # declared-sum guard above already bounds the total — but this
+                # keeps the cap enforced on the bytes ACTUALLY written, so a
+                # zipfile that ever returned more than declared cannot slip a
+                # bomb past. Cheap, and not reliant on that internal cap.
                 raise StorageError(
                     f"zip_too_large: decompressed bytes exceed cap "
                     f"{MAX_EXTRACTED_BYTES} (compression bomb?)")

@@ -99,6 +99,22 @@ def test_extract_refuses_decompression_bomb(tmp_path):
         SubmissionStore(tmp_path / "vault").put(bomb, HK)
 
 
+def test_extract_corrupt_member_is_storageerror_not_500(tmp_path):
+    # A ZIP whose central directory parses but a member has a bad CRC /
+    # truncated deflate raises BadZipFile from read() (not OSError) — it must
+    # surface as StorageError (→ 400 bad_zip), never escape as a 500.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("gen.py", b"payload bytes here")
+    raw = bytearray(buf.getvalue())
+    # Corrupt the compressed stream: flip bytes in the local-header data area
+    # so the deflate/CRC fails on read while the central directory still parses.
+    for i in range(40, min(48, len(raw))):
+        raw[i] ^= 0xFF
+    with pytest.raises(StorageError):
+        extract_zip_safely(bytes(raw), tmp_path / "x")
+
+
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):
     store = SubmissionStore(tmp_path / "vault", max_bytes=64)
     with pytest.raises(StorageError, match="zip_too_large"):
