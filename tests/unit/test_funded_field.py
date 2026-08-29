@@ -21,10 +21,9 @@ def _runner(tmp_path, **round_kw):
     """A minimal stand-in: the funded methods touch only cfg.round + work_root."""
     rnd = RoundConfig(funded_queue_path="funded_queue.json", **round_kw)
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path)
-    fake._funded_queue = TrainerRunner._funded_queue.__get__(fake)
-    fake._filter_funded_challengers = TrainerRunner._filter_funded_challengers.__get__(fake)
-    fake._mark_funded_done = TrainerRunner._mark_funded_done.__get__(fake)
-    fake._skip_unfunded_round = TrainerRunner._skip_unfunded_round.__get__(fake)
+    for name in ("_funded_queue", "_filter_funded_challengers", "_mark_funded_done",
+                 "_skip_unfunded_round", "_submissions_path"):
+        setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     return fake
 
 
@@ -43,10 +42,15 @@ def test_off_mode_touches_nothing(tmp_path):
 def test_shadow_mode_reports_but_never_selects_or_mutates(tmp_path):
     q = _queue(tmp_path)
     q.add("hkA", REF, reveal_block=10)
+    q.add("hkC", REF, reveal_block=20)
+    q.mark_in_round(["hkC"])                 # e.g. left over from a required era
     runner = _runner(tmp_path, funded_mode="shadow")
     field = [_challenger("hkA"), _challenger("hkB")]
     assert runner._filter_funded_challengers(field) == field
     assert _queue(tmp_path).get("hkA").status == "queued"   # untouched
+    # Strictly read-only: shadow must not recover/expire — the observer never
+    # changes the observed (audit 2026-08-29).
+    assert _queue(tmp_path).get("hkC").status == "in_round"
 
 
 def test_required_selects_by_queue_seniority_capped(tmp_path):
@@ -65,13 +69,32 @@ def test_required_selects_by_queue_seniority_capped(tmp_path):
     assert reread.get("hkLate").status == "queued"          # waits, unburned
 
 
-def test_required_ref_mismatch_waits(tmp_path):
+def test_required_ref_mismatch_is_terminal(tmp_path):
+    # A re-revealed ref can never match again — leaving it queued would hold
+    # the skip-floor open and bill a king leg per boundary forever.
     q = _queue(tmp_path)
     q.add("hkA", "ns/old@sha256:" + "b" * 64, reveal_block=10)
     runner = _runner(tmp_path, funded_mode="required")
     kept = runner._filter_funded_challengers([_challenger("hkA", ref=REF)])
-    assert kept == []                                        # funded a different reveal
-    assert _queue(tmp_path).get("hkA").status == "queued"
+    assert kept == []
+    entry = _queue(tmp_path).get("hkA")
+    assert (entry.status, entry.last_error_class) == ("failed", "ref_mismatch")
+    # …and the miner can immediately fund the new ref.
+    assert _queue(tmp_path).add("hkA", REF, 11) == "queued"
+
+
+def test_required_burned_hotkey_is_terminal(tmp_path):
+    import json
+
+    q = _queue(tmp_path)
+    q.add("hkBurned", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required")
+    (tmp_path / "trainer_submissions.json").write_text(json.dumps(["hkBurned"]))
+    # The burn filter already removed the challenger from the field; the
+    # funded entry must die too, not squat in the depth count.
+    assert runner._filter_funded_challengers([_challenger("hkOther")]) == []
+    entry = _queue(tmp_path).get("hkBurned")
+    assert (entry.status, entry.last_error_class) == ("failed", "burned")
 
 
 def test_required_funded_but_not_revealed_waits(tmp_path):
@@ -107,13 +130,28 @@ def test_mark_done_only_touches_in_round_entries(tmp_path):
 
 
 def test_skip_unfunded_round_floor(tmp_path):
+    import time
+
     runner = _runner(tmp_path, funded_mode="required", skip_unfunded_rounds=True)
     assert runner._skip_unfunded_round("r1")                 # empty queue: skip
-    _queue(tmp_path).add("hkA", REF, reveal_block=10)
+    FundedQueue(tmp_path / "funded_queue.json", clock=time.time).add(
+        "hkA", REF, reveal_block=10)
     assert not runner._skip_unfunded_round("r1")
     # Without the flag a required round still runs (king-only if unfunded).
     runner2 = _runner(tmp_path, funded_mode="required", skip_unfunded_rounds=False)
     assert not runner2._skip_unfunded_round("r1")
+
+
+def test_skip_floor_expires_dead_entries(tmp_path):
+    # An entry far older than the payer-key TTL cannot hold the boundary open:
+    # the skip path expires it terminally and then skips — no perpetual
+    # king-leg drain from one never-enterable fund (audit 2026-08-29).
+    FundedQueue(tmp_path / "funded_queue.json", clock=lambda: 1000.0).add(
+        "hkStale", REF, reveal_block=10)     # funded_at ≈ 1970 vs the real now
+    runner = _runner(tmp_path, funded_mode="required", skip_unfunded_rounds=True)
+    assert runner._skip_unfunded_round("r1")
+    entry = _queue(tmp_path).get("hkStale")
+    assert (entry.status, entry.last_error_class) == ("failed", "funding_expired")
 
 
 def test_validate_funded_mode():

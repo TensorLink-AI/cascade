@@ -8,7 +8,12 @@ import hashlib
 from cascade.funding.intake import FundingIntake
 from cascade.funding.queue import FundedQueue
 from cascade.funding.vault import PayerKeyVault
-from cascade.miner.cli import _cmd_fund, build_fund_headers
+from cascade.miner.cli import (
+    _cmd_fund,
+    _decode_json_body,
+    _intake_transport_ok,
+    build_fund_headers,
+)
 
 HK = "5FakeHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 REF = "cascade-gen-abc@sha256:" + "c" * 64
@@ -74,3 +79,22 @@ def test_cmd_fund_refuses_plain_http_remote(monkeypatch, capsys):
     # Withdraw needs no key, but the transport guard still applies first.
     monkeypatch.delenv("TEST_LIUM_KEY", raising=False)
     assert _cmd_fund(_args(intake_url="http://intake.example", withdraw=True)) == 2
+
+
+def test_transport_guard_parses_hostname_not_substrings():
+    # The bypass class the audit flagged: hostnames that merely CONTAIN a
+    # local name must not pass.
+    assert not _intake_transport_ok("http://localhost.evil.example")
+    assert not _intake_transport_ok("http://127.0.0.1.attacker.example:80")
+    assert not _intake_transport_ok("ftp://localhost")
+    assert _intake_transport_ok("http://localhost:8790")
+    assert _intake_transport_ok("http://127.0.0.1:8790")
+    assert _intake_transport_ok("https://intake.example")
+
+
+def test_decode_json_body_survives_proxy_html():
+    assert _decode_json_body(b'{"code": "x", "message": "y"}') == {
+        "code": "x", "message": "y"}
+    body = _decode_json_body(b"<html><body>502 Bad Gateway</body></html>")
+    assert body["code"] == "non_json_response" and "502" in body["message"]
+    assert _decode_json_body(b"") == {}

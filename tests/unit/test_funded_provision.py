@@ -12,6 +12,7 @@ from cascade.provision.core import LaunchSpec, LiumProvider, PodAddress, Provisi
 from cascade.provision.funded import (
     FUNDED_STAGE,
     funded_pod_name,
+    payer_pod_pattern,
     reconcile_funded,
     rent_funded_pod,
     teardown_funded,
@@ -94,6 +95,8 @@ class FakeProvider:
     name: str = "lium"
     fail_launch: str = ""            # raise this message from launch
     ready: bool = True
+    rm_noop: bool = False            # terminate "succeeds" but the pod stays live
+    rm_raises: str = ""              # terminate raises (e.g. a hung-CLI timeout)
     launched: list = field(default_factory=list)
     terminated: list = field(default_factory=list)
     tagged: list = field(default_factory=list)
@@ -112,10 +115,14 @@ class FakeProvider:
         return PodAddress(ip="10.0.0.9", ssh_port=2222)
 
     def terminate(self, pod_id: str) -> None:
+        if self.rm_raises:
+            raise RuntimeError(self.rm_raises)
         self.terminated.append(pod_id)
+        if not self.rm_noop and pod_id in self.tagged:
+            self.tagged.remove(pod_id)
 
     def list_tagged(self, prefix: str) -> list[str]:
-        return list(self.tagged)
+        return [t for t in self.tagged if t.startswith(prefix)]
 
 
 def _rent(provider, **kw):
@@ -170,16 +177,19 @@ def _vault_with_key():
     return v
 
 
-def _funded_instance(instance_id="cascade-777-funded-5fakehotkey-0"):
+POD_ID = f"{funded_pod_name('777', HK)}-0"     # what launch() actually names it
+
+
+def _funded_instance(instance_id=POD_ID):
     return PodInstance("lium", instance_id, FUNDED_STAGE,
                        "2026-08-28T00:00:00Z", payer_hotkey=HK)
 
 
-def test_teardown_funded_uses_payer_key():
-    provider = FakeProvider()
+def test_teardown_funded_uses_payer_key_and_verifies():
+    provider = FakeProvider(tagged=[POD_ID])
     left = teardown_funded([_funded_instance()], _vault_with_key(),
                            provider_factory=lambda key: provider)
-    assert left == [] and provider.terminated == ["cascade-777-funded-5fakehotkey-0"]
+    assert left == [] and provider.terminated == [POD_ID]
 
 
 def test_teardown_funded_reports_keyless_pods_instead_of_swallowing():
@@ -190,14 +200,53 @@ def test_teardown_funded_reports_keyless_pods_instead_of_swallowing():
     assert left == [inst] and provider.terminated == []
 
 
-def test_reconcile_funded_kills_only_unowned_tagged_pods():
-    owned = _funded_instance("cascade-777-funded-5fakehotkey-0")
+def test_teardown_detects_pod_still_live_after_terminate():
+    # LiumProvider.terminate treats a failed `lium rm` as already-terminated
+    # (operator-fleet idempotency); on a REVOKED miner key that turns a 401
+    # into silence. The verification re-list is what catches it.
+    provider = FakeProvider(tagged=[POD_ID], rm_noop=True)
+    inst = _funded_instance()
+    left = teardown_funded([inst], _vault_with_key(),
+                           provider_factory=lambda key: provider)
+    assert left == [inst]
+
+
+def test_teardown_continues_past_a_crashing_terminate():
+    hk2 = "5FakeHotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    vault = _vault_with_key()
+    vault.insert(hk2, "sk-miner-2")
+    bad = _funded_instance()
+    good = PodInstance("lium", f"{funded_pod_name('777', hk2)}-0", FUNDED_STAGE,
+                       "2026-08-28T00:00:00Z", payer_hotkey=hk2)
+    providers = {
+        "sk-miner": FakeProvider(rm_raises="lium CLI hung (TimeoutExpired)"),
+        "sk-miner-2": FakeProvider(tagged=[good.instance_id]),
+    }
+    left = teardown_funded([bad, good], vault,
+                           provider_factory=lambda key: providers[key])
+    assert left == [bad]                       # reported, not swallowed…
+    assert providers["sk-miner-2"].terminated == [good.instance_id]  # …and the rest ran
+
+
+def test_reconcile_funded_scoped_to_this_payers_funded_pods():
+    owned = _funded_instance(POD_ID)
+    orphan = f"{funded_pod_name('777', HK)}-r1"
     provider = FakeProvider(tagged=[
-        "cascade-777-funded-5fakehotkey-0",   # owned → keep
-        "cascade-777-funded-5fakehotkey-r1",  # ours-by-name, unowned → kill
-        "cascade-workerpad",                  # hand-rented lookalike → keep
+        POD_ID,                                # owned → keep
+        orphan,                                # this payer's funded orphan → kill
+        "cascade-777-heat-0",                  # miner's OWN cascade deployment → keep
+        "cascade-777-funded-otherpayer1-0",    # someone else's slug → keep
+        "cascade-workerpad",                   # hand-rented lookalike → keep
     ])
     killed = reconcile_funded([owned], _vault_with_key(),
                               provider_factory=lambda key: provider)
-    assert killed == ["cascade-777-funded-5fakehotkey-r1"]
+    assert killed == [orphan]
     assert provider.terminated == killed
+
+
+def test_payer_pod_pattern_matches_only_this_payer():
+    pat = payer_pod_pattern(HK)
+    assert pat.match(POD_ID)
+    assert pat.match(f"{funded_pod_name('12345', HK)}")
+    assert not pat.match("cascade-777-heat-0")
+    assert not pat.match("cascade-777-funded-otherpayer1-0")

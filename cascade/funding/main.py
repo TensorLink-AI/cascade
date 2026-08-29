@@ -81,8 +81,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1",
                    help="Bind address (default loopback; front with TLS to expose).")
     p.add_argument("--port", type=int, default=8790)
-    p.add_argument("--queue-path", type=Path, default=Path("funded_queue.json"),
-                   help="Funded queue file (shared with trainer/provisioner).")
+    p.add_argument("--queue-path", type=Path, required=True,
+                   help="Funded queue file — MUST be the exact path the trainer "
+                        "resolves for [round] funded_queue_path (relative values "
+                        "resolve under the trainer's work_root). No default: a "
+                        "CWD-relative fallback here silently split-brains the "
+                        "queue against the trainer (funds 202 but never enter).")
     p.add_argument("--vault-dir", type=Path, default=None,
                    help="Payer-key vault dir (0600 files; restart teardown). "
                         "Omit for memory-only — keys then die with the process.")

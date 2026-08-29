@@ -1022,24 +1022,34 @@ class TrainerRunner:
     ) -> list[ResolvedGenerator]:
         """Apply ``[round] funded_mode`` to the eligible field.
 
-        ``"shadow"`` only reports: the field is untouched and the queue is
-        never mutated, so an operator can watch adoption. ``"required"``
-        makes the funded queue THE field: at most ``finalist_cap`` funded
-        entries enter, earliest reveal block first (queue seniority), and a
-        funded entry only matches when its ref equals the challenger's
-        revealed ref — funding one reveal never covers a different one.
+        ``"shadow"`` only reports: the field AND the queue are untouched
+        (strictly read-only — no recovery, no expiry), so an operator can
+        watch adoption without the observer changing the observed.
+        ``"required"`` makes the funded queue THE field: at most
+        ``finalist_cap`` funded entries enter, in ``select_field`` order
+        (earliest reveal block — the one shared ordering rule), and a funded
+        entry only matches when its ref equals the challenger's revealed ref.
         Selected entries are marked ``in_round``; a torn round's leftovers
         are recovered to ``queued`` first (never burned — the same rule as
         the submission burn). Runs BEFORE the burn filter's output is burned,
         so an unfunded reveal waits without consuming its one submission.
+
+        Entries that can never enter go TERMINAL rather than lingering: a
+        funded ref that no longer matches the hotkey's eligible reveal
+        (they re-revealed — fund the new ref), and a hotkey that already
+        burned its one submission. A queued entry can otherwise hold the
+        skip-floor open and bill a king leg per boundary forever; the
+        residual "funded but never reveals" case dies via ``expire_stale``
+        at the payer-key TTL.
         """
+        from ..funding.queue import select_field
+
         mode = self.cfg.round.funded_mode
         queue = self._funded_queue()
         if queue is None or not challengers:
             return challengers
-        queue.recover_in_round()
-        funded = {e.hotkey: e for e in queue.entries() if e.status == "queued"}
         if mode == "shadow":
+            funded = {e.hotkey: e for e in queue.entries() if e.status == "queued"}
             n_funded = sum(1 for c in challengers
                            if c.hotkey in funded and funded[c.hotkey].ref == c.ref)
             log.info("funded shadow: %d/%d eligible challengers are funded",
@@ -1047,20 +1057,31 @@ class TrainerRunner:
             return challengers
         # required: the funded queue decides who enters, in queue seniority
         # order, capped at the duel cohort the round can actually judge.
+        queue.recover_in_round()
+        queue.expire_stale()
+        burned: set[str] = set()
+        if self.cfg.round.one_submission_per_hotkey:
+            burned = _load_seen_hotkeys(self._submissions_path())
         by_hotkey = {c.hotkey: c for c in challengers}
         kept: list[ResolvedGenerator] = []
-        for entry in sorted(funded.values(), key=lambda e: (e.reveal_block, e.hotkey)):
+        for entry in select_field(queue.entries(), cap=0):
+            if entry.hotkey in burned:
+                queue.fail(entry.hotkey,
+                           error="hotkey already used its one lifetime submission — "
+                                 "re-register, reveal, and fund the new hotkey",
+                           error_class="burned")
+                continue
             c = by_hotkey.get(entry.hotkey)
             if c is None:
                 continue                      # funded but not revealed/eligible: waits
             if entry.ref != c.ref:
-                log.info("funded entry for %s covers ref %s, but the eligible reveal "
-                         "is %s — not entering (re-fund the new ref)",
-                         entry.hotkey, entry.ref, c.ref)
+                queue.fail(entry.hotkey,
+                           error=f"funded ref {entry.ref} no longer matches the "
+                                 f"eligible reveal {c.ref} — fund the new ref",
+                           error_class="ref_mismatch")
                 continue
-            kept.append(c)
-            if len(kept) >= max(1, self.cfg.round.finalist_cap):
-                break
+            if len(kept) < max(1, self.cfg.round.finalist_cap):
+                kept.append(c)
         dropped = len(challengers) - len(kept)
         if dropped:
             log.info("funded_mode=required: %d unfunded/over-cap challenger(s) wait "
@@ -1099,14 +1120,21 @@ class TrainerRunner:
         rnd = self.cfg.round
         if rnd.funded_mode != "required" or not rnd.skip_unfunded_rounds:
             return False
+        from ..funding.queue import rounds_needed
+
         queue = self._funded_queue()
         queue.recover_in_round()
+        queue.expire_stale()   # dead entries must not hold the boundary open
         depth = queue.queued_depth()
         if depth == 0:
             log.info("round %s: funded queue empty — skipping the boundary "
                      "(skip_unfunded_rounds)", round_id)
             return True
-        log.info("round %s: %d funded challenger(s) queued", round_id, depth)
+        cap = max(1, rnd.finalist_cap)
+        log.info("round %s: %d funded challenger(s) queued (≈%d round(s) to drain "
+                 "at cap %d, max_rounds_per_day=%d)", round_id, depth,
+                 rounds_needed(depth, cap, max_rounds=max(1, rnd.max_rounds_per_day)),
+                 cap, rnd.max_rounds_per_day)
         return False
 
     def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:

@@ -210,11 +210,24 @@ class FundingIntake:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _dispatch(self, fn) -> None:
+                # A handler exception must come back as a clean 500, not a
+                # connection reset: under ThreadingHTTPServer a raced write or
+                # any internal error would otherwise kill just this thread and
+                # leave the miner with a hung/EOF'd request and no error code.
+                try:
+                    status, body = fn()
+                except Exception:  # noqa: BLE001 — the reply is the error channel
+                    log.exception("intake handler failed for %s", self.path)
+                    status, body = 500, {"code": "internal_error",
+                                         "message": "intake error; retry shortly"}
+                self._reply(status, body)
+
             def do_GET(self) -> None:  # noqa: N802 — http.server API
                 if self.path == "/health":
                     self._reply(200, {"status": "ok"})
                 elif self.path == "/v1/queue":
-                    self._reply(*intake.queue_view())
+                    self._dispatch(intake.queue_view)
                 else:
                     self._reply(404, {"code": "not_found"})
 
@@ -225,9 +238,9 @@ class FundingIntake:
                 if length:
                     self.rfile.read(min(length, 1 << 16))
                 if self.path == "/v1/fund":
-                    self._reply(*intake.fund(self.headers))
+                    self._dispatch(lambda: intake.fund(self.headers))
                 elif self.path == "/v1/withdraw":
-                    self._reply(*intake.withdraw(self.headers))
+                    self._dispatch(lambda: intake.withdraw(self.headers))
                 else:
                     self._reply(404, {"code": "not_found"})
 

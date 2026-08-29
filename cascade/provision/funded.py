@@ -41,6 +41,7 @@ __all__ = [
     "FundedRentResult",
     "funded_pod_name",
     "lium_provider_for_key",
+    "payer_pod_pattern",
     "reconcile_funded",
     "rent_funded_pod",
     "teardown_funded",
@@ -165,11 +166,16 @@ def teardown_funded(
 ) -> list[PodInstance]:
     """Terminate funded pods, each with its own payer's key from the vault.
 
-    Returns the instances that could NOT be handled because the payer's key is
-    gone (vault expiry after a very long outage). Those are the one leak class
-    this design cannot fix by itself — the miner is billed until they stop the
-    pod, which is why the vault TTL must exceed every legitimate pod lifetime
-    and why the caller must surface the leftovers loudly, never swallow them.
+    Returns every instance that could NOT be CONFIRMED gone: the payer's key
+    missing from the vault, a terminate that crashed, or — the sneaky case —
+    a terminate that "succeeded" while the pod is still listed live.
+    ``LiumProvider.terminate`` deliberately treats a failed ``lium rm`` as
+    already-terminated (idempotency for the operator fleets), which on a
+    REVOKED miner key turns a 401 into silence — so this path re-lists the
+    payer's pods after terminating and believes only the listing (audit
+    2026-08-29). Unconfirmed pods bill the miner until someone acts, which is
+    why the vault TTL must exceed every legitimate pod lifetime and why the
+    caller must surface the returned leftovers loudly, never swallow them.
     """
     orphaned: list[PodInstance] = []
     for inst in instances:
@@ -182,8 +188,39 @@ def teardown_funded(
                       inst.payer_hotkey or "<unset>", inst.instance_id)
             orphaned.append(inst)
             continue
-        provider_factory(key).terminate(inst.instance_id)
+        try:
+            provider = provider_factory(key)
+            provider.terminate(inst.instance_id)
+            lister = getattr(provider, "list_tagged", None)
+            still_live = (lister is not None
+                          and inst.instance_id in set(lister(inst.instance_id)))
+        except Exception as e:  # noqa: BLE001 — one pod's failure must not skip the rest
+            log.error("funded teardown of %s (payer %s) failed: %s",
+                      inst.instance_id, inst.payer_hotkey, e)
+            orphaned.append(inst)
+            continue
+        if still_live:
+            log.error("funded pod %s still LIVE after terminate on payer %s's "
+                      "account (revoked key?) — miner is billed until it stops",
+                      inst.instance_id, inst.payer_hotkey)
+            orphaned.append(inst)
     return orphaned
+
+
+def payer_pod_pattern(hotkey: str) -> re.Pattern:
+    """The ONLY names reconcile may touch on ``hotkey``'s account.
+
+    ``cascade-<digits>-funded-<this payer's slug>`` (plus replacement/lane
+    suffixes) — never the generic provisioner scheme. A miner may run their
+    own cascade deployment on the same Lium account they fund with; matching
+    ``cascade-<n>-heat-…`` there would kill hardware the operator never
+    rented — the 2026-07-13 over-reap failure mode, aimed at someone else's
+    fleet (audit 2026-08-29).
+    """
+    slug = _SLUG_RE.sub("", hotkey.lower())[:12]
+    if not slug:
+        raise ProvisionError(f"cannot derive a pod slug from hotkey {hotkey!r}")
+    return re.compile(rf"^cascade-\d+-funded-{re.escape(slug)}(-|$)")
 
 
 def reconcile_funded(
@@ -191,19 +228,15 @@ def reconcile_funded(
     vault: PayerKeyVault,
     *,
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
-    is_ours: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """The orphan reaper's per-payer sweep; returns the pod names it killed.
 
     The operator-account reaper cannot see pods on miners' accounts, so this
-    walks every hotkey that has a vaulted key, lists THAT account's
-    ``cascade-``-tagged pods, and kills any the ledger does not own — the
-    crash-between-launch-and-ledger hole, closed per payer. ``is_ours``
-    defaults to the loop's naming gate and exists as a seam for tests.
+    walks every hotkey that has a vaulted key, lists THAT account's pods, and
+    kills any matching :func:`payer_pod_pattern` for THAT payer that the
+    ledger does not own — the crash-between-launch-and-ledger hole, closed
+    per payer, scoped so a miner's own unrelated cascade pods are untouchable.
     """
-    from .loop import is_provisioner_pod_name
-
-    ours = is_ours or is_provisioner_pod_name
     owned_ids = {i.instance_id for i in owned if i.stage == FUNDED_STAGE}
     killed: list[str] = []
     for hotkey in vault.hotkeys():
@@ -214,15 +247,20 @@ def reconcile_funded(
         lister = getattr(provider, "list_tagged", None)
         if lister is None:
             continue
+        mine = payer_pod_pattern(hotkey)
         try:
             tagged = lister("cascade-")
         except Exception as e:  # noqa: BLE001 — one payer's API trouble must not stop the sweep
             log.warning("funded reconcile: listing payer %s failed: %s", hotkey, e)
             continue
         for pod_name in tagged:
-            if ours(pod_name) and pod_name not in owned_ids:
+            if mine.match(pod_name) and pod_name not in owned_ids:
                 log.warning("funded reconcile: killing orphan %s on payer %s's account",
                             pod_name, hotkey)
-                provider.terminate(pod_name)
+                try:
+                    provider.terminate(pod_name)
+                except Exception as e:  # noqa: BLE001 — keep sweeping the rest
+                    log.error("funded reconcile: terminate %s failed: %s", pod_name, e)
+                    continue
                 killed.append(pod_name)
     return killed

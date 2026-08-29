@@ -815,8 +815,36 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
     return headers
 
 
-def _cmd_fund(args: argparse.Namespace) -> int:
+def _intake_transport_ok(url: str) -> bool:
+    """True when the intake URL may carry the key: https, or genuinely local.
+
+    The hostname is PARSED and compared exactly — a substring check would
+    pass ``http://localhost.evil.example`` and ship the key in cleartext to a
+    non-local box (audit 2026-08-29).
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return True
+    if parts.scheme == "http":
+        return (parts.hostname or "") in ("127.0.0.1", "localhost", "::1")
+    return False
+
+
+def _decode_json_body(raw: bytes) -> dict:
+    """Best-effort JSON body; a proxy's HTML error page must not traceback."""
     import json as _json
+
+    try:
+        body = _json.loads(raw or b"{}")
+        return body if isinstance(body, dict) else {"message": str(body)}
+    except ValueError:
+        text = raw.decode("utf-8", errors="replace").strip()
+        return {"code": "non_json_response", "message": text[:200]}
+
+
+def _cmd_fund(args: argparse.Namespace) -> int:
     import os
     import urllib.error
     import urllib.request
@@ -830,7 +858,7 @@ def _cmd_fund(args: argparse.Namespace) -> int:
                   f"(never pass the key itself as an argument)", file=sys.stderr)
             return 2
     base = args.intake_url.rstrip("/")
-    if base.startswith("http://") and "://127.0.0.1" not in base and "://localhost" not in base:
+    if not _intake_transport_ok(base):
         print("refusing to send your Lium key over plain http to a non-local intake; "
               "use https", file=sys.stderr)
         return 2
@@ -849,10 +877,10 @@ def _cmd_fund(args: argparse.Namespace) -> int:
     req = urllib.request.Request(f"{base}/v1/{action}", method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            body = _json.loads(resp.read() or b"{}")
+            body = _decode_json_body(resp.read())
             status = resp.status
     except urllib.error.HTTPError as e:
-        body, status = _json.loads(e.read() or b"{}"), e.code
+        body, status = _decode_json_body(e.read()), e.code
     except (urllib.error.URLError, OSError) as e:
         print(f"intake unreachable: {e}", file=sys.stderr)
         return 3

@@ -28,9 +28,15 @@ rationale; this file is the how.
 
 1. **Intake.** `cascade-intake --queue-path <work_root>/funded_queue.json
    --vault-dir /root/.cascade/payer-vault --chain-toml chain.toml` behind a
-   TLS terminator. Loopback bind is the default; the key header must never
-   cross the wire in clear. The vault dir stays off git, off rsync'd pod
-   trees, and off backups that leave the box.
+   TLS terminator. `--queue-path` is REQUIRED and must be the exact path the
+   trainer resolves for `[round] funded_queue_path` (work_root-relative) —
+   there is deliberately no default, because a CWD-relative fallback silently
+   split-brains the queue (funds 202 but never enter). The queue writes are
+   flock-serialised via a sibling `funded_queue.json.lock` — keep both files
+   on one local filesystem (flock over NFS is not a lock). Loopback bind is
+   the default; the key header must never cross the wire in clear. The vault
+   dir stays off git, off rsync'd pod trees, and off backups that leave the
+   box.
 2. **Shadow.** Set `[round] funded_mode = "shadow"` (trainer restart; no
    digest impact). Rounds behave identically; logs show `funded shadow:
    N/M eligible challengers are funded`. Watch adoption.
@@ -79,9 +85,13 @@ Failure semantics, as a miner experiences them: a dead pod / sold-out market
 / 429 **requeues your entry without burning it** (sold-out waits as long as
 it takes; infra faults get bounded retries on your kept key); an invalid or
 revoked key fails your entry `auth` — fix the key and fund again; your
-generator crashing is your run, spent as ever. Your key is held at most 36h
-(TTL), forgotten on withdraw, and never stored anywhere but the operator's
-sealed vault.
+generator crashing is your run, spent as ever. Three more terminal classes
+exist so a dead entry can never squat in the queue: `ref_mismatch` (you
+re-revealed a different ref — fund the new one), `burned` (the hotkey
+already used its one submission), and `funding_expired` (the entry outlived
+the key TTL without entering a round). All are re-fundable immediately.
+Your key is held at most 36h (TTL), forgotten on withdraw, and never stored
+anywhere but the operator's sealed vault.
 
 ## Cost model after arming
 

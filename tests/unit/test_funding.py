@@ -214,6 +214,40 @@ def test_public_view_carries_no_key_shaped_fields(tmp_path):
     assert "api_key" not in blob and "lium" not in blob.lower()
 
 
+def test_stale_instance_never_resurrects_settled_entries(tmp_path):
+    """The intake's long-lived instance and the trainer's fresh one share the
+    file: every operation must act on the CURRENT file, or a fund arriving at
+    the intake would rewrite entries the trainer already settled and re-rent
+    a done entry on its still-vaulted key (audit 2026-08-29)."""
+    path = tmp_path / "queue.json"
+    intake_q = FundedQueue(path, clock=FakeClock())     # long-lived, "stale" view
+    intake_q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    trainer_q = FundedQueue(path, clock=FakeClock())    # fresh per round
+    trainer_q.mark_in_round([HK_A])
+    trainer_q.mark_done(HK_A)
+    # The intake instance now funds B — A must STAY done.
+    assert intake_q.add(HK_B, "repo-b@sha256:bb", reveal_block=200) == "queued"
+    assert FundedQueue(path, clock=FakeClock()).get(HK_A).status == "done"
+    # And its reads see the other writer's state without a rebuild.
+    assert intake_q.get(HK_A).status == "done"
+    assert intake_q.queued_depth() == 1
+
+
+def test_expire_stale_kills_only_old_queued(tmp_path):
+    clock = FakeClock(t=1000.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    clock.t += 10.0
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)
+    q.mark_in_round([HK_B])                  # in-flight work never expires
+    clock.t = 1000.0 + 36 * 3600 + 1
+    assert q.expire_stale() == 1
+    assert q.get(HK_A).last_error_class == "funding_expired"
+    assert q.get(HK_B).status == "in_round"
+    # Terminal-with-reason, so the miner can re-fund immediately.
+    assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "queued"
+
+
 def test_rounds_needed_clamps():
     assert rounds_needed(0, cap=3) == 1
     assert rounds_needed(3, cap=3) == 1
