@@ -22,9 +22,26 @@ transfers):
     → 400 missing_lium_api_key / missing_hotkey / missing_ref /
           stale_timestamp / bad_signature      |  403 not_revealed
 
+    POST /v1/submit     (body = the generator ZIP; same identity headers,
+        X-Content-Digest: sha256:<hex> of the body — the SIGNED binding —
+        and optionally X-Lium-Api-Key to fund in the same request)
+    → 201 {"status": "stored", "ref": "vault/direct@sha256:…",
+           "commit_payload": "metro-v1:gen:hippius:vault/direct@sha256:…",
+           "funding": "pending_reveal" | "none"}
+    → 400 digest_mismatch / missing_digest  |  409 digest_owned
+    → 413 zip_too_large                     |  503 submissions_disabled
+
     POST /v1/withdraw   (same auth headers, no key needed)
     GET  /v1/queue      (public transparency feed — no key material)
     GET  /health
+
+Direct submission (DEC-CA-0036's private-code half): the ZIP never touches a
+miner-hosted repo — it lands in the operator's private
+:class:`~cascade.funding.store.SubmissionStore`, the miner chain-commits the
+returned vault ref, and the code goes public only if it takes the throne
+(the champion publisher). A submit that also carries the Lium key parks a
+``pending_reveal`` queue entry that auto-promotes to ``queued`` the moment
+the chain reveal resolves — one request funds the whole entry.
 
 Fail-closed at intake: a request that cannot fund a rental is rejected with
 the code the miner needs to fix it, never accepted-and-stuck. There is
@@ -58,7 +75,7 @@ log = logging.getLogger("cascade.funding.intake")
 # window plus per-request freshness closes it without clock heroics.
 FRESHNESS_WINDOW_SECONDS = 300.0
 
-_ACTIONS = ("fund", "withdraw")
+_ACTIONS = ("fund", "withdraw", "submit")
 
 
 def canonical_fund_message(action: str, hotkey: str, ref: str, timestamp: str) -> bytes:
@@ -110,6 +127,7 @@ class FundingIntake:
         require_signature: bool = True,
         verify: Callable[[str, bytes, str], bool] = verify_hotkey_signature,
         clock: Callable[[], float] = time.time,
+        store: object | None = None,   # SubmissionStore; None = submissions off
     ) -> None:
         self.queue = queue
         self.vault = vault
@@ -117,6 +135,22 @@ class FundingIntake:
         self.require_signature = require_signature
         self.verify = verify
         self.clock = clock
+        self.store = store
+
+    def sweep_pending(self) -> int:
+        """Promote submit-with-key entries whose chain reveal has landed.
+
+        Lazy, request-driven (no background thread): runs at the top of every
+        fund/submit/queue read, so a pending entry goes live within one
+        interaction — or at latest the trainer's own queue read — of its
+        reveal resolving. Never raises: a chain hiccup here must not fail the
+        request that triggered the sweep.
+        """
+        try:
+            return self.queue.promote_pending(self.resolve_reveal)
+        except Exception:  # noqa: BLE001 — sweep is best-effort by design
+            log.exception("pending-reveal sweep failed (will retry next request)")
+            return 0
 
     # ── request handling (returns (http_status, body_dict)) ──────────────────
 
@@ -148,7 +182,80 @@ class FundingIntake:
                                         "signature over the canonical message"}
         return None, {"hotkey": hotkey, "ref": ref}
 
+    def submit(self, headers, body: bytes) -> tuple[int, dict]:
+        """Store a generator ZIP; optionally fund it in the same request.
+
+        The signature binds the CONTENT: the miner signs over
+        ``X-Content-Digest`` (``sha256:<hex>`` of the ZIP they built), and the
+        server recomputes the digest from the received body — a tampered or
+        truncated upload fails ``digest_mismatch`` before anything stores.
+        """
+        import hashlib
+
+        if self.store is None:
+            return 503, {"code": "submissions_disabled",
+                         "message": "this intake accepts funding only; submit via "
+                                    "the Hub path (cascade deploy)"}
+        self.sweep_pending()
+        hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
+        if not hotkey:
+            return 400, {"code": "missing_hotkey",
+                         "message": "send your SS58 hotkey as X-Miner-Hotkey"}
+        declared = (headers.get("X-Content-Digest") or "").strip()
+        if not declared.startswith("sha256:"):
+            return 400, {"code": "missing_digest",
+                         "message": "send sha256:<hex> of the ZIP as X-Content-Digest"}
+        if self.require_signature:
+            ts = (headers.get("X-Timestamp") or "").strip()
+            sig = (headers.get("X-Signature") or "").strip()
+            try:
+                skew = abs(self.clock() - float(ts))
+            except ValueError:
+                skew = float("inf")
+            if skew > FRESHNESS_WINDOW_SECONDS:
+                return 400, {"code": "stale_timestamp",
+                             "message": "X-Timestamp must be current unix seconds "
+                                        f"(±{FRESHNESS_WINDOW_SECONDS:.0f}s)"}
+            msg = canonical_fund_message("submit", hotkey, declared, ts)
+            if not sig or not self.verify(hotkey, msg, sig):
+                return 400, {"code": "bad_signature",
+                             "message": "X-Signature must be the hotkey's sr25519 "
+                                        "signature over the canonical message "
+                                        "(which binds X-Content-Digest)"}
+        actual = f"sha256:{hashlib.sha256(body).hexdigest()}"
+        if actual != declared:
+            return 400, {"code": "digest_mismatch",
+                         "message": f"body hashes to {actual}, header declared "
+                                    f"{declared} — corrupted upload?"}
+        from ..interface.validation import format_commit
+        from ..shared.hippius import StorageError
+        from .store import vault_ref
+
+        try:
+            digest = self.store.put(body, hotkey)
+        except StorageError as e:
+            text = str(e)
+            if "zip_too_large" in text:
+                return 413, {"code": "zip_too_large", "message": text}
+            if "digest_owned" in text:
+                return 409, {"code": "digest_owned", "message": text}
+            return 400, {"code": "bad_zip", "message": text}
+        ref = vault_ref(digest)
+        funding = "none"
+        api_key = (headers.get("X-Lium-Api-Key") or "").strip()
+        if api_key:
+            # One-request flow: the key vaults now, the entry parks until the
+            # miner's chain reveal resolves (the sweep promotes it). Vault
+            # AFTER the store accepted, mirroring fund().
+            self.queue.add_pending(hotkey, ref)
+            self.vault.insert(hotkey, api_key)
+            funding = "pending_reveal"
+        log.info("submit %s: stored %s (funding=%s)", hotkey, digest, funding)
+        return 201, {"status": "stored", "ref": ref,
+                     "commit_payload": format_commit(ref), "funding": funding}
+
     def fund(self, headers) -> tuple[int, dict]:
+        self.sweep_pending()
         status, ctx = self._auth("fund", headers)
         if status is not None:
             return status, ctx
@@ -187,6 +294,7 @@ class FundingIntake:
         return 200, {"status": "withdrawn"}
 
     def queue_view(self) -> tuple[int, dict]:
+        self.sweep_pending()
         return 200, self.queue.public_view()
 
     # ── HTTP server ──────────────────────────────────────────────────────────
@@ -232,9 +340,20 @@ class FundingIntake:
                     self._reply(404, {"code": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802 — http.server API
-                # Bodies are ignored (the contract is header-only); drain so
-                # keep-alive clients are not desynced.
                 length = int(self.headers.get("Content-Length") or 0)
+                if self.path == "/v1/submit":
+                    cap = getattr(getattr(intake, "store", None), "max_bytes", 0) or (1 << 20)
+                    if length > cap:
+                        # Reject on the DECLARED length before reading — a
+                        # too-large upload must not stream through first.
+                        self._reply(413, {"code": "zip_too_large",
+                                          "message": f"declared {length} bytes > cap {cap}"})
+                        return
+                    body = self.rfile.read(length) if length else b""
+                    self._dispatch(lambda: intake.submit(self.headers, body))
+                    return
+                # Everything else is header-only; drain the body so keep-alive
+                # clients are not desynced.
                 if length:
                     self.rfile.read(min(length, 1 << 16))
                 if self.path == "/v1/fund":

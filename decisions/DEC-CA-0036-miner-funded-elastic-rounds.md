@@ -82,6 +82,44 @@ per-submission pipelines.
   cost, so `one_submission_per_hotkey`'s lifetime bar can move toward
   PRISM's one-live-entry-per-hotkey (the queue already enforces that shape).
 
+## Direct submissions + champion-only publication (second half, same node)
+
+Code POSTs straight to the gateway — the SAME request that carries the Lium
+key — and nothing is miner-hosted. This kills the account-watching and
+delete-my-repo-after-losing problems in one move:
+
+1. **The vault ref rides the existing grammar.** The intake stores the ZIP
+   privately (content-addressed sha256, ownership recorded) and the miner
+   chain-commits ``metro-v1:gen:hippius:vault/direct@sha256:<hex>`` — a
+   byte-ordinary payload every deployed validator already parses, so
+   participant sets cannot fork and no coordinated validator release is
+   needed. Only the FETCH path branches (``fetch_from_hub`` → the private
+   store / staged pod ZIP / the published champion object).
+2. **Ownership is enforced, not assumed.** A digest is owned by its earliest
+   uploader; a copied digest (the published champion's, most obviously)
+   committed by another hotkey is dropped at field entry. Byte-copies
+   arriving as fresh uploads still die at [[DEC-CA-0008]]'s dedup screen.
+3. **Only thrones publish** (the sn100/PRISM ``top-model/`` pattern):
+   ``champions/<digest>.zip`` + index land public-read on the manifest
+   bucket per ``[round] champion_publish`` — ``crown`` (immediately),
+   ``delay`` (after N reign rounds), ``dethrone`` (at hand-off). Every
+   policy reveals a deposed vault king at latest, so history stays fully
+   re-derivable; only the LIVE king's privacy varies, and losers never
+   publish. ``cascade fetch king`` resolves the published object
+   anonymously; ``cascade submit`` is the one-request miner flow.
+4. **Accepted trade, stated plainly:** third-party re-derivation of
+   non-champion entries is gone (their code is operator-private), and under
+   ``delay``/``dethrone`` the live king's is too until reveal. The audit
+   trail for every PUBLISHED reign is intact; auditing a private entry means
+   trusting the operator or a disclosure agreement. This is PRISM's exact
+   posture and the price of killing copy-watching.
+
+Additional arming gate beyond the list below: per-dispatch ZIP staging
+(``SubmissionStore.stage_for_dispatch`` exists; the remote-dispatch wiring
+that places exactly ONE entry's ZIP on its pod, and ``$CASCADE_VAULT_DIR`` /
+``$CASCADE_CHAMPION_BASE`` in the pod environment, are deploy work) — a
+funded pod's payer can read the box, so the whole store must never ship.
+
 ## Built (this node's landing, all inert at shipped defaults)
 
 `cascade/funding/` (vault, fault taxonomy, queue, intake + `cascade-intake`),

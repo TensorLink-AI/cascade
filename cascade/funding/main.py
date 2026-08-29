@@ -90,6 +90,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--vault-dir", type=Path, default=None,
                    help="Payer-key vault dir (0600 files; restart teardown). "
                         "Omit for memory-only — keys then die with the process.")
+    p.add_argument("--submission-dir", type=Path, default=None,
+                   help="Private submission store for direct (vault-ref) code "
+                        "uploads — MUST match the trainer's [round] "
+                        "submission_vault_dir resolution. Omit to refuse "
+                        "/v1/submit (funding-only intake).")
+    p.add_argument("--max-zip-mb", type=int, default=128,
+                   help="Per-submission ZIP cap in MiB (default 128, matching "
+                        "[generator] max_repo_mb).")
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_SECONDS / 3600.0)
     p.add_argument("--chain-toml", type=Path, default=Path("chain.toml"))
     p.add_argument("--network", default=None, help="Bittensor network override.")
@@ -124,11 +132,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     hydrated = vault.hydrate()
     if hydrated:
         log.info("vault: hydrated %d payer key(s) from disk", hydrated)
+    store = None
+    if args.submission_dir is not None:
+        from .store import SubmissionStore
+
+        store = SubmissionStore(args.submission_dir,
+                                max_bytes=args.max_zip_mb * 1024 * 1024)
     intake = FundingIntake(
         FundedQueue(args.queue_path),
         vault,
         resolve_reveal=resolver,
         require_signature=not args.no_require_signature,
+        store=store,
     )
     server = intake.make_server(args.host, args.port)
     log.info("cascade-intake listening on %s:%d (queue=%s, vault=%s, signatures=%s)",

@@ -283,9 +283,15 @@ in-context.
   existing scheduled `epoch_blocks` switch). King + confirmation legs stay
   operator-funded — a provisional dethrone is re-trained on the operator's
   account before it crowns (miner-account pods are console-accessible to
-  their payer). Landed inert 2026-08-28; arming gates: scoped pod creds,
-  confirmation wiring, DEC-CA-0016 wall-clock tenure, retrain-noise
-  measurement. (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
+  their payer). Second half: DIRECT submissions — code POSTs to the intake
+  (same request as the key), stored operator-private, chain-committed as an
+  ordinary hippius payload under the reserved `vault/direct` namespace (no
+  validator change); ONLY thrones publish (`champions/`, sn100-top-model
+  style: crown/delay/dethrone policy), losers stay private forever;
+  digest ownership enforced at field entry. Landed inert 2026-08-28; arming
+  gates: scoped pod creds + per-dispatch ZIP staging, confirmation wiring,
+  DEC-CA-0016 wall-clock tenure, retrain-noise measurement.
+  (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the

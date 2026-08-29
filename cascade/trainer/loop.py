@@ -1089,6 +1089,78 @@ class TrainerRunner:
         queue.mark_in_round([c.hotkey for c in kept])
         return kept
 
+    def _submission_store(self):
+        """The private direct-submission store, or None while unset."""
+        d = self.cfg.round.submission_vault_dir
+        if not d:
+            return None
+        from ..funding.store import SubmissionStore
+
+        p = Path(d)
+        return SubmissionStore(p if p.is_absolute() else (self.work_root / p))
+
+    def _verify_vault_ownership(
+        self, challengers: list[ResolvedGenerator]
+    ) -> list[ResolvedGenerator]:
+        """Drop vault-ref challengers whose digest belongs to someone else.
+
+        Content-addressing cuts both ways: a miner who learns a digest (the
+        published champion's, most obviously) could chain-commit
+        ``vault/direct@sha256:<that digest>`` and claim bytes they never had.
+        The store records who UPLOADED each digest; a mismatched claim is
+        dropped here — before any burn, screen, or pod — and an unresolvable
+        vault ref (no store configured, digest never uploaded) drops the same
+        way, since nothing could ever train it. Hub refs pass untouched.
+        """
+        from ..funding.store import parse_vault_ref
+
+        store = self._submission_store()
+        kept: list[ResolvedGenerator] = []
+        for c in challengers:
+            digest = parse_vault_ref(c.ref)
+            if digest is None:
+                kept.append(c)
+                continue
+            owner = store.owner(digest) if store is not None else None
+            if owner is None:
+                log.warning("dropping %s: vault ref %s has no stored submission "
+                            "(store %sconfigured)", c.hotkey, c.ref,
+                            "" if store is not None else "NOT ")
+                continue
+            if owner != c.hotkey:
+                log.warning("dropping %s: vault digest %s was uploaded by a "
+                            "different hotkey — a copied digest is not a submission",
+                            c.hotkey, digest)
+                continue
+            kept.append(c)
+        return kept
+
+    def _maybe_publish_champion(self, king: ResolvedGenerator, round_id: str) -> None:
+        """Run the champion-publication policy for this round's resolved king.
+
+        Best-effort by contract (a bucket must never sink a round) and inert
+        unless BOTH ``[round] champion_publish`` and ``submission_vault_dir``
+        are set. State (reign counter, published flag) lives in
+        ``champion_publisher.json`` under work_root.
+        """
+        policy = self.cfg.round.champion_publish
+        store = self._submission_store()
+        if policy == "off" or store is None:
+            return
+        try:
+            from ..funding.champion import ChampionPublisher
+
+            publisher = ChampionPublisher(
+                store, self.manifest_store(), policy=policy,
+                delay_rounds=self.cfg.round.champion_publish_delay_rounds,
+                state_path=self.work_root / "champion_publisher.json",
+            )
+            published = publisher.note_king(king.hotkey, king.ref, round_id)
+            for digest in published:
+                log.info("round %s: champion code published (%s)", round_id, digest)
+        except Exception as e:  # noqa: BLE001 — publication must never sink the round
+            log.warning("champion publication step failed (retries next round): %s", e)
+
     def _mark_funded_done(self, challengers: list[ResolvedGenerator]) -> None:
         """Settle funded entries whose round consumed them (required mode only).
 
@@ -3093,6 +3165,11 @@ class TrainerRunner:
 
         self._storage_dropped.clear()   # per-round: see _burn_hotkeys exemption
         eligible = self._filter_burned_challengers(plan.challengers)
+        # Direct submissions (DEC-CA-0036): a vault ref only enters if ITS
+        # uploader committed it — a copied digest is not a submission — and the
+        # round's champion-publication policy runs off the resolved king.
+        eligible = self._verify_vault_ownership(eligible)
+        self._maybe_publish_champion(plan.king, str(base_seed))
         # Miner-funded gate BEFORE anything burns or trains: an unfunded reveal
         # in required mode waits outside the round — never burned, never
         # screened — until its owner funds it (DEC-CA-0036).

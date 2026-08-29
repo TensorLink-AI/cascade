@@ -236,6 +236,18 @@ def validate_funded_mode(mode: str) -> str:
     return mode
 
 
+# Champion publication policies for direct (vault) submissions (DEC-CA-0036):
+# when a vault-ref king's code goes public. See cascade.funding.champion.
+CHAMPION_PUBLISH_MODES = ("off", "crown", "delay", "dethrone")
+
+
+def validate_champion_publish(mode: str) -> str:
+    if mode not in CHAMPION_PUBLISH_MODES:
+        raise ValueError(
+            f"champion_publish={mode!r} invalid; expected one of {CHAMPION_PUBLISH_MODES}")
+    return mode
+
+
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
     """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
 
@@ -800,6 +812,21 @@ class RoundConfig:
     # cadence and let skip_unfunded_rounds provide the scale-down; this knob
     # only feeds cascade.funding.rounds_needed sizing/telemetry).
     max_rounds_per_day: int = 1
+    # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
+    # Where the intake's private submission store lives (cascade.funding.store;
+    # relative resolves under work_root). "" = direct submissions off: vault
+    # refs cannot resolve and are dropped from the field with a log line. The
+    # dir is operator-local — off git, off any rsync'd pod tree; a dispatch
+    # stages exactly ONE entry's ZIP onto its pod, never the store.
+    submission_vault_dir: str = ""
+    # When a vault-ref king's code goes public (cascade.funding.champion):
+    # "off" (never — dev only), "crown" (immediately), "delay" (after
+    # champion_publish_delay_rounds of reign), "dethrone" (only when the reign
+    # ends). Under every non-off policy a dethroned vault king publishes at
+    # the hand-off if it never did; losers never publish. Trainer-side
+    # policy, consensus-inert.
+    champion_publish: str = "off"
+    champion_publish_delay_rounds: int = 2
     # Commit-order witness: {hotkey: {pending, committed}} block numbers, written
     # every poll tick. The chain deletes a commit's block when drand reveals it,
     # so the evidence of who submitted a generator FIRST exists only for whoever
@@ -1703,6 +1730,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_queue_path=str(r.get("funded_queue_path", "funded_queue.json")),
             skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
             max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
+            submission_vault_dir=str(r.get("submission_vault_dir", "")),
+            champion_publish=validate_champion_publish(
+                str(r.get("champion_publish", "off"))),
+            champion_publish_delay_rounds=int(r.get("champion_publish_delay_rounds", 2)),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),

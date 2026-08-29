@@ -206,6 +206,9 @@ funded_mode = "off"
 funded_queue_path = "funded_queue.json"
 skip_unfunded_rounds = false
 max_rounds_per_day = 1
+submission_vault_dir = ""       # direct submissions (vault refs) off until armed
+champion_publish = "off"
+champion_publish_delay_rounds = 2
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps

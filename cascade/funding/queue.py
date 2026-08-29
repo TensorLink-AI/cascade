@@ -53,7 +53,7 @@ __all__ = [
 # requeues do NOT count against this (should_recover's no-burn classes).
 DEFAULT_MAX_ATTEMPTS = 3
 
-_STATUSES = ("queued", "in_round", "done", "failed", "withdrawn")
+_STATUSES = ("pending_reveal", "queued", "in_round", "done", "failed", "withdrawn")
 
 
 @dataclass(frozen=True)
@@ -185,22 +185,68 @@ class FundedQueue:
         """
         with self._locked():
             prev = self._entries.get(hotkey)
-            if prev is not None and prev.status in ("queued", "in_round"):
-                if prev.ref == ref:
+            if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
+                if prev.ref == ref and prev.status != "pending_reveal":
                     return "already-queued"
                 if prev.status == "in_round":
                     # Mid-round the manifest may already reference the old ref —
                     # never mutate an entry a live round is training.
                     return "already-queued"
                 self._entries[hotkey] = replace(
-                    prev, ref=ref, reveal_block=int(reveal_block), funded_at=self.clock())
+                    prev, ref=ref, reveal_block=int(reveal_block),
+                    funded_at=self.clock(), status="queued")
                 self._save()
-                return "replaced"
+                return "replaced" if prev.ref != ref else "queued"
             self._entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
                 funded_at=self.clock())
             self._save()
             return "queued"
+
+    def add_pending(self, hotkey: str, ref: str) -> str:
+        """A submit-with-key entry whose reveal has not landed on chain yet.
+
+        The one-request flow: the ZIP and the Lium key arrive together, before
+        the miner's chain commit reveals — so the entry parks as
+        ``pending_reveal`` (no reveal block, no seniority, never selected) and
+        :meth:`promote_pending` flips it to ``queued`` the moment the reveal
+        resolves. Idempotent per (hotkey, ref); a live queued/in_round entry
+        is left alone (they already have a better state).
+        """
+        with self._locked():
+            prev = self._entries.get(hotkey)
+            if prev is not None and prev.status in ("queued", "in_round"):
+                return "already-queued"
+            if prev is not None and prev.status == "pending_reveal" and prev.ref == ref:
+                return "already-pending"
+            self._entries[hotkey] = FundedEntry(
+                hotkey=hotkey, ref=ref, reveal_block=0,
+                funded_at=self.clock(), status="pending_reveal")
+            self._save()
+            return "pending_reveal"
+
+    def promote_pending(self, resolve_reveal) -> int:
+        """Flip pending entries whose reveal now resolves; count promoted.
+
+        ``resolve_reveal(hotkey, ref) -> int | None`` is the intake's oracle.
+        Resolution stamps the REAL reveal block, so seniority is chain truth,
+        never upload order. Unresolvable entries stay pending until they
+        resolve or :meth:`expire_stale` reaps them at the key TTL.
+        """
+        with self._locked():
+            promoted = 0
+            for hk, e in list(self._entries.items()):
+                if e.status != "pending_reveal":
+                    continue
+                block = resolve_reveal(hk, e.ref)
+                if block is None:
+                    continue
+                self._entries[hk] = replace(
+                    e, status="queued", reveal_block=int(block))
+                promoted += 1
+            if promoted:
+                self._save()
+            return promoted
 
     def mark_in_round(self, hotkeys: Iterable[str]) -> None:
         with self._locked():
@@ -243,7 +289,8 @@ class FundedQueue:
         with self._locked():
             now = self.clock()
             expired = [hk for hk, e in self._entries.items()
-                       if e.status == "queued" and now - e.funded_at > max_age_seconds]
+                       if e.status in ("queued", "pending_reveal")
+                       and now - e.funded_at > max_age_seconds]
             for hk in expired:
                 self._entries[hk] = replace(
                     self._entries[hk], status="failed",
@@ -262,10 +309,10 @@ class FundedQueue:
                 self._save()
 
     def withdraw(self, hotkey: str) -> bool:
-        """Miner-initiated exit while queued; False once a round has it."""
+        """Miner-initiated exit while queued/pending; False once a round has it."""
         with self._locked():
             e = self._entries.get(hotkey)
-            if e is None or e.status != "queued":
+            if e is None or e.status not in ("queued", "pending_reveal"):
                 return False
             self._entries[hotkey] = replace(e, status="withdrawn")
             self._save()
