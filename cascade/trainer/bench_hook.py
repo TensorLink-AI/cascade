@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import shlex
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,32 @@ class BenchPlan:
     # interval > sweep duration and telemetry samples every Nth king instead
     # of racing (and being preempted by) every round's training.
     min_interval_seconds: int = 0
+    # Benchmark data dir on the TRAINER box to sideload to the pod (tar over
+    # ssh) before each sweep — None/absent-dir = old behavior (the pod's own
+    # HF download, fenced by download_timeout_seconds, remains the fallback
+    # either way). r45–r48: four rounds straight lost their reports to the
+    # on-pod fetch (forecast_wrapper/exit-2, then r48's exit-124 stall at
+    # ~4975 files); the manual sideload of the same 4.4G battery streams in
+    # ~75s and succeeded every time. Marker-guarded, so sequential roles on
+    # one pod stage exactly once.
+    local_data_dir: str | None = None
+    # Fence on the tar|ssh stream — its own stall guard, separate from (and
+    # much tighter than) the bench/download timeouts: the manual stream takes
+    # ~75s, so a stream still running at 15 min is wedged, and failing it
+    # early leaves the whole bench window to the download fallback.
+    sideload_timeout_seconds: int = 900
+
+
+def _suite_list(suites: str) -> list[str]:
+    return [s.strip() for s in str(suites).split(",") if s.strip()]
+
+
+def suite_markers(data_dir: str, suites: list[str]) -> str:
+    """The ``test`` expression asserting every suite's COMPLETION marker under
+    ``data_dir`` (`-f m1 -a -f m2 …`) — the one definition of "data is staged"
+    shared by the bench data guard, the prewarm, and the sideload."""
+    return " -a ".join(
+        f"-f {shlex.quote(f'{data_dir}/{s}/{DATA_MARKER}')}" for s in suites)
 
 
 def build_prewarm_remote_command(workdir: str, *,
@@ -95,9 +122,7 @@ def build_prewarm_remote_command(workdir: str, *,
     """
     data_dir = f"{workdir}/bench_data"
     project = shlex.quote(f"{workdir}/benchmarks")
-    suite_list = [s.strip() for s in str(suites).split(",") if s.strip()]
-    markers = " -a ".join(
-        f"-f {shlex.quote(f'{data_dir}/{s}/{DATA_MARKER}')}" for s in suite_list)
+    markers = suite_markers(data_dir, _suite_list(suites))
     inner = (f"timeout {int(download_timeout_seconds)} "
              f"{uv_bin} run --extra time --project {project} "
              f"cascade-benchmark-download --data-dir {shlex.quote(data_dir)}")
@@ -163,9 +188,7 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     # re-running over partial data is cheap; `timeout` fences the wedge mode
     # (thread-pool deadlock with no sockets, seen twice on 2026-08-12) so a
     # hung download fails this sweep instead of eating the bench window.
-    suites = [s.strip() for s in str(plan.suites).split(",") if s.strip()]
-    markers = " -a ".join(
-        f"-f {shlex.quote(f'{plan.data_dir}/{s}/{DATA_MARKER}')}" for s in suites)
+    markers = suite_markers(plan.data_dir, _suite_list(plan.suites))
     data_guard = (
         f"{{ test {markers} || "
         f"timeout {int(plan.download_timeout_seconds)} "
@@ -188,6 +211,92 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     return cmd, report
 
 
+def build_sideload_remote_command(data_dir: str) -> str:
+    """The remote shell string that receives the sideload tar stream on its
+    stdin and unpacks it into ``data_dir``. Pure — safe to unit test."""
+    dd = shlex.quote(data_dir)
+    return f"mkdir -p {dd} && tar -C {dd} -xf -"
+
+
+def _stream_tar(local_dir: str, ssh_argv: list[str], timeout: int) -> int:
+    """``tar -C local_dir -cf - . | ssh …`` — stream the local benchmark data
+    into the pod-side unpack command. Returns the pipeline's exit status
+    (remote/ssh failure wins; a clean remote surfaces the local tar's rc)."""
+    tar = subprocess.Popen(
+        ["tar", "-C", local_dir, "-cf", "-", "."],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        proc = subprocess.run(ssh_argv, stdin=tar.stdout, capture_output=True,
+                              text=True, timeout=timeout)
+    except Exception:
+        tar.kill()
+        tar.wait()
+        raise
+    finally:
+        tar.stdout.close()  # EPIPEs tar if ssh died early — no orphaned writer
+    tar_rc = tar.wait(timeout=60)
+    return proc.returncode if proc.returncode != 0 else tar_rc
+
+
+def sideload_bench_data(host: RemoteHost, plan: BenchPlan, *,
+                        runner=None, streamer=None) -> bool:
+    """Stage ``plan.local_data_dir`` (the trainer box's benchmark data) into
+    ``plan.data_dir`` on the pod before a sweep, so the bench command's data
+    guard finds warm markers instead of gambling on the on-pod HF download
+    (r45–r48: four consecutive rounds lost their reports to that fetch; the
+    manual tar-over-ssh of the same data succeeded every time, ~75s for 4.4G).
+
+    Returns True when the pod's data dir holds every requested suite's
+    completion marker afterwards; False means "not staged here" and is always
+    non-fatal — the bench command's marker-guarded download remains the
+    fallback, unchanged. Idempotent: the pod-side marker check runs first, so
+    the sequential per-role sweeps on one pod stream the data exactly once.
+    Skipped (False, no ssh) when the knob is unset or the LOCAL copy lacks any
+    requested suite's marker — never sideload data we can't vouch complete.
+
+    ``runner`` is the ``(ssh_argv, timeout)`` test seam shared with
+    :func:`run_post_round_benchmark`; ``streamer`` doubles for
+    :func:`_stream_tar` as ``(local_dir, ssh_argv, timeout) -> rc``.
+    """
+    try:
+        if not plan.local_data_dir:
+            return False
+        suites = _suite_list(plan.suites)
+        if not suites:
+            return False
+        local = Path(plan.local_data_dir)
+        missing = [s for s in suites if not (local / s / DATA_MARKER).is_file()]
+        if missing:
+            log.info("bench sideload skipped: %s missing suite marker(s) %s — "
+                     "pod falls back to the on-pod download", local, missing)
+            return False
+        run = runner or run_ssh
+        check = build_ssh_argv(host, f"test {suite_markers(plan.data_dir, suites)}")
+        if run(check, 120).returncode == 0:
+            log.info("bench data already staged on %s (%s) — sideload skipped",
+                     host.name, plan.data_dir)
+            return True
+        log.info("sideloading bench data %s → %s:%s", local, host.name, plan.data_dir)
+        unpack = build_ssh_argv(host, build_sideload_remote_command(plan.data_dir))
+        rc = (streamer or _stream_tar)(str(local), unpack,
+                                       plan.sideload_timeout_seconds)
+        if rc != 0:
+            log.warning("bench sideload to %s failed (rc=%s) — pod falls back "
+                        "to the on-pod download", host.name, rc)
+            return False
+        staged = run(check, 120).returncode == 0
+        if staged:
+            log.info("bench sideload to %s complete (markers verified)", host.name)
+        else:
+            log.warning("bench sideload to %s streamed but markers still missing "
+                        "under %s — pod falls back to the on-pod download",
+                        host.name, plan.data_dir)
+        return staged
+    except Exception as e:  # noqa: BLE001 — bench prep must never raise into a round
+        log.warning("bench sideload errored (pod falls back to download): %s", e)
+        return False
+
+
 def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
                              plan: BenchPlan, *, work_root: Path | None = None,
                              runner=None, role: str = "king") -> dict | None:
@@ -200,6 +309,11 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
     try:
         import os
 
+        # Guaranteed-first data staging: stream the trainer box's local copy to
+        # the pod (marker-guarded, no-op when unset/absent/already staged). The
+        # bench command's own download guard stays in place as the fallback,
+        # so a failed/skipped sideload degrades to exactly the old behavior.
+        sideload_bench_data(host, plan, runner=runner)
         token = os.environ.get("HF_TOKEN") or None
         remote_cmd, report_path = build_bench_remote_command(
             host, round_id, arch_preset, plan, role=role, hf_token=token)
