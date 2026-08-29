@@ -59,9 +59,39 @@ RUN uv pip install --python /root/cascade/.venv/bin/python \
         scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 \
         scikit-learn==1.9.0 gpytorch==1.15.2 networkx==3.6.1
 
-# The public contract (chain.toml) is baked in so every pod trains the identical
-# recipe; the worker cd's here and load_chain_config finds it. Override per-host
-# with hosts.toml `chain_toml` only if a pod must differ.
+# The baked chain.toml is a BUILD-TIME SNAPSHOT, kept only so a pod can boot
+# and run heats before the orchestrator pushes config. It is NOT authoritative:
+# its [training] train_image_digest is the pin as of the build — necessarily the
+# PREVIOUS image's digest, never this image's own (an image cannot know its
+# post-push digest; 2026-08-28 incident: freshly rotated images self-reported
+# the old pin and final workers refused with TrainImageMismatch). The pin cannot
+# be blanked here either — train_image_digest folds into contract_digest, so a
+# worker booting from a pin-blanked snapshot would compute a different contract
+# than the orchestrator. Instead the snapshot gets a loud header, and the
+# provisioner delivers truth at gate time: the deployed chain config
+# (chain.deployed.toml) plus the launch-injected CASCADE_TRAIN_IMAGE_DIGEST.
+#
+# HARD RULE for this image: NEVER bake CASCADE_TRAIN_IMAGE_DIGEST (no ENV, no
+# /etc/environment, no .bashrc, no sentinel). Any baked value is a stale
+# self-claim; absence makes the worker fail with an explicit "provisioner must
+# inject it" error instead of a confusing mismatch.
+ARG BUILD_REF=unknown
+ARG BUILD_SHA=unknown
+RUN for f in chain.toml chain.testnet.toml; do \
+        printf '%s\n' \
+"# =============================================================================" \
+"# BUILD-TIME SNAPSHOT — baked into the cascade-worker image at build time" \
+"# (ref ${BUILD_REF}, commit ${BUILD_SHA}). NOT authoritative on a live pod:" \
+"# the provisioner-pushed deployed chain config is the source of truth." \
+"# In particular, [training] train_image_digest below is the pin AS OF THE" \
+"# BUILD — for a freshly published image that is always the PREVIOUS image's" \
+"# digest, never this image's own (an image cannot know its post-push digest)." \
+"# Final-mode workers must run from the pushed config plus the launch-injected" \
+"# CASCADE_TRAIN_IMAGE_DIGEST; this file exists only so heats can boot before" \
+"# config delivery." \
+"# =============================================================================" \
+        | cat - "$f" > "$f.tmp" && mv "$f.tmp" "$f"; \
+    done
 ENV CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh

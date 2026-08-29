@@ -64,6 +64,16 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false        # single-arch manifest → a clean, pinnable digest
+          # BUILD_REF/BUILD_SHA stamp the baked chain.toml's build-time-snapshot
+          # header (deploy/Dockerfile) so a pod-side reader can tell WHICH build
+          # the snapshot came from. Note the chicken-and-egg: the true image
+          # digest exists only after push (steps.build.outputs.digest below) and
+          # must NEVER be re-baked into the image — rebaking would change the
+          # digest again. The image carries no self-digest claim; the
+          # provisioner injects CASCADE_TRAIN_IMAGE_DIGEST at gate time.
+          build-args: |
+            BUILD_REF=${{ github.ref_name }}
+            BUILD_SHA=${{ github.sha }}
 
       - name: Report digest
         run: |

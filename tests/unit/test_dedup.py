@@ -1028,3 +1028,141 @@ def test_witness_does_not_freeze_commits_on_a_failed_read(dedup_runner):
     for client in (_Failing(), _Raising()):
         w = runner.witness_commits(client)
         assert w["alice"] == {"pending": 100, "committed": None}, client
+
+
+# ── config-delta bounds (the recurring screen-timeout fix) ───────────────────
+# The delta pass is the ONE difflib call left, it runs on attacker-chosen token
+# streams, and it repeatedly blew the whole screen's dedup_phase_seconds budget
+# (OPSLOG 2026-08-26..28, five bites — each published a round's field
+# UNSCREENED). These tests pin the fences: exact dups short-circuit, oversized
+# and slow pairs FAIL OPEN to a delta-less label, and the config_only VERDICT
+# never depends on the delta being measurable.
+
+
+def _fp(tokens, *, sha, py="samepy", scoreable=True):
+    from cascade.interface.dedup import RepoFingerprint
+
+    return RepoFingerprint(
+        tree_sha256="tree-" + sha, token_sha256="tok-" + sha,
+        masked_sha256="mask-" + sha, py_sha256=py,
+        tokens=tuple(tokens), n_tokens=len(tokens), scoreable=scoreable)
+
+
+def test_delta_exact_duplicate_short_circuits_without_difflib(monkeypatch):
+    # Hash-identical streams are delta 0 by definition of the digest — the
+    # quadratic pass must not even start (patched to prove it is never called).
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
+                        lambda a, b: (_ for _ in ()).throw(AssertionError("ran")))
+    a = _fp(["x"] * 50, sha="same")
+    b = _fp(["x"] * 50, sha="same")
+    assert dedup_mod._safe_abs_token_delta(a, b) == 0
+
+
+def test_delta_near_duplicate_still_measured_exactly():
+    # Normal-sized near-dup pairs keep their EXACT delta — the fences must not
+    # degrade the shadow evidence on honest input (7–11k-token repos).
+    from cascade.interface.dedup import _abs_token_delta, _safe_abs_token_delta
+
+    a = _fp([f"t{i}" for i in range(2000)], sha="a")
+    toks = [f"t{i}" for i in range(2000)]
+    toks[1000] = "edited"
+    b = _fp(toks, sha="b")
+    assert _safe_abs_token_delta(a, b) == _abs_token_delta(a, b) == 1
+
+
+def test_delta_oversized_pair_fails_open_to_none():
+    from cascade.interface.dedup import _safe_abs_token_delta
+
+    a = _fp([f"t{i}" for i in range(300)], sha="a")
+    b = _fp([f"u{i}" for i in range(300)], sha="b")
+    assert _safe_abs_token_delta(a, b, max_tokens=100) is None   # over the band
+    assert _safe_abs_token_delta(a, b, max_tokens=0) is not None  # 0 = uncapped
+
+
+def test_delta_budget_expiry_fails_open_quickly(monkeypatch):
+    # A pathological pair (difflib grinding for minutes) costs at most the pair
+    # budget, then the label carries no delta — the screen moves on.
+    import time as _time
+
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
+                        lambda a, b: _time.sleep(30) or 0)
+    a = _fp(["x"] * 10, sha="a")
+    b = _fp(["y"] * 10, sha="b")
+    t0 = _time.monotonic()
+    assert dedup_mod._safe_abs_token_delta(a, b, budget_seconds=0.2) is None
+    assert _time.monotonic() - t0 < 5.0
+
+
+def test_delta_exception_fails_open_to_none(monkeypatch):
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
+                        lambda a, b: (_ for _ in ()).throw(RuntimeError("boom")))
+    a = _fp(["x"] * 10, sha="a")
+    b = _fp(["y"] * 10, sha="b")
+    assert dedup_mod._safe_abs_token_delta(a, b) is None
+
+
+def test_screen_survives_a_pathological_delta_pair(tmp_path, monkeypatch):
+    # End to end: identical code + differing configs where the delta pass would
+    # grind — the screen finishes inside its budget, both entries are KEPT, and
+    # the config_only label lands with abs_delta=None (fail open, not fail dark).
+    import time as _time
+
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
+                        lambda a, b: _time.sleep(30) or 0)
+    monkeypatch.setattr(dedup_mod, "DELTA_PAIR_BUDGET_SECONDS", 0.2)
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
+        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
+    ]
+    t0 = _time.monotonic()
+    result = screen_duplicates(entries, None)
+    assert _time.monotonic() - t0 < 10.0
+    assert result.kept_hotkeys == ("orig", "swp")
+    (v,) = [s for s in result.shadow if s.tier == "config_only"]
+    assert v.hotkey == "swp" and v.abs_delta is None
+
+
+def test_config_only_enforce_still_drops_when_the_delta_degrades(
+        tmp_path, monkeypatch):
+    # The VERDICT rides on _same_code (exact py-digest equality), never on the
+    # delta: a degraded delta must not weaken enforcement.
+    import time as _time
+
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
+                        lambda a, b: _time.sleep(30) or 0)
+    monkeypatch.setattr(dedup_mod, "DELTA_PAIR_BUDGET_SECONDS", 0.2)
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
+        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
+    ]
+    result = screen_duplicates(entries, None, config_only_enforce=True)
+    assert result.kept_hotkeys == ("orig",)
+    (v,) = result.dropped
+    assert v.tier == "config_only" and v.abs_delta is None
+
+
+def test_delta_phase_budget_bounds_the_whole_screen(tmp_path, monkeypatch):
+    # Many pathological pairs cost the PHASE budget in total, not per pair —
+    # the outer dedup_phase_seconds fence (whose expiry publishes the field
+    # unscreened) can no longer be eaten by delta measurements alone.
+    from cascade.interface import dedup as dedup_mod
+
+    monkeypatch.setattr(dedup_mod, "DELTA_PHASE_BUDGET_SECONDS", 0.0)
+    entries = [
+        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
+        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
+    ]
+    result = screen_duplicates(entries, None)
+    assert result.kept_hotkeys == ("orig", "swp")   # verdicts unchanged
+    (v,) = [s for s in result.shadow if s.tier == "config_only"]
+    assert v.abs_delta is None                       # only the metric degrades
