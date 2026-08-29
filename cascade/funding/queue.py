@@ -139,6 +139,13 @@ class FundedQueue:
         the dict they mutated; readers pass ``exclusive=False`` (LOCK_SH) and
         only read. The dict is local to this call — never stored on ``self`` —
         so nothing another thread does can corrupt it.
+
+        NOT re-entrant: each call opens its OWN fd, and flock conflicts across
+        fds even within one thread, so calling a public read (``get``/
+        ``entries``/``queued_depth``) or another mutator from INSIDE a
+        ``with self._locked()`` block self-deadlocks. Every method here works
+        the yielded ``entries`` dict directly for exactly this reason — keep it
+        that way; never nest a public queue call inside a lock.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")

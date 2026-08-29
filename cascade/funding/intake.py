@@ -27,8 +27,9 @@ transfers):
         and optionally X-Lium-Api-Key to fund in the same request)
     → 201 {"status": "stored", "ref": "vault/direct@sha256:…",
            "commit_payload": "metro-v1:gen:hippius:vault/direct@sha256:…",
-           "funding": "pending_reveal" | "none"}
-    → 400 digest_mismatch / missing_digest  |  409 digest_owned
+           "funding": "pending_reveal" | "already-funded" | "none" |
+                      "blocked-by-existing-entry"}  # last carries a funding_note
+    → 400 digest_mismatch / missing_digest / bad_content_length | 409 digest_owned
     → 413 zip_too_large                     |  503 submissions_disabled
 
     POST /v1/withdraw   (same auth headers, no key needed)
