@@ -627,6 +627,51 @@ def test_one_submission_per_hotkey_burns_challenger(cfg, tmp_path, monkeypatch):
     assert m2.entries_for_role("challenger") == []
 
 
+def test_burned_hotkeys_are_named_in_the_published_standings(cfg, tmp_path, monkeypatch):
+    """r48 (2026-08-28): 328 burned hotkeys with standing commitments were
+    skipped pre-eligibility and the round published as an unexplained
+    "0 entrants". The standings must say WHY the field is empty — an additive
+    ``skipped`` block plus the reason folded into ``no_screen_reason``."""
+    _patch_train_boundaries(monkeypatch)
+
+    class _Store:
+        def __init__(self):
+            self.objects: dict[str, str] = {}
+
+        def put_text(self, key, text, *, content_type="", acl=None):
+            self.objects[key] = text
+
+        def get_text(self, key):
+            if key not in self.objects:
+                raise StorageError(key)
+            return self.objects[key]
+
+    store = _Store()
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, publish_stage_status=True,
+                           screen_fn=lambda ckpt_dir, gen, base_seed, block=None: 0.5)
+    runner._manifest_store = store
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6)]
+    runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)  # burns 'b'
+
+    doc1 = json.loads(store.objects["status/heat.json"])
+    assert "skipped" not in doc1                     # round 1: nothing skipped
+
+    runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
+    doc2 = json.loads(store.objects["status/heat.json"])
+    assert doc2["round_id"] == "2" and doc2["no_screen"] is True
+    assert doc2["skipped"]["total"] == 1
+    assert doc2["skipped"]["by_reason"] == {"already_submitted": 1}
+    assert doc2["skipped"]["entries"] == [
+        {"hotkey": "b", "uid": 1, "reason": "already_submitted"}]
+    # the human-readable reason explains the empty field too
+    assert "1 already_submitted" in doc2["no_screen_reason"]
+    # and the index row carries the count for the listing view
+    index = json.loads(store.objects["heats/index.json"])
+    row = next(h for h in index["heats"] if h["round_id"] == "2")
+    assert row["n_skipped"] == 1
+
+
 def test_one_submission_per_hotkey_off_recompetes(cfg, tmp_path, monkeypatch):
     from dataclasses import replace
     _patch_train_boundaries(monkeypatch)

@@ -33,7 +33,13 @@ are fed incrementally (never from a retained buffer), the decode budget
 bounds per-repo CPU, and the retained token prefix — used only to measure the
 absolute config delta on ``config_only`` labels — is capped by
 ``max_tokens``; past the cap a fingerprint keeps its exact digests but is not
-``scoreable`` and the label simply carries no delta.
+``scoreable`` and the label simply carries no delta. The delta measurement
+itself (the one difflib pass left) is additionally fenced by
+``DELTA_MAX_TOKENS`` / ``DELTA_PAIR_BUDGET_SECONDS`` /
+``DELTA_PHASE_BUDGET_SECONDS`` — see :func:`_safe_abs_token_delta`; a
+pathological pair degrades to a delta-less label, never to a stalled screen
+(OPSLOG 2026-08-26..28: five screen-budget blowouts published rounds
+UNSCREENED off exactly this pass).
 """
 
 from __future__ import annotations
@@ -41,12 +47,17 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import re
+import threading
+import time
 import tokenize
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Token types dropped from the normalized stream: pure formatting, comments,
 # and the encoding pseudo-token — everything a lazy re-upload shuffles.
@@ -333,15 +344,84 @@ def _abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int:
                for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
 
 
-def _safe_abs_token_delta(a: RepoFingerprint, b: RepoFingerprint) -> int | None:
-    """:func:`_abs_token_delta` when both streams are scoreable, else ``None``.
+# Bounds on the config-delta quadratic pass (`_safe_abs_token_delta`). The
+# delta is a SHADOW label metric only — no drop rides on its value (config_only
+# drops on `_same_code`, before the delta is measured) — so it may degrade to
+# None on pathological input; a drop verdict never may. difflib is ~O(n·m) and
+# the streams are attacker-chosen up to `max_tokens` (50k): one crafted pair
+# measured ~13 min and has repeatedly blown the WHOLE screen's
+# `dedup_phase_seconds` budget, publishing the round's field UNSCREENED
+# (OPSLOG 2026-08-26..28, five bites). Honest field repos run 7–11k tokens.
+DELTA_MAX_TOKENS = 20_000          # per-side cap; larger pairs carry no delta
+DELTA_PAIR_BUDGET_SECONDS = 20.0   # wall fence per pair; expiry ⇒ no delta
+DELTA_PHASE_BUDGET_SECONDS = 120.0  # wall fence over ALL pairs in one screen
 
-    This is a SECOND quadratic pass, so it inherits the same cap — and unlike
-    the similarity tier it has no ``quick_ratio`` gate in front of it.
+
+def _safe_abs_token_delta(
+    a: RepoFingerprint,
+    b: RepoFingerprint,
+    *,
+    budget_seconds: float | None = None,
+    max_tokens: int | None = None,
+) -> int | None:
+    """:func:`_abs_token_delta` when both streams are scoreable AND the pair is
+    cheap enough to measure, else ``None`` (the label simply carries no delta —
+    the same graceful degradation the token cap already applies).
+
+    This is a SECOND quadratic pass over attacker-chosen input, so it is the
+    one place a hostile pair can burn unbounded CPU (no ``quick_ratio`` gate
+    helps here — the delta needs the full opcode walk, not a threshold test).
+    Three fences, all FAIL OPEN to ``None`` — never to an exception, never to
+    a changed verdict:
+
+    * exact short-circuit — hash-identical streams are delta 0 without any
+      comparison (cheap, and correct by definition of the digest);
+    * size band — a pair with a side over ``max_tokens`` is skipped outright:
+      at that size the pair is padding, not a config sweep, and the exact
+      number separates nothing (honest repos run 7–11k tokens);
+    * wall fence — the pass runs on a daemon worker joined for
+      ``budget_seconds``; on expiry the worker is abandoned (daemon ⇒ it can
+      never hold interpreter exit hostage, unlike a ThreadPoolExecutor
+      worker — OPSLOG 2026-08-26) and the label carries no delta.
     """
+    if budget_seconds is None:
+        budget_seconds = DELTA_PAIR_BUDGET_SECONDS
+    if max_tokens is None:
+        max_tokens = DELTA_MAX_TOKENS
     if not (a.scoreable and b.scoreable):
         return None
-    return _abs_token_delta(a, b)
+    if a.token_sha256 == b.token_sha256:
+        return 0
+    la, lb = len(a.tokens), len(b.tokens)
+    if max_tokens and max(la, lb) > max_tokens:
+        log.warning(
+            "dedup: config-delta pass skipped for a %d/%d-token pair (per-side "
+            "cap %d) — label carries no delta", la, lb, max_tokens)
+        return None
+    if budget_seconds <= 0:
+        log.warning(
+            "dedup: config-delta budget exhausted before a %d/%d-token pair — "
+            "label carries no delta", la, lb)
+        return None
+    out: list[int] = []
+
+    def _run() -> None:
+        try:
+            out.append(_abs_token_delta(a, b))
+        except Exception as e:  # noqa: BLE001 — attacker-chosen input; fail open
+            log.warning("dedup: config-delta pass failed (%s: %s) — label "
+                        "carries no delta", type(e).__name__, e)
+
+    worker = threading.Thread(target=_run, name="dedup-config-delta", daemon=True)
+    worker.start()
+    worker.join(budget_seconds)
+    if worker.is_alive():
+        log.warning(
+            "dedup: config-delta pass exceeded its %.0fs budget on a %d/%d-"
+            "token pair — abandoned (fails open; label carries no delta)",
+            budget_seconds, la, lb)
+        return None
+    return out[0] if out else None
 
 
 @dataclass(frozen=True)
@@ -423,6 +503,17 @@ def screen_duplicates(
     dropped: list[DedupVerdict] = []
     shadow: list[DedupVerdict] = []
 
+    # One shared wall clock for every config-delta measurement this screen
+    # performs: however many pathological pairs the field contains, the delta
+    # phase as a whole can never eat the screen's `dedup_phase_seconds` budget
+    # (whose expiry publishes the field UNSCREENED — the outcome this bounds).
+    delta_deadline = time.monotonic() + DELTA_PHASE_BUDGET_SECONDS
+
+    def _delta(a: RepoFingerprint, b: RepoFingerprint) -> int | None:
+        remaining = delta_deadline - time.monotonic()
+        return _safe_abs_token_delta(
+            a, b, budget_seconds=min(DELTA_PAIR_BUDGET_SECONDS, remaining))
+
     for hotkey, uid, fp in ordered:
         rivals: list[tuple[str, int, RepoFingerprint]] = []
         if king is not None:
@@ -447,7 +538,7 @@ def screen_duplicates(
                 tier = "rename_identical"
             elif _same_code(fp, r_fp):
                 # Identical code, different functional configs.
-                delta = _safe_abs_token_delta(fp, r_fp)
+                delta = _delta(fp, r_fp)
                 if not config_only_enforce:
                     shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid,
                                                "config_only", 1.0, delta))

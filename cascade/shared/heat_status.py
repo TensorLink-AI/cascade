@@ -45,6 +45,11 @@ HEAT_INDEX_SCHEMA = 1
 # documents themselves are never pruned (they are tiny and immutable).
 HEAT_INDEX_MAX_KEEP = 400
 
+# Cap on the per-hotkey rows inside the document's ``skipped`` block. The
+# aggregate counts are always complete; the row list is a sample so a round
+# with hundreds of skips (r48: 328 burned re-commits) stays a small document.
+SKIPPED_ENTRIES_MAX = 25
+
 # A live doc older than this describes a round whose heat is long over; a
 # consumer wanting "the heat of the round in flight" ignores it (the per-round
 # mirror is how you read an old heat). Generous: the heat settles early in the
@@ -71,6 +76,7 @@ def build_heat_status(
     no_screen_reason: str = "",
     finalists: int | None = None,
     warm_start: dict | None = None,
+    skipped: list[dict] | None = None,
 ) -> dict:
     """Assemble the public heat document (pure — storage I/O stays with the caller).
 
@@ -93,6 +99,15 @@ def build_heat_status(
     the entrant rows. ``next_scheduled_init`` is the rotation's pick for the
     FOLLOWING round — a schedule, not a promise: a promotion firing at the
     boundary replaces the member set, and dashboards should caption it so.
+
+    ``skipped`` — ``[{hotkey, uid, reason}]`` for hotkeys with a standing
+    commitment that never became entrants (today: ``already_submitted``, a
+    burned hotkey re-committing its one used submission). ADDITIVE: the field
+    is only present when there are skips, existing fields are untouched, and
+    the block is bounded — complete ``by_reason`` counts plus at most
+    :data:`SKIPPED_ENTRIES_MAX` per-hotkey rows — so 300+ skips (r48) cannot
+    bloat the document. Without it an all-burned field publishes as an
+    unexplained ``0 entrants``.
     """
     from .manifest import heat_to_json
 
@@ -118,6 +133,8 @@ def build_heat_status(
         doc.update(body)
     if screened is not None:
         doc["screened"] = int(screened)
+    if skipped:
+        doc["skipped"] = skipped_block(skipped)
     if warm_start:
         doc["warm_start"] = dict(warm_start)
     if network:
@@ -125,6 +142,34 @@ def build_heat_status(
     if netuid is not None:
         doc["netuid"] = int(netuid)
     return doc
+
+
+def skipped_block(
+    skipped: list[dict],
+    *,
+    max_entries: int = SKIPPED_ENTRIES_MAX,
+) -> dict:
+    """The bounded ``skipped`` block of the heat document.
+
+    ``total`` and ``by_reason`` always cover EVERY skip; ``entries`` is the
+    first ``max_entries`` rows (input order — the trainer records them in
+    commitment order) with ``entries_truncated`` flagging the cut, so a
+    consumer can tell "these are all of them" from "this is a sample".
+    """
+    rows = [r for r in skipped if isinstance(r, dict)]
+    by_reason: dict[str, int] = {}
+    for r in rows:
+        key = str(r.get("reason", "unknown"))
+        by_reason[key] = by_reason.get(key, 0) + 1
+    return {
+        "total": len(rows),
+        "by_reason": dict(sorted(by_reason.items())),
+        "entries": [{"hotkey": str(r.get("hotkey", "")),
+                     "uid": r.get("uid"),
+                     "reason": str(r.get("reason", "unknown"))}
+                    for r in rows[:max_entries]],
+        "entries_truncated": len(rows) > max_entries,
+    }
 
 
 def heat_summary(doc: dict) -> dict:
@@ -137,6 +182,7 @@ def heat_summary(doc: dict) -> dict:
     ents = [e for e in doc.get("entrants", ()) if isinstance(e, dict)]
     leader = next((e for e in ents if e.get("rank") == 1), None)
     advanced = [e for e in ents if str(e.get("status")) == "advanced"]
+    skipped = doc.get("skipped") if isinstance(doc.get("skipped"), dict) else {}
     return {
         "round_id": str(doc.get("round_id", "")),
         "epoch_start_block": int(doc.get("epoch_start_block", 0)),
@@ -145,6 +191,7 @@ def heat_summary(doc: dict) -> dict:
         "finalists": doc.get("finalists"),
         "n_entrants": len(ents),
         "n_advanced": len(advanced),
+        "n_skipped": int(skipped.get("total", 0) or 0),
         "no_screen": bool(doc.get("no_screen", False)),
         "leader_uid": (leader or {}).get("uid"),
         "leader_hotkey": (leader or {}).get("hotkey"),

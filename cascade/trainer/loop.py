@@ -836,6 +836,12 @@ class TrainerRunner:
     # Heat drops whose failure matched the storage layer (hotkey → gen ref),
     # reset each round: candidates for the burn exemption in _burn_hotkeys.
     _storage_dropped: dict = field(default_factory=dict, repr=False)
+    # Challengers dropped BEFORE the field was even eligible (today: burned
+    # hotkeys re-committing their one used submission), reset each round.
+    # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
+    # skipped miner can read WHY it is not listed (r48: 328 burned re-commits
+    # published as an unexplained "0 entrants").
+    _round_skipped: list = field(default_factory=list, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -990,7 +996,12 @@ class TrainerRunner:
         the heat stage completes. No-op when ``[round] one_submission_per_hotkey``
         is False (testnet). The king is never here (``plan_round`` separates it),
         so the incumbent is exempt.
+
+        Skips are recorded on ``_round_skipped`` (reset here, once per round)
+        so the published heat standings can say WHY a committed hotkey is not
+        an entrant — the skip is otherwise visible only in this journal.
         """
+        self._round_skipped = []
         if not self.cfg.round.one_submission_per_hotkey:
             return challengers
         seen = _load_seen_hotkeys(self._submissions_path())
@@ -998,6 +1009,8 @@ class TrainerRunner:
             if c.hotkey in seen:
                 log.info("skipping challenger %s: hotkey already used its 1 submission "
                          "(re-register to resubmit)", c.hotkey)
+                self._round_skipped.append({"hotkey": c.hotkey, "uid": c.uid,
+                                            "reason": "already_submitted"})
         return [c for c in challengers if c.hotkey not in seen]
 
     def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:
@@ -1662,9 +1675,20 @@ class TrainerRunner:
             update_heat_index,
         )
 
+        skipped = list(self._round_skipped)
         n = max(0, self.cfg.round.finalist_cap)
         if screened == 0:
             reason = "no eligible challengers entered the round"
+            if skipped:
+                # An empty field with standing commitments is not silence — say
+                # why the committed hotkeys were not eligible (r48: 328 burned
+                # re-commits read as an unexplained "0 entrants").
+                by_reason: dict[str, int] = {}
+                for s in skipped:
+                    key = str(s.get("reason", "unknown"))
+                    by_reason[key] = by_reason.get(key, 0) + 1
+                detail = ", ".join(f"{v} {k}" for k, v in sorted(by_reason.items()))
+                reason += f" ({len(skipped)} commitment(s) skipped: {detail})"
         elif self.screen_fn is None:
             reason = "no screener configured; the field advanced by UID order"
         else:
@@ -1681,6 +1705,7 @@ class TrainerRunner:
                 no_screen_reason="" if heat is not None else reason,
                 finalists=n,
                 warm_start=self._stage_ctx.get("warm_start"),
+                skipped=skipped,
             )
             store = self.manifest_store()
             publish_heat_status(store, doc)
