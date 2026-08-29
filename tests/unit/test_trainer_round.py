@@ -807,6 +807,102 @@ def test_burn_happens_after_heat_not_at_entry(cfg, tmp_path, monkeypatch):
     assert (tmp_path / cfg.round.submissions_db_path).exists()  # …and is burned now
 
 
+def _retry_after_settled_heat_runner(cfg, tmp_path, monkeypatch, screen_fn):
+    """A round whose heat SETTLES (finalists chosen, everyone burned,
+    heat_complete.json written) and whose FINAL then dies — the r47 shape.
+    Returns (runner, commits, real_train_final) with ``_train_final`` still
+    patched to raise; the caller restores it for the retry."""
+    _patch_train_boundaries(monkeypatch)
+    assert cfg.round.one_submission_per_hotkey is True
+    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(), work_root=tmp_path,
+                           use_sandbox=False, screen_fn=screen_fn)
+    commits = [_commit(0, "a", REF_A, 5), _commit(1, "b", REF_B, 6),
+               _commit(2, "c", REF_C, 7), _commit(3, "d", REF_D, 8)]
+    real_train_final = runner._train_final
+
+    def _boom(*a, **k):
+        raise RuntimeError("final pod died")
+
+    monkeypatch.setattr(runner, "_train_final", _boom)
+    with pytest.raises(RuntimeError, match="final pod died"):
+        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    # The heat settled before the final died: burns applied, marker on disk.
+    assert (tmp_path / cfg.round.submissions_db_path).exists()
+    assert (tmp_path / "1" / "heat_complete.json").exists()
+    return runner, commits, real_train_final
+
+
+def test_round_retry_after_settled_heat_reuses_finalists(cfg, tmp_path, monkeypatch):
+    # r47 (2026-08-28): a FINAL-stage failure retried the round, the retry
+    # re-derived eligibility, found every heat finalist already burned, and
+    # degenerated into a king-only walkover. The retry must reuse the settled
+    # finalist set instead — without re-spending heat compute and without
+    # un-burning anyone for later rounds.
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    screened: list[str] = []
+
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        screened.append(gen.hotkey)
+        return scores[gen.hotkey]
+
+    runner, commits, real_train_final = _retry_after_settled_heat_runner(
+        cfg, tmp_path, monkeypatch, screen)
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker["finalists"] == ["c"]
+    assert sorted(screened) == ["b", "c", "d"]
+
+    screened.clear()
+    monkeypatch.setattr(runner, "_train_final", real_train_final)
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    # The settled finalist duels — no walkover, and no heat compute re-spent.
+    assert [e.miner_hotkey for e in manifest.entries_for_role("challenger")] == ["c"]
+    assert screened == []
+    # Burn semantics untouched for LATER rounds: the same field next epoch is
+    # all-burned ⇒ king-only, exactly as before.
+    m2 = runner.run_round(commits, king_hotkey="a", base_seed=2, block=20)
+    assert m2.entries_for_role("challenger") == []
+
+
+def test_round_retry_zero_finalist_heat_stays_walkover(cfg, tmp_path, monkeypatch):
+    # A heat that legitimately settled with ZERO finalists (every entrant failed
+    # to screen) means the king-only walkover is CORRECT — the retry guard must
+    # not "rescue" anyone.
+    def screen(ckpt_dir, gen, base_seed, block=None):
+        raise RuntimeError("broken entry")
+
+    runner, commits, real_train_final = _retry_after_settled_heat_runner(
+        cfg, tmp_path, monkeypatch, screen)
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker["finalists"] == []
+
+    monkeypatch.setattr(runner, "_train_final", real_train_final)
+    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entries_for_role("challenger") == []  # walkover preserved
+
+
+def test_round_retry_corrupt_or_missing_marker_falls_back(cfg, tmp_path, monkeypatch,
+                                                          caplog):
+    # A corrupt heat_complete.json must not sink the retry: warn, fall back to
+    # the old from-scratch eligibility (all burned ⇒ king-only). A missing
+    # marker is the plain old behaviour, no warning needed.
+    scores = {"b": 0.9, "c": 0.2, "d": 0.5}
+    runner, commits, real_train_final = _retry_after_settled_heat_runner(
+        cfg, tmp_path, monkeypatch,
+        lambda ckpt_dir, gen, base_seed, block=None: scores[gen.hotkey])
+    monkeypatch.setattr(runner, "_train_final", real_train_final)
+
+    (tmp_path / "1" / "heat_complete.json").write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
+        manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert manifest.entries_for_role("challenger") == []  # old behaviour
+    assert any("heat_complete marker unreadable" in r.getMessage()
+               for r in caplog.records)
+
+    (tmp_path / "1" / "heat_complete.json").unlink()
+    m = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+    assert m.entries_for_role("challenger") == []  # old behaviour, no crash
+
+
 def test_heat_and_final_contracts_use_scaled_guard(cfg, tmp_path, monkeypatch):
     # The heat trains under for_hours(heat_train_hours): token budget AND the hard
     # wall-clock guard scale to the cheap budget (a staller costs minutes, not the
