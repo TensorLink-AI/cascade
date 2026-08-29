@@ -134,8 +134,15 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             if not target.resolve().parent.is_relative_to(dest_resolved) \
                     and target.resolve().parent != dest_resolved:
                 raise StorageError(f"zip member escapes the destination: {name!r}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(info))
+            # A hostile ZIP can name `a` (a file) then `a/b`, or the reverse:
+            # mkdir/write_bytes then raise a raw OSError (FileExistsError,
+            # NotADirectoryError, …). Convert to StorageError so the intake
+            # returns a clean 400 bad_zip, never a 500 (review 2026-08-29).
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(info))
+            except OSError as e:
+                raise StorageError(f"zip member {name!r} not extractable: {e}") from e
     return dest
 
 

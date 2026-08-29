@@ -91,6 +91,12 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
   the king's published code also resolves via `$CASCADE_CHAMPION_BASE`
   (`{s3_endpoint}/{manifest_bucket}`). Staging wiring is an ARMING GATE —
   never rsync the whole store anywhere.
+- Reveal timing: a submit-with-key entry parks `pending_reveal` and its key
+  lives in the vault under the same TTL, so submit (or fund) within the key
+  TTL of your reveal — a reveal timed beyond it fails the entry because the
+  key it needs is already gone (re-submit+fund closer to reveal). Default
+  36h TTL vs a ≤12–24h timed reveal leaves ample headroom; keep
+  `[round] funded_entry_ttl_hours` = `cascade-intake --ttl-hours`.
 
 ## Miner flow
 

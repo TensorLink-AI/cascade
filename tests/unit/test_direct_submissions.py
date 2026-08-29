@@ -72,6 +72,17 @@ def test_store_put_owner_and_roundtrip(tmp_path):
     assert (out / "generator.py").read_bytes().startswith(b"def generate")
 
 
+def test_extract_converts_clashing_member_paths_to_storageerror(tmp_path):
+    # A hostile ZIP naming `a` (file) then `a/b` (path under it) must surface
+    # as StorageError → a clean 400 at the intake, never a raw OSError → 500.
+    clash = make_zip({"a": b"file", "a/b": b"under a file"})
+    with pytest.raises(StorageError, match="not extractable"):
+        extract_zip_safely(clash, tmp_path / "x")
+    store = SubmissionStore(tmp_path / "vault")
+    with pytest.raises(StorageError):
+        store.put(clash, HK)
+
+
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):
     store = SubmissionStore(tmp_path / "vault", max_bytes=64)
     with pytest.raises(StorageError, match="zip_too_large"):
@@ -303,6 +314,20 @@ def test_submit_reports_blocked_when_live_entry_holds_other_ref(tmp_path):
     assert body["funding"] == "blocked-by-existing-entry"    # the truth, not a promise
     assert "funding_note" in body
     assert intake.queue.get(HK).ref.endswith("0" * 64)       # old entry untouched
+
+
+def test_champion_index_failure_retries_not_marks_done(tmp_path):
+    # ZIP upload succeeds but the index write fails: the reign must NOT be
+    # marked published (the index readers consume would stay stale forever).
+    pub, public, digest = _publisher(tmp_path, "crown")
+    real_put_text = public.put_text
+    public.put_text = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("index 500"))
+    assert pub.note_king(HK, vault_ref(digest), "r1") == []      # not published
+    assert f"champions/{digest}.zip" in public.objects           # ZIP is up (idempotent)
+    public.put_text = real_put_text
+    assert pub.note_king(HK, vault_ref(digest), "r2") == [digest]  # retried, now indexed
+    index = json.loads(public.objects[CHAMPION_INDEX_KEY])
+    assert index["latest"]["digest"] == digest
 
 
 def test_submit_gate_rejects_before_any_body(tmp_path):

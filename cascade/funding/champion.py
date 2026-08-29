@@ -193,7 +193,14 @@ class ChampionPublisher:
             except StorageError:
                 self.public.put_text(CHAMPION_INDEX_KEY, text,
                                      content_type="application/json")
-        except Exception as e:  # noqa: BLE001
-            log.error("champion index update failed (zip IS published): %s", e)
+        except Exception as e:  # noqa: BLE001 — index is what readers consume
+            # The ZIP is public but the index anonymous readers/dashboards use
+            # is stale. Report NOT-published so the next round retries the
+            # whole step (the ZIP re-upload is idempotent) — returning True
+            # here would mark the reign done and never re-write the index
+            # (review 2026-08-29).
+            log.error("champion index update for %s failed (zip is up; retrying "
+                      "next round): %s", digest, e)
+            return False
         log.info("champion published: %s (%s, %s)", digest, hotkey, reason)
         return True
