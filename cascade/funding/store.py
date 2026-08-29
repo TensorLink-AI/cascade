@@ -41,6 +41,7 @@ import os
 import shutil
 import time
 import urllib.request
+import uuid
 import zipfile
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -398,14 +399,18 @@ def fetch_vault_snapshot(ref: HubRef, dest_dir: Path | str) -> Path:
     if actual != digest:
         raise StorageError(f"vault fetch of {digest} hashed to {actual} — refusing")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.parent / f".{dest.name}.vault-{os.getpid()}"
+    # PID + uuid, matching fetch_from_hub: two same-process lanes fetching the
+    # same digest into the same dest must NOT collide on one tmp tree (a
+    # PID-only name let each lane's rmtree delete the other's mid-extract).
+    tmp = dest.parent / f".{dest.name}.vault-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     # This is the FETCH path: fetch_from_hub's whole contract is "raises
     # StorageError on failure", and its callers (the dedup screen, promotion,
     # heat-status publish) catch StorageError to degrade gracefully. So ANY
-    # failure here — including an operator OSError that extract_zip_safely
-    # deliberately propagates raw for the INTAKE path (→500) — must become a
-    # StorageError so a trainer-side disk hiccup degrades instead of crashing
-    # the round with an uncaught OSError (review 2026-08-29).
+    # failure here — including the operator OSError/MemoryError that
+    # extract_zip_safely deliberately propagates raw for the INTAKE path
+    # (→500) — must become a StorageError so a trainer-side disk/OOM hiccup
+    # degrades instead of crashing the round (review 2026-08-29). The message
+    # does NOT echo the raw error: it can carry operator-internal paths.
     try:
         try:
             extract_zip_safely(data, tmp)
@@ -418,8 +423,8 @@ def fetch_vault_snapshot(ref: HubRef, dest_dir: Path | str) -> Path:
                     os.rename(tmp, dest)
         except StorageError:
             raise
-        except OSError as e:
-            raise StorageError(f"vault snapshot of {digest} failed: {e}") from e
+        except (OSError, MemoryError) as e:
+            raise StorageError(f"vault snapshot of {digest} failed") from e
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return dest
