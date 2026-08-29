@@ -145,44 +145,50 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             name = info.filename
             if name.endswith("/"):
                 continue                      # directories materialise via parents
+            if "\x00" in name:
+                # Defence-in-depth: CPython's zipfile truncates a member name
+                # at a NUL before we see it, but a reader that did not would
+                # hand us a name whose Path.resolve() raises ValueError — reject
+                # it as the malformed input it is, before any resolve.
+                raise StorageError(f"zip member has an invalid name: {name!r}")
             p = Path(name)
             if p.is_absolute() or ".." in p.parts:
                 raise StorageError(f"zip member escapes the destination: {name!r}")
-            target = dest / p
-            # A path equal to dest is already relative-to dest, so is_relative_to
-            # alone is the complete check.
-            if not target.resolve().parent.is_relative_to(dest_resolved):
-                raise StorageError(f"zip member escapes the destination: {name!r}")
-            # A hostile ZIP can name `a` (a file) then `a/b`, or the reverse:
-            # mkdir/write_bytes then raise a raw OSError (FileExistsError,
-            # NotADirectoryError, …). Convert to StorageError so the intake
-            # returns a clean 400 bad_zip, never a 500 (review 2026-08-29).
+            # One hostile-INPUT boundary per member. EVERYTHING that can fail on
+            # untrusted bytes lives inside it — the path resolve (ValueError on
+            # odd names), mkdir over a clashing member (OSError), and the
+            # streamed inflate (BadZipFile / zlib.error / NotImplementedError /
+            # EOFError / bad CRC). All become a clean 400 bad_zip. A genuine
+            # resource fault (MemoryError) is the OPERATOR's problem and must
+            # propagate to a 500; KeyboardInterrupt/SystemExit are BaseException
+            # and already pass through. The message NEVER echoes the caught
+            # exception — an OSError carries operator-internal paths that must
+            # not reach the miner (review 2026-08-29).
             try:
+                target = dest / p
+                if not target.resolve().parent.is_relative_to(dest_resolved):
+                    raise StorageError(f"zip member escapes the destination: {name!r}")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                payload = zf.read(info)       # deflate happens here
-            except Exception as e:  # noqa: BLE001
-                # This is a HOSTILE-INPUT boundary: reading an untrusted member
-                # can fail as BadZipFile (bad CRC / truncation), zlib.error
-                # (garbage deflate), NotImplementedError (unsupported method),
-                # EOFError, or OSError — every one of which must become a clean
-                # 400 bad_zip, never a 500. Catching the type list was
-                # incomplete twice (review 2026-08-29); ANY failure to inflate
-                # a member is a rejected upload.
-                raise StorageError(f"zip member {name!r} not extractable: {e}") from e
-            written += len(payload)
-            if written > MAX_EXTRACTED_BYTES:
-                # Backstop: today's CPython caps read() at file_size, so the
-                # declared-sum guard above already bounds the total — but this
-                # keeps the cap enforced on the bytes ACTUALLY written, so a
-                # zipfile that ever returned more than declared cannot slip a
-                # bomb past. Cheap, and not reliant on that internal cap.
-                raise StorageError(
-                    f"zip_too_large: decompressed bytes exceed cap "
-                    f"{MAX_EXTRACTED_BYTES} (compression bomb?)")
-            try:
-                target.write_bytes(payload)
-            except OSError as e:
-                raise StorageError(f"zip member {name!r} not extractable: {e}") from e
+                # Stream in chunks so RAM is bounded to one chunk regardless of
+                # a member's declared size, and the running cap is enforced on
+                # bytes ACTUALLY inflated — no reliance on any zipfile internal.
+                with zf.open(info) as src, open(target, "wb") as out:
+                    while True:
+                        chunk = src.read(1 << 20)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > MAX_EXTRACTED_BYTES:
+                            raise StorageError(
+                                f"zip_too_large: decompressed bytes exceed cap "
+                                f"{MAX_EXTRACTED_BYTES} (compression bomb?)")
+                        out.write(chunk)
+            except StorageError:
+                raise
+            except MemoryError:
+                raise
+            except Exception as e:  # noqa: BLE001 — any INPUT failure ⇒ 400, no leak
+                raise StorageError(f"zip member {name!r} not extractable") from e
     return dest
 
 

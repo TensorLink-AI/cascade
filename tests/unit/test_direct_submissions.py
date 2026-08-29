@@ -104,29 +104,48 @@ def test_extract_corrupt_member_is_storageerror_not_500(tmp_path):
     # Reading an untrusted member can fail as BadZipFile (bad CRC/truncation),
     # zlib.error (garbage deflate), or NotImplementedError (unsupported
     # method) — EVERY one must surface as StorageError (→ 400 bad_zip), never
-    # escape as a 500. Chasing the exception TYPE list was incomplete twice.
-    # (a) CRC/truncation → BadZipFile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("gen.py", b"payload bytes here")
-    raw = bytearray(buf.getvalue())
-    for i in range(40, min(48, len(raw))):
-        raw[i] ^= 0xFF
-    with pytest.raises(StorageError):
-        extract_zip_safely(bytes(raw), tmp_path / "a")
-
-    # (b) the type-list-independent guarantee: ANY read() failure converts —
-    # zlib.error (garbage deflate) and NotImplementedError (unsupported
-    # method) are the two vectors that escaped the previous narrow handlers.
+    # escape as a 500. Chasing the exception TYPE list was incomplete THREE
+    # times; the guarantee is now type-independent, so prove it by injection:
+    # every inflate-failure class the streamed read can raise converts.
     import zlib
 
     good = make_zip({"gen.py": b"x"})
-    for exc in (zlib.error("invalid stored block lengths"),
+    for exc in (zipfile.BadZipFile("bad CRC"),
+                zlib.error("invalid stored block lengths"),
                 NotImplementedError("compression method 99 not supported"),
                 EOFError("truncated")):
-        with mock.patch.object(zipfile.ZipFile, "read", side_effect=exc), \
+        with mock.patch.object(zipfile.ZipExtFile, "read", side_effect=exc), \
                 pytest.raises(StorageError):
-            extract_zip_safely(good, tmp_path / f"b-{type(exc).__name__}")
+            extract_zip_safely(good, tmp_path / f"e-{type(exc).__name__}")
+
+    # A crafted NUL in a member's stored name must never escape as a 500.
+    # CPython's zipfile truncates the name at the NUL on read, so it arrives
+    # as a benign "gen" and extracts cleanly; the explicit NUL guard in
+    # extract_zip_safely is defence-in-depth for any reader that does NOT
+    # truncate (there it would be a clean StorageError). Either way: no 500.
+    crafted = make_zip({"gen0.py": b"x"}).replace(b"gen0.py", b"gen\x00.py")
+    out = extract_zip_safely(crafted, tmp_path / "c")   # must not raise a 500
+    assert (out / "gen").read_bytes() == b"x"
+
+
+def test_extract_resource_faults_propagate_not_masked(tmp_path):
+    # A genuine operator OOM must NOT be relabeled as client bad_zip (that
+    # would hide an infra incident behind a 400). MemoryError propagates.
+    good = make_zip({"gen.py": b"x"})
+    with mock.patch.object(zipfile.ZipExtFile, "read", side_effect=MemoryError()), \
+            pytest.raises(MemoryError):
+        extract_zip_safely(good, tmp_path / "oom")
+
+
+def test_extract_error_message_never_leaks_operator_paths(tmp_path):
+    # An OSError during extraction carries operator-internal paths; the 400
+    # message must not echo them back to the miner.
+    secret_path = "/root/.cascade/vault/tmpSECRET/inner"
+    with mock.patch.object(zipfile.ZipExtFile, "read",
+                           side_effect=OSError(f"No such file: {secret_path}")), \
+            pytest.raises(StorageError) as ei:
+        extract_zip_safely(make_zip({"gen.py": b"x"}), tmp_path / "leak")
+    assert secret_path not in str(ei.value)
 
 
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):
