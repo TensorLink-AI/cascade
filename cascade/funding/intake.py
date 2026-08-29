@@ -182,21 +182,20 @@ class FundingIntake:
                                         "signature over the canonical message"}
         return None, {"hotkey": hotkey, "ref": ref}
 
-    def submit(self, headers, body: bytes) -> tuple[int, dict]:
-        """Store a generator ZIP; optionally fund it in the same request.
+    def submit_gate(self, headers) -> tuple[int, dict] | tuple[None, dict]:
+        """Identity + signature gate for a submit, checkable BEFORE the body.
 
-        The signature binds the CONTENT: the miner signs over
-        ``X-Content-Digest`` (``sha256:<hex>`` of the ZIP they built), and the
-        server recomputes the digest from the received body — a tampered or
-        truncated upload fails ``digest_mismatch`` before anything stores.
+        The signature is over the DECLARED digest, so the whole gate runs on
+        headers alone — the HTTP layer calls it before reading a byte of the
+        upload, which is what stops an unauthenticated client from making N
+        handler threads each buffer a cap-sized body on the orchestrator
+        (review 2026-08-29). (With ``require_signature`` off — dev only —
+        the body is still gated on the cheap header checks.)
         """
-        import hashlib
-
         if self.store is None:
             return 503, {"code": "submissions_disabled",
                          "message": "this intake accepts funding only; submit via "
                                     "the Hub path (cascade deploy)"}
-        self.sweep_pending()
         hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
         if not hotkey:
             return 400, {"code": "missing_hotkey",
@@ -222,6 +221,23 @@ class FundingIntake:
                              "message": "X-Signature must be the hotkey's sr25519 "
                                         "signature over the canonical message "
                                         "(which binds X-Content-Digest)"}
+        return None, {"hotkey": hotkey, "declared": declared}
+
+    def submit(self, headers, body: bytes) -> tuple[int, dict]:
+        """Store a generator ZIP; optionally fund it in the same request.
+
+        The signature binds the CONTENT: the miner signs over
+        ``X-Content-Digest`` (``sha256:<hex>`` of the ZIP they built), and the
+        server recomputes the digest from the received body — a tampered or
+        truncated upload fails ``digest_mismatch`` before anything stores.
+        """
+        import hashlib
+
+        status, ctx = self.submit_gate(headers)
+        if status is not None:
+            return status, ctx
+        self.sweep_pending()
+        hotkey, declared = ctx["hotkey"], ctx["declared"]
         actual = f"sha256:{hashlib.sha256(body).hexdigest()}"
         if actual != declared:
             return 400, {"code": "digest_mismatch",
@@ -241,18 +257,30 @@ class FundingIntake:
                 return 409, {"code": "digest_owned", "message": text}
             return 400, {"code": "bad_zip", "message": text}
         ref = vault_ref(digest)
-        funding = "none"
+        funding, note = "none", ""
         api_key = (headers.get("X-Lium-Api-Key") or "").strip()
         if api_key:
             # One-request flow: the key vaults now, the entry parks until the
             # miner's chain reveal resolves (the sweep promotes it). Vault
-            # AFTER the store accepted, mirroring fund().
-            self.queue.add_pending(hotkey, ref)
+            # AFTER the store accepted, mirroring fund(). The response tells
+            # the truth about what parked: a live entry for a DIFFERENT ref
+            # is never silently replaced — the miner re-funds the new ref
+            # deliberately (or withdraws the old one first).
+            outcome = self.queue.add_pending(hotkey, ref)
             self.vault.insert(hotkey, api_key)
-            funding = "pending_reveal"
+            if outcome in ("pending_reveal", "already-pending"):
+                funding = "pending_reveal"
+            else:
+                funding = "blocked-by-existing-entry"
+                note = ("your queue already holds a live entry for a different "
+                        "ref — withdraw it or let it settle, then "
+                        "`cascade fund` this new ref")
         log.info("submit %s: stored %s (funding=%s)", hotkey, digest, funding)
-        return 201, {"status": "stored", "ref": ref,
-                     "commit_payload": format_commit(ref), "funding": funding}
+        body_out = {"status": "stored", "ref": ref,
+                    "commit_payload": format_commit(ref), "funding": funding}
+        if note:
+            body_out["funding_note"] = note
+        return 201, body_out
 
     def fund(self, headers) -> tuple[int, dict]:
         self.sweep_pending()
@@ -348,6 +376,12 @@ class FundingIntake:
                         # too-large upload must not stream through first.
                         self._reply(413, {"code": "zip_too_large",
                                           "message": f"declared {length} bytes > cap {cap}"})
+                        return
+                    # Identity/signature gate BEFORE buffering the upload: an
+                    # unauthenticated request never costs more than headers.
+                    status, err = intake.submit_gate(self.headers)
+                    if status is not None:
+                        self._reply(status, err)
                         return
                     body = self.rfile.read(length) if length else b""
                     self._dispatch(lambda: intake.submit(self.headers, body))

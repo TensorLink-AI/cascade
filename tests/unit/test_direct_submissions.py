@@ -281,6 +281,48 @@ def test_dethrone_policy_reveals_only_at_handoff(tmp_path):
     assert public.objects[f"champions/{digest}.zip"] == GOOD_ZIP
 
 
+def test_dethrone_reveal_survives_a_failed_publish(tmp_path):
+    # One bucket 500 at hand-off must not erase a reign's audit trail: the
+    # deposed king goes on a persistent backlog and retries every round.
+    pub, public, digest = _publisher(tmp_path, "dethrone")
+    pub.note_king(HK, vault_ref(digest), "r1")
+    original_put = public.put_bytes
+    public.put_bytes = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bucket 500"))
+    assert pub.note_king(HK2, "ns/new@sha256:" + "b" * 64, "r2") == []   # failed
+    public.put_bytes = original_put
+    assert pub.note_king(HK2, "ns/new@sha256:" + "b" * 64, "r3") == [digest]
+    assert public.objects[f"champions/{digest}.zip"] == GOOD_ZIP
+
+
+def test_submit_reports_blocked_when_live_entry_holds_other_ref(tmp_path):
+    intake = make_intake(tmp_path, resolve=lambda hk, ref: 100)
+    intake.queue.add(HK, "ns/old@sha256:" + "0" * 64, reveal_block=100)  # live entry
+    headers = _submit_headers(HK, GOOD_ZIP, ts=time.time(), key="sk-live")
+    status, body = intake.submit(headers, GOOD_ZIP)
+    assert status == 201
+    assert body["funding"] == "blocked-by-existing-entry"    # the truth, not a promise
+    assert "funding_note" in body
+    assert intake.queue.get(HK).ref.endswith("0" * 64)       # old entry untouched
+
+
+def test_submit_gate_rejects_before_any_body(tmp_path):
+    intake = FundingIntake(
+        FundedQueue(tmp_path / "queue.json"), PayerKeyVault(dir=None),
+        resolve_reveal=lambda hk, ref: None, require_signature=True,
+        verify=lambda hk, msg, sig: False,
+        store=SubmissionStore(tmp_path / "subs"),
+    )
+    status, body = intake.submit_gate({
+        "X-Miner-Hotkey": HK, "X-Content-Digest": f"sha256:{GOOD_DIGEST}",
+        "X-Timestamp": str(int(time.time())), "X-Signature": "bad",
+    })
+    assert (status, body["code"]) == (400, "bad_signature")
+    status, body = intake.submit_gate({})
+    assert (status, body["code"]) == (400, "missing_hotkey")
+    ok, ctx = intake.submit_gate(_submit_headers(HK, GOOD_ZIP, ts=time.time()))
+    assert ok == 400                     # unverifiable signature still gates
+
+
 def test_hub_ref_king_is_a_noop(tmp_path):
     pub, public, _ = _publisher(tmp_path, "crown")
     assert pub.note_king(HK, "ns/genesis@sha256:" + "c" * 64, "r1") == []
@@ -329,6 +371,24 @@ def test_maybe_publish_champion_wires_policy(tmp_path):
 
 
 # ── deterministic client-side packaging ──────────────────────────────────────
+
+
+def test_zip_repo_bytes_filters_like_the_hub_path(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git" / "objects").mkdir(parents=True)
+    (repo / "__pycache__").mkdir()
+    (repo / ".git" / "objects" / "pack").write_bytes(b"secret history")
+    (repo / ".git" / "config").write_bytes(b"[user] email=me@real.example")
+    (repo / "__pycache__" / "gen.cpython-311.pyc").write_bytes(b"\x00")
+    (repo / "notes.bin").write_bytes(b"not an allowed type")
+    (repo / "generator.py").write_bytes(b"code")
+    (repo / "config.json").write_bytes(b"{}")
+    data = zip_repo_bytes(repo)
+    names = set(zipfile.ZipFile(io.BytesIO(data)).namelist())
+    # Same filter as the Hub upload: code/config only — never .git history,
+    # caches, or arbitrary binaries (which would otherwise reach the operator
+    # store and, on a throne, PUBLIC champions/).
+    assert names == {"generator.py", "config.json"}
 
 
 def test_zip_repo_bytes_is_deterministic(tmp_path):

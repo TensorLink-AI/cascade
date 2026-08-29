@@ -139,7 +139,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         store = SubmissionStore(args.submission_dir,
                                 max_bytes=args.max_zip_mb * 1024 * 1024)
     intake = FundingIntake(
-        FundedQueue(args.queue_path),
+        # Entry TTL tracks the key TTL by construction here; the trainer's
+        # [round] funded_entry_ttl_hours must be set to the same value.
+        FundedQueue(args.queue_path, entry_ttl_seconds=args.ttl_hours * 3600.0),
         vault,
         resolve_reveal=resolver,
         require_signature=not args.no_require_signature,

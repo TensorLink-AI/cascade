@@ -1015,7 +1015,10 @@ class TrainerRunner:
         from ..funding.queue import FundedQueue
 
         p = Path(self.cfg.round.funded_queue_path)
-        return FundedQueue(p if p.is_absolute() else (self.work_root / p))
+        return FundedQueue(
+            p if p.is_absolute() else (self.work_root / p),
+            entry_ttl_seconds=self.cfg.round.funded_entry_ttl_hours * 3600.0,
+        )
 
     def _filter_funded_challengers(
         self, challengers: list[ResolvedGenerator]
@@ -1086,18 +1089,36 @@ class TrainerRunner:
         if dropped:
             log.info("funded_mode=required: %d unfunded/over-cap challenger(s) wait "
                      "for a later round (unburned)", dropped)
-        queue.mark_in_round([c.hotkey for c in kept])
-        return kept
+        # Ref-checked flip: an intake ref-replace landing between our snapshot
+        # and this lock must not have ITS entry consumed by a round training
+        # the old ref — unconfirmed selections drop out of the round.
+        confirmed = set(queue.mark_in_round([(c.hotkey, c.ref) for c in kept]))
+        stale = [c.hotkey for c in kept if c.hotkey not in confirmed]
+        if stale:
+            log.info("funded selection changed under us for %s — re-entering "
+                     "next round", ", ".join(stale))
+        return [c for c in kept if c.hotkey in confirmed]
 
     def _submission_store(self):
-        """The private direct-submission store, or None while unset."""
+        """The private direct-submission store, or None while unset.
+
+        Also exports the resolved dir as ``$CASCADE_VAULT_DIR`` (unless the
+        operator already set one): the FETCH path — the dedup screen, a
+        vault-ref king fetch, local training — resolves vault refs through
+        that env, and without this bridge a fully configured store would be
+        invisible to every fetch on the orchestrator (review 2026-08-29).
+        """
         d = self.cfg.round.submission_vault_dir
         if not d:
             return None
-        from ..funding.store import SubmissionStore
+        import os
+
+        from ..funding.store import VAULT_DIR_ENV, SubmissionStore
 
         p = Path(d)
-        return SubmissionStore(p if p.is_absolute() else (self.work_root / p))
+        resolved = p if p.is_absolute() else (self.work_root / p)
+        os.environ.setdefault(VAULT_DIR_ENV, str(resolved))
+        return SubmissionStore(resolved)
 
     def _verify_vault_ownership(
         self, challengers: list[ResolvedGenerator]

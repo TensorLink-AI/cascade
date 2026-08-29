@@ -248,6 +248,57 @@ def test_expire_stale_kills_only_old_queued(tmp_path):
     assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "queued"
 
 
+def test_sold_out_cycling_never_expires_but_idle_does(tmp_path):
+    # "Sold out is not Score(0), no time bound": a requeue is proof of life
+    # and refreshes the idle clock; only a genuinely untouched entry dies.
+    clock = FakeClock(t=0.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock, entry_ttl_seconds=100.0)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)   # will cycle
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)   # will idle
+    for _ in range(5):
+        clock.t += 90.0                                  # < TTL between touches
+        q.mark_in_round([HK_A])
+        q.requeue(HK_A, error="sold out", error_class="no_capacity",
+                  burn_attempt=False)
+    assert q.expire_stale() == 1                         # only the idle one
+    assert q.get(HK_A).status == "queued"
+    assert q.get(HK_B).last_error_class == "funding_expired"
+
+
+def test_entry_ttl_is_configurable(tmp_path):
+    clock = FakeClock(t=0.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock, entry_ttl_seconds=10.0)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    clock.t = 11.0
+    assert q.expire_stale() == 1                         # honors the ctor TTL
+
+
+def test_mark_in_round_rechecks_ref_inside_lock(tmp_path):
+    # The select→mark TOCTOU: a ref-replace landing between the trainer's
+    # snapshot and the flip must NOT have its new entry consumed by a round
+    # that trained the old ref.
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)
+    q.add(HK_A, "repo-a2@sha256:ac", reveal_block=150)   # the mid-window replace
+    confirmed = q.mark_in_round([(HK_A, "repo-a@sha256:aa"),
+                                 (HK_B, "repo-b@sha256:bb")])
+    assert confirmed == [HK_B]
+    assert q.get(HK_A).status == "queued"                # new entry untouched
+    assert q.get(HK_B).status == "in_round"
+
+
+def test_public_view_redacts_pending_reveal(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.add_pending(HK_B, "vault/direct@sha256:" + "b" * 64)
+    view = q.public_view()
+    # The sealed field never leaks: pending entries appear only as a count.
+    assert view["pending_reveal_count"] == 1
+    assert [e["hotkey"] for e in view["entries"]] == [HK_A]
+    assert HK_B not in json.dumps(view)
+
+
 def test_rounds_needed_clamps():
     assert rounds_needed(0, cap=3) == 1
     assert rounds_needed(3, cap=3) == 1

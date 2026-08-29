@@ -68,6 +68,16 @@ class FundedEntry:
     attempts: int = 0              # infra-fault retries consumed (bounded)
     last_error: str = ""
     last_error_class: str = ""     # cascade.funding.faults class, "" = none
+    # Refreshed by every touch that proves the entry is alive (fund, requeue,
+    # promotion) — expiry keys off THIS, not funded_at, so an entry actively
+    # cycling through no_capacity requeues waits as long as the drought lasts
+    # ("sold out is not Score(0)", no time bound) while a genuinely abandoned
+    # one still dies at the TTL. 0.0 = pre-field files: fall back to funded_at.
+    last_active: float = 0.0
+
+    @property
+    def active_at(self) -> float:
+        return self.last_active or self.funded_at
 
 
 def select_field(entries: Iterable[FundedEntry], cap: int) -> list[FundedEntry]:
@@ -101,9 +111,15 @@ def rounds_needed(queue_depth: int, cap: int, *, min_rounds: int = 1, max_rounds
 class FundedQueue:
     """JSON-file queue shared across processes: flock-serialised, reload-first."""
 
-    def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time,
+                 entry_ttl_seconds: float = DEFAULT_TTL_SECONDS) -> None:
         self.path = Path(path)
         self.clock = clock
+        # Must track the payer vault's TTL (cascade-intake --ttl-hours /
+        # [round] funded_entry_ttl_hours): expiring earlier kills paid entries
+        # whose key still works; later leaves keyless entries holding the
+        # skip-floor open. The runbook pins the two knobs together.
+        self.entry_ttl_seconds = float(entry_ttl_seconds)
         self._entries: dict[str, FundedEntry] = {}
         self._load()
 
@@ -143,6 +159,7 @@ class FundedQueue:
                 attempts=int(item.get("attempts", 0)),
                 last_error=str(item.get("last_error", "")),
                 last_error_class=str(item.get("last_error_class", "")),
+                last_active=float(item.get("last_active", 0.0)),
             )
             self._entries[entry.hotkey] = entry
 
@@ -184,9 +201,14 @@ class FundedQueue:
         slot: entry cost is the compute funding, not a lifetime bar).
         """
         with self._locked():
+            now = self.clock()
             prev = self._entries.get(hotkey)
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
+                    # Idempotent, but a re-fund is proof of life — refresh so
+                    # an actively-tended entry never TTL-expires under you.
+                    self._entries[hotkey] = replace(prev, last_active=now)
+                    self._save()
                     return "already-queued"
                 if prev.status == "in_round":
                     # Mid-round the manifest may already reference the old ref —
@@ -194,12 +216,12 @@ class FundedQueue:
                     return "already-queued"
                 self._entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
-                    funded_at=self.clock(), status="queued")
+                    funded_at=now, last_active=now, status="queued")
                 self._save()
                 return "replaced" if prev.ref != ref else "queued"
             self._entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=self.clock())
+                funded_at=now, last_active=now)
             self._save()
             return "queued"
 
@@ -217,11 +239,14 @@ class FundedQueue:
             prev = self._entries.get(hotkey)
             if prev is not None and prev.status in ("queued", "in_round"):
                 return "already-queued"
+            now = self.clock()
             if prev is not None and prev.status == "pending_reveal" and prev.ref == ref:
+                self._entries[hotkey] = replace(prev, last_active=now)
+                self._save()
                 return "already-pending"
             self._entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=0,
-                funded_at=self.clock(), status="pending_reveal")
+                funded_at=now, last_active=now, status="pending_reveal")
             self._save()
             return "pending_reveal"
 
@@ -242,22 +267,38 @@ class FundedQueue:
                 if block is None:
                     continue
                 self._entries[hk] = replace(
-                    e, status="queued", reveal_block=int(block))
+                    e, status="queued", reveal_block=int(block),
+                    last_active=self.clock())
                 promoted += 1
             if promoted:
                 self._save()
             return promoted
 
-    def mark_in_round(self, hotkeys: Iterable[str]) -> None:
+    def mark_in_round(self, selections: Iterable) -> list[str]:
+        """Flip selected entries to ``in_round``; returns the hotkeys CONFIRMED.
+
+        ``selections`` is ``(hotkey, ref)`` pairs (bare hotkeys accepted for
+        callers that cannot know the ref). The ref is re-checked INSIDE the
+        lock: the trainer selects from a snapshot, and an intake ref-replace
+        landing in the select→mark window would otherwise get the NEW entry
+        consumed by a round that trained the OLD ref (review 2026-08-29).
+        A selection whose entry changed underneath is skipped — the caller
+        must drop that challenger from the round.
+        """
         with self._locked():
-            changed = False
-            for hk in hotkeys:
+            confirmed: list[str] = []
+            for sel in selections:
+                hk, ref = sel if isinstance(sel, tuple) else (sel, None)
                 e = self._entries.get(hk)
-                if e is not None and e.status == "queued":
-                    self._entries[hk] = replace(e, status="in_round")
-                    changed = True
-            if changed:
+                if e is None or e.status != "queued":
+                    continue
+                if ref is not None and e.ref != ref:
+                    continue
+                self._entries[hk] = replace(e, status="in_round")
+                confirmed.append(hk)
+            if confirmed:
                 self._save()
+            return confirmed
 
     def recover_in_round(self) -> int:
         """Return every ``in_round`` entry to ``queued``; count recovered.
@@ -276,21 +317,25 @@ class FundedQueue:
                 self._save()
             return len(stale)
 
-    def expire_stale(self, max_age_seconds: float = DEFAULT_TTL_SECONDS) -> int:
-        """Terminally expire queued entries older than the payer-key TTL.
+    def expire_stale(self, max_age_seconds: float | None = None) -> int:
+        """Terminally expire idle queued entries past the payer-key TTL.
 
-        An entry that has waited past the vault TTL has no key left to rent
-        with — but it still counted toward ``queued_depth``, so one never-
-        enterable fund (never revealed, hotkey deregistered) could hold every
-        boundary open and bill the operator a king leg per epoch indefinitely
-        (audit 2026-08-29). Expiry is terminal-with-reason: the miner re-funds
-        to re-enter, exactly as after any other terminal state.
+        An entry idle past the vault TTL has no key left to rent with — but
+        it still counted toward ``queued_depth``, so one never-enterable fund
+        (never revealed, hotkey deregistered) could hold every boundary open
+        and bill the operator a king leg per epoch indefinitely (audit
+        2026-08-29). "Idle" is measured from ``active_at``: a requeue or
+        re-fund is proof of life, so a sold-out entry actively cycling waits
+        as long as the drought lasts. Expiry is terminal-with-reason: the
+        miner re-funds to re-enter, exactly as after any other terminal state.
         """
+        if max_age_seconds is None:
+            max_age_seconds = self.entry_ttl_seconds
         with self._locked():
             now = self.clock()
             expired = [hk for hk, e in self._entries.items()
                        if e.status in ("queued", "pending_reveal")
-                       and now - e.funded_at > max_age_seconds]
+                       and now - e.active_at > max_age_seconds]
             for hk in expired:
                 self._entries[hk] = replace(
                     self._entries[hk], status="failed",
@@ -342,7 +387,8 @@ class FundedQueue:
                 return False
             self._entries[hotkey] = replace(
                 e, status="queued", attempts=attempts,
-                last_error=error[:500], last_error_class=error_class)
+                last_error=error[:500], last_error_class=error_class,
+                last_active=self.clock())
             self._save()
             return True
 
@@ -358,10 +404,20 @@ class FundedQueue:
     # ── transparency feed ────────────────────────────────────────────────────
 
     def public_view(self) -> dict:
-        """The queue as miners may see it — statuses and order, no key material."""
+        """The queue as miners may see it — no key material, no sealed field.
+
+        ``pending_reveal`` entries are REDACTED to a bare count: their chain
+        commit is still timelock-encrypted, so listing (hotkey, ref) here
+        would leak exactly what the timed reveal hides — who is entering the
+        next round, hours early (review 2026-08-29). They join the listing
+        the moment their reveal resolves, which is when the chain shows them
+        anyway.
+        """
         current = self.entries()
         return {
             "queued_depth": sum(1 for e in current if e.status == "queued"),
+            "pending_reveal_count": sum(1 for e in current
+                                        if e.status == "pending_reveal"),
             "entries": [
                 {
                     "hotkey": e.hotkey,
@@ -371,6 +427,6 @@ class FundedQueue:
                     "attempts": e.attempts,
                     "last_error_class": e.last_error_class,
                 }
-                for e in current
+                for e in current if e.status != "pending_reveal"
             ],
         }

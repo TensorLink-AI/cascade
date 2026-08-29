@@ -45,6 +45,7 @@ __all__ = [
     "reconcile_funded",
     "rent_funded_pod",
     "teardown_funded",
+    "terminate_verified",
 ]
 
 log = logging.getLogger("cascade.provision.funded")
@@ -75,6 +76,23 @@ def lium_provider_for_key(api_key: str) -> Provider:
     return LiumProvider(api_key=api_key)
 
 
+def terminate_verified(provider: Provider, pod_id: str) -> bool:
+    """Terminate and CONFIRM by re-listing; True only when the pod is gone.
+
+    ``LiumProvider.terminate`` deliberately swallows a failed ``lium rm`` as
+    already-terminated (operator-fleet idempotency) — on a revoked miner key
+    that turns a 401 into silence, so every funded-path teardown must believe
+    the listing, not the call (review 2026-08-29). A provider without
+    ``list_tagged`` cannot be re-checked; the call's own success is then the
+    best evidence available.
+    """
+    provider.terminate(pod_id)
+    lister = getattr(provider, "list_tagged", None)
+    if lister is None:
+        return True
+    return pod_id not in set(lister(pod_id))
+
+
 @dataclass(frozen=True)
 class FundedRentResult:
     """One funded rent attempt, success or classified failure."""
@@ -86,6 +104,10 @@ class FundedRentResult:
     error: str = ""
     error_class: str = ""           # cascade.funding.faults class; "" on success
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
+    # A half-launched pod the failure-path cleanup could NOT confirm dead —
+    # billing the MINER until someone acts. The caller must surface it (queue
+    # error text, operator alert), never drop it on the floor.
+    leaked_pod: str = ""
 
 
 def rent_funded_pod(
@@ -110,7 +132,7 @@ def rent_funded_pod(
     key), classifies the error, and reports whether the attempt should burn.
     """
 
-    def _fail(err: Exception | str) -> FundedRentResult:
+    def _fail(err: Exception | str, *, leaked_pod: str = "") -> FundedRentResult:
         msg = str(err)
         if api_key:
             msg = msg.replace(api_key, "<redacted>")
@@ -118,7 +140,7 @@ def rent_funded_pod(
         log.warning("funded rent for %s failed [%s]: %s", hotkey, cls, msg[-300:])
         return FundedRentResult(
             hotkey=hotkey, ok=False, error=msg[-500:], error_class=cls,
-            burn_attempt=(cls == "infra"),
+            burn_attempt=(cls == "infra"), leaked_pod=leaked_pod,
         )
 
     name = funded_pod_name(round_id, hotkey)
@@ -149,13 +171,17 @@ def rent_funded_pod(
                  pod_id, hotkey, addr.ip, addr.ssh_port)
         return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
+        leaked = ""
         for pid in launched:
             try:
-                provider.terminate(pid)
-            except Exception as te:  # noqa: BLE001 — best-effort, reconcile is the backstop
-                log.error("funded teardown of %s (payer %s) failed — may be leaked "
-                          "on the MINER's account: %s", pid, hotkey, te)
-        return _fail(e)
+                if not terminate_verified(provider, pid):
+                    raise ProvisionError("still listed live after terminate")
+            except Exception as te:  # noqa: BLE001 — record loudly; never silent
+                log.error("funded cleanup of %s could NOT confirm teardown — pod "
+                          "may be LEAKED on payer %s's account (revoked key?): %s",
+                          pid, hotkey, te)
+                leaked = pid
+        return _fail(e, leaked_pod=leaked)
 
 
 def teardown_funded(
@@ -189,17 +215,13 @@ def teardown_funded(
             orphaned.append(inst)
             continue
         try:
-            provider = provider_factory(key)
-            provider.terminate(inst.instance_id)
-            lister = getattr(provider, "list_tagged", None)
-            still_live = (lister is not None
-                          and inst.instance_id in set(lister(inst.instance_id)))
+            confirmed_gone = terminate_verified(provider_factory(key), inst.instance_id)
         except Exception as e:  # noqa: BLE001 — one pod's failure must not skip the rest
             log.error("funded teardown of %s (payer %s) failed: %s",
                       inst.instance_id, inst.payer_hotkey, e)
             orphaned.append(inst)
             continue
-        if still_live:
+        if not confirmed_gone:
             log.error("funded pod %s still LIVE after terminate on payer %s's "
                       "account (revoked key?) — miner is billed until it stops",
                       inst.instance_id, inst.payer_hotkey)

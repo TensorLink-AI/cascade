@@ -109,17 +109,30 @@ class ChampionPublisher:
             return []
         state = self._load_state()
         published: list[str] = []
+        backlog: list[dict] = list(state.get("unpublished", []))
         if state.get("king_hotkey") != king_hotkey or state.get("king_ref") != king_ref:
             prev_ref = state.get("king_ref", "")
             prev_digest = parse_vault_ref(prev_ref) if prev_ref else None
+            # The reveal of last resort must SURVIVE a failed publish: a
+            # deposed king lands on a persistent backlog, not a one-shot
+            # attempt — one bucket 500 at hand-off must not erase a reign's
+            # audit trail forever (review 2026-08-29).
             unrevealed = prev_digest and not state.get("published", False)
-            if unrevealed and self._publish(prev_digest, str(state.get("king_hotkey", "")),
-                                            round_id, reason="dethroned"):
-                published.append(prev_digest)
+            if unrevealed and not any(b.get("digest") == prev_digest for b in backlog):
+                backlog.append({"digest": prev_digest,
+                                "hotkey": str(state.get("king_hotkey", ""))})
             state = {"king_hotkey": king_hotkey, "king_ref": king_ref,
                      "reign_rounds": 0, "published": False}
         else:
             state["reign_rounds"] = int(state.get("reign_rounds", 0)) + 1
+        still_unpublished: list[dict] = []
+        for item in backlog:
+            if self._publish(str(item["digest"]), str(item.get("hotkey", "")),
+                             round_id, reason="dethroned"):
+                published.append(str(item["digest"]))
+            else:
+                still_unpublished.append(item)
+        state["unpublished"] = still_unpublished
         digest = parse_vault_ref(king_ref)
         if digest is None:
             # A Hub-ref king is already public by construction.

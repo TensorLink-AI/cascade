@@ -831,21 +831,42 @@ def _add_submit(sub: argparse._SubParsersAction) -> None:
 
 
 def zip_repo_bytes(repo_dir: Path) -> bytes:
-    """Deterministically ZIP a repo tree (sorted paths, zeroed timestamps).
+    """Deterministically ZIP the SUBMITTABLE part of a repo tree.
 
-    Re-zipping an unchanged tree yields identical bytes, so the sha256 the
-    miner signs — and the vault ref the chain commit pins — is a property of
-    the CODE, not of when the archive was built.
+    Two properties matter:
+
+    * Determinism (sorted paths, zeroed timestamps): re-zipping an unchanged
+      tree yields identical bytes, so the sha256 the miner signs — and the
+      vault ref the chain commit pins — is a property of the CODE.
+    * The SAME file filter as the Hub upload path (``hippius.ALLOW_PATTERNS``,
+      plus dropping dotted dirs and ``__pycache__``): a raw ``rglob('*')``
+      would pack ``.git`` packfiles — commit history, committer emails, any
+      secret ever committed — into the operator store and, on a throne, into
+      PUBLIC ``champions/`` (review 2026-08-29). Matching the Hub filter also
+      keeps the two channels' trees identical, so the dedup screen's tree
+      tier compares like with like.
     """
+    import fnmatch
     import io
     import zipfile
+
+    from ..shared.hippius import ALLOW_PATTERNS
 
     d = Path(repo_dir)
     if not d.is_dir():
         raise ValueError(f"not a directory: {d}")
+
+    def _wanted(p: Path) -> bool:
+        rel = p.relative_to(d)
+        if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+            return False
+        rel_posix = rel.as_posix()
+        return any(fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(p.name, pat)
+                   for pat in ALLOW_PATTERNS)
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in sorted(x for x in d.rglob("*") if x.is_file()):
+        for p in sorted(x for x in d.rglob("*") if x.is_file() and _wanted(x)):
             info = zipfile.ZipInfo(p.relative_to(d).as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16

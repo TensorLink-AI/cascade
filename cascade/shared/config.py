@@ -812,6 +812,12 @@ class RoundConfig:
     # cadence and let skip_unfunded_rounds provide the scale-down; this knob
     # only feeds cascade.funding.rounds_needed sizing/telemetry).
     max_rounds_per_day: int = 1
+    # Queue-entry idle TTL, hours. MUST track cascade-intake --ttl-hours (the
+    # payer-key vault TTL): expiring earlier kills paid entries whose key still
+    # works; later leaves keyless entries holding the skip-floor open. Idle is
+    # measured from the entry's last activity (fund/requeue/promotion), so a
+    # sold-out entry actively cycling never expires mid-drought.
+    funded_entry_ttl_hours: float = 36.0
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -1730,6 +1736,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_queue_path=str(r.get("funded_queue_path", "funded_queue.json")),
             skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
             max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
+            funded_entry_ttl_hours=float(r.get("funded_entry_ttl_hours", 36.0)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

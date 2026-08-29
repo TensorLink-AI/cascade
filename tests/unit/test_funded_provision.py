@@ -161,6 +161,25 @@ def test_rent_not_ready_tears_down_on_payer_key():
     res = _rent(provider, ready_timeout=1.0)
     assert not res.ok and res.error_class == "infra"
     assert provider.terminated == [f"{funded_pod_name('777', HK)}-0"]
+    assert res.leaked_pod == ""                        # confirmed gone
+
+
+def test_rent_cleanup_records_unconfirmed_teardown():
+    # A revoked key mid-launch: terminate "succeeds" but the pod stays listed
+    # — the result must carry the leak, never drop it on the floor.
+    pod = f"{funded_pod_name('777', HK)}-0"
+    provider = FakeProvider(ready=False, rm_noop=True)
+    provider.launch_hook = None
+
+    def launch(spec):
+        provider.tagged.append(pod)
+        provider.launched.append((pod, spec))
+        return [pod]
+
+    provider.launch = launch
+    res = _rent(provider, ready_timeout=1.0)
+    assert not res.ok
+    assert res.leaked_pod == pod
 
 
 def test_rent_never_leaks_key_in_error():

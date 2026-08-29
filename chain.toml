@@ -401,6 +401,7 @@ funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_roo
 # This is the elastic-cadence floor; the ceiling is the epoch grid itself.
 skip_unfunded_rounds = false
 max_rounds_per_day = 1                    # cadence sizing/telemetry only (grid = epoch_blocks)
+funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as

@@ -206,6 +206,7 @@ funded_mode = "off"
 funded_queue_path = "funded_queue.json"
 skip_unfunded_rounds = false
 max_rounds_per_day = 1
+funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
 submission_vault_dir = ""       # direct submissions (vault refs) off until armed
 champion_publish = "off"
 champion_publish_delay_rounds = 2

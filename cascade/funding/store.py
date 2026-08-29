@@ -32,6 +32,7 @@ inside the destination.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import json
@@ -41,6 +42,7 @@ import time
 import urllib.request
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..shared.hippius import FETCH_COMPLETE_MARKER, HubRef, StorageError
@@ -161,6 +163,23 @@ class SubmissionStore:
     def _meta_path(self, digest_hex: str) -> Path:
         return self.dir / f"{digest_hex}.json"
 
+    @contextmanager
+    def _locked(self):
+        """Exclusive lock for the ownership check-then-write in :meth:`put`.
+
+        The intake's handler threads (and any sibling process) race on the
+        same digest when identical bytes arrive concurrently — without this,
+        the LAST meta write would win ownership, handing "earliest upload
+        owns the content" to scheduler ordering (review 2026-08-29). Same
+        flock discipline as the funded queue.
+        """
+        with open(self.dir / ".lock", "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
     def put(self, zip_bytes: bytes, hotkey: str) -> str:
         """Store a submission; returns its sha256 hex digest.
 
@@ -182,25 +201,26 @@ class SubmissionStore:
         with tempfile.TemporaryDirectory(dir=self.dir) as probe:
             extract_zip_safely(zip_bytes, Path(probe) / "x")
         digest = hashlib.sha256(zip_bytes).hexdigest()
-        existing = self.owner(digest)
-        if existing is not None:
-            if existing != hotkey:
-                raise StorageError(
-                    "digest_owned: identical bytes were already submitted by "
-                    "another hotkey (earliest upload owns the content)")
+        with self._locked():
+            existing = self.owner(digest)
+            if existing is not None:
+                if existing != hotkey:
+                    raise StorageError(
+                        "digest_owned: identical bytes were already submitted by "
+                        "another hotkey (earliest upload owns the content)")
+                return digest
+            zp, mp = self._zip_path(digest), self._meta_path(digest)
+            tmp = zp.with_suffix(".zip.tmp")
+            tmp.write_bytes(zip_bytes)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, zp)
+            mtmp = mp.with_suffix(".json.tmp")
+            mtmp.write_text(json.dumps({
+                "hotkey": hotkey, "uploaded_at": self.clock(), "size": len(zip_bytes),
+            }), encoding="utf-8")
+            os.chmod(mtmp, 0o600)
+            os.replace(mtmp, mp)
             return digest
-        zp, mp = self._zip_path(digest), self._meta_path(digest)
-        tmp = zp.with_suffix(".zip.tmp")
-        tmp.write_bytes(zip_bytes)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, zp)
-        mtmp = mp.with_suffix(".json.tmp")
-        mtmp.write_text(json.dumps({
-            "hotkey": hotkey, "uploaded_at": self.clock(), "size": len(zip_bytes),
-        }), encoding="utf-8")
-        os.chmod(mtmp, 0o600)
-        os.replace(mtmp, mp)
-        return digest
 
     def has(self, digest_hex: str) -> bool:
         return self._zip_path(digest_hex).is_file()
