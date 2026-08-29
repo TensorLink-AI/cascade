@@ -8,6 +8,7 @@ import json
 import time
 import zipfile
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -100,19 +101,32 @@ def test_extract_refuses_decompression_bomb(tmp_path):
 
 
 def test_extract_corrupt_member_is_storageerror_not_500(tmp_path):
-    # A ZIP whose central directory parses but a member has a bad CRC /
-    # truncated deflate raises BadZipFile from read() (not OSError) — it must
-    # surface as StorageError (→ 400 bad_zip), never escape as a 500.
+    # Reading an untrusted member can fail as BadZipFile (bad CRC/truncation),
+    # zlib.error (garbage deflate), or NotImplementedError (unsupported
+    # method) — EVERY one must surface as StorageError (→ 400 bad_zip), never
+    # escape as a 500. Chasing the exception TYPE list was incomplete twice.
+    # (a) CRC/truncation → BadZipFile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("gen.py", b"payload bytes here")
     raw = bytearray(buf.getvalue())
-    # Corrupt the compressed stream: flip bytes in the local-header data area
-    # so the deflate/CRC fails on read while the central directory still parses.
     for i in range(40, min(48, len(raw))):
         raw[i] ^= 0xFF
     with pytest.raises(StorageError):
-        extract_zip_safely(bytes(raw), tmp_path / "x")
+        extract_zip_safely(bytes(raw), tmp_path / "a")
+
+    # (b) the type-list-independent guarantee: ANY read() failure converts —
+    # zlib.error (garbage deflate) and NotImplementedError (unsupported
+    # method) are the two vectors that escaped the previous narrow handlers.
+    import zlib
+
+    good = make_zip({"gen.py": b"x"})
+    for exc in (zlib.error("invalid stored block lengths"),
+                NotImplementedError("compression method 99 not supported"),
+                EOFError("truncated")):
+        with mock.patch.object(zipfile.ZipFile, "read", side_effect=exc), \
+                pytest.raises(StorageError):
+            extract_zip_safely(good, tmp_path / f"b-{type(exc).__name__}")
 
 
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):

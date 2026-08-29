@@ -134,10 +134,7 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
     except zipfile.BadZipFile as e:
         raise StorageError(f"not a valid zip: {e}") from e
     with zf:
-        try:
-            infos = zf.infolist()
-        except zipfile.BadZipFile as e:
-            raise StorageError(f"not a valid zip: {e}") from e
+        infos = zf.infolist()   # cached by ZipFile.__init__; cannot raise here
         declared_total = sum(max(0, i.file_size) for i in infos)
         if declared_total > MAX_EXTRACTED_BYTES:
             raise StorageError(
@@ -152,8 +149,9 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             if p.is_absolute() or ".." in p.parts:
                 raise StorageError(f"zip member escapes the destination: {name!r}")
             target = dest / p
-            if not target.resolve().parent.is_relative_to(dest_resolved) \
-                    and target.resolve().parent != dest_resolved:
+            # A path equal to dest is already relative-to dest, so is_relative_to
+            # alone is the complete check.
+            if not target.resolve().parent.is_relative_to(dest_resolved):
                 raise StorageError(f"zip member escapes the destination: {name!r}")
             # A hostile ZIP can name `a` (a file) then `a/b`, or the reverse:
             # mkdir/write_bytes then raise a raw OSError (FileExistsError,
@@ -162,12 +160,14 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 payload = zf.read(info)       # deflate happens here
-            except (OSError, zipfile.BadZipFile) as e:
-                # A corrupt/truncated member, a mismatched CRC, or a member
-                # whose real deflate exceeds its declared file_size all raise
-                # BadZipFile here (NOT an OSError) — convert them, so the
-                # intake returns a clean 400 bad_zip rather than a 500 on a
-                # hostile upload (review 2026-08-29).
+            except Exception as e:  # noqa: BLE001
+                # This is a HOSTILE-INPUT boundary: reading an untrusted member
+                # can fail as BadZipFile (bad CRC / truncation), zlib.error
+                # (garbage deflate), NotImplementedError (unsupported method),
+                # EOFError, or OSError — every one of which must become a clean
+                # 400 bad_zip, never a 500. Catching the type list was
+                # incomplete twice (review 2026-08-29); ANY failure to inflate
+                # a member is a rejected upload.
                 raise StorageError(f"zip member {name!r} not extractable: {e}") from e
             written += len(payload)
             if written > MAX_EXTRACTED_BYTES:
