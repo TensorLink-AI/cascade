@@ -1366,8 +1366,10 @@ class ValidatorRunner:
     ) -> RoundReceipt:
         """Assemble the round's public receipt (pure — no I/O, no signing).
 
-        A gated-out manifest — or one with no (king, challenger) pair to score —
-        yields a ``rejected`` receipt carrying the reason; a scored round yields
+        A gated-out manifest — or one with no (king, challenger) pair to score
+        (a no-contest round: nothing failed, the king simply holds) — yields a
+        ``rejected``-status receipt carrying the reason (the machine-readable
+        status string is kept for compatibility); a scored round yields
         the full record: chain context, embedded manifest, participant set, the
         eval slice, every per-window score, the verdict, and the weight vector.
         """
@@ -1490,8 +1492,15 @@ class ValidatorRunner:
             store = open_manifest_store(self.cfg.storage)
             key = publish_receipt(store, dump_receipt(receipt), manifest.round_id,
                                   validator_hotkey=hotkey_ss58)
+            # Operator-facing label only: a king-only round is a designed
+            # no-contest, not a rejection — but the receipt's machine-readable
+            # status stays "rejected" (audit checks, receipt bootstrap, and
+            # dashboards branch on it, and archived signatures cover it).
+            status_label = ("no-contest (king holds)"
+                            if reject_reason == "no_king_challenger_pair"
+                            else receipt.status)
             log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
-                     receipt.status, manifest.round_id, receipt.signature is not None,
+                     status_label, manifest.round_id, receipt.signature is not None,
                      self.cfg.storage.manifest_bucket, key)
             # Refresh the dashboard-facing rolling index (best-effort, and inside
             # the outer guard: a listing convenience must never disturb a round).
