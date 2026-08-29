@@ -110,17 +110,30 @@ def assert_train_image(contract: TrainingContractConfig) -> None:
             f"[training] train_image_digest={contract.train_image_digest!r} carries no "
             "sha256:<64hex> digest; pin the deployed image by digest (…@sha256:…)"
         )
-    runtime = _image_sha256(os.environ.get(TRAIN_IMAGE_DIGEST_ENV, ""))
+    raw_runtime = os.environ.get(TRAIN_IMAGE_DIGEST_ENV, "")
+    if not raw_runtime.strip():
+        # Deliberate design: the image bakes NO self-digest (it cannot know its
+        # own post-push digest — any baked value would be the previous pin), so
+        # an unset env here means the provisioner never delivered it.
+        raise TrainImageMismatch(
+            f"refusing FINAL run: {TRAIN_IMAGE_DIGEST_ENV} is unset in this runtime — "
+            "digest env not provided; the image deliberately bakes no self-digest, the "
+            "provisioner must inject the deployed image digest at launch/gate time "
+            f"([training] train_image_digest pins {pinned})"
+        )
+    runtime = _image_sha256(raw_runtime)
     if runtime is None:
         raise TrainImageMismatch(
-            f"refusing FINAL run: [training] train_image_digest pins {pinned} but "
-            f"{TRAIN_IMAGE_DIGEST_ENV} is unset/malformed in this runtime — inject the "
-            "deployed image digest at launch (see chain.toml [training])"
+            f"refusing FINAL run: {TRAIN_IMAGE_DIGEST_ENV}={raw_runtime!r} carries no "
+            "sha256:<64hex> digest — malformed injection; the provisioner must inject "
+            f"the deployed image digest ([training] train_image_digest pins {pinned})"
         )
     if runtime != pinned:
         raise TrainImageMismatch(
             f"refusing FINAL run: runtime image {runtime} != pinned train_image_digest "
-            f"{pinned} — this runtime is not the contracted training image"
+            f"{pinned} — this runtime is not the contracted training image. If the pin "
+            "was read from the image's baked build-time chain.toml snapshot, it is the "
+            "PRE-release pin — run finals from the provisioner-pushed deployed config"
         )
 
 
