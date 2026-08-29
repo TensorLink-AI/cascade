@@ -64,6 +64,8 @@ class DigestOwned(StorageError):
 _OPERATOR_ERRNOS = frozenset({
     errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS,
     errno.EMFILE, errno.ENFILE, errno.ENOMEM,
+    errno.EACCES, errno.EPERM,      # a mis-permissioned vault dir is operator-side
+    errno.EFBIG, errno.EBUSY,
 })
 
 __all__ = [
@@ -397,15 +399,27 @@ def fetch_vault_snapshot(ref: HubRef, dest_dir: Path | str) -> Path:
         raise StorageError(f"vault fetch of {digest} hashed to {actual} — refusing")
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.parent / f".{dest.name}.vault-{os.getpid()}"
+    # This is the FETCH path: fetch_from_hub's whole contract is "raises
+    # StorageError on failure", and its callers (the dedup screen, promotion,
+    # heat-status publish) catch StorageError to degrade gracefully. So ANY
+    # failure here — including an operator OSError that extract_zip_safely
+    # deliberately propagates raw for the INTAKE path (→500) — must become a
+    # StorageError so a trainer-side disk hiccup degrades instead of crashing
+    # the round with an uncaught OSError (review 2026-08-29).
     try:
-        extract_zip_safely(data, tmp)
-        (tmp / FETCH_COMPLETE_MARKER).touch()
         try:
-            os.rename(tmp, dest)
-        except OSError:
-            if not (dest / FETCH_COMPLETE_MARKER).exists():
-                shutil.rmtree(dest, ignore_errors=True)
+            extract_zip_safely(data, tmp)
+            (tmp / FETCH_COMPLETE_MARKER).touch()
+            try:
                 os.rename(tmp, dest)
+            except OSError:
+                if not (dest / FETCH_COMPLETE_MARKER).exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                    os.rename(tmp, dest)
+        except StorageError:
+            raise
+        except OSError as e:
+            raise StorageError(f"vault snapshot of {digest} failed: {e}") from e
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return dest

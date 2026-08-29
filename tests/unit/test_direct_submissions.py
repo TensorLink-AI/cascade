@@ -162,6 +162,28 @@ def test_extract_disk_full_propagates_as_operator_fault(tmp_path):
     # A STRUCTURAL OSError (member path clash) is still input → StorageError.
     with pytest.raises(StorageError):
         extract_zip_safely(make_zip({"a": b"f", "a/b": b"under"}), tmp_path / "clash")
+    # A permission fault (EACCES) is operator-side → propagates, not 400.
+    eacces = OSError(errno.EACCES, "Permission denied")
+    with mock.patch.object(zipfile.ZipExtFile, "read", side_effect=eacces), \
+            pytest.raises(OSError, match="Permission"):
+        extract_zip_safely(make_zip({"gen.py": b"x"}), tmp_path / "perm")
+
+
+def test_fetch_vault_snapshot_wraps_operator_oserror_as_storageerror(tmp_path, monkeypatch):
+    # The FETCH path's contract is StorageError-on-failure (callers degrade on
+    # it); an operator OSError from extraction must be WRAPPED, not leaked raw,
+    # or a trainer-side disk hiccup crashes the round (review 2026-08-29).
+    import errno as _errno
+
+    from cascade.funding.store import VAULT_DIR_ENV
+
+    store = SubmissionStore(tmp_path / "vault")
+    digest = store.put(GOOD_ZIP, HK)
+    monkeypatch.setenv(VAULT_DIR_ENV, str(tmp_path / "vault"))
+    with mock.patch.object(zipfile.ZipExtFile, "read",
+                           side_effect=OSError(_errno.ENOSPC, "No space")), \
+            pytest.raises(StorageError):
+        fetch_from_hub(vault_ref(digest), tmp_path / "fetched-oom")
 
 
 def test_intake_status_not_hijacked_by_member_name(tmp_path):
