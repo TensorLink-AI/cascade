@@ -176,7 +176,10 @@ def test_lium_launch_injects_ssh_pubkey_env_and_port():
     assert names == ["cascade-pod-0", "cascade-pod-1"]
     up = spawned[0]
     assert up[:3] == ["lium", "up", "exec-1"]
-    assert "--image" in up and IMG in up
+    # r48 fix: lium's API 400-rejects digest-pinned refs, so --image carries
+    # the digest-stripped form; the pin rides the env + health gate instead.
+    assert up[up.index("--image") + 1] == "reg.example/cascade-worker"
+    assert IMG not in up
     assert "-e" in up and f"SSH_PUBKEY={_spec().ssh_pubkey}" in up
     assert up[up.index("--internal-ports") + 1] == "22"
 

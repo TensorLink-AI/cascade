@@ -836,6 +836,12 @@ class TrainerRunner:
     # Heat drops whose failure matched the storage layer (hotkey → gen ref),
     # reset each round: candidates for the burn exemption in _burn_hotkeys.
     _storage_dropped: dict = field(default_factory=dict, repr=False)
+    # Challengers dropped BEFORE the field was even eligible (today: burned
+    # hotkeys re-committing their one used submission), reset each round.
+    # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
+    # skipped miner can read WHY it is not listed (r48: 328 burned re-commits
+    # published as an unexplained "0 entrants").
+    _round_skipped: list = field(default_factory=list, repr=False)
 
     # ── storage handles (lazy so offline/tests need no Hippius) ──────────────
 
@@ -990,7 +996,12 @@ class TrainerRunner:
         the heat stage completes. No-op when ``[round] one_submission_per_hotkey``
         is False (testnet). The king is never here (``plan_round`` separates it),
         so the incumbent is exempt.
+
+        Skips are recorded on ``_round_skipped`` (reset here, once per round)
+        so the published heat standings can say WHY a committed hotkey is not
+        an entrant — the skip is otherwise visible only in this journal.
         """
+        self._round_skipped = []
         if not self.cfg.round.one_submission_per_hotkey:
             return challengers
         seen = _load_seen_hotkeys(self._submissions_path())
@@ -998,6 +1009,8 @@ class TrainerRunner:
             if c.hotkey in seen:
                 log.info("skipping challenger %s: hotkey already used its 1 submission "
                          "(re-register to resubmit)", c.hotkey)
+                self._round_skipped.append({"hotkey": c.hotkey, "uid": c.uid,
+                                            "reason": "already_submitted"})
         return [c for c in challengers if c.hotkey not in seen]
 
     # ── miner-funded compute (DEC-CA-0036) ───────────────────────────────────
@@ -1811,6 +1824,70 @@ class TrainerRunner:
             log.warning("could not write heat_complete marker for round=%s: %s",
                         base_seed, e)
 
+    def _settled_finalists(
+        self,
+        base_seed: int,
+        challengers: list[ResolvedGenerator],
+    ) -> list[ResolvedGenerator] | None:
+        """This round's already-settled finalist set, when its heat completed.
+
+        The round-retry reuse guard (r47, 2026-08-28): a FINAL-stage failure
+        sends ``run_forever`` back through :meth:`run_round` for the SAME round
+        id — but the heat settle already burned every entrant
+        (:meth:`_burn_hotkeys`), so the retry's re-derived eligibility finds
+        them all consumed, fields nobody, and the round silently degenerates
+        into a king-only walkover that discards the settled heat's finalists
+        (r47 needed manual surgery on the submissions db to recover them).
+        When ``work_root/<round_id>/heat_complete.json`` records a non-empty
+        finalist set for THIS round, the retry reuses it directly instead.
+
+        Scope is exactly the marker's finalist hotkeys for exactly this round:
+        the burn set itself is never edited, so those hotkeys stay burned for
+        every later round, and non-finalist entrants stay out (they had their
+        screening shot in the settled heat).
+
+        Returns the finalists in their settled (heat-rank) order — the order
+        :meth:`run_round` stamps ``duel_rank`` from — or ``None`` for the old
+        behaviour: no marker (first entry, or a retry from BEFORE the heat
+        settled), an unreadable/malformed marker (warn and fall back), a
+        marker for a different round, or a legitimately empty finalist set
+        (a zero-finalist heat means the king-only walkover is correct).
+        """
+        path = self.work_root / f"{base_seed}" / "heat_complete.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None  # heat never settled for this round — normal entry
+        except (OSError, ValueError) as e:
+            log.warning("round=%s: heat_complete marker unreadable (%s); "
+                        "re-deriving eligibility from scratch", base_seed, e)
+            return None
+        hotkeys = raw.get("finalists") if isinstance(raw, dict) else None
+        if (not isinstance(raw, dict) or str(raw.get("round_id")) != str(base_seed)
+                or not isinstance(hotkeys, list)
+                or not all(isinstance(h, str) for h in hotkeys)):
+            log.warning("round=%s: heat_complete marker malformed (%r); "
+                        "re-deriving eligibility from scratch", base_seed, raw)
+            return None
+        if not hotkeys:
+            return None  # heat settled with zero finalists — walkover is correct
+        by_hotkey = {c.hotkey: c for c in challengers}
+        matched = [by_hotkey[h] for h in hotkeys if h in by_hotkey]
+        missing = [h for h in hotkeys if h not in by_hotkey]
+        if missing:
+            log.warning("round=%s retry: settled finalist(s) %s no longer resolve "
+                        "from the commitment set; reusing the %d that do",
+                        base_seed, ", ".join(missing), len(matched))
+        if not matched:
+            log.warning("round=%s retry: none of the settled finalists resolve; "
+                        "re-deriving eligibility from scratch", base_seed)
+            return None
+        log.warning("round=%s retry: heat already settled — reusing finalist(s) %s "
+                    "directly (their hotkeys are already burned; the burn still "
+                    "stands for later rounds)",
+                    base_seed, ", ".join(c.hotkey for c in matched))
+        return matched
+
     # ── live round-stage reporting (status/round.json, presentational) ───────
 
     HEAT_PROGRESS_PUBLISH_SECONDS = 300.0
@@ -1892,9 +1969,20 @@ class TrainerRunner:
             update_heat_index,
         )
 
+        skipped = list(self._round_skipped)
         n = max(0, self.cfg.round.finalist_cap)
         if screened == 0:
             reason = "no eligible challengers entered the round"
+            if skipped:
+                # An empty field with standing commitments is not silence — say
+                # why the committed hotkeys were not eligible (r48: 328 burned
+                # re-commits read as an unexplained "0 entrants").
+                by_reason: dict[str, int] = {}
+                for s in skipped:
+                    key = str(s.get("reason", "unknown"))
+                    by_reason[key] = by_reason.get(key, 0) + 1
+                detail = ", ".join(f"{v} {k}" for k, v in sorted(by_reason.items()))
+                reason += f" ({len(skipped)} commitment(s) skipped: {detail})"
         elif self.screen_fn is None:
             reason = "no screener configured; the field advanced by UID order"
         else:
@@ -1911,6 +1999,7 @@ class TrainerRunner:
                 no_screen_reason="" if heat is not None else reason,
                 finalists=n,
                 warm_start=self._stage_ctx.get("warm_start"),
+                skipped=skipped,
             )
             store = self.manifest_store()
             publish_heat_status(store, doc)
@@ -3185,21 +3274,37 @@ class TrainerRunner:
                      base_seed, warm_start[0], warm_start[1], epoch_idx)
 
         self._storage_dropped.clear()   # per-round: see _burn_hotkeys exemption
-        eligible = self._filter_burned_challengers(plan.challengers)
-        # Direct submissions (DEC-CA-0036): a vault ref only enters if ITS
-        # uploader committed it — a copied digest is not a submission — and the
-        # round's champion-publication policy runs off the resolved king.
-        eligible = self._verify_vault_ownership(eligible)
+        # Champion publication (DEC-CA-0036) runs on EVERY attempt of a round —
+        # it is idempotent per round_id (the reign counter advances once), and
+        # a dethrone hand-off retry must not be skippable by the settled-retry
+        # path below.
         self._maybe_publish_champion(plan.king, str(base_seed))
-        # Miner-funded gate BEFORE anything burns or trains: an unfunded reveal
-        # in required mode waits outside the round — never burned, never
-        # screened — until its owner funds it (DEC-CA-0036).
-        eligible = self._filter_funded_challengers(eligible)
-        # Content-level duplicate screen ([round] dedup_mode): re-uploads and
-        # near-copies of the king or a lower-UID challenger lose their heat GPU
-        # slot before any pod is dispatched. They stay in ``eligible`` — entering
-        # the round as a copy still consumes the one lifetime submission.
-        screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed)
+        # Round-level retry AFTER this round's heat settled (r47): the settle
+        # burned every entrant, so re-deriving eligibility would field nobody
+        # and walk the king over the settled finalists. Reuse them instead —
+        # the burn filter, the DEC-CA-0036 vault/funded gates, and the dedup
+        # screen are deliberately bypassed for exactly these hotkeys in exactly
+        # this round: the settled heat already applied all of them, and the
+        # funded entries were settled ``done`` at the original settle (re-
+        # filtering would empty the field). The burn set itself is untouched.
+        reused = self._settled_finalists(base_seed, plan.challengers)
+        if reused is not None:
+            eligible = list(reused)
+            screened = list(reused)
+        else:
+            eligible = self._filter_burned_challengers(plan.challengers)
+            # Direct submissions (DEC-CA-0036): a vault ref only enters if ITS
+            # uploader committed it — a copied digest is not a submission.
+            eligible = self._verify_vault_ownership(eligible)
+            # Miner-funded gate BEFORE anything burns or trains: an unfunded
+            # reveal in required mode waits outside the round — never burned,
+            # never screened — until its owner funds it (DEC-CA-0036).
+            eligible = self._filter_funded_challengers(eligible)
+            # Content-level duplicate screen ([round] dedup_mode): re-uploads and
+            # near-copies of the king or a lower-UID challenger lose their heat GPU
+            # slot before any pod is dispatched. They stay in ``eligible`` — entering
+            # the round as a copy still consumes the one lifetime submission.
+            screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed)
         # Stage reporting context for this round; the epoch boundary is the
         # dashboards' join key (they derive it from the same grid).
         ws_info = None
@@ -3222,22 +3327,37 @@ class TrainerRunner:
                            "epoch_start_block": int(screen_block),
                            "warm_start": ws_info}
         self._publish_stage("heat", heat_done=0, heat_total=len(screened))
-        finalists, heat = self._run_heat(screened, seeds, block,
-                                         screen_block=screen_block,
-                                         warm_start=warm_start)
+        if reused is not None:
+            # Retry after settle: no heat compute is re-spent and no standings
+            # are re-derived — the finalists advance exactly as settled.
+            finalists, heat = list(reused), None
+        else:
+            finalists, heat = self._run_heat(screened, seeds, block,
+                                             screen_block=screen_block,
+                                             warm_start=warm_start)
         # Burn only now, after the heat stage completed: every eligible entrant
         # got its screening attempt (or its pass-through to the final). A crash
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
-        # submission is consumed by a round that never judged it.
+        # submission is consumed by a round that never judged it. (On the
+        # settled-retry path this is an idempotent no-op: the reused finalists
+        # were burned at the original settle.)
         self._burn_hotkeys(eligible)
-        self._mark_funded_done(eligible)   # same settle moment, same rationale
-        # Heat settled (screened + burned + finalists chosen): signal external
-        # watchers (the provisioner) that heat-stage pods are now safe to release.
-        self._mark_heat_complete(base_seed, eligible, finalists)
-        # Heat feedback goes public NOW, not with the round's receipt: the duel
-        # and its validation still have hours to run, and a miner reading its
-        # placement needs it before the next submission deadline.
-        self._publish_heat_standings(heat, screened=len(screened))
+        # Same settle moment, same rationale as the burn; idempotent on the
+        # settled-retry path (entries were marked done at the original settle,
+        # and only in_round entries flip — a crash between burn and this line
+        # self-corrects next round via the burned-hotkey terminal fail).
+        self._mark_funded_done(eligible)
+        if reused is None:
+            # Heat settled (screened + burned + finalists chosen): signal external
+            # watchers (the provisioner) that heat-stage pods are now safe to release.
+            self._mark_heat_complete(base_seed, eligible, finalists)
+            # Heat feedback goes public NOW, not with the round's receipt: the duel
+            # and its validation still have hours to run, and a miner reading its
+            # placement needs it before the next submission deadline.
+            # (On the settled-retry path both already happened at the original
+            # settle; re-publishing here would overwrite the real standings
+            # with a no-screen doc.)
+            self._publish_heat_standings(heat, screened=len(screened))
         self._publish_stage("duel", heat_done=len(eligible),
                             heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far

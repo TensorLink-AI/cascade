@@ -89,6 +89,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Cap datasets per suite for --post-round-benchmarks (0 = full).")
     p.add_argument("--bench-data-dir", default="/root/bench_data",
                    help="Benchmark data dir on the pod.")
+    p.add_argument("--bench-local-data-dir", default="/root/bench_data",
+                   help="Benchmark data dir on THIS box to sideload to the pod (tar "
+                        "over ssh, ~75s for the 4.4G battery) before each sweep, so "
+                        "the sweep never depends on the pod's own HF fetch (which "
+                        "cost r45-r48 their reports; the on-pod download remains the "
+                        "fallback). Skipped harmlessly when the dir or its suite "
+                        "markers are absent, or the pod is already staged. '' disables.")
     p.add_argument("--bench-device", default="auto",
                    help="Device for the Cascade king bench eval ([scoring] cascade_enabled). "
                         "'auto' (default) uses the trainer's GPU when one is present, else cpu — "
@@ -217,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_series=args.bench_max_series,
                 data_dir=args.bench_data_dir,
                 min_interval_seconds=args.bench_interval,
+                local_data_dir=args.bench_local_data_dir or None,
             )
 
     # Cascade: score BOTH duel checkpoints on GIFT-Eval/BOOM/TIME after each
@@ -283,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
                 device="cuda",
                 data_dir=f"{wd}/bench_data",
                 timeout_seconds=timeout_s,
+                local_data_dir=args.bench_local_data_dir or None,
             )
             log.info("cascade duel bench enabled on the final pods (device=cuda, "
                      "max_series=%s, timeout=%ss)",

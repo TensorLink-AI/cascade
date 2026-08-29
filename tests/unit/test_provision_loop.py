@@ -1150,6 +1150,113 @@ def test_dry_run_never_terminates_anything(tmp_path):
     assert prov.terminated == []
 
 
+# ── adoption re-gate (a restart must not trust a previous run's gate pass) ───
+#
+# 2026-08-28: a zombie provisioner had gated pods against ITS OWN stale image
+# pin; on restart the adopted pods' old passes were honored, wrong-image pods
+# re-entered hosts.toml, and the final workers refused to run. Adoption now
+# re-runs the SAME health gate against the config loaded at startup.
+
+
+def _adopted(tmp_path, health, **kw):
+    """Rent a fleet with loop1 (gate skipped: health=None), then restart as
+    loop2 with ``health`` bound — its ledger adoption must re-gate the pods."""
+    prov = FakeProvider("lium")
+    loop1, _ = make_loop(tmp_path, providers={"lium": prov})
+    cycle(loop1)
+    assert len(prov.live) == 2                                # 1 heat + 1 final
+    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, block=885,
+                         health=health, **kw)
+    loop2.sleep = lambda s: None          # retry spacing: no real waits in tests
+    return loop2, prov
+
+
+def cycle_adopted(loop):
+    """One tick, with the adopt-regate worker joined (same discipline as
+    ``cycle`` joins the rent worker)."""
+    loop.run_once()
+    t = loop._adopt_thread
+    if t is not None:
+        t.join(timeout=30)
+
+
+def test_adopted_pods_regate_against_current_config_and_survive_on_pass(tmp_path):
+    seen = []
+
+    def health(addr, stage, provider="", **shape):
+        seen.append((stage, shape.get("sku"), shape.get("gpus")))
+        return _report(ok=True)
+
+    loop2, prov = _adopted(tmp_path, health)
+    cycle_adopted(loop2)
+    # Every adopted pod went through the gate, asserting the LEDGERED shape
+    # (what was actually rented), not a guess.
+    assert sorted(seen) == [("final", "NVIDIA L40S", 2),
+                            ("heat", "NVIDIA RTX A6000", 8)]
+    assert prov.terminated == []                              # passes are adopted
+    hosts = load_hosts(tmp_path / "hosts.toml")               # lane fan-out per GPU
+    assert {h.stage for h in hosts} == {"final", "heat"}
+
+
+def test_adopted_pod_failing_regate_is_terminated_and_unpublished(tmp_path):
+    calls = []
+
+    def health(addr, stage, provider="", **shape):
+        calls.append(stage)
+        return _report(ok=(stage != "final"))      # e.g. image pin changed under it
+
+    loop2, prov = _adopted(tmp_path, health)
+    cycle_adopted(loop2)
+    # The bad pod is treated like a fresh gate failure: terminated + dropped.
+    assert [p for p in prov.terminated if "-final-" in p]
+    assert not [p for p in prov.terminated if "-heat-" in p]
+    st = load_state(tmp_path / "state.json")
+    assert [i.stage for i in st.instances] == ["heat"]        # ledger excludes it
+    hosts = load_hosts(tmp_path / "hosts.toml")               # fleet republished
+    assert {h.stage for h in hosts} == {"heat"}
+    # Deterministic failure burned every bounded attempt before the verdict.
+    assert calls.count("final") == 3 and calls.count("heat") == 1
+
+
+def test_adopted_pod_survives_a_transient_gate_blip(tmp_path):
+    """A pod mid-training must not die to one ssh hiccup: the first probe
+    fails, the bounded retry passes, the pod stays."""
+    calls = []
+
+    def health(addr, stage, provider="", **shape):
+        calls.append(stage)
+        return _report(ok=calls.count(stage) > 1)             # blip, then fine
+
+    loop2, prov = _adopted(tmp_path, health)
+    slept = []
+    loop2.sleep = slept.append
+    cycle_adopted(loop2)
+    assert prov.terminated == []
+    assert load_hosts(tmp_path / "hosts.toml")                # fleet intact
+    assert slept and all(s == 30.0 for s in slept)            # paced, bounded
+    assert len(calls) == 4                                    # 2 pods × (fail+pass)
+
+
+def test_adoption_regate_runs_once_and_skips_without_a_gate(tmp_path):
+    """health_check=None (gate disabled) adopts as before — and a gate that
+    exists probes each adopted pod exactly once across cycles."""
+    prov = FakeProvider("lium")
+    loop1, _ = make_loop(tmp_path, providers={"lium": prov})
+    cycle(loop1)
+    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, block=885)
+    cycle_adopted(loop2)                                      # health=None: no-op
+    assert loop2._adopt_thread is None
+    assert prov.terminated == []
+
+    calls = []
+    loop3, _ = make_loop(tmp_path, providers={"lium": prov}, block=885,
+                         health=lambda a, s, provider="", **k: (calls.append(s),
+                                                                _report(ok=True))[1])
+    cycle_adopted(loop3)
+    cycle_adopted(loop3)                                      # second tick: latched
+    assert len(calls) == 2                                    # once per adopted pod
+
+
 def test_plan_failure_retries_next_tick(tmp_path):
     prov = FakeProvider("lium")
     calls = []

@@ -122,6 +122,27 @@ def image_digest_of(image: str) -> str:
     return digest if sep and digest.startswith("sha256:") else ""
 
 
+def lium_image_ref(image: str) -> str:
+    """The image ref to hand lium's launch API: any ``@sha256:`` pin stripped.
+
+    Lium's API 400-rejects the canonical digest-pinned form
+    ``repo[:tag]@sha256:<64hex>`` ("Digest must be sha256: followed by 64 hex
+    characters" — their parser chokes on the full ref; observed live
+    2026-08-28, killed every lium pod that round). So lium launches send the
+    tag form (``repo:tag``) when the ref carries one, else the bare repo.
+
+    This does NOT weaken the reproducibility pin: the launch env still carries
+    the exact digest (``CASCADE_TRAIN_IMAGE_DIGEST``, derived from the
+    ORIGINAL ref — see :meth:`LiumProvider.launch`), and the health gate
+    byte-compares the booted pod's digest against the chain.toml pin before
+    the pod can ever enter hosts.toml — a wrong-image pod is bounced there.
+    """
+    base, sep, digest = image.partition("@")
+    if sep and digest.startswith("sha256:"):
+        return base
+    return image
+
+
 @dataclass(frozen=True)
 class PodAddress:
     """Where the orchestrator SSHes to reach a launched pod."""
@@ -625,6 +646,17 @@ class LiumProvider:
                 f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available"
                 f"{' after exclusions' if spec.exclude_ids else ''}, need {spec.count}"
             )
+        # Lium cannot parse a digest-pinned ref (400s on repo@sha256:… — see
+        # lium_image_ref): degrade to the tag/repo form for the launch call
+        # only. The env keeps the FULL pin and the health gate enforces it.
+        image_ref = lium_image_ref(spec.image) if spec.image else ""
+        if spec.image and image_ref != spec.image:
+            log.warning(
+                "lium: degrading image ref %r -> %r for launch (lium's API "
+                "400-rejects digest-pinned refs); the digest pin is NOT "
+                "weakened — CASCADE_TRAIN_IMAGE_DIGEST still carries %s and "
+                "the health gate byte-compares it before the pod serves",
+                spec.image, image_ref, image_digest_of(spec.image))
         names: list[str] = []
         for i, ex in enumerate(execs[: spec.count]):
             name = f"{spec.name_prefix}-{i}"
@@ -632,7 +664,7 @@ class LiumProvider:
             if spec.image:
                 # docker-run style: the image must be a REAL docker ref whose
                 # entrypoint runs sshd and reads $SSH_PUBKEY (the worker image).
-                argv += ["--image", spec.image, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
+                argv += ["--image", image_ref, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
                          "--internal-ports", str(spec.ssh_port)]
                 digest = image_digest_of(spec.image)
                 if digest:
