@@ -32,6 +32,7 @@ inside the destination.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import io
@@ -47,12 +48,32 @@ from pathlib import Path
 
 from ..shared.hippius import FETCH_COMPLETE_MARKER, HubRef, StorageError
 
+
+class SubmissionTooLarge(StorageError):
+    """A submission ZIP exceeds its size / decompression cap (→ HTTP 413)."""
+
+
+class DigestOwned(StorageError):
+    """Identical bytes were already submitted by a different hotkey (→ 409)."""
+
+
+# Filesystem errnos that mean the OPERATOR's box is unhealthy, not that the
+# upload is malformed — these propagate (→ 500), never re-labelled as a client
+# bad_zip. Everything else an extraction can raise (structural OSErrors like a
+# member path clashing with a file, plus deflate errors) is input-caused.
+_OPERATOR_ERRNOS = frozenset({
+    errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS,
+    errno.EMFILE, errno.ENFILE, errno.ENOMEM,
+})
+
 __all__ = [
     "CHAMPION_INDEX_KEY",
     "VAULT_DIR_ENV",
     "CHAMPION_BASE_ENV",
     "VAULT_REPO",
+    "DigestOwned",
     "SubmissionStore",
+    "SubmissionTooLarge",
     "champion_zip_key",
     "extract_zip_safely",
     "fetch_vault_snapshot",
@@ -137,8 +158,8 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
         infos = zf.infolist()   # cached by ZipFile.__init__; cannot raise here
         declared_total = sum(max(0, i.file_size) for i in infos)
         if declared_total > MAX_EXTRACTED_BYTES:
-            raise StorageError(
-                f"zip_too_large: declared decompressed size {declared_total} "
+            raise SubmissionTooLarge(
+                f"declared decompressed size {declared_total} "
                 f"exceeds cap {MAX_EXTRACTED_BYTES}")
         written = 0
         for info in infos:
@@ -179,15 +200,23 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
                             break
                         written += len(chunk)
                         if written > MAX_EXTRACTED_BYTES:
-                            raise StorageError(
-                                f"zip_too_large: decompressed bytes exceed cap "
+                            raise SubmissionTooLarge(
+                                f"decompressed bytes exceed cap "
                                 f"{MAX_EXTRACTED_BYTES} (compression bomb?)")
                         out.write(chunk)
             except StorageError:
                 raise
             except MemoryError:
                 raise
-            except Exception as e:  # noqa: BLE001 — any INPUT failure ⇒ 400, no leak
+            except OSError as e:
+                # Separate the two OSError origins: a full/unhealthy operator
+                # disk is a 500 (surface the incident), a structural fault the
+                # hostile ZIP caused (a member path clashing with a file) is a
+                # 400. Classify by errno rather than by one carve-out type.
+                if e.errno in _OPERATOR_ERRNOS:
+                    raise
+                raise StorageError(f"zip member {name!r} not extractable") from e
+            except Exception as e:  # noqa: BLE001 — inflate faults ⇒ 400, no leak
                 raise StorageError(f"zip member {name!r} not extractable") from e
     return dest
 
@@ -243,8 +272,8 @@ class SubmissionStore:
         separately kills byte-copies that arrive as distinct uploads).
         """
         if len(zip_bytes) > self.max_bytes:
-            raise StorageError(
-                f"zip_too_large: {len(zip_bytes)} bytes > cap {self.max_bytes}")
+            raise SubmissionTooLarge(
+                f"{len(zip_bytes)} bytes > cap {self.max_bytes}")
         if not zip_bytes:
             raise StorageError("empty submission body")
         # Validate contents BEFORE storing: everything in the store must be
@@ -258,9 +287,9 @@ class SubmissionStore:
             existing = self.owner(digest)
             if existing is not None:
                 if existing != hotkey:
-                    raise StorageError(
-                        "digest_owned: identical bytes were already submitted by "
-                        "another hotkey (earliest upload owns the content)")
+                    raise DigestOwned(
+                        "identical bytes were already submitted by another "
+                        "hotkey (earliest upload owns the content)")
                 return digest
             zp, mp = self._zip_path(digest), self._meta_path(digest)
             tmp = zp.with_suffix(".zip.tmp")

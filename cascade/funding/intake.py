@@ -245,17 +245,21 @@ class FundingIntake:
                                     f"{declared} — corrupted upload?"}
         from ..interface.validation import format_commit
         from ..shared.hippius import StorageError
-        from .store import vault_ref
+        from .store import DigestOwned, SubmissionTooLarge, vault_ref
 
+        # Dispatch HTTP status on the exception TYPE, never by substring-matching
+        # the message — the message can carry the attacker-chosen member name,
+        # so a member named "zip_too_large" must not steer the response code
+        # (review 2026-08-29). Operator-side faults (OSError ENOSPC, MemoryError)
+        # are NOT StorageError, so they propagate to a 500 rather than a 400.
         try:
             digest = self.store.put(body, hotkey)
+        except SubmissionTooLarge as e:
+            return 413, {"code": "zip_too_large", "message": str(e)}
+        except DigestOwned as e:
+            return 409, {"code": "digest_owned", "message": str(e)}
         except StorageError as e:
-            text = str(e)
-            if "zip_too_large" in text:
-                return 413, {"code": "zip_too_large", "message": text}
-            if "digest_owned" in text:
-                return 409, {"code": "digest_owned", "message": text}
-            return 400, {"code": "bad_zip", "message": text}
+            return 400, {"code": "bad_zip", "message": str(e)}
         ref = vault_ref(digest)
         funding, note = "none", ""
         api_key = (headers.get("X-Lium-Api-Key") or "").strip()

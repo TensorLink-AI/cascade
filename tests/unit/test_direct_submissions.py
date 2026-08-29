@@ -16,7 +16,9 @@ from cascade.funding.champion import CHAMPION_INDEX_KEY, ChampionPublisher, shou
 from cascade.funding.intake import FundingIntake, canonical_fund_message
 from cascade.funding.queue import FundedQueue
 from cascade.funding.store import (
+    DigestOwned,
     SubmissionStore,
+    SubmissionTooLarge,
     extract_zip_safely,
     is_vault_ref,
     parse_vault_ref,
@@ -67,7 +69,7 @@ def test_store_put_owner_and_roundtrip(tmp_path):
     assert digest == GOOD_DIGEST
     assert store.owner(digest) == HK
     assert store.put(GOOD_ZIP, HK) == digest          # own re-upload: idempotent
-    with pytest.raises(StorageError, match="digest_owned"):
+    with pytest.raises(DigestOwned):
         store.put(GOOD_ZIP, HK2)                      # earliest upload owns bytes
     out = store.extract(digest, tmp_path / "out")
     assert (out / "generator.py").read_bytes().startswith(b"def generate")
@@ -94,9 +96,9 @@ def test_extract_refuses_decompression_bomb(tmp_path):
         zf.writestr("big.py", b"\x00" * (MAX_EXTRACTED_BYTES + 1))
     bomb = buf.getvalue()
     assert len(bomb) < MAX_EXTRACTED_BYTES        # zeros compress tiny
-    with pytest.raises(StorageError, match="zip_too_large"):
+    with pytest.raises(SubmissionTooLarge):
         extract_zip_safely(bomb, tmp_path / "x")
-    with pytest.raises(StorageError, match="zip_too_large"):
+    with pytest.raises(SubmissionTooLarge):
         SubmissionStore(tmp_path / "vault").put(bomb, HK)
 
 
@@ -148,9 +150,38 @@ def test_extract_error_message_never_leaks_operator_paths(tmp_path):
     assert secret_path not in str(ei.value)
 
 
+def test_extract_disk_full_propagates_as_operator_fault(tmp_path):
+    # A full/unhealthy operator disk during the streamed write is a 500, not a
+    # client 400 bad_zip — classified by errno, not a single carve-out type.
+    import errno
+
+    enospc = OSError(errno.ENOSPC, "No space left on device")
+    with mock.patch.object(zipfile.ZipExtFile, "read", side_effect=enospc), \
+            pytest.raises(OSError, match="No space"):
+        extract_zip_safely(make_zip({"gen.py": b"x"}), tmp_path / "full")
+    # A STRUCTURAL OSError (member path clash) is still input → StorageError.
+    with pytest.raises(StorageError):
+        extract_zip_safely(make_zip({"a": b"f", "a/b": b"under"}), tmp_path / "clash")
+
+
+def test_intake_status_not_hijacked_by_member_name(tmp_path):
+    # The HTTP status is dispatched on the exception TYPE, so a bad-zip whose
+    # member is NAMED "zip_too_large" is still 400 bad_zip, not 413 — the
+    # attacker cannot steer the response code through the member name.
+    intake = make_intake(tmp_path)
+    # A structurally-bad zip (path clash) whose member is NAMED "zip_too_large":
+    # the failure is a plain StorageError, so type-dispatch gives 400 bad_zip —
+    # the name in the message does not promote it to 413.
+    body = make_zip({"zip_too_large": b"f", "zip_too_large/x": b"under"})
+    digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+    status, resp = intake.submit(
+        {"X-Miner-Hotkey": HK, "X-Content-Digest": digest}, body)
+    assert (status, resp["code"]) == (400, "bad_zip")
+
+
 def test_store_rejects_oversize_and_hostile_zips(tmp_path):
     store = SubmissionStore(tmp_path / "vault", max_bytes=64)
-    with pytest.raises(StorageError, match="zip_too_large"):
+    with pytest.raises(SubmissionTooLarge):
         store.put(GOOD_ZIP, HK)
     store2 = SubmissionStore(tmp_path / "vault2")
     with pytest.raises(StorageError, match="not a valid zip"):
