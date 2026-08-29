@@ -1081,11 +1081,14 @@ class TrainerRunner:
         by_hotkey = {c.hotkey: c for c in challengers}
         kept: list[ResolvedGenerator] = []
         for entry in select_field(queue.entries(), cap=0):
+            # expect_ref on every fail: this loop acts on a queue SNAPSHOT, so
+            # a re-fund landing before the fail must not terminally fail the
+            # miner's fresh entry for the old ref's reason (review 2026-08-29).
             if entry.hotkey in burned:
                 queue.fail(entry.hotkey,
                            error="hotkey already used its one lifetime submission — "
                                  "re-register, reveal, and fund the new hotkey",
-                           error_class="burned")
+                           error_class="burned", expect_ref=entry.ref)
                 continue
             c = by_hotkey.get(entry.hotkey)
             if c is None:
@@ -1094,7 +1097,7 @@ class TrainerRunner:
                 queue.fail(entry.hotkey,
                            error=f"funded ref {entry.ref} no longer matches the "
                                  f"eligible reveal {c.ref} — fund the new ref",
-                           error_class="ref_mismatch")
+                           error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
             if len(kept) < max(1, self.cfg.round.finalist_cap):
                 kept.append(c)

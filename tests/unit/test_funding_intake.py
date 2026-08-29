@@ -143,6 +143,38 @@ def _request(url, method="GET", headers=None):
         return e.code, json.loads(e.read())
 
 
+def _raw_post(base, path, extra_headers):
+    """Send a hand-built POST (for headers urllib refuses, like a bad length)."""
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base)
+    host, port = parts.hostname, parts.port
+    lines = [f"POST {path} HTTP/1.1", f"Host: {host}:{port}", "Connection: close"]
+    lines += extra_headers
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode()
+    with socket.create_connection((host, port), timeout=5) as s:
+        s.sendall(raw)
+        buf = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    status_line = buf.split(b"\r\n", 1)[0].decode()
+    return int(status_line.split()[1])
+
+
+def test_negative_content_length_is_rejected_not_an_unbounded_read(live_server):
+    # A negative Content-Length must be a clean 400, never rfile.read(-1)
+    # (read-to-EOF past the cap) and never an uncaught int() ValueError that
+    # kills the connection with no reply (review 2026-08-29).
+    _, base = live_server
+    assert _raw_post(base, "/v1/submit", ["Content-Length: -1"]) == 400
+    assert _raw_post(base, "/v1/fund", ["Content-Length: -1"]) == 400
+    assert _raw_post(base, "/v1/submit", ["Content-Length: not-a-number"]) == 400
+
+
 def test_http_fund_and_queue_feed(live_server):
     intake, base = live_server
     status, body = _request(f"{base}/health")

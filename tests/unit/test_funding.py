@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -297,6 +298,87 @@ def test_public_view_redacts_pending_reveal(tmp_path):
     assert view["pending_reveal_count"] == 1
     assert [e["hotkey"] for e in view["entries"]] == [HK_A]
     assert HK_B not in json.dumps(view)
+
+
+def test_concurrent_reads_never_corrupt_a_write(tmp_path):
+    # The read/write shared-state race (review 2026-08-29): a reader loading
+    # the file must never wipe a writer's in-flight mutation. With no cached
+    # self._entries and flock on both paths, a write is atomic w.r.t. reads.
+    import threading
+
+    path = tmp_path / "queue.json"
+    q = FundedQueue(path, clock=time.time)
+    stop = threading.Event()
+
+    def hammer_reads():
+        while not stop.is_set():
+            q.entries()
+            q.queued_depth()
+
+    readers = [threading.Thread(target=hammer_reads) for _ in range(6)]
+    for t in readers:
+        t.start()
+    try:
+        for i in range(200):
+            q.add(f"5Hk{i:062d}", f"r{i}@sha256:" + "a" * 64, reveal_block=i)
+    finally:
+        stop.set()
+        for t in readers:
+            t.join()
+    # Every one of the 200 funds survived — none dropped by a racing read.
+    assert q.queued_depth() == 200
+    assert len(FundedQueue(path).entries()) == 200
+
+
+def test_promote_pending_does_not_hold_lock_across_resolver(tmp_path):
+    # The resolver (a chain poll that can hang) must run OUTSIDE the flock, or
+    # a hung poll stalls every queue op including the trainer (review
+    # 2026-08-29). Prove it: while the resolver runs, another thread can still
+    # read the queue.
+    import threading
+
+    q = FundedQueue(tmp_path / "q.json", clock=time.time)
+    q.add_pending(HK_A, "r@sha256:" + "a" * 64)
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+    read_completed = threading.Event()
+
+    def slow_resolve(hk, ref):
+        resolver_entered.set()
+        release_resolver.wait(timeout=5)     # simulate a hanging chain call
+        return 42
+
+    def try_read():
+        resolver_entered.wait(timeout=5)
+        q.queued_depth()                     # must NOT block on the resolver's lock
+        read_completed.set()
+
+    reader = threading.Thread(target=try_read)
+    reader.start()
+    try:
+        promoter = threading.Thread(target=lambda: q.promote_pending(slow_resolve))
+        promoter.start()
+        assert read_completed.wait(timeout=5), "a read blocked on the hung resolver"
+    finally:
+        release_resolver.set()
+        promoter.join()
+        reader.join()
+    assert q.get(HK_A).status == "queued" and q.get(HK_A).reveal_block == 42
+
+
+def test_fail_expect_ref_skips_a_replaced_entry(tmp_path):
+    # The select→fail race: a fail decided off a snapshot must not kill a
+    # fresh re-funded entry with a different ref (review 2026-08-29).
+    q = FundedQueue(tmp_path / "q.json", clock=FakeClock())
+    q.add(HK_A, "old@sha256:" + "0" * 64, reveal_block=10)
+    # A re-fund replaced the ref before the fail lands:
+    q.add(HK_A, "new@sha256:" + "1" * 64, reveal_block=11)
+    assert not q.fail(HK_A, error="stale", error_class="ref_mismatch",
+                      expect_ref="old@sha256:" + "0" * 64)   # skipped
+    assert q.get(HK_A).status == "queued"                    # fresh entry lives
+    assert q.fail(HK_A, error="x", error_class="y",
+                  expect_ref="new@sha256:" + "1" * 64)       # matching ref fails it
+    assert q.get(HK_A).status == "failed"
 
 
 def test_rounds_needed_clamps():

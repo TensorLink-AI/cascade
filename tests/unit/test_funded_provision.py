@@ -263,6 +263,19 @@ def test_reconcile_funded_scoped_to_this_payers_funded_pods():
     assert provider.terminated == killed
 
 
+def test_reconcile_verifies_termination_not_just_the_rm_call():
+    # A revoked key: terminate "succeeds" (rm swallowed) but the pod stays
+    # live. reconcile must NOT report it killed — that would mask a still-
+    # billing orphan every sweep (review 2026-08-29).
+    owned = _funded_instance(POD_ID)
+    orphan = f"{funded_pod_name('777', HK)}-r1"
+    provider = FakeProvider(tagged=[POD_ID, orphan], rm_noop=True)
+    killed = reconcile_funded([owned], _vault_with_key(),
+                              provider_factory=lambda key: provider)
+    assert killed == []                        # nothing CONFIRMED gone
+    assert orphan in provider.terminated       # it was attempted, just unconfirmed
+
+
 def test_payer_pod_pattern_matches_only_this_payer():
     pat = payer_pod_pattern(HK)
     assert pat.match(POD_ID)

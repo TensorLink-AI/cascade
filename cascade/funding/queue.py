@@ -120,34 +120,39 @@ class FundedQueue:
         # whose key still works; later leaves keyless entries holding the
         # skip-floor open. The runbook pins the two knobs together.
         self.entry_ttl_seconds = float(entry_ttl_seconds)
-        self._entries: dict[str, FundedEntry] = {}
-        self._load()
 
     # ── persistence ──────────────────────────────────────────────────────────
+    #
+    # There is NO cached ``self._entries``: this instance is shared across the
+    # intake's handler threads and the trainer process, so a per-instance dict
+    # would race (an unlocked read rebinding it mid-write could serialise a
+    # torn or empty map, dropping a just-202'd fund — review 2026-08-29). Every
+    # operation instead loads a FRESH local dict under a flock and never shares
+    # it. Writers hold LOCK_EX; readers hold LOCK_SH so they cannot observe a
+    # write mid-flight, yet concurrent readers do not block each other.
 
     @contextmanager
-    def _locked(self) -> Iterator[None]:
-        """Exclusive cross-process (and cross-thread) lock + fresh reload.
+    def _locked(self, *, exclusive: bool = True) -> Iterator[dict[str, FundedEntry]]:
+        """flock the sibling ``.lock``, yield a freshly-loaded local dict.
 
-        flock on a sibling ``.lock`` file serialises the intake service, its
-        handler threads, and the trainer; the reload inside the lock is what
-        makes read-modify-write safe — the mutation applies to the CURRENT
-        file, never to a snapshot from this instance's past.
+        Writers pass ``exclusive=True`` (LOCK_EX) and call :meth:`_save` with
+        the dict they mutated; readers pass ``exclusive=False`` (LOCK_SH) and
+        only read. The dict is local to this call — never stored on ``self`` —
+        so nothing another thread does can corrupt it.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         with open(lock_path, "w") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            fcntl.flock(lock_file, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
             try:
-                self._load()
-                yield
+                yield self._load()
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-    def _load(self) -> None:
-        self._entries = {}
+    def _load(self) -> dict[str, FundedEntry]:
+        entries: dict[str, FundedEntry] = {}
         if not self.path.is_file():
-            return
+            return entries
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         for item in raw.get("entries", []):
             entry = FundedEntry(
@@ -161,33 +166,34 @@ class FundedQueue:
                 last_error_class=str(item.get("last_error_class", "")),
                 last_active=float(item.get("last_active", 0.0)),
             )
-            self._entries[entry.hotkey] = entry
+            entries[entry.hotkey] = entry
+        return entries
 
-    def _save(self) -> None:
+    def _save(self, entries: dict[str, FundedEntry]) -> None:
         import os
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "entries": [asdict(e) for e in sorted(
-                self._entries.values(), key=lambda e: (e.reveal_block, e.hotkey))],
+                entries.values(), key=lambda e: (e.reveal_block, e.hotkey))],
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, self.path)
 
-    # ── reads (always against the current file, never a cached snapshot) ─────
+    # ── reads (shared lock, fresh local dict — never a cached snapshot) ──────
 
     def entries(self) -> list[FundedEntry]:
-        self._load()
-        return sorted(self._entries.values(), key=lambda e: (e.reveal_block, e.hotkey))
+        with self._locked(exclusive=False) as entries:
+            return sorted(entries.values(), key=lambda e: (e.reveal_block, e.hotkey))
 
     def get(self, hotkey: str) -> FundedEntry | None:
-        self._load()
-        return self._entries.get(hotkey)
+        with self._locked(exclusive=False) as entries:
+            return entries.get(hotkey)
 
     def queued_depth(self) -> int:
-        self._load()
-        return sum(1 for e in self._entries.values() if e.status == "queued")
+        with self._locked(exclusive=False) as entries:
+            return sum(1 for e in entries.values() if e.status == "queued")
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -200,29 +206,29 @@ class FundedQueue:
         including over a terminal one (a resubmit after done/failed frees the
         slot: entry cost is the compute funding, not a lifetime bar).
         """
-        with self._locked():
+        with self._locked() as entries:
             now = self.clock()
-            prev = self._entries.get(hotkey)
+            prev = entries.get(hotkey)
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
                     # an actively-tended entry never TTL-expires under you.
-                    self._entries[hotkey] = replace(prev, last_active=now)
-                    self._save()
+                    entries[hotkey] = replace(prev, last_active=now)
+                    self._save(entries)
                     return "already-queued"
                 if prev.status == "in_round":
                     # Mid-round the manifest may already reference the old ref —
                     # never mutate an entry a live round is training.
                     return "already-queued"
-                self._entries[hotkey] = replace(
+                entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
                     funded_at=now, last_active=now, status="queued")
-                self._save()
+                self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
-            self._entries[hotkey] = FundedEntry(
+            entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
                 funded_at=now, last_active=now)
-            self._save()
+            self._save(entries)
             return "queued"
 
     def add_pending(self, hotkey: str, ref: str) -> str:
@@ -235,19 +241,19 @@ class FundedQueue:
         resolves. Idempotent per (hotkey, ref); a live queued/in_round entry
         is left alone (they already have a better state).
         """
-        with self._locked():
-            prev = self._entries.get(hotkey)
+        with self._locked() as entries:
+            prev = entries.get(hotkey)
             if prev is not None and prev.status in ("queued", "in_round"):
                 return "already-queued"
             now = self.clock()
             if prev is not None and prev.status == "pending_reveal" and prev.ref == ref:
-                self._entries[hotkey] = replace(prev, last_active=now)
-                self._save()
+                entries[hotkey] = replace(prev, last_active=now)
+                self._save(entries)
                 return "already-pending"
-            self._entries[hotkey] = FundedEntry(
+            entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=0,
                 funded_at=now, last_active=now, status="pending_reveal")
-            self._save()
+            self._save(entries)
             return "pending_reveal"
 
     def promote_pending(self, resolve_reveal) -> int:
@@ -257,21 +263,37 @@ class FundedQueue:
         Resolution stamps the REAL reveal block, so seniority is chain truth,
         never upload order. Unresolvable entries stay pending until they
         resolve or :meth:`expire_stale` reaps them at the key TTL.
+
+        The chain resolver is called OUTSIDE the flock: a substrate poll can
+        hang with no timeout, and holding the exclusive lock across it would
+        stall every other queue op — including the trainer's round-entry
+        filter (review 2026-08-29). So: snapshot the pending set under a
+        SHARED lock, resolve unlocked, then apply the resolutions under the
+        exclusive lock, re-checking each entry is still the same pending ref.
         """
-        with self._locked():
+        with self._locked(exclusive=False) as snapshot:
+            pending = {hk: e.ref for hk, e in snapshot.items()
+                       if e.status == "pending_reveal"}
+        if not pending:
+            return 0
+        resolved = {hk: resolve_reveal(hk, ref) for hk, ref in pending.items()}
+        resolved = {hk: b for hk, b in resolved.items() if b is not None}
+        if not resolved:
+            return 0
+        with self._locked() as entries:
             promoted = 0
-            for hk, e in list(self._entries.items()):
-                if e.status != "pending_reveal":
+            for hk, block in resolved.items():
+                e = entries.get(hk)
+                # Re-check under the lock: the entry must still be the same
+                # pending ref we resolved (a re-fund could have replaced it).
+                if e is None or e.status != "pending_reveal" or e.ref != pending[hk]:
                     continue
-                block = resolve_reveal(hk, e.ref)
-                if block is None:
-                    continue
-                self._entries[hk] = replace(
+                entries[hk] = replace(
                     e, status="queued", reveal_block=int(block),
                     last_active=self.clock())
                 promoted += 1
             if promoted:
-                self._save()
+                self._save(entries)
             return promoted
 
     def mark_in_round(self, selections: Iterable) -> list[str]:
@@ -285,19 +307,19 @@ class FundedQueue:
         A selection whose entry changed underneath is skipped — the caller
         must drop that challenger from the round.
         """
-        with self._locked():
+        with self._locked() as entries:
             confirmed: list[str] = []
             for sel in selections:
                 hk, ref = sel if isinstance(sel, tuple) else (sel, None)
-                e = self._entries.get(hk)
+                e = entries.get(hk)
                 if e is None or e.status != "queued":
                     continue
                 if ref is not None and e.ref != ref:
                     continue
-                self._entries[hk] = replace(e, status="in_round")
+                entries[hk] = replace(e, status="in_round")
                 confirmed.append(hk)
             if confirmed:
-                self._save()
+                self._save(entries)
             return confirmed
 
     def recover_in_round(self) -> int:
@@ -309,12 +331,12 @@ class FundedQueue:
         the entries re-enter the field un-burned, mirroring the trainer's
         burn-after-heat rule ("the field simply re-enters the retried round").
         """
-        with self._locked():
-            stale = [hk for hk, e in self._entries.items() if e.status == "in_round"]
+        with self._locked() as entries:
+            stale = [hk for hk, e in entries.items() if e.status == "in_round"]
             for hk in stale:
-                self._entries[hk] = replace(self._entries[hk], status="queued")
+                entries[hk] = replace(entries[hk], status="queued")
             if stale:
-                self._save()
+                self._save(entries)
             return len(stale)
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
@@ -331,36 +353,36 @@ class FundedQueue:
         """
         if max_age_seconds is None:
             max_age_seconds = self.entry_ttl_seconds
-        with self._locked():
+        with self._locked() as entries:
             now = self.clock()
-            expired = [hk for hk, e in self._entries.items()
+            expired = [hk for hk, e in entries.items()
                        if e.status in ("queued", "pending_reveal")
                        and now - e.active_at > max_age_seconds]
             for hk in expired:
-                self._entries[hk] = replace(
-                    self._entries[hk], status="failed",
+                entries[hk] = replace(
+                    entries[hk], status="failed",
                     last_error="funding expired: entry outlived the payer-key TTL "
                                "without entering a round — fund again to re-enter",
                     last_error_class="funding_expired")
             if expired:
-                self._save()
+                self._save(entries)
             return len(expired)
 
     def mark_done(self, hotkey: str) -> None:
-        with self._locked():
-            e = self._entries.get(hotkey)
+        with self._locked() as entries:
+            e = entries.get(hotkey)
             if e is not None:
-                self._entries[hotkey] = replace(e, status="done")
-                self._save()
+                entries[hotkey] = replace(e, status="done")
+                self._save(entries)
 
     def withdraw(self, hotkey: str) -> bool:
         """Miner-initiated exit while queued/pending; False once a round has it."""
-        with self._locked():
-            e = self._entries.get(hotkey)
+        with self._locked() as entries:
+            e = entries.get(hotkey)
             if e is None or e.status not in ("queued", "pending_reveal"):
                 return False
-            self._entries[hotkey] = replace(e, status="withdrawn")
-            self._save()
+            entries[hotkey] = replace(e, status="withdrawn")
+            self._save(entries)
             return True
 
     def requeue(self, hotkey: str, *, error: str, error_class: str,
@@ -374,32 +396,45 @@ class FundedQueue:
         ``fund`` starts fresh. The entry itself is NEVER silently dropped:
         the miner paid for visibility into where their money went.
         """
-        with self._locked():
-            e = self._entries.get(hotkey)
+        with self._locked() as entries:
+            e = entries.get(hotkey)
             if e is None:
                 return False
             attempts = e.attempts + (1 if burn_attempt else 0)
             if burn_attempt and attempts > max_attempts:
-                self._entries[hotkey] = replace(
+                entries[hotkey] = replace(
                     e, status="failed", attempts=attempts,
                     last_error=error[:500], last_error_class=error_class)
-                self._save()
+                self._save(entries)
                 return False
-            self._entries[hotkey] = replace(
+            entries[hotkey] = replace(
                 e, status="queued", attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
                 last_active=self.clock())
-            self._save()
+            self._save(entries)
             return True
 
-    def fail(self, hotkey: str, *, error: str, error_class: str = "") -> None:
-        """Terminal failure (e.g. an auth-class key the miner must replace)."""
-        with self._locked():
-            e = self._entries.get(hotkey)
-            if e is not None:
-                self._entries[hotkey] = replace(
-                    e, status="failed", last_error=error[:500], last_error_class=error_class)
-                self._save()
+    def fail(self, hotkey: str, *, error: str, error_class: str = "",
+             expect_ref: str | None = None) -> bool:
+        """Terminal failure (e.g. an auth-class key the miner must replace).
+
+        ``expect_ref`` guards against the select→fail race: a caller that
+        decided to fail an entry off a snapshot passes the ref it saw, and the
+        fail is SKIPPED if a re-fund replaced the entry with a different ref in
+        the window — otherwise the miner's fresh, correctly-funded entry would
+        be terminally failed for the OLD ref's reason (review 2026-08-29).
+        Returns True iff the entry was failed.
+        """
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None:
+                return False
+            if expect_ref is not None and e.ref != expect_ref:
+                return False
+            entries[hotkey] = replace(
+                e, status="failed", last_error=error[:500], last_error_class=error_class)
+            self._save(entries)
+            return True
 
     # ── transparency feed ────────────────────────────────────────────────────
 

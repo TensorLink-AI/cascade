@@ -275,10 +275,18 @@ class FundingIntake:
             if outcome in ("pending_reveal", "already-pending"):
                 funding = "pending_reveal"
             else:
-                funding = "blocked-by-existing-entry"
-                note = ("your queue already holds a live entry for a different "
-                        "ref — withdraw it or let it settle, then "
-                        "`cascade fund` this new ref")
+                # add_pending returned "already-queued": a live queued/in_round
+                # entry blocked it. Distinguish the idempotent SAME-ref
+                # re-submit (already funded — the truth) from a genuine
+                # different-ref collision (the miner must withdraw first).
+                existing = self.queue.get(hotkey)
+                if existing is not None and existing.ref == ref:
+                    funding = "already-funded"
+                else:
+                    funding = "blocked-by-existing-entry"
+                    note = ("your queue already holds a live entry for a "
+                            "different ref — withdraw it or let it settle, then "
+                            "`cascade fund` this new ref")
         log.info("submit %s: stored %s (funding=%s)", hotkey, digest, funding)
         body_out = {"status": "stored", "ref": ref,
                     "commit_payload": format_commit(ref), "funding": funding}
@@ -372,7 +380,25 @@ class FundingIntake:
                     self._reply(404, {"code": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802 — http.server API
-                length = int(self.headers.get("Content-Length") or 0)
+                # A Content-Length that is missing → 0, and one that is
+                # non-numeric or NEGATIVE is rejected outright: int() on junk
+                # would raise (killing the connection with no reply), and a
+                # negative length would make rfile.read(length) an unbounded
+                # read-to-EOF, slipping past the declared-length cap
+                # (review 2026-08-29).
+                raw_len = self.headers.get("Content-Length")
+                if raw_len is None:
+                    length = 0
+                else:
+                    try:
+                        length = int(raw_len)
+                    except ValueError:
+                        length = -1
+                    if length < 0:
+                        self._reply(400, {"code": "bad_content_length",
+                                          "message": "Content-Length must be a "
+                                                     "non-negative integer"})
+                        return
                 if self.path == "/v1/submit":
                     cap = getattr(getattr(intake, "store", None), "max_bytes", 0) or (1 << 20)
                     if length > cap:

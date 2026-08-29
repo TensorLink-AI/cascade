@@ -370,7 +370,11 @@ class FakePublicStore:
 
     def get_text(self, key):
         if key not in self.objects:
-            raise KeyError(key)
+            # Mirror the real S3Store: a MISSING object is ObjectNotFound,
+            # distinct from a transient read failure — the publisher relies on
+            # that distinction to avoid erasing the index on a bucket hiccup.
+            from cascade.shared.hippius import ObjectNotFound
+            raise ObjectNotFound(key)
         return self.objects[key].decode()
 
 
@@ -440,6 +444,31 @@ def test_dethrone_reveal_survives_a_failed_publish(tmp_path):
     assert public.objects[f"champions/{digest}.zip"] == GOOD_ZIP
 
 
+def test_champion_index_transient_read_failure_preserves_prior_entries(tmp_path):
+    # Two champions already listed; a THIRD publishes while the index GET
+    # transiently 500s. That must NOT reset the index to a single entry and
+    # erase the two priors — the publish reports not-done and retries.
+    store = SubmissionStore(tmp_path / "vault")
+    d1, d2, d3 = (store.put(make_zip({f"{n}.py": bytes([i])}), HK)
+                  for i, n in enumerate(("a", "b", "c")))
+    public = FakePublicStore()
+    public.objects[CHAMPION_INDEX_KEY] = json.dumps(
+        {"champions": [{"digest": d1}, {"digest": d2}]}).encode()
+    pub = ChampionPublisher(store, public, policy="crown",
+                            state_path=tmp_path / "s.json")
+    real_get = public.get_text
+    public.get_text = lambda k: (_ for _ in ()).throw(StorageError("index 500"))
+    assert pub.note_king(HK, vault_ref(d3), "r1") == []       # not published
+    public.get_text = real_get
+    # The prior index is intact (never overwritten from empty).
+    assert {c["digest"] for c in json.loads(
+        public.objects[CHAMPION_INDEX_KEY])["champions"]} == {d1, d2}
+    # …and the next round retries and lands the third alongside the priors.
+    assert pub.note_king(HK, vault_ref(d3), "r2") == [d3]
+    assert {c["digest"] for c in json.loads(
+        public.objects[CHAMPION_INDEX_KEY])["champions"]} == {d1, d2, d3}
+
+
 def test_submit_reports_blocked_when_live_entry_holds_other_ref(tmp_path):
     intake = make_intake(tmp_path, resolve=lambda hk, ref: 100)
     intake.queue.add(HK, "ns/old@sha256:" + "0" * 64, reveal_block=100)  # live entry
@@ -449,6 +478,18 @@ def test_submit_reports_blocked_when_live_entry_holds_other_ref(tmp_path):
     assert body["funding"] == "blocked-by-existing-entry"    # the truth, not a promise
     assert "funding_note" in body
     assert intake.queue.get(HK).ref.endswith("0" * 64)       # old entry untouched
+
+
+def test_submit_same_ref_reports_already_funded_not_blocked(tmp_path):
+    # The idempotent second submit of the SAME code must not tell the miner to
+    # withdraw their correctly-funded entry (review 2026-08-29).
+    intake = make_intake(tmp_path, resolve=lambda hk, ref: 100)
+    headers = _submit_headers(HK, GOOD_ZIP, ts=time.time(), key="sk-live")
+    intake.submit(headers, GOOD_ZIP)                          # funds pending_reveal
+    intake.queue.promote_pending(lambda hk, ref: 100)         # reveal lands → queued
+    status, body = intake.submit(headers, GOOD_ZIP)           # same ref again
+    assert (status, body["funding"]) == (201, "already-funded")
+    assert "funding_note" not in body
 
 
 def test_champion_index_failure_retries_not_marks_done(tmp_path):

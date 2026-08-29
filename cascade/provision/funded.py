@@ -251,13 +251,19 @@ def reconcile_funded(
     *,
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
 ) -> list[str]:
-    """The orphan reaper's per-payer sweep; returns the pod names it killed.
+    """The orphan reaper's per-payer sweep; returns the pod names CONFIRMED gone.
 
     The operator-account reaper cannot see pods on miners' accounts, so this
     walks every hotkey that has a vaulted key, lists THAT account's pods, and
     kills any matching :func:`payer_pod_pattern` for THAT payer that the
     ledger does not own — the crash-between-launch-and-ledger hole, closed
     per payer, scoped so a miner's own unrelated cascade pods are untouchable.
+
+    Termination is VERIFIED (:func:`terminate_verified` re-lists after rm):
+    ``LiumProvider.terminate`` swallows a failed ``lium rm`` on a revoked key
+    as already-terminated, so an unverified reap would report a still-billing
+    orphan as killed every sweep (review 2026-08-29). Only confirmed kills are
+    returned; a pod that could not be confirmed dead is logged as a leak.
     """
     owned_ids = {i.instance_id for i in owned if i.stage == FUNDED_STAGE}
     killed: list[str] = []
@@ -280,9 +286,15 @@ def reconcile_funded(
                 log.warning("funded reconcile: killing orphan %s on payer %s's account",
                             pod_name, hotkey)
                 try:
-                    provider.terminate(pod_name)
+                    confirmed = terminate_verified(provider, pod_name)
                 except Exception as e:  # noqa: BLE001 — keep sweeping the rest
-                    log.error("funded reconcile: terminate %s failed: %s", pod_name, e)
+                    log.error("funded reconcile: terminate %s failed — may still "
+                              "bill payer %s: %s", pod_name, hotkey, e)
                     continue
-                killed.append(pod_name)
+                if confirmed:
+                    killed.append(pod_name)
+                else:
+                    log.error("funded reconcile: %s still LIVE after terminate on "
+                              "payer %s's account (revoked key?) — still billing",
+                              pod_name, hotkey)
     return killed

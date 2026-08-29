@@ -185,10 +185,22 @@ class ChampionPublisher:
             log.error("champion publish of %s failed (will retry next round): %s",
                       digest, e)
             return False
+        from ..shared.hippius import ObjectNotFound
+
         try:
             index = json.loads(self.public.get_text(CHAMPION_INDEX_KEY))
-        except Exception:  # noqa: BLE001 — first publish, or unreadable index
-            index = {"champions": []}
+        except ObjectNotFound:
+            index = {"champions": []}          # genuine first publish
+        except Exception as e:  # noqa: BLE001 — a TRANSIENT read failure
+            # A bucket hiccup reading the existing index must NOT be treated as
+            # "first publish" — rewriting it from empty would erase every prior
+            # champion from the audit trail. Report not-published so the next
+            # round retries the whole step (the ZIP re-upload is idempotent),
+            # rather than overwriting a list we could not read (review
+            # 2026-08-29).
+            log.error("champion index read for %s failed (retrying next round, "
+                      "not overwriting): %s", digest, e)
+            return False
         entry = {"digest": digest, "hotkey": hotkey, "zip_key": key,
                  "published_round": str(round_id), "reason": reason,
                  "published_at": self.clock()}
