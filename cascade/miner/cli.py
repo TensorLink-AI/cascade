@@ -6,8 +6,11 @@
 
 * ``cascade score <repo_dir>`` — train the fixed model on your generator's data
   at the cheap heat budget and score it on a local/sample pool, entirely offline
-  (no chain, no TAO, no ~30-min round). The fast iteration loop; needs the
-  ``[train]`` extra. See ``cascade/miner/score.py``.
+  (no chain, no TAO, no ~12h round). The fast iteration loop; needs the
+  ``[train]`` extra. Trains from random init — live rounds train from the
+  promoted cascade warm-start once a generation is live, so compare against
+  ``cascade score ./king`` on the same pool, not against live heat numbers.
+  See ``cascade/miner/score.py``.
 
 * ``cascade deploy <repo_dir> --hub-repo <namespace/name>`` — verify the local
   generator, push it to your Hippius Hub repo, and commit
