@@ -109,6 +109,13 @@ class LaunchSpec:
     # the exact lemon that just failed its boot gate. Adapters that cannot
     # map ids to offers may ignore it.
     exclude_ids: tuple[str, ...] = ()
+    # Facilities (provider regions) a launch must NOT pick. An image_digest
+    # gate failure is a host-image-cache property of the FACILITY, not the
+    # machine (2026-08-30, r51: a kansascity replacement booted the same stale
+    # v0.6.0 template its predecessor did), so the replacement path excludes
+    # the whole region rather than one machine. Adapters without region
+    # placement may ignore it.
+    exclude_regions: tuple[str, ...] = ()
 
 
 def image_digest_of(image: str) -> str:
@@ -352,13 +359,15 @@ def lium_pod_address(pod: dict, *, container_ssh_port: int = DEFAULT_SSH_PORT) -
     return PodAddress(ip=str(ip), ssh_port=int(port))
 
 
-def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1) -> dict | None:
+def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1,
+                         exclude_regions: tuple[str, ...] = ()) -> dict | None:
     """Choose a ``(cloud, region, shade_instance_type)`` offer for ``sku``.
 
     Filters ``GET /instances/types`` results to the requested ``gpu_type`` AND
     the exact ``gpus`` pod shape (``configuration.num_gpus``) with an available
-    region, preferring the cheapest (``hourly_price``, in cents). Returns
-    ``None`` if nothing is available — the fall-through signal.
+    region outside ``exclude_regions``, preferring the cheapest
+    (``hourly_price``, in cents). Returns ``None`` if nothing is available —
+    the fall-through signal.
     """
     offers: list[tuple[int, dict]] = []
     for t in types_json.get("instance_types", []):
@@ -367,7 +376,8 @@ def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1) -> dict |
         if int(t.get("configuration", {}).get("num_gpus", 1) or 1) != int(gpus):
             continue
         region = next(
-            (a.get("region") for a in t.get("availability", []) if a.get("available")),
+            (a.get("region") for a in t.get("availability", [])
+             if a.get("available") and a.get("region") not in exclude_regions),
             None,
         )
         if not region:
@@ -723,6 +733,9 @@ class ShadeformProvider:
     _session: object | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     _now: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # region each pod was placed in (this process's launches only) — feeds the
+    # replacement path's facility exclusion after an image_digest gate failure.
+    _region_by_pod: dict = field(default_factory=dict, repr=False)
 
     def _http(self):
         if self._session is not None:
@@ -751,9 +764,11 @@ class ShadeformProvider:
         r.raise_for_status()
         return r.json() if r.content else {}
 
-    def _offer(self, sku: str, *, gpus: int = 1) -> dict | None:
+    def _offer(self, sku: str, *, gpus: int = 1,
+               exclude_regions: tuple[str, ...] = ()) -> dict | None:
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
-        return pick_shadeform_offer(types, sku, gpus=gpus)
+        return pick_shadeform_offer(types, sku, gpus=gpus,
+                                    exclude_regions=exclude_regions)
 
     def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         # Shadeform reports availability, not exact counts; an available offer
@@ -761,7 +776,8 @@ class ShadeformProvider:
         return self._offer(sku, gpus=gpus) is not None
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        offer = self._offer(spec.sku, gpus=spec.gpus_per_pod)
+        offer = self._offer(spec.sku, gpus=spec.gpus_per_pod,
+                            exclude_regions=spec.exclude_regions)
         if offer is None:
             raise ProvisionError(f"shadeform: no available {spec.sku} offer")
         ids: list[str] = []
@@ -774,7 +790,12 @@ class ShadeformProvider:
                 raise ProvisionError(f"shadeform create returned no id: {resp}")
             log.info("shadeform create → %s (%s/%s)", iid, offer["cloud"], offer["region"])
             ids.append(str(iid))
+            self._region_by_pod[str(iid)] = str(offer["region"] or "")
         return ids
+
+    def region_of(self, pod_id: str) -> str | None:
+        """Facility (region) a pod was placed in (this process's launches only)."""
+        return self._region_by_pod.get(pod_id) or None
 
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
         deadline = self._now() + timeout

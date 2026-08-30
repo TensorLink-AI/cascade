@@ -456,13 +456,22 @@ def make_bench_prewarm(render: RenderSettings, *, pod_user: str) -> callable:
     three rounds running). Best-effort and fast: the SSH only LAUNCHES the
     detached download (60s cap); any failure is logged and ignored — the
     bench's own marker-guarded download remains the backstop, exactly as
-    before this hook existed."""
+    before this hook existed.
+
+    The download authenticates with ``$HF_BENCH_TOKEN`` — NEVER ``$HF_TOKEN``.
+    The pre-warm runs concurrently with the round's generator fetches, which
+    share one account quota per token; on 2026-08-30 (r51) the pre-warm's
+    thousands of tiny-file API calls pinned ``HF_TOKEN``'s quota at zero and
+    429-starved both finalists' HF-hosted generator fetches to the brink of a
+    terminal drop. Unset, the download runs anonymous (per-IP quota, a
+    separate pool) — slower, but the bench-time marker guard remains the
+    backstop and runs post-duel when the shared token is idle."""
     import os
 
     def prewarm(addr, stage: str, provider: str = "") -> None:
         if stage != "final":
             return
-        token = os.environ.get("HF_TOKEN") or None
+        token = os.environ.get("HF_BENCH_TOKEN") or None
         prof = render.profile_for(provider)
         user = prof.user if provider else pod_user
         from ..trainer.bench_hook import build_prewarm_remote_command
