@@ -49,7 +49,8 @@
   estimated from the configured budgets, confirmed settled via the public
   receipt index) and a live feed of revealed on-chain submissions (a commit
   landing while you watch is flagged ``● new``). Once the round's heat settles
-  it also shows the heat standings inline (``--hotkey`` marks your row).
+  it also shows the heat standings inline (``--hotkey`` marks your row), and a
+  warm-started round shows which promoted cascade init it trains from.
   Ticks every second, re-syncing to the chain every ``--refresh`` seconds;
   ``--once`` prints a single snapshot (also the automatic behaviour when
   piped). Read-only; needs the ``[chain]`` extra, no wallet.

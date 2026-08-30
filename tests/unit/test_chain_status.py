@@ -124,9 +124,20 @@ def test_build_round_status_document():
     assert doc["stage"] == "heat"
     assert (doc["heat_done"], doc["heat_total"]) == (12, 65)
     assert "finalists" not in doc  # optional fields stay out when unset
+    assert "warm_start" not in doc  # random-init round: no block at all
     with pytest.raises(ValueError):
         build_round_status(round_id="99", epoch_start_block=0,
                            stage="settled", as_of="")  # settled is receipt-only
+
+
+def test_build_round_status_carries_warm_start():
+    ws = {"init_checkpoint": "metro-v1:trained:hippius:ns/ckpt@sha256:ab",
+          "size": "toto2-4m", "generation": 4}
+    doc = build_round_status(round_id="99", epoch_start_block=14_400,
+                             stage="heat", as_of="2026-07-22T10:00:00+00:00",
+                             warm_start=ws)
+    assert doc["warm_start"] == ws
+    assert doc["warm_start"] is not ws  # copied, not aliased
 
 
 def test_publish_round_status_public_read_with_acl_fallback():

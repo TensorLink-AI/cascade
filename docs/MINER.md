@@ -621,12 +621,13 @@ What it means for you as a miner:
   checkpoint benches worse than the live generation's best member holds until
   it produces an equal-or-better one. The king persists through a promotion —
   only a genuine dethrone changes the throne.
-- **Where to see it**: `cascade heat` prints a
-  `warm start — this round trained from …` line with the generation (plus the
-  rotation's scheduled pick for the next round), and the web dashboard's
-  warm-start panel shows the member rotation and which round each init came
-  from. The init is pinned in each round's signed manifest, so
-  `cascade-audit` verifies it like everything else.
+- **Where to see it**: `cascade round` shows a
+  `warm start — this round trains from …` line with the generation while the
+  round is in flight; `cascade heat` prints the same plus the rotation's
+  scheduled pick for the next round; and the web dashboard's warm-start
+  panel shows the member rotation and which round each init came from. The
+  init is pinned in each round's signed manifest, so `cascade-audit`
+  verifies it like everything else.
 
 ## Study the competition
 
