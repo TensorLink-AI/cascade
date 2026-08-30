@@ -2,7 +2,10 @@
 
 You compete by submitting a **data generator**: purely-algorithmic code that
 produces synthetic time series. The owner's trainer trains a fixed Toto2-4M
-forecaster from scratch on your data; you win rounds when your data trains a
+forecaster on your data from the round's **shared init** — random at
+generation 0, the promoted cascade checkpoint once promotions fire (the live
+case today; see [Warm-started rounds](#the-cascade--warm-started-rounds)).
+You win rounds when your data trains a
 better forecaster than the reigning king's, scored on a private, rotating
 held-out set you never see. No GPU, no shipped weights — you compete the
 *prior*. The submission contract (what the code must be) is
@@ -129,7 +132,7 @@ A green `[deterministic]` line means the trainer will accept it.
 ## 2b. Score it locally (the fast iteration loop)
 
 `verify` proves your generator is *valid*; `cascade score` tells you if it's
-*good* — without deploying, spending TAO, or waiting ~30 min for a round. It
+*good* — without deploying, spending TAO, or waiting out a ~12h round. It
 trains the fixed model on your data at the cheap **heat** budget and scores it
 on a pool you control, entirely offline (needs the `[train]` extra + ideally a
 GPU):
@@ -158,6 +161,10 @@ Two caveats worth internalising:
   offline synthetic sample is only a smoke signal.
 - **Don't overfit your pool.** A generator tuned to ace one fixed local set is
   exactly what the private rotating eval punishes. Rotate/expand your pool.
+- **Local scoring trains from random init.** Live rounds train from the
+  promoted warm-start init once a cascade generation is live (the case today),
+  so your absolute local numbers won't match live heat scores — the *relative*
+  comparison against `cascade score ./king` on the same pool is what carries.
 
 ## 3. Make a wallet and register
 
@@ -467,7 +474,10 @@ Then watch the **public round receipts** (or the dashboard): revealed *before*
 the epoch boundary, your generator enters the next round's **heat**, gets
 trained and scored, and appears in that round's receipt participant set with
 your `gen_ref`. If it wins the heat it advances to the full final against the
-king. Verify any round independently with `cascade-audit latest` (see
+king — and when the screen cannot statistically separate the top entrants, the
+tied cohort advances together (capped at `[round] max_finalists`, 3), the
+validators judging the whole cohort and crowning the best margin-clearer.
+Verify any round independently with `cascade-audit latest` (see
 [`AUDIT.md`](AUDIT.md)).
 
 ### Your heat result — `cascade heat`
@@ -583,6 +593,42 @@ This is observability, not an appeal channel: these fields are not signed, not
 in the manifest, and never re-weight a score. They exist so a claim about host
 variance can be checked against numbers instead of inferred.
 
+## The cascade — warm-started rounds
+
+Rounds no longer always train from random init. When a king survives
+`[scoring] cascade_reign_rounds` (5) consecutive rounds undethroned, the
+trainer **promotes** up to `cascade_top_k` (3) of that reign's best duel
+checkpoints — within `cascade_quality_epsilon` (5%) of the reign's best public
+benchmark score, picked for error diversity — as the next **warm-start
+generation**. Subsequent rounds rotate through the members, and **every run in
+a round — heat and final — trains from that same init**, so the controlled
+experiment is untouched: both sides still share one init and your data is
+still the only variable. Promotions have fired on mainnet; warm-started
+rounds are the live case, not a future feature.
+
+What it means for you as a miner:
+
+- **You are improving the strongest lineage, not teaching from zero.** After
+  generation 0 the model already forecasts when your data arrives; corpora
+  that add regimes the lineage is weak on beat corpora that re-teach what it
+  already knows. The per-domain win-rate table in `cascade duel` shows where
+  the current lineage is weak.
+- **Losing challengers' checkpoints are promotable too.** The candidate pool
+  is every benched duel checkpoint of the reign — the king's *and* the
+  challengers'. Promotion pays nothing, but your data can end up shaping the
+  init every later round trains from.
+- **The promotion can't ratchet downhill.** A ripe reign whose best
+  checkpoint benches worse than the live generation's best member holds until
+  it produces an equal-or-better one. The king persists through a promotion —
+  only a genuine dethrone changes the throne.
+- **Where to see it**: `cascade round` shows a
+  `warm start — this round trains from …` line with the generation while the
+  round is in flight; `cascade heat` prints the same plus the rotation's
+  scheduled pick for the next round; and the web dashboard's warm-start
+  panel shows the member rotation and which round each init came from. The
+  init is pinned in each round's signed manifest, so `cascade-audit`
+  verifies it like everything else.
+
 ## Study the competition
 
 Every committed generator is content-addressed and **public** — that's what
@@ -623,6 +669,6 @@ always scored on windows that have never been published.
 | `blocked_import` | a banned import (`socket`, `subprocess`, `pickle`, …); see `chain.toml [static_guard]` |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
-| `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5a](#5a-if-the-hippius-hub-is-down)) |
+| `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5b](#5b-if-the-hippius-hub-is-down)) |
 | committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |

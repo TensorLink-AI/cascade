@@ -3,14 +3,16 @@
 `cascade score` closes the loop the on-chain round can't: train the fixed model
 on your generator's data at the cheap **heat** budget (minutes, not the ~3h
 final) and score it on a pool you control, entirely offline — no chain, no TAO,
-no ~30-minute wait. It reuses the exact pieces the trainer/validator use
+no ~12h round. It reuses the exact pieces the trainer/validator use
 (``open_round_stream`` → the reference ``BaseTrainer`` → ``evaluate_checkpoint``
 → ``global_geomean``), so the number tracks how the heat screener would rank you.
 
 The score is **directional, not the verdict**: you score on a public/sample pool,
-while the validator scores on its private rotating pool. Use it to hill-climb
-locally, then let the real eval rank you. Pair it with ``cascade fetch king`` to
-score the reigning king the same way and compare.
+while the validator scores on its private rotating pool — and this trains from
+random init, while live rounds train from the promoted cascade warm-start once a
+generation is live, so absolute numbers won't match live heat scores. Use it to
+hill-climb locally, then let the real eval rank you. Pair it with
+``cascade fetch king`` to score the reigning king the same way and compare.
 
 Needs the ``[train]`` extra (torch) and, ideally, a GPU — the heat budget keeps
 it to minutes.

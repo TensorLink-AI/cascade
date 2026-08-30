@@ -43,9 +43,12 @@ holding the model fixed so miners compete the prior.
 
 ## How it works
 
-The fixed process is a Toto2-4M backbone trained from random initialisation
+The fixed process is a Toto2-4M backbone
 ([Datadog/Toto-2.0-4m](https://huggingface.co/Datadog/Toto-2.0-4m), arXiv
-2605.20119), *not* a fine-tune of released weights. Training from scratch is the
+2605.20119) trained from the round's shared init — random initialisation at
+generation 0, and the promoted cascade checkpoint once a king's reign is
+promoted (the live case today) — *never* a fine-tune of released weights.
+Keeping every learned parameter subnet-grown is the
 point: the corpus is then the only source of learned signal, so the downstream
 forecast skill measures the *data*, not what some pretrained checkpoint already
 knew. (Once the [cascade](#the-cascade-promoted-generations) promotes a
@@ -95,7 +98,7 @@ flowchart TD
 **The round cadence.** A round is one ~12h epoch (`[round] epoch_blocks`; it was
 24h until 2026-07-28): the trainer runs exactly one round per epoch, so the king
 is retrained twice a day and each round's trainings share one `RoundSeeds`
-(identical random init). Only
+(identical init — random, or the promoted cascade warm-start). Only
 generators whose on-chain pointer *revealed* strictly before the epoch boundary
 compete in that round — deploy defaults to a timed reveal targeting just before
 the boundary (docs/MINER.md §5a), and a reveal that lands late rolls into the
@@ -143,18 +146,25 @@ to pure winner-take-all and `king_decay = 1.0` to an equal split.
 
 ## The cascade: promoted generations
 
-The subnet's namesake, armed since 2026-08-05 (`[scoring] cascade_enabled`).
-When a king survives `cascade_reign_rounds` (5) consecutive rounds undethroned,
-its reign's best checkpoint is **promoted**: it becomes the warm-start
-initialisation for all subsequent rounds, and competition continues *on top of*
-it. The best-of-reign pick uses the geometric mean of six signed
-public-benchmark numbers (GIFT-Eval / BOOM / TIME × CRPS / MASE) from each
-round's benchmark report — telemetry that never feeds scoring, so it can't be
-Goodharted — and the checkpoint is promoted as-is, never re-evaluated. The king
-persists through promotion (same hotkey, reign clock reset); stagnation at
-generation N is converted into the launchpad for generation N+1, so proven data
-improvements compound across generations instead of resetting every round. Each
-promotion is a signed public record under `promotions/` in the manifest bucket.
+The subnet's namesake, live since 2026-08-05 (`[scoring] cascade_enabled`) —
+generations have been promoted on mainnet. When a king survives
+`cascade_reign_rounds` (5) consecutive rounds undethroned, up to
+`cascade_top_k` (3) of the reign's best duel checkpoints — the king's *and*
+the challengers', every member within `cascade_quality_epsilon` (5%) of the
+reign best, picked for error diversity — are **promoted** as the next
+warm-start generation: subsequent rounds rotate through the members as their
+shared init, and competition continues *on top of* the lineage. Scores come
+from the geometric mean of six signed public-benchmark numbers
+(GIFT-Eval / BOOM / TIME × CRPS / MASE) in each round's benchmark report —
+telemetry that never feeds KOTH scoring, so it can't be Goodharted — and
+checkpoints are promoted as-is, never re-evaluated; a no-downgrade guard
+holds any promotion until the reign best matches the live generation's best
+member. The king persists through promotion (same hotkey, reign clock reset);
+stagnation at generation N is converted into the launchpad for generation
+N+1, so proven data improvements compound across generations instead of
+resetting every round. Each promotion is a signed public record under
+`promotions/` in the manifest bucket, verified by validators as an envelope
+(provenance, quality floor, ripeness, cap) rather than re-derived.
 
 ## Why Toto2-4M
 

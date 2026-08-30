@@ -51,11 +51,14 @@ round:
 3. Derives one `RoundSeeds` from the round's base seed (the block hash **at the
    epoch boundary**): a shared `generation_seed` and a shared `training_seed`,
    used by every training in the round — heat and final, all sizes — so the whole
-   day shares one random init.
+   round shares one init (random, or the promoted cascade warm-start once a
+   generation is live — the current mainnet state).
 4. **Heat (screen).** Trains every eligible challenger cheaply
-   (`[round] heat_train_hours`, ~30min, on the primary/smallest size), scores each
+   (`[round] heat_train_hours`, ~1h, on the primary/smallest size), scores each
    on the held-out pool (geomean of CRPS/MASE), and keeps the top
-   `[round] finalists` (default 1). A challenger that fails to train or score just
+   `[round] finalists` (default 1; a top the screen cannot statistically
+   separate advances as a tied cohort, capped at `max_finalists`, 3). A
+   challenger that fails to train or score just
    doesn't qualify. Every entrant is screened on the *same* window slice, so a
    joint cluster bootstrap over the field is paired: the heat records `p_best`
    per entrant and a `leader_lcb` against the runner-up on the manifest's heat
@@ -76,7 +79,8 @@ round:
      `cache_reuse` draws a fixed corpus once (also sandboxed) and cycles it. Either
      way the trainer gets one budget-capped iterator (univariate `C = 1` today;
      the channel axis is carried so multivariate priors need no schema change),
-   - trains a **fresh Toto2 model from random init** at that size via the owner's
+   - trains a **fresh Toto2 model from the round's shared init** (random, or
+     the promoted cascade warm-start) at that size via the owner's
      `BaseTrainer` (`cascade.trainer.contract`; reference:
      `cascade.trainer.toto2_trainer`) — it pulls series until the stream ends, for
      the per-size budget (~3h on the reference GPU, enforced as a fixed
@@ -106,7 +110,8 @@ Toto2-4M backbone trained from random init under the `chain.toml [training]`
 recipe — `head_dim 64`, `patch_size 32`, a 9-quantile pinball head, u-μP, the
 NorMuon+AdamW split) is the operator's to provide; it must be **stateless across
 the king and challenger calls** so no information leaks between the two training
-runs (shared `training_seed` ⇒ identical random init for both).
+runs (shared `training_seed` and shared warm-start pointer ⇒ identical init for
+both).
 
 #### Two-device (remote) training
 
@@ -160,27 +165,46 @@ The validator never trains. Each round it:
 
 ### Cascade — king-reign promotion
 
-On top of the daily KOTH sits **Cascade** (`cascade.validator.cascade`), a
-wall-clock ratchet that periodically raises the floor the whole field trains up
-from. A **reign clock** counts days since the current king last took the throne;
-every dethrone re-crowns and resets it (Cascade reuses the KOTH dethrone signal —
-it never re-implements dethroning). During a reign every checkpoint the king
-produces is scored on the three public suites — **GIFT-Eval, BOOM, and TIME** —
+On top of the round-level KOTH sits **Cascade** (LIVE on mainnet —
+`[scoring] cascade_enabled`), a ratchet that periodically raises the floor the
+whole field trains up from. A **reign clock** counts rounds since the current
+king last took the throne — in blocks, anchored to the dethrone verdict's
+epoch-start block, so every node fires on the same round; every dethrone
+re-crowns and resets it (Cascade reuses the KOTH dethrone signal — it never
+re-implements dethroning). During a reign every **benched duel checkpoint** —
+the king's *and* the challengers'
+(promotion pays the checkpoint's owner nothing) — is scored on the three public
+suites — **GIFT-Eval, BOOM, and TIME** —
 `score = geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps,
-time_mase)`, lower better — and kept in a per-reign log. All three suites report
+time_mase)`, lower better — and kept in a per-reign candidate log. All three
+suites report
 CRPS/MASE the same way — the shifted geometric mean, across tasks, of each metric
 **normalized by the Seasonal-Naive baseline** (≈1.0 = baseline parity) — so the
-six numbers are the same kind of quantity before they enter the geomean. When a king holds the
-throne `[scoring] cascade_reign_days` (default 7) consecutive days undethroned —
-counted in blocks (7200/day), anchored to the manifest's epoch-start block so
-every validator fires on the same round — a
-**Cascade** fires: the reign's lowest-score checkpoint (a lookup, not a re-eval)
-is installed **as-is** as the warm-start init for all subsequent rounds; the king
-**persists** on the throne with a fresh reign clock (DEC-CA-0004 — both roles
-train from the shared init, so promotion confers no advantage worth vacating
-over, and the throne only changes hands via a genuine dethrone). The reign clock
-and checkpoint log persist next to the champion state, so Cascade survives
-validator restarts.
+six numbers are the same kind of quantity before they enter the geomean.
+
+When a king holds the throne `[scoring] cascade_reign_rounds` (5) consecutive
+rounds undethroned, the **trainer** proposes a promotion (DEC-CA-0013,
+propose-and-verify): it selects up to `cascade_top_k` (3) member checkpoints
+from the reign log — every member within `cascade_quality_epsilon` (5%) of the
+reign's best score; the best is the anchor, remaining slots picked greedily for
+**measured error decorrelation** (per-window residuals; DEC-CA-0015) with a
+structural fallback (distinct generator, round spacing) when error vectors are
+missing, never padded — and publishes a signed `PromotionRecord`
+(`promotions/gen-<n>.json`). A **no-downgrade guard** (DEC-CA-0017) holds a
+ripe promotion until the reign's best candidate benches at least as well as
+the live generation's best member, so the shared init never ratchets downhill.
+Validators don't re-derive the selection: they verify an **envelope** —
+trainer signature, generation increment, `cascade_top_k` cap, reign-clock
+ripeness, and per-member provenance against the trainer-signed bench reports
+within the epsilon floor — failing closed on anything unverifiable. Once a
+generation is live, each round's init is the rotation
+`members[epoch_index % len(members)]`, pinned in that round's signed manifest;
+**every run in the round — heat and final — trains from that one init**. The
+king **persists** on the throne with a fresh reign clock (DEC-CA-0004 — both
+roles train from the shared init, so promotion confers no advantage worth
+vacating over, and the throne only changes hands via a genuine dethrone). The
+reign clock and candidate log persist next to the trainer/validator state, so
+Cascade survives restarts.
 
 Those six numbers are **authoritative from the trainer, not recomputed per
 validator**. The trainer (owner-operated, already the manifest trust anchor)
@@ -194,13 +218,14 @@ trainer-signed artifact** — one JSON report per round at
 and same R2 dual-write as the manifest; `cascade.shared.bench_report`) — never
 inside the manifest entry, so every validator records the identical values and
 Cascade selection stays deterministic across validators rather than each
-re-running a non-bit-reproducible GPU sweep. The validator reads the king's set
-from the report into the reign log (the report lands ~30-60 min after the
-manifest, so it re-probes for a few rounds), falls back to the in-entry
-`bench_scores` older manifests carry, and tolerates a missing report — that
+re-running a non-bit-reproducible GPU sweep. Trainer and validators read
+**every duel checkpoint's set — king's and challengers' — into the reign
+candidate log** (the report lands ~30-60 min after the
+manifest, so nodes re-probe for a few rounds), fall back to the in-entry
+`bench_scores` older manifests carry, and tolerate a missing report — that
 round simply contributes no bench numbers, and promotion selects over the reign
-rounds that have them. The challenger's set is telemetry (and, when `[wandb]
-enabled`, the king/challenger pair is logged per round). The eval is the
+rounds that have them (when `[wandb]
+enabled`, the king/challenger pair is also logged per round). The eval is the
 **full** GIFT-Eval + BOOM + TIME battery each round (`[eval]
 cascade_bench_max_series = 0`; BOOM full ≈ 26 min on an RTX 5090, run with
 `--bench-device cuda`), and TIME's Seasonal-Naive baseline —
@@ -212,9 +237,9 @@ and the provisioner holds the **final** pods — only that class — until the
 report is uploaded or `[eval] bench_hold_max_hours` (default 2 h) expires, then
 reaps regardless. The dethrone verdict itself stays entirely on the private
 eval pool; these public-benchmark numbers drive only Cascade's warm-start
-promotion. Cascade is opt-in — `[scoring] cascade_enabled` (off by default) —
-and when off the trainer skips the eval, never writes the hold markers, and
-validators run pure KOTH.
+promotion. Cascade is gated by `[scoring] cascade_enabled` — **on for the live
+mainnet deployment** — and when off the trainer skips the eval, never writes
+the hold markers, and validators run pure KOTH.
 
 ## The controlled-experiment invariant
 
@@ -224,7 +249,8 @@ cascade enforces this on three sides:
 
 * **Trainer:** one `RoundSeeds` instance is reused for every run in the round —
   heat and final, king and challenger, all sizes — so weight initialisation
-  (`training_seed`, the from-scratch init) and the generation seed are identical;
+  (`training_seed` at generation 0; the one pinned warm-start checkpoint in a
+  warm-started round) and the generation seed are identical;
   only the per-size width/depth changes between sizes, never between king and
   challenger of the same size.
 * **Manifest:** `contract_digest` (sha256 of the `TrainingContractConfig`,

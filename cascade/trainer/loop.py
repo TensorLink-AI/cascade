@@ -1692,6 +1692,7 @@ class TrainerRunner:
                 heat_done=heat_done,
                 heat_total=heat_total,
                 finalists=finalists,
+                warm_start=self._stage_ctx.get("warm_start"),
             )
             publish_round_status(self.manifest_store(), doc)
             self._stage_published_at = time.time()

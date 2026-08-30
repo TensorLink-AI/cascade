@@ -6,7 +6,10 @@ DAGs, parametric trend/seasonality/noise, …). It is **code-only — no shipped
 weights** (see the contract below), so you compete on the data-generating prior,
 not on a large pretrained forecaster distilled into a "generator". Whatever it is,
 it produces synthetic time-series that the subnet owner's trainer uses to train a
-**Toto2-4M forecaster from scratch** (random init — not a fine-tune). You win when
+**Toto2-4M forecaster from the round's shared init** — random at generation 0,
+the promoted cascade checkpoint once promotions fire (the live case today);
+never a fine-tune of released weights, so every learned parameter traces back
+to subnet data. You win when
 your data trains a better forecaster than the king's data, scored on a private,
 rotating held-out set you never see.
 
@@ -181,13 +184,18 @@ See MINER.md §5a for the full threat model.
 ## What good data looks like
 
 You're optimising for **downstream forecast generalisation** of a Toto2-4M trained
-**from scratch** on real held-out series (CRPS + MASE). Two consequences:
+on your data from the round's shared init, evaluated on real held-out series
+(CRPS + MASE). Two consequences:
 
-* From random init the model learns forecasting *only* from your data, so
-  diversity of regimes (trend, multiple seasonalities, regime shifts, varied
-  noise structure, realistic scales) matters even more — a narrow or degenerate
-  corpus teaches a narrow forecaster, and a tiny one can't win by being memorised
-  (the budget is `train_tokens`, not a few epochs).
+* The model's learned signal comes only from subnet data — random init at
+  generation 0, and after a cascade promotion the init is itself the product of
+  earlier rounds' winning data — so diversity of regimes (trend, multiple
+  seasonalities, regime shifts, varied noise structure, realistic scales)
+  matters even more. A narrow or degenerate corpus teaches (or keeps) a narrow
+  forecaster, and a tiny one can't win by being memorised (the budget is
+  `train_tokens`, not a few epochs). In a warm-started round the marginal game
+  is sharper still: data that covers what the promoted lineage is *weak* on
+  beats data that repeats what it already does well.
 * The eval set is **private and rotates every round**, so you cannot
   distribution-match a public benchmark — you never see the windows, the slice
   changes each round, and the trainer only ever feeds the model *your generator's

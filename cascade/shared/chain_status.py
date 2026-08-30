@@ -148,6 +148,7 @@ def build_round_status(
     heat_done: int | None = None,
     heat_total: int | None = None,
     finalists: int | None = None,
+    warm_start: dict | None = None,
 ) -> dict:
     """Assemble the trainer-reported round-stage doc (pure).
 
@@ -155,6 +156,11 @@ def build_round_status(
     current epoch start from the chain grid and only trust a doc for THAT
     round (a doc left behind by a previous round simply doesn't match).
     ``heat_done``/``heat_total`` give the heat a real progress number.
+    ``warm_start`` is the round's promoted-init descriptor (same shape as the
+    heat doc's block: ``init_checkpoint``/``size``/``generation``/
+    ``next_scheduled_init``) so ``cascade round`` can show which init the
+    round trains from before the heat standings publish; absent in a
+    random-init round. Presentational like everything else here.
     """
     if stage not in ROUND_STAGES:
         raise ValueError(f"unknown round stage: {stage!r}")
@@ -171,6 +177,8 @@ def build_round_status(
         doc["heat_done"] = int(heat_done)
     if finalists is not None:
         doc["finalists"] = int(finalists)
+    if warm_start:
+        doc["warm_start"] = dict(warm_start)
     return doc
 
 
