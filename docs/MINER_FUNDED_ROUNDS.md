@@ -58,6 +58,45 @@ rationale; this file is the how.
    boundary, and a payer-key teardown after a provisioner restart
    (vault hydrate → `teardown_funded`).
 
+## Fronting the intake (DoS posture)
+
+The intake runs on the orchestrator — the box holding the trainer wallet and
+the private eval pool — so exposing it raw is not an option. The division of
+labour:
+
+**The front proxy does volumetric defence.** Terminate TLS in nginx/caddy (or
+put the DNS behind an edge like Cloudflare) and configure, at minimum:
+
+- per-IP connection and request-rate limits (nginx: `limit_conn` /
+  `limit_req`; the fund/withdraw endpoints are a few requests per miner per
+  day — single-digit req/s per IP is generous),
+- header/body read timeouts (`client_header_timeout`, `client_body_timeout`),
+- a body size limit matching the intake's ZIP cap (`client_max_body_size` =
+  `--max-zip-mb`, or ~1 MB if the intake is funding-only),
+- proxy buffering ON, so a slow client dribbles at the proxy, not at a
+  handler thread.
+
+**The intake keeps in-app backstops** so a missing or misconfigured proxy
+degrades gracefully instead of taking the orchestrator down:
+
+- `--request-timeout` (default 30 s): per-socket read/write timeout — a
+  slowloris client gets its connection closed, not a parked thread (the
+  stdlib serves with NO timeout by default).
+- `--max-connections` (default 64): concurrent-handler cap; over it, new
+  connections get an immediate `503` + `Retry-After` and are closed without
+  spawning a thread, so a connection flood costs one small write each.
+- `--chain-timeout` (default 30 s): deadline on the reveal poll — a hung
+  substrate websocket serves the stale reveal table instead of pinning every
+  handler slot behind one dead chain connection.
+- Structural caps already in the request path: declared-length `413` before
+  any body byte is read, the signature gate before body buffering, and the
+  streaming decompression cap in the store.
+
+None of this rate-limits per identity — an attacker with many IPs can still
+saturate `--max-connections` at the proxy-less intake. That is the front
+proxy's job; the backstops only guarantee the box stays responsive and the
+trainer keeps its CPU.
+
 ## What the provisioner must NOT do on funded pods
 
 - Rent them on the operator key (`provision/funded.py` has no such path —

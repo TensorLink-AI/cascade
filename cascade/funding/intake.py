@@ -35,6 +35,7 @@ transfers):
     POST /v1/withdraw   (same auth headers, no key needed)
     GET  /v1/queue      (public transparency feed — no key material)
     GET  /health
+    (any path)          → 503 overloaded + Retry-After past the connection cap
 
 Direct submission (DEC-CA-0036's private-code half): the ZIP never touches a
 miner-hosted repo — it lands in the operator's private
@@ -55,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -340,10 +342,34 @@ class FundingIntake:
 
     # ── HTTP server ──────────────────────────────────────────────────────────
 
-    def make_server(self, host: str, port: int) -> ThreadingHTTPServer:
+    def make_server(self, host: str, port: int, *,
+                    max_connections: int = 64,
+                    request_timeout_s: float = 30.0) -> ThreadingHTTPServer:
+        """The intake's HTTP server, with in-app DoS backstops.
+
+        Volumetric DDoS is the FRONT PROXY's job (the runbook mandates one);
+        these are the defence-in-depth floors that keep the orchestrator — the
+        box holding the trainer wallet and eval pool — degrading gracefully
+        even if the proxy is missing or misconfigured:
+
+        * ``request_timeout_s`` is the per-socket read/write timeout, so a
+          slowloris client dribbling header bytes cannot pin a handler thread
+          forever (the stdlib default is NO timeout).
+        * ``max_connections`` bounds concurrent handler threads — the stdlib
+          ``ThreadingHTTPServer`` spawns unboundedly. Over the cap, the
+          connection gets an immediate 503 with Retry-After and is closed
+          WITHOUT spawning a thread, so a connection flood costs one small
+          write each instead of a thread + fd each.
+        """
         intake = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Per-socket read/write timeout. StreamRequestHandler.setup() calls
+            # settimeout() with this, and handle_one_request turns the timeout
+            # into a closed connection — the thread is reclaimed instead of
+            # parked on a client that stopped sending.
+            timeout = request_timeout_s
+
             # Default BaseHTTPRequestHandler logging writes the request line to
             # stderr; route through our logger and keep it header-free (the
             # request line never carries the key — it is a header — but stay
@@ -428,4 +454,47 @@ class FundingIntake:
                 else:
                     self._reply(404, {"code": "not_found"})
 
-        return ThreadingHTTPServer((host, port), Handler)
+        overloaded = json.dumps(
+            {"code": "overloaded", "message": "intake at connection capacity; "
+                                              "retry shortly"}).encode()
+        reject = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                  b"Content-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(overloaded)).encode() + b"\r\n"
+                  b"Retry-After: 2\r\n"
+                  b"Connection: close\r\n"
+                  b"\r\n" + overloaded)
+
+        class BoundedServer(ThreadingHTTPServer):
+            # Re-assert the ThreadingHTTPServer default we depend on: daemon
+            # handler threads are never joined at server_close(), so a client
+            # mid-request cannot hold shutdown hostage.
+            daemon_threads = True
+
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self._slots = threading.BoundedSemaphore(max_connections)
+
+            def process_request(self, request, client_address) -> None:
+                if not self._slots.acquire(blocking=False):
+                    try:
+                        request.settimeout(request_timeout_s)
+                        request.sendall(reject)
+                    except OSError:
+                        pass  # client already gone — the close below is enough
+                    self.shutdown_request(request)
+                    return
+                try:
+                    super().process_request(request, client_address)
+                except BaseException:
+                    # Thread never started (spawn failure) → the slot would
+                    # leak; on success process_request_thread owns the release.
+                    self._slots.release()
+                    raise
+
+            def process_request_thread(self, request, client_address) -> None:
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    self._slots.release()
+
+        return BoundedServer((host, port), Handler)

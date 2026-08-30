@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -29,6 +30,7 @@ from .vault import DEFAULT_TTL_SECONDS, PayerKeyVault
 log = logging.getLogger("cascade.funding.main")
 
 _REVEAL_CACHE_SECONDS = 30.0
+_CHAIN_DEADLINE_SECONDS = 30.0
 
 
 class ChainRevealResolver:
@@ -38,25 +40,74 @@ class ChainRevealResolver:
     parse (``interface.validation.parse_commit``) and its ref must equal the
     funded ref exactly — funding somebody else's ref, or a ref you have not
     revealed yet, resolves to ``None`` and the intake refuses it.
+
+    The chain poll runs under ``deadline_seconds`` (same shape as the
+    trainer's ``_with_deadline``): substrate websockets can hang without
+    raising, and the resolver runs INSIDE intake request threads — a hung
+    poll would otherwise pin every handler slot on the box holding the
+    trainer wallet. On deadline the resolver serves the stale table (a fund
+    of an unseen reveal gets 403 and retries; a pending entry waits for the
+    next sweep) and never stacks a second poll on a hung one — the leaked
+    daemon thread is the accepted cost, harvested if it ever finishes.
+    Concurrent requests during the FIRST deadline window of a hang block on
+    the refresh lock (once, bounded by the deadline); after that every
+    request serves the stale table instantly.
     """
 
     def __init__(self, client, *, cache_seconds: float = _REVEAL_CACHE_SECONDS,
+                 deadline_seconds: float = _CHAIN_DEADLINE_SECONDS,
                  clock=time.time) -> None:
         self.client = client
         self.cache_seconds = cache_seconds
+        self.deadline_seconds = deadline_seconds
         self.clock = clock
         self._cached_at = float("-inf")
         self._by_hotkey: dict[str, list] = {}
+        self._lock = threading.Lock()
+        self._poll_thread: threading.Thread | None = None
+        self._poll_box: dict = {}
+
+    def _harvest(self) -> None:
+        """Fold a finished poll into the cache; re-raise its error in-caller."""
+        box, self._poll_box, self._poll_thread = self._poll_box, {}, None
+        if "error" in box:
+            raise box["error"]
+        by_hotkey: dict[str, list] = {}
+        for c in box.get("commitments", ()):
+            by_hotkey.setdefault(c.hotkey, []).append(c)
+        self._by_hotkey = by_hotkey
+        self._cached_at = self.clock()
 
     def _refresh(self) -> None:
         if self.clock() - self._cached_at < self.cache_seconds:
             return
-        commitments = self.client.poll_commitments(include_history=True)
-        by_hotkey: dict[str, list] = {}
-        for c in commitments:
-            by_hotkey.setdefault(c.hotkey, []).append(c)
-        self._by_hotkey = by_hotkey
-        self._cached_at = self.clock()
+        with self._lock:
+            if self.clock() - self._cached_at < self.cache_seconds:
+                return  # refreshed by the thread that held the lock before us
+            if self._poll_thread is not None:
+                if self._poll_thread.is_alive():
+                    return  # poll still hung — serve stale, don't stack threads
+                self._harvest()  # a formerly-hung poll finished late
+                return
+            box = self._poll_box = {}
+
+            def poll() -> None:
+                try:
+                    box["commitments"] = self.client.poll_commitments(
+                        include_history=True)
+                except Exception as e:  # noqa: BLE001 — carried to the caller
+                    box["error"] = e
+
+            t = threading.Thread(target=poll, daemon=True,
+                                 name="intake-chain-poll")
+            self._poll_thread = t
+            t.start()
+            t.join(self.deadline_seconds)
+            if t.is_alive():
+                log.warning("chain poll still running after %.0fs — serving "
+                            "the stale reveal table", self.deadline_seconds)
+                return
+            self._harvest()
 
     def __call__(self, hotkey: str, ref: str) -> int | None:
         from ..interface.validation import parse_commit
@@ -99,6 +150,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Per-submission ZIP cap in MiB (default 128, matching "
                         "[generator] max_repo_mb).")
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_SECONDS / 3600.0)
+    p.add_argument("--max-connections", type=int, default=64,
+                   help="Concurrent-connection cap; over it the intake answers "
+                        "an immediate 503 without spawning a handler thread. "
+                        "An in-app backstop — real rate limiting belongs on "
+                        "the front proxy (docs/MINER_FUNDED_ROUNDS.md).")
+    p.add_argument("--request-timeout", type=float, default=30.0,
+                   help="Per-socket read/write timeout in seconds (slowloris "
+                        "guard; the stdlib default is no timeout at all).")
+    p.add_argument("--chain-timeout", type=float, default=_CHAIN_DEADLINE_SECONDS,
+                   help="Deadline in seconds on each chain reveal poll; past "
+                        "it the intake serves its cached reveal table instead "
+                        "of pinning request threads on a hung substrate "
+                        "connection.")
     p.add_argument("--chain-toml", type=Path, default=Path("chain.toml"))
     p.add_argument("--network", default=None, help="Bittensor network override.")
     p.add_argument("--no-require-signature", action="store_true",
@@ -126,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from ..shared.chain import ChainClient
 
         client = ChainClient.from_config(cfg, network=args.network)
-        resolver = ChainRevealResolver(client)
+        resolver = ChainRevealResolver(client, deadline_seconds=args.chain_timeout)
 
     vault = PayerKeyVault(dir=args.vault_dir, ttl_seconds=args.ttl_hours * 3600.0)
     hydrated = vault.hydrate()
@@ -147,7 +211,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_signature=not args.no_require_signature,
         store=store,
     )
-    server = intake.make_server(args.host, args.port)
+    server = intake.make_server(args.host, args.port,
+                                max_connections=args.max_connections,
+                                request_timeout_s=args.request_timeout)
     log.info("cascade-intake listening on %s:%d (queue=%s, vault=%s, signatures=%s)",
              args.host, args.port, args.queue_path,
              args.vault_dir or "<memory-only>",

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
@@ -192,3 +194,156 @@ def test_http_fund_and_queue_feed(live_server):
     assert (status, body["code"]) == (400, "missing_lium_api_key")
     status, body = _request(f"{base}/nope", method="POST")
     assert status == 404
+
+
+# ── DoS backstops: socket timeout + bounded concurrency ──────────────────────
+
+
+def _connect(base):
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base)
+    return socket.create_connection((parts.hostname, parts.port), timeout=5)
+
+
+def _serve(intake, **server_kw):
+    server = intake.make_server("127.0.0.1", 0, **server_kw)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_slowloris_connection_is_closed_not_parked_forever(tmp_path):
+    # A client dribbling half a request must lose its connection after
+    # request_timeout_s — the stdlib default is NO socket timeout, i.e. a
+    # permanently pinned handler thread per slow client.
+    intake, _ = make_intake(tmp_path)
+    server, base = _serve(intake, request_timeout_s=0.3)
+    try:
+        with _connect(base) as s:
+            s.settimeout(5)
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nX-Drib")  # …stall
+            t0 = time.monotonic()
+            try:
+                data = s.recv(4096)
+            except OSError:
+                data = b""
+            assert data == b""                      # server hung up on us
+            assert time.monotonic() - t0 < 4.0      # promptly, not never
+        status, body = _request(f"{base}/health")   # thread was reclaimed
+        assert (status, body["status"]) == (200, "ok")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connection_flood_gets_fast_503_and_the_cap_recovers(tmp_path):
+    intake, _ = make_intake(tmp_path)
+    server, base = _serve(intake, max_connections=2, request_timeout_s=5.0)
+    try:
+        # Two idle connections pin both handler slots (a slot is taken at
+        # accept, before any bytes arrive — that is exactly the flood shape).
+        holders = [_connect(base) for _ in range(2)]
+        deadline = time.monotonic() + 5
+        while server._slots._value > 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server._slots._value == 0
+
+        # The third connection gets an immediate 503, not a queued thread.
+        with _connect(base) as s3:
+            s3.settimeout(5)
+            s3.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            buf = b""
+            while True:
+                chunk = s3.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        assert buf.startswith(b"HTTP/1.1 503")
+        assert b"Retry-After" in buf and b"overloaded" in buf
+
+        # Releasing the holders frees the slots and service resumes.
+        for h in holders:
+            h.close()
+        status = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                status, _body = _request(f"{base}/health")
+                if status == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ── ChainRevealResolver: the reveal poll runs under a deadline ───────────────
+
+# The resolver round-trips refs through the real commit grammar, which wants
+# a full Hub ``owner/name@sha256:…`` ref (unlike the header-plumbing tests
+# above, where REF is opaque).
+HUB_REF = "miner/gen-abc@sha256:" + "a" * 64
+
+
+def _commitment(hotkey, ref, block):
+    from cascade.interface.validation import format_commit
+
+    return SimpleNamespace(hotkey=hotkey, payload=format_commit(ref),
+                           commit_block=block)
+
+
+def test_resolver_resolves_caches_and_refuses_foreign_refs():
+    from cascade.funding.main import ChainRevealResolver
+
+    calls = []
+
+    def poll_commitments(include_history=True):
+        calls.append(1)
+        return [_commitment(HK, HUB_REF, 42)]
+
+    r = ChainRevealResolver(SimpleNamespace(poll_commitments=poll_commitments),
+                            cache_seconds=60.0, deadline_seconds=5.0)
+    assert r(HK, HUB_REF) == 42
+    assert r(HK, "other-repo@sha256:" + "b" * 64) is None
+    assert r("5SomeoneElse", HUB_REF) is None
+    assert len(calls) == 1                      # served from the cache
+
+
+def test_resolver_deadline_serves_stale_and_never_stacks_polls():
+    from cascade.funding.main import ChainRevealResolver
+
+    started = []
+    release = threading.Event()
+
+    def poll_commitments(include_history=True):
+        started.append(threading.current_thread())
+        release.wait(10)
+        return [_commitment(HK, HUB_REF, 42)]
+
+    r = ChainRevealResolver(SimpleNamespace(poll_commitments=poll_commitments),
+                            cache_seconds=0.0, deadline_seconds=0.05)
+    t0 = time.monotonic()
+    assert r(HK, HUB_REF) is None          # deadline hit → stale (empty) table
+    assert time.monotonic() - t0 < 2.0  # …and the caller was NOT pinned
+    assert r(HK, HUB_REF) is None          # a second call must not stack a poll
+    assert len(started) == 1           # on the one still hung
+    release.set()                      # the hung poll finally finishes…
+    started[0].join(5)
+    assert r(HK, HUB_REF) == 42            # …and the next refresh harvests it
+
+
+def test_resolver_poll_error_reaches_the_caller():
+    from cascade.funding.main import ChainRevealResolver
+
+    def boom(include_history=True):
+        raise RuntimeError("substrate down")
+
+    r = ChainRevealResolver(SimpleNamespace(poll_commitments=boom),
+                            cache_seconds=60.0, deadline_seconds=5.0)
+    with pytest.raises(RuntimeError, match="substrate down"):
+        r(HK, HUB_REF)
