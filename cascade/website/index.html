@@ -1055,7 +1055,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
   </div>
 
   <div>
-    <div class="section-label"><span>This round &mdash; live</span><span id="live-when" class="muted"></span></div>
+    <div class="section-label"><span id="live-title">This round &mdash; live</span><span id="live-when" class="muted"></span></div>
     <div class="panel">
       <div class="stage-strip" id="stage-strip"></div>
       <div class="stage-detail" id="stage-detail">--</div>
@@ -1270,7 +1270,8 @@ function stat(k,v,o){
 function renderVerdict(){
   var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
   if(!r){ el.innerHTML='<div class="empty">Waiting for the first published round…</div>'; return; }
-  document.getElementById("verdict-title").textContent="Round "+shortRoundId(r.round_id);
+  var vrn=roundNoOf(r.round_id);
+  document.getElementById("verdict-title").textContent="Round "+shortRoundId(r.round_id)+(vrn?" · r"+vrn:"");
   document.getElementById("verdict-when").textContent=r.published_at?"settled "+timeAgo(r.published_at):"";
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
@@ -1489,7 +1490,8 @@ function renderRounds(){
     var better=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
     // amber win rate = geomean favours the challenger but it wins few windows
     var wcls=r.win_rate==null?"":(r.win_rate>=0.5?"good":(better?"warn":""));
-    return '<tr><td title="'+esc(r.round_id)+'">'+esc(shortRoundId(r.round_id))+'</td>'+
+    var hrn=roundNoOf(r.round_id);
+    return '<tr><td title="'+esc(r.round_id)+'">'+(hrn?"<b>r"+hrn+"</b> · ":"")+esc(shortRoundId(r.round_id))+'</td>'+
       '<td><span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span></td>'+
       '<td>'+refLink(r.king_gen_ref)+'</td><td>'+refLink(r.chal_gen_ref)+'</td>'+
       '<td class="num">'+fmt(r.king_geomean)+'</td>'+
@@ -1592,6 +1594,11 @@ function stageDetail(stg){
 function renderStage(){
   var strip=document.getElementById("stage-strip"), detail=document.getElementById("stage-detail");
   if(!strip) return;
+  // Label the live section with the epoch-anchored round number (the same
+  // numbering warm-start checkpoints use, e.g. "(r30)") — the id alone
+  // doesn't tell a reader where we are in the sequence.
+  var lt=document.getElementById("live-title"), cn0=chainNow();
+  if(lt){ var rn0=cn0?roundNoOfBlock(cn0.epochStart):null; lt.innerHTML="This round — live"+(rn0?" · <b>r"+rn0+"</b>":""); }
   var stg=currentStage();
   var idx=stg?STAGES.map(function(s){return s[0];}).indexOf(stg.key):-1;
   strip.innerHTML=STAGES.map(function(s,i){
@@ -1637,7 +1644,13 @@ function renderSubs(){
 // block the index carries. Verified: r10/r11/r12/r15/r16/r17 all map correctly.
 var WS_ANCHOR_RID="3107676501688987439", WS_ANCHOR_NO=17;
 function roundBlockOf(rid){ var rs=_index&&_index.rounds; if(!rs) return null; for(var i=0;i<rs.length;i++) if(String(rs[i].round_id)===String(rid)) return rs[i].epoch_start_block; return null; }
-function roundNoOf(rid){ var b=roundBlockOf(rid), ab=roundBlockOf(WS_ANCHOR_RID); if(b==null||ab==null) return null; var n=Math.round(WS_ANCHOR_NO+(b-ab)/3600); return n>0?n:null; }
+function roundNoOfBlock(b){ var ab=roundBlockOf(WS_ANCHOR_RID); if(b==null||ab==null) return null; var n=Math.round(WS_ANCHOR_NO+(b-ab)/3600); return n>0?n:null; }
+function roundNoOf(rid){
+  var b=roundBlockOf(rid);
+  // the LIVE round is not in the receipts index yet — status/round.json carries its block
+  if(b==null&&_roundStatus&&String(_roundStatus.round_id)===String(rid)) b=Number(_roundStatus.epoch_start_block)||null;
+  return roundNoOfBlock(b);
+}
 function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
 function renderWarm(){
   var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
@@ -1658,13 +1671,14 @@ function renderWarm(){
   var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init;
   var settledRid=_heat.round_id, liveRid=_roundStatus && _roundStatus.round_id;
   var running = liveRid && String(liveRid)!==String(settledRid);
+  function ridLabel(rid){ var rn=roundNoOf(rid); return esc(shortRoundId(rid))+(rn?" · r"+rn:""); }
   var html='<div style="display:flex;flex-direction:column;gap:6px">';
   if(running){
     if(nxt){
-      html+='<div><span class="muted">Current round ('+esc(shortRoundId(liveRid))+', running) is training from:</span> '
+      html+='<div><span class="muted">Current round ('+ridLabel(liveRid)+', running) is training from:</span> '
           + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
     }
-    html+='<div><span class="muted">Last completed round ('+esc(shortRoundId(settledRid))+') trained from:</span> '
+    html+='<div><span class="muted">Last completed round ('+ridLabel(settledRid)+') trained from:</span> '
         + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
     html+='<div class="muted" style="font-size:.85em">The next round&rsquo;s init is drawn from the rotation '
         + 'when this heat settles. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by '
@@ -1674,7 +1688,7 @@ function renderWarm(){
       html+='<div><span class="muted">Next round will warm-start from:</span> '
           + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
     }
-    html+='<div><span class="muted">Current round ('+esc(shortRoundId(settledRid))+') warm-started from:</span> '
+    html+='<div><span class="muted">Current round ('+ridLabel(settledRid)+') warm-started from:</span> '
         + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
     html+='<div class="muted" style="font-size:.85em">Next is a schedule &mdash; a promotion can change the '
         + 'set. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by design; each start is '
