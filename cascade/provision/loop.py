@@ -401,6 +401,9 @@ class ProvisionerLoop:
     _next_retry_at: dict = field(default_factory=dict, init=False, repr=False)
     _retry_backoff: dict = field(default_factory=dict, init=False, repr=False)
     _dud_pods: dict = field(default_factory=dict, init=False, repr=False)
+    # pod id → names of the health checks it failed (set by _boot_and_gate,
+    # consumed once by the replacement path's facility-exclusion decision).
+    _gate_failures: dict = field(default_factory=dict, init=False, repr=False)
     _pending_logged_at: float = field(default=0.0, init=False, repr=False)
     # Ledger-adopted pods awaiting their re-gate against the CURRENT config
     # (see _maybe_regate_adopted): set on resume, cleared when the re-gate
@@ -1260,10 +1263,24 @@ class ProvisionerLoop:
             # failed executor (observed: eval pod + replacement both dead on
             # 63243c2c…, round 5052267627071284702).
             lemon = getattr(prov, "machine_of", lambda _p: None)(pid)
+            # An image_digest failure means the FACILITY's host image cache is
+            # serving a stale template — a same-region replacement predictably
+            # re-boots the same wrong image (r51, 2026-08-30: kansascity served
+            # v0.6.0 twice against the v0.7.0 pin). Walk the replacement to a
+            # different region instead of a different machine.
+            bad_region = None
+            if "image_digest" in self._gate_failures.pop(pid, ()):
+                bad_region = getattr(prov, "region_of", lambda _p: None)(pid)
+                if bad_region:
+                    log.warning("round %s %s: image_digest failure on %s — "
+                                "excluding region %s from the replacement pick",
+                                round_id, stage, pid, bad_region)
             self._terminate_and_drop(prov, pid)
             rspec = replace(spec, count=1,
                             name_prefix=f"{POD_TAG}{round_id}-{stage}{suffix}-r{i}",
-                            exclude_ids=spec.exclude_ids + ((lemon,) if lemon else ()))
+                            exclude_ids=spec.exclude_ids + ((lemon,) if lemon else ()),
+                            exclude_regions=spec.exclude_regions
+                            + ((bad_region,) if bad_region else ()))
             try:
                 rid = prov.launch(rspec)[0]
             except Exception as e:  # noqa: BLE001
@@ -1277,6 +1294,7 @@ class ProvisionerLoop:
             else:
                 log.error("round %s %s: replacement %s also failed; dropping the slot",
                           round_id, stage, rid)
+                self._gate_failures.pop(rid, None)
                 self._dud_pods[stage] = self._dud_pods.get(stage, 0) + 1
                 self._terminate_and_drop(prov, rid)
         return healthy
@@ -1316,6 +1334,10 @@ class ProvisionerLoop:
                                             attested_digest=attested))
                 if not report.ok:
                     log.warning("pod %s failed health gate: %s", pid, report.summary())
+                    # Remember WHICH checks failed: the replacement path treats
+                    # an image_digest failure as a facility property (stale
+                    # host image cache), not a machine lemon.
+                    self._gate_failures[pid] = tuple(c.name for c in report.failures)
                     return None
         except Exception as e:  # noqa: BLE001 — any boot fault is a failed pod, not a dead loop
             log.warning("pod %s boot/health errored: %s", pid, e)
