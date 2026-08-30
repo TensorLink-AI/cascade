@@ -136,9 +136,12 @@ def build_prewarm_remote_command(workdir: str, *,
 
 def role_paths(host: RemoteHost, round_id: str, arch_preset: str,
                role: str = "king") -> tuple[str, str]:
-    """(checkpoint dir, report path) of a round's final ``role`` on the pod —
-    the layout ``cascade.trainer.worker`` writes under ``<workdir>/_train_work``
-    (final runs carry no repo suffix, so the dir is exactly the role name)."""
+    """(checkpoint dir, report path) of a round's final ``role`` on the pod.
+    ``role`` is the work-DIR name: bare (``king``, ``challenger``) for
+    pre-cohort finals, uid-suffixed (``challenger-u<uid>``) when a
+    DEC-CA-0012 cohort trained several challengers — callers pass the
+    suffixed form (see ``loop._bench_role_dir``). Matches the layout
+    ``cascade.trainer.worker`` writes under ``<workdir>/_train_work``."""
     base = f"{host.workdir}/_train_work/{round_id}/{arch_preset}/{role}"
     return f"{base}/checkpoint", f"{base}/benchmark_report.json"
 
