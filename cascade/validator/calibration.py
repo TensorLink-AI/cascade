@@ -77,7 +77,6 @@ def calib_draw(
         return []
 
     rng = np.random.default_rng(seed)
-    domains = sorted(eligible)
     picked: list[int] = []
     want = n_windows
     # Scarce domains first at capacity, then the even split over the rest —
@@ -174,7 +173,8 @@ def run_horizon_calibration(
             elif king_scores is not None and len(scores) == len(king_scores):
                 # Paired per-window MASE deltas (challenger − king): the spread
                 # statistic the admission mask + margin recalibration need.
-                deltas = [c.mase - k.mase for c, k in zip(scores, king_scores)]
+                deltas = [c.mase - k.mase
+                          for c, k in zip(scores, king_scores, strict=True)]
                 entry["mase_delta_vs_king"] = {
                     "mean": round(float(np.mean(deltas)), 6),
                     "std": round(float(np.std(deltas)), 6),

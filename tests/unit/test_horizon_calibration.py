@@ -19,7 +19,6 @@ from cascade.validator.calibration import (
     run_horizon_calibration,
 )
 
-
 # ── config round-trip (every knob needs the loader parse) ────────────────────
 
 
@@ -75,7 +74,7 @@ def test_calib_draw_filters_eligibility_and_splits_evenly():
     assert len(w720) == 12
 
     # short series need horizon + MIN_CONTEXT
-    assert 300 < 720 + MIN_CONTEXT
+    assert 720 + MIN_CONTEXT > 300
 
 
 def test_calib_draw_deterministic_in_seed():
@@ -114,7 +113,7 @@ def _pool_dir(tmp_path):
     d.mkdir()
     series, metadata = _series_set()
     md = {}
-    for i, (s, m) in enumerate(zip(series, metadata)):
+    for i, (s, m) in enumerate(zip(series, metadata, strict=True)):
         np.save(d / f"s{i}.npy", s)
         md[f"s{i}"] = m
     (d / "metadata.json").write_text(json.dumps(md))
