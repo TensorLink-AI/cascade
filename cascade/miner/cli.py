@@ -901,8 +901,11 @@ def _cmd_submit(args: argparse.Namespace) -> int:
 
     try:
         import bittensor  # signing only — the chain connects later, if committing
-        wallet = bittensor.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey,
-                                  path=args.wallet_path)
+        # bittensor <9 exposed lowercase ``wallet``; 9+/10 only ship ``Wallet``
+        # (same shim as shared/chain.py — the pinned 10.5.0 has no ``wallet``).
+        _wallet_factory = getattr(bittensor, "wallet", None) or bittensor.Wallet
+        wallet = _wallet_factory(name=args.wallet_name, hotkey=args.wallet_hotkey,
+                                 path=args.wallet_path)
         hotkey_ss58 = wallet.hotkey.ss58_address
         sign_fn = wallet.hotkey.sign
     except Exception as e:  # noqa: BLE001 — wallet errors are usage errors here
@@ -1075,8 +1078,9 @@ def _cmd_fund(args: argparse.Namespace) -> int:
 
     try:
         import bittensor  # the [chain] extra; signing only — no connection
-        wallet = bittensor.wallet(name=args.wallet_name, hotkey=args.wallet_hotkey,
-                                  path=args.wallet_path)
+        _wallet_factory = getattr(bittensor, "wallet", None) or bittensor.Wallet
+        wallet = _wallet_factory(name=args.wallet_name, hotkey=args.wallet_hotkey,
+                                 path=args.wallet_path)
         hotkey_ss58 = wallet.hotkey.ss58_address
         sign_fn = wallet.hotkey.sign
     except Exception as e:  # noqa: BLE001 — wallet errors are usage errors here
