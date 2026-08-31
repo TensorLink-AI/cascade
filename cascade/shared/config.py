@@ -992,6 +992,19 @@ class EvalConfig:
     # ``benchmark_max_series`` so tightening telemetry never quietly shrinks the
     # Cascade decision. Set a positive cap only to speed up testnet iteration.
     cascade_bench_max_series: int = 0
+    # ── Multi-horizon calibration telemetry (LOG-ONLY; never feeds the verdict)
+    # docs/notes/2026-08-31-multi-horizon-eval.md. Empty tuple = off (inert
+    # default). When set, the validator scores the round's duel checkpoints at
+    # each extra horizon on its OWN seeded, even-by-domain, eligibility-filtered
+    # window draw AFTER the receipt publishes, and logs per-(horizon, domain)
+    # geomeans + king/challenger deltas. This is the calibration measurement
+    # for the scored 16/64/256/720 ladder — candidate spread vs noise per cell
+    # feeds the margin recalibration and the cell admission mask. The scored
+    # flip itself is a separate, coordinated consensus release; these knobs
+    # deliberately cannot cause one.
+    calib_horizons: tuple[int, ...] = ()
+    calib_windows: int = 256        # windows per horizon (even-by-domain draw)
+    calib_num_samples: int = 32     # sample paths per window (cost control)
     # Cascade post-publish bench hold (see provision.policy.bench_hold_active):
     # how long the provisioner may keep the round's FINAL pod alive past its
     # normal teardown signal while the duel bench runs, in hours. The hold ends
@@ -1777,6 +1790,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             gift_gate_data_dir=str(e.get("gift_gate_data_dir", "")),
             gift_gate_timeout_s=int(e.get("gift_gate_timeout_s", 3600)),
             cascade_bench_max_series=int(e.get("cascade_bench_max_series", 0)),
+            calib_horizons=tuple(int(h) for h in e.get("calib_horizons", ())),
+            calib_windows=int(e.get("calib_windows", 256)),
+            calib_num_samples=int(e.get("calib_num_samples", 32)),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
             mix_from_block=int(e.get("mix_from_block", 0)),
             mix_jitter_alpha=float(e.get("mix_jitter_alpha", 4.0)),

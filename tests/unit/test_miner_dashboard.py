@@ -269,6 +269,32 @@ def test_run_dashboard_stage_precedence_live_beats_estimate_settled_beats_live()
     assert "[SETTLED]" in out.getvalue()
 
 
+def test_run_dashboard_shows_warm_start_from_live_stage_doc():
+    from cascade.miner.dashboard import warm_start_line
+
+    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
+    ptr = ("metro-v1:trained:hippius:cascade/ckpt-r9-king-toto2-4m@sha256:"
+           + "a" * 64)
+    out = io.StringIO()
+    run_dashboard(_FakeClient(8400), rc, "test", out=out,
+                  status_fetch=lambda: _live_doc(warm_start={
+                      "init_checkpoint": ptr, "size": "toto2-4m",
+                      "generation": 4}))
+    text = out.getvalue()
+    assert ("warm start      this round trains from "
+            "cascade/ckpt-r9-king-toto2-4m@sha256:aaaaaaaaaaaa…") in text
+    assert "(generation 4)" in text
+    # Random-init round (no warm_start in the doc) ⇒ no line at all.
+    out = io.StringIO()
+    run_dashboard(_FakeClient(8400), rc, "test", out=out,
+                  status_fetch=lambda: _live_doc())
+    assert "warm start" not in out.getvalue()
+    # Helper edge cases: absent/malformed block, and no dangling generation.
+    assert warm_start_line(None) is None
+    assert warm_start_line({"size": "toto2-4m"}) is None
+    assert "generation" not in warm_start_line({"init_checkpoint": ptr})
+
+
 def test_settled_entry_prefers_scored_and_outcome_lines():
     doc = {"rounds": [
         {"round_id": "1", "epoch_start_block": 7200, "status": "rejected",

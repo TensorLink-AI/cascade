@@ -235,9 +235,19 @@ def test_make_bench_prewarm_launches_only_on_final_pods(monkeypatch, tmp_path):
     remote_cmd = argv[-1]
     assert "root@10.0.0.9" in argv and "2222" in argv
     assert "cascade-benchmark-download" in remote_cmd and "nohup" in remote_cmd
-    # the credential travels on stdin, never inside the command string
+    # the ROUND-CRITICAL token is never forwarded — the pre-warm runs
+    # concurrently with generator fetches and shares quota per token (r51,
+    # 2026-08-30: the download 429-starved both finalists' fetches). Without
+    # a dedicated bench token the download runs anonymous.
     assert "hf_secret456" not in remote_cmd
-    assert payload == "HF_TOKEN=hf_secret456\n"
+    assert payload is None
+    # a dedicated HF_BENCH_TOKEN rides stdin under the remote's HF_TOKEN name
+    # (what huggingface_hub reads on the pod), never the command string
+    monkeypatch.setenv("HF_BENCH_TOKEN", "hf_bench789")
+    hook(PodAddress("10.0.0.9", 2222), "final", "lium")
+    argv, payload = ran[-1]
+    assert "hf_bench789" not in argv[-1]
+    assert payload == "HF_TOKEN=hf_bench789\n"
 
 
 def test_no_trigger_outside_margin(tmp_path):
@@ -397,6 +407,50 @@ def test_replacement_excludes_the_failed_pods_machine(tmp_path):
     assert prov.machine_by_pod["cascade-900-heat-r0-0"] == "m-good"
     heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
     assert heat and all(h.host == prov.live["cascade-900-heat-r0-0"].ip for h in heat)
+
+
+def test_image_digest_failure_excludes_the_facility(tmp_path):
+    """Incident 2026-08-30 r51: a final pod booted a STALE image (facility
+    host-image cache) and its same-region replacement predictably booted the
+    same wrong image. An image_digest gate failure must walk the replacement
+    to a different region; other failures keep machine-level exclusion only."""
+
+    class RegionAwareProvider(FakeProvider):
+        regions = ("kansascity-usa-1", "chicago-usa-2")
+
+        def __init__(self, name, **kw):
+            super().__init__(name, **kw)
+            self.region_by_pod: dict[str, str] = {}
+            self.specs = []
+
+        def launch(self, spec):
+            self.specs.append(spec)
+            region = next(r for r in self.regions if r not in spec.exclude_regions)
+            ids = super().launch(spec)
+            for pid in ids:
+                self.region_by_pod[pid] = region
+            return ids
+
+        def region_of(self, pod_id):
+            return self.region_by_pod.get(pod_id)
+
+    prov = RegionAwareProvider("lium")
+
+    def health(addr, stage, provider="", **shape):
+        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
+        stale = (stage == "heat"
+                 and prov.region_by_pod[pid] == "kansascity-usa-1")
+        return _report(ok=not stale, name="image_digest")
+
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
+    cycle(loop)
+
+    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
+    assert rspec.exclude_regions == ("kansascity-usa-1",)    # the fix
+    assert prov.region_by_pod["cascade-900-heat-r0-0"] == "chicago-usa-2"
+    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
+    assert heat and all(h.host == prov.live["cascade-900-heat-r0-0"].ip for h in heat)
+    assert loop._gate_failures == {}                         # consumed, no leak
 
 
 def test_every_pod_unhealthy_clears_hosts(tmp_path):

@@ -590,6 +590,18 @@ def _short_pointer(pointer: str) -> str:
     return tail
 
 
+def warm_start_line(ws: object) -> str | None:
+    """One ``warm start`` dashboard line from a round/heat doc's ``warm_start``
+    block (``cascade round``'s compact form of :func:`render_heat`'s pair of
+    lines), or None — a random-init round or an absent block shows nothing."""
+    if not isinstance(ws, dict) or not ws.get("init_checkpoint"):
+        return None
+    gen = ws.get("generation")
+    return (f"  warm start      this round trains from "
+            f"{_short_pointer(str(ws['init_checkpoint']))}"
+            + (f"  (generation {gen})" if gen else ""))
+
+
 def render_heat(doc: dict | None, *, me: str | None = None) -> str:
     """The standalone ``cascade heat`` view of one published heat document."""
     if not isinstance(doc, dict):
@@ -961,12 +973,13 @@ def render(
     last_outcome: str | None = None,
     heat_lines: list[str] | None = None,
     bar_line: str | None = None,
+    warm_line: str | None = None,
 ) -> str:
     """The dashboard frame. ``drift_seconds`` is the wall-clock time elapsed
     since ``st.block`` was fetched, so watch mode can tick the countdown every
     second between chain polls. ``phase`` / ``submissions`` / ``last_outcome`` /
-    ``heat_lines`` are optional sections (None omits each), so the countdown-only
-    frame is unchanged for callers without the live feed."""
+    ``heat_lines`` / ``warm_line`` are optional sections (None omits each), so
+    the countdown-only frame is unchanged for callers without the live feed."""
     remaining = max(0.0, st.seconds_remaining - drift_seconds)
     eta = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(time.time() + remaining))
     pct = st.progress * 100.0
@@ -990,6 +1003,8 @@ def render(
         lines.append(f"  last round      {last_outcome}")
     if bar_line:
         lines.append(bar_line)
+    if warm_line:
+        lines.append(warm_line)
     if heat_lines:
         lines += heat_lines
     if submissions is not None:
@@ -1057,9 +1072,21 @@ def compose_frame(
     # settles its receipt states the margin it was actually judged at.
     bar_line = (dethrone_bar_line(feed.index_doc, scoring)
                 if entry is None else None)
+    # Cascade warm-start: which promoted init this round's runs train from.
+    # The trainer-reported stage doc carries it from the first stage publish
+    # (older trainers don't — then the heat doc supplies it once the heat
+    # settles); both are gated to THIS round, so a stale doc shows nothing.
+    from ..shared.chain_status import live_round_stage
+
+    live_doc = live_round_stage(feed.round_status_doc,
+                                epoch_start_block=st.epoch_start,
+                                now_s=time.time())
+    ws = ((live_doc.get("warm_start") if isinstance(live_doc, dict) else None)
+          or (heat_doc.get("warm_start") if isinstance(heat_doc, dict) else None))
     return render(st, network, drift_seconds=drift_seconds, phase=phase,
                   submissions=submissions, last_outcome=last_outcome,
-                  heat_lines=heat_lines, bar_line=bar_line)
+                  heat_lines=heat_lines, bar_line=bar_line,
+                  warm_line=warm_start_line(ws))
 
 
 def run_dashboard(

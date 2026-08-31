@@ -3,8 +3,10 @@
 > cascade is a Bittensor subnet (mainnet netuid 91, testnet netuid 259) that builds
 > state-of-the-art time-series foundation models by competing on **synthetic training
 > data**. Miners submit deterministic, code-only data generators; the subnet owner's
-> trainer trains a fixed Toto2-4M forecaster **from scratch** on each generator's
-> output under a byte-identical contract, and validators score the resulting models
+> trainer trains a fixed Toto2-4M forecaster on each generator's output **from the
+> round's shared init** (random at generation 0; the promoted cascade checkpoint
+> once a reign is promoted — live on mainnet) under a byte-identical contract, and
+> validators score the resulting models
 > on a private, rotating held-out set (CRPS + MASE). The best data holds the throne
 > (king-of-the-hill) and earns emissions. Miners need **no GPU** to compete.
 
@@ -17,11 +19,12 @@ repository docs that hold the full detail. When this summary and a linked doc or
 
 - The task: produce a synthetic time-series **data generator** whose output trains a
   better zero-shot forecaster than the reigning king's data. The model
-  (Toto2-4M, trained from random init) is byte-identical across all competitors; the
-  ONLY variable is the generator code. This makes each round a controlled
-  experiment on data quality, not architecture or hyperparameters.
+  (Toto2-4M, trained from the round's shared init) is byte-identical across all
+  competitors; the ONLY variable is the generator code. This makes each round a
+  controlled experiment on data quality, not architecture or hyperparameters.
 - Scoring: validators evaluate trained checkpoints on a **private, rotating**
-  held-out pool of real-world windows (2000 windows/round, context 4096,
+  held-out pool of real-world windows (a jittered ~1200-window draw whose domain
+  mix re-rolls every round, context 4096,
   horizon 64) using the geometric mean of CRPS (via a 9-quantile pinball head) and
   MASE. Lower is better. You never see the eval windows, and the slice rotates
   every round — benchmark-shaped or memorisable corpora do not win; broad,
@@ -34,10 +37,16 @@ repository docs that hold the full detail. When this summary and a linked doc or
   prior distinct kings still registered share emission ∝ 0.5^i
   (≈52/26/13/6/3%); unregistered remainder burns. Winning ONE round is not the
   goal; taking and holding the throne is.
-- The cascade (namesake, armed): when a king survives 5 consecutive rounds, its
-  reign's best checkpoint is **promoted** and becomes the warm-start init for all
-  later rounds — improvements compound across generations instead of resetting.
-  The king persists through promotion (reign clock resets).
+- The cascade (namesake, **LIVE** — generations are promoting on mainnet): when a
+  king survives 5 consecutive rounds, up to 3 of the reign's best duel checkpoints
+  (within 5% of the reign best — the king's AND losing challengers') are
+  **promoted** as the next warm-start generation; later rounds rotate across the
+  members, and every run in a round (heat and final) trains from that same init —
+  improvements compound across generations instead of resetting. A no-downgrade
+  guard holds the promotion until the reign best benches at least as well as the
+  live generation's best member. The king persists through promotion (reign clock
+  resets), and promotion pays the checkpoint's owner nothing — but your data can
+  shape the shared init even from a losing duel.
 
 ## Rules — binding constraints on submissions
 
@@ -99,15 +108,17 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
   pointer **revealed strictly before** the epoch boundary compete; a late reveal
   auto-rolls into the next round.
 - **Heat** (screening): every eligible challenger's generator trains the fixed
-  model for ~1h at the screen size, scored on 2000 held-out windows. The top
-  `finalists` (currently 1) advance. Standings publish the moment the heat
-  settles (`cascade heat`), including for rounds later rejected at a gate.
-- **Final** (the duel): king and finalist each train from the SAME shared round
+  model for ~1h at the screen size, scored on the round's held-out eval draw. A
+  leader the screen statistically separates advances alone; a tied top advances
+  as a cohort, capped at `max_finalists` (3). Standings publish the moment the
+  heat settles (`cascade heat`), including for rounds later rejected at a gate.
+- **Final** (the duel): king and finalists each train from the SAME shared round
   init (random at generation 0; the promoted cascade checkpoint after a
-  promotion) with identical seeds, budget (~3h as a fixed token count), and
-  contract, at every configured throne size (4M live today). Validators verify
-  the signed manifest's contract digests, evaluate both checkpoints on the
-  shared private windows, and issue one paired-bootstrap KOTH verdict.
+  promotion — the live case today) with identical seeds, budget (~3h as a fixed
+  token count), and contract, at every configured throne size (4M live today).
+  Validators verify the signed manifest's contract digests, evaluate the
+  checkpoints on the shared private windows, and judge the whole advanced cohort
+  under a family-wise alpha, crowning the best margin-clearer.
 - Everything is publicly re-derivable: signed manifests and round receipts land
   in a public bucket; `cascade-audit latest` re-derives seeds, digests, and the
   verdict of any published round (docs/AUDIT.md). If no real miner has taken the
@@ -171,13 +182,19 @@ Widen the prior (mix families) rather than fitting one shape.
 ## Key configuration values (chain.toml, shipped)
 
 - netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 3600 blocks ≈ 12h
-- heat: 1h train budget, 2000 eval windows, top 1 advances
+- heat: 1h train budget, scored on the round's eval draw; separated leader
+  advances alone, tied cohort capped at `max_finalists` (3)
+- eval: jittered ~1200-window draw per round (`mix_target_windows`) from the
+  private rotating pool — the domain mix re-rolls every round
 - final: 3h token-budget train per side, Toto2-4M from the shared round init
-- dethrone: paired-bootstrap LCB (B=10000, α=0.05) must clear the tenure-decayed
+- dethrone: paired-bootstrap LCB (B=10000, α=0.05, α/k across a tied cohort)
+  must clear the tenure-decayed
   margin (2% → 0.5% over 8 rounds); ≥200 common windows or no decision
 - rewards: king + 4 prior kings, geometric 0.5 decay; remainder burns to uid 0
-- cascade promotion: after 5 undethroned rounds, top-k (≤3) reign checkpoints
-  within 5% of the best bench geomean become the next warm-start generation
+- cascade promotion (LIVE): after 5 undethroned rounds, top-k (≤3) reign
+  checkpoints within 5% of the best bench geomean become the next warm-start
+  generation; a no-downgrade guard holds vs the current generation's best;
+  rounds then rotate members by epoch index
 
 ## Docs
 

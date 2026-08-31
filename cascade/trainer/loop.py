@@ -688,6 +688,20 @@ def _final_repo_suffix(
     return f"-u{gen.uid}"
 
 
+def _bench_role_dir(duel: list, entry) -> str:
+    """Work-dir name of a duel entry's checkpoint on its pod, for the
+    post-publish bench sweep. Must mirror ``_final_repo_suffix``: a
+    DEC-CA-0012 cohort final trains each challenger under
+    ``challenger-u<uid>``, so the bench has to look there — while the king
+    and every single-challenger final keep the bare role name (pre-cohort
+    rounds bench at exactly the paths they always did)."""
+    if entry.role != "challenger":
+        return entry.role
+    if sum(1 for e in duel if e.role == "challenger") <= 1:
+        return entry.role
+    return f"{entry.role}-u{entry.miner_uid}"
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -1925,6 +1939,7 @@ class TrainerRunner:
                 heat_done=heat_done,
                 heat_total=heat_total,
                 finalists=finalists,
+                warm_start=self._stage_ctx.get("warm_start"),
             )
             publish_round_status(self.manifest_store(), doc)
             self._stage_published_at = time.time()
@@ -3026,7 +3041,9 @@ class TrainerRunner:
             def _bench_pod_group(pairs: list[tuple[object, TrainedEntry]]) -> None:
                 for host, entry in pairs:
                     try:
-                        scores = self._remote_bench_scores(host, entry, round_id, primary)
+                        scores = self._remote_bench_scores(
+                            host, entry, round_id, primary,
+                            role_dir=_bench_role_dir(duel, entry))
                     except Exception as e:  # noqa: BLE001 — one bad sweep must not lose the rest
                         log.warning("round=%s: remote bench failed for %s %s on %s: %s",
                                     round_id, entry.role, entry.miner_hotkey,
@@ -3065,7 +3082,8 @@ class TrainerRunner:
         return hosts[0] if entry.role == "king" else hosts[1 % len(hosts)]
 
     def _remote_bench_scores(
-        self, host: object, entry: TrainedEntry, round_id: str, primary: str
+        self, host: object, entry: TrainedEntry, round_id: str, primary: str,
+        *, role_dir: str | None = None,
     ) -> BenchScores | None:
         """One remote sweep → six numbers, or ``None`` on any miss.
 
@@ -3076,7 +3094,7 @@ class TrainerRunner:
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import run_post_round_benchmark
 
-        bench_round, bench_role = round_id, entry.role
+        bench_round, bench_role = round_id, (role_dir or entry.role)
         frac = float(getattr(self.cfg.telemetry, "bench_anneal_fraction", 0.0) or 0.0)
         if frac > 0.0:
             annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac)

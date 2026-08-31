@@ -143,7 +143,8 @@ def window_source_from_dir(
         )
     log.info("loaded eval pool %s series=%d windows=%d", label, len(series), len(windows))
     return RotatingWindowSource(
-        pool=tuple(windows), provenance=provenance, mix=mix_params_from_config(cfg)
+        pool=tuple(windows), provenance=provenance, mix=mix_params_from_config(cfg),
+        source_dir=str(dest),
     )
 
 
@@ -219,6 +220,17 @@ class BucketWindowSource:
         # Forward the epoch block: it selected the snapshot above AND gates the
         # jittered mix inside the snapshot's RotatingWindowSource.
         return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows, block=block)
+
+    def snapshot_dir_for_round(self, *, block=None):
+        """Local directory of the snapshot serving a round at epoch ``block``,
+        or ``None`` when no snapshot is published. Fetches (and caches) the
+        snapshot exactly like the round draw, so the calibration pass reads
+        the same series the verdict windows were cut from."""
+        meta = self._select(block)
+        if meta is None:
+            return None
+        self._ensure_snapshot(meta)
+        return self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
 
     def provenance_for_round(self, round_seed, *, block=None) -> tuple[str, str]:
         """``(snapshot_key, tar_sha256)`` of the snapshot active for the round —
