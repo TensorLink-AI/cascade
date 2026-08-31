@@ -1565,6 +1565,56 @@ class ValidatorRunner:
         except Exception as e:  # noqa: BLE001 — telemetry only
             log.debug("chain status publish skipped: %s", e)
 
+    def _maybe_calibrate_horizons(
+        self, manifest: TrainingManifest, base_seed: int | str, window_source: object
+    ) -> None:
+        """Multi-horizon calibration telemetry (``[eval] calib_horizons``) —
+        LOG-ONLY, runs strictly AFTER weights and the receipt, and is wrapped
+        so no failure mode can reach the round path. Scores the round's duel
+        checkpoints (already fetched by the verdict eval, so this re-uses the
+        local cache) at each extra rung on its own seeded even-by-domain draw
+        and writes ``_calib/round-<id>.json`` beside the state file."""
+        horizons = tuple(getattr(self.cfg.eval, "calib_horizons", ()) or ())
+        if not horizons:
+            return
+        try:
+            from .calibration import run_horizon_calibration
+
+            dir_fn = getattr(window_source, "snapshot_dir_for_round", None)
+            pool_dir = dir_fn(block=self._epoch_start_block(manifest)) if dir_fn else None
+            if pool_dir is None:
+                log.info("calib: window source exposes no series dir; skipping")
+                return
+            primary = self.cfg.training.primary_size.arch_preset
+            checkpoints: dict[str, Path] = {}
+            for entry in manifest.entries:
+                if (entry.size or primary) != primary:
+                    continue
+                label = ("king" if entry.role == "king"
+                         else f"{entry.role}-u{entry.miner_uid}")
+                checkpoints[label] = self._fetch_checkpoint_dir(entry)
+            if "king" not in checkpoints:
+                return
+            # King first: the paired deltas in the report are vs the king.
+            ordered = {"king": checkpoints.pop("king"), **checkpoints}
+            doc = run_horizon_calibration(
+                ordered, Path(pool_dir),
+                horizons=horizons,
+                n_windows=int(self.cfg.eval.calib_windows),
+                num_samples=int(self.cfg.eval.calib_num_samples),
+                context_length=int(self.cfg.eval.context_length),
+                seed=int(str(base_seed)) % (2**63),
+                device=self.device,
+            )
+            out = Path("_calib")
+            out.mkdir(parents=True, exist_ok=True)
+            p = out / f"round-{manifest.round_id}.json"
+            p.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+            log.info("calib: round=%s horizons=%s → %s",
+                     manifest.round_id, list(horizons), p)
+        except Exception as e:  # noqa: BLE001 — telemetry must never hurt the round
+            log.warning("calib: skipped for round=%s (%s)", manifest.round_id, e)
+
     def run_forever(self, client: object, *, window_source: object) -> None:  # pragma: no cover
         """Poll the manifest bucket → evaluate → set weights, once per round.
 
@@ -1756,6 +1806,9 @@ class ValidatorRunner:
                         # reign clock on a dethrone, records the king's checkpoint,
                         # and fires the promotion when the clock is ripe.
                         self._cascade_round(manifest, outcome)
+                        # Multi-horizon calibration telemetry — after everything
+                        # consensus-relevant; log-only, inert unless configured.
+                        self._maybe_calibrate_horizons(manifest, base_seed, window_source)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
             try:

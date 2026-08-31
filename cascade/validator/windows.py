@@ -406,10 +406,22 @@ class RotatingWindowSource:
     # every round while they upgrade, and audit replay applies each round's
     # own rule.
     mix: MixParams | None = None
+    # Local directory the pool's raw series were loaded from ("" for an
+    # injected/test pool). The multi-horizon calibration pass re-cuts windows
+    # at its own horizons from these series — the pre-cut ``pool`` targets are
+    # exactly ``[eval] horizon`` long and cannot serve a longer rung.
+    source_dir: str = ""
 
     def __post_init__(self) -> None:
         if not self.pool:
             raise ValueError("RotatingWindowSource pool is empty")
+
+    def snapshot_dir_for_round(self, *, block: int | None = None):
+        """Series directory serving the round, or ``None`` (``block`` ignored:
+        a static pool serves every round from one directory)."""
+        from pathlib import Path
+
+        return Path(self.source_dir) if self.source_dir else None
 
     def provenance_for_round(self, round_seed: int | str, *, block: int | None = None) -> tuple[str, str]:
         """``(pool_ref, pool_digest)`` recorded in the round receipt. A static
