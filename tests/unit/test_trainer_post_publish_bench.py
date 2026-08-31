@@ -279,6 +279,65 @@ def test_wandb_pair_logged_per_round(cascade_cfg, tmp_path, monkeypatch):
                for r in emitted if isinstance(r, dict))
 
 
+# ── cohort finals bench at uid-suffixed work dirs (r51 regression) ───────────
+# A DEC-CA-0012 cohort trains challengers under challenger-u<uid> dirs
+# (_final_repo_suffix), but the remote bench sweep looked at the bare
+# "challenger" path — on the first 2-challenger mainnet final (r51) every
+# challenger leg 404'd and the signed report shipped king-only.
+
+
+def _duel_entry(role, uid, hotkey):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(role=role, size="toto2-4m", miner_uid=uid,
+                           miner_hotkey=hotkey, trained_pointer=f"ptr-{hotkey}")
+
+
+def test_bench_role_dir_suffixes_only_cohort_challengers():
+    king = _duel_entry("king", 7, "k")
+    solo = [king, _duel_entry("challenger", 1, "a")]
+    # pre-cohort shapes keep their exact dirs (inert-default bit-identity)
+    assert loop_mod._bench_role_dir(solo, solo[0]) == "king"
+    assert loop_mod._bench_role_dir(solo, solo[1]) == "challenger"
+    cohort = [king, _duel_entry("challenger", 1, "a"), _duel_entry("challenger", 2, "b")]
+    assert loop_mod._bench_role_dir(cohort, cohort[0]) == "king"
+    assert loop_mod._bench_role_dir(cohort, cohort[1]) == "challenger-u1"
+    assert loop_mod._bench_role_dir(cohort, cohort[2]) == "challenger-u2"
+
+
+def test_cohort_remote_sweep_benches_every_suffixed_challenger(
+        cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    runner.cascade_bench_plan = object()      # remote plan wired
+    runner.remote_hosts = {"final": ["pod"]}  # truthiness gate only
+    duel = [_duel_entry("king", 7, "k"),
+            _duel_entry("challenger", 1, "a"), _duel_entry("challenger", 2, "b")]
+    from types import SimpleNamespace
+
+    host = SimpleNamespace(host="1.2.3.4", name="pod-0")
+    for e in duel:
+        runner._final_role_hosts[(e.role, e.size, e.miner_hotkey)] = host
+
+    benched_dirs: list[str] = []
+
+    def _fake_bench(host, rid, size, plan, *, work_root=None, role="king", **kw):
+        benched_dirs.append(role)
+        return {"report": role}
+
+    monkeypatch.setattr("cascade.trainer.bench_hook.run_post_round_benchmark",
+                        _fake_bench)
+    monkeypatch.setattr(
+        "cascade.eval.benchmarks.extract_bench_scores",
+        lambda report: dict(gifteval_crps=0.4, gifteval_mase=0.8, boom_crps=0.5,
+                            boom_mase=0.9, time_crps=0.3, time_mase=0.7))
+
+    out = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+
+    # every leg benched at its actual work dir — and every entry scored
+    assert sorted(benched_dirs) == ["challenger-u1", "challenger-u2", "king"]
+    assert set(out) == {e.trained_pointer for e in duel}
+
+
 # ── boundary replay of published bench reports ───────────────────────────────
 # The candidate pool otherwise only sees reports the in-process bench thread
 # publishes: an out-of-band report (a mop-up after a failed leg, a publish
