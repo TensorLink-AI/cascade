@@ -42,24 +42,33 @@ RECOVERY_WINDOW_SECONDS = 6 * 3600.0
 _RETRY_SECS_CAP = 7200
 
 _AUTH_MARKERS = (
-    "permission", "unauthorized", "forbidden", "401", "invalid api key",
+    "permission", "unauthorized", "forbidden", "invalid api key",
     "missing_lium_api_key", "api key missing",
 )
-_RATE_MARKERS = ("429", "too many requests", "rate limit")
+_RATE_MARKERS = ("too many requests", "rate limit")
 _CAPACITY_MARKERS = (
     "no_capacity", "no lium offer", "no offer matches", "no matching offer",
     "sold out", "out of capacity", "only 0 ",
 )
 
+# The numeric codes match only as standalone tokens: error text routinely
+# embeds pod names, and pod names embed a slug of the payer's HOTKEY — a
+# vanity hotkey containing "401"/"429" would otherwise steer every failure on
+# its pods into the auth/rate classes, dodging the bounded infra-attempt
+# budget forever (review 2026-09-02). No boundary between alphanumerics, so
+# "ab401cd" never matches while "HTTP 401" and "(401)" do.
+_AUTH_CODE_RE = re.compile(r"(?<![0-9a-z])401(?![0-9a-z])")
+_RATE_CODE_RE = re.compile(r"(?<![0-9a-z])429(?![0-9a-z])")
+
 
 def is_rate_limited(msg: str) -> bool:
     low = (msg or "").lower()
-    return any(m in low for m in _RATE_MARKERS)
+    return any(m in low for m in _RATE_MARKERS) or bool(_RATE_CODE_RE.search(low))
 
 
 def is_auth_or_permission(msg: str) -> bool:
     low = (msg or "").lower()
-    return any(m in low for m in _AUTH_MARKERS)
+    return any(m in low for m in _AUTH_MARKERS) or bool(_AUTH_CODE_RE.search(low))
 
 
 def is_no_capacity(msg: str) -> bool:

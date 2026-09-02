@@ -55,18 +55,23 @@ FUNDED_STAGE = "funded"
 _SLUG_RE = re.compile(r"[^0-9a-z]")
 
 
-def funded_pod_name(round_id: str, hotkey: str) -> str:
-    """``cascade-<round>-funded-<slug>``: reaper-matchable, payer-attributable.
+def funded_pod_name(round_id: str, hotkey: str, netuid: int) -> str:
+    """``cascade-n<netuid>-<round>-funded-<slug>``: deployment-scoped, payer-attributable.
 
     The slug is the hotkey's first 12 chars lowercased (SS58 is alnum, so this
-    is stable and collision-safe within any real field). The name must satisfy
-    ``loop.is_provisioner_pod_name`` or the orphan reaper would skip — or
-    worse, a rename would orphan — funded pods.
+    is stable and collision-safe within any real field). The ``n<netuid>``
+    token scopes the name to THIS deployment: a miner may fund a testnet and
+    a mainnet cascade from ONE Lium account, and without the discriminator
+    either side's :func:`reconcile_funded` sweep would read the other's live
+    leg as an off-ledger orphan and kill it mid-round (review 2026-09-02).
+    Deliberately NOT the provisioner's ``cascade-<round>-<stage>`` scheme —
+    funded pods are the trainer's, ledgered in ``funded_pods.json``; the
+    provisioner's orphan reaper must never consider them its own.
     """
     slug = _SLUG_RE.sub("", hotkey.lower())[:12]
     if not slug:
         raise ProvisionError(f"cannot derive a pod slug from hotkey {hotkey!r}")
-    return f"cascade-{round_id}-funded-{slug}"
+    return f"cascade-n{int(netuid)}-{round_id}-funded-{slug}"
 
 
 def lium_provider_for_key(api_key: str) -> Provider:
@@ -122,6 +127,7 @@ def rent_funded_pod(
     sku: str,
     image: str,
     ssh_pubkey: str,
+    netuid: int = 0,
     gpus_per_pod: int = 1,
     ready_timeout: float = 900.0,
     exclude_ids: tuple[str, ...] = (),
@@ -148,7 +154,7 @@ def rent_funded_pod(
             burn_attempt=(cls == "infra"), leaked_pod=leaked_pod,
         )
 
-    name = funded_pod_name(round_id, hotkey)
+    name = funded_pod_name(round_id, hotkey, netuid)
     try:
         provider = provider_factory(api_key)
     except Exception as e:  # noqa: BLE001 — a bad key must classify, not crash the round
@@ -163,7 +169,18 @@ def rent_funded_pod(
         launched = provider.launch(spec)
         pod_id = launched[0]
         if not provider.wait_ready(pod_id, timeout=ready_timeout):
-            raise ProvisionError(f"funded pod {pod_id} not ready within {ready_timeout:.0f}s")
+            # Surface the captured `lium up` output INTO the error: launch is
+            # fire-and-forget, so a key revoked (or balance exhausted) between
+            # `ls` and `up` otherwise reads as a generic timeout → classified
+            # "infra" → burns a miner-fixable fault (review 2026-09-02). The
+            # taxonomy classifies on this text; _fail scrubs the key from it.
+            tail = ""
+            tail_fn = getattr(provider, "_up_log_tail", None)
+            if callable(tail_fn):
+                tail = tail_fn(pod_id)
+            raise ProvisionError(
+                f"funded pod {pod_id} not ready within {ready_timeout:.0f}s"
+                + (f"; lium up said: {tail}" if tail else ""))
         addr = provider.get_ip(pod_id)
         if addr is None:
             raise ProvisionError(f"funded pod {pod_id} exposed no IP")
@@ -239,26 +256,30 @@ def teardown_funded(
     return orphaned
 
 
-def payer_pod_pattern(hotkey: str) -> re.Pattern:
+def payer_pod_pattern(hotkey: str, netuid: int) -> re.Pattern:
     """The ONLY names reconcile may touch on ``hotkey``'s account.
 
-    ``cascade-<digits>-funded-<this payer's slug>`` (plus replacement/lane
-    suffixes) — never the generic provisioner scheme. A miner may run their
-    own cascade deployment on the same Lium account they fund with; matching
+    ``cascade-n<netuid>-<digits>-funded-<this payer's slug>`` (plus
+    replacement/lane suffixes) — never the generic provisioner scheme, and
+    never another deployment's funded scheme. A miner may run their own
+    cascade deployment on the same Lium account they fund with; matching
     ``cascade-<n>-heat-…`` there would kill hardware the operator never
     rented — the 2026-07-13 over-reap failure mode, aimed at someone else's
-    fleet (audit 2026-08-29).
+    fleet (audit 2026-08-29). The netuid token additionally stops a testnet
+    deployment sweeping a mainnet deployment's live funded legs (and vice
+    versa) when both share the payer's account (review 2026-09-02).
     """
     slug = _SLUG_RE.sub("", hotkey.lower())[:12]
     if not slug:
         raise ProvisionError(f"cannot derive a pod slug from hotkey {hotkey!r}")
-    return re.compile(rf"^cascade-\d+-funded-{re.escape(slug)}(-|$)")
+    return re.compile(rf"^cascade-n{int(netuid)}-\d+-funded-{re.escape(slug)}(-|$)")
 
 
 def reconcile_funded(
     owned: Iterable[PodInstance],
     vault: PayerKeyVault,
     *,
+    netuid: int = 0,
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
 ) -> list[str]:
     """The orphan reaper's per-payer sweep; returns the pod names CONFIRMED gone.
@@ -285,7 +306,7 @@ def reconcile_funded(
         lister = getattr(provider, "list_tagged", None)
         if lister is None:
             continue
-        mine = payer_pod_pattern(hotkey)
+        mine = payer_pod_pattern(hotkey, netuid)
         try:
             tagged = lister("cascade-")
         except Exception as e:  # noqa: BLE001 — one payer's API trouble must not stop the sweep

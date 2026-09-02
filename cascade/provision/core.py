@@ -642,17 +642,37 @@ class LiumProvider:
             )
         return proc
 
+    def _scrub_key(self, e: ProvisionError) -> ProvisionError:
+        """Re-raiseable copy of ``e`` with the payer key redacted.
+
+        The JSON-parse errors quote raw CLI STDOUT (``output was: …``) —
+        stderr is scrubbed in :meth:`_cli`, but a CLI that ever echoed the key
+        on stdout would reach log lines through the parse path unscrubbed
+        (review 2026-09-02). ``from None`` on the re-raise side: chaining the
+        unscrubbed original would put the key one traceback away.
+        """
+        if self.api_key and self.api_key in str(e):
+            return ProvisionError(str(e).replace(self.api_key, "<redacted>"))
+        return e
+
     def _list_executors(self, sku: str, *, gpus: int = 1) -> list[dict]:
         """Marketplace executors of ``sku`` with EXACTLY ``gpus`` GPUs.
 
         Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
         a 1× machine rented against an 8-lane plan strands seven lanes (and the
         health gate then kills the pod anyway — filter here, before renting)."""
-        execs = parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        try:
+            execs = parse_lium_executors(
+                self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        except ProvisionError as e:
+            raise self._scrub_key(e) from None
         return [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
 
     def _list_pods(self) -> list[dict]:
-        return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
+        try:
+            return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
+        except ProvisionError as e:
+            raise self._scrub_key(e) from None
 
     def _pod(self, pod_id: str) -> dict | None:
         return next((p for p in self._list_pods()

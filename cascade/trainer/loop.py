@@ -856,6 +856,12 @@ class TrainerRunner:
     # Heat drops whose failure matched the storage layer (hotkey → gen ref),
     # reset each round: candidates for the burn exemption in _burn_hotkeys.
     _storage_dropped: dict = field(default_factory=dict, repr=False)
+    # Serialises the funded-pod ledger's load-modify-save: king + N challenger
+    # legs rent concurrently, and two unlocked RMWs would silently drop one
+    # live pod from the crash-recovery ledger (review 2026-09-02). Instance-
+    # level (not per-round): startup reconcile touches the ledger too.
+    _funded_ledger_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
     # Challengers dropped BEFORE the field was even eligible (today: burned
     # hotkeys re-committing their one used submission), reset each round.
     # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
@@ -1100,13 +1106,8 @@ class TrainerRunner:
             burned = _load_seen_hotkeys(self._submissions_path())
         by_hotkey = {c.hotkey: c for c in challengers}
         cap = self._funded_admission_cap()
-        if cap == 0:
-            log.warning("funded admission: capacity probe says 0 same-SKU "
-                        "machine(s) available after the reserve — nobody "
-                        "seats this round; the queue holds, unburned")
-            self._funded_field = {}
-            return []
         kept: list[ResolvedGenerator] = []
+        held_back: list[str] = []
         for entry in select_field(queue.entries(), cap=0):
             # expect_ref on every fail: this loop acts on a queue SNAPSHOT, so
             # a re-fund landing before the fail must not terminally fail the
@@ -1128,6 +1129,20 @@ class TrainerRunner:
                 continue
             if len(kept) < cap:
                 kept.append(c)
+            else:
+                held_back.append(entry.hotkey)
+        if held_back:
+            # Admission held these back (capacity clamp / out-capped by more-
+            # senior entries): they never rent, so nothing else refreshes
+            # last_active — touch them or they TTL-expire while actively
+            # waiting through no fault of their own (review 2026-09-02).
+            queue.touch(held_back)
+        if cap == 0:
+            log.warning("funded admission: capacity probe says 0 same-SKU "
+                        "machine(s) available after the reserve — nobody "
+                        "seats this round; the queue holds, unburned")
+            self._funded_field = {}
+            return []
         dropped = len(challengers) - len(kept)
         if dropped:
             log.info("funded_mode=required: %d unfunded/over-cap challenger(s) wait "
@@ -1276,7 +1291,15 @@ class TrainerRunner:
             if role != "challenger" or gen.hotkey not in self._funded_field:
                 continue
             entry = queue.get(gen.hotkey)
-            if entry is None or entry.status != "in_round":
+            # "queued" is accepted alongside "in_round": a restart between the
+            # heat settle and a settled-retry passes through recover_in_round
+            # first, which flips the entry back to queued before this settle
+            # can judge it (review 2026-09-02). The ref equality is the guard
+            # either way — a re-fund under a NEW ref since selection is a
+            # different entry and must not be settled by this round.
+            if entry is None or entry.status not in ("in_round", "queued"):
+                continue
+            if entry.ref != self._funded_field.get(gen.hotkey):
                 continue
             if gen.hotkey in trained:
                 queue.mark_done(gen.hotkey)
@@ -1468,13 +1491,16 @@ class TrainerRunner:
         os.replace(tmp, path)
 
     def _ledger_add(self, pod) -> None:
-        pods = self._load_funded_ledger()
-        pods = [x for x in pods if x.instance_id != pod.instance_id] + [pod]
-        self._save_funded_ledger(pods)
+        with self._funded_ledger_lock:
+            pods = self._load_funded_ledger()
+            pods = [x for x in pods if x.instance_id != pod.instance_id] + [pod]
+            self._save_funded_ledger(pods)
 
     def _ledger_remove(self, instance_id: str) -> None:
-        self._save_funded_ledger(
-            [x for x in self._load_funded_ledger() if x.instance_id != instance_id])
+        with self._funded_ledger_lock:
+            self._save_funded_ledger(
+                [x for x in self._load_funded_ledger()
+                 if x.instance_id != instance_id])
 
     def _reconcile_funded_pods(self) -> None:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
@@ -1482,30 +1508,38 @@ class TrainerRunner:
         API hiccup must never hold a boundary."""
         if self.cfg.round.funded_pods != "rent":
             return
-        vault = self._payer_vault()
-        if vault is None:
-            return
         from ..provision.funded import reconcile_funded, teardown_funded
 
         try:
             pods = self._load_funded_ledger()
             # Operator-billed ledger pods (the JIT king; payer_hotkey = "")
             # never go through the per-payer path — it would demand a vault
-            # key that rightly does not exist.
+            # key that rightly does not exist. Swept BEFORE the vault check:
+            # a missing/mis-set vault must not leave operator pods billing
+            # (review 2026-09-02).
             for pod in [x for x in pods if not x.payer_hotkey]:
                 self._teardown_operator_pod(pod)
+            vault = self._payer_vault()
+            if vault is None:
+                if any(x.payer_hotkey for x in pods):
+                    log.error("funded ledger holds payer pods but [round] "
+                              "payer_vault_dir is unset — they bill their "
+                              "miners until the vault comes back")
+                return
             pods = [x for x in pods if x.payer_hotkey]
             if pods:
                 leftovers = teardown_funded(pods, vault)
-                self._save_funded_ledger(
-                    leftovers + [x for x in self._load_funded_ledger()
-                                 if not x.payer_hotkey])
+                with self._funded_ledger_lock:
+                    self._save_funded_ledger(
+                        leftovers + [x for x in self._load_funded_ledger()
+                                     if not x.payer_hotkey])
                 for inst in leftovers:
                     log.error("funded pod %s (payer %s) could not be confirmed "
                               "gone — still billing the miner; kept on the "
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
-            reconcile_funded(self._load_funded_ledger(), vault)
+            reconcile_funded(self._load_funded_ledger(), vault,
+                             netuid=self.cfg.subnet.netuid)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -1555,10 +1589,24 @@ class TrainerRunner:
             raise _FundedLegSkip(gen.hotkey) from e
         with self._funded_exec_lock:
             claimed = tuple(sorted(self._funded_claimed_execs))
+        # TRUE write-ahead: the pod's name is deterministic (launch appends
+        # "-0"), so ledger the INTENT before `lium up` — a crash anywhere in
+        # launch/wait/IP leaves the entry for the boundary sweep, instead of
+        # a pod billing its miner with no record (review 2026-09-02; the old
+        # "write-ahead" landed only after up to 900s of readiness wait).
+        from ..provision.funded import funded_pod_name
+        from ..provision.state import PodInstance
+
+        netuid = self.cfg.subnet.netuid
+        expected_id = funded_pod_name(str(round_id), gen.hotkey, netuid) + "-0"
+        self._ledger_add(PodInstance(
+            provider="lium", instance_id=expected_id, stage="funded",
+            rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            sku=round_sku, gpus=1, payer_hotkey=gen.hotkey))
         result = rent_funded_pod(
             round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
             sku=round_sku, image=rnd.funded_pod_image,
-            ssh_pubkey=ssh_pubkey,
+            ssh_pubkey=ssh_pubkey, netuid=netuid,
             ready_timeout=rnd.funded_ready_timeout_seconds,
             exclude_ids=claimed,
         )
@@ -1566,6 +1614,11 @@ class TrainerRunner:
             with self._funded_exec_lock:
                 self._funded_claimed_execs.add(result.machine_id)
         if not result.ok:
+            # rent_funded_pod's own failure path verified-terminated anything
+            # it launched; drop the write-ahead entry only when nothing leaked
+            # (a leaked pod keeps its ledger row for the sweep).
+            if not result.leaked_pod:
+                self._ledger_remove(expected_id)
             msg = result.error
             if result.leaked_pod:
                 msg += (f" [LEAKED pod {result.leaked_pod} may still bill this "
@@ -1575,8 +1628,7 @@ class TrainerRunner:
                 gen.hotkey, msg, miner_fault=(result.error_class == "auth"),
                 error_class=result.error_class, burn=result.burn_attempt)
             raise _FundedLegSkip(gen.hotkey)
-        # Write-ahead: the pod is on the ledger BEFORE any use, so a crash
-        # right here still gets it torn down at the next boundary sweep.
+        # Replace the intent row with the real pod record (same instance id).
         self._ledger_add(result.pod)
         host = RemoteHost(
             name=f"funded-{gen.hotkey[:12].lower()}",
@@ -1621,6 +1673,12 @@ class TrainerRunner:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
         vault = self._payer_vault()
         if vault is None:
+            # A silent return here would leave a miner-billed pod running with
+            # zero operator signal (review 2026-09-02). The ledger entry stays
+            # so the sweep retries once the vault is configured again.
+            log.error("funded pod %s (payer %s): [round] payer_vault_dir is "
+                      "unset — cannot tear it down; it bills the miner until "
+                      "the vault is restored", pod.instance_id, pod.payer_hotkey)
             return
         from ..provision.funded import teardown_funded
 
@@ -1655,6 +1713,7 @@ class TrainerRunner:
             if self._funded_king_host is not None:
                 return self._funded_king_host
             from ..provision.core import LaunchSpec, LiumProvider, ProvisionError
+            from ..provision.funded import terminate_verified
             from ..provision.state import PodInstance
             from .remote import RemoteHost
 
@@ -1667,27 +1726,53 @@ class TrainerRunner:
             provider = LiumProvider()
             with self._funded_exec_lock:
                 claimed = tuple(sorted(self._funded_claimed_execs))
+            # The n<netuid> token keeps this OUT of both the provisioner's
+            # reaper scheme (which must never touch trainer-ledgered pods) and
+            # any co-hosted deployment's sweep (review 2026-09-02).
+            name_prefix = f"cascade-n{self.cfg.subnet.netuid}-{round_id}-funded-king"
             spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
                               ssh_pubkey=ssh_pubkey,
-                              name_prefix=f"cascade-{round_id}-funded-king",
+                              name_prefix=name_prefix,
                               gpus_per_pod=1, exclude_ids=claimed)
+
+            def _ledger_king(pod_id: str) -> None:
+                self._ledger_add(PodInstance(
+                    provider=provider.name, instance_id=pod_id, stage="funded",
+                    rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime()),
+                    sku=sku, gpus=1, payer_hotkey=""))
+
+            # Write-ahead (name is deterministic): a crash during the
+            # readiness wait must leave a ledger row for the boundary sweep —
+            # an operator king pod is on NOBODY else's radar.
+            _ledger_king(f"{name_prefix}-0")
+
+            def _fail_king(pod_id: str, why: str) -> None:
+                # Verified teardown, ledger row dropped only when CONFIRMED
+                # gone (bare terminate swallows a failed rm as success).
+                try:
+                    if terminate_verified(provider, pod_id):
+                        self._ledger_remove(pod_id)
+                    else:
+                        log.error("king pod %s still LIVE after terminate — "
+                                  "kept on ledger for the sweep", pod_id)
+                except Exception as te:  # noqa: BLE001 — row stays for the sweep
+                    log.error("king pod %s teardown failed (kept on ledger): "
+                              "%s", pod_id, te)
+                raise ProvisionError(why)
+
             pod_id = provider.launch(spec)[0]
             if not provider.wait_ready(pod_id,
                                        timeout=rnd.funded_ready_timeout_seconds):
-                provider.terminate(pod_id)
-                raise ProvisionError(f"king pod {pod_id} not ready in time")
+                _fail_king(pod_id, f"king pod {pod_id} not ready in time")
             addr = provider.get_ip(pod_id)
             if addr is None:
-                provider.terminate(pod_id)
-                raise ProvisionError(f"king pod {pod_id} exposed no IP")
+                _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
             machine = provider.machine_of(pod_id) or ""
             if machine:
                 with self._funded_exec_lock:
                     self._funded_claimed_execs.add(machine)
-            self._ledger_add(PodInstance(
-                provider=provider.name, instance_id=pod_id, stage="funded",
-                rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                sku=sku, gpus=1, payer_hotkey=""))
+            _ledger_king(pod_id)
             log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
                      pod_id, addr.ip, addr.ssh_port, sku)
             self._funded_king_host = RemoteHost(
@@ -2346,6 +2431,21 @@ class TrainerRunner:
             "screened": len(screened),
             "finalists": [c.hotkey for c in finalists],
         }
+        if self.cfg.round.funded_mode == "required":
+            # The settled-retry path re-enters run_round with round-init having
+            # reset every funded attribute: without this snapshot the retry's
+            # funded legs would dispatch on OPERATOR lanes (the bill silently
+            # moves), the multi-SKU king rent would see sku="" and abort every
+            # retry, and settle would no-op — leaving paid entries to be
+            # terminally failed by the burned-hotkey check despite having
+            # competed (review 2026-09-02). _settled_finalists restores it.
+            payload["funded"] = {
+                "field": dict(self._funded_field),
+                "round_sku": self._funded_round_sku,
+                "admission": dict(self._funded_admission_info),
+                "roster": {k: list(v) for k, v in self._funded_roster.items()
+                           if k != "outcomes"},
+            }
         try:
             out_dir = self.work_root / f"{base_seed}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2418,6 +2518,26 @@ class TrainerRunner:
                     "directly (their hotkeys are already burned; the burn still "
                     "stands for later rounds)",
                     base_seed, ", ".join(c.hotkey for c in matched))
+        funded = raw.get("funded")
+        if isinstance(funded, dict) and self.cfg.round.funded_mode == "required":
+            # Restore the settled funded state so the retry keeps billing the
+            # payers, keeps the chosen SKU, and can settle its entries — see
+            # the snapshot's rationale in _mark_heat_complete.
+            self._funded_field = {str(k): str(v) for k, v in
+                                  (funded.get("field") or {}).items()}
+            self._funded_round_sku = str(funded.get("round_sku") or
+                                         self._funded_round_sku)
+            info = funded.get("admission")
+            if isinstance(info, dict):
+                self._funded_admission_info = info
+            roster = funded.get("roster")
+            if isinstance(roster, dict):
+                for k in ("seated", "waiting", "terminal"):
+                    if isinstance(roster.get(k), list):
+                        self._funded_roster[k] = roster[k]
+            log.info("round=%s retry: restored funded state (%d seated, "
+                     "sku=%s)", base_seed, len(self._funded_field),
+                     self._funded_round_sku or "<none>")
         return matched
 
     # ── live round-stage reporting (status/round.json, presentational) ───────
@@ -3803,6 +3923,12 @@ class TrainerRunner:
         self._funded_round_sku = self.cfg.round.funded_pod_sku
         self._funded_king_host = None
         self._funded_king_lock = threading.Lock()
+        # Sweep funded-pod leftovers at EVERY round entry (not only on the
+        # skip path, which needs skip_unfunded_rounds on — review 2026-09-02):
+        # the previous round's JIT king, a crashed leg's payer pod, and any
+        # launched-but-never-ledgered orphan all get torn down here, before
+        # this round rents anything. Self-guarded to funded_pods="rent".
+        self._reconcile_funded_pods()
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
@@ -3835,9 +3961,11 @@ class TrainerRunner:
         # and walk the king over the settled finalists. Reuse them instead —
         # the burn filter, the DEC-CA-0036 vault/funded gates, and the dedup
         # screen are deliberately bypassed for exactly these hotkeys in exactly
-        # this round: the settled heat already applied all of them, and the
-        # funded entries were settled ``done`` at the original settle (re-
-        # filtering would empty the field). The burn set itself is untouched.
+        # this round: the settled heat already applied all of them. Funded
+        # entries are NOT yet settled at this point (they settle at the duel);
+        # _settled_finalists restores the round's funded state from the marker
+        # so the retry's legs stay payer-billed and settle-able. The burn set
+        # itself is untouched.
         reused = self._settled_finalists(base_seed, plan.challengers)
         if reused is not None:
             eligible = list(reused)
@@ -4050,6 +4178,16 @@ class TrainerRunner:
         n = max(0, self.cfg.round.finalists)
         armed = self.cfg.round.max_finalists > 1
         cap = max(0, self.cfg.round.finalist_cap)
+        if (self.cfg.round.funded_mode == "required" and self._funded_field
+                and all(c.hotkey in self._funded_field for c in challengers)):
+            # No-heat contract (DEC-CA-0036 elastic field): every SEATED funded
+            # challenger duels — admission already capped the field, each seat
+            # rents its own pod, and the duel's alpha/k splits over the cohort.
+            # Without this, funded_field_cap > finalist_cap sent the overflow
+            # through a real heat screen and the screened-out reached settle
+            # with no manifest entry → burned as "failed before dispatch" for
+            # miners who paid and were never judged (review 2026-09-02).
+            cap = max(cap, len(challengers))
         if not challengers or cap == 0:
             return [], None
         if self.screen_fn is None or len(challengers) <= cap:
@@ -5092,6 +5230,10 @@ class TrainerRunner:
         """
         poll = self.cfg.manifest.poll_seconds
         last_round: str | None = None
+        # Startup sweep: a crashed process leaves funded/king pods billing
+        # with nobody's leg attached — reconcile from the ledger + per-payer
+        # listings before any round work (self-guarded to funded_pods="rent").
+        self._reconcile_funded_pods()
         while True:
             try:
                 block = self._block_with_freeze_guard(client)

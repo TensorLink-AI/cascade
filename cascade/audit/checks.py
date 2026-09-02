@@ -992,13 +992,18 @@ def check_funded_roster(receipt: RoundReceipt,
             name, WARN,
             f"manifest challenger(s) not on the published funded roster: "
             f"{', '.join(strangers)}")
-    order = [(int(e.get("reveal_block") or 0), str(e.get("hotkey")))
-             for e in seated]
+    # A null reveal_block (the hotkey withdrew between selection and roster
+    # build) is UNKNOWN seniority, not block 0 — coercing it to 0 makes it
+    # "most senior" and fires a spurious order/jump WARN (review 2026-09-02).
+    # Unknowns are excluded from both ordering claims.
+    order = [(int(e["reveal_block"]), str(e.get("hotkey")))
+             for e in seated if e.get("reveal_block") is not None]
     if order != sorted(order):
         return CheckResult(name, WARN, "seated list is not in reveal-block "
                                        "seniority order")
-    waiting = [(int(e.get("reveal_block") or 0), str(e.get("hotkey")))
-               for e in (roster.get("waiting") or [])]
+    waiting = [(int(e["reveal_block"]), str(e.get("hotkey")))
+               for e in (roster.get("waiting") or [])
+               if e.get("reveal_block") is not None]
     if order and waiting and min(waiting) < max(order):
         jumped = min(waiting)
         return CheckResult(

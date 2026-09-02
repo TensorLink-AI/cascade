@@ -252,6 +252,27 @@ def validate_funded_pods(mode: str) -> str:
     return mode
 
 
+def validate_funded_field_cap(value: object) -> int:
+    """A non-negative int, fail-loud: a negative cap is truthy, so it would
+    silently seat NOBODY every round (the elastic-cap arithmetic reads any
+    non-zero value as "use me") — review 2026-09-02."""
+    cap = int(value)  # type: ignore[arg-type]
+    if cap < 0:
+        raise ValueError(f"funded_field_cap={cap} invalid; must be >= 0")
+    return cap
+
+
+def validate_funded_pod_skus(value: object) -> tuple[str, ...]:
+    """A tuple of SKU strings, fail-loud on a bare string: ``"RTX4090"``
+    would iterate as its CHARACTERS ('R', 'T', …) and every probe/rent would
+    target one-letter SKUs — review 2026-09-02."""
+    if isinstance(value, str):
+        raise ValueError(
+            f'funded_pod_skus={value!r} invalid; must be a list of SKU '
+            f'strings, e.g. ["RTX4090", "A6000"]')
+    return tuple(str(x) for x in value)  # type: ignore[union-attr]
+
+
 # Champion publication policies for direct (vault) submissions (DEC-CA-0036):
 # when a vault-ref king's code goes public. See cascade.funding.champion.
 CHAMPION_PUBLISH_MODES = ("off", "crown", "delay", "dethrone")
@@ -1560,6 +1581,16 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             )
     if not cfg.manifest.trainer_hotkey:
         problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
+    # Per-round GPU-type choice needs an unpinned expected_gpu: a hard pin
+    # would fail EVERY leg trained on any other chosen type (validator
+    # gpu_name gate) — requeue-with-burn ×3 → terminal fail for every seated
+    # miner. Comment-enforced until 2026-09-02; now fail-loud at launch.
+    if (role == "trainer" and cfg.round.funded_pods == "rent"
+            and len(cfg.round.funded_pod_skus) > 1 and cfg.training.expected_gpu):
+        problems.append(
+            "[round] funded_pod_skus lists multiple GPU types but [training] "
+            f"expected_gpu pins {cfg.training.expected_gpu!r} — per-round SKU "
+            'choice needs expected_gpu = "" (a coordinated contract change)')
     # The round's screen/throne size pointers must name configured sizes.
     registry = cfg.training.size_registry
     for label, name in [("screen_size", cfg.round.screen_size), *(("throne_sizes", n) for n in cfg.round.throne_sizes)]:
@@ -1823,10 +1854,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_pod_image=str(r.get("funded_pod_image", "")),
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", 900.0)),
-            funded_field_cap=int(r.get("funded_field_cap", 0)),
+            funded_field_cap=validate_funded_field_cap(
+                r.get("funded_field_cap", 0)),
             funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),
             funded_capacity_reserve=int(r.get("funded_capacity_reserve", 1)),
-            funded_pod_skus=tuple(str(x) for x in r.get("funded_pod_skus", ())),
+            funded_pod_skus=validate_funded_pod_skus(
+                r.get("funded_pod_skus", ())),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(

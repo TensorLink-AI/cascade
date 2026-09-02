@@ -389,3 +389,72 @@ def test_rounds_needed_clamps():
     assert rounds_needed(100, cap=3, max_rounds=2) == 2
     with pytest.raises(ValueError):
         rounds_needed(1, cap=0)
+
+
+from cascade.funding.queue import FundedQueue as Q
+
+R1 = "ns/gen@sha256:" + "a" * 64
+R2 = "ns/gen@sha256:" + "b" * 64
+
+# ── review 2026-09-02: vanity-code steering, rate-limit window, touch ────────
+
+
+def test_numeric_codes_match_only_as_standalone_tokens():
+    # A vanity hotkey slug containing "401"/"429" lands in pod names, and pod
+    # names land in error text — it must not steer classification.
+    assert classify_rent_failure("pod cascade-n91-7-funded-ab401cd-0 boom") == "infra"
+    assert classify_rent_failure("pod cascade-n91-7-funded-xx429yy-0 died") == "infra"
+    # Real codes still classify.
+    assert classify_rent_failure("HTTP 401 for this key") == "auth"
+    assert classify_rent_failure("error (429): slow down") == "rate_limited"
+
+
+def test_requeue_rate_limited_streak_turns_terminal(tmp_path):
+    from cascade.funding.faults import RECOVERY_WINDOW_SECONDS
+
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    assert q.mark_in_round([HK_A])
+    # First rate-limited requeue starts the streak, unburned.
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    e = q.get(HK_A)
+    assert (e.status, e.attempts) == ("queued", 0)
+    assert e.rate_limited_since == clock.t
+    # Still inside the window: keeps requeueing.
+    clock.t += RECOVERY_WINDOW_SECONDS / 2
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    # Past the window: the streak turns terminal.
+    clock.t += RECOVERY_WINDOW_SECONDS
+    assert q.mark_in_round([HK_A])
+    assert not q.requeue(HK_A, error="429", error_class="rate_limited",
+                         burn_attempt=False)
+    assert q.get(HK_A).status == "failed"
+
+
+def test_requeue_non_rate_limited_resets_the_streak(tmp_path):
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    assert q.get(HK_A).rate_limited_since > 0
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="sold out", error_class="no_capacity",
+                     burn_attempt=False)
+    assert q.get(HK_A).rate_limited_since == 0.0
+
+
+def test_touch_refreshes_queued_last_active_only(tmp_path):
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    q.add(HK_B, R2, reveal_block=6)
+    assert q.mark_in_round([HK_B])
+    clock.t += 500
+    assert q.touch([HK_A, HK_B, "nobody"]) == 1     # only the queued entry
+    assert q.get(HK_A).last_active == clock.t
+    # A touched entry survives an expiry sweep that would otherwise kill it.
+    q2 = Q(tmp_path / "q.json", clock=clock, entry_ttl_seconds=400)
+    assert q2.expire_stale() == 0 or q2.get(HK_A).status == "queued"

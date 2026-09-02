@@ -78,13 +78,16 @@ def test_pod_instance_payer_roundtrip(tmp_path):
     assert load_state(tmp_path / "old.json").instances[0].payer_hotkey == ""
 
 
-def test_funded_pod_name_matches_reaper_gate():
-    name = funded_pod_name("8901234", HK)
-    assert name.startswith("cascade-8901234-funded-")
-    assert is_provisioner_pod_name(name)
-    assert is_provisioner_pod_name(f"{name}-r1")     # replacement suffix too
+def test_funded_pod_name_is_deployment_scoped_and_off_the_provisioner_scheme():
+    name = funded_pod_name("8901234", HK, 91)
+    assert name.startswith("cascade-n91-8901234-funded-")
+    # Deliberately OUTSIDE the provisioner's reaper scheme: funded pods (and
+    # the trainer's JIT king) are trainer-ledgered — a provisioner that
+    # matched them would reap the live king mid-round (review 2026-09-02).
+    assert not is_provisioner_pod_name(name)
+    assert not is_provisioner_pod_name(f"{name}-0")
     with pytest.raises(ProvisionError):
-        funded_pod_name("1", "!!!")
+        funded_pod_name("1", "!!!", 91)
 
 
 # ── rent_funded_pod ──────────────────────────────────────────────────────────
@@ -129,7 +132,7 @@ def _rent(provider, **kw):
     return rent_funded_pod(
         round_id="777", hotkey=HK, api_key="sk-miner", sku="L40S",
         image="img@sha256:" + "0" * 64, ssh_pubkey="ssh-ed25519 AAA",
-        provider_factory=lambda key: provider, **kw,
+        netuid=91, provider_factory=lambda key: provider, **kw,
     )
 
 
@@ -141,7 +144,7 @@ def test_rent_success_ledgers_payer_and_stage():
     assert res.pod.payer_hotkey == HK
     assert res.address.ssh_port == 2222
     _, spec = provider.launched[0]
-    assert spec.count == 1 and spec.name_prefix == funded_pod_name("777", HK)
+    assert spec.count == 1 and spec.name_prefix == funded_pod_name("777", HK, 91)
 
 
 @pytest.mark.parametrize("msg,cls,burns", [
@@ -160,14 +163,14 @@ def test_rent_not_ready_tears_down_on_payer_key():
     provider = FakeProvider(ready=False)
     res = _rent(provider, ready_timeout=1.0)
     assert not res.ok and res.error_class == "infra"
-    assert provider.terminated == [f"{funded_pod_name('777', HK)}-0"]
+    assert provider.terminated == [f"{funded_pod_name('777', HK, 91)}-0"]
     assert res.leaked_pod == ""                        # confirmed gone
 
 
 def test_rent_cleanup_records_unconfirmed_teardown():
     # A revoked key mid-launch: terminate "succeeds" but the pod stays listed
     # — the result must carry the leak, never drop it on the floor.
-    pod = f"{funded_pod_name('777', HK)}-0"
+    pod = f"{funded_pod_name('777', HK, 91)}-0"
     provider = FakeProvider(ready=False, rm_noop=True)
     provider.launch_hook = None
 
@@ -196,7 +199,7 @@ def _vault_with_key():
     return v
 
 
-POD_ID = f"{funded_pod_name('777', HK)}-0"     # what launch() actually names it
+POD_ID = f"{funded_pod_name('777', HK, 91)}-0"     # what launch() actually names it
 
 
 def _funded_instance(instance_id=POD_ID):
@@ -235,7 +238,7 @@ def test_teardown_continues_past_a_crashing_terminate():
     vault = _vault_with_key()
     vault.insert(hk2, "sk-miner-2")
     bad = _funded_instance()
-    good = PodInstance("lium", f"{funded_pod_name('777', hk2)}-0", FUNDED_STAGE,
+    good = PodInstance("lium", f"{funded_pod_name('777', hk2, 91)}-0", FUNDED_STAGE,
                        "2026-08-28T00:00:00Z", payer_hotkey=hk2)
     providers = {
         "sk-miner": FakeProvider(rm_raises="lium CLI hung (TimeoutExpired)"),
@@ -249,7 +252,7 @@ def test_teardown_continues_past_a_crashing_terminate():
 
 def test_reconcile_funded_scoped_to_this_payers_funded_pods():
     owned = _funded_instance(POD_ID)
-    orphan = f"{funded_pod_name('777', HK)}-r1"
+    orphan = f"{funded_pod_name('777', HK, 91)}-r1"
     provider = FakeProvider(tagged=[
         POD_ID,                                # owned → keep
         orphan,                                # this payer's funded orphan → kill
@@ -257,7 +260,7 @@ def test_reconcile_funded_scoped_to_this_payers_funded_pods():
         "cascade-777-funded-otherpayer1-0",    # someone else's slug → keep
         "cascade-workerpad",                   # hand-rented lookalike → keep
     ])
-    killed = reconcile_funded([owned], _vault_with_key(),
+    killed = reconcile_funded([owned], _vault_with_key(), netuid=91,
                               provider_factory=lambda key: provider)
     assert killed == [orphan]
     assert provider.terminated == killed
@@ -268,17 +271,17 @@ def test_reconcile_verifies_termination_not_just_the_rm_call():
     # live. reconcile must NOT report it killed — that would mask a still-
     # billing orphan every sweep (review 2026-08-29).
     owned = _funded_instance(POD_ID)
-    orphan = f"{funded_pod_name('777', HK)}-r1"
+    orphan = f"{funded_pod_name('777', HK, 91)}-r1"
     provider = FakeProvider(tagged=[POD_ID, orphan], rm_noop=True)
-    killed = reconcile_funded([owned], _vault_with_key(),
+    killed = reconcile_funded([owned], _vault_with_key(), netuid=91,
                               provider_factory=lambda key: provider)
     assert killed == []                        # nothing CONFIRMED gone
     assert orphan in provider.terminated       # it was attempted, just unconfirmed
 
 
 def test_payer_pod_pattern_matches_only_this_payer():
-    pat = payer_pod_pattern(HK)
+    pat = payer_pod_pattern(HK, 91)
     assert pat.match(POD_ID)
-    assert pat.match(f"{funded_pod_name('12345', HK)}")
+    assert pat.match(f"{funded_pod_name('12345', HK, 91)}")
     assert not pat.match("cascade-777-heat-0")
     assert not pat.match("cascade-777-funded-otherpayer1-0")

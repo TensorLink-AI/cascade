@@ -43,10 +43,13 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                       payer_vault_dir=vault_dir, funded_pod_sku=sku,
                       funded_pod_image=image, **round_kw)
     import threading
-    fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path,
+    fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd,
+                                               subnet=SimpleNamespace(netuid=91)),
+                           work_root=tmp_path,
                            _funded_field={}, _funded_leg_failures={},
                            _funded_claimed_execs=set(),
                            _funded_exec_lock=threading.Lock(),
+                           _funded_ledger_lock=threading.Lock(),
                            _funded_admission_info={},
                            _funded_round_sku="",
                            _funded_king_host=None,
@@ -75,7 +78,10 @@ def _vault(tmp_path, hotkey: str, key: str = "sk_test123") -> PayerKeyVault:
 
 
 def _pod(hotkey: str = "hkA") -> PodInstance:
-    return PodInstance(provider="lium", instance_id="cascade-1-funded-hka",
+    # Mirrors the REAL name rent_funded_pod produces (netuid-scoped, "-0"
+    # launch suffix) — the write-ahead ledger row is keyed on it.
+    return PodInstance(provider="lium",
+                      instance_id=f"cascade-n91-777-funded-{hotkey.lower()}-0",
                       stage="funded", rented_at_iso="2026-09-02T00:00:00Z",
                       sku="RTX4090", gpus=1, payer_hotkey=hotkey)
 
@@ -193,7 +199,7 @@ def test_funded_leg_dispatches_on_the_rented_pod_and_tears_down(tmp_path, monkey
     assert entry.hotkey == "hkA"
     (host, kw), = disp.calls
     assert host.host == "10.9.9.9" and kw["role"] == "challenger"
-    assert torn == ["cascade-1-funded-hka"]      # teardown ALWAYS runs
+    assert torn == ["cascade-n91-777-funded-hka-0"]   # teardown ALWAYS runs
 
 
 def test_funded_leg_failure_classifies_and_still_tears_down(tmp_path, monkeypatch):
@@ -202,7 +208,7 @@ def test_funded_leg_failure_classifies_and_still_tears_down(tmp_path, monkeypatc
     with pytest.raises(Exception):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
-    assert torn == ["cascade-1-funded-hka"]
+    assert torn == ["cascade-n91-777-funded-hka-0"]
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (False, "infra", True)
 
@@ -268,7 +274,7 @@ def test_boundary_sweep_tears_down_ledgered_leftovers(tmp_path, monkeypatch):
         calls["teardown"] += 1
         return []
 
-    def fake_reconcile(owned, vault):
+    def fake_reconcile(owned, vault, **kw):
         calls["reconcile"] += 1
         return []
 
@@ -542,7 +548,7 @@ def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path):
         name = "lium"
         def launch(self, spec):
             launched.append((spec.sku, spec.name_prefix, spec.exclude_ids))
-            return ["king-pod-1"]
+            return [f"{spec.name_prefix}-0"]
         def wait_ready(self, pod_id, *, timeout):
             return True
         def get_ip(self, pod_id):
@@ -561,11 +567,11 @@ def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path):
         core_mod.LiumProvider = orig
     assert h1 is h2 and len(launched) == 1
     sku, prefix, excl = launched[0]
-    assert sku == "A6000" and prefix == "cascade-42-funded-king"
+    assert sku == "A6000" and prefix == "cascade-n91-42-funded-king"
     assert (h1.host, h1.port) == ("9.9.9.9", 41000)
     assert "exec-king" in r._funded_claimed_execs
     ledger = r._load_funded_ledger()
-    assert [(x.instance_id, x.payer_hotkey) for x in ledger] == [("king-pod-1", "")]
+    assert [(x.instance_id, x.payer_hotkey) for x in ledger] == [("cascade-n91-42-funded-king-0", "")]
 
 
 def test_sweep_routes_operator_pods_off_the_payer_path(tmp_path, monkeypatch):
@@ -580,9 +586,9 @@ def test_sweep_routes_operator_pods_off_the_payer_path(tmp_path, monkeypatch):
     r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
                                             r._ledger_remove(pod.instance_id))
     monkeypatch.setattr(funded_mod, "teardown_funded",
-                        lambda pods, vault: (payers.extend(
+                        lambda pods, vault, **kw: (payers.extend(
                             p.instance_id for p in pods), [])[1])
-    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v: [])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
     r._reconcile_funded_pods()
     assert ops == ["king-pod-1"]
-    assert payers == ["cascade-1-funded-hka"]
+    assert payers == ["cascade-n91-777-funded-hka-0"]

@@ -74,6 +74,12 @@ class FundedEntry:
     # ("sold out is not Score(0)", no time bound) while a genuinely abandoned
     # one still dies at the TTL. 0.0 = pre-field files: fall back to funded_at.
     last_active: float = 0.0
+    # When this entry FIRST hit a rate_limited requeue in its current streak
+    # (0.0 = not in one; any non-rate_limited outcome resets it). The
+    # taxonomy's RECOVERY_WINDOW applies to rate limits only — a key 429ing
+    # for six hours is not going to clear by waiting, and without the bound a
+    # hostile payer could occupy a funded seat forever (review 2026-09-02).
+    rate_limited_since: float = 0.0
 
     @property
     def active_at(self) -> float:
@@ -172,6 +178,7 @@ class FundedQueue:
                 last_error=str(item.get("last_error", "")),
                 last_error_class=str(item.get("last_error_class", "")),
                 last_active=float(item.get("last_active", 0.0)),
+                rate_limited_since=float(item.get("rate_limited_since", 0.0)),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -402,11 +409,31 @@ class FundedQueue:
         the entry terminal ``failed`` — returns False, and the miner's next
         ``fund`` starts fresh. The entry itself is NEVER silently dropped:
         the miner paid for visibility into where their money went.
+
+        Rate limits get the taxonomy's RECOVERY_WINDOW: an unbroken streak of
+        ``rate_limited`` requeues longer than it turns terminal — otherwise a
+        key pinned at its rate limit occupies a funded seat and triggers a
+        fresh rent attempt every round, forever (review 2026-09-02).
         """
+        from .faults import RECOVERY_WINDOW_SECONDS
+
         with self._locked() as entries:
             e = entries.get(hotkey)
             if e is None:
                 return False
+            now = self.clock()
+            rl_since = 0.0
+            if error_class == "rate_limited":
+                rl_since = e.rate_limited_since or now
+                if now - rl_since > RECOVERY_WINDOW_SECONDS:
+                    entries[hotkey] = replace(
+                        e, status="failed",
+                        last_error=(error[:400] + " [rate-limited past the "
+                                    "recovery window — fix the key's rate "
+                                    "limit, then fund again]"),
+                        last_error_class=error_class)
+                    self._save(entries)
+                    return False
             attempts = e.attempts + (1 if burn_attempt else 0)
             if burn_attempt and attempts > max_attempts:
                 entries[hotkey] = replace(
@@ -417,9 +444,29 @@ class FundedQueue:
             entries[hotkey] = replace(
                 e, status="queued", attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
-                last_active=self.clock())
+                last_active=now, rate_limited_since=rl_since)
             self._save(entries)
             return True
+
+    def touch(self, hotkeys: Iterable[str]) -> int:
+        """Refresh ``last_active`` for queued entries; count touched.
+
+        Proof-of-life without a state change: an entry the ADMISSION side held
+        back (capacity clamp, more-senior entries out-capping it) never rents,
+        so nothing else refreshes it — without this it TTL-expires while
+        actively waiting through no fault of its own (review 2026-09-02).
+        """
+        with self._locked() as entries:
+            now = self.clock()
+            touched = 0
+            for hk in hotkeys:
+                e = entries.get(hk)
+                if e is not None and e.status == "queued":
+                    entries[hk] = replace(e, last_active=now)
+                    touched += 1
+            if touched:
+                self._save(entries)
+            return touched
 
     def fail(self, hotkey: str, *, error: str, error_class: str = "",
              expect_ref: str | None = None) -> bool:
