@@ -49,6 +49,8 @@ def main() -> int:
     ap.add_argument("--chain-toml", default="chain.toml")
     ap.add_argument("--network", default="finney")
     ap.add_argument("--push", action="store_true", help="git push after committing")
+    ap.add_argument("--allow-findings", action="store_true",
+                    help="archive even with high-severity scan findings")
     args = ap.parse_args()
     if args.python is None:
         venv_py = args.cascade_tree / ".venv" / "bin" / "python"
@@ -92,9 +94,34 @@ def main() -> int:
             print(f"king unchanged ({ref}) — nothing to commit")
             return 0
 
+        # Static security scan BEFORE anything lands in the repo: the king is
+        # untrusted competitor code; the subnet only ever runs it sandboxed,
+        # but an archived copy can be run by a human on a real machine. High
+        # findings block the archive unless --allow-findings; every scan is
+        # recorded beside the provenance either way.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from scan_generator import scan as scan_tree
+
+        findings = scan_tree(out)
+        high = [f for f in findings if f["severity"] == "high"]
+        for f in findings:
+            print(f"scan [{f['severity'].upper()}] {f['path']}: {f['finding']}")
+        if high and not args.allow_findings:
+            print(f"REFUSING to archive: {len(high)} high-severity finding(s) "
+                  "— rerun with --allow-findings to archive anyway",
+                  file=sys.stderr)
+            return 1
+
         if DEST.exists():
             shutil.rmtree(DEST)
         shutil.copytree(out, DEST)
+        (DEST / "SCAN.json").write_text(json.dumps({
+            "high": len(high),
+            "warn": sum(1 for f in findings if f["severity"] == "warn"),
+            "findings": findings,
+            "note": "static scan only — NEVER run this code outside a sandbox "
+                    "regardless of a clean scan",
+        }, indent=2, default=str) + "\n")
         PROVENANCE.write_text(json.dumps({
             "ref": ref, "digest": digest, "network": args.network,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
