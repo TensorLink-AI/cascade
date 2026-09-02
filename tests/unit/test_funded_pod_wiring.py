@@ -423,13 +423,12 @@ def test_rent_passes_exclude_ids_into_launch_spec():
 
 # ── transparency: the published roster + its audit check ─────────────────────
 
-def _entry(hotkey, role="challenger"):
-    return SimpleNamespace(miner_hotkey=hotkey, role=role)
-
-
 def _receipt(challengers):
-    return SimpleNamespace(manifest=SimpleNamespace(
-        entries=tuple(_entry(h) for h in challengers)), round_id="1")
+    # receipt.manifest is the embedded RAW dict, entries included — the test
+    # double must mirror the real shape (the settle bug taught us that).
+    return SimpleNamespace(manifest={"entries": [
+        {"miner_hotkey": h, "role": "challenger"} for h in challengers]},
+        round_id="1")
 
 
 def test_roster_check_passes_on_honest_allocation():

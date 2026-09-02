@@ -981,10 +981,12 @@ def check_funded_roster(receipt: RoundReceipt,
         return CheckResult(name, SKIP, "no funded roster published for this round")
     seated = roster.get("seated") or []
     seated_keys = {str(e.get("hotkey")) for e in seated}
-    challengers = [e for e in getattr(receipt.manifest, "entries", ())
-                   if getattr(e, "role", "") == "challenger"]
-    strangers = [getattr(e, "miner_hotkey", "?") for e in challengers
-                 if getattr(e, "miner_hotkey", "?") not in seated_keys]
+    # receipt.manifest is the embedded RAW manifest dict (like every other
+    # check here reads it); entries are dicts too.
+    challengers = [e for e in (receipt.manifest.get("entries") or ())
+                   if e.get("role") == "challenger"]
+    strangers = [str(e.get("miner_hotkey", "?")) for e in challengers
+                 if str(e.get("miner_hotkey", "?")) not in seated_keys]
     if strangers:
         return CheckResult(
             name, WARN,
