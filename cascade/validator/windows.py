@@ -28,14 +28,17 @@ can use to turn raw held-out series into :class:`EvalWindow` s.
 from __future__ import annotations
 
 import hashlib
+import logging
 import zlib
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
 from ..eval.window import EvalWindow
+
+log = logging.getLogger("cascade.validator.windows")
 
 
 def _seed_to_int(seed: int | str) -> int:
@@ -444,6 +447,175 @@ class RotatingWindowSource:
         perm = rng.permutation(len(self.pool))
         take = min(n_windows, len(self.pool))
         return [self.pool[i] for i in perm[:take]]
+
+
+def horizon_draw(
+    series: list[np.ndarray],
+    metadata: list[dict],
+    *,
+    horizon: int,
+    n_windows: int,
+    context_length: int,
+    seed: int,
+    min_context: int = 64,
+    id_prefix: str | None = None,
+) -> list[EvalWindow]:
+    """Even-by-domain, eligibility-filtered, seeded window draw at one horizon.
+
+    Eligibility: a series must hold ``horizon`` target steps plus at least
+    ``min_context`` history. Domains that cannot fill an even share contribute
+    everything they have (the DEC-CA-0032 scarce-domain behaviour); the
+    remainder splits evenly across the rest. Deterministic in ``seed`` —
+    identical for every checkpoint scored this round, so comparisons stay
+    paired. Window ids are ``<id_prefix>s<pool_index>`` (default prefix
+    ``h<horizon>-``) so a window is traceable to its series and ids differ
+    across different draws.
+    """
+    prefix = id_prefix if id_prefix is not None else f"h{int(horizon)}-"
+    eligible: dict[str, list[int]] = {}
+    for i, s in enumerate(series):
+        if np.atleast_2d(np.asarray(s)).shape[-1] >= horizon + min_context:
+            dom = str(metadata[i].get("domain", "") or "")
+            eligible.setdefault(dom, []).append(i)
+    if not eligible:
+        return []
+
+    rng = np.random.default_rng(seed)
+    picked: list[int] = []
+    want = n_windows
+    # Scarce domains first at capacity, then the even split over the rest —
+    # iterate smallest-first so freed budget flows to domains that can absorb it.
+    remaining = dict(eligible)
+    while remaining and want > 0:
+        share = max(1, want // len(remaining))
+        dom = min(remaining, key=lambda d: len(remaining[d]))
+        idxs = remaining.pop(dom)
+        take = min(len(idxs), share if remaining else want)
+        order = rng.permutation(len(idxs))
+        picked.extend(idxs[j] for j in order[:take])
+        want -= take
+    picked.sort()  # stable window order — pairing across checkpoints
+
+    windows = build_windows_from_series(
+        [series[i] for i in picked],
+        context_length=context_length,
+        horizon=horizon,
+        metadata=[metadata[i] for i in picked],
+        id_prefix=prefix,
+    )
+    # Positional ids carry no provenance; stamp the ORIGINAL pool index.
+    windows = [replace(w, series_id=f"{prefix}s{picked[j]}")
+               for j, w in enumerate(windows)]
+    counts: dict[str, int] = {}
+    for i in picked:
+        d = str(metadata[i].get("domain", "") or "")
+        counts[d] = counts.get(d, 0) + 1
+    log.info("window draw h=%d: %d windows (%s)", horizon, len(windows),
+             ", ".join(f"{d or '?'}:{c}" for d, c in sorted(counts.items())))
+    return windows
+
+
+def scored_ladder(eval_cfg, block: int | None) -> tuple[int, ...]:
+    """The scored horizon ladder active for a round at ``block``, or ``()``
+    when the single-horizon rule applies.
+
+    Activation is block-gated exactly like the jittered mix: with
+    ``scored_from_block = 0`` (or no horizons configured) the legacy draw runs
+    for every round; otherwise rounds whose epoch-boundary block is at or past
+    the gate score the ladder. The gate is what keeps a mixed fleet consistent
+    during a rollout — validators that upgraded early still judge pre-gate
+    rounds under the old rule — and what lets audit replay apply each round's
+    own rule from the receipt's ``epoch_start_block``.
+    """
+    horizons = tuple(int(h) for h in (eval_cfg.scored_horizons or ()))
+    from_block = int(eval_cfg.scored_from_block or 0)
+    if not horizons or from_block <= 0 or block is None or int(block) < from_block:
+        return ()
+    return horizons
+
+
+def ladder_windows(
+    series: list[np.ndarray],
+    metadata: list[dict],
+    *,
+    horizons: tuple[int, ...],
+    n_windows: int,
+    context_length: int,
+    seed: int,
+    min_context: int = 64,
+) -> list[EvalWindow]:
+    """Concatenated per-horizon draws with equalised rung sizes.
+
+    Each horizon draws ``n_windows // len(horizons)`` windows via its own
+    seeded :func:`horizon_draw` (seed offset by the horizon value); every rung
+    is then truncated to the smallest rung's count. Equal rung sizes are what
+    make the pooled round statistic weight horizons equally: the geometric
+    mean over the concatenated rows equals the geometric mean of per-horizon
+    geomeans exactly when each horizon contributes the same number of rows.
+    The cluster bootstrap then resamples upstream feeds jointly across
+    horizons — rows from one feed carry the same ``source`` cluster key at
+    every horizon, so a feed's windows move in and out of a bag together.
+
+    Deterministic in ``seed``. Raises when any horizon has no eligible series:
+    a partial ladder would change the metric mid-flight, and every validator
+    shares the pool, so failing loudly keeps the fleet in agreement.
+    """
+    horizons = tuple(int(h) for h in horizons)
+    if not horizons:
+        raise ValueError("horizons must be non-empty")
+    per = max(1, int(n_windows) // len(horizons))
+    rungs = [
+        horizon_draw(series, metadata, horizon=h, n_windows=per,
+                     context_length=context_length, seed=int(seed) + h,
+                     min_context=min_context)
+        for h in horizons
+    ]
+    m = min(len(r) for r in rungs)
+    if m == 0:
+        empty = [h for h, r in zip(horizons, rungs, strict=True) if not r]
+        raise ValueError(f"no eligible series at horizon(s) {empty}")
+    if any(len(r) != m for r in rungs):
+        log.info("ladder draw equalised to %d windows/horizon (drew %s)",
+                 m, {h: len(r) for h, r in zip(horizons, rungs, strict=True)})
+    return [w for r in rungs for w in r[:m]]
+
+
+def ladder_windows_for_round(
+    window_source: object,
+    *,
+    horizons: tuple[int, ...],
+    n_windows: int,
+    context_length: int,
+    round_seed: int | str,
+    block: int | None,
+    min_context: int = 64,
+) -> list[EvalWindow]:
+    """Draw one round's scored ladder from the source's raw series.
+
+    The pre-cut pool windows carry targets exactly one horizon long and cannot
+    serve the other rungs, so the ladder re-cuts windows from the snapshot's
+    raw series directory (``snapshot_dir_for_round``). A source that exposes
+    no series directory cannot serve a ladder round — that is an error, never
+    a silent fall-back to the single-horizon draw: a validator that fell back
+    would score different windows from the rest of the fleet.
+    """
+    from pathlib import Path
+
+    dir_fn = getattr(window_source, "snapshot_dir_for_round", None)
+    pool_dir = dir_fn(block=block) if dir_fn is not None else None
+    if pool_dir is None:
+        raise ValueError(
+            "scored_horizons active but the window source exposes no series directory"
+        )
+    # Runtime import: calibration imports this module at load time.
+    from .calibration import load_pool_series
+
+    series, _ids, metadata = load_pool_series(Path(pool_dir))
+    return ladder_windows(
+        series, metadata, horizons=horizons, n_windows=n_windows,
+        context_length=context_length, seed=_seed_to_int(round_seed),
+        min_context=min_context,
+    )
 
 
 def build_windows_from_series(

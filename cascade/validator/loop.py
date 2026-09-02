@@ -54,6 +54,7 @@ from ..shared.receipt import (
 )
 from . import state as state_mod
 from .state import ChampionState, StateTransition
+from .windows import ladder_windows_for_round, scored_ladder
 
 if TYPE_CHECKING:
     from ..trainer.remote import RemoteHost
@@ -639,6 +640,26 @@ class ValidatorRunner:
         dest = Path(self.cache_dir or "./_eval_ckpts") / HubRef.parse(ref).digest.replace(":", "-")
         fetch_from_hub(ref, dest, hub)
         return dest
+
+    def _verdict_windows(
+        self, window_source: object, round_seed: int | str, *, block: int | None
+    ) -> list[EvalWindow]:
+        """The round's verdict windows: the scored horizon ladder when active
+        at this round's epoch block (``[eval] scored_horizons`` /
+        ``scored_from_block``), else the single-horizon rotating draw. Both
+        are deterministic in ``(round_seed, block)``, so every validator
+        scores the identical set."""
+        horizons = scored_ladder(self.cfg.eval, block)
+        if not horizons:
+            return window_source.windows_for_round(
+                round_seed, self.cfg.eval.n_windows, block=block
+            )
+        return ladder_windows_for_round(
+            window_source, horizons=horizons,
+            n_windows=self.cfg.eval.n_windows,
+            context_length=self.cfg.eval.context_length,
+            round_seed=round_seed, block=block,
+        )
 
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
         if self.evaluate_fn is not None:
@@ -1757,8 +1778,8 @@ class ValidatorRunner:
                     else:
                         # The epoch block selects the daily snapshot; base_seed
                         # rotates the window slice within it.
-                        windows = window_source.windows_for_round(
-                            base_seed, self.cfg.eval.n_windows,
+                        windows = self._verdict_windows(
+                            window_source, base_seed,
                             block=self._epoch_start_block(manifest),
                         )
                         # process_round mutates the sticky KOTH state atomically (it

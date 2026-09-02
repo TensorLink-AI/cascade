@@ -361,12 +361,27 @@ def _tier2_score_compare(
         from ..validator.pool import load_pool
 
         source = load_pool(cfg)
-        n = receipt.eval_context.n_windows if receipt.eval_context else cfg.eval.n_windows
-        # The epoch block gates the jittered mix: replay applies the selection
-        # rule that was active AT the audited round, not today's.
-        windows = source.windows_for_round(
-            receipt.base_seed, n, block=receipt.epoch_start_block
-        )
+        # The epoch block gates both the jittered mix and the scored horizon
+        # ladder: replay applies the selection rule that was active AT the
+        # audited round, not today's.
+        from ..validator.windows import ladder_windows_for_round, scored_ladder
+
+        horizons = scored_ladder(cfg.eval, receipt.epoch_start_block)
+        if horizons:
+            # The ladder draw is keyed on the CONFIG budget (per-rung size =
+            # n_windows // len(horizons)); the receipt's total reflects rung
+            # equalisation and would re-key the per-rung draws.
+            windows = ladder_windows_for_round(
+                source, horizons=horizons, n_windows=cfg.eval.n_windows,
+                context_length=cfg.eval.context_length,
+                round_seed=receipt.base_seed, block=receipt.epoch_start_block,
+            )
+        else:
+            n = (receipt.eval_context.n_windows if receipt.eval_context
+                 else cfg.eval.n_windows)
+            windows = source.windows_for_round(
+                receipt.base_seed, n, block=receipt.epoch_start_block
+            )
         ours = global_geomean(evaluate_checkpoint(
             retrained, windows, num_samples=cfg.eval.num_samples, device=device))
         theirs = global_geomean(evaluate_checkpoint(

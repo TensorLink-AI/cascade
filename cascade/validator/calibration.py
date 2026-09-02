@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .windows import EvalWindow, build_windows_from_series
+from .windows import EvalWindow, horizon_draw
 
 log = logging.getLogger("cascade.validator.calib")
 
@@ -61,57 +61,17 @@ def calib_draw(
 ) -> list[EvalWindow]:
     """Even-by-domain, eligibility-filtered, seeded window draw for one rung.
 
-    Eligibility: a series must hold ``horizon`` target steps plus at least
-    ``MIN_CONTEXT`` history. Domains that cannot fill an even share contribute
-    everything they have (the DEC-CA-0032 scarce-domain behaviour); the
-    remainder splits evenly across the rest. Deterministic in ``seed`` —
-    identical for every checkpoint scored this round, so comparisons stay
-    paired.
+    Thin wrapper over :func:`cascade.validator.windows.horizon_draw` — the
+    draw is shared with the scored path so the two can never drift — keeping
+    the calibration id namespace (``calib-h<h>-s<i>``) distinct from scored
+    draws. Deterministic in ``seed`` — identical for every checkpoint scored
+    this round, so comparisons stay paired.
     """
-    eligible: dict[str, list[int]] = {}
-    for i, s in enumerate(series):
-        if np.atleast_2d(np.asarray(s)).shape[-1] >= horizon + MIN_CONTEXT:
-            dom = str(metadata[i].get("domain", "") or "")
-            eligible.setdefault(dom, []).append(i)
-    if not eligible:
-        return []
-
-    rng = np.random.default_rng(seed)
-    picked: list[int] = []
-    want = n_windows
-    # Scarce domains first at capacity, then the even split over the rest —
-    # iterate smallest-first so freed budget flows to domains that can absorb it.
-    remaining = dict(eligible)
-    while remaining and want > 0:
-        share = max(1, want // len(remaining))
-        dom = min(remaining, key=lambda d: len(remaining[d]))
-        idxs = remaining.pop(dom)
-        take = min(len(idxs), share if remaining else want)
-        order = rng.permutation(len(idxs))
-        picked.extend(idxs[j] for j in order[:take])
-        want -= take
-    picked.sort()  # stable window order — pairing across checkpoints
-
-    from dataclasses import replace as _replace
-
-    windows = build_windows_from_series(
-        [series[i] for i in picked],
-        context_length=context_length,
-        horizon=horizon,
-        metadata=[metadata[i] for i in picked],
-        id_prefix=f"calib-h{horizon}-",
+    return horizon_draw(
+        series, metadata, horizon=int(horizon), n_windows=n_windows,
+        context_length=context_length, seed=seed, min_context=MIN_CONTEXT,
+        id_prefix=f"calib-h{int(horizon)}-",
     )
-    # Positional ids carry no provenance; stamp the ORIGINAL pool index so a
-    # window is traceable to its series and ids differ across different draws.
-    windows = [_replace(w, series_id=f"calib-h{horizon}-s{picked[j]}")
-               for j, w in enumerate(windows)]
-    counts: dict[str, int] = {}
-    for i in picked:
-        d = str(metadata[i].get("domain", "") or "")
-        counts[d] = counts.get(d, 0) + 1
-    log.info("calib draw h=%d: %d windows (%s)", horizon, len(windows),
-             ", ".join(f"{d or '?'}:{c}" for d, c in sorted(counts.items())))
-    return windows
 
 
 def _geo(scores) -> float | None:

@@ -929,6 +929,24 @@ class EvalConfig:
     calib_horizons: tuple[int, ...] = ()
     calib_windows: int = 256        # windows per horizon (even-by-domain draw)
     calib_num_samples: int = 32     # sample paths per window (cost control)
+    # ── Scored horizon ladder (CONSENSUS, block-gated) ───────────────────────
+    # ``scored_from_block = 0`` keeps the single-horizon verdict draw
+    # everywhere (byte-identical history). When ``scored_horizons`` is set and
+    # a round's epoch-boundary block is >= ``scored_from_block``, the round's
+    # verdict — and the heat screen, which must rank on the metric the duel
+    # judges — draws its windows as a horizon ladder instead: each horizon
+    # gets its own seeded even-by-domain draw over the snapshot's raw series
+    # (``n_windows`` split evenly across horizons, rung sizes equalised), and
+    # the pooled rows flow through the unchanged round statistic. With equal
+    # rung sizes the geometric mean weights horizons equally, and the cluster
+    # bootstrap resamples upstream feeds jointly across horizons (rows from
+    # one feed share a cluster key at every horizon). Block-gating is the
+    # ``mix_from_block`` rollout shape: every validator AND the trainer must
+    # run the same values before the activation block, or verdicts fork from
+    # that block on; audit replay applies each round's own rule via the
+    # receipt's ``epoch_start_block``.
+    scored_horizons: tuple[int, ...] = ()
+    scored_from_block: int = 0
     # Cascade post-publish bench hold (see provision.policy.bench_hold_active):
     # how long the provisioner may keep the round's FINAL pod alive past its
     # normal teardown signal while the duel bench runs, in hours. The hold ends
@@ -1708,6 +1726,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             calib_horizons=tuple(int(h) for h in e.get("calib_horizons", ())),
             calib_windows=int(e.get("calib_windows", 256)),
             calib_num_samples=int(e.get("calib_num_samples", 32)),
+            scored_horizons=tuple(int(h) for h in e.get("scored_horizons", ())),
+            scored_from_block=int(e.get("scored_from_block", 0) or 0),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
             mix_from_block=int(e.get("mix_from_block", 0)),
             mix_jitter_alpha=float(e.get("mix_jitter_alpha", 4.0)),
