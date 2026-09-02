@@ -1248,7 +1248,8 @@ class TrainerRunner:
         queue = self._funded_queue()
         if queue is None:
             return
-        trained = {e.hotkey for e in entries if getattr(e, "role", "") == "challenger"}
+        trained = {getattr(e, "miner_hotkey", getattr(e, "hotkey", ""))
+                   for e in entries if getattr(e, "role", "") == "challenger"}
         for gen, role in jobs:
             if role != "challenger" or gen.hotkey not in self._funded_field:
                 continue

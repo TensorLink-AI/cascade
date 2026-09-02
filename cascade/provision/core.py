@@ -315,7 +315,14 @@ def parse_lium_executors(stdout: str) -> list[dict]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ProvisionError(f"could not parse `lium ls` JSON: {e}") from e
+        # Carry the CLI's actual words: on a bad key `lium` prints a plain-text
+        # "Invalid API key" instead of JSON, and the funded path's fault
+        # taxonomy (cascade.funding.faults) can only classify that as "auth"
+        # if the text survives into the error (observed live 2026-09-02 —
+        # the bare parse error classified a revoked key as "infra").
+        raise ProvisionError(
+            f"could not parse `lium ls` JSON ({e}); output was: "
+            f"{text[:200]!r}") from e
     if not isinstance(data, list):
         raise ProvisionError(f"expected a JSON array from `lium ls`, got {type(data).__name__}")
     return data
@@ -329,7 +336,14 @@ def parse_lium_pods(stdout: str) -> list[dict]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ProvisionError(f"could not parse `lium ps` JSON: {e}") from e
+        # Carry the CLI's actual words: on a bad key `lium` prints a plain-text
+        # "Invalid API key" instead of JSON, and the funded path's fault
+        # taxonomy (cascade.funding.faults) can only classify that as "auth"
+        # if the text survives into the error (observed live 2026-09-02 —
+        # the bare parse error classified a revoked key as "infra").
+        raise ProvisionError(
+            f"could not parse `lium ps` JSON ({e}); output was: "
+            f"{text[:200]!r}") from e
     if not isinstance(data, list):
         raise ProvisionError(f"expected a JSON array from `lium ps`, got {type(data).__name__}")
     return data

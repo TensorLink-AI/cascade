@@ -120,7 +120,7 @@ def test_torn_round_recovers_then_settle_marks_done(tmp_path):
     # Settle from the duel outcome: a trained (judged) entry goes done; a
     # re-fund then starts fresh.
     runner._settle_funded([(field[0], "challenger")],
-                          [SimpleNamespace(hotkey="hkA", role="challenger")])
+                          [SimpleNamespace(miner_hotkey="hkA", role="challenger")])
     assert _queue(tmp_path).get("hkA").status == "done"
     assert _queue(tmp_path).add("hkA", REF, 10) == "queued"
 
@@ -131,7 +131,7 @@ def test_settle_only_touches_in_round_entries(tmp_path):
     runner = _runner(tmp_path, funded_mode="required")
     runner._funded_field = {"hkA": REF}                      # claimed but never flipped
     runner._settle_funded([(_challenger("hkA"), "challenger")],
-                          [SimpleNamespace(hotkey="hkA", role="challenger")])
+                          [SimpleNamespace(miner_hotkey="hkA", role="challenger")])
     assert _queue(tmp_path).get("hkA").status == "queued"
 
 
