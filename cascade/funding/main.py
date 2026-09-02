@@ -33,49 +33,50 @@ _REVEAL_CACHE_SECONDS = 30.0
 _CHAIN_DEADLINE_SECONDS = 30.0
 
 
-class ChainRevealResolver:
-    """``(hotkey, ref) -> reveal block`` off the chain's revealed commitments.
-
-    Matches the trainer's eligibility view: the hotkey's revealed payload must
-    parse (``interface.validation.parse_commit``) and its ref must equal the
-    funded ref exactly — funding somebody else's ref, or a ref you have not
-    revealed yet, resolves to ``None`` and the intake refuses it.
+class _DeadlineCachedPoll:
+    """A chain read behind a cache and a hard poll deadline (shared plumbing).
 
     The chain poll runs under ``deadline_seconds`` (same shape as the
     trainer's ``_with_deadline``): substrate websockets can hang without
-    raising, and the resolver runs INSIDE intake request threads — a hung
-    poll would otherwise pin every handler slot on the box holding the
-    trainer wallet. On deadline the resolver serves the stale table (a fund
-    of an unseen reveal gets 403 and retries; a pending entry waits for the
-    next sweep) and never stacks a second poll on a hung one — the leaked
-    daemon thread is the accepted cost, harvested if it ever finishes.
-    Concurrent requests during the FIRST deadline window of a hang block on
-    the refresh lock (once, bounded by the deadline); after that every
-    request serves the stale table instantly.
+    raising, and resolvers run INSIDE intake request threads — a hung poll
+    would otherwise pin every handler slot on the box holding the trainer
+    wallet. On deadline the resolver serves its stale state and never stacks
+    a second poll on a hung one — the leaked daemon thread is the accepted
+    cost, harvested if it ever finishes. Concurrent requests during the FIRST
+    deadline window of a hang block on the refresh lock (once, bounded by the
+    deadline); after that every request serves the stale state instantly.
+
+    Subclasses implement ``_poll()`` (the blocking chain read, poll-thread
+    side) and ``_fold(result)`` (cache the result, caller side).
     """
 
-    def __init__(self, client, *, cache_seconds: float = _REVEAL_CACHE_SECONDS,
-                 deadline_seconds: float = _CHAIN_DEADLINE_SECONDS,
+    def __init__(self, *, cache_seconds: float, deadline_seconds: float,
                  clock=time.time) -> None:
-        self.client = client
         self.cache_seconds = cache_seconds
         self.deadline_seconds = deadline_seconds
         self.clock = clock
         self._cached_at = float("-inf")
-        self._by_hotkey: dict[str, list] = {}
         self._lock = threading.Lock()
         self._poll_thread: threading.Thread | None = None
         self._poll_box: dict = {}
+
+    def _poll(self):  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    def _fold(self, result) -> None:  # pragma: no cover — abstract
+        raise NotImplementedError
+
+    @property
+    def has_data(self) -> bool:
+        """True once at least one poll has ever succeeded."""
+        return self._cached_at != float("-inf")
 
     def _harvest(self) -> None:
         """Fold a finished poll into the cache; re-raise its error in-caller."""
         box, self._poll_box, self._poll_thread = self._poll_box, {}, None
         if "error" in box:
             raise box["error"]
-        by_hotkey: dict[str, list] = {}
-        for c in box.get("commitments", ()):
-            by_hotkey.setdefault(c.hotkey, []).append(c)
-        self._by_hotkey = by_hotkey
+        self._fold(box.get("result"))
         self._cached_at = self.clock()
 
     def _refresh(self) -> None:
@@ -93,21 +94,49 @@ class ChainRevealResolver:
 
             def poll() -> None:
                 try:
-                    box["commitments"] = self.client.poll_commitments(
-                        include_history=True)
+                    box["result"] = self._poll()
                 except Exception as e:  # noqa: BLE001 — carried to the caller
                     box["error"] = e
 
             t = threading.Thread(target=poll, daemon=True,
-                                 name="intake-chain-poll")
+                                 name=f"intake-chain-poll-{type(self).__name__}")
             self._poll_thread = t
             t.start()
             t.join(self.deadline_seconds)
             if t.is_alive():
                 log.warning("chain poll still running after %.0fs — serving "
-                            "the stale reveal table", self.deadline_seconds)
+                            "the stale table", self.deadline_seconds)
                 return
             self._harvest()
+
+
+class ChainRevealResolver(_DeadlineCachedPoll):
+    """``(hotkey, ref) -> reveal block`` off the chain's revealed commitments.
+
+    Matches the trainer's eligibility view: the hotkey's revealed payload must
+    parse (``interface.validation.parse_commit``) and its ref must equal the
+    funded ref exactly — funding somebody else's ref, or a ref you have not
+    revealed yet, resolves to ``None`` and the intake refuses it. On a hung
+    poll a fund of an unseen reveal gets 403 and retries; a pending entry
+    waits for the next sweep.
+    """
+
+    def __init__(self, client, *, cache_seconds: float = _REVEAL_CACHE_SECONDS,
+                 deadline_seconds: float = _CHAIN_DEADLINE_SECONDS,
+                 clock=time.time) -> None:
+        super().__init__(cache_seconds=cache_seconds,
+                         deadline_seconds=deadline_seconds, clock=clock)
+        self.client = client
+        self._by_hotkey: dict[str, list] = {}
+
+    def _poll(self):
+        return self.client.poll_commitments(include_history=True)
+
+    def _fold(self, result) -> None:
+        by_hotkey: dict[str, list] = {}
+        for c in result or ():
+            by_hotkey.setdefault(c.hotkey, []).append(c)
+        self._by_hotkey = by_hotkey
 
     def __call__(self, hotkey: str, ref: str) -> int | None:
         from ..interface.validation import parse_commit
@@ -122,6 +151,37 @@ class ChainRevealResolver:
             if parsed is not None and parsed.ref == ref:
                 best = c.commit_block if best is None else max(best, c.commit_block)
         return best
+
+
+class ChainRegistrationResolver(_DeadlineCachedPoll):
+    """``hotkey -> registered on the subnet?`` off the lite metagraph.
+
+    The submit gate's membership oracle (review 2026-09-02): without it any
+    self-minted keypair could fill the private submission store. Fail-closed
+    semantics: ``None`` (→ 503 retry) until the first successful poll —
+    a chain outage at startup must not open the store to anyone.
+    Registration churn is slow, so the cache is minutes, not seconds.
+    """
+
+    def __init__(self, client, *, cache_seconds: float = 300.0,
+                 deadline_seconds: float = _CHAIN_DEADLINE_SECONDS,
+                 clock=time.time) -> None:
+        super().__init__(cache_seconds=cache_seconds,
+                         deadline_seconds=deadline_seconds, clock=clock)
+        self.client = client
+        self._hotkeys: frozenset[str] = frozenset()
+
+    def _poll(self):
+        return self.client.registered_hotkeys()
+
+    def _fold(self, result) -> None:
+        self._hotkeys = frozenset(str(hk) for hk in result or ())
+
+    def __call__(self, hotkey: str) -> bool | None:
+        self._refresh()
+        if not self.has_data:
+            return None
+        return hotkey in self._hotkeys
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -149,6 +209,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-zip-mb", type=int, default=128,
                    help="Per-submission ZIP cap in MiB (default 128, matching "
                         "[generator] max_repo_mb).")
+    p.add_argument("--max-hotkey-mb", type=int, default=256,
+                   help="Per-hotkey stored-submission quota in MiB (default "
+                        "256) — the store keeps everything it accepts, so "
+                        "this bounds what one registered hotkey can fill.")
+    p.add_argument("--request-deadline", type=float, default=120.0,
+                   help="Whole-connection wall clock in seconds; a reaper "
+                        "force-closes older sockets (drip-feed guard — the "
+                        "per-op timeout alone never fires for a client "
+                        "sending one byte per interval).")
+    p.add_argument("--max-uploads", type=int, default=4,
+                   help="Concurrent submit-body buffers (each holds up to the "
+                        "ZIP cap in RAM).")
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_SECONDS / 3600.0)
     p.add_argument("--max-connections", type=int, default=64,
                    help="Concurrent-connection cap; over it the intake answers "
@@ -181,8 +253,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_env_files()
 
     if args.trust_refs:
-        log.warning("--trust-refs: reveal check DISABLED — dev only, never mainnet")
+        log.warning("--trust-refs: reveal + registration checks DISABLED — "
+                    "dev only, never mainnet")
         resolver = lambda hotkey, ref: 0  # noqa: E731
+        registration = None
     else:
         from ..shared.config import load_chain_config
 
@@ -191,6 +265,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         client = ChainClient.from_config(cfg, network=args.network)
         resolver = ChainRevealResolver(client, deadline_seconds=args.chain_timeout)
+        registration = ChainRegistrationResolver(
+            client, deadline_seconds=args.chain_timeout)
 
     vault = PayerKeyVault(dir=args.vault_dir, ttl_seconds=args.ttl_hours * 3600.0)
     hydrated = vault.hydrate()
@@ -201,7 +277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .store import SubmissionStore
 
         store = SubmissionStore(args.submission_dir,
-                                max_bytes=args.max_zip_mb * 1024 * 1024)
+                                max_bytes=args.max_zip_mb * 1024 * 1024,
+                                max_hotkey_bytes=args.max_hotkey_mb * 1024 * 1024)
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
         # [round] funded_entry_ttl_hours must be set to the same value.
@@ -210,10 +287,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolve_reveal=resolver,
         require_signature=not args.no_require_signature,
         store=store,
+        resolve_registered=registration,
     )
     server = intake.make_server(args.host, args.port,
                                 max_connections=args.max_connections,
-                                request_timeout_s=args.request_timeout)
+                                request_timeout_s=args.request_timeout,
+                                request_deadline_s=args.request_deadline,
+                                max_concurrent_uploads=args.max_uploads)
     log.info("cascade-intake listening on %s:%d (queue=%s, vault=%s, signatures=%s)",
              args.host, args.port, args.queue_path,
              args.vault_dir or "<memory-only>",

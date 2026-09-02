@@ -54,6 +54,10 @@ class SubmissionTooLarge(StorageError):
     """A submission ZIP exceeds its size / decompression cap (→ HTTP 413)."""
 
 
+class SubmissionQuotaExceeded(StorageError):
+    """A hotkey's stored submissions exceed its byte quota (→ HTTP 429)."""
+
+
 class DigestOwned(StorageError):
     """Identical bytes were already submitted by a different hotkey (→ 409)."""
 
@@ -75,6 +79,7 @@ __all__ = [
     "CHAMPION_BASE_ENV",
     "VAULT_REPO",
     "DigestOwned",
+    "SubmissionQuotaExceeded",
     "SubmissionStore",
     "SubmissionTooLarge",
     "champion_zip_key",
@@ -138,6 +143,29 @@ def champion_zip_key(digest_hex: str) -> str:
 # next to any real generator; well under the smallest cloud volume.
 MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
 
+# Member-COUNT cap, the byte caps' sibling: millions of zero-byte members (or
+# one-byte files in deep directory trees) pass every byte cap yet materialise
+# millions of inodes per extraction and make tempdir cleanup take minutes
+# (review 2026-09-02). A real generator is a handful of files; 4096 is
+# generous next to any legitimate tree.
+MAX_ZIP_MEMBERS = 4096
+
+# Per-hotkey stored-bytes quota. Registration gates WHO may store; this bounds
+# HOW MUCH each registered hotkey can accumulate (the store has no other GC).
+# Two max-size ZIPs, or hundreds of realistic ones.
+DEFAULT_MAX_HOTKEY_BYTES = 256 * 1024 * 1024
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` created 0600 — private from the first byte.
+
+    ``write_bytes`` + ``chmod`` leaves a umask-default window between create
+    and chmod; creating with the final mode closes it (review 2026-09-02).
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
 
 def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
     """Extract hostile ZIP bytes: regular files only, strictly inside ``dest``.
@@ -159,6 +187,9 @@ def extract_zip_safely(data: bytes, dest_dir: Path | str) -> Path:
         raise StorageError(f"not a valid zip: {e}") from e
     with zf:
         infos = zf.infolist()   # cached by ZipFile.__init__; cannot raise here
+        if len(infos) > MAX_ZIP_MEMBERS:
+            raise SubmissionTooLarge(
+                f"{len(infos)} zip members exceeds cap {MAX_ZIP_MEMBERS}")
         declared_total = sum(max(0, i.file_size) for i in infos)
         if declared_total > MAX_EXTRACTED_BYTES:
             raise SubmissionTooLarge(
@@ -235,12 +266,39 @@ class SubmissionStore:
     """
 
     def __init__(self, dir: Path | str, *, max_bytes: int = DEFAULT_MAX_ZIP_BYTES,
+                 max_hotkey_bytes: int = DEFAULT_MAX_HOTKEY_BYTES,
                  clock: Callable[[], float] = time.time) -> None:
         self.dir = Path(dir)
         self.max_bytes = int(max_bytes)
+        self.max_hotkey_bytes = int(max_hotkey_bytes)
         self.clock = clock
         self.dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.dir, 0o700)
+
+    def _check_quota(self, hotkey: str, incoming: int) -> None:
+        """Refuse when ``hotkey``'s stored bytes + ``incoming`` exceed quota.
+
+        Caller holds the store lock. The meta scan is a dir glob — bounded by
+        the quota itself (a full hotkey holds at most quota/1-byte files is
+        impossible: each stored ZIP is a valid archive, and the count is
+        bounded by quota / min zip size).
+        """
+        if self.max_hotkey_bytes <= 0:
+            return
+        total = 0
+        for mp in self.dir.glob("*.json"):
+            try:
+                raw = json.loads(mp.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if raw.get("hotkey") == hotkey:
+                total += int(raw.get("size", 0))
+        if total + incoming > self.max_hotkey_bytes:
+            raise SubmissionQuotaExceeded(
+                f"this hotkey already stores {total} submission bytes; cap "
+                f"{self.max_hotkey_bytes} — the store keeps everything you "
+                "upload (champion publication needs the bytes), so submit "
+                "less or smaller")
 
     def _zip_path(self, digest_hex: str) -> Path:
         return self.dir / f"{digest_hex}.zip"
@@ -279,13 +337,10 @@ class SubmissionStore:
                 f"{len(zip_bytes)} bytes > cap {self.max_bytes}")
         if not zip_bytes:
             raise StorageError("empty submission body")
-        # Validate contents BEFORE storing: everything in the store must be
-        # extractable later, when the miner is no longer on the wire to fix it.
-        import tempfile
-
-        with tempfile.TemporaryDirectory(dir=self.dir) as probe:
-            extract_zip_safely(zip_bytes, Path(probe) / "x")
         digest = hashlib.sha256(zip_bytes).hexdigest()
+        # Quota BEFORE the validation extraction: an over-quota hotkey must
+        # not cost the box a 512MB probe per refused request. Re-checked at
+        # write time (below) — two concurrent puts may both pass this look.
         with self._locked():
             existing = self.owner(digest)
             if existing is not None:
@@ -294,16 +349,32 @@ class SubmissionStore:
                         "identical bytes were already submitted by another "
                         "hotkey (earliest upload owns the content)")
                 return digest
+            self._check_quota(hotkey, len(zip_bytes))
+        # Validate contents BEFORE storing: everything in the store must be
+        # extractable later, when the miner is no longer on the wire to fix
+        # it. Deliberately OUTSIDE the lock — an expensive extraction under
+        # the lock would serialize every uploader behind the slowest ZIP.
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=self.dir) as probe:
+            extract_zip_safely(zip_bytes, Path(probe) / "x")
+        with self._locked():
+            existing = self.owner(digest)
+            if existing is not None:
+                if existing != hotkey:
+                    raise DigestOwned(
+                        "identical bytes were already submitted by another "
+                        "hotkey (earliest upload owns the content)")
+                return digest
+            self._check_quota(hotkey, len(zip_bytes))
             zp, mp = self._zip_path(digest), self._meta_path(digest)
             tmp = zp.with_suffix(".zip.tmp")
-            tmp.write_bytes(zip_bytes)
-            os.chmod(tmp, 0o600)
+            _write_private(tmp, zip_bytes)
             os.replace(tmp, zp)
             mtmp = mp.with_suffix(".json.tmp")
-            mtmp.write_text(json.dumps({
+            _write_private(mtmp, json.dumps({
                 "hotkey": hotkey, "uploaded_at": self.clock(), "size": len(zip_bytes),
-            }), encoding="utf-8")
-            os.chmod(mtmp, 0o600)
+            }).encode("utf-8"))
             os.replace(mtmp, mp)
             return digest
 

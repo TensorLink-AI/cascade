@@ -16,11 +16,16 @@ transfers):
         X-Miner-Hotkey:  SS58 hotkey (identity)
         X-Lium-Api-Key:  the miner's Lium key (payment)
         X-Commit-Ref:    the revealed generator ref this funds (repo@digest)
-        X-Timestamp:     unix seconds, ±FRESHNESS_WINDOW_SECONDS
+        X-Timestamp:     unix seconds, ±FRESHNESS_WINDOW_SECONDS, strictly
+                         increasing per (action, hotkey) — a re-signed retry
+                         needs a fresh timestamp
         X-Signature:     hex sr25519 by the hotkey over canonical_fund_message
+                         (v2: binds sha256 of the API key too, so an on-path
+                         replay cannot attach or swap a key)
     → 202 {"status": "queued" | "replaced"}  |  200 "already-queued"
     → 400 missing_lium_api_key / missing_hotkey / missing_ref /
-          stale_timestamp / bad_signature      |  403 not_revealed
+          stale_timestamp / bad_signature      |  403 not_revealed / not_registered
+    → 409 replayed_timestamp | 503 registration_unavailable
 
     POST /v1/submit     (body = the generator ZIP; same identity headers,
         X-Content-Digest: sha256:<hex> of the body — the SIGNED binding —
@@ -30,9 +35,12 @@ transfers):
            "funding": "pending_reveal" | "already-funded" | "none" |
                       "blocked-by-existing-entry"}  # last carries a funding_note
     → 400 digest_mismatch / missing_digest / bad_content_length | 409 digest_owned
-    → 413 zip_too_large                     |  503 submissions_disabled
+    → 403 not_registered (submissions require a hotkey registered on the
+          subnet — self-minted keypairs cannot fill the private store)
+    → 413 zip_too_large | 429 quota_exceeded | 503 submissions_disabled / busy
 
-    POST /v1/withdraw   (same auth headers, no key needed)
+    POST /v1/withdraw   (same auth headers, no key needed; with no live queue
+        entry it still forgets the vaulted key → 200 "key-forgotten")
     GET  /v1/queue      (public transparency feed — no key material)
     GET  /health
     (any path)          → 503 overloaded + Retry-After past the connection cap
@@ -68,6 +76,7 @@ __all__ = [
     "FRESHNESS_WINDOW_SECONDS",
     "FundingIntake",
     "canonical_fund_message",
+    "header_key_digest",
     "verify_hotkey_signature",
 ]
 
@@ -81,16 +90,31 @@ FRESHNESS_WINDOW_SECONDS = 300.0
 _ACTIONS = ("fund", "withdraw", "submit")
 
 
-def canonical_fund_message(action: str, hotkey: str, ref: str, timestamp: str) -> bytes:
+def canonical_fund_message(action: str, hotkey: str, ref: str, timestamp: str,
+                           key_digest: str = "-") -> bytes:
     """The byte string the miner's hotkey signs. Versioned; fields ``:``-joined.
 
-    ``ref`` is a Hub ``repo@digest`` and hotkeys are SS58 — neither contains
-    ``:``-ambiguity in practice, and the version tag pins the layout so a
-    future field addition is a new version, not a silent re-parse.
+    ``ref`` is a Hub ``repo@digest`` and hotkeys are SS58, and the version tag
+    pins the layout so a future field addition is a new version, not a silent
+    re-parse. v2 (review 2026-09-02) appends ``key_digest`` — sha256 hex of
+    the ``X-Lium-Api-Key`` value, or ``-`` when the request carries no key —
+    so the signature binds WHICH key funds the entry: an on-path replay of a
+    captured request can no longer attach its own key header (overwriting the
+    victim's vaulted working key) or strip/swap the one that was sent.
     """
     if action not in _ACTIONS:
         raise ValueError(f"unknown action {action!r}")
-    return f"cascade-{action}:v1:{hotkey}:{ref}:{timestamp}".encode()
+    return f"cascade-{action}:v2:{hotkey}:{ref}:{timestamp}:{key_digest}".encode()
+
+
+def header_key_digest(headers) -> str:
+    """The canonical-message key field for a request's headers."""
+    import hashlib
+
+    api_key = (headers.get("X-Lium-Api-Key") or "").strip()
+    if not api_key:
+        return "-"
+    return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 def verify_hotkey_signature(hotkey: str, message: bytes, signature_hex: str) -> bool:
@@ -119,6 +143,14 @@ class FundingIntake:
     is refused — the queue orders by reveal block, so an unresolvable one has
     no seniority to claim). Injected so the service can run against the chain
     poller in production and a table in tests.
+
+    ``resolve_registered(hotkey) -> bool | None`` is the subnet-membership
+    oracle: True/False for a definite answer, ``None`` when the chain view is
+    unavailable (→ 503, fail closed). ``None`` for the whole oracle disables
+    the check (dev / --trust-refs). Fund is already gated by the reveal check
+    (a reveal requires a registered commit), but submit happens BEFORE any
+    chain action — without this gate any self-minted keypair could fill the
+    private store (review 2026-09-02).
     """
 
     def __init__(
@@ -131,6 +163,7 @@ class FundingIntake:
         verify: Callable[[str, bytes, str], bool] = verify_hotkey_signature,
         clock: Callable[[], float] = time.time,
         store: object | None = None,   # SubmissionStore; None = submissions off
+        resolve_registered: Callable[[str], bool | None] | None = None,
     ) -> None:
         self.queue = queue
         self.vault = vault
@@ -139,6 +172,12 @@ class FundingIntake:
         self.verify = verify
         self.clock = clock
         self.store = store
+        self.resolve_registered = resolve_registered
+        # Replay floor: highest signature-verified timestamp per (action,
+        # hotkey). In-memory only — the freshness window is 300s, so a
+        # restart's forgotten floor re-opens at most that window.
+        self._replay_lock = threading.Lock()
+        self._last_ts: dict[tuple[str, str], float] = {}
 
     def sweep_pending(self) -> int:
         """Promote submit-with-key entries whose chain reveal has landed.
@@ -150,12 +189,81 @@ class FundingIntake:
         request that triggered the sweep.
         """
         try:
+            # Piggy-back the vault's TTL purge on the same request-driven
+            # cadence: without it an expired key's plaintext survives on disk
+            # until that hotkey is get()'d or the process restarts.
+            self.vault.purge_expired()
+        except Exception:  # noqa: BLE001 — purge is best-effort housekeeping
+            log.exception("vault TTL purge failed (will retry next request)")
+        try:
             return self.queue.promote_pending(self.resolve_reveal)
         except Exception:  # noqa: BLE001 — sweep is best-effort by design
             log.exception("pending-reveal sweep failed (will retry next request)")
             return 0
 
     # ── request handling (returns (http_status, body_dict)) ──────────────────
+
+    def _parse_fresh_timestamp(self, ts: str) -> float | None:
+        """The parsed timestamp when fresh, else ``None``.
+
+        The comparison is ``not (skew <= window)`` rather than ``skew >
+        window``: ``float("nan")`` parses, and NaN compares False BOTH ways —
+        the ``>`` form would treat a ``X-Timestamp: nan`` signature as fresh
+        forever, an eternal replay token (review 2026-09-02).
+        """
+        try:
+            tsf = float(ts)
+            skew = abs(self.clock() - tsf)
+        except ValueError:
+            return None
+        if not (skew <= FRESHNESS_WINDOW_SECONDS):
+            return None
+        return tsf
+
+    def _register_timestamp(self, action: str, hotkey: str, tsf: float) -> bool:
+        """Record a VERIFIED signature's timestamp; False = replay.
+
+        Timestamps must be strictly increasing per (action, hotkey): within
+        the freshness window a captured request replays verbatim — the
+        damaging case is a re-played withdraw landing after the miner
+        re-funded (review 2026-09-02). Runs only after signature
+        verification, so unverified garbage cannot poison the floor.
+        """
+        now = self.clock()
+        with self._replay_lock:
+            if len(self._last_ts) > 4096:   # bound the table; old floors are dead
+                cutoff = now - 2 * FRESHNESS_WINDOW_SECONDS
+                self._last_ts = {k: v for k, v in self._last_ts.items()
+                                 if v >= cutoff}
+            key = (action, hotkey)
+            last = self._last_ts.get(key)
+            if last is not None and tsf <= last:
+                return False
+            self._last_ts[key] = tsf
+            return True
+
+    _REPLAY_BODY = {"code": "replayed_timestamp",
+                    "message": "this (action, hotkey) already accepted an equal "
+                               "or newer X-Timestamp — sign a fresh one and retry"}
+
+    def _registration_gate(self, hotkey: str) -> tuple[int, dict] | None:
+        """403/503 when the hotkey is not (provably) registered on the subnet."""
+        if self.resolve_registered is None:
+            return None
+        try:
+            registered = self.resolve_registered(hotkey)
+        except Exception:  # noqa: BLE001 — an oracle crash is "unavailable"
+            log.exception("registration oracle failed for %s", hotkey)
+            registered = None
+        if registered is None:
+            return 503, {"code": "registration_unavailable",
+                         "message": "cannot verify subnet registration right "
+                                    "now; retry shortly"}
+        if not registered:
+            return 403, {"code": "not_registered",
+                         "message": "this hotkey is not registered on the "
+                                    "subnet — register first, then retry"}
+        return None
 
     def _auth(self, action: str, headers) -> tuple[int, dict] | tuple[None, dict]:
         """Shared identity/signature gate; (None, ctx) when the request passes."""
@@ -170,19 +278,20 @@ class FundingIntake:
         if self.require_signature:
             ts = (headers.get("X-Timestamp") or "").strip()
             sig = (headers.get("X-Signature") or "").strip()
-            try:
-                skew = abs(self.clock() - float(ts))
-            except ValueError:
-                skew = float("inf")
-            if skew > FRESHNESS_WINDOW_SECONDS:
+            tsf = self._parse_fresh_timestamp(ts)
+            if tsf is None:
                 return 400, {"code": "stale_timestamp",
                              "message": "X-Timestamp must be current unix seconds "
                                         f"(±{FRESHNESS_WINDOW_SECONDS:.0f}s)"}
-            msg = canonical_fund_message(action, hotkey, ref, ts)
+            msg = canonical_fund_message(action, hotkey, ref, ts,
+                                         header_key_digest(headers))
             if not sig or not self.verify(hotkey, msg, sig):
                 return 400, {"code": "bad_signature",
                              "message": "X-Signature must be the hotkey's sr25519 "
-                                        "signature over the canonical message"}
+                                        "signature over the canonical message "
+                                        "(v2 — it binds the key header too)"}
+            if not self._register_timestamp(action, hotkey, tsf):
+                return 409, dict(self._REPLAY_BODY)
         return None, {"hotkey": hotkey, "ref": ref}
 
     def submit_gate(self, headers) -> tuple[int, dict] | tuple[None, dict]:
@@ -210,35 +319,50 @@ class FundingIntake:
         if self.require_signature:
             ts = (headers.get("X-Timestamp") or "").strip()
             sig = (headers.get("X-Signature") or "").strip()
-            try:
-                skew = abs(self.clock() - float(ts))
-            except ValueError:
-                skew = float("inf")
-            if skew > FRESHNESS_WINDOW_SECONDS:
+            tsf = self._parse_fresh_timestamp(ts)
+            if tsf is None:
                 return 400, {"code": "stale_timestamp",
                              "message": "X-Timestamp must be current unix seconds "
                                         f"(±{FRESHNESS_WINDOW_SECONDS:.0f}s)"}
-            msg = canonical_fund_message("submit", hotkey, declared, ts)
+            msg = canonical_fund_message("submit", hotkey, declared, ts,
+                                         header_key_digest(headers))
             if not sig or not self.verify(hotkey, msg, sig):
                 return 400, {"code": "bad_signature",
                              "message": "X-Signature must be the hotkey's sr25519 "
                                         "signature over the canonical message "
-                                        "(which binds X-Content-Digest)"}
+                                        "(v2 — binds X-Content-Digest and the "
+                                        "key header)"}
+            if not self._register_timestamp("submit", hotkey, tsf):
+                return 409, dict(self._REPLAY_BODY)
+        # Subnet-membership gate, still header-only: storing code (and the
+        # validation extraction it costs) is for registered participants.
+        gate = self._registration_gate(hotkey)
+        if gate is not None:
+            return gate
         return None, {"hotkey": hotkey, "declared": declared}
 
-    def submit(self, headers, body: bytes) -> tuple[int, dict]:
+    def submit(self, headers, body: bytes,
+               gate_ctx: dict | None = None) -> tuple[int, dict]:
         """Store a generator ZIP; optionally fund it in the same request.
 
         The signature binds the CONTENT: the miner signs over
         ``X-Content-Digest`` (``sha256:<hex>`` of the ZIP they built), and the
         server recomputes the digest from the received body — a tampered or
         truncated upload fails ``digest_mismatch`` before anything stores.
+
+        ``gate_ctx`` is the context an earlier :meth:`submit_gate` call
+        returned (the HTTP layer gates before reading the body). Passing it
+        skips re-running the gate — which would trip the strictly-increasing
+        timestamp floor on the request's own second check.
         """
         import hashlib
 
-        status, ctx = self.submit_gate(headers)
-        if status is not None:
-            return status, ctx
+        if gate_ctx is None:
+            status, ctx = self.submit_gate(headers)
+            if status is not None:
+                return status, ctx
+        else:
+            ctx = gate_ctx
         self.sweep_pending()
         hotkey, declared = ctx["hotkey"], ctx["declared"]
         actual = f"sha256:{hashlib.sha256(body).hexdigest()}"
@@ -248,7 +372,8 @@ class FundingIntake:
                                     f"{declared} — corrupted upload?"}
         from ..interface.validation import format_commit
         from ..shared.hippius import StorageError
-        from .store import DigestOwned, SubmissionTooLarge, vault_ref
+        from .store import (DigestOwned, SubmissionQuotaExceeded,
+                            SubmissionTooLarge, vault_ref)
 
         # Dispatch HTTP status on the exception TYPE, never by substring-matching
         # the message — the message can carry the attacker-chosen member name,
@@ -257,6 +382,8 @@ class FundingIntake:
         # are NOT StorageError, so they propagate to a 500 rather than a 400.
         try:
             digest = self.store.put(body, hotkey)
+        except SubmissionQuotaExceeded as e:
+            return 429, {"code": "quota_exceeded", "message": str(e)}
         except SubmissionTooLarge as e:
             return 413, {"code": "zip_too_large", "message": str(e)}
         except DigestOwned as e:
@@ -302,6 +429,12 @@ class FundingIntake:
         status, ctx = self._auth("fund", headers)
         if status is not None:
             return status, ctx
+        # Belt over the reveal check's braces: a reveal implies the hotkey was
+        # registered when it committed, but a since-deregistered hotkey has no
+        # seat to fund.
+        gate = self._registration_gate(ctx["hotkey"])
+        if gate is not None:
+            return gate
         api_key = (headers.get("X-Lium-Api-Key") or "").strip()
         if not api_key:
             return 400, {"code": "missing_lium_api_key",
@@ -328,13 +461,23 @@ class FundingIntake:
         if status is not None:
             return status, ctx
         hotkey = ctx["hotkey"]
-        if not self.queue.withdraw(hotkey):
+        if self.queue.withdraw(hotkey):
+            self.vault.remove(hotkey)
+            log.info("withdraw %s", hotkey)
+            return 200, {"status": "withdrawn"}
+        entry = self.queue.get(hotkey)
+        if entry is not None and entry.status == "in_round":
             return 409, {"code": "not_queued",
-                         "message": "only a queued entry can withdraw — an entry "
-                                    "already in a round runs to its verdict"}
+                         "message": "an entry already in a round runs to its "
+                                    "verdict — the key is retained until then "
+                                    "(teardown needs it)"}
+        # No live entry: nothing to unqueue, but honor the custody half — a
+        # terminal (done/failed) or absent entry has no teardown claim on the
+        # key, so the miner can make us forget it NOW rather than waiting out
+        # the 36h TTL (review 2026-09-02).
         self.vault.remove(hotkey)
-        log.info("withdraw %s", hotkey)
-        return 200, {"status": "withdrawn"}
+        log.info("withdraw %s: no live entry — key forgotten", hotkey)
+        return 200, {"status": "key-forgotten"}
 
     def queue_view(self) -> tuple[int, dict]:
         self.sweep_pending()
@@ -344,7 +487,9 @@ class FundingIntake:
 
     def make_server(self, host: str, port: int, *,
                     max_connections: int = 64,
-                    request_timeout_s: float = 30.0) -> ThreadingHTTPServer:
+                    request_timeout_s: float = 30.0,
+                    request_deadline_s: float = 120.0,
+                    max_concurrent_uploads: int = 4) -> ThreadingHTTPServer:
         """The intake's HTTP server, with in-app DoS backstops.
 
         Volumetric DDoS is the FRONT PROXY's job (the runbook mandates one);
@@ -355,13 +500,24 @@ class FundingIntake:
         * ``request_timeout_s`` is the per-socket read/write timeout, so a
           slowloris client dribbling header bytes cannot pin a handler thread
           forever (the stdlib default is NO timeout).
+        * ``request_deadline_s`` is a whole-CONNECTION wall clock, enforced by
+          a reaper thread that force-closes any socket older than it. The
+          per-operation timeout alone is defeated by a drip-feed client that
+          sends one byte per interval — each read succeeds, the connection
+          never ends (review 2026-09-02). Connections are one-request
+          (HTTP/1.0 close semantics), so no legitimate request outlives this.
         * ``max_connections`` bounds concurrent handler threads — the stdlib
           ``ThreadingHTTPServer`` spawns unboundedly. Over the cap, the
           connection gets an immediate 503 with Retry-After and is closed
           WITHOUT spawning a thread, so a connection flood costs one small
           write each instead of a thread + fd each.
+        * ``max_concurrent_uploads`` bounds how many submit bodies buffer at
+          once: each is up to the ZIP cap in RAM (plus the store's validation
+          copy), so the worst case is this × ~3 × cap instead of
+          ``max_connections`` × ~3 × cap.
         """
         intake = self
+        upload_slots = threading.BoundedSemaphore(max_concurrent_uploads)
 
         class Handler(BaseHTTPRequestHandler):
             # Per-socket read/write timeout. StreamRequestHandler.setup() calls
@@ -436,12 +592,23 @@ class FundingIntake:
                         return
                     # Identity/signature gate BEFORE buffering the upload: an
                     # unauthenticated request never costs more than headers.
-                    status, err = intake.submit_gate(self.headers)
+                    # The returned ctx rides into submit() — re-gating there
+                    # would trip the strictly-increasing timestamp floor.
+                    status, gate_out = intake.submit_gate(self.headers)
                     if status is not None:
-                        self._reply(status, err)
+                        self._reply(status, gate_out)
                         return
-                    body = self.rfile.read(length) if length else b""
-                    self._dispatch(lambda: intake.submit(self.headers, body))
+                    if not upload_slots.acquire(timeout=10.0):
+                        self._reply(503, {"code": "busy",
+                                          "message": "too many concurrent "
+                                                     "uploads; retry shortly"})
+                        return
+                    try:
+                        body = self.rfile.read(length) if length else b""
+                        self._dispatch(lambda: intake.submit(
+                            self.headers, body, gate_ctx=gate_out))
+                    finally:
+                        upload_slots.release()
                     return
                 # Everything else is header-only; drain the body so keep-alive
                 # clients are not desynced.
@@ -473,6 +640,42 @@ class FundingIntake:
             def __init__(self, *args, **kwargs) -> None:
                 super().__init__(*args, **kwargs)
                 self._slots = threading.BoundedSemaphore(max_connections)
+                self._live_lock = threading.Lock()
+                self._live: dict[int, tuple] = {}   # id(sock) → (sock, started)
+                self._reaper_stop = threading.Event()
+                threading.Thread(target=self._reap_over_deadline, daemon=True,
+                                 name="intake-conn-reaper").start()
+
+            def _reap_over_deadline(self) -> None:
+                # The whole-connection deadline: force-close any socket older
+                # than request_deadline_s. The handler's blocked read then
+                # raises OSError, the thread unwinds, and its slot frees — a
+                # drip-feed client cannot hold a slot past the deadline.
+                import socket as _socket
+
+                while not self._reaper_stop.wait(5.0):
+                    now = time.monotonic()
+                    with self._live_lock:
+                        stuck = [(key, sock) for key, (sock, t0) in
+                                 self._live.items()
+                                 if now - t0 > request_deadline_s]
+                    for key, sock in stuck:
+                        log.warning("closing connection past the %.0fs "
+                                    "deadline", request_deadline_s)
+                        try:
+                            sock.shutdown(_socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        with self._live_lock:
+                            self._live.pop(key, None)
+
+            def server_close(self) -> None:
+                self._reaper_stop.set()
+                super().server_close()
 
             def process_request(self, request, client_address) -> None:
                 if not self._slots.acquire(blocking=False):
@@ -483,18 +686,25 @@ class FundingIntake:
                         pass  # client already gone — the close below is enough
                     self.shutdown_request(request)
                     return
+                with self._live_lock:
+                    self._live[id(request)] = (request, time.monotonic())
                 try:
                     super().process_request(request, client_address)
                 except BaseException:
                     # Thread never started (spawn failure) → the slot would
                     # leak; on success process_request_thread owns the release.
-                    self._slots.release()
+                    self._release(request)
                     raise
+
+            def _release(self, request) -> None:
+                with self._live_lock:
+                    self._live.pop(id(request), None)
+                self._slots.release()
 
             def process_request_thread(self, request, client_address) -> None:
                 try:
                     super().process_request_thread(request, client_address)
                 finally:
-                    self._slots.release()
+                    self._release(request)
 
         return BoundedServer((host, port), Handler)

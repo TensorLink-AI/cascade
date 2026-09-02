@@ -251,12 +251,13 @@ def test_fetch_from_hub_resolves_vault_refs_from_env_dir(tmp_path, monkeypatch):
 def _submit_headers(hotkey: str, body: bytes, *, ts: float, key: str = "",
                     sign=lambda m: b"sig") -> dict:
     digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+    key_digest = hashlib.sha256(key.encode()).hexdigest() if key else "-"
     h = {
         "X-Miner-Hotkey": hotkey,
         "X-Content-Digest": digest,
         "X-Timestamp": str(int(ts)),
         "X-Signature": sign(canonical_fund_message(
-            "submit", hotkey, digest, str(int(ts)))).hex()
+            "submit", hotkey, digest, str(int(ts)), key_digest)).hex()
             if callable(sign) else "",
     }
     if key:
@@ -607,3 +608,48 @@ def test_zip_repo_bytes_is_deterministic(tmp_path):
     # …and the archive round-trips through the store's safe extraction.
     out = extract_zip_safely(a, tmp_path / "out")
     assert (out / "sub" / "util.py").read_bytes() == b"more"
+
+
+# ── review 2026-09-02: member-count cap, per-hotkey quota, registration ──────
+
+
+def test_extract_refuses_member_count_bomb(tmp_path):
+    # Millions of zero-byte members pass every BYTE cap yet materialise an
+    # inode per member — the count cap refuses before extraction begins.
+    from cascade.funding.store import MAX_ZIP_MEMBERS
+
+    many = make_zip({f"f{i}": b"" for i in range(MAX_ZIP_MEMBERS + 1)})
+    with pytest.raises(SubmissionTooLarge, match="members"):
+        extract_zip_safely(many, tmp_path / "x")
+    ok = make_zip({f"f{i}": b"" for i in range(64)})
+    extract_zip_safely(ok, tmp_path / "y")
+
+
+def test_store_per_hotkey_quota(tmp_path):
+    from cascade.funding.store import SubmissionQuotaExceeded
+
+    z1 = make_zip({"generator.py": b"a" * 400})
+    z2 = make_zip({"generator.py": b"b" * 400})
+    store = SubmissionStore(tmp_path / "vault", max_hotkey_bytes=len(z1) + 10)
+    store.put(z1, HK)
+    with pytest.raises(SubmissionQuotaExceeded):
+        store.put(z2, HK)                     # over quota for this hotkey…
+    assert store.put(z2, HK2)                 # …but another hotkey is fine
+    # Idempotent re-upload of already-stored bytes never counts against quota.
+    assert store.put(z1, HK) == hashlib.sha256(z1).hexdigest()
+
+
+def test_submit_registration_gate_blocks_unregistered(tmp_path):
+    intake = make_intake(tmp_path)
+    intake.resolve_registered = lambda hk: hk == HK2
+    headers = _submit_headers(HK, GOOD_ZIP, ts=time.time())
+    status, body = intake.submit(headers, GOOD_ZIP)
+    assert (status, body["code"]) == (403, "not_registered")
+    assert not intake.store.has(GOOD_DIGEST)   # nothing stored, nothing probed
+    status, body = intake.submit(_submit_headers(HK2, GOOD_ZIP, ts=time.time()),
+                                 GOOD_ZIP)
+    assert status == 201
+    intake.resolve_registered = lambda hk: None    # chain view unavailable
+    status, body = intake.submit(_submit_headers(HK, GOOD_ZIP, ts=time.time()),
+                                 GOOD_ZIP)
+    assert (status, body["code"]) == (503, "registration_unavailable")

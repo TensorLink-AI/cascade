@@ -466,9 +466,15 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         if not _intake_transport_ok(args.intake):
             print("refusing plain http to a non-loopback intake", file=sys.stderr)
             return 2
-        with urllib.request.urlopen(f"{args.intake.rstrip('/')}/v1/queue",
-                                    timeout=10) as r:
-            live = _json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(f"{args.intake.rstrip('/')}/v1/queue",
+                                        timeout=10) as r:
+                live = _json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # URLError covers HTTPError; ValueError covers a proxy's HTML body.
+            print(f"intake unreachable or not answering JSON: {e}",
+                  file=sys.stderr)
+            return 3
         print(f"live queue (depth {live.get('queued_depth')}):")
         for e in live.get("entries") or []:
             err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
@@ -1003,20 +1009,25 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     from ..funding.intake import canonical_fund_message
 
     ts = str(int(_time.time()))
+    api_key = ""
+    if not args.no_fund:
+        api_key = (os.environ.get(args.lium_key_env) or "").strip()
+        if not api_key:
+            print(f"note: ${args.lium_key_env} not set — submitting unfunded "
+                  f"(fund later with `cascade fund`)")
+    # v2 canonical message: the signature binds the key header (its sha256)
+    # so an on-path replay cannot attach or swap a key.
+    key_digest = hashlib.sha256(api_key.encode()).hexdigest() if api_key else "-"
     headers = {
         "X-Miner-Hotkey": hotkey_ss58,
         "X-Content-Digest": digest,
         "X-Timestamp": ts,
-        "X-Signature": sign_fn(canonical_fund_message("submit", hotkey_ss58, digest, ts)).hex(),
+        "X-Signature": sign_fn(canonical_fund_message(
+            "submit", hotkey_ss58, digest, ts, key_digest)).hex(),
         "Content-Type": "application/zip",
     }
-    if not args.no_fund:
-        api_key = (os.environ.get(args.lium_key_env) or "").strip()
-        if api_key:
-            headers["X-Lium-Api-Key"] = api_key
-        else:
-            print(f"note: ${args.lium_key_env} not set — submitting unfunded "
-                  f"(fund later with `cascade fund`)")
+    if api_key:
+        headers["X-Lium-Api-Key"] = api_key
 
     req = urllib.request.Request(f"{base}/v1/submit", data=body, method="POST",
                                  headers=headers)
@@ -1033,8 +1044,14 @@ def _cmd_submit(args: argparse.Namespace) -> int:
         print(f"submit rejected ({status}): {resp_body.get('code', '?')} — "
               f"{resp_body.get('message', '')}", file=sys.stderr)
         return 1
-    ref = resp_body["ref"]
-    payload = resp_body["commit_payload"]
+    ref = resp_body.get("ref")
+    payload = resp_body.get("commit_payload")
+    if not ref or not payload:
+        # A middlebox can 200 with a non-JSON body; don't traceback on it.
+        print(f"intake answered {status} but the body is not a submit "
+              f"response: {resp_body.get('message', resp_body)!s:.200}",
+              file=sys.stderr)
+        return 3
     print(f"stored privately: {ref} (funding={resp_body.get('funding', 'none')})")
     if args.no_commit:
         print(f"commit it yourself when ready:\n  payload: {payload}")
@@ -1097,13 +1114,18 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
     from ..funding.intake import canonical_fund_message
 
     ts = str(int((now or _time.time)()))
+    import hashlib as _hashlib
+
+    sends_key = action == "fund" and bool(api_key)
+    key_digest = _hashlib.sha256(api_key.encode()).hexdigest() if sends_key else "-"
     headers = {
         "X-Miner-Hotkey": hotkey_ss58,
         "X-Commit-Ref": ref,
         "X-Timestamp": ts,
-        "X-Signature": sign_fn(canonical_fund_message(action, hotkey_ss58, ref, ts)).hex(),
+        "X-Signature": sign_fn(canonical_fund_message(
+            action, hotkey_ss58, ref, ts, key_digest)).hex(),
     }
-    if action == "fund":
+    if sends_key:
         headers["X-Lium-Api-Key"] = api_key
     return headers
 

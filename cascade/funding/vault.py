@@ -78,10 +78,11 @@ class PayerKeyVault:
         if self.dir is not None:
             path = self.dir / f"{hotkey}.json"
             tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps({"api_key": api_key, "stored_at": now}), encoding="utf-8"
-            )
-            os.chmod(tmp, 0o600)
+            # Create 0600 from the first byte — write_text + chmod leaves a
+            # umask-default window with the key already on disk.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"api_key": api_key, "stored_at": now}))
             os.replace(tmp, path)
 
     def refresh(self, hotkey: str) -> bool:

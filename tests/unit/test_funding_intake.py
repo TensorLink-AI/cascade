@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -97,11 +98,56 @@ def test_signature_gate(tmp_path):
     assert (status, body["code"]) == (400, "bad_signature")
     status, body = intake.fund({**base, "X-Signature": "beef"})
     assert status == 202
-    assert seen["msg"] == canonical_fund_message("fund", HK, REF, str(int(clock.t)))
+    # v2 message binds the key header's sha256 — an on-path replay can no
+    # longer attach or swap a key without breaking the signature.
+    key_digest = hashlib.sha256(b"sk").hexdigest()
+    assert seen["msg"] == canonical_fund_message(
+        "fund", HK, REF, str(int(clock.t)), key_digest)
     # Stale timestamp rejected even with a "valid" signature.
     stale = {**base, "X-Timestamp": str(int(clock.t) - 3600), "X-Signature": "beef"}
     status, body = intake.fund(stale)
     assert (status, body["code"]) == (400, "stale_timestamp")
+    # NaN parses as a float but must not read as fresh — the eternal-replay
+    # token (review 2026-09-02).
+    nan = {**base, "X-Timestamp": "nan", "X-Signature": "beef"}
+    status, body = intake.fund(nan)
+    assert (status, body["code"]) == (400, "stale_timestamp")
+
+
+def test_replayed_timestamp_refused(tmp_path):
+    clock = FakeClock()
+    intake, _ = make_intake(tmp_path, require_signature=True,
+                            verify=lambda hk, msg, sig: sig == "beef", clock=clock)
+    base = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk",
+            "X-Timestamp": str(int(clock.t)), "X-Signature": "beef"}
+    assert intake.fund(base)[0] == 202
+    # The identical verified request replays inside the freshness window →
+    # refused: timestamps are strictly increasing per (action, hotkey).
+    status, body = intake.fund(base)
+    assert (status, body["code"]) == (409, "replayed_timestamp")
+    # A re-signed request with a newer timestamp goes through.
+    clock.t += 5
+    newer = {**base, "X-Timestamp": str(int(clock.t))}
+    assert intake.fund(newer)[0] == 200      # already-queued (idempotent re-fund)
+    # The floor is per-action: the same timestamp is fine for withdraw.
+    wd = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF,
+          "X-Timestamp": str(int(clock.t)), "X-Signature": "beef"}
+    assert intake.withdraw(wd)[0] == 200
+
+
+def test_registration_gate(tmp_path):
+    registered = {"answer": False}
+    intake, _ = make_intake(tmp_path)
+    intake.resolve_registered = lambda hk: registered["answer"]
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    status, body = intake.fund(headers)
+    assert (status, body["code"]) == (403, "not_registered")
+    assert intake.vault.get(HK) is None      # nothing vaulted on refusal
+    registered["answer"] = None              # oracle has no chain view yet
+    status, body = intake.fund(headers)
+    assert (status, body["code"]) == (503, "registration_unavailable")
+    registered["answer"] = True
+    assert intake.fund(headers)[0] == 202
 
 
 def test_withdraw_lifecycle(tmp_path):
@@ -111,8 +157,24 @@ def test_withdraw_lifecycle(tmp_path):
     status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
     assert (status, body["status"]) == (200, "withdrawn")
     assert intake.vault.get(HK) is None      # withdrawing forgets the key
+    # A second withdraw has no live entry left: it still (idempotently)
+    # honors the key-custody half instead of 409ing (review 2026-09-02).
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-forgotten")
+
+
+def test_withdraw_in_round_keeps_key_but_terminal_forgets_it(tmp_path):
+    intake, _ = make_intake(tmp_path)
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    intake.fund(headers)
+    assert intake.queue.mark_in_round([HK])  # teardown still needs the key
     status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
     assert (status, body["code"]) == (409, "not_queued")
+    assert intake.vault.get(HK) == "sk"
+    intake.queue.mark_done(HK)               # terminal: no teardown claim remains
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-forgotten")
+    assert intake.vault.get(HK) is None
 
 
 def test_canonical_message_rejects_unknown_action():
