@@ -398,6 +398,86 @@ def _cmd_round(args: argparse.Namespace) -> int:
         return 3
 
 
+def _add_queue(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "queue",
+        help="Funded-round transparency: the published roster — who seated in "
+        "what order (with on-chain reveal blocks), which GPU type the round "
+        "chose and every probed capacity, and how each seat ended. Add "
+        "--intake to also show the live queue.",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--round", default=None,
+                   help="Round id (default: the latest published roster).")
+    p.add_argument("--intake", default=None,
+                   help="Intake base URL — also fetch the live /v1/queue.")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) — marks your rows '← you'.")
+    p.set_defaults(func=_cmd_queue)
+
+
+def _cmd_queue(args: argparse.Namespace) -> int:
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import fetch_public_json
+
+    key = (f"funded/round-{args.round}.json" if args.round else "funded/latest.json")
+    doc = fetch_public_json(cfg.storage, key)
+    me = args.hotkey or ""
+
+    def _tag(hk: str) -> str:
+        return "  ← you" if me and hk == me else ""
+
+    if doc is None:
+        print(f"no published funded roster at {key} (pre-funded round, or "
+              "funded_mode is not 'required' yet)")
+    else:
+        adm = doc.get("admission") or {}
+        print(f"round {doc.get('round_id')} — funded roster")
+        sku = adm.get("sku") or "?"
+        caps = adm.get("sku_capacities")
+        if caps:
+            print(f"  GPU type: {sku} (market: "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(caps.items())) + ")")
+        else:
+            print(f"  GPU type: {sku}")
+        print(f"  admission cap: {adm.get('cap')} (configured {adm.get('configured_cap')}, "
+              f"market {adm.get('market_capacity')}, reserve {adm.get('reserve')})")
+        print(f"  seated ({len(doc.get('seated') or [])}, reveal-block seniority):")
+        for e in doc.get("seated") or []:
+            print(f"    {e.get('hotkey')}  reveal={e.get('reveal_block')}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("waiting") or []:
+            print(f"  waiting: {e.get('hotkey')}  reveal={e.get('reveal_block')}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("outcomes") or []:
+            extra = f" [{e.get('error_class')}]" if e.get("error_class") else ""
+            print(f"  outcome: {e.get('hotkey')}  {e.get('outcome')}{extra}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("terminal") or []:
+            print(f"  terminal: {e.get('hotkey')}  [{e.get('error_class')}]"
+                  f"{_tag(str(e.get('hotkey')))}")
+        print("  (verify independently: reveal blocks are on-chain; "
+              "`cascade-audit round <id>` cross-checks this roster against "
+              "the signed manifest)")
+    if args.intake:
+        import json as _json
+        import urllib.request
+
+        if not _intake_transport_ok(args.intake):
+            print("refusing plain http to a non-loopback intake", file=sys.stderr)
+            return 2
+        with urllib.request.urlopen(f"{args.intake.rstrip('/')}/v1/queue",
+                                    timeout=10) as r:
+            live = _json.loads(r.read().decode("utf-8"))
+        print(f"live queue (depth {live.get('queued_depth')}):")
+        for e in live.get("entries") or []:
+            err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
+            print(f"  {e.get('hotkey')}  {e.get('status')}  "
+                  f"reveal={e.get('reveal_block')} attempts={e.get('attempts')}"
+                  f"{err}{_tag(str(e.get('hotkey')))}")
+    return 0
+
+
 def _add_heat(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "heat",
@@ -1122,6 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_score(sub)
     _add_reveal_status(sub)
     _add_round(sub)
+    _add_queue(sub)
     _add_heat(sub)
     _add_duel(sub)
     _add_fund(sub)

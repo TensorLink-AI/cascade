@@ -98,3 +98,34 @@ def test_decode_json_body_survives_proxy_html():
     body = _decode_json_body(b"<html><body>502 Bad Gateway</body></html>")
     assert body["code"] == "non_json_response" and "502" in body["message"]
     assert _decode_json_body(b"") == {}
+
+
+def test_cascade_queue_renders_roster_and_marks_you(capsys, monkeypatch, tmp_path):
+    """`cascade queue` prints the published roster (sku, capacities, seniority
+    order, outcomes) and marks the caller's rows — the miner-side half of the
+    funded transparency contract (the audit's funded-roster check is the
+    other)."""
+    import argparse
+
+    from cascade.miner import cli as cli_mod
+
+    doc = {"round_id": "77",
+           "admission": {"cap": 8, "configured_cap": 8, "market_capacity": 17,
+                         "reserve": 1, "sku": "RTX4090",
+                         "sku_capacities": {"RTX4090": 17, "A6000": 1}},
+           "seated": [{"hotkey": "hkME", "ref": "r", "reveal_block": 10}],
+           "waiting": [{"hotkey": "hkW", "reveal_block": 20}],
+           "terminal": [{"hotkey": "hkBad", "error_class": "auth"}],
+           "outcomes": [{"hotkey": "hkME", "outcome": "trained"}]}
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_json",
+                        lambda storage, key, **kw: doc)
+    monkeypatch.setattr(cli_mod, "load_chain_config",
+                        lambda p: type("C", (), {"storage": None})())
+    rc = cli_mod._cmd_queue(argparse.Namespace(
+        chain_toml=None, round=None, intake=None, hotkey="hkME"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RTX4090=17" in out and "A6000=1" in out
+    assert "hkME  reveal=10  ← you" in out
+    assert "hkBad  [auth]" in out
+    assert "cascade-audit round" in out
