@@ -862,6 +862,15 @@ class TrainerRunner:
     # level (not per-round): startup reconcile touches the ledger too.
     _funded_ledger_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False)
+    # Serialises the RENT phase (marketplace pick + `lium up` + readiness):
+    # concurrent rents snapshot the claimed-executor set before anyone has
+    # claimed, so they all pick the market's same top row — observed live
+    # 2026-09-02: every simultaneous pair chose one executor and the loser
+    # 429'd on the provider's create limit, every round. One rent at a time
+    # makes each later rent see the earlier claims; training itself still
+    # runs fully parallel, so wall-clock stays one leg + ~90s per seat.
+    _funded_rent_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
     # Challengers dropped BEFORE the field was even eligible (today: burned
     # hotkeys re-committing their one used submission), reset each round.
     # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
@@ -1587,8 +1596,6 @@ class TrainerRunner:
                                         f"config fault: {e}", miner_fault=False,
                                         error_class="infra", burn=False)
             raise _FundedLegSkip(gen.hotkey) from e
-        with self._funded_exec_lock:
-            claimed = tuple(sorted(self._funded_claimed_execs))
         # TRUE write-ahead: the pod's name is deterministic (launch appends
         # "-0"), so ledger the INTENT before `lium up` — a crash anywhere in
         # launch/wait/IP leaves the entry for the boundary sweep, instead of
@@ -1603,16 +1610,22 @@ class TrainerRunner:
             provider="lium", instance_id=expected_id, stage="funded",
             rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             sku=round_sku, gpus=1, payer_hotkey=gen.hotkey))
-        result = rent_funded_pod(
-            round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
-            sku=round_sku, image=rnd.funded_pod_image,
-            ssh_pubkey=ssh_pubkey, netuid=netuid,
-            ready_timeout=rnd.funded_ready_timeout_seconds,
-            exclude_ids=claimed,
-        )
-        if result.ok and result.machine_id:
+        # One rent at a time (see _funded_rent_lock): later rents must SEE
+        # earlier claims, or every concurrent pair picks the market's same
+        # top executor and races one create-rate window.
+        with self._funded_rent_lock:
             with self._funded_exec_lock:
-                self._funded_claimed_execs.add(result.machine_id)
+                claimed = tuple(sorted(self._funded_claimed_execs))
+            result = rent_funded_pod(
+                round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
+                sku=round_sku, image=rnd.funded_pod_image,
+                ssh_pubkey=ssh_pubkey, netuid=netuid,
+                ready_timeout=rnd.funded_ready_timeout_seconds,
+                exclude_ids=claimed,
+            )
+            if result.ok and result.machine_id:
+                with self._funded_exec_lock:
+                    self._funded_claimed_execs.add(result.machine_id)
         if not result.ok:
             # rent_funded_pod's own failure path verified-terminated anything
             # it launched; drop the write-ahead entry only when nothing leaked
@@ -1724,16 +1737,10 @@ class TrainerRunner:
                           ).read_text(encoding="utf-8").strip()
             sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
             provider = LiumProvider()
-            with self._funded_exec_lock:
-                claimed = tuple(sorted(self._funded_claimed_execs))
             # The n<netuid> token keeps this OUT of both the provisioner's
             # reaper scheme (which must never touch trainer-ledgered pods) and
             # any co-hosted deployment's sweep (review 2026-09-02).
             name_prefix = f"cascade-n{self.cfg.subnet.netuid}-{round_id}-funded-king"
-            spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
-                              ssh_pubkey=ssh_pubkey,
-                              name_prefix=name_prefix,
-                              gpus_per_pod=1, exclude_ids=claimed)
 
             def _ledger_king(pod_id: str) -> None:
                 self._ledger_add(PodInstance(
@@ -1747,7 +1754,7 @@ class TrainerRunner:
             # an operator king pod is on NOBODY else's radar.
             _ledger_king(f"{name_prefix}-0")
 
-            def _fail_king(pod_id: str, why: str) -> None:
+            def _fail_king(pod_id: str, why: str) -> None:  # noqa: ANN001
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
@@ -1761,17 +1768,27 @@ class TrainerRunner:
                               "%s", pod_id, te)
                 raise ProvisionError(why)
 
-            pod_id = provider.launch(spec)[0]
-            if not provider.wait_ready(pod_id,
-                                       timeout=rnd.funded_ready_timeout_seconds):
-                _fail_king(pod_id, f"king pod {pod_id} not ready in time")
-            addr = provider.get_ip(pod_id)
-            if addr is None:
-                _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
-            machine = provider.machine_of(pod_id) or ""
-            if machine:
+            # Serialized with every funded rent (see _funded_rent_lock): the
+            # king's `lium up` must not race a challenger's for the same
+            # executor / create-rate window.
+            with self._funded_rent_lock:
                 with self._funded_exec_lock:
-                    self._funded_claimed_execs.add(machine)
+                    claimed = tuple(sorted(self._funded_claimed_execs))
+                spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                                  ssh_pubkey=ssh_pubkey,
+                                  name_prefix=name_prefix,
+                                  gpus_per_pod=1, exclude_ids=claimed)
+                pod_id = provider.launch(spec)[0]
+                if not provider.wait_ready(
+                        pod_id, timeout=rnd.funded_ready_timeout_seconds):
+                    _fail_king(pod_id, f"king pod {pod_id} not ready in time")
+                addr = provider.get_ip(pod_id)
+                if addr is None:
+                    _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                machine = provider.machine_of(pod_id) or ""
+                if machine:
+                    with self._funded_exec_lock:
+                        self._funded_claimed_execs.add(machine)
             _ledger_king(pod_id)
             log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
                      pod_id, addr.ip, addr.ssh_port, sku)

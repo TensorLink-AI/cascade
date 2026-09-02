@@ -50,6 +50,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_claimed_execs=set(),
                            _funded_exec_lock=threading.Lock(),
                            _funded_ledger_lock=threading.Lock(),
+                           _funded_rent_lock=threading.Lock(),
                            _funded_admission_info={},
                            _funded_round_sku="",
                            _funded_king_host=None,
@@ -592,3 +593,38 @@ def test_sweep_routes_operator_pods_off_the_payer_path(tmp_path, monkeypatch):
     r._reconcile_funded_pods()
     assert ops == ["king-pod-1"]
     assert payers == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_rent_serialization_makes_claims_visible_to_the_next_rent(tmp_path, monkeypatch):
+    # Live 2026-09-02: concurrent rents snapshotted the claimed set before
+    # anyone claimed, so every simultaneous pair picked the market's same top
+    # executor (and the loser 429'd the account's create limit). The rent
+    # lock serialises the rent phase: the SECOND rent must see the first's
+    # machine in exclude_ids.
+    import threading
+
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    _vault(tmp_path, "hkB")
+    seen_excludes = {}
+    machines = iter(["exec-1", "exec-2"])
+
+    def fake_rent(**kw):
+        seen_excludes[kw["hotkey"]] = kw["exclude_ids"]
+        pod = _pod(kw["hotkey"])
+        return funded_mod.FundedRentResult(
+            hotkey=kw["hotkey"], ok=True, pod=pod,
+            address=PodAddress(ip="10.9.9.9", ssh_port=2222),
+            machine_id=next(machines))
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", fake_rent)
+    threads = [threading.Thread(target=runner._rent_funded_host,
+                                args=("777", _challenger(hk)))
+               for hk in ("hkA", "hkB")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    first, second = sorted(seen_excludes.values(), key=len)
+    assert first == ()
+    assert second in (("exec-1",), ("exec-2",))
