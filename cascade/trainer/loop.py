@@ -1050,6 +1050,31 @@ class TrainerRunner:
 
     # ── miner-funded compute (DEC-CA-0036) ───────────────────────────────────
 
+    def _funded_gate_open(self) -> bool:
+        """True when ``[round] funded_activation_block`` has passed (0 = no gate).
+
+        The release-then-activate switch for DEC-CA-0036: the armed config
+        ships fleet-wide days early and the funded machinery stays inert
+        until the chain reaches the announced block — no coordinated
+        flip-morning restart. The block height is stamped by ``run_forever``
+        each tick and by ``run_round`` at entry; a caller that never saw a
+        block (offline tools) treats an unreached gate as CLOSED, so the
+        armed config can never leak early.
+        """
+        act = self.cfg.round.funded_activation_block
+        if act <= 0:
+            return True
+        seen = getattr(self, "_funded_gate_block", None)
+        return seen is not None and int(seen) >= act
+
+    def _effective_funded_mode(self) -> str:
+        """``funded_mode`` as it applies RIGHT NOW ("off" before the gate)."""
+        return self.cfg.round.funded_mode if self._funded_gate_open() else "off"
+
+    def _effective_funded_pods(self) -> str:
+        """``funded_pods`` as it applies RIGHT NOW ("off" before the gate)."""
+        return self.cfg.round.funded_pods if self._funded_gate_open() else "off"
+
     def _funded_queue(self):
         """The funded queue, or ``None`` while ``[round] funded_mode = "off"``.
 
@@ -1058,7 +1083,7 @@ class TrainerRunner:
         newest state is always one load away). Relative paths resolve under
         ``work_root``, like ``submissions_db_path``.
         """
-        if self.cfg.round.funded_mode == "off":
+        if self._effective_funded_mode() == "off":
             return None
         from ..funding.queue import FundedQueue
 
@@ -1095,7 +1120,7 @@ class TrainerRunner:
         """
         from ..funding.queue import select_field
 
-        mode = self.cfg.round.funded_mode
+        mode = self._effective_funded_mode()
         queue = self._funded_queue()
         if queue is None or not challengers:
             return challengers
@@ -1289,7 +1314,7 @@ class TrainerRunner:
         nothing: its entries stay ``in_round`` and the next boundary's
         ``recover_in_round`` returns them to ``queued``, unburned.
         """
-        if self.cfg.round.funded_mode != "required" or not self._funded_field:
+        if self._effective_funded_mode() != "required" or not self._funded_field:
             return
         queue = self._funded_queue()
         if queue is None:
@@ -1360,7 +1385,7 @@ class TrainerRunner:
                                        "reserve": rnd.funded_capacity_reserve,
                                        "sku": self._funded_round_sku,
                                        "sku_capacities": None}
-        if rnd.funded_pods != "rent":
+        if self._effective_funded_pods() != "rent":
             return cap
         skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
                                               if rnd.funded_pod_sku else ())
@@ -1422,7 +1447,7 @@ class TrainerRunner:
         unsigned like the heat standings (DEC-CA-0011) — a publish failure
         must never disturb the round.
         """
-        if self.cfg.round.funded_mode != "required":
+        if self._effective_funded_mode() != "required":
             return
         from ..shared.heat_status import _publish_public_json
 
@@ -1515,7 +1540,7 @@ class TrainerRunner:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
         orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
         API hiccup must never hold a boundary."""
-        if self.cfg.round.funded_pods != "rent":
+        if self._effective_funded_pods() != "rent":
             return
         from ..provision.funded import reconcile_funded, teardown_funded
 
@@ -1854,7 +1879,18 @@ class TrainerRunner:
         is consensus-invisible: the king simply holds.
         """
         rnd = self.cfg.round
-        if rnd.funded_mode != "required" or not rnd.skip_unfunded_rounds:
+        if (rnd.funded_activation_block and rnd.funded_mode == "required"
+                and not self._funded_gate_open()):
+            # Announced go-live pending: HOLD every boundary between deploy
+            # and the activation block. Spending normal heat+duel rounds
+            # hours before the field rule flips would waste provisioner money
+            # and muddy the announcement; a held boundary is consensus-
+            # invisible (validators score what publishes — the king holds).
+            log.info("round %s: holding — funded go-live at block %d "
+                     "(gate not yet reached)", round_id,
+                     rnd.funded_activation_block)
+            return True
+        if self._effective_funded_mode() != "required" or not rnd.skip_unfunded_rounds:
             return False
         # Sweep funded-pod leftovers each boundary: a leg's own teardown covers
         # the normal path, this covers the crash paths (ledgered but live, or
@@ -2448,7 +2484,7 @@ class TrainerRunner:
             "screened": len(screened),
             "finalists": [c.hotkey for c in finalists],
         }
-        if self.cfg.round.funded_mode == "required":
+        if self._effective_funded_mode() == "required":
             # The settled-retry path re-enters run_round with round-init having
             # reset every funded attribute: without this snapshot the retry's
             # funded legs would dispatch on OPERATOR lanes (the bill silently
@@ -2536,7 +2572,7 @@ class TrainerRunner:
                     "stands for later rounds)",
                     base_seed, ", ".join(c.hotkey for c in matched))
         funded = raw.get("funded")
-        if isinstance(funded, dict) and self.cfg.round.funded_mode == "required":
+        if isinstance(funded, dict) and self._effective_funded_mode() == "required":
             # Restore the settled funded state so the retry keeps billing the
             # payers, keeps the chosen SKU, and can settle its entries — see
             # the snapshot's rationale in _mark_heat_complete.
@@ -3925,6 +3961,10 @@ class TrainerRunner:
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
         self._final_role_hosts = {}
+        # Stamp the height for the funded activation gate — run_round is also
+        # a direct entry point (scripts, tests), which must see the same gate
+        # decision the live loop would at this block.
+        self._funded_gate_block = int(block)
         # Funded-leg bookkeeping for THIS round: the selection map feeds the
         # per-payer dispatch, the failure map feeds the duel-settle (below).
         self._funded_field = {}
@@ -4195,7 +4235,7 @@ class TrainerRunner:
         n = max(0, self.cfg.round.finalists)
         armed = self.cfg.round.max_finalists > 1
         cap = max(0, self.cfg.round.finalist_cap)
-        if (self.cfg.round.funded_mode == "required" and self._funded_field
+        if (self._effective_funded_mode() == "required" and self._funded_field
                 and all(c.hotkey in self._funded_field for c in challengers)):
             # No-heat contract (DEC-CA-0036 elastic field): every SEATED funded
             # challenger duels — admission already capped the field, each seat
@@ -4931,8 +4971,9 @@ class TrainerRunner:
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
             if (role == "king"
-                    and self.cfg.round.funded_pods == "rent"
-                    and self.cfg.round.funded_king_rent):
+                    and self._effective_funded_pods() == "rent"
+                    and self.cfg.round.funded_king_rent
+                    and self._funded_gate_open()):
                 # No-heat end-state: the king's pod rents JIT at the round's
                 # chosen SKU (operator-billed) instead of a standing fleet.
                 host = self._rent_king_host(str(seeds.base_seed))
@@ -4950,7 +4991,7 @@ class TrainerRunner:
                     ("king", contract.arch_preset, gen.hotkey)] = host
                 return entry
             if (role == "challenger"
-                    and self.cfg.round.funded_pods == "rent"
+                    and self._effective_funded_pods() == "rent"
                     and gen.hotkey in self._funded_field):
                 # DEC-CA-0036: this leg bills its payer, on a pod rented with
                 # THEIR key — never an operator lane, even as a fallback (the
@@ -5254,6 +5295,9 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # Stamp the height for the funded release-then-activate gate
+                # (funded_activation_block) before ANY funded read this tick.
+                self._funded_gate_block = int(block)
                 # Resolved per tick, NOT hoisted: under a scheduled cadence
                 # change ([round] epoch_activation_block) a hoisted value would
                 # pin the trainer to the pre-switch length until it restarted,

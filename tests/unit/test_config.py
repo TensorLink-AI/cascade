@@ -313,14 +313,14 @@ def test_activation_block_must_be_on_both_grids(tmp_path):
     src = DEFAULT_CHAIN_TOML.read_text()
     p = tmp_path / "chain.toml"
 
-    # 8726400 is a multiple of both 7200 and 3600 — accepted.
+    # 8989200 is a multiple of both 3600 and 900 — accepted.
     p.write_text(src)
     shutil.copy(DEFAULT_CHAIN_TOML, p)
     load_chain_config(p)
 
-    # 8722800 is on the 3600 grid but NOT the 7200 grid — rejected.
-    p.write_text(src.replace("epoch_activation_block = 8726400",
-                             "epoch_activation_block = 8722800"))
+    # 8990100 is on the 900 grid but NOT the 3600 grid — rejected.
+    p.write_text(src.replace("epoch_activation_block = 8989200",
+                             "epoch_activation_block = 8990100"))
     with pytest.raises(ValueError, match="multiple of BOTH"):
         load_chain_config(p)
 
@@ -332,7 +332,7 @@ def test_cadence_keys_must_be_set_together(tmp_path):
 
     src = DEFAULT_CHAIN_TOML.read_text()
     p = tmp_path / "chain.toml"
-    p.write_text(src.replace("epoch_blocks_prev      = 7200",
+    p.write_text(src.replace("epoch_blocks_prev      = 3600",
                              "epoch_blocks_prev      = 0"))
     with pytest.raises(ValueError, match="must be set together"):
         load_chain_config(p)

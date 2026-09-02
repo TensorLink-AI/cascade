@@ -87,6 +87,48 @@ rationale; this file is the how.
    boundary, and a payer-key teardown after a provisioner restart
    (vault hydrate → `teardown_funded`).
 
+## GO-LIVE 2026-09-04 (mainnet, block-gated — owner 2026-09-02)
+
+The shipped `chain.toml` is ARMED behind two blocks:
+
+| what | block | projected UTC |
+|---|---|---|
+| epoch grid 3600 → 900 (`epoch_activation_block`) | 8989200 | Thu 2026-09-03 ~20:30 |
+| funded machinery live (`[round] funded_activation_block`) | 8991900 | Fri 2026-09-04 ~05:30 |
+
+(The 3h grid has no boundary at exactly 06:00 UTC; 8991900 is the closest
+round-start. Projections assume 12s blocks — verify against the live chain
+the day before and, if drift matters, adjust BOTH blocks keeping 8989200 a
+multiple of 3600 and 8991900 a multiple of 900.)
+
+Between deploy and the funded block the trainer **holds** (no rounds at all
+— announced-flip semantics, no provisioner spend); at 8991900 the first
+funded round fires. Operator checklist, in order:
+
+1. **Before block 8989200 (Thu ~20:30 UTC):** deploy this release to the
+   trainer AND every validator (the `expected_gpu = ""` unpin changes
+   `contract_digest`, and the grid seam needs everyone on the new pair) —
+   the standard coordinated window; announce to externals.
+2. **Start `cascade-intake`** on the orchestrator (see "bringing it up") with
+   `--vault-dir` matching `[round] payer_vault_dir` and the queue path the
+   trainer resolves; front it with TLS and publish the intake URL to miners.
+   NO `--trust-refs` and NO `--no-require-signature` on mainnet, ever.
+3. **Retire the provisioner's final stage** at the seam: with
+   `funded_king_rent = true` the trainer rents/ledgers/sweeps the king pod
+   itself; a standing final fleet would idle-bill and the provisioner must
+   never touch `cascade-n91-…` pods.
+4. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
+   from block 8991900; `cascade fund` after reveal; registered hotkey; keep
+   ~3h × chosen-GPU balance on the Lium key.
+5. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
+   `cascade-audit latest` (funded-roster check), and the trainer log's
+   admission/SKU lines. Rollback = set `funded_activation_block` far future
+   + restart trainer (grid stays 900; rounds hold).
+
+Direct submissions stay OFF at go-live (`submission_vault_dir = ""`): the
+pinned worker image predates the vault fetch — arming them is a separate
+image rebuild + budget-parity release.
+
 ## Fronting the intake (DoS posture)
 
 The intake runs on the orchestrator — the box holding the trainer wallet and

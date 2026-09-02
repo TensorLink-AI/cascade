@@ -15,7 +15,8 @@ At a glance:
 
 ```
 fork a generator → cascade verify → make a wallet → register on the subnet
-   → set Hippius creds → cascade deploy → confirm it competes in a round
+   → set Hippius creds → cascade deploy → cascade fund (your leg, your Lium key)
+   → confirm it competes in a round
 ```
 
 ## 0. Install
@@ -132,7 +133,7 @@ A green `[deterministic]` line means the trainer will accept it.
 ## 2b. Score it locally (the fast iteration loop)
 
 `verify` proves your generator is *valid*; `cascade score` tells you if it's
-*good* — without deploying, spending TAO, or waiting out a ~12h round. It
+*good* — without deploying, spending TAO, or funding a live round's leg. It
 trains the fixed model on your data at the cheap **heat** budget and scores it
 on a pool you control, entirely offline (needs the `[train]` extra + ideally a
 GPU):
@@ -384,7 +385,7 @@ How it works, and what to know:
 ### 5c. Time your submission — `cascade round`
 
 Only commits revealed **strictly before** the epoch boundary enter the next
-round; commit at or after it and you wait a whole extra round (~12h). `cascade
+round; commit at or after it and you wait a whole extra round (~3h once the 900-block grid is live). `cascade
 round` is a live round dashboard: the countdown to that deadline, where the
 round roughly is, and the revealed submissions — run it before you deploy so
 you don't commit into the wrong round, and keep it running to see your own
@@ -593,6 +594,57 @@ This is observability, not an appeal channel: these fields are not signed, not
 in the manifest, and never re-weight a score. They exist so a claim about host
 variance can be checked against numbers instead of inferred.
 
+## 6b. Fund your training leg — REQUIRED from Fri 2026-09-04 (~05:30 UTC, block 8991900)
+
+From block **8991900** (DEC-CA-0036), a revealed submission only enters a
+round once you FUND its training leg: your leg's GPU pod rents on **your own
+Lium API key** (lium.io), so the compute you consume bills you, not the
+operator. The operator still pays for the king's leg, the evals, and
+everything else. There is no heat screen any more — every funded, seated
+entrant goes straight to the paired duel against the king.
+
+```bash
+# after `cascade deploy` (your reveal must be on-chain and your hotkey
+# REGISTERED on the subnet):
+export LIUM_API_KEY=sk-...        # your key, env only — never on the command line
+cascade fund https://<operator-intake>     --ref <repo@digest>     --wallet-name mywallet --wallet-hotkey myhotkey
+# → fund: queued  (your seat is ordered by your on-chain reveal block)
+
+cascade queue                     # the last round's published seat allocation
+cascade queue --intake https://<operator-intake>   # + the LIVE queue
+cascade fund https://<operator-intake> --ref <repo@digest> --withdraw     --wallet-name mywallet --wallet-hotkey myhotkey   # exit while still queued
+```
+
+What to know:
+
+- **Seniority is your reveal block** — first revealed, first seated. Each
+  round seats up to 8 funded entries, clamped to the GPU marketplace's live
+  capacity; everyone else waits, unburned. Seat allocation is published
+  per-round (`funded/round-<id>.json`, `cascade queue`) with the on-chain
+  reveal blocks beside every seat, and `cascade-audit` cross-checks it
+  against the signed manifest — queue-jumping is a named, reproducible
+  audit warning.
+- **One GPU type per round**, chosen at the boundary as the most available
+  of `["RTX4090", "RTX3090", "L40S", "L40", "A6000"]` — king and challenger
+  always train on identical silicon. Keep enough balance on your Lium
+  account for ~3h of the round's type.
+- **Your entry never burns for infrastructure.** A dead pod, a sold-out
+  market, or a rate limit re-queues you without spending anything (sold-out
+  waits as long as it takes; a rate-limit streak longer than 6h turns
+  terminal — fix the key's limits and fund again). An invalid/revoked key
+  releases your entry as `auth` — fix it, `cascade fund` again. Your
+  generator crashing is your run, spent as ever.
+- **Your key is held at most 36h** in a sealed operator vault (0600 files,
+  never logged, never in any shared store), used ONLY to rent and tear down
+  your pod, forgotten on withdraw. The signed request binds the key's hash,
+  a fresh timestamp, and your ref, so it cannot be replayed or altered in
+  transit — always use an `https://` intake URL.
+- **Rounds are ~3h** (epoch 900 blocks) and fire only when someone funded:
+  an unfunded boundary runs nothing and the king simply holds.
+
+Full contract (failure classes, TTLs, the operator's obligations):
+[docs/MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUNDS.md).
+
 ## The cascade — warm-started rounds
 
 Rounds no longer always train from random init. When a king survives
@@ -671,4 +723,8 @@ always scored on windows that have never been published.
 | deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5b](#5b-if-the-hippius-hub-is-down)) |
 | committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
+| `403 not_registered` on fund/submit | your hotkey is not registered on the subnet — `btcli subnets register` first |
+| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-04-0530-utc-block-8991900)) |
+| funded but never seated | more-senior (earlier-revealed) entries out-capped you, or the GPU market is thin — you wait unburned; watch `cascade queue` |
+| entry `failed [rate_limited]` | your Lium key 429'd for 6h straight — raise the key's rate limits, then fund again |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |

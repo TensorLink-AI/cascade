@@ -835,6 +835,15 @@ class RoundConfig:
     # digests; "required" IS a change to who competes, so arming follows the
     # release-then-activate discipline like every other mode flag here.
     funded_mode: str = "off"
+    # Release-then-activate gate for the WHOLE funded machinery: before this
+    # block, every funded_* knob behaves as "off" regardless of its configured
+    # value; from it on, the configured values apply. 0 = no gate (configured
+    # values apply immediately — the pre-2026-09-02 behaviour). This is what
+    # lets the armed config ship fleet-wide days early and flip at one
+    # announced block with no coordinated restart — the same shape as
+    # epoch_activation_block / mix_from_block. Trainer-side ([round]),
+    # consensus-inert: validators score what publishes and never schedule.
+    funded_activation_block: int = 0
     # The funded queue file shared with cascade-intake and the provisioner.
     # Relative paths resolve under work_root (like submissions_db_path).
     funded_queue_path: str = "funded_queue.json"
@@ -1848,6 +1857,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
             max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
             funded_entry_ttl_hours=float(r.get("funded_entry_ttl_hours", 36.0)),
+            funded_activation_block=max(0, int(r.get("funded_activation_block", 0))),
             funded_pods=validate_funded_pods(str(r.get("funded_pods", "off"))),
             payer_vault_dir=str(r.get("payer_vault_dir", "")),
             funded_pod_sku=str(r.get("funded_pod_sku", "")),

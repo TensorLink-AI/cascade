@@ -29,7 +29,8 @@ def _runner(tmp_path, **round_kw):
                            _funded_ledger_lock=threading.Lock(),
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
-    for name in ("_funded_queue", "_filter_funded_challengers", "_settle_funded",
+    for name in ("_funded_gate_open", "_effective_funded_mode",
+                 "_effective_funded_pods", "_funded_queue", "_filter_funded_challengers", "_settle_funded",
                  "_skip_unfunded_round", "_submissions_path", "_payer_vault",
                  "_reconcile_funded_pods", "_record_funded_failure",
                  "_funded_admission_cap", "_probe_funded_capacity"):
@@ -263,7 +264,8 @@ def test_no_heat_every_seated_funded_challenger_advances(tmp_path):
         screen_fn=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the screen must never run for an all-funded field")),
     )
-    fake._run_heat = TrainerRunner._run_heat.__get__(fake)
+    for name in ("_run_heat", "_funded_gate_open", "_effective_funded_mode"):
+        setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     # finalist_cap (max(1, max_finalists)=3) < seated 5: without the funded
     # fast-path the overflow would be screened out and burned unjudged.
     finalists, heat = fake._run_heat(field, None, 100)
@@ -313,3 +315,31 @@ def test_funded_config_validators_fail_loud():
     assert validate_funded_pod_skus(["RTX4090", "A6000"]) == ("RTX4090", "A6000")
     with pytest.raises(ValueError):
         validate_funded_pod_skus("RTX4090")      # would iterate as characters
+
+
+def test_funded_activation_block_gates_everything(tmp_path):
+    # Release-then-activate: the armed config ships early and stays inert
+    # until the chain reaches the announced block (2026-09-04 go-live).
+    q = _queue(tmp_path)
+    q.add("hkA", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required", funded_pods="rent",
+                     skip_unfunded_rounds=True, funded_activation_block=1000)
+    field = [_challenger("hkA"), _challenger("hkB")]
+    # No block seen yet → gate CLOSED (armed config must never leak early).
+    assert runner._filter_funded_challengers(field) == field
+    # Announced go-live pending → boundaries HOLD (no normal rounds spent
+    # in the hours between deploy and the flip).
+    assert runner._skip_unfunded_round("r1")
+    assert runner._effective_funded_pods() == "off"
+    # Pre-activation block → still closed.
+    runner._funded_gate_block = 999
+    assert runner._filter_funded_challengers(field) == field
+    assert _queue(tmp_path).get("hkA").status == "queued"    # untouched
+    # At the block → configured modes apply: queue becomes the field.
+    runner._funded_gate_block = 1000
+    kept = runner._filter_funded_challengers(field)
+    assert [c.hotkey for c in kept] == ["hkA"]
+    assert runner._effective_funded_pods() == "rent"
+    # No gate configured (0) → open immediately, block or not (compat).
+    open_runner = _runner(tmp_path, funded_mode="required")
+    assert open_runner._effective_funded_mode() == "required"

@@ -57,7 +57,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_king_lock=threading.Lock(),
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
-    for name in ("_funded_queue", "_payer_vault", "_funded_pod_profile",
+    for name in ("_funded_gate_open", "_effective_funded_mode",
+                 "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity",
                  "_rent_king_host", "_teardown_operator_pod",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",

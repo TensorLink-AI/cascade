@@ -59,7 +59,17 @@ def cfg() -> ChainConfig:
                    # corpus_n_series with a 67M-point draw. Tests that exercise
                    # the points path arm it explicitly via replace().
                    generator=replace(c.generator, corpus_target_points=0),
-                   round=replace(c.round, commit_floor_block=0, dedup_mode="off"),
+                   # The scheduled cadence pair and the ARMED funded go-live
+                   # config (2026-09-04) are real-chain state: under pytest's
+                   # tiny block numbers the pair resolves every round to the
+                   # OLD grid, and funded_mode="required" would filter every
+                   # fixture challenger out of every round. Neutralize like
+                   # the pins; funded tests arm their own RoundConfig.
+                   round=replace(c.round, commit_floor_block=0, dedup_mode="off",
+                                 epoch_blocks_prev=0, epoch_activation_block=0,
+                                 funded_activation_block=0, funded_mode="off",
+                                 funded_pods="off", funded_king_rent=False,
+                                 skip_unfunded_rounds=False),
                    manifest=replace(c.manifest, validator_hotkey=""))
 
 
