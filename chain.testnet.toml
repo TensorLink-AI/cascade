@@ -207,6 +207,16 @@ funded_queue_path = "funded_queue.json"
 skip_unfunded_rounds = false
 max_rounds_per_day = 1
 funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
+# Per-payer funded pods (DEC-CA-0036 second arming gate): "off" = funded legs
+# run on the operator fleet (pre-wiring behaviour); "rent" = each funded
+# challenger leg rents ONE pod on its payer's own Lium key, dispatches there,
+# and tears it down when the leg ends (king + eval pods stay operator-funded,
+# always). "rent" needs the three keys below; consensus-inert ([round]).
+funded_pods = "off"
+payer_vault_dir = ""            # cascade-intake --vault-dir (work_root-relative)
+funded_pod_sku = ""             # marketplace SKU, keep = the final stage's SKU
+funded_pod_image = ""           # digest-pinned worker image (…@sha256:…)
+funded_ready_timeout_seconds = 900.0
 submission_vault_dir = ""       # direct submissions (vault refs) off until armed
 champion_publish = "off"
 champion_publish_delay_rounds = 2

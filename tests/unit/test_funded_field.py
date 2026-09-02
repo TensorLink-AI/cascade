@@ -20,9 +20,11 @@ def _challenger(hotkey: str, ref: str = REF, reveal_block: int = 0) -> SimpleNam
 def _runner(tmp_path, **round_kw):
     """A minimal stand-in: the funded methods touch only cfg.round + work_root."""
     rnd = RoundConfig(funded_queue_path="funded_queue.json", **round_kw)
-    fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path)
-    for name in ("_funded_queue", "_filter_funded_challengers", "_mark_funded_done",
-                 "_skip_unfunded_round", "_submissions_path"):
+    fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path,
+                           _funded_field={}, _funded_leg_failures={})
+    for name in ("_funded_queue", "_filter_funded_challengers", "_settle_funded",
+                 "_skip_unfunded_round", "_submissions_path", "_payer_vault",
+                 "_reconcile_funded_pods", "_record_funded_failure"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     return fake
 
@@ -115,18 +117,60 @@ def test_torn_round_recovers_then_settle_marks_done(tmp_path):
     # recovers it and re-selects — never burned, never dropped.
     kept = runner._filter_funded_challengers(field)
     assert [c.hotkey for c in kept] == ["hkA"]
-    # Settle: the consumed entry goes done; a re-fund then starts fresh.
-    runner._mark_funded_done(field)
+    # Settle from the duel outcome: a trained (judged) entry goes done; a
+    # re-fund then starts fresh.
+    runner._settle_funded([(field[0], "challenger")],
+                          [SimpleNamespace(hotkey="hkA", role="challenger")])
     assert _queue(tmp_path).get("hkA").status == "done"
     assert _queue(tmp_path).add("hkA", REF, 10) == "queued"
 
 
-def test_mark_done_only_touches_in_round_entries(tmp_path):
+def test_settle_only_touches_in_round_entries(tmp_path):
     q = _queue(tmp_path)
     q.add("hkA", REF, reveal_block=10)
     runner = _runner(tmp_path, funded_mode="required")
-    runner._mark_funded_done([_challenger("hkA")])           # never selected
+    runner._funded_field = {"hkA": REF}                      # claimed but never flipped
+    runner._settle_funded([(_challenger("hkA"), "challenger")],
+                          [SimpleNamespace(hotkey="hkA", role="challenger")])
     assert _queue(tmp_path).get("hkA").status == "queued"
+
+
+def test_settle_requeues_infra_failed_leg_unburning_the_entry(tmp_path):
+    # The 2026-09-01 live finding: a duel leg lost to operator infra must NOT
+    # consume the paid entry — it re-queues with one bounded attempt burned.
+    q = _queue(tmp_path)
+    q.add("hkA", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required")
+    field = runner._filter_funded_challengers([_challenger("hkA")])
+    runner._record_funded_failure("hkA", "remote challenger failed (rc=255)",
+                                  miner_fault=False, error_class="infra", burn=True)
+    runner._settle_funded([(field[0], "challenger")], [])    # no manifest entry
+    entry = _queue(tmp_path).get("hkA")
+    assert (entry.status, entry.attempts, entry.last_error_class) == ("queued", 1, "infra")
+
+
+def test_settle_fails_miner_fault_leg_terminally(tmp_path):
+    # Worker rc=3 = the miner's own submission was rejected: their entry fails
+    # visibly (fund again after fixing), never silently re-queues forever.
+    q = _queue(tmp_path)
+    q.add("hkA", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required")
+    field = runner._filter_funded_challengers([_challenger("hkA")])
+    runner._record_funded_failure("hkA", "miner submission rejected: corpus",
+                                  miner_fault=True, error_class="generator", burn=False)
+    runner._settle_funded([(field[0], "challenger")], [])
+    entry = _queue(tmp_path).get("hkA")
+    assert (entry.status, entry.last_error_class) == ("failed", "generator")
+
+
+def test_settle_unknown_failure_defaults_to_bounded_infra_requeue(tmp_path):
+    q = _queue(tmp_path)
+    q.add("hkA", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required")
+    field = runner._filter_funded_challengers([_challenger("hkA")])
+    runner._settle_funded([(field[0], "challenger")], [])    # no record at all
+    entry = _queue(tmp_path).get("hkA")
+    assert (entry.status, entry.attempts) == ("queued", 1)
 
 
 def test_skip_unfunded_round_floor(tmp_path):

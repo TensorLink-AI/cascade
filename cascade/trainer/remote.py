@@ -92,6 +92,12 @@ class RemoteHost:
     forward_env: tuple[str, ...] = ()
     ssh_options: tuple[str, ...] = ()       # extra raw `-o Key=Value` style flags
     stage: str = "any"                      # "any" | "heat" | "final"
+    # Fixed (name, value) pairs merged into the dispatch's stdin env AFTER the
+    # forward_env copies — per-HOST values the orchestrator's own environment
+    # cannot supply (e.g. a funded pod's staged-vault dir, which is a pod-local
+    # path). Travels on stdin like every forwarded credential, never on the
+    # remote command line.
+    static_env: tuple[tuple[str, str], ...] = ()
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -139,6 +145,8 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 forward_env=tuple(str(x) for x in h.get("forward_env", ())),
                 ssh_options=tuple(str(x) for x in h.get("ssh_options", ())),
                 stage=stage,
+                static_env=tuple(sorted(
+                    (str(k), str(v)) for k, v in dict(h.get("static_env", {})).items())),
             )
         )
     return hosts
@@ -370,6 +378,10 @@ class RemoteDispatcher:
         # dict.fromkeys de-dups while preserving order if a host lists one too.
         names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
         env = {k: os.environ[k] for k in names if k in os.environ}
+        # Host-pinned values win over forwarded copies: a funded pod's
+        # CASCADE_VAULT_DIR must be the POD's staging path even when the
+        # orchestrator exports its own store dir under the same name.
+        env.update(dict(host.static_env))
         remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,

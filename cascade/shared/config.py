@@ -236,6 +236,22 @@ def validate_funded_mode(mode: str) -> str:
     return mode
 
 
+FUNDED_POD_MODES = ("off", "rent")
+
+
+def validate_funded_pods(mode: str) -> str:
+    """Return ``mode`` if it is a known funded-pods mode, else raise ValueError.
+
+    "rent" silently degrading to "off" would move every funded challenger leg
+    back onto the operator's GPU bill — same fail-loud rationale as
+    :func:`validate_funded_mode`.
+    """
+    if mode not in FUNDED_POD_MODES:
+        raise ValueError(
+            f"funded_pods={mode!r} invalid; expected one of {FUNDED_POD_MODES}")
+    return mode
+
+
 # Champion publication policies for direct (vault) submissions (DEC-CA-0036):
 # when a vault-ref king's code goes public. See cascade.funding.champion.
 CHAMPION_PUBLISH_MODES = ("off", "crown", "delay", "dethrone")
@@ -818,6 +834,28 @@ class RoundConfig:
     # measured from the entry's last activity (fund/requeue/promotion), so a
     # sold-out entry actively cycling never expires mid-drought.
     funded_entry_ttl_hours: float = 36.0
+    # ── Per-payer funded pods (DEC-CA-0036, second arming gate) ──────────────
+    # "off"  — funded challenger legs run on the operator fleet (hosts.toml),
+    #          exactly the pre-wiring behaviour.
+    # "rent" — each funded challenger leg rents ONE pod on ITS payer's Lium key
+    #          (cascade.provision.funded), dispatches there, and tears it down
+    #          when the leg ends. The king's leg and every eval pod stay on the
+    #          operator fleet, always. Requires funded_mode = "required" plus
+    #          the three keys below; consensus-inert ([round]).
+    funded_pods: str = "off"
+    # The payer-key vault directory shared with cascade-intake --vault-dir
+    # (cascade.funding.vault; relative resolves under work_root). Required for
+    # "rent": without the miner's key no pod can be rented on their account.
+    payer_vault_dir: str = ""
+    # Marketplace SKU for funded pods (e.g. "RTX4090"). One SKU for every
+    # funded leg — the validator's gpu_name pairing needs king and challenger
+    # on matching silicon, so keep this the FINAL stage's SKU.
+    funded_pod_sku: str = ""
+    # Digest-pinned worker image funded pods launch from (full ref,
+    # ``…@sha256:…`` — the same image the operator's final fleet runs).
+    funded_pod_image: str = ""
+    # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
+    funded_ready_timeout_seconds: float = 900.0
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -1750,6 +1788,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
             max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
             funded_entry_ttl_hours=float(r.get("funded_entry_ttl_hours", 36.0)),
+            funded_pods=validate_funded_pods(str(r.get("funded_pods", "off"))),
+            payer_vault_dir=str(r.get("payer_vault_dir", "")),
+            funded_pod_sku=str(r.get("funded_pod_sku", "")),
+            funded_pod_image=str(r.get("funded_pod_image", "")),
+            funded_ready_timeout_seconds=float(
+                r.get("funded_ready_timeout_seconds", 900.0)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),
