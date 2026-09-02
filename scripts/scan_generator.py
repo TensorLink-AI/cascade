@@ -14,10 +14,11 @@ Checks (all static):
                       files, path-traversal names
   * requirements    — non-PyPI sources (URLs, git+, local paths), packages
                       outside the known generator stack
-  * Python AST      — network primitives, subprocess/os.system, exec/eval/
-                      compile on data, ctypes/FFI, dynamic import from
-                      strings, env/credential reads, writes outside the
-                      tree, base64→exec style obfuscation
+  * Python AST      — network primitives, subprocess/os.system (dotted,
+                      from-imported, and literal-string runtime imports),
+                      exec/eval/compile on data, ctypes/FFI, dynamic import
+                      from strings, env/credential reads, base64→exec style
+                      obfuscation
 
 Findings are advisory but the exit code is honest: 0 clean, 1 findings,
 2 scan error. Usage: scripts/scan_generator.py <dir> [--json out.json]
@@ -47,6 +48,16 @@ KNOWN_STACK_PREFIXES = (
     "pyyaml", "typing-extensions", "typing_extensions", "joblib", "threadpoolctl",
 )
 SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "WALLET")
+
+# Dangerous members of `os` — the module itself is ubiquitous in legitimate
+# code, so `import os` is never flagged, but `from os import system` (which
+# also hides the later bare `system(...)` call from the dotted-name check)
+# is exactly the cheap evasion the from-import check closes (review
+# 2026-09-02).
+OS_DANGER_MEMBERS = {"system", "popen", "execl", "execle", "execlp", "execv",
+                     "execve", "execvp", "execvpe", "spawnl", "spawnle",
+                     "spawnlp", "spawnv", "spawnve", "spawnvp", "fork",
+                     "forkpty", "posix_spawn", "posix_spawnp"}
 
 
 def _finding(out, sev, path, what):
@@ -116,6 +127,12 @@ class _PyScan(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node):
         self._flag_import(self._root(node.module))
+        if self._root(node.module) == "os":
+            for a in node.names:
+                if a.name in OS_DANGER_MEMBERS or a.name == "*":
+                    _finding(self.out, "high", self.rel,
+                             f"process primitive from-import: "
+                             f"from os import {a.name}")
         self.generic_visit(node)
 
     def _flag_import(self, root):
@@ -143,6 +160,15 @@ class _PyScan(ast.NodeVisitor):
             if not (node.args and isinstance(node.args[0], ast.Constant)):
                 _finding(self.out, "high", self.rel,
                          f"dynamic import from a computed string: {name}()")
+            else:
+                # A LITERAL runtime import bypasses the import-statement
+                # checks entirely — `__import__("socket")` was invisible
+                # (review 2026-09-02). Same module lists as the statements.
+                root = self._root(str(node.args[0].value))
+                if root in NET_MODULES | PROC_MODULES | FFI_MODULES:
+                    _finding(self.out, "high", self.rel,
+                             f"runtime import of a flagged module: "
+                             f"{name}({root!r})")
         if name in ("getattr",) and len(node.args) >= 2 and not isinstance(
                 node.args[1], ast.Constant):
             _finding(self.out, "warn", self.rel,
@@ -173,13 +199,24 @@ class _PyScan(ast.NodeVisitor):
 
 def scan_python(root: Path, out: list) -> None:
     for p in root.rglob("*.py"):
+        if not p.is_file():
+            continue    # rglob matches a DIRECTORY named *.py too
         rel = p.relative_to(root)
+        # A hostile file can crash ast.parse in ways SyntaxError does not
+        # cover — ValueError (null bytes survive errors="replace"),
+        # RecursionError (pathological nesting; also reachable from visit()) —
+        # and an unhandled crash here takes down the whole sync instead of
+        # producing a finding (review 2026-09-02). Fail-visible: an
+        # unanalyzable file is a HIGH finding, not a pass.
         try:
             tree = ast.parse(p.read_text(errors="replace"))
+            _PyScan(rel, out).visit(tree)
         except SyntaxError as e:
             _finding(out, "warn", rel, f"unparseable python ({e.msg} line {e.lineno})")
-            continue
-        _PyScan(rel, out).visit(tree)
+        except (ValueError, RecursionError, OSError, MemoryError) as e:
+            _finding(out, "high", rel,
+                     f"unanalyzable python ({type(e).__name__}) — treat as "
+                     "hostile until read by a human")
 
 
 def scan(root: Path) -> list:

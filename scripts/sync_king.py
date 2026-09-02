@@ -78,6 +78,16 @@ def main() -> int:
             if ref:
                 break
         digest = ref.split("@sha256:")[-1][:64] if "@sha256:" in ref else ""
+        if not digest:
+            # Without the digest the idempotence check cannot run: an hourly
+            # cron would re-commit a fresh "unknown-ref" reign EVERY run,
+            # forever, and poison future idempotence with an empty digest
+            # (review 2026-09-02). Fail loudly instead — this only happens if
+            # the CLI's output format changes, which a human must look at.
+            print("could not parse the resolved king ref from the CLI output "
+                  "— refusing to archive without provenance. CLI said:\n"
+                  f"{(r.stdout + r.stderr)[-800:]}", file=sys.stderr)
+            return 2
 
         prev = {}
         if PROVENANCE.is_file():
@@ -112,17 +122,28 @@ def main() -> int:
                   file=sys.stderr)
             return 1
 
-        if DEST.exists():
-            shutil.rmtree(DEST)
-        shutil.copytree(out, DEST)
-        (DEST / "SCAN.json").write_text(json.dumps({
+        # Stage the full replacement BESIDE the destination, then swap: a
+        # copy that dies mid-way (disk full) must not leave a half-replaced
+        # champions/king/ behind (review 2026-09-02). Symlinks are dropped
+        # from the copy UNCONDITIONALLY — the scan flags them high, but an
+        # --allow-findings run (accepting some unrelated finding) must never
+        # let copytree's default dereference commit HOST file contents into
+        # a public repo.
+        def _drop_symlinks(dirpath, names):
+            return [n for n in names if (Path(dirpath) / n).is_symlink()]
+
+        staged = DEST.parent / ".king.staging"
+        if staged.exists():
+            shutil.rmtree(staged)
+        shutil.copytree(out, staged, ignore=_drop_symlinks)
+        (staged / "SCAN.json").write_text(json.dumps({
             "high": len(high),
             "warn": sum(1 for f in findings if f["severity"] == "warn"),
             "findings": findings,
             "note": "static scan only — NEVER run this code outside a sandbox "
                     "regardless of a clean scan",
         }, indent=2, default=str) + "\n")
-        PROVENANCE.write_text(json.dumps({
+        (staged / "PROVENANCE.json").write_text(json.dumps({
             "ref": ref, "digest": digest, "network": args.network,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "previous_digest": prev.get("digest", ""),
@@ -130,6 +151,9 @@ def main() -> int:
                     "verify against the on-chain commitment and the round "
                     "receipts (cascade-audit)",
         }, indent=2) + "\n")
+        if DEST.exists():
+            shutil.rmtree(DEST)
+        staged.rename(DEST)
 
         sh(["git", "-C", str(REPO), "add", str(DEST)])
         # a bare box may have no git identity; commit with an explicit one

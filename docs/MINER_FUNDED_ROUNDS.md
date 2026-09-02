@@ -18,8 +18,13 @@ rationale; this file is the how.
 | Intake service (`cascade-intake`, signed `X-Lium-Api-Key` POST) | `cascade/funding/intake.py`, `main.py` | built |
 | Per-payer rentals + payer-attributed ledger + payer-key reap | `cascade/provision/funded.py`, `core.py`, `state.py` | built |
 | `[round] funded_mode` field selection + boundary skip | `cascade/trainer/loop.py`, `shared/config.py` | built |
-| Miner command (`cascade fund` / `--withdraw`) | `cascade/miner/cli.py` | built |
+| Per-payer funded pods (`[round] funded_pods = "rent"`: rent → dispatch → verified teardown, write-ahead ledger, boundary + startup sweep) | `cascade/trainer/loop.py`, `provision/funded.py` | built, live-validated (testnet 2026-09-02) |
+| Elastic no-heat field (`funded_field_cap`, capacity probe/reserve clamp, whole seated field duels) | `cascade/trainer/loop.py` | built, live-validated |
+| Per-round GPU-type choice (`funded_pod_skus` preference list, most-available wins; JIT operator king pod via `funded_king_rent`) | `cascade/trainer/loop.py` | built, live-validated |
+| Transparency (public roster `funded/round-<id>.json`, `cascade queue`, tier-0 `funded-roster` audit check) | `trainer/loop.py`, `miner/cli.py`, `audit/checks.py` | built |
+| Miner command (`cascade fund` / `--withdraw` / `cascade queue`) | `cascade/miner/cli.py` | built |
 | Scoped per-pod credentials for funded pods | — | **gates arming** |
+| Worker image rebuilt from this branch (vault-ref fetch on funded pods) + image/orchestrator `[training]` budget parity | — | **gates arming** |
 | Confirmation-leg wiring (operator retrain on provisional dethrone) | — | **gates arming** |
 | Tenure decay re-denominated to wall-clock/blocks (DEC-CA-0016 amendment) | — | **gates "required" + elastic grid** |
 | Retrain-noise measurement (scratch-shadow paired evals) | — | gates confirmation margin choice |
@@ -45,6 +50,30 @@ rationale; this file is the how.
    `finalist_cap` at a time, earliest reveal first; the heat's
    fits-the-cap fast path means no screen GPU is spent. Unfunded boundaries
    run nothing.
+3a. **Per-payer pods + the elastic no-heat field.** `funded_pods = "rent"`
+   moves every funded challenger leg onto ITS payer's own Lium key (one pod
+   per seat, verified teardown, write-ahead ledger `_train_work/
+   funded_pods.json`, swept at every round entry and trainer startup).
+   `funded_field_cap = N` seats up to N funded challengers per round — the
+   WHOLE seated field advances to the duel (no heat, ever; alpha/k splits
+   over the cohort), wall-clock stays one leg because seats parallelize
+   across payer pods. With `funded_capacity_probe`, admission clamps to the
+   live 1-GPU market minus `funded_capacity_reserve` (the king's own
+   rental); held-back seats wait unburned and un-expired. `funded_pod_skus`
+   lists the allowed GPU types preference-ordered: each boundary probes all
+   of them and the round runs ENTIRELY on the most-available type — king
+   included via `funded_king_rent` (JIT operator-billed king pod at the
+   chosen SKU; requires `[training] expected_gpu = ""`, enforced at trainer
+   launch). Pod names are deployment-scoped (`cascade-n<netuid>-…`) so
+   co-hosted deployments on a shared payer account never reap each other,
+   and the provisioner's reaper never touches them.
+3b. **Transparency.** Every required round publishes
+   `funded/round-<id>.json` + `funded/latest.json` (admission cap, market
+   capacities, seated in reveal-block seniority with on-chain blocks,
+   waiting, outcomes). Miners read it with `cascade queue` (add `--intake
+   <url>` for the live queue); the tier-0 `funded-roster` audit check
+   cross-checks it against the signed manifest — "the queue was jumped" is
+   a named WARN anyone can reproduce.
 4. **Elastic grid (the one consensus-coordinated step).** Shrink
    `epoch_blocks` to the max cadence (6h grid = 4 rounds/day ceiling) via
    the scheduled switch: publish `epoch_blocks_prev` = old,
@@ -88,6 +117,18 @@ degrades gracefully instead of taking the orchestrator down:
 - `--chain-timeout` (default 30 s): deadline on the reveal poll — a hung
   substrate websocket serves the stale reveal table instead of pinning every
   handler slot behind one dead chain connection.
+- `--request-deadline` (default 120 s): whole-connection wall clock enforced
+  by a reaper — a drip-feed client sending one byte per interval defeats a
+  per-op timeout but not this.
+- `--max-uploads` (default 4): concurrent submit-body buffers (each is up to
+  the ZIP cap in RAM).
+- Identity floors: submits (and funds) require a hotkey REGISTERED on the
+  subnet (metagraph oracle, fail-closed 503 when the chain is unreachable);
+  each hotkey gets `--max-hotkey-mb` (default 256 MiB) of stored
+  submissions; ZIPs are capped by bytes, decompressed bytes, AND member
+  count; signed timestamps are NaN-proof, strictly increasing per (action,
+  hotkey), and the v2 signature binds the sha256 of the key header, so a
+  captured request cannot be replayed with a swapped key.
 - Structural caps already in the request path: declared-length `413` before
   any body byte is read, the signature gate before body buffering, and the
   streaming decompression cap in the store.
@@ -155,10 +196,16 @@ cascade fund https://<intake> --ref <repo@digest> --withdraw \
 cascade fetch king                     # published champions resolve anonymously
 ```
 
+Your hotkey must be **registered on the subnet** before the intake accepts a
+submission or fund (403 `not_registered` otherwise) — reveal + registration
+are what give an entry seniority to claim.
+
 Failure semantics, as a miner experiences them: a dead pod / sold-out market
 / 429 **requeues your entry without burning it** (sold-out waits as long as
-it takes; infra faults get bounded retries on your kept key); an invalid or
-revoked key fails your entry `auth` — fix the key and fund again; your
+it takes; a rate-limit streak longer than 6h turns terminal — fix the key's
+limits and fund again; infra faults get bounded retries on your kept key);
+an invalid or revoked key fails your entry `auth` — fix the key and fund
+again; your
 generator crashing is your run, spent as ever. Three more terminal classes
 exist so a dead entry can never squat in the queue: `ref_mismatch` (you
 re-revealed a different ref — fund the new one), `burned` (the hotkey

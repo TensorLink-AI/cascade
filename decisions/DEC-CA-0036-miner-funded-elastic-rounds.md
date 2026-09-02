@@ -133,3 +133,51 @@ required on testnet (with the grid change) → mainnet release-then-activate.
 NOT built here: scoped pod credentials, the confirmation-leg wiring, the
 tenure re-denomination, and the retrain-noise measurement — each gates
 arming, none gates landing.
+
+## Amendment 2026-09-02 — elastic no-heat field, per-round GPU choice, review hardening
+
+Built and live-validated on testnet 259 (rounds 9997246590844856043,
+9598728707958414075), extending the landing above; all still inert at
+shipped defaults:
+
+* **Per-payer pods armed-able**: `[round] funded_pods = "rent"` wires
+  `provision/funded.py` into the trainer — rent on the payer's key →
+  dispatch → verified teardown, a write-ahead ledger
+  (`_train_work/funded_pods.json`, intent row BEFORE `lium up`), a sweep at
+  every round entry + trainer startup, and the burn point moved from heat
+  settle to DUEL settle (`_settle_funded`: manifest entry → done; auth/rc=3
+  → terminal; else requeue per taxonomy — a leg lost to operator infra can
+  no longer burn a paid entry).
+* **Elastic no-heat field**: `funded_field_cap` seats up to N funded
+  challengers (0 = legacy finalist_cap); the whole seated field advances to
+  the duel (the heat cap yields to the funded field — no screen ever runs
+  on an all-funded field); `funded_capacity_probe`/`funded_capacity_reserve`
+  clamp admission to the live 1-GPU market; held-back seats are touched so
+  they never TTL-expire while waiting.
+* **Per-round GPU type**: `funded_pod_skus` (preference-ordered allow-list)
+  — each boundary probes every type and the round runs entirely on the
+  most-available one, king included via `funded_king_rent` (JIT
+  operator-billed king pod, ledgered payer_hotkey="", swept next boundary).
+  Requires `[training] expected_gpu = ""` (enforced at trainer launch).
+* **Transparency**: public per-round roster `funded/round-<id>.json` +
+  `funded/latest.json` (cap, market capacities, seniority order with
+  on-chain reveal blocks, outcomes), the `cascade queue` miner command, and
+  the WARN-only tier-0 `funded-roster` audit check ("the queue was jumped"
+  is a named, reproducible warning).
+* **Review hardening (2026-09-02 pre-deploy review)**: intake requires
+  subnet REGISTRATION (fail-closed metagraph oracle) + per-hotkey stored
+  quota + ZIP member-count cap + NaN-proof, strictly-increasing signed
+  timestamps + v2 canonical message binding the key header's sha256 +
+  whole-connection deadline + bounded upload buffers; funded pod names are
+  deployment-scoped (`cascade-n<netuid>-…`) and OFF the provisioner reaper
+  scheme (kill-the-live-king / cross-deployment-reap classes); the
+  settled-retry path restores funded state from the heat_complete marker
+  (bills stayed payer-side, entries settle-able); rate-limit streaks turn
+  terminal past the 6h recovery window; numeric fault markers match only
+  standalone tokens (vanity-hotkey steering).
+
+Owner direction this amendment serves: **no heat — miners provide keys, any
+number of challengers, all rounds ~3h; coordination = same-GPU-type
+capacity, chosen per round from the five cu124-compatible types**
+(`["RTX4090", "RTX3090", "L40S", "L40", "A6000"]`; Blackwell waits on the
+torch cu12.8 re-pin, a coordinated contract change).

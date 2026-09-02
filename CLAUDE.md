@@ -288,9 +288,19 @@ in-context.
   ordinary hippius payload under the reserved `vault/direct` namespace (no
   validator change); ONLY thrones publish (`champions/`, sn100-top-model
   style: crown/delay/dethrone policy), losers stay private forever;
-  digest ownership enforced at field entry. Landed inert 2026-08-28; arming
-  gates: scoped pod creds + per-dispatch ZIP staging, confirmation wiring,
-  DEC-CA-0016 wall-clock tenure, retrain-noise measurement.
+  digest ownership enforced at field entry. Landed inert 2026-08-28.
+  AMENDED 2026-09-02 (built + testnet-live-validated, still inert): per-payer
+  pods wired (`funded_pods="rent"`, write-ahead ledger, duel-settle burn
+  point), ELASTIC no-heat field (`funded_field_cap` + capacity probe; the
+  whole seated field duels — no screen on an all-funded field), per-round
+  GPU-type choice (`funded_pod_skus` five-type cu124 set, most-available
+  wins; JIT operator king via `funded_king_rent`), public roster +
+  `cascade queue` + tier-0 funded-roster audit check, intake registration
+  gate/quotas/replay hardening, deployment-scoped pod names
+  (`cascade-n<netuid>-…`, off the provisioner reaper). Remaining arming
+  gates: scoped pod creds + per-dispatch ZIP staging wiring, worker-image
+  rebuild + budget parity, confirmation wiring, DEC-CA-0016 wall-clock
+  tenure, retrain-noise measurement.
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
