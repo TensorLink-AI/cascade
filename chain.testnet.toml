@@ -230,7 +230,11 @@ funded_capacity_reserve = 1
 # each boundary probes every listed type and the round runs ENTIRELY on the
 # most-available one — king included. Empty = single-SKU on funded_pod_sku.
 # Needs [training] expected_gpu = "" (a hard pin freezes the type).
-funded_pod_skus = []
+# Owner-selected target set (2026-09-02): the five types the pinned stack
+# (torch 2.4.1+cu124) can run, preference-ordered by market depth + price.
+# Blackwell types (RTX5090, B200/B300) stay OFF the list until the torch
+# pin moves to a cu12.8+ build — that is a coordinated contract change.
+funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
 # Rent the KING's pod just-in-time each funded round (operator-billed, the
 # round's chosen SKU) — the no-heat end-state; do not also run the
 # provisioner's final stage in this mode.
