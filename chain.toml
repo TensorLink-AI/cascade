@@ -210,19 +210,10 @@ allow_future_known = false
 # FORBIDDEN until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness
 # rule (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
 real_corpus_ref    = ""
-# Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
-# "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
-# UNPINNED 2026-09-02 (owner, DEC-CA-0036 go-live): per-round GPU-type choice
-# ([round] funded_pod_skus) picks the most-available of five types each
-# boundary and the WHOLE round — king included — runs on it, so king and
-# challenger still match exactly; a hard pin would freeze the type (the
-# trainer refuses to launch multi-SKU with a pin). CONTRACT CHANGE: folds
-# into contract_digest — trainer + every validator deploy this release
-# together, before the epoch seam (the DEC-CA-0016/0019 coordinated-window
-# pattern). Was "NVIDIA L40S" (DEC-CA-0002).
-expected_gpu = ""                # king+challenger must still train on
-                                  # identical silicon (gpu_name pairing;
-                                  # unit fixtures set their own in conftest)
+# Pin the GPU SKU (exact torch device name). Empty = king and challenger must
+# match each other. Unpinned 2026-09-02 for per-round GPU choice
+# ([round] funded_pod_skus); folds into contract_digest — coordinated deploy.
+expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
@@ -296,23 +287,11 @@ train_image_digest = "sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437
 # that overrides the derivation and over-rents on quiet rounds.
 epoch_blocks     = 900    # ≈3h at a 12s block time (DEC-CA-0036 go-live grid)
 round_hours      = 3.0    # informational: wall-clock span of an epoch
-# SCHEDULED ACTIVATION — this is what lets operators merge and restart TODAY
-# while the change takes effect tomorrow, with no coordinated restart. Every
-# node resolves the round length through effective_epoch_blocks(round, block),
-# so a validator that restarted early and one that restarted late agree on
-# every round: 3600 for blocks before the activation, 900 from it on.
-# 8989200 = projected Thu 2026-09-03 ~20:30 UTC. It is a boundary of BOTH
-# grids (8989200 / 3600 = 2497, / 900 = 9988) — load_chain_config enforces
-# that, so no round is cut short at the seam. The FUNDED go-live block
-# ([round] funded_activation_block = 8991900, ≈ Fri 05:30 UTC) sits three
-# 900-boundaries later on the new grid; between seam and go-live the trainer
-# HOLDS (no rounds), so the seam costs nothing.
-# (Previous switch, retired 2026-09-02 once safely past: 7200 → 3600 at
-# 8726400 on 2026-07-29.)
-# CLEAN-UP: once 8989200 is safely past, set both keys to 0 (the steady state);
-# the accessor then returns epoch_blocks unconditionally.
+# Scheduled switch: 3600 before the activation block, 900 from it on. The
+# block must be a boundary of BOTH grids (load-checked). Set both to 0 once
+# it is safely past. (Previous switch 7200 → 3600 at 8726400, 2026-07-29.)
 epoch_blocks_prev      = 3600
-epoch_activation_block = 8989200
+epoch_activation_block = 8989200   # ≈ Thu 2026-09-03 20:30 UTC
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
                           # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
                           # ranking; watch p_best / leader_lcb to confirm it pays.
@@ -400,22 +379,13 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
-# ── Miner-funded compute (DEC-CA-0036) — ARMED, block-gated go-live ──────────
-# "off" / "shadow" (log funding status, change nothing) / "required" (the
-# round's field IS the funded queue, earliest reveal first; every seated
-# funded entrant duels — no heat). ARMED 2026-09-02 (owner): the whole
-# machinery activates at funded_activation_block below; before that block
-# every funded_* knob behaves as "off" and — because the go-live is announced
-# — boundaries HOLD (no normal rounds spent between deploy and the flip).
+# ── Miner-funded compute (DEC-CA-0036) — armed, block-gated ──────────────────
+# "off" / "shadow" / "required" (funded queue IS the field; every seated
+# entrant duels, no heat). Everything below is inert before
+# funded_activation_block, and the trainer holds boundaries until it.
+# Details: docs/MINER_FUNDED_ROUNDS.md.
 funded_mode = "required"
-# GO-LIVE BLOCK (owner, 2026-09-02): 8991900 — a boundary of the new 900
-# grid, projected ≈ Fri 2026-09-04 05:30 UTC (the grid has no boundary at
-# exactly 06:00; this is the closest round-start, ~30 min early; block-time
-# drift can move it a few minutes). From this block: the funded queue is the
-# field, unfunded boundaries skip, legs rent on payer keys, the king rents
-# JIT. Deploy trainer + validators BEFORE epoch_activation_block (the grid
-# seam, ~Thu 20:30 UTC); the trainer then holds until this block.
-funded_activation_block = 8991900
+funded_activation_block = 8991900   # go-live ≈ Fri 2026-09-04 05:30 UTC (owner)
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
 # With funded_mode = "required": an unfunded boundary runs NOTHING (no king
 # leg, no pods, no manifest — validators just see no manifest and hold).
@@ -423,43 +393,25 @@ funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_roo
 skip_unfunded_rounds = true
 max_rounds_per_day = 8                    # cadence sizing/telemetry only (grid = epoch_blocks)
 funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
-# Per-payer funded pods (DEC-CA-0036 second arming gate): "off" = funded legs
-# run on the operator fleet (pre-wiring behaviour); "rent" = each funded
-# challenger leg rents ONE pod on its payer's own Lium key, dispatches there,
-# and tears it down when the leg ends (king + eval pods stay operator-funded,
-# always). "rent" needs the three keys below; consensus-inert ([round]).
+# "rent": each funded leg rents ONE pod on its payer's Lium key (king + eval
+# stay operator-funded). Consensus-inert.
 funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
-# The worker image every funded pod (and the JIT king) boots — MUST stay the
-# fleet's pinned digest. Hub-ref legs verified E2E on this pin (testnet
-# 2026-09-02); vault-ref (direct-submission) legs need an image rebuilt from
-# this branch, which is why submission_vault_dir ships OFF below.
+# Worker image funded pods boot — keep = the fleet's pinned digest.
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"
 funded_ready_timeout_seconds = 900.0
-# Elastic no-heat field: 0 = legacy finalist_cap admission; N > 0 seats up to
-# N funded challengers per round (each rents its own payer pod — wall-clock
-# stays one leg; the duel's alpha splits over those that actually TRAIN).
+# Seats per round (0 = finalist_cap); clamped to live market capacity minus
+# the king's reserve when the probe is on. Held-back seats wait unburned.
 funded_field_cap = 8
-# With funded_pods="rent": clamp admission to live same-SKU market capacity
-# minus the reserve (the king's operator rental). Advisory — lost races
-# requeue unburned; a failed probe clamps nothing.
 funded_capacity_probe = true
 funded_capacity_reserve = 1
-# Allowed GPU types, PREFERENCE-ordered (e.g. ["RTX4090", "A6000", "RTX3090"]):
-# each boundary probes every listed type and the round runs ENTIRELY on the
-# most-available one — king included. Empty = single-SKU on funded_pod_sku.
-# Needs [training] expected_gpu = "" (a hard pin freezes the type).
-# Owner-selected target set (2026-09-02): the five types the pinned stack
-# (torch 2.4.1+cu124) can run, preference-ordered by market depth + price.
-# Blackwell types (RTX5090, B200/B300) stay OFF the list until the torch
-# pin moves to a cu12.8+ build — that is a coordinated contract change.
+# Allowed GPU types, preference-ordered; each round runs entirely on the
+# most-available one (king included). Needs [training] expected_gpu = "".
+# Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
-# Rent the KING's pod just-in-time each funded round (operator-billed, the
-# round's chosen SKU) — the no-heat end-state; do not also run the
-# provisioner's final stage in this mode (retire the standing final fleet
-# and the provisioner service at the grid seam — the trainer ledgers and
-# sweeps these pods itself).
+# King pod rents JIT at the round's SKU (operator-billed); retire the
+# provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
@@ -601,22 +553,12 @@ mix_tier_from_block  = 8942400   # ARMED 2026-08-27 (owner): two-tier even-domai
                                  # split live from r47's epoch — same boundary as
                                  # the recipe cut, one coordinated validator update
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
-# ── Scored horizon ladder (PR #241; CONSENSUS, block-gated) ──────────────────
-# From scored_from_block the round verdict draws its windows as a horizon
-# ladder — one seeded even-by-domain draw per horizon over the snapshot's raw
-# series, n_windows split evenly, rung sizes equalised — and the pooled rows
-# flow through the unchanged round statistic (bootstrap, margin, receipt
-# schema all untouched). Same rollout shape as mix_from_block: every
-# validator AND the trainer must run this release before the block, or
-# verdicts fork from it on; audit replay applies each round's own rule from
-# the receipt's epoch_start_block. ARMED 2026-09-02 (owner) at the SAME block
-# as the DEC-CA-0036 funded go-live ([round] funded_activation_block) — one
-# coordinated validator update for both. Requires the #241 loader; ignored
-# by builds without it. NOTE the 720 rung needs series >= 784 steps: every
-# rung equalises to that eligible count (149 of 230 series on the last
-# revealed July snapshot) — check the current pool before the block.
+# Scored horizon ladder (PR #241): from scored_from_block the verdict draws
+# one even-by-domain rung per horizon (rung sizes equalised). CONSENSUS —
+# same rollout as mix_from_block; every validator must run it before the
+# block. The 720 rung needs series >= 784 steps.
 scored_horizons   = [64, 256, 720]
-scored_from_block = 8991900      # = funded_activation_block (≈ Fri 2026-09-04 05:30 UTC)
+scored_from_block = 8991900      # = funded_activation_block
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
