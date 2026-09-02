@@ -869,6 +869,22 @@ class RoundConfig:
     # unburned via the no_capacity taxonomy; a failed probe clamps nothing.
     funded_capacity_probe: bool = False
     funded_capacity_reserve: int = 1
+    # Allowed GPU types for funded rounds, PREFERENCE-ordered (first wins
+    # ties). Empty = single-SKU rounds on funded_pod_sku. With entries, each
+    # boundary probes every listed SKU and the round runs ENTIRELY on the
+    # most-available one — king included (see funded_king_rent): the duel
+    # compares king and challengers directly, budgets are compute-denominated
+    # and the validator pairs gpu_name, so one round must never mix types.
+    # Per-round choice needs [training] expected_gpu = "" (a hard pin freezes
+    # the type until a coordinated validator update).
+    funded_pod_skus: tuple[str, ...] = ()
+    # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
+    # account, at the round's chosen SKU — the no-heat end-state (no standing
+    # final fleet). Required for funded_pod_skus to guarantee the king lands
+    # on the chosen type. NOTE: do not run the provisioner's final stage in
+    # this mode — its orphan reaper does not know these pods; the trainer
+    # ledgers them and sweeps at each boundary.
+    funded_king_rent: bool = False
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -1810,6 +1826,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_field_cap=int(r.get("funded_field_cap", 0)),
             funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),
             funded_capacity_reserve=int(r.get("funded_capacity_reserve", 1)),
+            funded_pod_skus=tuple(str(x) for x in r.get("funded_pod_skus", ())),
+            funded_king_rent=bool(r.get("funded_king_rent", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

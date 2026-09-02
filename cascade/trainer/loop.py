@@ -1322,31 +1322,60 @@ class TrainerRunner:
         """
         rnd = self.cfg.round
         cap = rnd.funded_field_cap or max(1, rnd.finalist_cap)
+        self._funded_round_sku = rnd.funded_pod_sku
         self._funded_admission_info = {"configured_cap": cap, "cap": cap,
                                        "market_capacity": None,
-                                       "reserve": rnd.funded_capacity_reserve}
-        if rnd.funded_pods != "rent" or not rnd.funded_capacity_probe:
+                                       "reserve": rnd.funded_capacity_reserve,
+                                       "sku": self._funded_round_sku,
+                                       "sku_capacities": None}
+        if rnd.funded_pods != "rent":
             return cap
-        avail = self._probe_funded_capacity()
-        if avail is None:
+        skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
+                                              if rnd.funded_pod_sku else ())
+        multi = len(skus) > 1
+        if not multi and not rnd.funded_capacity_probe:
+            return cap
+        caps = {}
+        for sku in skus:
+            n = self._probe_funded_capacity(sku)
+            if n is not None:
+                caps[sku] = n
+        if not caps:
+            # Every probe failed: keep the preference-order SKU, clamp nothing
+            # — a market-API blip must not gate the round.
+            if multi:
+                self._funded_round_sku = skus[0]
+                self._funded_admission_info["sku"] = skus[0]
+            return cap
+        # Most-available wins; ties break toward the operator's listed
+        # preference order. The whole round — king included — runs this type.
+        chosen = max(skus, key=lambda k: (caps.get(k, -1), -skus.index(k)))
+        self._funded_round_sku = chosen
+        avail = caps.get(chosen, 0)
+        self._funded_admission_info.update(
+            {"sku": chosen, "market_capacity": avail,
+             "sku_capacities": dict(caps)})
+        if multi:
+            log.info("funded round SKU: %s (capacities: %s)", chosen,
+                     ", ".join(f"{k}={v}" for k, v in caps.items()))
+        if not rnd.funded_capacity_probe:
             return cap
         clamped = min(cap, max(0, avail - max(0, rnd.funded_capacity_reserve)))
-        self._funded_admission_info.update({"cap": clamped, "market_capacity": avail})
+        self._funded_admission_info["cap"] = clamped
         if clamped < cap:
             log.info("funded admission: market has %d × %s (reserve %d) — "
-                     "seating %d of cap %d", avail, rnd.funded_pod_sku,
+                     "seating %d of cap %d", avail, chosen,
                      rnd.funded_capacity_reserve, clamped, cap)
         return clamped
 
-    def _probe_funded_capacity(self) -> int | None:
-        """Same-SKU marketplace availability on the OPERATOR's key, or None."""
+    def _probe_funded_capacity(self, sku: str) -> int | None:
+        """``sku``'s marketplace availability on the OPERATOR's key, or None."""
         try:
             from ..provision.core import LiumProvider
 
-            return LiumProvider().capacity(self.cfg.round.funded_pod_sku)
+            return LiumProvider().capacity(sku)
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
-            log.warning("funded capacity probe failed (admission uncapped by "
-                        "capacity this round): %s", e)
+            log.warning("funded capacity probe for %s failed: %s", sku, e)
             return None
 
     def _publish_funded_roster(self, round_id: str) -> None:
@@ -1460,9 +1489,17 @@ class TrainerRunner:
 
         try:
             pods = self._load_funded_ledger()
+            # Operator-billed ledger pods (the JIT king; payer_hotkey = "")
+            # never go through the per-payer path — it would demand a vault
+            # key that rightly does not exist.
+            for pod in [x for x in pods if not x.payer_hotkey]:
+                self._teardown_operator_pod(pod)
+            pods = [x for x in pods if x.payer_hotkey]
             if pods:
                 leftovers = teardown_funded(pods, vault)
-                self._save_funded_ledger(leftovers)
+                self._save_funded_ledger(
+                    leftovers + [x for x in self._load_funded_ledger()
+                                 if not x.payer_hotkey])
                 for inst in leftovers:
                     log.error("funded pod %s (payer %s) could not be confirmed "
                               "gone — still billing the miner; kept on the "
@@ -1506,9 +1543,11 @@ class TrainerRunner:
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
-            if not rnd.funded_pod_sku or not rnd.funded_pod_image:
+            round_sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            if not round_sku or not rnd.funded_pod_image:
                 raise RuntimeError("funded_pods=rent needs [round] "
-                                   "funded_pod_sku and funded_pod_image")
+                                   "funded_pod_sku (or funded_pod_skus) and "
+                                   "funded_pod_image")
         except Exception as e:  # noqa: BLE001 — operator config faults never burn miners
             self._record_funded_failure(gen.hotkey, f"operator-side funded-pod "
                                         f"config fault: {e}", miner_fault=False,
@@ -1518,7 +1557,7 @@ class TrainerRunner:
             claimed = tuple(sorted(self._funded_claimed_execs))
         result = rent_funded_pod(
             round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
-            sku=rnd.funded_pod_sku, image=rnd.funded_pod_image,
+            sku=round_sku, image=rnd.funded_pod_image,
             ssh_pubkey=ssh_pubkey,
             ready_timeout=rnd.funded_ready_timeout_seconds,
             exclude_ids=claimed,
@@ -1597,6 +1636,83 @@ class TrainerRunner:
                       pod.payer_hotkey)
         else:
             self._ledger_remove(pod.instance_id)
+
+    def _rent_king_host(self, round_id: str):
+        """JIT king pod on the OPERATOR's account at the round's chosen SKU.
+
+        The no-heat end-state has no standing final fleet: with
+        ``funded_king_rent`` the king's pod rents at round start on the
+        operator's own key (never a payer's — provision.funded must never
+        bill an operator pod, so this rents through LiumProvider directly),
+        same image, same chosen SKU as every funded challenger. The pod is
+        kept for the WHOLE round — the post-publish duel bench targets it —
+        and swept at the next boundary via the ledger (payer_hotkey = "" is
+        the operator marker there). Rented once per round under a lock; a
+        rent failure raises, which aborts the round exactly like any king-leg
+        failure.
+        """
+        with self._funded_king_lock:
+            if self._funded_king_host is not None:
+                return self._funded_king_host
+            from ..provision.core import LaunchSpec, LiumProvider, ProvisionError
+            from ..provision.state import PodInstance
+            from .remote import RemoteHost
+
+            rnd = self.cfg.round
+            profile = self._funded_pod_profile()
+            key_path = Path(profile.key_path or "").expanduser()
+            ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
+                          ).read_text(encoding="utf-8").strip()
+            sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            provider = LiumProvider()
+            with self._funded_exec_lock:
+                claimed = tuple(sorted(self._funded_claimed_execs))
+            spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                              ssh_pubkey=ssh_pubkey,
+                              name_prefix=f"cascade-{round_id}-funded-king",
+                              gpus_per_pod=1, exclude_ids=claimed)
+            pod_id = provider.launch(spec)[0]
+            if not provider.wait_ready(pod_id,
+                                       timeout=rnd.funded_ready_timeout_seconds):
+                provider.terminate(pod_id)
+                raise ProvisionError(f"king pod {pod_id} not ready in time")
+            addr = provider.get_ip(pod_id)
+            if addr is None:
+                provider.terminate(pod_id)
+                raise ProvisionError(f"king pod {pod_id} exposed no IP")
+            machine = provider.machine_of(pod_id) or ""
+            if machine:
+                with self._funded_exec_lock:
+                    self._funded_claimed_execs.add(machine)
+            self._ledger_add(PodInstance(
+                provider=provider.name, instance_id=pod_id, stage="funded",
+                rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                sku=sku, gpus=1, payer_hotkey=""))
+            log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
+                     pod_id, addr.ip, addr.ssh_port, sku)
+            self._funded_king_host = RemoteHost(
+                name="funded-king", host=addr.ip, port=addr.ssh_port,
+                user=profile.user, key_path=profile.key_path,
+                remote_python=profile.remote_python, workdir=profile.workdir,
+                cuda_device="0", chain_toml=profile.chain_toml,
+                forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+                stage="final")
+            return self._funded_king_host
+
+    def _teardown_operator_pod(self, pod) -> None:
+        """Verified teardown of an operator-billed ledger pod (king JIT)."""
+        from ..provision.core import LiumProvider
+        from ..provision.funded import terminate_verified
+
+        try:
+            if terminate_verified(LiumProvider(), pod.instance_id):
+                self._ledger_remove(pod.instance_id)
+            else:
+                log.error("operator pod %s still LIVE after terminate — kept "
+                          "on ledger for the next sweep", pod.instance_id)
+        except Exception as e:  # noqa: BLE001
+            log.error("operator pod %s teardown crashed (kept on ledger): %s",
+                      pod.instance_id, e)
 
     def _run_funded_leg(self, disp, gen: ResolvedGenerator, seeds, block: int,
                         contract, suffix: str, *, warm_start_ref: str | None):
@@ -3684,6 +3800,9 @@ class TrainerRunner:
         self._funded_admission_info = {}
         self._funded_roster = {"seated": [], "waiting": [], "terminal": [],
                                "outcomes": []}
+        self._funded_round_sku = self.cfg.round.funded_pod_sku
+        self._funded_king_host = None
+        self._funded_king_lock = threading.Lock()
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
@@ -4656,6 +4775,25 @@ class TrainerRunner:
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
+            if (role == "king"
+                    and self.cfg.round.funded_pods == "rent"
+                    and self.cfg.round.funded_king_rent):
+                # No-heat end-state: the king's pod rents JIT at the round's
+                # chosen SKU (operator-billed) instead of a standing fleet.
+                host = self._rent_king_host(str(seeds.base_seed))
+                entry = disp.dispatch(
+                    host, lane_count=1,
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role="king", base_seed=seeds.base_seed, block=block,
+                    arch_preset=contract.arch_preset,
+                    warm_start_ref=warm_start_ref,
+                    **({"repo_suffix": suffix} if suffix else {}),
+                )
+                # The bench and scratch shadow target the king's pod — it
+                # stays up through the round; the boundary sweep reaps it.
+                self._final_role_hosts[
+                    ("king", contract.arch_preset, gen.hotkey)] = host
+                return entry
             if (role == "challenger"
                     and self.cfg.round.funded_pods == "rent"
                     and gen.hotkey in self._funded_field):

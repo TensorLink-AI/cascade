@@ -226,6 +226,15 @@ funded_field_cap = 0
 # requeue unburned; a failed probe clamps nothing.
 funded_capacity_probe = false
 funded_capacity_reserve = 1
+# Allowed GPU types, PREFERENCE-ordered (e.g. ["RTX4090", "A6000", "RTX3090"]):
+# each boundary probes every listed type and the round runs ENTIRELY on the
+# most-available one — king included. Empty = single-SKU on funded_pod_sku.
+# Needs [training] expected_gpu = "" (a hard pin freezes the type).
+funded_pod_skus = []
+# Rent the KING's pod just-in-time each funded round (operator-billed, the
+# round's chosen SKU) — the no-heat end-state; do not also run the
+# provisioner's final stage in this mode.
+funded_king_rent = false
 submission_vault_dir = ""       # direct submissions (vault refs) off until armed
 champion_publish = "off"
 champion_publish_delay_rounds = 2

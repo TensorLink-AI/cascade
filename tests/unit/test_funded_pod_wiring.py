@@ -48,10 +48,14 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_claimed_execs=set(),
                            _funded_exec_lock=threading.Lock(),
                            _funded_admission_info={},
+                           _funded_round_sku="",
+                           _funded_king_host=None,
+                           _funded_king_lock=threading.Lock(),
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
     for name in ("_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity",
+                 "_rent_king_host", "_teardown_operator_pod",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
@@ -347,20 +351,20 @@ def test_funded_field_cap_overrides_finalist_cap(tmp_path):
 def test_capacity_probe_clamps_to_market_minus_reserve(tmp_path):
     r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
-    r._probe_funded_capacity = lambda: 5
+    r._probe_funded_capacity = lambda sku: 5
     assert r._funded_admission_cap() == 4
 
 
 def test_capacity_probe_failure_clamps_nothing(tmp_path):
     r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True)
-    r._probe_funded_capacity = lambda: None
+    r._probe_funded_capacity = lambda sku: None
     assert r._funded_admission_cap() == 12
 
 
 def test_capacity_zero_seats_nobody_and_queue_holds(tmp_path):
     r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
-    r._probe_funded_capacity = lambda: 1          # king's reserve eats it
+    r._probe_funded_capacity = lambda sku: 1      # king's reserve eats it
     from cascade.funding.queue import FundedQueue
     FundedQueue(tmp_path / "funded_queue.json").add("hkA", REF, reveal_block=10)
     kept = r._filter_funded_challengers([_challenger("hkA")])
@@ -480,3 +484,106 @@ def test_roster_publishes_seats_waiting_and_outcomes(tmp_path):
     assert doc["seated"][0]["hotkey"] == "hkA"
     assert doc["outcomes"] == [{"hotkey": "hkA", "outcome": "trained"}]
     assert "funded/latest.json" in published
+
+
+# ── per-round SKU choice + JIT king ──────────────────────────────────────────
+
+def test_multi_sku_picks_most_available(tmp_path):
+    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000", "RTX3090"))
+    r._probe_funded_capacity = lambda sku: {"RTX4090": 2, "A6000": 9,
+                                            "RTX3090": 4}[sku]
+    r._funded_admission_cap()
+    assert r._funded_round_sku == "A6000"
+    assert r._funded_admission_info["sku_capacities"] == {
+        "RTX4090": 2, "A6000": 9, "RTX3090": 4}
+
+
+def test_multi_sku_tie_breaks_toward_preference_order(tmp_path):
+    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"))
+    r._probe_funded_capacity = lambda sku: 7
+    r._funded_admission_cap()
+    assert r._funded_round_sku == "RTX4090"
+
+
+def test_multi_sku_probe_blackout_falls_back_to_first(tmp_path):
+    r = _runner(tmp_path, funded_pod_skus=("A6000", "RTX4090"),
+                funded_field_cap=6)
+    r._probe_funded_capacity = lambda sku: None
+    assert r._funded_admission_cap() == 6            # no clamp
+    assert r._funded_round_sku == "A6000"
+
+
+def test_multi_sku_capacity_clamp_uses_chosen_sku(tmp_path):
+    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"),
+                funded_field_cap=10, funded_capacity_probe=True,
+                funded_capacity_reserve=1)
+    r._probe_funded_capacity = lambda sku: {"RTX4090": 1, "A6000": 4}[sku]
+    assert r._funded_admission_cap() == 3            # A6000: 4 - 1 reserve
+    assert r._funded_round_sku == "A6000"
+
+
+def test_rent_uses_the_rounds_chosen_sku(tmp_path, monkeypatch):
+    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"))
+    _vault(tmp_path, "hkA")
+    r._funded_round_sku = "A6000"
+    seen = {}
+    monkeypatch.setattr(funded_mod, "rent_funded_pod",
+                        lambda **kw: (seen.update(kw), _rent_ok())[1])
+    r._rent_funded_host("1", _challenger("hkA"))
+    assert seen["sku"] == "A6000"
+
+
+def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path):
+    import cascade.provision.core as core_mod
+    r = _runner(tmp_path, funded_king_rent=True)
+    r._funded_round_sku = "A6000"
+    launched = []
+
+    class _Prov:
+        name = "lium"
+        def launch(self, spec):
+            launched.append((spec.sku, spec.name_prefix, spec.exclude_ids))
+            return ["king-pod-1"]
+        def wait_ready(self, pod_id, *, timeout):
+            return True
+        def get_ip(self, pod_id):
+            return PodAddress(ip="9.9.9.9", ssh_port=41000)
+        def machine_of(self, pod_id):
+            return "exec-king"
+        def terminate(self, pod_id):
+            pass
+
+    orig = core_mod.LiumProvider
+    core_mod.LiumProvider = _Prov
+    try:
+        h1 = r._rent_king_host("42")
+        h2 = r._rent_king_host("42")                  # cached, no second rent
+    finally:
+        core_mod.LiumProvider = orig
+    assert h1 is h2 and len(launched) == 1
+    sku, prefix, excl = launched[0]
+    assert sku == "A6000" and prefix == "cascade-42-funded-king"
+    assert (h1.host, h1.port) == ("9.9.9.9", 41000)
+    assert "exec-king" in r._funded_claimed_execs
+    ledger = r._load_funded_ledger()
+    assert [(x.instance_id, x.payer_hotkey) for x in ledger] == [("king-pod-1", "")]
+
+
+def test_sweep_routes_operator_pods_off_the_payer_path(tmp_path, monkeypatch):
+    r = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    king = PodInstance(provider="lium", instance_id="king-pod-1", stage="funded",
+                       rented_at_iso="2026-09-02T00:00:00Z", sku="A6000",
+                       gpus=1, payer_hotkey="")
+    r._ledger_add(king)
+    r._ledger_add(_pod("hkA"))
+    ops, payers = [], []
+    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
+                                            r._ledger_remove(pod.instance_id))
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault: (payers.extend(
+                            p.instance_id for p in pods), [])[1])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v: [])
+    r._reconcile_funded_pods()
+    assert ops == ["king-pod-1"]
+    assert payers == ["cascade-1-funded-hka"]
