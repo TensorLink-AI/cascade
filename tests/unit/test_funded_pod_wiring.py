@@ -42,9 +42,16 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     rnd = RoundConfig(funded_mode="required", funded_pods="rent",
                       payer_vault_dir=vault_dir, funded_pod_sku=sku,
                       funded_pod_image=image, **round_kw)
+    import threading
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path,
-                           _funded_field={}, _funded_leg_failures={})
+                           _funded_field={}, _funded_leg_failures={},
+                           _funded_claimed_execs=set(),
+                           _funded_exec_lock=threading.Lock(),
+                           _funded_admission_info={},
+                           _funded_roster={"seated": [], "waiting": [],
+                                           "terminal": [], "outcomes": []})
     for name in ("_funded_queue", "_payer_vault", "_funded_pod_profile",
+                 "_funded_admission_cap", "_probe_funded_capacity",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
@@ -317,3 +324,159 @@ def test_dispatch_static_env_wins_over_forwarded_copies(monkeypatch, tmp_path):
         pass  # receipt shape isn't the point; the env is
     assert "CASCADE_VAULT_DIR=/root/cascade/_vault_stage" in captured["stdin"]
     assert "/orchestrator/store" not in captured["stdin"]
+
+
+# ── elastic admission (no-heat field) + executor claims ──────────────────────
+
+def _cap_runner(tmp_path, **kw):
+    r = _runner(tmp_path, **kw)
+    return r
+
+
+def test_admission_cap_defaults_to_finalist_cap(tmp_path):
+    r = _runner(tmp_path)
+    r.cfg.round = RoundConfig(funded_mode="required", finalists=1, max_finalists=3)
+    assert r._funded_admission_cap() == 3
+
+
+def test_funded_field_cap_overrides_finalist_cap(tmp_path):
+    r = _runner(tmp_path, funded_field_cap=12)
+    assert r._funded_admission_cap() == 12
+
+
+def test_capacity_probe_clamps_to_market_minus_reserve(tmp_path):
+    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
+                funded_capacity_reserve=1)
+    r._probe_funded_capacity = lambda: 5
+    assert r._funded_admission_cap() == 4
+
+
+def test_capacity_probe_failure_clamps_nothing(tmp_path):
+    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True)
+    r._probe_funded_capacity = lambda: None
+    assert r._funded_admission_cap() == 12
+
+
+def test_capacity_zero_seats_nobody_and_queue_holds(tmp_path):
+    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
+                funded_capacity_reserve=1)
+    r._probe_funded_capacity = lambda: 1          # king's reserve eats it
+    from cascade.funding.queue import FundedQueue
+    FundedQueue(tmp_path / "funded_queue.json").add("hkA", REF, reveal_block=10)
+    kept = r._filter_funded_challengers([_challenger("hkA")])
+    assert kept == []
+    q = FundedQueue(tmp_path / "funded_queue.json")
+    assert q.get("hkA").status == "queued"        # holds, unburned
+
+
+def test_concurrent_rents_claim_distinct_executors(tmp_path, monkeypatch):
+    r = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    _vault(tmp_path, "hkB")
+    seen_excludes = []
+
+    def fake_rent(**kw):
+        seen_excludes.append(kw["exclude_ids"])
+        hk = kw["hotkey"]
+        return funded_mod.FundedRentResult(
+            hotkey=hk, ok=True, pod=_pod(hk),
+            address=PodAddress(ip="10.0.0.9", ssh_port=22),
+            machine_id=f"exec-{hk}")
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", fake_rent)
+    r._rent_funded_host("1", _challenger("hkA"))
+    r._rent_funded_host("1", _challenger("hkB"))
+    assert seen_excludes[0] == ()
+    assert seen_excludes[1] == ("exec-hkA",)
+    assert r._funded_claimed_execs == {"exec-hkA", "exec-hkB"}
+
+
+def test_rent_passes_exclude_ids_into_launch_spec():
+    captured = {}
+
+    class _Prov:
+        name = "fake"
+        def launch(self, spec):
+            captured["exclude"] = spec.exclude_ids
+            return ["pod-1"]
+        def wait_ready(self, pod_id, *, timeout):
+            return True
+        def get_ip(self, pod_id):
+            return PodAddress(ip="1.1.1.1", ssh_port=22)
+        def terminate(self, pod_id):
+            pass
+        def machine_of(self, pod_id):
+            return "exec-77"
+
+    res = funded_mod.rent_funded_pod(
+        round_id="1", hotkey="hkA", api_key="sk_x", sku="RTX4090",
+        image="x@sha256:" + "0" * 64, ssh_pubkey="ssh-ed25519 A",
+        exclude_ids=("exec-1", "exec-2"),
+        provider_factory=lambda key: _Prov())
+    assert captured["exclude"] == ("exec-1", "exec-2")
+    assert res.ok and res.machine_id == "exec-77"
+
+
+# ── transparency: the published roster + its audit check ─────────────────────
+
+def _entry(hotkey, role="challenger"):
+    return SimpleNamespace(miner_hotkey=hotkey, role=role)
+
+
+def _receipt(challengers):
+    return SimpleNamespace(manifest=SimpleNamespace(
+        entries=tuple(_entry(h) for h in challengers)), round_id="1")
+
+
+def test_roster_check_passes_on_honest_allocation():
+    from cascade.audit.checks import PASS, check_funded_roster
+    roster = {"seated": [{"hotkey": "hkA", "reveal_block": 10},
+                         {"hotkey": "hkB", "reveal_block": 20}],
+              "waiting": [{"hotkey": "hkC", "reveal_block": 30}]}
+    r = check_funded_roster(_receipt(["hkA", "hkB"]), roster)
+    assert r.status == PASS
+
+
+def test_roster_check_warns_on_stranger_challenger():
+    from cascade.audit.checks import WARN, check_funded_roster
+    roster = {"seated": [{"hotkey": "hkA", "reveal_block": 10}], "waiting": []}
+    r = check_funded_roster(_receipt(["hkA", "hkGhost"]), roster)
+    assert r.status == WARN and "hkGhost" in r.detail
+
+
+def test_roster_check_warns_on_queue_jump():
+    from cascade.audit.checks import WARN, check_funded_roster
+    roster = {"seated": [{"hotkey": "hkLate", "reveal_block": 50}],
+              "waiting": [{"hotkey": "hkEarly", "reveal_block": 10}]}
+    r = check_funded_roster(_receipt(["hkLate"]), roster)
+    assert r.status == WARN and "jumped" in r.detail
+
+
+def test_roster_check_skips_when_unpublished():
+    from cascade.audit.checks import SKIP, check_funded_roster
+    assert check_funded_roster(_receipt(["hkA"]), None).status == SKIP
+
+
+def test_roster_publishes_seats_waiting_and_outcomes(tmp_path):
+    runner = _runner(tmp_path)
+    for name in ("_publish_funded_roster",):
+        setattr(runner, name, getattr(TrainerRunner, name).__get__(runner))
+    runner._funded_admission_info = {"cap": 2, "configured_cap": 2,
+                                     "market_capacity": 5, "reserve": 1}
+    runner._funded_roster = {
+        "seated": [{"hotkey": "hkA", "ref": REF, "reveal_block": 10}],
+        "waiting": [{"hotkey": "hkB", "reveal_block": 20}],
+        "terminal": [], "outcomes": [{"hotkey": "hkA", "outcome": "trained"}]}
+    published = {}
+
+    class _Store:
+        def put_text(self, key, text, **kw):
+            published[key] = json.loads(text)
+
+    runner.manifest_store = lambda: _Store()
+    runner._publish_funded_roster("777")
+    doc = published["funded/round-777.json"]
+    assert doc["admission"]["market_capacity"] == 5
+    assert doc["seated"][0]["hotkey"] == "hkA"
+    assert doc["outcomes"] == [{"hotkey": "hkA", "outcome": "trained"}]
+    assert "funded/latest.json" in published

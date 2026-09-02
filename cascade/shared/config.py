@@ -856,6 +856,19 @@ class RoundConfig:
     funded_pod_image: str = ""
     # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
     funded_ready_timeout_seconds: float = 900.0
+    # Elastic field sizing ("no heat, any number of challengers"): 0 keeps the
+    # legacy finalist_cap admission; N > 0 admits up to N funded challengers
+    # per round (each rents its own payer pod, so wall-clock stays one leg).
+    # The duel's alpha splits over the challengers that actually TRAIN, so a
+    # bigger seated field stiffens each seat's dethrone bar — deliberate.
+    funded_field_cap: int = 0
+    # With funded_pods = "rent": probe the marketplace at the boundary and
+    # clamp admission to the same-SKU machines it can actually serve, minus
+    # funded_capacity_reserve (kept for the king's own operator rental).
+    # Advisory — rents that lose the race to other renters still requeue
+    # unburned via the no_capacity taxonomy; a failed probe clamps nothing.
+    funded_capacity_probe: bool = False
+    funded_capacity_reserve: int = 1
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -1794,6 +1807,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_pod_image=str(r.get("funded_pod_image", "")),
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", 900.0)),
+            funded_field_cap=int(r.get("funded_field_cap", 0)),
+            funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),
+            funded_capacity_reserve=int(r.get("funded_capacity_reserve", 1)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

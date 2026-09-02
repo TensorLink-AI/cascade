@@ -103,6 +103,10 @@ class FundedRentResult:
     address: PodAddress | None = None
     error: str = ""
     error_class: str = ""           # cascade.funding.faults class; "" on success
+    # Marketplace machine id the pod landed on ("" when unknown): concurrent
+    # funded rents feed these back as ``exclude_ids`` so N challengers claim N
+    # DISTINCT executors instead of racing for the listing's first row.
+    machine_id: str = ""
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
     # A half-launched pod the failure-path cleanup could NOT confirm dead —
     # billing the MINER until someone acts. The caller must surface it (queue
@@ -120,6 +124,7 @@ def rent_funded_pod(
     ssh_pubkey: str,
     gpus_per_pod: int = 1,
     ready_timeout: float = 900.0,
+    exclude_ids: tuple[str, ...] = (),
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 ) -> FundedRentResult:
@@ -151,7 +156,7 @@ def rent_funded_pod(
 
     spec = LaunchSpec(
         sku=sku, count=1, image=image, ssh_pubkey=ssh_pubkey,
-        name_prefix=name, gpus_per_pod=gpus_per_pod,
+        name_prefix=name, gpus_per_pod=gpus_per_pod, exclude_ids=exclude_ids,
     )
     launched: list[str] = []
     try:
@@ -169,7 +174,12 @@ def rent_funded_pod(
         )
         log.info("funded pod %s ready for %s at %s:%d (billed to payer)",
                  pod_id, hotkey, addr.ip, addr.ssh_port)
-        return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr)
+        machine = ""
+        getter = getattr(provider, "machine_of", None)
+        if getter is not None:
+            machine = getter(pod_id) or ""
+        return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr,
+                                machine_id=machine)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
         for pid in launched:

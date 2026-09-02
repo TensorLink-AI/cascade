@@ -217,6 +217,15 @@ payer_vault_dir = ""            # cascade-intake --vault-dir (work_root-relative
 funded_pod_sku = ""             # marketplace SKU, keep = the final stage's SKU
 funded_pod_image = ""           # digest-pinned worker image (…@sha256:…)
 funded_ready_timeout_seconds = 900.0
+# Elastic no-heat field: 0 = legacy finalist_cap admission; N > 0 seats up to
+# N funded challengers per round (each rents its own payer pod — wall-clock
+# stays one leg; the duel's alpha splits over those that actually TRAIN).
+funded_field_cap = 0
+# With funded_pods="rent": clamp admission to live same-SKU market capacity
+# minus the reserve (the king's operator rental). Advisory — lost races
+# requeue unburned; a failed probe clamps nothing.
+funded_capacity_probe = false
+funded_capacity_reserve = 1
 submission_vault_dir = ""       # direct submissions (vault refs) off until armed
 champion_publish = "off"
 champion_publish_delay_rounds = 2

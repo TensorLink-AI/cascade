@@ -21,10 +21,14 @@ def _runner(tmp_path, **round_kw):
     """A minimal stand-in: the funded methods touch only cfg.round + work_root."""
     rnd = RoundConfig(funded_queue_path="funded_queue.json", **round_kw)
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path,
-                           _funded_field={}, _funded_leg_failures={})
+                           _funded_field={}, _funded_leg_failures={},
+                           _funded_admission_info={},
+                           _funded_roster={"seated": [], "waiting": [],
+                                           "terminal": [], "outcomes": []})
     for name in ("_funded_queue", "_filter_funded_challengers", "_settle_funded",
                  "_skip_unfunded_round", "_submissions_path", "_payer_vault",
-                 "_reconcile_funded_pods", "_record_funded_failure"):
+                 "_reconcile_funded_pods", "_record_funded_failure",
+                 "_funded_admission_cap", "_probe_funded_capacity"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     return fake
 

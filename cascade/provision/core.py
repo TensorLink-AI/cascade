@@ -661,6 +661,14 @@ class LiumProvider:
     def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         return len(self._list_executors(sku, gpus=gpus)) >= count
 
+    def capacity(self, sku: str, *, gpus: int = 1) -> int:
+        """How many ``sku`` machines the marketplace offers RIGHT NOW.
+
+        A snapshot, not a reservation — other renters race it, so callers
+        must treat the number as advisory and keep a requeue path for rents
+        that lose the race (the funded taxonomy's ``no_capacity``)."""
+        return len(self._list_executors(sku, gpus=gpus))
+
     def launch(self, spec: LaunchSpec) -> list[str]:
         execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
         if spec.exclude_ids:

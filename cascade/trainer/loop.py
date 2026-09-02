@@ -1099,6 +1099,13 @@ class TrainerRunner:
         if self.cfg.round.one_submission_per_hotkey:
             burned = _load_seen_hotkeys(self._submissions_path())
         by_hotkey = {c.hotkey: c for c in challengers}
+        cap = self._funded_admission_cap()
+        if cap == 0:
+            log.warning("funded admission: capacity probe says 0 same-SKU "
+                        "machine(s) available after the reserve — nobody "
+                        "seats this round; the queue holds, unburned")
+            self._funded_field = {}
+            return []
         kept: list[ResolvedGenerator] = []
         for entry in select_field(queue.entries(), cap=0):
             # expect_ref on every fail: this loop acts on a queue SNAPSHOT, so
@@ -1119,7 +1126,7 @@ class TrainerRunner:
                                  f"eligible reveal {c.ref} — fund the new ref",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
-            if len(kept) < max(1, self.cfg.round.finalist_cap):
+            if len(kept) < cap:
                 kept.append(c)
         dropped = len(challengers) - len(kept)
         if dropped:
@@ -1138,6 +1145,21 @@ class TrainerRunner:
         # the per-payer dispatch routes on membership and the duel settle's
         # expect_ref guard rides the value.
         self._funded_field = {c.hotkey: c.ref for c in selected}
+        # Transparency roster (published at settle): who seated, who waits,
+        # in what order, under what cap — miners can hold the operator to
+        # reveal-block seniority with the on-chain blocks beside it.
+        reveal_of = {e.hotkey: e.reveal_block for e in queue.entries()}
+        seated_set = {c.hotkey for c in selected}
+        self._funded_roster["seated"] = [
+            {"hotkey": c.hotkey, "ref": c.ref,
+             "reveal_block": reveal_of.get(c.hotkey)} for c in selected]
+        self._funded_roster["waiting"] = [
+            {"hotkey": e.hotkey, "reveal_block": e.reveal_block}
+            for e in select_field(queue.entries(), cap=0)
+            if e.hotkey not in seated_set]
+        self._funded_roster["terminal"] = [
+            {"hotkey": e.hotkey, "error_class": e.last_error_class}
+            for e in queue.entries() if e.status == "failed"]
         return selected
 
     def _submission_store(self):
@@ -1258,6 +1280,8 @@ class TrainerRunner:
                 continue
             if gen.hotkey in trained:
                 queue.mark_done(gen.hotkey)
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey, "outcome": "trained"})
                 continue
             msg, miner_fault, error_class, burn = self._funded_leg_failures.get(
                 gen.hotkey,
@@ -1265,6 +1289,9 @@ class TrainerRunner:
             if miner_fault:
                 queue.fail(gen.hotkey, error=msg, error_class=error_class,
                            expect_ref=self._funded_field[gen.hotkey])
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey, "outcome": "failed",
+                     "error_class": error_class})
             else:
                 requeued = queue.requeue(gen.hotkey, error=msg,
                                          error_class=error_class,
@@ -1274,6 +1301,82 @@ class TrainerRunner:
                          "re-queued unburned" if not burn else
                          ("re-queued (one attempt burned)" if requeued
                           else "attempts exhausted — entry failed"))
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey,
+                     "outcome": "requeued" if requeued else "failed",
+                     "error_class": error_class})
+
+    def _funded_admission_cap(self) -> int:
+        """How many funded challengers THIS round seats.
+
+        ``funded_field_cap = 0`` keeps the legacy ``finalist_cap`` admission;
+        ``N > 0`` is the elastic no-heat field ("any number of challengers" —
+        each seat rents its own payer pod, so wall-clock stays one leg). With
+        ``funded_capacity_probe`` on under rent mode, the cap further clamps
+        to the same-SKU machines the marketplace can serve right now minus
+        ``funded_capacity_reserve`` (the king's own operator rental comes off
+        the same market). The probe is ADVISORY: it stops us seating miners
+        the market visibly cannot serve, while rents that lose the race to
+        other renters still requeue unburned — and a failed probe clamps
+        nothing rather than freezing admission.
+        """
+        rnd = self.cfg.round
+        cap = rnd.funded_field_cap or max(1, rnd.finalist_cap)
+        self._funded_admission_info = {"configured_cap": cap, "cap": cap,
+                                       "market_capacity": None,
+                                       "reserve": rnd.funded_capacity_reserve}
+        if rnd.funded_pods != "rent" or not rnd.funded_capacity_probe:
+            return cap
+        avail = self._probe_funded_capacity()
+        if avail is None:
+            return cap
+        clamped = min(cap, max(0, avail - max(0, rnd.funded_capacity_reserve)))
+        self._funded_admission_info.update({"cap": clamped, "market_capacity": avail})
+        if clamped < cap:
+            log.info("funded admission: market has %d × %s (reserve %d) — "
+                     "seating %d of cap %d", avail, rnd.funded_pod_sku,
+                     rnd.funded_capacity_reserve, clamped, cap)
+        return clamped
+
+    def _probe_funded_capacity(self) -> int | None:
+        """Same-SKU marketplace availability on the OPERATOR's key, or None."""
+        try:
+            from ..provision.core import LiumProvider
+
+            return LiumProvider().capacity(self.cfg.round.funded_pod_sku)
+        except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
+            log.warning("funded capacity probe failed (admission uncapped by "
+                        "capacity this round): %s", e)
+            return None
+
+    def _publish_funded_roster(self, round_id: str) -> None:
+        """Publish the round's funded seat allocation, public-read.
+
+        ``funded/round-<id>.json`` + ``funded/latest.json`` on the manifest
+        bucket: the admission cap (and the capacity probe behind it), who
+        seated in what order, who waits, and how each seat ended. The reveal
+        blocks beside each seat are ON-CHAIN facts, so anyone can re-check
+        that seniority was honored; the audit's funded-roster check does
+        exactly that against the signed manifest. Presentational and
+        unsigned like the heat standings (DEC-CA-0011) — a publish failure
+        must never disturb the round.
+        """
+        if self.cfg.round.funded_mode != "required":
+            return
+        from ..shared.heat_status import _publish_public_json
+
+        doc = {"round_id": round_id,
+               "funded_pods": self.cfg.round.funded_pods,
+               "admission": dict(self._funded_admission_info),
+               **{k: list(v) for k, v in self._funded_roster.items()}}
+        try:
+            store = self.manifest_store()
+            for key in (f"funded/round-{round_id}.json", "funded/latest.json"):
+                _publish_public_json(store, key, doc)
+            log.info("round=%s: published funded roster (%d seated, %d waiting)",
+                     round_id, len(doc["seated"]), len(doc["waiting"]))
+        except Exception as e:  # noqa: BLE001 — transparency must not sink the round
+            log.warning("funded roster publish failed (ignored): %s", e)
 
     # ── per-payer funded pods (DEC-CA-0036, [round] funded_pods = "rent") ────
 
@@ -1411,12 +1514,18 @@ class TrainerRunner:
                                         f"config fault: {e}", miner_fault=False,
                                         error_class="infra", burn=False)
             raise _FundedLegSkip(gen.hotkey) from e
+        with self._funded_exec_lock:
+            claimed = tuple(sorted(self._funded_claimed_execs))
         result = rent_funded_pod(
             round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
             sku=rnd.funded_pod_sku, image=rnd.funded_pod_image,
             ssh_pubkey=ssh_pubkey,
             ready_timeout=rnd.funded_ready_timeout_seconds,
+            exclude_ids=claimed,
         )
+        if result.ok and result.machine_id:
+            with self._funded_exec_lock:
+                self._funded_claimed_execs.add(result.machine_id)
         if not result.ok:
             msg = result.error
             if result.leaked_pod:
@@ -3567,6 +3676,14 @@ class TrainerRunner:
         # per-payer dispatch, the failure map feeds the duel-settle (below).
         self._funded_field = {}
         self._funded_leg_failures = {}
+        # Executor ids this round's funded rents have claimed: N concurrent
+        # rents must pick N DISTINCT machines, not race for the listing's
+        # first row (both live rents on 2026-09-02 picked the same executor).
+        self._funded_claimed_execs = set()
+        self._funded_exec_lock = threading.Lock()
+        self._funded_admission_info = {}
+        self._funded_roster = {"seated": [], "waiting": [], "terminal": [],
+                               "outcomes": []}
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
@@ -3696,6 +3813,7 @@ class TrainerRunner:
         # so its funded entries stay in_round and the next boundary recovers
         # them to queued, unburned.
         self._settle_funded(jobs, entries)
+        self._publish_funded_roster(str(seeds.base_seed))
         if len(finalists) > 1:
             # DEC-CA-0012: stamp the advancing cohort's record order — 0-based,
             # best observed heat geomean first. Record order ONLY: the
