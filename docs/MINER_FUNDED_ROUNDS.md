@@ -95,6 +95,7 @@ The shipped `chain.toml` is ARMED behind two blocks:
 |---|---|---|
 | epoch grid 3600 → 900 (`epoch_activation_block`) | 8989200 | Thu 2026-09-03 ~20:30 |
 | funded machinery live (`[round] funded_activation_block`) | 8991900 | Fri 2026-09-04 ~05:30 |
+| scored horizon ladder `[64, 256, 720]` (`[eval] scored_from_block`, PR #241) | 8991900 | Fri 2026-09-04 ~05:30 |
 
 (The 3h grid has no boundary at exactly 06:00 UTC; 8991900 is the closest
 round-start. Projections assume 12s blocks — verify against the live chain
@@ -105,10 +106,13 @@ Between deploy and the funded block the trainer **holds** (no rounds at all
 — announced-flip semantics, no provisioner spend); at 8991900 the first
 funded round fires. Operator checklist, in order:
 
-1. **Before block 8989200 (Thu ~20:30 UTC):** deploy this release to the
-   trainer AND every validator (the `expected_gpu = ""` unpin changes
-   `contract_digest`, and the grid seam needs everyone on the new pair) —
-   the standard coordinated window; announce to externals.
+1. **Before block 8989200 (Thu ~20:30 UTC):** deploy this release — WITH
+   PR #241 merged — to the trainer AND every validator (the
+   `expected_gpu = ""` unpin changes `contract_digest`, the grid seam
+   needs everyone on the new pair, and the horizon ladder forks verdicts
+   from 8991900 on any validator without it) — the standard coordinated
+   window; announce to externals. Verify the current pool's series-length
+   eligibility at the 720 rung (>= 784 steps) before the block.
 2. **Start `cascade-intake`** on the orchestrator (see "bringing it up") with
    `--vault-dir` matching `[round] payer_vault_dir` and the queue path the
    trainer resolves; front it with TLS and publish the intake URL to miners.
