@@ -1,0 +1,17 @@
+{
+  "high": 0,
+  "warn": 2,
+  "findings": [
+    {
+      "severity": "warn",
+      "path": "requirements.txt",
+      "finding": "requirement outside the known generator stack: 'networkx' (check for typosquatting before installing)"
+    },
+    {
+      "severity": "warn",
+      "path": "tempo_gen/synthetic_generation/ornstein_uhlenbeck_process/ou_generator.py",
+      "finding": "getattr with computed attribute (obfuscation vector)"
+    }
+  ],
+  "note": "static scan only \u2014 NEVER run this code outside a sandbox regardless of a clean scan"
+}
