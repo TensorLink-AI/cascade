@@ -27,9 +27,10 @@ def _runner(tmp_path, **round_kw):
                            _funded_field={}, _funded_leg_failures={},
                            _funded_admission_info={},
                            _funded_ledger_lock=threading.Lock(),
+                           _storage_dropped={},
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
-    for name in ("_funded_gate_open", "_effective_funded_mode",
+    for name in ("_funded_gate_open", "_effective_funded_mode", "_burn_hotkeys",
                  "_effective_funded_pods", "_funded_queue", "_filter_funded_challengers", "_settle_funded",
                  "_skip_unfunded_round", "_submissions_path", "_payer_vault",
                  "_reconcile_funded_pods", "_record_funded_failure",
@@ -325,11 +326,10 @@ def test_funded_activation_block_gates_everything(tmp_path):
     runner = _runner(tmp_path, funded_mode="required", funded_pods="rent",
                      skip_unfunded_rounds=True, funded_activation_block=1000)
     field = [_challenger("hkA"), _challenger("hkB")]
-    # No block seen yet → gate CLOSED (armed config must never leak early).
+    # No block seen yet → gate CLOSED (armed config must never leak early):
+    # legacy rounds keep running, nothing is skipped, nothing rents.
     assert runner._filter_funded_challengers(field) == field
-    # Announced go-live pending → boundaries HOLD (no normal rounds spent
-    # in the hours between deploy and the flip).
-    assert runner._skip_unfunded_round("r1")
+    assert not runner._skip_unfunded_round("r1")
     assert runner._effective_funded_pods() == "off"
     # Pre-activation block → still closed.
     runner._funded_gate_block = 999
@@ -343,3 +343,45 @@ def test_funded_activation_block_gates_everything(tmp_path):
     # No gate configured (0) → open immediately, block or not (compat).
     open_runner = _runner(tmp_path, funded_mode="required")
     assert open_runner._effective_funded_mode() == "required"
+
+
+def test_funded_burn_happens_at_settle_per_outcome(tmp_path):
+    # one_submission_per_hotkey = true (mainnet): a hotkey's submission is
+    # spent only when its funded leg was actually JUDGED (trained) or its own
+    # generator failed — never by a requeue (sold-out / rate limit / infra)
+    # or an auth-class key fault, which stay re-fundable. Burning at the heat
+    # settle (the legacy shape) would terminally fail the requeued entry as
+    # "burned" at the next round's filter (review 2026-09-02).
+    from cascade.trainer.loop import _load_seen_hotkeys
+
+    q = _queue(tmp_path)
+    for hk in ("hkTrained", "hkGen", "hkAuth", "hkInfra", "hkRate"):
+        q.add(hk, REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required",
+                     one_submission_per_hotkey=True, funded_field_cap=8)
+    field = [_challenger(hk) for hk in ("hkTrained", "hkGen", "hkAuth",
+                                        "hkInfra", "hkRate")]
+    assert len(runner._filter_funded_challengers(field)) == 5
+    # Nothing is burned at admission / heat time.
+    assert _load_seen_hotkeys(tmp_path / "trainer_submissions.json") == set()
+    runner._record_funded_failure("hkGen", "rc=3", miner_fault=True,
+                                  error_class="generator", burn=False)
+    runner._record_funded_failure("hkAuth", "bad key", miner_fault=True,
+                                  error_class="auth", burn=False)
+    runner._record_funded_failure("hkInfra", "pod died", miner_fault=False,
+                                  error_class="infra", burn=True)
+    runner._record_funded_failure("hkRate", "429", miner_fault=False,
+                                  error_class="rate_limited", burn=False)
+    runner._settle_funded([(c, "challenger") for c in field],
+                          [SimpleNamespace(miner_hotkey="hkTrained", role="challenger")])
+    burned = _load_seen_hotkeys(tmp_path / "trainer_submissions.json")
+    assert burned == {"hkTrained", "hkGen"}
+    statuses = {hk: _queue(tmp_path).get(hk).status for hk in
+                ("hkTrained", "hkGen", "hkAuth", "hkInfra", "hkRate")}
+    assert statuses == {"hkTrained": "done", "hkGen": "failed",
+                        "hkAuth": "failed", "hkInfra": "queued",
+                        "hkRate": "queued"}
+    # The requeued ones re-enter the next round instead of dying as "burned".
+    nxt = runner._filter_funded_challengers([_challenger("hkInfra"),
+                                             _challenger("hkRate")])
+    assert sorted(c.hotkey for c in nxt) == ["hkInfra", "hkRate"]

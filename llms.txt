@@ -104,11 +104,10 @@ Full contract: docs/INTERFACE.md. Enforced limits: chain.toml `[generator]`,
 
 Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
 
-- A round = one ~3h epoch (900 blocks, from block 8989200 ≈ Thu 2026-09-03
-  20:30 UTC; ~12h before that). Only commitments whose on-chain pointer
+- A round = one ~12h epoch (3600 blocks). Only commitments whose on-chain pointer
   **revealed strictly before** the epoch boundary compete; a late reveal
   auto-rolls into the next round.
-- **MINER-FUNDED ROUNDS (live from block 8991900 ≈ Fri 2026-09-04 05:30 UTC,
+- **MINER-FUNDED ROUNDS (live from block 8992800 ≈ Fri 2026-09-04 08:30 UTC,
   DEC-CA-0036):** entering a round now requires FUNDING your own training leg
   with your Lium API key (`cascade fund` — the leg's GPU pod rents on YOUR
   account; the operator pays for the king, evals, and everything else). The
@@ -122,7 +121,11 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
   audit-checked against the signed manifest. Infra/sold-out/rate-limit
   failures on your pod re-queue you WITHOUT burning your entry; an invalid
   key releases your entry (fix it and re-fund); your key is held at most 36h
-  in a sealed vault, forgotten on withdraw. Full contract:
+  in a sealed vault, forgotten on withdraw. One submission per hotkey
+  still holds but is spent ONLY when your leg is judged (or your generator
+  fails) — requeues never burn it. A hotkey that competed in a legacy
+  round is spent: enter the funded era with a fresh hotkey revealed after
+  the last legacy cutoff (Thu 2026-09-03 20:30 UTC). Full contract:
   docs/MINER_FUNDED_ROUNDS.md.
 - **Heat** (screening; retired for funded rounds — pre-go-live history): every
   eligible challenger trained ~1h at the screen size and the leader/tied top
@@ -181,7 +184,7 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
    environment (`bittensor==10.5.0`) — older SDKs write reveals the subnet
    cannot decode and you are silently skipped.
 8. **Fund your training leg** (required once funded rounds are live —
-   block 8991900, ≈ Fri 2026-09-04 05:30 UTC): after your reveal lands,
+   block 8992800, ≈ Fri 2026-09-04 08:30 UTC): after your reveal lands,
    `export LIUM_API_KEY=sk-…` (env only, never argv) and
    `cascade fund https://<operator-intake> --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
    Your hotkey must be REGISTERED on the subnet and the ref must match your
@@ -209,9 +212,8 @@ seat you take bills your own key for ~3h of GPU.
 
 ## Key configuration values (chain.toml, shipped)
 
-- netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 900 blocks ≈ 3h
-  (from block 8989200; 3600 ≈ 12h before it)
-- funded rounds (from block 8991900): `funded_mode = "required"`,
+- netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 3600 blocks ≈ 12h
+- funded rounds (from block 8992800): `funded_mode = "required"`,
   `funded_pods = "rent"` (your leg bills your Lium key), field cap 8 clamped
   to live GPU-market capacity, GPU type per round from
   ["RTX4090", "RTX3090", "L40S", "L40", "A6000"], king rents JIT

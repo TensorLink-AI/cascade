@@ -1321,6 +1321,12 @@ class TrainerRunner:
             return
         trained = {getattr(e, "miner_hotkey", getattr(e, "hotkey", ""))
                    for e in entries if getattr(e, "role", "") == "challenger"}
+        # Hotkeys whose one lifetime submission is SPENT by this round: judged
+        # (trained → done) or their own generator failed (worker rc=3). An
+        # auth-class key fault, a sold-out market, a rate limit, or exhausted
+        # infra attempts leave the hotkey re-fundable — the miner's generator
+        # was never judged.
+        spent: set[str] = set()
         for gen, role in jobs:
             if role != "challenger" or gen.hotkey not in self._funded_field:
                 continue
@@ -1337,6 +1343,7 @@ class TrainerRunner:
                 continue
             if gen.hotkey in trained:
                 queue.mark_done(gen.hotkey)
+                spent.add(gen.hotkey)
                 self._funded_roster["outcomes"].append(
                     {"hotkey": gen.hotkey, "outcome": "trained"})
                 continue
@@ -1346,6 +1353,8 @@ class TrainerRunner:
             if miner_fault:
                 queue.fail(gen.hotkey, error=msg, error_class=error_class,
                            expect_ref=self._funded_field[gen.hotkey])
+                if error_class == "generator":
+                    spent.add(gen.hotkey)    # their run — that was the shot
                 self._funded_roster["outcomes"].append(
                     {"hotkey": gen.hotkey, "outcome": "failed",
                      "error_class": error_class})
@@ -1362,6 +1371,9 @@ class TrainerRunner:
                     {"hotkey": gen.hotkey,
                      "outcome": "requeued" if requeued else "failed",
                      "error_class": error_class})
+        if spent:
+            self._burn_hotkeys([gen for gen, role in jobs
+                                if role == "challenger" and gen.hotkey in spent])
 
     def _funded_admission_cap(self) -> int:
         """How many funded challengers THIS round seats.
@@ -1879,17 +1891,11 @@ class TrainerRunner:
         is consensus-invisible: the king simply holds.
         """
         rnd = self.cfg.round
-        if (rnd.funded_activation_block and rnd.funded_mode == "required"
-                and not self._funded_gate_open()):
-            # Announced go-live pending: HOLD every boundary between deploy
-            # and the activation block. Spending normal heat+duel rounds
-            # hours before the field rule flips would waste provisioner money
-            # and muddy the announcement; a held boundary is consensus-
-            # invisible (validators score what publishes — the king holds).
-            log.info("round %s: holding — funded go-live at block %d "
-                     "(gate not yet reached)", round_id,
-                     rnd.funded_activation_block)
-            return True
+        # Before funded_activation_block the configured modes read "off" here
+        # (see _effective_funded_mode), so normal rounds keep running right up
+        # to the flip — the owner's rollover shape: the last legacy round
+        # starts, the intake is already accepting funded entries, and the
+        # first boundary at/after the block runs the funded field.
         if self._effective_funded_mode() != "required" or not rnd.skip_unfunded_rounds:
             return False
         # Sweep funded-pod leftovers each boundary: a leg's own teardown covers
@@ -4077,7 +4083,17 @@ class TrainerRunner:
         # submission is consumed by a round that never judged it. (On the
         # settled-retry path this is an idempotent no-op: the reused finalists
         # were burned at the original settle.)
-        self._burn_hotkeys(eligible)
+        if self._effective_funded_mode() == "required":
+            # Funded entries burn at the DUEL settle (_settle_funded), per
+            # outcome — burning the seated field here, before its legs run,
+            # would let the next round's burned-hotkey check terminally fail
+            # an entry the queue had just requeued UNBURNED (sold-out, rate
+            # limit, operator infra), voiding the taxonomy's core promise.
+            # Only surfaced with one_submission_per_hotkey = true (mainnet;
+            # testnet runs it off) — review 2026-09-02.
+            pass
+        else:
+            self._burn_hotkeys(eligible)
         # Funded entries do NOT settle here. Under funded_mode = "required" the
         # field fits the cap by construction, so this heat "completion" is the
         # short-circuit — settling now would spend every entry BEFORE its duel

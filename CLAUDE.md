@@ -301,11 +301,13 @@ in-context.
   gates: scoped pod creds + per-dispatch ZIP staging wiring, worker-image
   rebuild + budget parity, confirmation wiring, DEC-CA-0016 wall-clock
   tenure, retrain-noise measurement. MAINNET GO-LIVE ARMED (owner
-  2026-09-02): `[round] funded_activation_block = 8991900` (≈ Fri
-  2026-09-04 05:30 UTC; pre-gate the trainer HOLDS) + epoch seam 3600→900
-  at 8989200 + `expected_gpu` unpinned (contract change — coordinated
-  deploy before the seam); direct submissions stay off. Confirmation-leg
-  and tenure gates ship OPEN, owner-accepted — revisit in week one.
+  2026-09-02): ONE block, 8992800 (≈ Fri 2026-09-04 08:30 UTC), for
+  `[round] funded_activation_block` and PR #241's
+  `[eval] scored_from_block` (ladder [64, 256, 720]); the 12h grid stays for now;
+  legacy rounds run until it (last one Thu 20:30), no hold. `expected_gpu` unpinned
+  (contract change — coordinated deploy before Thu 20:30); direct
+  submissions stay off. The confirmation-leg gate ships OPEN,
+  owner-accepted — revisit in week one.
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:

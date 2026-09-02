@@ -184,16 +184,17 @@ torch cu12.8 re-pin, a coordinated contract change).
 
 ## Amendment 2026-09-02 (2) — block-gated mainnet go-live Fri 2026-09-04
 
-Owner directive: live at ~06:00 UTC Friday. Shipped in `chain.toml`:
-`[round] funded_activation_block = 8991900` (new key — before it every
-funded_* knob reads "off" and, because the flip is announced, boundaries
-HOLD; from it the armed config applies) + the epoch seam 3600→900 at
-8989200 (Thu ~20:30 UTC; the grid's closest boundary to 6am is 8991900 ≈
-05:30 Fri). `expected_gpu` unpinned ("" — contract change, coordinated
-deploy before the seam). Direct submissions stay off (image gate).
-Go-live checklist: docs/MINER_FUNDED_ROUNDS.md; miner-facing:
-docs/MINER.md §6b + llms.txt. Accepted risk, owner-directed: the
-confirmation-leg wiring and DEC-CA-0016 wall-clock tenure gates ship
-OPEN — a provisional dethrone crowns without an operator retrain, and
-tenure decay now counts 3h rounds (a full decay in ~24h of held throne
-instead of 8 days). Revisit both within the first week live.
+Owner directive: live Friday morning UTC, legacy rounds running right up to
+the flip, epoch grid STAYING 12h for now. Shipped in `chain.toml`: `[round]
+funded_activation_block` (new key — before it every funded_* knob reads
+"off"; from it the armed config applies) and PR #241's `[eval]
+scored_from_block` (ladder [64, 256, 720]) BOTH at block 8992800 (≈ Fri
+08:30 UTC) — the first 12h boundary after the last legacy round (Thu 20:30,
+6–8h, ~4h gap as today): no extra rounds, no overlap, no hold. The 3h grid
+is a later scheduled `epoch_activation_block` switch. `expected_gpu`
+unpinned ("" — contract change, coordinated deploy before Thu 20:30).
+Direct submissions stay off (image gate). Go-live checklist:
+docs/MINER_FUNDED_ROUNDS.md; miner-facing: docs/MINER.md §6b + llms.txt.
+Accepted risk, owner-directed: the confirmation-leg wiring ships OPEN — a
+provisional dethrone crowns without an operator retrain. Revisit within
+the first week live.

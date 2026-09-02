@@ -385,7 +385,7 @@ How it works, and what to know:
 ### 5c. Time your submission — `cascade round`
 
 Only commits revealed **strictly before** the epoch boundary enter the next
-round; commit at or after it and you wait a whole extra round (~3h once the 900-block grid is live). `cascade
+round; commit at or after it and you wait a whole extra round (~12h). `cascade
 round` is a live round dashboard: the countdown to that deadline, where the
 round roughly is, and the revealed submissions — run it before you deploy so
 you don't commit into the wrong round, and keep it running to see your own
@@ -594,9 +594,9 @@ This is observability, not an appeal channel: these fields are not signed, not
 in the manifest, and never re-weight a score. They exist so a claim about host
 variance can be checked against numbers instead of inferred.
 
-## 6b. Fund your training leg — REQUIRED from Fri 2026-09-04 (~05:30 UTC, block 8991900)
+## 6b. Fund your training leg — REQUIRED from Fri 2026-09-04 (~08:30 UTC, block 8992800)
 
-From block **8991900** (DEC-CA-0036), a revealed submission only enters a
+From block **8992800** (DEC-CA-0036), a revealed submission only enters a
 round once you FUND its training leg: your leg's GPU pod rents on **your own
 Lium API key** (lium.io), so the compute you consume bills you, not the
 operator. The operator still pays for the king's leg, the evals, and
@@ -639,8 +639,16 @@ What to know:
   your pod, forgotten on withdraw. The signed request binds the key's hash,
   a fresh timestamp, and your ref, so it cannot be replayed or altered in
   transit — always use an `https://` intake URL.
-- **Rounds are ~3h** (epoch 900 blocks) and fire only when someone funded:
-  an unfunded boundary runs nothing and the king simply holds.
+- **Rounds fire only when someone funded** (still on the ~12h epoch grid
+  for now): an unfunded boundary runs nothing and the king simply holds.
+- **One submission per hotkey still holds — and it is spent only when
+  judged.** Your hotkey burns when your funded leg actually trains and
+  duels (or your own generator fails on the pod); a sold-out market, a
+  rate limit, operator infra, or a bad key never spend it. A hotkey that
+  already competed in a legacy (pre-funded) round IS spent: to enter the
+  funded era, register a fresh hotkey and reveal AFTER the last legacy
+  cutoff (Thu 2026-09-03 20:30 UTC) — a reveal before it competes in the
+  final legacy round and burns.
 
 Full contract (failure classes, TTLs, the operator's obligations):
 [docs/MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUNDS.md).
@@ -724,7 +732,7 @@ always scored on windows that have never been published.
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5b](#5b-if-the-hippius-hub-is-down)) |
 | committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
 | `403 not_registered` on fund/submit | your hotkey is not registered on the subnet — `btcli subnets register` first |
-| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-04-0530-utc-block-8991900)) |
+| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-04-0530-utc-block-8992800)) |
 | funded but never seated | more-senior (earlier-revealed) entries out-capped you, or the GPU market is thin — you wait unburned; watch `cascade queue` |
 | entry `failed [rate_limited]` | your Lium key 429'd for 6h straight — raise the key's rate limits, then fund again |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |

@@ -89,45 +89,54 @@ rationale; this file is the how.
 
 ## GO-LIVE 2026-09-04 (mainnet, block-gated — owner 2026-09-02)
 
-The shipped `chain.toml` is ARMED behind two blocks:
+The shipped `chain.toml` flips at ONE block; the epoch grid stays 12h
+(3600 blocks) for now:
 
 | what | block | projected UTC |
 |---|---|---|
-| epoch grid 3600 → 900 (`epoch_activation_block`) | 8989200 | Thu 2026-09-03 ~20:30 |
-| funded machinery live (`[round] funded_activation_block`) | 8991900 | Fri 2026-09-04 ~05:30 |
-| scored horizon ladder `[64, 256, 720]` (`[eval] scored_from_block`, PR #241) | 8991900 | Fri 2026-09-04 ~05:30 |
+| funded machinery live (`[round] funded_activation_block`) | 8992800 | Fri 2026-09-04 ~08:30 |
+| scored horizon ladder `[64, 256, 720]` (`[eval] scored_from_block`, PR #241) | 8992800 | Fri 2026-09-04 ~08:30 |
 
-(The 3h grid has no boundary at exactly 06:00 UTC; 8991900 is the closest
-round-start. Projections assume 12s blocks — verify against the live chain
-the day before and, if drift matters, adjust BOTH blocks keeping 8989200 a
-multiple of 3600 and 8991900 a multiple of 900.)
+Why this block: it is the first 12h boundary after the last legacy round.
+Legacy rounds (6–8h) keep running right up to the flip — the last one
+starts at the Thu 20:30 boundary (8989200) and ends ~02:30–04:30, leaving
+the usual gap; at 8992800 the funded field and the ladder activate together.
+No extra rounds, no hold, no overlap. (Projections assume 12s blocks —
+verify against the live chain the day before; keep any moved block a
+multiple of 3600.) A later move to a 3h grid is its own scheduled
+`epoch_activation_block` switch (a coordinated validator update).
 
-Between deploy and the funded block the trainer **holds** (no rounds at all
-— announced-flip semantics, no provisioner spend); at 8991900 the first
-funded round fires. Operator checklist, in order:
+Miners can `cascade fund` as soon as the intake is up — entries queue by
+reveal block and the first funded round at 8992800 seats them. With
+`one_submission_per_hotkey = true` a hotkey that competed in a legacy
+round is spent, so the funded era's entrants are FRESH hotkeys whose
+reveal lands after the Thu 20:30 cutoff (an earlier reveal competes in
+the last legacy round and burns). Funded entries burn at the DUEL settle,
+only when judged or on a generator failure — never on a requeue or an
+auth fault. Operator checklist, in order:
 
-1. **Before block 8989200 (Thu ~20:30 UTC):** deploy this release — WITH
-   PR #241 merged — to the trainer AND every validator (the
-   `expected_gpu = ""` unpin changes `contract_digest`, the grid seam
-   needs everyone on the new pair, and the horizon ladder forks verdicts
-   from 8991900 on any validator without it) — the standard coordinated
-   window; announce to externals. Verify the current pool's series-length
-   eligibility at the 720 rung (>= 784 steps) before the block.
+1. **Before block 8989200 (Thu ~20:30 UTC, the last legacy boundary):**
+   deploy this release — WITH PR #241 merged — to the trainer AND every
+   validator (the `expected_gpu = ""` unpin changes `contract_digest`, and
+   the horizon ladder forks verdicts from 8992800 on any validator without
+   it) — the standard coordinated window; announce to externals. Verify the current pool's
+   series-length eligibility at the 720 rung (>= 784 steps) before the block.
 2. **Start `cascade-intake`** on the orchestrator (see "bringing it up") with
    `--vault-dir` matching `[round] payer_vault_dir` and the queue path the
    trainer resolves; front it with TLS and publish the intake URL to miners.
    NO `--trust-refs` and NO `--no-require-signature` on mainnet, ever.
+   Start it before the Thu 20:30 legacy round so miners can pre-fund.
 3. **Retire the provisioner's final stage** at the seam: with
    `funded_king_rent = true` the trainer rents/ledgers/sweeps the king pod
    itself; a standing final fleet would idle-bill and the provisioner must
    never touch `cascade-n91-…` pods.
 4. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
-   from block 8991900; `cascade fund` after reveal; registered hotkey; keep
+   from block 8992800; `cascade fund` after reveal; registered hotkey; keep
    ~3h × chosen-GPU balance on the Lium key.
 5. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
    `cascade-audit latest` (funded-roster check), and the trainer log's
    admission/SKU lines. Rollback = set `funded_activation_block` far future
-   + restart trainer (grid stays 900; rounds hold).
+   + restart trainer (legacy rounds resume).
 
 Direct submissions stay OFF at go-live (`submission_vault_dir = ""`): the
 pinned worker image predates the vault fetch — arming them is a separate
