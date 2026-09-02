@@ -886,6 +886,10 @@ class RoundConfig:
     funded_pod_image: str = ""
     # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
     funded_ready_timeout_seconds: float = 900.0
+    # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
+    # (cascade.funding.robots). Revocation at teardown is the real bound;
+    # this is the backstop if a revoke ever fails.
+    funded_robot_duration_days: int = 1
     # Elastic field sizing ("no heat, any number of challengers"): 0 keeps the
     # legacy finalist_cap admission; N > 0 admits up to N funded challengers
     # per round (each rents its own payer pod, so wall-clock stays one leg).
@@ -1864,6 +1868,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_pod_image=str(r.get("funded_pod_image", "")),
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", 900.0)),
+            funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
             funded_field_cap=validate_funded_field_cap(
                 r.get("funded_field_cap", 0)),
             funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),

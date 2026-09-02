@@ -98,6 +98,11 @@ class RemoteHost:
     # path). Travels on stdin like every forwarded credential, never on the
     # remote command line.
     static_env: tuple[tuple[str, str], ...] = ()
+    # An ISOLATED host receives nothing from the orchestrator's environment —
+    # not its forward_env, not the dispatcher's global extras (WANDB_API_KEY)
+    # — only its own static_env. Set on funded (payer-account) pods: the
+    # payer has console access, so every forwarded value is theirs to read.
+    isolated: bool = False
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -376,7 +381,8 @@ class RemoteDispatcher:
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.
-        names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
+        names = (dict.fromkeys(()) if host.isolated
+                 else dict.fromkeys((*host.forward_env, *self.extra_forward_env)))
         env = {k: os.environ[k] for k in names if k in os.environ}
         # Host-pinned values win over forwarded copies: a funded pod's
         # CASCADE_VAULT_DIR must be the POD's staging path even when the

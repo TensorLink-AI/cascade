@@ -1495,6 +1495,101 @@ class TrainerRunner:
         vault.hydrate()
         return vault
 
+    # Env pairs the funded-leg credential resolver reads. Neither is ever
+    # forwarded to a pod: the ADMIN pair mints per-pod robots and stays on the
+    # orchestrator; the FUNDED pair is the static fallback that IS handed to
+    # payer pods (a push-only robot the operator created by hand).
+    HUB_ADMIN_ENV = ("CASCADE_HUB_ADMIN_USERNAME", "CASCADE_HUB_ADMIN_PASSWORD")
+    FUNDED_HUB_ENV = ("CASCADE_FUNDED_HUB_USERNAME", "CASCADE_FUNDED_HUB_PASSWORD")
+
+    def _hub_robots(self):
+        """The Harbor robot minter on a PROJECT-ADMIN Hub login, or ``None``.
+
+        Harbor refuses to let a robot account manage robots, and the
+        operator's everyday Hub identity is itself a project robot
+        (``robot$cascade+cascade-bot``), so minting needs a real user login:
+        ``CASCADE_HUB_ADMIN_USERNAME`` / ``CASCADE_HUB_ADMIN_PASSWORD``. Absent
+        that, ``None`` — the caller then tries the static funded robot and
+        otherwise fails CLOSED. Nothing here ever forwards the operator's
+        login to a payer-controlled pod.
+        """
+        import base64
+        import os
+
+        try:
+            from ..funding.robots import HarborRobots
+            from ..shared.hippius import HubConfig
+
+            user = os.environ.get(self.HUB_ADMIN_ENV[0], "")
+            pw = os.environ.get(self.HUB_ADMIN_ENV[1], "")
+            if not (user and pw):
+                return None
+            if user.startswith("robot$"):
+                log.error("%s is a robot account — Harbor forbids robots minting "
+                          "robots; set a project-admin USER login", self.HUB_ADMIN_ENV[0])
+                return None
+            header = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+            return HarborRobots(HubConfig.from_storage(self.cfg.storage).registry_url,
+                                header)
+        except Exception as e:  # noqa: BLE001 — a minter fault is an infra fault
+            log.error("Hub robot minter unavailable: %s", e)
+            return None
+
+    def _funded_pod_credential(self, round_id: str, hotkey: str):
+        """``(env_pairs, robot_id)`` for one payer pod, or ``None`` (fail closed).
+
+        Preference: a per-pod robot minted now (revoked at teardown) → the
+        static funded robot from the environment (rotated by hand) → nothing.
+        The operator's own Hub login is NEVER an option here.
+        """
+        import os
+
+        from ..funding.robots import robot_name
+
+        minter = self._hub_robots()
+        if minter is not None:
+            try:
+                cred = minter.create(
+                    robot_name(self.cfg.subnet.netuid, str(round_id), hotkey),
+                    self.hub().namespace,
+                    duration_days=self.cfg.round.funded_robot_duration_days)
+                return cred.as_env(), cred.id
+            except Exception as e:  # noqa: BLE001 — fall through to the static robot
+                log.error("Hub robot mint for %s failed: %s", hotkey, e)
+        user = os.environ.get(self.FUNDED_HUB_ENV[0], "")
+        pw = os.environ.get(self.FUNDED_HUB_ENV[1], "")
+        if user and pw:
+            if not user.startswith("robot$"):
+                log.error("%s must be a push-only Hub ROBOT (robot$…), not a "
+                          "user login — refusing to hand a user login to a "
+                          "payer pod", self.FUNDED_HUB_ENV[0])
+                return None
+            log.info("funded leg for %s uses the static funded robot %s "
+                     "(no admin login to mint a per-pod one)", hotkey, user)
+            return (("HIPPIUS_HUB_USERNAME", user),
+                    ("HIPPIUS_HUB_PASSWORD", pw)), 0
+        log.error("no credential for the funded leg of %s: set %s/%s (per-pod "
+                  "robots) or %s/%s (a static push-only robot)", hotkey,
+                  *self.HUB_ADMIN_ENV, *self.FUNDED_HUB_ENV)
+        return None
+
+    def _revoke_robot(self, pod) -> None:
+        """Best-effort revoke of a ledgered pod's Hub robot (Harbor expiry is
+        the backstop when this fails)."""
+        robot_id = int(getattr(pod, "robot_id", 0) or 0)
+        if not robot_id:
+            return
+        minter = self._hub_robots()
+        if minter is None:
+            log.error("cannot revoke Hub robot id=%d for pod %s (no operator Hub "
+                      "login) — it expires on its own", robot_id, pod.instance_id)
+            return
+        try:
+            minter.delete(robot_id)
+        except Exception as e:  # noqa: BLE001 — expiry backstop
+            log.error("Hub robot id=%d for pod %s NOT revoked (%s) — it expires "
+                      "on its own", robot_id, pod.instance_id, e)
+
     def _funded_pod_profile(self):
         """The pod profile funded rentals mirror: the first FINAL-stage host.
 
@@ -1573,6 +1668,8 @@ class TrainerRunner:
                               "miners until the vault comes back")
                 return
             pods = [x for x in pods if x.payer_hotkey]
+            for pod in pods:
+                self._revoke_robot(pod)
             if pods:
                 leftovers = teardown_funded(pods, vault)
                 with self._funded_ledger_lock:
@@ -1680,16 +1777,34 @@ class TrainerRunner:
             raise _FundedLegSkip(gen.hotkey)
         # Replace the intent row with the real pod record (same instance id).
         self._ledger_add(result.pod)
+        # Least-privilege credential for a payer-controlled box: a per-pod Hub
+        # robot (push-only, checkpoint project, revoked at teardown) and
+        # NOTHING from the orchestrator's environment (cascade.funding.robots).
+        # Fail closed — never fall back to forwarding the operator's login.
+        from dataclasses import replace as dc_replace
+
+        cred = self._funded_pod_credential(str(round_id), gen.hotkey)
+        if cred is None:
+            self._teardown_funded_pod(result.pod)
+            self._record_funded_failure(
+                gen.hotkey, "operator-side fault: could not mint a per-pod Hub "
+                "credential (the leg never forwards operator logins to a payer "
+                "pod)", miner_fault=False, error_class="infra", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+        env_pairs, robot_id = cred
+        pod = dc_replace(result.pod, robot_id=robot_id)
+        self._ledger_add(pod)
         host = RemoteHost(
             name=f"funded-{gen.hotkey[:12].lower()}",
             host=result.address.ip, port=result.address.ssh_port,
             user=profile.user, key_path=profile.key_path,
             remote_python=profile.remote_python, workdir=profile.workdir,
             cuda_device="0", chain_toml=profile.chain_toml,
-            forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+            forward_env=(), static_env=env_pairs, isolated=True,
+            ssh_options=profile.ssh_options,
             stage="final",
         )
-        return host, result.pod
+        return host, pod
 
     def _stage_vault_zip_on(self, host, digest_hex: str):
         """Ship ONE vault ZIP to the funded pod; return the host with the
@@ -1717,10 +1832,13 @@ class TrainerRunner:
         subprocess.run(["scp", *scp_base, str(staged),
                         f"{host.user}@{host.host}:{pod_dir}/{digest_hex}.zip"],
                        check=True, capture_output=True, timeout=300)
-        return dc_replace(host, static_env=(("CASCADE_VAULT_DIR", pod_dir),))
+        return dc_replace(host, static_env=(*host.static_env,
+                                            ("CASCADE_VAULT_DIR", pod_dir)))
 
     def _teardown_funded_pod(self, pod) -> None:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
+        # The leg is over: its Hub robot dies first, whatever the pod does.
+        self._revoke_robot(pod)
         vault = self._payer_vault()
         if vault is None:
             # A silent return here would leave a miner-billed pod running with

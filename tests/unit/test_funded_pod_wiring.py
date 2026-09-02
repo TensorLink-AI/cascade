@@ -57,7 +57,14 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_king_lock=threading.Lock(),
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
-    for name in ("_funded_gate_open", "_effective_funded_mode",
+    fake.hub = lambda: SimpleNamespace(namespace="cascade")
+    fake.HUB_ADMIN_ENV = TrainerRunner.HUB_ADMIN_ENV
+    fake.FUNDED_HUB_ENV = TrainerRunner.FUNDED_HUB_ENV
+    # Default: a working fake robot minter (tests override to simulate faults).
+    fake._minter = _FakeMinter()
+    fake._hub_robots = lambda: fake._minter
+    for name in ("_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
+                 "_funded_pod_credential",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity",
                  "_rent_king_host", "_teardown_operator_pod",
@@ -86,6 +93,30 @@ def _pod(hotkey: str = "hkA") -> PodInstance:
                       instance_id=f"cascade-n91-777-funded-{hotkey.lower()}-0",
                       stage="funded", rented_at_iso="2026-09-02T00:00:00Z",
                       sku="RTX4090", gpus=1, payer_hotkey=hotkey)
+
+
+class _FakeMinter:
+    """Mirrors cascade.funding.robots.HarborRobots' surface."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.created = []
+        self.deleted = []
+        self._next = 41
+
+    def create(self, name, project, *, duration_days=1, actions=("push",)):
+        from cascade.funding.robots import RobotCredential, RobotError
+
+        if self.fail:
+            raise RobotError("harbor down")
+        self._next += 1
+        self.created.append((name, project, duration_days, actions))
+        return RobotCredential(id=self._next, username=f"robot$cascade+{name}",
+                               secret=f"sec-{self._next}", project=project)
+
+    def delete(self, robot_id):
+        self.deleted.append(robot_id)
+        return True
 
 
 def _rent_ok(hotkey="hkA"):
@@ -119,6 +150,88 @@ def test_rent_success_builds_host_from_profile_and_ledgers_first(tmp_path, monke
     # write-ahead: the pod is on the ledger before any use
     ledger = json.loads((tmp_path / "funded_pods.json").read_text())
     assert [x["instance_id"] for x in ledger] == [pod.instance_id]
+    # Least privilege: NOTHING forwarded from the orchestrator's env, only
+    # the per-pod push-only Hub robot — a payer can read the pod's env.
+    assert host.isolated and host.forward_env == ()
+    env = dict(host.static_env)
+    assert env["HIPPIUS_HUB_USERNAME"].startswith("robot$cascade+funded-n91-777-hka-")
+    assert env["HIPPIUS_HUB_PASSWORD"] == "sec-42"
+    assert set(env) == {"HIPPIUS_HUB_USERNAME", "HIPPIUS_HUB_PASSWORD"}
+    (name, project, days, actions), = runner._minter.created
+    assert (project, days, actions) == ("cascade", 1, ("push",))
+    assert ledger[0]["robot_id"] == 42 and pod.robot_id == 42
+
+
+def test_rent_robot_mint_failure_fails_closed(tmp_path, monkeypatch):
+    # No robot → NO leg (unburned infra skip) and the pod is torn down. It
+    # must never fall back to forwarding the operator's Hub login.
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    runner._minter = _FakeMinter(fail=True)
+    monkeypatch.delenv("CASCADE_FUNDED_HUB_USERNAME", raising=False)
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    torn = []
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
+    with pytest.raises(_FundedLegSkip):
+        runner._rent_funded_host("777", _challenger("hkA"))
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (False, "infra", False)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_teardown_revokes_the_pods_robot_first(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    from dataclasses import replace
+    pod = replace(_pod("hkA"), robot_id=77)
+    runner._ledger_add(pod)
+    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
+    runner._teardown_funded_pod(pod)
+    assert runner._minter.deleted == [77]
+    assert runner._load_funded_ledger() == []
+
+
+def test_sweep_revokes_robots_on_ledgered_payer_pods(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    from dataclasses import replace
+    runner._ledger_add(replace(_pod("hkA"), robot_id=78))
+    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
+    runner._reconcile_funded_pods()
+    assert runner._minter.deleted == [78]
+
+
+def test_isolated_host_receives_no_orchestrator_env(monkeypatch):
+    # The dispatcher's global extras (WANDB_API_KEY) and any forward_env are
+    # dropped for an isolated host; only its static_env travels.
+    from cascade.trainer.remote import RemoteDispatcher
+
+    monkeypatch.setenv("HIPPIUS_S3_ACCESS_KEY", "op-s3")
+    monkeypatch.setenv("WANDB_API_KEY", "op-wandb")
+    seen = {}
+
+    def runner(argv, timeout, stdin_env=None):
+        seen["stdin"] = stdin_env or ""
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "miner_hotkey": "hkA", "role": "challenger"}), stderr="")
+
+    disp = RemoteDispatcher(trainer_spec="m:C", extra_forward_env=("WANDB_API_KEY",),
+                            _runner=runner)
+    host = RemoteHost(name="funded-x", host="10.0.0.9", port=22, user="root",
+                      key_path=None, remote_python="python", workdir="/w",
+                      cuda_device="0", chain_toml="chain.toml",
+                      forward_env=("HIPPIUS_S3_ACCESS_KEY",),
+                      static_env=(("HIPPIUS_HUB_USERNAME", "robot$x"),), isolated=True)
+    try:
+        disp.dispatch(host, lane_count=1, gen_ref=REF, uid=1, hotkey="hkA",
+                      role="challenger", base_seed=1, block=1, arch_preset="toto2-4m",
+                      warm_start_ref=None)
+    except Exception:  # noqa: BLE001 — the parsed entry shape is not under test
+        pass
+    assert "robot$x" in seen["stdin"]
+    assert "op-s3" not in seen["stdin"] and "op-wandb" not in seen["stdin"]
 
 
 def test_rent_missing_key_settles_auth_and_skips(tmp_path):
@@ -231,10 +344,13 @@ def test_vault_ref_leg_stages_the_zip_and_pins_the_pod_env(tmp_path, monkeypatch
     staged = []
 
     def fake_stage(host, digest):
+        # Mirrors the real _stage_vault_zip_on's env composition (append,
+        # never replace) with the scp/ssh transport stubbed out.
         staged.append(digest)
         from dataclasses import replace
-        return replace(host, static_env=(("CASCADE_VAULT_DIR",
-                                          f"{host.workdir}/_vault_stage"),))
+        return replace(host, static_env=(*host.static_env,
+                                         ("CASCADE_VAULT_DIR",
+                                          f"{host.workdir}/_vault_stage")))
 
     runner._stage_vault_zip_on = fake_stage
     runner._funded_field = {"hkA": VAULT_REF}
@@ -242,7 +358,11 @@ def test_vault_ref_leg_stages_the_zip_and_pins_the_pod_env(tmp_path, monkeypatch
                            contract, "", warm_start_ref=None)
     assert staged == ["b" * 64]
     (host, kw), = disp.calls
-    assert dict(host.static_env) == {"CASCADE_VAULT_DIR": "/root/cascade/_vault_stage"}
+    env = dict(host.static_env)
+    assert env["CASCADE_VAULT_DIR"] == "/root/cascade/_vault_stage"
+    # Staging the ZIP must not drop the pod's robot credential.
+    assert env["HIPPIUS_HUB_USERNAME"].startswith("robot$")
+    assert host.isolated
 
 
 # ── teardown + ledger + boundary sweep ───────────────────────────────────────
@@ -629,3 +749,25 @@ def test_rent_serialization_makes_claims_visible_to_the_next_rent(tmp_path, monk
     first, second = sorted(seen_excludes.values(), key=len)
     assert first == ()
     assert second in (("exec-1",), ("exec-2",))
+
+
+def test_static_funded_robot_is_the_fallback_and_user_logins_are_refused(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    runner._hub_robots = lambda: None            # no admin login → no minting
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    # A hand-made push-only robot in the env is accepted (robot_id 0 = static).
+    monkeypatch.setenv("CASCADE_FUNDED_HUB_USERNAME", "robot$cascade+funded-static")
+    monkeypatch.setenv("CASCADE_FUNDED_HUB_PASSWORD", "static-secret")
+    host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert dict(host.static_env) == {"HIPPIUS_HUB_USERNAME": "robot$cascade+funded-static",
+                                     "HIPPIUS_HUB_PASSWORD": "static-secret"}
+    assert host.isolated and pod.robot_id == 0
+    # A USER login in that slot is refused outright — never handed to a pod.
+    monkeypatch.setenv("CASCADE_FUNDED_HUB_USERNAME", "chris")
+    torn = []
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
+    with pytest.raises(_FundedLegSkip):
+        runner._rent_funded_host("777", _challenger("hkA"))
+    assert torn and runner._funded_leg_failures["hkA"][2] == "infra"

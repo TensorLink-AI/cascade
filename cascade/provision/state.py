@@ -59,6 +59,10 @@ class PodInstance:
     # terminated/listed with that miner's key (from the payer vault), so a
     # restart must know whose key to hydrate before it can stop the pod.
     payer_hotkey: str = ""
+    # Hub robot account minted for this pod's leg (cascade.funding.robots);
+    # 0 = none. Persisted so a teardown/sweep after a restart can still revoke
+    # the credential the pod was given.
+    robot_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,7 @@ def save_state(path: Path | str, state: RoundState) -> None:
                 # Drop-when-default (the repo-wide convention): operator-account
                 # pods serialise byte-identically to pre-funding ledgers.
                 **({"payer_hotkey": i.payer_hotkey} if i.payer_hotkey else {}),
+                **({"robot_id": i.robot_id} if i.robot_id else {}),
             }
             for i in state.instances
         ],
@@ -191,6 +196,7 @@ def load_state(path: Path | str) -> RoundState | None:
                 sku=str(i.get("sku", "")),
                 gpus=int(i.get("gpus", 1)),
                 payer_hotkey=str(i.get("payer_hotkey", "")),
+                robot_id=int(i.get("robot_id", 0) or 0),
             )
             for i in raw.get("instances", [])
         ),

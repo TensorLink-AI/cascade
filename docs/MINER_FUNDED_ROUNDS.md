@@ -23,7 +23,7 @@ rationale; this file is the how.
 | Per-round GPU-type choice (`funded_pod_skus` preference list, most-available wins; JIT operator king pod via `funded_king_rent`) | `cascade/trainer/loop.py` | built, live-validated |
 | Transparency (public roster `funded/round-<id>.json`, `cascade queue`, tier-0 `funded-roster` audit check) | `trainer/loop.py`, `miner/cli.py`, `audit/checks.py` | built |
 | Miner command (`cascade fund` / `--withdraw` / `cascade queue`) | `cascade/miner/cli.py` | built |
-| Scoped per-pod credentials for funded pods | — | **gates arming** |
+| Scoped per-pod credentials: payer pods are ISOLATED (nothing from the orchestrator env) and get a per-pod push-only Hub robot, revoked at teardown (`cascade/funding/robots.py`) | `funding/robots.py`, `trainer/loop.py`, `trainer/remote.py` | built (needs a project-admin Hub login or a static funded robot — see "Credentials on payer pods") |
 | Worker image rebuilt from this branch (vault-ref fetch on funded pods) + image/orchestrator `[training]` budget parity | — | **gates arming** |
 | Confirmation-leg wiring (operator retrain on provisional dethrone) | — | **gates arming** |
 | Tenure decay re-denominated to wall-clock/blocks (DEC-CA-0016 amendment) | — | **gates "required" + elastic grid** |
@@ -121,19 +121,23 @@ auth fault. Operator checklist, in order:
    the horizon ladder forks verdicts from 8992800 on any validator without
    it) — the standard coordinated window; announce to externals. Verify the current pool's
    series-length eligibility at the 720 rung (>= 784 steps) before the block.
-2. **Start `cascade-intake`** on the orchestrator (see "bringing it up") with
+2. **Set the payer-pod credential source** on the orchestrator: either
+   `CASCADE_HUB_ADMIN_USERNAME/PASSWORD` (a project-admin Hub user — per-pod
+   robots) or `CASCADE_FUNDED_HUB_USERNAME/PASSWORD` (a hand-made push-only
+   robot). Without one, every funded leg skips (fail-closed).
+3. **Start `cascade-intake`** on the orchestrator (see "bringing it up") with
    `--vault-dir` matching `[round] payer_vault_dir` and the queue path the
    trainer resolves; front it with TLS and publish the intake URL to miners.
    NO `--trust-refs` and NO `--no-require-signature` on mainnet, ever.
    Start it before the Thu 20:30 legacy round so miners can pre-fund.
-3. **Retire the provisioner's final stage** at the seam: with
+4. **Retire the provisioner's final stage** at the seam: with
    `funded_king_rent = true` the trainer rents/ledgers/sweeps the king pod
    itself; a standing final fleet would idle-bill and the provisioner must
    never touch `cascade-n91-…` pods.
-4. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
+5. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
    from block 8992800; `cascade fund` after reveal; registered hotkey; keep
    ~3h × chosen-GPU balance on the Lium key.
-5. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
+6. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
    `cascade-audit latest` (funded-roster check), and the trainer log's
    admission/SKU lines. Rollback = set `funded_activation_block` far future
    + restart trainer (legacy rounds resume).
@@ -193,14 +197,44 @@ saturate `--max-connections` at the proxy-less intake. That is the front
 proxy's job; the backstops only guarantee the box stays responsive and the
 trainer keeps its CPU.
 
+## Credentials on payer pods (PRISM-level trust model)
+
+A funded pod runs on the MINER's Lium account: the payer has console access,
+so everything in the worker's environment is theirs to read. Rules, enforced
+in code:
+
+- The pod is **isolated**: `RemoteHost.isolated` drops every `forward_env`
+  and the dispatcher's global extras (`WANDB_API_KEY`); nothing from the
+  orchestrator's environment travels. Pulls are anonymous (the repos are
+  public by design), so the only credential the worker needs is a Hub push.
+- That push credential is a **Harbor robot** scoped to the checkpoint project
+  with `repository:push` only — no delete, no other project, no S3, no HF:
+  1. **Per-pod robot (preferred):** minted at rent, revoked at teardown and by
+     every sweep, Harbor expiry `[round] funded_robot_duration_days` as the
+     backstop. Harbor forbids robots managing robots, and the operator's
+     everyday Hub identity IS a project robot (`robot$cascade+cascade-bot`),
+     so minting needs a project-admin USER login on the orchestrator:
+     `CASCADE_HUB_ADMIN_USERNAME` / `CASCADE_HUB_ADMIN_PASSWORD` (used only
+     by the minter; never forwarded anywhere).
+  2. **Static funded robot (fallback):** a push-only robot you create in the
+     Hippius UI, handed to the trainer as `CASCADE_FUNDED_HUB_USERNAME` /
+     `CASCADE_FUNDED_HUB_PASSWORD`; rotate it by hand. A user login in that
+     slot is refused.
+  3. **Neither → the leg fails CLOSED** (skipped, unburned). The operator's
+     own Hub login is never an option.
+- Still open vs PRISM: their pod holds NO credential at all (the master
+  SSH-harvests the checkpoint through a secure receive). Ours needs the
+  pinned worker to gain a local-only mode — the next worker-image release —
+  after which payer pods carry zero credentials. Also PRISM seals payer keys
+  at rest with a key file; our vault is plaintext 0600 (operator-local).
+
 ## What the provisioner must NOT do on funded pods
 
 - Rent them on the operator key (`provision/funded.py` has no such path —
   keep it that way).
 - Forward shared credentials (`HIPPIUS_*`, `HF_TOKEN`, `WANDB_*`): the payer
-  owns the Lium account and can console into their own pod. Until scoped
-  per-pod credentials exist, funded legs must run credential-free (artifacts
-  pulled by the orchestrator, not pushed by the pod).
+  owns the Lium account and can console into their own pod. Funded hosts are
+  `isolated` and carry only their per-pod robot (above).
 - Auto-retry a rent in place — every attempt spends the miner's budget.
   Retry cadence lives on queue requeues (`should_recover` + attempt caps).
 

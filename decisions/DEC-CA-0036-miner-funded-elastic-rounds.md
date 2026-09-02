@@ -198,3 +198,19 @@ docs/MINER_FUNDED_ROUNDS.md; miner-facing: docs/MINER.md §6b + llms.txt.
 Accepted risk, owner-directed: the confirmation-leg wiring ships OPEN — a
 provisional dethrone crowns without an operator retrain. Revisit within
 the first week live.
+
+## Amendment 2026-09-02 (3) — payer-pod credential model (PRISM-level)
+
+A payer has console access to their pod, so its environment is theirs. The
+funded host is now ISOLATED (no forward_env, no dispatcher extras) and holds
+ONLY a per-pod Harbor robot — push-only on the checkpoint project, minted at
+rent, revoked at teardown/sweep, day-expiry backstop
+(`cascade/funding/robots.py`). Fallback: a static push-only robot from the
+environment; the operator's own login is never handed to a pod and the leg
+fails closed without a credential. Live finding: the operator's Hub identity
+is itself a project robot and Harbor forbids robots minting robots, so
+per-pod minting needs a project-admin USER login on the orchestrator. The
+"scoped per-pod credentials" arming gate is closed at this bar; the remaining
+delta from PRISM (a credential-free pod with master-side SSH harvest +
+secure receive, and a sealed-at-rest payer vault) waits on the worker-image
+release.

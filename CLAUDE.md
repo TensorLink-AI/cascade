@@ -298,7 +298,7 @@ in-context.
   `cascade queue` + tier-0 funded-roster audit check, intake registration
   gate/quotas/replay hardening, deployment-scoped pod names
   (`cascade-n<netuid>-…`, off the provisioner reaper). Remaining arming
-  gates: scoped pod creds + per-dispatch ZIP staging wiring, worker-image
+  gates: per-dispatch ZIP staging wiring, worker-image
   rebuild + budget parity, confirmation wiring, DEC-CA-0016 wall-clock
   tenure, retrain-noise measurement. MAINNET GO-LIVE ARMED (owner
   2026-09-02): ONE block, 8992800 (≈ Fri 2026-09-04 08:30 UTC), for
@@ -306,8 +306,10 @@ in-context.
   `[eval] scored_from_block` (ladder [64, 256, 720]); the 12h grid stays for now;
   legacy rounds run until it (last one Thu 20:30), no hold. `expected_gpu` unpinned
   (contract change — coordinated deploy before Thu 20:30); direct
-  submissions stay off. The confirmation-leg gate ships OPEN,
-  owner-accepted — revisit in week one.
+  submissions stay off. Payer pods are ISOLATED + per-pod push-only Hub
+  robots (revoked at teardown; needs CASCADE_HUB_ADMIN_* or a static
+  CASCADE_FUNDED_HUB_* robot, else fail-closed). The confirmation-leg gate
+  ships OPEN, owner-accepted — revisit in week one.
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
