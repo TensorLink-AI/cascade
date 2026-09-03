@@ -146,6 +146,9 @@ def test_seats_follow_the_lanes_and_the_epoch():
     assert duel_waves_that_fit(12.0, 3.0) == 3        # (12 − 1.5) // 3
     assert duel_waves_that_fit(3.0, 3.0) == 1         # never below one leg
     assert duel_waves_that_fit(12.0, 0.0) == 1
+    # short grids scale the overhead (12.5%) instead of paying the 12h figure
+    assert duel_waves_that_fit(0.5, 0.05) == 8        # (0.5 − 0.0625) // 0.05
+    assert duel_waves_that_fit(3.0, 0.25) == 10       # (3 − 0.375) // 0.25
     auto = RoundConfig(duel_field_cap=0)
     assert auto.duel_seats(lanes=4, epoch_hours=12.0, leg_hours=3.0) == 11   # 4×3 − king
     assert auto.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0) == 2

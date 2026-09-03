@@ -33,7 +33,12 @@ from typing import TYPE_CHECKING
 
 from ..interface.validation import check_repo_size, parse_commit
 from ..shared.chain import Commitment
-from ..shared.config import ChainConfig, TrainingContractConfig, effective_epoch_blocks
+from ..shared.config import (
+    ChainConfig,
+    TrainingContractConfig,
+    duel_round_overhead_hours,
+    effective_epoch_blocks,
+)
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -3294,7 +3299,7 @@ class TrainerRunner:
         waves = -(-legs // lanes)
         hours = waves * float(self.cfg.training.target_train_hours)
         epoch_h = self._epoch_hours(screen_block)
-        level = log.warning if hours + 1.5 > epoch_h else log.info
+        level = log.warning if hours + duel_round_overhead_hours(epoch_h) > epoch_h else log.info
         level("round=%s duel-only geometry: %d leg(s) over %d lane(s) = %d wave(s) "
               "× %.1fh ≈ %.1fh of training in a %.1fh round", base_seed, legs,
               lanes, waves, float(self.cfg.training.target_train_hours), hours, epoch_h)

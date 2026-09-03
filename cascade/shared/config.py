@@ -230,19 +230,27 @@ def validate_duel_field_cap(value: object) -> int:
     return cap
 
 
-# Fixed per-round overhead a duel-only round pays outside its training legs:
-# rental + boot at the margin, checkpoint push, manifest. Hours.
+# Per-round overhead a duel-only round pays outside its training legs:
+# rental + boot at the margin, checkpoint push, manifest. 1.5h on the 12h
+# grid, scaled down proportionally on shorter grids (a compressed test grid
+# must not read as "nothing fits").
 DUEL_ROUND_OVERHEAD_HOURS = 1.5
+DUEL_ROUND_OVERHEAD_FRAC = 0.125
+
+
+def duel_round_overhead_hours(epoch_hours: float) -> float:
+    return min(DUEL_ROUND_OVERHEAD_HOURS, DUEL_ROUND_OVERHEAD_FRAC * float(epoch_hours))
 
 
 def duel_waves_that_fit(epoch_hours: float, leg_hours: float) -> int:
     """Back-to-back full-budget legs ONE lane can finish inside an epoch after
-    :data:`DUEL_ROUND_OVERHEAD_HOURS`. Never below 1: a lane always runs one
+    :func:`duel_round_overhead_hours`. Never below 1: a lane always runs one
     leg (a grid shorter than a leg is a configuration to fix, not a crash).
     Shared by the fleet sizer and the trainer's seating so both agree."""
     if leg_hours <= 0:
         return 1
-    return max(1, int((float(epoch_hours) - DUEL_ROUND_OVERHEAD_HOURS) // float(leg_hours)))
+    usable = float(epoch_hours) - duel_round_overhead_hours(epoch_hours)
+    return max(1, int(usable // float(leg_hours)))
 
 
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
