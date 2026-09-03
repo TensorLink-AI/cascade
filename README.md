@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/cascade-logo.png" alt="cascade logo" width="280">
+  <img src="docs/assets/cascade-logo.png" alt="cascade logo" width="180">
 </p>
 
 # cascade: SOTA time-series foundation models on Bittensor
