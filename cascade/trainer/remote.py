@@ -103,6 +103,12 @@ class RemoteHost:
     # — only its own static_env. Set on funded (payer-account) pods: the
     # payer has console access, so every forwarded value is theirs to read.
     isolated: bool = False
+    # A pinned SSH host key line (``<keytype> <base64>``) for this host. When
+    # set, every ssh to it runs StrictHostKeyChecking=yes against a
+    # known_hosts file holding ONLY this key, so a container swapped under
+    # the same address (a payer relaunching "their" pod) is refused at the
+    # transport — a pod's host key is generated at its first boot.
+    pinned_host_key: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -292,10 +298,33 @@ def build_remote_command(
     return command, stdin_env
 
 
+def pinned_known_hosts_file(host: RemoteHost) -> Path:
+    """A known_hosts file holding exactly ``host``'s pinned key (idempotent).
+
+    Keyed on the pin itself so concurrent legs never share or clobber a file.
+    """
+    import hashlib
+    import tempfile
+
+    line = f"[{host.host}]:{host.port} {host.pinned_host_key.strip()}\n"
+    path = Path(tempfile.gettempdir()) / (
+        "cascade-pin-" + hashlib.sha256(line.encode()).hexdigest()[:20])
+    if not path.is_file() or path.read_text() != line:
+        path.write_text(line)
+    return path
+
+
 def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
     """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
-    argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new"]
+    if host.pinned_host_key:
+        # ssh honours the FIRST value given for an option, so the pin goes
+        # first and nothing later (host.ssh_options included) can loosen it.
+        argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={pinned_known_hosts_file(host)}"]
+    else:
+        argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new"]
     if host.key_path:
         argv += ["-i", str(Path(host.key_path).expanduser())]
     for opt in host.ssh_options:

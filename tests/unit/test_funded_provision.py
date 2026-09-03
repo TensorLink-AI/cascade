@@ -127,6 +127,10 @@ class FakeProvider:
     def list_tagged(self, prefix: str) -> list[str]:
         return [t for t in self.tagged if t.startswith(prefix)]
 
+    def pod_identity(self, pod_id: str):
+        return {"id": f"uid-{pod_id}", "huid": "h1", "status": "RUNNING",
+                "ip": "10.0.0.9", "port": 2222}
+
 
 def _rent(provider, **kw):
     return rent_funded_pod(
@@ -285,3 +289,37 @@ def test_payer_pod_pattern_matches_only_this_payer():
     assert pat.match(f"{funded_pod_name('12345', HK, 91)}")
     assert not pat.match("cascade-777-heat-0")
     assert not pat.match("cascade-777-funded-otherpayer1-0")
+
+
+def test_rent_pins_platform_identity_and_host_key():
+    provider = FakeProvider()
+    res = _rent(provider, host_key_scanner=lambda ip, port: "ssh-ed25519 AAAAkey")
+    assert res.ok and res.pod_uid == f"uid-{POD_ID}" and res.pod.pod_uid == res.pod_uid
+    assert res.host_key == "ssh-ed25519 AAAAkey"
+
+
+def test_rent_fails_closed_when_the_host_key_cannot_be_pinned(monkeypatch):
+    import cascade.provision.funded as fm
+
+    monkeypatch.setattr(fm.time, "sleep", lambda s: None)
+    provider = FakeProvider()
+
+    def never(ip, port):
+        raise RuntimeError("connection refused")
+
+    res = _rent(provider, host_key_scanner=never)
+    assert not res.ok and "host key" in res.error
+    assert provider.terminated == [POD_ID]           # the unpinnable pod is torn down
+
+
+def test_scan_ssh_host_key_prefers_ed25519():
+    import subprocess
+
+    from cascade.provision.core import scan_ssh_host_key
+
+    out = ("# 10.0.0.9:2222 SSH-2.0-OpenSSH_9.6\n"
+           "[10.0.0.9]:2222 ssh-rsa AAAArsa\n"
+           "[10.0.0.9]:2222 ssh-ed25519 AAAAed\n")
+    key = scan_ssh_host_key("10.0.0.9", 2222,
+                            runner=lambda a: subprocess.CompletedProcess(a, 0, stdout=out, stderr=""))
+    assert key == "ssh-ed25519 AAAAed"

@@ -117,6 +117,12 @@ BenchEvalFn = Callable[[Path], "BenchScores | None"]
 log = logging.getLogger("cascade.trainer")
 
 
+class _FundedTamper(Exception):
+    """A funded pod failed its identity pin (replaced under the same name, or
+    a different container answering at its address). Miner fault, terminal,
+    hotkey spent."""
+
+
 class _FundedLegSkip(Exception):
     """A funded challenger leg that settled its own queue verdict (rent/setup
     failure) and must simply be dropped from the round — never retried on the
@@ -1353,8 +1359,8 @@ class TrainerRunner:
             if miner_fault:
                 queue.fail(gen.hotkey, error=msg, error_class=error_class,
                            expect_ref=self._funded_field[gen.hotkey])
-                if error_class == "generator":
-                    spent.add(gen.hotkey)    # their run — that was the shot
+                if error_class in ("generator", "tamper"):
+                    spent.add(gen.hotkey)    # their run / their tampering — the shot
                 self._funded_roster["outcomes"].append(
                     {"hotkey": gen.hotkey, "outcome": "failed",
                      "error_class": error_class})
@@ -1750,12 +1756,14 @@ class TrainerRunner:
         with self._funded_rent_lock:
             with self._funded_exec_lock:
                 claimed = tuple(sorted(self._funded_claimed_execs))
+            from ..provision.core import scan_ssh_host_key
+
             result = rent_funded_pod(
                 round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
                 sku=round_sku, image=rnd.funded_pod_image,
                 ssh_pubkey=ssh_pubkey, netuid=netuid,
                 ready_timeout=rnd.funded_ready_timeout_seconds,
-                exclude_ids=claimed,
+                exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
             )
             if result.ok and result.machine_id:
                 with self._funded_exec_lock:
@@ -1801,10 +1809,40 @@ class TrainerRunner:
             remote_python=profile.remote_python, workdir=profile.workdir,
             cuda_device="0", chain_toml=profile.chain_toml,
             forward_env=(), static_env=env_pairs, isolated=True,
+            pinned_host_key=result.host_key,
             ssh_options=profile.ssh_options,
             stage="final",
         )
         return host, pod
+
+    def _funded_pod_identity_mismatch(self, pod) -> str | None:
+        """Why the pod answering to ``pod.instance_id`` is not the one we
+        rented, or ``None`` when it is. Names are owner-chosen and reusable;
+        the platform's pod id is not — so a payer who relaunched "their" pod
+        under the same name shows up here (checked before dispatch and when
+        the leg returns; the pinned SSH host key guards the transport in
+        between). Unverifiable (no key, API down) counts as a mismatch: we
+        never dispatch into a pod we cannot identify."""
+        if not getattr(pod, "pod_uid", ""):
+            return "no platform identity was pinned at rent"
+        vault = self._payer_vault()
+        key = vault.get(pod.payer_hotkey) if vault is not None else None
+        if not key:
+            return "payer key unavailable to re-identify the pod"
+        try:
+            from ..provision.core import LiumProvider
+
+            ident = LiumProvider(api_key=key).pod_identity(pod.instance_id)
+        except Exception as e:  # noqa: BLE001 — unverifiable ⇒ mismatch
+            return f"identity check failed: {str(e)[:200]}"
+        if ident is None:
+            return "pod no longer listed on the payer's account"
+        if ident.get("id") != pod.pod_uid:
+            return (f"pod id changed: rented {pod.pod_uid}, now {ident.get('id')} "
+                    "(replaced under the same name)")
+        if str(ident.get("status", "")).upper() != "RUNNING":
+            return f"pod status is {ident.get('status')!r}, not RUNNING"
+        return None
 
     def _stage_vault_zip_on(self, host, digest_hex: str):
         """Ship ONE vault ZIP to the funded pod; return the host with the
@@ -1979,20 +2017,47 @@ class TrainerRunner:
 
         host, pod = self._rent_funded_host(str(seeds.base_seed), gen)
         try:
+            # Identity pin, before a single byte of dispatch: the pod that
+            # answers to this name must be the one we rented (platform id)
+            # and still running. A payer relaunching "their" pod under the
+            # same name is TAMPER — their shot, spent — never infra.
+            why = self._funded_pod_identity_mismatch(pod)
+            if why:
+                raise _FundedTamper(f"before dispatch: {why}")
             digest = parse_vault_ref(gen.ref)
             if digest is not None:
                 host = self._stage_vault_zip_on(host, digest)
-            return disp.dispatch(
+            entry = disp.dispatch(
                 host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role="challenger", base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
                 **({"repo_suffix": suffix} if suffix else {}),
             )
+            # …and again when the leg returns: the checkpoint this entry
+            # points at must have come from the pod we pinned.
+            why = self._funded_pod_identity_mismatch(pod)
+            if why:
+                raise _FundedTamper(f"after training: {why}")
+            return entry
+        except _FundedTamper as e:
+            self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
+                                        miner_fault=True, error_class="tamper",
+                                        burn=False)
+            raise
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise for the drop
             rc = getattr(e, "returncode", None)
+            text = str(e)
+            if "Host key verification failed" in text:
+                # The pinned host key did not match: a different container
+                # answered at the pod's address mid-leg.
+                self._record_funded_failure(
+                    gen.hotkey, f"pod identity: ssh host key changed mid-leg "
+                    f"({text[-200:]})", miner_fault=True, error_class="tamper",
+                    burn=False)
+                raise
             self._record_funded_failure(
-                gen.hotkey, str(e), miner_fault=(rc == 3),
+                gen.hotkey, text, miner_fault=(rc == 3),
                 error_class=("generator" if rc == 3 else "infra"),
                 burn=(rc != 3))
             raise

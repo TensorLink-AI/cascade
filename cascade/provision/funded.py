@@ -113,6 +113,12 @@ class FundedRentResult:
     # DISTINCT executors instead of racing for the listing's first row.
     machine_id: str = ""
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
+    # Platform identity of the pod that answered (Lium pod id + huid) and the
+    # container's SSH host key, both read once the pod is READY: the trainer
+    # pins them for the leg and re-checks before dispatch and at return, so
+    # a pod the payer replaced under the same name is caught as tamper.
+    pod_uid: str = ""
+    host_key: str = ""              # "<keytype> <base64>" from ssh-keyscan
     # A half-launched pod the failure-path cleanup could NOT confirm dead —
     # billing the MINER until someone acts. The caller must surface it (queue
     # error text, operator alert), never drop it on the floor.
@@ -133,6 +139,7 @@ def rent_funded_pod(
     exclude_ids: tuple[str, ...] = (),
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    host_key_scanner: Callable[[str, int], str] | None = None,
 ) -> FundedRentResult:
     """Rent ONE pod for ``hotkey``'s challenger leg on ``hotkey``'s own key.
 
@@ -184,10 +191,32 @@ def rent_funded_pod(
         addr = provider.get_ip(pod_id)
         if addr is None:
             raise ProvisionError(f"funded pod {pod_id} exposed no IP")
+        # Identity pins (fail CLOSED: a leg we cannot pin is a leg we cannot
+        # trust — it skips as infra, unburned, rather than run unpinned).
+        ident = None
+        ident_fn = getattr(provider, "pod_identity", None)
+        if callable(ident_fn):
+            ident = ident_fn(pod_id)
+        pod_uid = str((ident or {}).get("id") or "")
+        if ident_fn is not None and not pod_uid:
+            raise ProvisionError(f"funded pod {pod_id}: platform identity unavailable")
+        host_key = ""
+        if host_key_scanner is not None:
+            last = None
+            for _ in range(6):
+                try:
+                    host_key = host_key_scanner(addr.ip, addr.ssh_port)
+                    break
+                except Exception as e:  # noqa: BLE001 — sshd may still be starting
+                    last = e
+                    time.sleep(10)
+            if not host_key:
+                raise ProvisionError(f"funded pod {pod_id}: could not pin its "
+                                     f"ssh host key ({last})")
         pod = PodInstance(
             provider=provider.name, instance_id=pod_id, stage=FUNDED_STAGE,
             rented_at_iso=now_iso(), sku=sku, gpus=gpus_per_pod,
-            payer_hotkey=hotkey,
+            payer_hotkey=hotkey, pod_uid=pod_uid,
         )
         log.info("funded pod %s ready for %s at %s:%d (billed to payer)",
                  pod_id, hotkey, addr.ip, addr.ssh_port)
@@ -196,7 +225,8 @@ def rent_funded_pod(
         if getter is not None:
             machine = getter(pod_id) or ""
         return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr,
-                                machine_id=machine)
+                                machine_id=machine, pod_uid=pod_uid,
+                                host_key=host_key)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
         for pid in launched:

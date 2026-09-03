@@ -385,3 +385,18 @@ def test_funded_burn_happens_at_settle_per_outcome(tmp_path):
     nxt = runner._filter_funded_challengers([_challenger("hkInfra"),
                                              _challenger("hkRate")])
     assert sorted(c.hotkey for c in nxt) == ["hkInfra", "hkRate"]
+
+
+def test_settle_burns_a_tampered_leg(tmp_path):
+    from cascade.trainer.loop import _load_seen_hotkeys
+
+    q = _queue(tmp_path)
+    q.add("hkT", REF, reveal_block=10)
+    runner = _runner(tmp_path, funded_mode="required", one_submission_per_hotkey=True)
+    assert runner._filter_funded_challengers([_challenger("hkT")])
+    runner._record_funded_failure("hkT", "pod identity: pod id changed", miner_fault=True,
+                                  error_class="tamper", burn=False)
+    runner._settle_funded([(_challenger("hkT"), "challenger")], [])
+    assert _queue(tmp_path).get("hkT").status == "failed"
+    assert _queue(tmp_path).get("hkT").last_error_class == "tamper"
+    assert "hkT" in _load_seen_hotkeys(tmp_path / "trainer_submissions.json")

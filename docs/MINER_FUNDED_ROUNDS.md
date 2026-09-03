@@ -222,6 +222,17 @@ in code:
      slot is refused.
   3. **Neither → the leg fails CLOSED** (skipped, unburned). The operator's
      own Hub login is never an option.
+- **Pod identity is pinned for the leg.** Names are owner-chosen and
+  reusable, so the trainer records the platform's pod id at rent and the
+  container's SSH host key (generated at first boot), dispatches with
+  `StrictHostKeyChecking=yes` against that key only, and re-checks the
+  platform id before dispatch and when the leg returns. A pod relaunched
+  under the same name, or a different container answering at its address,
+  settles the entry as **`tamper`** — miner fault, terminal, hotkey spent —
+  never as infra. (Verified on live pods: the owner cannot ssh/exec into a
+  custom-image pod — only the rent caller's keys are injected — and backups
+  are confined to `/workspace`, so replacing the pod is the remaining move,
+  and this catches it.)
 - Still open vs PRISM: their pod holds NO credential at all (the master
   SSH-harvests the checkpoint through a secure receive). Ours needs the
   pinned worker to gain a local-only mode — the next worker-image release —

@@ -64,7 +64,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     fake._minter = _FakeMinter()
     fake._hub_robots = lambda: fake._minter
     for name in ("_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
-                 "_funded_pod_credential",
+                 "_funded_pod_credential", "_funded_pod_identity_mismatch",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity",
                  "_rent_king_host", "_teardown_operator_pod",
@@ -92,7 +92,8 @@ def _pod(hotkey: str = "hkA") -> PodInstance:
     return PodInstance(provider="lium",
                       instance_id=f"cascade-n91-777-funded-{hotkey.lower()}-0",
                       stage="funded", rented_at_iso="2026-09-02T00:00:00Z",
-                      sku="RTX4090", gpus=1, payer_hotkey=hotkey)
+                      sku="RTX4090", gpus=1, payer_hotkey=hotkey,
+                      pod_uid=f"uid-{hotkey.lower()}")
 
 
 class _FakeMinter:
@@ -122,7 +123,8 @@ class _FakeMinter:
 def _rent_ok(hotkey="hkA"):
     return funded_mod.FundedRentResult(
         hotkey=hotkey, ok=True, pod=_pod(hotkey),
-        address=PodAddress(ip="10.9.9.9", ssh_port=2222))
+        address=PodAddress(ip="10.9.9.9", ssh_port=2222),
+        pod_uid=f"uid-{hotkey.lower()}", host_key="ssh-ed25519 AAAAtestkey")
 
 
 # ── _rent_funded_host ────────────────────────────────────────────────────────
@@ -301,6 +303,7 @@ def _leg_runner(tmp_path, monkeypatch, *, disp):
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
+    runner._funded_pod_identity_mismatch = lambda pod: None   # pinned pod answers
     seeds = SimpleNamespace(base_seed=777)
     contract = SimpleNamespace(arch_preset="toto2-4m")
     return runner, torn, seeds, contract
@@ -771,3 +774,100 @@ def test_static_funded_robot_is_the_fallback_and_user_logins_are_refused(tmp_pat
     with pytest.raises(_FundedLegSkip):
         runner._rent_funded_host("777", _challenger("hkA"))
     assert torn and runner._funded_leg_failures["hkA"][2] == "infra"
+
+
+# ── pod identity pins (review 2026-09-02: "if they relaunch we can tell") ────
+
+def test_rent_pins_host_key_on_the_isolated_host(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert host.pinned_host_key == "ssh-ed25519 AAAAtestkey"
+    assert pod.pod_uid == "uid-hka"
+    assert runner._load_funded_ledger()[0].pod_uid == "uid-hka"
+
+
+def test_identity_mismatch_before_dispatch_is_tamper_and_never_dispatches(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    runner._funded_pod_identity_mismatch = lambda pod: "pod id changed: rented uid-hka, now uid-x"
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert disp.calls == []                          # nothing reached the impostor
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls) == (True, "tamper") and "pod id changed" in msg
+    assert torn                                      # teardown still runs
+
+
+def test_identity_mismatch_after_training_is_tamper(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    calls = iter([None, "pod no longer listed on the payer's account"])
+    runner._funded_pod_identity_mismatch = lambda pod: next(calls)
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert len(disp.calls) == 1
+    assert runner._funded_leg_failures["hkA"][2] == "tamper"
+
+
+def test_host_key_refusal_mid_leg_is_tamper(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+
+    def refused(host, **kw):
+        raise RuntimeError("remote challenger failed (rc=255): Host key verification failed.")
+
+    disp.dispatch = refused
+    with pytest.raises(RuntimeError):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "tamper", False)
+
+
+def test_identity_mismatch_reasons(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    import cascade.provision.core as core_mod
+
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    pod = _pod("hkA")
+    seen = {}
+
+    class _Prov:
+        def __init__(self, api_key=""):
+            seen["key"] = api_key
+        def pod_identity(self, name):
+            return seen.get("ident")
+
+    monkeypatch.setattr(core_mod, "LiumProvider", _Prov)
+    seen["ident"] = {"id": "uid-hka", "huid": "h", "status": "RUNNING"}
+    assert runner._funded_pod_identity_mismatch(pod) is None
+    assert seen["key"] == "sk_test123"               # re-identified on the PAYER's key
+    seen["ident"] = {"id": "uid-other", "huid": "h", "status": "RUNNING"}
+    assert "pod id changed" in runner._funded_pod_identity_mismatch(pod)
+    seen["ident"] = {"id": "uid-hka", "huid": "h", "status": "STOPPED"}
+    assert "not RUNNING" in runner._funded_pod_identity_mismatch(pod)
+    seen["ident"] = None
+    assert "no longer listed" in runner._funded_pod_identity_mismatch(pod)
+    assert "no platform identity" in runner._funded_pod_identity_mismatch(replace(pod, pod_uid=""))
+
+
+def test_pinned_host_key_wins_in_ssh_argv(tmp_path):
+    from cascade.trainer.remote import build_ssh_argv
+
+    host = RemoteHost(name="f", host="10.0.0.9", port=2222, user="root", key_path=None,
+                      remote_python="python", workdir="/w", cuda_device="0",
+                      chain_toml="c.toml", ssh_options=("StrictHostKeyChecking=accept-new",),
+                      pinned_host_key="ssh-ed25519 AAAApinned")
+    argv = build_ssh_argv(host, "true")
+    # First StrictHostKeyChecking wins for ssh; the pin must come first.
+    first = next(a for a in argv if a.startswith("StrictHostKeyChecking="))
+    assert first == "StrictHostKeyChecking=yes"
+    kh = next(a for a in argv if a.startswith("UserKnownHostsFile="))
+    from pathlib import Path
+    assert Path(kh.split("=", 1)[1]).read_text() == "[10.0.0.9]:2222 ssh-ed25519 AAAApinned\n"

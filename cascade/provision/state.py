@@ -63,6 +63,9 @@ class PodInstance:
     # 0 = none. Persisted so a teardown/sweep after a restart can still revoke
     # the credential the pod was given.
     robot_id: int = 0
+    # Platform-assigned pod identity (Lium pod id). Names are owner-chosen and
+    # reusable; this is not — the trainer re-checks it around a funded leg.
+    pod_uid: str = ""
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,7 @@ def save_state(path: Path | str, state: RoundState) -> None:
                 # pods serialise byte-identically to pre-funding ledgers.
                 **({"payer_hotkey": i.payer_hotkey} if i.payer_hotkey else {}),
                 **({"robot_id": i.robot_id} if i.robot_id else {}),
+                **({"pod_uid": i.pod_uid} if i.pod_uid else {}),
             }
             for i in state.instances
         ],
@@ -197,6 +201,7 @@ def load_state(path: Path | str) -> RoundState | None:
                 gpus=int(i.get("gpus", 1)),
                 payer_hotkey=str(i.get("payer_hotkey", "")),
                 robot_id=int(i.get("robot_id", 0) or 0),
+                pod_uid=str(i.get("pod_uid", "")),
             )
             for i in raw.get("instances", [])
         ),

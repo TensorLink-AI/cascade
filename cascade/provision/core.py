@@ -739,6 +739,22 @@ class LiumProvider:
         """Executor id a pod was launched on (this process's launches only)."""
         return self._executor_by_name.get(pod_id)
 
+    def pod_identity(self, pod_id: str) -> dict | None:
+        """The platform's identity of the pod currently answering to ``pod_id``.
+
+        ``{"id", "huid", "status", "ip", "port"}`` from ``lium ps`` — the
+        account owner picks a pod's NAME, so a name can be re-used by a
+        replacement; the platform-assigned ``id``/``huid`` cannot. ``None``
+        when nothing by that name is listed.
+        """
+        pod = self._pod(pod_id)
+        if not pod:
+            return None
+        addr = lium_pod_address(pod)
+        return {"id": str(pod.get("id") or ""), "huid": str(pod.get("huid") or ""),
+                "status": str(pod.get("status") or ""),
+                "ip": addr.ip if addr else "", "port": addr.ssh_port if addr else 0}
+
     @staticmethod
     def _up_log_path(name: str) -> Path:
         import tempfile
@@ -789,6 +805,32 @@ class LiumProvider:
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""
         return filter_tagged_names(self._list_pods(), prefix, id_key="name")
+
+
+def scan_ssh_host_key(ip: str, port: int, *, timeout: float = 15.0,
+                      runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None) -> str:
+    """``<keytype> <base64>`` of the sshd at ``ip:port`` (ed25519 preferred).
+
+    Read once when a pod is ready and pinned for the leg
+    (:attr:`RemoteHost.pinned_host_key`): a container generates its host
+    key at first boot, so a pod replaced under the same address cannot
+    present it. Raises ProvisionError when nothing scans.
+    """
+    argv = ["ssh-keyscan", "-T", str(int(timeout)), "-p", str(port), ip]
+    proc = (runner or (lambda a: subprocess.run(a, capture_output=True, text=True,
+                                                timeout=timeout + 10)))(argv)
+    lines = [ln.split(None, 1) for ln in (proc.stdout or "").splitlines()
+             if ln and not ln.startswith("#")]
+    keys = {}
+    for parts in lines:
+        if len(parts) == 2:
+            keytype_key = parts[1].split()
+            if len(keytype_key) >= 2:
+                keys[keytype_key[0]] = f"{keytype_key[0]} {keytype_key[1]}"
+    for kt in ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"):
+        if kt in keys:
+            return keys[kt]
+    raise ProvisionError(f"no ssh host key scanned at {ip}:{port}")
 
 
 # ── Shadeform adapter (REST) ─────────────────────────────────────────────────
