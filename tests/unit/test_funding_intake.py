@@ -409,3 +409,46 @@ def test_resolver_poll_error_reaches_the_caller():
                             cache_seconds=60.0, deadline_seconds=5.0)
     with pytest.raises(RuntimeError, match="substrate down"):
         r(HK, HUB_REF)
+
+
+# ── per-IP limiter (review 2026-09-02) ──────────────────────────────────────
+
+
+def test_per_ip_limiter_windows_and_connection_caps():
+    from cascade.funding.intake import PerIpLimiter
+
+    clock = FakeClock()
+    lim = PerIpLimiter(rpm=2, max_connections=1, clock=clock)
+    assert lim.allow_request("1.1.1.1") and lim.allow_request("1.1.1.1")
+    assert not lim.allow_request("1.1.1.1")          # third in the window
+    assert lim.allow_request("2.2.2.2")              # other IPs unaffected
+    clock.t += 61
+    assert lim.allow_request("1.1.1.1")              # window rolled
+    assert lim.connection_open("3.3.3.3") and not lim.connection_open("3.3.3.3")
+    lim.connection_close("3.3.3.3")
+    assert lim.connection_open("3.3.3.3")
+    assert PerIpLimiter(rpm=0).allow_request("x")     # 0 = off
+
+
+def test_http_per_ip_rate_limit_returns_429(tmp_path):
+    intake, _ = make_intake(tmp_path)
+    server = intake.make_server("127.0.0.1", 0, per_ip_rpm=2, per_ip_connections=8)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        codes = []
+        for _ in range(3):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/queue", timeout=5) as r:
+                    codes.append(r.status)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+                assert json.loads(e.read())["code"] == "rate_limited"
+        assert codes == [200, 200, 429]
+        # /health is exempt so probes keep working under a flood.
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
+            assert r.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()

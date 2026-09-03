@@ -221,6 +221,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-uploads", type=int, default=4,
                    help="Concurrent submit-body buffers (each holds up to the "
                         "ZIP cap in RAM).")
+    p.add_argument("--per-ip-rpm", type=int, default=60,
+                   help="Requests per rolling minute per client IP (0 = off). "
+                        "An in-app backstop; the proxy's limits are primary.")
+    p.add_argument("--per-ip-connections", type=int, default=8,
+                   help="Concurrent connections per client IP (0 = off).")
+    p.add_argument("--trusted-proxy", default="",
+                   help="IP of the TLS proxy in front of the intake: connections "
+                        "from it are attributed to X-Forwarded-For's last hop. "
+                        "Never honoured from any other peer.")
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_SECONDS / 3600.0)
     p.add_argument("--max-connections", type=int, default=64,
                    help="Concurrent-connection cap; over it the intake answers "
@@ -293,7 +302,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 max_connections=args.max_connections,
                                 request_timeout_s=args.request_timeout,
                                 request_deadline_s=args.request_deadline,
-                                max_concurrent_uploads=args.max_uploads)
+                                max_concurrent_uploads=args.max_uploads,
+                                per_ip_rpm=args.per_ip_rpm,
+                                per_ip_connections=args.per_ip_connections,
+                                trusted_proxy=args.trusted_proxy)
     log.info("cascade-intake listening on %s:%d (queue=%s, vault=%s, signatures=%s)",
              args.host, args.port, args.queue_path,
              args.vault_dir or "<memory-only>",

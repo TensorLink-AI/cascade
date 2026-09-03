@@ -194,10 +194,37 @@ degrades gracefully instead of taking the orchestrator down:
   any body byte is read, the signature gate before body buffering, and the
   streaming decompression cap in the store.
 
-None of this rate-limits per identity — an attacker with many IPs can still
-saturate `--max-connections` at the proxy-less intake. That is the front
-proxy's job; the backstops only guarantee the box stays responsive and the
-trainer keeps its CPU.
+- `--per-ip-rpm` (default 60) / `--per-ip-connections` (default 8): a
+  sliding-window request cap and a concurrent-connection cap per client IP
+  (429 + Retry-After; `/health` exempt). Behind the proxy every connection
+  arrives from the proxy's IP, so pass `--trusted-proxy <proxy-ip>` and the
+  client is read from `X-Forwarded-For`'s last hop — never honoured from any
+  other peer.
+
+Per-identity limits (registration + quotas) and per-IP backstops together
+mean a single attacker needs many registered hotkeys AND many IPs to hurt
+the intake; the front proxy still carries the volumetric load. A minimal
+nginx front (the config the runbook mandates), for reference:
+
+```nginx
+limit_req_zone  $binary_remote_addr zone=intake_req:10m rate=2r/s;
+limit_conn_zone $binary_remote_addr zone=intake_conn:10m;
+server {
+    listen 443 ssl;  server_name intake.example;
+    # ssl_certificate / ssl_certificate_key …
+    client_max_body_size 128m;          # = cascade-intake --max-zip-mb
+    client_header_timeout 15s;  client_body_timeout 60s;
+    proxy_request_buffering on;         # slow bodies dribble at nginx, not us
+    location / {
+        limit_req  zone=intake_req burst=10 nodelay;
+        limit_conn intake_conn 8;
+        proxy_pass http://127.0.0.1:8790;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 180s;
+    }
+}
+```
+(then `cascade-intake … --trusted-proxy 127.0.0.1`).
 
 ## Credentials on payer pods (PRISM-level trust model)
 

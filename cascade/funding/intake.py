@@ -134,6 +134,65 @@ def verify_hotkey_signature(hotkey: str, message: bytes, signature_hex: str) -> 
         return False
 
 
+class PerIpLimiter:
+    """Sliding-window request cap per client IP (in-app backstop).
+
+    ``rpm`` requests per rolling 60s per IP; ``max_connections`` concurrent
+    connections per IP. Both are BACKSTOPS for a proxy-less intake — behind
+    the mandated TLS proxy every connection arrives from the proxy's IP, so
+    the server honours ``X-Forwarded-For`` only when the peer IS the
+    configured ``trusted_proxy`` (otherwise the header is attacker-supplied
+    and ignored). ``rpm = 0`` disables the request cap.
+    """
+
+    WINDOW = 60.0
+    MAX_TRACKED = 20_000    # bound the table; idle IPs are evicted on pressure
+
+    def __init__(self, rpm: int = 60, max_connections: int = 8,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.rpm = int(rpm)
+        self.max_connections = int(max_connections)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._hits: dict[str, list[float]] = {}
+        self._open: dict[str, int] = {}
+
+    def allow_request(self, ip: str) -> bool:
+        if self.rpm <= 0:
+            return True
+        now = self.clock()
+        with self._lock:
+            if len(self._hits) > self.MAX_TRACKED:
+                cutoff = now - self.WINDOW
+                self._hits = {k: v for k, v in self._hits.items() if v and v[-1] >= cutoff}
+            hits = [t for t in self._hits.get(ip, ()) if t > now - self.WINDOW]
+            if len(hits) >= self.rpm:
+                self._hits[ip] = hits
+                return False
+            hits.append(now)
+            self._hits[ip] = hits
+            return True
+
+    def connection_open(self, ip: str) -> bool:
+        """Claim a connection slot for ``ip``; False when it is at its cap."""
+        if self.max_connections <= 0:
+            return True
+        with self._lock:
+            n = self._open.get(ip, 0)
+            if n >= self.max_connections:
+                return False
+            self._open[ip] = n + 1
+            return True
+
+    def connection_close(self, ip: str) -> None:
+        with self._lock:
+            n = self._open.get(ip, 0) - 1
+            if n <= 0:
+                self._open.pop(ip, None)
+            else:
+                self._open[ip] = n
+
+
 class FundingIntake:
     """The intake's behaviour, separated from HTTP plumbing for testability.
 
@@ -489,7 +548,9 @@ class FundingIntake:
                     max_connections: int = 64,
                     request_timeout_s: float = 30.0,
                     request_deadline_s: float = 120.0,
-                    max_concurrent_uploads: int = 4) -> ThreadingHTTPServer:
+                    max_concurrent_uploads: int = 4,
+                    per_ip_rpm: int = 60, per_ip_connections: int = 8,
+                    trusted_proxy: str = "") -> ThreadingHTTPServer:
         """The intake's HTTP server, with in-app DoS backstops.
 
         Volumetric DDoS is the FRONT PROXY's job (the runbook mandates one);
@@ -515,9 +576,23 @@ class FundingIntake:
           once: each is up to the ZIP cap in RAM (plus the store's validation
           copy), so the worst case is this × ~3 × cap instead of
           ``max_connections`` × ~3 × cap.
+        * ``per_ip_rpm`` / ``per_ip_connections`` (:class:`PerIpLimiter`): a
+          single source cannot take every slot or hammer the chain oracle.
+          Behind the proxy, set ``trusted_proxy`` to its IP so the client is
+          read from ``X-Forwarded-For`` (never trusted from anyone else).
         """
         intake = self
         upload_slots = threading.BoundedSemaphore(max_concurrent_uploads)
+        limiter = PerIpLimiter(rpm=per_ip_rpm, max_connections=per_ip_connections)
+        too_many = json.dumps({"code": "rate_limited",
+                               "message": "too many requests from this address; "
+                                          "retry shortly"}).encode()
+        reject_ip = (b"HTTP/1.1 429 Too Many Requests\r\n"
+                     b"Content-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(too_many)).encode() + b"\r\n"
+                     b"Retry-After: 10\r\n"
+                     b"Connection: close\r\n"
+                     b"\r\n" + too_many)
 
         class Handler(BaseHTTPRequestHandler):
             # Per-socket read/write timeout. StreamRequestHandler.setup() calls
@@ -554,7 +629,28 @@ class FundingIntake:
                                          "message": "intake error; retry shortly"}
                 self._reply(status, body)
 
+            def _client_ip(self) -> str:
+                peer = self.client_address[0]
+                if trusted_proxy and peer == trusted_proxy:
+                    xff = (self.headers.get("X-Forwarded-For") or "").split(",")
+                    last = xff[-1].strip() if xff and xff[-1].strip() else ""
+                    return last or peer
+                return peer
+
+            def _rate_limited(self) -> bool:
+                if limiter.allow_request(self._client_ip()):
+                    return False
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(too_many)))
+                self.send_header("Retry-After", "10")
+                self.end_headers()
+                self.wfile.write(too_many)
+                return True
+
             def do_GET(self) -> None:  # noqa: N802 — http.server API
+                if self.path != "/health" and self._rate_limited():
+                    return
                 if self.path == "/health":
                     self._reply(200, {"status": "ok"})
                 elif self.path == "/v1/queue":
@@ -563,6 +659,8 @@ class FundingIntake:
                     self._reply(404, {"code": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802 — http.server API
+                if self._rate_limited():
+                    return
                 # A Content-Length that is missing → 0, and one that is
                 # non-numeric or NEGATIVE is rejected outright: int() on junk
                 # would raise (killing the connection with no reply), and a
@@ -656,7 +754,7 @@ class FundingIntake:
                 while not self._reaper_stop.wait(5.0):
                     now = time.monotonic()
                     with self._live_lock:
-                        stuck = [(key, sock) for key, (sock, t0) in
+                        stuck = [(key, sock) for key, (sock, t0, _ip) in
                                  self._live.items()
                                  if now - t0 > request_deadline_s]
                     for key, sock in stuck:
@@ -678,7 +776,17 @@ class FundingIntake:
                 super().server_close()
 
             def process_request(self, request, client_address) -> None:
+                ip = client_address[0]
+                if not limiter.connection_open(ip):
+                    try:
+                        request.settimeout(request_timeout_s)
+                        request.sendall(reject_ip)
+                    except OSError:
+                        pass
+                    self.shutdown_request(request)
+                    return
                 if not self._slots.acquire(blocking=False):
+                    limiter.connection_close(ip)
                     try:
                         request.settimeout(request_timeout_s)
                         request.sendall(reject)
@@ -687,7 +795,7 @@ class FundingIntake:
                     self.shutdown_request(request)
                     return
                 with self._live_lock:
-                    self._live[id(request)] = (request, time.monotonic())
+                    self._live[id(request)] = (request, time.monotonic(), ip)
                 try:
                     super().process_request(request, client_address)
                 except BaseException:
@@ -698,8 +806,10 @@ class FundingIntake:
 
             def _release(self, request) -> None:
                 with self._live_lock:
-                    self._live.pop(id(request), None)
+                    live = self._live.pop(id(request), None)
                 self._slots.release()
+                if live is not None:
+                    limiter.connection_close(live[2])
 
             def process_request_thread(self, request, client_address) -> None:
                 try:
