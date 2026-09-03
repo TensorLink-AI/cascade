@@ -455,7 +455,8 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
         # publishes global_components (raw CRPS/MASE), and resamples them for
         # the shadow selection diagnostics.
         return evaluate_checkpoint(
-            ckpt_dir, windows, num_samples=num_samples, device="cpu"
+            ckpt_dir, windows, num_samples=num_samples, device="cpu",
+            contract=cfg.screen_contract(),
         )
 
     def runoff(ckpt_dir: Path, gen, base_seed: int, block: int | None = None,
@@ -466,7 +467,8 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
         # scoring only the tail keeps the concatenation paired by construction.
         windows = window_source.windows_for_round(base_seed, stop, block=block)[start:]
         return evaluate_checkpoint(
-            ckpt_dir, windows, num_samples=num_samples, device="cpu"
+            ckpt_dir, windows, num_samples=num_samples, device="cpu",
+            contract=cfg.screen_contract(),
         )
 
     def pool_provenance(base_seed: int, block: int | None = None) -> tuple[str, str]:

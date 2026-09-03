@@ -315,7 +315,14 @@ def parse_lium_executors(stdout: str) -> list[dict]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ProvisionError(f"could not parse `lium ls` JSON: {e}") from e
+        # Carry the CLI's actual words: on a bad key `lium` prints a plain-text
+        # "Invalid API key" instead of JSON, and the funded path's fault
+        # taxonomy (cascade.funding.faults) can only classify that as "auth"
+        # if the text survives into the error (observed live 2026-09-02 —
+        # the bare parse error classified a revoked key as "infra").
+        raise ProvisionError(
+            f"could not parse `lium ls` JSON ({e}); output was: "
+            f"{text[:200]!r}") from e
     if not isinstance(data, list):
         raise ProvisionError(f"expected a JSON array from `lium ls`, got {type(data).__name__}")
     return data
@@ -329,7 +336,14 @@ def parse_lium_pods(stdout: str) -> list[dict]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ProvisionError(f"could not parse `lium ps` JSON: {e}") from e
+        # Carry the CLI's actual words: on a bad key `lium` prints a plain-text
+        # "Invalid API key" instead of JSON, and the funded path's fault
+        # taxonomy (cascade.funding.faults) can only classify that as "auth"
+        # if the text survives into the error (observed live 2026-09-02 —
+        # the bare parse error classified a revoked key as "infra").
+        raise ProvisionError(
+            f"could not parse `lium ps` JSON ({e}); output was: "
+            f"{text[:200]!r}") from e
     if not isinstance(data, list):
         raise ProvisionError(f"expected a JSON array from `lium ps`, got {type(data).__name__}")
     return data
@@ -503,9 +517,15 @@ SHADEFORM_CONTAINER_BAD = {"failed", "error", "stopped"}
 # ── side-effecting helpers (adapter surface, not unit-tested) ─────────────────
 
 
-def _run_cli(argv: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess:
-    """Run a CLI command and capture output (text mode)."""
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+def _run_cli(argv: list[str], timeout: float = 120.0,
+             env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run a CLI command and capture output (text mode).
+
+    ``env`` (full environment, not a delta) overrides the child's environment —
+    the per-payer rental path uses it to point the ``lium`` CLI at a miner's
+    API key without ever mutating this process's environ.
+    """
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _default_lium_bin() -> str:
@@ -521,7 +541,8 @@ def _default_lium_bin() -> str:
     return shutil.which("lium") or "lium"
 
 
-def _spawn_cli(argv: list[str], log_path: Path | None = None) -> subprocess.Popen:
+def _spawn_cli(argv: list[str], log_path: Path | None = None,
+               env: dict[str, str] | None = None) -> subprocess.Popen:
     """Fire-and-forget a CLI command (e.g. ``lium up``, which attaches/streams).
 
     We don't wait on it — pod readiness is observed via ``lium ps`` polling, and
@@ -532,9 +553,10 @@ def _spawn_cli(argv: list[str], log_path: Path | None = None) -> subprocess.Pope
     a DEVNULL'd spawn leaves a 900s ghost hunt with zero diagnostics).
     """
     if log_path is None:
-        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=env)
     with open(log_path, "ab") as f:
-        return subprocess.Popen(argv, stdout=f, stderr=f)
+        return subprocess.Popen(argv, stdout=f, stderr=f, env=env)
 
 
 def wait_ssh_reachable(ip: str, port: int, *, timeout: float, interval: float = 5.0,
@@ -558,14 +580,23 @@ def wait_ssh_reachable(ip: str, port: int, *, timeout: float, interval: float = 
 class LiumProvider:
     """Lium marketplace via its ``lium`` CLI (``--format json`` for machine output).
 
-    Auth is the CLI's own (``LIUM_API_KEY`` / ``~/.lium/config.ini``). Each pod is
-    one ``lium up`` on a distinct executor; SSH is injected via the container's
-    ``SSH_PUBKEY`` env (the CLI has no direct pubkey flag). Pods are addressed by
-    the ``--name`` we assign (Lium's ``ps``/``rm`` accept name, huid, or id).
+    Auth is the CLI's own (``LIUM_API_KEY`` / ``~/.lium/config.ini``) — unless
+    ``api_key`` is set, in which case EVERY CLI call this instance makes runs
+    with that key in its child environment instead (the miner-funded rental
+    path, DEC-CA-0036: one provider instance per payer, mirroring PRISM's
+    per-submission ``LiumClient``). The key never enters this process's own
+    environ, never appears in argv (world-readable in ``/proc``), and the
+    dataclass repr excludes it.
+
+    Each pod is one ``lium up`` on a distinct executor; SSH is injected via the
+    container's ``SSH_PUBKEY`` env (the CLI has no direct pubkey flag). Pods are
+    addressed by the ``--name`` we assign (Lium's ``ps``/``rm`` accept name,
+    huid, or id).
     """
 
     name: str = "lium"
     bin: str = field(default_factory=_default_lium_bin)
+    api_key: str = field(default="", repr=False)
     poll_interval: float = POD_POLL_INTERVAL
     _run: Callable[[list[str]], subprocess.CompletedProcess] | None = field(default=None, repr=False)
     _spawn: Callable[[list[str]], object] | None = field(default=None, repr=False)
@@ -575,9 +606,25 @@ class LiumProvider:
     # exclude a failed pod's machine when renting its replacement.
     _executor_by_name: dict = field(default_factory=dict, repr=False)
 
+    def _subprocess_env(self) -> dict[str, str] | None:
+        """Child env for CLI calls: the payer's key layered over ours, or None.
+
+        ``None`` (no per-payer key) inherits the process environment untouched
+        — the operator-account path, bit-identical to pre-DEC-CA-0036
+        behaviour. With a key set we copy the environment and override
+        ``LIUM_API_KEY`` so the CLI bills the payer; the copy also guards
+        against the CLI falling back to ``~/.lium/config.ini`` *and* against
+        us ever exporting the key to our own environ.
+        """
+        if not self.api_key:
+            return None
+        return {**os.environ, "LIUM_API_KEY": self.api_key}
+
     def _cli(self, args: list[str]) -> subprocess.CompletedProcess:
         try:
-            proc = (self._run or _run_cli)([self.bin, *args])
+            runner = self._run or (
+                lambda argv: _run_cli(argv, env=self._subprocess_env()))
+            proc = runner([self.bin, *args])
         except FileNotFoundError as e:
             # A missing binary is a config error, not "no capacity" — surface it
             # loudly instead of silently falling through to another provider.
@@ -585,11 +632,28 @@ class LiumProvider:
                 f"lium CLI not found at {self.bin!r}; install it (pip install lium.io)"
             ) from e
         if proc.returncode != 0:
+            detail = (proc.stderr or "")[-500:]
+            if self.api_key:
+                # A CLI must never echo its key, but the one place it could
+                # land is stderr — scrub before it can reach a log line.
+                detail = detail.replace(self.api_key, "<redacted>")
             raise ProvisionError(
-                f"`{self.bin} {' '.join(args)}` failed (rc={proc.returncode}): "
-                f"{(proc.stderr or '')[-500:]}"
+                f"`{self.bin} {' '.join(args)}` failed (rc={proc.returncode}): {detail}"
             )
         return proc
+
+    def _scrub_key(self, e: ProvisionError) -> ProvisionError:
+        """Re-raiseable copy of ``e`` with the payer key redacted.
+
+        The JSON-parse errors quote raw CLI STDOUT (``output was: …``) —
+        stderr is scrubbed in :meth:`_cli`, but a CLI that ever echoed the key
+        on stdout would reach log lines through the parse path unscrubbed
+        (review 2026-09-02). ``from None`` on the re-raise side: chaining the
+        unscrubbed original would put the key one traceback away.
+        """
+        if self.api_key and self.api_key in str(e):
+            return ProvisionError(str(e).replace(self.api_key, "<redacted>"))
+        return e
 
     def _list_executors(self, sku: str, *, gpus: int = 1) -> list[dict]:
         """Marketplace executors of ``sku`` with EXACTLY ``gpus`` GPUs.
@@ -597,11 +661,18 @@ class LiumProvider:
         Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
         a 1× machine rented against an 8-lane plan strands seven lanes (and the
         health gate then kills the pod anyway — filter here, before renting)."""
-        execs = parse_lium_executors(self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        try:
+            execs = parse_lium_executors(
+                self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+        except ProvisionError as e:
+            raise self._scrub_key(e) from None
         return [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
 
     def _list_pods(self) -> list[dict]:
-        return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
+        try:
+            return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
+        except ProvisionError as e:
+            raise self._scrub_key(e) from None
 
     def _pod(self, pod_id: str) -> dict | None:
         return next((p for p in self._list_pods()
@@ -609,6 +680,14 @@ class LiumProvider:
 
     def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         return len(self._list_executors(sku, gpus=gpus)) >= count
+
+    def capacity(self, sku: str, *, gpus: int = 1) -> int:
+        """How many ``sku`` machines the marketplace offers RIGHT NOW.
+
+        A snapshot, not a reservation — other renters race it, so callers
+        must treat the number as advisory and keep a requeue path for rents
+        that lose the race (the funded taxonomy's ``no_capacity``)."""
+        return len(self._list_executors(sku, gpus=gpus))
 
     def launch(self, spec: LaunchSpec) -> list[str]:
         execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
@@ -649,7 +728,8 @@ class LiumProvider:
             if self._spawn is not None:
                 self._spawn(argv)
             else:
-                _spawn_cli(argv, log_path=self._up_log_path(name))
+                _spawn_cli(argv, log_path=self._up_log_path(name),
+                           env=self._subprocess_env())
             log.info("lium up → executor %s as %s", ex.get("id"), name)
             self._executor_by_name[name] = str(ex.get("id"))
             names.append(name)
@@ -658,6 +738,22 @@ class LiumProvider:
     def machine_of(self, pod_id: str) -> str | None:
         """Executor id a pod was launched on (this process's launches only)."""
         return self._executor_by_name.get(pod_id)
+
+    def pod_identity(self, pod_id: str) -> dict | None:
+        """The platform's identity of the pod currently answering to ``pod_id``.
+
+        ``{"id", "huid", "status", "ip", "port"}`` from ``lium ps`` — the
+        account owner picks a pod's NAME, so a name can be re-used by a
+        replacement; the platform-assigned ``id``/``huid`` cannot. ``None``
+        when nothing by that name is listed.
+        """
+        pod = self._pod(pod_id)
+        if not pod:
+            return None
+        addr = lium_pod_address(pod)
+        return {"id": str(pod.get("id") or ""), "huid": str(pod.get("huid") or ""),
+                "status": str(pod.get("status") or ""),
+                "ip": addr.ip if addr else "", "port": addr.ssh_port if addr else 0}
 
     @staticmethod
     def _up_log_path(name: str) -> Path:
@@ -709,6 +805,32 @@ class LiumProvider:
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""
         return filter_tagged_names(self._list_pods(), prefix, id_key="name")
+
+
+def scan_ssh_host_key(ip: str, port: int, *, timeout: float = 15.0,
+                      runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None) -> str:
+    """``<keytype> <base64>`` of the sshd at ``ip:port`` (ed25519 preferred).
+
+    Read once when a pod is ready and pinned for the leg
+    (:attr:`RemoteHost.pinned_host_key`): a container generates its host
+    key at first boot, so a pod replaced under the same address cannot
+    present it. Raises ProvisionError when nothing scans.
+    """
+    argv = ["ssh-keyscan", "-T", str(int(timeout)), "-p", str(port), ip]
+    proc = (runner or (lambda a: subprocess.run(a, capture_output=True, text=True,
+                                                timeout=timeout + 10)))(argv)
+    lines = [ln.split(None, 1) for ln in (proc.stdout or "").splitlines()
+             if ln and not ln.startswith("#")]
+    keys = {}
+    for parts in lines:
+        if len(parts) == 2:
+            keytype_key = parts[1].split()
+            if len(keytype_key) >= 2:
+                keys[keytype_key[0]] = f"{keytype_key[0]} {keytype_key[1]}"
+    for kt in ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"):
+        if kt in keys:
+            return keys[kt]
+    raise ProvisionError(f"no ssh host key scanned at {ip}:{port}")
 
 
 # ── Shadeform adapter (REST) ─────────────────────────────────────────────────

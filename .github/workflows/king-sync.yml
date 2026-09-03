@@ -1,0 +1,67 @@
+name: king-sync
+
+# Archives the subnet's current best generator (the king) into
+# champions/king/ — one commit per reign, scan-gated, provenance-stamped.
+#
+# Every run: resolve the king on-chain → fetch its exact code by digest →
+# static security scan (scripts/scan_generator.py; high-severity findings
+# REFUSE the archive) → commit + push only when the digest changed. A quiet
+# run is a no-op, so the hourly schedule costs nothing between dethrones.
+# `git log champions/king` is the subnet's reign timeline, each snapshot
+# independently verifiable against the on-chain commitment.
+#
+# The fetch is read-only (public chain RPC + anonymous artifact pull) and
+# needs no secrets; the push back uses GITHUB_TOKEN.
+#
+# GitHub silently disables cron workflows on repos with 60 idle days —
+# if syncs go quiet for weeks, check the schedule is still enabled
+# (workflow_dispatch re-runs it by hand).
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      allow_findings:
+        description: "Archive even with high-severity scan findings"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: king-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # fetch needs only the chain + storage halves — no torch, no train stack
+      - name: Install CLI deps
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e ".[chain,hippius]" numpy
+
+      - name: Sync the king
+        run: |
+          python scripts/sync_king.py --python "$(which python)" \
+            ${{ inputs.allow_findings && '--allow-findings' || '' }}
+
+      - name: Push the reign commit (if any)
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]; then
+            git push
+            echo "pushed a new reign commit"
+          else
+            echo "king unchanged — nothing pushed"
+          fi

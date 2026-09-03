@@ -70,6 +70,26 @@
   archived round, ``--history`` lists every settled round's outcome.
   Read-only: no wallet, no chain call, no credentials.
 
+* ``cascade fund <intake_url> --ref <repo@digest>`` — fund your revealed
+  submission's training leg with YOUR Lium API key (DEC-CA-0036). The key is
+  read from the environment (``$LIUM_API_KEY`` by default; never pass it on
+  the command line — argv is world-readable) and travels only as the
+  ``X-Lium-Api-Key`` header of one authenticated POST to the operator's
+  intake; the request is signed by your hotkey, so nobody can fund (or
+  withdraw) on your behalf. ``--withdraw`` exits a still-queued entry and
+  makes the operator forget your key. Needs the ``[chain]`` extra (wallet
+  signing only — no chain connection is made).
+
+* ``cascade submit <repo_dir> <intake_url>`` — the DIRECT path (DEC-CA-0036):
+  verify locally, ZIP deterministically, POST the code straight to the
+  operator's intake (with your Lium key in the same request when
+  ``$LIUM_API_KEY`` is set — one request submits AND funds), then chain-commit
+  the returned ``vault/direct@sha256:…`` ref with the usual timed reveal.
+  Nothing is miner-hosted and your code stays PRIVATE unless it takes the
+  throne — champions publish to ``champions/`` per the operator's policy
+  (crown / delay / dethrone); losers never do. ``cascade fetch king``
+  resolves a published champion anonymously.
+
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
 """
@@ -297,11 +317,29 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
 
     out = args.out or Path(f"./fetched-{label}")
     print(f"fetching {ref}\n  → {out}")
+    import os
+
+    from ..funding.store import CHAMPION_BASE_ENV, is_vault_ref
     from ..shared.hippius import HubConfig, StorageError, fetch_from_hub
 
+    if is_vault_ref(ref) and not os.environ.get(CHAMPION_BASE_ENV):
+        # A direct (vault) submission resolves publicly ONLY through the
+        # published champions/ objects — point the fetch at the same
+        # anonymous endpoint the dashboards read.
+        endpoint = str(getattr(cfg.storage, "s3_endpoint", "") or "").rstrip("/")
+        bucket = str(getattr(cfg.storage, "manifest_bucket", "") or "")
+        if endpoint and bucket:
+            os.environ[CHAMPION_BASE_ENV] = f"{endpoint}/{bucket}"
     try:
         dest = fetch_from_hub(ref, out, HubConfig.from_storage(cfg.storage))
     except StorageError as e:
+        if is_vault_ref(ref):
+            print("fetch failed: this is a direct (private) submission and its "
+                  "code has not been published to champions/ yet — under the "
+                  "operator's champion_publish policy it goes public on crown, "
+                  "after a reign delay, or at dethronement.", file=sys.stderr)
+            print(f"  detail: {e}", file=sys.stderr)
+            return 4
         print(f"registry fetch failed: {e}", file=sys.stderr)
         return 4
     files = sorted(p.name for p in dest.iterdir()) if dest.is_dir() else []
@@ -358,6 +396,92 @@ def _cmd_round(args: argparse.Namespace) -> int:
     except ChainError as e:
         print(f"chain error: {e}", file=sys.stderr)
         return 3
+
+
+def _add_queue(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "queue",
+        help="Funded-round transparency: the published roster — who seated in "
+        "what order (with on-chain reveal blocks), which GPU type the round "
+        "chose and every probed capacity, and how each seat ended. Add "
+        "--intake to also show the live queue.",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--round", default=None,
+                   help="Round id (default: the latest published roster).")
+    p.add_argument("--intake", default=None,
+                   help="Intake base URL — also fetch the live /v1/queue.")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) — marks your rows '← you'.")
+    p.set_defaults(func=_cmd_queue)
+
+
+def _cmd_queue(args: argparse.Namespace) -> int:
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import fetch_public_json
+
+    key = (f"funded/round-{args.round}.json" if args.round else "funded/latest.json")
+    doc = fetch_public_json(cfg.storage, key)
+    me = args.hotkey or ""
+
+    def _tag(hk: str) -> str:
+        return "  ← you" if me and hk == me else ""
+
+    if doc is None:
+        print(f"no published funded roster at {key} (pre-funded round, or "
+              "funded_mode is not 'required' yet)")
+    else:
+        adm = doc.get("admission") or {}
+        print(f"round {doc.get('round_id')} — funded roster")
+        sku = adm.get("sku") or "?"
+        caps = adm.get("sku_capacities")
+        if caps:
+            print(f"  GPU type: {sku} (market: "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(caps.items())) + ")")
+        else:
+            print(f"  GPU type: {sku}")
+        print(f"  admission cap: {adm.get('cap')} (configured {adm.get('configured_cap')}, "
+              f"market {adm.get('market_capacity')}, reserve {adm.get('reserve')})")
+        print(f"  seated ({len(doc.get('seated') or [])}, reveal-block seniority):")
+        for e in doc.get("seated") or []:
+            print(f"    {e.get('hotkey')}  reveal={e.get('reveal_block')}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("waiting") or []:
+            print(f"  waiting: {e.get('hotkey')}  reveal={e.get('reveal_block')}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("outcomes") or []:
+            extra = f" [{e.get('error_class')}]" if e.get("error_class") else ""
+            print(f"  outcome: {e.get('hotkey')}  {e.get('outcome')}{extra}"
+                  f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("terminal") or []:
+            print(f"  terminal: {e.get('hotkey')}  [{e.get('error_class')}]"
+                  f"{_tag(str(e.get('hotkey')))}")
+        print("  (verify independently: reveal blocks are on-chain; "
+              "`cascade-audit round <id>` cross-checks this roster against "
+              "the signed manifest)")
+    if args.intake:
+        import json as _json
+        import urllib.request
+
+        if not _intake_transport_ok(args.intake):
+            print("refusing plain http to a non-loopback intake", file=sys.stderr)
+            return 2
+        try:
+            with urllib.request.urlopen(f"{args.intake.rstrip('/')}/v1/queue",
+                                        timeout=10) as r:
+                live = _json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # URLError covers HTTPError; ValueError covers a proxy's HTML body.
+            print(f"intake unreachable or not answering JSON: {e}",
+                  file=sys.stderr)
+            return 3
+        print(f"live queue (depth {live.get('queued_depth')}):")
+        for e in live.get("entries") or []:
+            err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
+            print(f"  {e.get('hotkey')}  {e.get('status')}  "
+                  f"reveal={e.get('reveal_block')} attempts={e.get('attempts')}"
+                  f"{err}{_tag(str(e.get('hotkey')))}")
+    return 0
 
 
 def _add_heat(sub: argparse._SubParsersAction) -> None:
@@ -764,6 +888,331 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_submit(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "submit",
+        help="Verify, ZIP, and submit your generator DIRECTLY to the operator's "
+             "intake — private until it takes the throne — then commit the "
+             "returned vault ref on-chain.",
+    )
+    p.add_argument("repo_dir", type=Path, help="Path to your prepared generator repo.")
+    p.add_argument("intake_url", help="Operator intake base URL (https://…).")
+    p.add_argument("--chain-toml", type=Path, default=None)
+    p.add_argument("--network", default="finney")
+    p.add_argument("--wallet-name", required=True)
+    p.add_argument("--wallet-hotkey", required=True)
+    p.add_argument("--wallet-path", default=None)
+    p.add_argument("--lium-key-env", default="LIUM_API_KEY",
+                   help="Env var holding your Lium key: when set, the SAME request "
+                        "funds your entry (auto-queues once the reveal lands).")
+    p.add_argument("--no-fund", action="store_true",
+                   help="Submit code only; fund later with `cascade fund`.")
+    p.add_argument("--skip-runtime", action="store_true",
+                   help="Skip the determinism check during pre-submit verify.")
+    p.add_argument("--skip-verify", action="store_true",
+                   help="Skip local verification entirely (the trainer still verifies).")
+    p.add_argument("--no-commit", action="store_true",
+                   help="Upload only; print the commit payload without touching the chain.")
+    p.add_argument("--blocks-until-reveal", type=int, default=None,
+                   help="Explicit timelock reveal delay (default: TIMED reveal, as deploy).")
+    p.add_argument("--reveal-now", action="store_true")
+    p.add_argument("--next-epoch", action="store_true")
+    p.set_defaults(func=_cmd_submit)
+
+
+def zip_repo_bytes(repo_dir: Path) -> bytes:
+    """Deterministically ZIP the SUBMITTABLE part of a repo tree.
+
+    Two properties matter:
+
+    * Determinism (sorted paths, zeroed timestamps): re-zipping an unchanged
+      tree yields identical bytes, so the sha256 the miner signs — and the
+      vault ref the chain commit pins — is a property of the CODE.
+    * The SAME file filter as the Hub upload path (``hippius.ALLOW_PATTERNS``,
+      plus dropping dotted dirs and ``__pycache__``): a raw ``rglob('*')``
+      would pack ``.git`` packfiles — commit history, committer emails, any
+      secret ever committed — into the operator store and, on a throne, into
+      PUBLIC ``champions/`` (review 2026-08-29). Matching the Hub filter also
+      keeps the two channels' trees identical, so the dedup screen's tree
+      tier compares like with like.
+    """
+    import fnmatch
+    import io
+    import zipfile
+
+    from ..shared.hippius import ALLOW_PATTERNS
+
+    d = Path(repo_dir)
+    if not d.is_dir():
+        raise ValueError(f"not a directory: {d}")
+
+    def _wanted(p: Path) -> bool:
+        rel = p.relative_to(d)
+        if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+            return False
+        rel_posix = rel.as_posix()
+        return any(fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(p.name, pat)
+                   for pat in ALLOW_PATTERNS)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in sorted(x for x in d.rglob("*") if x.is_file() and _wanted(x)):
+            info = zipfile.ZipInfo(p.relative_to(d).as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, p.read_bytes())
+    return buf.getvalue()
+
+
+def _cmd_submit(args: argparse.Namespace) -> int:
+    import hashlib
+    import os
+    import urllib.error
+    import urllib.request
+
+    base = args.intake_url.rstrip("/")
+    if not _intake_transport_ok(base):
+        print("refusing to submit over plain http to a non-local intake; use https",
+              file=sys.stderr)
+        return 2
+    cfg = load_chain_config(args.chain_toml)
+    if not args.skip_verify:
+        report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime)
+        print(report.render())
+        if not report.ok:
+            print("refusing to submit: verification failed (fix, or --skip-verify "
+                  "to send anyway — the trainer will reject the same faults)",
+                  file=sys.stderr)
+            return 1
+
+    try:
+        import bittensor  # signing only — the chain connects later, if committing
+        # bittensor <9 exposed lowercase ``wallet``; 9+/10 only ship ``Wallet``
+        # (same shim as shared/chain.py — the pinned 10.5.0 has no ``wallet``).
+        _wallet_factory = getattr(bittensor, "wallet", None) or bittensor.Wallet
+        wallet = _wallet_factory(name=args.wallet_name, hotkey=args.wallet_hotkey,
+                                 path=args.wallet_path)
+        hotkey_ss58 = wallet.hotkey.ss58_address
+        sign_fn = wallet.hotkey.sign
+    except Exception as e:  # noqa: BLE001 — wallet errors are usage errors here
+        print(f"could not load wallet for signing: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        body = zip_repo_bytes(args.repo_dir)
+    except (ValueError, OSError) as e:
+        print(f"could not package the repo: {e}", file=sys.stderr)
+        return 2
+    digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
+    import time as _time
+
+    from ..funding.intake import canonical_fund_message
+
+    ts = str(int(_time.time()))
+    api_key = ""
+    if not args.no_fund:
+        api_key = (os.environ.get(args.lium_key_env) or "").strip()
+        if not api_key:
+            print(f"note: ${args.lium_key_env} not set — submitting unfunded "
+                  f"(fund later with `cascade fund`)")
+    # v2 canonical message: the signature binds the key header (its sha256)
+    # so an on-path replay cannot attach or swap a key.
+    key_digest = hashlib.sha256(api_key.encode()).hexdigest() if api_key else "-"
+    headers = {
+        "X-Miner-Hotkey": hotkey_ss58,
+        "X-Content-Digest": digest,
+        "X-Timestamp": ts,
+        "X-Signature": sign_fn(canonical_fund_message(
+            "submit", hotkey_ss58, digest, ts, key_digest)).hex(),
+        "Content-Type": "application/zip",
+    }
+    if api_key:
+        headers["X-Lium-Api-Key"] = api_key
+
+    req = urllib.request.Request(f"{base}/v1/submit", data=body, method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp_body = _decode_json_body(resp.read())
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        resp_body, status = _decode_json_body(e.read()), e.code
+    except (urllib.error.URLError, OSError) as e:
+        print(f"intake unreachable: {e}", file=sys.stderr)
+        return 3
+    if not (200 <= status < 300):
+        print(f"submit rejected ({status}): {resp_body.get('code', '?')} — "
+              f"{resp_body.get('message', '')}", file=sys.stderr)
+        return 1
+    ref = resp_body.get("ref")
+    payload = resp_body.get("commit_payload")
+    if not ref or not payload:
+        # A middlebox can 200 with a non-JSON body; don't traceback on it.
+        print(f"intake answered {status} but the body is not a submit "
+              f"response: {resp_body.get('message', resp_body)!s:.200}",
+              file=sys.stderr)
+        return 3
+    print(f"stored privately: {ref} (funding={resp_body.get('funding', 'none')})")
+    if args.no_commit:
+        print(f"commit it yourself when ready:\n  payload: {payload}")
+        return 0
+
+    from ..shared.chain import ChainClient, ChainError
+
+    try:
+        client = ChainClient.from_config(
+            cfg, network=args.network, wallet_name=args.wallet_name,
+            wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
+        )
+        current_block = client.current_block()
+        blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
+        client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)
+    except ChainError as e:
+        print(f"chain error: {e} — your code IS stored; commit later with:\n"
+              f"  payload: {payload}", file=sys.stderr)
+        return 3
+    except ValueError as e:
+        print(f"bad [round] reveal config: {e}", file=sys.stderr)
+        return 2
+    print(f"committed: {payload}")
+    print("your code stays PRIVATE unless it takes the throne (champion_publish "
+          "policy); once revealed on-chain, a funded entry queues automatically.")
+    return 0
+
+
+def _add_fund(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "fund",
+        help="Fund your revealed submission's training leg with YOUR Lium API key.",
+    )
+    p.add_argument("intake_url",
+                   help="Operator intake base URL (https://…; TLS protects the key in transit).")
+    p.add_argument("--ref", required=True,
+                   help="The revealed generator ref this funds (repo@digest — what you deployed).")
+    p.add_argument("--wallet-name", required=True, help="Bittensor wallet (coldkey) name.")
+    p.add_argument("--wallet-hotkey", required=True, help="Bittensor wallet hotkey name.")
+    p.add_argument("--wallet-path", default=None, help="Optional non-default wallet root.")
+    p.add_argument("--lium-key-env", default="LIUM_API_KEY",
+                   help="Environment variable holding your Lium API key (default "
+                        "LIUM_API_KEY). The key is NEVER accepted on the command line.")
+    p.add_argument("--withdraw", action="store_true",
+                   help="Withdraw a still-queued entry (the operator forgets your key).")
+    p.set_defaults(func=_cmd_fund)
+
+
+def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
+                       sign_fn, *, now=None) -> dict[str, str]:
+    """The signed header set for one intake request (pure; testable).
+
+    ``sign_fn(message: bytes) -> bytes`` is the hotkey's sr25519 signer. The
+    canonical message binds action + hotkey + ref + timestamp, so a captured
+    fund request cannot be replayed as a withdraw (or vice versa), and none of
+    it can be replayed at all past the intake's freshness window.
+    """
+    import time as _time
+
+    from ..funding.intake import canonical_fund_message
+
+    ts = str(int((now or _time.time)()))
+    import hashlib as _hashlib
+
+    sends_key = action == "fund" and bool(api_key)
+    key_digest = _hashlib.sha256(api_key.encode()).hexdigest() if sends_key else "-"
+    headers = {
+        "X-Miner-Hotkey": hotkey_ss58,
+        "X-Commit-Ref": ref,
+        "X-Timestamp": ts,
+        "X-Signature": sign_fn(canonical_fund_message(
+            action, hotkey_ss58, ref, ts, key_digest)).hex(),
+    }
+    if sends_key:
+        headers["X-Lium-Api-Key"] = api_key
+    return headers
+
+
+def _intake_transport_ok(url: str) -> bool:
+    """True when the intake URL may carry the key: https, or genuinely local.
+
+    The hostname is PARSED and compared exactly — a substring check would
+    pass ``http://localhost.evil.example`` and ship the key in cleartext to a
+    non-local box (audit 2026-08-29).
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return True
+    if parts.scheme == "http":
+        return (parts.hostname or "") in ("127.0.0.1", "localhost", "::1")
+    return False
+
+
+def _decode_json_body(raw: bytes) -> dict:
+    """Best-effort JSON body; a proxy's HTML error page must not traceback."""
+    import json as _json
+
+    try:
+        body = _json.loads(raw or b"{}")
+        return body if isinstance(body, dict) else {"message": str(body)}
+    except ValueError:
+        text = raw.decode("utf-8", errors="replace").strip()
+        return {"code": "non_json_response", "message": text[:200]}
+
+
+def _cmd_fund(args: argparse.Namespace) -> int:
+    import os
+    import urllib.error
+    import urllib.request
+
+    action = "withdraw" if args.withdraw else "fund"
+    api_key = ""
+    if action == "fund":
+        api_key = (os.environ.get(args.lium_key_env) or "").strip()
+        if not api_key:
+            print(f"no Lium API key in ${args.lium_key_env} — export it first "
+                  f"(never pass the key itself as an argument)", file=sys.stderr)
+            return 2
+    base = args.intake_url.rstrip("/")
+    if not _intake_transport_ok(base):
+        print("refusing to send your Lium key over plain http to a non-local intake; "
+              "use https", file=sys.stderr)
+        return 2
+
+    try:
+        import bittensor  # the [chain] extra; signing only — no connection
+        _wallet_factory = getattr(bittensor, "wallet", None) or bittensor.Wallet
+        wallet = _wallet_factory(name=args.wallet_name, hotkey=args.wallet_hotkey,
+                                 path=args.wallet_path)
+        hotkey_ss58 = wallet.hotkey.ss58_address
+        sign_fn = wallet.hotkey.sign
+    except Exception as e:  # noqa: BLE001 — wallet errors are usage errors here
+        print(f"could not load wallet for signing: {e}", file=sys.stderr)
+        return 2
+
+    headers = build_fund_headers(action, hotkey_ss58, args.ref, api_key, sign_fn)
+    req = urllib.request.Request(f"{base}/v1/{action}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _decode_json_body(resp.read())
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        body, status = _decode_json_body(e.read()), e.code
+    except (urllib.error.URLError, OSError) as e:
+        print(f"intake unreachable: {e}", file=sys.stderr)
+        return 3
+
+    if 200 <= status < 300:
+        print(f"{action}: {body.get('status', 'ok')} (hotkey {hotkey_ss58})")
+        if action == "fund":
+            print("your entry queues by reveal block; watch it via the intake's "
+                  "/v1/queue or `cascade round`. An infra failure on your pod "
+                  "re-queues you without burning the entry.")
+        return 0
+    print(f"{action} rejected ({status}): {body.get('code', '?')} — "
+          f"{body.get('message', '')}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     from ..shared.env import load_env_files
     load_env_files()
@@ -775,8 +1224,11 @@ def main(argv: list[str] | None = None) -> int:
     _add_score(sub)
     _add_reveal_status(sub)
     _add_round(sub)
+    _add_queue(sub)
     _add_heat(sub)
     _add_duel(sub)
+    _add_fund(sub)
+    _add_submit(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

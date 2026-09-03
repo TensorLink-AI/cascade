@@ -45,7 +45,7 @@ class PodInstance:
 
     provider: str
     instance_id: str
-    stage: str                       # "heat" | "final" | "eval"
+    stage: str                       # "heat" | "final" | "eval" | "funded"
     rented_at_iso: str
     # The candidate actually rented (SKU fallback makes this vary per round);
     # persisted so a mid-round restart republishes hosts with the RIGHT lane
@@ -53,6 +53,19 @@ class PodInstance:
     # pre-fallback ledgers loading.
     sku: str = ""
     gpus: int = 1
+    # Miner-funded pods (DEC-CA-0036): the hotkey whose Lium key was billed.
+    # "" = operator account (every pre-funding ledger loads unchanged). This is
+    # ALSO the teardown routing key — a pod on a miner's account can only be
+    # terminated/listed with that miner's key (from the payer vault), so a
+    # restart must know whose key to hydrate before it can stop the pod.
+    payer_hotkey: str = ""
+    # Hub robot account minted for this pod's leg (cascade.funding.robots);
+    # 0 = none. Persisted so a teardown/sweep after a restart can still revoke
+    # the credential the pod was given.
+    robot_id: int = 0
+    # Platform-assigned pod identity (Lium pod id). Names are owner-chosen and
+    # reusable; this is not — the trainer re-checks it around a funded leg.
+    pod_uid: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,11 @@ def save_state(path: Path | str, state: RoundState) -> None:
                 "rented_at_iso": i.rented_at_iso,
                 "sku": i.sku,
                 "gpus": i.gpus,
+                # Drop-when-default (the repo-wide convention): operator-account
+                # pods serialise byte-identically to pre-funding ledgers.
+                **({"payer_hotkey": i.payer_hotkey} if i.payer_hotkey else {}),
+                **({"robot_id": i.robot_id} if i.robot_id else {}),
+                **({"pod_uid": i.pod_uid} if i.pod_uid else {}),
             }
             for i in state.instances
         ],
@@ -181,6 +199,9 @@ def load_state(path: Path | str) -> RoundState | None:
                 rented_at_iso=str(i["rented_at_iso"]),
                 sku=str(i.get("sku", "")),
                 gpus=int(i.get("gpus", 1)),
+                payer_hotkey=str(i.get("payer_hotkey", "")),
+                robot_id=int(i.get("robot_id", 0) or 0),
+                pod_uid=str(i.get("pod_uid", "")),
             )
             for i in raw.get("instances", [])
         ),

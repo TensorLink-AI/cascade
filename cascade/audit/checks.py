@@ -959,8 +959,66 @@ def _confirm_rejection(receipt: RoundReceipt, results: list[CheckResult]) -> lis
     ]
 
 
+def check_funded_roster(receipt: RoundReceipt,
+                        roster: dict | None) -> CheckResult:
+    """Cross-check the published funded roster against the signed manifest.
+
+    The roster (``funded/round-<id>.json``) is the trainer's UNSIGNED
+    transparency record of seat allocation under ``funded_mode = "required"``
+    — so this check WARNs, never FAILs, mirroring contract-declaration. It
+    verifies three things a miner cares about:
+
+    * every challenger the signed manifest trained was a SEATED funded entry
+      (nobody entered the round outside the published queue);
+    * the seated list is in reveal-block seniority order;
+    * nobody left waiting had strictly earlier (reveal_block, hotkey)
+      precedence than someone seated — the queue was not jumped.
+
+    No roster published ⇒ SKIP (a pre-funded or non-required round).
+    """
+    name = "funded-roster"
+    if not roster:
+        return CheckResult(name, SKIP, "no funded roster published for this round")
+    seated = roster.get("seated") or []
+    seated_keys = {str(e.get("hotkey")) for e in seated}
+    # receipt.manifest is the embedded RAW manifest dict (like every other
+    # check here reads it); entries are dicts too.
+    challengers = [e for e in (receipt.manifest.get("entries") or ())
+                   if e.get("role") == "challenger"]
+    strangers = [str(e.get("miner_hotkey", "?")) for e in challengers
+                 if str(e.get("miner_hotkey", "?")) not in seated_keys]
+    if strangers:
+        return CheckResult(
+            name, WARN,
+            f"manifest challenger(s) not on the published funded roster: "
+            f"{', '.join(strangers)}")
+    # A null reveal_block (the hotkey withdrew between selection and roster
+    # build) is UNKNOWN seniority, not block 0 — coercing it to 0 makes it
+    # "most senior" and fires a spurious order/jump WARN (review 2026-09-02).
+    # Unknowns are excluded from both ordering claims.
+    order = [(int(e["reveal_block"]), str(e.get("hotkey")))
+             for e in seated if e.get("reveal_block") is not None]
+    if order != sorted(order):
+        return CheckResult(name, WARN, "seated list is not in reveal-block "
+                                       "seniority order")
+    waiting = [(int(e["reveal_block"]), str(e.get("hotkey")))
+               for e in (roster.get("waiting") or [])
+               if e.get("reveal_block") is not None]
+    if order and waiting and min(waiting) < max(order):
+        jumped = min(waiting)
+        return CheckResult(
+            name, WARN,
+            f"waiting entry {jumped[1]} (reveal {jumped[0]}) had seniority "
+            f"over a seated entry — the queue was jumped")
+    return CheckResult(
+        name, PASS,
+        f"{len(challengers)} manifest challenger(s) all seated from the "
+        f"published queue in seniority order ({len(waiting)} waiting)")
+
+
 def run_tier0(
-    receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None
+    receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None,
+    *, funded_roster: dict | None = None,
 ) -> list[CheckResult]:
     """All Tier-0 checks, in a stable order. CPU-only, seconds; ``client`` is an
     optional chain connection (None ⇒ the chain-dependent halves WARN)."""
@@ -979,6 +1037,7 @@ def run_tier0(
         check_koth_params(receipt, cfg),
         check_verdict(receipt),
         check_duel_cohort(receipt),
+        check_funded_roster(receipt, funded_roster),
         check_transition(receipt),
         check_weights(receipt, cfg, client),
     ]

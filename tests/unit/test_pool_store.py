@@ -357,7 +357,9 @@ def test_resolve_effective_block_auto_projects_next_epoch(monkeypatch):
     from cascade.pool import cli
 
     cfg = _cfg_small()
-    cfg = dataclasses.replace(cfg, round=dataclasses.replace(cfg.round, epoch_blocks=7200))
+    cfg = dataclasses.replace(cfg, round=dataclasses.replace(
+        cfg.round, epoch_blocks=7200, epoch_blocks_prev=0,
+        epoch_activation_block=0))
 
     class _Manifest:
         created_block = 3 * 7200 + 123   # mid-epoch 3

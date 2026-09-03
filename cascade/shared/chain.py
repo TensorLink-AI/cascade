@@ -365,6 +365,18 @@ class ChainClient:
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
 
+    def registered_hotkeys(self) -> list[str]:
+        """Every hotkey currently registered on the netuid (lite metagraph).
+
+        The intake's registration gate reads this — membership, not weights.
+        """
+        sub = self.subtensor()
+        try:
+            meta = sub.metagraph(netuid=self.netuid, lite=True)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        return [str(hk) for hk in meta.hotkeys]
+
     def subnet_economics(self) -> dict | None:
         """Live pool economics for the netuid, or None when unavailable.
 

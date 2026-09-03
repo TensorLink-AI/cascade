@@ -274,6 +274,52 @@ in-context.
   bench-report wire format, and duel verdicts untouched; leg failure falls
   back to the raw bench. Interim for the DEC-CA-0029 contract cut — never
   arm both. (`decisions/DEC-CA-0030-bench-anneal-finished-form-benchscores.md`)
+- **DEC-CA-0036** (proposed) — Miner-funded challenger legs (PRISM/sn100 port:
+  signed `X-Lium-Api-Key` intake → sealed vault → per-payer `LiumProvider`;
+  infra faults requeue, never burn) under ELASTIC-cadence rounds: funded
+  queue IS the field (`[round] funded_mode`, ≤ finalist_cap per round by
+  reveal-block seniority ⇒ heat fast-path, everyone duels), unfunded
+  boundaries skip (validators poll manifests, never schedule; scale-up = the
+  existing scheduled `epoch_blocks` switch). King + confirmation legs stay
+  operator-funded — a provisional dethrone is re-trained on the operator's
+  account before it crowns (miner-account pods are console-accessible to
+  their payer). Second half: DIRECT submissions — code POSTs to the intake
+  (same request as the key), stored operator-private, chain-committed as an
+  ordinary hippius payload under the reserved `vault/direct` namespace (no
+  validator change); ONLY thrones publish (`champions/`, sn100-top-model
+  style: crown/delay/dethrone policy), losers stay private forever;
+  digest ownership enforced at field entry. Landed inert 2026-08-28.
+  AMENDED 2026-09-02 (built + testnet-live-validated, still inert): per-payer
+  pods wired (`funded_pods="rent"`, write-ahead ledger, duel-settle burn
+  point), ELASTIC no-heat field (`funded_field_cap` + capacity probe; the
+  whole seated field duels — no screen on an all-funded field), per-round
+  GPU-type choice (`funded_pod_skus` five-type cu124 set, most-available
+  wins; JIT operator king via `funded_king_rent`), public roster +
+  `cascade queue` + tier-0 funded-roster audit check, intake registration
+  gate/quotas/replay hardening, deployment-scoped pod names
+  (`cascade-n<netuid>-…`, off the provisioner reaper). Remaining arming
+  gates: per-dispatch ZIP staging wiring, worker-image
+  rebuild + budget parity, confirmation wiring, DEC-CA-0016 wall-clock
+  tenure, retrain-noise measurement. MAINNET GO-LIVE ARMED (owner
+  2026-09-02): ONE block, 8992800 (≈ Fri 2026-09-04 08:30 UTC), for
+  `[round] funded_activation_block` and PR #241's
+  `[eval] scored_from_block` (ladder [64, 256, 720]); the 12h grid stays for now;
+  legacy rounds run until it (last one Thu 20:30), no hold. `expected_gpu` unpinned
+  (contract change — coordinated deploy before Thu 20:30); direct
+  submissions stay off. Payer pods are ISOLATED + per-pod push-only Hub
+  robots (revoked at teardown; needs CASCADE_HUB_ADMIN_* or a static
+  CASCADE_FUNDED_HUB_* robot, else fail-closed). The confirmation-leg gate
+  ships OPEN, owner-accepted — revisit in week one. Funded challengers
+  bench on their OWN pod post-publish (`[telemetry] funded_bench`; pod
+  kept through the sweep, then torn down); payer numbers are a FILTER —
+  the top-N re-bench on the operator's king pod and only operator numbers
+  are signed (forged sweep ⇒ entry dropped). Payer pods are CREDENTIAL-FREE
+  by default (`[round] funded_pod_checkpoint = "harvest"`: worker
+  --local-only, orchestrator harvest → ingest-verify → upload under its own
+  identity; robots remain as the "robot" fallback) — needs the worker image
+  rebuilt from this release.
+  (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
+  `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
@@ -288,8 +334,10 @@ New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
-decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
-condition in the node's `revisit_when:` key.
+decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0036 is claimed by the
+2026-08-28 miner-funded elastic-rounds pass, renumbered from 0029 after
+colliding with the accepted anneal/mix/init nodes 0029..0035; status
+proposed). Put the revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 

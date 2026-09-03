@@ -1,0 +1,517 @@
+"""cascade.funding: vault custody, fault taxonomy, and queue lifecycle."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import time
+
+import pytest
+
+from cascade.funding import (
+    FundedQueue,
+    PayerKeyVault,
+    classify_rent_failure,
+    is_no_capacity,
+    parse_retry_secs,
+    rounds_needed,
+    select_field,
+    should_recover,
+)
+from cascade.funding.queue import FundedEntry
+
+HK_A = "5FakeHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+HK_B = "5FakeHotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+
+
+# ── vault ────────────────────────────────────────────────────────────────────
+
+
+class FakeClock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_vault_memory_roundtrip_and_expiry():
+    clock = FakeClock()
+    v = PayerKeyVault(dir=None, ttl_seconds=100.0, clock=clock)
+    v.insert(HK_A, "sk-live-secret")
+    assert v.get(HK_A) == "sk-live-secret"
+    clock.t += 101.0
+    assert v.get(HK_A) is None          # expired ⇒ purged
+    assert not v.has(HK_A)
+
+
+def test_vault_persists_0600_and_hydrates(tmp_path):
+    clock = FakeClock()
+    v = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=1000.0, clock=clock)
+    v.insert(HK_A, "sk-live-secret")
+    path = tmp_path / "vault" / f"{HK_A}.json"
+    assert path.is_file()
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    # Fresh process, same dir: hydrate recovers the key (the teardown path).
+    v2 = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=1000.0, clock=clock)
+    assert v2.hydrate() == 1
+    assert v2.get(HK_A) == "sk-live-secret"
+
+
+def test_vault_hydrate_sweeps_expired_files(tmp_path):
+    clock = FakeClock()
+    v = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=10.0, clock=clock)
+    v.insert(HK_A, "sk-old")
+    clock.t += 11.0
+    v2 = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=10.0, clock=clock)
+    assert v2.hydrate() == 0
+    assert not (tmp_path / "vault" / f"{HK_A}.json").exists()
+
+
+def test_vault_refresh_restamps_ttl():
+    clock = FakeClock()
+    v = PayerKeyVault(dir=None, ttl_seconds=100.0, clock=clock)
+    v.insert(HK_A, "sk")
+    clock.t += 90.0
+    assert v.refresh(HK_A)
+    clock.t += 90.0                      # 180 total, but re-stamped at 90
+    assert v.get(HK_A) == "sk"
+
+
+def test_vault_rejects_traversal_hotkey(tmp_path):
+    v = PayerKeyVault(dir=tmp_path / "vault")
+    with pytest.raises(ValueError):
+        v.insert("../../etc/passwd", "sk")
+
+
+def test_vault_repr_never_carries_keys():
+    v = PayerKeyVault(dir=None)
+    v.insert(HK_A, "sk-live-secret")
+    assert "sk-live-secret" not in repr(v)
+
+
+# ── faults ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("HTTP 401 unauthorized", "auth"),
+    ("invalid api key supplied", "auth"),
+    ("HTTP 429 too many requests", "rate_limited"),
+    ("no lium offer matches the request", "no_capacity"),
+    ("SKU sold out in every region", "no_capacity"),
+    ("pod never appeared in `lium ps`", "infra"),
+    ("ssh transport closed rc=255", "infra"),
+])
+def test_classify_rent_failure(msg, expected):
+    assert classify_rent_failure(msg) == expected
+
+
+def test_auth_short_circuits_capacity():
+    # A permission error that also mentions offers must read as auth, never
+    # as sold-out (sold-out waits forever; auth needs the miner).
+    msg = "forbidden: no offer visible to this api key"
+    assert classify_rent_failure(msg) == "auth"
+    assert not is_no_capacity(msg)
+
+
+def test_should_recover_rules():
+    now = 10_000.0
+    assert should_recover("sold out of L40S", now - 100_000, now)          # no time bound
+    assert should_recover("429 too many requests", now - 60, now)
+    assert not should_recover("429 too many requests", now - 7 * 3600, now)  # window over
+    assert not should_recover("401 unauthorized", now - 60, now)            # miner's fix
+    assert not should_recover("huggingface 429 rate limit", now - 60, now)  # CDN, not rent
+
+
+def test_parse_retry_secs():
+    assert parse_retry_secs("try again in 37 seconds") == 37
+    assert parse_retry_secs("limit per 1 hour") == 120
+    assert parse_retry_secs("allowed per 5 seconds") == 5
+    assert parse_retry_secs("retry after 999999 seconds") == 7200  # capped
+    assert parse_retry_secs("nothing numeric here") is None
+
+
+# ── queue ────────────────────────────────────────────────────────────────────
+
+
+def test_queue_add_idempotent_and_replace(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "queued"
+    assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "already-queued"
+    assert q.add(HK_A, "repo-a2@sha256:ab", reveal_block=120) == "replaced"
+    q.mark_in_round([HK_A])
+    # A live round's entry is frozen — a re-fund cannot swap its ref.
+    assert q.add(HK_A, "repo-a3@sha256:ac", reveal_block=130) == "already-queued"
+    assert q.get(HK_A).ref == "repo-a2@sha256:ab"
+
+
+def test_queue_persists_across_reload(tmp_path):
+    path = tmp_path / "queue.json"
+    q = FundedQueue(path, clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q2 = FundedQueue(path, clock=FakeClock())
+    assert q2.get(HK_A).status == "queued"
+    assert q2.get(HK_A).reveal_block == 100
+
+
+def test_select_field_orders_by_reveal_block(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=90)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    field = select_field(q.entries(), cap=1)
+    assert [e.hotkey for e in field] == [HK_B]   # earliest reveal wins the slot
+    assert len(select_field(q.entries(), cap=3)) == 2
+
+
+def test_select_field_skips_non_queued():
+    entries = [
+        FundedEntry(HK_A, "r@sha256:aa", 100, 0.0, status="in_round"),
+        FundedEntry(HK_B, "r@sha256:bb", 200, 0.0, status="queued"),
+    ]
+    assert [e.hotkey for e in select_field(entries, cap=5)] == [HK_B]
+
+
+def test_requeue_infra_burns_attempt_and_exhausts(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.mark_in_round([HK_A])
+    for _ in range(3):
+        assert q.requeue(HK_A, error="pod dud", error_class="infra",
+                         burn_attempt=True, max_attempts=3)
+        q.mark_in_round([HK_A])
+    assert not q.requeue(HK_A, error="pod dud", error_class="infra",
+                         burn_attempt=True, max_attempts=3)
+    assert q.get(HK_A).status == "failed"
+    # A terminal entry frees the slot for a fresh fund.
+    assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "queued"
+    assert q.get(HK_A).attempts == 0
+
+
+def test_requeue_capacity_never_burns(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    for _ in range(10):
+        q.mark_in_round([HK_A])
+        assert q.requeue(HK_A, error="sold out", error_class="no_capacity",
+                         burn_attempt=False)
+    assert q.get(HK_A).status == "queued"
+    assert q.get(HK_A).attempts == 0
+
+
+def test_withdraw_only_while_queued(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.mark_in_round([HK_A])
+    assert not q.withdraw(HK_A)
+    q.requeue(HK_A, error="x", error_class="infra", burn_attempt=True)
+    assert q.withdraw(HK_A)
+
+
+def test_public_view_carries_no_key_shaped_fields(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    blob = json.dumps(q.public_view())
+    assert "api_key" not in blob and "lium" not in blob.lower()
+
+
+def test_stale_instance_never_resurrects_settled_entries(tmp_path):
+    """The intake's long-lived instance and the trainer's fresh one share the
+    file: every operation must act on the CURRENT file, or a fund arriving at
+    the intake would rewrite entries the trainer already settled and re-rent
+    a done entry on its still-vaulted key (audit 2026-08-29)."""
+    path = tmp_path / "queue.json"
+    intake_q = FundedQueue(path, clock=FakeClock())     # long-lived, "stale" view
+    intake_q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    trainer_q = FundedQueue(path, clock=FakeClock())    # fresh per round
+    trainer_q.mark_in_round([HK_A])
+    trainer_q.mark_done(HK_A)
+    # The intake instance now funds B — A must STAY done.
+    assert intake_q.add(HK_B, "repo-b@sha256:bb", reveal_block=200) == "queued"
+    assert FundedQueue(path, clock=FakeClock()).get(HK_A).status == "done"
+    # And its reads see the other writer's state without a rebuild.
+    assert intake_q.get(HK_A).status == "done"
+    assert intake_q.queued_depth() == 1
+
+
+def test_expire_stale_kills_only_old_queued(tmp_path):
+    clock = FakeClock(t=1000.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    clock.t += 10.0
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)
+    q.mark_in_round([HK_B])                  # in-flight work never expires
+    clock.t = 1000.0 + 36 * 3600 + 1
+    assert q.expire_stale() == 1
+    assert q.get(HK_A).last_error_class == "funding_expired"
+    assert q.get(HK_B).status == "in_round"
+    # Terminal-with-reason, so the miner can re-fund immediately.
+    assert q.add(HK_A, "repo-a@sha256:aa", reveal_block=100) == "queued"
+
+
+def test_sold_out_cycling_never_expires_but_idle_does(tmp_path):
+    # "Sold out is not Score(0), no time bound": a requeue is proof of life
+    # and refreshes the idle clock; only a genuinely untouched entry dies.
+    clock = FakeClock(t=0.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock, entry_ttl_seconds=100.0)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)   # will cycle
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)   # will idle
+    for _ in range(5):
+        clock.t += 90.0                                  # < TTL between touches
+        q.mark_in_round([HK_A])
+        q.requeue(HK_A, error="sold out", error_class="no_capacity",
+                  burn_attempt=False)
+    assert q.expire_stale() == 1                         # only the idle one
+    assert q.get(HK_A).status == "queued"
+    assert q.get(HK_B).last_error_class == "funding_expired"
+
+
+def test_entry_ttl_is_configurable(tmp_path):
+    clock = FakeClock(t=0.0)
+    q = FundedQueue(tmp_path / "queue.json", clock=clock, entry_ttl_seconds=10.0)
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    clock.t = 11.0
+    assert q.expire_stale() == 1                         # honors the ctor TTL
+
+
+def test_mark_in_round_rechecks_ref_inside_lock(tmp_path):
+    # The select→mark TOCTOU: a ref-replace landing between the trainer's
+    # snapshot and the flip must NOT have its new entry consumed by a round
+    # that trained the old ref.
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.add(HK_B, "repo-b@sha256:bb", reveal_block=200)
+    q.add(HK_A, "repo-a2@sha256:ac", reveal_block=150)   # the mid-window replace
+    confirmed = q.mark_in_round([(HK_A, "repo-a@sha256:aa"),
+                                 (HK_B, "repo-b@sha256:bb")])
+    assert confirmed == [HK_B]
+    assert q.get(HK_A).status == "queued"                # new entry untouched
+    assert q.get(HK_B).status == "in_round"
+
+
+def test_public_view_redacts_pending_reveal(tmp_path):
+    q = FundedQueue(tmp_path / "queue.json", clock=FakeClock())
+    q.add(HK_A, "repo-a@sha256:aa", reveal_block=100)
+    q.add_pending(HK_B, "vault/direct@sha256:" + "b" * 64)
+    view = q.public_view()
+    # The sealed field never leaks: pending entries appear only as a count.
+    assert view["pending_reveal_count"] == 1
+    assert [e["hotkey"] for e in view["entries"]] == [HK_A]
+    assert HK_B not in json.dumps(view)
+
+
+def test_concurrent_reads_never_corrupt_a_write(tmp_path):
+    # The read/write shared-state race (review 2026-08-29): a reader loading
+    # the file must never wipe a writer's in-flight mutation. With no cached
+    # self._entries and flock on both paths, a write is atomic w.r.t. reads.
+    import threading
+
+    path = tmp_path / "queue.json"
+    q = FundedQueue(path, clock=time.time)
+    stop = threading.Event()
+
+    def hammer_reads():
+        while not stop.is_set():
+            q.entries()
+            q.queued_depth()
+
+    readers = [threading.Thread(target=hammer_reads) for _ in range(6)]
+    for t in readers:
+        t.start()
+    try:
+        for i in range(200):
+            q.add(f"5Hk{i:062d}", f"r{i}@sha256:" + "a" * 64, reveal_block=i)
+    finally:
+        stop.set()
+        for t in readers:
+            t.join()
+    # Every one of the 200 funds survived — none dropped by a racing read.
+    assert q.queued_depth() == 200
+    assert len(FundedQueue(path).entries()) == 200
+
+
+def test_promote_pending_does_not_hold_lock_across_resolver(tmp_path):
+    # The resolver (a chain poll that can hang) must run OUTSIDE the flock, or
+    # a hung poll stalls every queue op including the trainer (review
+    # 2026-08-29). Prove it: while the resolver runs, another thread can still
+    # read the queue.
+    import threading
+
+    q = FundedQueue(tmp_path / "q.json", clock=time.time)
+    q.add_pending(HK_A, "r@sha256:" + "a" * 64)
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+    read_completed = threading.Event()
+
+    def slow_resolve(hk, ref):
+        resolver_entered.set()
+        release_resolver.wait(timeout=5)     # simulate a hanging chain call
+        return 42
+
+    def try_read():
+        resolver_entered.wait(timeout=5)
+        q.queued_depth()                     # must NOT block on the resolver's lock
+        read_completed.set()
+
+    reader = threading.Thread(target=try_read)
+    reader.start()
+    try:
+        promoter = threading.Thread(target=lambda: q.promote_pending(slow_resolve))
+        promoter.start()
+        assert read_completed.wait(timeout=5), "a read blocked on the hung resolver"
+    finally:
+        release_resolver.set()
+        promoter.join()
+        reader.join()
+    assert q.get(HK_A).status == "queued" and q.get(HK_A).reveal_block == 42
+
+
+def test_fail_expect_ref_skips_a_replaced_entry(tmp_path):
+    # The select→fail race: a fail decided off a snapshot must not kill a
+    # fresh re-funded entry with a different ref (review 2026-08-29).
+    q = FundedQueue(tmp_path / "q.json", clock=FakeClock())
+    q.add(HK_A, "old@sha256:" + "0" * 64, reveal_block=10)
+    # A re-fund replaced the ref before the fail lands:
+    q.add(HK_A, "new@sha256:" + "1" * 64, reveal_block=11)
+    assert not q.fail(HK_A, error="stale", error_class="ref_mismatch",
+                      expect_ref="old@sha256:" + "0" * 64)   # skipped
+    assert q.get(HK_A).status == "queued"                    # fresh entry lives
+    assert q.fail(HK_A, error="x", error_class="y",
+                  expect_ref="new@sha256:" + "1" * 64)       # matching ref fails it
+    assert q.get(HK_A).status == "failed"
+
+
+def test_rounds_needed_clamps():
+    assert rounds_needed(0, cap=3) == 1
+    assert rounds_needed(3, cap=3) == 1
+    assert rounds_needed(4, cap=3) == 2
+    assert rounds_needed(100, cap=3) == 4
+    assert rounds_needed(100, cap=3, max_rounds=2) == 2
+    with pytest.raises(ValueError):
+        rounds_needed(1, cap=0)
+
+
+from cascade.funding.queue import FundedQueue as Q
+
+R1 = "ns/gen@sha256:" + "a" * 64
+R2 = "ns/gen@sha256:" + "b" * 64
+
+# ── review 2026-09-02: vanity-code steering, rate-limit window, touch ────────
+
+
+def test_numeric_codes_match_only_as_standalone_tokens():
+    # A vanity hotkey slug containing "401"/"429" lands in pod names, and pod
+    # names land in error text — it must not steer classification.
+    assert classify_rent_failure("pod cascade-n91-7-funded-ab401cd-0 boom") == "infra"
+    assert classify_rent_failure("pod cascade-n91-7-funded-xx429yy-0 died") == "infra"
+    # Real codes still classify.
+    assert classify_rent_failure("HTTP 401 for this key") == "auth"
+    assert classify_rent_failure("error (429): slow down") == "rate_limited"
+
+
+def test_requeue_rate_limited_streak_turns_terminal(tmp_path):
+    from cascade.funding.faults import RECOVERY_WINDOW_SECONDS
+
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    assert q.mark_in_round([HK_A])
+    # First rate-limited requeue starts the streak, unburned.
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    e = q.get(HK_A)
+    assert (e.status, e.attempts) == ("queued", 0)
+    assert e.rate_limited_since == clock.t
+    # Still inside the window: keeps requeueing.
+    clock.t += RECOVERY_WINDOW_SECONDS / 2
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    # Past the window: the streak turns terminal.
+    clock.t += RECOVERY_WINDOW_SECONDS
+    assert q.mark_in_round([HK_A])
+    assert not q.requeue(HK_A, error="429", error_class="rate_limited",
+                         burn_attempt=False)
+    assert q.get(HK_A).status == "failed"
+
+
+def test_requeue_non_rate_limited_resets_the_streak(tmp_path):
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="429", error_class="rate_limited", burn_attempt=False)
+    assert q.get(HK_A).rate_limited_since > 0
+    assert q.mark_in_round([HK_A])
+    assert q.requeue(HK_A, error="sold out", error_class="no_capacity",
+                     burn_attempt=False)
+    assert q.get(HK_A).rate_limited_since == 0.0
+
+
+def test_touch_refreshes_queued_last_active_only(tmp_path):
+    clock = FakeClock()
+    q = Q(tmp_path / "q.json", clock=clock)
+    q.add(HK_A, R1, reveal_block=5)
+    q.add(HK_B, R2, reveal_block=6)
+    assert q.mark_in_round([HK_B])
+    clock.t += 500
+    assert q.touch([HK_A, HK_B, "nobody"]) == 1     # only the queued entry
+    assert q.get(HK_A).last_active == clock.t
+    # A touched entry survives an expiry sweep that would otherwise kill it.
+    q2 = Q(tmp_path / "q.json", clock=clock, entry_ttl_seconds=400)
+    assert q2.expire_stale() == 0 or q2.get(HK_A).status == "queued"
+
+
+# ── sealed vault at rest (review 2026-09-02, PRISM's sealed-payer shape) ─────
+
+
+def test_vault_seals_at_rest_and_hydrates_with_the_key(tmp_path):
+    import json
+    import os
+
+    key = os.urandom(32)
+    v = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    v.insert(HK_A, "sk-live-secret")
+    raw = json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+    assert "sealed" in raw and "api_key" not in raw
+    assert "sk-live-secret" not in (tmp_path / "pv" / f"{HK_A}.json").read_text()
+    # Same key (the trainer's process) hydrates it; a wrong key skips it.
+    v2 = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert v2.hydrate() == 1 and v2.get(HK_A) == "sk-live-secret"
+    v3 = PayerKeyVault(dir=tmp_path / "pv", seal_key=os.urandom(32))
+    assert v3.hydrate() == 0 and v3.get(HK_A) is None
+    # Associated data binds the blob to its hotkey: a renamed file fails.
+    (tmp_path / "pv" / f"{HK_A}.json").rename(tmp_path / "pv" / f"{HK_B}.json")
+    v4 = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert v4.hydrate() == 0
+
+
+def test_vault_reads_legacy_plaintext_and_reseals_on_insert(tmp_path, monkeypatch):
+    import json
+    import os
+
+    monkeypatch.delenv("CASCADE_VAULT_KEY_FILE", raising=False)
+    plain = PayerKeyVault(dir=tmp_path / "pv")          # no key → legacy form
+    assert not plain.sealed
+    plain.insert(HK_A, "sk-old")
+    assert "api_key" in json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+    key = os.urandom(32)
+    sealed = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert sealed.hydrate() == 1 and sealed.get(HK_A) == "sk-old"
+    assert sealed.refresh(HK_A)                          # re-seals the legacy entry
+    assert "sealed" in json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+
+
+def test_seal_key_file_forms(tmp_path, monkeypatch):
+    import os
+
+    from cascade.funding.vault import load_seal_key
+
+    raw = os.urandom(32)
+    (tmp_path / "k.raw").write_bytes(raw)
+    (tmp_path / "k.hex").write_text(raw.hex())
+    (tmp_path / "k.bad").write_bytes(b"short")
+    assert load_seal_key(tmp_path / "k.raw") == raw
+    assert load_seal_key(tmp_path / "k.hex") == raw
+    with pytest.raises(ValueError):
+        load_seal_key(tmp_path / "k.bad")
+    monkeypatch.setenv("CASCADE_VAULT_KEY_FILE", str(tmp_path / "k.hex"))
+    assert PayerKeyVault(dir=None).sealed

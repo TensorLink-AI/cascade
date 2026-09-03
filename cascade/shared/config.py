@@ -221,6 +221,70 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     return mode
 
 
+# Miner-funded compute modes (DEC-CA-0036) — see RoundConfig.funded_mode.
+FUNDED_MODES = ("off", "shadow", "required")
+
+
+def validate_funded_mode(mode: str) -> str:
+    """Return ``mode`` if it is a known funded mode, else raise ValueError.
+
+    Same rationale as dedup: "required" silently degrading to "off" would put
+    unfunded entries back on the operator's GPU bill without anyone noticing.
+    """
+    if mode not in FUNDED_MODES:
+        raise ValueError(f"funded_mode={mode!r} invalid; expected one of {FUNDED_MODES}")
+    return mode
+
+
+FUNDED_POD_MODES = ("off", "rent")
+
+
+def validate_funded_pods(mode: str) -> str:
+    """Return ``mode`` if it is a known funded-pods mode, else raise ValueError.
+
+    "rent" silently degrading to "off" would move every funded challenger leg
+    back onto the operator's GPU bill — same fail-loud rationale as
+    :func:`validate_funded_mode`.
+    """
+    if mode not in FUNDED_POD_MODES:
+        raise ValueError(
+            f"funded_pods={mode!r} invalid; expected one of {FUNDED_POD_MODES}")
+    return mode
+
+
+def validate_funded_field_cap(value: object) -> int:
+    """A non-negative int, fail-loud: a negative cap is truthy, so it would
+    silently seat NOBODY every round (the elastic-cap arithmetic reads any
+    non-zero value as "use me") — review 2026-09-02."""
+    cap = int(value)  # type: ignore[arg-type]
+    if cap < 0:
+        raise ValueError(f"funded_field_cap={cap} invalid; must be >= 0")
+    return cap
+
+
+def validate_funded_pod_skus(value: object) -> tuple[str, ...]:
+    """A tuple of SKU strings, fail-loud on a bare string: ``"RTX4090"``
+    would iterate as its CHARACTERS ('R', 'T', …) and every probe/rent would
+    target one-letter SKUs — review 2026-09-02."""
+    if isinstance(value, str):
+        raise ValueError(
+            f'funded_pod_skus={value!r} invalid; must be a list of SKU '
+            f'strings, e.g. ["RTX4090", "A6000"]')
+    return tuple(str(x) for x in value)  # type: ignore[union-attr]
+
+
+# Champion publication policies for direct (vault) submissions (DEC-CA-0036):
+# when a vault-ref king's code goes public. See cascade.funding.champion.
+CHAMPION_PUBLISH_MODES = ("off", "crown", "delay", "dethrone")
+
+
+def validate_champion_publish(mode: str) -> str:
+    if mode not in CHAMPION_PUBLISH_MODES:
+        raise ValueError(
+            f"champion_publish={mode!r} invalid; expected one of {CHAMPION_PUBLISH_MODES}")
+    return mode
+
+
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
     """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
 
@@ -757,6 +821,128 @@ class RoundConfig:
     # repo the trainer can fetch anonymously (same contract as a miner submission).
     genesis_generator_ref: str = ""
     submissions_db_path: str = "trainer_submissions.json"
+    # ── Miner-funded compute (DEC-CA-0036) — inert at defaults ───────────────
+    # "off"      — legacy behaviour, the funded queue is never read.
+    # "shadow"   — the field is unchanged; funding status is only logged, so an
+    #              operator can watch adoption before flipping the switch.
+    # "required" — the round's challenger field IS the funded queue: at most
+    #              ``finalist_cap`` funded entries enter, earliest reveal block
+    #              first, and everyone who enters duels (the heat's fits-the-cap
+    #              fast path short-circuits the screen — no GPU is spent on
+    #              screening a field that already fits). Unfunded reveals wait,
+    #              unburned, until their owner funds them.
+    # [round] is not part of contract_digest, so none of these move deployed
+    # digests; "required" IS a change to who competes, so arming follows the
+    # release-then-activate discipline like every other mode flag here.
+    funded_mode: str = "off"
+    # Release-then-activate gate for the WHOLE funded machinery: before this
+    # block, every funded_* knob behaves as "off" regardless of its configured
+    # value; from it on, the configured values apply. 0 = no gate (configured
+    # values apply immediately — the pre-2026-09-02 behaviour). This is what
+    # lets the armed config ship fleet-wide days early and flip at one
+    # announced block with no coordinated restart — the same shape as
+    # epoch_activation_block / mix_from_block. Trainer-side ([round]),
+    # consensus-inert: validators score what publishes and never schedule.
+    funded_activation_block: int = 0
+    # The funded queue file shared with cascade-intake and the provisioner.
+    # Relative paths resolve under work_root (like submissions_db_path).
+    funded_queue_path: str = "funded_queue.json"
+    # With funded_mode = "required": a boundary whose funded queue is empty
+    # skips the ENTIRE round — no king leg, no pods, no manifest; validators
+    # simply see no manifest and idle (they score what publishes; they never
+    # schedule). This is the elastic-cadence lower bound: rounds fire only
+    # when someone has paid for one.
+    skip_unfunded_rounds: bool = False
+    # Elastic-cadence ceiling (informational for the operator's grid choice:
+    # the epoch grid itself is [round] epoch_blocks — set THAT to the max
+    # cadence and let skip_unfunded_rounds provide the scale-down; this knob
+    # only feeds cascade.funding.rounds_needed sizing/telemetry).
+    max_rounds_per_day: int = 1
+    # Queue-entry idle TTL, hours. MUST track cascade-intake --ttl-hours (the
+    # payer-key vault TTL): expiring earlier kills paid entries whose key still
+    # works; later leaves keyless entries holding the skip-floor open. Idle is
+    # measured from the entry's last activity (fund/requeue/promotion), so a
+    # sold-out entry actively cycling never expires mid-drought.
+    funded_entry_ttl_hours: float = 36.0
+    # ── Per-payer funded pods (DEC-CA-0036, second arming gate) ──────────────
+    # "off"  — funded challenger legs run on the operator fleet (hosts.toml),
+    #          exactly the pre-wiring behaviour.
+    # "rent" — each funded challenger leg rents ONE pod on ITS payer's Lium key
+    #          (cascade.provision.funded), dispatches there, and tears it down
+    #          when the leg ends. The king's leg and every eval pod stay on the
+    #          operator fleet, always. Requires funded_mode = "required" plus
+    #          the three keys below; consensus-inert ([round]).
+    funded_pods: str = "off"
+    # The payer-key vault directory shared with cascade-intake --vault-dir
+    # (cascade.funding.vault; relative resolves under work_root). Required for
+    # "rent": without the miner's key no pod can be rented on their account.
+    payer_vault_dir: str = ""
+    # Marketplace SKU for funded pods (e.g. "RTX4090"). One SKU for every
+    # funded leg — the validator's gpu_name pairing needs king and challenger
+    # on matching silicon, so keep this the FINAL stage's SKU.
+    funded_pod_sku: str = ""
+    # Digest-pinned worker image funded pods launch from (full ref,
+    # ``…@sha256:…`` — the same image the operator's final fleet runs).
+    funded_pod_image: str = ""
+    # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
+    funded_ready_timeout_seconds: float = 900.0
+    # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
+    # (cascade.funding.robots). Revocation at teardown is the real bound;
+    # this is the backstop if a revoke ever fails.
+    funded_robot_duration_days: int = 1
+    # How a funded leg's checkpoint leaves its payer pod. "harvest" (default,
+    # DEC-CA-0036 credential-free pods): the worker runs --local-only, the pod
+    # holds NO Hub credential at all, and the orchestrator pulls the checkpoint
+    # over the pinned SSH, ingest-verifies it, and uploads it under its own
+    # identity. "robot": the legacy per-pod push-only Harbor robot (needs a
+    # worker image that predates --local-only, or a Hub whose anonymous pulls
+    # are off). Requires a funded_pod_image built from a --local-only-aware
+    # release when set to "harvest".
+    funded_pod_checkpoint: str = "harvest"
+    # Elastic field sizing ("no heat, any number of challengers"): 0 keeps the
+    # legacy finalist_cap admission; N > 0 admits up to N funded challengers
+    # per round (each rents its own payer pod, so wall-clock stays one leg).
+    # The duel's alpha splits over the challengers that actually TRAIN, so a
+    # bigger seated field stiffens each seat's dethrone bar — deliberate.
+    funded_field_cap: int = 0
+    # With funded_pods = "rent": probe the marketplace at the boundary and
+    # clamp admission to the same-SKU machines it can actually serve, minus
+    # funded_capacity_reserve (kept for the king's own operator rental).
+    # Advisory — rents that lose the race to other renters still requeue
+    # unburned via the no_capacity taxonomy; a failed probe clamps nothing.
+    funded_capacity_probe: bool = False
+    funded_capacity_reserve: int = 1
+    # Allowed GPU types for funded rounds, PREFERENCE-ordered (first wins
+    # ties). Empty = single-SKU rounds on funded_pod_sku. With entries, each
+    # boundary probes every listed SKU and the round runs ENTIRELY on the
+    # most-available one — king included (see funded_king_rent): the duel
+    # compares king and challengers directly, budgets are compute-denominated
+    # and the validator pairs gpu_name, so one round must never mix types.
+    # Per-round choice needs [training] expected_gpu = "" (a hard pin freezes
+    # the type until a coordinated validator update).
+    funded_pod_skus: tuple[str, ...] = ()
+    # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
+    # account, at the round's chosen SKU — the no-heat end-state (no standing
+    # final fleet). Required for funded_pod_skus to guarantee the king lands
+    # on the chosen type. NOTE: do not run the provisioner's final stage in
+    # this mode — its orphan reaper does not know these pods; the trainer
+    # ledgers them and sweeps at each boundary.
+    funded_king_rent: bool = False
+    # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
+    # Where the intake's private submission store lives (cascade.funding.store;
+    # relative resolves under work_root). "" = direct submissions off: vault
+    # refs cannot resolve and are dropped from the field with a log line. The
+    # dir is operator-local — off git, off any rsync'd pod tree; a dispatch
+    # stages exactly ONE entry's ZIP onto its pod, never the store.
+    submission_vault_dir: str = ""
+    # When a vault-ref king's code goes public (cascade.funding.champion):
+    # "off" (never — dev only), "crown" (immediately), "delay" (after
+    # champion_publish_delay_rounds of reign), "dethrone" (only when the reign
+    # ends). Under every non-off policy a dethroned vault king publishes at
+    # the hand-off if it never did; losers never publish. Trainer-side
+    # policy, consensus-inert.
+    champion_publish: str = "off"
+    champion_publish_delay_rounds: int = 2
     # Commit-order witness: {hotkey: {pending, committed}} block numbers, written
     # every poll tick. The chain deletes a commit's block when drand reveals it,
     # so the evidence of who submitted a generator FIRST exists only for whoever
@@ -1240,12 +1426,28 @@ class TelemetryConfig:
     Deliberately a ``[telemetry]`` key: it must never touch
     ``contract_digest`` — the digest-bound path to finished-form DUEL
     artifacts is [training] anneal_fraction (DEC-CA-0029), a contract cut.
+
+    ``funded_bench`` (DEC-CA-0036) benches each funded challenger on its
+    OWN payer pod after the duel (the pod stays up through publish and is
+    torn down when its sweep ends) instead of not at all — a payer-billed
+    box the operator never benched on, so its numbers are a FILTER, never a
+    published fact: the top ``funded_bench_verify_top`` payer-reported
+    challengers are re-benched on the operator's king pod, and only the
+    operator's numbers reach the signed report (and so the promotion pool).
+    A payer number more than ``funded_bench_verify_tolerance`` (relative,
+    on the six-number cascade score) better than the operator's re-bench is
+    a forged sweep: the entry is dropped from the report (its submission was
+    already spent at the duel settle; the promotion seat is what the drop
+    denies). Payer numbers outside the verified top-N are logged only.
     """
 
     host_probe: bool = True
     host_bench: bool = True
     scratch_shadow_every_rounds: int = 0
     bench_anneal_fraction: float = 0.0
+    funded_bench: bool = True
+    funded_bench_verify_top: int = 1
+    funded_bench_verify_tolerance: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -1417,6 +1619,16 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             )
     if not cfg.manifest.trainer_hotkey:
         problems.append("[manifest] trainer_hotkey is empty (set the owner trainer ss58 hotkey)")
+    # Per-round GPU-type choice needs an unpinned expected_gpu: a hard pin
+    # would fail EVERY leg trained on any other chosen type (validator
+    # gpu_name gate) — requeue-with-burn ×3 → terminal fail for every seated
+    # miner. Comment-enforced until 2026-09-02; now fail-loud at launch.
+    if (role == "trainer" and cfg.round.funded_pods == "rent"
+            and len(cfg.round.funded_pod_skus) > 1 and cfg.training.expected_gpu):
+        problems.append(
+            "[round] funded_pod_skus lists multiple GPU types but [training] "
+            f"expected_gpu pins {cfg.training.expected_gpu!r} — per-round SKU "
+            'choice needs expected_gpu = "" (a coordinated contract change)')
     # The round's screen/throne size pointers must name configured sizes.
     registry = cfg.training.size_registry
     for label, name in [("screen_size", cfg.round.screen_size), *(("throne_sizes", n) for n in cfg.round.throne_sizes)]:
@@ -1669,6 +1881,31 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             # warn-and-off at the use site, not a load failure)
             init_gate_mode=str(r.get("init_gate_mode", "off")),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
+            funded_mode=validate_funded_mode(str(r.get("funded_mode", "off"))),
+            funded_queue_path=str(r.get("funded_queue_path", "funded_queue.json")),
+            skip_unfunded_rounds=bool(r.get("skip_unfunded_rounds", False)),
+            max_rounds_per_day=int(r.get("max_rounds_per_day", 1)),
+            funded_entry_ttl_hours=float(r.get("funded_entry_ttl_hours", 36.0)),
+            funded_activation_block=max(0, int(r.get("funded_activation_block", 0))),
+            funded_pods=validate_funded_pods(str(r.get("funded_pods", "off"))),
+            payer_vault_dir=str(r.get("payer_vault_dir", "")),
+            funded_pod_sku=str(r.get("funded_pod_sku", "")),
+            funded_pod_image=str(r.get("funded_pod_image", "")),
+            funded_ready_timeout_seconds=float(
+                r.get("funded_ready_timeout_seconds", 900.0)),
+            funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
+            funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
+            funded_field_cap=validate_funded_field_cap(
+                r.get("funded_field_cap", 0)),
+            funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),
+            funded_capacity_reserve=int(r.get("funded_capacity_reserve", 1)),
+            funded_pod_skus=validate_funded_pod_skus(
+                r.get("funded_pod_skus", ())),
+            funded_king_rent=bool(r.get("funded_king_rent", False)),
+            submission_vault_dir=str(r.get("submission_vault_dir", "")),
+            champion_publish=validate_champion_publish(
+                str(r.get("champion_publish", "off"))),
+            champion_publish_delay_rounds=int(r.get("champion_publish_delay_rounds", 2)),
             commit_witness_path=str(r.get("commit_witness_path",
                                           "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
@@ -1807,6 +2044,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             host_bench=bool(tm.get("host_bench", True)),
             scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
             bench_anneal_fraction=float(tm.get("bench_anneal_fraction", 0.0)),
+            funded_bench=bool(tm.get("funded_bench", True)),
+            funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
+            funded_bench_verify_tolerance=float(
+                tm.get("funded_bench_verify_tolerance", 0.02)),
         ),
         raw=raw,
     )

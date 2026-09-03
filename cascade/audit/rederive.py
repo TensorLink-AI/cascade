@@ -367,10 +367,15 @@ def _tier2_score_compare(
         windows = source.windows_for_round(
             receipt.base_seed, n, block=receipt.epoch_start_block
         )
+        # Both checkpoints go through the ingest guard under the round's own
+        # contract: the PUBLISHED one may have come off a miner-funded pod.
+        contract = contract_for_replay(receipt, cfg)
         ours = global_geomean(evaluate_checkpoint(
-            retrained, windows, num_samples=cfg.eval.num_samples, device=device))
+            retrained, windows, num_samples=cfg.eval.num_samples, device=device,
+            contract=contract))
         theirs = global_geomean(evaluate_checkpoint(
-            published, windows, num_samples=cfg.eval.num_samples, device=device))
+            published, windows, num_samples=cfg.eval.num_samples, device=device,
+            contract=contract))
     except Exception as e:  # noqa: BLE001
         return CheckResult(name, WARN, f"score comparison unavailable "
                                        f"({type(e).__name__}: {e}); {why}")

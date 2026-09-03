@@ -648,8 +648,13 @@ class ValidatorRunner:
         from .evaluator import evaluate_checkpoint
 
         dest = self._fetch_checkpoint_dir(entry)
+        # The entry's contract arms the ingest guard: the checkpoint's code
+        # must be this release's, its config the contract's, its weights the
+        # pinned model's shape — a funded (miner-pod) checkpoint is untrusted.
+        size = getattr(entry, "size", "") or self.cfg.training.arch_preset
         return evaluate_checkpoint(
-            dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device
+            dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device,
+            contract=self.cfg.training.contract_for(size),
         )
 
     # Sentinel identity for the increment margin's third reference — the

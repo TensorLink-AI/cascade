@@ -47,6 +47,16 @@ def _invoke_sidecar(
     if not (ckpt / "forecast_wrapper.py").is_file():
         log.warning("benchmarks: %s has no forecast_wrapper.py; skipping", ckpt)
         return None
+    # The sidecar imports the checkpoint's wrapper: refuse any checkpoint
+    # whose code is not byte-identical to this release's (a funded
+    # challenger's checkpoint comes off a miner-controlled pod).
+    try:
+        from .checkpoint_guard import verify_checkpoint_code
+
+        verify_checkpoint_code(ckpt)
+    except Exception as e:  # noqa: BLE001 — never raise into the bench thread
+        log.error("benchmarks: refusing %s — %s", ckpt, e)
+        return None
     if not (project / "pyproject.toml").is_file():
         log.warning("benchmarks: sidecar project not found at %s; skipping", project)
         return None

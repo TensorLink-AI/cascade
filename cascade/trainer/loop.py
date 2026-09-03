@@ -116,6 +116,18 @@ BenchEvalFn = Callable[[Path], "BenchScores | None"]
 
 log = logging.getLogger("cascade.trainer")
 
+
+class _FundedTamper(Exception):
+    """A funded pod failed its identity pin (replaced under the same name, or
+    a different container answering at its address). Miner fault, terminal,
+    hotkey spent."""
+
+
+class _FundedLegSkip(Exception):
+    """A funded challenger leg that settled its own queue verdict (rent/setup
+    failure) and must simply be dropped from the round — never retried on the
+    operator fleet, which would silently move the bill."""
+
 # Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
 # a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
 # never re-fits the round's exact training draw, and the salted seed keys the
@@ -850,6 +862,33 @@ class TrainerRunner:
     # Heat drops whose failure matched the storage layer (hotkey → gen ref),
     # reset each round: candidates for the burn exemption in _burn_hotkeys.
     _storage_dropped: dict = field(default_factory=dict, repr=False)
+    # Serialises the funded-pod ledger's load-modify-save: king + N challenger
+    # legs rent concurrently, and two unlocked RMWs would silently drop one
+    # live pod from the crash-recovery ledger (review 2026-09-02). Instance-
+    # level (not per-round): startup reconcile touches the ledger too.
+    _funded_ledger_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
+    # Serialises the RENT phase (marketplace pick + `lium up` + readiness):
+    # concurrent rents snapshot the claimed-executor set before anyone has
+    # claimed, so they all pick the market's same top row — observed live
+    # 2026-09-02: every simultaneous pair chose one executor and the loser
+    # 429'd on the provider's create limit, every round. One rent at a time
+    # makes each later rent see the earlier claims; training itself still
+    # runs fully parallel, so wall-clock stays one leg + ~90s per seat.
+    _funded_rent_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
+    # Funded pods kept ALIVE past their leg for the post-publish bench
+    # (payer hotkey → PodInstance; [telemetry] funded_bench). Each is torn
+    # down the moment its own sweep ends (_bench_pod_group), and whatever is
+    # left is swept when the bench thread exits, when a round never reaches
+    # its bench, and at the next run_round — a kept pod bills its payer, so
+    # nothing may hold one longer than the sweep it was kept for.
+    _funded_bench_pods: dict = field(default_factory=dict, repr=False)
+    _funded_bench_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
+    # trained_pointers whose scores in the current sweep came off a payer
+    # pod — verified on the operator's pod before anything is published.
+    _payer_benched: set = field(default_factory=set, repr=False)
     # Challengers dropped BEFORE the field was even eligible (today: burned
     # hotkeys re-committing their one used submission), reset each round.
     # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
@@ -1026,6 +1065,1194 @@ class TrainerRunner:
                 self._round_skipped.append({"hotkey": c.hotkey, "uid": c.uid,
                                             "reason": "already_submitted"})
         return [c for c in challengers if c.hotkey not in seen]
+
+    # ── miner-funded compute (DEC-CA-0036) ───────────────────────────────────
+
+    def _funded_gate_open(self) -> bool:
+        """True when ``[round] funded_activation_block`` has passed (0 = no gate).
+
+        The release-then-activate switch for DEC-CA-0036: the armed config
+        ships fleet-wide days early and the funded machinery stays inert
+        until the chain reaches the announced block — no coordinated
+        flip-morning restart. The block height is stamped by ``run_forever``
+        each tick and by ``run_round`` at entry; a caller that never saw a
+        block (offline tools) treats an unreached gate as CLOSED, so the
+        armed config can never leak early.
+        """
+        act = self.cfg.round.funded_activation_block
+        if act <= 0:
+            return True
+        seen = getattr(self, "_funded_gate_block", None)
+        return seen is not None and int(seen) >= act
+
+    def _effective_funded_mode(self) -> str:
+        """``funded_mode`` as it applies RIGHT NOW ("off" before the gate)."""
+        return self.cfg.round.funded_mode if self._funded_gate_open() else "off"
+
+    def _effective_funded_pods(self) -> str:
+        """``funded_pods`` as it applies RIGHT NOW ("off" before the gate)."""
+        return self.cfg.round.funded_pods if self._funded_gate_open() else "off"
+
+    def _funded_harvest(self) -> bool:
+        """Credential-free funded pods (``[round] funded_pod_checkpoint =
+        "harvest"``, the default): the worker runs ``--local-only``, the pod
+        holds NO Hub credential, and the orchestrator harvests + verifies +
+        uploads the checkpoint itself. ``"robot"`` keeps the per-pod
+        push-only Harbor robot (the pre-harvest image path)."""
+        mode = str(getattr(self.cfg.round, "funded_pod_checkpoint", "harvest"))
+        if mode not in ("harvest", "robot"):
+            raise RuntimeError(
+                f"[round] funded_pod_checkpoint must be 'harvest' or 'robot'; got {mode!r}")
+        return mode == "harvest"
+
+    def _funded_queue(self):
+        """The funded queue, or ``None`` while ``[round] funded_mode = "off"``.
+
+        A fresh file-backed instance per call (single-writer process; the
+        intake service appends via its own instance and atomic replace, so the
+        newest state is always one load away). Relative paths resolve under
+        ``work_root``, like ``submissions_db_path``.
+        """
+        if self._effective_funded_mode() == "off":
+            return None
+        from ..funding.queue import FundedQueue
+
+        p = Path(self.cfg.round.funded_queue_path)
+        return FundedQueue(
+            p if p.is_absolute() else (self.work_root / p),
+            entry_ttl_seconds=self.cfg.round.funded_entry_ttl_hours * 3600.0,
+        )
+
+    def _filter_funded_challengers(
+        self, challengers: list[ResolvedGenerator]
+    ) -> list[ResolvedGenerator]:
+        """Apply ``[round] funded_mode`` to the eligible field.
+
+        ``"shadow"`` only reports: the field AND the queue are untouched
+        (strictly read-only — no recovery, no expiry), so an operator can
+        watch adoption without the observer changing the observed.
+        ``"required"`` makes the funded queue THE field: at most
+        ``finalist_cap`` funded entries enter, in ``select_field`` order
+        (earliest reveal block — the one shared ordering rule), and a funded
+        entry only matches when its ref equals the challenger's revealed ref.
+        Selected entries are marked ``in_round``; a torn round's leftovers
+        are recovered to ``queued`` first (never burned — the same rule as
+        the submission burn). Runs BEFORE the burn filter's output is burned,
+        so an unfunded reveal waits without consuming its one submission.
+
+        Entries that can never enter go TERMINAL rather than lingering: a
+        funded ref that no longer matches the hotkey's eligible reveal
+        (they re-revealed — fund the new ref), and a hotkey that already
+        burned its one submission. A queued entry can otherwise hold the
+        skip-floor open and bill a king leg per boundary forever; the
+        residual "funded but never reveals" case dies via ``expire_stale``
+        at the payer-key TTL.
+        """
+        from ..funding.queue import select_field
+
+        mode = self._effective_funded_mode()
+        queue = self._funded_queue()
+        if queue is None or not challengers:
+            return challengers
+        if mode == "shadow":
+            funded = {e.hotkey: e for e in queue.entries() if e.status == "queued"}
+            n_funded = sum(1 for c in challengers
+                           if c.hotkey in funded and funded[c.hotkey].ref == c.ref)
+            log.info("funded shadow: %d/%d eligible challengers are funded",
+                     n_funded, len(challengers))
+            return challengers
+        # required: the funded queue decides who enters, in queue seniority
+        # order, capped at the duel cohort the round can actually judge.
+        queue.recover_in_round()
+        queue.expire_stale()
+        burned: set[str] = set()
+        if self.cfg.round.one_submission_per_hotkey:
+            burned = _load_seen_hotkeys(self._submissions_path())
+        by_hotkey = {c.hotkey: c for c in challengers}
+        cap = self._funded_admission_cap()
+        kept: list[ResolvedGenerator] = []
+        held_back: list[str] = []
+        for entry in select_field(queue.entries(), cap=0):
+            # expect_ref on every fail: this loop acts on a queue SNAPSHOT, so
+            # a re-fund landing before the fail must not terminally fail the
+            # miner's fresh entry for the old ref's reason (review 2026-08-29).
+            if entry.hotkey in burned:
+                queue.fail(entry.hotkey,
+                           error="hotkey already used its one lifetime submission — "
+                                 "re-register, reveal, and fund the new hotkey",
+                           error_class="burned", expect_ref=entry.ref)
+                continue
+            c = by_hotkey.get(entry.hotkey)
+            if c is None:
+                continue                      # funded but not revealed/eligible: waits
+            if entry.ref != c.ref:
+                queue.fail(entry.hotkey,
+                           error=f"funded ref {entry.ref} no longer matches the "
+                                 f"eligible reveal {c.ref} — fund the new ref",
+                           error_class="ref_mismatch", expect_ref=entry.ref)
+                continue
+            if len(kept) < cap:
+                kept.append(c)
+            else:
+                held_back.append(entry.hotkey)
+        if held_back:
+            # Admission held these back (capacity clamp / out-capped by more-
+            # senior entries): they never rent, so nothing else refreshes
+            # last_active — touch them or they TTL-expire while actively
+            # waiting through no fault of their own (review 2026-09-02).
+            queue.touch(held_back)
+        if cap == 0:
+            log.warning("funded admission: capacity probe says 0 same-SKU "
+                        "machine(s) available after the reserve — nobody "
+                        "seats this round; the queue holds, unburned")
+            self._funded_field = {}
+            return []
+        dropped = len(challengers) - len(kept)
+        if dropped:
+            log.info("funded_mode=required: %d unfunded/over-cap challenger(s) wait "
+                     "for a later round (unburned)", dropped)
+        # Ref-checked flip: an intake ref-replace landing between our snapshot
+        # and this lock must not have ITS entry consumed by a round training
+        # the old ref — unconfirmed selections drop out of the round.
+        confirmed = set(queue.mark_in_round([(c.hotkey, c.ref) for c in kept]))
+        stale = [c.hotkey for c in kept if c.hotkey not in confirmed]
+        if stale:
+            log.info("funded selection changed under us for %s — re-entering "
+                     "next round", ", ".join(stale))
+        selected = [c for c in kept if c.hotkey in confirmed]
+        # The round's funded selection, hotkey → the EXACT ref marked in_round:
+        # the per-payer dispatch routes on membership and the duel settle's
+        # expect_ref guard rides the value.
+        self._funded_field = {c.hotkey: c.ref for c in selected}
+        # Transparency roster (published at settle): who seated, who waits,
+        # in what order, under what cap — miners can hold the operator to
+        # reveal-block seniority with the on-chain blocks beside it.
+        reveal_of = {e.hotkey: e.reveal_block for e in queue.entries()}
+        seated_set = {c.hotkey for c in selected}
+        self._funded_roster["seated"] = [
+            {"hotkey": c.hotkey, "ref": c.ref,
+             "reveal_block": reveal_of.get(c.hotkey)} for c in selected]
+        self._funded_roster["waiting"] = [
+            {"hotkey": e.hotkey, "reveal_block": e.reveal_block}
+            for e in select_field(queue.entries(), cap=0)
+            if e.hotkey not in seated_set]
+        self._funded_roster["terminal"] = [
+            {"hotkey": e.hotkey, "error_class": e.last_error_class}
+            for e in queue.entries() if e.status == "failed"]
+        return selected
+
+    def _submission_store(self):
+        """The private direct-submission store, or None while unset.
+
+        Also exports the resolved dir as ``$CASCADE_VAULT_DIR`` (unless the
+        operator already set one): the FETCH path — the dedup screen, a
+        vault-ref king fetch, local training — resolves vault refs through
+        that env, and without this bridge a fully configured store would be
+        invisible to every fetch on the orchestrator (review 2026-08-29).
+        """
+        d = self.cfg.round.submission_vault_dir
+        if not d:
+            return None
+        import os
+
+        from ..funding.store import VAULT_DIR_ENV, SubmissionStore
+
+        p = Path(d)
+        resolved = p if p.is_absolute() else (self.work_root / p)
+        os.environ.setdefault(VAULT_DIR_ENV, str(resolved))
+        return SubmissionStore(resolved)
+
+    def _verify_vault_ownership(
+        self, challengers: list[ResolvedGenerator]
+    ) -> list[ResolvedGenerator]:
+        """Drop vault-ref challengers whose digest belongs to someone else.
+
+        Content-addressing cuts both ways: a miner who learns a digest (the
+        published champion's, most obviously) could chain-commit
+        ``vault/direct@sha256:<that digest>`` and claim bytes they never had.
+        The store records who UPLOADED each digest; a mismatched claim is
+        dropped here — before any burn, screen, or pod — and an unresolvable
+        vault ref (no store configured, digest never uploaded) drops the same
+        way, since nothing could ever train it. Hub refs pass untouched.
+        """
+        from ..funding.store import parse_vault_ref
+
+        store = self._submission_store()
+        kept: list[ResolvedGenerator] = []
+        for c in challengers:
+            digest = parse_vault_ref(c.ref)
+            if digest is None:
+                kept.append(c)
+                continue
+            owner = store.owner(digest) if store is not None else None
+            if owner is None:
+                log.warning("dropping %s: vault ref %s has no stored submission "
+                            "(store %sconfigured)", c.hotkey, c.ref,
+                            "" if store is not None else "NOT ")
+                continue
+            if owner != c.hotkey:
+                log.warning("dropping %s: vault digest %s was uploaded by a "
+                            "different hotkey — a copied digest is not a submission",
+                            c.hotkey, digest)
+                continue
+            kept.append(c)
+        return kept
+
+    def _maybe_publish_champion(self, king: ResolvedGenerator, round_id: str) -> None:
+        """Run the champion-publication policy for this round's resolved king.
+
+        Best-effort by contract (a bucket must never sink a round) and inert
+        unless BOTH ``[round] champion_publish`` and ``submission_vault_dir``
+        are set. State (reign counter, published flag) lives in
+        ``champion_publisher.json`` under work_root.
+        """
+        policy = self.cfg.round.champion_publish
+        store = self._submission_store()
+        if policy == "off" or store is None:
+            return
+        try:
+            from ..funding.champion import ChampionPublisher
+
+            publisher = ChampionPublisher(
+                store, self.manifest_store(), policy=policy,
+                delay_rounds=self.cfg.round.champion_publish_delay_rounds,
+                state_path=self.work_root / "champion_publisher.json",
+            )
+            published = publisher.note_king(king.hotkey, king.ref, round_id)
+            for digest in published:
+                log.info("round %s: champion code published (%s)", round_id, digest)
+        except Exception as e:  # noqa: BLE001 — publication must never sink the round
+            log.warning("champion publication step failed (retries next round): %s", e)
+
+    def _settle_funded(self, jobs: list, entries: list) -> None:
+        """Settle each funded entry from its DUEL-leg outcome (required mode).
+
+        An entry is spent only by a round that actually judged it — and under
+        ``funded_mode = "required"`` the field fits the cap by construction, so
+        the heat always short-circuits and the ONLY judgment is the duel leg.
+        Hence the settle runs here, after ``_train_final``:
+
+        * leg produced a manifest entry              → ``mark_done`` (spent);
+        * leg failed on the MINER (worker rc=3, or an auth-class key at rent
+          time)                                      → terminal ``fail``;
+        * leg failed any other way — operator infra, a dud rented pod, a
+          torn dispatch                              → ``requeue`` per the
+          fault taxonomy (infra burns one bounded attempt; sold-out and
+          rate-limited burn nothing).
+
+        A round aborted before this point (king failure, crash) settles
+        nothing: its entries stay ``in_round`` and the next boundary's
+        ``recover_in_round`` returns them to ``queued``, unburned.
+        """
+        if self._effective_funded_mode() != "required" or not self._funded_field:
+            return
+        queue = self._funded_queue()
+        if queue is None:
+            return
+        trained = {getattr(e, "miner_hotkey", getattr(e, "hotkey", ""))
+                   for e in entries if getattr(e, "role", "") == "challenger"}
+        # Hotkeys whose one lifetime submission is SPENT by this round: judged
+        # (trained → done) or their own generator failed (worker rc=3). An
+        # auth-class key fault, a sold-out market, a rate limit, or exhausted
+        # infra attempts leave the hotkey re-fundable — the miner's generator
+        # was never judged.
+        spent: set[str] = set()
+        for gen, role in jobs:
+            if role != "challenger" or gen.hotkey not in self._funded_field:
+                continue
+            entry = queue.get(gen.hotkey)
+            # "queued" is accepted alongside "in_round": a restart between the
+            # heat settle and a settled-retry passes through recover_in_round
+            # first, which flips the entry back to queued before this settle
+            # can judge it (review 2026-09-02). The ref equality is the guard
+            # either way — a re-fund under a NEW ref since selection is a
+            # different entry and must not be settled by this round.
+            if entry is None or entry.status not in ("in_round", "queued"):
+                continue
+            if entry.ref != self._funded_field.get(gen.hotkey):
+                continue
+            if gen.hotkey in trained:
+                queue.mark_done(gen.hotkey)
+                spent.add(gen.hotkey)
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey, "outcome": "trained"})
+                continue
+            msg, miner_fault, error_class, burn = self._funded_leg_failures.get(
+                gen.hotkey,
+                ("challenger leg failed before dispatch", False, "infra", True))
+            if miner_fault:
+                queue.fail(gen.hotkey, error=msg, error_class=error_class,
+                           expect_ref=self._funded_field[gen.hotkey])
+                if error_class in ("generator", "tamper"):
+                    spent.add(gen.hotkey)    # their run / their tampering — the shot
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey, "outcome": "failed",
+                     "error_class": error_class})
+            else:
+                requeued = queue.requeue(gen.hotkey, error=msg,
+                                         error_class=error_class,
+                                         burn_attempt=burn)
+                log.info("funded leg for %s failed [%s]; %s", gen.hotkey,
+                         error_class,
+                         "re-queued unburned" if not burn else
+                         ("re-queued (one attempt burned)" if requeued
+                          else "attempts exhausted — entry failed"))
+                self._funded_roster["outcomes"].append(
+                    {"hotkey": gen.hotkey,
+                     "outcome": "requeued" if requeued else "failed",
+                     "error_class": error_class})
+        if spent:
+            self._burn_hotkeys([gen for gen, role in jobs
+                                if role == "challenger" and gen.hotkey in spent])
+
+    def _funded_admission_cap(self) -> int:
+        """How many funded challengers THIS round seats.
+
+        ``funded_field_cap = 0`` keeps the legacy ``finalist_cap`` admission;
+        ``N > 0`` is the elastic no-heat field ("any number of challengers" —
+        each seat rents its own payer pod, so wall-clock stays one leg). With
+        ``funded_capacity_probe`` on under rent mode, the cap further clamps
+        to the same-SKU machines the marketplace can serve right now minus
+        ``funded_capacity_reserve`` (the king's own operator rental comes off
+        the same market). The probe is ADVISORY: it stops us seating miners
+        the market visibly cannot serve, while rents that lose the race to
+        other renters still requeue unburned — and a failed probe clamps
+        nothing rather than freezing admission.
+        """
+        rnd = self.cfg.round
+        cap = rnd.funded_field_cap or max(1, rnd.finalist_cap)
+        self._funded_round_sku = rnd.funded_pod_sku
+        self._funded_admission_info = {"configured_cap": cap, "cap": cap,
+                                       "market_capacity": None,
+                                       "reserve": rnd.funded_capacity_reserve,
+                                       "sku": self._funded_round_sku,
+                                       "sku_capacities": None}
+        if self._effective_funded_pods() != "rent":
+            return cap
+        skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
+                                              if rnd.funded_pod_sku else ())
+        multi = len(skus) > 1
+        if not multi and not rnd.funded_capacity_probe:
+            return cap
+        caps = {}
+        for sku in skus:
+            n = self._probe_funded_capacity(sku)
+            if n is not None:
+                caps[sku] = n
+        if not caps:
+            # Every probe failed: keep the preference-order SKU, clamp nothing
+            # — a market-API blip must not gate the round.
+            if multi:
+                self._funded_round_sku = skus[0]
+                self._funded_admission_info["sku"] = skus[0]
+            return cap
+        # Most-available wins; ties break toward the operator's listed
+        # preference order. The whole round — king included — runs this type.
+        chosen = max(skus, key=lambda k: (caps.get(k, -1), -skus.index(k)))
+        self._funded_round_sku = chosen
+        avail = caps.get(chosen, 0)
+        self._funded_admission_info.update(
+            {"sku": chosen, "market_capacity": avail,
+             "sku_capacities": dict(caps)})
+        if multi:
+            log.info("funded round SKU: %s (capacities: %s)", chosen,
+                     ", ".join(f"{k}={v}" for k, v in caps.items()))
+        if not rnd.funded_capacity_probe:
+            return cap
+        clamped = min(cap, max(0, avail - max(0, rnd.funded_capacity_reserve)))
+        self._funded_admission_info["cap"] = clamped
+        if clamped < cap:
+            log.info("funded admission: market has %d × %s (reserve %d) — "
+                     "seating %d of cap %d", avail, chosen,
+                     rnd.funded_capacity_reserve, clamped, cap)
+        return clamped
+
+    def _probe_funded_capacity(self, sku: str) -> int | None:
+        """``sku``'s marketplace availability on the OPERATOR's key, or None."""
+        try:
+            from ..provision.core import LiumProvider
+
+            return LiumProvider().capacity(sku)
+        except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
+            log.warning("funded capacity probe for %s failed: %s", sku, e)
+            return None
+
+    def _publish_funded_roster(self, round_id: str) -> None:
+        """Publish the round's funded seat allocation, public-read.
+
+        ``funded/round-<id>.json`` + ``funded/latest.json`` on the manifest
+        bucket: the admission cap (and the capacity probe behind it), who
+        seated in what order, who waits, and how each seat ended. The reveal
+        blocks beside each seat are ON-CHAIN facts, so anyone can re-check
+        that seniority was honored; the audit's funded-roster check does
+        exactly that against the signed manifest. Presentational and
+        unsigned like the heat standings (DEC-CA-0011) — a publish failure
+        must never disturb the round.
+        """
+        if self._effective_funded_mode() != "required":
+            return
+        from ..shared.heat_status import _publish_public_json
+
+        doc = {"round_id": round_id,
+               "funded_pods": self.cfg.round.funded_pods,
+               "admission": dict(self._funded_admission_info),
+               **{k: list(v) for k, v in self._funded_roster.items()}}
+        try:
+            store = self.manifest_store()
+            for key in (f"funded/round-{round_id}.json", "funded/latest.json"):
+                _publish_public_json(store, key, doc)
+            log.info("round=%s: published funded roster (%d seated, %d waiting)",
+                     round_id, len(doc["seated"]), len(doc["waiting"]))
+        except Exception as e:  # noqa: BLE001 — transparency must not sink the round
+            log.warning("funded roster publish failed (ignored): %s", e)
+
+    # ── per-payer funded pods (DEC-CA-0036, [round] funded_pods = "rent") ────
+
+    def _payer_vault(self):
+        """The payer-key vault shared with cascade-intake, or ``None`` unset."""
+        d = self.cfg.round.payer_vault_dir
+        if not d:
+            return None
+        from ..funding.vault import PayerKeyVault
+
+        p = Path(d)
+        vault = PayerKeyVault(
+            dir=(p if p.is_absolute() else (self.work_root / p)),
+            ttl_seconds=self.cfg.round.funded_entry_ttl_hours * 3600.0,
+        )
+        # The intake wrote these keys from ITS process; this one starts empty —
+        # hydrate from the shared directory or every get() comes back None.
+        vault.hydrate()
+        return vault
+
+    # Env pairs the funded-leg credential resolver reads. Neither is ever
+    # forwarded to a pod: the ADMIN pair mints per-pod robots and stays on the
+    # orchestrator; the FUNDED pair is the static fallback that IS handed to
+    # payer pods (a push-only robot the operator created by hand).
+    HUB_ADMIN_ENV = ("CASCADE_HUB_ADMIN_USERNAME", "CASCADE_HUB_ADMIN_PASSWORD")
+    FUNDED_HUB_ENV = ("CASCADE_FUNDED_HUB_USERNAME", "CASCADE_FUNDED_HUB_PASSWORD")
+
+    def _hub_robots(self):
+        """The Harbor robot minter on a PROJECT-ADMIN Hub login, or ``None``.
+
+        Harbor refuses to let a robot account manage robots, and the
+        operator's everyday Hub identity is itself a project robot
+        (``robot$cascade+cascade-bot``), so minting needs a real user login:
+        ``CASCADE_HUB_ADMIN_USERNAME`` / ``CASCADE_HUB_ADMIN_PASSWORD``. Absent
+        that, ``None`` — the caller then tries the static funded robot and
+        otherwise fails CLOSED. Nothing here ever forwards the operator's
+        login to a payer-controlled pod.
+        """
+        import base64
+        import os
+
+        try:
+            from ..funding.robots import HarborRobots
+            from ..shared.hippius import HubConfig
+
+            user = os.environ.get(self.HUB_ADMIN_ENV[0], "")
+            pw = os.environ.get(self.HUB_ADMIN_ENV[1], "")
+            if not (user and pw):
+                return None
+            if user.startswith("robot$"):
+                log.error("%s is a robot account — Harbor forbids robots minting "
+                          "robots; set a project-admin USER login", self.HUB_ADMIN_ENV[0])
+                return None
+            header = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+            return HarborRobots(HubConfig.from_storage(self.cfg.storage).registry_url,
+                                header)
+        except Exception as e:  # noqa: BLE001 — a minter fault is an infra fault
+            log.error("Hub robot minter unavailable: %s", e)
+            return None
+
+    def _funded_pod_credential(self, round_id: str, hotkey: str):
+        """``(env_pairs, robot_id)`` for one payer pod, or ``None`` (fail closed).
+
+        Preference: a per-pod robot minted now (revoked at teardown) → the
+        static funded robot from the environment (rotated by hand) → nothing.
+        The operator's own Hub login is NEVER an option here.
+        """
+        import os
+
+        from ..funding.robots import robot_name
+
+        minter = self._hub_robots()
+        if minter is not None:
+            try:
+                cred = minter.create(
+                    robot_name(self.cfg.subnet.netuid, str(round_id), hotkey),
+                    self.hub().namespace,
+                    duration_days=self.cfg.round.funded_robot_duration_days)
+                return cred.as_env(), cred.id
+            except Exception as e:  # noqa: BLE001 — fall through to the static robot
+                log.error("Hub robot mint for %s failed: %s", hotkey, e)
+        user = os.environ.get(self.FUNDED_HUB_ENV[0], "")
+        pw = os.environ.get(self.FUNDED_HUB_ENV[1], "")
+        if user and pw:
+            if not user.startswith("robot$"):
+                log.error("%s must be a push-only Hub ROBOT (robot$…), not a "
+                          "user login — refusing to hand a user login to a "
+                          "payer pod", self.FUNDED_HUB_ENV[0])
+                return None
+            log.info("funded leg for %s uses the static funded robot %s "
+                     "(no admin login to mint a per-pod one)", hotkey, user)
+            return (("HIPPIUS_HUB_USERNAME", user),
+                    ("HIPPIUS_HUB_PASSWORD", pw)), 0
+        log.error("no credential for the funded leg of %s: set %s/%s (per-pod "
+                  "robots) or %s/%s (a static push-only robot)", hotkey,
+                  *self.HUB_ADMIN_ENV, *self.FUNDED_HUB_ENV)
+        return None
+
+    def _revoke_robot(self, pod) -> None:
+        """Best-effort revoke of a ledgered pod's Hub robot (Harbor expiry is
+        the backstop when this fails)."""
+        robot_id = int(getattr(pod, "robot_id", 0) or 0)
+        if not robot_id:
+            return
+        minter = self._hub_robots()
+        if minter is None:
+            log.error("cannot revoke Hub robot id=%d for pod %s (no operator Hub "
+                      "login) — it expires on its own", robot_id, pod.instance_id)
+            return
+        try:
+            minter.delete(robot_id)
+        except Exception as e:  # noqa: BLE001 — expiry backstop
+            log.error("Hub robot id=%d for pod %s NOT revoked (%s) — it expires "
+                      "on its own", robot_id, pod.instance_id, e)
+
+    def _funded_pod_profile(self):
+        """The pod profile funded rentals mirror: the first FINAL-stage host.
+
+        Funded pods must be interchangeable with the operator's final pods
+        (same image, same paths, same forwarded creds) — the validator's
+        gpu_name pairing and the audit both assume one runtime. The king's leg
+        needs an operator final host anyway, so this is always available when
+        a remote round runs.
+        """
+        hosts = self._hosts_for("final")
+        if not hosts:
+            raise RuntimeError("funded_pods=rent needs at least one operator "
+                               "final host to mirror (none configured)")
+        return hosts[0]
+
+    def _funded_ledger_path(self) -> Path:
+        return self.work_root / "funded_pods.json"
+
+    def _load_funded_ledger(self) -> list:
+        from ..provision.state import PodInstance
+
+        try:
+            raw = json.loads(self._funded_ledger_path().read_text(encoding="utf-8"))
+            return [PodInstance(**d) for d in raw]
+        except FileNotFoundError:
+            return []
+        except Exception as e:  # noqa: BLE001 — a torn ledger must not sink a round
+            log.error("funded pod ledger unreadable (%s) — reconcile will rely "
+                      "on the per-payer sweep alone", e)
+            return []
+
+    def _save_funded_ledger(self, pods: list) -> None:
+        import os
+        from dataclasses import asdict
+
+        path = self._funded_ledger_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps([asdict(x) for x in pods], indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _ledger_add(self, pod) -> None:
+        with self._funded_ledger_lock:
+            pods = self._load_funded_ledger()
+            pods = [x for x in pods if x.instance_id != pod.instance_id] + [pod]
+            self._save_funded_ledger(pods)
+
+    def _ledger_remove(self, instance_id: str) -> None:
+        with self._funded_ledger_lock:
+            self._save_funded_ledger(
+                [x for x in self._load_funded_ledger()
+                 if x.instance_id != instance_id])
+
+    def _reconcile_funded_pods(self) -> None:
+        """Boundary sweep: tear down ledgered leftovers, then the per-payer
+        orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
+        API hiccup must never hold a boundary."""
+        if self._effective_funded_pods() != "rent":
+            return
+        from ..provision.funded import reconcile_funded, teardown_funded
+
+        try:
+            pods = self._load_funded_ledger()
+            # Operator-billed ledger pods (the JIT king; payer_hotkey = "")
+            # never go through the per-payer path — it would demand a vault
+            # key that rightly does not exist. Swept BEFORE the vault check:
+            # a missing/mis-set vault must not leave operator pods billing
+            # (review 2026-09-02).
+            for pod in [x for x in pods if not x.payer_hotkey]:
+                self._teardown_operator_pod(pod)
+            vault = self._payer_vault()
+            if vault is None:
+                if any(x.payer_hotkey for x in pods):
+                    log.error("funded ledger holds payer pods but [round] "
+                              "payer_vault_dir is unset — they bill their "
+                              "miners until the vault comes back")
+                return
+            pods = [x for x in pods if x.payer_hotkey]
+            for pod in pods:
+                self._revoke_robot(pod)
+            if pods:
+                leftovers = teardown_funded(pods, vault)
+                with self._funded_ledger_lock:
+                    self._save_funded_ledger(
+                        leftovers + [x for x in self._load_funded_ledger()
+                                     if not x.payer_hotkey])
+                for inst in leftovers:
+                    log.error("funded pod %s (payer %s) could not be confirmed "
+                              "gone — still billing the miner; kept on the "
+                              "ledger for the next sweep",
+                              inst.instance_id, inst.payer_hotkey)
+            reconcile_funded(self._load_funded_ledger(), vault,
+                             netuid=self.cfg.subnet.netuid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("funded pod reconcile failed (ignored): %s", e)
+
+    def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
+                               error_class: str, burn: bool) -> None:
+        self._funded_leg_failures[hotkey] = (msg[-500:], miner_fault,
+                                             error_class, burn)
+
+    def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator):
+        """Rent ``gen``'s leg pod on ITS payer's key → ``(RemoteHost, PodInstance)``.
+
+        Every failure records a settle verdict for :meth:`_settle_funded` and
+        raises ``_FundedLegSkip`` so the leg (never the round) is dropped.
+        """
+        from ..provision.funded import rent_funded_pod
+        from .remote import RemoteHost
+
+        rnd = self.cfg.round
+        vault = self._payer_vault()
+        if vault is None:
+            self._record_funded_failure(
+                gen.hotkey, "funded_pods=rent but [round] payer_vault_dir is "
+                "unset (operator config)", miner_fault=False,
+                error_class="infra", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+        api_key = vault.get(gen.hotkey)
+        if not api_key:
+            self._record_funded_failure(
+                gen.hotkey, "no vaulted key for this hotkey (TTL expired or "
+                "never funded here) — re-fund to supply a fresh key",
+                miner_fault=True, error_class="auth", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+        try:
+            profile = self._funded_pod_profile()
+            key_path = Path(profile.key_path or "").expanduser()
+            ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
+                          ).read_text(encoding="utf-8").strip()
+            round_sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            if not round_sku or not rnd.funded_pod_image:
+                raise RuntimeError("funded_pods=rent needs [round] "
+                                   "funded_pod_sku (or funded_pod_skus) and "
+                                   "funded_pod_image")
+        except Exception as e:  # noqa: BLE001 — operator config faults never burn miners
+            self._record_funded_failure(gen.hotkey, f"operator-side funded-pod "
+                                        f"config fault: {e}", miner_fault=False,
+                                        error_class="infra", burn=False)
+            raise _FundedLegSkip(gen.hotkey) from e
+        # TRUE write-ahead: the pod's name is deterministic (launch appends
+        # "-0"), so ledger the INTENT before `lium up` — a crash anywhere in
+        # launch/wait/IP leaves the entry for the boundary sweep, instead of
+        # a pod billing its miner with no record (review 2026-09-02; the old
+        # "write-ahead" landed only after up to 900s of readiness wait).
+        from ..provision.funded import funded_pod_name
+        from ..provision.state import PodInstance
+
+        netuid = self.cfg.subnet.netuid
+        expected_id = funded_pod_name(str(round_id), gen.hotkey, netuid) + "-0"
+        self._ledger_add(PodInstance(
+            provider="lium", instance_id=expected_id, stage="funded",
+            rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            sku=round_sku, gpus=1, payer_hotkey=gen.hotkey))
+        # One rent at a time (see _funded_rent_lock): later rents must SEE
+        # earlier claims, or every concurrent pair picks the market's same
+        # top executor and races one create-rate window.
+        with self._funded_rent_lock:
+            with self._funded_exec_lock:
+                claimed = tuple(sorted(self._funded_claimed_execs))
+            from ..provision.core import scan_ssh_host_key
+
+            result = rent_funded_pod(
+                round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
+                sku=round_sku, image=rnd.funded_pod_image,
+                ssh_pubkey=ssh_pubkey, netuid=netuid,
+                ready_timeout=rnd.funded_ready_timeout_seconds,
+                exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
+            )
+            if result.ok and result.machine_id:
+                with self._funded_exec_lock:
+                    self._funded_claimed_execs.add(result.machine_id)
+        if not result.ok:
+            # rent_funded_pod's own failure path verified-terminated anything
+            # it launched; drop the write-ahead entry only when nothing leaked
+            # (a leaked pod keeps its ledger row for the sweep).
+            if not result.leaked_pod:
+                self._ledger_remove(expected_id)
+            msg = result.error
+            if result.leaked_pod:
+                msg += (f" [LEAKED pod {result.leaked_pod} may still bill this "
+                        f"payer — run `lium rm {result.leaked_pod}` on your "
+                        f"account]")
+            self._record_funded_failure(
+                gen.hotkey, msg, miner_fault=(result.error_class == "auth"),
+                error_class=result.error_class, burn=result.burn_attempt)
+            raise _FundedLegSkip(gen.hotkey)
+        # Replace the intent row with the real pod record (same instance id).
+        self._ledger_add(result.pod)
+        # Least-privilege credential for a payer-controlled box: a per-pod Hub
+        # robot (push-only, checkpoint project, revoked at teardown) and
+        # NOTHING from the orchestrator's environment (cascade.funding.robots).
+        # Fail closed — never fall back to forwarding the operator's login.
+        from dataclasses import replace as dc_replace
+
+        if self._funded_harvest():
+            # Credential-free pod: the worker trains --local-only and the
+            # orchestrator harvests the checkpoint, so NOTHING is minted and
+            # nothing at all reaches the pod's environment.
+            env_pairs: tuple = ()
+            pod = result.pod
+        else:
+            cred = self._funded_pod_credential(str(round_id), gen.hotkey)
+            if cred is None:
+                self._teardown_funded_pod(result.pod)
+                self._record_funded_failure(
+                    gen.hotkey, "operator-side fault: could not mint a per-pod Hub "
+                    "credential (the leg never forwards operator logins to a payer "
+                    "pod)", miner_fault=False, error_class="infra", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
+            env_pairs, robot_id = cred
+            pod = dc_replace(result.pod, robot_id=robot_id)
+            self._ledger_add(pod)
+        host = RemoteHost(
+            name=f"funded-{gen.hotkey[:12].lower()}",
+            host=result.address.ip, port=result.address.ssh_port,
+            user=profile.user, key_path=profile.key_path,
+            remote_python=profile.remote_python, workdir=profile.workdir,
+            cuda_device="0", chain_toml=profile.chain_toml,
+            forward_env=(), static_env=env_pairs, isolated=True,
+            pinned_host_key=result.host_key,
+            ssh_options=profile.ssh_options,
+            stage="final",
+        )
+        return host, pod
+
+    def _funded_checkpoint_mismatch(self, entry, contract) -> str | None:
+        """Why a funded leg's published checkpoint fails the ingest guard, or
+        ``None`` when it passes (cascade.eval.checkpoint_guard: repo-identical
+        code, contract config, pinned weight shapes and size). Unfetchable
+        counts as a mismatch — an entry we cannot inspect is not published."""
+        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
+        from ..shared.manifest import parse_trained_pointer
+
+        pointer = str(getattr(entry, "trained_pointer", "") or "")
+        ref = parse_trained_pointer(pointer)
+        if ref is None:
+            return f"malformed trained_pointer {pointer!r}"
+        try:
+            dest = (self.work_root / "_funded_ckpt_guard"
+                    / HubRef.parse(ref).digest.replace(":", "-"))
+            fetch_from_hub(ref, dest, HubConfig.from_storage(self.cfg.storage))
+            verify_checkpoint(dest, contract)
+        except CheckpointTampered as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001 — unfetchable ⇒ not publishable
+            return f"could not fetch/inspect the checkpoint: {str(e)[:200]}"
+        return None
+
+    def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
+                                   suffix: str):
+        """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
+        ingest-verify it, upload it under the operator's identity, and return
+        the real :class:`TrainedEntry` (DEC-CA-0036 credential-free pods).
+
+        Any guard deviation raises :class:`_FundedTamper` (miner fault,
+        terminal); a transport/upload failure raises plain (infra — the
+        miner's training was fine, the operator's pull was not)."""
+        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from .remote import harvest_remote_dir
+
+        dest = (self.work_root / "_funded_harvest" / f"{seeds.base_seed}"
+                / receipt.miner_hotkey)
+        harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        try:
+            verify_checkpoint(dest, contract)
+        except CheckpointTampered as e:
+            raise _FundedTamper(f"checkpoint: {e}") from e
+        size = contract.arch_preset
+        ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
+                     f"{receipt.role}-{size}{suffix}")
+        up = upload_dir_to_hub_or_hf(
+            dest, ckpt_repo, self.hub(), hf_repo=self._hf_ckpt_repo(ckpt_repo))
+        return TrainedEntry(
+            miner_hotkey=receipt.miner_hotkey,
+            miner_uid=receipt.miner_uid,
+            role=receipt.role,
+            gen_ref=receipt.gen_ref,
+            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
+            corpus_digest=receipt.corpus_digest,
+            train_block=receipt.train_block,
+            gpu_name=receipt.gpu_name,
+            size=receipt.size or size,
+        )
+
+    def _funded_pod_identity_mismatch(self, pod) -> str | None:
+        """Why the pod answering to ``pod.instance_id`` is not the one we
+        rented, or ``None`` when it is. Names are owner-chosen and reusable;
+        the platform's pod id is not — so a payer who relaunched "their" pod
+        under the same name shows up here (checked before dispatch and when
+        the leg returns; the pinned SSH host key guards the transport in
+        between). Unverifiable (no key, API down) counts as a mismatch: we
+        never dispatch into a pod we cannot identify."""
+        if not getattr(pod, "pod_uid", ""):
+            return "no platform identity was pinned at rent"
+        vault = self._payer_vault()
+        key = vault.get(pod.payer_hotkey) if vault is not None else None
+        if not key:
+            return "payer key unavailable to re-identify the pod"
+        try:
+            from ..provision.core import LiumProvider
+
+            ident = LiumProvider(api_key=key).pod_identity(pod.instance_id)
+        except Exception as e:  # noqa: BLE001 — unverifiable ⇒ mismatch
+            return f"identity check failed: {str(e)[:200]}"
+        if ident is None:
+            return "pod no longer listed on the payer's account"
+        if ident.get("id") != pod.pod_uid:
+            return (f"pod id changed: rented {pod.pod_uid}, now {ident.get('id')} "
+                    "(replaced under the same name)")
+        if str(ident.get("status", "")).upper() != "RUNNING":
+            return f"pod status is {ident.get('status')!r}, not RUNNING"
+        return None
+
+    def _stage_vault_zip_on(self, host, digest_hex: str):
+        """Ship ONE vault ZIP to the funded pod; return the host with the
+        pod-local ``CASCADE_VAULT_DIR`` pinned into its dispatch env."""
+        import shlex
+        import subprocess
+        from dataclasses import replace as dc_replace
+
+        store = self._submission_store()
+        if store is None:
+            raise RuntimeError("vault ref selected but submission_vault_dir unset")
+        staged = store.stage_for_dispatch(
+            digest_hex, self.work_root / "_vault_dispatch" / digest_hex)
+        from .remote import build_scp_argv, build_ssh_argv
+
+        pod_dir = f"{host.workdir}/_vault_stage"
+        # Same transport policy as every dispatch: a pinned host key stays
+        # pinned for the copy (an accept-new scp here would be the one hole
+        # in the leg's identity pin).
+        subprocess.run(build_ssh_argv(host, f"mkdir -p {shlex.quote(pod_dir)}"),
+                       check=True, capture_output=True, timeout=60)
+        subprocess.run(build_scp_argv(host, str(staged), f"{pod_dir}/{digest_hex}.zip"),
+                       check=True, capture_output=True, timeout=300)
+        return dc_replace(host, static_env=(*host.static_env,
+                                            ("CASCADE_VAULT_DIR", pod_dir)))
+
+    def _teardown_funded_pod(self, pod) -> None:
+        """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
+        # The leg is over: its Hub robot dies first, whatever the pod does.
+        self._revoke_robot(pod)
+        vault = self._payer_vault()
+        if vault is None:
+            # A silent return here would leave a miner-billed pod running with
+            # zero operator signal (review 2026-09-02). The ledger entry stays
+            # so the sweep retries once the vault is configured again.
+            log.error("funded pod %s (payer %s): [round] payer_vault_dir is "
+                      "unset — cannot tear it down; it bills the miner until "
+                      "the vault is restored", pod.instance_id, pod.payer_hotkey)
+            return
+        from ..provision.funded import teardown_funded
+
+        try:
+            leftovers = teardown_funded([pod], vault)
+        except Exception as e:  # noqa: BLE001
+            log.error("funded pod %s teardown crashed (kept on ledger for the "
+                      "boundary sweep): %s", pod.instance_id, e)
+            return
+        if leftovers:
+            log.error("funded pod %s could not be confirmed gone — still "
+                      "billing payer %s; kept on ledger", pod.instance_id,
+                      pod.payer_hotkey)
+        else:
+            self._ledger_remove(pod.instance_id)
+
+    def _rent_king_host(self, round_id: str):
+        """JIT king pod on the OPERATOR's account at the round's chosen SKU.
+
+        The no-heat end-state has no standing final fleet: with
+        ``funded_king_rent`` the king's pod rents at round start on the
+        operator's own key (never a payer's — provision.funded must never
+        bill an operator pod, so this rents through LiumProvider directly),
+        same image, same chosen SKU as every funded challenger. The pod is
+        kept for the WHOLE round — the post-publish duel bench targets it —
+        and swept at the next boundary via the ledger (payer_hotkey = "" is
+        the operator marker there). Rented once per round under a lock; a
+        rent failure raises, which aborts the round exactly like any king-leg
+        failure.
+        """
+        with self._funded_king_lock:
+            if self._funded_king_host is not None:
+                return self._funded_king_host
+            from ..provision.core import LaunchSpec, LiumProvider, ProvisionError
+            from ..provision.funded import terminate_verified
+            from ..provision.state import PodInstance
+            from .remote import RemoteHost
+
+            rnd = self.cfg.round
+            profile = self._funded_pod_profile()
+            key_path = Path(profile.key_path or "").expanduser()
+            ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
+                          ).read_text(encoding="utf-8").strip()
+            sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            provider = LiumProvider()
+            # The n<netuid> token keeps this OUT of both the provisioner's
+            # reaper scheme (which must never touch trainer-ledgered pods) and
+            # any co-hosted deployment's sweep (review 2026-09-02).
+            name_prefix = f"cascade-n{self.cfg.subnet.netuid}-{round_id}-funded-king"
+
+            def _ledger_king(pod_id: str) -> None:
+                self._ledger_add(PodInstance(
+                    provider=provider.name, instance_id=pod_id, stage="funded",
+                    rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime()),
+                    sku=sku, gpus=1, payer_hotkey=""))
+
+            # Write-ahead (name is deterministic): a crash during the
+            # readiness wait must leave a ledger row for the boundary sweep —
+            # an operator king pod is on NOBODY else's radar.
+            _ledger_king(f"{name_prefix}-0")
+
+            def _fail_king(pod_id: str, why: str) -> None:  # noqa: ANN001
+                # Verified teardown, ledger row dropped only when CONFIRMED
+                # gone (bare terminate swallows a failed rm as success).
+                try:
+                    if terminate_verified(provider, pod_id):
+                        self._ledger_remove(pod_id)
+                    else:
+                        log.error("king pod %s still LIVE after terminate — "
+                                  "kept on ledger for the sweep", pod_id)
+                except Exception as te:  # noqa: BLE001 — row stays for the sweep
+                    log.error("king pod %s teardown failed (kept on ledger): "
+                              "%s", pod_id, te)
+                raise ProvisionError(why)
+
+            # Serialized with every funded rent (see _funded_rent_lock): the
+            # king's `lium up` must not race a challenger's for the same
+            # executor / create-rate window.
+            with self._funded_rent_lock:
+                with self._funded_exec_lock:
+                    claimed = tuple(sorted(self._funded_claimed_execs))
+                spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                                  ssh_pubkey=ssh_pubkey,
+                                  name_prefix=name_prefix,
+                                  gpus_per_pod=1, exclude_ids=claimed)
+                pod_id = provider.launch(spec)[0]
+                if not provider.wait_ready(
+                        pod_id, timeout=rnd.funded_ready_timeout_seconds):
+                    _fail_king(pod_id, f"king pod {pod_id} not ready in time")
+                addr = provider.get_ip(pod_id)
+                if addr is None:
+                    _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                machine = provider.machine_of(pod_id) or ""
+                if machine:
+                    with self._funded_exec_lock:
+                        self._funded_claimed_execs.add(machine)
+            _ledger_king(pod_id)
+            log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
+                     pod_id, addr.ip, addr.ssh_port, sku)
+            self._funded_king_host = RemoteHost(
+                name="funded-king", host=addr.ip, port=addr.ssh_port,
+                user=profile.user, key_path=profile.key_path,
+                remote_python=profile.remote_python, workdir=profile.workdir,
+                cuda_device="0", chain_toml=profile.chain_toml,
+                forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+                stage="final")
+            return self._funded_king_host
+
+    def _teardown_operator_pod(self, pod) -> None:
+        """Verified teardown of an operator-billed ledger pod (king JIT)."""
+        from ..provision.core import LiumProvider
+        from ..provision.funded import terminate_verified
+
+        try:
+            if terminate_verified(LiumProvider(), pod.instance_id):
+                self._ledger_remove(pod.instance_id)
+            else:
+                log.error("operator pod %s still LIVE after terminate — kept "
+                          "on ledger for the next sweep", pod.instance_id)
+        except Exception as e:  # noqa: BLE001
+            log.error("operator pod %s teardown crashed (kept on ledger): %s",
+                      pod.instance_id, e)
+
+    def _run_funded_leg(self, disp, gen: ResolvedGenerator, seeds, block: int,
+                        contract, suffix: str, *, warm_start_ref: str | None):
+        """One funded challenger leg on its payer's own pod: rent → (stage the
+        vault ZIP when the ref is one) → dispatch → teardown — immediately on
+        any failure, or (with the payer-pod bench armed) after the
+        post-publish sweep that benches the checkpoint where it was trained
+        (see :meth:`_keep_funded_pod_for_bench`)."""
+        from ..funding.store import parse_vault_ref
+
+        host, pod = self._rent_funded_host(str(seeds.base_seed), gen)
+        keep = False
+        try:
+            # Identity pin, before a single byte of dispatch: the pod that
+            # answers to this name must be the one we rented (platform id)
+            # and still running. A payer relaunching "their" pod under the
+            # same name is TAMPER — their shot, spent — never infra.
+            why = self._funded_pod_identity_mismatch(pod)
+            if why:
+                raise _FundedTamper(f"before dispatch: {why}")
+            digest = parse_vault_ref(gen.ref)
+            if digest is not None:
+                host = self._stage_vault_zip_on(host, digest)
+            harvest = self._funded_harvest()
+            entry = disp.dispatch(
+                host, lane_count=1,
+                gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                role="challenger", base_seed=seeds.base_seed, block=block,
+                arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
+                local_checkpoint=harvest,
+                **({"repo_suffix": suffix} if suffix else {}),
+            )
+            # …and again when the leg returns: the checkpoint this entry
+            # points at must have come from the pod we pinned.
+            why = self._funded_pod_identity_mismatch(pod)
+            if why:
+                raise _FundedTamper(f"after training: {why}")
+            if harvest:
+                # Credential-free pod: the checkpoint is still ON the pod.
+                # Pull it over the pinned ssh, ingest-verify the local copy,
+                # and upload it under the OPERATOR's identity — the entry's
+                # pointer is then a checkpoint whose bytes we inspected.
+                entry = self._harvest_funded_checkpoint(
+                    host, entry, contract, seeds, suffix)
+            else:
+                # Robot mode: the pod pushed it — fetch and run the ingest
+                # guard NOW, before it can reach the manifest; validators and
+                # the king pod's bench must never see a checkpoint whose
+                # code/config/weights deviate from the contract.
+                why = self._funded_checkpoint_mismatch(entry, contract)
+                if why:
+                    raise _FundedTamper(f"checkpoint: {why}")
+            if self._keep_funded_pod_for_bench():
+                # The checkpoint benches on THIS pod after publish (payer-
+                # billed, the miner's own sidecar eval); _bench_pod_group
+                # tears it down when the sweep ends.
+                with self._funded_bench_lock:
+                    self._funded_bench_pods[gen.hotkey] = pod
+                self._final_role_hosts[
+                    ("challenger", contract.arch_preset, gen.hotkey)] = host
+                keep = True
+            return entry
+        except _FundedTamper as e:
+            self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
+                                        miner_fault=True, error_class="tamper",
+                                        burn=False)
+            raise
+        except Exception as e:  # noqa: BLE001 — classify, record, re-raise for the drop
+            rc = getattr(e, "returncode", None)
+            text = str(e)
+            if "Host key verification failed" in text:
+                # The pinned host key did not match: a different container
+                # answered at the pod's address mid-leg.
+                self._record_funded_failure(
+                    gen.hotkey, f"pod identity: ssh host key changed mid-leg "
+                    f"({text[-200:]})", miner_fault=True, error_class="tamper",
+                    burn=False)
+                raise
+            self._record_funded_failure(
+                gen.hotkey, text, miner_fault=(rc == 3),
+                error_class=("generator" if rc == 3 else "infra"),
+                burn=(rc != 3))
+            raise
+        finally:
+            if not keep:
+                self._teardown_funded_pod(pod)
+
+    def _keep_funded_pod_for_bench(self) -> bool:
+        """Whether a funded leg's pod outlives its leg for the post-publish
+        bench: ``[telemetry] funded_bench`` plus a wired REMOTE cascade bench
+        (the local ``bench_eval_fn`` path fetches from the Hub and needs no
+        pod). Without this the funded challenger is never benched at all —
+        its pod died with the leg and the sweep only knows pods."""
+        return bool(
+            getattr(self.cfg.telemetry, "funded_bench", True)
+            and self.will_run_post_publish_bench()
+            and self.cascade_bench_plan is not None
+        )
+
+    def _teardown_kept_funded_pod(self, hotkey: str) -> None:
+        """Tear down the pod kept for ``hotkey``'s bench (no-op if none)."""
+        with self._funded_bench_lock:
+            pod = self._funded_bench_pods.pop(hotkey, None)
+        if pod is not None:
+            self._teardown_funded_pod(pod)
+
+    def _teardown_kept_funded_pods(self, why: str) -> None:
+        """Tear down EVERY pod still kept for a bench — the sweep never ran,
+        died, or is over. Idempotent; each pod is popped before its teardown
+        so a concurrent per-pod teardown cannot double-bill the ledger."""
+        with self._funded_bench_lock:
+            hotkeys = list(self._funded_bench_pods)
+        if hotkeys:
+            log.info("tearing down %d kept funded pod(s): %s", len(hotkeys), why)
+        for hk in hotkeys:
+            try:
+                self._teardown_kept_funded_pod(hk)
+            except Exception as e:  # noqa: BLE001 — one stuck pod must not shield the rest
+                log.error("kept funded pod for %s: teardown failed (%s); the "
+                          "boundary sweep retries", hk[:12], e)
+
+    def _skip_unfunded_round(self, round_id: str) -> bool:
+        """True when this boundary should not run at all (elastic-cadence floor).
+
+        Only with ``funded_mode = "required"`` and ``skip_unfunded_rounds``:
+        an empty funded queue means nobody paid for this round — no king leg,
+        no pods, no manifest. Validators score what publishes and never
+        schedule (they poll ``read_latest_manifest``), so a skipped boundary
+        is consensus-invisible: the king simply holds.
+        """
+        rnd = self.cfg.round
+        # Before funded_activation_block the configured modes read "off" here
+        # (see _effective_funded_mode), so normal rounds keep running right up
+        # to the flip — the owner's rollover shape: the last legacy round
+        # starts, the intake is already accepting funded entries, and the
+        # first boundary at/after the block runs the funded field.
+        if self._effective_funded_mode() != "required" or not rnd.skip_unfunded_rounds:
+            return False
+        # Sweep funded-pod leftovers each boundary: a leg's own teardown covers
+        # the normal path, this covers the crash paths (ledgered but live, or
+        # launched-but-never-ledgered via the per-payer reconcile).
+        self._reconcile_funded_pods()
+        from ..funding.queue import rounds_needed
+
+        queue = self._funded_queue()
+        queue.recover_in_round()
+        queue.expire_stale()   # dead entries must not hold the boundary open
+        depth = queue.queued_depth()
+        if depth == 0:
+            log.info("round %s: funded queue empty — skipping the boundary "
+                     "(skip_unfunded_rounds)", round_id)
+            return True
+        cap = max(1, rnd.finalist_cap)
+        log.info("round %s: %d funded challenger(s) queued (≈%d round(s) to drain "
+                 "at cap %d, max_rounds_per_day=%d)", round_id, depth,
+                 rounds_needed(depth, cap, max_rounds=max(1, rnd.max_rounds_per_day)),
+                 cap, rnd.max_rounds_per_day)
+        return False
 
     def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:
         """Burn the challengers that got their shot: 1 hotkey = 1 submission.
@@ -1598,6 +2825,21 @@ class TrainerRunner:
             "screened": len(screened),
             "finalists": [c.hotkey for c in finalists],
         }
+        if self._effective_funded_mode() == "required":
+            # The settled-retry path re-enters run_round with round-init having
+            # reset every funded attribute: without this snapshot the retry's
+            # funded legs would dispatch on OPERATOR lanes (the bill silently
+            # moves), the multi-SKU king rent would see sku="" and abort every
+            # retry, and settle would no-op — leaving paid entries to be
+            # terminally failed by the burned-hotkey check despite having
+            # competed (review 2026-09-02). _settled_finalists restores it.
+            payload["funded"] = {
+                "field": dict(self._funded_field),
+                "round_sku": self._funded_round_sku,
+                "admission": dict(self._funded_admission_info),
+                "roster": {k: list(v) for k, v in self._funded_roster.items()
+                           if k != "outcomes"},
+            }
         try:
             out_dir = self.work_root / f"{base_seed}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -1670,6 +2912,26 @@ class TrainerRunner:
                     "directly (their hotkeys are already burned; the burn still "
                     "stands for later rounds)",
                     base_seed, ", ".join(c.hotkey for c in matched))
+        funded = raw.get("funded")
+        if isinstance(funded, dict) and self._effective_funded_mode() == "required":
+            # Restore the settled funded state so the retry keeps billing the
+            # payers, keeps the chosen SKU, and can settle its entries — see
+            # the snapshot's rationale in _mark_heat_complete.
+            self._funded_field = {str(k): str(v) for k, v in
+                                  (funded.get("field") or {}).items()}
+            self._funded_round_sku = str(funded.get("round_sku") or
+                                         self._funded_round_sku)
+            info = funded.get("admission")
+            if isinstance(info, dict):
+                self._funded_admission_info = info
+            roster = funded.get("roster")
+            if isinstance(roster, dict):
+                for k in ("seated", "waiting", "terminal"):
+                    if isinstance(roster.get(k), list):
+                        self._funded_roster[k] = roster[k]
+            log.info("round=%s retry: restored funded state (%d seated, "
+                     "sku=%s)", base_seed, len(self._funded_field),
+                     self._funded_round_sku or "<none>")
         return matched
 
     # ── live round-stage reporting (status/round.json, presentational) ───────
@@ -2000,6 +3262,84 @@ class TrainerRunner:
         contract = contract if contract is not None else self.cfg.training.primary_size
         token_budget = token_budget if token_budget is not None else contract.train_tokens
         size = contract.arch_preset
+        out_dir, corpus_digest, gpu_name = self._train_for_entry(
+            gen, role, seeds, contract=contract, token_budget=token_budget,
+            repo_suffix=repo_suffix, heat=heat, warm_start_ref=warm_start_ref)
+        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
+        # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
+        # alive through a Hub outage instead of failing the checkpoint upload).
+        up = upload_dir_to_hub_or_hf(
+            out_dir, ckpt_repo, self.hub(),
+            hf_repo=self._hf_ckpt_repo(ckpt_repo),
+        )
+        return TrainedEntry(
+            miner_hotkey=gen.hotkey,
+            miner_uid=gen.uid,
+            role=role,
+            gen_ref=gen.ref,
+            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
+            corpus_digest=corpus_digest,
+            train_block=block,
+            gpu_name=gpu_name,
+            size=size,
+        )
+
+    def train_one_local(
+        self,
+        gen: ResolvedGenerator,
+        role: str,
+        seeds: RoundSeeds,
+        block: int,
+        *,
+        contract: TrainingContractConfig | None = None,
+        token_budget: int | None = None,
+        repo_suffix: str = "",
+        heat: bool = False,
+        warm_start_ref: str | None = None,
+    ) -> dict:
+        """:meth:`train_one` WITHOUT the registry upload: train, stamp the
+        marker, and return a plain receipt dict — every ``TrainedEntry`` field
+        except ``trained_pointer`` plus ``local_checkpoint_dir``.
+
+        This is the credential-free pod mode (DEC-CA-0036): a payer-controlled
+        box holds NO Hub credential of any kind — the orchestrator harvests the
+        checkpoint over the pinned SSH, verifies it, and uploads it under its
+        own identity. Deliberately a dict, not a ``TrainedEntry``: the entry
+        class refuses anything but a real hub pointer, which is exactly the
+        property that keeps a local receipt out of a manifest."""
+        contract = contract if contract is not None else self.cfg.training.primary_size
+        token_budget = token_budget if token_budget is not None else contract.train_tokens
+        out_dir, corpus_digest, gpu_name = self._train_for_entry(
+            gen, role, seeds, contract=contract, token_budget=token_budget,
+            repo_suffix=repo_suffix, heat=heat, warm_start_ref=warm_start_ref)
+        return {
+            "miner_hotkey": gen.hotkey,
+            "miner_uid": gen.uid,
+            "role": role,
+            "gen_ref": gen.ref,
+            "corpus_digest": corpus_digest,
+            "train_block": int(block),
+            "gpu_name": gpu_name,
+            "size": contract.arch_preset,
+            "local_checkpoint_dir": str(out_dir),
+        }
+
+    def _train_for_entry(
+        self,
+        gen: ResolvedGenerator,
+        role: str,
+        seeds: RoundSeeds,
+        *,
+        contract: TrainingContractConfig,
+        token_budget: int,
+        repo_suffix: str,
+        heat: bool,
+        warm_start_ref: str | None,
+    ) -> tuple[Path, str, str]:
+        """The shared training body of :meth:`train_one` / :meth:`train_one_local`:
+        train (or reuse a complete prior run), stamp the marker, and return
+        ``(checkpoint dir, corpus_digest, gpu_name)`` — everything but the upload."""
+        size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
         log_role = f"heat-{gen.hotkey}" if heat else f"{role}-{size}"
         # Retry-without-retrain: if a PRIOR run of this exact job already trained
@@ -2030,25 +3370,7 @@ class TrainerRunner:
             self._write_train_complete_marker(
                 out_dir, contract, gen, corpus_digest=corpus_digest, gpu_name=gpu_name,
             )
-
-        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
-        # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
-        # alive through a Hub outage instead of failing the checkpoint upload).
-        up = upload_dir_to_hub_or_hf(
-            out_dir, ckpt_repo, self.hub(),
-            hf_repo=self._hf_ckpt_repo(ckpt_repo),
-        )
-        return TrainedEntry(
-            miner_hotkey=gen.hotkey,
-            miner_uid=gen.uid,
-            role=role,
-            gen_ref=gen.ref,
-            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
-            corpus_digest=corpus_digest,
-            train_block=block,
-            gpu_name=gpu_name,
-            size=size,
-        )
+        return out_dir, corpus_digest, gpu_name
 
     # ── retry-without-retrain (the .train_complete marker) ────────────────────
 
@@ -2282,6 +3604,9 @@ class TrainerRunner:
             # point).
             self._run_scratch_shadow(manifest, report, final_hosts=final_hosts)
         finally:
+            # Payer pods kept for this sweep (DEC-CA-0036): each went down as
+            # its own bench ended; this catches the ones a failed sweep skipped.
+            self._teardown_kept_funded_pods("post-publish bench finished")
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
         return report
 
@@ -2743,6 +4068,10 @@ class TrainerRunner:
         # a miss drops that entry from the report, never the report itself.
         duel = [e for e in manifest.entries if (e.size or primary) == primary]
         scored = self._bench_duel_checkpoints(duel, manifest.round_id, primary)
+        # Numbers off a PAYER's pod are a filter, never a published fact: the
+        # top-N re-bench on the operator's king pod and only those operator
+        # numbers go on to the signed report (DEC-CA-0036).
+        scored = self._verify_payer_benches(duel, scored, manifest.round_id, primary)
         entries = []
         for m_entry in duel:
             scores = scored.get(m_entry.trained_pointer)
@@ -2796,7 +4125,9 @@ class TrainerRunner:
         from concurrent.futures import ThreadPoolExecutor
 
         out: dict[str, BenchScores] = {}
-        if self.cascade_bench_plan is not None and self.remote_hosts:
+        self._payer_benched = set()
+        if self.cascade_bench_plan is not None and (self.remote_hosts
+                                                    or self._final_role_hosts):
             by_pod: dict[str, list[tuple[object, TrainedEntry]]] = {}
             for entry in duel:
                 host = self._bench_host_for(entry, primary)
@@ -2816,8 +4147,15 @@ class TrainerRunner:
                                     round_id, entry.role, entry.miner_hotkey,
                                     getattr(host, "name", host), e)
                         continue
+                    finally:
+                        if getattr(host, "isolated", False):
+                            # A payer's pod, kept alive only for this sweep
+                            # (DEC-CA-0036): its bill ends here, scored or not.
+                            self._teardown_kept_funded_pod(entry.miner_hotkey)
                     if scores is not None:
                         out[entry.trained_pointer] = scores
+                        if getattr(host, "isolated", False):
+                            self._payer_benched.add(entry.trained_pointer)
 
             with ThreadPoolExecutor(max_workers=max(1, len(by_pod))) as ex:
                 list(ex.map(_bench_pod_group, by_pod.values()))
@@ -2838,15 +4176,100 @@ class TrainerRunner:
     def _bench_host_for(self, entry: TrainedEntry, primary: str) -> object | None:
         """The pod holding ``entry``'s checkpoint: the tracked dispatch host,
         or the round-robin heuristic (king first, challenger next) when a
-        restart between duel and bench lost the tracking dict."""
+        restart between duel and bench lost the tracking dict. A funded
+        challenger has no heuristic: its checkpoint only ever existed on its
+        payer's pod, and a guess would bench a stranger's path on the king."""
         host = self._final_role_hosts.get(
             (entry.role, entry.size or primary, entry.miner_hotkey))
         if host is not None:
             return host
+        if entry.role == "challenger" and entry.miner_hotkey in self._funded_field:
+            return None
         hosts = self._hosts_for("final")
         if not hosts:
             return None
         return hosts[0] if entry.role == "king" else hosts[1 % len(hosts)]
+
+    def _verify_payer_benches(
+        self, duel: list[TrainedEntry], scored: dict, round_id: str, primary: str,
+    ) -> dict:
+        """Replace payer-pod numbers with the operator's own, or drop them.
+
+        The payer-benched challengers (``_payer_benched``) rank by their
+        reported cascade score; the top ``[telemetry] funded_bench_verify_top``
+        are pushed to the king's pod (the guard-verified copy the leg already
+        fetched) and benched there. Within tolerance ⇒ the operator's scores
+        stand in; a payer report better than the operator's by more than the
+        tolerance ⇒ a forged sweep: the entry is dropped (its submission was
+        already spent at the settle; the promotion seat is what the drop
+        denies). The rest — unverified — are logged and dropped from the
+        report: everything the trainer signs was produced on its own box.
+        Any verification failure (no king host, push/sweep miss) just drops
+        the entry; the signed stream carries fewer numbers, never wrong ones.
+        """
+        payer = {p for p in getattr(self, "_payer_benched", ()) if p in scored}
+        if not payer:
+            return scored
+        from ..eval.benchmarks import extract_bench_scores
+        from ..validator.cascade import cascade_score
+        from .bench_hook import push_checkpoint, run_post_round_benchmark
+
+        def _score(bs: BenchScores) -> float:
+            return cascade_score(bs.gifteval_crps, bs.gifteval_mase, bs.boom_crps,
+                                 bs.boom_mase, bs.time_crps, bs.time_mase)
+
+        out = {p: s for p, s in scored.items() if p not in payer}
+        ranked = sorted((e for e in duel if e.trained_pointer in payer),
+                        key=lambda e: _score(scored[e.trained_pointer]))
+        top = max(0, int(getattr(self.cfg.telemetry, "funded_bench_verify_top", 1)))
+        tol = float(getattr(self.cfg.telemetry, "funded_bench_verify_tolerance", 0.02))
+        king = next((e for e in duel if e.role == "king"), None)
+        king_host = self._bench_host_for(king, primary) if king is not None else None
+        for i, entry in enumerate(ranked):
+            reported = _score(scored[entry.trained_pointer])
+            if i >= top:
+                log.info("round=%s: payer-pod bench for %s = %.5f (unverified, "
+                         "not published)", round_id, entry.miner_hotkey[:12], reported)
+                continue
+            if king_host is None:
+                log.warning("round=%s: no king pod to verify %s's payer-pod bench "
+                            "(%.5f) on; entry not published", round_id,
+                            entry.miner_hotkey[:12], reported)
+                continue
+            try:
+                local = self._fetch_checkpoint_dir(entry.trained_pointer)
+                role_dir = f"{_bench_role_dir(duel, entry)}-verify"
+                push_checkpoint(king_host, local, round_id, primary, role_dir)
+                report = run_post_round_benchmark(
+                    king_host, round_id, primary, self.cascade_bench_plan,
+                    work_root=self.work_root, role=role_dir)
+                raw = extract_bench_scores(report) if report is not None else None
+            except Exception as e:  # noqa: BLE001 — verification miss ⇒ not published
+                log.warning("round=%s: operator re-bench of %s failed (%s); entry "
+                            "not published", round_id, entry.miner_hotkey[:12], e)
+                continue
+            if raw is None:
+                log.warning("round=%s: operator re-bench of %s produced no scores; "
+                            "entry not published", round_id, entry.miner_hotkey[:12])
+                continue
+            ours = BenchScores(**raw)
+            actual = _score(ours)
+            # Lower is better: a payer number BELOW ours by more than the
+            # tolerance was not produced by this checkpoint on this battery.
+            if reported < actual * (1.0 - tol):
+                # The submission was already spent at the duel settle; what a
+                # forged sweep could still buy is a promotion-pool seat, and
+                # that is exactly what the drop denies.
+                log.error("round=%s: payer-pod bench for %s reported %.5f but the "
+                          "operator's re-bench scores %.5f — forged sweep; entry "
+                          "dropped from the report (TAMPER)", round_id,
+                          entry.miner_hotkey[:12], reported, actual)
+                continue
+            log.info("round=%s: payer-pod bench for %s verified (payer %.5f, "
+                     "operator %.5f) — publishing the operator's numbers",
+                     round_id, entry.miner_hotkey[:12], reported, actual)
+            out[entry.trained_pointer] = ours
+        return out
 
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str,
@@ -3040,6 +4463,35 @@ class TrainerRunner:
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
         self._final_role_hosts = {}
+        # A previous round's bench thread should have torn its kept payer
+        # pods down long ago; whatever it left (crash, hung sweep) goes now —
+        # every one of them is billing a miner for nothing.
+        self._teardown_kept_funded_pods("previous round's bench left them")
+        # Stamp the height for the funded activation gate — run_round is also
+        # a direct entry point (scripts, tests), which must see the same gate
+        # decision the live loop would at this block.
+        self._funded_gate_block = int(block)
+        # Funded-leg bookkeeping for THIS round: the selection map feeds the
+        # per-payer dispatch, the failure map feeds the duel-settle (below).
+        self._funded_field = {}
+        self._funded_leg_failures = {}
+        # Executor ids this round's funded rents have claimed: N concurrent
+        # rents must pick N DISTINCT machines, not race for the listing's
+        # first row (both live rents on 2026-09-02 picked the same executor).
+        self._funded_claimed_execs = set()
+        self._funded_exec_lock = threading.Lock()
+        self._funded_admission_info = {}
+        self._funded_roster = {"seated": [], "waiting": [], "terminal": [],
+                               "outcomes": []}
+        self._funded_round_sku = self.cfg.round.funded_pod_sku
+        self._funded_king_host = None
+        self._funded_king_lock = threading.Lock()
+        # Sweep funded-pod leftovers at EVERY round entry (not only on the
+        # skip path, which needs skip_unfunded_rounds on — review 2026-09-02):
+        # the previous round's JIT king, a crashed leg's payer pod, and any
+        # launched-but-never-ledgered orphan all get torn down here, before
+        # this round rents anything. Self-guarded to funded_pods="rent".
+        self._reconcile_funded_pods()
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
@@ -3062,18 +4514,34 @@ class TrainerRunner:
                      base_seed, warm_start[0], warm_start[1], epoch_idx)
 
         self._storage_dropped.clear()   # per-round: see _burn_hotkeys exemption
+        # Champion publication (DEC-CA-0036) runs on EVERY attempt of a round —
+        # it is idempotent per round_id (the reign counter advances once), and
+        # a dethrone hand-off retry must not be skippable by the settled-retry
+        # path below.
+        self._maybe_publish_champion(plan.king, str(base_seed))
         # Round-level retry AFTER this round's heat settled (r47): the settle
         # burned every entrant, so re-deriving eligibility would field nobody
         # and walk the king over the settled finalists. Reuse them instead —
-        # the burn filter and the dedup screen are deliberately bypassed for
-        # exactly these hotkeys in exactly this round (the settled heat already
-        # screened and deduped them); the burn set itself is untouched.
+        # the burn filter, the DEC-CA-0036 vault/funded gates, and the dedup
+        # screen are deliberately bypassed for exactly these hotkeys in exactly
+        # this round: the settled heat already applied all of them. Funded
+        # entries are NOT yet settled at this point (they settle at the duel);
+        # _settled_finalists restores the round's funded state from the marker
+        # so the retry's legs stay payer-billed and settle-able. The burn set
+        # itself is untouched.
         reused = self._settled_finalists(base_seed, plan.challengers)
         if reused is not None:
             eligible = list(reused)
             screened = list(reused)
         else:
             eligible = self._filter_burned_challengers(plan.challengers)
+            # Direct submissions (DEC-CA-0036): a vault ref only enters if ITS
+            # uploader committed it — a copied digest is not a submission.
+            eligible = self._verify_vault_ownership(eligible)
+            # Miner-funded gate BEFORE anything burns or trains: an unfunded
+            # reveal in required mode waits outside the round — never burned,
+            # never screened — until its owner funds it (DEC-CA-0036).
+            eligible = self._filter_funded_challengers(eligible)
             # Content-level duplicate screen ([round] dedup_mode): re-uploads and
             # near-copies of the king or a lower-UID challenger lose their heat GPU
             # slot before any pod is dispatched. They stay in ``eligible`` — entering
@@ -3115,7 +4583,25 @@ class TrainerRunner:
         # submission is consumed by a round that never judged it. (On the
         # settled-retry path this is an idempotent no-op: the reused finalists
         # were burned at the original settle.)
-        self._burn_hotkeys(eligible)
+        if self._effective_funded_mode() == "required":
+            # Funded entries burn at the DUEL settle (_settle_funded), per
+            # outcome — burning the seated field here, before its legs run,
+            # would let the next round's burned-hotkey check terminally fail
+            # an entry the queue had just requeued UNBURNED (sold-out, rate
+            # limit, operator infra), voiding the taxonomy's core promise.
+            # Only surfaced with one_submission_per_hotkey = true (mainnet;
+            # testnet runs it off) — review 2026-09-02.
+            pass
+        else:
+            self._burn_hotkeys(eligible)
+        # Funded entries do NOT settle here. Under funded_mode = "required" the
+        # field fits the cap by construction, so this heat "completion" is the
+        # short-circuit — settling now would spend every entry BEFORE its duel
+        # leg trains, and a leg lost to operator infra would burn a paid entry
+        # with no score (observed live 2026-09-01, round 17975568316740397687).
+        # They settle from actual duel-leg outcomes in _settle_funded, after
+        # _train_final returns; a crash before that leaves them in_round for
+        # the next round's recover_in_round (unburned).
         if reused is None:
             # Heat settled (screened + burned + finalists chosen): signal external
             # watchers (the provisioner) that heat-stage pods are now safe to release.
@@ -3141,6 +4627,13 @@ class TrainerRunner:
         jobs += [(c, "challenger") for c in finalists]
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
+        # The judgment moment for funded entries: their duel legs have run (or
+        # failed) — settle each from its outcome. A king failure raised out of
+        # _train_final skips this on purpose: an aborted round judged nobody,
+        # so its funded entries stay in_round and the next boundary recovers
+        # them to queued, unburned.
+        self._settle_funded(jobs, entries)
+        self._publish_funded_roster(str(seeds.base_seed))
         if len(finalists) > 1:
             # DEC-CA-0012: stamp the advancing cohort's record order — 0-based,
             # best observed heat geomean first. Record order ONLY: the
@@ -3258,6 +4751,16 @@ class TrainerRunner:
         n = max(0, self.cfg.round.finalists)
         armed = self.cfg.round.max_finalists > 1
         cap = max(0, self.cfg.round.finalist_cap)
+        if (self._effective_funded_mode() == "required" and self._funded_field
+                and all(c.hotkey in self._funded_field for c in challengers)):
+            # No-heat contract (DEC-CA-0036 elastic field): every SEATED funded
+            # challenger duels — admission already capped the field, each seat
+            # rents its own pod, and the duel's alpha/k splits over the cohort.
+            # Without this, funded_field_cap > finalist_cap sent the overflow
+            # through a real heat screen and the screened-out reached settle
+            # with no manifest entry → burned as "failed before dispatch" for
+            # miners who paid and were never judged (review 2026-09-02).
+            cap = max(cap, len(challengers))
         if not challengers or cap == 0:
             return [], None
         if self.screen_fn is None or len(challengers) <= cap:
@@ -3983,6 +5486,37 @@ class TrainerRunner:
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
+            if (role == "king"
+                    and self._effective_funded_pods() == "rent"
+                    and self.cfg.round.funded_king_rent
+                    and self._funded_gate_open()):
+                # No-heat end-state: the king's pod rents JIT at the round's
+                # chosen SKU (operator-billed) instead of a standing fleet.
+                host = self._rent_king_host(str(seeds.base_seed))
+                entry = disp.dispatch(
+                    host, lane_count=1,
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role="king", base_seed=seeds.base_seed, block=block,
+                    arch_preset=contract.arch_preset,
+                    warm_start_ref=warm_start_ref,
+                    **({"repo_suffix": suffix} if suffix else {}),
+                )
+                # The bench and scratch shadow target the king's pod — it
+                # stays up through the round; the boundary sweep reaps it.
+                self._final_role_hosts[
+                    ("king", contract.arch_preset, gen.hotkey)] = host
+                return entry
+            if (role == "challenger"
+                    and self._effective_funded_pods() == "rent"
+                    and gen.hotkey in self._funded_field):
+                # DEC-CA-0036: this leg bills its payer, on a pod rented with
+                # THEIR key — never an operator lane, even as a fallback (the
+                # bill must not silently move). The leg itself records the
+                # pod in _final_role_hosts when it stays up for the bench
+                # (and only then — a torn-down pod must never be a target).
+                return self._run_funded_leg(
+                    disp, gen, seeds, block, contract, suffix,
+                    warm_start_ref=warm_start_ref)
             entry = self._dispatch_on_free_lane(
                 disp, lane_pool, lane_pool.known_hosts(),
                 describe=f"final {role} {gen.hotkey}",
@@ -4270,9 +5804,16 @@ class TrainerRunner:
         """
         poll = self.cfg.manifest.poll_seconds
         last_round: str | None = None
+        # Startup sweep: a crashed process leaves funded/king pods billing
+        # with nobody's leg attached — reconcile from the ledger + per-payer
+        # listings before any round work (self-guarded to funded_pods="rent").
+        self._reconcile_funded_pods()
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # Stamp the height for the funded release-then-activate gate
+                # (funded_activation_block) before ANY funded read this tick.
+                self._funded_gate_block = int(block)
                 # Resolved per tick, NOT hoisted: under a scheduled cadence
                 # change ([round] epoch_activation_block) a hoisted value would
                 # pin the trainer to the pre-switch length until it restarted,
@@ -4300,6 +5841,14 @@ class TrainerRunner:
                     # thread died with the old process) — release the hold
                     # rather than bill the final pod to the cap.
                     self._release_stale_bench_hold(round_id)
+                    last_round = round_id
+                    time.sleep(poll)
+                    continue
+                # Elastic-cadence floor (DEC-CA-0036): an unfunded boundary in
+                # required mode runs nothing — no king leg, no pods, no
+                # manifest. Checked before ANY round work (commitment polls,
+                # promotion, hosts waits) so a quiet day costs nothing.
+                if self._skip_unfunded_round(round_id):
                     last_round = round_id
                     time.sleep(poll)
                     continue
@@ -4373,7 +5922,10 @@ class TrainerRunner:
                         self.launch_post_publish_bench(manifest)
                     except Exception as e:  # noqa: BLE001 — telemetry/promotion input only
                         self._mark_bench_complete(round_id, uploaded=False)
+                        self._teardown_kept_funded_pods("bench launch failed")
                         log.warning("post-publish bench launch failed (ignored): %s", e)
+                else:
+                    self._teardown_kept_funded_pods("no post-publish bench this round")
                 if self.bench_plan is not None and self.remote_hosts and not will_bench:
                     # Guarded separately: the round is already published, so a
                     # telemetry failure here must not fall through to the round
@@ -4400,4 +5952,7 @@ class TrainerRunner:
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)
+                # A round that died between its funded legs and its bench
+                # leaves payer pods kept for a sweep that will never come.
+                self._teardown_kept_funded_pods("round failed before its bench")
             time.sleep(poll)

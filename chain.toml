@@ -210,11 +210,10 @@ allow_future_known = false
 # FORBIDDEN until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness
 # rule (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
 real_corpus_ref    = ""
-# Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
-# "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
-expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must
-                                  # train on identical silicon (folds into contract_digest;
-                                  # unit fixtures neutralize this in tests/conftest.py)
+# Pin the GPU SKU (exact torch device name). Empty = king and challenger must
+# match each other. Unpinned 2026-09-02 for per-round GPU choice
+# ([round] funded_pod_skus); folds into contract_digest — coordinated deploy.
+expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # Pin the training-runtime image (digest-pinned worker-image ref) and inject the
 # same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
 # a mismatched runtime. Folded into contract_digest. Empty = unpinned.
@@ -288,18 +287,11 @@ train_image_digest = "sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437
 # that overrides the derivation and over-rents on quiet rounds.
 epoch_blocks     = 3600   # ≈12h at a 12s block time
 round_hours      = 12.0   # informational: wall-clock span of an epoch
-# SCHEDULED ACTIVATION — this is what lets operators merge and restart TODAY
-# while the change takes effect tomorrow, with no coordinated restart. Every
-# node resolves the round length through effective_epoch_blocks(round, block),
-# so a validator that restarted early and one that restarted late agree on
-# every round: 7200 for blocks before the activation, 3600 from it on.
-# 8726400 = Wed 2026-07-29 ~08:17 UTC. It is a boundary of BOTH grids
-# (8726400 / 7200 = 1212, / 3600 = 2424) — load_chain_config enforces that, so
-# no round is cut short at the seam.
-# CLEAN-UP: once 8726400 is safely past, set both keys to 0 (the steady state);
-# the accessor then returns epoch_blocks unconditionally.
-epoch_blocks_prev      = 7200
-epoch_activation_block = 8726400
+# Scheduled switch (0/0 = steady state). Last used: 7200 → 3600 at 8726400,
+# 2026-07-29. To schedule another, the block must be a boundary of BOTH grids
+# (load-checked); set both back to 0 once it is safely past.
+epoch_blocks_prev      = 0
+epoch_activation_block = 0
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
                           # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
                           # ranking; watch p_best / leader_lcb to confirm it pays.
@@ -387,6 +379,59 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
+# ── Miner-funded compute (DEC-CA-0036) — armed, block-gated ──────────────────
+# "off" / "shadow" / "required" (funded queue IS the field; every seated
+# entrant duels, no heat). Everything below is inert before
+# funded_activation_block; legacy rounds keep running until it.
+# Details: docs/MINER_FUNDED_ROUNDS.md.
+funded_mode = "required"
+funded_activation_block = 8992800   # go-live ≈ Fri 2026-09-04 08:30 UTC (owner)
+funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
+# With funded_mode = "required": an unfunded boundary runs NOTHING (no king
+# leg, no pods, no manifest — validators just see no manifest and hold).
+# This is the elastic-cadence floor; the ceiling is the epoch grid itself.
+skip_unfunded_rounds = true
+max_rounds_per_day = 2                    # cadence sizing/telemetry only (grid = epoch_blocks)
+funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
+# "rent": each funded leg rents ONE pod on its payer's Lium key (king + eval
+# stay operator-funded). Consensus-inert.
+funded_pods = "rent"
+payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
+funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
+# Worker image funded pods boot — keep = the fleet's pinned digest.
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"
+funded_ready_timeout_seconds = 900.0
+# How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
+# CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
+# pod's env), the orchestrator pulls the checkpoint over the pinned ssh,
+# ingest-verifies it, and uploads it under its own identity. Needs a
+# funded_pod_image built from a --local-only-aware release. "robot": legacy
+# per-pod push-only Hub robot (revoked at teardown; Harbor expiry below).
+funded_pod_checkpoint = "harvest"
+funded_robot_duration_days = 1
+# Seats per round (0 = finalist_cap); clamped to live market capacity minus
+# the king's reserve when the probe is on. Held-back seats wait unburned.
+funded_field_cap = 8
+funded_capacity_probe = true
+funded_capacity_reserve = 1
+# Allowed GPU types, preference-ordered; each round runs entirely on the
+# most-available one (king included). Needs [training] expected_gpu = "".
+# Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
+funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
+# King pod rents JIT at the round's SKU (operator-billed); retire the
+# provisioner's final stage — the trainer ledgers and sweeps these pods.
+funded_king_rent = true
+# Direct submissions + champion-only publication (DEC-CA-0036, second half;
+# SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
+# Lium key), lives in the operator-private store below, and rides the chain as
+# an ordinary hippius payload under the reserved vault/direct namespace — no
+# validator change, no digest change. Only a THRONE publishes (champions/
+# on the manifest bucket, sn100-top-model style): "crown" immediately,
+# "delay" after N reign rounds, "dethrone" at hand-off (every policy reveals
+# a deposed vault king at latest). Losers stay private forever.
+submission_vault_dir = ""                 # "" = direct submissions off (work_root-relative)
+champion_publish = "off"
+champion_publish_delay_rounds = 2
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never
@@ -516,6 +561,12 @@ mix_tier_from_block  = 8942400   # ARMED 2026-08-27 (owner): two-tier even-domai
                                  # split live from r47's epoch — same boundary as
                                  # the recipe cut, one coordinated validator update
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
+# Scored horizon ladder (PR #241): from scored_from_block the verdict draws
+# one even-by-domain rung per horizon (rung sizes equalised). CONSENSUS —
+# same rollout as mix_from_block; every validator must run it before the
+# block. The 720 rung needs series >= 784 steps.
+scored_horizons   = [64, 256, 720]
+scored_from_block = 8992800      # = funded_activation_block
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -820,6 +871,14 @@ mode    = "online"              # online | offline | disabled
 # first training batch), and is the one field comparable across pods.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Payer-pod bench (DEC-CA-0036): each funded challenger benches on its own pod
+# after the duel (miner-billed, ~1h; the pod is torn down when the sweep ends).
+# Payer numbers are a FILTER: the top-N re-bench on the operator's king pod and
+# only the operator's numbers are signed/published; a payer number better than
+# the re-bench by more than the tolerance is a forged sweep (entry dropped).
+funded_bench = true
+funded_bench_verify_top = 1
+funded_bench_verify_tolerance = 0.02
 # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round
 # the trainer ALSO trains the king's generator from scratch (random init,
 # identical contract + seeds) strictly post-publish on the idle final pod,

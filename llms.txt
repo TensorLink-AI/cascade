@@ -104,14 +104,33 @@ Full contract: docs/INTERFACE.md. Enforced limits: chain.toml `[generator]`,
 
 Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
 
-- A round = one ~12h epoch (3600 blocks). Only commitments whose on-chain
-  pointer **revealed strictly before** the epoch boundary compete; a late reveal
+- A round = one ~12h epoch (3600 blocks). Only commitments whose on-chain pointer
+  **revealed strictly before** the epoch boundary compete; a late reveal
   auto-rolls into the next round.
-- **Heat** (screening): every eligible challenger's generator trains the fixed
-  model for ~1h at the screen size, scored on the round's held-out eval draw. A
-  leader the screen statistically separates advances alone; a tied top advances
-  as a cohort, capped at `max_finalists` (3). Standings publish the moment the
-  heat settles (`cascade heat`), including for rounds later rejected at a gate.
+- **MINER-FUNDED ROUNDS (live from block 8992800 ≈ Fri 2026-09-04 08:30 UTC,
+  DEC-CA-0036):** entering a round now requires FUNDING your own training leg
+  with your Lium API key (`cascade fund` — the leg's GPU pod rents on YOUR
+  account; the operator pays for the king, evals, and everything else). The
+  funded queue IS the field: seats fill by on-chain reveal-block seniority up
+  to the round's capacity (up to 8, clamped to live GPU-market capacity), and
+  EVERY seated entrant goes straight to the duel — the heat screen is retired
+  for funded rounds. Each round runs entirely on ONE GPU type, chosen per
+  round as the most available of ["RTX4090", "RTX3090", "L40S", "L40",
+  "A6000"]. Unfunded boundaries run nothing (the king holds). Seat
+  allocation is public (`cascade queue`, `funded/round-<id>.json`) and
+  audit-checked against the signed manifest. Infra/sold-out/rate-limit
+  failures on your pod re-queue you WITHOUT burning your entry; an invalid
+  key releases your entry (fix it and re-fund); your key is held at most 36h
+  in a sealed vault, forgotten on withdraw. One submission per hotkey
+  still holds but is spent ONLY when your leg is judged (or your generator
+  fails) — requeues never burn it. A hotkey that competed in a legacy
+  round is spent: enter the funded era with a fresh hotkey revealed after
+  the last legacy cutoff (Thu 2026-09-03 20:30 UTC). Full contract:
+  docs/MINER_FUNDED_ROUNDS.md.
+- **Heat** (screening; retired for funded rounds — pre-go-live history): every
+  eligible challenger trained ~1h at the screen size and the leader/tied top
+  advanced, capped at `max_finalists` (3). Standings still publish
+  (`cascade heat`) whenever a screen actually runs.
 - **Final** (the duel): king and finalists each train from the SAME shared round
   init (random at generation 0; the promoted cascade checkpoint after a
   promotion — the live case today) with identical seeds, budget (~3h as a fixed
@@ -164,26 +183,44 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
    it as `generator_artifact_unreachable`. Commit from this repo's pinned
    environment (`bittensor==10.5.0`) — older SDKs write reveals the subnet
    cannot decode and you are silently skipped.
-8. **Time and confirm**: `cascade round` shows the live countdown to the
+8. **Fund your training leg** (required once funded rounds are live —
+   block 8992800, ≈ Fri 2026-09-04 08:30 UTC): after your reveal lands,
+   `export LIUM_API_KEY=sk-…` (env only, never argv) and
+   `cascade fund https://<operator-intake> --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
+   Your hotkey must be REGISTERED on the subnet and the ref must match your
+   revealed commitment. The leg's pod rents on your Lium account only when
+   your seat comes up (budget ~4h: the 3h leg plus ~1h benching your own
+   checkpoint on that pod after the duel); requeues never burn your entry, and
+   `cascade fund … --withdraw` exits a still-queued entry (the operator
+   forgets your key). Watch your seat with `cascade queue` (add
+   `--intake <url>` for the live queue).
+9. **Time and confirm**: `cascade round` shows the live countdown to the
    submission deadline, the round stage, and your commit landing (`● new`);
    `cascade reveal-status <hotkey> --watch` confirms the reveal beat the
    boundary. Re-deploy any time — the latest pre-cutoff reveal per hotkey
    competes; a missed reveal rolls forward without burning your submission.
-9. **Read results**: `cascade heat --hotkey <you>` (your screening rank, gap to
+10. **Read results**: `cascade heat --hotkey <you>` (your screening rank, gap to
    the leader, raw CRPS/MASE, published as soon as the heat settles),
    `cascade duel` (the full signed verdict once the round settles), the public
    training logs (`logs/round-<id>/…jsonl`; `data_wait_frac` high = your
    generator was too slow, `host_bench_tokens_per_s` low = the pod was slow),
    and `cascade-audit latest` to verify any round yourself.
 
-Losing every heat while iterating is normal: the pool is broad real-world data.
-Widen the prior (mix families) rather than fitting one shape.
+Losing duels while iterating is normal: the pool is broad real-world data.
+Widen the prior (mix families) rather than fitting one shape — and under
+funded rounds, iterate locally (`cascade score`) BEFORE funding a leg: every
+seat you take bills your own key for ~3h of GPU.
 
 ## Key configuration values (chain.toml, shipped)
 
 - netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 3600 blocks ≈ 12h
-- heat: 1h train budget, scored on the round's eval draw; separated leader
-  advances alone, tied cohort capped at `max_finalists` (3)
+- funded rounds (from block 8992800): `funded_mode = "required"`,
+  `funded_pods = "rent"` (your leg bills your Lium key), field cap 8 clamped
+  to live GPU-market capacity, GPU type per round from
+  ["RTX4090", "RTX3090", "L40S", "L40", "A6000"], king rents JIT
+  operator-billed, unfunded boundaries skip
+- heat (pre-funded-era): 1h train budget; separated leader advanced alone,
+  tied cohort capped at `max_finalists` (3)
 - eval: jittered ~1200-window draw per round (`mix_target_windows`) from the
   private rotating pool — the domain mix re-rolls every round
 - final: 3h token-budget train per side, Toto2-4M from the shared round init
@@ -200,6 +237,7 @@ Widen the prior (mix families) rather than fitting one shape.
 
 - [README](README.md): why compete on data, how a round works, roadmap, console scripts
 - [docs/MINER.md](docs/MINER.md): the complete miner operator walkthrough (fork → verify → score → register → deploy → confirm), timed-reveal threat model, failure table
+- [docs/MINER_FUNDED_ROUNDS.md](docs/MINER_FUNDED_ROUNDS.md): funded rounds — the funding contract, queue/seniority rules, failure classes, and the operator runbook
 - [docs/INTERFACE.md](docs/INTERFACE.md): the DataGenerator submission contract (the code you must write)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): end-to-end flow, trust model, the controlled-experiment invariant
 - [docs/AUDIT.md](docs/AUDIT.md): verify published rounds with cascade-audit (no wallet/GPU for tiers 0–1)
