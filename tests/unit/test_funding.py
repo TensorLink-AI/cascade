@@ -458,3 +458,60 @@ def test_touch_refreshes_queued_last_active_only(tmp_path):
     # A touched entry survives an expiry sweep that would otherwise kill it.
     q2 = Q(tmp_path / "q.json", clock=clock, entry_ttl_seconds=400)
     assert q2.expire_stale() == 0 or q2.get(HK_A).status == "queued"
+
+
+# ── sealed vault at rest (review 2026-09-02, PRISM's sealed-payer shape) ─────
+
+
+def test_vault_seals_at_rest_and_hydrates_with_the_key(tmp_path):
+    import json
+    import os
+
+    key = os.urandom(32)
+    v = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    v.insert(HK_A, "sk-live-secret")
+    raw = json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+    assert "sealed" in raw and "api_key" not in raw
+    assert "sk-live-secret" not in (tmp_path / "pv" / f"{HK_A}.json").read_text()
+    # Same key (the trainer's process) hydrates it; a wrong key skips it.
+    v2 = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert v2.hydrate() == 1 and v2.get(HK_A) == "sk-live-secret"
+    v3 = PayerKeyVault(dir=tmp_path / "pv", seal_key=os.urandom(32))
+    assert v3.hydrate() == 0 and v3.get(HK_A) is None
+    # Associated data binds the blob to its hotkey: a renamed file fails.
+    (tmp_path / "pv" / f"{HK_A}.json").rename(tmp_path / "pv" / f"{HK_B}.json")
+    v4 = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert v4.hydrate() == 0
+
+
+def test_vault_reads_legacy_plaintext_and_reseals_on_insert(tmp_path, monkeypatch):
+    import json
+    import os
+
+    monkeypatch.delenv("CASCADE_VAULT_KEY_FILE", raising=False)
+    plain = PayerKeyVault(dir=tmp_path / "pv")          # no key → legacy form
+    assert not plain.sealed
+    plain.insert(HK_A, "sk-old")
+    assert "api_key" in json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+    key = os.urandom(32)
+    sealed = PayerKeyVault(dir=tmp_path / "pv", seal_key=key)
+    assert sealed.hydrate() == 1 and sealed.get(HK_A) == "sk-old"
+    assert sealed.refresh(HK_A)                          # re-seals the legacy entry
+    assert "sealed" in json.loads((tmp_path / "pv" / f"{HK_A}.json").read_text())
+
+
+def test_seal_key_file_forms(tmp_path, monkeypatch):
+    import os
+
+    from cascade.funding.vault import load_seal_key
+
+    raw = os.urandom(32)
+    (tmp_path / "k.raw").write_bytes(raw)
+    (tmp_path / "k.hex").write_text(raw.hex())
+    (tmp_path / "k.bad").write_bytes(b"short")
+    assert load_seal_key(tmp_path / "k.raw") == raw
+    assert load_seal_key(tmp_path / "k.hex") == raw
+    with pytest.raises(ValueError):
+        load_seal_key(tmp_path / "k.bad")
+    monkeypatch.setenv("CASCADE_VAULT_KEY_FILE", str(tmp_path / "k.hex"))
+    assert PayerKeyVault(dir=None).sealed

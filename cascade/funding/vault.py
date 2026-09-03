@@ -15,23 +15,74 @@ process except as the ``LIUM_API_KEY`` env of a rent subprocess
 (``cascade.provision.core.LiumProvider``).
 
 File format: one ``<hotkey>.json`` per entry under ``dir`` (mode 0600, dir
-0700) holding ``{"api_key": …, "stored_at": <unix>}``. Plaintext-on-disk
-matches the repo's existing posture for the operator's own key
-(``.env.provisioner``); the protection is file mode + an operator-local path
-that must stay off git and off any rsync'd pod tree.
+0700). With a seal key configured (``CASCADE_VAULT_KEY_FILE`` → 32 raw bytes
+or 64 hex chars; the same file on the intake and the trainer) the entry is
+**sealed at rest** — ``{"sealed": <b64 nonce||ciphertext||tag>, "stored_at":
+<unix>, "v": 1}`` under AES-256-GCM with the hotkey as associated data, so a
+copied vault directory (backup, disk image) is useless without the key file
+(PRISM's ``prism-lium-payer/sealed`` shape). Without a seal key the legacy
+plaintext ``{"api_key": …, "stored_at": …}`` form is written, protected by
+file mode alone; legacy files still hydrate when a key is later configured
+and are re-sealed on their next insert/refresh.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import os
 import re
+import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["DEFAULT_TTL_SECONDS", "PayerKeyVault"]
+__all__ = ["DEFAULT_TTL_SECONDS", "PayerKeyVault", "VAULT_KEY_FILE_ENV", "load_seal_key"]
+
+log = logging.getLogger("cascade.funding.vault")
+
+VAULT_KEY_FILE_ENV = "CASCADE_VAULT_KEY_FILE"
+
+
+def load_seal_key(path: str | os.PathLike | None = None) -> bytes | None:
+    """The 32-byte vault seal key from ``path`` (or ``$CASCADE_VAULT_KEY_FILE``),
+    accepting raw bytes or 64 hex characters; ``None`` when unconfigured.
+    A configured-but-unreadable key fails loud: silently falling back to
+    plaintext would be the worst outcome."""
+    p = Path(path) if path else (Path(os.environ[VAULT_KEY_FILE_ENV])
+                                 if os.environ.get(VAULT_KEY_FILE_ENV) else None)
+    if p is None:
+        return None
+    raw = p.read_bytes()
+    text = raw.strip()
+    if len(text) == 64 and all(c in b"0123456789abcdefABCDEF" for c in text):
+        return bytes.fromhex(text.decode())
+    if len(raw) != 32:
+        raise ValueError(f"vault seal key {p} must be 32 raw bytes or 64 hex chars "
+                         f"(got {len(raw)} bytes)")
+    return raw
+
+
+def _seal(key: bytes, hotkey: str, api_key: str) -> str:
+    from Crypto.Cipher import AES  # pycryptodome, via the chain extra
+
+    nonce = secrets.token_bytes(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    cipher.update(hotkey.encode())
+    ct, tag = cipher.encrypt_and_digest(api_key.encode())
+    return base64.b64encode(nonce + ct + tag).decode()
+
+
+def _unseal(key: bytes, hotkey: str, blob: str) -> str:
+    from Crypto.Cipher import AES
+
+    raw = base64.b64decode(blob)
+    nonce, ct, tag = raw[:12], raw[12:-16], raw[-16:]
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    cipher.update(hotkey.encode())
+    return cipher.decrypt_and_verify(ct, tag).decode()
 
 # 36h, the PRISM default: covers a 3h train leg plus every in-round requeue
 # plus a full round of queue wait, with margin. An entry older than this that
@@ -56,15 +107,30 @@ class PayerKeyVault:
     dir: Path | None = None
     ttl_seconds: float = DEFAULT_TTL_SECONDS
     clock: Callable[[], float] = time.time
+    # AES-256-GCM key sealing entries at rest; None ⇒ resolve from
+    # $CASCADE_VAULT_KEY_FILE at construction, and plaintext when unset.
+    seal_key: bytes | None = field(default=None, repr=False)
     # hotkey → (api_key, stored_at). Not in repr — a dataclass repr that
     # printed this dict would put every key one log line away from leaking.
     _entries: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        if self.seal_key is None:
+            self.seal_key = load_seal_key()
+        if self.seal_key is not None and len(self.seal_key) != 32:
+            raise ValueError("vault seal key must be 32 bytes")
         if self.dir is not None:
             self.dir = Path(self.dir)
             self.dir.mkdir(parents=True, exist_ok=True)
             os.chmod(self.dir, 0o700)
+            if self.seal_key is None:
+                log.warning("payer vault %s is PLAINTEXT at rest (no %s) — set a "
+                            "seal key on the intake and the trainer before mainnet",
+                            self.dir, VAULT_KEY_FILE_ENV)
+
+    @property
+    def sealed(self) -> bool:
+        return self.seal_key is not None
 
     # ── writes ───────────────────────────────────────────────────────────────
 
@@ -80,9 +146,14 @@ class PayerKeyVault:
             tmp = path.with_suffix(".json.tmp")
             # Create 0600 from the first byte — write_text + chmod leaves a
             # umask-default window with the key already on disk.
+            if self.seal_key is not None:
+                record = {"sealed": _seal(self.seal_key, hotkey, api_key),
+                          "stored_at": now, "v": 1}
+            else:
+                record = {"api_key": api_key, "stored_at": now}
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(json.dumps({"api_key": api_key, "stored_at": now}))
+                f.write(json.dumps(record))
             os.replace(tmp, path)
 
     def refresh(self, hotkey: str) -> bool:
@@ -143,9 +214,21 @@ class PayerKeyVault:
         for path in sorted(self.dir.glob("*.json")):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-                api_key = str(raw["api_key"])
                 stored_at = float(raw["stored_at"])
+                if "sealed" in raw:
+                    if self.seal_key is None:
+                        log.error("vault entry %s is sealed but no seal key is "
+                                  "configured (%s) — skipped", path.name,
+                                  VAULT_KEY_FILE_ENV)
+                        continue
+                    api_key = _unseal(self.seal_key, path.stem, str(raw["sealed"]))
+                else:
+                    api_key = str(raw["api_key"])   # legacy plaintext entry
             except (OSError, ValueError, KeyError):
+                continue
+            except Exception as e:  # noqa: BLE001 — wrong key / tampered blob
+                log.error("vault entry %s could not be unsealed (%s) — skipped",
+                          path.name, type(e).__name__)
                 continue
             if not api_key or now - stored_at > self.ttl_seconds:
                 path.unlink(missing_ok=True)
