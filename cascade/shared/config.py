@@ -222,12 +222,27 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
 
 
 def validate_duel_field_cap(value: object) -> int:
-    """``[round] duel_field_cap`` must be >= 1: a duel-only round with a zero
-    cap would seat nobody and publish king-only manifests indefinitely."""
+    """``[round] duel_field_cap``: 0 (every screened entrant seats, the fleet
+    bounds the round) or a positive explicit cap; negative is a typo."""
     cap = int(value)  # type: ignore[arg-type]
-    if cap < 1:
-        raise ValueError(f"duel_field_cap={cap} invalid; must be >= 1")
+    if cap < 0:
+        raise ValueError(f"duel_field_cap={cap} invalid; must be >= 0")
     return cap
+
+
+# Fixed per-round overhead a duel-only round pays outside its training legs:
+# rental + boot at the margin, checkpoint push, manifest. Hours.
+DUEL_ROUND_OVERHEAD_HOURS = 1.5
+
+
+def duel_waves_that_fit(epoch_hours: float, leg_hours: float) -> int:
+    """Back-to-back full-budget legs ONE lane can finish inside an epoch after
+    :data:`DUEL_ROUND_OVERHEAD_HOURS`. Never below 1: a lane always runs one
+    leg (a grid shorter than a leg is a configuration to fix, not a crash).
+    Shared by the fleet sizer and the trainer's seating so both agree."""
+    if leg_hours <= 0:
+        return 1
+    return max(1, int((float(epoch_hours) - DUEL_ROUND_OVERHEAD_HOURS) // float(leg_hours)))
 
 
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
@@ -744,18 +759,21 @@ class RoundConfig:
     # ── Duel-only rounds (no heat), block-gated ──────────────────────────────
     # From the first epoch boundary >= duel_from_block the heat screen is
     # skipped: the screened field is seated straight into the duel, earliest
-    # reveal block first, up to duel_field_cap challengers. Entrants beyond
-    # the cap wait for a later round WITHOUT spending their submission; the
-    # seated field burns at the settle as before, and the king plus every
-    # seated challenger train the full [training] budget. The validator
-    # judges the whole cohort under alpha/k (DEC-CA-0012) with k = the seated
-    # count — nothing validator-side changes. 0 = never (heat → final every
-    # round). Trainer-side: [round] is outside contract_digest.
+    # reveal block first. Entrants the round cannot seat wait for a later
+    # round WITHOUT spending their submission; the seated field burns at the
+    # settle as before, and the king plus every seated challenger train the
+    # full [training] budget. The validator judges the whole cohort under
+    # alpha/k (DEC-CA-0012) with k = the seated count — nothing
+    # validator-side changes. 0 = never (heat → final every round).
+    # Trainer-side: [round] is outside contract_digest.
     duel_from_block: int = 0
-    # Challengers seated per duel-only round. Legs beyond the final fleet's
-    # lane count queue on the same pods, so a round's training wall clock is
-    # ceil((1 + cap) / lanes) × [training] target_train_hours.
-    duel_field_cap: int = 3
+    # 0 = every screened entrant seats; the provisioner sizes the final fleet
+    # to fit the field inside the epoch (legs queue on each lane, see
+    # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
+    # the rented lanes can finish before the boundary — only that physical
+    # overflow carries to the next round. A positive value is an explicit
+    # per-round cap on top of that.
+    duel_field_cap: int = 0
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
     # already entered a round's heat is never screened again — it must re-register
     # (a new UID, paying the registration cost) to resubmit, so a miner cannot
@@ -897,6 +915,15 @@ class RoundConfig:
         if self.duel_from_block <= 0 or block is None:
             return False
         return int(block) >= self.duel_from_block
+
+    def duel_seats(self, *, lanes: int, epoch_hours: float, leg_hours: float) -> int:
+        """Challengers a duel-only round seats: the explicit cap when set,
+        else what ``lanes`` can finish inside the epoch — one leg per lane
+        per wave, the king taking one of them."""
+        if self.duel_field_cap > 0:
+            return int(self.duel_field_cap)
+        waves = duel_waves_that_fit(epoch_hours, leg_hours)
+        return max(1, max(1, int(lanes)) * waves - 1)
 
 
 @dataclass(frozen=True)
@@ -1713,7 +1740,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
-            duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 3)),
+            duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),

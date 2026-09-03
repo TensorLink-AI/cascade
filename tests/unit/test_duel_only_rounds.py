@@ -1,9 +1,10 @@
 """Duel-only rounds (``[round] duel_from_block`` / ``duel_field_cap``).
 
 From the gate block the heat is skipped: the screened field seats into the
-duel in reveal order up to the cap, the overflow waits with its submission
-intact, and the provisioner rents no heat fleet. Inert at 0 — every pre-gate
-path is byte-identical to the heat → final pipeline.
+duel in reveal order — as many as the fleet's lanes can finish inside the
+epoch (or an explicit cap) — the overflow waits with its submission intact,
+and the provisioner rents no heat fleet sized to fit the field. Inert at 0 —
+every pre-gate path is byte-identical to the heat → final pipeline.
 """
 
 from __future__ import annotations
@@ -84,11 +85,13 @@ def _screen_must_not_run(*a, **k):
 
 @pytest.fixture()
 def duel_cfg(cfg):
-    """Gate at block 1000 with two seats; the legacy screen mechanics
+    """Gate at block 1000, no explicit cap: a local final (1 lane) on a 12h
+    grid with 3h legs fits 3 waves ⇒ king + 2 seats. Legacy screen mechanics
     (single finalist, inert tie cap) below the gate."""
+    assert cfg.training.target_train_hours == 3.0
     return replace(cfg, round=replace(cfg.round, max_finalists=1, finalists=1,
-                                      duel_from_block=1000, duel_field_cap=2,
-                                      # flat 3600 grid: block 5000 ⇒ boundary 3600
+                                      duel_from_block=1000, duel_field_cap=0,
+                                      # flat 3600 grid (12h): block 5000 ⇒ boundary 3600
                                       epoch_blocks_prev=0, epoch_activation_block=0))
 
 
@@ -115,7 +118,7 @@ def test_duel_knobs_parse_validate_and_gate(tmp_path):
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     cfg = load_chain_config(p)
-    assert cfg.round.duel_from_block == 0 and cfg.round.duel_field_cap == 3
+    assert cfg.round.duel_from_block == 0 and cfg.round.duel_field_cap == 0
     assert not cfg.round.duel_only(10**9)          # unset gate: never
 
     p.write_text(bare.replace(
@@ -125,7 +128,7 @@ def test_duel_knobs_parse_validate_and_gate(tmp_path):
     assert cfg.round.duel_only(5000) and cfg.round.duel_only(9000)
     assert not cfg.round.duel_only(4999) and not cfg.round.duel_only(None)
 
-    p.write_text(bare.replace("\n[round]\n", "\n[round]\nduel_field_cap = 0\n", 1))
+    p.write_text(bare.replace("\n[round]\n", "\n[round]\nduel_field_cap = -1\n", 1))
     with pytest.raises(ValueError, match="duel_field_cap"):
         load_chain_config(p)
 
@@ -135,6 +138,20 @@ def test_duel_knobs_parse_validate_and_gate(tmp_path):
     if shipped.round.duel_from_block:
         assert shipped.round.duel_from_block % shipped.round.epoch_blocks == 0
         assert shipped.eval.scored_from_block in (0, shipped.round.duel_from_block)
+
+
+def test_seats_follow_the_lanes_and_the_epoch():
+    from cascade.shared.config import RoundConfig, duel_waves_that_fit
+
+    assert duel_waves_that_fit(12.0, 3.0) == 3        # (12 − 1.5) // 3
+    assert duel_waves_that_fit(3.0, 3.0) == 1         # never below one leg
+    assert duel_waves_that_fit(12.0, 0.0) == 1
+    auto = RoundConfig(duel_field_cap=0)
+    assert auto.duel_seats(lanes=4, epoch_hours=12.0, leg_hours=3.0) == 11   # 4×3 − king
+    assert auto.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0) == 2
+    assert auto.duel_seats(lanes=0, epoch_hours=3.0, leg_hours=3.0) == 1     # floor: one seat
+    capped = RoundConfig(duel_field_cap=5)
+    assert capped.duel_seats(lanes=4, epoch_hours=12.0, leg_hours=3.0) == 5
 
 
 # ── the round: seats, overflow, burn, marker ─────────────────────────────────
@@ -176,12 +193,20 @@ def test_pre_gate_round_keeps_the_heat_screen(duel_cfg, tmp_path, monkeypatch):
     assert _burned(duel_cfg, tmp_path) == {"b", "c", "d"}   # legacy: everyone screened burns
 
 
-def test_duel_only_field_within_the_cap_seats_everyone(duel_cfg, tmp_path, monkeypatch):
+def test_duel_only_field_within_the_seats_seats_everyone(duel_cfg, tmp_path, monkeypatch):
     runner = _runner(duel_cfg, tmp_path, monkeypatch, screen_fn=_screen_must_not_run)
     commits = _field()[:3]                          # a (king), b, c
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=5000)
     assert sorted(e.miner_hotkey for e in manifest.entries_for_role("challenger")) == ["b", "c"]
     assert _burned(duel_cfg, tmp_path) == {"b", "c"}
+
+
+def test_explicit_cap_overrides_the_fleet_derived_seats(duel_cfg, tmp_path, monkeypatch):
+    one = replace(duel_cfg, round=replace(duel_cfg.round, duel_field_cap=1))
+    runner = _runner(one, tmp_path, monkeypatch, screen_fn=_screen_must_not_run)
+    manifest = runner.run_round(_field(), king_hotkey="a", base_seed=1, block=5000)
+    assert [e.miner_hotkey for e in manifest.entries_for_role("challenger")] == ["c"]
+    assert _burned(one, tmp_path) == {"c"}
 
 
 def test_duel_only_retry_after_settle_reuses_the_seated_field(duel_cfg, tmp_path, monkeypatch):
@@ -232,7 +257,7 @@ def test_duel_only_standings_name_the_waiting_entrants(duel_cfg, tmp_path, monke
     doc = json.loads(store.objects["status/heat.json"])
     assert doc["round_id"] == "1" and doc["screened"] == 2
     assert "duel-only" in doc["no_screen_reason"]
-    assert "1 wait" in doc["no_screen_reason"]
+    assert "1 wait" in doc["no_screen_reason"] and "cap" not in doc["no_screen_reason"]
     skipped = json.dumps(doc["skipped"])
     assert "waiting" in skipped and '"d"' in skipped
 
@@ -260,9 +285,12 @@ def test_plan_payload_marks_duel_only_rounds(duel_cfg, tmp_path):
     payload = _plan_payload(duel_cfg, _Client(eb + 100), tmp_path)
     assert payload["next_boundary_block"] == 2 * eb        # past the gate at 1000
     assert payload["duel_only"] is True
-    assert payload["finalists"] == 2                        # min(cap, 3 screened)
+    assert payload["finalists"] == 3                        # everyone: the fleet sizes to fit
     assert payload["max_finalists"] == 0
     assert payload["screened_challengers"] == 3
+
+    capped = replace(duel_cfg, round=replace(duel_cfg.round, duel_field_cap=2))
+    assert _plan_payload(capped, _Client(eb + 100), tmp_path)["finalists"] == 2
 
     legacy = replace(duel_cfg, round=replace(duel_cfg.round, duel_from_block=10**9))
     payload = _plan_payload(legacy, _Client(eb + 100), tmp_path)
@@ -272,22 +300,26 @@ def test_plan_payload_marks_duel_only_rounds(duel_cfg, tmp_path):
 
 
 def test_size_fleet_no_heat_rents_no_heat_pods_and_queues_the_final():
-    from cascade.provision.policy import size_fleet
+    from cascade.provision.policy import StagePolicy, size_fleet
     from tests.unit.test_provision_loop import _policy
 
     pol = _policy()                                          # final: 2× L40S pods, 2 GPU each
-    plan = size_fleet(24, 7, 1.0, 12.0, 3.0, pol, no_heat=True)
+    # 24 entrants + king = 25 legs; a 12h epoch fits 3 legs per lane ⇒ 9 lanes
+    plan = size_fleet(24, 24, 1.0, 12.0, 3.0, pol, no_heat=True)
     assert (plan.heat.pods, plan.heat.slots) == (0, 0)
-    assert plan.final.slots == 8                             # king + 7 seats
-    assert plan.final.pods == 2                              # clamped: legs queue over 4 lanes
+    assert plan.final.slots == 9
+    assert plan.final.pods == 2                              # clamped by max_pods: legs queue
+    roomy = _policy(final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=8,
+                                      providers=("lium",), max_price_hr=3.0))
+    assert size_fleet(24, 24, 1.0, 12.0, 3.0, roomy, no_heat=True).final.pods == 5
     assert size_fleet(24, 7, 1.0, 12.0, 3.0, pol).heat.pods > 0   # legacy path untouched
     assert size_fleet(0, 0, 1.0, 12.0, 3.0, pol, no_heat=True).final.slots == 1
 
 
 def test_provisioner_rents_the_final_at_the_margin_for_a_duel_only_plan(tmp_path):
     """With no heat fleet there is nothing to defer the final behind: the
-    margin trigger rents it directly, sized 1 + seats, even under the JIT
-    (``final_rent_on = "heat_complete"``) policy."""
+    margin trigger rents it directly, sized to fit king + field inside the
+    epoch, even under the JIT (``final_rent_on = "heat_complete"``) policy."""
     from cascade.provision.state import load_state
     from tests.unit.test_provision_loop import PLAN, FakeProvider, _policy, cycle, make_loop
 
@@ -298,6 +330,7 @@ def test_provisioner_rents_the_final_at_the_margin_for_a_duel_only_plan(tmp_path
                         policy=_policy(max_spend_per_round=100.0),
                         final_rent_on="heat_complete")
     cycle(loop)
-    assert prov.launched == ["cascade-900-final-0", "cascade-900-final-1"]   # 4 slots / 2 per pod
+    # 3h epoch, 0.25h legs ⇒ 6 legs per lane: 4 legs need one 2-GPU pod.
+    assert prov.launched == ["cascade-900-final-0"]
     assert not any("heat" in name for name in prov.launched)
     assert load_state(tmp_path / "state.json").final_pending is False

@@ -664,12 +664,14 @@ always scored on windows that have never been published.
 ## Duel-only rounds (from block 8992800)
 
 From block 8992800 (≈ 2026-09-04 08:30 UTC) rounds run without a heat. After
-the duplicate screen, the field seats straight into the duel in **reveal
-order**, up to `duel_field_cap` (7) challengers per round; the rest wait for
-a later round with their submission intact — `cascade heat` lists them as
-`waiting`, and they seat automatically when their turn comes (no re-commit,
-no burn). Every seated challenger trains the full final budget on the same
-fleet as the king, and the whole seated cohort is judged under the α/k rule.
+the duplicate screen, the whole field seats straight into the duel in
+**reveal order** and every challenger trains the full final budget on the
+same fleet as the king; the fleet is sized to fit the field inside the epoch.
+When the field outgrows what the rented lanes can finish before the boundary,
+the latest reveals wait for the next round with their submission intact —
+`cascade heat` lists them as `waiting`, and they seat automatically when their
+turn comes (no re-commit, no burn). The whole seated cohort is judged under
+the α/k rule, so a bigger cohort means a stricter per-challenger bound.
 From the same block the verdict is scored on a horizon ladder (64 / 256 / 720
 steps, one even-by-domain draw each) instead of the single 64-step horizon.
 

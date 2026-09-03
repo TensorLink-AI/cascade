@@ -389,16 +389,19 @@ commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals bef
 one_submission_per_hotkey = true
 # ── Duel-only rounds (no heat), block-gated ──────────────────────────────────
 # From the first epoch boundary >= duel_from_block the heat screen is skipped:
-# the screened field seats straight into the duel in reveal order, up to
-# duel_field_cap challengers; the overflow waits for a later round without
-# spending its submission. King + every seated challenger train the full
-# [training] budget on the final fleet; legs beyond the fleet's lanes queue on
-# the same pods (2 L40S pods × 2 lanes: 1 + 7 legs = 2 waves ≈ 6h). The
-# validator judges the whole cohort under alpha/k (DEC-CA-0012, k = seated).
-# Trainer-side ([round] is outside contract_digest); the provisioner rents no
-# heat fleet for these rounds. 0 = off. Rollback = 0 + trainer restart.
+# every screened entrant seats straight into the duel in reveal order and
+# trains the full [training] budget beside the king on the L40S final fleet.
+# The provisioner rents no heat fleet and sizes the final to fit the whole
+# field inside the epoch — each lane runs floor((round_hours − 1.5h) / 3h) = 3
+# legs back to back (pods carry a one-epoch TTL) — up to its pod ceiling
+# ([provisioner.final] max_pods); the trainer seats what the rented lanes can
+# finish before the boundary and only that overflow waits for the next round,
+# without spending its submission. With 2 pods × 2 lanes that is 11 seats a
+# round; each extra 2-lane pod adds 6. The validator judges the whole cohort
+# under alpha/k (DEC-CA-0012, k = seated). Trainer-side ([round] is outside
+# contract_digest). 0 = off; rollback = 0 + trainer restart.
 duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
-duel_field_cap  = 7
+duel_field_cap  = 0         # 0 = no per-round cap (the fleet bounds the round); N = explicit cap
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never

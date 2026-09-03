@@ -202,7 +202,7 @@ tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set adv
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
 # Duel-only rounds (no heat) — see chain.toml; 0 = off. Arm on testnet first.
 duel_from_block = 0
-duel_field_cap  = 3
+duel_field_cap  = 0
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps

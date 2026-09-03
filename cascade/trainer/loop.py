@@ -1763,11 +1763,12 @@ class TrainerRunner:
             skipped += [{"hotkey": c.hotkey, "uid": c.uid, "reason": "waiting"}
                         for c in waiting]
         if heat is None and waiting is not None:
-            n = max(1, int(self.cfg.round.duel_field_cap))
+            n = screened
             reason = (f"duel-only round: {screened} entrant(s) seated in reveal "
-                      f"order (cap {n}), no heat screen")
+                      "order, no heat screen")
             if waiting:
-                reason += f"; {len(waiting)} wait for a later round"
+                reason += (f"; {len(waiting)} wait for a later round (the fleet "
+                           "seats what it can finish inside the epoch)")
         elif screened == 0:
             reason = "no eligible challengers entered the round"
             if skipped:
@@ -3113,12 +3114,15 @@ class TrainerRunner:
                            "epoch_start_block": int(screen_block),
                            "warm_start": ws_info}
         # Duel-only rounds ([round] duel_from_block): no heat — the screened
-        # field seats straight into the duel in reveal order, up to
-        # duel_field_cap; the overflow waits for a later round, unburned.
+        # field seats straight into the duel in reveal order. The seats
+        # follow the fleet: wait for the final-capable pods the provisioner
+        # rents at the margin, then seat what their lanes can finish inside
+        # the epoch; the overflow waits for a later round, unburned.
         duel_only = self.cfg.round.duel_only(screen_block)
         waiting: list[ResolvedGenerator] = []
         if duel_only and reused is None:
-            screened, waiting = self._seat_duel_field(screened, base_seed)
+            self._reload_remote_hosts(require_stage="final")
+            screened, waiting = self._seat_duel_field(screened, base_seed, screen_block)
         self._publish_stage("heat", heat_done=0, heat_total=len(screened))
         if reused is not None:
             # Retry after settle: no heat compute is re-spent and no standings
@@ -3244,19 +3248,32 @@ class TrainerRunner:
         if heats or finals:
             log.info("%s", telemetry_rollup_line(base_seed, heats, finals))
 
+    def _duel_lanes(self) -> int:
+        """Final-capable lanes the duel can dispatch on (1 for a local final)."""
+        return max(1, len(self._hosts_for("final"))) if self.remote_hosts else 1
+
+    def _epoch_hours(self, screen_block: int) -> float:
+        return effective_epoch_blocks(self.cfg.round, int(screen_block)) * 12.0 / 3600.0
+
     def _seat_duel_field(
-        self, screened: list[ResolvedGenerator], base_seed: int,
+        self, screened: list[ResolvedGenerator], base_seed: int, screen_block: int,
     ) -> tuple[list[ResolvedGenerator], list[ResolvedGenerator]]:
         """Split the screened field into ``(seated, waiting)`` for a duel-only
-        round: the earliest ``duel_field_cap`` entrants by ``(reveal_block,
-        uid)`` seat, the rest wait for a later round. Reveal order is the
-        seniority rule the heat's tie-break already uses (a UID recycles, the
-        reveal block does not)."""
-        cap = max(1, int(self.cfg.round.duel_field_cap))
+        round: the earliest entrants by ``(reveal_block, uid)`` seat, as many
+        as the fleet's lanes can finish inside the epoch (or the explicit
+        ``duel_field_cap``); the rest wait for a later round. Reveal order is
+        the seniority rule the heat's tie-break already uses (a UID recycles,
+        the reveal block does not)."""
+        lanes = self._duel_lanes()
+        seats = self.cfg.round.duel_seats(
+            lanes=lanes, epoch_hours=self._epoch_hours(screen_block),
+            leg_hours=float(self.cfg.training.target_train_hours))
         ordered = sorted(screened, key=lambda c: (c.reveal_block, c.uid))
-        seated, waiting = ordered[:cap], ordered[cap:]
-        log.info("round=%s duel-only: %d of %d challenger(s) seated (cap %d, reveal "
-                 "order)%s", base_seed, len(seated), len(ordered), cap,
+        seated, waiting = ordered[:seats], ordered[seats:]
+        how = (f"cap {self.cfg.round.duel_field_cap}" if self.cfg.round.duel_field_cap > 0
+               else f"{lanes} lane(s) fit {seats} + king inside the epoch")
+        log.info("round=%s duel-only: %d of %d challenger(s) seated (%s, reveal "
+                 "order)%s", base_seed, len(seated), len(ordered), how,
                  f"; {len(waiting)} wait for a later round: "
                  f"{[c.hotkey for c in waiting]}" if waiting else "")
         return seated, waiting
@@ -3267,11 +3284,10 @@ class TrainerRunner:
         does not fit the round is a WARNING — the cap or the fleet is
         mis-sized — but never blocks the round (the pods keep going; the
         manifest just lands late)."""
-        lanes = len(self._hosts_for("final")) if self.remote_hosts else 1
-        lanes = max(1, lanes)
+        lanes = self._duel_lanes()
         waves = -(-legs // lanes)
         hours = waves * float(self.cfg.training.target_train_hours)
-        epoch_h = effective_epoch_blocks(self.cfg.round, int(screen_block)) * 12.0 / 3600.0
+        epoch_h = self._epoch_hours(screen_block)
         level = log.warning if hours + 1.5 > epoch_h else log.info
         level("round=%s duel-only geometry: %d leg(s) over %d lane(s) = %d wave(s) "
               "× %.1fh ≈ %.1fh of training in a %.1fh round", base_seed, legs,

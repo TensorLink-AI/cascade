@@ -36,6 +36,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from ..shared.config import duel_waves_that_fit
+
 __all__ = [
     "FleetPlan",
     "SkuCandidate",
@@ -307,8 +309,11 @@ def size_fleet(
 
     ``no_heat`` (a duel-only round, ``[round] duel_from_block``): nothing is
     screened whatever the field size — the heat fleet is zero and the final
-    is sized off ``finalists`` (the trainer's seated count, already capped).
-    A final clamped by ``max_pods`` queues its legs over the pods it got.
+    is sized so that ``1 + finalists`` legs fit inside the epoch with each
+    lane running :func:`duel_waves_that_fit` legs back to back (the pods
+    carry a one-epoch TTL). A final clamped by ``max_pods`` queues its legs
+    over the pods it got; the trainer then seats only what those lanes can
+    finish and carries the rest to the next round.
     """
     if n_eligible < 0 or finalists < 0 or max_finalists < 0:
         raise ValueError("n_eligible/finalists/max_finalists must be non-negative")
@@ -339,7 +344,11 @@ def size_fleet(
     else:
         heat_slots, heat_pods = 0, 0
 
-    final_slots = 1 + finalists
+    if no_heat:
+        waves = duel_waves_that_fit(epoch_hours, final_hours)
+        final_slots = max(1, math.ceil((1 + finalists) / waves))
+    else:
+        final_slots = 1 + finalists
     # max_pods = 0 means "stage unmanaged": the operator serves it with static
     # hand-rented pods (hosts.toml static entries), so the provisioner rents none.
     if policy.final.max_pods == 0:
