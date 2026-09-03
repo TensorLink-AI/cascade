@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/cascade-logo.png" alt="cascade logo" width="280">
+</p>
+
 # cascade: SOTA time-series foundation models on Bittensor
 
 cascade is building state-of-the-art time-series foundation models (TSFM) on
