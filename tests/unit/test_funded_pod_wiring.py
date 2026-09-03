@@ -65,6 +65,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     fake._hub_robots = lambda: fake._minter
     for name in ("_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
                  "_funded_pod_credential", "_funded_pod_identity_mismatch",
+                 "_funded_checkpoint_mismatch",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity",
                  "_rent_king_host", "_teardown_operator_pod",
@@ -304,6 +305,7 @@ def _leg_runner(tmp_path, monkeypatch, *, disp):
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
     runner._funded_pod_identity_mismatch = lambda pod: None   # pinned pod answers
+    runner._funded_checkpoint_mismatch = lambda entry, contract: None   # guard passes
     seeds = SimpleNamespace(base_seed=777)
     contract = SimpleNamespace(arch_preset="toto2-4m")
     return runner, torn, seeds, contract
@@ -871,3 +873,17 @@ def test_pinned_host_key_wins_in_ssh_argv(tmp_path):
     kh = next(a for a in argv if a.startswith("UserKnownHostsFile="))
     from pathlib import Path
     assert Path(kh.split("=", 1)[1]).read_text() == "[10.0.0.9]:2222 ssh-ed25519 AAAApinned\n"
+
+
+def test_tampered_checkpoint_never_reaches_the_manifest(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    runner._funded_checkpoint_mismatch = (
+        lambda entry, contract: "forecast_wrapper.py differs from this release's copy")
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert len(disp.calls) == 1                      # it trained…
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls) == (True, "tamper")    # …but the entry is dropped as tamper
+    assert "forecast_wrapper.py differs" in msg

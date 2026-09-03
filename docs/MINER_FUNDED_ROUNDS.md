@@ -233,6 +233,20 @@ in code:
   custom-image pod — only the rent caller's keys are injected — and backups
   are confined to `/workspace`, so replacing the pod is the remaining move,
   and this catches it.)
+- **A checkpoint is data, never code.** Every scorer (validator verdict,
+  king-pod bench, audit replay, heat screen) used to import and execute the
+  `forecast_wrapper.py` / `model.py` shipped INSIDE the checkpoint and build
+  the model from its `config.json` — sound while only operator pods produced
+  checkpoints, arbitrary code execution on every validator once a miner's pod
+  does. `cascade/eval/checkpoint_guard.py` now requires the two files to be
+  byte-identical to the release's own copies (any other `.py` is refused),
+  `config.json` to equal the contract's model config, and the safetensors
+  HEADER (names/dtypes/shapes) plus file size to match the pinned model —
+  before a tensor is allocated. The trainer runs the same guard on every
+  funded leg's checkpoint before it can enter the manifest (a deviation
+  settles as `tamper`); validators/audit/bench run it again on their side.
+  Honest checkpoints pass byte-for-byte; nothing about which checkpoints
+  bench or promote changes.
 - Still open vs PRISM: their pod holds NO credential at all (the master
   SSH-harvests the checkpoint through a secure receive). Ours needs the
   pinned worker to gain a local-only mode — the next worker-image release —

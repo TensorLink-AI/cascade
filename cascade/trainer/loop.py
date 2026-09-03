@@ -1815,6 +1815,30 @@ class TrainerRunner:
         )
         return host, pod
 
+    def _funded_checkpoint_mismatch(self, entry, contract) -> str | None:
+        """Why a funded leg's published checkpoint fails the ingest guard, or
+        ``None`` when it passes (cascade.eval.checkpoint_guard: repo-identical
+        code, contract config, pinned weight shapes and size). Unfetchable
+        counts as a mismatch — an entry we cannot inspect is not published."""
+        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
+        from ..shared.manifest import parse_trained_pointer
+
+        pointer = str(getattr(entry, "trained_pointer", "") or "")
+        ref = parse_trained_pointer(pointer)
+        if ref is None:
+            return f"malformed trained_pointer {pointer!r}"
+        try:
+            dest = (self.work_root / "_funded_ckpt_guard"
+                    / HubRef.parse(ref).digest.replace(":", "-"))
+            fetch_from_hub(ref, dest, HubConfig.from_storage(self.cfg.storage))
+            verify_checkpoint(dest, contract)
+        except CheckpointTampered as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001 — unfetchable ⇒ not publishable
+            return f"could not fetch/inspect the checkpoint: {str(e)[:200]}"
+        return None
+
     def _funded_pod_identity_mismatch(self, pod) -> str | None:
         """Why the pod answering to ``pod.instance_id`` is not the one we
         rented, or ``None`` when it is. Names are owner-chosen and reusable;
@@ -2039,6 +2063,13 @@ class TrainerRunner:
             why = self._funded_pod_identity_mismatch(pod)
             if why:
                 raise _FundedTamper(f"after training: {why}")
+            # The checkpoint itself is untrusted data off a miner's pod: fetch
+            # it and run the ingest guard NOW, before it can reach the
+            # manifest — validators and the king pod's bench must never see a
+            # checkpoint whose code/config/weights deviate from the contract.
+            why = self._funded_checkpoint_mismatch(entry, contract)
+            if why:
+                raise _FundedTamper(f"checkpoint: {why}")
             return entry
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
