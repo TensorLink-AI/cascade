@@ -24,6 +24,19 @@ _pool_real/
 _vpool_cache/
 _eval_pool/
 _train_work/
+_eval_ckpts/
+_bench_ckpts/
+_funded_harvest/
+_funded_ckpt_guard/
+_vault_dispatch/
+wandb/
+
+# Payer-key vaults and local orchestrator state — MUST never land in the image
+_payer_vault/
+payer_vault/
+cascade_state*.json
+warm_start_init*.json
+run_*.sh
 
 # Local state, scratch, logs
 *.db
