@@ -626,11 +626,14 @@ class ProvisionerLoop:
             # pre-phased fleet and the budget breaker cover the worst case
             # (absent from a pre-cap plan payload ⇒ 0 ⇒ finalists alone).
             max_finalists=int(payload.get("max_finalists", 0)),
+            # Duel-only round: no heat fleet; the final seats king + cap.
+            no_heat=bool(payload.get("duel_only", False)),
         )
-        log.info("round %d plan: eligible=%s screened=%s → heat %d pod(s)/%d slot(s), "
+        log.info("round %d plan: eligible=%s screened=%s%s → heat %d pod(s)/%d slot(s), "
                  "final %d pod(s)/%d slot(s)",
                  round_id, payload["eligible_challengers"],
                  payload.get("screened_challengers", "n/a"),
+                 " (duel-only)" if payload.get("duel_only") else "",
                  fleet.heat.pods, fleet.heat.slots, fleet.final.pods, fleet.final.slots)
 
         wants: dict[str, int] = {}
@@ -1005,7 +1008,8 @@ class ProvisionerLoop:
                 refleet = size_fleet(_heat_field(plan),
                                      int(plan["finalists"]), heat_hours,
                                      remaining, self.final_hours, self.policy,
-                                     max_finalists=int(plan.get("max_finalists", 0)))
+                                     max_finalists=int(plan.get("max_finalists", 0)),
+                                     no_heat=bool(plan.get("duel_only", False)))
                 if refleet.heat.pods > 0:
                     wants["heat"] = refleet.heat.slots
                 else:

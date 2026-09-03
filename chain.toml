@@ -387,6 +387,21 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
+# ── Duel-only rounds (no heat), block-gated ──────────────────────────────────
+# From the first epoch boundary >= duel_from_block the heat screen is skipped:
+# every screened entrant seats straight into the duel in reveal order and
+# trains the full [training] budget beside the king on the L40S final fleet.
+# The provisioner rents no heat fleet and sizes the final to fit the whole
+# field inside the epoch — each lane runs floor((round_hours − 1.5h) / 3h) = 3
+# legs back to back (pods carry a one-epoch TTL) — up to its pod ceiling
+# ([provisioner.final] max_pods); the trainer seats what the rented lanes can
+# finish before the boundary and only that overflow waits for the next round,
+# without spending its submission. With 2 pods × 2 lanes that is 11 seats a
+# round; each extra 2-lane pod adds 6. The validator judges the whole cohort
+# under alpha/k (DEC-CA-0012, k = seated). Trainer-side ([round] is outside
+# contract_digest). 0 = off; rollback = 0 + trainer restart.
+duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
+duel_field_cap  = 0         # 0 = no per-round cap (the fleet bounds the round); N = explicit cap
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never
@@ -406,7 +421,10 @@ one_submission_per_hotkey = true
 dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
-dedup_config_only_enforce = false
+# Block-gated: with dedup_config_only_from_block set the tier drops only in
+# rounds whose epoch boundary is at/after it (shadow before). Trainer-side.
+dedup_config_only_enforce = true
+dedup_config_only_from_block = 8992800   # = [round] duel_from_block
 # Cost caps: tokenizer input is attacker-chosen up to max_repo_mb (~2s/MB);
 # the retained-token cap bounds the config_only delta measurement, the only
 # quadratic pass left. Field repos are ~100KB / 7-11k tokens (~40x headroom).
@@ -516,6 +534,14 @@ mix_tier_from_block  = 8942400   # ARMED 2026-08-27 (owner): two-tier even-domai
                                  # split live from r47's epoch — same boundary as
                                  # the recipe cut, one coordinated validator update
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
+# Scored horizon ladder: from scored_from_block the verdict draws one
+# even-by-domain rung per horizon over the round's snapshot (rung sizes
+# equalised, n_windows total; the 720 rung needs series >= 784 steps) and the
+# pooled rows go through the unchanged paired bootstrap. CONSENSUS — same
+# rollout as mix_from_block: every validator must run this release before the
+# block. [] / 0 = single-horizon rule.
+scored_horizons   = [64, 256, 720]
+scored_from_block = 8992800      # = [round] duel_from_block
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -562,7 +588,16 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
 # property (0.5% sits above the bootstrap noise band, so a statistically
 # tied challenger never wins by luck; a 0 or sub-noise floor becomes a slow
 # term-limit lottery).
-win_margin_start     = 0.02      # fresh-king margin (tenure 0)
+win_margin_start     = 0.01      # fresh-king margin (tenure 0) from margin_activation_block
+# Scheduled change of the fresh-king margin (same shape as epoch_blocks_prev /
+# epoch_activation_block): rounds whose epoch boundary precedes
+# margin_activation_block are judged at win_margin_start_prev, later rounds at
+# win_margin_start. Every validator resolves it from the round's block, so
+# restart timing never forks a verdict; cascade-audit replays each receipt
+# under its own value. KEEP the pair after the flip (pre-flip receipts replay
+# against it). 0.0 / 0 = no scheduled change.
+win_margin_start_prev   = 0.02   # in force for rounds before margin_activation_block
+margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_from_block
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision

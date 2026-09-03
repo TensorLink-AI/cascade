@@ -221,6 +221,38 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     return mode
 
 
+def validate_duel_field_cap(value: object) -> int:
+    """``[round] duel_field_cap``: 0 (every screened entrant seats, the fleet
+    bounds the round) or a positive explicit cap; negative is a typo."""
+    cap = int(value)  # type: ignore[arg-type]
+    if cap < 0:
+        raise ValueError(f"duel_field_cap={cap} invalid; must be >= 0")
+    return cap
+
+
+# Per-round overhead a duel-only round pays outside its training legs:
+# rental + boot at the margin, checkpoint push, manifest. 1.5h on the 12h
+# grid, scaled down proportionally on shorter grids (a compressed test grid
+# must not read as "nothing fits").
+DUEL_ROUND_OVERHEAD_HOURS = 1.5
+DUEL_ROUND_OVERHEAD_FRAC = 0.125
+
+
+def duel_round_overhead_hours(epoch_hours: float) -> float:
+    return min(DUEL_ROUND_OVERHEAD_HOURS, DUEL_ROUND_OVERHEAD_FRAC * float(epoch_hours))
+
+
+def duel_waves_that_fit(epoch_hours: float, leg_hours: float) -> int:
+    """Back-to-back full-budget legs ONE lane can finish inside an epoch after
+    :func:`duel_round_overhead_hours`. Never below 1: a lane always runs one
+    leg (a grid shorter than a leg is a configuration to fix, not a crash).
+    Shared by the fleet sizer and the trainer's seating so both agree."""
+    if leg_hours <= 0:
+        return 1
+    usable = float(epoch_hours) - duel_round_overhead_hours(epoch_hours)
+    return max(1, int(usable // float(leg_hours)))
+
+
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
     """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
 
@@ -732,6 +764,24 @@ class RoundConfig:
     init_gate_mode: str = "off"       # "off" | "shadow" (heat-side has no enforce)
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
+    # ── Duel-only rounds (no heat), block-gated ──────────────────────────────
+    # From the first epoch boundary >= duel_from_block the heat screen is
+    # skipped: the screened field is seated straight into the duel, earliest
+    # reveal block first. Entrants the round cannot seat wait for a later
+    # round WITHOUT spending their submission; the seated field burns at the
+    # settle as before, and the king plus every seated challenger train the
+    # full [training] budget. The validator judges the whole cohort under
+    # alpha/k (DEC-CA-0012) with k = the seated count — nothing
+    # validator-side changes. 0 = never (heat → final every round).
+    # Trainer-side: [round] is outside contract_digest.
+    duel_from_block: int = 0
+    # 0 = every screened entrant seats; the provisioner sizes the final fleet
+    # to fit the field inside the epoch (legs queue on each lane, see
+    # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
+    # the rented lanes can finish before the boundary — only that physical
+    # overflow carries to the next round. A positive value is an explicit
+    # per-round cap on top of that.
+    duel_field_cap: int = 0
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
     # already entered a round's heat is never screened again — it must re-register
     # (a new UID, paying the registration cost) to resubmit, so a miner cannot
@@ -789,6 +839,10 @@ class RoundConfig:
     # generator. False (default): shadow-log the verdict, never drop, whatever
     # dedup_mode says. Flip only after the shadow log shows the split.
     dedup_config_only_enforce: bool = False
+    # Release-then-activate gate for the flag above: with a block set, the
+    # config_only tier only DROPS in rounds whose epoch boundary is at/after
+    # it and stays shadow-logged before (0 = the flag applies immediately).
+    dedup_config_only_from_block: int = 0
     # Cost caps on the screen itself. Tokenizing is linear but not cheap
     # (~2s/MB) and input size is attacker-chosen up to [generator]
     # max_repo_mb. dedup_max_text_mb bounds the tokenizer's input per repo;
@@ -866,6 +920,33 @@ class RoundConfig:
             return max(self.finalists, self.max_finalists)
         return self.finalists
 
+    def duel_only(self, block: int | None) -> bool:
+        """True when the round at epoch boundary ``block`` runs without a heat
+        (``duel_from_block`` set and reached). ``None`` (unknown height) and
+        an unset gate both keep the heat → final pipeline."""
+        if self.duel_from_block <= 0 or block is None:
+            return False
+        return int(block) >= self.duel_from_block
+
+    def config_only_enforced(self, block: int | None) -> bool:
+        """Whether the config_only dedup tier DROPS in the round at epoch
+        boundary ``block``: the flag, gated on ``dedup_config_only_from_block``
+        when set. An unknown block under a set gate stays shadow."""
+        if not self.dedup_config_only_enforce:
+            return False
+        if self.dedup_config_only_from_block <= 0:
+            return True
+        return block is not None and int(block) >= self.dedup_config_only_from_block
+
+    def duel_seats(self, *, lanes: int, epoch_hours: float, leg_hours: float) -> int:
+        """Challengers a duel-only round seats: the explicit cap when set,
+        else what ``lanes`` can finish inside the epoch — one leg per lane
+        per wave, the king taking one of them."""
+        if self.duel_field_cap > 0:
+            return int(self.duel_field_cap)
+        waves = duel_waves_that_fit(epoch_hours, leg_hours)
+        return max(1, max(1, int(lanes)) * waves - 1)
+
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -929,6 +1010,24 @@ class EvalConfig:
     calib_horizons: tuple[int, ...] = ()
     calib_windows: int = 256        # windows per horizon (even-by-domain draw)
     calib_num_samples: int = 32     # sample paths per window (cost control)
+    # ── Scored horizon ladder (CONSENSUS, block-gated) ───────────────────────
+    # ``scored_from_block = 0`` keeps the single-horizon verdict draw
+    # everywhere (byte-identical history). When ``scored_horizons`` is set and
+    # a round's epoch-boundary block is >= ``scored_from_block``, the round's
+    # verdict — and the heat screen, which must rank on the metric the duel
+    # judges — draws its windows as a horizon ladder instead: each horizon
+    # gets its own seeded even-by-domain draw over the snapshot's raw series
+    # (``n_windows`` split evenly across horizons, rung sizes equalised), and
+    # the pooled rows flow through the unchanged round statistic. With equal
+    # rung sizes the geometric mean weights horizons equally, and the cluster
+    # bootstrap resamples upstream feeds jointly across horizons (rows from
+    # one feed share a cluster key at every horizon). Block-gating is the
+    # ``mix_from_block`` rollout shape: every validator AND the trainer must
+    # run the same values before the activation block, or verdicts fork from
+    # that block on; audit replay applies each round's own rule via the
+    # receipt's ``epoch_start_block``.
+    scored_horizons: tuple[int, ...] = ()
+    scored_from_block: int = 0
     # Cascade post-publish bench hold (see provision.policy.bench_hold_active):
     # how long the provisioner may keep the round's FINAL pod alive past its
     # normal teardown signal while the duel bench runs, in hours. The hold ends
@@ -970,6 +1069,16 @@ class ScoringConfig:
     bootstrap_B: int
     bootstrap_alpha: float
     dethrone_cp: int
+    # Scheduled change of the fresh-king margin (the epoch_blocks_prev /
+    # epoch_activation_block shape): rounds whose epoch boundary precedes
+    # ``margin_activation_block`` are judged at ``win_margin_start_prev``,
+    # rounds from it on at ``win_margin_start``. Consensus — every validator
+    # resolves the value from the round's block, so restart timing never
+    # forks a verdict, and cascade-audit replays each round under its own
+    # value. 0.0 / 0 = no scheduled change. Keep the pair in place after the
+    # flip: retiring it makes pre-flip receipts fail the params replay.
+    win_margin_start_prev: float = 0.0
+    margin_activation_block: int = 0
     # Breadth floor for the verdict: below this many distinct window clusters
     # (upstream feeds, from pool metadata ``source``) the round is inconclusive.
     # 0 disables; pools without ``source`` metadata are unaffected. Default keeps
@@ -1329,8 +1438,11 @@ class ChainConfig:
         names = self.round.throne_sizes or (self.training.arch_preset,)
         return [self.training.contract_for(n) for n in names]
 
-    def koth_params(self) -> Any:
-        """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``.
+    def koth_params(self, block: int | None = None) -> Any:
+        """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``
+        for the round at epoch boundary ``block`` (``None`` = the steady-state
+        values; a scheduled ``win_margin_start`` change resolves per round —
+        see :func:`effective_win_margin_start`).
 
         Imported lazily so :mod:`cascade.shared.config` stays free of the
         eval package at import time.
@@ -1338,7 +1450,7 @@ class ChainConfig:
         from ..eval.koth import KothParams
 
         return KothParams(
-            win_margin_start=self.scoring.win_margin_start,
+            win_margin_start=effective_win_margin_start(self.scoring, block),
             win_margin_end=self.scoring.win_margin_end,
             margin_warmup_rounds=self.scoring.margin_warmup_rounds,
             min_windows=self.scoring.min_windows,
@@ -1361,6 +1473,17 @@ class LaunchConfigError(RuntimeError):
 
 
 _PLACEHOLDER_DIGEST = "0" * 64
+
+
+def effective_win_margin_start(scoring: ScoringConfig, block: int | None) -> float:
+    """The fresh-king margin in force for the round at epoch boundary ``block``:
+    ``win_margin_start_prev`` for blocks strictly before
+    ``margin_activation_block``, ``win_margin_start`` from it on. With no
+    scheduled change (prev 0.0 / block 0) or no block given, the steady value."""
+    if (scoring.margin_activation_block > 0 and scoring.win_margin_start_prev > 0.0
+            and block is not None and int(block) < scoring.margin_activation_block):
+        return float(scoring.win_margin_start_prev)
+    return float(scoring.win_margin_start)
 
 
 def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
@@ -1662,6 +1785,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             tie_runoff_phase_seconds=int(r.get("tie_runoff_phase_seconds", 900)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
+            duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
+            duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),
@@ -1674,6 +1799,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
                                            "dedup_mode"),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
+            dedup_config_only_from_block=max(
+                0, int(r.get("dedup_config_only_from_block", 0) or 0)),
             dedup_max_tokens=int(r.get("dedup_max_tokens", 50_000)),
             dedup_max_text_mb=int(r.get("dedup_max_text_mb", 4)),
             dedup_phase_seconds=int(r.get("dedup_phase_seconds", 900)),
@@ -1708,6 +1835,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             calib_horizons=tuple(int(h) for h in e.get("calib_horizons", ())),
             calib_windows=int(e.get("calib_windows", 256)),
             calib_num_samples=int(e.get("calib_num_samples", 32)),
+            scored_horizons=tuple(int(h) for h in e.get("scored_horizons", ())),
+            scored_from_block=int(e.get("scored_from_block", 0) or 0),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
             mix_from_block=int(e.get("mix_from_block", 0)),
             mix_jitter_alpha=float(e.get("mix_jitter_alpha", 4.0)),
@@ -1722,6 +1851,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_start=float(s["win_margin_start"]),
             win_margin_end=float(s["win_margin_end"]),
             margin_warmup_rounds=int(s["margin_warmup_rounds"]),
+            win_margin_start_prev=float(s.get("win_margin_start_prev", 0.0) or 0.0),
+            margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),

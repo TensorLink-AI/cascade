@@ -54,6 +54,7 @@ from ..shared.receipt import (
 )
 from . import state as state_mod
 from .state import ChampionState, StateTransition
+from .windows import ladder_windows_for_round, scored_ladder
 
 if TYPE_CHECKING:
     from ..trainer.remote import RemoteHost
@@ -640,6 +641,26 @@ class ValidatorRunner:
         fetch_from_hub(ref, dest, hub)
         return dest
 
+    def _verdict_windows(
+        self, window_source: object, round_seed: int | str, *, block: int | None
+    ) -> list[EvalWindow]:
+        """The round's verdict windows: the scored horizon ladder when active
+        at this round's epoch block (``[eval] scored_horizons`` /
+        ``scored_from_block``), else the single-horizon rotating draw. Both
+        are deterministic in ``(round_seed, block)``, so every validator
+        scores the identical set."""
+        horizons = scored_ladder(self.cfg.eval, block)
+        if not horizons:
+            return window_source.windows_for_round(
+                round_seed, self.cfg.eval.n_windows, block=block
+            )
+        return ladder_windows_for_round(
+            window_source, horizons=horizons,
+            n_windows=self.cfg.eval.n_windows,
+            context_length=self.cfg.eval.context_length,
+            round_seed=round_seed, block=block,
+        )
+
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
         if self.evaluate_fn is not None:
             return self.evaluate_fn(entry, windows)
@@ -1137,7 +1158,9 @@ class ValidatorRunner:
             ))
         _t_king = _time.perf_counter() - _t0
 
-        base_params = self.cfg.koth_params()
+        # Decision parameters for THIS round's epoch: a scheduled margin
+        # change resolves from the boundary block, never from restart timing.
+        base_params = self.cfg.koth_params(block=self._epoch_start_block(manifest))
         # Score the shared warm-start init when either consumer needs it: the
         # increment margin (DEC-CA-0027) or the init-baseline floor
         # ([scoring] init_gate_mode). The increment fallback mutates only the
@@ -1396,7 +1419,7 @@ class ValidatorRunner:
         )
         verdict = VerdictRecord.from_round(
             outcome.result, outcome.transition,
-            params=self.cfg.koth_params(), bootstrap_seed=base_seed,
+            params=self.cfg.koth_params(block=epoch_start_block), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
             cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
         )
@@ -1757,8 +1780,8 @@ class ValidatorRunner:
                     else:
                         # The epoch block selects the daily snapshot; base_seed
                         # rotates the window slice within it.
-                        windows = window_source.windows_for_round(
-                            base_seed, self.cfg.eval.n_windows,
+                        windows = self._verdict_windows(
+                            window_source, base_seed,
                             block=self._epoch_start_block(manifest),
                         )
                         # process_round mutates the sticky KOTH state atomically (it

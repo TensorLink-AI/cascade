@@ -390,7 +390,11 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     # screen for a lost rental window is never the right side of that.
     screened = probe._screen_duplicate_entrants(
         plan.king, eligible, next_boundary, static_only=True, report=False,
-        budget_seconds=cfg.round.dedup_plan_seconds)
+        budget_seconds=cfg.round.dedup_plan_seconds, block=next_boundary)
+    # Duel-only round ([round] duel_from_block): no heat fleet; the final is
+    # sized to fit the whole field (or the explicit cap) inside the epoch.
+    duel_only = cfg.round.duel_only(next_boundary)
+    cap = cfg.round.duel_field_cap
     return {
         "block": block,
         "epoch_blocks": epoch_blocks,
@@ -402,12 +406,14 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
         "eligible_challengers": len(eligible),
         "screened_challengers": len(screened),
         "heat_train_hours": cfg.round.heat_train_hours,
-        "finalists": cfg.round.finalists,
+        "finalists": ((min(cap, len(screened)) if cap > 0 else len(screened))
+                      if duel_only else cfg.round.finalists),
         # DEC-CA-0012: the provisioner's final fleet and budget breaker must
         # cover the WORST case the tie-aware advance rule can produce, not the
         # single finalist the plan predicts (JIT rental adapts off the
         # heat_complete marker's actual list either way).
-        "max_finalists": cfg.round.max_finalists,
+        "max_finalists": 0 if duel_only else cfg.round.max_finalists,
+        "duel_only": duel_only,
     }
 
 
@@ -449,8 +455,33 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
     # keeps the sequential CPU screening from rivalling the heat training time.
     num_samples = cfg.round.heat_num_samples or cfg.eval.num_samples
 
+    # One draw per (seed, block), shared across the whole field: the screen is
+    # called once per entrant and the ladder draw re-reads the snapshot's raw
+    # series, so an uncached draw would reload the pool for every checkpoint.
+    _screen_cache: dict = {}
+
+    def _screen_windows(base_seed: int, block: int | None):
+        from ..validator.windows import ladder_windows_for_round, scored_ladder
+
+        key = (base_seed, block)
+        if key not in _screen_cache:
+            horizons = scored_ladder(cfg.eval, block)
+            if horizons:
+                # The screen must rank on the metric the duel judges: the same
+                # ladder draw at the heat's window budget.
+                windows = ladder_windows_for_round(
+                    window_source, horizons=horizons, n_windows=n,
+                    context_length=cfg.eval.context_length,
+                    round_seed=base_seed, block=block,
+                )
+            else:
+                windows = window_source.windows_for_round(base_seed, n, block=block)
+            _screen_cache.clear()
+            _screen_cache[key] = windows
+        return _screen_cache[key]
+
     def screen(ckpt_dir: Path, gen, base_seed: int, block: int | None = None):
-        windows = window_source.windows_for_round(base_seed, n, block=block)
+        windows = _screen_windows(base_seed, block)
         # Return the per-window scores: the runner ranks on global_geomean,
         # publishes global_components (raw CRPS/MASE), and resamples them for
         # the shadow selection diagnostics.
@@ -475,11 +506,24 @@ def _build_screen_fn(cfg, *, cache_dir: Path | None):
 
     def composition(base_seed: int, block: int | None = None) -> dict | None:
         """Realised composition of the round's VERDICT draw (n_windows, not the
-        heat's smaller slice) — None while the jittered mix is inactive, so
-        pre-activation manifests carry no new field."""
+        heat's smaller slice) — None while neither the jittered mix nor the
+        scored ladder is active, so pre-activation manifests carry no new
+        field."""
         from ..validator.pool import mix_params_from_config
-        from ..validator.windows import round_composition
+        from ..validator.windows import (
+            ladder_windows_for_round,
+            round_composition,
+            scored_ladder,
+        )
 
+        horizons = scored_ladder(cfg.eval, block)
+        if horizons:
+            windows = ladder_windows_for_round(
+                window_source, horizons=horizons, n_windows=cfg.eval.n_windows,
+                context_length=cfg.eval.context_length,
+                round_seed=base_seed, block=block,
+            )
+            return round_composition(windows, None)
         mix = mix_params_from_config(cfg)
         if mix is None or not mix.active(block):
             return None

@@ -200,6 +200,9 @@ max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20)
 tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see chain.toml NOTE
 tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
 one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
+# Duel-only rounds (no heat) — see chain.toml; 0 = off. Arm on testnet first.
+duel_from_block = 0
+duel_field_cap  = 0
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps
@@ -249,6 +252,9 @@ horizon        = 64
 # mix_tier_from_block only in a coordinated release (0 = flat split).
 mix_tier_from_block  = 1         # testnet: armed from genesis of the next cycle
 mix_tier_jitter_alpha = 75.0
+# Scored horizon ladder — see chain.toml; [] / 0 = single-horizon rule.
+scored_horizons   = []
+scored_from_block = 0
 # at n_windows (300) — the testnet pool is small; the jitter room comes from
 # the bag and the Dirichlet, and the mainnet 1200 calibration doesn't apply.
 mix_from_block       = 1
@@ -309,6 +315,9 @@ declared_contract_from_block = 1
 # HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
 # bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
 win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
+# Scheduled fresh-king margin change — see chain.toml; 0.0 / 0 = none.
+win_margin_start_prev   = 0.0
+margin_activation_block = 0
 win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
                                  # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)
