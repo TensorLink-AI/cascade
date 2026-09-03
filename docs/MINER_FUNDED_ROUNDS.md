@@ -121,7 +121,9 @@ auth fault. Operator checklist, in order:
    the horizon ladder forks verdicts from 8992800 on any validator without
    it) — the standard coordinated window; announce to externals. Verify the current pool's
    series-length eligibility at the 720 rung (>= 784 steps) before the block.
-2. **Set the payer-pod credential source** on the orchestrator: either
+2. **Set the payer-pod credential source and the vault seal key** on the
+   orchestrator: `CASCADE_VAULT_KEY_FILE` (e.g. `head -c 32 /dev/urandom >
+   /root/.cascade/vault.key; chmod 600`) for BOTH the intake and the trainer; and either
    `CASCADE_HUB_ADMIN_USERNAME/PASSWORD` (a project-admin Hub user — per-pod
    robots) or `CASCADE_FUNDED_HUB_USERNAME/PASSWORD` (a hand-made push-only
    robot). Without one, every funded leg skips (fail-closed).
@@ -250,8 +252,13 @@ in code:
 - Still open vs PRISM: their pod holds NO credential at all (the master
   SSH-harvests the checkpoint through a secure receive). Ours needs the
   pinned worker to gain a local-only mode — the next worker-image release —
-  after which payer pods carry zero credentials. Also PRISM seals payer keys
-  at rest with a key file; our vault is plaintext 0600 (operator-local).
+  after which payer pods carry zero credentials.
+- **The payer vault is sealed at rest** when `CASCADE_VAULT_KEY_FILE` (32 raw
+  bytes or 64 hex; the SAME file on the intake and the trainer) is set:
+  AES-256-GCM per entry with the hotkey as associated data, so a copied
+  vault directory is useless without the key. Unset = legacy plaintext 0600
+  with a startup warning; set it before mainnet. Legacy entries still
+  hydrate and re-seal on their next insert.
 
 ## What the provisioner must NOT do on funded pods
 
