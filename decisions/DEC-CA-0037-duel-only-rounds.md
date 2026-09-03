@@ -34,7 +34,12 @@ The same block also moves the fresh-king margin from 2% to 1%
 (`[scoring] win_margin_start = 0.01`, `win_margin_start_prev = 0.02`,
 `margin_activation_block = 8992800`): validators resolve the value from the
 round's epoch boundary and the audit replays each receipt under its own
-value, so the change is block-exact rather than restart-timed.
+value, so the change is block-exact rather than restart-timed. And the
+config_only dedup tier starts DROPPING at the same block
+(`dedup_config_only_enforce = true`, `dedup_config_only_from_block =
+8992800`; shadow-logged before): identical code with a different config is
+the seat-spray pattern (19 of r58's 24 entrants came from 5 code groups; the
+gate would have kept 10), and with no heat the seats are what spam takes.
 
 ## Why
 

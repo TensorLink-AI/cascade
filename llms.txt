@@ -94,7 +94,9 @@ Full contract: docs/INTERFACE.md. Enforced limits: chain.toml `[generator]`,
   identical corpus digest under the shared round seed and is dropped as
   `duplicate` before training (exact-identity dedup: same tree / same normalized
   tokens / tokens-modulo-renames; earliest commit keeps the slot; dropped copies
-  still burn the submission). Forking + genuinely improving the king is the
+  still burn the submission). From block 8992800 identical code with only a
+  different config (`config_only`) is dropped the same way — a config sweep of
+  someone's generator is one submission, the earliest one. Forking + genuinely improving the king is the
   intended game — a byte-identical copy can only tie, so it can never win.
 - **Generator speed is priced on purpose.** The training budget is a fixed token
   count, not a timer; a slow generator starves the model of compute and that IS

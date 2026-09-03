@@ -831,6 +831,10 @@ class RoundConfig:
     # generator. False (default): shadow-log the verdict, never drop, whatever
     # dedup_mode says. Flip only after the shadow log shows the split.
     dedup_config_only_enforce: bool = False
+    # Release-then-activate gate for the flag above: with a block set, the
+    # config_only tier only DROPS in rounds whose epoch boundary is at/after
+    # it and stays shadow-logged before (0 = the flag applies immediately).
+    dedup_config_only_from_block: int = 0
     # Cost caps on the screen itself. Tokenizing is linear but not cheap
     # (~2s/MB) and input size is attacker-chosen up to [generator]
     # max_repo_mb. dedup_max_text_mb bounds the tokenizer's input per repo;
@@ -915,6 +919,16 @@ class RoundConfig:
         if self.duel_from_block <= 0 or block is None:
             return False
         return int(block) >= self.duel_from_block
+
+    def config_only_enforced(self, block: int | None) -> bool:
+        """Whether the config_only dedup tier DROPS in the round at epoch
+        boundary ``block``: the flag, gated on ``dedup_config_only_from_block``
+        when set. An unknown block under a set gate stays shadow."""
+        if not self.dedup_config_only_enforce:
+            return False
+        if self.dedup_config_only_from_block <= 0:
+            return True
+        return block is not None and int(block) >= self.dedup_config_only_from_block
 
     def duel_seats(self, *, lanes: int, epoch_hours: float, leg_hours: float) -> int:
         """Challengers a duel-only round seats: the explicit cap when set,
@@ -1777,6 +1791,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
                                            "dedup_mode"),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
+            dedup_config_only_from_block=max(
+                0, int(r.get("dedup_config_only_from_block", 0) or 0)),
             dedup_max_tokens=int(r.get("dedup_max_tokens", 50_000)),
             dedup_max_text_mb=int(r.get("dedup_max_text_mb", 4)),
             dedup_phase_seconds=int(r.get("dedup_phase_seconds", 900)),

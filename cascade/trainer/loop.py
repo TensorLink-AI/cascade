@@ -1134,6 +1134,7 @@ class TrainerRunner:
         static_only: bool = False,
         report: bool = True,
         budget_seconds: int | None = None,
+        block: int | None = None,
     ) -> list[ResolvedGenerator]:
         """Drop entrants whose repo CONTENT duplicates the king or an earlier
         entrant, before any heat GPU is spent (see :mod:`cascade.interface.dedup`).
@@ -1175,7 +1176,7 @@ class TrainerRunner:
             return self._with_deadline(
                 lambda: self._screen_duplicate_entrants_inner(
                     king, entrants, base_seed, mode, fetch_root,
-                    static_only=static_only, report=report),
+                    static_only=static_only, report=report, block=block),
                 budget)
         except TimeoutError:
             # The helper thread is abandoned (it dies with the process, as in
@@ -1198,6 +1199,7 @@ class TrainerRunner:
         *,
         static_only: bool = False,
         report: bool = True,
+        block: int | None = None,
     ) -> list[ResolvedGenerator]:
         from ..interface.dedup import (
             collapse_identical_behavior,
@@ -1289,9 +1291,12 @@ class TrainerRunner:
             triples.append((c.hotkey, c.uid, fp))
 
         try:
+            # The config_only tier drops only once its activation block is
+            # reached ([round] dedup_config_only_from_block); shadow before.
+            config_only_enforce = rnd.config_only_enforced(block)
             result = screen_duplicates(
                 triples, king_fp,
-                config_only_enforce=rnd.dedup_config_only_enforce,
+                config_only_enforce=config_only_enforce,
                 priority=self._commit_priority(entrants),
                 enforce=(mode == "enforce"),
             )
@@ -1437,7 +1442,7 @@ class TrainerRunner:
         report_doc = {
             "round_id": str(base_seed),
             "mode": mode,
-            "config_only_enforce": rnd.dedup_config_only_enforce,
+            "config_only_enforce": rnd.config_only_enforced(block),
             "max_tokens": rnd.dedup_max_tokens,
             "max_text_mb": rnd.dedup_max_text_mb,
             "probe_mode": probe_mode,
@@ -3091,7 +3096,8 @@ class TrainerRunner:
             # near-copies of the king or a lower-UID challenger lose their heat GPU
             # slot before any pod is dispatched. They stay in ``eligible`` — entering
             # the round as a copy still consumes the one lifetime submission.
-            screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed)
+            screened = self._screen_duplicate_entrants(plan.king, eligible, base_seed,
+                                                       block=screen_block)
         # Stage reporting context for this round; the epoch boundary is the
         # dashboards' join key (they derive it from the same grid).
         ws_info = None

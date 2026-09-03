@@ -421,7 +421,10 @@ duel_field_cap  = 0         # 0 = no per-round cap (the fleet bounds the round);
 dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
 # config_only tier (identical .py, differing configs): SHADOW-logged until
 # this is true — config sweeps are ticket-spam AND the legitimate fork path.
-dedup_config_only_enforce = false
+# Block-gated: with dedup_config_only_from_block set the tier drops only in
+# rounds whose epoch boundary is at/after it (shadow before). Trainer-side.
+dedup_config_only_enforce = true
+dedup_config_only_from_block = 8992800   # = [round] duel_from_block
 # Cost caps: tokenizer input is attacker-chosen up to max_repo_mb (~2s/MB);
 # the retained-token cap bounds the config_only delta measurement, the only
 # quadratic pass left. Field repos are ~100KB / 7-11k tokens (~40x headroom).

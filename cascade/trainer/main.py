@@ -390,7 +390,7 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     # screen for a lost rental window is never the right side of that.
     screened = probe._screen_duplicate_entrants(
         plan.king, eligible, next_boundary, static_only=True, report=False,
-        budget_seconds=cfg.round.dedup_plan_seconds)
+        budget_seconds=cfg.round.dedup_plan_seconds, block=next_boundary)
     # Duel-only round ([round] duel_from_block): no heat fleet; the final is
     # sized to fit the whole field (or the explicit cap) inside the epoch.
     duel_only = cfg.round.duel_only(next_boundary)
