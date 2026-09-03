@@ -313,7 +313,11 @@ in-context.
   bench on their OWN pod post-publish (`[telemetry] funded_bench`; pod
   kept through the sweep, then torn down); payer numbers are a FILTER —
   the top-N re-bench on the operator's king pod and only operator numbers
-  are signed (forged sweep ⇒ entry dropped).
+  are signed (forged sweep ⇒ entry dropped). Payer pods are CREDENTIAL-FREE
+  by default (`[round] funded_pod_checkpoint = "harvest"`: worker
+  --local-only, orchestrator harvest → ingest-verify → upload under its own
+  identity; robots remain as the "robot" fallback) — needs the worker image
+  rebuilt from this release.
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:

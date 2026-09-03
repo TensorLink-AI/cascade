@@ -890,6 +890,15 @@ class RoundConfig:
     # (cascade.funding.robots). Revocation at teardown is the real bound;
     # this is the backstop if a revoke ever fails.
     funded_robot_duration_days: int = 1
+    # How a funded leg's checkpoint leaves its payer pod. "harvest" (default,
+    # DEC-CA-0036 credential-free pods): the worker runs --local-only, the pod
+    # holds NO Hub credential at all, and the orchestrator pulls the checkpoint
+    # over the pinned SSH, ingest-verifies it, and uploads it under its own
+    # identity. "robot": the legacy per-pod push-only Harbor robot (needs a
+    # worker image that predates --local-only, or a Hub whose anonymous pulls
+    # are off). Requires a funded_pod_image built from a --local-only-aware
+    # release when set to "harvest".
+    funded_pod_checkpoint: str = "harvest"
     # Elastic field sizing ("no heat, any number of challengers"): 0 keeps the
     # legacy finalist_cap admission; N > 0 admits up to N funded challengers
     # per round (each rents its own payer pod, so wall-clock stays one leg).
@@ -1885,6 +1894,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", 900.0)),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
+            funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
             funded_field_cap=validate_funded_field_cap(
                 r.get("funded_field_cap", 0)),
             funded_capacity_probe=bool(r.get("funded_capacity_probe", False)),

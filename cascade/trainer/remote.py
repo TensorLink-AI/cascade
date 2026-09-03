@@ -178,6 +178,7 @@ def worker_argv(
     repo_suffix: str = "",
     warm_start_ref: str | None = None,
     anneal: bool = False,
+    local_only: bool = False,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -212,6 +213,10 @@ def worker_argv(
     if anneal:
         # bench-anneal telemetry leg (DEC-CA-0030): pure cosine decay resume
         argv.append("--anneal")
+    if local_only:
+        # credential-free pod (DEC-CA-0036): no upload; the orchestrator
+        # harvests the checkpoint and uploads it under its own identity
+        argv.append("--local-only")
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -365,6 +370,97 @@ def parse_receipt(stdout: str) -> dict:
     raise RemoteDispatchError("no receipt sentinel found in worker stdout")
 
 
+@dataclass(frozen=True)
+class LocalTrainReceipt:
+    """A ``--local-only`` worker's receipt: a trained checkpoint still ON the
+    pod, awaiting orchestrator harvest + verify + upload (DEC-CA-0036
+    credential-free pods). Deliberately NOT a :class:`TrainedEntry` — the
+    entry class refuses anything but a real hub pointer, which is the guard
+    that keeps an un-harvested checkpoint out of a manifest."""
+
+    miner_hotkey: str
+    miner_uid: int
+    role: str
+    gen_ref: str
+    corpus_digest: str
+    train_block: int
+    checkpoint_dir: str            # pod-local path of the trained checkpoint
+    gpu_name: str = ""
+    size: str = ""
+
+
+def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
+    """Validate a ``--local-only`` receipt dict into a :class:`LocalTrainReceipt`."""
+    try:
+        return LocalTrainReceipt(
+            miner_hotkey=str(receipt["miner_hotkey"]),
+            miner_uid=int(receipt["miner_uid"]),
+            role=str(receipt["role"]),
+            gen_ref=str(receipt["gen_ref"]),
+            corpus_digest=str(receipt["corpus_digest"]),
+            train_block=int(receipt["train_block"]),
+            checkpoint_dir=str(receipt["local_checkpoint_dir"]),
+            gpu_name=str(receipt.get("gpu_name", "")),
+            size=str(receipt.get("size", "")),
+        )
+    except (KeyError, ValueError) as e:
+        raise RemoteDispatchError(f"receipt is not a valid local-train receipt: {e}") from e
+
+
+def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
+                       *, timeout: int = 600, runner=None) -> Path:
+    """Copy ``host:remote_dir`` into local ``dest`` (tar over ssh, ``dest``
+    wiped first), under exactly the dispatch transport policy — a pinned host
+    key stays pinned for the harvest. The credential-free pods' return
+    channel: the pod pushes nothing; the orchestrator pulls.
+
+    The stream comes off a MINER-controlled box, so extraction runs under
+    :mod:`tarfile`'s ``"data"`` filter (PEP 706): absolute paths, ``..``
+    traversal, symlinks/hardlinks escaping ``dest``, and device nodes are all
+    refused — a hostile archive fails the harvest instead of writing outside
+    it (or smuggling ``/etc`` into the later upload via a symlink)."""
+    import shutil
+    import tarfile
+
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    argv = build_ssh_argv(host, f"tar -C {shlex.quote(remote_dir)} -cf - .")
+    if runner is not None:  # test seam: (argv, timeout) → CompletedProcess-like
+        proc = runner(argv, timeout)
+        if proc.returncode != 0:
+            raise RemoteDispatchError(
+                f"checkpoint harvest from {host.name}:{remote_dir} failed "
+                f"(rc={proc.returncode})", returncode=proc.returncode)
+        return dest
+    ssh = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=ssh.stdout, mode="r|") as tf:
+            tf.extractall(dest, filter="data")
+    except tarfile.TarError as e:
+        ssh.kill()
+        ssh.wait()
+        raise RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir}: refused or "
+            f"malformed archive: {e}") from e
+    except Exception:
+        ssh.kill()
+        ssh.wait()
+        raise
+    finally:
+        ssh.stdout.close()
+    ssh_rc = ssh.wait(timeout=60)
+    if ssh_rc != 0:
+        err = ssh.stderr.read()[-400:]
+        ssh.stderr.close()
+        raise RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir} failed "
+            f"(ssh rc={ssh_rc}): {err!r}", returncode=ssh_rc)
+    ssh.stderr.close()
+    return dest
+
+
 def receipt_to_entry(receipt: dict) -> TrainedEntry:
     """Validate a receipt dict into a :class:`TrainedEntry` (re-runs its checks)."""
     try:
@@ -414,14 +510,15 @@ class RemoteDispatcher:
         warm_start_ref: str | None = None,
         lane_count: int | None = None,
         anneal: bool = False,
-    ) -> TrainedEntry:
+        local_checkpoint: bool = False,
+    ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
-            warm_start_ref=warm_start_ref, anneal=anneal,
+            warm_start_ref=warm_start_ref, anneal=anneal, local_only=local_checkpoint,
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.
@@ -454,7 +551,9 @@ class RemoteDispatcher:
                 f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
                 returncode=proc.returncode,
             )
-        entry = receipt_to_entry(parse_receipt(proc.stdout or ""))
+        receipt = parse_receipt(proc.stdout or "")
+        entry = (receipt_to_local(receipt) if local_checkpoint
+                 else receipt_to_entry(receipt))
         if entry.role != role:
             raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
         return entry

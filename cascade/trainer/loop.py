@@ -1093,6 +1093,18 @@ class TrainerRunner:
         """``funded_pods`` as it applies RIGHT NOW ("off" before the gate)."""
         return self.cfg.round.funded_pods if self._funded_gate_open() else "off"
 
+    def _funded_harvest(self) -> bool:
+        """Credential-free funded pods (``[round] funded_pod_checkpoint =
+        "harvest"``, the default): the worker runs ``--local-only``, the pod
+        holds NO Hub credential, and the orchestrator harvests + verifies +
+        uploads the checkpoint itself. ``"robot"`` keeps the per-pod
+        push-only Harbor robot (the pre-harvest image path)."""
+        mode = str(getattr(self.cfg.round, "funded_pod_checkpoint", "harvest"))
+        if mode not in ("harvest", "robot"):
+            raise RuntimeError(
+                f"[round] funded_pod_checkpoint must be 'harvest' or 'robot'; got {mode!r}")
+        return mode == "harvest"
+
     def _funded_queue(self):
         """The funded queue, or ``None`` while ``[round] funded_mode = "off"``.
 
@@ -1803,17 +1815,24 @@ class TrainerRunner:
         # Fail closed — never fall back to forwarding the operator's login.
         from dataclasses import replace as dc_replace
 
-        cred = self._funded_pod_credential(str(round_id), gen.hotkey)
-        if cred is None:
-            self._teardown_funded_pod(result.pod)
-            self._record_funded_failure(
-                gen.hotkey, "operator-side fault: could not mint a per-pod Hub "
-                "credential (the leg never forwards operator logins to a payer "
-                "pod)", miner_fault=False, error_class="infra", burn=False)
-            raise _FundedLegSkip(gen.hotkey)
-        env_pairs, robot_id = cred
-        pod = dc_replace(result.pod, robot_id=robot_id)
-        self._ledger_add(pod)
+        if self._funded_harvest():
+            # Credential-free pod: the worker trains --local-only and the
+            # orchestrator harvests the checkpoint, so NOTHING is minted and
+            # nothing at all reaches the pod's environment.
+            env_pairs: tuple = ()
+            pod = result.pod
+        else:
+            cred = self._funded_pod_credential(str(round_id), gen.hotkey)
+            if cred is None:
+                self._teardown_funded_pod(result.pod)
+                self._record_funded_failure(
+                    gen.hotkey, "operator-side fault: could not mint a per-pod Hub "
+                    "credential (the leg never forwards operator logins to a payer "
+                    "pod)", miner_fault=False, error_class="infra", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
+            env_pairs, robot_id = cred
+            pod = dc_replace(result.pod, robot_id=robot_id)
+            self._ledger_add(pod)
         host = RemoteHost(
             name=f"funded-{gen.hotkey[:12].lower()}",
             host=result.address.ip, port=result.address.ssh_port,
@@ -1850,6 +1869,42 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — unfetchable ⇒ not publishable
             return f"could not fetch/inspect the checkpoint: {str(e)[:200]}"
         return None
+
+    def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
+                                   suffix: str):
+        """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
+        ingest-verify it, upload it under the operator's identity, and return
+        the real :class:`TrainedEntry` (DEC-CA-0036 credential-free pods).
+
+        Any guard deviation raises :class:`_FundedTamper` (miner fault,
+        terminal); a transport/upload failure raises plain (infra — the
+        miner's training was fine, the operator's pull was not)."""
+        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from .remote import harvest_remote_dir
+
+        dest = (self.work_root / "_funded_harvest" / f"{seeds.base_seed}"
+                / receipt.miner_hotkey)
+        harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        try:
+            verify_checkpoint(dest, contract)
+        except CheckpointTampered as e:
+            raise _FundedTamper(f"checkpoint: {e}") from e
+        size = contract.arch_preset
+        ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
+                     f"{receipt.role}-{size}{suffix}")
+        up = upload_dir_to_hub_or_hf(
+            dest, ckpt_repo, self.hub(), hf_repo=self._hf_ckpt_repo(ckpt_repo))
+        return TrainedEntry(
+            miner_hotkey=receipt.miner_hotkey,
+            miner_uid=receipt.miner_uid,
+            role=receipt.role,
+            gen_ref=receipt.gen_ref,
+            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
+            corpus_digest=receipt.corpus_digest,
+            train_block=receipt.train_block,
+            gpu_name=receipt.gpu_name,
+            size=receipt.size or size,
+        )
 
     def _funded_pod_identity_mismatch(self, pod) -> str | None:
         """Why the pod answering to ``pod.instance_id`` is not the one we
@@ -2063,11 +2118,13 @@ class TrainerRunner:
             digest = parse_vault_ref(gen.ref)
             if digest is not None:
                 host = self._stage_vault_zip_on(host, digest)
+            harvest = self._funded_harvest()
             entry = disp.dispatch(
                 host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role="challenger", base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
+                local_checkpoint=harvest,
                 **({"repo_suffix": suffix} if suffix else {}),
             )
             # …and again when the leg returns: the checkpoint this entry
@@ -2075,13 +2132,21 @@ class TrainerRunner:
             why = self._funded_pod_identity_mismatch(pod)
             if why:
                 raise _FundedTamper(f"after training: {why}")
-            # The checkpoint itself is untrusted data off a miner's pod: fetch
-            # it and run the ingest guard NOW, before it can reach the
-            # manifest — validators and the king pod's bench must never see a
-            # checkpoint whose code/config/weights deviate from the contract.
-            why = self._funded_checkpoint_mismatch(entry, contract)
-            if why:
-                raise _FundedTamper(f"checkpoint: {why}")
+            if harvest:
+                # Credential-free pod: the checkpoint is still ON the pod.
+                # Pull it over the pinned ssh, ingest-verify the local copy,
+                # and upload it under the OPERATOR's identity — the entry's
+                # pointer is then a checkpoint whose bytes we inspected.
+                entry = self._harvest_funded_checkpoint(
+                    host, entry, contract, seeds, suffix)
+            else:
+                # Robot mode: the pod pushed it — fetch and run the ingest
+                # guard NOW, before it can reach the manifest; validators and
+                # the king pod's bench must never see a checkpoint whose
+                # code/config/weights deviate from the contract.
+                why = self._funded_checkpoint_mismatch(entry, contract)
+                if why:
+                    raise _FundedTamper(f"checkpoint: {why}")
             if self._keep_funded_pod_for_bench():
                 # The checkpoint benches on THIS pod after publish (payer-
                 # billed, the miner's own sidecar eval); _bench_pod_group
@@ -3197,6 +3262,84 @@ class TrainerRunner:
         contract = contract if contract is not None else self.cfg.training.primary_size
         token_budget = token_budget if token_budget is not None else contract.train_tokens
         size = contract.arch_preset
+        out_dir, corpus_digest, gpu_name = self._train_for_entry(
+            gen, role, seeds, contract=contract, token_budget=token_budget,
+            repo_suffix=repo_suffix, heat=heat, warm_start_ref=warm_start_ref)
+        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
+        # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
+        # alive through a Hub outage instead of failing the checkpoint upload).
+        up = upload_dir_to_hub_or_hf(
+            out_dir, ckpt_repo, self.hub(),
+            hf_repo=self._hf_ckpt_repo(ckpt_repo),
+        )
+        return TrainedEntry(
+            miner_hotkey=gen.hotkey,
+            miner_uid=gen.uid,
+            role=role,
+            gen_ref=gen.ref,
+            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
+            corpus_digest=corpus_digest,
+            train_block=block,
+            gpu_name=gpu_name,
+            size=size,
+        )
+
+    def train_one_local(
+        self,
+        gen: ResolvedGenerator,
+        role: str,
+        seeds: RoundSeeds,
+        block: int,
+        *,
+        contract: TrainingContractConfig | None = None,
+        token_budget: int | None = None,
+        repo_suffix: str = "",
+        heat: bool = False,
+        warm_start_ref: str | None = None,
+    ) -> dict:
+        """:meth:`train_one` WITHOUT the registry upload: train, stamp the
+        marker, and return a plain receipt dict — every ``TrainedEntry`` field
+        except ``trained_pointer`` plus ``local_checkpoint_dir``.
+
+        This is the credential-free pod mode (DEC-CA-0036): a payer-controlled
+        box holds NO Hub credential of any kind — the orchestrator harvests the
+        checkpoint over the pinned SSH, verifies it, and uploads it under its
+        own identity. Deliberately a dict, not a ``TrainedEntry``: the entry
+        class refuses anything but a real hub pointer, which is exactly the
+        property that keeps a local receipt out of a manifest."""
+        contract = contract if contract is not None else self.cfg.training.primary_size
+        token_budget = token_budget if token_budget is not None else contract.train_tokens
+        out_dir, corpus_digest, gpu_name = self._train_for_entry(
+            gen, role, seeds, contract=contract, token_budget=token_budget,
+            repo_suffix=repo_suffix, heat=heat, warm_start_ref=warm_start_ref)
+        return {
+            "miner_hotkey": gen.hotkey,
+            "miner_uid": gen.uid,
+            "role": role,
+            "gen_ref": gen.ref,
+            "corpus_digest": corpus_digest,
+            "train_block": int(block),
+            "gpu_name": gpu_name,
+            "size": contract.arch_preset,
+            "local_checkpoint_dir": str(out_dir),
+        }
+
+    def _train_for_entry(
+        self,
+        gen: ResolvedGenerator,
+        role: str,
+        seeds: RoundSeeds,
+        *,
+        contract: TrainingContractConfig,
+        token_budget: int,
+        repo_suffix: str,
+        heat: bool,
+        warm_start_ref: str | None,
+    ) -> tuple[Path, str, str]:
+        """The shared training body of :meth:`train_one` / :meth:`train_one_local`:
+        train (or reuse a complete prior run), stamp the marker, and return
+        ``(checkpoint dir, corpus_digest, gpu_name)`` — everything but the upload."""
+        size = contract.arch_preset
         out_dir = self.work_root / f"{seeds.base_seed}" / size / f"{role}{repo_suffix}" / "checkpoint"
         log_role = f"heat-{gen.hotkey}" if heat else f"{role}-{size}"
         # Retry-without-retrain: if a PRIOR run of this exact job already trained
@@ -3227,25 +3370,7 @@ class TrainerRunner:
             self._write_train_complete_marker(
                 out_dir, contract, gen, corpus_digest=corpus_digest, gpu_name=gpu_name,
             )
-
-        ckpt_repo = f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-{role}-{size}{repo_suffix}"
-        # Hub is priority-one; mirror to HF only if the Hub is down (keeps a round
-        # alive through a Hub outage instead of failing the checkpoint upload).
-        up = upload_dir_to_hub_or_hf(
-            out_dir, ckpt_repo, self.hub(),
-            hf_repo=self._hf_ckpt_repo(ckpt_repo),
-        )
-        return TrainedEntry(
-            miner_hotkey=gen.hotkey,
-            miner_uid=gen.uid,
-            role=role,
-            gen_ref=gen.ref,
-            trained_pointer=format_trained_pointer(up.ref.immutable_ref),
-            corpus_digest=corpus_digest,
-            train_block=block,
-            gpu_name=gpu_name,
-            size=size,
-        )
+        return out_dir, corpus_digest, gpu_name
 
     # ── retry-without-retrain (the .train_complete marker) ────────────────────
 

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import cascade.provision.funded as funded_mod
+import cascade.trainer.loop as loop_module
 from cascade.funding.queue import FundedQueue
 from cascade.funding.vault import PayerKeyVault
 from cascade.provision.core import PodAddress
@@ -39,6 +40,7 @@ def _profile(tmp_path) -> RemoteHost:
 
 def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" * 64,
             vault_dir="pv", profile=None, **round_kw):
+    round_kw.setdefault("funded_pod_checkpoint", "robot")
     rnd = RoundConfig(funded_mode="required", funded_pods="rent",
                       payer_vault_dir=vault_dir, funded_pod_sku=sku,
                       funded_pod_image=image, **round_kw)
@@ -80,7 +82,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_record_funded_failure", "_rent_funded_host",
                  "_teardown_funded_pod", "_run_funded_leg", "_settle_funded",
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
-                 "_teardown_kept_funded_pods",
+                 "_teardown_kept_funded_pods", "_funded_harvest",
+                 "_harvest_funded_checkpoint",
                  "_filter_funded_challengers", "_submissions_path",
                  "_submission_store"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
@@ -943,3 +946,108 @@ def test_funded_bench_off_tears_down_with_the_leg(tmp_path, monkeypatch):
                            contract, "", warm_start_ref=None)
     assert torn == ["cascade-n91-777-funded-hka-0"]
     assert runner._final_role_hosts == {}
+
+
+# ── DEC-CA-0036: credential-free pods (funded_pod_checkpoint = "harvest") ─────
+
+def _harvest_runner(tmp_path, monkeypatch, *, disp):
+    runner = _runner(tmp_path, funded_pod_checkpoint="harvest")
+    _vault(tmp_path, "hkA")
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    torn = []
+    runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
+    runner._funded_field = {"hkA": REF}
+    runner._funded_pod_identity_mismatch = lambda pod: None
+    seeds = SimpleNamespace(base_seed=777)
+    contract = SimpleNamespace(arch_preset="toto2-4m")
+    return runner, torn, seeds, contract
+
+
+class _FakeLocalDisp:
+    """Dispatch double that returns a --local-only receipt."""
+
+    def __init__(self):
+        self.calls = []
+
+    def dispatch(self, host, **kw):
+        self.calls.append((host, kw))
+        from cascade.trainer.remote import LocalTrainReceipt
+        return LocalTrainReceipt(
+            miner_hotkey=kw["hotkey"], miner_uid=kw["uid"], role=kw["role"],
+            gen_ref=kw["gen_ref"], corpus_digest="cd", train_block=kw["block"],
+            checkpoint_dir="/root/cascade/_train_work/777/toto2-4m/challenger/checkpoint",
+            gpu_name="RTX4090", size=kw["arch_preset"])
+
+
+def test_harvest_mode_mints_no_robot_and_pod_env_is_empty(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, funded_pod_checkpoint="harvest")
+    _vault(tmp_path, "hkA")
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert runner._minter.created == []          # no robot minted
+    assert host.static_env == () and host.isolated
+    assert not pod.robot_id            # write-ahead default, never a minted id
+
+
+def test_harvest_leg_pulls_verifies_uploads_and_returns_a_real_entry(
+        tmp_path, monkeypatch):
+    disp = _FakeLocalDisp()
+    runner, torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp)
+    harvested, verified, uploaded = [], [], []
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir",
+                        lambda host, rdir, dest, **kw: harvested.append((rdir, dest)) or dest)
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint",
+                        lambda d, contract=None, **kw: verified.append(d))
+    fake_up = SimpleNamespace(ref=SimpleNamespace(
+        immutable_ref="cascade/ckpt-r777-challenger-toto2-4m@sha256:" + "d" * 64))
+    monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
+                        lambda d, repo, hub, hf_repo=None: uploaded.append(repo) or fake_up)
+    runner._hf_ckpt_repo = lambda repo: None
+    entry = runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                                   contract, "", warm_start_ref=None)
+    (host, kw), = disp.calls
+    assert kw["local_checkpoint"] is True        # worker ran --local-only
+    assert harvested and harvested[0][0].endswith("/challenger/checkpoint")
+    assert verified                              # ingest guard ran on the local copy
+    assert uploaded == ["cascade/ckpt-r777-challenger-toto2-4m"]
+    from cascade.shared.manifest import parse_trained_pointer
+    assert parse_trained_pointer(entry.trained_pointer) is not None
+    assert entry.miner_hotkey == "hkA" and entry.corpus_digest == "cd"
+    assert torn == ["cascade-n91-777-funded-hka-0"]   # no bench armed ⇒ teardown
+
+
+def test_harvest_guard_failure_is_tamper(tmp_path, monkeypatch):
+    from cascade.eval.checkpoint_guard import CheckpointTampered
+
+    disp = _FakeLocalDisp()
+    runner, torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp)
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir",
+                        lambda host, rdir, dest, **kw: dest)
+    def _boom(d, contract=None, **kw):
+        raise CheckpointTampered("model.py differs from this release's copy")
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint", _boom)
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                               contract, "", warm_start_ref=None)
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "tamper", False)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_harvest_transport_failure_is_infra_not_tamper(tmp_path, monkeypatch):
+    disp = _FakeLocalDisp()
+    runner, torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp)
+    def _dead(host, rdir, dest, **kw):
+        raise RuntimeError("harvest rc=255")
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", _dead)
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                               contract, "", warm_start_ref=None)
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls) == (False, "infra")   # miner's training was fine
+
+
+def test_bad_funded_pod_checkpoint_value_fails_loud(tmp_path):
+    runner = _runner(tmp_path, funded_pod_checkpoint="maybe")
+    with pytest.raises(RuntimeError, match="funded_pod_checkpoint"):
+        runner._funded_harvest()

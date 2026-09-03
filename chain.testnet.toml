@@ -217,6 +217,7 @@ payer_vault_dir = "/root/cascade-funded-compute/_payer_vault"  # FUNDED-TEST
 funded_pod_sku = "RTX4090"      # FUNDED-TEST
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"  # FUNDED-TEST
 funded_ready_timeout_seconds = 900.0
+funded_pod_checkpoint = "harvest"  # credential-free pods (worker --local-only + orchestrator harvest)
 funded_field_cap = 8            # FUNDED-TEST: elastic field
 funded_capacity_probe = true    # FUNDED-TEST: clamp to the chosen type's live market
 funded_capacity_reserve = 1

@@ -401,8 +401,13 @@ funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pic
 # Worker image funded pods boot — keep = the fleet's pinned digest.
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"
 funded_ready_timeout_seconds = 900.0
-# Payer pods get a per-pod push-only Hub robot (revoked at teardown) and
-# NOTHING from the operator's environment; this is the robot's Harbor expiry.
+# How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
+# CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
+# pod's env), the orchestrator pulls the checkpoint over the pinned ssh,
+# ingest-verifies it, and uploads it under its own identity. Needs a
+# funded_pod_image built from a --local-only-aware release. "robot": legacy
+# per-pod push-only Hub robot (revoked at teardown; Harbor expiry below).
+funded_pod_checkpoint = "harvest"
 funded_robot_duration_days = 1
 # Seats per round (0 = finalist_cap); clamped to live market capacity minus
 # the king's reserve when the probe is on. Held-back seats wait unburned.

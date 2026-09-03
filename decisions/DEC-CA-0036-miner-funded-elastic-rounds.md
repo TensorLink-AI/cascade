@@ -243,3 +243,22 @@ challenger earns the king pod's hour. Bench-report wire format untouched
 Rejected: trusting payer numbers outright (forgeable promotion), and
 benching every challenger on the king pod (8 × ~1h does not fit the hold —
 the payer bench is what makes verification O(1) per round).
+
+## Amendment 2026-09-03 (5) — credential-free pods (harvest mode, PRISM parity)
+
+`[round] funded_pod_checkpoint = "harvest"` (new default) removes the last
+credential from payer pods: the worker trains `--local-only` (no upload, a
+receipt carrying `local_checkpoint_dir` instead of a pointer — TrainedEntry
+still refuses anything but a real hub pointer, which keeps un-harvested
+checkpoints out of manifests by construction), and the orchestrator pulls
+the checkpoint over the pinned ssh, ingest-verifies the local copy
+(deviation ⇒ tamper, terminal), and uploads it under its own identity.
+The harvest extracts through tarfile's "data" filter (PEP 706): traversal,
+absolute paths, and symlink/hardlink escapes off a miner-controlled stream
+fail the harvest instead of writing outside it. Harvest transport failures
+settle infra (requeue, unburned) — the miner's training was fine. The
+per-pod Harbor robot survives as `"robot"`, the fallback for a
+pre-`--local-only` image. The payer-pod bench (amendment 4) is unaffected:
+the checkpoint also stays on the pod at its work path. Closes the "scoped
+per-pod credentials → zero credentials" arming gate at PRISM's bar; needs
+the worker image rebuilt from this release (`--local-only` is new CLI).

@@ -235,8 +235,21 @@ in code:
 - The pod is **isolated**: `RemoteHost.isolated` drops every `forward_env`
   and the dispatcher's global extras (`WANDB_API_KEY`); nothing from the
   orchestrator's environment travels. Pulls are anonymous (the repos are
-  public by design), so the only credential the worker needs is a Hub push.
-- That push credential is a **Harbor robot** scoped to the checkpoint project
+  public by design).
+- **Credential-free by default** (`[round] funded_pod_checkpoint = "harvest"`,
+  PRISM parity): the worker runs `--local-only` — it trains and leaves the
+  checkpoint on disk, uploading nothing, and the pod's environment holds NO
+  credential of any kind. The orchestrator then pulls the checkpoint over the
+  same pinned ssh (`harvest_remote_dir`, tar streamed through Python's
+  `tarfile` `filter="data"` so a hostile archive with `..`/absolute/symlink
+  members fails the harvest rather than writing outside it), runs the ingest
+  guard on the local copy (deviation ⇒ `tamper`), and uploads it under the
+  OPERATOR's identity — the manifest pointer is a checkpoint whose bytes the
+  orchestrator inspected before anything else could fetch them. A harvest
+  transport failure settles as infra (requeue), never tamper. Requires a
+  `funded_pod_image` built from a `--local-only`-aware release.
+- `"robot"` mode (fallback for a pre-harvest image): the pod pushes with a
+  **Harbor robot** scoped to the checkpoint project
   with `repository:push` only — no delete, no other project, no S3, no HF:
   1. **Per-pod robot (preferred):** minted at rent, revoked at teardown and by
      every sweep, Harbor expiry `[round] funded_robot_duration_days` as the
@@ -276,10 +289,9 @@ in code:
   settles as `tamper`); validators/audit/bench run it again on their side.
   Honest checkpoints pass byte-for-byte; nothing about which checkpoints
   bench or promote changes.
-- Still open vs PRISM: their pod holds NO credential at all (the master
-  SSH-harvests the checkpoint through a secure receive). Ours needs the
-  pinned worker to gain a local-only mode — the next worker-image release —
-  after which payer pods carry zero credentials.
+- PRISM-parity closed: with `"harvest"` (the default) the payer pod holds NO
+  credential at all — the master-side SSH harvest above IS the secure
+  receive. The robot machinery remains only as the `"robot"` fallback.
 - **The payer vault is sealed at rest** when `CASCADE_VAULT_KEY_FILE` (32 raw
   bytes or 64 hex; the SAME file on the intake and the trainer) is set:
   AES-256-GCM per entry with the hotkey as associated data, so a copied
