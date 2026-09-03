@@ -37,6 +37,8 @@ payer_vault/
 cascade_state*.json
 warm_start_init*.json
 run_*.sh
+hosts.toml
+provision.toml
 
 # Local state, scratch, logs
 *.db
