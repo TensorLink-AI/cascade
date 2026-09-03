@@ -43,8 +43,10 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                       payer_vault_dir=vault_dir, funded_pod_sku=sku,
                       funded_pod_image=image, **round_kw)
     import threading
+    from cascade.shared.config import TelemetryConfig
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd,
-                                               subnet=SimpleNamespace(netuid=91)),
+                                               subnet=SimpleNamespace(netuid=91),
+                                               telemetry=TelemetryConfig()),
                            work_root=tmp_path,
                            _funded_field={}, _funded_leg_failures={},
                            _funded_claimed_execs=set(),
@@ -55,6 +57,10 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_round_sku="",
                            _funded_king_host=None,
                            _funded_king_lock=threading.Lock(),
+                           _funded_bench_pods={},
+                           _funded_bench_lock=threading.Lock(),
+                           _final_role_hosts={},
+                           cascade_bench_plan=None,
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
     fake.hub = lambda: SimpleNamespace(namespace="cascade")
@@ -73,11 +79,14 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
                  "_teardown_funded_pod", "_run_funded_leg", "_settle_funded",
+                 "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
+                 "_teardown_kept_funded_pods",
                  "_filter_funded_challengers", "_submissions_path",
                  "_submission_store"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     prof = profile or _profile(tmp_path)
     fake._hosts_for = lambda stage: [prof]
+    fake.will_run_post_publish_bench = lambda: fake.cascade_bench_plan is not None
     return fake
 
 
@@ -887,3 +896,50 @@ def test_tampered_checkpoint_never_reaches_the_manifest(tmp_path, monkeypatch):
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
     assert (miner_fault, cls) == (True, "tamper")    # …but the entry is dropped as tamper
     assert "forecast_wrapper.py differs" in msg
+
+
+# ── DEC-CA-0036: the pod outlives its leg for the payer-pod bench ────────────
+
+def test_funded_leg_keeps_the_pod_for_the_bench_when_armed(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    runner.cascade_bench_plan = object()          # remote cascade bench wired
+    entry = runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                                   contract, "", warm_start_ref=None)
+    assert entry.hotkey == "hkA"
+    assert torn == []                             # NOT torn down with the leg
+    (host, _), = disp.calls
+    # …the sweep finds it where the checkpoint is, and the keep is bookkept
+    assert runner._final_role_hosts[("challenger", "toto2-4m", "hkA")] is host
+    assert host.isolated and runner._funded_bench_pods["hkA"].instance_id == \
+        "cascade-n91-777-funded-hka-0"
+    # the kept-pod sweeps end the bill exactly once
+    runner._teardown_kept_funded_pod("hkA")
+    runner._teardown_kept_funded_pods("test")
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_funded_leg_failure_never_keeps_the_pod(tmp_path, monkeypatch):
+    disp = _FakeDisp(fail_rc=255)
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    runner.cascade_bench_plan = object()
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                               contract, "", warm_start_ref=None)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+    assert runner._funded_bench_pods == {} and runner._final_role_hosts == {}
+
+
+def test_funded_bench_off_tears_down_with_the_leg(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from cascade.shared.config import TelemetryConfig
+
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    runner.cascade_bench_plan = object()
+    runner.cfg.telemetry = replace(TelemetryConfig(), funded_bench=False)
+    runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                           contract, "", warm_start_ref=None)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+    assert runner._final_role_hosts == {}

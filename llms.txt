@@ -189,7 +189,8 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
    `cascade fund https://<operator-intake> --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
    Your hotkey must be REGISTERED on the subnet and the ref must match your
    revealed commitment. The leg's pod rents on your Lium account only when
-   your seat comes up; requeues never burn your entry, and
+   your seat comes up (budget ~4h: the 3h leg plus ~1h benching your own
+   checkpoint on that pod after the duel); requeues never burn your entry, and
    `cascade fund … --withdraw` exits a still-queued entry (the operator
    forgets your key). Watch your seat with `cascade queue` (add
    `--intake <url>` for the live queue).

@@ -866,6 +866,14 @@ mode    = "online"              # online | offline | disabled
 # first training batch), and is the one field comparable across pods.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Payer-pod bench (DEC-CA-0036): each funded challenger benches on its own pod
+# after the duel (miner-billed, ~1h; the pod is torn down when the sweep ends).
+# Payer numbers are a FILTER: the top-N re-bench on the operator's king pod and
+# only the operator's numbers are signed/published; a payer number better than
+# the re-bench by more than the tolerance is a forged sweep (entry dropped).
+funded_bench = true
+funded_bench_verify_top = 1
+funded_bench_verify_tolerance = 0.02
 # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round
 # the trainer ALSO trains the king's generator from scratch (random init,
 # identical contract + seeds) strictly post-publish on the idle final pod,

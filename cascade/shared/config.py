@@ -1417,12 +1417,28 @@ class TelemetryConfig:
     Deliberately a ``[telemetry]`` key: it must never touch
     ``contract_digest`` — the digest-bound path to finished-form DUEL
     artifacts is [training] anneal_fraction (DEC-CA-0029), a contract cut.
+
+    ``funded_bench`` (DEC-CA-0036) benches each funded challenger on its
+    OWN payer pod after the duel (the pod stays up through publish and is
+    torn down when its sweep ends) instead of not at all — a payer-billed
+    box the operator never benched on, so its numbers are a FILTER, never a
+    published fact: the top ``funded_bench_verify_top`` payer-reported
+    challengers are re-benched on the operator's king pod, and only the
+    operator's numbers reach the signed report (and so the promotion pool).
+    A payer number more than ``funded_bench_verify_tolerance`` (relative,
+    on the six-number cascade score) better than the operator's re-bench is
+    a forged sweep: the entry is dropped from the report (its submission was
+    already spent at the duel settle; the promotion seat is what the drop
+    denies). Payer numbers outside the verified top-N are logged only.
     """
 
     host_probe: bool = True
     host_bench: bool = True
     scratch_shadow_every_rounds: int = 0
     bench_anneal_fraction: float = 0.0
+    funded_bench: bool = True
+    funded_bench_verify_top: int = 1
+    funded_bench_verify_tolerance: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -2018,6 +2034,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             host_bench=bool(tm.get("host_bench", True)),
             scratch_shadow_every_rounds=int(tm.get("scratch_shadow_every_rounds", 0)),
             bench_anneal_fraction=float(tm.get("bench_anneal_fraction", 0.0)),
+            funded_bench=bool(tm.get("funded_bench", True)),
+            funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
+            funded_bench_verify_tolerance=float(
+                tm.get("funded_bench_verify_tolerance", 0.02)),
         ),
         raw=raw,
     )

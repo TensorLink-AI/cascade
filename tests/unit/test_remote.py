@@ -397,3 +397,22 @@ def test_load_hosts_parses_and_validates_stage(tmp_path):
     p.write_text('[[host]]\nname="x"\nhost="10.0.0.9"\nstage="warmup"\n', encoding="utf-8")
     with pytest.raises(RemoteDispatchError, match="stage"):
         load_hosts(p)
+
+
+def test_scp_argv_carries_the_pinned_host_key_policy():
+    """A file copy to a pinned host must be exactly as strict as a command:
+    an accept-new scp would be the one hole in the leg's identity pin."""
+    from cascade.trainer.remote import build_scp_argv, build_ssh_argv
+
+    pinned = RemoteHost(name="p", host="10.0.0.5", port=2222, key_path="/k",
+                        pinned_host_key="ssh-ed25519 AAAAtest", ssh_options=("X=1",))
+    scp = build_scp_argv(pinned, "/tmp/a.zip", "/workspace/a.zip")
+    ssh = build_ssh_argv(pinned, "true")
+    assert scp[0] == "scp" and scp[-2:] == ["/tmp/a.zip", "root@10.0.0.5:/workspace/a.zip"]
+    # same options, -p → -P, pin first so nothing later can loosen it
+    assert scp[1:-2] == ["-P" if a == "-p" else a for a in ssh[1:-2]]
+    assert scp[1:3] == ["-P", "2222"]
+    assert "StrictHostKeyChecking=yes" in scp
+    assert "StrictHostKeyChecking=accept-new" not in scp
+    plain = build_scp_argv(RemoteHost(name="q", host="h"), "/a", "/b")
+    assert "StrictHostKeyChecking=accept-new" in plain

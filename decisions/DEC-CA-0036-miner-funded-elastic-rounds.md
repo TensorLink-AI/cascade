@@ -214,3 +214,32 @@ per-pod minting needs a project-admin USER login on the orchestrator. The
 delta from PRISM (a credential-free pod with master-side SSH harvest +
 secure receive, and a sealed-at-rest payer vault) waits on the worker-image
 release.
+
+## Amendment 2026-09-03 (4) — payer-pod bench, operator-verified
+
+Funded challengers were never benched: the pod died with the leg and the
+post-publish sweep only knows pods, so no funded-round challenger could
+reach the public bench stream or the DEC-CA-0013 promotion pool — against
+the owner's stated intent that challengers better at external checkpoints
+get through. Now (`[telemetry] funded_bench`, default on) the leg's pod
+stays up through publish and the sweep benches each checkpoint where it was
+trained, in parallel across pods; the pod is torn down when its own sweep
+ends, with sweeps at bench-thread exit, round failure, and the next
+`run_round` for anything left (a kept pod bills its payer). No credential
+of any kind goes to the isolated host (HF token withheld; data sideloaded).
+
+Payer numbers are a FILTER, never a published fact: the miner controls the
+box, and the signed report seeds the shared init for every future round.
+The top `funded_bench_verify_top` (1) payer-reported challengers are
+re-benched on the operator's king pod (guard-verified checkpoint pushed
+over the pinned ssh to a `<role>-verify` work dir); within
+`funded_bench_verify_tolerance` (2%, one-sided) the operator's numbers stand
+in, beyond it the entry is dropped and logged TAMPER (the submission was
+already spent at the settle — the promotion seat is what the drop denies).
+Unverified payer numbers are logged only. Everything the trainer signs was
+produced on operator hardware; the payer bench only decides which
+challenger earns the king pod's hour. Bench-report wire format untouched
+(a provenance field would fork validators' canonical-body signatures).
+Rejected: trusting payer numbers outright (forgeable promotion), and
+benching every challenger on the king pod (8 × ~1h does not fit the hold —
+the payer bench is what makes verification O(1) per round).

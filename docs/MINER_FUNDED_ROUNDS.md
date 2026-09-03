@@ -287,6 +287,44 @@ in code:
   with a startup warning; set it before mainnet. Legacy entries still
   hydrate and re-seal on their next insert.
 
+## Bench on the payer's pod (post-duel, miner-billed)
+
+Before this the funded challenger was **never benched**: its pod died with
+the leg, and the post-publish sweep only knows pods — so no challenger from
+a funded round could enter the public bench stream or the promotion pool.
+With `[telemetry] funded_bench = true` (default):
+
+- The leg's pod **stays up through publish**. After the manifest publishes,
+  the sweep benches every checkpoint where it was trained — the king on the
+  operator's pod, each challenger on its payer's — in parallel across pods
+  (`_bench_duel_checkpoints`). The 4.4G battery is sideloaded from the
+  trainer box (`sideload_bench_data`, ~75s) and **no HF token** goes to an
+  isolated host (a failed sideload degrades to an anonymous download). The
+  pod is torn down the moment its own sweep ends; a sweep that never runs
+  (round failure, launch failure, bench off) or dies is swept in the bench
+  thread's `finally`, the round-failure handler, and at the next
+  `run_round` — a kept pod bills its payer for nothing otherwise. Expect
+  ~1h of extra pod time per submission.
+- **Payer numbers are a filter, never a published fact.** A pod the miner
+  controls can write any `benchmark_report.json` it likes, and the signed
+  report feeds the DEC-CA-0013 promotion pool (the shared init for every
+  future round). So the top `funded_bench_verify_top` (default 1)
+  payer-reported challengers are **re-benched on the operator's king pod**:
+  the orchestrator pushes its guard-verified copy of the checkpoint to
+  `_train_work/<round>/<size>/<role>-verify/checkpoint` (`push_checkpoint`,
+  ~64MB over the pinned ssh) and runs the same sweep there. Within
+  `funded_bench_verify_tolerance` (2% relative, one-sided) the operator's
+  numbers replace the payer's; a payer number better than the re-bench by
+  more than that is a forged sweep — the entry is dropped from the report
+  (its submission was already spent at the settle; the promotion seat is
+  what the drop denies) and logged as TAMPER. Unverified payer numbers
+  (below the top-N) are logged only. Everything the trainer signs was
+  therefore produced on the operator's hardware; the payer bench decides
+  only *which* challenger is worth the king pod's hour. `[eval]
+  bench_hold_max_hours` must cover king bench + N verification benches.
+- Wire format untouched: `BenchReport` carries no provenance field
+  (validators sign-check the canonical body; adding one would fork them).
+
 ## What the provisioner must NOT do on funded pods
 
 - Rent them on the operator key (`provision/funded.py` has no such path —
@@ -365,7 +403,8 @@ anywhere but the operator's sealed vault.
 ## Cost model after arming
 
 Operator: one king leg per fired round + one confirmation leg per
-provisional dethrone + CPU evals + the intake box — O(rounds + dethrones).
-Miners: their own leg, win or lose. Nobody pays for screening, because
-nothing is screened: the queue caps the cohort and everyone who enters
-duels.
+provisional dethrone + the king bench + `funded_bench_verify_top`
+verification benches + CPU evals + the intake box — O(rounds + dethrones).
+Miners: their own leg plus ~1h of bench on the same pod, win or lose.
+Nobody pays for screening, because nothing is screened: the queue caps the
+cohort and everyone who enters duels.

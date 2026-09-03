@@ -309,7 +309,11 @@ in-context.
   submissions stay off. Payer pods are ISOLATED + per-pod push-only Hub
   robots (revoked at teardown; needs CASCADE_HUB_ADMIN_* or a static
   CASCADE_FUNDED_HUB_* robot, else fail-closed). The confirmation-leg gate
-  ships OPEN, owner-accepted — revisit in week one.
+  ships OPEN, owner-accepted — revisit in week one. Funded challengers
+  bench on their OWN pod post-publish (`[telemetry] funded_bench`; pod
+  kept through the sweep, then torn down); payer numbers are a FILTER —
+  the top-N re-bench on the operator's king pod and only operator numbers
+  are signed (forged sweep ⇒ entry dropped).
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:

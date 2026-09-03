@@ -877,6 +877,18 @@ class TrainerRunner:
     # runs fully parallel, so wall-clock stays one leg + ~90s per seat.
     _funded_rent_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False)
+    # Funded pods kept ALIVE past their leg for the post-publish bench
+    # (payer hotkey → PodInstance; [telemetry] funded_bench). Each is torn
+    # down the moment its own sweep ends (_bench_pod_group), and whatever is
+    # left is swept when the bench thread exits, when a round never reaches
+    # its bench, and at the next run_round — a kept pod bills its payer, so
+    # nothing may hold one longer than the sweep it was kept for.
+    _funded_bench_pods: dict = field(default_factory=dict, repr=False)
+    _funded_bench_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False)
+    # trained_pointers whose scores in the current sweep came off a payer
+    # pod — verified on the operator's pod before anything is published.
+    _payer_benched: set = field(default_factory=set, repr=False)
     # Challengers dropped BEFORE the field was even eligible (today: burned
     # hotkeys re-committing their one used submission), reset each round.
     # ``[{hotkey, uid, reason}]`` — feeds the published heat standings so a
@@ -1880,19 +1892,15 @@ class TrainerRunner:
             raise RuntimeError("vault ref selected but submission_vault_dir unset")
         staged = store.stage_for_dispatch(
             digest_hex, self.work_root / "_vault_dispatch" / digest_hex)
+        from .remote import build_scp_argv, build_ssh_argv
+
         pod_dir = f"{host.workdir}/_vault_stage"
-        base = ["-p", str(host.port), "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=accept-new"]
-        if host.key_path:
-            base += ["-i", str(Path(host.key_path).expanduser())]
-        for opt in host.ssh_options:
-            base += ["-o", opt]
-        subprocess.run(["ssh", *base, f"{host.user}@{host.host}",
-                        f"mkdir -p {shlex.quote(pod_dir)}"],
+        # Same transport policy as every dispatch: a pinned host key stays
+        # pinned for the copy (an accept-new scp here would be the one hole
+        # in the leg's identity pin).
+        subprocess.run(build_ssh_argv(host, f"mkdir -p {shlex.quote(pod_dir)}"),
                        check=True, capture_output=True, timeout=60)
-        scp_base = ["-P" if a == "-p" else a for a in base]
-        subprocess.run(["scp", *scp_base, str(staged),
-                        f"{host.user}@{host.host}:{pod_dir}/{digest_hex}.zip"],
+        subprocess.run(build_scp_argv(host, str(staged), f"{pod_dir}/{digest_hex}.zip"),
                        check=True, capture_output=True, timeout=300)
         return dc_replace(host, static_env=(*host.static_env,
                                             ("CASCADE_VAULT_DIR", pod_dir)))
@@ -2036,10 +2044,14 @@ class TrainerRunner:
     def _run_funded_leg(self, disp, gen: ResolvedGenerator, seeds, block: int,
                         contract, suffix: str, *, warm_start_ref: str | None):
         """One funded challenger leg on its payer's own pod: rent → (stage the
-        vault ZIP when the ref is one) → dispatch → teardown, always."""
+        vault ZIP when the ref is one) → dispatch → teardown — immediately on
+        any failure, or (with the payer-pod bench armed) after the
+        post-publish sweep that benches the checkpoint where it was trained
+        (see :meth:`_keep_funded_pod_for_bench`)."""
         from ..funding.store import parse_vault_ref
 
         host, pod = self._rent_funded_host(str(seeds.base_seed), gen)
+        keep = False
         try:
             # Identity pin, before a single byte of dispatch: the pod that
             # answers to this name must be the one we rented (platform id)
@@ -2070,6 +2082,15 @@ class TrainerRunner:
             why = self._funded_checkpoint_mismatch(entry, contract)
             if why:
                 raise _FundedTamper(f"checkpoint: {why}")
+            if self._keep_funded_pod_for_bench():
+                # The checkpoint benches on THIS pod after publish (payer-
+                # billed, the miner's own sidecar eval); _bench_pod_group
+                # tears it down when the sweep ends.
+                with self._funded_bench_lock:
+                    self._funded_bench_pods[gen.hotkey] = pod
+                self._final_role_hosts[
+                    ("challenger", contract.arch_preset, gen.hotkey)] = host
+                keep = True
             return entry
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
@@ -2093,7 +2114,42 @@ class TrainerRunner:
                 burn=(rc != 3))
             raise
         finally:
+            if not keep:
+                self._teardown_funded_pod(pod)
+
+    def _keep_funded_pod_for_bench(self) -> bool:
+        """Whether a funded leg's pod outlives its leg for the post-publish
+        bench: ``[telemetry] funded_bench`` plus a wired REMOTE cascade bench
+        (the local ``bench_eval_fn`` path fetches from the Hub and needs no
+        pod). Without this the funded challenger is never benched at all —
+        its pod died with the leg and the sweep only knows pods."""
+        return bool(
+            getattr(self.cfg.telemetry, "funded_bench", True)
+            and self.will_run_post_publish_bench()
+            and self.cascade_bench_plan is not None
+        )
+
+    def _teardown_kept_funded_pod(self, hotkey: str) -> None:
+        """Tear down the pod kept for ``hotkey``'s bench (no-op if none)."""
+        with self._funded_bench_lock:
+            pod = self._funded_bench_pods.pop(hotkey, None)
+        if pod is not None:
             self._teardown_funded_pod(pod)
+
+    def _teardown_kept_funded_pods(self, why: str) -> None:
+        """Tear down EVERY pod still kept for a bench — the sweep never ran,
+        died, or is over. Idempotent; each pod is popped before its teardown
+        so a concurrent per-pod teardown cannot double-bill the ledger."""
+        with self._funded_bench_lock:
+            hotkeys = list(self._funded_bench_pods)
+        if hotkeys:
+            log.info("tearing down %d kept funded pod(s): %s", len(hotkeys), why)
+        for hk in hotkeys:
+            try:
+                self._teardown_kept_funded_pod(hk)
+            except Exception as e:  # noqa: BLE001 — one stuck pod must not shield the rest
+                log.error("kept funded pod for %s: teardown failed (%s); the "
+                          "boundary sweep retries", hk[:12], e)
 
     def _skip_unfunded_round(self, round_id: str) -> bool:
         """True when this boundary should not run at all (elastic-cadence floor).
@@ -3423,6 +3479,9 @@ class TrainerRunner:
             # point).
             self._run_scratch_shadow(manifest, report, final_hosts=final_hosts)
         finally:
+            # Payer pods kept for this sweep (DEC-CA-0036): each went down as
+            # its own bench ended; this catches the ones a failed sweep skipped.
+            self._teardown_kept_funded_pods("post-publish bench finished")
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
         return report
 
@@ -3884,6 +3943,10 @@ class TrainerRunner:
         # a miss drops that entry from the report, never the report itself.
         duel = [e for e in manifest.entries if (e.size or primary) == primary]
         scored = self._bench_duel_checkpoints(duel, manifest.round_id, primary)
+        # Numbers off a PAYER's pod are a filter, never a published fact: the
+        # top-N re-bench on the operator's king pod and only those operator
+        # numbers go on to the signed report (DEC-CA-0036).
+        scored = self._verify_payer_benches(duel, scored, manifest.round_id, primary)
         entries = []
         for m_entry in duel:
             scores = scored.get(m_entry.trained_pointer)
@@ -3937,7 +4000,9 @@ class TrainerRunner:
         from concurrent.futures import ThreadPoolExecutor
 
         out: dict[str, BenchScores] = {}
-        if self.cascade_bench_plan is not None and self.remote_hosts:
+        self._payer_benched = set()
+        if self.cascade_bench_plan is not None and (self.remote_hosts
+                                                    or self._final_role_hosts):
             by_pod: dict[str, list[tuple[object, TrainedEntry]]] = {}
             for entry in duel:
                 host = self._bench_host_for(entry, primary)
@@ -3957,8 +4022,15 @@ class TrainerRunner:
                                     round_id, entry.role, entry.miner_hotkey,
                                     getattr(host, "name", host), e)
                         continue
+                    finally:
+                        if getattr(host, "isolated", False):
+                            # A payer's pod, kept alive only for this sweep
+                            # (DEC-CA-0036): its bill ends here, scored or not.
+                            self._teardown_kept_funded_pod(entry.miner_hotkey)
                     if scores is not None:
                         out[entry.trained_pointer] = scores
+                        if getattr(host, "isolated", False):
+                            self._payer_benched.add(entry.trained_pointer)
 
             with ThreadPoolExecutor(max_workers=max(1, len(by_pod))) as ex:
                 list(ex.map(_bench_pod_group, by_pod.values()))
@@ -3979,15 +4051,100 @@ class TrainerRunner:
     def _bench_host_for(self, entry: TrainedEntry, primary: str) -> object | None:
         """The pod holding ``entry``'s checkpoint: the tracked dispatch host,
         or the round-robin heuristic (king first, challenger next) when a
-        restart between duel and bench lost the tracking dict."""
+        restart between duel and bench lost the tracking dict. A funded
+        challenger has no heuristic: its checkpoint only ever existed on its
+        payer's pod, and a guess would bench a stranger's path on the king."""
         host = self._final_role_hosts.get(
             (entry.role, entry.size or primary, entry.miner_hotkey))
         if host is not None:
             return host
+        if entry.role == "challenger" and entry.miner_hotkey in self._funded_field:
+            return None
         hosts = self._hosts_for("final")
         if not hosts:
             return None
         return hosts[0] if entry.role == "king" else hosts[1 % len(hosts)]
+
+    def _verify_payer_benches(
+        self, duel: list[TrainedEntry], scored: dict, round_id: str, primary: str,
+    ) -> dict:
+        """Replace payer-pod numbers with the operator's own, or drop them.
+
+        The payer-benched challengers (``_payer_benched``) rank by their
+        reported cascade score; the top ``[telemetry] funded_bench_verify_top``
+        are pushed to the king's pod (the guard-verified copy the leg already
+        fetched) and benched there. Within tolerance ⇒ the operator's scores
+        stand in; a payer report better than the operator's by more than the
+        tolerance ⇒ a forged sweep: the entry is dropped (its submission was
+        already spent at the settle; the promotion seat is what the drop
+        denies). The rest — unverified — are logged and dropped from the
+        report: everything the trainer signs was produced on its own box.
+        Any verification failure (no king host, push/sweep miss) just drops
+        the entry; the signed stream carries fewer numbers, never wrong ones.
+        """
+        payer = {p for p in getattr(self, "_payer_benched", ()) if p in scored}
+        if not payer:
+            return scored
+        from ..eval.benchmarks import extract_bench_scores
+        from ..validator.cascade import cascade_score
+        from .bench_hook import push_checkpoint, run_post_round_benchmark
+
+        def _score(bs: BenchScores) -> float:
+            return cascade_score(bs.gifteval_crps, bs.gifteval_mase, bs.boom_crps,
+                                 bs.boom_mase, bs.time_crps, bs.time_mase)
+
+        out = {p: s for p, s in scored.items() if p not in payer}
+        ranked = sorted((e for e in duel if e.trained_pointer in payer),
+                        key=lambda e: _score(scored[e.trained_pointer]))
+        top = max(0, int(getattr(self.cfg.telemetry, "funded_bench_verify_top", 1)))
+        tol = float(getattr(self.cfg.telemetry, "funded_bench_verify_tolerance", 0.02))
+        king = next((e for e in duel if e.role == "king"), None)
+        king_host = self._bench_host_for(king, primary) if king is not None else None
+        for i, entry in enumerate(ranked):
+            reported = _score(scored[entry.trained_pointer])
+            if i >= top:
+                log.info("round=%s: payer-pod bench for %s = %.5f (unverified, "
+                         "not published)", round_id, entry.miner_hotkey[:12], reported)
+                continue
+            if king_host is None:
+                log.warning("round=%s: no king pod to verify %s's payer-pod bench "
+                            "(%.5f) on; entry not published", round_id,
+                            entry.miner_hotkey[:12], reported)
+                continue
+            try:
+                local = self._fetch_checkpoint_dir(entry.trained_pointer)
+                role_dir = f"{_bench_role_dir(duel, entry)}-verify"
+                push_checkpoint(king_host, local, round_id, primary, role_dir)
+                report = run_post_round_benchmark(
+                    king_host, round_id, primary, self.cascade_bench_plan,
+                    work_root=self.work_root, role=role_dir)
+                raw = extract_bench_scores(report) if report is not None else None
+            except Exception as e:  # noqa: BLE001 — verification miss ⇒ not published
+                log.warning("round=%s: operator re-bench of %s failed (%s); entry "
+                            "not published", round_id, entry.miner_hotkey[:12], e)
+                continue
+            if raw is None:
+                log.warning("round=%s: operator re-bench of %s produced no scores; "
+                            "entry not published", round_id, entry.miner_hotkey[:12])
+                continue
+            ours = BenchScores(**raw)
+            actual = _score(ours)
+            # Lower is better: a payer number BELOW ours by more than the
+            # tolerance was not produced by this checkpoint on this battery.
+            if reported < actual * (1.0 - tol):
+                # The submission was already spent at the duel settle; what a
+                # forged sweep could still buy is a promotion-pool seat, and
+                # that is exactly what the drop denies.
+                log.error("round=%s: payer-pod bench for %s reported %.5f but the "
+                          "operator's re-bench scores %.5f — forged sweep; entry "
+                          "dropped from the report (TAMPER)", round_id,
+                          entry.miner_hotkey[:12], reported, actual)
+                continue
+            log.info("round=%s: payer-pod bench for %s verified (payer %.5f, "
+                     "operator %.5f) — publishing the operator's numbers",
+                     round_id, entry.miner_hotkey[:12], reported, actual)
+            out[entry.trained_pointer] = ours
+        return out
 
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str,
@@ -4181,6 +4338,10 @@ class TrainerRunner:
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
         self._final_role_hosts = {}
+        # A previous round's bench thread should have torn its kept payer
+        # pods down long ago; whatever it left (crash, hung sweep) goes now —
+        # every one of them is billing a miner for nothing.
+        self._teardown_kept_funded_pods("previous round's bench left them")
         # Stamp the height for the funded activation gate — run_round is also
         # a direct entry point (scripts, tests), which must see the same gate
         # decision the live loop would at this block.
@@ -5225,9 +5386,9 @@ class TrainerRunner:
                     and gen.hotkey in self._funded_field):
                 # DEC-CA-0036: this leg bills its payer, on a pod rented with
                 # THEIR key — never an operator lane, even as a fallback (the
-                # bill must not silently move). The pod is not recorded in
-                # _final_role_hosts: it is torn down with the leg, so the
-                # post-publish bench would target a corpse.
+                # bill must not silently move). The leg itself records the
+                # pod in _final_role_hosts when it stays up for the bench
+                # (and only then — a torn-down pod must never be a target).
                 return self._run_funded_leg(
                     disp, gen, seeds, block, contract, suffix,
                     warm_start_ref=warm_start_ref)
@@ -5636,7 +5797,10 @@ class TrainerRunner:
                         self.launch_post_publish_bench(manifest)
                     except Exception as e:  # noqa: BLE001 — telemetry/promotion input only
                         self._mark_bench_complete(round_id, uploaded=False)
+                        self._teardown_kept_funded_pods("bench launch failed")
                         log.warning("post-publish bench launch failed (ignored): %s", e)
+                else:
+                    self._teardown_kept_funded_pods("no post-publish bench this round")
                 if self.bench_plan is not None and self.remote_hosts and not will_bench:
                     # Guarded separately: the round is already published, so a
                     # telemetry failure here must not fall through to the round
@@ -5663,4 +5827,7 @@ class TrainerRunner:
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)
+                # A round that died between its funded legs and its bench
+                # leaves payer pods kept for a sweep that will never come.
+                self._teardown_kept_funded_pods("round failed before its bench")
             time.sleep(poll)

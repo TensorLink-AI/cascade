@@ -627,7 +627,12 @@ What to know:
 - **One GPU type per round**, chosen at the boundary as the most available
   of `["RTX4090", "RTX3090", "L40S", "L40", "A6000"]` — king and challenger
   always train on identical silicon. Keep enough balance on your Lium
-  account for ~3h of the round's type.
+  account for ~4h of the round's type: the ~3h leg plus ~1h in which your
+  pod benches your OWN checkpoint on GIFT-Eval/BOOM/TIME after the duel
+  (data is pushed to it; the pod is released when the sweep ends). The
+  operator re-benches the best-reported challenger on its own pod before
+  any number is signed, so a doctored sweep buys nothing — it just drops
+  your entry from the public bench stream and the promotion pool.
 - **Your entry never burns for infrastructure.** A dead pod, a sold-out
   market, or a rate limit re-queues you without spending anything (sold-out
   waits as long as it takes; a rate-limit streak longer than 6h turns

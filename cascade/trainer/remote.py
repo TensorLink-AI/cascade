@@ -314,23 +314,38 @@ def pinned_known_hosts_file(host: RemoteHost) -> Path:
     return path
 
 
-def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
-    """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
+def ssh_transport_options(host: RemoteHost) -> list[str]:
+    """The option argv (everything between the command name and the
+    ``user@host`` target) shared by every ssh/scp to ``host``: port,
+    BatchMode, the host-key policy, identity, then ``host.ssh_options``.
+    Uses ssh's ``-p``; scp callers rewrite it to ``-P``."""
     if host.pinned_host_key:
         # ssh honours the FIRST value given for an option, so the pin goes
         # first and nothing later (host.ssh_options included) can loosen it.
-        argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
+        argv = ["-p", str(host.port), "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", f"UserKnownHostsFile={pinned_known_hosts_file(host)}"]
     else:
-        argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
+        argv = ["-p", str(host.port), "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new"]
     if host.key_path:
         argv += ["-i", str(Path(host.key_path).expanduser())]
     for opt in host.ssh_options:
         argv += ["-o", opt]
-    argv += [f"{host.user}@{host.host}", remote_command]
     return argv
+
+
+def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
+    """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
+    return ["ssh", *ssh_transport_options(host), f"{host.user}@{host.host}", remote_command]
+
+
+def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
+    """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
+    under exactly :func:`build_ssh_argv`'s transport policy (a pinned host
+    key stays pinned for file copies too)."""
+    opts = ["-P" if a == "-p" else a for a in ssh_transport_options(host)]
+    return ["scp", *opts, local_path, f"{host.user}@{host.host}:{remote_path}"]
 
 
 def parse_receipt(stdout: str) -> dict:
