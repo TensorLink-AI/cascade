@@ -274,6 +274,13 @@ in-context.
   bench-report wire format, and duel verdicts untouched; leg failure falls
   back to the raw bench. Interim for the DEC-CA-0029 contract cut — never
   arm both. (`decisions/DEC-CA-0030-bench-anneal-finished-form-benchscores.md`)
+- **DEC-CA-0037** — Duel-only rounds from `[round] duel_from_block`
+  (8992800): no heat; the screened field seats into the duel in reveal order
+  up to `duel_field_cap` (7), the overflow waits unburned, legs queue over
+  the L40S final fleet's lanes, the cohort is judged under α/k as before.
+  Same block arms the scored horizon ladder (`[eval] scored_horizons`,
+  consensus). Trainer/provisioner policy; no contract change.
+  (`decisions/DEC-CA-0037-duel-only-rounds.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

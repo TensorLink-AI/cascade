@@ -1728,6 +1728,7 @@ class TrainerRunner:
         heat: HeatResult | None,
         *,
         screened: int,
+        waiting: list[ResolvedGenerator] | None = None,
     ) -> None:
         """Publish the heat standings the moment the heat settles.
 
@@ -1756,7 +1757,18 @@ class TrainerRunner:
 
         skipped = list(self._round_skipped)
         n = max(0, self.cfg.round.finalist_cap)
-        if screened == 0:
+        if waiting:
+            # Duel-only overflow: listed beside the burned/skipped rows so a
+            # queued miner can read that its submission is intact.
+            skipped += [{"hotkey": c.hotkey, "uid": c.uid, "reason": "waiting"}
+                        for c in waiting]
+        if heat is None and waiting is not None:
+            n = max(1, int(self.cfg.round.duel_field_cap))
+            reason = (f"duel-only round: {screened} entrant(s) seated in reveal "
+                      f"order (cap {n}), no heat screen")
+            if waiting:
+                reason += f"; {len(waiting)} wait for a later round"
+        elif screened == 0:
             reason = "no eligible challengers entered the round"
             if skipped:
                 # An empty field with standing commitments is not silence — say
@@ -3100,11 +3112,20 @@ class TrainerRunner:
         self._stage_ctx = {"round_id": str(base_seed),
                            "epoch_start_block": int(screen_block),
                            "warm_start": ws_info}
+        # Duel-only rounds ([round] duel_from_block): no heat — the screened
+        # field seats straight into the duel in reveal order, up to
+        # duel_field_cap; the overflow waits for a later round, unburned.
+        duel_only = self.cfg.round.duel_only(screen_block)
+        waiting: list[ResolvedGenerator] = []
+        if duel_only and reused is None:
+            screened, waiting = self._seat_duel_field(screened, base_seed)
         self._publish_stage("heat", heat_done=0, heat_total=len(screened))
         if reused is not None:
             # Retry after settle: no heat compute is re-spent and no standings
             # are re-derived — the finalists advance exactly as settled.
             finalists, heat = list(reused), None
+        elif duel_only:
+            finalists, heat = list(screened), None
         else:
             finalists, heat = self._run_heat(screened, seeds, block,
                                              screen_block=screen_block,
@@ -3114,8 +3135,10 @@ class TrainerRunner:
         # mid-heat leaves the burn set untouched, so no miner's one lifetime
         # submission is consumed by a round that never judged it. (On the
         # settled-retry path this is an idempotent no-op: the reused finalists
-        # were burned at the original settle.)
-        self._burn_hotkeys(eligible)
+        # were burned at the original settle.) A duel-only round's waiting
+        # entrants were not judged either — they keep their submission.
+        held = {c.hotkey for c in waiting}
+        self._burn_hotkeys([c for c in eligible if c.hotkey not in held])
         if reused is None:
             # Heat settled (screened + burned + finalists chosen): signal external
             # watchers (the provisioner) that heat-stage pods are now safe to release.
@@ -3126,7 +3149,8 @@ class TrainerRunner:
             # (On the settled-retry path both already happened at the original
             # settle; re-publishing here would overwrite the real standings
             # with a no-screen doc.)
-            self._publish_heat_standings(heat, screened=len(screened))
+            self._publish_heat_standings(heat, screened=len(screened),
+                                         waiting=waiting if duel_only else None)
         self._publish_stage("duel", heat_done=len(eligible),
                             heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far
@@ -3139,11 +3163,14 @@ class TrainerRunner:
         self._reload_remote_hosts(require_stage="final")
         jobs: list[tuple[ResolvedGenerator, str]] = [(plan.king, "king")]
         jobs += [(c, "challenger") for c in finalists]
+        if duel_only:
+            self._log_duel_geometry(base_seed, len(jobs), screen_block)
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
         if len(finalists) > 1:
             # DEC-CA-0012: stamp the advancing cohort's record order — 0-based,
-            # best observed heat geomean first. Record order ONLY: the
+            # best observed heat geomean first (reveal order on a duel-only
+            # round, where no screen ranked anyone). Record order ONLY: the
             # validator sorts on (duel_rank, hotkey), judges the WHOLE cohort,
             # and crowns the best margin-clearer, so this never decides the
             # throne. A single finalist keeps the field default (0, dropped
@@ -3216,6 +3243,39 @@ class TrainerRunner:
         finals = self._round_telemetry["final"]
         if heats or finals:
             log.info("%s", telemetry_rollup_line(base_seed, heats, finals))
+
+    def _seat_duel_field(
+        self, screened: list[ResolvedGenerator], base_seed: int,
+    ) -> tuple[list[ResolvedGenerator], list[ResolvedGenerator]]:
+        """Split the screened field into ``(seated, waiting)`` for a duel-only
+        round: the earliest ``duel_field_cap`` entrants by ``(reveal_block,
+        uid)`` seat, the rest wait for a later round. Reveal order is the
+        seniority rule the heat's tie-break already uses (a UID recycles, the
+        reveal block does not)."""
+        cap = max(1, int(self.cfg.round.duel_field_cap))
+        ordered = sorted(screened, key=lambda c: (c.reveal_block, c.uid))
+        seated, waiting = ordered[:cap], ordered[cap:]
+        log.info("round=%s duel-only: %d of %d challenger(s) seated (cap %d, reveal "
+                 "order)%s", base_seed, len(seated), len(ordered), cap,
+                 f"; {len(waiting)} wait for a later round: "
+                 f"{[c.hotkey for c in waiting]}" if waiting else "")
+        return seated, waiting
+
+    def _log_duel_geometry(self, base_seed: int, legs: int, screen_block: int) -> None:
+        """Projected training wall clock of a duel-only round: ``legs`` full
+        budget runs queued over the final fleet's lanes. A projection that
+        does not fit the round is a WARNING — the cap or the fleet is
+        mis-sized — but never blocks the round (the pods keep going; the
+        manifest just lands late)."""
+        lanes = len(self._hosts_for("final")) if self.remote_hosts else 1
+        lanes = max(1, lanes)
+        waves = -(-legs // lanes)
+        hours = waves * float(self.cfg.training.target_train_hours)
+        epoch_h = effective_epoch_blocks(self.cfg.round, int(screen_block)) * 12.0 / 3600.0
+        level = log.warning if hours + 1.5 > epoch_h else log.info
+        level("round=%s duel-only geometry: %d leg(s) over %d lane(s) = %d wave(s) "
+              "× %.1fh ≈ %.1fh of training in a %.1fh round", base_seed, legs,
+              lanes, waves, float(self.cfg.training.target_train_hours), hours, epoch_h)
 
     def _run_heat(
         self,

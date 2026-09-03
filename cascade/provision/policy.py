@@ -265,6 +265,7 @@ def size_fleet(
     policy: ProvisionPolicy,
     *,
     max_finalists: int = 0,
+    no_heat: bool = False,
 ) -> FleetPlan:
     """Size both fleets off the revealed field — SLOT-based for multi-GPU pods.
 
@@ -303,6 +304,11 @@ def size_fleet(
     field itself: ``n_eligible`` challengers can produce at most
     ``n_eligible`` finalists, so a king-only round (zero fresh submissions)
     sizes the final at exactly 1 slot (r48, 2026-08-28).
+
+    ``no_heat`` (a duel-only round, ``[round] duel_from_block``): nothing is
+    screened whatever the field size — the heat fleet is zero and the final
+    is sized off ``finalists`` (the trainer's seated count, already capped).
+    A final clamped by ``max_pods`` queues its legs over the pods it got.
     """
     if n_eligible < 0 or finalists < 0 or max_finalists < 0:
         raise ValueError("n_eligible/finalists/max_finalists must be non-negative")
@@ -320,7 +326,7 @@ def size_fleet(
     # countable, and ``n_eligible`` is the post-dedup screened count the loop
     # feeds in. The king always trains, so the final floor stays 1 slot.
     finalists = min(finalists, n_eligible)
-    n_to_screen = n_eligible if n_eligible > finalists else 0
+    n_to_screen = 0 if no_heat else (n_eligible if n_eligible > finalists else 0)
     if n_to_screen > 0:
         window = max(epoch_hours - final_hours, heat_hours)
         heat_slots = math.ceil(n_to_screen * heat_hours * policy.heat.slot_overhead / window)

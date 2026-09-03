@@ -24,9 +24,13 @@ from cascade.validator.windows import (
 
 
 def test_scored_knobs_parse_and_default_off(tmp_path):
+    import re
+
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = DEFAULT_CHAIN_TOML.read_text()
+    # The shipped toml may carry the armed keys; strip them to pin the defaults.
+    src = re.sub(r"^scored_(horizons|from_block)\s*=.*$", "",
+                 DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(src)
     cfg = load_chain_config(p)
@@ -40,6 +44,11 @@ def test_scored_knobs_parse_and_default_off(tmp_path):
     cfg = load_chain_config(p)
     assert cfg.eval.scored_horizons == (64, 256, 720)
     assert cfg.eval.scored_from_block == 9000000
+
+    # An armed shipped toml must gate on an epoch boundary, never inside one.
+    shipped = load_chain_config(DEFAULT_CHAIN_TOML)
+    if shipped.eval.scored_from_block:
+        assert shipped.eval.scored_from_block % shipped.round.epoch_blocks == 0
 
 
 # ── the activation gate ──────────────────────────────────────────────────────

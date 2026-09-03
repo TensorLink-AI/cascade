@@ -107,11 +107,18 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
 - A round = one ~12h epoch (3600 blocks). Only commitments whose on-chain
   pointer **revealed strictly before** the epoch boundary compete; a late reveal
   auto-rolls into the next round.
-- **Heat** (screening): every eligible challenger's generator trains the fixed
-  model for ~1h at the screen size, scored on the round's held-out eval draw. A
-  leader the screen statistically separates advances alone; a tied top advances
-  as a cohort, capped at `max_finalists` (3). Standings publish the moment the
-  heat settles (`cascade heat`), including for rounds later rejected at a gate.
+- **Heat** (screening; rounds before block 8992800): every eligible challenger's
+  generator trains the fixed model for ~1h at the screen size, scored on the
+  round's held-out eval draw. A leader the screen statistically separates
+  advances alone; a tied top advances as a cohort, capped at `max_finalists`
+  (3). Standings publish the moment the heat settles (`cascade heat`),
+  including for rounds later rejected at a gate.
+- **Duel-only rounds** (from block 8992800, ≈ 2026-09-04 08:30 UTC): no heat.
+  The screened field seats straight into the duel in reveal order, up to
+  `duel_field_cap` (7) challengers per round; the rest wait for a later round
+  with their submission intact (`cascade heat` lists them as `waiting`). Every
+  seated challenger trains the full final budget and the whole cohort is
+  judged under α/k.
 - **Final** (the duel): king and finalists each train from the SAME shared round
   init (random at generation 0; the promoted cascade checkpoint after a
   promotion — the live case today) with identical seeds, budget (~3h as a fixed
@@ -182,10 +189,15 @@ Widen the prior (mix families) rather than fitting one shape.
 ## Key configuration values (chain.toml, shipped)
 
 - netuid 91 mainnet (testnet 259 via chain.testnet.toml); epoch 3600 blocks ≈ 12h
-- heat: 1h train budget, scored on the round's eval draw; separated leader
-  advances alone, tied cohort capped at `max_finalists` (3)
+- heat (before block 8992800): 1h train budget, scored on the round's eval
+  draw; separated leader advances alone, tied cohort capped at
+  `max_finalists` (3)
+- duel-only (from block 8992800): no heat; up to `duel_field_cap` (7)
+  challengers seat per round in reveal order, the rest wait unburned
 - eval: jittered ~1200-window draw per round (`mix_target_windows`) from the
-  private rotating pool — the domain mix re-rolls every round
+  private rotating pool — the domain mix re-rolls every round; from block
+  8992800 the verdict draw is a horizon ladder (`scored_horizons` = 64/256/720,
+  one even-by-domain rung each, `n_windows` split evenly)
 - final: 3h token-budget train per side, Toto2-4M from the shared round init
 - dethrone: paired-bootstrap LCB (B=10000, α=0.05, α/k across a tied cohort)
   must clear the tenure-decayed

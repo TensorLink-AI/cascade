@@ -387,6 +387,18 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
+# ── Duel-only rounds (no heat), block-gated ──────────────────────────────────
+# From the first epoch boundary >= duel_from_block the heat screen is skipped:
+# the screened field seats straight into the duel in reveal order, up to
+# duel_field_cap challengers; the overflow waits for a later round without
+# spending its submission. King + every seated challenger train the full
+# [training] budget on the final fleet; legs beyond the fleet's lanes queue on
+# the same pods (2 L40S pods × 2 lanes: 1 + 7 legs = 2 waves ≈ 6h). The
+# validator judges the whole cohort under alpha/k (DEC-CA-0012, k = seated).
+# Trainer-side ([round] is outside contract_digest); the provisioner rents no
+# heat fleet for these rounds. 0 = off. Rollback = 0 + trainer restart.
+duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
+duel_field_cap  = 7
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never
@@ -516,6 +528,14 @@ mix_tier_from_block  = 8942400   # ARMED 2026-08-27 (owner): two-tier even-domai
                                  # split live from r47's epoch — same boundary as
                                  # the recipe cut, one coordinated validator update
 mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_block is set
+# Scored horizon ladder: from scored_from_block the verdict draws one
+# even-by-domain rung per horizon over the round's snapshot (rung sizes
+# equalised, n_windows total; the 720 rung needs series >= 784 steps) and the
+# pooled rows go through the unchanged paired bootstrap. CONSENSUS — same
+# rollout as mix_from_block: every validator must run this release before the
+# block. [] / 0 = single-horizon rule.
+scored_horizons   = [64, 256, 720]
+scored_from_block = 8992800      # = [round] duel_from_block
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

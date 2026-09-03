@@ -221,6 +221,15 @@ def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     return mode
 
 
+def validate_duel_field_cap(value: object) -> int:
+    """``[round] duel_field_cap`` must be >= 1: a duel-only round with a zero
+    cap would seat nobody and publish king-only manifests indefinitely."""
+    cap = int(value)  # type: ignore[arg-type]
+    if cap < 1:
+        raise ValueError(f"duel_field_cap={cap} invalid; must be >= 1")
+    return cap
+
+
 def validate_corpus_target_points(target: object, max_total_points: int) -> int:
     """Normalise ``[generator] corpus_target_points`` (DEC-CA-0031).
 
@@ -732,6 +741,21 @@ class RoundConfig:
     init_gate_mode: str = "off"       # "off" | "shadow" (heat-side has no enforce)
     screen_size: str = ""             # arch_preset the heat screens at ("" ⇒ primary)
     throne_sizes: tuple[str, ...] = ()  # arch_presets the final trains/judges at (() ⇒ [primary])
+    # ── Duel-only rounds (no heat), block-gated ──────────────────────────────
+    # From the first epoch boundary >= duel_from_block the heat screen is
+    # skipped: the screened field is seated straight into the duel, earliest
+    # reveal block first, up to duel_field_cap challengers. Entrants beyond
+    # the cap wait for a later round WITHOUT spending their submission; the
+    # seated field burns at the settle as before, and the king plus every
+    # seated challenger train the full [training] budget. The validator
+    # judges the whole cohort under alpha/k (DEC-CA-0012) with k = the seated
+    # count — nothing validator-side changes. 0 = never (heat → final every
+    # round). Trainer-side: [round] is outside contract_digest.
+    duel_from_block: int = 0
+    # Challengers seated per duel-only round. Legs beyond the final fleet's
+    # lane count queue on the same pods, so a round's training wall clock is
+    # ceil((1 + cap) / lanes) × [training] target_train_hours.
+    duel_field_cap: int = 3
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
     # already entered a round's heat is never screened again — it must re-register
     # (a new UID, paying the registration cost) to resubmit, so a miner cannot
@@ -865,6 +889,14 @@ class RoundConfig:
         if self.max_finalists > 1:
             return max(self.finalists, self.max_finalists)
         return self.finalists
+
+    def duel_only(self, block: int | None) -> bool:
+        """True when the round at epoch boundary ``block`` runs without a heat
+        (``duel_from_block`` set and reached). ``None`` (unknown height) and
+        an unset gate both keep the heat → final pipeline."""
+        if self.duel_from_block <= 0 or block is None:
+            return False
+        return int(block) >= self.duel_from_block
 
 
 @dataclass(frozen=True)
@@ -1680,6 +1712,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             tie_runoff_phase_seconds=int(r.get("tie_runoff_phase_seconds", 900)),
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
+            duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
+            duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 3)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),

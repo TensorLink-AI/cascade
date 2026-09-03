@@ -391,6 +391,9 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
     screened = probe._screen_duplicate_entrants(
         plan.king, eligible, next_boundary, static_only=True, report=False,
         budget_seconds=cfg.round.dedup_plan_seconds)
+    # Duel-only round ([round] duel_from_block): no heat fleet, and the final
+    # is sized off the seats the cap grants this field (king + seated).
+    duel_only = cfg.round.duel_only(next_boundary)
     return {
         "block": block,
         "epoch_blocks": epoch_blocks,
@@ -402,12 +405,14 @@ def _plan_payload(cfg, client, work_root: Path | str) -> dict:
         "eligible_challengers": len(eligible),
         "screened_challengers": len(screened),
         "heat_train_hours": cfg.round.heat_train_hours,
-        "finalists": cfg.round.finalists,
+        "finalists": (min(cfg.round.duel_field_cap, len(screened)) if duel_only
+                      else cfg.round.finalists),
         # DEC-CA-0012: the provisioner's final fleet and budget breaker must
         # cover the WORST case the tie-aware advance rule can produce, not the
         # single finalist the plan predicts (JIT rental adapts off the
         # heat_complete marker's actual list either way).
-        "max_finalists": cfg.round.max_finalists,
+        "max_finalists": 0 if duel_only else cfg.round.max_finalists,
+        "duel_only": duel_only,
     }
 
 
