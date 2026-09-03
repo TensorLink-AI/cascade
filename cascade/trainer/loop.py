@@ -1739,6 +1739,7 @@ class TrainerRunner:
         *,
         screened: int,
         waiting: list[ResolvedGenerator] | None = None,
+        seated: list[ResolvedGenerator] | None = None,
     ) -> None:
         """Publish the heat standings the moment the heat settles.
 
@@ -1767,12 +1768,25 @@ class TrainerRunner:
 
         skipped = list(self._round_skipped)
         n = max(0, self.cfg.round.finalist_cap)
-        if waiting:
-            # Duel-only overflow: listed beside the burned/skipped rows so a
-            # queued miner can read that its submission is intact.
-            skipped += [{"hotkey": c.hotkey, "uid": c.uid, "reason": "waiting"}
-                        for c in waiting]
-        if heat is None and waiting is not None:
+        duel_only = waiting is not None
+        if duel_only:
+            # Duel-only round: publish EVERY entrant — seated ones in seat
+            # order (they duel the king directly), waiting ones after — as
+            # the standings' entrants, so the dashboards list the whole field
+            # even though no screen ranked anyone.
+            from ..shared.manifest import HeatEntrant, HeatResult
+
+            rows = [HeatEntrant(uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
+                                status="seated", rank=i + 1, rel_score=None,
+                                p_best=None, crps=None, mase=None)
+                    for i, c in enumerate(seated or [])]
+            rows += [HeatEntrant(uid=c.uid, hotkey=c.hotkey, gen_ref=c.ref,
+                                 status="waiting", rank=None, rel_score=None,
+                                 p_best=None, crps=None, mase=None)
+                     for c in waiting]
+            heat = HeatResult(screen_size="", finalists=len(seated or []),
+                              entrants=tuple(rows))
+        if duel_only:
             n = screened
             reason = (f"duel-only round: {screened} entrant(s) seated in reveal "
                       "order, no heat screen")
@@ -1804,10 +1818,11 @@ class TrainerRunner:
                 as_of=datetime.now(UTC).isoformat(),
                 screened=screened,
                 netuid=self.cfg.subnet.netuid,
-                no_screen_reason="" if heat is not None else reason,
+                no_screen_reason="" if (heat is not None and not duel_only) else reason,
                 finalists=n,
                 warm_start=self._stage_ctx.get("warm_start"),
                 skipped=skipped,
+                duel_only=duel_only,
             )
             store = self.manifest_store()
             publish_heat_status(store, doc)
@@ -3165,7 +3180,8 @@ class TrainerRunner:
             # settle; re-publishing here would overwrite the real standings
             # with a no-screen doc.)
             self._publish_heat_standings(heat, screened=len(screened),
-                                         waiting=waiting if duel_only else None)
+                                         waiting=waiting if duel_only else None,
+                                         seated=screened if duel_only else None)
         self._publish_stage("duel", heat_done=len(eligible),
                             heat_total=len(eligible), finalists=len(finalists))
         self._log_telemetry_rollup(base_seed)  # heat-stage standings so far

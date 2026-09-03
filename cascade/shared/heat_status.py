@@ -77,6 +77,7 @@ def build_heat_status(
     finalists: int | None = None,
     warm_start: dict | None = None,
     skipped: list[dict] | None = None,
+    duel_only: bool = False,
 ) -> dict:
     """Assemble the public heat document (pure — storage I/O stays with the caller).
 
@@ -131,6 +132,13 @@ def build_heat_status(
             doc["finalists"] = int(finalists)
     else:
         doc.update(body)
+    if duel_only:
+        # A duel-only round: the entrants are ``seated`` (duelling the king
+        # directly) or ``waiting`` (carried to a later round); no screen ran,
+        # the reason line says how the seats were filled.
+        doc["duel_only"] = True
+        if no_screen_reason:
+            doc["no_screen_reason"] = str(no_screen_reason)
     if screened is not None:
         doc["screened"] = int(screened)
     if skipped:
@@ -181,9 +189,10 @@ def heat_summary(doc: dict) -> dict:
     """
     ents = [e for e in doc.get("entrants", ()) if isinstance(e, dict)]
     leader = next((e for e in ents if e.get("rank") == 1), None)
-    advanced = [e for e in ents if str(e.get("status")) == "advanced"]
+    advanced = [e for e in ents if str(e.get("status")) in ("advanced", "seated")]
     skipped = doc.get("skipped") if isinstance(doc.get("skipped"), dict) else {}
     return {
+        "duel_only": bool(doc.get("duel_only", False)),
         "round_id": str(doc.get("round_id", "")),
         "epoch_start_block": int(doc.get("epoch_start_block", 0)),
         "as_of": str(doc.get("as_of", "")),
