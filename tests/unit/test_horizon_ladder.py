@@ -103,6 +103,35 @@ def test_ladder_equalises_to_the_scarcest_rung():
     assert n64 == n720 == 12
 
 
+def test_ladder_equalisation_keeps_each_rung_even_by_domain():
+    # The scarce rung sets the size; the OTHER rungs must be drawn at that
+    # size even-by-domain — not drawn at the full ask and truncated by pool
+    # index, which keeps filename order and starves whichever domain sorts
+    # last (review 2026-09-02). Build a pool where domain "b" sorts after
+    # "a" and only some series are long enough for h=720.
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    series, metadata = [], []
+    for i in range(20):        # domain a: all long (eligible at 720)
+        series.append(rng.normal(size=(1, 1200))); metadata.append({"domain": "a", "source": f"a{i}"})
+    for i in range(20):        # domain b: half long, half short
+        L = 1200 if i % 2 == 0 else 400
+        series.append(rng.normal(size=(1, L))); metadata.append({"domain": "b", "source": f"b{i}"})
+    windows = ladder_windows(series, metadata, horizons=(64, 720),
+                             n_windows=40, context_length=256, seed=7)
+    by_rung = {}
+    for w in windows:
+        rung, idx = w.series_id.split("-s")
+        by_rung.setdefault(rung, []).append(metadata[int(idx)]["domain"])
+    # 720 eligible: a=20, b=10 → 30; per-rung ask 20 → m = 20 on both rungs.
+    assert len(by_rung["h64"]) == len(by_rung["h720"]) == 20
+    # Even-by-domain at size 20 on the h64 rung: 10 a + 10 b (all 20 b are
+    # eligible at h=64). Index-order truncation would have given 20 a + 0 b.
+    assert by_rung["h64"].count("b") == 10
+    assert by_rung["h720"].count("b") == 10
+
+
 def test_ladder_raises_when_a_rung_has_no_eligible_series():
     series, metadata = _series_set()
     with pytest.raises(ValueError, match="5000"):

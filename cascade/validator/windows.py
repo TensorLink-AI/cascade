@@ -564,20 +564,37 @@ def ladder_windows(
     if not horizons:
         raise ValueError("horizons must be non-empty")
     per = max(1, int(n_windows) // len(horizons))
+    # Equalise BEFORE drawing: the rung size is the smallest horizon's
+    # eligible-series count (capped at the per-rung ask), and every rung is
+    # drawn even-by-domain AT that size. Drawing each rung at the full ask
+    # and truncating afterwards (`r[:m]`) kept the lowest pool indices —
+    # i.e. filename order — and silently undid the even-by-domain draw on
+    # every rung larger than the scarcest one (on the 2026-07-19 mainnet
+    # snapshot the h16 rung's healthcare share fell from 13 to 4 while h720
+    # kept 7). Review 2026-09-02.
+    lengths = [np.atleast_2d(np.asarray(s)).shape[-1] for s in series]
+    eligible = {h: sum(1 for L in lengths if L >= h + min_context) for h in horizons}
+    empty = [h for h, n in eligible.items() if n == 0]
+    if empty:
+        raise ValueError(f"no eligible series at horizon(s) {empty}")
+    m = min(per, min(eligible.values()))
     rungs = [
-        horizon_draw(series, metadata, horizon=h, n_windows=per,
+        horizon_draw(series, metadata, horizon=h, n_windows=m,
                      context_length=context_length, seed=int(seed) + h,
                      min_context=min_context)
         for h in horizons
     ]
-    m = min(len(r) for r in rungs)
-    if m == 0:
-        empty = [h for h, r in zip(horizons, rungs, strict=True) if not r]
-        raise ValueError(f"no eligible series at horizon(s) {empty}")
     if any(len(r) != m for r in rungs):
-        log.info("ladder draw equalised to %d windows/horizon (drew %s)",
-                 m, {h: len(r) for h, r in zip(horizons, rungs, strict=True)})
-    return [w for r in rungs for w in r[:m]]
+        # horizon_draw returns min(ask, eligible) — with the ask already at
+        # the minimum eligible count this cannot happen; fail loud if it does
+        # rather than judge on an unequal ladder.
+        raise ValueError(
+            f"ladder rungs drew unequally: "
+            f"{ {h: len(r) for h, r in zip(horizons, rungs, strict=True)} }")
+    if m < per:
+        log.info("ladder draw equalised to %d windows/horizon (eligible %s, "
+                 "asked %d)", m, eligible, per)
+    return [w for r in rungs for w in r]
 
 
 def ladder_windows_for_round(
