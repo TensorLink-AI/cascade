@@ -30,6 +30,11 @@ The same block arms the scored horizon ladder (`[eval] scored_horizons =
 rung per horizon over the round's snapshot and pools the rows through the
 unchanged paired bootstrap. That half is consensus (release-then-activate,
 every validator before the block); the duel-only half is trainer policy.
+The same block also moves the fresh-king margin from 2% to 1%
+(`[scoring] win_margin_start = 0.01`, `win_margin_start_prev = 0.02`,
+`margin_activation_block = 8992800`): validators resolve the value from the
+round's epoch boundary and the audit replays each receipt under its own
+value, so the change is block-exact rather than restart-timed.
 
 ## Why
 

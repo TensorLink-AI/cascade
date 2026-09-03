@@ -23,6 +23,13 @@ win_margin_end       = 0.005     # floor, reached at margin_warmup_rounds of ten
 margin_warmup_rounds = 8         # rounds of tenure over which the margin decays
 ```
 
+Scheduled change (2026-09-03): `win_margin_start = 0.01` from block 8992800,
+with `win_margin_start_prev = 0.02` and `margin_activation_block = 8992800`
+carrying the old value for every earlier round. The validator resolves the
+fresh-king margin from the round's epoch boundary block, `cascade-audit`
+replays each receipt under the value its round was judged at, and the pair
+stays in `chain.toml` after the flip so pre-flip receipts keep replaying.
+
 With `end < start` the existing warmup schedule runs in reverse: an entrenched
 king must be beaten by progressively *less* as its tenure grows, floored at
 `win_margin_end`. Facts the design rests on (all verified in code):

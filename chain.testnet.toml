@@ -315,6 +315,9 @@ declared_contract_from_block = 1
 # HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
 # bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
 win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
+# Scheduled fresh-king margin change — see chain.toml; 0.0 / 0 = none.
+win_margin_start_prev   = 0.0
+margin_activation_block = 0
 win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
                                  # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)

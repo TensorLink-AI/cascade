@@ -31,8 +31,9 @@ repository docs that hold the full detail. When this summary and a linked doc or
   diverse, realistic priors do.
 - King-of-the-hill: a challenger dethrones the king when the paired-bootstrap
   **lower confidence bound (LCB)** of its advantage clears the win margin. The
-  margin decays with the king's tenure: 2% for a fresh king → 0.5% floor after
-  8 rounds (the floor is a hard safety guardrail, never 0).
+  margin decays with the king's tenure: 1% for a fresh king (2% for rounds
+  before block 8992800) → 0.5% floor after 8 rounds (the floor is a hard
+  safety guardrail, never 0).
 - Rewards: geometric decay across the lineage — the current king plus up to 4
   prior distinct kings still registered share emission ∝ 0.5^i
   (≈52/26/13/6/3%); unregistered remainder burns. Winning ONE round is not the

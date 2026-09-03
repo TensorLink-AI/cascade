@@ -1158,7 +1158,9 @@ class ValidatorRunner:
             ))
         _t_king = _time.perf_counter() - _t0
 
-        base_params = self.cfg.koth_params()
+        # Decision parameters for THIS round's epoch: a scheduled margin
+        # change resolves from the boundary block, never from restart timing.
+        base_params = self.cfg.koth_params(block=self._epoch_start_block(manifest))
         # Score the shared warm-start init when either consumer needs it: the
         # increment margin (DEC-CA-0027) or the init-baseline floor
         # ([scoring] init_gate_mode). The increment fallback mutates only the
@@ -1417,7 +1419,7 @@ class ValidatorRunner:
         )
         verdict = VerdictRecord.from_round(
             outcome.result, outcome.transition,
-            params=self.cfg.koth_params(), bootstrap_seed=base_seed,
+            params=self.cfg.koth_params(block=epoch_start_block), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
             cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
         )

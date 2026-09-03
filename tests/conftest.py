@@ -60,6 +60,10 @@ def cfg() -> ChainConfig:
                    # the points path arm it explicitly via replace().
                    generator=replace(c.generator, corpus_target_points=0),
                    round=replace(c.round, commit_floor_block=0, dedup_mode="off"),
+                   # a scheduled fresh-king margin change ships armed: pin the
+                   # steady value so fixtures judge every block the same way
+                   scoring=replace(c.scoring, win_margin_start_prev=0.0,
+                                   margin_activation_block=0),
                    manifest=replace(c.manifest, validator_hotkey=""))
 
 

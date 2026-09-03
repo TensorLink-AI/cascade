@@ -650,7 +650,9 @@ def check_koth_params(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
 
     from ..eval.koth import KothParams
 
-    want = dict(asdict(cfg.koth_params()))
+    # The values in force for THIS receipt's epoch: a scheduled margin change
+    # is replayed per round, exactly as the validator resolved it.
+    want = dict(asdict(cfg.koth_params(block=receipt.epoch_start_block)))
     try:
         # Normalise through the dataclass: a receipt written before a params
         # field existed compares at that field's default instead of failing on

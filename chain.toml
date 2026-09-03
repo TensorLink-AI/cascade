@@ -585,7 +585,16 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
 # property (0.5% sits above the bootstrap noise band, so a statistically
 # tied challenger never wins by luck; a 0 or sub-noise floor becomes a slow
 # term-limit lottery).
-win_margin_start     = 0.02      # fresh-king margin (tenure 0)
+win_margin_start     = 0.01      # fresh-king margin (tenure 0) from margin_activation_block
+# Scheduled change of the fresh-king margin (same shape as epoch_blocks_prev /
+# epoch_activation_block): rounds whose epoch boundary precedes
+# margin_activation_block are judged at win_margin_start_prev, later rounds at
+# win_margin_start. Every validator resolves it from the round's block, so
+# restart timing never forks a verdict; cascade-audit replays each receipt
+# under its own value. KEEP the pair after the flip (pre-flip receipts replay
+# against it). 0.0 / 0 = no scheduled change.
+win_margin_start_prev   = 0.02   # in force for rounds before margin_activation_block
+margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_from_block
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision

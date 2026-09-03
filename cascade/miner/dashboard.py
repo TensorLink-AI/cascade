@@ -399,13 +399,18 @@ def current_king_tenure(index_doc: dict | None) -> int | None:
     return tenure
 
 
-def margin_for_tenure_cfg(scoring: ScoringConfig, tenure: int) -> float:
+def margin_for_tenure_cfg(scoring: ScoringConfig, tenure: int,
+                          block: int | None = None) -> float:
     """The validator's affine margin schedule (``eval.koth.margin_for_tenure``)
-    computed from ``[scoring]`` directly."""
+    computed from ``[scoring]`` directly, for the round at epoch boundary
+    ``block`` (``None`` = the steady-state fresh-king margin)."""
+    from ..shared.config import effective_win_margin_start
+
+    start = effective_win_margin_start(scoring, block)
     if scoring.margin_warmup_rounds <= 0:
         return scoring.win_margin_end
     frac = min(max(tenure, 0) / scoring.margin_warmup_rounds, 1.0)
-    return scoring.win_margin_start + frac * (scoring.win_margin_end - scoring.win_margin_start)
+    return start + frac * (scoring.win_margin_end - start)
 
 
 def dethrone_bar_line(index_doc: dict | None, scoring: ScoringConfig | None) -> str | None:

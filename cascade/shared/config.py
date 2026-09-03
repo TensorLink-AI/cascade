@@ -1047,6 +1047,16 @@ class ScoringConfig:
     bootstrap_B: int
     bootstrap_alpha: float
     dethrone_cp: int
+    # Scheduled change of the fresh-king margin (the epoch_blocks_prev /
+    # epoch_activation_block shape): rounds whose epoch boundary precedes
+    # ``margin_activation_block`` are judged at ``win_margin_start_prev``,
+    # rounds from it on at ``win_margin_start``. Consensus — every validator
+    # resolves the value from the round's block, so restart timing never
+    # forks a verdict, and cascade-audit replays each round under its own
+    # value. 0.0 / 0 = no scheduled change. Keep the pair in place after the
+    # flip: retiring it makes pre-flip receipts fail the params replay.
+    win_margin_start_prev: float = 0.0
+    margin_activation_block: int = 0
     # Breadth floor for the verdict: below this many distinct window clusters
     # (upstream feeds, from pool metadata ``source``) the round is inconclusive.
     # 0 disables; pools without ``source`` metadata are unaffected. Default keeps
@@ -1406,8 +1416,11 @@ class ChainConfig:
         names = self.round.throne_sizes or (self.training.arch_preset,)
         return [self.training.contract_for(n) for n in names]
 
-    def koth_params(self) -> Any:
-        """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``.
+    def koth_params(self, block: int | None = None) -> Any:
+        """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``
+        for the round at epoch boundary ``block`` (``None`` = the steady-state
+        values; a scheduled ``win_margin_start`` change resolves per round —
+        see :func:`effective_win_margin_start`).
 
         Imported lazily so :mod:`cascade.shared.config` stays free of the
         eval package at import time.
@@ -1415,7 +1428,7 @@ class ChainConfig:
         from ..eval.koth import KothParams
 
         return KothParams(
-            win_margin_start=self.scoring.win_margin_start,
+            win_margin_start=effective_win_margin_start(self.scoring, block),
             win_margin_end=self.scoring.win_margin_end,
             margin_warmup_rounds=self.scoring.margin_warmup_rounds,
             min_windows=self.scoring.min_windows,
@@ -1438,6 +1451,17 @@ class LaunchConfigError(RuntimeError):
 
 
 _PLACEHOLDER_DIGEST = "0" * 64
+
+
+def effective_win_margin_start(scoring: ScoringConfig, block: int | None) -> float:
+    """The fresh-king margin in force for the round at epoch boundary ``block``:
+    ``win_margin_start_prev`` for blocks strictly before
+    ``margin_activation_block``, ``win_margin_start`` from it on. With no
+    scheduled change (prev 0.0 / block 0) or no block given, the steady value."""
+    if (scoring.margin_activation_block > 0 and scoring.win_margin_start_prev > 0.0
+            and block is not None and int(block) < scoring.margin_activation_block):
+        return float(scoring.win_margin_start_prev)
+    return float(scoring.win_margin_start)
 
 
 def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
@@ -1803,6 +1827,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_start=float(s["win_margin_start"]),
             win_margin_end=float(s["win_margin_end"]),
             margin_warmup_rounds=int(s["margin_warmup_rounds"]),
+            win_margin_start_prev=float(s.get("win_margin_start_prev", 0.0) or 0.0),
+            margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),
