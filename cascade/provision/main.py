@@ -32,7 +32,9 @@ from .core import (
     ProvisionError,
     _read_pubkey,
     build_providers,
+    image_digest_of,
     validate_digest_pinned,
+    validate_image_pin_agreement,
     wait_ssh_reachable,
 )
 from .health import HealthGate, HealthReport, _sha256_of
@@ -660,6 +662,13 @@ def _run(args) -> int:
         # Image-boot mode: the pod IS the image, so a moving tag breaks the
         # expected_gpu re-derivation contract — digest pin required.
         validate_digest_pinned(image)
+    # The launch ref's digest is what the gate reads back off the pod, so it
+    # must be the SAME digest chain.toml pins — a one-file re-pin fails every
+    # pod at the gate looking like a stale facility image. Refuse at startup.
+    validate_image_pin_agreement(image, cfg.training.train_image_digest)
+    if image_digest_of(image):
+        log.info("worker image pin: launch %s == chain.toml train_image_digest %s",
+                 image_digest_of(image), cfg.training.train_image_digest or "(unpinned)")
     # Bootstrap mode: image may be EMPTY — lium then boots its default SSH
     # template (a template name is not a valid docker ref and would 400), and
     # shadeform VM-mode ignores the image entirely.

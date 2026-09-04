@@ -43,6 +43,17 @@ digest). With the pin set, `cascade-train-worker` **refuses a final run** whose
 runtime doesn't report the pinned digest, and `cascade-audit` Tier 2 uses the
 match to decide when a byte-exact checkpoint comparison applies.
 
+**Re-pin both files together.** The provisioner injects the digest it reads
+from `[provisioner] image` (provision.toml) and gates pods against
+`[training] train_image_digest` (chain.toml). Rotating one file and not the
+other fails every pod at the gate as `pod digest <old> != pinned <new>` —
+which reads as "the facility booted a stale image" when the provisioner
+simply launched the old ref. The provisioner now refuses to start on such a
+mismatch. The re-pin order is: bump both files, restart validator + trainer
+at the epoch boundary (the pin folds into `contract_digest`), then restart
+the provisioner outside its trigger window — a provisioner left running
+reads its config once at startup and keeps launching the previous image.
+
 ## 2. Pick ONE GPU SKU and stick to it
 
 Every pod, on every provider, must be the **same** GPU SKU — otherwise the

@@ -33,6 +33,7 @@ from cascade.provision import (
     shadeform_create_body,
     shadeform_pod_address,
     validate_digest_pinned,
+    validate_image_pin_agreement,
 )
 from cascade.provision.core import filter_tagged_names, shadeform_offer_price_usd_hr
 
@@ -826,3 +827,27 @@ def test_make_health_check_attested_digest_on_frozen_gate(monkeypatch):
     r2 = check(addr, "heat", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
                attested_digest="sha256:" + "bb" * 32)
     assert isinstance(r1, HealthReport) and isinstance(r2, HealthReport)
+
+
+# ── launch image vs chain.toml pin agreement ─────────────────────────────────
+
+
+def test_image_pin_agreement_accepts_matching_digests():
+    validate_image_pin_agreement(IMG, "sha256:" + "a" * 64)          # bare digest
+    validate_image_pin_agreement(IMG, IMG)                            # full ref
+    validate_image_pin_agreement(IMG, "SHA256:" + "A" * 64)          # case-insensitive
+
+
+@pytest.mark.parametrize("image, pin", [
+    ("", "sha256:" + "a" * 64),                     # bootstrap mode: nothing to compare
+    (IMG, ""),                                      # unpinned chain: gate is unpinned
+    ("reg.example/cascade-worker:v0.7.0", "sha256:" + "a" * 64),   # tag-only ref
+])
+def test_image_pin_agreement_skips_when_either_side_unpinned(image, pin):
+    validate_image_pin_agreement(image, pin)  # no raise
+
+
+def test_image_pin_agreement_rejects_one_file_repin():
+    # chain.toml re-pinned to the new image, provision.toml still launching the old
+    with pytest.raises(ProvisionError, match="Rotate both files"):
+        validate_image_pin_agreement(IMG, "sha256:" + "b" * 64)

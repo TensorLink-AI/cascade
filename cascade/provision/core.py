@@ -195,6 +195,41 @@ def validate_digest_pinned(image: str) -> None:
         )
 
 
+def validate_image_pin_agreement(image: str, train_image_digest: str) -> None:
+    """Refuse a launch image whose digest disagrees with the chain.toml pin.
+
+    The health gate's ``image_digest`` check compares the pod's
+    ``CASCADE_TRAIN_IMAGE_DIGEST`` — which the PROVISIONER ITSELF injects from
+    ``[provisioner] image`` — against ``[training] train_image_digest``. The
+    two live in different files and are rotated by hand, so a re-pin that
+    touches one and not the other makes every pod of every round fail as
+    ``pod digest <old> != pinned <new>``: the log reads as "the facility booted
+    an old image" when the provisioner simply LAUNCHED the old ref. Catch the
+    drift at startup, before a rental is billed, instead of at gate time.
+
+    Only fires when both sides carry a ``sha256:`` digest: an unpinned chain
+    (empty ``train_image_digest``) leaves the gate unpinned, and a bare
+    bootstrap-mode image (empty) has nothing to compare.
+    """
+    launch = image_digest_of(image)
+    pinned = _sha256_of(train_image_digest)
+    if not launch or not pinned:
+        return
+    if launch.lower() != pinned:
+        raise ProvisionError(
+            f"[provisioner] image pins {launch} but chain.toml [training] "
+            f"train_image_digest pins {pinned}: every pod would launch the "
+            "former and fail the health gate against the latter. Rotate both "
+            "files together (re-pin protocol, chain.toml [training])."
+        )
+
+
+def _sha256_of(value: str) -> str | None:
+    """``sha256:<64hex>`` inside a digest pin or a full ref, lowercased."""
+    m = re.search(r"sha256:[0-9a-f]{64}", (value or "").strip().lower())
+    return m.group(0) if m else None
+
+
 def select_provider(
     providers: Sequence[Provider], sku: str, count: int
 ) -> Provider | None:

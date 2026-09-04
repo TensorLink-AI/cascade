@@ -42,6 +42,7 @@ from .core import (
     shadeform_pod_address,
     teardown,
     validate_digest_pinned,
+    validate_image_pin_agreement,
     wait_ssh_reachable,
 )
 
@@ -76,5 +77,6 @@ __all__ = [
     "shadeform_pod_address",
     "teardown",
     "validate_digest_pinned",
+    "validate_image_pin_agreement",
     "wait_ssh_reachable",
 ]
