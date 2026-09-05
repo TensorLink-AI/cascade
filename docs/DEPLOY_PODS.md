@@ -258,6 +258,34 @@ each side degrades safely without the other:
   is accepted — only one round runs at a time.
 - **The round manifest** (`manifests/round-<id>.json` / a `latest.json`
   round-id change) ends the round: final pods die when it publishes.
+- **Liveness guard.** Before terminating a heat/final pod whose signal is
+  due, the provisioner asks the pod (`pgrep` for `cascade.trainer.worker`
+  over the same SSH transport as the health gate). A pod with live training
+  legs — or one that cannot be reached — is deferred to the next cycle. The
+  trainer flips rounds at the boundary block while the provisioner flips at
+  plan time ~20 min later, so the OLD round's manifest+bench signals can
+  fire on pods the NEW round has already dispatched onto (2026-09-04); the
+  guard makes that harmless. Only the TTL kills a pod with live legs.
+- **Operator lanes survive.** `[[host]]` entries the provisioner does not own
+  (hand-rented pods appended to `hosts.toml`) are preserved on every
+  republish. Ownership is by address: an entry is the provisioner's iff its
+  host is a ledger pod (re-rendered from the ledger) or a pod it terminated.
+  Two rules for hand-added lanes: use any name shape **except** the
+  provisioner's own `cascade-<round>-<stage>-<i>-g<g>` (that exact shape with
+  no ledger pod is treated as a stale self-published lane and dropped), and
+  do **not** name the pod `cascade-<digits>-(heat|final|eval)…` on the
+  provider — the orphan reconciler terminates provisioner-named pods that
+  are not in its ledger. Remove a lane's entry yourself when you terminate
+  its pod. The optional `static_hosts` fragment is re-read on every publish
+  (an edit lands without a restart; a broken edit keeps the last good copy).
+- **Recycled containers fail the gate.** A facility that restarts a leftover
+  container instead of creating one from the requested image serves stale
+  state. The health gate's `fresh_boot` check fails a pod whose
+  `/etc/environment` or `~/.bashrc` already pins `CASCADE_TRAIN_IMAGE_DIGEST`
+  (only the provisioner's post-gate hook ever writes that) or whose
+  `_train_work` is non-empty, and walks the replacement to another facility
+  like an `image_digest` failure. The adopted-pod re-gate after a restart
+  skips it (those pods were pinned by this service).
 - **TTL backstop.** Every pod dies one epoch after rent no matter what — a
   crashed trainer, an unreachable store, or a lost ledger can cost at most
   the round's worst-case projection, which `max_spend_per_round` caps before
