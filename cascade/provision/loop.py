@@ -96,7 +96,7 @@ from .core import (
     render_hosts_toml,
 )
 from .health import HealthReport
-from .hostsfile import clear_hosts, write_hosts
+from .hostsfile import clear_hosts, parse_host_entries, render_host_entries, write_hosts
 from .policy import (
     ProvisionPolicy,
     bench_hold_active,
@@ -127,6 +127,12 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share. Reaping
 # by bare prefix terminated a live hand-rented final pod on 2026-07-13.
 _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
+# The exact lane-name shape render_hosts_toml gives THIS service's pods
+# (``cascade-<round>-<stage>-<i>-g<g>``, integer slot). A hosts.toml entry of
+# that shape whose pod is not in the ledger is a stale self-published lane
+# (a previous run's pod), never an operator's — operator lanes must use any
+# other shape (e.g. ``cascade-<round>-final-m0-g0``) to be preserved.
+_SELF_LANE_RE = re.compile(r"^cascade-\d+-(heat|final)-\d+-g\d+$")
 
 # Boot slack folded into the "is there still time?" checks for late rentals
 # (JIT final rental and within-round retries). Sized from the REAL delivery
@@ -272,6 +278,18 @@ class ProvisionerLoop:
     # must degrade to "static fleet", never to an empty file while a static
     # final exists.
     static_hosts_text: str = ""
+    # When set, the static fragment is RE-READ on every publish (an operator
+    # edit lands without a restart); ``static_hosts_text`` is the last-good
+    # copy used when the file is missing or fails to parse.
+    static_hosts_path: Path | None = None
+    # ``live_legs(addr, provider) -> int | None``: how many training-worker
+    # processes are running on a pod right now (None = could not tell). The
+    # teardown sweep asks it before terminating a heat/final pod whose signal
+    # is due: a pod with live legs — or one it cannot reach — is deferred to
+    # the next cycle, the TTL staying the only unconditional kill. Closes the
+    # 2026-09-04 20:30 class: the OLD round's manifest+bench signals judged
+    # pods the NEW round had already dispatched onto. None disables the guard.
+    live_legs: Callable[[PodAddress, str], int | None] | None = None
     # Called at the top of EVERY cycle (never raises consequences — errors are
     # suppressed): the logging self-heal hook. bittensor's logging init strips
     # handlers and raises the level (to CRITICAL) on NAMED loggers when a chain
@@ -404,6 +422,13 @@ class ProvisionerLoop:
     # pod id → names of the health checks it failed (set by _boot_and_gate,
     # consumed once by the replacement path's facility-exclusion decision).
     _gate_failures: dict = field(default_factory=dict, init=False, repr=False)
+    # Addresses of pods this service terminated (any path) — their hosts.toml
+    # entries must never be preserved as "operator lanes" on a republish.
+    _retired_ips: set = field(default_factory=set, init=False, repr=False)
+    # Pods whose teardown was deferred on live legs (INFO once, DEBUG after).
+    _defer_logged: set = field(default_factory=set, init=False, repr=False)
+    # Operator lanes already announced as preserved (log once per name).
+    _foreign_logged: set = field(default_factory=set, init=False, repr=False)
     _pending_logged_at: float = field(default=0.0, init=False, repr=False)
     # Ledger-adopted pods awaiting their re-gate against the CURRENT config
     # (see _maybe_regate_adopted): set on resume, cleared when the re-gate
@@ -1272,13 +1297,18 @@ class ProvisionerLoop:
             # re-boots the same wrong image (r51, 2026-08-30: kansascity served
             # v0.6.0 twice against the v0.7.0 pin). Walk the replacement to a
             # different region instead of a different machine.
+            # A fresh_boot failure (recycled container) is the same facility
+            # property — the container cache, not the machine.
             bad_region = None
-            if "image_digest" in self._gate_failures.pop(pid, ()):
+            facility_faults = {"image_digest", "fresh_boot"} & set(
+                self._gate_failures.pop(pid, ()))
+            if facility_faults:
                 bad_region = getattr(prov, "region_of", lambda _p: None)(pid)
                 if bad_region:
-                    log.warning("round %s %s: image_digest failure on %s — "
+                    log.warning("round %s %s: %s failure on %s — "
                                 "excluding region %s from the replacement pick",
-                                round_id, stage, pid, bad_region)
+                                round_id, stage, "/".join(sorted(facility_faults)),
+                                pid, bad_region)
             self._terminate_and_drop(prov, pid)
             rspec = replace(spec, count=1,
                             name_prefix=f"{POD_TAG}{round_id}-{stage}{suffix}-r{i}",
@@ -1451,7 +1481,8 @@ class ProvisionerLoop:
                     shape = ({"sku": inst.sku, "gpus": inst.gpus}
                              if inst.sku else {})
                     report = self.health_check(addr, inst.stage, inst.provider,
-                                               attested_digest=attested, **shape)
+                                               attested_digest=attested, adopted=True,
+                                               **shape)
                     if report.ok:
                         return True
                     detail = report.summary()
@@ -1472,11 +1503,85 @@ class ProvisionerLoop:
         activity. Only with no static text AND no dynamic pods does the file
         clear (the trainer's local-fallback signal).
         """
-        content = "".join([self.static_hosts_text, *sections])
+        foreign = self._foreign_hosts_text(sections)
+        content = "".join([self._static_hosts(), *sections, foreign])
         if content.strip():
             write_hosts(self.hosts_path, content)
         else:
             clear_hosts(self.hosts_path)
+
+    def _static_hosts(self) -> str:
+        """The operator's static fragment, re-read from disk when a path is set."""
+        if self.static_hosts_path is None:
+            return self.static_hosts_text
+        try:
+            text = self.static_hosts_path.read_text(encoding="utf-8")
+            parse_host_entries(text)                     # validate before trusting
+        except Exception as e:  # noqa: BLE001 — keep the last-good copy
+            log.warning("static_hosts %s unreadable (%s); using the last-good copy",
+                        self.static_hosts_path, e)
+            return self.static_hosts_text
+        self.static_hosts_text = text
+        return text
+
+    def _foreign_hosts_text(self, sections: list[str]) -> str:
+        """Entries in the CURRENT hosts.toml that this service does not own.
+
+        An operator who appends hand-rented lanes to hosts.toml (the 2026-09-04
+        flip-round fleet) must not lose them on the next provisioner publish.
+        Ownership is by ADDRESS, not name: an entry is ours iff its host is a
+        ledger pod's address (re-rendered from the ledger anyway) or one we
+        terminated. Everything else is preserved verbatim-in-substance —
+        except entries in this service's exact lane-name shape whose pod is
+        gone (``_SELF_LANE_RE``: a previous run's stale lane, never an
+        operator's), and names that the static fragment or this publish
+        already carries. A torn/unparseable file preserves nothing (never
+        re-emit garbage into the trainer's contract file).
+        """
+        try:
+            current = self.hosts_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        try:
+            entries = parse_host_entries(current)
+        except Exception as e:  # noqa: BLE001 — malformed: preserve nothing
+            log.warning("hosts.toml did not parse (%s); operator lanes not preserved", e)
+            return ""
+        owned_ips = {a.ip for a in self._addrs.values()} | set(self._retired_ips)
+        taken: set[str] = set()
+        with contextlib.suppress(Exception):
+            taken |= {str(e.get("name")) for e in parse_host_entries(
+                "".join([self.static_hosts_text, *sections]))}
+        keep: list[dict] = []
+        for e in entries:
+            name, host = str(e.get("name", "")), str(e.get("host", ""))
+            if not name or not host or host in owned_ips or name in taken:
+                continue
+            if _SELF_LANE_RE.match(name):
+                log.info("dropping stale self-published lane %s (%s): pod not in the ledger",
+                         name, host)
+                continue
+            keep.append(e)
+            taken.add(name)
+        for e in keep:
+            if e["name"] not in self._foreign_logged:
+                self._foreign_logged.add(e["name"])
+                log.info("preserving operator lane %s (%s) not in the ledger",
+                         e["name"], e["host"])
+        return render_host_entries(keep)
+
+    def _live_legs_on(self, inst: PodInstance) -> int | None:
+        """Training-worker count on a pod, or None when it cannot be determined."""
+        if self.live_legs is None:
+            return None
+        try:
+            addr = self._addr_for(inst)
+            if addr is None:
+                return None
+            return self.live_legs(addr, inst.provider)
+        except Exception as e:  # noqa: BLE001 — unreachable ≠ idle
+            log.debug("live-leg probe on %s errored: %s", inst.instance_id, e)
+            return None
 
     def _publish_hosts(self, by_stage: dict[str, list[tuple[PodInstance, PodAddress]]]) -> None:
         sections = []
@@ -1740,6 +1845,26 @@ class ProvisionerLoop:
                             receipt_seen=receipt, newer_manifest=newer,
                             rented_at=_iso_ts(inst.rented_at_iso), now=now,
                             ttl_hours=self.ttl_hours, bench_hold=bench_hold):
+                ttl_hit = now - _iso_ts(inst.rented_at_iso) >= self.ttl_hours * 3600.0
+                if (not ttl_hit and inst.stage in ("heat", "final")
+                        and self.live_legs is not None):
+                    # Liveness guard: signals say the round is over, but the
+                    # NEXT round may already be training here (the trainer
+                    # flips at the boundary block; this service flips at
+                    # plan time ~20 min later). Ask the pod. Only the TTL
+                    # kills a pod with live legs — or one that cannot answer.
+                    legs = self._live_legs_on(inst)
+                    if legs is None or legs > 0:
+                        why = ("unreachable — not proof of idleness" if legs is None
+                               else f"{legs} live training leg(s)")
+                        lvl = (logging.DEBUG if inst.instance_id in self._defer_logged
+                               else logging.INFO)
+                        self._defer_logged.add(inst.instance_id)
+                        log.log(lvl, "teardown of %s pod %s deferred: %s (TTL %.1fh "
+                                "remains the backstop)", inst.stage, inst.instance_id,
+                                why, self.ttl_hours)
+                        continue
+                self._defer_logged.discard(inst.instance_id)
                 log.info("tearing down %s pod %s (marker=%s manifest=%s receipt=%s "
                          "newer=%s bench_hold=%s ttl=%.1fh)", inst.stage, inst.instance_id,
                          marker, manifest, receipt, newer, bench_hold, self.ttl_hours)
@@ -1758,7 +1883,7 @@ class ProvisionerLoop:
                     log.error("terminate %s failed (may be leaked!): %s", inst.instance_id, e)
                     continue
                 dead.add(inst.instance_id)
-                self._addrs.pop(inst.instance_id, None)
+                self._retire_addr(inst.instance_id)
         if dead:
             dead_eval = {i.instance_id for i in self._state.instances
                          if i.instance_id in dead and i.stage == "eval"}
@@ -2049,8 +2174,15 @@ class ProvisionerLoop:
                 log.error("terminate %s failed: %s", pid, e)
         with self._state_lock:
             self._state = drop_instances(self._state, {pid})
-            self._addrs.pop(pid, None)
+            self._retire_addr(pid)
             self._save()
+
+    def _retire_addr(self, pid: str) -> None:
+        """Forget a terminated pod's address, remembering its IP as retired so
+        its hosts.toml entry is never preserved as an operator lane."""
+        addr = self._addrs.pop(pid, None)
+        if addr is not None:
+            self._retired_ips.add(addr.ip)
 
     def _save(self) -> None:
         with self._state_lock:
