@@ -6,6 +6,7 @@ All numpy — no torch — so the statistics are unit-testable in a minimal env.
 from __future__ import annotations
 
 from .bootstrap import (
+    cohort_maxt_lcbs,
     joint_bag_geomeans,
     paired_bootstrap_lcb,
     paired_bootstrap_lcb_aggregated,
@@ -32,6 +33,7 @@ from .scoring import (
 from .window import EvalWindow
 
 __all__ = [
+    "cohort_maxt_lcbs",
     "joint_bag_geomeans",
     "paired_bootstrap_lcb",
     "paired_bootstrap_lcb_aggregated",
