@@ -450,6 +450,10 @@ _HEAT_LABELS = {
     "failed_train": "did not train",
     "failed_screen": "screen error",
     "duplicate": "duplicate",
+    # duel-only rounds (no screen): seated entrants duel the king directly,
+    # waiting ones carry to a later round with their submission intact
+    "seated": "● seated — duels the king",
+    "waiting": "waiting — next round",
 }
 
 
@@ -521,6 +525,12 @@ def heat_headline(doc: dict | None) -> str:
     if not isinstance(doc, dict):
         return "no heat standings published"
     rows = heat_rows(doc)
+    if doc.get("duel_only"):
+        seated = sum(1 for r in rows if r.status == "seated")
+        waiting = sum(1 for r in rows if r.status == "waiting")
+        return (f"duel-only round — {seated} seated (full 3h duel vs the king)"
+                + (f" · {waiting} waiting for a later round" if waiting else "")
+                + " · no screen")
     if doc.get("no_screen") or not rows:
         why = str(doc.get("no_screen_reason") or "no screen ran this round")
         return f"no screen — {why}"
@@ -619,7 +629,11 @@ def render_heat(doc: dict | None, *, me: str | None = None) -> str:
         f"  field           {heat_headline(doc)}",
     ]
     finalists = doc.get("finalists")
-    if finalists is not None:
+    if doc.get("duel_only"):
+        head.append("  duel-only       every seated entrant trains the full budget and is "
+                    "judged against the king (α/k over the seated cohort); "
+                    "waiting entrants seat next round in reveal order")
+    elif finalists is not None:
         head.append(f"  advancing       top {finalists} to the duel against the king")
     lcb, nw, nc = doc.get("leader_lcb"), doc.get("n_windows"), doc.get("n_clusters")
     if lcb is not None:
@@ -784,6 +798,8 @@ def render_duel(rows: list[dict]) -> str:
     p50, p95 = _as_float(row.get("boot_p50")), _as_float(row.get("boot_p95"))
     if p50 is not None and p95 is not None:
         lines.append(f"  bootstrap      Δ p50 {p50:+.4f} / p95 {p95:+.4f}")
+    lines += horizon_lines(row.get("per_horizon"))
+    lines += cohort_lines(row)
     gift = row.get("gift_gate_passed")
     if gift is not None:
         lines.append("  gift gate      " + ("passed" if gift else "BLOCKED the dethrone"))
@@ -810,6 +826,84 @@ def render_duel(rows: list[dict]) -> str:
     if (validators := _duel_validators_line(rows)) is not None:
         lines.append(validators)
     return "\n".join(lines)
+
+
+def _horizon_gap(cell: dict) -> tuple[float | None, float | None, float | None]:
+    """(king, chal, relative gap %) for one rung; gap negative = challenger better."""
+    k, c = _as_float(cell.get("king")), _as_float(cell.get("chal"))
+    if k is None or c is None or k == 0:
+        return k, c, None
+    return k, c, (c - k) / k * 100.0
+
+
+def horizon_lines(per_horizon: object) -> list[str]:
+    """The ``by horizon`` block of a ladder-round verdict: one line per rung
+    with the king's and the decided challenger's rung geomeans, the relative
+    gap, and the challenger's per-window win rate on that rung. Empty for a
+    single-horizon round (the field is absent)."""
+    if not isinstance(per_horizon, dict) or not per_horizon:
+        return []
+    lines = ["  by horizon     (pooled rungs decide; negative gap = challenger better)"]
+    for h in sorted(per_horizon, key=lambda x: int(x)):
+        cell = per_horizon[h] if isinstance(per_horizon[h], dict) else {}
+        k, c, gap = _horizon_gap(cell)
+        if k is None or c is None:
+            continue
+        wr, n = _as_float(cell.get("win_rate")), _as_int(cell.get("n"))
+        line = f"    h={int(h):<4} king {k:.5f}  chal {c:.5f}"
+        if gap is not None:
+            line += f"  ({gap:+.2f}%)"
+        if wr is not None:
+            line += f"  win {wr * 100:.0f}%"
+        if n:
+            line += f"  n={n}"
+        lines.append(line)
+    return lines
+
+
+def cohort_lines(row: dict) -> list[str]:
+    """The ``cohort`` block: every judged challenger with its observed geomean
+    vs the king, its LCB against the margin (when published), and its
+    per-horizon gaps — the "all miners" view of a duel-only round. Empty when
+    the receipt carries no cohort geomeans (pre-ladder receipts)."""
+    geos = row.get("cohort_geomeans")
+    if not isinstance(geos, dict) or not geos:
+        return []
+    kg = _as_float(row.get("king_geomean"))
+    lcbs = row.get("cohort_lcbs") if isinstance(row.get("cohort_lcbs"), dict) else {}
+    phs = (row.get("cohort_per_horizon")
+           if isinstance(row.get("cohort_per_horizon"), dict) else {})
+    margin = _as_float(row.get("margin"))
+    winner = row.get("chal_hotkey") if row.get("dethroned") else None
+    ranked = sorted(((hk, _as_float(g)) for hk, g in geos.items()),
+                    key=lambda t: (t[1] is None, t[1] if t[1] is not None else 0.0))
+    k = len(ranked)
+    lines = [f"  cohort         {k} challenger(s) judged"
+             + (f" at α/{k}" if k > 1 else "") + " — best point estimate first"]
+    for i, (hk, g) in enumerate(ranked, 1):
+        line = f"    #{i:<2} {_short_hotkey(str(hk)):<11}"
+        if g is not None:
+            line += f"  geomean {g:.5f}"
+            if kg:
+                line += f"  ({(g - kg) / kg * 100:+.2f}% vs king)"
+        lcb = _as_float(lcbs.get(hk))
+        if lcb is not None:
+            line += f"  LCB {lcb:+.4f}"
+            if margin is not None:
+                line += "  ✓ cleared" if lcb > margin else "  ✗"
+        ph = phs.get(hk)
+        if isinstance(ph, dict) and ph:
+            gaps = []
+            for h in sorted(ph, key=lambda x: int(x)):
+                _, _, gap = _horizon_gap(ph[h] if isinstance(ph[h], dict) else {})
+                if gap is not None:
+                    gaps.append(f"h{int(h)} {gap:+.1f}%")
+            if gaps:
+                line += "  [" + " · ".join(gaps) + "]"
+        if winner and hk == winner:
+            line += "  ← took the throne"
+        lines.append(line)
+    return lines
 
 
 def _domain_pair(value: object) -> tuple[float | None, int | None]:

@@ -15,6 +15,7 @@ holds no state.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -167,6 +168,12 @@ class RoundResult:
     win_rate: float | None = None
     wilcoxon_p: float | None = None
     per_domain_win_rate: dict | None = None
+    # Per-horizon breakdown on a scored-ladder round (window ids ``h<H>-…``):
+    # ``{horizon: {king, chal, win_rate, n}}`` — king/chal are the rung's
+    # geomeans, win_rate the challenger's per-window win fraction on it.
+    # None on a single-horizon round. Display only; the verdict is the pooled
+    # statistic.
+    per_horizon: dict | None = None
     # Diagnostic spread of the same bootstrap the LCB gates on: the median and
     # 95th pct of the relative-improvement distribution (the LCB is its 5th pct).
     # A wide gap between a positive median and a negative LCB = a fragile verdict
@@ -248,6 +255,46 @@ def _shadow_diagnostics(
         mask = np.asarray([d == dom for d in domains])
         per_domain[dom] = (float(wins[mask].mean()), int(mask.sum()))
     return win_rate, wilcoxon_p, per_domain
+
+
+_HORIZON_PREFIX = re.compile(r"^h(\d+)-")
+
+
+def per_horizon_breakdown(
+    king_scores: list[WindowScore], chal_scores: list[WindowScore]
+) -> dict | None:
+    """``{horizon: {"king", "chal", "win_rate", "n"}}`` for a ladder round.
+
+    Rungs are recognised from the window ids the ladder draw stamps
+    (``h64-s123``); a round with no such ids (the single-horizon rule, every
+    archived round) returns None so nothing changes for it. Geomeans use the
+    same round statistic as the verdict, restricted to the rung. Never gates.
+    """
+    if not king_scores or len(king_scores) != len(chal_scores):
+        return None
+    rungs: dict[int, list[int]] = {}
+    for i, s in enumerate(king_scores):
+        m = _HORIZON_PREFIX.match(str(s.series_id))
+        if m is None:
+            return None
+        rungs.setdefault(int(m.group(1)), []).append(i)
+    if not rungs:
+        return None
+    g_king = _per_window_geomeans(king_scores)
+    g_chal = _per_window_geomeans(chal_scores)
+    out: dict[str, dict] = {}
+    for h in sorted(rungs):
+        idx = rungs[h]
+        ks = [king_scores[i] for i in idx]
+        cs = [chal_scores[i] for i in idx]
+        wins = np.asarray([g_chal[i] < g_king[i] for i in idx])
+        out[str(h)] = {
+            "king": float(global_geomean(ks)),
+            "chal": float(global_geomean(cs)),
+            "win_rate": float(wins.mean()) if len(idx) else None,
+            "n": int(len(idx)),
+        }
+    return out
 
 
 def evaluate_round(
@@ -395,6 +442,7 @@ def evaluate_round(
         win_rate=win_rate,
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,
+        per_horizon=per_horizon_breakdown(king_scores, chal_scores),
         boot_p50=boot_p50,
         boot_p95=boot_p95,
     )
