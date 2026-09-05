@@ -135,6 +135,17 @@ describe the published checkpoints (that's Tier 2's job) and, offline, that
 the recorded block hash is the real chain's (drop `--no-chain`, or check any
 block explorer).
 
+On a cohort round (more than one challenger duelled, DEC-CA-0012) the receipt
+also publishes, per challenger, its bootstrap bound under the corrected alpha
+(`verdict.cohort_lcbs`) and its shadow diagnostics — observed geomean, window
+win rate, Wilcoxon p, bootstrap p50/p95, per-domain win rates
+(`verdict.cohort_stats`). Both are signed and both are replayed from the
+recorded scores by the `duel-cohort` check: a published number that does not
+reproduce fails the round. The diagnostics never gate; they are there so a
+dashboard or a miner can read every challenger's outcome, not only the
+crowned one's, without re-running the bootstrap. Receipts from before this
+shipped carry neither field and verify unchanged.
+
 **Tier 1** proves the corpus provenance: the pinned generator, run at the
 receipt's `generation_seed` in the same sandbox, reproduces the exact
 `corpus_digest` the trainer claimed to have trained on.

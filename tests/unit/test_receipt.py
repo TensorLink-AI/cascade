@@ -204,6 +204,10 @@ def _mutations(receipt: RoundReceipt) -> dict[str, RoundReceipt]:
         "verdict": replace(
             receipt, verdict=replace(receipt.verdict, challenger_wins_round=False)
         ),
+        "cohort_stats": replace(
+            receipt, verdict=replace(receipt.verdict,
+                                     cohort_stats={"5Mallory": {"geomean": 0.1}})
+        ),
         "weights": replace(receipt, weights=(1.0,) + receipt.weights[1:]),
         "validator_hotkey": replace(receipt, validator_hotkey="5MalloryHotkey"),
     }

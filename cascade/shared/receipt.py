@@ -56,6 +56,52 @@ def _clean_per_domain(pd: dict | None) -> dict | None:
     return out
 
 
+# The per-challenger shadow diagnostics a cohort receipt publishes under
+# ``VerdictRecord.cohort_stats``. Every key is recomputable from the signed
+# ``entry_scores`` (the audit replays them); none of them gates.
+COHORT_STAT_KEYS = ("geomean", "win_rate", "wilcoxon_p", "boot_p50", "boot_p95",
+                    "per_domain_win_rate")
+
+
+def cohort_stats_of(result) -> dict:
+    """One challenger's published diagnostics from its ``eval.koth.RoundResult``.
+
+    Same fields the headline verdict carries for the decided challenger
+    (``chal_geomean``, ``win_rate``, ``wilcoxon_p``, ``boot_p50``, ``boot_p95``,
+    ``per_domain_win_rate``), NaN-scrubbed and strict-JSON shaped so the dict
+    round-trips byte-identically through ``load_receipt``.
+    """
+    return _clean_stats({
+        "geomean": getattr(result, "chal_geomean", None),
+        "win_rate": getattr(result, "win_rate", None),
+        "wilcoxon_p": getattr(result, "wilcoxon_p", None),
+        "boot_p50": getattr(result, "boot_p50", None),
+        "boot_p95": getattr(result, "boot_p95", None),
+        "per_domain_win_rate": getattr(result, "per_domain_win_rate", None),
+    })
+
+
+def _clean_stats(stats: dict | None) -> dict:
+    """Canonical shape of one ``cohort_stats`` entry: every key present (None
+    when unknown), floats finite-or-None, ``per_domain_win_rate`` through
+    :func:`_clean_per_domain`. Idempotent — applied on write AND on load."""
+    stats = stats or {}
+    out: dict = {}
+    for key in COHORT_STAT_KEYS:
+        if key == "per_domain_win_rate":
+            out[key] = _clean_per_domain(stats.get(key))
+        else:
+            out[key] = _none_for_nan(stats.get(key))
+    return out
+
+
+def _clean_cohort_stats(by_hotkey: dict | None) -> dict | None:
+    """``{challenger_hotkey: stats}`` → canonical, or None when empty."""
+    if not by_hotkey:
+        return None
+    return {str(h): _clean_stats(s) for h, s in by_hotkey.items()}
+
+
 @dataclass(frozen=True)
 class Participant:
     """One eligible entrant: a pre-cutoff on-chain commitment, resolved.
@@ -226,6 +272,14 @@ class VerdictRecord:
     # round, i.e. every round before this shipped.
     cohort_k: int = 0
     cohort_lcbs: dict | None = None   # {challenger_hotkey: lcb at alpha/k}
+    # Every duelled challenger's shadow diagnostics — the same set the headline
+    # verdict carries for the decided challenger only (geomean, win_rate,
+    # wilcoxon_p, boot_p50/p95, per-domain win rates), keyed by hotkey. Display
+    # and audit material, never a gate; recomputable from ``entry_scores`` and
+    # checked by ``cascade-audit``'s duel-cohort replay. Absent (dropped from the
+    # signed body) on single-challenger rounds and on every receipt archived
+    # before it shipped, so their signatures still verify.
+    cohort_stats: dict | None = None  # {challenger_hotkey: {COHORT_STAT_KEYS}}
 
     # ── init-baseline floor ([scoring] init_gate_mode) ──────────────────────
     # The shared warm-start init's observed geomean on the verdict windows and
@@ -260,6 +314,7 @@ class VerdictRecord:
     def from_round(
         cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0,
         cohort_k: int = 0, cohort_lcbs: dict | None = None,
+        cohort_stats: dict | None = None,
     ) -> VerdictRecord:
         """From an ``eval.koth.RoundResult`` + ``validator.state.StateTransition``.
 
@@ -306,6 +361,7 @@ class VerdictRecord:
                 {str(h): _none_for_nan(float(v)) for h, v in cohort_lcbs.items()}
                 if cohort_lcbs else None
             ),
+            cohort_stats=_clean_cohort_stats(cohort_stats),
             init_baseline_geomean=_none_for_nan(
                 getattr(result, "baseline_geomean", None)),
             init_floor_passed=getattr(result, "init_floor_passed", None),
@@ -329,6 +385,8 @@ def _verdict_body(v: VerdictRecord | None) -> dict | None:
         d.pop("cohort_k", None)
     if not d.get("cohort_lcbs"):
         d.pop("cohort_lcbs", None)
+    if not d.get("cohort_stats"):
+        d.pop("cohort_stats", None)
     # Init-baseline floor fields: absent ⇒ dropped, so a receipt from a
     # gate-off round serialises byte-for-byte as before the fields existed.
     if d.get("init_baseline_geomean") is None:
@@ -552,6 +610,7 @@ def load_receipt(text: str) -> RoundReceipt:
                  for h, v in verdict["cohort_lcbs"].items()}
                 if verdict.get("cohort_lcbs") else None
             ),
+            cohort_stats=_clean_cohort_stats(verdict.get("cohort_stats")),
             init_baseline_geomean=(
                 None if verdict.get("init_baseline_geomean") is None
                 else float(verdict["init_baseline_geomean"])

@@ -620,6 +620,7 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
     for hk in (v.cohort_lcbs or {}):
         if hk not in {h for h, _ in replayed}:
             problems.append(f"published an LCB for {hk}, which was never scored")
+    problems += _cohort_stats_problems(v.cohort_stats, replayed)
     if v.inconclusive:
         if clearers:
             problems.append(
@@ -639,6 +640,47 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
     return _ok(name, f"{len(duelled)} challengers replayed at alpha="
                      f"{duel_params.bootstrap_alpha:.5f} (={params.bootstrap_alpha:.4f}/{k}); "
                      f"{len(clearers)} cleared; crowned {crowned[:12]}")
+
+
+def _cohort_stats_problems(published: dict | None, replayed: list) -> list[str]:
+    """Every published per-challenger diagnostic must be the one that replays.
+
+    ``cohort_stats`` is optional on the receipt (receipts before it shipped carry
+    none), so its absence is not a problem; but once published it is signed, so
+    it must cover every duelled challenger, name no one else, and every number
+    must reproduce from the recorded scores — the same standard as the LCBs.
+    ``wilcoxon_p`` is compared only when the replay could compute one (scipy
+    is optional for the auditor).
+    """
+    if not published:
+        return []
+    from ..shared.receipt import cohort_stats_of
+
+    problems: list[str] = []
+    scored = {hk for hk, _ in replayed}
+    for hk in published:
+        if hk not in scored:
+            problems.append(f"published stats for {hk}, which was never scored")
+    for hk, res in replayed:
+        rec = published.get(hk)
+        if rec is None:
+            problems.append(f"no published stats for duelled challenger {hk}")
+            continue
+        want = cohort_stats_of(res)
+        for key in ("geomean", "win_rate", "boot_p50", "boot_p95"):
+            if not _close(rec.get(key), want.get(key)):
+                problems.append(f"published {key} for {hk} is {rec.get(key)} but "
+                                f"replays as {want.get(key)}")
+        if want.get("wilcoxon_p") is not None and not _close(
+                rec.get("wilcoxon_p"), want["wilcoxon_p"]):
+            problems.append(f"published wilcoxon_p for {hk} is {rec.get('wilcoxon_p')} "
+                            f"but replays as {want['wilcoxon_p']}")
+        got_pd, want_pd = rec.get("per_domain_win_rate") or {}, want.get("per_domain_win_rate") or {}
+        if set(got_pd) != set(want_pd) or any(
+                not _close(got_pd[d][0], want_pd[d][0]) or int(got_pd[d][1]) != int(want_pd[d][1])
+                for d in want_pd):
+            problems.append(f"published per_domain_win_rate for {hk} does not replay")
+    return problems
 
 
 def check_koth_params(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
