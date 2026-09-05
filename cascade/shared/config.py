@@ -1079,6 +1079,18 @@ class ScoringConfig:
     # flip: retiring it makes pre-flip receipts fail the params replay.
     win_margin_start_prev: float = 0.0
     margin_activation_block: int = 0
+    # Cohort-duel family-wise correction (DEC-CA-0038). Bonferroni's alpha/k
+    # over-protects the king: the k challengers share the king's scores and one
+    # window draw, so the tests are strongly positively correlated and the
+    # union bound is loose (at k=11 it reads the 0.45th bootstrap percentile).
+    # From a round whose epoch boundary is >= this block the cohort is judged
+    # under a shared-resample max-T (Westfall-Young step-down) instead — exact
+    # under the real correlation, no alpha/k. CONSENSUS, block-gated exactly
+    # like margin_activation_block: every validator resolves the rule from the
+    # round's block, so restart timing never forks a verdict and audit replays
+    # each round under its own rule. 0 = Bonferroni forever. Bit-identical at
+    # k <= 1 (no multiplicity), so single-challenger rounds never change.
+    cohort_maxt_from_block: int = 0
     # Breadth floor for the verdict: below this many distinct window clusters
     # (upstream feeds, from pool metadata ``source``) the round is inconclusive.
     # 0 disables; pools without ``source`` metadata are unaffected. Default keeps
@@ -1486,6 +1498,17 @@ def effective_win_margin_start(scoring: ScoringConfig, block: int | None) -> flo
     return float(scoring.win_margin_start)
 
 
+def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """Whether a cohort round at epoch boundary ``block`` is judged under the
+    shared-resample max-T (DEC-CA-0038) rather than Bonferroni ``alpha/k``:
+    ``cohort_maxt_from_block`` set and reached. ``0`` / unknown block ⇒ False
+    (Bonferroni). Block-gated exactly like :func:`effective_win_margin_start`,
+    so every validator and the audit resolve the same rule from the round's
+    block."""
+    return (scoring.cohort_maxt_from_block > 0 and block is not None
+            and int(block) >= scoring.cohort_maxt_from_block)
+
+
 def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
     """Round length in force AT ``block`` — the only correct way to turn a block
     into an epoch.
@@ -1853,6 +1876,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_warmup_rounds=int(s["margin_warmup_rounds"]),
             win_margin_start_prev=float(s.get("win_margin_start_prev", 0.0) or 0.0),
             margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
+            cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),

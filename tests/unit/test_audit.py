@@ -205,7 +205,7 @@ def test_tamper_params_fails_koth_params(audit_cfg, signed_receipt):
     assert r.status == C.FAIL and "bootstrap_B" in r.detail
 
 
-def test_tamper_score_fails_verdict(signed_receipt):
+def test_tamper_score_fails_verdict(signed_receipt, audit_cfg):
     es = signed_receipt.entry_scores
     chal = es[1]
     # dope one window WORSE for the challenger: the bootstrap's lower tail
@@ -215,23 +215,23 @@ def test_tamper_score_fails_verdict(signed_receipt):
         signed_receipt,
         entry_scores=(es[0], replace(chal, scores=(doped, *chal.scores[1:]))),
     )
-    r = C.check_verdict(tampered)
+    r = C.check_verdict(tampered, audit_cfg)
     assert r.status == C.FAIL and "lcb" in r.detail
 
 
-def test_tamper_lcb_fails_verdict(signed_receipt):
+def test_tamper_lcb_fails_verdict(signed_receipt, audit_cfg):
     v = signed_receipt.verdict
     tampered = replace(signed_receipt, verdict=replace(v, lcb=(v.lcb or 0.0) + 0.1))
-    assert C.check_verdict(tampered).status == C.FAIL
+    assert C.check_verdict(tampered, audit_cfg).status == C.FAIL
 
 
-def test_tamper_win_bit_fails_verdict(signed_receipt):
+def test_tamper_win_bit_fails_verdict(signed_receipt, audit_cfg):
     v = signed_receipt.verdict
     tampered = replace(
         signed_receipt,
         verdict=replace(v, challenger_wins_round=not v.challenger_wins_round),
     )
-    assert C.check_verdict(tampered).status == C.FAIL
+    assert C.check_verdict(tampered, audit_cfg).status == C.FAIL
 
 
 def test_tamper_dethrone_fails_transition(signed_receipt):
