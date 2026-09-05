@@ -598,6 +598,13 @@ win_margin_start     = 0.01      # fresh-king margin (tenure 0) from margin_acti
 # against it). 0.0 / 0 = no scheduled change.
 win_margin_start_prev   = 0.02   # in force for rounds before margin_activation_block
 margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_from_block
+# Cohort-duel family-wise correction (DEC-CA-0038): Bonferroni alpha/k -> a
+# shared-resample max-T (Westfall-Young), exact under the k challengers' real
+# positive correlation instead of the loose union bound. CONSENSUS, block-gated
+# like margin_activation_block above: every validator resolves the rule from the
+# round's epoch block, audit replays each round under its own. Bit-identical at
+# k<=1 (single-challenger rounds never change). 0 = Bonferroni forever.
+cohort_maxt_from_block = 9043200  # Fri 2026-09-11 08:30 UTC (an epoch boundary; upgrade window)
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision

@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from .bootstrap import (
+    cohort_maxt_lcbs,
     increment_bootstrap_rel,
     paired_bootstrap_lcb_aggregated,
     paired_bootstrap_quantiles_aggregated,
@@ -248,6 +249,50 @@ def _shadow_diagnostics(
         mask = np.asarray([d == dom for d in domains])
         per_domain[dom] = (float(wins[mask].mean()), int(mask.sum()))
     return win_rate, wilcoxon_p, per_domain
+
+
+def cohort_maxt_lcb_map(
+    king_scores: list[WindowScore],
+    cohort_scores: "list[tuple[str, list[WindowScore]]]",
+    params: KothParams,
+    *,
+    seed: int | str,
+    wql_mode: str = "geomean",
+) -> dict[str, float]:
+    """``{hotkey: family-wise LCB}`` for a cohort under the shared-resample
+    max-T (DEC-CA-0038) — the consensus replacement for Bonferroni ``alpha/k``
+    when ``[scoring] cohort_maxt_from_block`` is reached.
+
+    ``king_scores`` and every challenger's pooled scores must be paired (same
+    windows, same order — the caller pools across sizes exactly as the level
+    LCB does). One shared cluster resample scores king + all challengers
+    (:func:`cascade.eval.bootstrap.cohort_maxt_lcbs`), so the correction reads
+    the ACTUAL joint correlation instead of the loose union bound. The single
+    source of truth for BOTH the validator's decision and the audit's replay,
+    so the two can never derive a different bound. Uses ``params.bootstrap_B``
+    at the FULL ``params.bootstrap_alpha`` — the max-T needs no ``alpha/k``.
+    """
+    clusters, _ = _window_clusters(king_scores)
+    king_c = stack_components(king_scores)
+    chal_c = [stack_components(cs) for _, cs in cohort_scores]
+    lcbs = cohort_maxt_lcbs(
+        king_c, chal_c, alpha=params.bootstrap_alpha, B=params.bootstrap_B,
+        seed=seed, clusters=clusters, wql_mode=wql_mode,
+    )
+    return {hk: lcb for (hk, _), lcb in zip(cohort_scores, lcbs, strict=True)}
+
+
+def with_cohort_lcb(result: RoundResult, lcb: float, params: KothParams) -> RoundResult:
+    """A cohort challenger's :class:`RoundResult` re-decided under its
+    family-wise max-T ``lcb`` (DEC-CA-0038): swap the lcb and recompute the win
+    under the SAME rule :func:`evaluate_round` used — ``lcb >= margin``, AND-ed
+    with the enforce-mode init-baseline floor. Geomeans, the floor result, and
+    the diagnostics are untouched (they never depended on the correction). The
+    one place the win is re-derived, shared by the validator and the audit."""
+    wins = bool(lcb >= result.margin)
+    if params.init_gate_mode == "enforce" and result.init_floor_passed is False:
+        wins = False
+    return replace(result, lcb=lcb, challenger_wins_round=wins)
 
 
 def evaluate_round(

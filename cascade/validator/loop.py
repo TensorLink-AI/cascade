@@ -31,10 +31,10 @@ from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..eval.koth import RoundResult, evaluate_round
+from ..eval.koth import RoundResult, cohort_maxt_lcb_map, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
-from ..shared.config import ChainConfig, effective_epoch_blocks
+from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -1183,22 +1183,34 @@ class ValidatorRunner:
                          "round; floor not applied",
                          manifest.round_id, base_params.init_gate_mode)
         k = len(cohort)
-        # Family-wise (Bonferroni) correction. Conservative under the cohort's
-        # real correlation — every challenger shares the king's scores and one
-        # window draw — which over-protects the king rather than under-, the
-        # correct side to err on for a change whose failure mode is an
-        # illegitimate dethrone. See DEC-CA-0012.
-        duel_params = (
-            base_params if k <= 1
-            else replace(base_params, bootstrap_alpha=base_params.bootstrap_alpha / k)
-        )
-        if k > 1:
-            log.info("round=%s cohort duel: k=%d challengers, alpha %.4f -> %.5f",
-                     manifest.round_id, k, base_params.bootstrap_alpha,
-                     duel_params.bootstrap_alpha)
+        # Cohort family-wise correction (DEC-CA-0038, block-gated). max-T reads
+        # the critical value off the ACTUAL joint spread (one shared resample,
+        # exact under the challengers' real positive correlation); Bonferroni
+        # alpha/k is the pre-gate rule (loose under that correlation — it
+        # over-protects the king). Under max-T the per-challenger evaluate_round
+        # below runs at the UNCORRECTED alpha (its lcb is discarded and replaced
+        # by the joint bound); the geomeans/floors/diagnostics it computes are
+        # unaffected. k <= 1 is bit-identical either way (no multiplicity).
+        use_maxt = k > 1 and cohort_maxt_active(
+            self.cfg.scoring, self._epoch_start_block(manifest))
+        if use_maxt:
+            duel_params = base_params
+            log.info("round=%s cohort duel: k=%d challengers, max-T family-wise "
+                     "correction (alpha %.4f, shared resample)", manifest.round_id,
+                     k, base_params.bootstrap_alpha)
+        else:
+            duel_params = (
+                base_params if k <= 1
+                else replace(base_params, bootstrap_alpha=base_params.bootstrap_alpha / k)
+            )
+            if k > 1:
+                log.info("round=%s cohort duel: k=%d challengers, Bonferroni "
+                         "alpha %.4f -> %.5f", manifest.round_id, k,
+                         base_params.bootstrap_alpha, duel_params.bootstrap_alpha)
 
         tenure_at_decision = self.state.tenure_rounds
         judged: list[tuple[str, TrainedEntry, RoundResult]] = []
+        cohort_scores: list[tuple[str, list[WindowScore]]] = []
         inconclusive: RoundResult | None = None
         for hk, by_size in cohort:
             chal_scores: list[WindowScore] = []
@@ -1234,9 +1246,7 @@ class ValidatorRunner:
                 inconclusive = result
                 break
             judged.append((hk, by_size[paired_sizes[0]], result))
-            log.info("round=%s duel %s lcb=%.4f margin=%.4f clears=%s",
-                     manifest.round_id, hk, result.lcb, result.margin,
-                     result.challenger_wins_round)
+            cohort_scores.append((hk, chal_scores))
             if result.init_floor_passed is not None:
                 log.info(
                     "round=%s init-baseline floor (%s) %s: chal=%.5f vs "
@@ -1248,6 +1258,25 @@ class ValidatorRunner:
                     ("" if base_params.init_gate_mode == "enforce"
                      or result.init_floor_passed else " (shadow: not gating)"),
                 )
+
+        # Cohort family-wise correction (DEC-CA-0038): replace each judged
+        # challenger's solo lcb with its joint max-T bound — one shared
+        # resample over king + the whole cohort, exact under the real
+        # correlation — and re-decide the win under the same margin/floor rule.
+        # Only when armed and the cohort completed (an inconclusive round holds
+        # regardless); the per-challenger evaluate_round above ran at the
+        # uncorrected alpha, so its geomeans/floors carry over unchanged.
+        if use_maxt and inconclusive is None and len(judged) > 1:
+            from ..eval.koth import with_cohort_lcb
+
+            lcbs = cohort_maxt_lcb_map(
+                king_scores, cohort_scores, base_params, seed=base_seed)
+            judged = [(hk, entry, with_cohort_lcb(res, lcbs[hk], base_params))
+                      for hk, entry, res in judged]
+        for hk, _, res in judged:
+            log.info("round=%s duel %s lcb=%.4f margin=%.4f clears=%s",
+                     manifest.round_id, hk, res.lcb, res.margin,
+                     res.challenger_wins_round)
 
         if inconclusive is not None:
             decided_hotkey, chal_entry, result = (

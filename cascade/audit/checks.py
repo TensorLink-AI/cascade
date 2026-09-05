@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
-from ..shared.config import ChainConfig, effective_epoch_blocks
+from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
 from ..shared.manifest import (
     LOCKED_CONTRACT_FIELDS,
     TrainingManifest,
@@ -487,6 +487,27 @@ def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
     return out
 
 
+def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params):
+    """``{hotkey: max-T family-wise LCB}`` for a cohort round replayed under
+    the shared-resample correction (DEC-CA-0038) — the same call the validator
+    made (:func:`cascade.eval.koth.cohort_maxt_lcb_map`), off the receipt's own
+    scores. ``params`` is the UNMODIFIED recorded set (max-T needs no
+    ``alpha/k``). Raises on unpaired/​unrebuildable scores."""
+    from ..eval.koth import cohort_maxt_lcb_map
+
+    duelled = _duelled_hotkeys(receipt)
+    king_scores = None
+    cohort: list[tuple[str, list]] = []
+    for hk in duelled:
+        king_scores, chal, paired = _pooled_scores(receipt, manifest, hotkey=hk)
+        if not paired:
+            raise ValueError(f"challenger {hk} has no paired size")
+        cohort.append((hk, chal))
+    return cohort_maxt_lcb_map(
+        king_scores, cohort, params,
+        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean")
+
+
 def _cohort_params(params, manifest: TrainingManifest):
     """``params`` with the duel's family-wise alpha applied (DEC-CA-0012).
 
@@ -503,7 +524,7 @@ def _cohort_params(params, manifest: TrainingManifest):
     return replace(params, bootstrap_alpha=params.bootstrap_alpha / k)
 
 
-def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
+def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """Verify the cohort duel's SELECTION, not just its verdict (DEC-CA-0012).
 
     With one challenger this is a no-op skip. With a cohort it replays every
@@ -601,6 +622,23 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
         )
         replayed.append((hk, res))
 
+    # Cohort family-wise correction (DEC-CA-0038): from cohort_maxt_from_block
+    # the round was judged under the shared-resample max-T, not Bonferroni
+    # alpha/k. Resolve the rule from THIS receipt's block (exactly as the
+    # validator did) and, when armed, replace every replayed lcb with its
+    # joint bound and re-decide the win — so the cohort_lcbs check below
+    # verifies the numbers that actually decided the round. Bonferroni rounds
+    # (and every pre-gate round) skip this untouched.
+    if cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
+        from ..eval.koth import with_cohort_lcb
+
+        try:
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+        except (ValueError, KeyError) as e:
+            return _fail(name, f"cannot replay cohort max-T bound: {e}")
+        replayed = [(hk, with_cohort_lcb(res, lcbs[hk], params))
+                    for hk, res in replayed]
+
     # The verdict belongs to the LAST challenger recorded (the validator appends
     # in evaluation order and the crowned/​stopping challenger is scored last).
     crowned = duelled[-1]
@@ -668,7 +706,7 @@ def check_koth_params(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     return _ok(name, "recorded params match chain.toml [scoring]")
 
 
-def check_verdict(receipt: RoundReceipt) -> CheckResult:
+def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """Recompute the KOTH verdict from the receipt's own scores.
 
     Feeds the recorded per-window scores back into ``evaluate_round`` with the
@@ -743,7 +781,23 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
 
     result = _replay("geomean")
     scoring_note = ""
-    if not _close(None if math.isnan(result.lcb) else result.lcb, v.lcb):
+    # Cohort family-wise correction (DEC-CA-0038): from cohort_maxt_from_block
+    # the crowned challenger's lcb is its JOINT max-T bound (it depends on the
+    # whole cohort), so a solo replay cannot reproduce it. Resolve the rule
+    # from this receipt's block and, when armed, swap in the crowned bound +
+    # re-decide the win before comparing. k <= 1 and pre-gate rounds never
+    # enter this branch (the crowned solo replay is the whole story there).
+    duelled = _duelled_hotkeys(receipt)
+    if len(duelled) > 1 and cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
+        from ..eval.koth import with_cohort_lcb
+
+        try:
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+        except (ValueError, KeyError) as e:
+            return _fail(name, f"cannot replay cohort max-T bound: {e}")
+        result = with_cohort_lcb(result, lcbs[duelled[-1]], params)
+        scoring_note = " (cohort max-T family-wise correction, DEC-CA-0038)"
+    elif not _close(None if math.isnan(result.lcb) else result.lcb, v.lcb):
         legacy = _replay("pooled")
         if _close(None if math.isnan(legacy.lcb) else legacy.lcb, v.lcb):
             result = legacy
@@ -979,8 +1033,8 @@ def run_tier0(
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),
         check_koth_params(receipt, cfg),
-        check_verdict(receipt),
-        check_duel_cohort(receipt),
+        check_verdict(receipt, cfg),
+        check_duel_cohort(receipt, cfg),
         check_transition(receipt),
         check_weights(receipt, cfg, client),
     ]

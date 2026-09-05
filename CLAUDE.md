@@ -282,6 +282,17 @@ in-context.
   Same block arms the scored horizon ladder (`[eval] scored_horizons`,
   consensus). Trainer/provisioner policy; no contract change.
   (`decisions/DEC-CA-0037-duel-only-rounds.md`)
+- **DEC-CA-0038** — Cohort duel family-wise correction: Bonferroni `α/k`
+  over-protects the king (the k challengers share the king's scores + one
+  window draw → strongly positively correlated → the union bound is loose;
+  at k=11 it reads the 0.45th bootstrap pct). Replaced by a shared-resample,
+  centred, STUDENTISED max-T (Westfall–Young) off `joint_bag_geomeans` —
+  exact under the real correlation, no `α/k`, bit-identical at k≤1. Consensus,
+  block-gated `[scoring] cohort_maxt_from_block` (mainnet 9043200 ≈ Fri
+  2026-09-11 08:30 UTC; testnet 1); audit replays each round under its block's
+  rule via `cohort_maxt_lcb_map` (one impl for validator + audit); no receipt
+  field (correction lives in the gate). Revises DEC-CA-0012.
+  (`decisions/DEC-CA-0038-cohort-maxt-correction.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
