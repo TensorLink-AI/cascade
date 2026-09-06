@@ -271,13 +271,22 @@ each side degrades safely without the other:
   republish. Ownership is by address: an entry is the provisioner's iff its
   host is a ledger pod (re-rendered from the ledger) or a pod it terminated.
   Two rules for hand-added lanes: use any name shape **except** the
-  provisioner's own `cascade-<round>-<stage>-<i>-g<g>` (that exact shape with
-  no ledger pod is treated as a stale self-published lane and dropped), and
+  provisioner's own `cascade-<provider>-<8 hex>-g<g>` (or the pre-2026-09-06
+  `cascade-<round>-<stage>-<i>-g<g>`; either exact shape with no ledger pod
+  is treated as a stale self-published lane and dropped), and
   do **not** name the pod `cascade-<digits>-(heat|final|eval)…` on the
   provider — the orphan reconciler terminates provisioner-named pods that
   are not in its ledger. Remove a lane's entry yourself when you terminate
   its pod. The optional `static_hosts` fragment is re-read on every publish
   (an edit lands without a restart; a broken edit keeps the last good copy).
+- **Lane names are stable.** The provisioner names each lane
+  `cascade-<provider>-<8 hex of the instance id>-g<gpu>`, derived from pod
+  identity only. The trainer's final lane pool is keyed by name and never
+  shrinks, so a lane that changed name between two publishes would look like
+  a new free GPU and get a second leg (2026-09-06: the second pod's publish
+  renamed the first pod's lanes after the round id and the king's GPU took a
+  second leg). Adding, replacing, or tearing down a sibling pod now leaves
+  every other pod's names untouched.
 - **Recycled containers fail the gate.** A facility that restarts a leftover
   container instead of creating one from the requested image serves stale
   state. The health gate's `fresh_boot` check fails a pod whose

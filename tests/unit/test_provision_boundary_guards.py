@@ -330,7 +330,7 @@ def test_our_own_terminated_pods_are_never_preserved_as_operator_lanes(tmp_path)
     hosts_path = tmp_path / "hosts.toml"
     # Rename our final lanes to an operator-looking shape: address ownership
     # must still drop them once the pod is terminated.
-    text = hosts_path.read_text().replace("cascade-900-final-0-g", "cascade-900-final-mX-g")
+    text = hosts_path.read_text().replace("cascade-lium-", "cascade-operator-")
     hosts_path.write_text(text)
     _manifest_round(tmp_path, clock, store, loop, prov)
     cycle(loop)
@@ -349,7 +349,47 @@ def test_torn_hosts_file_preserves_nothing(tmp_path):
     _heat_marker(tmp_path, clock, loop)
     names = [h.name for h in load_hosts(hosts_path)]
     assert "cascade-900-final-m0-g0" not in names            # garbage never re-emitted
-    assert names and all(n.startswith("cascade-900-final-0-g") for n in names)
+    assert names and all(n.startswith("cascade-lium-") and n.endswith(("-g0", "-g1")) for n in names)
+
+
+def test_lane_names_are_stable_across_a_second_rental(tmp_path):
+    """2026-09-06 09:05: the second pod's publish renamed the first pod's lanes
+    (old round id → new) and the trainer's name-keyed pool dispatched a second
+    leg onto the king's GPU. Names must derive from pod identity only."""
+    from cascade.provision.loop import lane_pod_name
+
+    clock, store = Clock(), FakeStore()
+    prov = FakeProvider("lium")
+    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
+    cycle(loop)
+    first = {h.name: (h.host, h.cuda_device) for h in load_hosts(tmp_path / "hosts.toml")}
+    assert first and all(n.startswith("cascade-lium-") for n in first)
+    # Every name carries its pod's identity, not the round or position.
+    for inst in loop._state.instances:
+        stem = lane_pod_name(inst.provider, inst.instance_id)
+        assert any(n.startswith(stem + "-g") for n in first), (stem, sorted(first))
+    # A republish under a NEW round id (the second rental of the incident)
+    # keeps every existing lane byte-identical in name/host/device.
+    from dataclasses import replace as dc_replace
+
+    loop._state = dc_replace(loop._state, round_id="9010800")
+    loop._republish_from_ledger()
+    second = {h.name: (h.host, h.cuda_device) for h in load_hosts(tmp_path / "hosts.toml")}
+    assert second == first
+
+
+def test_lane_pod_name_shapes():
+    from cascade.provision.loop import _SELF_LANE_RE, lane_pod_name
+
+    assert lane_pod_name("shadeform", "bbc38fd9-b0f9-4156-a9ad-ccb1864e8e8a") == "cascade-shadeform-bbc38fd9"
+    lium = lane_pod_name("lium", "cascade-900-heat-0")
+    assert lium.startswith("cascade-lium-") and len(lium) == len("cascade-lium-") + 8
+    assert lane_pod_name("lium", "cascade-900-heat-0") == lium          # deterministic
+    assert lane_pod_name("lium", "cascade-900-heat-1") != lium
+    for name in (lium + "-g0", "cascade-shadeform-bbc38fd9-g1", "cascade-800-final-0-g0"):
+        assert _SELF_LANE_RE.match(name), name                          # our shapes
+    for name in ("cascade-8996400-final-m0-g0", "cascade-final-b", "benchpod-r64-g0"):
+        assert not _SELF_LANE_RE.match(name), name                      # operator shapes
 
 
 def test_static_fragment_is_reread_on_every_publish(tmp_path):

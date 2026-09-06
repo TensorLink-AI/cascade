@@ -184,7 +184,7 @@ def test_happy_path_rents_publishes_and_records(tmp_path):
     final = [h for h in hosts if h.stage == "final"]
     assert len(heat) == 8 and len(final) == 2               # per-GPU fan-out
     assert {h.cuda_device for h in heat} == {str(i) for i in range(8)}
-    assert all(h.name.startswith("cascade-900-heat") for h in heat)
+    assert all(h.name.startswith("cascade-lium-") and h.stage == "heat" for h in heat)   # stable per-pod names (H4)
 
     st = load_state(tmp_path / "state.json")
     assert st.round_id == "900" and st.published
@@ -1432,7 +1432,7 @@ def test_static_hosts_survive_every_publish_and_clear(tmp_path):
     cycle(loop)                               # provisions + publishes
     text = (tmp_path / "hosts.toml").read_text()
     assert "cascade-final-b" in text              # static entry present
-    assert "cascade-900-heat" in text             # dynamic heat pods present
+    assert 'stage         = "heat"' in text        # dynamic heat pods present
     # all-providers-down path: static fleet remains, never an empty file
     prov2 = FakeProvider("lium", available=False)
     loop2, _ = make_loop(tmp_path, providers={"lium": prov2}, block=1780)
