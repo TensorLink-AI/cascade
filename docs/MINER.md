@@ -675,6 +675,17 @@ the α/k rule, so a bigger cohort means a stricter per-challenger bound.
 From the same block the verdict is scored on a horizon ladder (64 / 256 / 720
 steps, one even-by-domain draw each) instead of the single 64-step horizon.
 
+### Reading a duel-only round
+
+On a duel-only round `cascade heat` lists the whole field: every seated entrant
+(`● seated — duels the king`, in seat order) and every waiting one
+(`waiting — next round`); there is no rank, because no screen ran. The round's
+result is the validator's receipt: `cascade duel` shows the decided pair, a
+`by horizon` block with the king's and the challenger's geomeans on each rung
+(64 / 256 / 720 steps) and the challenger's per-window win rate there, and a
+`cohort` block listing every judged challenger with its geomean relative to the
+king, its LCB against the margin, and its per-horizon gaps.
+
 ## Common failures
 
 | symptom | cause |

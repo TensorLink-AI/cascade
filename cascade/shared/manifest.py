@@ -301,7 +301,10 @@ class TrainedEntry:
             raise ValueError(f"malformed trained_pointer: {self.trained_pointer!r}")
 
 
-HEAT_STATUSES = ("advanced", "screened", "failed_train", "failed_screen", "duplicate")
+# ``seated`` / ``waiting`` are the duel-only round's standings (no screen ran:
+# seated entrants duel the king directly, waiting ones carry to a later round).
+HEAT_STATUSES = ("advanced", "screened", "failed_train", "failed_screen", "duplicate",
+                 "seated", "waiting")
 
 
 @dataclass(frozen=True)

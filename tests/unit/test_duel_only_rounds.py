@@ -261,8 +261,10 @@ def test_duel_only_standings_name_the_waiting_entrants(duel_cfg, tmp_path, monke
     assert doc["round_id"] == "1" and doc["screened"] == 2
     assert "duel-only" in doc["no_screen_reason"]
     assert "1 wait" in doc["no_screen_reason"] and "cap" not in doc["no_screen_reason"]
-    skipped = json.dumps(doc["skipped"])
-    assert "waiting" in skipped and '"d"' in skipped
+    # the whole field is listed: seated in seat order, then the waiting entrant
+    assert [(e["hotkey"], e["status"]) for e in doc["entrants"]] == [
+        ("c", "seated"), ("b", "seated"), ("d", "waiting")]
+    assert doc["duel_only"] is True
 
 
 # ── provisioner plan: no heat fleet, final sized off the seats ───────────────

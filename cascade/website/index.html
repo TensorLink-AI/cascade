@@ -973,6 +973,15 @@ th.num { text-align: right; }
 .heat-empty .he-glyph { font-family: var(--font-mono); font-size: 18px; color: var(--muted); letter-spacing: 0.3em; }
 .heat-empty .he-head { font-family: var(--font-mono); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
 .heat-empty p { font-size: 12px; color: var(--muted); max-width: 58ch; margin: 0; }
+.heat-pill.wait { color: var(--chal); }
+
+/* latest verdict — scored-ladder breakdown + the whole judged cohort */
+.panel.cohort { margin-top: 12px; display: grid; gap: 18px; }
+.cohort-head { font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); margin-bottom: 8px; }
+.cohort-head .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.h-gap { display: inline-block; font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-right: 8px; }
+.h-gap.good { color: var(--good); font-weight: 700; }
+tr.throne td { background: var(--hatch); }
 
 /* live round panel — stage strip + revealed submissions */
 .stage-strip { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 4px 0 16px; }
@@ -1052,6 +1061,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
     <div class="verdict" id="verdict"></div>
+    <div id="cohort-panel" hidden></div>
   </div>
 
   <div>
@@ -1069,7 +1079,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
   <!-- section order is the read order: NOW (verdict, live round, this round's
        heat) → TREND (error chart) → REFERENCE (reigns/field, warm-start, history) -->
   <div>
-    <div class="section-label"><span>Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
+    <div class="section-label"><span id="heat-title">Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
     <div id="heat-panel"></div>
   </div>
 
@@ -1312,6 +1322,78 @@ function renderVerdict(){
   }
   el.innerHTML=cells.join("");
 }
+// ── latest verdict, expanded: the scored-ladder breakdown of the decided pair
+// and EVERY judged challenger of the cohort (the "all miners" duel view of a
+// duel-only round). Fields ride the receipts index row once a post-ladder
+// validator publishes it (per_horizon / cohort_geomeans / cohort_per_horizon);
+// the anchor's full receipt for the same round is the fallback. Pre-ladder
+// rounds carry cohort_lcbs only (DEC-CA-0012) — still listed, LCB column only.
+// Single-challenger, single-horizon rounds render nothing (panel stays hidden).
+function cohortSource(r){
+  var v=(_latest&&String(_latest.round_id)===String(r.round_id)&&_latest.verdict)||{};
+  function pick(k){ var x=r[k]; if(x==null) x=v[k]; return (x&&typeof x==="object")?x:null; }
+  return {per_horizon:pick("per_horizon"), geos:pick("cohort_geomeans")||{}, lcbs:pick("cohort_lcbs")||{},
+          phs:pick("cohort_per_horizon")||{}, king:r.king_geomean, margin:r.margin,
+          chal:r.chal_hotkey, winner:r.dethroned?r.chal_hotkey:null};
+}
+function gapPct(cell){ if(!cell||cell.king==null||cell.chal==null||!Number(cell.king)) return null; return (cell.chal-cell.king)/cell.king*100; }
+function signedPct(g,dp){ return g==null?"--":(g>0?"+":"")+g.toFixed(dp==null?2:dp)+"%"; }
+function uidOfHotkey(hk,r){
+  if(hk===r.chal_hotkey&&r.chal_uid!=null) return r.chal_uid;
+  var ps=(_latest&&String(_latest.round_id)===String(r.round_id)&&_latest.participants)||[];
+  for(var i=0;i<ps.length;i++){ if(ps[i].hotkey===hk) return ps[i].uid; }
+  return null;
+}
+function horizonKeys(o){ return Object.keys(o||{}).sort(function(a,b){ return Number(a)-Number(b); }); }
+function renderCohort(){
+  var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("cohort-panel");
+  if(!r||r.status==="rejected"){ el.hidden=true; el.innerHTML=""; return; }
+  var s=cohortSource(r), html="";
+  if(s.per_horizon&&horizonKeys(s.per_horizon).length){
+    var hrows=horizonKeys(s.per_horizon).map(function(h){
+      var c=s.per_horizon[h]||{}, g=gapPct(c);
+      return '<tr><td class="num">'+esc(h)+'</td><td class="num">'+fmt(c.king,5)+'</td><td class="num">'+fmt(c.chal,5)+'</td>'+
+        '<td class="num'+(g!=null&&g<0?' good':'')+'">'+signedPct(g)+'</td>'+
+        '<td class="num">'+pct(c.win_rate)+'</td><td class="num">'+(c.n!=null?c.n:"--")+'</td></tr>';
+    }).join("");
+    html+='<div><div class="cohort-head">By horizon <span class="muted">— the pooled rungs decide; negative gap = challenger better</span></div>'+
+      '<div class="scroll-box"><table><thead><tr><th class="num">h</th><th class="num">King</th><th class="num">Challenger</th>'+
+      '<th class="num">Gap</th><th class="num">Win rate</th><th class="num">n</th></tr></thead><tbody>'+hrows+'</tbody></table></div></div>';
+  }
+  var seen={}, hks=[];
+  Object.keys(s.geos).concat(Object.keys(s.lcbs)).forEach(function(hk){ if(!seen[hk]){ seen[hk]=1; hks.push(hk); } });
+  if(hks.length>1||(hks.length===1&&Object.keys(s.geos).length)){
+    hks.sort(function(a,b){                   // best point estimate first; LCB breaks ties for pre-ladder rows
+      var ga=s.geos[a], gb=s.geos[b];
+      if(ga!=null&&gb!=null) return ga-gb;
+      if(ga!=null) return -1; if(gb!=null) return 1;
+      return (s.lcbs[b]==null?-1e9:s.lcbs[b])-(s.lcbs[a]==null?-1e9:s.lcbs[a]);
+    });
+    var k=hks.length;
+    var crows=hks.map(function(hk,i){
+      var g=s.geos[hk], lcb=s.lcbs[hk], uid=uidOfHotkey(hk,r);
+      var rel=(g!=null&&s.king)?(g-s.king)/s.king*100:null;
+      var cleared=(lcb!=null&&s.margin!=null)?(lcb>s.margin):null;
+      var gaps=horizonKeys(s.phs[hk]).map(function(h){ var gp=gapPct(s.phs[hk][h]); return gp==null?"":'<span class="h-gap'+(gp<0?' good':'')+'">h'+esc(h)+' '+signedPct(gp,1)+'</span>'; }).join("");
+      var tag=s.winner===hk?' <span class="crown">← took the throne</span>':(hk===s.chal?' <span class="sub-tag">decided pair</span>':'');
+      return '<tr'+(s.winner===hk?' class="throne"':'')+'>'+
+        '<td class="num">'+(i+1)+'</td><td class="num">'+(uid!=null?uid:"--")+'</td>'+
+        '<td title="'+esc(hk)+'">'+esc(shortHk(hk))+tag+'</td>'+
+        '<td class="num'+(rel!=null&&rel<0?' good':'')+'">'+(g!=null?fmt(g,5):"--")+(rel!=null?' <span class="sub">'+signedPct(rel)+'</span>':'')+'</td>'+
+        '<td class="num">'+(lcb!=null?fmt(lcb,4):"--")+'</td>'+
+        '<td>'+(cleared==null?'<span class="muted">--</span>':'<span class="heat-pill '+(cleared?'adv':'nofit')+'">'+(cleared?'✓ cleared':'✗ under margin')+'</span>')+'</td>'+
+        '<td>'+(gaps||'<span class="muted">--</span>')+'</td></tr>';
+    }).join("");
+    html+='<div><div class="cohort-head">Cohort <span class="muted">— '+k+' challenger'+(k===1?"":"s")+' judged'+(k>1?' at α/'+k:'')+
+      ', best point estimate first · margin '+fmt(s.margin,3)+'</span></div>'+
+      '<div class="scroll-box scroll-field"><table><thead><tr><th class="num">#</th><th class="num">UID</th><th>Miner</th>'+
+      '<th class="num" title="geomean(CRPS · MASE), lower is better; relative to the king">Error · vs king</th>'+
+      '<th class="num" title="Bootstrap lower confidence bound on the improvement vs the king">LCB</th><th>Gate</th><th>By horizon</th>'+
+      '</tr></thead><tbody>'+crows+'</tbody></table></div></div>';
+  }
+  if(!html){ el.hidden=true; el.innerHTML=""; el.className=""; return; }
+  el.hidden=false; el.className="panel cohort"; el.innerHTML=html;
+}
 function renderChart(){
   var svg=document.getElementById("chart");
   var W=1000,H=400,PAD_L=56,PAD_R=16,PAD_T=16,PAD_B=26;
@@ -1412,6 +1494,10 @@ function heatStatusMeta(s){
   if(s==="failed_train") return {cls:"nofit",label:"Did not train"};
   if(s==="failed_screen") return {cls:"nofit",label:"Screen error"};
   if(s==="duplicate") return {cls:"nofit",label:"Duplicate"};
+  // duel-only rounds (DEC-CA-0037): no screen ran — seated entrants duel the
+  // king directly, waiting ones carry to a later round with their submission.
+  if(s==="seated") return {cls:"adv",label:"● Seated — duels the king"};
+  if(s==="waiting") return {cls:"wait",label:"Waiting — next round"};
   return {cls:"screened",label:s||"--"};
 }
 function heatSource(){
@@ -1450,6 +1536,39 @@ function renderHeat(){
   }
   var nf=heat.finalists, inFlight=src.live&&!heatRoundSettled(src.esb);
   panel.className="panel";
+  var duel=!!heat.duel_only, title=document.getElementById("heat-title");
+  if(title) title.innerHTML=duel?"Duel field &mdash; seated":"Heat &mdash; screening";
+  if(duel){
+    // Duel-only round (DEC-CA-0037): nobody was screened, so there is no heat
+    // score to bar-chart — the standing IS the information: seat order (they
+    // duel the king in the seated cohort) or waiting for a later round.
+    var seated=0, waiting=0;
+    ents.forEach(function(e){ if(e.status==="seated") seated++; else if(e.status==="waiting") waiting++; });
+    when.textContent="round "+shortRoundId(src.round)+" · "+seated+" seated"+(waiting?" · "+waiting+" waiting":"")+
+      " · no screen"+(src.live&&src.asOf?" · published "+timeAgo(src.asOf):"");
+    var drows=ents.map(function(e,i){ return {e:e,i:i}; }).sort(function(a,b){
+      var ra=a.e.rank==null?1e9:a.e.rank, rb=b.e.rank==null?1e9:b.e.rank;
+      return (ra-rb)||(a.i-b.i);            // seats in seat order, then waiting in reveal order
+    });
+    var dbody=drows.map(function(x){
+      var e=x.e, m=heatStatusMeta(e.status);
+      return '<tr>'+
+        '<td class="num">'+(e.rank!=null?e.rank:"—")+'</td>'+
+        '<td class="num">'+(e.uid!=null?e.uid:"--")+'</td>'+
+        '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+'</td>'+
+        '<td>'+refLink(e.gen_ref)+'</td>'+
+        '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
+    }).join("");
+    panel.innerHTML='<div class="heat-note" title="Published by the trainer the moment the field is seated — hours before the round’s receipt. The verdict panel above lists every seated challenger’s score once the validators judge the cohort.">'+
+      (inFlight?'<b>Live</b> — duel in flight, no verdict yet. ':'')+
+      'Duel-only round — no screen. Every seated entrant trains the full budget and is judged against the king '+
+      '(α/k over the seated cohort); waiting entrants seat next round in reveal order.'+
+      (heat.no_screen_reason?' <span class="muted">'+esc(heat.no_screen_reason)+'</span>':'')+'</div>'+
+      '<div class="scroll-box scroll-field"><table><thead><tr>'+
+      '<th class="num">Seat</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Standing</th>'+
+      '</tr></thead><tbody>'+dbody+'</tbody></table></div>';
+    return;
+  }
   when.textContent="round "+shortRoundId(src.round)+" · "+ents.length+" entrants · "+
     (nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
     (heat.screen_size?" · screened at "+esc(heat.screen_size):"")+
@@ -1771,7 +1890,7 @@ function renderWarmHistory(){
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -1933,7 +2052,7 @@ function poll(){
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
-    .then(function(d){ _latest=d; renderField(); renderHeat(); }).catch(function(){});
+    .then(function(d){ _latest=d; renderField(); renderHeat(); renderCohort(); }).catch(function(){});
   // Live chain status (validator poll cadence). The first live doc resets the
   // new-marker baseline, so ● new only ever flags a commit that appeared while
   // THIS page was watching real data. On failure keep the last good doc (or the

@@ -133,6 +133,11 @@ class RoundOutcome:
     # pre-cohort receipt.
     cohort_k: int = 0
     cohort_lcbs: dict[str, float] = field(default_factory=dict)
+    # Every judged challenger's observed geomean and per-horizon breakdown
+    # (``{hotkey: {horizon: {king, chal, win_rate, n}}}``) — display fields
+    # for the "all miners" duel view; the verdict itself is unchanged.
+    cohort_geomeans: dict[str, float] = field(default_factory=dict)
+    cohort_per_horizon: dict[str, dict] = field(default_factory=dict)
     # Every duelled challenger's shadow diagnostics (geomean, win_rate, …), keyed
     # by hotkey — what the headline verdict records for the decided challenger
     # only. Published on the receipt as ``cohort_stats`` (same drop-when-default
@@ -1359,6 +1364,10 @@ class ValidatorRunner:
             # bytes exactly as a pre-DEC-CA-0012 round's.
             cohort_k=(k if k > 1 else 0),
             cohort_lcbs=({hk: r.lcb for hk, _, r in judged} if k > 1 else {}),
+            # Display fields for every judged challenger (never gating).
+            cohort_geomeans={hk: r.chal_geomean for hk, _, r in judged},
+            cohort_per_horizon={hk: r.per_horizon for hk, _, r in judged
+                                if r.per_horizon},
             cohort_stats=({hk: cohort_stats_of(r) for hk, _, r in judged} if k > 1 else {}),
         )
 
@@ -1429,6 +1438,8 @@ class ValidatorRunner:
             params=self.cfg.koth_params(block=epoch_start_block), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
             cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
+            cohort_geomeans=outcome.cohort_geomeans,
+            cohort_per_horizon=outcome.cohort_per_horizon,
             cohort_stats=outcome.cohort_stats,
         )
         return build_receipt(
