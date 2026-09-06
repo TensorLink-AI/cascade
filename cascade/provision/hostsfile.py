@@ -15,10 +15,55 @@ all-providers-down escape hatch).
 
 from __future__ import annotations
 
+import json
 import os
+import tomllib
 from pathlib import Path
 
-__all__ = ["clear_hosts", "write_hosts"]
+__all__ = ["clear_hosts", "parse_host_entries", "render_host_entries", "write_hosts"]
+
+# Field order for re-rendered entries (the trainer's load_hosts schema order);
+# unknown keys follow, sorted, so nothing an operator wrote is dropped.
+_ENTRY_KEY_ORDER = ("name", "host", "port", "user", "key_path", "remote_python",
+                    "workdir", "cuda_device", "stage", "chain_toml", "forward_env",
+                    "ssh_options")
+
+
+def parse_host_entries(text: str) -> list[dict]:
+    """The ``[[host]]`` tables of a hosts.toml body, as dicts (``[]`` when none).
+
+    Raises ``tomllib.TOMLDecodeError`` on a malformed file — the caller decides
+    whether a torn file means "preserve nothing" (it does: never re-emit
+    garbage into the trainer's contract file).
+    """
+    return [dict(h) for h in tomllib.loads(text).get("host", []) if isinstance(h, dict)]
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int | float):
+        return repr(v)
+    if isinstance(v, list | tuple):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    # json.dumps yields a valid TOML basic string for any str (same escapes).
+    return json.dumps(str(v))
+
+
+def render_host_entries(entries: list[dict]) -> str:
+    """Re-render parsed ``[[host]]`` entries as a hosts.toml fragment.
+
+    Byte-for-byte fidelity is not the goal (tomllib drops comments and
+    layout); semantic fidelity is: the fragment parses back to the same dicts
+    through ``tomllib`` and loads through the trainer's ``load_hosts``.
+    """
+    out = []
+    for e in entries:
+        keys = [k for k in _ENTRY_KEY_ORDER if k in e] + sorted(
+            k for k in e if k not in _ENTRY_KEY_ORDER)
+        lines = ["[[host]]"] + [f"{k} = {_toml_value(e[k])}" for k in keys]
+        out.append("\n".join(lines) + "\n\n")
+    return "".join(out)
 
 
 def write_hosts(path: Path | str, content: str) -> None:

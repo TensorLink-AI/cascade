@@ -197,7 +197,8 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
     gates: dict = {}
 
     def check(addr, stage: str, provider: str = "", *,
-              sku: str = "", gpus: int = 0, attested_digest: str = "") -> HealthReport:
+              sku: str = "", gpus: int = 0, attested_digest: str = "",
+              adopted: bool = False) -> HealthReport:
         prof = render.profile_for(provider)
         sp = {"heat": policy.heat, "final": policy.final, "eval": policy.eval}.get(stage)
         # The gate asserts what was ACTUALLY rented — with SKU fallback the
@@ -213,6 +214,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                 remote_python=prof.remote_python, workdir=prof.workdir,
                 image_digest=image_digest, min_disk_gb=min_disk_gb,
                 hippius_probe=hippius_probe,
+                home_dir=("/root" if prof.user == "root" else f"/home/{prof.user}"),
             )
         host = RemoteHost(name="health-probe", host=addr.ip, port=addr.ssh_port,
                           user=prof.user, key_path=render.key_path, workdir=prof.workdir)
@@ -223,10 +225,43 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
         # Per-pod provider attestation on the (stage-cached) gate — see
         # HealthGate.attested_digest for why pod env alone can't be trusted
         # to exist on sshd-as-PID-1 images.
-        gate = replace(gates[key], attested_digest=attested_digest)
+        # The adopted-pod re-gate skips fresh_boot: those pods were pinned and
+        # trained on by this very service, so the recycled-container evidence
+        # is expected there.
+        gate = replace(gates[key], attested_digest=attested_digest,
+                       require_fresh_boot=not adopted)
         return gate.check(run)
 
     return check
+
+
+def make_live_legs_probe(render: RenderSettings, *, timeout: float = 60.0) -> callable:
+    """``live_legs(addr, provider) -> int | None`` over the same ssh transport.
+
+    Counts processes whose command line names the training worker module
+    (``pgrep -fc``; the dispatch wrapper matches too, which only inflates a
+    non-zero count). ``pgrep`` exits 1 for "no match" (⇒ 0 legs); any other
+    failure — ssh refused, timeout, remote error — is ``None``: an
+    unreachable pod is not proof that it is idle.
+    """
+    from ..trainer.remote import RemoteHost, build_ssh_argv, run_ssh
+
+    def probe(addr, provider: str = "") -> int | None:
+        prof = render.profile_for(provider)
+        host = RemoteHost(name="legs-probe", host=addr.ip, port=addr.ssh_port,
+                          user=prof.user, key_path=render.key_path, workdir=prof.workdir)
+        argv = ["pgrep", "-fc", "cascade[.]trainer[.]worker"]
+        proc = run_ssh(build_ssh_argv(host, shlex.join(argv)), timeout=timeout)
+        if proc.returncode == 0:
+            try:
+                return int((proc.stdout or "0").strip() or 0)
+            except ValueError:
+                return None
+        if proc.returncode == 1:
+            return 0
+        return None
+
+    return probe
 
 
 def make_bootstrap(script: Path, render: RenderSettings, *,
@@ -738,6 +773,7 @@ def _run(args) -> int:
     # Operator's static [[host]] entries (e.g. a long-lived final pod) — appended
     # verbatim to every hosts.toml publish so provisioner activity never drops them.
     static_hosts_text = ""
+    static_path = None
     if top.get("static_hosts"):
         static_path = Path(top["static_hosts"])
         static_hosts_text = static_path.read_text(encoding="utf-8")
@@ -815,6 +851,8 @@ def _run(args) -> int:
              if cfg.scoring.cascade_enabled else None),
         ),
         static_hosts_text=static_hosts_text,
+        static_hosts_path=static_path,
+        live_legs=make_live_legs_probe(render),
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),
         escalate_deadline_s=escalate_deadline_s,

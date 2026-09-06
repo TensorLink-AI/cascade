@@ -28,6 +28,9 @@ GOOD_L40S = {
     "printenv": _proc("sha256:" + "a" * 64 + "\n"),
     "df": _proc("Filesystem 1024-blocks Used Available Capacity Mounted on\n"
                 "/dev/vda1 524288000 104857600 419430400 20% /\n"),   # 400 GB free
+    # fresh container: no pinned digest line anywhere, no _train_work yet
+    "grep": _proc("", rc=1),
+    "ls": _proc("", rc=2, stderr="ls: cannot access '/root/cascade/_train_work': No such file"),
 }
 
 
@@ -46,6 +49,10 @@ def _run_ssh(overrides=None, calls=None):
             return table["printenv"]
         if argv[0] == "df":
             return table["df"]
+        if argv[0] == "grep":
+            return table["grep"]
+        if argv[0] == "ls":
+            return table["ls"]
         if "torch.__version__" in argv[-1]:
             return table["runtime"]
         if "import cascade.trainer.worker" in argv[-1]:
@@ -70,7 +77,7 @@ def test_healthy_pod_passes_all_checks():
     assert report.ok and report.failures == ()
     assert [c.name for c in report.checks] == [
         "ssh_echo", "gpu_sku", "runtime_pin", "worker_import",
-        "image_digest", "hippius", "disk",
+        "image_digest", "hippius", "disk", "fresh_boot",
     ]
 
 
@@ -416,6 +423,10 @@ def test_make_health_check_per_pod_attestation_does_not_mutate_frozen_gate(monke
             return SimpleNamespace(returncode=1, stdout="", stderr="")       # /proc/1 unreadable
         if cmd.startswith("df"):
             return SimpleNamespace(returncode=0, stdout=df_ok, stderr="")
+        if cmd.startswith("grep "):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")       # never pinned
+        if cmd.startswith("ls "):
+            return SimpleNamespace(returncode=2, stdout="", stderr="")       # no _train_work
         raise AssertionError(f"unexpected remote command: {cmd!r}")
 
     import cascade.trainer.remote as remote_mod

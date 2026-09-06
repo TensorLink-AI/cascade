@@ -26,6 +26,16 @@ when ALL of them pass:
    generator pulls both need it).
 7. **disk headroom** — enough free GB under the workdir for a generator +
    corpus + checkpoint; full disks fail slowly and confusingly.
+8. **fresh boot** — the container is NOT a recycled one from an earlier
+   rental: nothing has pinned ``CASCADE_TRAIN_IMAGE_DIGEST`` into
+   ``/etc/environment`` / ``~/.bashrc`` yet (only the provisioner's own
+   post-gate hook ever writes that — no image bakes it) and the workdir's
+   ``_train_work`` is absent or empty. A facility that restarts a leftover
+   container instead of creating one from the requested image serves stale
+   state and whatever was left running (2026-09-04: nine "stale v0.6.0" boots
+   were exactly this); the digest check alone only catches it when the
+   leftover pin happens to differ from today's. Skipped on the adopted-pod
+   re-gate (a restart re-gates pods this service pinned itself).
 
 Everything here is a pure predicate over an injected ``run_ssh(argv) →
 CompletedProcess``-style boundary; the replace-once policy on failure lives in
@@ -120,6 +130,12 @@ class HealthGate:
     expected_python: str = EXPECTED_PYTHON
     expected_torch: str = EXPECTED_TORCH
     hippius_probe: Callable[[], bool] | None = field(default=None, compare=False)
+    # Login-shell home of the pod user (where the post-gate pin lands in
+    # ``.bashrc``) — the fresh_boot check reads it.
+    home_dir: str = "/root"
+    # False on the adopted-pod re-gate: those pods were pinned and trained on
+    # by THIS service, so the recycled-container evidence is expected there.
+    require_fresh_boot: bool = True
     # Provider-echoed image digest for the CURRENT pod (set per-check by the
     # caller). Fallback attestation when the pod itself can't testify: an
     # sshd-as-PID-1 image destroys its own /proc/1/environ via setproctitle
@@ -145,6 +161,7 @@ class HealthGate:
             ("image_digest", self._check_image_digest),
             ("hippius", self._check_hippius),
             ("disk", self._check_disk),
+            ("fresh_boot", self._check_fresh_boot),
         )
         results = []
         for name, fn in checks:
@@ -249,6 +266,27 @@ class HealthGate:
             return False, f"unparseable df output {(proc.stdout or '')[:100]!r}"
         if avail_gb < self.min_disk_gb:
             return False, f"{avail_gb:.1f} GB free < {self.min_disk_gb:g} GB required"
+        return True, ""
+
+
+    def _check_fresh_boot(self, run_ssh: RunSSH) -> tuple[bool, str]:
+        if not self.require_fresh_boot:
+            return True, "skipped (adopted pod)"
+        # -q: exit 0 on ANY match even if another file is missing; -s: no
+        # noise for a missing file. rc 1 = no match, rc 2 = neither readable
+        # — both mean "never pinned" (a fresh container has neither line).
+        proc = run_ssh(["grep", "-q", "-s", "CASCADE_TRAIN_IMAGE_DIGEST",
+                        "/etc/environment", f"{self.home_dir}/.bashrc"])
+        if proc.returncode == 0:
+            return False, ("recycled container: CASCADE_TRAIN_IMAGE_DIGEST already "
+                           "pinned in /etc/environment or ~/.bashrc by a previous rental")
+        proc = run_ssh(["ls", "-A", f"{self.workdir}/_train_work"])
+        if proc.returncode == 0:
+            entries = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            if entries:
+                return False, (f"recycled container: {self.workdir}/_train_work holds "
+                               f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
+                               f"from a previous rental")
         return True, ""
 
 

@@ -232,6 +232,7 @@ def render_hosts_toml(
     provider: str = "",
     stage: str = "any",
     gpus_per_pod: int = 1,
+    pod_names: Sequence[str] | None = None,
 ) -> str:
     """Render a trainer ``hosts.toml`` (schema: ``remote_hosts.example.toml``).
 
@@ -250,9 +251,21 @@ def render_hosts_toml(
     so provision a cheap heat fleet (``--stage heat``) and a single-SKU final pair
     (``--stage final``) as separate runs, then concatenate the ``[[host]]`` blocks.
     ``"any"`` is omitted (it is the schema default).
+
+    ``pod_names`` (one per address) overrides the positional ``{prefix}-{i}``
+    stem with a STABLE per-pod name: entries become ``{pod_names[i]}-g{g}``
+    (always ``-g``-suffixed, even for one GPU). The trainer's final lane pool
+    is keyed by name and only ever grows, so a lane that changes name across
+    two publishes is a NEW lane to it — and the same GPU gets dispatched twice
+    (2026-09-06 09:05: the second pod's publish renamed the first pod's lanes
+    from the old round id to the new one and the king's GPU took a second
+    leg). Callers that publish repeatedly must pass names derived from pod
+    identity, never from the round or the position in the list.
     """
     if not addrs:
         raise ProvisionError("cannot render hosts.toml with zero pods")
+    if pod_names is not None and len(pod_names) != len(addrs):
+        raise ProvisionError(f"pod_names has {len(pod_names)} entries for {len(addrs)} pods")
     if gpus_per_pod < 1:
         raise ProvisionError(f"gpus_per_pod must be >= 1; got {gpus_per_pod}")
 
@@ -267,7 +280,10 @@ def render_hosts_toml(
     ]
     for i, addr in enumerate(addrs):
         for g in range(gpus_per_pod):
-            name = f"{name_prefix}-{i}" if gpus_per_pod == 1 else f"{name_prefix}-{i}-g{g}"
+            if pod_names is not None:
+                name = f"{pod_names[i]}-g{g}"
+            else:
+                name = f"{name_prefix}-{i}" if gpus_per_pod == 1 else f"{name_prefix}-{i}-g{g}"
             lines += [
                 "",
                 "[[host]]",

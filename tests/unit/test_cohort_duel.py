@@ -441,6 +441,32 @@ def test_receipt_publishes_k_and_every_challenger_lcb(cfg):
     assert v.lcb == pytest.approx(v.cohort_lcbs[outcome.decided_hotkey])
 
 
+def test_receipt_publishes_every_challenger_diagnostics(cfg):
+    """The headline verdict carries geomean/win_rate/… for the DECIDED challenger
+    only; ``cohort_stats`` carries the same set for every duelled challenger."""
+    from cascade.shared.receipt import COHORT_STAT_KEYS
+
+    king = _scores(1.0, 0)
+    receipt, outcome = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1), ("c_hk", 3, 2)],
+                               {"a_hk": _rescale(king, 0.7),
+                                "b_hk": _rescale(king, 0.4),
+                                "c_hk": _rescale(king, 1.2)}, king)
+    v = receipt.verdict
+    assert set(v.cohort_stats) == {"a_hk", "b_hk", "c_hk"}
+    for stats in v.cohort_stats.values():
+        assert tuple(stats) == COHORT_STAT_KEYS
+        assert stats["geomean"] is not None and stats["win_rate"] is not None
+    # The decided challenger's entry IS the headline verdict's diagnostics.
+    mine = v.cohort_stats[outcome.decided_hotkey]
+    assert mine["geomean"] == pytest.approx(v.chal_geomean)
+    assert mine["win_rate"] == pytest.approx(v.win_rate)
+    assert mine["boot_p50"] == pytest.approx(v.boot_p50)
+    assert mine["boot_p95"] == pytest.approx(v.boot_p95)
+    # The losing challenger's geomean is worse than the king's; the winners' better.
+    assert v.cohort_stats["c_hk"]["geomean"] > v.king_geomean
+    assert v.cohort_stats["b_hk"]["geomean"] < v.king_geomean
+
+
 def test_alpha_over_k_moves_the_quantile_and_leaves_the_margin_alone(cfg):
     """The semantics ask: alpha/k tightens the BOOTSTRAP QUANTILE, not the margin.
     Pinned here because raising the margin instead would give different answers at
@@ -474,6 +500,7 @@ def test_single_challenger_receipt_body_is_byte_identical_to_pre_cohort(cfg):
     body = receipt.canonical_body()
     assert b"cohort_k" not in body
     assert b"cohort_lcbs" not in body
+    assert b"cohort_stats" not in body
     # A cohort round DOES carry them, so they are inside what the validator signs.
     cohort, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
@@ -490,6 +517,46 @@ def test_cohort_fields_round_trip_and_preserve_the_signed_bytes(cfg):
     assert back.canonical_body() == receipt.canonical_body()
     assert back.verdict.cohort_k == 2
     assert back.verdict.cohort_lcbs == receipt.verdict.cohort_lcbs
+    assert back.verdict.cohort_stats == receipt.verdict.cohort_stats
+
+
+def test_audit_rejects_a_doctored_published_geomean(cfg):
+    """``cohort_stats`` is signed display material: a published number that does
+    not replay from the recorded scores fails the audit like a doctored LCB."""
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    assert C.check_duel_cohort(receipt).status == C.PASS
+    bad = {hk: dict(s) for hk, s in receipt.verdict.cohort_stats.items()}
+    bad["a_hk"]["geomean"] = bad["a_hk"]["geomean"] * 0.5
+    tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
+    r = C.check_duel_cohort(tampered)
+    assert r.status == C.FAIL
+    assert "geomean for a_hk" in r.detail and "replays as" in r.detail
+    # Stats for a hotkey that was never scored are equally a failure.
+    bad = dict(receipt.verdict.cohort_stats)
+    bad["z_hk"] = bad.pop("a_hk")
+    tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
+    assert C.check_duel_cohort(tampered).status == C.FAIL
+
+
+def test_audit_accepts_a_receipt_without_cohort_stats(cfg):
+    """Receipts archived before ``cohort_stats`` shipped carry none; the audit
+    must not demand it."""
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    king = _scores(1.0, 0)
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    legacy = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=None))
+    assert b"cohort_stats" not in legacy.canonical_body()
+    assert C.check_duel_cohort(legacy).status == C.PASS
 
 
 def test_audit_rejects_a_doctored_published_lcb(cfg):
