@@ -132,7 +132,25 @@ _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 # that shape whose pod is not in the ledger is a stale self-published lane
 # (a previous run's pod), never an operator's — operator lanes must use any
 # other shape (e.g. ``cascade-<round>-final-m0-g0``) to be preserved.
-_SELF_LANE_RE = re.compile(r"^cascade-\d+-(heat|final)-\d+-g\d+$")
+_SELF_LANE_RE = re.compile(
+    r"^cascade-(?:\d+-(?:heat|final)-\d+|[a-z0-9]+-[0-9a-f]{8})-g\d+$")
+
+
+def lane_pod_name(provider: str, instance_id: str) -> str:
+    """The STABLE per-pod stem of this service's hosts.toml lane names:
+    ``cascade-<provider>-<8 hex of the instance id>`` (``-g<n>`` per GPU is
+    appended by ``render_hosts_toml``). Derived from pod identity only — never
+    the round id or the pod's position — so a pod carried across publishes
+    (a second rental, a teardown of a sibling, a round boundary) keeps its
+    name and the trainer's name-keyed lane pool never sees a renamed twin
+    (the 2026-09-06 09:05 double dispatch). Hex-uuid ids (shadeform) use
+    their first 8 chars so the name is greppable against the provider
+    console; anything else (lium names) is hashed to 8 hex."""
+    iid = str(instance_id)
+    key = iid[:8] if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]+", iid) else hashlib.sha1(
+        iid.encode("utf-8")).hexdigest()[:8]
+    prov = re.sub(r"[^a-z0-9]", "", str(provider).lower()) or "pod"
+    return f"{POD_TAG}{prov}-{key}"
 
 # Boot slack folded into the "is there still time?" checks for late rentals
 # (JIT final rental and within-round retries). Sized from the REAL delivery
@@ -1603,6 +1621,10 @@ class ProvisionerLoop:
                 provider=entries[0][0].provider,
                 stage=stage,
                 gpus_per_pod=fleet_gpus,
+                # Stable per-pod stems (H4): a republish must never rename a
+                # lane the trainer already holds.
+                pod_names=[lane_pod_name(inst.provider, inst.instance_id)
+                           for inst, _addr in entries],
             ))
         self._write_hosts(sections)
         n = sum(len(v) for v in by_stage.values())
