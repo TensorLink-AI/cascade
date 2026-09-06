@@ -293,6 +293,18 @@ in-context.
   rule via `cohort_maxt_lcb_map` (one impl for validator + audit); no receipt
   field (correction lives in the gate). Revises DEC-CA-0012.
   (`decisions/DEC-CA-0038-cohort-maxt-correction.md`)
+- **DEC-CA-0039** — Arm the increment margin, block-gated `[scoring]
+  increment_from_block`. Under `level` the dethrone bar is a fixed % of the
+  king's absolute score, so a maturing lineage's sub-floor gains are
+  undethroneable; `increment` (DEC-CA-0027) prices the bar as a fraction of
+  the per-round increment over the shared init, tracking the shrinking signal.
+  Receipt-replay on recent mainnet: 2 of 17 competitive rounds flip HELD→
+  DETHRONE, zero false dethrones. Resolved per round via `koth_params(block)`
+  / `effective_margin_mode`; audit replays each round under its block (level
+  fallback for random-init preserved); no receipt change. ARMED at 9043200 —
+  SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
+  increment fixes the signal, max-T the multiplicity). Not a basin-escape
+  substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

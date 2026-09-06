@@ -105,3 +105,27 @@ def test_dashboard_margin_line_uses_the_round_value():
     assert margin_for_tenure_cfg(armed, 0, block=5000) == 0.01
     assert margin_for_tenure_cfg(armed, 0) == 0.01
     assert margin_for_tenure_cfg(armed, 8, block=4999) == pytest.approx(0.005)
+
+
+# ── DEC-CA-0039: block-gated increment-margin activation ─────────────────────
+
+def test_increment_from_block_resolves_per_block():
+    from cascade.shared.config import effective_margin_mode
+
+    armed = _scoring(margin_mode="level", increment_from_block=5000)
+    assert effective_margin_mode(armed, 4999) == "level"       # pre-gate: base
+    assert effective_margin_mode(armed, 5000) == "increment"   # from the gate on
+    assert effective_margin_mode(armed, 9000) == "increment"
+    assert effective_margin_mode(armed, None) == "level"       # unknown block ⇒ base
+    # gate off ⇒ the base mode for every block
+    assert effective_margin_mode(_scoring(margin_mode="level"), 9000) == "level"
+
+
+def test_koth_params_flip_margin_mode_at_the_block(cfg):
+    armed = replace(cfg, scoring=replace(cfg.scoring, margin_mode="level",
+                                         increment_from_block=5000))
+    assert armed.koth_params(block=4999).margin_mode == "level"
+    assert armed.koth_params(block=5000).margin_mode == "increment"
+    # And the audit resolves the SAME rule off the receipt's block, so
+    # check_koth_params expects increment for a post-gate round and level before.
+    assert armed.koth_params(block=None).margin_mode == "level"

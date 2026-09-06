@@ -1091,6 +1091,18 @@ class ScoringConfig:
     # each round under its own rule. 0 = Bonferroni forever. Bit-identical at
     # k <= 1 (no multiplicity), so single-challenger rounds never change.
     cohort_maxt_from_block: int = 0
+    # Increment-margin activation (DEC-CA-0039, block-gated). Under margin_mode
+    # "level" the dethrone bar is a fixed fraction of the king's ABSOLUTE score
+    # (win_margin_* ), so a maturing lineage whose per-round gains fall below
+    # the floor becomes structurally undethroneable. From a round whose epoch
+    # boundary is >= this block the margin is judged in INCREMENT units instead
+    # (DEC-CA-0027: the bar prices a fraction of the typical per-round
+    # improvement over the shared warm-start init), so dethrones stay clearable
+    # as the lineage converges. Needs the init scored on the round's windows —
+    # already true while init_gate_mode != "off". CONSENSUS, resolved per round
+    # like the other gates; audit replays each round under its own rule. 0 =
+    # keep `margin_mode` for every round (no scheduled flip).
+    increment_from_block: int = 0
     # Breadth floor for the verdict: below this many distinct window clusters
     # (upstream feeds, from pool metadata ``source``) the round is inconclusive.
     # 0 disables; pools without ``source`` metadata are unaffected. Default keeps
@@ -1473,7 +1485,7 @@ class ChainConfig:
             gift_gate_mode=self.scoring.gift_gate_mode,
             gift_gate_tolerance=self.scoring.gift_gate_tolerance,
             gift_gate_min_configs=self.scoring.gift_gate_min_configs,
-            margin_mode=self.scoring.margin_mode,
+            margin_mode=effective_margin_mode(self.scoring, block),
             margin_increment_floor=self.scoring.margin_increment_floor,
             init_gate_mode=self.scoring.init_gate_mode,
             init_gate_tolerance=self.scoring.init_gate_tolerance,
@@ -1507,6 +1519,19 @@ def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
     block."""
     return (scoring.cohort_maxt_from_block > 0 and block is not None
             and int(block) >= scoring.cohort_maxt_from_block)
+
+
+def effective_margin_mode(scoring: ScoringConfig, block: int | None) -> str:
+    """The margin denomination in force for the round at epoch boundary
+    ``block``: ``"increment"`` from ``increment_from_block`` on (DEC-CA-0039),
+    else the base ``[scoring] margin_mode``. Block-gated exactly like
+    :func:`effective_win_margin_start`, so validator and audit resolve the same
+    rule per round and a random-init round still falls back to level in
+    evaluate_round (no baseline)."""
+    if (scoring.increment_from_block > 0 and block is not None
+            and int(block) >= scoring.increment_from_block):
+        return "increment"
+    return scoring.margin_mode
 
 
 def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
@@ -1877,6 +1902,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_start_prev=float(s.get("win_margin_start_prev", 0.0) or 0.0),
             margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
+            increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),

@@ -605,6 +605,13 @@ margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_f
 # round's epoch block, audit replays each round under its own. Bit-identical at
 # k<=1 (single-challenger rounds never change). 0 = Bonferroni forever.
 cohort_maxt_from_block = 9043200  # Fri 2026-09-11 08:30 UTC (an epoch boundary; upgrade window)
+# Increment-margin activation (DEC-CA-0039): from this block the dethrone bar
+# is judged in INCREMENT units (a fraction of the typical per-round gain over
+# the shared init) instead of a fixed % of the king's absolute score, so a
+# maturing lineage's small-but-real gains stay clearable. Same block as the
+# cohort max-T above = one coordinated validator-upgrade window for both.
+# margin_mode below stays "level" (the pre-gate rule); 0 = no scheduled flip.
+increment_from_block = 9043200  # = cohort_maxt_from_block
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision
