@@ -51,6 +51,7 @@ from ..shared.receipt import (
     VerdictRecord,
     WindowScoreRecord,
     build_receipt,
+    cohort_stats_of,
 )
 from . import state as state_mod
 from .state import ChampionState, StateTransition
@@ -132,6 +133,11 @@ class RoundOutcome:
     # pre-cohort receipt.
     cohort_k: int = 0
     cohort_lcbs: dict[str, float] = field(default_factory=dict)
+    # Every duelled challenger's shadow diagnostics (geomean, win_rate, …), keyed
+    # by hotkey — what the headline verdict records for the decided challenger
+    # only. Published on the receipt as ``cohort_stats`` (same drop-when-default
+    # rule as ``cohort_lcbs``); display/audit material, never a gate.
+    cohort_stats: dict[str, dict] = field(default_factory=dict)
 
 
 # How long the live loop keeps re-trying a round whose eval-pool index cannot
@@ -1353,6 +1359,7 @@ class ValidatorRunner:
             # bytes exactly as a pre-DEC-CA-0012 round's.
             cohort_k=(k if k > 1 else 0),
             cohort_lcbs=({hk: r.lcb for hk, _, r in judged} if k > 1 else {}),
+            cohort_stats=({hk: cohort_stats_of(r) for hk, _, r in judged} if k > 1 else {}),
         )
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
@@ -1422,6 +1429,7 @@ class ValidatorRunner:
             params=self.cfg.koth_params(block=epoch_start_block), bootstrap_seed=base_seed,
             king_tenure_rounds=outcome.king_tenure_rounds,
             cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
+            cohort_stats=outcome.cohort_stats,
         )
         return build_receipt(
             round_id=manifest.round_id, status="scored",
