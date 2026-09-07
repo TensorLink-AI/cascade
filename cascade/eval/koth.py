@@ -296,9 +296,11 @@ def per_horizon_breakdown(
             "n": int(len(idx)),
         }
     return out
+
+
 def cohort_maxt_lcb_map(
     king_scores: list[WindowScore],
-    cohort_scores: "list[tuple[str, list[WindowScore]]]",
+    cohort_scores: list[tuple[str, list[WindowScore]]],
     params: KothParams,
     *,
     seed: int | str,

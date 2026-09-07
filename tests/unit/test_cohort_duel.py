@@ -663,7 +663,6 @@ def test_cohort_maxt_active_path_validator_to_audit(cfg):
     from dataclasses import replace
 
     from cascade.audit import checks as C
-
     from cascade.shared.config import effective_epoch_blocks
     # A boundary-aligned block ABOVE the gate, so both the validator's
     # _epoch_start_block(manifest) and the receipt's block resolve max-T on.
