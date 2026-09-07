@@ -544,18 +544,18 @@ def test_audit_rejects_a_doctored_published_geomean(cfg):
     king = _scores(1.0, 0)
     receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
-    assert C.check_duel_cohort(receipt).status == C.PASS
+    assert C.check_duel_cohort(receipt, cfg).status == C.PASS
     bad = {hk: dict(s) for hk, s in receipt.verdict.cohort_stats.items()}
     bad["a_hk"]["geomean"] = bad["a_hk"]["geomean"] * 0.5
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
-    r = C.check_duel_cohort(tampered)
+    r = C.check_duel_cohort(tampered, cfg)
     assert r.status == C.FAIL
     assert "geomean for a_hk" in r.detail and "replays as" in r.detail
     # Stats for a hotkey that was never scored are equally a failure.
     bad = dict(receipt.verdict.cohort_stats)
     bad["z_hk"] = bad.pop("a_hk")
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
-    assert C.check_duel_cohort(tampered).status == C.FAIL
+    assert C.check_duel_cohort(tampered, cfg).status == C.FAIL
 
 
 def test_audit_accepts_a_receipt_without_cohort_stats(cfg):
@@ -570,7 +570,7 @@ def test_audit_accepts_a_receipt_without_cohort_stats(cfg):
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
     legacy = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=None))
     assert b"cohort_stats" not in legacy.canonical_body()
-    assert C.check_duel_cohort(legacy).status == C.PASS
+    assert C.check_duel_cohort(legacy, cfg).status == C.PASS
 
 
 def test_audit_rejects_a_doctored_published_lcb(cfg):
