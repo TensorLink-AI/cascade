@@ -66,7 +66,13 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # forge-mirror sync crossed the old 60m wall on 2026-08-18 (fresh runner re-syncs the whole growing bucket daily; last success 52m57s) and every run since died mid-sync — reveals stalled 6 days. 120 unblocks; the structural fix is caching/scoping the sync.
+    # 2026-08-18: the sync crossed the old 60m wall (full re-download daily);
+    # 120 unblocked it. 2026-09-05..07: it crossed 120 too — see the sync step:
+    # --exact-timestamps defeated the mirror cache, so every run re-pulled the
+    # whole bucket (105k objects, ~2h, +3.5k/day). With the cache honoured the
+    # sync is a delta of minutes; 180 is the backstop for a cache MISS (a
+    # full pull at 64-wide concurrency), not the expected runtime.
+    timeout-minutes: 180
     env:
       # CASCADE key — writes the eval-pool bucket (and reads the manifest bucket
       # for --effective-block auto). cascade-pool publish reads HIPPIUS_S3_*, so
@@ -120,10 +126,24 @@ jobs:
           AWS_RETRY_MODE: adaptive
         run: |
           aws --version   # pre-installed AWS CLI v2; fail loudly if the image drops it
+          # The bucket is ~100k SMALL objects: a full pull is latency-bound,
+          # not bandwidth-bound. 64 in-flight requests (CLI default 10) keeps a
+          # cache-miss full sync inside the wall; a cache-hit delta is minutes.
+          aws configure set default.s3.max_concurrent_requests 64
+          aws configure set default.s3.max_queue_size 20000
           if [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo "::error::TSFORGE_S3_ACCESS_KEY not set — cannot read the forge bucket."
             exit 1
           fi
+          # NO --exact-timestamps: partitions are immutable once written, so a
+          # same-sized local copy IS the object. With the flag, any mtime skew
+          # between the cache-restored file and S3's LastModified counted as a
+          # change and the sync re-downloaded the ENTIRE mirror despite a cache
+          # hit (2026-09-04: 95,765 downloads for 95,602 files; 2026-09-07:
+          # 105,440 for 105,277 — 1h55m, killed at the 120m wall 3 days
+          # running, pool rotation stalled on block-8989200). The default rule
+          # (download when the size differs or the local copy is OLDER) turns
+          # the sync into a delta pull of the new partitions only.
           # `aws s3 sync` exits 1 if ANY file fails, but sync is resumable —
           # a repeat pass only fetches the un-synced remainder. Three passes
           # ride through transient Hippius resets (2026-08-27: two
@@ -132,7 +152,7 @@ jobs:
           ok=""
           for pass in 1 2 3; do
             if aws s3 sync "s3://${TSFORGE_BUCKET}" ./tsforge \
-                 --endpoint-url "$S3_ENDPOINT" --exact-timestamps; then
+                 --endpoint-url "$S3_ENDPOINT"; then
               ok=1; break
             fi
             echo "::warning::forge sync pass $pass failed; retrying the remainder"
@@ -140,7 +160,8 @@ jobs:
           done
           test -n "$ok" || { echo "::error::forge sync failed after 3 passes"; exit 1; }
           n=$(find ./tsforge/data -name '*.parquet' 2>/dev/null | wc -l)
-          newest=$(ls -1 ./tsforge/data/*/*.parquet 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)
+          # find, not a shell glob: ~100k paths overflow ls's argv (every recent run printed 'none').
+          newest=$(find ./tsforge -name '*.parquet' 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u | tail -1)
           echo "synced $n parquet files; newest partition: ${newest:-none}"
           # mirror size, for watching growth against the 10 GB cache quota
           du -sh ./tsforge || true
