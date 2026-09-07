@@ -305,6 +305,19 @@ in-context.
   SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
   increment fixes the signal, max-T the multiplicity). Not a basin-escape
   substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)
+- **DEC-CA-0040** (proposed) — Make the king beatable more often by flattening
+  the FRESH-KING margin ramp (`win_margin_start` 0.01 → the 0.005 floor), NOT by
+  touching the noise gate. Replay of 86 mainnet rounds: the margin below ~0.3% is
+  INERT — the paired-bootstrap `LCB>0` requirement binds first (at ~1.3% point
+  improvement), so the ramp (DEC-CA-0016), not the threshold value, is what
+  rejects real (LCB>0) challengers, which cluster on fresh-king rounds. Flat 0.5%
+  unlocks +9 bootstrap-confirmed real dethrones (~21%→31%), zero noise flips;
+  floor + `LCB>0` + `alpha=0.05` all unchanged. Rejects: LCB>0-only / lower floor
+  / FLIP the decay / tenure-vary or raise `alpha` / stack increment — each buys
+  beatability by loosening the noise floor or inverting the incentive. Arming
+  gate: re-run `scripts/replay_margin_decay.py` + a testnet no-ping-pong cycle
+  (else ship a LIGHT ramp 0.007→0.005). Revises DEC-CA-0016; chain.toml NOT
+  changed by the node. (`decisions/DEC-CA-0040-flatten-fresh-king-margin.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
