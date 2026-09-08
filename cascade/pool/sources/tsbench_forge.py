@@ -47,6 +47,9 @@ log = logging.getLogger("cascade.pool")
 # Directory holding `sources.yaml` + `data/` (the synced forge mirror).
 ENV_FORGE_DIR = "TSFORGE_DIR"
 DEFAULT_FORGE_DIR = "./tsforge"
+# DEC-CA-0041 mv_channels contract cap (docs/EVAL_POOL.md): ordered value-columns
+# within one (source, panel_row), at most this many, packed into one (C, L) window.
+MAX_MV_CHANNELS = 8
 
 # ISO-8601 duration (forge `frequency`) → (pandas-style freq, seasonal period).
 # Explicit periods because cascade's gluonts-style mapping gives D → 1 while
@@ -145,10 +148,16 @@ class TsbenchForgeSource:
         *,
         max_stale_days: int = 4,
         max_series_per_source: int = 200,
+        mv_pack: bool = False,
     ) -> None:
         self.forge_dir = Path(forge_dir or os.environ.get(ENV_FORGE_DIR, DEFAULT_FORGE_DIR))
         self.max_stale_days = int(max_stale_days)
         self.max_series_per_source = int(max_series_per_source)
+        # DEC-CA-0041: when True, a catalog entry's ``mv_channels`` columns are
+        # packed into ONE (C, L) series (multivariate scoring). When False
+        # (default, until mv_score is armed), a tagged source is PROJECTED to its
+        # first mv_channel — one univariate window, so the pool stays inert.
+        self.mv_pack = bool(mv_pack)
 
     # ------------------------------------------------------------------ deps
 
@@ -214,7 +223,16 @@ class TsbenchForgeSource:
                 continue
             domain = str(entry.get("domain", "unknown"))
             dgp_class = str(entry.get("dgp_class", ""))
-            for panel_key, values in self._iter_panel_series(pd, df, ctx):
+            # DEC-CA-0041 mv_channels contract (docs/EVAL_POOL.md): an ordered
+            # list of value-columns within one (source, panel_row). Pack them to
+            # (C, L) when armed; else project to the first (one univariate row).
+            mvc = entry.get("mv_channels") or None
+            if mvc:
+                mvc = [str(c) for c in mvc][:MAX_MV_CHANNELS]
+                columns = mvc if self.mv_pack else [mvc[0]]
+            else:
+                columns = None
+            for panel_key, values in self._iter_panel_series(pd, df, ctx, columns=columns):
                 if emitted >= ctx.max_series:
                     log.warning(
                         "tsbench_forge: max_series=%d reached at catalog entry %s; "
@@ -283,11 +301,15 @@ class TsbenchForgeSource:
 
     # ---------------------------------------------------------------- series
 
-    def _iter_panel_series(self, pd, df, ctx: HarvestContext):
-        """Yield ``(panel_key, values)`` per panel row (or once when unpaneled)."""
+    def _iter_panel_series(self, pd, df, ctx: HarvestContext, *, columns=None):
+        """Yield ``(panel_key, values)`` per panel row (or once when unpaneled).
+
+        ``columns`` (DEC-CA-0041): the specific value-columns to emit — a
+        length-1 list projects to one univariate channel, a longer list packs an
+        aligned ``(C, L)`` group. ``None`` keeps the densest-column default."""
         panel_cols = [c for c in df.columns if c.startswith("_panel_")]
         if not panel_cols:
-            values = self._extract_values(pd, df, panel_cols, ctx)
+            values = self._extract_values(pd, df, panel_cols, ctx, columns=columns)
             if values is not None:
                 yield {}, values
             return
@@ -299,16 +321,21 @@ class TsbenchForgeSource:
             panel_key = {
                 c.removeprefix("_panel_"): str(v) for c, v in zip(panel_cols, key_t, strict=False)
             }
-            values = self._extract_values(pd, sub, panel_cols, ctx)
+            values = self._extract_values(pd, sub, panel_cols, ctx, columns=columns)
             if values is not None:
                 yield panel_key, values
 
-    def _extract_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext):
-        """One panel row's frame → a clean-enough 1-D float array, or ``None``.
+    def _extract_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext,
+                        *, columns=None):
+        """One panel row's frame → a clean-enough float array, or ``None``.
 
-        Sorts by parsed timestamp, drops post-``as_of`` rows, picks the densest
-        numeric value column (categorical feeds are skipped — rank codes are
-        meaningless under MASE/CRPS), and keeps the freshest contiguous segment.
+        Sorts by parsed timestamp, drops post-``as_of`` rows, and keeps the
+        freshest contiguous segment. With ``columns=None`` it picks the densest
+        numeric value column and returns 1-D (categorical feeds skipped — rank
+        codes are meaningless under MASE/CRPS). With ``columns`` given
+        (DEC-CA-0041) it takes exactly those, aligned on the shared segment:
+        one column → 1-D, several → ``(C, L)``; a missing/non-numeric named
+        column drops the whole group (a tagged channel must be present).
         NaN gaps are left in place; the builder interpolates or drops.
         """
         ts = None
@@ -335,6 +362,29 @@ class TsbenchForgeSource:
             return None
 
         excluded = {"timestamp", *panel_cols}
+        ts_arr = ts.to_numpy() if ts is not None else None
+
+        if columns is not None:
+            # DEC-CA-0041: pack exactly the named channels, aligned on ONE shared
+            # freshest segment (they are columns of the same panel row).
+            chans = []
+            for c in columns:
+                if c in excluded or c not in df.columns:
+                    return None
+                try:
+                    chans.append(df[c].astype(float).to_numpy())
+                except (TypeError, ValueError):
+                    return None
+            width = min(len(v) for v in chans)
+            if width < 2:
+                return None
+            lo, hi = self._freshest_segment(
+                ts_arr[:width] if ts_arr is not None else None, width,
+                min_len=ctx.horizon + MIN_CONTEXT,
+            )
+            packed = np.stack([v[:width][lo:hi] for v in chans], axis=0)   # (C, L)
+            return packed[0] if packed.shape[0] == 1 else packed
+
         candidates = [c for c in df.columns if c not in excluded]
         best_finite, best = -1, None
         for c in candidates:
@@ -349,9 +399,7 @@ class TsbenchForgeSource:
             return None
 
         lo, hi = self._freshest_segment(
-            ts.to_numpy() if ts is not None else None,
-            len(best),
-            min_len=ctx.horizon + MIN_CONTEXT,
+            ts_arr, len(best), min_len=ctx.horizon + MIN_CONTEXT,
         )
         return best[lo:hi]
 
