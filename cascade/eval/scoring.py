@@ -34,6 +34,7 @@ from .crps import (
     geomean_wql_from_components,
     mwsql_components,
     mwsql_from_components,
+    wql_per_window,
 )
 from .mase import mase as mase_one
 from .seasonality import get_seasonality
@@ -225,6 +226,78 @@ def stack_components(
     abs_t = np.asarray([s.abs_target for s in scores], dtype=np.float64)
     mase_a = np.asarray([s.mase for s in scores], dtype=np.float64)
     return qloss, abs_t, mase_a
+
+
+def _collapse_window_group(group: list[WindowScore]) -> WindowScore:
+    """Collapse one window's per-channel rows into a single per-window row.
+
+    A one-channel group is returned UNTOUCHED (bit-exact). For C>1, the metric
+    is averaged over variates the GIFT-Eval way — arithmetic mean, NOT
+    ``sum(qloss)/sum(abs_target)`` pooling (which is scale-dominated by the
+    largest-|y| channel; DEC-CA-0009): MASE is the arithmetic mean of the
+    channels' MASE; WQL is the arithmetic mean of the channels' per-window WQL
+    over the channels where it is DEFINED (``|y| > 0``). A window with no defined
+    channel stays WQL-undefined (masked from that half, MASE still counts),
+    exactly as :func:`cascade.eval.crps.wql_per_window` masks a zero-target
+    window. The averaged WQL is re-encoded as ``abs_target = 1`` with a flat
+    ``qloss`` so it flows through the unchanged ``geomean`` aggregation; this
+    re-encode runs ONLY for C>1 groups, so the univariate path never round-trips.
+    """
+    if len(group) == 1:
+        return group[0]
+    g0 = group[0]
+    qloss = np.stack([g.qloss_per_q for g in group], axis=0).astype(np.float64)
+    abs_t = np.asarray([g.abs_target for g in group], dtype=np.float64)
+    wql, valid = wql_per_window(qloss, abs_t)
+    mase = float(np.mean([g.mase for g in group]))
+    nq = qloss.shape[1]
+    if bool(valid.any()):
+        window_wql = float(wql[valid].mean())
+        q_out = np.full(nq, window_wql / 2.0, dtype=np.float64)
+        abs_out = 1.0
+    else:
+        q_out = np.zeros(nq, dtype=np.float64)
+        abs_out = 0.0
+    return WindowScore(
+        series_id=g0.series_id,
+        mase=mase,
+        qloss_per_q=q_out,
+        abs_target=abs_out,
+        quantile_levels=g0.quantile_levels,
+        channel=0,
+        domain=g0.domain,
+        source=g0.source,
+    )
+
+
+def collapse_channels_by_window(scores: list[WindowScore]) -> list[WindowScore]:
+    """GIFT-Eval multivariate weighting: average a window's channels into ONE
+    per-window contribution, so a C-channel window counts ONCE (variates
+    averaged within it) — never C times — exactly as GIFT-Eval weights a
+    multivariate dataset once (DEC-CA-0041). The source-cluster bootstrap
+    (:func:`cascade.eval.koth._window_clusters`) already treats a multivariate
+    window as one resampling unit; this makes the round POINT statistic agree,
+    so point estimate and CI are computed on the same weighting.
+
+    Windows are segmented by the per-window ``channel`` reset to 0 (the score
+    loop emits channels ``0..C-1`` contiguously per window). A single-channel
+    window passes through UNTOUCHED, so every univariate pool — one channel per
+    window, i.e. the whole pool until multivariate data lands — is a bit-exact
+    no-op. Order and pairing are preserved (king and challenger share the
+    ``(window, channel)`` order), so the paired bootstrap stays paired.
+    """
+    if not scores:
+        return scores
+    out: list[WindowScore] = []
+    group: list[WindowScore] = []
+    for s in scores:
+        if s.channel == 0 and group:
+            out.append(_collapse_window_group(group))
+            group = []
+        group.append(s)
+    if group:
+        out.append(_collapse_window_group(group))
+    return out
 
 
 def global_geomean(scores: list[WindowScore], wql_mode: str = "geomean") -> float:

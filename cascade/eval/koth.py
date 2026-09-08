@@ -27,7 +27,12 @@ from .bootstrap import (
     paired_bootstrap_quantiles_aggregated,
 )
 from .gift_gate import GiftGateResult
-from .scoring import WindowScore, global_geomean, stack_components
+from .scoring import (
+    WindowScore,
+    collapse_channels_by_window,
+    global_geomean,
+    stack_components,
+)
 
 # The public-benchmark gate rollout modes (``[scoring] gift_gate_mode``):
 #   "off"     — gate never runs (default; pure private-pool KOTH).
@@ -108,6 +113,14 @@ class KothParams:
     # (scale-free): with both increments ≈ 0 an unfloored unit divides by
     # noise exactly when the evidence is weakest (the DEC-CA-0009 lesson).
     margin_increment_floor: float = 0.01
+    # Multivariate scoring (DEC-CA-0041, block-gated [scoring] mv_score_from_block):
+    # when True, a window's channels are averaged into ONE per-window
+    # contribution (GIFT-Eval weighting — a C-channel window counts once), so
+    # the round point statistic agrees with the source-cluster bootstrap that
+    # already treats an MV window as one unit. Resolved from the round's block
+    # by the caller (koth_params), like margin_mode. BIT-IDENTICAL on any
+    # univariate pool (one channel per window) whether on or off.
+    mv_score: bool = False
 
 
 def margin_for_tenure(params: KothParams, king_tenure_rounds: int) -> float:
@@ -392,6 +405,20 @@ def evaluate_round(
         raise ValueError(
             f"unpaired baseline: {len(baseline_scores)} vs king {len(king_scores)}"
         )
+    if params.mv_score:
+        # GIFT-Eval multivariate weighting (DEC-CA-0041): average each window's
+        # channels into one per-window row so an MV window counts once, matching
+        # the source-cluster bootstrap. Only defined for the live geomean rule;
+        # 'pooled' is legacy univariate receipt replay and never carries MV data.
+        if wql_mode != "geomean":
+            raise ValueError(
+                "mv_score requires wql_mode='geomean' (pooled is legacy "
+                "univariate receipt replay)"
+            )
+        king_scores = collapse_channels_by_window(king_scores)
+        chal_scores = collapse_channels_by_window(chal_scores)
+        if baseline_scores is not None:
+            baseline_scores = collapse_channels_by_window(baseline_scores)
     n = len(king_scores)
     margin = margin_for_tenure(params, king_tenure_rounds)
     clusters, n_clusters = _window_clusters(king_scores)

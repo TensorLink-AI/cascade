@@ -1103,6 +1103,15 @@ class ScoringConfig:
     # like the other gates; audit replays each round under its own rule. 0 =
     # keep `margin_mode` for every round (no scheduled flip).
     increment_from_block: int = 0
+    # Multivariate scoring activation (DEC-CA-0041, block-gated). From a round
+    # whose epoch boundary is >= this block, a multivariate window's channels
+    # are averaged into ONE per-window contribution (GIFT-Eval weighting — the
+    # window counts once, not once per channel), so the round point statistic
+    # agrees with the source-cluster bootstrap that already treats an MV window
+    # as one resampling unit. CONSENSUS, resolved per round like the other
+    # gates; audit replays each round under its own rule. BIT-IDENTICAL on any
+    # univariate pool (one channel per window). 0 = per-channel forever.
+    mv_score_from_block: int = 0
     # Breadth floor for the verdict: below this many distinct window clusters
     # (upstream feeds, from pool metadata ``source``) the round is inconclusive.
     # 0 disables; pools without ``source`` metadata are unaffected. Default keeps
@@ -1489,6 +1498,7 @@ class ChainConfig:
             margin_increment_floor=self.scoring.margin_increment_floor,
             init_gate_mode=self.scoring.init_gate_mode,
             init_gate_tolerance=self.scoring.init_gate_tolerance,
+            mv_score=mv_score_active(self.scoring, block),
         )
 
 
@@ -1519,6 +1529,18 @@ def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
     block."""
     return (scoring.cohort_maxt_from_block > 0 and block is not None
             and int(block) >= scoring.cohort_maxt_from_block)
+
+
+def mv_score_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """Whether a round at epoch boundary ``block`` is scored with the GIFT-Eval
+    multivariate weighting (DEC-CA-0041) — a window's channels averaged into one
+    per-window contribution — rather than one geomean row per channel:
+    ``mv_score_from_block`` set and reached. ``0`` / unknown block ⇒ False.
+    Block-gated exactly like :func:`cohort_maxt_active`, so every validator and
+    the audit resolve the same rule from the round's block. Bit-identical on any
+    univariate pool regardless."""
+    return (scoring.mv_score_from_block > 0 and block is not None
+            and int(block) >= scoring.mv_score_from_block)
 
 
 def effective_margin_mode(scoring: ScoringConfig, block: int | None) -> str:
@@ -1903,6 +1925,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
+            mv_score_from_block=max(0, int(s.get("mv_score_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),

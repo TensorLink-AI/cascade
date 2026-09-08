@@ -318,6 +318,19 @@ in-context.
   gate: re-run `scripts/replay_margin_decay.py` + a testnet no-ping-pong cycle
   (else ship a LIGHT ramp 0.007→0.005). Revises DEC-CA-0016; chain.toml NOT
   changed by the node. (`decisions/DEC-CA-0040-flatten-fresh-king-margin.md`)
+- **DEC-CA-0041** (proposed) — Multivariate scoring for the private-pool duel is
+  GIFT-Eval-weighted: a window's channels are AVERAGED into one per-window
+  contribution (arithmetic mean over variates, zero-target channels masked from
+  the WQL half; NOT sum/sum pooling — 0.28× scale-domination), so a C-channel
+  window counts ONCE — matching the source-cluster bootstrap that already treats
+  it as one unit (the point statistic was the only non-GIFT half). Block-gated
+  `[scoring] mv_score_from_block` (0 = per-channel forever, UNARMED),
+  BIT-IDENTICAL on the univariate pool (singleton windows pass through untouched).
+  N_eff = distinct coupled-SOURCE count, not channels (C=4 ≡ C=12 on 3 sources);
+  a realistic MV gain needs ~12+ coupled sources / ~38% pool share to clear a
+  0.5% margin. Phase 0 (aggregation + gate + tests) LANDED; pool builder / cap
+  raise / ablation gate arming. Revises DEC-CA-0026.
+  (`decisions/DEC-CA-0041-multivariate-scoring.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
