@@ -10,6 +10,7 @@ every pre-gate path is byte-identical to the heat → final pipeline.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import replace
 
@@ -113,13 +114,17 @@ def test_duel_knobs_parse_validate_and_gate(tmp_path):
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
     # The shipped toml may carry the armed keys; strip them to pin the defaults.
-    bare = re.sub(r"^duel_(from_block|field_cap)\s*=.*$", "",
+    bare = re.sub(r"^duel_(from_block|field_cap|seat_all)\s*=.*$", "",
                   DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     cfg = load_chain_config(p)
     assert cfg.round.duel_from_block == 0 and cfg.round.duel_field_cap == 0
+    assert cfg.round.duel_seat_all is True          # default: the field, not the fleet
     assert not cfg.round.duel_only(10**9)          # unset gate: never
+
+    p.write_text(bare.replace("\n[round]\n", "\n[round]\nduel_seat_all = false\n", 1))
+    assert load_chain_config(p).round.duel_seat_all is False
 
     p.write_text(bare.replace(
         "\n[round]\n", "\n[round]\nduel_from_block = 5000\nduel_field_cap = 4\n", 1))
@@ -153,6 +158,12 @@ def test_seats_follow_the_lanes_and_the_epoch():
     assert auto.duel_seats(lanes=4, epoch_hours=12.0, leg_hours=3.0) == 11   # 4×3 − king
     assert auto.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0) == 2
     assert auto.duel_seats(lanes=0, epoch_hours=3.0, leg_hours=3.0) == 1     # floor: one seat
+    # seat_all (default): a known field seats whole, whatever the lanes fit;
+    # without a field the lane rule still answers (the geometry projection).
+    assert auto.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0, field=5) == 5
+    assert auto.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0, field=0) == 1
+    lanes_bound = replace(auto, duel_seat_all=False)
+    assert lanes_bound.duel_seats(lanes=1, epoch_hours=12.0, leg_hours=3.0, field=5) == 2
     capped = RoundConfig(duel_field_cap=5)
     assert capped.duel_seats(lanes=4, epoch_hours=12.0, leg_hours=3.0) == 5
 
@@ -160,8 +171,35 @@ def test_seats_follow_the_lanes_and_the_epoch():
 # ── the round: seats, overflow, burn, marker ─────────────────────────────────
 
 
+@pytest.fixture()
+def lanes_bound_cfg(duel_cfg):
+    """The pre-2026-09-08 rule: seats = what the lanes on file can finish."""
+    return replace(duel_cfg, round=replace(duel_cfg.round, duel_seat_all=False))
+
+
+def test_duel_only_round_seats_the_whole_field_and_flags_a_short_fleet(
+        duel_cfg, tmp_path, monkeypatch, caplog):
+    """Round 565093567954236803 (2026-09-07): 5 eligible, 1 lane on file at
+    seat time ⇒ 2 seated, 3 benched a round. Under duel_seat_all the field
+    seats whole in reveal order and the short fleet is a WARNING."""
+    runner = _runner(duel_cfg, tmp_path, monkeypatch, screen_fn=_screen_must_not_run)
+    commits = _field()
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
+        manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=5000)
+
+    chal = {e.miner_hotkey: e for e in manifest.entries_for_role("challenger")}
+    assert set(chal) == {"c", "b", "d"}
+    assert [chal[h].duel_rank for h in ("c", "b", "d")] == [0, 1, 2]   # reveal order
+    marker = json.loads((tmp_path / "1" / "heat_complete.json").read_text())
+    assert marker == {"round_id": "1", "screened": 3, "finalists": ["c", "b", "d"]}
+    assert _burned(duel_cfg, tmp_path) == {"b", "c", "d"}
+    short = [r for r in caplog.records if "FLEET SHORT" in r.getMessage()]
+    assert len(short) == 1 and "1 lane(s) on file fit 2" in short[0].getMessage()
+
+
 def test_duel_only_round_seats_by_reveal_order_and_holds_the_overflow(
-        duel_cfg, tmp_path, monkeypatch):
+        lanes_bound_cfg, tmp_path, monkeypatch):
+    duel_cfg = lanes_bound_cfg
     runner = _runner(duel_cfg, tmp_path, monkeypatch, screen_fn=_screen_must_not_run)
     commits = _field()
     manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=5000)
@@ -212,10 +250,12 @@ def test_explicit_cap_overrides_the_fleet_derived_seats(duel_cfg, tmp_path, monk
     assert _burned(one, tmp_path) == {"c"}
 
 
-def test_duel_only_retry_after_settle_reuses_the_seated_field(duel_cfg, tmp_path, monkeypatch):
+def test_duel_only_retry_after_settle_reuses_the_seated_field(
+        lanes_bound_cfg, tmp_path, monkeypatch):
     """The r47 shape on a duel-only round: the settle burned the seated pair
     and wrote the marker, then the final died. The retry re-seats exactly
     them — the waiting entrant is neither pulled in nor burned."""
+    duel_cfg = lanes_bound_cfg
     runner = _runner(duel_cfg, tmp_path, monkeypatch, screen_fn=_screen_must_not_run)
     commits = _field()
     real_train_final = runner._train_final
@@ -250,7 +290,9 @@ class _Store:
         return self.objects[key]
 
 
-def test_duel_only_standings_name_the_waiting_entrants(duel_cfg, tmp_path, monkeypatch):
+def test_duel_only_standings_name_the_waiting_entrants(
+        lanes_bound_cfg, tmp_path, monkeypatch):
+    duel_cfg = lanes_bound_cfg
     store = _Store()
     runner = _runner(duel_cfg, tmp_path, monkeypatch, publish_stage_status=True,
                      screen_fn=_screen_must_not_run)
