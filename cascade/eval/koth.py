@@ -331,7 +331,22 @@ def cohort_maxt_lcb_map(
     source of truth for BOTH the validator's decision and the audit's replay,
     so the two can never derive a different bound. Uses ``params.bootstrap_B``
     at the FULL ``params.bootstrap_alpha`` — the max-T needs no ``alpha/k``.
+
+    Multivariate (DEC-CA-0041): when ``params.mv_score`` is armed, each window's
+    channels are collapsed to one per-window row FIRST — the same rule as the
+    single-duel :func:`evaluate_round`, so the cohort max-T reads a multivariate
+    window as one unit exactly as the point statistic and the cluster bootstrap
+    do. Bit-identical on any univariate pool (one channel per window).
     """
+    if params.mv_score:
+        if wql_mode != "geomean":
+            raise ValueError(
+                "mv_score requires wql_mode='geomean' (pooled is legacy "
+                "univariate receipt replay)"
+            )
+        king_scores = collapse_channels_by_window(king_scores)
+        cohort_scores = [(hk, collapse_channels_by_window(cs))
+                         for hk, cs in cohort_scores]
     clusters, _ = _window_clusters(king_scores)
     king_c = stack_components(king_scores)
     chal_c = [stack_components(cs) for _, cs in cohort_scores]

@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 
 from cascade.eval.crps import DEFAULT_QUANTILE_LEVELS
-from cascade.eval.koth import KothParams, evaluate_round
+from cascade.eval.koth import KothParams, cohort_maxt_lcb_map, evaluate_round
 from cascade.eval.scoring import (
     WindowScore,
     collapse_channels_by_window,
@@ -137,6 +137,40 @@ def test_mv_window_votes_once_not_per_channel():
 # --------------------------------------------------------------------------- #
 # 4. block-gate resolver
 # --------------------------------------------------------------------------- #
+def _paired_king_chals(n=10, seed=0):
+    rng = np.random.default_rng(seed)
+    king, c1, c2 = [], [], []
+    for i in range(n):
+        diff = float(rng.uniform(0.6, 1.4))
+        src = f"src{i % 3}"
+        king.append(ws(f"w{i}", 0.9 * diff, 0.2 * diff, source=src))
+        c1.append(ws(f"w{i}", 0.9 * diff * 0.92, 0.2 * diff * 0.92, source=src))
+        c2.append(ws(f"w{i}", 0.9 * diff * 0.96, 0.2 * diff * 0.96, source=src))
+    return king, c1, c2
+
+
+def test_cohort_maxt_univariate_bit_identical_mv_on_vs_off():
+    """The k>=2 max-T path must also be a bit-exact no-op on a univariate pool."""
+    king, c1, c2 = _paired_king_chals()
+    cohort = [("hkA", c1), ("hkB", c2)]
+    off = cohort_maxt_lcb_map(king, cohort, _params(mv_score=False), seed="c")
+    on = cohort_maxt_lcb_map(king, cohort, _params(mv_score=True), seed="c")
+    assert off == on                              # exact dict equality
+
+
+def test_cohort_maxt_collapses_channels_when_armed():
+    """A multivariate window must be re-weighted (channels averaged to one) in
+    the cohort max-T LCB when mv_score is armed — not voted per channel."""
+    king, c1, c2 = _paired_king_chals(n=6)
+    for scores, f in ((king, 1.0), (c1, 0.80), (c2, 0.85)):
+        for c in range(3):
+            scores.append(ws("mv", 0.9 * f, 0.2 * f, channel=c, source="mvsrc"))
+    cohort = [("A", c1), ("B", c2)]
+    off = cohort_maxt_lcb_map(king, cohort, _params(mv_score=False), seed="c")
+    on = cohort_maxt_lcb_map(king, cohort, _params(mv_score=True), seed="c")
+    assert off != on                              # collapse changed the weighting
+
+
 def test_mv_score_active_block_gate():
     s0 = ScoringConfig.__new__(ScoringConfig)   # only need mv_score_from_block
     object.__setattr__(s0, "mv_score_from_block", 0)
