@@ -1079,6 +1079,15 @@ class ScoringConfig:
     # flip: retiring it makes pre-flip receipts fail the params replay.
     win_margin_start_prev: float = 0.0
     margin_activation_block: int = 0
+    # Second (older) step of the same schedule, so a two-transition history
+    # (e.g. 2% -> 1% -> 0.5%) stays fully audit-resolvable: rounds before
+    # ``margin_activation_block2`` judge at ``win_margin_start_prev2``, between
+    # the two blocks at ``win_margin_start_prev``, from ``margin_activation_block``
+    # on at ``win_margin_start``. Both default 0/0.0 = single transition,
+    # bit-identical to the one-step form. Same "keep the pair after the flip"
+    # rule (DEC-CA-0016): retiring a step makes that era's receipts fail replay.
+    win_margin_start_prev2: float = 0.0
+    margin_activation_block2: int = 0
     # Cohort-duel family-wise correction (DEC-CA-0038). Bonferroni's alpha/k
     # over-protects the king: the k challengers share the king's scores and one
     # window draw, so the tests are strongly positively correlated and the
@@ -1510,13 +1519,22 @@ _PLACEHOLDER_DIGEST = "0" * 64
 
 
 def effective_win_margin_start(scoring: ScoringConfig, block: int | None) -> float:
-    """The fresh-king margin in force for the round at epoch boundary ``block``:
-    ``win_margin_start_prev`` for blocks strictly before
+    """The fresh-king margin in force for the round at epoch boundary ``block``,
+    resolving an up-to-two-step schedule so a full margin history stays
+    audit-verifiable: ``win_margin_start_prev2`` for blocks before
+    ``margin_activation_block2``, ``win_margin_start_prev`` before
     ``margin_activation_block``, ``win_margin_start`` from it on. With no
-    scheduled change (prev 0.0 / block 0) or no block given, the steady value."""
-    if (scoring.margin_activation_block > 0 and scoring.win_margin_start_prev > 0.0
-            and block is not None and int(block) < scoring.margin_activation_block):
-        return float(scoring.win_margin_start_prev)
+    scheduled change (activation 0 / prev 0.0) or no block, the steady value.
+    Bit-identical to the single-step form when the ``*2`` fields are unset."""
+    if block is None:
+        return float(scoring.win_margin_start)
+    b = int(block)
+    if scoring.margin_activation_block > 0 and b < scoring.margin_activation_block:
+        if (scoring.margin_activation_block2 > 0 and scoring.win_margin_start_prev2 > 0.0
+                and b < scoring.margin_activation_block2):
+            return float(scoring.win_margin_start_prev2)
+        if scoring.win_margin_start_prev > 0.0:
+            return float(scoring.win_margin_start_prev)
     return float(scoring.win_margin_start)
 
 
@@ -1923,6 +1941,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_warmup_rounds=int(s["margin_warmup_rounds"]),
             win_margin_start_prev=float(s.get("win_margin_start_prev", 0.0) or 0.0),
             margin_activation_block=max(0, int(s.get("margin_activation_block", 0) or 0)),
+            win_margin_start_prev2=float(s.get("win_margin_start_prev2", 0.0) or 0.0),
+            margin_activation_block2=max(0, int(s.get("margin_activation_block2", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
             mv_score_from_block=max(0, int(s.get("mv_score_from_block", 0) or 0)),

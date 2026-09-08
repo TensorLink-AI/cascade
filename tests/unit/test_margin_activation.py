@@ -63,6 +63,25 @@ def test_effective_margin_resolves_per_block():
     assert effective_win_margin_start(_scoring(margin_activation_block=5000), 1) == 0.01
 
 
+def test_effective_margin_two_step_schedule():
+    """A 2% -> 1% -> 0.5% history resolves at each era, so old rounds stay
+    audit-resolvable — a pre-flip block re-derives the value it recorded, and
+    check_koth_params does not fail on the earlier era after a second flip."""
+    sched = _scoring(win_margin_start=0.005,
+                     win_margin_start_prev=0.01, margin_activation_block=9043200,
+                     win_margin_start_prev2=0.02, margin_activation_block2=8992800)
+    assert effective_win_margin_start(sched, 8992799) == 0.02    # launch..flip2 (2%)
+    assert effective_win_margin_start(sched, 8992800) == 0.01    # flip2..flip1 start
+    assert effective_win_margin_start(sched, 9043199) == 0.01    # flip2..flip1 end
+    assert effective_win_margin_start(sched, 9043200) == 0.005   # flip1 on (0.5%)
+    assert effective_win_margin_start(sched, None) == 0.005      # steady / head
+    # *2 unset must stay bit-identical to the one-step resolver
+    one = _scoring(win_margin_start_prev=0.02, margin_activation_block=5000)
+    for b in (None, 1, 4999, 5000, 9000):
+        assert effective_win_margin_start(one, b) == effective_win_margin_start(
+            replace(one, win_margin_start_prev2=0.02, margin_activation_block2=0), b)
+
+
 def test_koth_params_carry_the_round_value(cfg):
     from cascade.eval.koth import margin_for_tenure
 
