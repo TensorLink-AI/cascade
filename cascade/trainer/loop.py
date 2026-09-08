@@ -3140,10 +3140,11 @@ class TrainerRunner:
                            "epoch_start_block": int(screen_block),
                            "warm_start": ws_info}
         # Duel-only rounds ([round] duel_from_block): no heat — the screened
-        # field seats straight into the duel in reveal order. The seats
-        # follow the fleet: wait for the final-capable pods the provisioner
-        # rents at the margin, then seat what their lanes can finish inside
-        # the epoch; the overflow waits for a later round, unburned.
+        # field seats straight into the duel in reveal order. Wait for the
+        # final-capable pods the provisioner rents at the margin, then seat:
+        # the whole field under duel_seat_all (a short fleet queues the legs
+        # and grows mid-final), else what the lanes on file can finish inside
+        # the epoch; any overflow waits for a later round, unburned.
         duel_only = self.cfg.round.duel_only(screen_block)
         waiting: list[ResolvedGenerator] = []
         if duel_only and reused is None:
@@ -3286,23 +3287,40 @@ class TrainerRunner:
         self, screened: list[ResolvedGenerator], base_seed: int, screen_block: int,
     ) -> tuple[list[ResolvedGenerator], list[ResolvedGenerator]]:
         """Split the screened field into ``(seated, waiting)`` for a duel-only
-        round: the earliest entrants by ``(reveal_block, uid)`` seat, as many
-        as the fleet's lanes can finish inside the epoch (or the explicit
-        ``duel_field_cap``); the rest wait for a later round. Reveal order is
-        the seniority rule the heat's tie-break already uses (a UID recycles,
-        the reveal block does not)."""
+        round: the earliest entrants by ``(reveal_block, uid)`` seat — the
+        whole field under ``duel_seat_all``, else as many as the fleet's
+        lanes can finish inside the epoch — or the explicit ``duel_field_cap``;
+        the rest wait for a later round. Reveal order is the seniority rule
+        the heat's tie-break already uses (a UID recycles, the reveal block
+        does not). Seating is one-shot: lanes that join later only spread
+        the legs already seated, so under ``duel_seat_all`` a fleet on file
+        that cannot finish the field inside the epoch is logged as a WARNING
+        for the provisioner/operator to top up (the mid-final lane pool
+        dispatches the queued legs the moment a lane joins)."""
         lanes = self._duel_lanes()
-        seats = self.cfg.round.duel_seats(
-            lanes=lanes, epoch_hours=self._epoch_hours(screen_block),
-            leg_hours=float(self.cfg.training.target_train_hours))
+        epoch_hours = self._epoch_hours(screen_block)
+        leg_hours = float(self.cfg.training.target_train_hours)
+        rc = self.cfg.round
+        fit = rc.duel_seats(lanes=lanes, epoch_hours=epoch_hours, leg_hours=leg_hours)
+        seats = rc.duel_seats(lanes=lanes, epoch_hours=epoch_hours, leg_hours=leg_hours,
+                              field=len(screened))
         ordered = sorted(screened, key=lambda c: (c.reveal_block, c.uid))
         seated, waiting = ordered[:seats], ordered[seats:]
-        how = (f"cap {self.cfg.round.duel_field_cap}" if self.cfg.round.duel_field_cap > 0
-               else f"{lanes} lane(s) fit {seats} + king inside the epoch")
+        if rc.duel_field_cap > 0:
+            how = f"cap {rc.duel_field_cap}"
+        elif rc.duel_seat_all:
+            how = f"seat_all; {lanes} lane(s) on file fit {fit} + king inside the epoch"
+        else:
+            how = f"{lanes} lane(s) fit {seats} + king inside the epoch"
         log.info("round=%s duel-only: %d of %d challenger(s) seated (%s, reveal "
                  "order)%s", base_seed, len(seated), len(ordered), how,
                  f"; {len(waiting)} wait for a later round: "
                  f"{[c.hotkey for c in waiting]}" if waiting else "")
+        if rc.duel_field_cap <= 0 and rc.duel_seat_all and len(seated) > fit:
+            log.warning("round=%s duel-only: FLEET SHORT — %d lane(s) on file fit %d "
+                        "challenger(s) inside the epoch but %d seated; %d leg(s) queue "
+                        "until more final lanes join hosts.toml (the round lands late "
+                        "otherwise)", base_seed, lanes, fit, len(seated), len(seated) - fit)
         return seated, waiting
 
     def _log_duel_geometry(self, base_seed: int, legs: int, screen_block: int) -> None:
