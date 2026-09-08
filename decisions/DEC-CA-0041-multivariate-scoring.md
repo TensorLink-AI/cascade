@@ -196,3 +196,39 @@ attribute — a silent no-op that made every "coupling" arm identical (fixed in
 `041bb3e`). The harness now asserts that each coupling level produces a distinct
 corpus. Worth repeating for any future ablation here: a knob that does not
 change the data will otherwise return a confident, meaningless null.
+
+## Memory footprint at production shape (2026-09-08, measured)
+
+`batch_size=64`, `context_length=4096`, `patch_size=32` (P=128, the widest
+bucket), float32 (the trainer uses no autocast), AdamW + EMA state included.
+Measured on a **physical RTX 3090** (23.6 GB usable) and, identically, on an
+RTX 6000 Ada with the allocator capped:
+
+    C    peak alloc GB   reserved GB   fits 24 GB card?
+    1        1.05           1.26            yes
+    4        2.51           3.24            yes
+    8        4.92           5.79            yes
+   16        9.77          11.01            yes
+   32       19.47          21.41            yes  (~2.2 GB headroom)
+
+Scaling is **linear in C**, not quadratic: the O(C²) variate-attention matrix is
+(B·P, C, C) ≈ 33 MB at C=32, while the dominant term is time attention at
+(B·C, heads, P, P), linear in C. The backbone is 2.7M params, so fixed cost is
+~0.05 GB and essentially all of this is activations. Mixing widths does not
+help — buckets are keyed `(P, C)` and each fills to `batch_size`, so peak is set
+by the widest bucket present.
+
+**Consequence: memory is not an argument for or against any cap up to 32.** Even
+C=32 fits the smallest plausible validator card. A miner who overreaches is
+self-policing anyway — OOM is a challenger fault and never re-queues
+(`loop.py`), so they lose their own round rather than the fleet's.
+
+The cap recommendation of **8** therefore rests on exactly two things: (a) caps
+are additive to raise and breaking to lower, so ship the smaller one and widen
+when coupled-group supply justifies it; (b) regime match with the `mv_channels
+≤ 8` eval contract — a model trained wider than the eval windows pays a
+mismatch penalty (the C=8-trained-model-run-at-C=1 case measured ~5% relative).
+
+Caveats: 5-step probe, so no allocator fragmentation accumulates over a real
+round; headless datacenter cards (a desktop 3090 driving a display gives up
+another ~0.5-1 GB); nothing else resident on the GPU.
