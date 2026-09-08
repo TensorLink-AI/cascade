@@ -54,7 +54,7 @@ class Generator(DataGenerator):
         self._min_channels = int(cfg.get("min_channels", 2))
         self._length = int(cfg.get("length", 1024))
         self._max_delay = int(cfg.get("max_coupling_delay", 24))
-        self._coupling = float(cfg.get("coupling_strength", 0.6))
+        self._coupling_strength = float(cfg.get("coupling_strength", 0.6))
 
     def generate(self, n_series: int) -> Iterator[np.ndarray | Mapping]:
         for i in range(int(n_series)):
@@ -94,7 +94,7 @@ class Generator(DataGenerator):
             parents = rng.choice(k, size=n_parents, replace=False)
             for p in parents:
                 delay = int(rng.integers(1, self._max_delay + 1))
-                w = self._coupling * float(rng.normal(1.0, 0.3))
+                w = self._coupling_strength * float(rng.normal(1.0, 0.3))
                 # child's value at t adds a weighted copy of parent p at t-delay:
                 # the parent's PAST drives the child's FUTURE (cross-predictive).
                 out[k, delay:] += w * out[p, :-delay]
