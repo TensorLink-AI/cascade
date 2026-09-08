@@ -63,6 +63,17 @@ error — there is no MV bonus. Two consequences the numbers make hard:
   gain clears. Rule of thumb: `gain × MV-share ≳ 1%`. So the beatability lever is
   distinct coupled SOURCES, harvested broadly — never channels stacked on a few.
 
+**Channels are free; the coupled-source count is the currency.** A coupled group
+packs to one `(C, L)` window (the `mv_channels` contract, `docs/EVAL_POOL.md`):
+one series against the 200/source cap, one joint forecast call, and — the
+bootstrap clustering by `source` — zero extra clusters. So tagging costs the pool
+nothing and there is no size-vs-evidence tension; the cross-predictiveness audit
+(lagged sibling info, not `|corr|`) is the only gatekeeper. NOTE the deliberate
+forge/cascade accounting divergence: forge's OWN benchmark expands a group into C
+univariate challenges (C slots, group-level bootstrap); cascade packs to one
+window (1 slot, source-level clusters). Same tag, two consumers, NOT reconciled —
+neither should be "fixed" to match the other.
+
 **Rejected alternatives:** per-row weighting (over-weights a C-channel window C×
 and makes it a high-leverage bootstrap unit — the current, non-GIFT default);
 `sum/sum` WQL pooling (scale-dominated, above); scoring MV as C independent
