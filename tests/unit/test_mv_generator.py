@@ -102,3 +102,41 @@ def test_channels_are_cross_predictive_not_just_correlated():
             allc = np.concatenate([_lag_matrix(s[j], h) for j in range(c)], axis=1)
             gains.append(_ridge_oos_mse(own, tgt) - _ridge_oos_mse(allc, tgt))
     assert np.mean(gains) > 0.0, f"sibling lags did not help (mean gain {np.mean(gains):.4g})"
+
+
+def test_coupling_strength_actually_changes_the_corpus():
+    """Regression for a silent no-op: the config key is ``coupling_strength`` but
+    the attribute was once ``_coupling``, so every caller setting the former wrote
+    a dead attribute and got the default. Three ablation runs compared corpora
+    that were byte-identical before this was caught. A knob that does not move
+    the data returns confident, meaningless nulls."""
+    def gen(coup):
+        g = _gen(seed=888_888, length=512, min_channels=8, max_channels=8,
+                 coupling_strength=coup)
+        return next(iter(g.generate(1)))
+
+    weak, mid, strong = gen(0.0), gen(0.6), gen(2.4)
+    assert not np.array_equal(weak, mid), "coupling_strength 0.0 vs 0.6 is a no-op"
+    assert not np.array_equal(mid, strong), "coupling_strength 0.6 vs 2.4 is a no-op"
+    # channel 0 has no parents, so it must be invariant to coupling strength --
+    # this pins that the knob acts through the DAG and not some global rescale.
+    assert np.allclose(weak[0], mid[0]) and np.allclose(mid[0], strong[0])
+
+
+def test_stronger_coupling_raises_cross_channel_dependence():
+    """The knob must be monotone in the direction it claims: more coupling => a
+    child's own lags explain less of it relative to its siblings' lags."""
+    def mean_gain(coup):
+        g = _gen(seed=21, length=800, min_channels=4, max_channels=4,
+                 coupling_strength=coup, max_delay=12)
+        h, gains = 15, []
+        for s in g.generate(4):
+            for k in range(1, s.shape[0]):
+                tgt = s[k][h:]
+                own = _lag_matrix(s[k], h)
+                allc = np.concatenate([_lag_matrix(s[j], h) for j in range(s.shape[0])],
+                                      axis=1)
+                gains.append(_ridge_oos_mse(own, tgt) - _ridge_oos_mse(allc, tgt))
+        return float(np.mean(gains))
+
+    assert mean_gain(1.5) > mean_gain(0.2), "coupling strength is not monotone"
