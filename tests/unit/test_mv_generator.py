@@ -42,6 +42,34 @@ def test_passes_check_series_at_a_raised_cap():
     check_series(s, min_length=64, max_length=4096, max_channels=8)
 
 
+def test_supports_the_ablation_channel_sweep_up_to_32():
+    """Toto2's variate layers train at up to 32 variates, so the generator must
+    produce valid coupled corpora across the whole sweep. (Distinct from the
+    eval-pool mv_channels <= 8 contract, which caps REAL harvested columns.)"""
+    for c in (4, 8, 16, 32):
+        g = _gen(seed=c, length=256, min_channels=c, max_channels=c)
+        s = next(iter(g.generate(1)))
+        assert s.shape == (c, 256), f"C={c} produced {s.shape}"
+        assert np.isfinite(s).all()
+
+
+def test_coupling_survives_at_wide_C():
+    """Cross-predictiveness must hold at the wide end of the sweep too, not just
+    at C=4 — a wide corpus of independent channels would earn no MV reward."""
+    g = _gen(seed=11, length=800, min_channels=16, max_channels=16,
+             coupling_strength=1.5, max_delay=12)
+    h = 15
+    gains = []
+    for s in g.generate(2):
+        c = s.shape[0]
+        for k in range(1, c, 4):          # sample children across the width
+            tgt = s[k][h:]
+            own = _lag_matrix(s[k], h)
+            allc = np.concatenate([_lag_matrix(s[j], h) for j in range(c)], axis=1)
+            gains.append(_ridge_oos_mse(own, tgt) - _ridge_oos_mse(allc, tgt))
+    assert np.mean(gains) > 0.0, f"no cross-predictive lift at C=16 ({np.mean(gains):.4g})"
+
+
 def _lag_matrix(x, h):
     """Rows t=h..L-1, cols [x[t-1], …, x[t-h]]."""
     return np.stack([x[t - h:t][::-1] for t in range(h, len(x))], axis=0)

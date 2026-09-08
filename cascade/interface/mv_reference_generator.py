@@ -16,6 +16,16 @@ Importable as ``generator.Generator`` (the trainer's contract). Emits ``(C, L)``
 arrays; deterministic from ``seed`` and ``n_series`` alone. Until
 ``[generator] max_channels`` is raised the trainer rejects C>1 — this generator
 exists to be run in the ablation once it is.
+
+TWO DIFFERENT CHANNEL BUDGETS — do not conflate them:
+
+* **Training corpus C (here)** — Toto2's grouped variate attention trains at up
+  to 32 variates (``toto2_model``: the last layer of each group of 4 attends
+  over variates), so the ablation sweeps C ∈ {4, 8, 16, 32} against a C=1
+  univariate baseline. Set ``min_channels``/``max_channels`` per run.
+* **Eval-pool ``mv_channels`` (≤ 8)** — the forge→cascade contract for REAL
+  coupled columns within one ``(source, panel_row)`` (docs/EVAL_POOL.md). That
+  cap is about harvestable real data, not what the model can train on.
 """
 from __future__ import annotations
 
