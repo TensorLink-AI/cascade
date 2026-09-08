@@ -102,3 +102,97 @@ mismatch). Rollout:
 5. Raise `[generator] max_channels` (4–8, matched to coupled-group supply and the
    O(C²) variate-attention cost; not 10) and arm `mv_score_from_block` at the
    same coordinated block the first MV pool snapshot goes live.
+
+## Phase 3 ablation results (2026-09-08, measured)
+
+Run on an RTX 6000 Ada, Toto2 backbone, L=4096/P=128, equal 240s wall per arm,
+3 seeds per config, synthetic coupled corpora from
+`cascade/interface/mv_reference_generator.py`. Harnesses were scratch; the
+numbers below are the durable part.
+
+**1. Wide training is cheaper, not costlier.** Against a *token-matched*
+univariate baseline (C=1 at batch 16·C, so both push identical sequence counts),
+packing sequences on the variate axis is ~20% faster per step and ~40% lighter
+in peak memory, consistently at every width to C=32:
+
+    seqs/step   MV ms/step   UV ms/step   MV peak GB   UV peak GB
+       64          11.1        13.2          0.71        1.12
+      128          20.7        25.8          1.35        2.18
+      256          42.5        55.0          2.66        4.31
+      512          89.9       118.0          5.26        9.04
+
+This corrects the O(C²) worry that motivated capping `max_channels` low. C=32 is
+8× slower per step than C=1/batch-16, but that comparison is against an idle GPU
+(0.32 GB peak); against equal work the variate axis wins.
+
+**2. Wide training also improves univariate skill.** Held-out univariate pinball
+loss vs the token-matched control, 3 seeds, sd ≈ 0.001:
+
+    C=4  vs C=1/BS=64    -0.02331  (21 sd)
+    C=8  vs C=1/BS=128   -0.01527  (13 sd)
+
+So raising `max_channels` does not depend on the multivariate thesis at all — it
+is free on throughput and positive on univariate quality. Note the univariate
+control curve is non-monotonic in batch size at fixed LR 3e-4 (0.0803 → 0.0888 →
+0.0759 → 0.0551 → 0.0519 for BS 16→512), so LR is not neutral across that range;
+the MV-vs-control comparisons above are matched pairs and unaffected.
+
+**3. Variate attention extracts real cross-channel information, and it must be
+LEARNED.** Channel-shuffle test: score one model on C=8 windows built normally
+vs windows whose channel k is drawn from a *different* series (same shape, same
+per-channel marginals, co-membership destroyed). All arms at C=8, so no regime
+mismatch. `eval_coup=0.0` is a null — true and shuffled are then the same
+distribution, so the gap is required to be zero.
+
+    train_coup  eval_coup   true     shuffled    gap        rel%
+       1.2        0.0     0.05293   0.05303   -0.00009     0.17   <- null clean
+       1.2        0.3     0.05951   0.06034   -0.00083     1.37
+       1.2        0.6     0.05759   0.05964   -0.00205     3.43
+       1.2        1.2     0.04929   0.05270   -0.00341     6.47
+       1.2        2.4     0.04753   0.05136   -0.00383     7.46
+       0.0        0.0     0.04431   0.04435   -0.00004     0.08   <- null clean
+       0.0        0.3     0.06192   0.06190   +0.00002    -0.02
+       0.0        0.6     0.06910   0.06901   +0.00009    -0.13
+       0.0        1.2     0.06571   0.06562   +0.00009    -0.13
+       0.0        2.4     0.06466   0.06450   +0.00016    -0.25
+
+Null clean in both arms; monotonic dose-response in the coupled-trained arm; and
+the model trained on *independent* channels gains exactly nothing at any
+coupling strength. The capability is learned from coupled training data, not a
+generic property of the architecture.
+
+**Consequence for the A1 admission threshold.** With the DEC-CA-0040 rule of
+thumb (`gain × MV-share ≳ 1%` to clear a 0.5% margin):
+
+    coupling    joint-vs-marginal lift    MV pool share needed
+    0.3 (weak)         1.4%                   ~73%  -- infeasible
+    0.6 (moderate)     3.4%                   ~29%
+    1.2 (strong)       6.5%                   ~15%
+
+A1 should admit column groups whose measured **joint-vs-marginal lift is ≳3%**
+and target ≳30% pool share. `|corr|` is not the bar and neither is "coupled in
+principle" — weakly-coupled groups would need three-quarters of the pool to move
+a duel and are not worth harvesting.
+
+**Consequence for step 5.** Arming MV scoring rewards miners whose *generators
+emit causally coupled channels*, since the skill cannot be picked up from
+independent-channel corpora. That is an incentive gradient on generator design,
+not just model architecture, and it is reachable — `mv_reference_generator`
+is the worked example.
+
+**Caveats.** Synthetic corpora throughout, generously coupled (dense random DAG,
+lags ≤24); real harvested panel columns will sit lower on the dose-response
+curve, so 3.4% at coupling 0.6 is the honest planning anchor and the 1.2/2.4
+rows are ceilings, not forecasts. 240s per arm is short — these are directional.
+The eval-first ordering above is unchanged: none of this licenses arming the
+gate before MV windows are actually in the pool.
+
+**Methodology note.** Four earlier designs returned nulls, each for a different
+reason: a univariate eval set (variate attention inert at eval, null by
+construction), a joint-vs-marginal comparison (C=8-trained model run at C=1 is a
+regime mismatch, not an information test), and two runs invalidated by the
+generator's `coupling_strength` config key not matching its `_coupling`
+attribute — a silent no-op that made every "coupling" arm identical (fixed in
+`041bb3e`). The harness now asserts that each coupling level produces a distinct
+corpus. Worth repeating for any future ablation here: a knob that does not
+change the data will otherwise return a confident, meaningless null.
