@@ -169,6 +169,20 @@ def validate_sandbox_mode(mode: str) -> str:
 # DEC-CA-0020's refuse-unconsumed rule made mechanical). [training]
 # accepted_fields may only name these; every other reserved name is still
 # rejected at load so a typo or a premature arming fails the boot, not a round.
+# Batch denominations at C > 1 (DEC-CA-0041) — see
+# TrainingContractConfig.batch_denomination.
+BATCH_DENOMINATIONS = ("series", "sequences")
+
+
+def validate_batch_denomination(mode: str) -> str:
+    """Fail loud: "sequences" silently degrading to "series" would cut a wide
+    miner's step count 32× under an operator who believed it equalised."""
+    if mode not in BATCH_DENOMINATIONS:
+        raise ValueError(
+            f"batch_denomination={mode!r} invalid; expected one of {BATCH_DENOMINATIONS}")
+    return mode
+
+
 CONSUMABLE_FIELDS = ("mask", "roles")
 
 
@@ -515,6 +529,20 @@ class TrainingContractConfig:
     # reserved names with a wired consumer: "mask" (DEC-CA-0023), "roles"
     # (DEC-CA-0026). Order-insensitive (normalised sorted at load).
     accepted_fields: tuple[str, ...] = ()
+    # ── batch denomination at C > 1 (DEC-CA-0041; digest-bound) ──────────────
+    # What ``batch_size`` COUNTS when a series carries C > 1 variates.
+    # "series": a (P, C) bucket fills to batch_size series — a C=32 batch is
+    # batch_size×32 sequences, so a fixed token budget buys C× fewer optimizer
+    # steps (Toto 2's own batch geometry: 64 series × 32 variates).
+    # "sequences": a bucket fills to max(1, batch_size // C) series, holding
+    # tokens-per-step ~constant across C — every miner gets the same step
+    # count from the same budget whatever channel mix they emit, at the price
+    # of fewer independent groups per wide step. Bit-identical at C = 1 either
+    # way (and C > 1 was impossible before max_channels rose, so no historical
+    # round is affected). Drop-when-default: "series" is absent from
+    # contract_digest; arming "sequences" is a deliberate contract cut — king
+    # and challenger batch identically either way, but every trainer must agree.
+    batch_denomination: str = "series"
     # roles value 2 (future-known covariates) admission. Digest-bound and OFF
     # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
     # arming it before that rule exists is forbidden (DEC-CA-0026).
@@ -2049,6 +2077,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             expected_gpu=str(t.get("expected_gpu", "")),
             train_image_digest=str(t.get("train_image_digest", "")),
             extra_sizes=extra_sizes,
+            batch_denomination=validate_batch_denomination(
+                str(t.get("batch_denomination", "series"))),
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),

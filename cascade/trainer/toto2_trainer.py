@@ -275,7 +275,8 @@ def weighted_pinball_loss(pred_q, target, levels: tuple[float, ...], weight=None
     return (loss * w).sum() / denom
 
 
-def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batch_size: int):
+def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
+                          batch_size: int, batch_denomination: str = "series"):
     """Yield ``(B, C, P*patch_size)`` float64 training batches from a series
     stream.
 
@@ -288,8 +289,16 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batc
     stack without padding or a variate attention mask — the model's forward
     takes a uniform channel count per batch. Full buckets are emitted eagerly;
     partial buckets are flushed when the stream ends. A corpus may freely mix
-    channel counts; at ``C = 1`` throughout (today's cap) every batch is
-    ``(B, 1, L)`` carrying exactly the bytes the old channel-0 path carried.
+    channel counts; at ``C = 1`` every batch is ``(B, 1, L)`` carrying exactly
+    the bytes the old channel-0 path carried, under either denomination.
+
+    ``batch_denomination`` (DEC-CA-0041) sets what ``batch_size`` counts for a
+    ``C > 1`` bucket. ``"series"``: the bucket fills to ``batch_size`` series
+    (Toto 2's geometry — a C=32 batch is ``batch_size×32`` sequences, so a
+    fixed token budget buys C× fewer optimizer steps). ``"sequences"``: the
+    bucket fills to ``max(1, batch_size // C)`` series, holding tokens-per-step
+    ~constant across C so every channel mix earns the same step count from the
+    same budget. Identical at ``C = 1`` by construction.
 
     History note (DEC-CA-0026): this used to reduce every series to channel 0
     (``s = s[0]``) while the stream billed all ``C`` channels against the token
@@ -343,7 +352,9 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int, batc
         buckets.setdefault(key, []).append(
             (s[:, -w:], None if mask is None else mask[:, -w:], roles)
         )
-        if len(buckets[key]) >= batch_size:
+        fill = (batch_size if batch_denomination == "series"
+                else max(1, batch_size // c))
+        if len(buckets[key]) >= fill:
             yield _stack(buckets.pop(key))
     for items in buckets.values():
         if items:
@@ -625,6 +636,7 @@ class Toto2Trainer:
         for arr in iter_training_batches(
             timed_stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
+            batch_denomination=getattr(contract, "batch_denomination", "series"),
         ):
             if deadline is None:             # first batch: training starts NOW
                 t0 = time.time()

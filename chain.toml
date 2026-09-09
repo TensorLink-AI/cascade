@@ -47,14 +47,9 @@ stream_stall_seconds = 1800
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
 # Per-series variates (DEC-CA-0041). 32 = Toto 2 training-width parity (owner
-# 2026-09-09). Measured at production shape (batch 64, L=4096, P=128, fp32,
-# AdamW+EMA): C=32 peaks 19.5 GB alloc / 21.4 GB reserved — fits a 24 GB
-# validator card with ~2 GB headroom, and scaling is LINEAR in C (variate
-# attention's (B·P,C,C) term is ~33 MB; time attention dominates). Per-token
-# it trains ~20% FASTER than the token-matched univariate packing, so the cap
-# costs no throughput. Eval-side mv_channels stays ≤ 8 (EVAL_POOL.md) — a
-# miner training wider than the eval windows accepts the regime-mismatch risk.
-# OOM self-polices: a challenger fault never re-queues (loop.py).
+# 2026-09-09). Measured: C=32 fits a 24 GB card at production shape (19.5 GB,
+# linear in C) and costs no per-token throughput. Eval-side mv_channels stays
+# ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
 max_channels         = 32
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
@@ -81,10 +76,8 @@ max_missing_frac     = 0.5
 # 0.999 targets ONLY the jitter-duplicate exploit. Keep off until the Stage 1
 # shadow telemetry (channel_telemetry.frac_over_0999) clears honest
 # generators; then shadow; enforce last. Meaningless at max_channels = 1.
-channel_corr_mode    = "shadow"  # Stage 1 telemetry armed with the C=32 cap raise
-                                 # (2026-09-09): meaningful now that C>1 is legal;
-                                 # labels only, drops nothing. Enforce waits on
-                                 # frac_over_0999 clearing honest generators.
+channel_corr_mode    = "shadow"  # armed with the C=32 raise: labels only, drops
+                                 # nothing; enforce waits on the shadow telemetry
 max_channel_corr     = 0.999
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
@@ -136,6 +129,12 @@ ref_throughput_tokens_per_s = 3700000  # 20x (2026-07-15): L40S is ~20x the old 
                                         # finishing the budget early; 20x the TOKEN budget, same 3h wall
 warmup_fraction             = 0.05
 batch_size                  = 64       # Toto 2.0 global batch size
+# ARMED with the C=32 raise (owner 2026-09-09; DEC-CA-0041): batch_size counts
+# SEQUENCES at C > 1 (a bucket fills to 64 // C series), so tokens-per-step is
+# ~constant and every channel mix earns the SAME ~152k steps from the leg
+# budget — the legacy "series" fill collapsed a C=32 leg to ~4.8k updates.
+# Bit-identical at C=1; digest-bound, rides this release's coordinated deploy.
+batch_denomination          = "sequences"
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
@@ -688,12 +687,10 @@ increment_from_block = 9043200  # = cohort_maxt_from_block
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
 # statistic agrees with the source-cluster bootstrap. Bit-identical on today's
-# univariate pool. ARMED 2026-09-09 (owner): 9064800 ≈ Mon 2026-09-14 08:30 UTC,
-# the first round boundary of Monday UTC — three days after the 9043200 window
-# (max-T + increment + funded go-live), so the two consensus flips never share a
-# deploy. CONSENSUS: every validator must run this release before the block, or
-# verdicts fork on the first MV-packed pool. Until an MV-packed pool publishes
-# (pool build --mv-pack), the flip is bit-identical on the univariate pool.
+# univariate pool. ARMED 2026-09-09 (owner): 9064800 ≈ Mon 2026-09-14 08:30 UTC
+# — deliberately 3 days after the 9043200 window so the consensus flips never
+# share a boundary; one release covers both. Bit-identical until an MV-packed
+# pool publishes (pool build --mv-pack).
 mv_score_from_block  = 9064800
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
