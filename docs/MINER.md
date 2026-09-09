@@ -751,6 +751,34 @@ result is the validator's receipt: `cascade duel` shows the decided pair, a
 `cohort` block listing every judged challenger with its geomean relative to the
 king, its LCB against the margin, and its per-horizon gaps.
 
+## Multivariate series (from 2026-09-09; scored from block 9064800)
+
+`max_channels` is now **32**: `generate()` may yield `(C, L)` arrays whose
+channels are the variates of one series (a 1-D yield is still one channel, and
+a pure-univariate generator remains fully legal and byte-identical to before).
+The economics, so you can plan a corpus:
+
+* **A channel costs what it trains** — a `(C, L)` series bills `C×L` points of
+  the token budget. There is no discount for width and no penalty either: the
+  per-point wall-clock cost is measured flat in `C`.
+* **Your step count does not depend on your channel mix.** Batches fill to
+  `batch_size // C` series (`batch_denomination = "sequences"`), so a C=32
+  corpus trains the same ~number of optimizer steps as a univariate one from
+  the same budget. Width buys cross-channel signal per step, not fewer steps.
+* **From block 9064800 (≈ Mon 2026-09-14 08:30 UTC) the duel scores
+  multivariate eval windows jointly**: the model forecasts all channels of a
+  window in one pass (sibling channels condition each other) and the window's
+  channels average into ONE per-window contribution. Until the eval pool
+  carries multivariate windows this changes nothing; once it does, a model
+  whose variate layers were trained on genuinely coupled data can earn on
+  them.
+* **What trains the variate layers is your data.** At `C = 1` the variate
+  attention receives no gradient at all; channels only teach cross-channel
+  structure if they are actually related. Stacking unrelated series into one
+  `(C, L)` array is legal but buys nothing the redundancy telemetry won't
+  eventually price (`channel_corr_mode` is in shadow now; enforcement follows
+  calibration).
+
 ## Common failures
 
 | symptom | cause |
