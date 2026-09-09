@@ -333,3 +333,68 @@ the coupled arm's coupling is a linear lagged DAG, so the 14.6% is specific to
 that mechanism. All arms still sit above the king (0.392 vs 0.321) after 240s of
 fine-tuning, so these are short-run deltas between matched arms, not forecasts
 of a settled round.
+
+## RETRACTION: the coupling gain does not survive real data (2026-09-09)
+
+The dose-response above (1.4% at coupling 0.3 rising to 7.5% at 2.4, and the
+resulting ">=3% joint-vs-marginal lift" admission threshold for A1) was measured
+on the reference generator, whose coupling is a SINGLE mechanism: linear, lagged,
+additive (`out[k, d:] += w * out[p, :-d]`). Random structure, homogeneous
+relationships. CauKer / TempoPFN mix mechanism types per edge — nonlinear warps,
+threshold and regime switches, multiplicative interactions. Real coupling is of
+that kind.
+
+Re-measured on **GIFT-Eval's genuinely multivariate configs** — which the
+benchmark sidecar discards (`suites/_common.py` sets
+`to_univariate = probe.target_dim != 1`) but which load fine with
+`to_univariate=False`: ETT1/ETT2 (transformer, dim 7), Jena weather (dim 21),
+bizitobs_l2c (dim 7), bitbrains (dim 2). Scored through the duel statistic, with
+`marginal` = the deployed wrapper's batch path and `joint` = the identical
+tensor reshaped so the variate axis carries the channels. Verified identical at
+C=1 (`max|joint-marginal| = 0.000e+00`), so any difference is the variate axis
+alone.
+
+           arm    marginal       joint   joint gain %
+          king    0.429918    0.432022      -0.489
+            c1    0.507820    0.506166      +0.326
+            c8    0.513433    0.513265      +0.033
+    c8_coupled    0.543250    0.543404      -0.028
+
+**No model extracts cross-channel information from real multivariate data.**
+All four sit within +/-0.5%, and the per-config breakdown ranges -8.2% to +8.2%
+with the sign flipping between datasets — noise, not signal. The C=8-trained arm
+is no better than the univariate one, and `c8_coupled` (trained on the synthetic
+linear coupling) is the WORST of the four on real MV data: fitting the wrong
+coupling prior actively hurts.
+
+**Consequences.**
+
+* The ">=3% lift" A1 admission threshold is withdrawn. It is not a bar real data
+  has been shown to clear, because no available model can express the lift at
+  all. Do not calibrate forge harvesting against it.
+* The synthetic dose-response measures how well variate attention exploits one
+  linear mechanism. It is not evidence about real coupling and should not be
+  quoted as such.
+* This is NOT proof the capability is unlearnable: every model tested saw either
+  no coupling (`c8`) or linear-lag coupling (`c8_coupled`), and all arms are
+  240s fine-tunes. Training on genuinely mixed-mechanism multivariate data is
+  untested and is the branch that could change the answer.
+
+## Wrapper blocker: the joint path is unreachable in production
+
+`_FORECAST_WRAPPER_PY` in `toto2_trainer.py` — byte-identical to the wrapper
+shipped inside the gen-7 king checkpoint (8686 bytes) — exposes only
+`forecast(history_1d, ...)`. It has no `forecast_joint`. `load_forecaster`
+supports a joint path ("wrappers exposing `forecast_joint` are called once per
+window with all channels") but **no checkpoint the trainer produces can trigger
+it**; archived 1-D wrappers are lifted through the per-channel adapter.
+
+So even with `mv_score_from_block` armed and coupled windows in the pool, every
+channel would be forecast independently and `collapse_channels_by_window` would
+average per-channel scores of a per-channel forecaster. Multivariate would earn
+exactly zero by construction.
+
+Cheap to fix when it is wanted: `compute_base_arch_digest` hashes the ARCH
+fields plus `toto2_model.py` only, not `forecast_wrapper.py`, so adding
+`forecast_joint` to the template is additive and does not force a contract cut.
+It is nevertheless a hard prerequisite for Phase 4 that Phase 0 did not address.
