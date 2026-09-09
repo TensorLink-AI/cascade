@@ -629,7 +629,8 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     # joint bound and re-decide the win — so the cohort_lcbs check below
     # verifies the numbers that actually decided the round. Bonferroni rounds
     # (and every pre-gate round) skip this untouched.
-    if cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
+    use_maxt = cohort_maxt_active(cfg.scoring, receipt.epoch_start_block)
+    if use_maxt:
         from ..eval.koth import with_cohort_lcb
 
         try:
@@ -675,8 +676,13 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 f"observed geomean and no public-benchmark gate is recorded")
     if problems:
         return _fail(name, "; ".join(problems))
-    return _ok(name, f"{len(duelled)} challengers replayed at alpha="
-                     f"{duel_params.bootstrap_alpha:.5f} (={params.bootstrap_alpha:.4f}/{k}); "
+    rule = (
+        f"cohort max-T family-wise correction (DEC-CA-0038, alpha="
+        f"{params.bootstrap_alpha:.4f})" if use_maxt else
+        f"Bonferroni alpha={duel_params.bootstrap_alpha:.5f} "
+        f"(={params.bootstrap_alpha:.4f}/{k})"
+    )
+    return _ok(name, f"{len(duelled)} challengers replayed under {rule}; "
                      f"{len(clearers)} cleared; crowned {crowned[:12]}")
 
 
@@ -713,10 +719,19 @@ def _cohort_stats_problems(published: dict | None, replayed: list) -> list[str]:
                 rec.get("wilcoxon_p"), want["wilcoxon_p"]):
             problems.append(f"published wilcoxon_p for {hk} is {rec.get('wilcoxon_p')} "
                             f"but replays as {want['wilcoxon_p']}")
+        # per_domain_win_rate is a non-gating diagnostic, and unlike the
+        # bootstrap inputs the window's DOMAIN label is not carried on the
+        # receipt (``WindowScoreRecord`` keeps only the cluster ``source``). So
+        # a Tier-0 replay collapses every window into the ``"unknown"`` bucket
+        # and cannot reconstruct the published split — the same Tier-0 limit the
+        # gift-gate sidecar has. Compare it only when the replay actually
+        # resolved domains (a future receipt that carries them), exactly as
+        # ``wilcoxon_p`` above is compared only when the replay could compute one.
         got_pd, want_pd = rec.get("per_domain_win_rate") or {}, want.get("per_domain_win_rate") or {}
-        if set(got_pd) != set(want_pd) or any(
+        replay_resolved_domains = bool(want_pd) and set(want_pd) != {"unknown"}
+        if replay_resolved_domains and (set(got_pd) != set(want_pd) or any(
                 not _close(got_pd[d][0], want_pd[d][0]) or int(got_pd[d][1]) != int(want_pd[d][1])
-                for d in want_pd):
+                for d in want_pd)):
             problems.append(f"published per_domain_win_rate for {hk} does not replay")
     return problems
 

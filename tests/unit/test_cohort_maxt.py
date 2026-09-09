@@ -5,9 +5,12 @@ the king's scores and one window draw — strongly positively correlated tests,
 where the union bound is loose. :func:`cohort_maxt_lcbs` reads the critical
 value off the ACTUAL joint spread instead. These tests pin the three things
 that make it a legitimate replacement: it reduces EXACTLY to the deployed
-single-challenger LCB at k=1, it sits BETWEEN Bonferroni and no-correction for
-k>1, and its false-dethrone rate lands at alpha (not far below, like
-Bonferroni) under the cohort's real correlation.
+single-challenger LCB at k=1, it sits between Bonferroni and no-correction for
+k>1 IN EXPECTATION (an ensemble property — on any single draw the
+studentised-basic bound can fall on either side of the percentile-alpha/k
+Bonferroni bound; see ``test_maxt_between_is_an_expectation_not_a_per_draw_law``),
+and its false-dethrone rate lands at alpha (not far below, like Bonferroni)
+under the cohort's real correlation.
 """
 from __future__ import annotations
 
@@ -62,9 +65,12 @@ def test_maxt_reduces_to_the_single_lcb_at_k1():
 
 
 def test_maxt_sits_between_bonferroni_and_uncorrected():
-    """For the best challenger of a real cohort: Bonferroni (alpha/k) is the
-    lowest bound, no-correction (alpha) the highest, and the max-T strictly
-    between — it spends the correlation Bonferroni throws away."""
+    """In the TIGHT/correlated regime (a homogeneous cohort — the common case):
+    Bonferroni (alpha/k) is the lowest bound, no-correction (alpha) the highest,
+    and the max-T between — it spends the correlation Bonferroni throws away.
+    This ordering is the TYPICAL case, not a per-draw law: on a wide/skewed
+    heterogeneous cohort it can invert (see
+    ``test_maxt_between_is_an_expectation_not_a_per_draw_law``)."""
     n, k = 80, 6
     king = _components(n, 9, 1.0, 100)
     king = (king[0], king[1], king[2])
@@ -130,3 +136,42 @@ def test_maxt_empty_and_order_preserved():
     b = (_components(40, 9, 0.95, 3)[0], king[1], _components(40, 9, 0.95, 3)[2])
     ls = cohort_maxt_lcbs(king, [a, b], B=1000, seed="o")
     assert len(ls) == 2 and ls[0] > ls[1]   # the clearly-better challenger has the higher LCB
+
+
+def _hetero_cohort(seed, sigma_dom, sigma_weak, n=80, num_q=9):
+    """A cohort sharing one per-window difficulty (the real positive
+    correlation) with independent idiosyncratic noise: one strong low/high-var
+    challenger + two weak. Returns (king, [dom, w1, w2]) as bootstrap
+    components."""
+    rng = np.random.default_rng(seed)
+    d = rng.uniform(0.5, 1.5, n)                     # shared window difficulty
+    def comp(factor, sigma, s2):
+        v = d * factor * np.exp(np.random.default_rng(s2).normal(0, sigma, n))
+        return np.repeat(v[:, None], num_q, axis=1), np.ones(n), v.copy()
+    king = comp(1.0, 0.3, seed * 7 + 1)
+    dom = comp(0.85, sigma_dom, seed * 7 + 2)
+    w1 = comp(1.00, sigma_weak, seed * 7 + 3)
+    w2 = comp(1.02, sigma_weak, seed * 7 + 4)
+    return king, [dom, w1, w2]
+
+
+def test_maxt_between_is_an_expectation_not_a_per_draw_law():
+    """max-T is between Bonferroni and uncorrected IN EXPECTATION, not on every
+    draw. Over many wide/heterogeneous cohorts: (1) on average its bound is
+    >= Bonferroni's (it frees the king — the whole point), but (2) on individual
+    draws it lands on BOTH sides of Bonferroni. Guards against re-introducing the
+    false 'always sits between' claim (a live testnet cohort, round 17856…, had
+    max-T below Bonferroni — a normal minority draw)."""
+    alpha, k, B, N = 0.05, 3, 2000, 30
+    gaps = []
+    for s in range(N):
+        king, chals = _hetero_cohort(s, sigma_dom=0.5, sigma_weak=0.5)
+        j = int(np.argmax([_point_estimate(king, c) for c in chals]))
+        bonf = paired_bootstrap_lcb_aggregated(*king, *chals[j], alpha=alpha / k,
+                                               B=B, seed="b")
+        maxt = cohort_maxt_lcbs(king, chals, alpha=alpha, B=B, seed="b")[j]
+        gaps.append(maxt - bonf)
+    gaps = np.array(gaps)
+    assert gaps.mean() >= 0.0, f"max-T should be >= Bonferroni on average, mean gap {gaps.mean():.5f}"
+    assert (gaps < 0).any(), "expected some draws with max-T below Bonferroni (not a per-draw law)"
+    assert (gaps >= 0).any(), "expected some draws with max-T at/above Bonferroni"

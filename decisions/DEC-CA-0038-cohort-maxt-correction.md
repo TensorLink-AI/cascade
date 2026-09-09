@@ -34,8 +34,26 @@ Exact under the real correlation: at ρ→1 `D` collapses to a single
 challenger's deviation (no correction); at ρ→0 it widens to the true max of k
 — never the fixed `α/k` tail. It reduces BIT-IDENTICALLY to the deployed
 percentile LCB at k = 1 (the SE cancels), so single-challenger rounds — every
-round before cohorts — never change, and it always sits BETWEEN Bonferroni
-(lowest bound) and no correction (highest).
+round before cohorts — never change, and IN EXPECTATION it sits between
+Bonferroni (the more conservative bound on average) and no correction. That is
+an ensemble property, not a per-draw guarantee: on any single cohort the
+studentised-basic bound can land on EITHER side of the percentile-α/k
+Bonferroni bound (a wide/left-skewed resample is where the two constructions
+diverge). A live testnet cohort (round 17856…, k=3) did exactly this — max-T
+0.012 vs Bonferroni 0.020 — a minority draw, not a flaw. What a Monte-Carlo
+study (1000 trials) does and does NOT show: no correction is badly
+anti-conservative (false-dethrone rate ~0.15 vs a 0.05 target — correcting is
+mandatory); max-T and Bonferroni are INDISTINGUISHABLE on FWER at feasible
+sample sizes (e.g. σ=0.4: 0.070±0.008 vs 0.062±0.008 — within one SE), with
+max-T marginally the less conservative, as WY step-down is under positive
+correlation; and on wide/skewed cohorts BOTH run somewhat above nominal α — a
+percentile-bootstrap coverage limitation the max-T shares with the deployed
+Bonferroni rule, not a regression it introduces. So the justification for
+max-T over Bonferroni is the THEORY (exactness under the observed correlation;
+no arbitrary α/k) plus its being a NON-REGRESSING, slightly-less-conservative
+drop-in — NOT a demonstrated FWER improvement, which these sample sizes cannot
+resolve. Across draws max-T's bound is higher than Bonferroni's on average
+(P(max-T < Bonferroni) ≈ 0.3); the per-round ordering is not fixed.
 
 Two refinements the naive form gets wrong, both pinned by tests
 (`tests/unit/test_cohort_maxt.py`): (1) it is CENTRED (basic bootstrap), not a

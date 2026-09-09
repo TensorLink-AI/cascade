@@ -693,3 +693,58 @@ def test_cohort_maxt_active_path_validator_to_audit(cfg):
     # replaying under Bonferroni (gate off) does NOT reproduce them.
     off = replace(cfg, scoring=replace(cfg.scoring, cohort_maxt_from_block=0))
     assert C.check_duel_cohort(receipt, off).status == C.FAIL
+
+
+def test_audit_ignores_per_domain_that_the_receipt_cannot_replay(cfg):
+    """per_domain_win_rate is a non-gating diagnostic and the window's DOMAIN
+    label is NOT carried on the receipt (``WindowScoreRecord`` keeps only the
+    cluster ``source``). A real cohort round therefore publishes a real-domain
+    split that a Tier-0 replay — rebuilding domain-less scores — collapses to a
+    single ``unknown`` bucket and cannot reproduce. The audit must not fail the
+    round on that.
+
+    Regression: the first live k=3 testnet cohort under DEC-CA-0038 failed
+    ``duel-cohort`` on exactly this, the verdict itself reproducing cleanly.
+    """
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    doms = ["econ_fin", "energy", "healthcare", "nature", "sales"]
+    king = [dc_replace(s, domain=doms[i % len(doms)])
+            for i, s in enumerate(_scores(1.0, 0))]
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    # The validator recorded a genuine multi-domain split at scoring time …
+    pub = receipt.verdict.cohort_stats["a_hk"]["per_domain_win_rate"]
+    assert set(pub) - {"unknown"}, "expected real domain names in the published split"
+    # … which the domain-less receipt cannot replay, yet the audit still passes.
+    assert C.check_duel_cohort(receipt, cfg).status == C.PASS
+
+
+def test_cohort_stats_guard_skips_unresolved_but_flags_resolved_mismatch():
+    """The per_domain guard is narrow: it tolerates ONLY the unreplayable case
+    (the replay collapsed to ``unknown``), and still hard-fails a real
+    disagreement when the replay actually resolved domains — so the guard cannot
+    be used to smuggle a doctored split past the audit."""
+    from dataclasses import replace
+
+    from cascade.audit.checks import _cohort_stats_problems
+    from cascade.eval.koth import RoundResult
+    from cascade.shared.receipt import cohort_stats_of
+
+    res = RoundResult(challenger_wins_round=False, lcb=0.0, margin=0.02,
+                      n_windows=100, king_geomean=1.0, chal_geomean=0.9,
+                      inconclusive=False, win_rate=0.5, boot_p50=0.1, boot_p95=0.2,
+                      per_domain_win_rate={"unknown": (0.5, 100)})
+    # Published a real-domain split; the domain-less replay is all 'unknown'.
+    published = dict(cohort_stats_of(res))
+    published["per_domain_win_rate"] = {"nature": [0.6, 60], "sales": [0.35, 40]}
+    assert _cohort_stats_problems({"a": published}, [("a", res)]) == []
+
+    # Replay DID resolve domains and one disagrees → still a hard failure.
+    res2 = replace(res, per_domain_win_rate={"nature": (0.9, 60), "sales": (0.35, 40)})
+    pub2 = dict(cohort_stats_of(res2))
+    pub2["per_domain_win_rate"] = {"nature": [0.6, 60], "sales": [0.35, 40]}
+    probs = _cohort_stats_problems({"a": pub2}, [("a", res2)])
+    assert any("per_domain_win_rate" in p for p in probs)
