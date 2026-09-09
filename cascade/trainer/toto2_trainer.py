@@ -1179,6 +1179,10 @@ decodes the full horizon in one forward pass via contiguous patch masking
   forecast(history, horizon, num_samples) -> (1, num_samples, horizon)
       the cascade validator contract — sample paths drawn once from the
       decoded quantiles (seeded per window for validator consensus).
+  forecast_joint(history_2d, horizon, num_samples) -> (C, num_samples, horizon)
+      the multivariate contract: all channels decoded in ONE pass so the
+      variate-attention layers can condition across them. Identical to
+      forecast() at C = 1.
   forecast_quantiles(history, horizon) -> (1, horizon, num_q)
   forecast_quantiles_batch(histories, horizon) -> (B, horizon, num_q)
       the quantile head directly — what benchmark CRPS consumes; batched
@@ -1248,10 +1252,13 @@ class Wrapper:
         return torch.as_tensor(np.stack(rows), dtype=torch.float64, device=self.device)
 
     @torch.no_grad()
-    def _decode_block_z(self, z, block: int):
+    def _decode_block_z(self, z, block: int, joint: bool = False):
         """One CPM forward pass: append ``block`` masked patches to the
         normalized context ``(B, L)`` and read their z-space quantiles
-        ``(B, block*patch_size, num_q)``."""
+        ``(B, block*patch_size, num_q)``.
+
+        ``joint`` treats the ``B`` rows as the VARIATES of a single series
+        instead of independent series."""
         ps = self.cfg.patch_size
         # keep as much context as the positional table allows
         ctx_p = min(z.shape[1] // ps, self.cfg.max_patches - block)
@@ -1259,7 +1266,15 @@ class Wrapper:
         filler = torch.zeros(z.shape[0], block, ps, dtype=ctx.dtype, device=self.device)
         mask = torch.zeros(z.shape[0], ctx_p + block, dtype=ctx.dtype, device=self.device)
         mask[:, ctx_p:] = 1.0
-        pred = self.model(torch.cat([ctx, filler], dim=1), mask=mask)
+        patches = torch.cat([ctx, filler], dim=1)
+        if joint:
+            # rows are VARIATES of ONE series: (1, C, P, ps) lets the variate
+            # attention layers condition across channels. At C = 1 this is
+            # numerically identical to the batch path below (the model squeezes
+            # a singleton variate axis), which the unit tests pin.
+            pred = self.model(patches.unsqueeze(0), mask=mask.unsqueeze(0))[0]
+        else:
+            pred = self.model(patches, mask=mask)
         # position i predicts patch i+1 → the horizon patches come from
         # positions ctx_p-1 .. ctx_p+block-2.
         q = pred[:, ctx_p - 1 : ctx_p + block - 1]          # (B, block, ps, nq)
@@ -1267,7 +1282,7 @@ class Wrapper:
         return q.reshape(z.shape[0], block * ps, -1)
 
     @torch.no_grad()
-    def _decode_quantiles(self, x, horizon: int):
+    def _decode_quantiles(self, x, horizon: int, joint: bool = False):
         """Block-decode real-space quantiles ``(B, horizon, num_q)`` from the
         real-space context ``x`` ``(B, L)``.
 
@@ -1293,7 +1308,7 @@ class Wrapper:
             if lo is None:
                 lo = x.min(dim=-1, keepdim=True).values.unsqueeze(-1) - 1e4 * scale
                 hi = x.max(dim=-1, keepdim=True).values.unsqueeze(-1) + 1e4 * scale
-            qz = self._decode_block_z(z.to(torch.float32), block)
+            qz = self._decode_block_z(z.to(torch.float32), block, joint)
             q = torch.sinh(qz.double()) * scale + loc       # (B, block*ps, nq)
             q = torch.clamp(q, min=lo, max=hi)
             out.append(q)
@@ -1346,4 +1361,58 @@ class Wrapper:
         frac = ((u.double() - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
         out = vl + frac * (vh - vl)                         # (ns, h)
         return out.detach().cpu().numpy().reshape(1, int(num_samples), int(horizon))
+
+    # ── multivariate contract (DEC-CA-0041) ──────────────────────────────────
+
+    @torch.no_grad()
+    def forecast_joint(self, history, horizon: int, num_samples: int) -> np.ndarray:
+        """Forecast ALL channels of a ``(C, L)`` window in one pass →
+        ``(C, num_samples, horizon)``.
+
+        The validator prefers this over :meth:`forecast` when present
+        (``cascade.validator.evaluator.load_forecaster``): the C rows are fed as
+        the VARIATE axis of a single series, so the backbone's variate-attention
+        layers can condition each channel on its siblings. Without it a
+        multivariate window is scored one channel at a time through the
+        per-channel adapter and cross-channel structure cannot be used at all.
+
+        At ``C = 1`` this is numerically identical to :meth:`forecast` — same
+        context prep, same block decode, same seed, same inverse-CDF draws — so
+        univariate rounds are unaffected. The unit tests pin that equality.
+        """
+        hist = np.atleast_2d(np.asarray(history, dtype=np.float64))
+        if hist.ndim != 2:
+            raise ValueError(f"history must be (C, L) or (L,); got {hist.shape}")
+        n_ch = int(hist.shape[0])
+        # Same seed recipe as forecast(): at C = 1 the bytes are identical, so
+        # the two paths draw the same uniforms and agree exactly.
+        seed_src = (np.ascontiguousarray(hist).tobytes()
+                    + int(horizon).to_bytes(8, "big") + int(num_samples).to_bytes(8, "big"))
+        seed = int.from_bytes(hashlib.sha256(seed_src).digest()[:8], "big") & ((1 << 63) - 1)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed)
+
+        q_all = self._decode_quantiles(
+            self._prep(list(hist)), horizon, joint=True
+        )                                                   # (C, h, nq) real-space
+        nq = q_all.shape[-1]
+        levels = self.levels
+        # One shared draw matrix across channels: paired Monte-Carlo still holds
+        # king vs challenger, and every channel of a window sees the same paths.
+        u = torch.rand(int(num_samples), int(horizon), device=self.device, generator=generator)
+        idx = torch.searchsorted(levels, u.clamp(levels[0].item(), levels[-1].item()))
+        idx = idx.clamp(1, nq - 1)
+        i_lo = idx - 1
+        i_hi = idx
+        ql = levels[i_lo].double()
+        qh = levels[i_hi].double()
+        frac = ((u.double() - ql) / (qh - ql).clamp_min(1e-8)).clamp(0, 1)
+        rows = []
+        for c in range(n_ch):
+            qe = q_all[c].unsqueeze(0).expand(u.shape[0], -1, -1)   # (ns, h, nq)
+            vl = torch.gather(qe, -1, i_lo.unsqueeze(-1)).squeeze(-1)
+            vh = torch.gather(qe, -1, i_hi.unsqueeze(-1)).squeeze(-1)
+            rows.append(vl + frac * (vh - vl))
+        out = torch.stack(rows, dim=0)                      # (C, ns, h)
+        return out.detach().cpu().numpy().reshape(n_ch, int(num_samples), int(horizon))
 '''
