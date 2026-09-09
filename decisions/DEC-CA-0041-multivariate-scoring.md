@@ -398,3 +398,67 @@ Cheap to fix when it is wanted: `compute_base_arch_digest` hashes the ARCH
 fields plus `toto2_model.py` only, not `forecast_wrapper.py`, so adding
 `forecast_joint` to the template is additive and does not force a contract cut.
 It is nevertheless a hard prerequisite for Phase 4 that Phase 0 did not address.
+
+## Can synthetic coupling teach variate attention? Not in this harness (2026-09-09)
+
+After verifying what the literature actually does (see the retraction above),
+`cascade/interface/mv_coupling.py` was rebuilt from the published mechanisms:
+TimePFN's linear coregionalization, Chronos-2's cotemporaneous *nonlinear*
+variant, and lagged causal edges through CauKer's real activation bank (linear,
+relu, sigmoid, sine, modulo, leaky-relu) with its concat-then-random-linear
+aggregation. Chronos-2 is the encouraging precedent: it relies ENTIRELY on
+synthetic data for multivariate ability and reports synthetic-only matching
+real+synthetic hybrids. (Toto 2.0 by contrast gets multivariate skill from real
+telemetry; its synthetic half is TempoPFN, which is univariate.)
+
+Trained the gen-7 king on the king's OWN generator corpus with that coupling —
+150k steps, batch 64, C=8, lr 5e-4, warm-started from `weights_stable`,
+EMA-scored, and (per Chronos-2) a 50/50 MIX of univariate and multivariate
+tasks. Scored joint-vs-marginal on GIFT-Eval's genuinely multivariate configs.
+
+    joint gain % (higher better; joint beating marginal)
+      v2 @25k  (100% multivariate)   -4.02
+      v3 @50k  (50/50 mix)           -1.65
+      v3 @75k                        -1.14
+      v3 @100k                       -1.83
+      v3 @125k                       -2.11
+      v3 @150k                       -1.30
+      untouched king (variate Q/K at random init)   -0.49
+
+**Joint never beat marginal, and never even reached the untrained baseline.**
+Mixing the task (v3 vs v2) helped substantially, which supports the Chronos-2
+recipe detail, but the gap plateaued around -1.5% rather than crossing zero.
+
+**This also refutes the "harmless floor" argument** that made the incentive look
+safe: an MV-trained model was expected to at worst learn to neutralise its
+variate layer (joint approximately equals marginal), leaving univariate-only
+miners stuck at the -0.49% random-init penalty they cannot remove. Instead MV
+training landed WORSE than random — the model learns to expect a coupling
+structure real windows do not have and mis-applies it.
+
+**What this cannot conclude.** The harness degrades the king regardless of data:
+the pure-univariate arm on the king's own in-distribution corpus also fell
+(0.321 -> 0.392 on the real pool). Training here is plain AdamW at flat LR with
+fresh optimiser state; production is NorMuon + Polar Express under u-muP with a
+wsd schedule and warm-start optimiser continuity. So "synthetic coupling does
+not transfer" and "this fine-tuning recipe is destructive" are both consistent
+with these numbers. The within-model joint-vs-marginal gap is immune to that
+(same weights, same context, only the variate axis differs), which is why it is
+the quoted statistic — but the absolute geomeans are not evidence about
+coupling.
+
+**Next experiment, if pursued:** run the PRODUCTION trainer on a multivariate
+corpus — real optimiser, schedule and warm-start path — rather than a hand-rolled
+loop. That is the only test that could reverse this.
+
+**Standing recommendation: keep `max_channels = 1` and `mv_score_from_block = 0`.**
+Arming now would tax univariate-only miners ~0.5% (their random variate weights
+cannot be neutralised) while rewarding MV-trained miners nothing — a tax, not an
+incentive. Worse, if scoring did reward synthetic coupling that happens to match
+the pool's real coupling, that is pool-fitting by luck: miners cannot see the
+private pool, so a lead-lag prior would win or lose on the pool's composition
+rather than on skill.
+
+**Unblocked meanwhile:** `forecast_joint` now ships in the wrapper template
+(commit 5970c5f), so the inference side is no longer the blocker whenever the
+production-trainer test is run.
