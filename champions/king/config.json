@@ -1,0 +1,57 @@
+{
+  "name": "aresmix-gpheavy",
+  "min_length": 64,
+  "max_length": 2048,
+  "generate_length": 2048,
+  "batch_size": 64,
+  "standardize": false,
+  "clip_sigma": 0.0,
+  "max_abs_value": 1000000.0,
+  "length_mixture": [
+    [
+      0.15,
+      64,
+      192
+    ],
+    [
+      0.3,
+      192,
+      768
+    ],
+    [
+      0.55,
+      768,
+      2048
+    ]
+  ],
+  "weights": {
+    "forecast_pfn": 0.3,
+    "fastgp": 0.5,
+    "fgn": 0.1,
+    "realistic": 0.1
+  },
+  "family_params": {
+    "fastgp": {
+      "grid": 256,
+      "max_compositions": 3,
+      "samples_per_chol": [
+        6,
+        16
+      ]
+    }
+  },
+  "post": {
+    "scale": [
+      0.01,
+      1000.0
+    ],
+    "positive_scale": [
+      0.05,
+      100.0
+    ],
+    "p_offset": 0.6,
+    "time_warp_prob": 0.1,
+    "damping_prob": 0.08,
+    "spike_prob": 0.1
+  }
+}

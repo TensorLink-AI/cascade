@@ -277,3 +277,54 @@ def test_launch_is_fire_and_forget(monkeypatch):
     t = launch_post_round_benchmark(HOST, "42", "toto2-4m", BenchPlan())
     t.join(timeout=10)
     assert not t.is_alive()
+
+
+# ── DEC-CA-0036: benching on a payer's (isolated) pod ─────────────────────────
+
+def test_isolated_host_gets_no_hf_token(monkeypatch):
+    """A payer pod is credential-free: the operator's HF_TOKEN never arms the
+    stdin sourcing there, however the environment is set."""
+    monkeypatch.setenv("HF_TOKEN", "hf_operator_secret")
+    from dataclasses import replace
+
+    seen = []
+
+    def runner(argv, timeout):
+        seen.append(argv[-1])
+        return CompletedProcess(argv, 1, stdout="", stderr="")
+
+    run_post_round_benchmark(replace(HOST, isolated=True), "42", "toto2-4m",
+                             BenchPlan(), runner=runner)
+    assert seen and "/dev/stdin" not in seen[0]
+    seen.clear()
+    run_post_round_benchmark(HOST, "42", "toto2-4m", BenchPlan(), runner=runner)
+    assert "/dev/stdin" in seen[0]   # the operator's own pod still sources it
+
+
+def test_push_checkpoint_stages_at_the_role_path_and_wipes_first(tmp_path: Path):
+    from cascade.trainer.bench_hook import push_checkpoint, role_paths
+
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append(argv[-1])
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    dest = push_checkpoint(HOST, tmp_path, "42", "toto2-4m", "challenger-u3-verify",
+                           runner=runner)
+    ckpt, _ = role_paths(HOST, "42", "toto2-4m", "challenger-u3-verify")
+    assert dest == ckpt
+    (remote,) = calls
+    assert remote.startswith(f"rm -rf {ckpt} && mkdir -p {ckpt} && tar -C {ckpt} -xf -")
+
+
+def test_push_checkpoint_raises_on_a_failed_stream(tmp_path: Path):
+    import pytest
+
+    from cascade.trainer.bench_hook import push_checkpoint
+
+    def runner(argv, timeout):
+        return CompletedProcess(argv, 255, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="checkpoint push"):
+        push_checkpoint(HOST, tmp_path, "42", "toto2-4m", "king-verify", runner=runner)

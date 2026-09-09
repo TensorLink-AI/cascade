@@ -35,7 +35,8 @@ class EvaluatorError(RuntimeError):
 
 
 def load_forecaster(
-    checkpoint_dir: Path | str, *, device: str = "cpu"
+    checkpoint_dir: Path | str, *, device: str = "cpu", contract=None,
+    trust_checkpoint_code: bool = False,
 ) -> JointForecastFn:
     """Import ``forecast_wrapper.Wrapper`` from a trained checkpoint and return
     a numpy JOINT forecaster ``f(history_2d, horizon, num_samples) -> (C, m, H)``.
@@ -44,10 +45,24 @@ def load_forecaster(
     channels; archived 1-D wrappers (``forecast`` only) are lifted through the
     permanent per-channel adapter — numerically identical at ``C = 1``.
 
-    The wrapper is owner-produced and trusted; no static guard or sandbox is
-    applied here (unlike the miner-controlled generators on the trainer side).
+    The checkpoint is DATA, not code: under miner-funded compute it comes off
+    a pod the miner controls, so before anything is imported the guard
+    (:mod:`cascade.eval.checkpoint_guard`) requires the shipped
+    ``forecast_wrapper.py`` / ``model.py`` to be byte-identical to this
+    release's copies, refuses any other ``.py``, and — when ``contract`` is
+    given — pins ``config.json`` and the weights header to the contract's
+    model before a tensor is allocated. ``trust_checkpoint_code=True`` skips
+    the guard and is for ARCHIVED, operator-produced checkpoints only (audit
+    of pre-guard rounds whose wrapper predates this release).
     """
     d = Path(checkpoint_dir)
+    if not trust_checkpoint_code:
+        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+
+        try:
+            verify_checkpoint(d, contract)
+        except CheckpointTampered as e:
+            raise EvaluatorError(f"checkpoint_tampered: {e}") from e
     wrapper_py = d / "forecast_wrapper.py"
     if not wrapper_py.is_file():
         raise EvaluatorError(f"missing forecast_wrapper.py in {d}")
@@ -107,8 +122,13 @@ def evaluate_checkpoint(
     *,
     num_samples: int,
     device: str = "cpu",
+    contract=None,
+    trust_checkpoint_code: bool = False,
 ) -> list[WindowScore]:
     """Load the checkpoint and score it on ``windows``. Convenience wrapper over
-    :func:`load_forecaster` + :func:`score_joint_forecaster_on_windows`."""
-    forecast_fn = load_forecaster(checkpoint_dir, device=device)
+    :func:`load_forecaster` + :func:`score_joint_forecaster_on_windows`.
+    ``contract`` (the entry's TrainingContractConfig) arms the full ingest
+    guard — every live scorer should pass it."""
+    forecast_fn = load_forecaster(checkpoint_dir, device=device, contract=contract,
+                                  trust_checkpoint_code=trust_checkpoint_code)
     return score_joint_forecaster_on_windows(forecast_fn, windows, num_samples)

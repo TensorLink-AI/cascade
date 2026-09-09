@@ -397,3 +397,185 @@ def test_load_hosts_parses_and_validates_stage(tmp_path):
     p.write_text('[[host]]\nname="x"\nhost="10.0.0.9"\nstage="warmup"\n', encoding="utf-8")
     with pytest.raises(RemoteDispatchError, match="stage"):
         load_hosts(p)
+
+
+def test_scp_argv_carries_the_pinned_host_key_policy():
+    """A file copy to a pinned host must be exactly as strict as a command:
+    an accept-new scp would be the one hole in the leg's identity pin."""
+    from cascade.trainer.remote import build_scp_argv, build_ssh_argv
+
+    pinned = RemoteHost(name="p", host="10.0.0.5", port=2222, key_path="/k",
+                        pinned_host_key="ssh-ed25519 AAAAtest", ssh_options=("X=1",))
+    scp = build_scp_argv(pinned, "/tmp/a.zip", "/workspace/a.zip")
+    ssh = build_ssh_argv(pinned, "true")
+    assert scp[0] == "scp" and scp[-2:] == ["/tmp/a.zip", "root@10.0.0.5:/workspace/a.zip"]
+    # same options, -p → -P, pin first so nothing later can loosen it
+    assert scp[1:-2] == ["-P" if a == "-p" else a for a in ssh[1:-2]]
+    assert scp[1:3] == ["-P", "2222"]
+    assert "StrictHostKeyChecking=yes" in scp
+    assert "StrictHostKeyChecking=accept-new" not in scp
+    plain = build_scp_argv(RemoteHost(name="q", host="h"), "/a", "/b")
+    assert "StrictHostKeyChecking=accept-new" in plain
+
+
+# ── DEC-CA-0036: credential-free pods (--local-only + harvest) ───────────────
+
+def test_worker_argv_local_only_flag():
+    from cascade.trainer.remote import worker_argv
+
+    h = RemoteHost(name="p", host="h")
+    base = worker_argv(h, gen_ref="ns/g@sha256:" + "a" * 64, uid=1, hotkey="hk",
+                       role="challenger", base_seed=7, block=9, trainer_spec="m:C")
+    assert "--local-only" not in base
+    local = worker_argv(h, gen_ref="ns/g@sha256:" + "a" * 64, uid=1, hotkey="hk",
+                        role="challenger", base_seed=7, block=9, trainer_spec="m:C",
+                        local_only=True)
+    assert "--local-only" in local
+
+
+def test_receipt_to_local_roundtrip_and_missing_dir_fails():
+    import pytest
+
+    from cascade.trainer.remote import (
+        RemoteDispatchError,
+        receipt_to_local,
+    )
+
+    good = {"miner_hotkey": "hk", "miner_uid": 3, "role": "challenger",
+            "gen_ref": "ns/g@sha256:" + "a" * 64, "corpus_digest": "cd",
+            "train_block": 12, "gpu_name": "RTX4090", "size": "toto2-4m",
+            "local_checkpoint_dir": "/root/cascade/_train_work/7/toto2-4m/challenger/checkpoint"}
+    r = receipt_to_local(good)
+    assert r.checkpoint_dir.endswith("/checkpoint") and r.miner_uid == 3
+    with pytest.raises(RemoteDispatchError):
+        receipt_to_local({k: v for k, v in good.items() if k != "local_checkpoint_dir"})
+
+
+def test_dispatch_local_checkpoint_returns_local_receipt(tmp_path):
+    import json as _json
+    from subprocess import CompletedProcess
+
+    from cascade.trainer.remote import (
+        RECEIPT_SENTINEL,
+        LocalTrainReceipt,
+        RemoteDispatcher,
+    )
+
+    receipt = {"miner_hotkey": "hk", "miner_uid": 3, "role": "king",
+               "gen_ref": "ns/g@sha256:" + "a" * 64, "corpus_digest": "cd",
+               "train_block": 12, "local_checkpoint_dir": "/w/checkpoint"}
+    seen = {}
+
+    def runner(argv, timeout, stdin=None):
+        seen["cmd"] = argv[-1]
+        return CompletedProcess(argv, 0, stdout=RECEIPT_SENTINEL + _json.dumps(receipt),
+                                stderr="")
+
+    disp = RemoteDispatcher(trainer_spec="m:C", _runner=runner)
+    h = RemoteHost(name="p", host="h")
+    out = disp.dispatch(h, gen_ref="ns/g@sha256:" + "a" * 64, uid=3, hotkey="hk",
+                        role="king", base_seed=7, block=12, local_checkpoint=True)
+    assert isinstance(out, LocalTrainReceipt) and out.checkpoint_dir == "/w/checkpoint"
+    assert "--local-only" in seen["cmd"]
+
+
+def _tar_bytes(entries):
+    """Build an in-memory tar; entries = [(name, data | None for dir)]."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                tf.addfile(info)
+            else:
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_harvest_extracts_a_clean_archive(tmp_path, monkeypatch):
+    from cascade.trainer import remote as remote_mod
+
+    tarball = tmp_path / "ok.tar"
+    tarball.write_bytes(_tar_bytes([("./weights.safetensors", b"W" * 8),
+                                    ("./config.json", b"{}")]))
+    monkeypatch.setattr(remote_mod, "build_ssh_argv",
+                        lambda host, cmd: ["cat", str(tarball)])
+    dest = remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"),
+                                         "/w/checkpoint", tmp_path / "out")
+    assert (dest / "weights.safetensors").read_bytes() == b"W" * 8
+    assert (dest / "config.json").is_file()
+
+
+def test_harvest_refuses_path_traversal_and_symlink_escape(tmp_path, monkeypatch):
+    """The stream comes off a miner-controlled pod: '..' members and symlinks
+    pointing outside the dest must fail the harvest, not write through it."""
+    import io
+    import tarfile
+
+    import pytest
+
+    from cascade.trainer import remote as remote_mod
+
+    evil = tmp_path / "evil.tar"
+    evil.write_bytes(_tar_bytes([("../outside.txt", b"pwn")]))
+    monkeypatch.setattr(remote_mod, "build_ssh_argv",
+                        lambda host, cmd: ["cat", str(evil)])
+    with pytest.raises(remote_mod.RemoteDispatchError, match="refused|failed"):
+        remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"),
+                                      "/w/checkpoint", tmp_path / "out1")
+    assert not (tmp_path / "outside.txt").exists()
+
+    # symlink member aimed outside the harvest dir
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        link = tarfile.TarInfo("./weights.safetensors")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tf.addfile(link)
+    (tmp_path / "link.tar").write_bytes(buf.getvalue())
+    monkeypatch.setattr(remote_mod, "build_ssh_argv",
+                        lambda host, cmd: ["cat", str(tmp_path / "link.tar")])
+    with pytest.raises(remote_mod.RemoteDispatchError, match="refused|failed"):
+        remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"),
+                                      "/w/checkpoint", tmp_path / "out2")
+
+
+def test_worker_local_only_prints_a_local_receipt(cfg, tmp_path, monkeypatch, capsys):
+    """--local-only (credential-free pods): no upload path is touched — the
+    receipt carries local_checkpoint_dir and no trained_pointer at all."""
+    import json as _json
+
+    from cascade.trainer import worker as worker_mod
+    from cascade.trainer.remote import RECEIPT_SENTINEL
+
+    monkeypatch.setattr(worker_mod, "load_chain_config", lambda p: cfg)
+    monkeypatch.setattr(worker_mod, "_load_trainer", lambda spec: object())
+
+    def _fake_local(self, gen, role, seeds, block, *, contract=None,
+                    token_budget=None, repo_suffix="", heat=False,
+                    warm_start_ref=None):
+        return {"miner_hotkey": gen.hotkey, "miner_uid": gen.uid, "role": role,
+                "gen_ref": gen.ref, "corpus_digest": "d", "train_block": block,
+                "gpu_name": "", "size": contract.arch_preset if contract else "",
+                "local_checkpoint_dir": "/w/checkpoint"}
+
+    def _never(self, *a, **k):
+        raise AssertionError("train_one (upload path) must not run under --local-only")
+
+    monkeypatch.setattr(TrainerRunner, "train_one_local", _fake_local)
+    monkeypatch.setattr(TrainerRunner, "train_one", _never)
+    rc = worker_mod.main([
+        "--gen-ref", REF_A, "--uid", "5", "--hotkey", "hkB", "--role", "challenger",
+        "--base-seed", "1", "--block", "10", "--trainer", "m:C",
+        "--arch-preset", "toto2-4m", "--work-root", str(tmp_path), "--local-only"])
+    assert rc == 0
+    line = [ln for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith(RECEIPT_SENTINEL)][-1]
+    receipt = _json.loads(line[len(RECEIPT_SENTINEL):])
+    assert receipt["local_checkpoint_dir"] == "/w/checkpoint"
+    assert "trained_pointer" not in receipt
