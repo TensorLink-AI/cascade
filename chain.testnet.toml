@@ -42,9 +42,8 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
                                  # source + config, a few MB; this is the wall that actually
                                  # makes a distilled model impossible. max_memory_mb /
                                  # max_generate_seconds bound it at runtime.
-max_channels         = 1         # per-series variates. 1 = univariate (generators may
-                                 # yield 1-D, promoted to (1, L)); raise to enable
-                                 # multivariate priors without a schema change.
+max_channels         = 32        # MV-TEST: C=32 raise (DEC-CA-0041), matches the mainnet cut.
+channel_corr_mode    = "shadow"  # MV-TEST: channel-redundancy telemetry, labels only.
 # Cheap data-quality gates on generator output (see chain.toml for the rationale).
 max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.
 reject_constant      = false     # reject flat (zero-range) series (parked for v1).
@@ -97,6 +96,7 @@ ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes th
                                         # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
 warmup_fraction             = 0.05
 batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was 256
+batch_denomination          = "sequences"  # MV-TEST: step-count parity across C (DEC-CA-0041)
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate
@@ -216,9 +216,9 @@ funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
 # and tears it down when the leg ends (king + eval pods stay operator-funded,
 # always). "rent" needs the three keys below; consensus-inert ([round]).
 funded_pods = "rent"   # FUNDED-TEST phase 3 (live wiring validation)
-payer_vault_dir = "/root/cascade-funded-compute/_payer_vault"  # FUNDED-TEST
+payer_vault_dir = "/root/cascade-main/.claude/worktrees/funded-release/_payer_vault"  # FUNDED-TEST (rehearsal intake vault)
 funded_pod_sku = "RTX4090"      # FUNDED-TEST
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"  # FUNDED-TEST
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"  # FUNDED-TEST
 funded_ready_timeout_seconds = 900.0
 funded_pod_checkpoint = "harvest"  # credential-free pods (worker --local-only + orchestrator harvest)
 funded_field_cap = 8            # FUNDED-TEST: elastic field
@@ -227,7 +227,7 @@ funded_capacity_reserve = 1
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST: per-round pick
 funded_king_rent = true   # FUNDED-TEST: JIT operator king at the round SKU (standing final pod expired 09-02)
 submission_vault_dir = "submission_vault"  # FUNDED-TEST       # direct submissions (vault refs) off until armed
-champion_publish = "crown"  # FUNDED-TEST
+champion_publish = "dethrone"  # FUNDED-TEST: rehearse the mainnet publish policy
 champion_publish_delay_rounds = 2
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
@@ -319,6 +319,7 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 # reporting the drift as a contract-declaration WARN rather than a rejected
 # round.
 declared_contract_from_block = 1
+mv_score_from_block = 1   # MV-TEST: joint multivariate window scoring live from round one
 
 # King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
 # (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
