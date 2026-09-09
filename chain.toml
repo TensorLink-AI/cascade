@@ -385,7 +385,11 @@ one_submission_per_hotkey = true
 # funded_activation_block; legacy rounds keep running until it.
 # Details: docs/MINER_FUNDED_ROUNDS.md.
 funded_mode = "required"
-funded_activation_block = 8992800   # go-live ≈ Fri 2026-09-04 08:30 UTC (owner)
+funded_activation_block = 9043200   # go-live ≈ Fri 2026-09-11 08:30 UTC (owner 2026-09-09;
+                                    # the 2026-09-04 block passed unreleased). Same boundary
+                                    # as cohort max-T + increment margin (DEC-CA-0038/0039):
+                                    # ONE coordinated validator-update window. MV scoring
+                                    # arms separately at 9064800 (Mon), same release.
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
 # With funded_mode = "required": an unfunded boundary runs NOTHING (no king
 # leg, no pods, no manifest — validators just see no manifest and hold).
@@ -429,8 +433,14 @@ funded_king_rent = true
 # on the manifest bucket, sn100-top-model style): "crown" immediately,
 # "delay" after N reign rounds, "dethrone" at hand-off (every policy reveals
 # a deposed vault king at latest). Losers stay private forever.
-submission_vault_dir = ""                 # "" = direct submissions off (work_root-relative)
-champion_publish = "off"
+# ARMED with the 9043200 release (owner 2026-09-09, reversing the 2026-09-02
+# "stay off"): private submissions ship in the same window as the funded
+# go-live. Policy "dethrone" = maximum privacy — the LIVE king's code stays
+# private for its whole reign and publishes only at hand-off, so history stays
+# re-derivable while a reigning edge is never exposed. Flip to "delay" (+N
+# reign rounds) or "crown" (immediate) before Friday if less privacy is wanted.
+submission_vault_dir = "submission_vault" # work_root-relative operator-private store
+champion_publish = "dethrone"
 champion_publish_delay_rounds = 2
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
@@ -566,7 +576,9 @@ mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_blo
 # same rollout as mix_from_block; every validator must run it before the
 # block. The 720 rung needs series >= 784 steps.
 scored_horizons   = [64, 256, 720]
-scored_from_block = 8992800      # = funded_activation_block
+scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
+                                 # 2026-09-04; no longer tied to funded_activation_block
+                                 # (which moved to 9043200). DO NOT move a passed gate.
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
