@@ -232,3 +232,40 @@ mismatch penalty (the C=8-trained-model-run-at-C=1 case measured ~5% relative).
 Caveats: 5-step probe, so no allocator fragmentation accumulates over a real
 round; headless datacenter cards (a desktop 3090 driving a display gives up
 another ~0.5-1 GB); nothing else resident on the GPU.
+
+## Coupled-group supply already in the pool (2026-09-09, measured)
+
+Measured on the REAL mainnet pool at block 8989200 — the byte-identical reveal
+from `Tensor-Link/cascade-eval-pool` (POOL_SHA256 verified against the published
+marker), i.e. exactly what validators scored that day.
+
+    total series: 2801    distinct sources: 1238
+    sources with >=2 series: 118  covering 1681 series (60.0% of pool)
+    sources with >=4 series: 107  covering 1654 series (59.1%)
+    sources with >=8 series:  79  covering 1505 series (53.7%)
+
+The arming targets were >=12 coupled sources and >=30% pool share. The pool
+already carries **79 sources with >=8 series each, covering 53.7%** — past both
+thresholds structurally, before any new harvesting. So A3's "breadth harvest" is
+largely already done: what remains is A1 (does a candidate group actually carry
+cross-predictive information) and A2 (tag it). That is a tagging problem, not a
+harvesting problem, and much cheaper than the plan assumed.
+
+**Pivot direction is the live design question.** `cdc_nssp_ed_{ari,covid19,
+influenza,rsv}_daily_by_state` carries 25 series each = one per (condition,
+state). Two groupings are possible and they are not equally good:
+
+* **by state, across conditions** — C=4 (ARI/COVID/flu/RSV in one state),
+  sharing epidemic and reporting dynamics; plausibly cross-predictive and fits
+  `mv_channels <= 8` with no subsetting.
+* **by condition, across states** — C=25, over the cap, coupled only through
+  weak national co-movement.
+
+The first is the NSSP CASE-pivot and is the one worth testing first. The same
+question applies to `citibike_station_status` / `cabi_station_status` (25
+stations each; spatially coupled, so nearby-station subsets of <=8 are the
+natural group).
+
+None of this changes the eval-first ordering: a group is admitted on MEASURED
+joint-vs-marginal lift (>=3%, per the ablation above), never on being
+structurally groupable.
