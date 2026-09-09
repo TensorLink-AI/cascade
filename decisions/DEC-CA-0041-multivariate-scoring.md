@@ -269,3 +269,67 @@ natural group).
 None of this changes the eval-first ordering: a group is admitted on MEASURED
 joint-vs-marginal lift (>=3%, per the ablation above), never on being
 structurally groupable.
+
+## The cost of flipping early, measured on the real king (2026-09-09)
+
+Measured end-to-end on production artifacts: the **generation-7 mainnet king**
+(`ckpt-r6270219435605126478-challenger-toto2-4m-u51`, fetched anonymously), its
+**own generator** (`tonybilling/gen-64a0412cd332`, chronoforge v216 — the corpus
+the lineage actually learned from), and the **real scored pool** at block
+8989200 (byte-identical HF reveal, POOL_SHA256 verified) over the full
+`[64, 256, 720]` ladder at `num_samples=100`. Warm start from
+`weights_stable.safetensors` (the lineage branch) and scored on each arm's own
+EMA (`ema_decay=0.999`), matching what the duel scores.
+
+Arms equalised on BOTH axes — same series consumed per step (128) and same
+240s wall — so neither steps nor data can flatter either side:
+
+    king EMA = 0.321283
+            arm  n   bs  ema geomean       sd    vs king   steps
+             c1  3  128     0.391922  0.000324  +0.070638    8288
+             c8  3   16     0.404719  0.004291  +0.083436   10069
+     c8_coupled  3   16     0.463933  0.000810  +0.142650    9987
+
+      c8 vs c1          +0.012798  (+3.27%)  SEPARATED (4.2 pooled sd)
+      c8_coupled vs c8  +0.059214 (+14.63%)  SEPARATED
+
+**Flipping the generator to C=8 while the pool is univariate costs 3.27% of the
+round statistic** — and conservatively so, since `c8` fitted MORE steps into the
+same wall (variate packing is cheaper per step) and still lost. If the miner's
+generator also emits coupled channels, the total cost is ~18%: the coupled arm's
+extra 14.6% is corpus shift (a channel's marginal becomes base + lagged
+siblings, away from the king's prior) with no univariate eval surface to earn it
+back.
+
+**This is the eval-first rule with a price on it.** The dethrone margin is
+0.5-1%; the self-inflicted penalty is 3-6x that. Raising `[generator]
+max_channels` before MV windows are in the pool is not merely premature, it
+actively punishes anyone who uses the headroom. Keep `max_channels = 1` and
+`mv_score_from_block = 0` until coupled windows are live, then raise both at one
+coordinated block.
+
+**Also settled, on the same real weights:**
+
+* **Do not roll the lineage back.** Random init at C=8 scored 0.894915 vs the
+  warm-started flip's 0.460017 at matched steps — **94.5% worse** (and 29.4%
+  worse in an earlier run on a different corpus). Seven generations are worth
+  roughly double; no confound touches this comparison.
+* **Generation count is irrelevant to MV readiness.** In the real gen-7 weights
+  the variate layer's Q/K match a fresh init's std and stable rank to ~0.1%
+  (0.06245 vs 0.06237; srank 184.33 vs 183.76), because attention over a single
+  key has softmax == 1 and passes them zero gradient. Gen 1 and gen 7 are
+  equally unprepared, so "roll back for a cleaner MV start" has no mechanism.
+  Its V, by contrast, trained hard (stable rank 184 -> 54).
+* **A diagonal-dominant (`W_k := W_q`) variate init does not help** (+0.8%, not
+  separated). No mitigation to build.
+
+**Superseded:** an earlier synthetic ablation reported wide training IMPROVING
+univariate skill by 0.015-0.023 at token-matched budgets. That measured
+next-patch pinball loss on a toy prior (level + one sinusoid + AR(1)). On the
+duel metric with the king's real corpus the sign reverses. Prefer these numbers.
+
+**Caveats:** 240s arms (a real round trains far longer), one pool snapshot, and
+the coupled arm's coupling is a linear lagged DAG, so the 14.6% is specific to
+that mechanism. All arms still sit above the king (0.392 vs 0.321) after 240s of
+fine-tuning, so these are short-run deltas between matched arms, not forecasts
+of a settled round.
