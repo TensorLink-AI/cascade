@@ -418,7 +418,7 @@ funded_activation_block = 9043200   # go-live ≈ Fri 2026-09-11 08:30 UTC (owne
                                     # the 2026-09-04 block passed unreleased). Same boundary
                                     # as cohort max-T + increment margin (DEC-CA-0038/0039):
                                     # ONE coordinated validator-update window. MV scoring
-                                    # arms separately at 9064800 (Mon), same release.
+                                    # arms separately at 9068400 (Mon 20:30 UTC), same release.
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
 # With funded_mode = "required": an unfunded boundary runs NOTHING (no king
 # leg, no pods, no manifest — validators just see no manifest and hold).
@@ -687,11 +687,12 @@ increment_from_block = 9043200  # = cohort_maxt_from_block
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
 # statistic agrees with the source-cluster bootstrap. Bit-identical on today's
-# univariate pool. ARMED 2026-09-09 (owner): 9064800 ≈ Mon 2026-09-14 08:30 UTC
-# — deliberately 3 days after the 9043200 window so the consensus flips never
-# share a boundary; one release covers both. Bit-identical until an MV-packed
-# pool publishes (pool build --mv-pack).
-mv_score_from_block  = 9064800
+# univariate pool. ARMED 2026-09-09 (owner): 9068400 ≈ Mon 2026-09-14 20:30 UTC
+# (owner 2026-09-10: the Monday-arvo boundary, +12h off the 08:30 grid slot) —
+# well after the 9043200 Friday window so the consensus flips never share a
+# boundary; one release covers both. Bit-identical until an MV-packed pool
+# publishes (pool build --mv-pack).
+mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision

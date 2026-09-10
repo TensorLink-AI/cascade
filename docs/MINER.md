@@ -751,7 +751,7 @@ result is the validator's receipt: `cascade duel` shows the decided pair, a
 `cohort` block listing every judged challenger with its geomean relative to the
 king, its LCB against the margin, and its per-horizon gaps.
 
-## Multivariate series (from 2026-09-09; scored from block 9064800)
+## Multivariate series (from 2026-09-09; scored from block 9068400)
 
 `max_channels` is now **32**: `generate()` may yield `(C, L)` arrays whose
 channels are the variates of one series (a 1-D yield is still one channel, and
@@ -765,7 +765,7 @@ The economics, so you can plan a corpus:
   `batch_size // C` series (`batch_denomination = "sequences"`), so a C=32
   corpus trains the same ~number of optimizer steps as a univariate one from
   the same budget. Width buys cross-channel signal per step, not fewer steps.
-* **From block 9064800 (≈ Mon 2026-09-14 08:30 UTC) the duel scores
+* **From block 9068400 (≈ Mon 2026-09-14 20:30 UTC) the duel scores
   multivariate eval windows jointly**: the model forecasts all channels of a
   window in one pass (sibling channels condition each other) and the window's
   channels average into ONE per-window contribution. Until the eval pool
