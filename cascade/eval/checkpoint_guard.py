@@ -29,10 +29,26 @@ trainer's funded leg settles it as ``tamper``).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import struct
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("cascade.eval.checkpoint_guard")
+
+# Wrapper templates shipped by PREVIOUS releases, by sha256 of their exact
+# bytes. A checkpoint carrying one of these is an honest artifact of an older
+# release (the warm-start baseline, the live lineage across an upgrade), not
+# tampering — the guard REFRESHES it to this release's copy before anything
+# loads it, so only current repo code ever executes and the fleet scores one
+# wrapper semantics. ``model.py`` gets no such list: its bytes fold into
+# base_arch_digest, so changing it is a contract cut, never a rolling upgrade.
+_HISTORICAL_WRAPPER_SHA256 = frozenset({
+    # pre-DEC-CA-0041 wrapper (no forecast_joint) — releases through 2026-09.
+    "2f22cd49a201bbd73da5365625a5ff74f16c3ef377f9d38136f195d52dca8950",
+})
 
 __all__ = [
     "CheckpointReport",
@@ -94,7 +110,17 @@ def verify_checkpoint_code(checkpoint_dir: Path | str) -> None:
         p = d / name
         if not p.is_file():
             raise CheckpointTampered(f"checkpoint is missing {name}")
-        if p.read_bytes() != want:
+        got = p.read_bytes()
+        if got != want:
+            if (name == "forecast_wrapper.py"
+                    and hashlib.sha256(got).hexdigest() in _HISTORICAL_WRAPPER_SHA256):
+                # A previous release's exact wrapper: refresh it in place so
+                # the load below executes THIS release's copy (same weights,
+                # same model.py — forward-compat across an upgrade).
+                p.write_bytes(want)
+                log.info("checkpoint %s: refreshed pre-upgrade forecast_wrapper.py "
+                         "to this release's copy", d)
+                continue
             raise CheckpointTampered(
                 f"{name} differs from this release's copy — a checkpoint's "
                 "code is never executed unless it is byte-identical")

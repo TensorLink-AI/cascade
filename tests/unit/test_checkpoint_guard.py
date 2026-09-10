@@ -127,3 +127,41 @@ def test_evaluator_refuses_tampered_and_trust_flag_bypasses(tmp_path, contract):
         load_forecaster(d, contract=contract)
     # Archived, operator-produced checkpoints can still be loaded explicitly.
     load_forecaster(d, trust_checkpoint_code=True)
+
+
+def test_historical_wrapper_is_refreshed_not_refused(tmp_path, contract):
+    """A checkpoint carrying a PREVIOUS release's exact wrapper (pinned by
+    sha256 in _HISTORICAL_WRAPPER_SHA256) is an upgrade artifact, not
+    tampering: the guard refreshes the file to this release's bytes so only
+    current repo code ever executes (forward-compat across a wrapper change,
+    e.g. DEC-CA-0041's forecast_joint)."""
+    import hashlib
+
+    from cascade.eval import checkpoint_guard as cg
+
+    d = _honest_checkpoint(tmp_path, contract)
+    w = d / "forecast_wrapper.py"
+    old = b"# a previous release's wrapper template\n"
+    added = hashlib.sha256(old).hexdigest()
+    cg._HISTORICAL_WRAPPER_SHA256 = frozenset({added}) | cg._HISTORICAL_WRAPPER_SHA256
+    try:
+        w.write_bytes(old)
+        verify_checkpoint_code(d)  # refreshes instead of raising
+        assert w.read_bytes() == cg.expected_checkpoint_code()["forecast_wrapper.py"]
+        # anything NOT on the pinned list still dies
+        w.write_bytes(old + b"# attacker tweak\n")
+        with pytest.raises(CheckpointTampered, match="forecast_wrapper.py differs"):
+            verify_checkpoint_code(d)
+    finally:
+        cg._HISTORICAL_WRAPPER_SHA256 = frozenset(
+            h for h in cg._HISTORICAL_WRAPPER_SHA256 if h != added)
+
+
+def test_historical_model_py_is_still_refused(tmp_path, contract):
+    """model.py gets NO historical allowlist — its bytes fold into
+    base_arch_digest, so an old copy is a contract mismatch, never a
+    rolling-upgrade artifact."""
+    d = _honest_checkpoint(tmp_path, contract)
+    (d / "model.py").write_bytes(b"# any non-identical bytes\n")
+    with pytest.raises(CheckpointTampered, match="model.py differs"):
+        verify_checkpoint_code(d)
