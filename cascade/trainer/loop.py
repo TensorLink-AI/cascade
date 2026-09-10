@@ -2077,13 +2077,23 @@ class TrainerRunner:
             _ledger_king(pod_id)
             log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
                      pod_id, addr.ip, addr.ssh_port, sku)
-            self._funded_king_host = RemoteHost(
+            king_host = RemoteHost(
                 name="funded-king", host=addr.ip, port=addr.ssh_port,
                 user=profile.user, key_path=profile.key_path,
                 remote_python=profile.remote_python, workdir=profile.workdir,
                 cuda_device="0", chain_toml=profile.chain_toml,
                 forward_env=profile.forward_env, ssh_options=profile.ssh_options,
                 stage="final")
+            # Same runtime attestation as the funded legs: lium can boot a
+            # host-cached stale image under the degraded tag ref, and a stale
+            # KING pod trains under the wrong baked contract. Failing here
+            # aborts the round like any king-leg failure (retried next
+            # boundary, likely on a different executor).
+            from .remote import probe_worker_runtime
+            why = probe_worker_runtime(king_host)
+            if why:
+                raise ProvisionError(f"king pod runtime rejected: {why}")
+            self._funded_king_host = king_host
             return self._funded_king_host
 
     def _teardown_operator_pod(self, pod) -> None:
@@ -2120,6 +2130,14 @@ class TrainerRunner:
             why = self._funded_pod_identity_mismatch(pod)
             if why:
                 raise _FundedTamper(f"before dispatch: {why}")
+            # Runtime attestation, before a single byte of dispatch: lium can
+            # serve a host-cached stale image under the degraded tag ref (the
+            # env digest gate attests the REQUEST there, not the runtime).
+            # A stale pod is a provider fault — infra, requeue, never a burn.
+            from .remote import probe_worker_runtime
+            why = probe_worker_runtime(host)
+            if why:
+                raise RuntimeError(f"funded pod runtime rejected: {why}")
             digest = parse_vault_ref(gen.ref)
             if digest is not None:
                 host = self._stage_vault_zip_on(host, digest)

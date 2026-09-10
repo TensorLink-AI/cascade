@@ -345,6 +345,38 @@ def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
     return ["ssh", *ssh_transport_options(host), f"{host.user}@{host.host}", remote_command]
 
 
+def probe_worker_runtime(host: RemoteHost, *, required_flags: tuple[str, ...] = ("--local-only",),
+                         timeout: float = 90.0) -> str:
+    """Functional attestation that ``host`` runs THIS release's worker.
+
+    Lium's launch API cannot pull by digest — :func:`cascade.provision.core.
+    lium_image_ref` degrades the pin to ``repo[:tag]`` — and the env-based
+    digest gate is circular there (``CASCADE_TRAIN_IMAGE_DIGEST`` is injected
+    from the REQUESTED ref into whatever container boots, so it attests the
+    request, not the runtime). A host with the repo's ``latest``/tag cached
+    from an older release therefore boots stale code and still looks pinned
+    (observed live 2026-09-10: a funded pod booted a pre-harvest worker and
+    the dispatch died ``unrecognized arguments: --local-only``). This probe
+    asks the pod's worker itself: its ``--help`` must know every flag the
+    dispatch relies on. Returns ``""`` when the runtime checks out, else a
+    reason string (the caller classifies it as an infra fault — the payer
+    did nothing wrong; retry on another executor)."""
+    cmd = f"{host.remote_python} -m cascade.trainer.worker --help"
+    try:
+        proc = subprocess.run(build_ssh_argv(host, cmd), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return f"worker runtime probe timed out after {timeout:.0f}s"
+    if proc.returncode != 0:
+        return f"worker runtime probe failed rc={proc.returncode}: {(proc.stderr or '')[-200:]}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    missing = [f for f in required_flags if f not in out]
+    if missing:
+        return (f"pod booted a STALE worker image (missing worker flags {missing}); "
+                "provider served a cached tag instead of the pinned digest")
+    return ""
+
+
 def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
     """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
     under exactly :func:`build_ssh_argv`'s transport policy (a pinned host

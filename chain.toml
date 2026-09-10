@@ -432,7 +432,7 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
