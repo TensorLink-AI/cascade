@@ -458,7 +458,14 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    argv = build_ssh_argv(host, f"tar -C {shlex.quote(remote_dir)} -cf - .")
+    # The worker runs under ``cd host.workdir`` (see build_remote_command), so a
+    # ``--local-only`` receipt's checkpoint dir is relative to THAT — but this is
+    # a fresh ssh session whose cwd is the login home. Resolve the harvest in the
+    # same workdir (a no-op for an absolute remote_dir); without it ``tar -C`` hit
+    # ``$HOME/<relative>``, which does not exist → an empty archive (live
+    # 2026-09-10, the first harvest-mode funded round).
+    tar_cmd = f"cd {shlex.quote(host.workdir)} && tar -C {shlex.quote(remote_dir)} -cf - ."
+    argv = build_ssh_argv(host, tar_cmd)
     if runner is not None:  # test seam: (argv, timeout) → CompletedProcess-like
         proc = runner(argv, timeout)
         if proc.returncode != 0:
