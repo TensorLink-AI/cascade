@@ -774,15 +774,18 @@ cascade_quality_epsilon = 0.05
 # above. Same activation block as mix_from_block — one flip boundary for the
 # whole release. Fleet-consensus values: keep identical across validators.
 # Retire (""/0) in the release after the transition round ages out.
-# ARMED 2026-08-27 (owner): the DEC-CA-0035+0033 recipe cut takes effect for
-# rounds from block 8942400 (r47's epoch, boundary 2026-08-28 ~08:25 UTC).
-# Rounds whose epoch precedes it (r45/r46 in flight) verify against the pinned
-# PRIOR digest below — the unarmed contract every round through epoch 8938800
-# trained under — so validators restart onto this release ANY TIME before
-# block 8942400 without sacrificing an in-flight round. (This retires the
-# aged-out 6420f564…/8895600 warmup_cosine transition pair.)
-prior_contract_digest  = "c6d2462135198c36eefc009ea0f945957e647c20bf521a1fbc9d721a4324f3af"
-contract_from_block    = 8942400
+# ARMED 2026-09-10 (owner): this release's [training] cut (expected_gpu ""→
+# unpinned, train_image_digest → worker-v0.8.0 sha256:9d5bc70d…,
+# batch_denomination = "sequences") takes effect for rounds from block 9043200
+# (Fri 2026-09-11 08:30 UTC — the funded/max-T/increment window). Rounds whose
+# epoch precedes it verify against the pinned PRIOR digest below — the exact
+# contract_digest the LIVE mainnet manifests carry right now (read off
+# manifests/latest.json 2026-09-10) — so validators restart onto this release
+# ANY TIME before block 9043200 without sacrificing an in-flight round. New
+# digest recomputed from [training] above = 22081e46…; verify after any edit.
+# (Retires the aged-out c6d24621…/8942400 DEC-CA-0035+0033 transition pair.)
+prior_contract_digest  = "81d28346acb55892290ef3a6970caed2c3e8a5f569627b76cdefc29426f6f045"
+contract_from_block    = 9043200
 # Declared-contract gating (DEC-CA-0036). From this block a manifest is gated on
 # the LOCKED terms only — arch_preset, base_arch_digest, expected_gpu,
 # train_seed_salt, and each extra size's preset/GPU pin — verified against the
