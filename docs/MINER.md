@@ -679,7 +679,9 @@ What to know:
   The earliest upload owns a digest — another hotkey committing your digest is
   dropped at field entry.
 
-Full contract (failure classes, TTLs, the operator's obligations):
+Short version of all of this (funding, private submissions, multivariate):
+[docs/MINER_FUNDED_QUICKSTART.md](MINER_FUNDED_QUICKSTART.md). Full contract
+(failure classes, TTLs, the operator's obligations):
 [docs/MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUNDS.md).
 
 ## The cascade — warm-started rounds
