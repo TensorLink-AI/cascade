@@ -144,14 +144,16 @@ auth fault. Operator checklist, in order:
    admission/SKU lines. Rollback = set `funded_activation_block` far future
    + restart trainer (legacy rounds resume).
 
-Direct submissions are ARMED with the 9043200 go-live (owner 2026-09-09):
+Direct submissions are ARMED with this release (owner 2026-09-09):
 `submission_vault_dir = "submission_vault"`, `champion_publish = "dethrone"` —
 your code POSTs privately to the intake, losers stay private forever, and a
-king's code publishes only when it is deposed. HARD PREREQUISITE: the worker
+king's code publishes only when it is deposed. The intake opens right after the
+Friday 08:30 morning round (block 9043200); the first funded round to consume
+submissions is the evening boundary 9046800. HARD PREREQUISITE: the worker
 image must be rebuilt from THIS release and its digest re-pinned before the
-block — the previously pinned image predates the vault fetch (and the
-`batch_denomination` contract field), so booting it after go-live either
-fails funded legs or trains under a mismatched contract.
+evening flip (9046800) — the previously pinned image predates the vault fetch
+(and the `batch_denomination` contract field), so booting it after go-live
+either fails funded legs or trains under a mismatched contract.
 
 ## Fronting the intake (DoS posture)
 

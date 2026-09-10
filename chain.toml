@@ -326,14 +326,16 @@ duel_seat_all   = true      # seat every screened entrant; false = seats bounded
 # Details: docs/MINER_FUNDED_ROUNDS.md.
 funded_mode = "required"
 funded_activation_block = 9046800   # first funded round ≈ Fri 2026-09-11 20:30 UTC (evening;
-                                    # owner 2026-09-10). The morning boundary 9043200 (08:30 UTC)
-                                    # is the release/validator-update flip — cohort max-T +
-                                    # increment (DEC-CA-0038/0039) + the [training] contract cut go
-                                    # live and cascade-intake opens for submissions/lium-key funding
-                                    # there; the first FUNDED round is the NEXT (evening) boundary,
-                                    # so miners have the whole morning+afternoon to submit and fund.
-                                    # The 08:30 slot runs a legacy operator-funded duel round. MV
-                                    # scoring arms 9068400 (Mon 20:30 UTC).
+                                    # owner 2026-09-10). The WHOLE release flips at THIS block, in
+                                    # one boundary: the funded queue becomes the field AND cohort
+                                    # max-T + increment (DEC-CA-0038/0039) + the [training] contract
+                                    # cut all go live together (their *_from_block below == this).
+                                    # The prior 08:30 boundary 9043200 runs the LAST old-world round
+                                    # — a legacy operator-funded duel under the OLD scoring/contract/
+                                    # trainer; nothing new fires there. cascade-intake opens for
+                                    # lium-key funding + private submissions right AFTER that morning
+                                    # round, so miners have the day to submit and fund before the
+                                    # evening funded round. MV scoring arms later, 9068400 (Mon 20:30).
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
 # With funded_mode = "required": an unfunded boundary runs NOTHING (no king
 # leg, no pods, no manifest — validators just see no manifest and hold).
@@ -377,9 +379,10 @@ funded_king_rent = true
 # on the manifest bucket, sn100-top-model style): "crown" immediately,
 # "delay" after N reign rounds, "dethrone" at hand-off (every policy reveals
 # a deposed vault king at latest). Losers stay private forever.
-# ARMED with the 9043200 release (owner 2026-09-09, reversing the 2026-09-02
-# "stay off"): private submissions ship in the same window as the funded
-# go-live. Policy "dethrone" = maximum privacy — the LIVE king's code stays
+# ARMED with this release (owner 2026-09-09, reversing the 2026-09-02
+# "stay off"): cascade-intake opens for private submissions + lium-key funding
+# right AFTER the 08:30 morning round (9043200); the first funded round to
+# consume them is the evening 9046800. Policy "dethrone" = maximum privacy — the LIVE king's code stays
 # private for its whole reign and publishes only at hand-off, so history stays
 # re-derivable while a reigning edge is never exposed. Flip to "delay" (+N
 # reign rounds) or "crown" (immediate) before Friday if less privacy is wanted.
@@ -527,7 +530,7 @@ mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_blo
 scored_horizons   = [64, 256, 720]
 scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
                                  # 2026-09-04; no longer tied to funded_activation_block
-                                 # (which moved to 9043200). DO NOT move a passed gate.
+                                 # (which moved to 9046800). DO NOT move a passed gate.
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -590,22 +593,24 @@ margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_f
 # like margin_activation_block above: every validator resolves the rule from the
 # round's epoch block, audit replays each round under its own. Bit-identical at
 # k<=1 (single-challenger rounds never change). 0 = Bonferroni forever.
-cohort_maxt_from_block = 9043200  # Fri 2026-09-11 08:30 UTC (an epoch boundary; upgrade window)
+cohort_maxt_from_block = 9046800  # Fri 2026-09-11 20:30 UTC — the evening funded round, one flip
+                                  # with funded_activation_block. The 08:30 morning round (9043200)
+                                  # is the last old-world round, still judged under Bonferroni α/k.
 # Increment-margin activation (DEC-CA-0039): from this block the dethrone bar
 # is judged in INCREMENT units (a fraction of the typical per-round gain over
 # the shared init) instead of a fixed % of the king's absolute score, so a
 # maturing lineage's small-but-real gains stay clearable. Same block as the
 # cohort max-T above = one coordinated validator-upgrade window for both.
 # margin_mode below stays "level" (the pre-gate rule); 0 = no scheduled flip.
-increment_from_block = 9043200  # = cohort_maxt_from_block
+increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the evening funded round)
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
 # statistic agrees with the source-cluster bootstrap. Bit-identical on today's
 # univariate pool. ARMED 2026-09-09 (owner): 9068400 ≈ Mon 2026-09-14 20:30 UTC
 # (owner 2026-09-10: the Monday-arvo boundary, +12h off the 08:30 grid slot) —
-# well after the 9043200 Friday window so the consensus flips never share a
-# boundary; one release covers both. Bit-identical until an MV-packed pool
+# well after the 9046800 Friday evening flip so the consensus flips never share
+# a boundary; one release covers both. Bit-identical until an MV-packed pool
 # publishes (pool build --mv-pack).
 mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
@@ -683,16 +688,18 @@ cascade_quality_epsilon = 0.05
 # Retire (""/0) in the release after the transition round ages out.
 # ARMED 2026-09-10 (owner): this release's [training] cut (expected_gpu ""→
 # unpinned, train_image_digest → worker-v0.8.0 sha256:9d5bc70d…,
-# batch_denomination = "sequences") takes effect for rounds from block 9043200
-# (Fri 2026-09-11 08:30 UTC — the funded/max-T/increment window). Rounds whose
-# epoch precedes it verify against the pinned PRIOR digest below — the exact
+# batch_denomination = "sequences") takes effect for rounds from block 9046800
+# (Fri 2026-09-11 20:30 UTC — the evening funded round; one flip with
+# funded/max-T/increment). Every earlier round — INCLUDING the 08:30 morning
+# round at 9043200 — verifies against the pinned PRIOR digest below: the exact
 # contract_digest the LIVE mainnet manifests carry right now (read off
-# manifests/latest.json 2026-09-10) — so validators restart onto this release
-# ANY TIME before block 9043200 without sacrificing an in-flight round. New
-# digest recomputed from [training] above = 22081e46…; verify after any edit.
+# manifests/latest.json 2026-09-10), so the morning round runs on the OLD
+# trainer/contract and validators restart onto this release ANY TIME before
+# 9046800 without sacrificing an in-flight round. New digest recomputed from
+# [training] above = 22081e46…; verify after any edit.
 # (Retires the aged-out c6d24621…/8942400 DEC-CA-0035+0033 transition pair.)
 prior_contract_digest  = "81d28346acb55892290ef3a6970caed2c3e8a5f569627b76cdefc29426f6f045"
-contract_from_block    = 9043200
+contract_from_block    = 9046800
 # Declared-contract gating (DEC-CA-0036). From this block a manifest is gated on
 # the LOCKED terms only — arch_preset, base_arch_digest, expected_gpu,
 # train_seed_salt, and each extra size's preset/GPU pin — verified against the

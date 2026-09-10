@@ -39,9 +39,9 @@ base; `0` = no scheduled flip. No receipt change (mode already rides
 `VerdictRecord.params`, drop-when-default) — verified: every pre-gate mainnet
 receipt still audits clean under the armed config.
 
-ARMED at mainnet `increment_from_block = 9043200` — the SAME block as the
-cohort max-T (DEC-CA-0038), so validators get one coordinated upgrade window
-for both. The two corrections are complementary and stack: increment fixes the
+ARMED at mainnet `increment_from_block = 9046800` (Fri 2026-09-11 20:30 UTC, the
+evening funded round) — the SAME block as the cohort max-T (DEC-CA-0038) and the
+funded go-live, so validators get one coordinated upgrade window for all of them. The two corrections are complementary and stack: increment fixes the
 shrinking-signal (level vs increment), max-T fixes the large-field multiplicity
 penalty (α/k vs the real correlation). Testnet armed at 1.
 

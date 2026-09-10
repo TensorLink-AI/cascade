@@ -288,8 +288,8 @@ in-context.
   at k=11 it reads the 0.45th bootstrap pct). Replaced by a shared-resample,
   centred, STUDENTISED max-T (Westfall–Young) off `joint_bag_geomeans` —
   exact under the real correlation, no `α/k`, bit-identical at k≤1. Consensus,
-  block-gated `[scoring] cohort_maxt_from_block` (mainnet 9043200 ≈ Fri
-  2026-09-11 08:30 UTC; testnet 1); audit replays each round under its block's
+  block-gated `[scoring] cohort_maxt_from_block` (mainnet 9046800 ≈ Fri
+  2026-09-11 20:30 UTC, the evening funded round; testnet 1); audit replays each round under its block's
   rule via `cohort_maxt_lcb_map` (one impl for validator + audit); no receipt
   field (correction lives in the gate). Revises DEC-CA-0012.
   (`decisions/DEC-CA-0038-cohort-maxt-correction.md`)
@@ -301,7 +301,7 @@ in-context.
   Receipt-replay on recent mainnet: 2 of 17 competitive rounds flip HELD→
   DETHRONE, zero false dethrones. Resolved per round via `koth_params(block)`
   / `effective_margin_mode`; audit replays each round under its block (level
-  fallback for random-init preserved); no receipt change. ARMED at 9043200 —
+  fallback for random-init preserved); no receipt change. ARMED at 9046800 —
   SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
   increment fixes the signal, max-T the multiplicity). Not a basin-escape
   substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)

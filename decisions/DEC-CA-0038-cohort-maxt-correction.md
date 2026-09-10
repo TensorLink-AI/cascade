@@ -77,7 +77,9 @@ correction lives in the block gate, so `VerdictRecord.params` stays the
 unmodified `[scoring]` set (`check_koth_params` still matches chain.toml) and
 archived-receipt bytes are untouched. `0` = Bonferroni forever.
 
-ARMED: mainnet `cohort_maxt_from_block = 9043200` (≈ Fri 2026-09-11 08:30 UTC,
-an epoch boundary — one coordinated validator-upgrade window; external
-validators diverge from that block until upgraded, exactly like the ladder /
-margin flips). Testnet armed at 1 for the one-cycle multi-cohort validation.
+ARMED: mainnet `cohort_maxt_from_block = 9046800` (≈ Fri 2026-09-11 20:30 UTC,
+the evening funded round — one coordinated validator-upgrade window shared with
+the funded go-live and the increment/contract flips; external validators
+diverge from that block until upgraded, exactly like the ladder / margin flips).
+The 08:30 morning round (9043200) is the last old-world round, still judged
+under Bonferroni. Testnet armed at 1 for the one-cycle multi-cohort validation.

@@ -3,7 +3,7 @@
 A [training] edit changes contract_digest; validators accept the PRIOR digest
 for rounds before [scoring] contract_from_block. If the prior pin goes stale
 (or the block isn't bumped) every validator forks on the flip. This guards the
-2026-09-11 (block 9043200) cut so the next [training] bump cannot ship
+2026-09-11 evening (block 9046800) cut so the next [training] bump cannot ship
 unpinned. The prior digest is ground truth: the contract_digest the LIVE
 mainnet manifests carried at release time (read off manifests/latest.json).
 """
@@ -12,9 +12,9 @@ from __future__ import annotations
 from cascade.shared.config import load_chain_config
 from cascade.shared.manifest import contract_digest
 
-# The contract_digest live mainnet manifests carry going into the 9043200 flip.
+# The contract_digest live mainnet manifests carry going into the 9046800 flip.
 _LIVE_PRIOR_DIGEST = "81d28346acb55892290ef3a6970caed2c3e8a5f569627b76cdefc29426f6f045"
-_TRANSITION_BLOCK = 9043200
+_TRANSITION_BLOCK = 9046800  # evening funded round; the morning round (9043200) stays on the prior digest
 
 
 def test_contract_transition_is_pinned_to_the_live_prior_digest():

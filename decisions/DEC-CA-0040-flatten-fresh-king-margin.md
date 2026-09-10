@@ -83,7 +83,7 @@ the noise floor or by inverting the incentive:**
   more aggressive beatability lever (it re-prices the bar as a fraction of the
   per-round increment, so the bar goes near-irrelevant for a maturing lineage).
   Stacking it on a flattened ramp overshoots into churn. Pick one lever; the ramp
-  flatten is the controllable one. (If increment arms at 9043200 as scheduled,
+  flatten is the controllable one. (If increment arms at 9046800 as scheduled,
   re-evaluate this node against increment-mode LCBs before also flattening.)
 
 **Reconciliation with the seed-variance bundle (DEC-CA-0033, armed:
