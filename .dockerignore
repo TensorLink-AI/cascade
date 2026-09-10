@@ -8,6 +8,8 @@
 # Python environments & caches (rebuilt in-image via uv)
 .venv
 venv
+**/.venv
+**/venv
 __pycache__/
 *.py[cod]
 .pytest_cache/
