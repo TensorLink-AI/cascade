@@ -873,6 +873,17 @@ class RoundConfig:
     # overflow carries to the next round. A positive value is an explicit
     # per-round cap on top of that.
     duel_field_cap: int = 0
+    # Seat EVERY screened entrant (owner 2026-09-08, after round 565093567954236803
+    # seated 2 of 5: the provisioner planned 2 lanes, the stale-image lottery
+    # delivered 1, and the trainer seated off that partial fleet). True (the
+    # default) makes the field, not the fleet on file at seat time, the seat
+    # count: a short fleet queues the extra legs (the mid-final lane pool
+    # dispatches them the moment a lane joins; the duel geometry line WARNS
+    # when the projection overruns the epoch) and the provisioner/operator
+    # tops the lanes up. False is the pre-2026-09-08 rule: seats = what the
+    # rented lanes can finish, the rest wait a round. duel_field_cap > 0
+    # still wins either way.
+    duel_seat_all: bool = True
     # Anti-spam: 1 hotkey = 1 submission (lifetime). When True, a hotkey that has
     # already entered a round's heat is never screened again — it must re-register
     # (a new UID, paying the registration cost) to resubmit, so a miner cannot
@@ -1151,12 +1162,16 @@ class RoundConfig:
             return True
         return block is not None and int(block) >= self.dedup_config_only_from_block
 
-    def duel_seats(self, *, lanes: int, epoch_hours: float, leg_hours: float) -> int:
-        """Challengers a duel-only round seats: the explicit cap when set,
+    def duel_seats(self, *, lanes: int, epoch_hours: float, leg_hours: float,
+                   field: int | None = None) -> int:
+        """Challengers a duel-only round seats: the explicit cap when set;
+        else, with ``duel_seat_all`` and a known ``field``, the whole field;
         else what ``lanes`` can finish inside the epoch — one leg per lane
-        per wave, the king taking one of them."""
+        per wave, the king taking one of them. Never below one seat."""
         if self.duel_field_cap > 0:
             return int(self.duel_field_cap)
+        if self.duel_seat_all and field is not None:
+            return max(1, int(field))
         waves = duel_waves_that_fit(epoch_hours, leg_hours)
         return max(1, max(1, int(lanes)) * waves - 1)
 
@@ -2116,6 +2131,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
+            duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             genesis_generator_ref=str(r.get("genesis_generator_ref", "")),

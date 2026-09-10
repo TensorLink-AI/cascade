@@ -313,6 +313,10 @@ def _leg_runner(tmp_path, monkeypatch, *, disp):
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkA")
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    # Fake pods can't answer a real ssh runtime probe — treat every pod as a
+    # good (this-release) worker so the leg logic under test is reached.
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
+                        lambda host, **kw: "")
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
@@ -677,7 +681,9 @@ def test_rent_uses_the_rounds_chosen_sku(tmp_path, monkeypatch):
     assert seen["sku"] == "A6000"
 
 
-def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path):
+def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path, monkeypatch):
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
+                        lambda host, **kw: "")
     import cascade.provision.core as core_mod
     r = _runner(tmp_path, funded_king_rent=True)
     r._funded_round_sku = "A6000"
@@ -954,6 +960,8 @@ def _harvest_runner(tmp_path, monkeypatch, *, disp):
     runner = _runner(tmp_path, funded_pod_checkpoint="harvest")
     _vault(tmp_path, "hkA")
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
+                        lambda host, **kw: "")
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
@@ -1032,6 +1040,24 @@ def test_harvest_guard_failure_is_tamper(tmp_path, monkeypatch):
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (True, "tamper", False)
     assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_stale_worker_image_probe_rejects_before_dispatch_as_infra(tmp_path, monkeypatch):
+    """A pod that booted a stale image (worker --help missing the dispatch
+    flags) is rejected by probe_worker_runtime BEFORE any bytes move, and the
+    leg settles infra (requeue, no burn) — the payer did nothing wrong."""
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    # override the permissive stub: this pod's worker is stale
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
+                        lambda host, **kw: "pod booted a STALE worker image (missing --local-only)")
+    with pytest.raises(Exception):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert disp.calls == []                       # never dispatched
+    assert torn == ["cascade-n91-777-funded-hka-0"]   # pod torn down anyway
+    _msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (False, "infra", True)
 
 
 def test_harvest_transport_failure_is_infra_not_tamper(tmp_path, monkeypatch):

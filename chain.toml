@@ -397,14 +397,22 @@ one_submission_per_hotkey = true
 # The provisioner rents no heat fleet and sizes the final to fit the whole
 # field inside the epoch — each lane runs floor((round_hours − 1.5h) / 3h) = 3
 # legs back to back (pods carry a one-epoch TTL) — up to its pod ceiling
-# ([provisioner.final] max_pods); the trainer seats what the rented lanes can
-# finish before the boundary and only that overflow waits for the next round,
-# without spending its submission. With 2 pods × 2 lanes that is 11 seats a
-# round; each extra 2-lane pod adds 6. The validator judges the whole cohort
-# under alpha/k (DEC-CA-0012, k = seated). Trainer-side ([round] is outside
-# contract_digest). 0 = off; rollback = 0 + trainer restart.
+# ([provisioner.final] max_pods). Seating is one-shot at the round start:
+# with duel_seat_all = true (default since 2026-09-08) the trainer seats the
+# WHOLE screened field and a fleet that came up short queues the extra legs
+# (the mid-final lane pool dispatches them as lanes join; the trainer logs
+# "FLEET SHORT" — top the lanes up, the round lands late otherwise). With
+# duel_seat_all = false (the pre-2026-09-08 rule) it seats only what the
+# lanes on file can finish before the boundary and the overflow waits for
+# the next round without spending its submission — round 565093567954236803
+# seated 2 of 5 that way after the rental lottery delivered 1 of 2 planned
+# lanes. With 2 pods × 2 lanes a round fits 11 legs; each extra 2-lane pod
+# adds 6. The validator judges the whole cohort under alpha/k (DEC-CA-0012,
+# k = seated). Trainer-side ([round] is outside contract_digest). 0 = off;
+# rollback = 0 + trainer restart.
 duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
-duel_field_cap  = 0         # 0 = no per-round cap (the fleet bounds the round); N = explicit cap
+duel_field_cap  = 0         # 0 = no per-round cap; N = explicit cap (wins over duel_seat_all)
+duel_seat_all   = true      # seat every screened entrant; false = seats bounded by the lanes on file
 # ── Miner-funded compute (DEC-CA-0036) — armed, block-gated ──────────────────
 # Composes with duel-only above: legacy (operator-funded, duel-only) rounds run
 # until funded_activation_block; from it the funded queue IS the field and the
