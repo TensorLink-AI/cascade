@@ -8,10 +8,13 @@ no ~12h round. It reuses the exact pieces the trainer/validator use
 → ``global_geomean``), so the number tracks how the heat screener would rank you.
 
 The score is **directional, not the verdict**: you score on a public/sample pool,
-while the validator scores on its private rotating pool — and this trains from
-random init, while live rounds train from the promoted cascade warm-start once a
-generation is live, so absolute numbers won't match live heat scores. Use it to
-hill-climb locally, then let the real eval rank you. Pair it with
+while the validator scores on its private rotating pool. By default this trains
+from random init; live rounds train from the promoted cascade warm-start once a
+generation is live, so pass ``--warm-start live`` (the init the current round
+trains from, read from the public round status) or an explicit ``repo@digest`` /
+local checkpoint dir to train the way the live round does — same starting
+weights AND the warm-started recipe (``warm_lr_scale``, wsd warmup-once). Use it
+to hill-climb locally, then let the real eval rank you. Pair it with
 ``cascade fetch king`` to score the reigning king the same way and compare.
 
 Needs the ``[train]`` extra (torch) and, ideally, a GPU — the heat budget keeps
@@ -36,6 +39,7 @@ class ScoreResult:
     n_series: int
     train_seconds: float
     pool_label: str
+    init_label: str = "random init"
 
 
 def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
@@ -83,6 +87,52 @@ def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
     return windows[:n_windows], "synthetic-sample (directional only — use --pool-dir for real data)"
 
 
+LIVE_WARM_START = "live"
+
+
+def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str]:
+    """Resolve ``warm_start`` to a local checkpoint dir for the trainer.
+
+    ``None``/empty ⇒ random init. ``"live"`` ⇒ the promoted init THIS round
+    trains from, read from the trainer's public round-status doc (a random-init
+    round resolves to random init). A ``metro-v1:trained:hippius:…`` pointer or
+    a bare ``repo@digest`` is fetched from the Hub into ``cache_dir``; anything
+    else must be an existing local directory holding the checkpoint weights.
+    Returns ``(dir_or_None, label)``.
+    """
+    if warm_start is None or str(warm_start).strip() == "":
+        return None, "random init"
+    spec = str(warm_start).strip()
+
+    if spec.lower() == LIVE_WARM_START:
+        from .dashboard import fetch_public_round_status
+
+        doc = fetch_public_round_status(cfg.storage)
+        ws = doc.get("warm_start") if isinstance(doc, dict) else None
+        init = ws.get("init_checkpoint") if isinstance(ws, dict) else None
+        if not init:
+            log.info("warm-start live: the current round trains from random init")
+            return None, "random init (live round is not warm-started)"
+        spec = str(init)
+
+    from ..shared.hippius import HubConfig, HubRef, fetch_from_hub, is_hub_ref
+    from ..shared.manifest import parse_trained_pointer
+
+    ref = parse_trained_pointer(spec) or (spec if is_hub_ref(spec) else None)
+    if ref is not None:
+        dest = Path(cache_dir) / "warm-start" / HubRef.parse(ref).digest.replace(":", "-")
+        fetch_from_hub(ref, dest, HubConfig.from_storage(cfg.storage))
+        return dest, f"warm-start {ref}"
+
+    local = Path(spec)
+    if local.is_dir():
+        return local, f"warm-start dir:{local}"
+    raise ValueError(
+        f"--warm-start {spec!r} is neither 'live', a Hub ref (repo@digest / trained "
+        "pointer), nor an existing checkpoint directory"
+    )
+
+
 def score_generator(
     repo_dir: Path | str,
     cfg,
@@ -95,6 +145,7 @@ def score_generator(
     seed: int = 0,
     cache_dir: Path | str = "./_score_work",
     trainer_spec: str = "cascade.trainer.toto2_trainer:Toto2Trainer",
+    warm_start: str | Path | None = None,
 ) -> ScoreResult:
     """Train the fixed model on ``repo_dir``'s corpus at the heat budget and score
     it on the resolved pool. Returns a :class:`ScoreResult` (lower geomean better).
@@ -102,6 +153,11 @@ def score_generator(
     ``train_hours`` defaults to ``[round] heat_train_hours`` (the cheap screen);
     ``n_windows`` to ``[round] heat_n_windows``. Reuses the round's contract at the
     screen size, so the number mirrors the heat screener's ranking.
+
+    ``warm_start`` (see :func:`_resolve_warm_start`) replaces the seeded random
+    init with a promoted cascade checkpoint — ``"live"`` for the one the current
+    round trains from — and switches the trainer to the warm-started recipe, so
+    the run mirrors a live warm-started round instead of a from-scratch one.
     """
     from ..eval.scoring import global_geomean
     from ..trainer.contract import RoundSeeds
@@ -132,10 +188,14 @@ def score_generator(
     if not windows:
         raise ValueError("scoring pool produced no windows (check --pool-dir / --pool contents)")
 
+    ws_dir, init_label = _resolve_warm_start(cfg, warm_start, cache_dir=cache)
+    train_kwargs = {"warm_start_dir": ws_dir} if ws_dir is not None else {}
+
     base_trainer = _load_trainer(trainer_spec)
     with tempfile.TemporaryDirectory(dir=cache, prefix="ckpt-") as td:
         out_dir = Path(td)
-        log.info("training on %s at %.3gh (%s point-passes) …", repo.name, hours, f"{token_budget:,}")
+        log.info("training on %s at %.3gh (%s point-passes) from %s …",
+                 repo.name, hours, f"{token_budget:,}", init_label)
         with open_round_stream(
             contract.corpus_mode, repo, seeds.generation_seed, cfg.generator,
             token_budget=token_budget, use_sandbox=False,      # local, trusted-own-code path
@@ -145,6 +205,7 @@ def score_generator(
             result = base_trainer.train(
                 rs.series(), contract,
                 training_seed=seeds.training_seed, token_budget=token_budget, out_dir=out_dir,
+                **train_kwargs,
             )
             corpus_digest, n_series = rs.digest, rs.n_series
         scores = evaluate_checkpoint(
@@ -158,4 +219,5 @@ def score_generator(
         n_series=n_series,
         train_seconds=result.train_seconds,
         pool_label=pool_label,
+        init_label=init_label,
     )
