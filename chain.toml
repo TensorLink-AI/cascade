@@ -325,11 +325,15 @@ duel_seat_all   = true      # seat every screened entrant; false = seats bounded
 # funded_activation_block; legacy rounds keep running until it.
 # Details: docs/MINER_FUNDED_ROUNDS.md.
 funded_mode = "required"
-funded_activation_block = 9043200   # go-live ≈ Fri 2026-09-11 08:30 UTC (owner 2026-09-09;
-                                    # the 2026-09-04 block passed unreleased). Same boundary
-                                    # as cohort max-T + increment margin (DEC-CA-0038/0039):
-                                    # ONE coordinated validator-update window. MV scoring
-                                    # arms separately at 9068400 (Mon 20:30 UTC), same release.
+funded_activation_block = 9046800   # first funded round ≈ Fri 2026-09-11 20:30 UTC (evening;
+                                    # owner 2026-09-10). The morning boundary 9043200 (08:30 UTC)
+                                    # is the release/validator-update flip — cohort max-T +
+                                    # increment (DEC-CA-0038/0039) + the [training] contract cut go
+                                    # live and cascade-intake opens for submissions/lium-key funding
+                                    # there; the first FUNDED round is the NEXT (evening) boundary,
+                                    # so miners have the whole morning+afternoon to submit and fund.
+                                    # The 08:30 slot runs a legacy operator-funded duel round. MV
+                                    # scoring arms 9068400 (Mon 20:30 UTC).
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
 # With funded_mode = "required": an unfunded boundary runs NOTHING (no king
 # leg, no pods, no manifest — validators just see no manifest and hold).
