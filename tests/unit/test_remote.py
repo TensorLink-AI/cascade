@@ -579,3 +579,89 @@ def test_worker_local_only_prints_a_local_receipt(cfg, tmp_path, monkeypatch, ca
     receipt = _json.loads(line[len(RECEIPT_SENTINEL):])
     assert receipt["local_checkpoint_dir"] == "/w/checkpoint"
     assert "trained_pointer" not in receipt
+
+
+# ── harvest resolves against the pod workdir (DEC-CA-0036 credential-free) ─────
+
+
+def test_harvest_cds_to_workdir_before_tar(tmp_path, monkeypatch):
+    """The --local-only worker runs under `cd host.workdir` and emits a
+    checkpoint dir relative to it; harvest_remote_dir must resolve in the SAME
+    workdir, not the ssh login home (else `tar -C <rel>` hits $HOME/<rel> →
+    empty archive, live 2026-09-10)."""
+    from cascade.trainer.remote import harvest_remote_dir
+
+    host = _host(workdir="/root/cascade")
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+    def _runner(argv, timeout):
+        captured["argv"] = argv
+        return _FakeProc()
+
+    harvest_remote_dir(host, "_train_work/9/toto2-4m/challenger/checkpoint",
+                       tmp_path / "dest", runner=_runner)
+    remote_cmd = captured["argv"][-1]
+    assert remote_cmd.startswith("cd /root/cascade && tar -C ")
+    assert "_train_work/9/toto2-4m/challenger/checkpoint" in remote_cmd
+
+
+def test_harvest_absolute_dir_still_cds_harmlessly(tmp_path):
+    """An absolute remote_dir is unaffected by the cd (tar -C <abs> ignores cwd)."""
+    from cascade.trainer.remote import harvest_remote_dir
+
+    host = _host(workdir="/root/cascade")
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+    def _runner(argv, timeout):
+        captured["argv"] = argv
+        return _FakeProc()
+
+    harvest_remote_dir(host, "/abs/checkpoint", tmp_path / "d2", runner=_runner)
+    assert "cd /root/cascade && tar -C /abs/checkpoint" in captured["argv"][-1]
+
+
+# ── worker runtime probe (stale-image attestation) ────────────────────────────
+
+
+def test_probe_worker_runtime_passes_when_flags_present(monkeypatch):
+    from cascade.trainer import remote as rmod
+
+    class _P:
+        returncode = 0
+        stdout = "usage: cascade-train-worker [--local-only] [--gen-ref ...]"
+        stderr = ""
+
+    monkeypatch.setattr(rmod.subprocess, "run", lambda *a, **k: _P())
+    assert rmod.probe_worker_runtime(_host()) == ""
+
+
+def test_probe_worker_runtime_flags_stale_image(monkeypatch):
+    from cascade.trainer import remote as rmod
+
+    class _P:
+        returncode = 0
+        stdout = "usage: cascade-train-worker [--gen-ref ...]"  # NO --local-only
+        stderr = ""
+
+    monkeypatch.setattr(rmod.subprocess, "run", lambda *a, **k: _P())
+    why = rmod.probe_worker_runtime(_host())
+    assert "STALE" in why and "--local-only" in why
+
+
+def test_probe_worker_runtime_reports_ssh_failure(monkeypatch):
+    from cascade.trainer import remote as rmod
+
+    class _P:
+        returncode = 255
+        stdout = ""
+        stderr = "Host key verification failed."
+
+    monkeypatch.setattr(rmod.subprocess, "run", lambda *a, **k: _P())
+    why = rmod.probe_worker_runtime(_host())
+    assert "rc=255" in why
