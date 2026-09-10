@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -14,8 +15,8 @@ from cascade.funding.vault import PayerKeyVault
 from cascade.provision.core import PodAddress
 from cascade.provision.state import PodInstance
 from cascade.shared.config import RoundConfig, validate_funded_pods
-from cascade.trainer.loop import TrainerRunner, _FundedLegSkip
-from cascade.trainer.remote import RemoteHost
+from cascade.trainer.loop import TrainerRunner, _FundedLegSkip, _FundedTamper
+from cascade.trainer.remote import RemoteDispatchError, RemoteHost
 
 REF = "ns/gen@sha256:" + "a" * 64
 VAULT_REF = "vault/direct@sha256:" + "b" * 64
@@ -45,6 +46,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                       payer_vault_dir=vault_dir, funded_pod_sku=sku,
                       funded_pod_image=image, **round_kw)
     import threading
+
     from cascade.shared.config import TelemetryConfig
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd,
                                                subnet=SimpleNamespace(netuid=91),
@@ -239,12 +241,10 @@ def test_isolated_host_receives_no_orchestrator_env(monkeypatch):
                       cuda_device="0", chain_toml="chain.toml",
                       forward_env=("HIPPIUS_S3_ACCESS_KEY",),
                       static_env=(("HIPPIUS_HUB_USERNAME", "robot$x"),), isolated=True)
-    try:
+    with contextlib.suppress(Exception):  # the parsed entry shape is not under test
         disp.dispatch(host, lane_count=1, gen_ref=REF, uid=1, hotkey="hkA",
                       role="challenger", base_seed=1, block=1, arch_preset="toto2-4m",
                       warm_start_ref=None)
-    except Exception:  # noqa: BLE001 — the parsed entry shape is not under test
-        pass
     assert "robot$x" in seen["stdin"]
     assert "op-s3" not in seen["stdin"] and "op-wandb" not in seen["stdin"]
 
@@ -341,7 +341,7 @@ def test_funded_leg_dispatches_on_the_rented_pod_and_tears_down(tmp_path, monkey
 def test_funded_leg_failure_classifies_and_still_tears_down(tmp_path, monkeypatch):
     disp = _FakeDisp(fail_rc=255)
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
-    with pytest.raises(Exception):
+    with pytest.raises(RemoteDispatchError):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     assert torn == ["cascade-n91-777-funded-hka-0"]
@@ -352,7 +352,7 @@ def test_funded_leg_failure_classifies_and_still_tears_down(tmp_path, monkeypatc
 def test_funded_leg_rc3_is_the_miners_fault(tmp_path, monkeypatch):
     disp = _FakeDisp(fail_rc=3)
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
-    with pytest.raises(Exception):
+    with pytest.raises(RemoteDispatchError):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
@@ -470,11 +470,9 @@ def test_dispatch_static_env_wins_over_forwarded_copies(monkeypatch, tmp_path):
              "total_points": 1}), stderr="")
 
     disp = RemoteDispatcher(trainer_spec="m:C", timeout_seconds=5, _runner=fake_runner)
-    try:
+    with contextlib.suppress(Exception):  # receipt shape isn't the point; the env is
         disp.dispatch(host, gen_ref=REF, uid=1, hotkey="hk", role="king",
                       base_seed=1, block=1)
-    except Exception:
-        pass  # receipt shape isn't the point; the env is
     assert "CASCADE_VAULT_DIR=/root/cascade/_vault_stage" in captured["stdin"]
     assert "/orchestrator/store" not in captured["stdin"]
 
@@ -514,7 +512,6 @@ def test_capacity_zero_seats_nobody_and_queue_holds(tmp_path):
     r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
     r._probe_funded_capacity = lambda sku: 1      # king's reserve eats it
-    from cascade.funding.queue import FundedQueue
     FundedQueue(tmp_path / "funded_queue.json").add("hkA", REF, reveal_block=10)
     kept = r._filter_funded_challengers([_challenger("hkA")])
     assert kept == []
@@ -812,7 +809,7 @@ def test_identity_mismatch_before_dispatch_is_tamper_and_never_dispatches(tmp_pa
     disp = _FakeDisp()
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
     runner._funded_pod_identity_mismatch = lambda pod: "pod id changed: rented uid-hka, now uid-x"
-    with pytest.raises(Exception):
+    with pytest.raises(_FundedTamper):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
                                warm_start_ref=None)
     assert disp.calls == []                          # nothing reached the impostor
@@ -826,7 +823,7 @@ def test_identity_mismatch_after_training_is_tamper(tmp_path, monkeypatch):
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
     calls = iter([None, "pod no longer listed on the payer's account"])
     runner._funded_pod_identity_mismatch = lambda pod: next(calls)
-    with pytest.raises(Exception):
+    with pytest.raises(_FundedTamper):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
                                warm_start_ref=None)
     assert len(disp.calls) == 1
@@ -898,7 +895,7 @@ def test_tampered_checkpoint_never_reaches_the_manifest(tmp_path, monkeypatch):
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
     runner._funded_checkpoint_mismatch = (
         lambda entry, contract: "forecast_wrapper.py differs from this release's copy")
-    with pytest.raises(Exception):
+    with pytest.raises(_FundedTamper):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
                                warm_start_ref=None)
     assert len(disp.calls) == 1                      # it trained…
@@ -932,7 +929,7 @@ def test_funded_leg_failure_never_keeps_the_pod(tmp_path, monkeypatch):
     disp = _FakeDisp(fail_rc=255)
     runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
     runner.cascade_bench_plan = object()
-    with pytest.raises(Exception):
+    with pytest.raises(RemoteDispatchError):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     assert torn == ["cascade-n91-777-funded-hka-0"]
@@ -1034,7 +1031,7 @@ def test_harvest_guard_failure_is_tamper(tmp_path, monkeypatch):
     def _boom(d, contract=None, **kw):
         raise CheckpointTampered("model.py differs from this release's copy")
     monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint", _boom)
-    with pytest.raises(Exception):
+    with pytest.raises(_FundedTamper):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
@@ -1051,7 +1048,7 @@ def test_stale_worker_image_probe_rejects_before_dispatch_as_infra(tmp_path, mon
     # override the permissive stub: this pod's worker is stale
     monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
                         lambda host, **kw: "pod booted a STALE worker image (missing --local-only)")
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
                                warm_start_ref=None)
     assert disp.calls == []                       # never dispatched
@@ -1066,7 +1063,7 @@ def test_harvest_transport_failure_is_infra_not_tamper(tmp_path, monkeypatch):
     def _dead(host, rdir, dest, **kw):
         raise RuntimeError("harvest rc=255")
     monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", _dead)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]

@@ -18,6 +18,7 @@ present), or read from a local file via ``--receipt``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import sys
@@ -211,11 +212,9 @@ def audit_receipt(
     """Run every check up to ``tier``. Pure orchestration; each check is a small
     function in :mod:`cascade.audit.checks` / :mod:`cascade.audit.rederive`."""
     roster = None
-    try:
+    with contextlib.suppress(Exception):  # absent on any pre-funded round; SKIP handles it
         roster = json.loads(_fetch_text(
             cfg, f"funded/round-{receipt.round_id}.json"))
-    except Exception:  # noqa: BLE001 — absent on any pre-funded round; SKIP handles it
-        pass
     results = run_tier0(receipt, cfg, client, funded_roster=roster)
     if tier >= 1:
         from .rederive import run_tier1

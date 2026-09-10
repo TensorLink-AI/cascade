@@ -91,12 +91,15 @@ def test_weights_header_shape_games_are_refused(tmp_path, contract):
     d = _honest_checkpoint(tmp_path, contract)
     state = Toto2Model(Toto2Config.from_contract(contract)).state_dict()
     # an extra tensor
-    bad = dict(state); bad["evil.extra"] = torch.zeros(4)
+    bad = dict(state)
+    bad["evil.extra"] = torch.zeros(4)
     save_file(bad, str(d / "weights.safetensors"))
     with pytest.raises(CheckpointTampered, match="extra="):
         verify_checkpoint(d, contract)
     # a reshaped tensor
-    bad = dict(state); k = next(iter(bad)); bad[k] = torch.zeros(bad[k].shape + (1,))
+    bad = dict(state)
+    k = next(iter(bad))
+    bad[k] = torch.zeros(bad[k].shape + (1,))
     save_file(bad, str(d / "weights.safetensors"))
     with pytest.raises(CheckpointTampered, match="shape/dtype"):
         verify_checkpoint(d, contract)

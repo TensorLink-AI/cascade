@@ -62,6 +62,7 @@ requeues without burning.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -431,8 +432,7 @@ class FundingIntake:
                                     f"{declared} — corrupted upload?"}
         from ..interface.validation import format_commit
         from ..shared.hippius import StorageError
-        from .store import (DigestOwned, SubmissionQuotaExceeded,
-                            SubmissionTooLarge, vault_ref)
+        from .store import DigestOwned, SubmissionQuotaExceeded, SubmissionTooLarge, vault_ref
 
         # Dispatch HTTP status on the exception TYPE, never by substring-matching
         # the message — the message can carry the attacker-chosen member name,
@@ -760,14 +760,10 @@ class FundingIntake:
                     for key, sock in stuck:
                         log.warning("closing connection past the %.0fs "
                                     "deadline", request_deadline_s)
-                        try:
+                        with contextlib.suppress(OSError):
                             sock.shutdown(_socket.SHUT_RDWR)
-                        except OSError:
-                            pass
-                        try:
+                        with contextlib.suppress(OSError):
                             sock.close()
-                        except OSError:
-                            pass
                         with self._live_lock:
                             self._live.pop(key, None)
 

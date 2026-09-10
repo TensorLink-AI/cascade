@@ -391,7 +391,7 @@ def test_rounds_needed_clamps():
         rounds_needed(1, cap=0)
 
 
-from cascade.funding.queue import FundedQueue as Q
+from cascade.funding.queue import FundedQueue as Q  # noqa: E402
 
 R1 = "ns/gen@sha256:" + "a" * 64
 R2 = "ns/gen@sha256:" + "b" * 64

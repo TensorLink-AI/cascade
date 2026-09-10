@@ -306,8 +306,7 @@ def test_settled_retry_restores_funded_state_from_the_marker(tmp_path):
 def test_funded_config_validators_fail_loud():
     import pytest
 
-    from cascade.shared.config import (validate_funded_field_cap,
-                                       validate_funded_pod_skus)
+    from cascade.shared.config import validate_funded_field_cap, validate_funded_pod_skus
 
     assert validate_funded_field_cap(0) == 0
     assert validate_funded_field_cap("8") == 8

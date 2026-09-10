@@ -304,7 +304,6 @@ def test_epoch_start_agrees_across_the_switch_for_pre_switch_rounds():
 def test_activation_block_must_be_on_both_grids(tmp_path):
     """A seam that is not a boundary of both grids leaves the round spanning it
     with two different lengths depending on which side you ask from."""
-    import shutil
 
     import pytest
 
