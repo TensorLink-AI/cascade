@@ -3,6 +3,8 @@ train→eval wiring, with the heavy train/eval steps mocked."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from cascade.miner import score as score_mod
@@ -44,8 +46,13 @@ class _FakeStream:
 
 
 class _FakeTrainer:
-    def train(self, stream, contract, *, training_seed, token_budget, out_dir, logger=None):
+    def __init__(self):
+        self.calls = []
+
+    def train(self, stream, contract, *, training_seed, token_budget, out_dir, logger=None,
+              **kw):
         from cascade.trainer.contract import TrainResult
+        self.calls.append(kw)
         for _ in stream:  # drain so the digest/n_series finalise
             pass
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -77,3 +84,79 @@ def test_score_generator_wiring(cfg, tmp_path, monkeypatch):
     assert r.n_series == 12 and r.corpus_digest.startswith("deadbeef")
     assert r.train_seconds == 4.2
     assert "synthetic-sample" in r.pool_label
+
+
+def _stub_train_eval(monkeypatch):
+    from cascade.eval.scoring import WindowScore
+
+    trainer = _FakeTrainer()
+    monkeypatch.setattr("cascade.trainer.main._load_trainer", lambda spec: trainer)
+    monkeypatch.setattr("cascade.trainer.stream.open_round_stream",
+                        lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(
+        "cascade.validator.evaluator.evaluate_checkpoint",
+        lambda ckpt, windows, *, num_samples, device: [
+            WindowScore(series_id=str(i), mase=1.0, qloss_per_q=np.full(9, 0.5), abs_target=5.0)
+            for i in range(len(windows))],
+    )
+    return trainer
+
+
+def test_default_is_random_init(cfg, tmp_path, monkeypatch):
+    trainer = _stub_train_eval(monkeypatch)
+    r = score_mod.score_generator("scripts/example_generator", cfg, n_windows=3, cache_dir=tmp_path)
+    assert r.init_label == "random init"
+    assert trainer.calls == [{}]                    # no warm_start_dir handed to the trainer
+
+
+def test_warm_start_local_dir_reaches_trainer(cfg, tmp_path, monkeypatch):
+    trainer = _stub_train_eval(monkeypatch)
+    init = tmp_path / "promoted"
+    init.mkdir()
+    r = score_mod.score_generator("scripts/example_generator", cfg, n_windows=3,
+                                  cache_dir=tmp_path, warm_start=init)
+    assert r.init_label == f"warm-start dir:{init}"
+    assert trainer.calls == [{"warm_start_dir": init}]
+
+
+def test_warm_start_hub_ref_and_pointer_fetch(cfg, tmp_path, monkeypatch):
+    fetched = []
+
+    def fake_fetch(ref, dest, hub=None):
+        fetched.append(ref)
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        return Path(dest)
+    monkeypatch.setattr("cascade.shared.hippius.fetch_from_hub", fake_fetch)
+    ref = "cascade/ckpt-r1-challenger-toto2-4m-u5@sha256:" + "ab" * 32
+
+    d, label = score_mod._resolve_warm_start(cfg, ref, cache_dir=tmp_path)
+    d2, _ = score_mod._resolve_warm_start(cfg, f"metro-v1:trained:hippius:{ref}", cache_dir=tmp_path)
+    assert fetched == [ref, ref]                     # pointer prefix stripped, bare ref as-is
+    assert d == d2 and d.is_dir() and str(d).startswith(str(tmp_path / "warm-start"))
+    assert label == f"warm-start {ref}"
+
+
+def test_warm_start_live_reads_round_status(cfg, tmp_path, monkeypatch):
+    ref = "cascade/ckpt-r1-challenger-toto2-4m-u5@sha256:" + "cd" * 32
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_round_status",
+                        lambda storage, **k: {"warm_start": {
+                            "init_checkpoint": f"metro-v1:trained:hippius:{ref}", "size": "toto2-4m"}})
+    seen = []
+    monkeypatch.setattr("cascade.shared.hippius.fetch_from_hub",
+                        lambda r, dest, hub=None: (seen.append(r), Path(dest).mkdir(parents=True), Path(dest))[-1])
+    d, label = score_mod._resolve_warm_start(cfg, "live", cache_dir=tmp_path)
+    assert seen == [ref] and d.is_dir() and ref in label
+
+    # a random-init round (no warm_start block) resolves to random init, no fetch
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_round_status",
+                        lambda storage, **k: {"round_id": "1"})
+    d, label = score_mod._resolve_warm_start(cfg, "live", cache_dir=tmp_path)
+    assert d is None and label.startswith("random init")
+    assert seen == [ref]
+
+
+def test_warm_start_garbage_is_rejected(cfg, tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="--warm-start"):
+        score_mod._resolve_warm_start(cfg, str(tmp_path / "nope"), cache_dir=tmp_path)

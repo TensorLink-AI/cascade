@@ -7,8 +7,9 @@
 * ``cascade score <repo_dir>`` — train the fixed model on your generator's data
   at the cheap heat budget and score it on a local/sample pool, entirely offline
   (no chain, no TAO, no ~12h round). The fast iteration loop; needs the
-  ``[train]`` extra. Trains from random init — live rounds train from the
-  promoted cascade warm-start once a generation is live, so compare against
+  ``[train]`` extra. Trains from random init unless ``--warm-start`` names a
+  promoted cascade init (``live`` = the one the current round trains from);
+  live rounds train from that warm-start once a generation is live, so compare against
   ``cascade score ./king`` on the same pool, not against live heat numbers.
   See ``cascade/miner/score.py``.
 
@@ -196,6 +197,11 @@ def _add_score(sub: argparse._SubParsersAction) -> None:
                    help="Eval windows to score on (default: [round] heat_n_windows).")
     p.add_argument("--device", default="cpu", help="Torch device (cuda recommended).")
     p.add_argument("--seed", type=int, default=0, help="Round seed (fixes generation + training).")
+    p.add_argument("--warm-start", default=None, metavar="live|repo@digest|DIR",
+                   help="Train from a promoted cascade init instead of random init, with the "
+                        "live warm-started recipe: 'live' (the init the current round trains "
+                        "from, per the public round status), a Hub ref / trained pointer, or a "
+                        "local checkpoint dir. Default: random init.")
     p.add_argument("--skip-verify", action="store_true",
                    help="Skip the pre-score determinism/guard check.")
     p.set_defaults(func=_cmd_score)
@@ -217,13 +223,15 @@ def _cmd_score(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001 — surface any train/eval failure cleanly
         print(f"scoring failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
+    same = "--pool-dir <same pool>" + (f" --warm-start {args.warm_start}" if args.warm_start else "")
     print(
         f"\nscore: geomean={r.geomean:.5f}  (lower is better)\n"
         f"  pool:    {r.pool_label}  ({r.n_windows} windows)\n"
         f"  corpus:  {r.n_series} series, digest {r.corpus_digest[:12]}…\n"
+        f"  init:    {r.init_label}\n"
         f"  trained: {r.train_seconds:.0f}s\n"
         f"\ncompare against the king:  cascade fetch king --out ./king && "
-        f"cascade score ./king --pool-dir <same pool>"
+        f"cascade score ./king {same}"
     )
     return 0
 
@@ -234,7 +242,7 @@ def _run_score(args: argparse.Namespace, cfg):
     return score_generator(
         args.repo_dir, cfg, pool_dir=args.pool_dir, pool_ref=args.pool_ref,
         train_hours=args.train_hours, n_windows=args.n_windows, device=args.device,
-        seed=args.seed,
+        seed=args.seed, warm_start=args.warm_start,
     )
 
 

@@ -162,10 +162,23 @@ Two caveats worth internalising:
   offline synthetic sample is only a smoke signal.
 - **Don't overfit your pool.** A generator tuned to ace one fixed local set is
   exactly what the private rotating eval punishes. Rotate/expand your pool.
-- **Local scoring trains from random init.** Live rounds train from the
-  promoted warm-start init once a cascade generation is live (the case today),
-  so your absolute local numbers won't match live heat scores — the *relative*
-  comparison against `cascade score ./king` on the same pool is what carries.
+- **Local scoring trains from random init by default.** Live rounds train from
+  the promoted warm-start init once a cascade generation is live (the case
+  today), so from-scratch local numbers won't match live heat scores — the
+  *relative* comparison against `cascade score ./king` on the same pool is what
+  carries. To train the way the live round does, add `--warm-start live`: it
+  reads the init the current round trains from off the public round status
+  (`cascade round` shows it), fetches it from the Hub, and switches to the
+  warm-started recipe (`warm_lr_scale`, no wsd warmup). `--warm-start` also
+  takes an explicit `repo@digest` / trained pointer or a local checkpoint dir.
+  Score the king and your candidate with the *same* `--warm-start` — a generator
+  that helps a warm init keep improving can rank differently from one that
+  helps random init converge.
+
+```bash
+cascade score ./king   --pool-dir ./my-heldout --warm-start live
+cascade score ./my-gen --pool-dir ./my-heldout --warm-start live
+```
 
 ## 3. Make a wallet and register
 
