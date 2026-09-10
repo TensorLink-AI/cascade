@@ -444,3 +444,167 @@ def test_boundary_replay_is_a_no_op_without_an_anchored_engine(
     runner.promotion = None
     runner._replay_reign_bench_reports()    # must not raise, must not read
     assert runner.manifest_store().reads == []
+
+
+# ── DEC-CA-0036: funded challengers bench on their payer's pod, verified on the king's ──
+
+def _scores(x):
+    return dict(gifteval_crps=x, gifteval_mase=x, boom_crps=x,
+                boom_mase=x, time_crps=x, time_mase=x)
+
+
+def _payer_sweep(runner, monkeypatch, *, payer_reported, operator_actual,
+                 verify_top=1, king_host=True):
+    """Wire a king (operator pod) + two funded challengers (payer pods, kept
+    for the bench). ``payer_reported`` maps hotkey → the number the payer pod
+    reports; ``operator_actual`` maps hotkey → what the king pod re-bench
+    finds. Returns (duel, benched-on log, torn-down hotkeys, pushed dirs)."""
+    from types import SimpleNamespace
+
+    runner.cascade_bench_plan = object()
+    runner.remote_hosts = {}                       # no standing fleet (JIT king)
+    runner.cfg = replace(runner.cfg, telemetry=replace(
+        runner.cfg.telemetry, funded_bench_verify_top=verify_top))
+    duel = [_duel_entry("king", 7, "k"),
+            _duel_entry("challenger", 1, "a"), _duel_entry("challenger", 2, "b")]
+    king = SimpleNamespace(host="1.1.1.1", name="king-pod", isolated=False)
+    if king_host:
+        runner._final_role_hosts[("king", "toto2-4m", "k")] = king
+    for hk in ("a", "b"):
+        runner._final_role_hosts[("challenger", "toto2-4m", hk)] = SimpleNamespace(
+            host=f"9.9.9.{ord(hk)}", name=f"funded-{hk}", isolated=True)
+        runner._funded_bench_pods[hk] = SimpleNamespace(instance_id=f"pod-{hk}",
+                                                        payer_hotkey=hk)
+    runner._funded_field = {"a": "ref-a", "b": "ref-b"}
+    torn: list[str] = []
+    runner._teardown_funded_pod = lambda pod: torn.append(pod.payer_hotkey)
+    benched: list[tuple[str, str]] = []
+    pushed: list[str] = []
+
+    def _fake_bench(host, rid, size, plan, *, work_root=None, role="king", **kw):
+        benched.append((host.name, role))
+        if host.isolated:
+            hk = host.name.split("-")[1]
+            return {"scores": payer_reported[hk]}
+        if role.endswith("-verify"):
+            hk = role.split("-u")[1].split("-")[0]
+            hk = {"1": "a", "2": "b"}[hk]
+            return {"scores": operator_actual[hk]}
+        return {"scores": 0.5}
+
+    monkeypatch.setattr("cascade.trainer.bench_hook.run_post_round_benchmark",
+                        _fake_bench)
+    monkeypatch.setattr("cascade.trainer.bench_hook.push_checkpoint",
+                        lambda host, local, rid, size, role, **kw: pushed.append(role))
+    monkeypatch.setattr("cascade.eval.benchmarks.extract_bench_scores",
+                        lambda report: _scores(report["scores"]))
+    runner._fetch_checkpoint_dir = lambda ptr: runner.work_root / ptr
+    return duel, benched, torn, pushed
+
+
+def test_payer_pod_sweep_tears_each_pod_down_when_its_bench_ends(
+        cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    duel, benched, torn, _ = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.4, "b": 0.45},
+        operator_actual={"a": 0.4, "b": 0.45})
+    out = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    # every checkpoint benched where it was trained (three pods, in parallel)
+    assert sorted(benched) == [("funded-a", "challenger-u1"),
+                               ("funded-b", "challenger-u2"), ("king-pod", "king")]
+    assert set(out) == {"ptr-k", "ptr-a", "ptr-b"}
+    assert runner._payer_benched == {"ptr-a", "ptr-b"}
+    # each payer pod went down as its own sweep ended; nothing left kept
+    assert sorted(torn) == ["a", "b"] and runner._funded_bench_pods == {}
+
+
+def test_payer_numbers_never_publish_unverified(cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    duel, benched, _, pushed = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.40, "b": 0.45},
+        operator_actual={"a": 0.405, "b": 0.30}, verify_top=1)
+    scored = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    out = runner._verify_payer_benches(duel, scored, "9988", "toto2-4m")
+    # only the best payer-reported challenger (a) was verified, on the KING pod
+    assert pushed == ["challenger-u1-verify"]
+    assert ("king-pod", "challenger-u1-verify") in benched
+    assert ("king-pod", "challenger-u2-verify") not in benched
+    # a's published numbers are the OPERATOR's, not the payer's
+    assert out["ptr-a"].gifteval_crps == 0.405
+    # b (unverified) is absent from what gets signed; the king is untouched
+    assert "ptr-b" not in out and out["ptr-k"] == scored["ptr-k"]
+
+
+def test_forged_payer_bench_is_dropped(cascade_cfg, tmp_path, monkeypatch, caplog):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    duel, _, _, _ = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.20, "b": 0.45},
+        operator_actual={"a": 0.40, "b": 0.45})
+    scored = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    with caplog.at_level("ERROR", logger="cascade.trainer"):
+        out = runner._verify_payer_benches(duel, scored, "9988", "toto2-4m")
+    # neither the payer's number nor the operator's stands in for a forger
+    assert "ptr-a" not in out and "ptr-k" in out
+    assert any("forged sweep" in r.message for r in caplog.records)
+
+
+def test_payer_bench_within_tolerance_publishes_the_operators_numbers(
+        cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    # payer reports 1% better than the operator finds: sweep noise, not forgery
+    duel, _, _, _ = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.396, "b": 0.45},
+        operator_actual={"a": 0.40, "b": 0.45})
+    scored = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    out = runner._verify_payer_benches(duel, scored, "9988", "toto2-4m")
+    assert out["ptr-a"].boom_mase == 0.40
+
+
+def test_verify_top_two_re_benches_both(cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    duel, _, _, pushed = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.40, "b": 0.45},
+        operator_actual={"a": 0.40, "b": 0.45}, verify_top=2)
+    scored = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    out = runner._verify_payer_benches(duel, scored, "9988", "toto2-4m")
+    assert pushed == ["challenger-u1-verify", "challenger-u2-verify"]
+    assert {"ptr-a", "ptr-b"} <= set(out)
+
+
+def test_no_king_pod_means_no_payer_number_publishes(cascade_cfg, tmp_path, monkeypatch):
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    duel, _, _, pushed = _payer_sweep(
+        runner, monkeypatch, payer_reported={"a": 0.40, "b": 0.45},
+        operator_actual={"a": 0.40, "b": 0.45}, king_host=False)
+    scored = runner._bench_duel_checkpoints(duel, "9988", "toto2-4m")
+    out = runner._verify_payer_benches(duel, scored, "9988", "toto2-4m")
+    assert pushed == [] and not ({"ptr-a", "ptr-b"} & set(out))
+
+
+def test_funded_challenger_without_a_tracked_host_is_never_guessed(
+        cascade_cfg, tmp_path, monkeypatch):
+    """A funded challenger's checkpoint only ever lived on its payer's pod;
+    losing the tracking dict must not bench a stranger's path on the king."""
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=None)
+    runner._funded_field = {"a": "ref-a"}
+    runner._hosts_for = lambda stage: ["king-pod"]
+    assert runner._bench_host_for(_duel_entry("challenger", 1, "a"), "toto2-4m") is None
+    # an operator-lane challenger keeps the legacy heuristic
+    assert runner._bench_host_for(_duel_entry("challenger", 2, "z"), "toto2-4m") == "king-pod"
+
+
+def test_bench_thread_exit_sweeps_kept_payer_pods(cascade_cfg, tmp_path, monkeypatch):
+    """The bench thread's finally is the last line of defence for a kept
+    payer pod: a sweep that never reached _bench_pod_group still ends its bill."""
+    from types import SimpleNamespace
+
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=lambda d: _BENCH)
+    torn: list[str] = []
+    runner._teardown_funded_pod = lambda pod: torn.append(pod.payer_hotkey)
+    runner._funded_bench_pods["a"] = SimpleNamespace(instance_id="p", payer_hotkey="a")
+    monkeypatch.setattr(runner, "_post_publish_bench",
+                        lambda manifest: (_ for _ in ()).throw(RuntimeError("boom")))
+    manifest = SimpleNamespace(round_id="1", created_block=1, entries=[],
+                               warm_start_ckpt="")
+    runner.run_post_publish_bench(manifest)
+    assert torn == ["a"] and runner._funded_bench_pods == {}

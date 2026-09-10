@@ -107,6 +107,11 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # DEC-CA-0020 layer 3: the accepted record-field set ([training]
     # accepted_fields). Empty = values-only (every deployed config).
     "accepted_fields": ((), []),
+    # DEC-CA-0041: what batch_size counts at C > 1. "series" = the legacy
+    # bucket fill (every deployed config; C > 1 was unreachable while
+    # max_channels was 1); "sequences" holds tokens-per-step constant across
+    # C so step counts equalise — arming it is the deliberate digest bump.
+    "batch_denomination": ("series",),
     # DEC-CA-0026: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
     "allow_future_known": (False,),

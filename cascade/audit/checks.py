@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
-from ..shared.config import ChainConfig, effective_epoch_blocks
+from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
 from ..shared.manifest import (
     LOCKED_CONTRACT_FIELDS,
     TrainingManifest,
@@ -487,6 +487,27 @@ def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
     return out
 
 
+def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params):
+    """``{hotkey: max-T family-wise LCB}`` for a cohort round replayed under
+    the shared-resample correction (DEC-CA-0038) — the same call the validator
+    made (:func:`cascade.eval.koth.cohort_maxt_lcb_map`), off the receipt's own
+    scores. ``params`` is the UNMODIFIED recorded set (max-T needs no
+    ``alpha/k``). Raises on unpaired/​unrebuildable scores."""
+    from ..eval.koth import cohort_maxt_lcb_map
+
+    duelled = _duelled_hotkeys(receipt)
+    king_scores = None
+    cohort: list[tuple[str, list]] = []
+    for hk in duelled:
+        king_scores, chal, paired = _pooled_scores(receipt, manifest, hotkey=hk)
+        if not paired:
+            raise ValueError(f"challenger {hk} has no paired size")
+        cohort.append((hk, chal))
+    return cohort_maxt_lcb_map(
+        king_scores, cohort, params,
+        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean")
+
+
 def _cohort_params(params, manifest: TrainingManifest):
     """``params`` with the duel's family-wise alpha applied (DEC-CA-0012).
 
@@ -503,7 +524,7 @@ def _cohort_params(params, manifest: TrainingManifest):
     return replace(params, bootstrap_alpha=params.bootstrap_alpha / k)
 
 
-def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
+def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """Verify the cohort duel's SELECTION, not just its verdict (DEC-CA-0012).
 
     With one challenger this is a no-op skip. With a cohort it replays every
@@ -601,6 +622,24 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
         )
         replayed.append((hk, res))
 
+    # Cohort family-wise correction (DEC-CA-0038): from cohort_maxt_from_block
+    # the round was judged under the shared-resample max-T, not Bonferroni
+    # alpha/k. Resolve the rule from THIS receipt's block (exactly as the
+    # validator did) and, when armed, replace every replayed lcb with its
+    # joint bound and re-decide the win — so the cohort_lcbs check below
+    # verifies the numbers that actually decided the round. Bonferroni rounds
+    # (and every pre-gate round) skip this untouched.
+    use_maxt = cohort_maxt_active(cfg.scoring, receipt.epoch_start_block)
+    if use_maxt:
+        from ..eval.koth import with_cohort_lcb
+
+        try:
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+        except (ValueError, KeyError) as e:
+            return _fail(name, f"cannot replay cohort max-T bound: {e}")
+        replayed = [(hk, with_cohort_lcb(res, lcbs[hk], params))
+                    for hk, res in replayed]
+
     # The verdict belongs to the LAST challenger recorded (the validator appends
     # in evaluation order and the crowned/​stopping challenger is scored last).
     crowned = duelled[-1]
@@ -637,8 +676,13 @@ def check_duel_cohort(receipt: RoundReceipt) -> CheckResult:
                 f"observed geomean and no public-benchmark gate is recorded")
     if problems:
         return _fail(name, "; ".join(problems))
-    return _ok(name, f"{len(duelled)} challengers replayed at alpha="
-                     f"{duel_params.bootstrap_alpha:.5f} (={params.bootstrap_alpha:.4f}/{k}); "
+    rule = (
+        f"cohort max-T family-wise correction (DEC-CA-0038, alpha="
+        f"{params.bootstrap_alpha:.4f})" if use_maxt else
+        f"Bonferroni alpha={duel_params.bootstrap_alpha:.5f} "
+        f"(={params.bootstrap_alpha:.4f}/{k})"
+    )
+    return _ok(name, f"{len(duelled)} challengers replayed under {rule}; "
                      f"{len(clearers)} cleared; crowned {crowned[:12]}")
 
 
@@ -675,10 +719,19 @@ def _cohort_stats_problems(published: dict | None, replayed: list) -> list[str]:
                 rec.get("wilcoxon_p"), want["wilcoxon_p"]):
             problems.append(f"published wilcoxon_p for {hk} is {rec.get('wilcoxon_p')} "
                             f"but replays as {want['wilcoxon_p']}")
+        # per_domain_win_rate is a non-gating diagnostic, and unlike the
+        # bootstrap inputs the window's DOMAIN label is not carried on the
+        # receipt (``WindowScoreRecord`` keeps only the cluster ``source``). So
+        # a Tier-0 replay collapses every window into the ``"unknown"`` bucket
+        # and cannot reconstruct the published split — the same Tier-0 limit the
+        # gift-gate sidecar has. Compare it only when the replay actually
+        # resolved domains (a future receipt that carries them), exactly as
+        # ``wilcoxon_p`` above is compared only when the replay could compute one.
         got_pd, want_pd = rec.get("per_domain_win_rate") or {}, want.get("per_domain_win_rate") or {}
-        if set(got_pd) != set(want_pd) or any(
+        replay_resolved_domains = bool(want_pd) and set(want_pd) != {"unknown"}
+        if replay_resolved_domains and (set(got_pd) != set(want_pd) or any(
                 not _close(got_pd[d][0], want_pd[d][0]) or int(got_pd[d][1]) != int(want_pd[d][1])
-                for d in want_pd):
+                for d in want_pd)):
             problems.append(f"published per_domain_win_rate for {hk} does not replay")
     return problems
 
@@ -710,7 +763,7 @@ def check_koth_params(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     return _ok(name, "recorded params match chain.toml [scoring]")
 
 
-def check_verdict(receipt: RoundReceipt) -> CheckResult:
+def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """Recompute the KOTH verdict from the receipt's own scores.
 
     Feeds the recorded per-window scores back into ``evaluate_round`` with the
@@ -785,7 +838,23 @@ def check_verdict(receipt: RoundReceipt) -> CheckResult:
 
     result = _replay("geomean")
     scoring_note = ""
-    if not _close(None if math.isnan(result.lcb) else result.lcb, v.lcb):
+    # Cohort family-wise correction (DEC-CA-0038): from cohort_maxt_from_block
+    # the crowned challenger's lcb is its JOINT max-T bound (it depends on the
+    # whole cohort), so a solo replay cannot reproduce it. Resolve the rule
+    # from this receipt's block and, when armed, swap in the crowned bound +
+    # re-decide the win before comparing. k <= 1 and pre-gate rounds never
+    # enter this branch (the crowned solo replay is the whole story there).
+    duelled = _duelled_hotkeys(receipt)
+    if len(duelled) > 1 and cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
+        from ..eval.koth import with_cohort_lcb
+
+        try:
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+        except (ValueError, KeyError) as e:
+            return _fail(name, f"cannot replay cohort max-T bound: {e}")
+        result = with_cohort_lcb(result, lcbs[duelled[-1]], params)
+        scoring_note = " (cohort max-T family-wise correction, DEC-CA-0038)"
+    elif not _close(None if math.isnan(result.lcb) else result.lcb, v.lcb):
         legacy = _replay("pooled")
         if _close(None if math.isnan(legacy.lcb) else legacy.lcb, v.lcb):
             result = legacy
@@ -1003,8 +1072,66 @@ def _confirm_rejection(receipt: RoundReceipt, results: list[CheckResult]) -> lis
     ]
 
 
+def check_funded_roster(receipt: RoundReceipt,
+                        roster: dict | None) -> CheckResult:
+    """Cross-check the published funded roster against the signed manifest.
+
+    The roster (``funded/round-<id>.json``) is the trainer's UNSIGNED
+    transparency record of seat allocation under ``funded_mode = "required"``
+    — so this check WARNs, never FAILs, mirroring contract-declaration. It
+    verifies three things a miner cares about:
+
+    * every challenger the signed manifest trained was a SEATED funded entry
+      (nobody entered the round outside the published queue);
+    * the seated list is in reveal-block seniority order;
+    * nobody left waiting had strictly earlier (reveal_block, hotkey)
+      precedence than someone seated — the queue was not jumped.
+
+    No roster published ⇒ SKIP (a pre-funded or non-required round).
+    """
+    name = "funded-roster"
+    if not roster:
+        return CheckResult(name, SKIP, "no funded roster published for this round")
+    seated = roster.get("seated") or []
+    seated_keys = {str(e.get("hotkey")) for e in seated}
+    # receipt.manifest is the embedded RAW manifest dict (like every other
+    # check here reads it); entries are dicts too.
+    challengers = [e for e in (receipt.manifest.get("entries") or ())
+                   if e.get("role") == "challenger"]
+    strangers = [str(e.get("miner_hotkey", "?")) for e in challengers
+                 if str(e.get("miner_hotkey", "?")) not in seated_keys]
+    if strangers:
+        return CheckResult(
+            name, WARN,
+            f"manifest challenger(s) not on the published funded roster: "
+            f"{', '.join(strangers)}")
+    # A null reveal_block (the hotkey withdrew between selection and roster
+    # build) is UNKNOWN seniority, not block 0 — coercing it to 0 makes it
+    # "most senior" and fires a spurious order/jump WARN (review 2026-09-02).
+    # Unknowns are excluded from both ordering claims.
+    order = [(int(e["reveal_block"]), str(e.get("hotkey")))
+             for e in seated if e.get("reveal_block") is not None]
+    if order != sorted(order):
+        return CheckResult(name, WARN, "seated list is not in reveal-block "
+                                       "seniority order")
+    waiting = [(int(e["reveal_block"]), str(e.get("hotkey")))
+               for e in (roster.get("waiting") or [])
+               if e.get("reveal_block") is not None]
+    if order and waiting and min(waiting) < max(order):
+        jumped = min(waiting)
+        return CheckResult(
+            name, WARN,
+            f"waiting entry {jumped[1]} (reveal {jumped[0]}) had seniority "
+            f"over a seated entry — the queue was jumped")
+    return CheckResult(
+        name, PASS,
+        f"{len(challengers)} manifest challenger(s) all seated from the "
+        f"published queue in seniority order ({len(waiting)} waiting)")
+
+
 def run_tier0(
-    receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None
+    receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None,
+    *, funded_roster: dict | None = None,
 ) -> list[CheckResult]:
     """All Tier-0 checks, in a stable order. CPU-only, seconds; ``client`` is an
     optional chain connection (None ⇒ the chain-dependent halves WARN)."""
@@ -1021,8 +1148,9 @@ def run_tier0(
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),
         check_koth_params(receipt, cfg),
-        check_verdict(receipt),
-        check_duel_cohort(receipt),
+        check_verdict(receipt, cfg),
+        check_duel_cohort(receipt, cfg),
+        check_funded_roster(receipt, funded_roster),
         check_transition(receipt),
         check_weights(receipt, cfg, client),
     ]

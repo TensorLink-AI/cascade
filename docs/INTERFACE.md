@@ -13,10 +13,25 @@ to subnet data. You win when
 your data trains a better forecaster than the king's data, scored on a private,
 rotating held-out set you never see.
 
-Series are univariate today (`max_channels = 1`), but the corpus carries a
-channel axis: `generate` may yield a 1-D `(L,)` array (treated as one channel) and
-the schema is ready for multivariate `(C, L)` priors the day the owner raises the
-cap — no interface change for you when that happens.
+Series may be **multivariate**: `generate` may yield a 1-D `(L,)` array (one
+channel) or a `(C, L)` array with up to `max_channels = 32` variates
+(DEC-CA-0041, armed 2026-09-09). Nothing else about the carrier changes.
+Channel economics, so you can decide what to emit:
+
+* **Channels bill at full freight** — a `(C, L)` series costs `C×L` points of
+  the token budget, exactly what it trains.
+* **Steps don't collapse with width**: training batches fill to
+  `batch_size // C` series (`[training] batch_denomination = "sequences"`), so
+  tokens-per-step is ~constant and every channel mix earns the same optimizer
+  step count from the same budget. Your trade-off is batch diversity per step,
+  not update count.
+* **Cross-channel structure only pays if it's real.** From `[scoring]
+  mv_score_from_block` the eval scores multivariate windows jointly (a
+  C-channel window counts once); channels of one series should carry related
+  signal. Near-duplicate channels are flagged by the channel-redundancy
+  telemetry (`channel_corr_mode = "shadow"` today; enforcement will follow it).
+* A univariate generator stays fully legal — `C = 1` batches, budgets, and
+  scores are byte-identical to the pre-raise behaviour.
 
 ## The record carrier (optional)
 

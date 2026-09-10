@@ -46,7 +46,11 @@ max_generate_seconds = 7200      # batch-drain budget: RLIMIT_CPU + wall for a m
 stream_stall_seconds = 1800
 max_memory_mb        = 4096      # rlimit for the generation sandbox
 max_repo_mb          = 128       # cap on the fetched submission (code-only, no weights)
-max_channels         = 1         # per-series variates; 1 = univariate
+# Per-series variates (DEC-CA-0041). 32 = Toto 2 training-width parity (owner
+# 2026-09-09). Measured: C=32 fits a 24 GB card at production shape (19.5 GB,
+# linear in C) and costs no per-token throughput. Eval-side mv_channels stays
+# ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
+max_channels         = 32
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
 # labels, quantiles) is hard-rejected until the release that consumes it. Bumps
@@ -72,7 +76,8 @@ max_missing_frac     = 0.5
 # 0.999 targets ONLY the jitter-duplicate exploit. Keep off until the Stage 1
 # shadow telemetry (channel_telemetry.frac_over_0999) clears honest
 # generators; then shadow; enforce last. Meaningless at max_channels = 1.
-channel_corr_mode    = "off"
+channel_corr_mode    = "shadow"  # armed with the C=32 raise: labels only, drops
+                                 # nothing; enforce waits on the shadow telemetry
 max_channel_corr     = 0.999
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
@@ -124,51 +129,34 @@ ref_throughput_tokens_per_s = 3700000  # 20x (2026-07-15): L40S is ~20x the old 
                                         # finishing the budget early; 20x the TOKEN budget, same 3h wall
 warmup_fraction             = 0.05
 batch_size                  = 64       # Toto 2.0 global batch size
+# ARMED with the C=32 raise (owner 2026-09-09; DEC-CA-0041): batch_size counts
+# SEQUENCES at C > 1 (a bucket fills to 64 // C series), so tokens-per-step is
+# ~constant and every channel mix earns the SAME ~152k steps from the leg
+# budget — the legacy "series" fill collapsed a C=32 leg to ~4.8k updates.
+# Bit-identical at C=1; digest-bound, rides this release's coordinated deploy.
+batch_denomination          = "sequences"
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
 weight_decay       = 2e-8        # ARMED 2026-08-27: part of the DEC-CA-0035 cut
                                   # (see the armed block below; was 0.05)
-lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only on a
-                                  # from-scratch (generation-start) run; warm-started rounds
-                                  # re-enter FLAT at base_lr — per-round cosine restarts
-                                  # distort continued pretraining. No in-round decay by
-                                  # default; finished form is a separate armable mechanism
-                                  # (fork-anneal below, DEC-CA-0029 — or EMA, ema_decay,
-                                  # DEC-CA-0033; arm at most ONE). wsd rounds also
-                                  # write optimizer.safetensors (~3x checkpoint size) so Muon
-                                  # momentum/row-EMA/AdamW moments survive the round boundary.
-                                  # [training] edit ⇒ contract_digest changed: restart trainer
-                                  # AND validator together (flipped from warmup_cosine 2026-08-14).
-# anneal_fraction  = 0.15         # fork-anneal (DEC-CA-0029, wsd's deferred "D"): each run ends
-                                  # with a cosine decay base_lr -> 0 over this fraction of extra
-                                  # tokens; the ANNEALED weights become the scored checkpoint
-                                  # (weights.safetensors) and the mid-stable branch rides beside
-                                  # it (weights_stable.safetensors + optimizer.safetensors) for
-                                  # warm-start continuity. Wall stretches by the same fraction.
-                                  # OFF (0.0) = today's mid-stable artifacts, digest untouched.
-                                  # ARMING CHECKLIST (a contract cut, the 2026-08-14 playbook):
-                                  # testnet full cycle first; recompute contract_digest
-                                  # (cascade-trainer --offline); coordinated release-then-activate
-                                  # with ALL external validators; OPSLOG entry. NEVER together
-                                  # with ema_decay (DEC-CA-0033 — the trainer refuses) or with
-                                  # [telemetry] bench_anneal_fraction: one finished-form
-                                  # mechanism at a time.
-# Toto2-aligned optimizer constants (DEC-CA-0035, all digest-bound
-# drop-when-default; defaults = the previously hardcoded trainer behavior).
-# MEASURED 2026-08-27 (docs/notes/2026-08-27-toto2-alignment.md): the full
-# bundle @ warm_lr_scale 0.125 BEATS the converged warm-start init by
-# 0.0038 ON THE EMA-999 ARTIFACT — the raw endpoint stays slightly above
-# init, so the cut only delivers its headline WITH the EMA finished form.
-# ARMED 2026-08-27 (owner): the full DEC-CA-0035 cut, one contract cut for
-# rounds from block 8942400 (see [scoring] contract_from_block — rounds
-# before it verify against prior_contract_digest). The constants were swept
-# together (arXiv 2605.20119); ema_decay 0.999 is the DEC-CA-0033 artifact
-# the measurement scored — the cut only delivers its headline WITH it.
-# weight_decay is set to 2e-8 above as part of this same cut. NEVER together
-# with anneal_fraction or [telemetry] bench_anneal_fraction (the trainer
-# refuses). NOTE: armed ahead of the wave-3 cross-generator separation check
-# on owner direction — watch the first armed rounds for separation loss.
+lr_schedule        = "wsd"       # warmup-stable-decay (DEC-CA-0018): warmup only at
+                                  # generation start; warm-started rounds re-enter FLAT at base_lr.
+                                  # Finished form is a separate armable mechanism (fork-anneal or
+                                  # ema_decay — arm at most ONE). wsd writes optimizer.safetensors
+                                  # (~3x) so Muon/AdamW moments survive the round boundary.
+                                  # [training] edit ⇒ contract_digest changed: restart trainer AND
+                                  # validator together.
+# anneal_fraction  = 0.15         # fork-anneal (DEC-CA-0029, wsd's deferred "D"): cosine decay
+                                  # base_lr->0 over this fraction; annealed weights scored,
+                                  # weights_stable rides beside for warm-start. OFF (0.0) = today's
+                                  # artifacts, digest untouched. Arming is a contract cut (testnet
+                                  # cycle + coordinated release). NEVER with ema_decay or
+                                  # [telemetry] bench_anneal_fraction — one finished form only.
+# Toto2-aligned optimizer constants (DEC-CA-0035, digest-bound drop-when-default;
+# defaults = previously hardcoded behavior). ARMED 2026-08-27 (owner), one cut
+# with ema_decay 0.999 (the artifact the measurement scored) + weight_decay 2e-8.
+# NEVER with anneal_fraction / bench_anneal_fraction (trainer refuses).
 ema_decay       = 0.999         # EMA finished form (DEC-CA-0033; the scored artifact)
 gen_seed_mix    = 3             # DEC-CA-0033 N-seed generation mix (owner-armed
                                 # 2026-08-27: measured working at 3 seeds) — corpus
@@ -210,40 +198,18 @@ allow_future_known = false
 # FORBIDDEN until docs/EVAL_POOL.md carries the corpus/eval-pool disjointness
 # rule (provenance + time wall) and the DEC-CA-0028 pricing experiment has run.
 real_corpus_ref    = ""
-# Pin the GPU SKU for byte-exact re-derivation (exact torch device name, e.g.
-# "NVIDIA H100 80GB HBM3"). Empty = only require king and challenger to match.
-expected_gpu = "NVIDIA L40S"     # exact nvidia-smi device string; king+challenger must
-                                  # train on identical silicon (folds into contract_digest;
-                                  # unit fixtures neutralize this in tests/conftest.py)
-# Pin the training-runtime image (digest-pinned worker-image ref) and inject the
-# same digest as CASCADE_TRAIN_IMAGE_DIGEST into each pod env; final runs refuse
-# a mismatched runtime. Folded into contract_digest. Empty = unpinned.
-# worker-v0.6.0 (2026-08-20, CI run 32427927572, built from main@b42f768 —
-# the full 8-PR go-live stack): bakes WSD + optimizer-state sidecar
-# (DEC-CA-0018), tie-aware cohort trainer (DEC-CA-0012), hub-fetch hardening
-# (#206, ends per-pod hippius patching), heat infra requeues (#207), bench
-# prewarm (#204). v0.5.0 retired:
-# sha256:0b90d44b7ca11c2c2964bc4df687033b489cdc8127a8dcbdb4c91303163b6f57
-train_image_digest = "sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437d3b266076df4f"
-# ^ ghcr.io/tensorlink-ai/cascade-worker@worker-v0.4.0 (2026-07-23, built from
-# 1325409 — [wandb] extra baked, warm-start worker plumbing, incident-hardening
-# trainer code; torch/generator-dependency stack unchanged from v0.3.1).
-# NOTE the baked chain.toml inside the image carries an EMPTY pin (an image
-# cannot contain its own digest — worker-v0.3.1 protocol).
-# Prior pin: sha256:2126219a8909797e313b1688ff7b27a666eb7376652cd0d322e229e91cfe01b4
-# (worker-v0.3.1, 2026-07-16, built from 56d40c7).
-# NOTE the baked chain.toml inside the image carries an EMPTY pin (an image
-# cannot contain its own digest); enforcement is launch-env injection + the
-# provisioner health gate, and contract_digest is computed orchestrator-side
-# only.
-# Prior pin: sha256:f08d8c52a19616… = ghcr.io/tensorlink-ai/cascade-worker@worker-v0.3.0
-# (2026-07-15, built from ed2f4a1 — 20x budget but MISSING the [dependencies]
-# generator allowlist; generators importing pandas failed heats — do not reuse).
-# Prior pin: sha256:46bc78fa0ddd… = ghcr.io/tensorlink-ai/cascade-worker@worker-v0.2.0
-# (built from main incl. PRs #76–#98; bakes the OLD 185k budget — do not reuse).
-# Re-pin protocol: the digest folds into contract_digest ⇒ trainer AND
+# Pin the GPU SKU (exact torch device name). Empty = king and challenger must
+# match each other. Unpinned 2026-09-02 for per-round GPU choice
+# ([round] funded_pod_skus); folds into contract_digest — coordinated deploy.
+expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
+# Training-runtime image (digest-pinned worker ref), injected as
+# CASCADE_TRAIN_IMAGE_DIGEST into each pod; final runs refuse a mismatched
+# runtime. Baked chain.toml inside the image carries an EMPTY pin (enforcement is
+# launch-env injection + the provisioner health gate; digest computed
+# orchestrator-side). Folded into contract_digest — re-pin ⇒ trainer AND
 # validators restart together at an epoch boundary, pods pull the new image.
-
+train_image_digest = "sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+# ^ ghcr cascade-worker:worker-v0.8.0 — harvest (--local-only) + batch_denomination.
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
 # overrides only shape fields + digest + throughput; all else inherits [training].
@@ -268,55 +234,25 @@ train_image_digest = "sha256:3c373d5b7d425fabb705ea009e3f11207114e5e32f80194c437
 #                             # null-LCB noise-floor measurement)
 
 [round]
-# Twice-daily round cadence + two-stage (heat → final) selection. The base seed
-# is the chain block hash at the epoch boundary; only commitments revealed
-# strictly before the boundary are eligible.
-#
-# 7200 → 3600 on 2026-07-28 (owner): halve the round to double throughput.
-# CONSENSUS-RELEVANT — every validator derives the epoch from this for
-# pool-snapshot selection (validator/loop.py:726), so it must land in LOCKSTEP
-# across operators exactly like a scoring-rule change. Nothing detects a stale
-# value; a validator on 7200 silently selects a different snapshot.
-# Not part of contract_digest (that is [training] only), so no digest recompute
-# and no manifest invalidation.
-# The heat fleet needs NO manual resize: plan_fleet (provision/policy.py:218)
-# derives it from this value every round —
-#   heat_slots = ceil(n × heat_train_hours × slot_overhead / (epoch_h − final_h))
-# so 24h/n=31 → 2 slots → 1 pod (4 GPU) becomes 12h/n=31 → 5 slots → 2 pods
-# (8 GPU); at the observed peak field n=48 → 7 slots → 2 pods. max_pods = 8
-# (32 GPU) stays well clear. Do NOT hand-pin gpus_per_pod/max_pods to "help" —
-# that overrides the derivation and over-rents on quiet rounds.
+# Twice-daily round cadence + two-stage (heat → final). Base seed = the chain
+# block hash at the epoch boundary; only commitments revealed strictly before it
+# are eligible. CONSENSUS-RELEVANT: every validator derives the epoch from this
+# for pool-snapshot selection, so it must move in LOCKSTEP across operators (a
+# validator on a stale value silently picks a different snapshot). NOT part of
+# contract_digest ([training] only). The heat fleet auto-sizes from this
+# (plan_fleet) — don't hand-pin gpus_per_pod/max_pods.
 epoch_blocks     = 3600   # ≈12h at a 12s block time
 round_hours      = 12.0   # informational: wall-clock span of an epoch
-# SCHEDULED ACTIVATION — this is what lets operators merge and restart TODAY
-# while the change takes effect tomorrow, with no coordinated restart. Every
-# node resolves the round length through effective_epoch_blocks(round, block),
-# so a validator that restarted early and one that restarted late agree on
-# every round: 7200 for blocks before the activation, 3600 from it on.
-# 8726400 = Wed 2026-07-29 ~08:17 UTC. It is a boundary of BOTH grids
-# (8726400 / 7200 = 1212, / 3600 = 2424) — load_chain_config enforces that, so
-# no round is cut short at the seam.
-# CLEAN-UP: once 8726400 is safely past, set both keys to 0 (the steady state);
-# the accessor then returns epoch_blocks unconditionally.
-epoch_blocks_prev      = 7200
-epoch_activation_block = 8726400
-heat_train_hours = 1.0    # screening budget per competitor (on screen_size).
-                          # 0.5 → 1.0 on 2026-07-26 (owner): lower-noise heat
-                          # ranking; watch p_best / leader_lcb to confirm it pays.
-heat_n_windows   = 2000   # eval windows the heat screens on
-                          # 256 → 2000 on 2026-08-07 (owner): screen on the full
-                          # [eval] n_windows — two straight record-setting
-                          # challengers showed the 256-window screen is noisy
-                          # near the top. ~34s/ckpt CPU (vs ~4s), ~17min/wave,
-                          # still inside the 1h wave-training shadow.
-heat_num_samples = 100    # sample forecasts per window in the heat (0 = reuse [eval] num_samples)
-                          # 20 → 100 on 2026-07-27 (owner): match the final's
-                          # sample count so the screen ranks on the same
-                          # estimator the duel decides on. Finite-sample CRPS
-                          # bias grows with predictive spread, so a 20-sample
-                          # screen mis-prices wide-distribution checkpoints
-                          # relative to the 100-sample verdict. Measured cost:
-                          # ~5.4s → ~30s per entrant (20-entrant field ≈ 10min).
+# Scheduled switch (0/0 = steady state). Last used: 7200 → 3600 at 8726400,
+# 2026-07-29. To schedule another, the block must be a boundary of BOTH grids
+# (load-checked); set both back to 0 once it is safely past.
+epoch_blocks_prev      = 0
+epoch_activation_block = 0
+heat_train_hours = 1.0    # screening budget per competitor (on screen_size)
+heat_n_windows   = 2000   # eval windows the heat screens on (= [eval] n_windows;
+                          # the full set — a smaller screen is noisy near the top)
+heat_num_samples = 100    # sample forecasts per window (0 = reuse [eval]); matches
+                          # the final's count so screen + duel rank on one estimator
 # Heat wall-clock cap: max(heat_guard_factor × heat_train_hours, floor), never
 # above max_train_seconds. RAISE the factor if heat pods are a slower SKU than
 # the reference box, else every heat time-truncates.
@@ -327,46 +263,16 @@ heat_guard_floor_seconds = 900
 # failures never re-queue. 0 restores terminal drops.
 heat_infra_requeues      = 2
 finalists        = 1      # challengers promoted from the heat to the final (top-N)
-# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED AT RELEASE
-# (owner 2026-08-20, max_finalists = 3). With max_finalists > 1 the finalist
-# count responds to the
-# screen's own statistic: a leader the screen separated from every other
-# entrant (the lcb_vs/leader_lcb diagnostic already logged on the heat block)
-# advances ALONE whatever the cap; a statistically tied top is re-scored on a
-# larger eval slice — CPU-only on the orchestrator, incremental windows
-# [heat's slice, tie_runoff_windows) via the seeded-prefix property of the
-# round's window permutation, no retraining, no GPU rent — and whoever still
-# cannot be separated advances too, capped at max_finalists. The screen's drop
-# bar is 0 (not the duel's 2% margin) and deliberately UNCORRECTED for
-# multiplicity: a field-size-dependent bar is gameable by padding the field;
-# the cap plus the run-off are the controls. The validator judges the WHOLE
-# advanced cohort under a family-wise alpha/k and crowns the best
-# margin-clearer (that half shipped 2026-08-11 and is a no-op at k=1).
-# At these defaults everything is bit-identical to today: one finalist,
-# duel_rank stays 0 on every entry, manifests hash as before.
-# NOTE: tie_runoff_windows MUST STAY 0 while the jittered mix (DEC-CA-0019)
-# is active: the run-off scores windows_for_round(seed, stop)[start:], which
-# assumes the draw is a permutation PREFIX. The jittered draw is not — and
-# mix_target_windows overrides the requested size outright, so a "larger"
-# draw returns the same 1200-window list and the tail is overlap, not
-# incremental evidence. A run-off with no incremental windows is skipped and
-# the tied set advances capped (the supported path). Re-arming the run-off
-# needs a jitter-aware incremental draw first (revisit in DEC-CA-0012).
-# ARMING ORDER (not cosmetic; DEC-CA-0012 rollout): testnet arms FIRST
-# (chain.testnet.toml), trainer and validator restarting together. Mainnet
-# does NOT restart onto this config until a full testnet round has produced
-# a genuine multi-finalist cohort duel AND cascade-audit has replayed it —
-# the 2026-07-30 JIT incident existed precisely because a config flip
-# live-exercised a never-run path. Pre-arm couplings VERIFIED 2026-08-20
-# against the deployed provisioner config:
-# (1) fleet check at 1 + max_finalists = 4 slots: final = ceil(4/2) = 2 pods
-#     = max_pods exactly (NOT clamped); within_budget worst case = 12 heat
-#     pods x $2.60 x 12h + 2 final pods x $3.00 x 12h = $446.40 <= $500;
-# (2) [eval] bench_hold_max_hours raised 6.0 -> 9.0: the post-publish bench
-#     is SEQUENTIAL per pod, so a k=3 cohort is 4 legs; 9h covers them at 2x
-#     the observed ~1h/leg while staying inside the ttl_epochs=1 (12h) pod
-#     lifetime measured from the JIT final rent. Past the hold, later cohort
-#     members drop out of the promotion candidate pool (soft degradation).
+# Tie-aware finalist cohort (DEC-CA-0012) — ARMED (owner 2026-08-20,
+# max_finalists=3): a leader the screen separated advances ALONE; a statistically
+# tied top is re-scored on a larger CPU-only slice (no retrain, no GPU) and
+# survivors advance too, capped at max_finalists. The validator judges the whole
+# cohort under a family-wise alpha/k. Bit-identical at max_finalists=1.
+# CRITICAL: tie_runoff_windows MUST STAY 0 while the jittered mix (DEC-CA-0019)
+# is active — the run-off assumes the draw is a permutation PREFIX, which the
+# jitter breaks (a "larger" draw returns the same mix_target_windows list, no
+# incremental evidence). With none, the run-off is skipped and the tied set
+# advances capped (the supported path). Re-arming needs a jitter-aware draw.
 max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20; 1 = tie logic OFF)
 # Init-baseline heat SHADOW row (DEC-CA-0034; armed 2026-08-27, owner): the
 # warm-start init is scored on the heat slice and published as
@@ -410,6 +316,79 @@ one_submission_per_hotkey = true
 duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
 duel_field_cap  = 0         # 0 = no per-round cap; N = explicit cap (wins over duel_seat_all)
 duel_seat_all   = true      # seat every screened entrant; false = seats bounded by the lanes on file
+# ── Miner-funded compute (DEC-CA-0036) — armed, block-gated ──────────────────
+# Composes with duel-only above: legacy (operator-funded, duel-only) rounds run
+# until funded_activation_block; from it the funded queue IS the field and the
+# whole seated cohort still duels with no heat, exactly the duel-only shape.
+# "off" / "shadow" / "required" (funded queue IS the field; every seated
+# entrant duels, no heat). Everything below is inert before
+# funded_activation_block; legacy rounds keep running until it.
+# Details: docs/MINER_FUNDED_ROUNDS.md.
+funded_mode = "required"
+funded_activation_block = 9046800   # first funded round ≈ Fri 2026-09-11 20:30 UTC (evening;
+                                    # owner 2026-09-10). The WHOLE release flips at THIS block, in
+                                    # one boundary: the funded queue becomes the field AND cohort
+                                    # max-T + increment (DEC-CA-0038/0039) + the [training] contract
+                                    # cut all go live together (their *_from_block below == this).
+                                    # The prior 08:30 boundary 9043200 runs the LAST old-world round
+                                    # — a legacy operator-funded duel under the OLD scoring/contract/
+                                    # trainer; nothing new fires there. cascade-intake opens for
+                                    # lium-key funding + private submissions right AFTER that morning
+                                    # round, so miners have the day to submit and fund before the
+                                    # evening funded round. MV scoring arms later, 9068400 (Mon 20:30).
+funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
+# With funded_mode = "required": an unfunded boundary runs NOTHING (no king
+# leg, no pods, no manifest — validators just see no manifest and hold).
+# This is the elastic-cadence floor; the ceiling is the epoch grid itself.
+skip_unfunded_rounds = true
+max_rounds_per_day = 2                    # cadence sizing/telemetry only (grid = epoch_blocks)
+funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
+# "rent": each funded leg rents ONE pod on its payer's Lium key (king + eval
+# stay operator-funded). Consensus-inert.
+funded_pods = "rent"
+payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
+funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
+# Worker image funded pods boot — keep = the fleet's pinned digest.
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+funded_ready_timeout_seconds = 900.0
+# How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
+# CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
+# pod's env), the orchestrator pulls the checkpoint over the pinned ssh,
+# ingest-verifies it, and uploads it under its own identity. Needs a
+# funded_pod_image built from a --local-only-aware release. "robot": legacy
+# per-pod push-only Hub robot (revoked at teardown; Harbor expiry below).
+funded_pod_checkpoint = "harvest"
+funded_robot_duration_days = 1
+# Seats per round (0 = finalist_cap); clamped to live market capacity minus
+# the king's reserve when the probe is on. Held-back seats wait unburned.
+funded_field_cap = 8
+funded_capacity_probe = true
+funded_capacity_reserve = 1
+# Allowed GPU types, preference-ordered; each round runs entirely on the
+# most-available one (king included). Needs [training] expected_gpu = "".
+# Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
+funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
+# King pod rents JIT at the round's SKU (operator-billed); retire the
+# provisioner's final stage — the trainer ledgers and sweeps these pods.
+funded_king_rent = true
+# Direct submissions + champion-only publication (DEC-CA-0036, second half;
+# SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
+# Lium key), lives in the operator-private store below, and rides the chain as
+# an ordinary hippius payload under the reserved vault/direct namespace — no
+# validator change, no digest change. Only a THRONE publishes (champions/
+# on the manifest bucket, sn100-top-model style): "crown" immediately,
+# "delay" after N reign rounds, "dethrone" at hand-off (every policy reveals
+# a deposed vault king at latest). Losers stay private forever.
+# ARMED with this release (owner 2026-09-09, reversing the 2026-09-02
+# "stay off"): cascade-intake opens for private submissions + lium-key funding
+# right AFTER the 08:30 morning round (9043200); the first funded round to
+# consume them is the evening 9046800. Policy "dethrone" = maximum privacy — the LIVE king's code stays
+# private for its whole reign and publishes only at hand-off, so history stays
+# re-derivable while a reigning edge is never exposed. Flip to "delay" (+N
+# reign rounds) or "crown" (immediate) before Friday if less privacy is wanted.
+submission_vault_dir = "submission_vault" # work_root-relative operator-private store
+champion_publish = "dethrone"
+champion_publish_delay_rounds = 2
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
 # their heat slot; the earliest submission keeps it. Pairwise only — never
@@ -549,7 +528,9 @@ mix_tier_jitter_alpha = 75.0      # jittered draw size; inert until mix_from_blo
 # rollout as mix_from_block: every validator must run this release before the
 # block. [] / 0 = single-horizon rule.
 scored_horizons   = [64, 256, 720]
-scored_from_block = 8992800      # = [round] duel_from_block
+scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
+                                 # 2026-09-04; no longer tied to funded_activation_block
+                                 # (which moved to 9046800). DO NOT move a passed gate.
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -606,6 +587,32 @@ win_margin_start     = 0.01      # fresh-king margin (tenure 0) from margin_acti
 # against it). 0.0 / 0 = no scheduled change.
 win_margin_start_prev   = 0.02   # in force for rounds before margin_activation_block
 margin_activation_block = 8992800  # = [eval] scored_from_block / [round] duel_from_block
+# Cohort-duel family-wise correction (DEC-CA-0038): Bonferroni alpha/k -> a
+# shared-resample max-T (Westfall-Young), exact under the k challengers' real
+# positive correlation instead of the loose union bound. CONSENSUS, block-gated
+# like margin_activation_block above: every validator resolves the rule from the
+# round's epoch block, audit replays each round under its own. Bit-identical at
+# k<=1 (single-challenger rounds never change). 0 = Bonferroni forever.
+cohort_maxt_from_block = 9046800  # Fri 2026-09-11 20:30 UTC — the evening funded round, one flip
+                                  # with funded_activation_block. The 08:30 morning round (9043200)
+                                  # is the last old-world round, still judged under Bonferroni α/k.
+# Increment-margin activation (DEC-CA-0039): from this block the dethrone bar
+# is judged in INCREMENT units (a fraction of the typical per-round gain over
+# the shared init) instead of a fixed % of the king's absolute score, so a
+# maturing lineage's small-but-real gains stay clearable. Same block as the
+# cohort max-T above = one coordinated validator-upgrade window for both.
+# margin_mode below stays "level" (the pre-gate rule); 0 = no scheduled flip.
+increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the evening funded round)
+# Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
+# window's channels are averaged into ONE per-window contribution (GIFT-Eval
+# weighting — the window counts once, not once per channel), so the round point
+# statistic agrees with the source-cluster bootstrap. Bit-identical on today's
+# univariate pool. ARMED 2026-09-09 (owner): 9068400 ≈ Mon 2026-09-14 20:30 UTC
+# (owner 2026-09-10: the Monday-arvo boundary, +12h off the 08:30 grid slot) —
+# well after the 9046800 Friday evening flip so the consensus flips never share
+# a boundary; one release covers both. Bit-identical until an MV-packed pool
+# publishes (pool build --mv-pack).
+mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 min_windows          = 200       # below this many common windows, no decision
@@ -679,15 +686,20 @@ cascade_quality_epsilon = 0.05
 # above. Same activation block as mix_from_block — one flip boundary for the
 # whole release. Fleet-consensus values: keep identical across validators.
 # Retire (""/0) in the release after the transition round ages out.
-# ARMED 2026-08-27 (owner): the DEC-CA-0035+0033 recipe cut takes effect for
-# rounds from block 8942400 (r47's epoch, boundary 2026-08-28 ~08:25 UTC).
-# Rounds whose epoch precedes it (r45/r46 in flight) verify against the pinned
-# PRIOR digest below — the unarmed contract every round through epoch 8938800
-# trained under — so validators restart onto this release ANY TIME before
-# block 8942400 without sacrificing an in-flight round. (This retires the
-# aged-out 6420f564…/8895600 warmup_cosine transition pair.)
-prior_contract_digest  = "c6d2462135198c36eefc009ea0f945957e647c20bf521a1fbc9d721a4324f3af"
-contract_from_block    = 8942400
+# ARMED 2026-09-10 (owner): this release's [training] cut (expected_gpu ""→
+# unpinned, train_image_digest → worker-v0.8.0 sha256:9d5bc70d…,
+# batch_denomination = "sequences") takes effect for rounds from block 9046800
+# (Fri 2026-09-11 20:30 UTC — the evening funded round; one flip with
+# funded/max-T/increment). Every earlier round — INCLUDING the 08:30 morning
+# round at 9043200 — verifies against the pinned PRIOR digest below: the exact
+# contract_digest the LIVE mainnet manifests carry right now (read off
+# manifests/latest.json 2026-09-10), so the morning round runs on the OLD
+# trainer/contract and validators restart onto this release ANY TIME before
+# 9046800 without sacrificing an in-flight round. New digest recomputed from
+# [training] above = 22081e46…; verify after any edit.
+# (Retires the aged-out c6d24621…/8942400 DEC-CA-0035+0033 transition pair.)
+prior_contract_digest  = "81d28346acb55892290ef3a6970caed2c3e8a5f569627b76cdefc29426f6f045"
+contract_from_block    = 9046800
 # Declared-contract gating (DEC-CA-0036). From this block a manifest is gated on
 # the LOCKED terms only — arch_preset, base_arch_digest, expected_gpu,
 # train_seed_salt, and each extra size's preset/GPU pin — verified against the
@@ -863,6 +875,14 @@ mode    = "online"              # online | offline | disabled
 # first training batch), and is the one field comparable across pods.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Payer-pod bench (DEC-CA-0036): each funded challenger benches on its own pod
+# after the duel (miner-billed, ~1h; the pod is torn down when the sweep ends).
+# Payer numbers are a FILTER: the top-N re-bench on the operator's king pod and
+# only the operator's numbers are signed/published; a payer number better than
+# the re-bench by more than the tolerance is a forged sweep (entry dropped).
+funded_bench = true
+funded_bench_verify_top = 1
+funded_bench_verify_tolerance = 0.02
 # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round
 # the trainer ALSO trains the king's generator from scratch (random init,
 # identical contract + seeds) strictly post-publish on the idle final pod,

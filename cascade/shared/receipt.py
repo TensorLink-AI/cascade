@@ -232,6 +232,9 @@ _PARAMS_DROP_WHEN_DEFAULT: dict[str, object] = {
     # Init-baseline floor: off on every archived round.
     "init_gate_mode": "off",
     "init_gate_tolerance": 0.0,
+    # Multivariate window aggregation (DEC-CA-0041): per-channel on every round
+    # before mv_score_from_block, including all archived rounds.
+    "mv_score": False,
 }
 
 

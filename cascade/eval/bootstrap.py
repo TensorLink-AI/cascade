@@ -381,6 +381,93 @@ def joint_bag_geomeans(
     ])
 
 
+def cohort_maxt_lcbs(
+    king: tuple[np.ndarray, np.ndarray, np.ndarray],
+    challengers: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    alpha: float = 0.05,
+    B: int = 10_000,
+    seed: int | str = 42,
+    clusters: list | np.ndarray | None = None,
+    wql_mode: str = "geomean",
+) -> list[float]:
+    """Family-wise LOWER bounds for a cohort of challengers vs ONE king, via a
+    shared-resample max-T (Westfall–Young step-down simultaneous band).
+
+    The ``k`` challengers all share the king's scores and one window draw, so
+    their relative-improvement estimates are strongly positively correlated.
+    Bonferroni's ``alpha/k`` union bound ignores that correlation and
+    over-protects the king — at ``k = 11`` it reads the 0.45th bootstrap
+    percentile (~45 of 10k bags deciding the bound). This resamples every
+    competitor JOINTLY (:func:`joint_bag_geomeans`, one shared cluster draw)
+    and takes the critical value from the ACTUAL joint spread::
+
+        rel[j,b] = (king_geo[b] - chal_geo[j,b]) / king_geo[b]   # per-bag improvement
+        D[b]     = max_j ( t[j] - rel[j,b] )                     # worst downward error in bag b
+        c        = quantile(D, 1 - alpha)                        # one simultaneous critical value
+        L[j]     = t[j] - c                                      # family-wise LCB for challenger j
+
+    ``t[j]`` is the full-sample relative improvement
+    ``(king_geo - chal_geo)/king_geo`` computed INTERNALLY from the identity
+    resample, so the band's centre is on the exact same bag scale as ``rel`` —
+    never a caller value that could drift from it.
+
+    The statistic is STUDENTISED (each challenger's downward deviation divided
+    by its own bootstrap SE) before the max, so a wide-spread challenger cannot
+    hijack the shared critical value and over-penalise a tight one — the
+    textbook Westfall–Young form, and what keeps per-challenger scale-adaptivity
+    that the deployed per-challenger percentile bound has for free. The band is
+    CENTRED (basic-bootstrap), not a raw percentile of the per-bag max:
+    ``quantile(max_j rel[j,b], alpha)`` is only calibrated at perfect
+    correlation and is grossly anti-conservative otherwise (at independence and
+    ``k = 11`` it collapses to the ~76th percentile of a single test). The
+    centred, studentised max-T is EXACT under the real correlation — at ρ→1 the
+    max collapses to a single challenger's deviation (no correction), at ρ→0 it
+    widens to the true max of ``k`` — and it reduces EXACTLY to the
+    single-challenger percentile LCB ``quantile(rel, alpha)`` at ``k = 1`` (the
+    SE cancels). It therefore always sits BETWEEN Bonferroni (lowest bound) and
+    no correction (highest).
+
+    Returns ``L[j]`` per challenger, in ``challengers`` order.
+    """
+    if not challengers:
+        return []
+    q0 = king[0]
+    if q0.ndim != 2:
+        raise ValueError(f"king qloss must be (N, num_q); got {q0.shape}")
+    n = q0.shape[0]
+    if n == 0:
+        return [float("nan")] * len(challengers)
+    codes = cluster_codes(clusters, n)
+    g = int(codes.max()) + 1
+    rng = np.random.default_rng(_seed_to_int(seed))
+    idx = rng.integers(0, g, size=(B, g))                # shared cluster resample
+    ident = np.arange(g).reshape(1, g)                   # identity = full sample
+    bags, fulls = [], []
+    for ql, ab, ms in (king, *challengers):
+        if ql.shape != q0.shape:
+            raise ValueError(
+                f"competitor qloss shape {ql.shape} != {q0.shape}; windows not paired")
+        sums = _cluster_sums(ql, ab, ms, codes, g)
+        bags.append(_bag_geomeans(*sums, idx, wql_mode=wql_mode))         # (B,)
+        fulls.append(float(_bag_geomeans(*sums, ident, wql_mode=wql_mode)[0]))
+    king_bag, king_full = bags[0], fulls[0]
+    if king_bag.size == 0:
+        return [float("nan")] * len(challengers)
+    safe_king = np.where(np.abs(king_bag) < 1e-9, 1e-9, king_bag)
+    sk_full = king_full if abs(king_full) >= 1e-9 else 1e-9
+    rel = np.stack([(king_bag - cb) / safe_king for cb in bags[1:]])      # (k, B)
+    t = np.array([(king_full - cf) / sk_full for cf in fulls[1:]])        # (k,)
+    dev = t[:, None] - rel                                                # (k, B) downward errors
+    se = np.std(rel, axis=1, ddof=1)                                      # (k,) per-challenger spread
+    se = np.where(se < 1e-12, 1e-12, se)
+    # Max studentised downward error across the family per bag, then its
+    # (1-alpha) quantile: one shared critical value in SE units, re-scaled per
+    # challenger — the whole simultaneous band from the ACTUAL joint spread.
+    crit = float(np.quantile(np.max(dev / se[:, None], axis=0), 1.0 - alpha))
+    return [float(x) for x in (t - crit * se)]
+
+
 def paired_bootstrap_quantiles_aggregated(
     king_qloss: np.ndarray,
     king_abs_target: np.ndarray,

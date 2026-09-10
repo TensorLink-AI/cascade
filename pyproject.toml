@@ -78,6 +78,7 @@ cascade-train-worker = "cascade.trainer.worker:main"
 cascade-validator = "cascade.validator.main:main"
 cascade-pool = "cascade.pool.cli:main"
 cascade-audit = "cascade.audit.main:main"
+cascade-intake = "cascade.funding.main:main"
 
 # Pin torch to a single CUDA build (cu124) so every worker/validator resolves the
 # SAME wheel regardless of the host's CUDA version — uv would otherwise auto-select

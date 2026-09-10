@@ -92,6 +92,23 @@ class RemoteHost:
     forward_env: tuple[str, ...] = ()
     ssh_options: tuple[str, ...] = ()       # extra raw `-o Key=Value` style flags
     stage: str = "any"                      # "any" | "heat" | "final"
+    # Fixed (name, value) pairs merged into the dispatch's stdin env AFTER the
+    # forward_env copies — per-HOST values the orchestrator's own environment
+    # cannot supply (e.g. a funded pod's staged-vault dir, which is a pod-local
+    # path). Travels on stdin like every forwarded credential, never on the
+    # remote command line.
+    static_env: tuple[tuple[str, str], ...] = ()
+    # An ISOLATED host receives nothing from the orchestrator's environment —
+    # not its forward_env, not the dispatcher's global extras (WANDB_API_KEY)
+    # — only its own static_env. Set on funded (payer-account) pods: the
+    # payer has console access, so every forwarded value is theirs to read.
+    isolated: bool = False
+    # A pinned SSH host key line (``<keytype> <base64>``) for this host. When
+    # set, every ssh to it runs StrictHostKeyChecking=yes against a
+    # known_hosts file holding ONLY this key, so a container swapped under
+    # the same address (a payer relaunching "their" pod) is refused at the
+    # transport — a pod's host key is generated at its first boot.
+    pinned_host_key: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -139,6 +156,8 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 forward_env=tuple(str(x) for x in h.get("forward_env", ())),
                 ssh_options=tuple(str(x) for x in h.get("ssh_options", ())),
                 stage=stage,
+                static_env=tuple(sorted(
+                    (str(k), str(v)) for k, v in dict(h.get("static_env", {})).items())),
             )
         )
     return hosts
@@ -159,6 +178,7 @@ def worker_argv(
     repo_suffix: str = "",
     warm_start_ref: str | None = None,
     anneal: bool = False,
+    local_only: bool = False,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -193,6 +213,10 @@ def worker_argv(
     if anneal:
         # bench-anneal telemetry leg (DEC-CA-0030): pure cosine decay resume
         argv.append("--anneal")
+    if local_only:
+        # credential-free pod (DEC-CA-0036): no upload; the orchestrator
+        # harvests the checkpoint and uploads it under its own identity
+        argv.append("--local-only")
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -279,16 +303,86 @@ def build_remote_command(
     return command, stdin_env
 
 
-def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
-    """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
-    argv = ["ssh", "-p", str(host.port), "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new"]
+def pinned_known_hosts_file(host: RemoteHost) -> Path:
+    """A known_hosts file holding exactly ``host``'s pinned key (idempotent).
+
+    Keyed on the pin itself so concurrent legs never share or clobber a file.
+    """
+    import hashlib
+    import tempfile
+
+    line = f"[{host.host}]:{host.port} {host.pinned_host_key.strip()}\n"
+    path = Path(tempfile.gettempdir()) / (
+        "cascade-pin-" + hashlib.sha256(line.encode()).hexdigest()[:20])
+    if not path.is_file() or path.read_text() != line:
+        path.write_text(line)
+    return path
+
+
+def ssh_transport_options(host: RemoteHost) -> list[str]:
+    """The option argv (everything between the command name and the
+    ``user@host`` target) shared by every ssh/scp to ``host``: port,
+    BatchMode, the host-key policy, identity, then ``host.ssh_options``.
+    Uses ssh's ``-p``; scp callers rewrite it to ``-P``."""
+    if host.pinned_host_key:
+        # ssh honours the FIRST value given for an option, so the pin goes
+        # first and nothing later (host.ssh_options included) can loosen it.
+        argv = ["-p", str(host.port), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={pinned_known_hosts_file(host)}"]
+    else:
+        argv = ["-p", str(host.port), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new"]
     if host.key_path:
         argv += ["-i", str(Path(host.key_path).expanduser())]
     for opt in host.ssh_options:
         argv += ["-o", opt]
-    argv += [f"{host.user}@{host.host}", remote_command]
     return argv
+
+
+def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
+    """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
+    return ["ssh", *ssh_transport_options(host), f"{host.user}@{host.host}", remote_command]
+
+
+def probe_worker_runtime(host: RemoteHost, *, required_flags: tuple[str, ...] = ("--local-only",),
+                         timeout: float = 90.0) -> str:
+    """Functional attestation that ``host`` runs THIS release's worker.
+
+    Lium's launch API cannot pull by digest — :func:`cascade.provision.core.
+    lium_image_ref` degrades the pin to ``repo[:tag]`` — and the env-based
+    digest gate is circular there (``CASCADE_TRAIN_IMAGE_DIGEST`` is injected
+    from the REQUESTED ref into whatever container boots, so it attests the
+    request, not the runtime). A host with the repo's ``latest``/tag cached
+    from an older release therefore boots stale code and still looks pinned
+    (observed live 2026-09-10: a funded pod booted a pre-harvest worker and
+    the dispatch died ``unrecognized arguments: --local-only``). This probe
+    asks the pod's worker itself: its ``--help`` must know every flag the
+    dispatch relies on. Returns ``""`` when the runtime checks out, else a
+    reason string (the caller classifies it as an infra fault — the payer
+    did nothing wrong; retry on another executor)."""
+    cmd = f"{host.remote_python} -m cascade.trainer.worker --help"
+    try:
+        proc = subprocess.run(build_ssh_argv(host, cmd), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return f"worker runtime probe timed out after {timeout:.0f}s"
+    if proc.returncode != 0:
+        return f"worker runtime probe failed rc={proc.returncode}: {(proc.stderr or '')[-200:]}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    missing = [f for f in required_flags if f not in out]
+    if missing:
+        return (f"pod booted a STALE worker image (missing worker flags {missing}); "
+                "provider served a cached tag instead of the pinned digest")
+    return ""
+
+
+def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
+    """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
+    under exactly :func:`build_ssh_argv`'s transport policy (a pinned host
+    key stays pinned for file copies too)."""
+    opts = ["-P" if a == "-p" else a for a in ssh_transport_options(host)]
+    return ["scp", *opts, local_path, f"{host.user}@{host.host}:{remote_path}"]
 
 
 def parse_receipt(stdout: str) -> dict:
@@ -306,6 +400,104 @@ def parse_receipt(stdout: str) -> dict:
             except json.JSONDecodeError as e:
                 raise RemoteDispatchError(f"malformed receipt JSON: {e}") from e
     raise RemoteDispatchError("no receipt sentinel found in worker stdout")
+
+
+@dataclass(frozen=True)
+class LocalTrainReceipt:
+    """A ``--local-only`` worker's receipt: a trained checkpoint still ON the
+    pod, awaiting orchestrator harvest + verify + upload (DEC-CA-0036
+    credential-free pods). Deliberately NOT a :class:`TrainedEntry` — the
+    entry class refuses anything but a real hub pointer, which is the guard
+    that keeps an un-harvested checkpoint out of a manifest."""
+
+    miner_hotkey: str
+    miner_uid: int
+    role: str
+    gen_ref: str
+    corpus_digest: str
+    train_block: int
+    checkpoint_dir: str            # pod-local path of the trained checkpoint
+    gpu_name: str = ""
+    size: str = ""
+
+
+def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
+    """Validate a ``--local-only`` receipt dict into a :class:`LocalTrainReceipt`."""
+    try:
+        return LocalTrainReceipt(
+            miner_hotkey=str(receipt["miner_hotkey"]),
+            miner_uid=int(receipt["miner_uid"]),
+            role=str(receipt["role"]),
+            gen_ref=str(receipt["gen_ref"]),
+            corpus_digest=str(receipt["corpus_digest"]),
+            train_block=int(receipt["train_block"]),
+            checkpoint_dir=str(receipt["local_checkpoint_dir"]),
+            gpu_name=str(receipt.get("gpu_name", "")),
+            size=str(receipt.get("size", "")),
+        )
+    except (KeyError, ValueError) as e:
+        raise RemoteDispatchError(f"receipt is not a valid local-train receipt: {e}") from e
+
+
+def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
+                       *, timeout: int = 600, runner=None) -> Path:
+    """Copy ``host:remote_dir`` into local ``dest`` (tar over ssh, ``dest``
+    wiped first), under exactly the dispatch transport policy — a pinned host
+    key stays pinned for the harvest. The credential-free pods' return
+    channel: the pod pushes nothing; the orchestrator pulls.
+
+    The stream comes off a MINER-controlled box, so extraction runs under
+    :mod:`tarfile`'s ``"data"`` filter (PEP 706): absolute paths, ``..``
+    traversal, symlinks/hardlinks escaping ``dest``, and device nodes are all
+    refused — a hostile archive fails the harvest instead of writing outside
+    it (or smuggling ``/etc`` into the later upload via a symlink)."""
+    import shutil
+    import tarfile
+
+    dest = Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    # The worker runs under ``cd host.workdir`` (see build_remote_command), so a
+    # ``--local-only`` receipt's checkpoint dir is relative to THAT — but this is
+    # a fresh ssh session whose cwd is the login home. Resolve the harvest in the
+    # same workdir (a no-op for an absolute remote_dir); without it ``tar -C`` hit
+    # ``$HOME/<relative>``, which does not exist → an empty archive (live
+    # 2026-09-10, the first harvest-mode funded round).
+    tar_cmd = f"cd {shlex.quote(host.workdir)} && tar -C {shlex.quote(remote_dir)} -cf - ."
+    argv = build_ssh_argv(host, tar_cmd)
+    if runner is not None:  # test seam: (argv, timeout) → CompletedProcess-like
+        proc = runner(argv, timeout)
+        if proc.returncode != 0:
+            raise RemoteDispatchError(
+                f"checkpoint harvest from {host.name}:{remote_dir} failed "
+                f"(rc={proc.returncode})", returncode=proc.returncode)
+        return dest
+    ssh = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=ssh.stdout, mode="r|") as tf:
+            tf.extractall(dest, filter="data")
+    except tarfile.TarError as e:
+        ssh.kill()
+        ssh.wait()
+        raise RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir}: refused or "
+            f"malformed archive: {e}") from e
+    except Exception:
+        ssh.kill()
+        ssh.wait()
+        raise
+    finally:
+        ssh.stdout.close()
+    ssh_rc = ssh.wait(timeout=60)
+    if ssh_rc != 0:
+        err = ssh.stderr.read()[-400:]
+        ssh.stderr.close()
+        raise RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir} failed "
+            f"(ssh rc={ssh_rc}): {err!r}", returncode=ssh_rc)
+    ssh.stderr.close()
+    return dest
 
 
 def receipt_to_entry(receipt: dict) -> TrainedEntry:
@@ -357,19 +549,25 @@ class RemoteDispatcher:
         warm_start_ref: str | None = None,
         lane_count: int | None = None,
         anneal: bool = False,
-    ) -> TrainedEntry:
+        local_checkpoint: bool = False,
+    ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
-            warm_start_ref=warm_start_ref, anneal=anneal,
+            warm_start_ref=warm_start_ref, anneal=anneal, local_only=local_checkpoint,
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.
-        names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
+        names = (dict.fromkeys(()) if host.isolated
+                 else dict.fromkeys((*host.forward_env, *self.extra_forward_env)))
         env = {k: os.environ[k] for k in names if k in os.environ}
+        # Host-pinned values win over forwarded copies: a funded pod's
+        # CASCADE_VAULT_DIR must be the POD's staging path even when the
+        # orchestrator exports its own store dir under the same name.
+        env.update(dict(host.static_env))
         remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
         ssh_argv = build_ssh_argv(host, remote_cmd)
         log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
@@ -392,7 +590,9 @@ class RemoteDispatcher:
                 f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
                 returncode=proc.returncode,
             )
-        entry = receipt_to_entry(parse_receipt(proc.stdout or ""))
+        receipt = parse_receipt(proc.stdout or "")
+        entry = (receipt_to_local(receipt) if local_checkpoint
+                 else receipt_to_entry(receipt))
         if entry.role != role:
             raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
         return entry

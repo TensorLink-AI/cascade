@@ -241,6 +241,33 @@ def _stream_tar(local_dir: str, ssh_argv: list[str], timeout: int) -> int:
     return proc.returncode if proc.returncode != 0 else tar_rc
 
 
+def push_checkpoint(host: RemoteHost, local_checkpoint: str | Path, round_id: str,
+                    arch_preset: str, role: str, *, timeout: int = 600,
+                    runner=None) -> str:
+    """Stage a LOCAL checkpoint directory at ``role``'s ``_train_work``
+    checkpoint path on ``host`` (tar over ssh; the target is wiped first so a
+    stale sibling can never be benched by mistake). Returns the pod-side
+    checkpoint dir — exactly what :func:`role_paths` derives, so a following
+    :func:`run_post_round_benchmark` at the same ``role`` benches it.
+
+    This is how the operator's king pod re-benches a checkpoint it did not
+    train (DEC-CA-0036 payer-bench verification): the orchestrator already
+    holds the guard-verified copy, and pushing ~64MB is cheaper and safer
+    than teaching the pod to pull from the Hub."""
+    ckpt, _ = role_paths(host, round_id, arch_preset, role)
+    remote = (f"rm -rf {shlex.quote(ckpt)} && mkdir -p {shlex.quote(ckpt)} && "
+              f"tar -C {shlex.quote(ckpt)} -xf -")
+    argv = build_ssh_argv(host, remote)
+    if runner is not None:  # test seam
+        proc = runner(argv, timeout)
+        rc = proc.returncode
+    else:
+        rc = _stream_tar(str(local_checkpoint), argv, timeout)
+    if rc != 0:
+        raise RuntimeError(f"checkpoint push to {host.name}:{ckpt} failed (rc={rc})")
+    return ckpt
+
+
 def sideload_bench_data(host: RemoteHost, plan: BenchPlan, *,
                         runner=None, streamer=None) -> bool:
     """Stage ``plan.local_data_dir`` (the trainer box's benchmark data) into
@@ -317,7 +344,11 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
         # bench command's own download guard stays in place as the fallback,
         # so a failed/skipped sideload degrades to exactly the old behavior.
         sideload_bench_data(host, plan, runner=runner)
-        token = os.environ.get("HF_TOKEN") or None
+        # An ISOLATED host (a payer's pod, DEC-CA-0036) gets no operator
+        # credential of any kind — the sideload above is what stages its
+        # data; a failed sideload degrades to a token-less download there.
+        token = (None if getattr(host, "isolated", False)
+                 else os.environ.get("HF_TOKEN") or None)
         remote_cmd, report_path = build_bench_remote_command(
             host, round_id, arch_preset, plan, role=role, hf_token=token)
         ssh = build_ssh_argv(host, remote_cmd)

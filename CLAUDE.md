@@ -282,6 +282,101 @@ in-context.
   Same block arms the scored horizon ladder (`[eval] scored_horizons`,
   consensus). Trainer/provisioner policy; no contract change.
   (`decisions/DEC-CA-0037-duel-only-rounds.md`)
+- **DEC-CA-0038** — Cohort duel family-wise correction: Bonferroni `α/k`
+  over-protects the king (the k challengers share the king's scores + one
+  window draw → strongly positively correlated → the union bound is loose;
+  at k=11 it reads the 0.45th bootstrap pct). Replaced by a shared-resample,
+  centred, STUDENTISED max-T (Westfall–Young) off `joint_bag_geomeans` —
+  exact under the real correlation, no `α/k`, bit-identical at k≤1. Consensus,
+  block-gated `[scoring] cohort_maxt_from_block` (mainnet 9046800 ≈ Fri
+  2026-09-11 20:30 UTC, the evening funded round; testnet 1); audit replays each round under its block's
+  rule via `cohort_maxt_lcb_map` (one impl for validator + audit); no receipt
+  field (correction lives in the gate). Revises DEC-CA-0012.
+  (`decisions/DEC-CA-0038-cohort-maxt-correction.md`)
+- **DEC-CA-0039** — Arm the increment margin, block-gated `[scoring]
+  increment_from_block`. Under `level` the dethrone bar is a fixed % of the
+  king's absolute score, so a maturing lineage's sub-floor gains are
+  undethroneable; `increment` (DEC-CA-0027) prices the bar as a fraction of
+  the per-round increment over the shared init, tracking the shrinking signal.
+  Receipt-replay on recent mainnet: 2 of 17 competitive rounds flip HELD→
+  DETHRONE, zero false dethrones. Resolved per round via `koth_params(block)`
+  / `effective_margin_mode`; audit replays each round under its block (level
+  fallback for random-init preserved); no receipt change. ARMED at 9046800 —
+  SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
+  increment fixes the signal, max-T the multiplicity). Not a basin-escape
+  substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)
+- **DEC-CA-0040** (proposed) — Make the king beatable more often by flattening
+  the FRESH-KING margin ramp (`win_margin_start` 0.01 → the 0.005 floor), NOT by
+  touching the noise gate. Replay of 86 mainnet rounds: the margin below ~0.3% is
+  INERT — the paired-bootstrap `LCB>0` requirement binds first (at ~1.3% point
+  improvement), so the ramp (DEC-CA-0016), not the threshold value, is what
+  rejects real (LCB>0) challengers, which cluster on fresh-king rounds. Flat 0.5%
+  unlocks +9 bootstrap-confirmed real dethrones (~21%→31%), zero noise flips;
+  floor + `LCB>0` + `alpha=0.05` all unchanged. Rejects: LCB>0-only / lower floor
+  / FLIP the decay / tenure-vary or raise `alpha` / stack increment — each buys
+  beatability by loosening the noise floor or inverting the incentive. Arming
+  gate: re-run `scripts/replay_margin_decay.py` + a testnet no-ping-pong cycle
+  (else ship a LIGHT ramp 0.007→0.005). Revises DEC-CA-0016; chain.toml NOT
+  changed by the node. (`decisions/DEC-CA-0040-flatten-fresh-king-margin.md`)
+- **DEC-CA-0041** (proposed) — Multivariate scoring for the private-pool duel is
+  GIFT-Eval-weighted: a window's channels are AVERAGED into one per-window
+  contribution (arithmetic mean over variates, zero-target channels masked from
+  the WQL half; NOT sum/sum pooling — 0.28× scale-domination), so a C-channel
+  window counts ONCE — matching the source-cluster bootstrap that already treats
+  it as one unit (the point statistic was the only non-GIFT half). Block-gated
+  `[scoring] mv_score_from_block` (0 = per-channel forever, UNARMED),
+  BIT-IDENTICAL on the univariate pool (singleton windows pass through untouched).
+  N_eff = distinct coupled-SOURCE count, not channels (C=4 ≡ C=12 on 3 sources);
+  a realistic MV gain needs ~12+ coupled sources / ~38% pool share to clear a
+  0.5% margin. Phase 0 (aggregation + gate + tests) LANDED; pool builder / cap
+  raise / ablation gate arming. Revises DEC-CA-0026.
+  (`decisions/DEC-CA-0041-multivariate-scoring.md`)
+- **DEC-CA-0036** (proposed) — Miner-funded challenger legs (PRISM/sn100 port:
+  signed `X-Lium-Api-Key` intake → sealed vault → per-payer `LiumProvider`;
+  infra faults requeue, never burn) under ELASTIC-cadence rounds: funded
+  queue IS the field (`[round] funded_mode`, ≤ finalist_cap per round by
+  reveal-block seniority ⇒ heat fast-path, everyone duels), unfunded
+  boundaries skip (validators poll manifests, never schedule; scale-up = the
+  existing scheduled `epoch_blocks` switch). King + confirmation legs stay
+  operator-funded — a provisional dethrone is re-trained on the operator's
+  account before it crowns (miner-account pods are console-accessible to
+  their payer). Second half: DIRECT submissions — code POSTs to the intake
+  (same request as the key), stored operator-private, chain-committed as an
+  ordinary hippius payload under the reserved `vault/direct` namespace (no
+  validator change); ONLY thrones publish (`champions/`, sn100-top-model
+  style: crown/delay/dethrone policy), losers stay private forever;
+  digest ownership enforced at field entry. Landed inert 2026-08-28.
+  AMENDED 2026-09-02 (built + testnet-live-validated, still inert): per-payer
+  pods wired (`funded_pods="rent"`, write-ahead ledger, duel-settle burn
+  point), ELASTIC no-heat field (`funded_field_cap` + capacity probe; the
+  whole seated field duels — no screen on an all-funded field), per-round
+  GPU-type choice (`funded_pod_skus` five-type cu124 set, most-available
+  wins; JIT operator king via `funded_king_rent`), public roster +
+  `cascade queue` + tier-0 funded-roster audit check, intake registration
+  gate/quotas/replay hardening, deployment-scoped pod names
+  (`cascade-n<netuid>-…`, off the provisioner reaper). Remaining arming
+  gates: per-dispatch ZIP staging wiring, worker-image
+  rebuild + budget parity, confirmation wiring, DEC-CA-0016 wall-clock
+  tenure, retrain-noise measurement. MAINNET GO-LIVE ARMED (owner
+  2026-09-02): ONE block, 8992800 (≈ Fri 2026-09-04 08:30 UTC), for
+  `[round] funded_activation_block` and PR #241's
+  `[eval] scored_from_block` (ladder [64, 256, 720]); the 12h grid stays for now;
+  legacy rounds run until it (last one Thu 20:30), no hold. `expected_gpu` unpinned
+  (contract change — coordinated deploy before Thu 20:30); direct
+  submissions stay off. Payer pods are ISOLATED + per-pod push-only Hub
+  robots (revoked at teardown; needs CASCADE_HUB_ADMIN_* or a static
+  CASCADE_FUNDED_HUB_* robot, else fail-closed). The confirmation-leg gate
+  ships OPEN, owner-accepted — revisit in week one. Funded challengers
+  bench on their OWN pod post-publish (`[telemetry] funded_bench`; pod
+  kept through the sweep, then torn down); payer numbers are a FILTER —
+  the top-N re-bench on the operator's king pod and only operator numbers
+  are signed (forged sweep ⇒ entry dropped). Payer pods are CREDENTIAL-FREE
+  by default (`[round] funded_pod_checkpoint = "harvest"`: worker
+  --local-only, orchestrator harvest → ingest-verify → upload under its own
+  identity; robots remain as the "robot" fallback) — needs the worker image
+  rebuilt from this release.
+  (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
+  `docs/MINER_FUNDED_ROUNDS.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
@@ -296,8 +391,10 @@ New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
 pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
-decay/guard/wsd/jitter nodes 0016..0019; status proposed). Put the revisit
-condition in the node's `revisit_when:` key.
+decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0036 is claimed by the
+2026-08-28 miner-funded elastic-rounds pass, renumbered from 0029 after
+colliding with the accepted anneal/mix/init nodes 0029..0035; status
+proposed). Put the revisit condition in the node's `revisit_when:` key.
 
 ## Operational invariants (hard-learned)
 

@@ -180,6 +180,39 @@ Install the producer extra first: `pip install "cascade[pool-forge]"` (pyarrow
 pool). Everything downstream — deterministic tar, `effective_block` consensus,
 validator fetch — is unchanged.
 
+#### Multivariate coupling — the `mv_channels` contract (DEC-CA-0041)
+
+A source may tag genuinely coupled channels for multivariate scoring via
+`mv_channels` in its `sources.yaml` entry. This is a **cross-repo interface**,
+versioned here (v1):
+
+> **`mv_channels`** — an ordered list (≤ 8) of value-column names within a
+> single `(source, panel_row)`, all on that row-group's shared timestamp index.
+> The group packs to one `(C, L)` eval window and counts as **one series**
+> against every cascade cap: the 200-series panel-expansion cap, the
+> `[eval] n_windows` draw, and — since the KOTH bootstrap clusters by `source`
+> — it adds no cluster beyond its source. Cross-predictiveness is verified by
+> forge's audit: a group is tagged only if a sibling channel's *lags* improve a
+> held-out forecast of a channel beyond its own lags (contemporaneous
+> correlation alone does not admit).
+
+Forge ships the tags first — **inert**, because cascade's builder drops
+multichannel today; cascade's Phase-2 builder reading `mv_channels` and packing
+`(C, L)` windows is the activation, paired with `[scoring] mv_score_from_block`
+(release-then-activate). Until then a tagged source is scored exactly as now.
+
+**Two consumers, deliberately different accounting.** Forge's own benchmark
+expands a coupled group into C univariate challenges (C slots, group-level
+bootstrap); cascade packs it to one window (1 slot, source-level clusters). The
+same tag serves both — do not "fix" one to match the other.
+
+Because a coupled group is free against every cascade cap (1 series, 1 forecast
+call, 0 extra clusters), tagging costs the pool nothing and there is no
+size-vs-evidence tension; the cross-predictiveness bar is the only gatekeeper.
+Panel width buys no evidence — a 200-station network is one cluster — so harvest
+breadth is counted in **distinct coupled sources** (≥ ~12 / ~38 % of the pool;
+headroom toward `min_clusters ≈ 30`), never in channels or series.
+
 Properties worth knowing:
 
 * **Freshness cutoff** — only snapshots dated `<= as_of` are read and rows

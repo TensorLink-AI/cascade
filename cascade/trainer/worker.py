@@ -97,6 +97,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "across the --train-hours budget, no warmup. A trainer-LOCAL recipe "
                         "override — the [training] contract and every canonical checkpoint "
                         "are untouched; requires --warm-start-ref and --train-hours.")
+    p.add_argument("--local-only", action="store_true",
+                   help="Credential-free pod mode (DEC-CA-0036): train and leave the "
+                        "checkpoint on disk WITHOUT uploading (this box holds no Hub "
+                        "credential); the receipt carries local_checkpoint_dir instead of "
+                        "a trained_pointer and the orchestrator harvests, verifies, and "
+                        "uploads the checkpoint itself.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -168,6 +174,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # heat=is_heat ⇒ the run's S3/wandb telemetry lands at heat-<hotkey>,
         # matching local heats and keeping it off the final's <role>-<size> key.
+        if args.local_only:
+            receipt = runner.train_one_local(
+                gen, args.role, seeds, args.block,
+                contract=contract, token_budget=token_budget,
+                repo_suffix=args.repo_suffix, heat=is_heat,
+                warm_start_ref=args.warm_start_ref)
+            log.info("worker done role=%s local checkpoint=%s (no upload — "
+                     "credential-free pod)", args.role, receipt["local_checkpoint_dir"])
+            print(RECEIPT_SENTINEL + json.dumps(receipt, sort_keys=True), flush=True)
+            return 0
         entry = runner.train_one(gen, args.role, seeds, args.block,
                                  contract=contract, token_budget=token_budget,
                                  repo_suffix=args.repo_suffix, heat=is_heat,

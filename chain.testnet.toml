@@ -42,9 +42,8 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
                                  # source + config, a few MB; this is the wall that actually
                                  # makes a distilled model impossible. max_memory_mb /
                                  # max_generate_seconds bound it at runtime.
-max_channels         = 1         # per-series variates. 1 = univariate (generators may
-                                 # yield 1-D, promoted to (1, L)); raise to enable
-                                 # multivariate priors without a schema change.
+max_channels         = 32        # MV-TEST: C=32 raise (DEC-CA-0041), matches the mainnet cut.
+channel_corr_mode    = "shadow"  # MV-TEST: channel-redundancy telemetry, labels only.
 # Cheap data-quality gates on generator output (see chain.toml for the rationale).
 max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.
 reject_constant      = false     # reject flat (zero-range) series (parked for v1).
@@ -92,11 +91,12 @@ horizon            = 64
 # compute regardless of data-dependent throughput — a raw 3h timer would let a
 # generator win by emitting cheap-to-step data instead of better data, and would
 # not reproduce on a re-derived audit run. max_train_seconds is the hard guard.
-target_train_hours          = 0.75     # TESTNET: 45-min final budget per king/challenger (was 0.25≈15min)
+target_train_hours          = 0.05    # FUNDED-TEST fast round
 ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes the budget
                                         # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
 warmup_fraction             = 0.05
 batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was 256
+batch_denomination          = "sequences"  # MV-TEST: step-count parity across C (DEC-CA-0041)
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate
@@ -114,7 +114,7 @@ lr_schedule        = "wsd"        # warmup-stable-decay (DEC-CA-0018): warmup on
                                    # recomputes contract_digest (restart trainer + validator).
 umup_base_d_model  = 256          # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 2700        # TESTNET: cap = the 45-min final budget itself, measured
+max_train_seconds  = 300     # FUNDED-TEST fast round
                                   # from the first training batch. Token budget or deadline —
                                   # first reached stops; a time stop is flagged deadline_hit.
                                   # (Was 14400 — longer than the whole 3h testnet epoch.)
@@ -172,9 +172,9 @@ train_image_digest = ""
 # (3500, = mainnet epoch − 100) exceeds this 900-block epoch, which build_policy
 # rejects. Running the provisioner against testnet needs its own margin override
 # (~800). Pre-existing — the previous 7100 failed the same way.
-epoch_blocks     = 900    # ~3h at 12s blocks (mainnet = 3600 ≈ 12h)
+epoch_blocks     = 150    # FUNDED-TEST fast round
 round_hours      = 3.0    # informational
-heat_train_hours = 0.1    # cheap screen per competitor (testnet: tiny)
+heat_train_hours = 0.025  # FUNDED-TEST fast round
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
 heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [eval] num_samples);
                           # ranking-only, so small keeps the CPU screen quick on a 3h epoch
@@ -184,7 +184,7 @@ heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [ev
 # so the ~6-min heat budget really is the cap.
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
-finalists        = 1      # challengers promoted from the heat to the final
+finalists        = 2      # FUNDED-TEST
 # Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED here FIRST
 # (2026-08-20, DEC-CA-0012 rollout order). With max_finalists > 1 a leader the
 # screen separated advances alone; a statistically tied top advances capped.
@@ -203,6 +203,32 @@ one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes 
 # Duel-only rounds (no heat) — see chain.toml; 0 = off. Arm on testnet first.
 duel_from_block = 0
 duel_field_cap  = 0
+# Miner-funded compute (DEC-CA-0036): testnet is where "shadow" → "required"
+# gets exercised first (cascade-intake may run --trust-refs here). Inert now.
+funded_mode = "required"  # FUNDED-TEST phase 2
+funded_queue_path = "funded_queue.json"
+skip_unfunded_rounds = true   # FUNDED-TEST phase 2
+max_rounds_per_day = 1
+funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
+# Per-payer funded pods (DEC-CA-0036 second arming gate): "off" = funded legs
+# run on the operator fleet (pre-wiring behaviour); "rent" = each funded
+# challenger leg rents ONE pod on its payer's own Lium key, dispatches there,
+# and tears it down when the leg ends (king + eval pods stay operator-funded,
+# always). "rent" needs the three keys below; consensus-inert ([round]).
+funded_pods = "rent"   # FUNDED-TEST phase 3 (live wiring validation)
+payer_vault_dir = "/root/cascade-main/.claude/worktrees/funded-release/_payer_vault"  # FUNDED-TEST (rehearsal intake vault)
+funded_pod_sku = "RTX4090"      # FUNDED-TEST
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.1@sha256:d9001d0d0e3f1a40504b2bdd06782157ce96539b7bc6b99971e5a5646580e89b"  # FUNDED-TEST: v0.8.1 rehearsal build (armed testnet toml baked); mainnet stays on v0.8.0
+funded_ready_timeout_seconds = 900.0
+funded_pod_checkpoint = "harvest"  # credential-free pods (worker --local-only + orchestrator harvest)
+funded_field_cap = 8            # FUNDED-TEST: elastic field
+funded_capacity_probe = true    # FUNDED-TEST: clamp to the chosen type's live market
+funded_capacity_reserve = 1
+funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST: per-round pick
+funded_king_rent = true   # FUNDED-TEST: JIT operator king at the round SKU (standing final pod expired 09-02)
+submission_vault_dir = "submission_vault"  # FUNDED-TEST       # direct submissions (vault refs) off until armed
+champion_publish = "dethrone"  # FUNDED-TEST: rehearse the mainnet publish policy
+champion_publish_delay_rounds = 2
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps
@@ -293,6 +319,7 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 # reporting the drift as a contract-declaration WARN rather than a rejected
 # round.
 declared_contract_from_block = 1
+mv_score_from_block = 1   # MV-TEST: joint multivariate window scoring live from round one
 
 # King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
 # (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
@@ -318,6 +345,8 @@ win_margin_start     = 0.02      # fresh-king margin (tenure 0) — unchanged
 # Scheduled fresh-king margin change — see chain.toml; 0.0 / 0 = none.
 win_margin_start_prev   = 0.0
 margin_activation_block = 0
+cohort_maxt_from_block = 1        # DEC-CA-0038: max-T cohort correction armed (testnet validation)
+increment_from_block = 1          # DEC-CA-0039: increment margin armed (testnet validation)
 win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
                                  # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)
@@ -500,6 +529,14 @@ mode    = "online"              # online | offline | disabled
 # corpus stream opens — the one field that is comparable pod to pod.
 host_probe = true               # lane geometry, CPU/GPU capability, opaque pod + machine ids
 host_bench = true               # + the fixed calibration bench (host_bench_tokens_per_s)
+# Payer-pod bench (DEC-CA-0036): each funded challenger benches on its own pod
+# after the duel (miner-billed, ~1h; the pod is torn down when the sweep ends).
+# Payer numbers are a FILTER: the top-N re-bench on the operator's king pod and
+# only the operator's numbers are signed/published; a payer number better than
+# the re-bench by more than the tolerance is a forged sweep (entry dropped).
+funded_bench = true
+funded_bench_verify_top = 1
+funded_bench_verify_tolerance = 0.02
 # Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round,
 # train the king's generator from scratch post-publish and publish the labeled
 # telemetry report (benchmarks/scratch/) — never feeds scoring/promotion.

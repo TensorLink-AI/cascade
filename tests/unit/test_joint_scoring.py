@@ -154,7 +154,7 @@ def test_evaluator_lifts_archived_1d_wrapper(tmp_path):
         "    def forecast(self, history, horizon, num_samples):\n"
         "        return np.zeros((1, num_samples, horizon)) + history[-1]\n",
     )
-    fn = load_forecaster(tmp_path)
+    fn = load_forecaster(tmp_path, trust_checkpoint_code=True)  # stub wrapper, not a real checkpoint
     out = fn(np.ones((2, 30)), 5, 7)
     assert out.shape == (2, 7, 5)
 
@@ -174,6 +174,6 @@ def test_evaluator_prefers_forecast_joint(tmp_path):
         "        c = history.shape[0]\n"
         "        return np.full((c, num_samples, horizon), 42.0)\n",
     )
-    fn = load_forecaster(tmp_path)
+    fn = load_forecaster(tmp_path, trust_checkpoint_code=True)  # stub wrapper, not a real checkpoint
     out = fn(np.ones((3, 30)), 5, 7)
     assert out.shape == (3, 7, 5) and float(out[0, 0, 0]) == 42.0

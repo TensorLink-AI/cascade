@@ -54,6 +54,12 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--horizon", type=int, default=None, help="Override [eval] horizon.")
     p.add_argument("--min-context", type=int, default=256, help="Minimum context a kept window affords.")
     p.add_argument("--max-missing-frac", type=float, default=0.2, help="Drop series gappier than this.")
+    p.add_argument("--mv-pack", action="store_true",
+                   help="DEC-CA-0041: pack each tagged source's mv_channels into one "
+                        "(C, L) multivariate series (else project to the first channel). "
+                        "Raise --max-channels alongside, and arm [scoring] mv_score_from_block.")
+    p.add_argument("--max-channels", type=int, default=1,
+                   help="Max variates a kept series may carry (raise with --mv-pack).")
     p.add_argument("--max-series-per-domain", type=int, default=None)
     p.add_argument(
         "--max-series-per-domain-freq",
@@ -196,6 +202,10 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
             # Only panel-expanding sources carry a per-feed cap (tsbench_forge).
             if hasattr(src, "max_series_per_source"):
                 src.max_series_per_source = int(args.max_panel_series_per_feed)
+    if getattr(args, "mv_pack", False):
+        for src in sources:
+            if hasattr(src, "mv_pack"):   # tsbench_forge packs mv_channels to (C, L)
+                src.mv_pack = True
     ctx = HarvestContext(
         as_of=_parse_date(args.as_of),
         span_days=args.span_days,
@@ -211,6 +221,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         max_series_per_domain=args.max_series_per_domain,
         max_series_per_domain_freq=args.max_series_per_domain_freq,
         max_series_total=args.max_series_total,
+        max_channels=int(getattr(args, "max_channels", 1) or 1),
     )
     return build_pool(
         sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite

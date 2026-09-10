@@ -53,6 +53,20 @@ def _rescale(base, factor):
     ]
 
 
+def _noisy(base, factor, seed):
+    """A competitor ``factor``x the base ON AVERAGE but with per-window jitter —
+    so the relative improvement VARIES across windows and the paired bootstrap
+    has real spread (unlike :func:`_rescale`, whose constant factor is a point
+    mass where every quantile collapses to the estimate and no correction can
+    bite). Paired by construction (shares ``abs_target``)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for s in base:
+        j = factor * float(rng.uniform(0.6, 1.4))
+        out.append(WindowScore(s.series_id, s.mase * j, s.qloss_per_q * j, s.abs_target))
+    return out
+
+
 def _cohort_manifest(cfg, challengers, *, sizes=("",)):
     """``challengers`` is ``[(hotkey, uid, duel_rank)]``."""
     entries = []
@@ -351,7 +365,7 @@ def test_cohort_audit_verifies_the_selection(cfg):
         m, base_seed=7, epoch_start_block=10, epoch_block_hash="0x" + "ab" * 32,
         outcome=outcome, windows=[],
     )
-    r = C.check_duel_cohort(receipt)
+    r = C.check_duel_cohort(receipt, cfg)
     assert r.status == C.PASS, r.detail
     # The correction it re-derived is the one the round was judged under, and the
     # receipt still records the UNMODIFIED config params (or check_koth_params
@@ -384,7 +398,7 @@ def test_cohort_audit_catches_crowning_the_wrong_clearer(cfg):
     chal = [s for s in scores if s.role == "challenger"]
     kings = [s for s in scores if s.role == "king"]
     swapped = dc_replace(receipt, entry_scores=tuple(kings + chal[::-1]))
-    r = C.check_duel_cohort(swapped)
+    r = C.check_duel_cohort(swapped, cfg)
     assert r.status == C.FAIL
     assert "not the best clearer" in r.detail
 
@@ -401,9 +415,9 @@ def test_single_challenger_round_skips_the_cohort_check(cfg):
         m, base_seed=7, epoch_start_block=10, epoch_block_hash="0x" + "ab" * 32,
         outcome=outcome, windows=[],
     )
-    assert C.check_duel_cohort(receipt).status == C.SKIP
+    assert C.check_duel_cohort(receipt, cfg).status == C.SKIP
     # ...and the ordinary verdict check still reproduces it.
-    assert C.check_verdict(receipt).status == C.PASS
+    assert C.check_verdict(receipt, cfg).status == C.PASS
 
 
 # ── what the receipt publishes ────────────────────────────────────────────────
@@ -530,18 +544,18 @@ def test_audit_rejects_a_doctored_published_geomean(cfg):
     king = _scores(1.0, 0)
     receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
-    assert C.check_duel_cohort(receipt).status == C.PASS
+    assert C.check_duel_cohort(receipt, cfg).status == C.PASS
     bad = {hk: dict(s) for hk, s in receipt.verdict.cohort_stats.items()}
     bad["a_hk"]["geomean"] = bad["a_hk"]["geomean"] * 0.5
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
-    r = C.check_duel_cohort(tampered)
+    r = C.check_duel_cohort(tampered, cfg)
     assert r.status == C.FAIL
     assert "geomean for a_hk" in r.detail and "replays as" in r.detail
     # Stats for a hotkey that was never scored are equally a failure.
     bad = dict(receipt.verdict.cohort_stats)
     bad["z_hk"] = bad.pop("a_hk")
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=bad))
-    assert C.check_duel_cohort(tampered).status == C.FAIL
+    assert C.check_duel_cohort(tampered, cfg).status == C.FAIL
 
 
 def test_audit_accepts_a_receipt_without_cohort_stats(cfg):
@@ -556,7 +570,7 @@ def test_audit_accepts_a_receipt_without_cohort_stats(cfg):
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
     legacy = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_stats=None))
     assert b"cohort_stats" not in legacy.canonical_body()
-    assert C.check_duel_cohort(legacy).status == C.PASS
+    assert C.check_duel_cohort(legacy, cfg).status == C.PASS
 
 
 def test_audit_rejects_a_doctored_published_lcb(cfg):
@@ -569,11 +583,11 @@ def test_audit_rejects_a_doctored_published_lcb(cfg):
     king = _scores(1.0, 0)
     receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
-    assert C.check_duel_cohort(receipt).status == C.PASS
+    assert C.check_duel_cohort(receipt, cfg).status == C.PASS
     bad = dict(receipt.verdict.cohort_lcbs)
     bad["a_hk"] = bad["a_hk"] + 0.5      # claim a_hk did far better than it did
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_lcbs=bad))
-    r = C.check_duel_cohort(tampered)
+    r = C.check_duel_cohort(tampered, cfg)
     assert r.status == C.FAIL
     assert "replays as" in r.detail
 
@@ -589,7 +603,7 @@ def test_audit_rejects_a_mismatched_k(cfg):
     receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
                           {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
     tampered = dc_replace(receipt, verdict=dc_replace(receipt.verdict, cohort_k=5))
-    r = C.check_duel_cohort(tampered)
+    r = C.check_duel_cohort(tampered, cfg)
     assert r.status == C.FAIL
     assert "cohort_k=5" in r.detail
 
@@ -629,12 +643,108 @@ def test_mid_cohort_winner_is_recorded_last_and_every_consumer_agrees(cfg):
     assert chal_order == ["a_hk", "c_hk", "b_hk"]
     assert outcome.duelled_hotkeys[-1] == "b_hk"
     # Every positional consumer now attributes the round to the crowned clearer.
-    r = C.check_verdict(receipt)
+    r = C.check_verdict(receipt, cfg)
     assert r.status == C.PASS, r.detail
-    r = C.check_duel_cohort(receipt)
+    r = C.check_duel_cohort(receipt, cfg)
     assert r.status == C.PASS, r.detail
     r = C.check_transition(receipt)
     assert r.status in (C.PASS, C.WARN), r.detail
     s = summarize_receipt(receipt)
     assert s["chal_hotkey"] == "b_hk"
     assert s["post_round_king_hotkey"] == "b_hk"
+
+
+def test_cohort_maxt_active_path_validator_to_audit(cfg):
+    """DEC-CA-0038 armed, end to end: gate the max-T on, the validator scores a
+    cohort under it, the receipt round-trips, and the audit re-derives the SAME
+    joint bound. Replaying the identical receipt under a Bonferroni (gate-off)
+    cfg FAILS — proof the block gate actually swaps the rule and the audit
+    resolves it per round rather than trusting the numbers."""
+    from dataclasses import replace
+
+    from cascade.audit import checks as C
+    from cascade.shared.config import effective_epoch_blocks
+    # A boundary-aligned block ABOVE the gate, so both the validator's
+    # _epoch_start_block(manifest) and the receipt's block resolve max-T on.
+    eb = effective_epoch_blocks(cfg.round, 1)
+    block = eb * 100
+    armed = replace(cfg, scoring=replace(cfg.scoring, cohort_maxt_from_block=eb))
+    king = _scores(1.0, 0)
+    fake_eval, _ = _by_hotkey(king, {
+        "a_hk": _noisy(king, 0.7, 11),
+        "b_hk": _noisy(king, 0.6, 22),
+    })
+    m = replace(_cohort_manifest(armed, [("a_hk", 1, 0), ("b_hk", 2, 1)]),
+                created_block=block)
+    runner = _runner(armed, fake_eval)
+    outcome = runner.process_round(m, windows=[], base_seed=7)
+    receipt = runner.build_round_receipt(
+        m, base_seed=7, epoch_start_block=block, epoch_block_hash="0x" + "ab" * 32,
+        outcome=outcome, windows=[],
+    )
+    # The receipt still records the UNMODIFIED config params (max-T needs no
+    # alpha/k), so check_koth_params stays happy — the correction lives in the
+    # block gate, not the params.
+    assert receipt.verdict.params["bootstrap_alpha"] == cfg.scoring.bootstrap_alpha
+    # Audit under the SAME armed cfg reproduces the joint max-T bound.
+    assert C.check_duel_cohort(receipt, armed).status == C.PASS
+    assert C.check_verdict(receipt, armed).status == C.PASS
+    # And the gate is load-bearing: the recorded LCBs are the max-T ones, so
+    # replaying under Bonferroni (gate off) does NOT reproduce them.
+    off = replace(cfg, scoring=replace(cfg.scoring, cohort_maxt_from_block=0))
+    assert C.check_duel_cohort(receipt, off).status == C.FAIL
+
+
+def test_audit_ignores_per_domain_that_the_receipt_cannot_replay(cfg):
+    """per_domain_win_rate is a non-gating diagnostic and the window's DOMAIN
+    label is NOT carried on the receipt (``WindowScoreRecord`` keeps only the
+    cluster ``source``). A real cohort round therefore publishes a real-domain
+    split that a Tier-0 replay — rebuilding domain-less scores — collapses to a
+    single ``unknown`` bucket and cannot reproduce. The audit must not fail the
+    round on that.
+
+    Regression: the first live k=3 testnet cohort under DEC-CA-0038 failed
+    ``duel-cohort`` on exactly this, the verdict itself reproducing cleanly.
+    """
+    from dataclasses import replace as dc_replace
+
+    from cascade.audit import checks as C
+
+    doms = ["econ_fin", "energy", "healthcare", "nature", "sales"]
+    king = [dc_replace(s, domain=doms[i % len(doms)])
+            for i, s in enumerate(_scores(1.0, 0))]
+    receipt, _ = _receipt(cfg, [("a_hk", 1, 0), ("b_hk", 2, 1)],
+                          {"a_hk": _rescale(king, 0.7), "b_hk": _rescale(king, 0.4)}, king)
+    # The validator recorded a genuine multi-domain split at scoring time …
+    pub = receipt.verdict.cohort_stats["a_hk"]["per_domain_win_rate"]
+    assert set(pub) - {"unknown"}, "expected real domain names in the published split"
+    # … which the domain-less receipt cannot replay, yet the audit still passes.
+    assert C.check_duel_cohort(receipt, cfg).status == C.PASS
+
+
+def test_cohort_stats_guard_skips_unresolved_but_flags_resolved_mismatch():
+    """The per_domain guard is narrow: it tolerates ONLY the unreplayable case
+    (the replay collapsed to ``unknown``), and still hard-fails a real
+    disagreement when the replay actually resolved domains — so the guard cannot
+    be used to smuggle a doctored split past the audit."""
+    from dataclasses import replace
+
+    from cascade.audit.checks import _cohort_stats_problems
+    from cascade.eval.koth import RoundResult
+    from cascade.shared.receipt import cohort_stats_of
+
+    res = RoundResult(challenger_wins_round=False, lcb=0.0, margin=0.02,
+                      n_windows=100, king_geomean=1.0, chal_geomean=0.9,
+                      inconclusive=False, win_rate=0.5, boot_p50=0.1, boot_p95=0.2,
+                      per_domain_win_rate={"unknown": (0.5, 100)})
+    # Published a real-domain split; the domain-less replay is all 'unknown'.
+    published = dict(cohort_stats_of(res))
+    published["per_domain_win_rate"] = {"nature": [0.6, 60], "sales": [0.35, 40]}
+    assert _cohort_stats_problems({"a": published}, [("a", res)]) == []
+
+    # Replay DID resolve domains and one disagrees → still a hard failure.
+    res2 = replace(res, per_domain_win_rate={"nature": (0.9, 60), "sales": (0.35, 40)})
+    pub2 = dict(cohort_stats_of(res2))
+    pub2["per_domain_win_rate"] = {"nature": [0.6, 60], "sales": [0.35, 40]}
+    probs = _cohort_stats_problems({"a": pub2}, [("a", res2)])
+    assert any("per_domain_win_rate" in p for p in probs)

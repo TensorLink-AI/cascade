@@ -21,12 +21,18 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from .bootstrap import (
+    cohort_maxt_lcbs,
     increment_bootstrap_rel,
     paired_bootstrap_lcb_aggregated,
     paired_bootstrap_quantiles_aggregated,
 )
 from .gift_gate import GiftGateResult
-from .scoring import WindowScore, global_geomean, stack_components
+from .scoring import (
+    WindowScore,
+    collapse_channels_by_window,
+    global_geomean,
+    stack_components,
+)
 
 # The public-benchmark gate rollout modes (``[scoring] gift_gate_mode``):
 #   "off"     — gate never runs (default; pure private-pool KOTH).
@@ -107,6 +113,14 @@ class KothParams:
     # (scale-free): with both increments ≈ 0 an unfloored unit divides by
     # noise exactly when the evidence is weakest (the DEC-CA-0009 lesson).
     margin_increment_floor: float = 0.01
+    # Multivariate scoring (DEC-CA-0041, block-gated [scoring] mv_score_from_block):
+    # when True, a window's channels are averaged into ONE per-window
+    # contribution (GIFT-Eval weighting — a C-channel window counts once), so
+    # the round point statistic agrees with the source-cluster bootstrap that
+    # already treats an MV window as one unit. Resolved from the round's block
+    # by the caller (koth_params), like margin_mode. BIT-IDENTICAL on any
+    # univariate pool (one channel per window) whether on or off.
+    mv_score: bool = False
 
 
 def margin_for_tenure(params: KothParams, king_tenure_rounds: int) -> float:
@@ -297,6 +311,65 @@ def per_horizon_breakdown(
     return out
 
 
+def cohort_maxt_lcb_map(
+    king_scores: list[WindowScore],
+    cohort_scores: list[tuple[str, list[WindowScore]]],
+    params: KothParams,
+    *,
+    seed: int | str,
+    wql_mode: str = "geomean",
+) -> dict[str, float]:
+    """``{hotkey: family-wise LCB}`` for a cohort under the shared-resample
+    max-T (DEC-CA-0038) — the consensus replacement for Bonferroni ``alpha/k``
+    when ``[scoring] cohort_maxt_from_block`` is reached.
+
+    ``king_scores`` and every challenger's pooled scores must be paired (same
+    windows, same order — the caller pools across sizes exactly as the level
+    LCB does). One shared cluster resample scores king + all challengers
+    (:func:`cascade.eval.bootstrap.cohort_maxt_lcbs`), so the correction reads
+    the ACTUAL joint correlation instead of the loose union bound. The single
+    source of truth for BOTH the validator's decision and the audit's replay,
+    so the two can never derive a different bound. Uses ``params.bootstrap_B``
+    at the FULL ``params.bootstrap_alpha`` — the max-T needs no ``alpha/k``.
+
+    Multivariate (DEC-CA-0041): when ``params.mv_score`` is armed, each window's
+    channels are collapsed to one per-window row FIRST — the same rule as the
+    single-duel :func:`evaluate_round`, so the cohort max-T reads a multivariate
+    window as one unit exactly as the point statistic and the cluster bootstrap
+    do. Bit-identical on any univariate pool (one channel per window).
+    """
+    if params.mv_score:
+        if wql_mode != "geomean":
+            raise ValueError(
+                "mv_score requires wql_mode='geomean' (pooled is legacy "
+                "univariate receipt replay)"
+            )
+        king_scores = collapse_channels_by_window(king_scores)
+        cohort_scores = [(hk, collapse_channels_by_window(cs))
+                         for hk, cs in cohort_scores]
+    clusters, _ = _window_clusters(king_scores)
+    king_c = stack_components(king_scores)
+    chal_c = [stack_components(cs) for _, cs in cohort_scores]
+    lcbs = cohort_maxt_lcbs(
+        king_c, chal_c, alpha=params.bootstrap_alpha, B=params.bootstrap_B,
+        seed=seed, clusters=clusters, wql_mode=wql_mode,
+    )
+    return {hk: lcb for (hk, _), lcb in zip(cohort_scores, lcbs, strict=True)}
+
+
+def with_cohort_lcb(result: RoundResult, lcb: float, params: KothParams) -> RoundResult:
+    """A cohort challenger's :class:`RoundResult` re-decided under its
+    family-wise max-T ``lcb`` (DEC-CA-0038): swap the lcb and recompute the win
+    under the SAME rule :func:`evaluate_round` used — ``lcb >= margin``, AND-ed
+    with the enforce-mode init-baseline floor. Geomeans, the floor result, and
+    the diagnostics are untouched (they never depended on the correction). The
+    one place the win is re-derived, shared by the validator and the audit."""
+    wins = bool(lcb >= result.margin)
+    if params.init_gate_mode == "enforce" and result.init_floor_passed is False:
+        wins = False
+    return replace(result, lcb=lcb, challenger_wins_round=wins)
+
+
 def evaluate_round(
     king_scores: list[WindowScore],
     chal_scores: list[WindowScore],
@@ -347,6 +420,20 @@ def evaluate_round(
         raise ValueError(
             f"unpaired baseline: {len(baseline_scores)} vs king {len(king_scores)}"
         )
+    if params.mv_score:
+        # GIFT-Eval multivariate weighting (DEC-CA-0041): average each window's
+        # channels into one per-window row so an MV window counts once, matching
+        # the source-cluster bootstrap. Only defined for the live geomean rule;
+        # 'pooled' is legacy univariate receipt replay and never carries MV data.
+        if wql_mode != "geomean":
+            raise ValueError(
+                "mv_score requires wql_mode='geomean' (pooled is legacy "
+                "univariate receipt replay)"
+            )
+        king_scores = collapse_channels_by_window(king_scores)
+        chal_scores = collapse_channels_by_window(chal_scores)
+        if baseline_scores is not None:
+            baseline_scores = collapse_channels_by_window(baseline_scores)
     n = len(king_scores)
     margin = margin_for_tenure(params, king_tenure_rounds)
     clusters, n_clusters = _window_clusters(king_scores)

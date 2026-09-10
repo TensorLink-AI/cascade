@@ -608,6 +608,14 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
     dest = Path(dest_dir)
     if (dest / FETCH_COMPLETE_MARKER).exists():
         return dest
+    if ref.repo == "vault/direct":
+        # Direct-to-gateway submission (DEC-CA-0036): the reserved vault
+        # namespace never touches a registry — it resolves from the private
+        # store / staged ZIP, or the published champion object. Lazy import:
+        # funding depends on this module, not the other way round.
+        from ..funding.store import fetch_vault_snapshot
+
+        return fetch_vault_snapshot(ref, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.parent / f".{dest.name}.fetch-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
