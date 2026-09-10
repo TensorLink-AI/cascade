@@ -123,7 +123,7 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
   the boundary wait for the next round with their submission intact
   (`cascade heat` lists them as `waiting`). The whole cohort is judged under
   α/k.
-- **MINER-FUNDED ROUNDS (live from block 8992800 ≈ Fri 2026-09-04 08:30 UTC,
+- **MINER-FUNDED ROUNDS (live from block 9046800 ≈ Fri 2026-09-11 20:30 UTC,
   DEC-CA-0036):** entering a round now requires FUNDING your own training leg
   with your Lium API key (`cascade fund` — the leg's GPU pod rents on YOUR
   account; the operator pays for the king, evals, and everything else). The
@@ -141,7 +141,7 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
   still holds but is spent ONLY when your leg is judged (or your generator
   fails) — requeues never burn it. A hotkey that competed in a legacy
   round is spent: enter the funded era with a fresh hotkey revealed after
-  the last legacy cutoff (Thu 2026-09-03 20:30 UTC). Full contract:
+  the last legacy boundary (Fri 2026-09-11 ~08:30 UTC, block 9043200). Full contract:
   docs/MINER_FUNDED_ROUNDS.md.
 - **Heat** (screening; retired for funded rounds — pre-go-live history): every
   eligible challenger trained ~1h at the screen size and the leader/tied top
@@ -200,7 +200,7 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
    environment (`bittensor==10.5.0`) — older SDKs write reveals the subnet
    cannot decode and you are silently skipped.
 8. **Fund your training leg** (required once funded rounds are live —
-   block 8992800, ≈ Fri 2026-09-04 08:30 UTC): after your reveal lands,
+   block 9046800, ≈ Fri 2026-09-11 20:30 UTC): after your reveal lands,
    `export LIUM_API_KEY=sk-…` (env only, never argv) and
    `cascade fund https://<operator-intake> --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
    Your hotkey must be REGISTERED on the subnet and the ref must match your
@@ -236,7 +236,7 @@ seat you take bills your own key for ~3h of GPU.
 - duel-only (from block 8992800): no heat; the whole field seats in reveal
   order (`duel_field_cap = 0`), the fleet sizes to fit it in the epoch, and
   only the lanes' physical overflow waits unburned for the next round
-- funded rounds (from block 8992800): `funded_mode = "required"`,
+- funded rounds (from block 9046800): `funded_mode = "required"`,
   `funded_pods = "rent"` (your leg bills your Lium key), field cap 8 clamped
   to live GPU-market capacity, GPU type per round from
   ["RTX4090", "RTX3090", "L40S", "L40", "A6000"], king rents JIT
