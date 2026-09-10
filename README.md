@@ -268,6 +268,7 @@ docs/
   AUDIT.md          verifying published rounds with cascade-audit (receipts, tiers)
   DEPLOY_PODS.md    pod bootstrap + provisioner service for the GPU fleet
   EVAL_POOL.md      the private eval-window pool and its rotation
+  MINER_FUNDED_QUICKSTART.md  miner quickstart: Lium-funded legs, private submissions, multivariate data
   MARGIN_DECAY_ROLLOUT.md   the tenure-decay margin: design + rollout record
 scripts/
   example_generator/   a forkable reference generator (also a test fixture)

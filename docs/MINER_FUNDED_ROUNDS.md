@@ -87,39 +87,47 @@ rationale; this file is the how.
    boundary, and a payer-key teardown after a provisioner restart
    (vault hydrate → `teardown_funded`).
 
-## GO-LIVE 2026-09-04 (mainnet, block-gated — owner 2026-09-02)
+## GO-LIVE 2026-09-11 (mainnet, block-gated — owner 2026-09-09/10; the 2026-09-04 block passed unreleased)
 
-The shipped `chain.toml` flips at ONE block; the epoch grid stays 12h
-(3600 blocks) for now:
+The shipped `chain.toml` flips at ONE evening boundary; the epoch grid stays
+12h (3600 blocks):
 
 | what | block | projected UTC |
 |---|---|---|
-| funded machinery live (`[round] funded_activation_block`) | 8992800 | Fri 2026-09-04 ~08:30 |
-| scored horizon ladder `[64, 256, 720]` (`[eval] scored_from_block`, PR #241) | 8992800 | Fri 2026-09-04 ~08:30 |
+| funded machinery live (`[round] funded_activation_block`) | 9046800 | Fri 2026-09-11 ~20:30 |
+| cohort max-T (`[scoring] cohort_maxt_from_block`, DEC-CA-0038) | 9046800 | Fri 2026-09-11 ~20:30 |
+| increment margin (`[scoring] increment_from_block`, DEC-CA-0039) | 9046800 | Fri 2026-09-11 ~20:30 |
+| contract transition (`[scoring] contract_from_block`; prior digest pinned) | 9046800 | Fri 2026-09-11 ~20:30 |
+| multivariate scoring (`[scoring] mv_score_from_block`, DEC-CA-0041) | 9068400 | Mon 2026-09-14 ~20:30 |
 
-Why this block: it is the first 12h boundary after the last legacy round.
-Legacy rounds (6–8h) keep running right up to the flip — the last one
-starts at the Thu 20:30 boundary (8989200) and ends ~02:30–04:30, leaving
-the usual gap; at 8992800 the funded field and the ladder activate together.
+(The scored horizon ladder `[64, 256, 720]` and duel-only rounds have been
+live since 8992800 = 2026-09-04; they are not part of this flip.)
+
+Why this block: the Friday 08:30 morning round (9043200) is the LAST
+old-world round — operator-funded, duel-only, judged under α/k, manifest on
+the prior contract digest. The intake opens right after it; at 9046800 the
+funded field, the two consensus flips and the new contract activate together.
 No extra rounds, no hold, no overlap. (Projections assume 12s blocks —
 verify against the live chain the day before; keep any moved block a
-multiple of 3600.) A later move to a 3h grid is its own scheduled
-`epoch_activation_block` switch (a coordinated validator update).
+multiple of 3600.)
 
-Miners can `cascade fund` as soon as the intake is up — entries queue by
-reveal block and the first funded round at 8992800 seats them. With
-`one_submission_per_hotkey = true` a hotkey that competed in a legacy
-round is spent, so the funded era's entrants are FRESH hotkeys whose
-reveal lands after the Thu 20:30 cutoff (an earlier reveal competes in
-the last legacy round and burns). Funded entries burn at the DUEL settle,
-only when judged or on a generator failure — never on a requeue or an
+Miners can `cascade fund` / `cascade submit` as soon as the intake is up —
+entries queue by reveal block and the first funded round at 9046800 seats
+them. With `one_submission_per_hotkey = true` a hotkey that competed in a
+legacy round is spent, so the funded era's entrants are FRESH hotkeys whose
+reveal lands after the Fri 08:30 boundary (9043200) — an earlier reveal
+competes in the last legacy round and burns. Funded entries burn at the DUEL
+settle, only when judged or on a generator failure — never on a requeue or an
 auth fault. Operator checklist, in order:
 
-1. **Before block 8989200 (Thu ~20:30 UTC, the last legacy boundary):**
-   deploy this release — WITH PR #241 merged — to the trainer AND every
-   validator (the `expected_gpu = ""` unpin changes `contract_digest`, and
-   the horizon ladder forks verdicts from 8992800 on any validator without
-   it) — the standard coordinated window; announce to externals. Verify the current pool's
+1. **Before block 9046800 (Fri ~20:30 UTC):** deploy this release to the
+   trainer AND every validator. The `[training]` changes (`expected_gpu = ""`,
+   worker-v0.8.0 image, `batch_denomination`) move `contract_digest`; the
+   transition is pinned (`prior_contract_digest` = the live digest,
+   `contract_from_block = 9046800`) so an early-upgraded validator still scores
+   the Fri 08:30 round. The TRAINER has no block gate on the digest: restart it
+   only AFTER the Fri 08:30 round's manifest is published and BEFORE 9046800.
+   Announce to externals. Verify the current pool's
    series-length eligibility at the 720 rung (>= 784 steps) before the block.
 2. **Set the payer-pod credential source and the vault seal key** on the
    orchestrator: `CASCADE_VAULT_KEY_FILE` (e.g. `head -c 32 /dev/urandom >
@@ -137,7 +145,7 @@ auth fault. Operator checklist, in order:
    itself; a standing final fleet would idle-bill and the provisioner must
    never touch `cascade-n91-…` pods.
 5. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
-   from block 8992800; `cascade fund` after reveal; registered hotkey; keep
+   from block 9046800; `cascade fund` after reveal; registered hotkey; keep
    ~3h × chosen-GPU balance on the Lium key.
 6. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
    `cascade-audit latest` (funded-roster check), and the trainer log's

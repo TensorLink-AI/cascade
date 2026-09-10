@@ -607,9 +607,9 @@ This is observability, not an appeal channel: these fields are not signed, not
 in the manifest, and never re-weight a score. They exist so a claim about host
 variance can be checked against numbers instead of inferred.
 
-## 6b. Fund your training leg — REQUIRED from Fri 2026-09-04 (~08:30 UTC, block 8992800)
+## 6b. Fund your training leg — REQUIRED from Fri 2026-09-11 (~20:30 UTC, block 9046800)
 
-From block **8992800** (DEC-CA-0036), a revealed submission only enters a
+From block **9046800** (DEC-CA-0036; the 2026-09-04 block passed unreleased), a revealed submission only enters a
 round once you FUND its training leg: your leg's GPU pod rents on **your own
 Lium API key** (lium.io), so the compute you consume bills you, not the
 operator. The operator still pays for the king's leg, the evals, and
@@ -665,10 +665,23 @@ What to know:
   rate limit, operator infra, or a bad key never spend it. A hotkey that
   already competed in a legacy (pre-funded) round IS spent: to enter the
   funded era, register a fresh hotkey and reveal AFTER the last legacy
-  cutoff (Thu 2026-09-03 20:30 UTC) — a reveal before it competes in the
-  final legacy round and burns.
+  boundary (Fri 2026-09-11 ~08:30 UTC, block 9043200) — a reveal before it
+  competes in the final legacy round and burns. Reveal + fund before the
+  ~20:30 UTC boundary (9046800) to be in the first funded round.
 
-Full contract (failure classes, TTLs, the operator's obligations):
+- **Private submissions (same release).** `cascade submit ./my-generator
+  https://<operator-intake> --wallet-name w --wallet-hotkey h` ZIPs your repo
+  straight to the operator-private vault, chain-commits a
+  `vault/direct@sha256:…` ref, and — with `LIUM_API_KEY` in env — funds the
+  leg in the same request (auto-queues when your reveal lands; `--no-fund` to
+  fund later). Losers are never published; a king's code publishes only when
+  it is deposed (`champion_publish = "dethrone"`), via `cascade fetch king`.
+  The earliest upload owns a digest — another hotkey committing your digest is
+  dropped at field entry.
+
+Short version of all of this (funding, private submissions, multivariate):
+[docs/MINER_FUNDED_QUICKSTART.md](MINER_FUNDED_QUICKSTART.md). Full contract
+(failure classes, TTLs, the operator's obligations):
 [docs/MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUNDS.md).
 
 ## The cascade — warm-started rounds
@@ -805,7 +818,7 @@ The economics, so you can plan a corpus:
 | `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5b](#5b-if-the-hippius-hub-is-down)) |
 | committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
 | `403 not_registered` on fund/submit | your hotkey is not registered on the subnet — `btcli subnets register` first |
-| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-04-0530-utc-block-8992800)) |
+| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-11-2030-utc-block-9046800)) |
 | funded but never seated | more-senior (earlier-revealed) entries out-capped you, or the GPU market is thin — you wait unburned; watch `cascade queue` |
 | entry `failed [rate_limited]` | your Lium key 429'd for 6h straight — raise the key's rate limits, then fund again |
 | loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |
