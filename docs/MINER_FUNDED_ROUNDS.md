@@ -253,6 +253,16 @@ in code:
   orchestrator inspected before anything else could fetch them. A harvest
   transport failure settles as infra (requeue), never tamper. Requires a
   `funded_pod_image` built from a `--local-only`-aware release.
+  - **Pin `funded_pod_image` as `repo:tag@sha256:…`, not digest-only.** Lium's
+    launch API rejects the canonical digest ref and the client degrades a
+    digest-only pin to the repo's floating tag (`:latest`), so a host with an
+    OLD image cached under that tag boots stale code while the env digest gate
+    still reads "pinned" (it attests the requested ref, not the runtime). Give
+    the pin an immutable version tag so the degraded form stays on-release, and
+    the trainer functionally probes each rented pod's `worker --help` for the
+    dispatch flags before any bytes move — a stale pod is requeued as infra,
+    never burned. (Both landed 2026-09-10 after a live funded pod booted a
+    pre-harvest image and the dispatch died on `--local-only`.)
 - `"robot"` mode (fallback for a pre-harvest image): the pod pushes with a
   **Harbor robot** scoped to the checkpoint project
   with `repository:push` only — no delete, no other project, no S3, no HF:
