@@ -40,3 +40,6 @@ worker_manual.log
 # local proposal prompts (not for the repo)
 /PROPOSAL-*.md
 receipts_cache/
+
+# Local operator deploy runbook — supplied to the install agent out-of-band, never committed
+docs/DEPLOY_FUNDED_MAINNET.md
