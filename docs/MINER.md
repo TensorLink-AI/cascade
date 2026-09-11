@@ -616,16 +616,18 @@ operator. The operator still pays for the king's leg, the evals, and
 everything else. There is no heat screen any more — every funded, seated
 entrant goes straight to the paired duel against the king.
 
+The mainnet intake is **`https://submissions.cascadesub.net`** (live).
+
 ```bash
 # after `cascade deploy` (your reveal must be on-chain and your hotkey
 # REGISTERED on the subnet):
 export LIUM_API_KEY=sk-...        # your key, env only — never on the command line
-cascade fund https://<operator-intake>     --ref <repo@digest>     --wallet-name mywallet --wallet-hotkey myhotkey
+cascade fund https://submissions.cascadesub.net     --ref <repo@digest>     --wallet-name mywallet --wallet-hotkey myhotkey
 # → fund: queued  (your seat is ordered by your on-chain reveal block)
 
 cascade queue                     # the last round's published seat allocation
-cascade queue --intake https://<operator-intake>   # + the LIVE queue
-cascade fund https://<operator-intake> --ref <repo@digest> --withdraw     --wallet-name mywallet --wallet-hotkey myhotkey   # exit while still queued
+cascade queue --intake https://submissions.cascadesub.net   # + the LIVE queue
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw     --wallet-name mywallet --wallet-hotkey myhotkey   # exit while still queued
 ```
 
 What to know:
@@ -670,7 +672,7 @@ What to know:
   ~20:30 UTC boundary (9046800) to be in the first funded round.
 
 - **Private submissions (same release).** `cascade submit ./my-generator
-  https://<operator-intake> --wallet-name w --wallet-hotkey h` ZIPs your repo
+  https://submissions.cascadesub.net --wallet-name w --wallet-hotkey h` ZIPs your repo
   straight to the operator-private vault, chain-commits a
   `vault/direct@sha256:…` ref, and — with `LIUM_API_KEY` in env — funds the
   leg in the same request (auto-queues when your reveal lands; `--no-fund` to
