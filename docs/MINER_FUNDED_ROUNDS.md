@@ -406,15 +406,15 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
 ```
 # Direct (one request: code + funding; private until it takes the throne):
 export LIUM_API_KEY=sk-…               # your key, env only — never argv
-cascade submit ./my-generator https://<intake> --wallet-name w --wallet-hotkey h
+cascade submit ./my-generator https://submissions.cascadesub.net --wallet-name w --wallet-hotkey h
 # → stores privately, chain-commits the vault ref, auto-funds on reveal
 
 # Or the classic Hub path + explicit funding:
 cascade deploy …                       # unchanged: upload + commit/reveal
-cascade fund https://<intake> --ref <repo@digest> \
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
     --wallet-name w --wallet-hotkey h
-# queue position: GET <intake>/v1/queue (or `cascade round`)
-cascade fund https://<intake> --ref <repo@digest> --withdraw \
+# queue position: GET https://submissions.cascadesub.net/v1/queue (or `cascade round`)
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw \
     --wallet-name w --wallet-hotkey h   # while still queued only
 cascade fetch king                     # published champions resolve anonymously
 ```

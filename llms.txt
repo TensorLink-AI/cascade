@@ -202,7 +202,7 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
 8. **Fund your training leg** (required once funded rounds are live —
    block 9046800, ≈ Fri 2026-09-11 20:30 UTC): after your reveal lands,
    `export LIUM_API_KEY=sk-…` (env only, never argv) and
-   `cascade fund https://<operator-intake> --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
+   `cascade fund https://submissions.cascadesub.net --ref <repo@digest> --wallet-name … --wallet-hotkey …`.
    Your hotkey must be REGISTERED on the subnet and the ref must match your
    revealed commitment. The leg's pod rents on your Lium account only when
    your seat comes up (budget ~4h: the 3h leg plus ~1h benching your own

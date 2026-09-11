@@ -11,6 +11,8 @@ Long form: [MINER.md](MINER.md) §6b, [MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUN
 
 Rounds stay on the 12h grid (~08:30 / ~20:30 UTC boundaries).
 
+**Intake (mainnet, netuid 91): `https://submissions.cascadesub.net`** — live now; `GET /v1/queue` shows the live queue.
+
 ---
 
 ## 1. Fund your leg with a Lium key
@@ -23,10 +25,10 @@ entrant duels the king.
 ```bash
 export LIUM_API_KEY=sk-...                     # env only; the CLI never takes it as an argument
 cascade deploy ./my-generator --hub-repo <ns/name> --wallet-name w --wallet-hotkey h   # as before
-cascade fund https://<intake> --ref <repo@digest> --wallet-name w --wallet-hotkey h
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> --wallet-name w --wallet-hotkey h
 # → fund: queued
-cascade queue --intake https://<intake> --hotkey <your ss58>    # live queue + last roster, your rows marked
-cascade fund https://<intake> --ref <repo@digest> --withdraw --wallet-name w --wallet-hotkey h   # leave while still queued
+cascade queue --intake https://submissions.cascadesub.net --hotkey <your ss58>    # live queue + last roster, your rows marked
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw --wallet-name w --wallet-hotkey h   # leave while still queued
 ```
 
 **Rules**
@@ -49,7 +51,7 @@ Skip the public Hub repo: POST the code straight to the operator's private vault
 
 ```bash
 export LIUM_API_KEY=sk-...
-cascade submit ./my-generator https://<intake> --wallet-name w --wallet-hotkey h
+cascade submit ./my-generator https://submissions.cascadesub.net --wallet-name w --wallet-hotkey h
 # → verifies locally, ZIPs the repo, stores it privately, chain-commits
 #   vault/direct@sha256:<hex>, funds the leg (auto-queues when the reveal lands)
 ```
@@ -92,4 +94,4 @@ def generate(self, n_series, rng):
 2. Lium API key with ~4h of RTX4090-class balance.
 3. Latest `cascade` CLI (`cascade fund`, `cascade submit`, `cascade queue` must exist).
 4. Reveal after Fri ~08:30 UTC (9043200); `cascade fund` or `cascade submit` before ~20:30 UTC (9046800).
-5. Watch `cascade queue --intake https://<intake> --hotkey <you>` and `cascade round`.
+5. Watch `cascade queue --intake https://submissions.cascadesub.net --hotkey <you>` and `cascade round`.
