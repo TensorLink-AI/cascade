@@ -9,7 +9,6 @@ chain.deployed.toml on every rented pod and dispatches with --chain-toml on it.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
