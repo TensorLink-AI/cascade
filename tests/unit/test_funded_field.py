@@ -280,6 +280,9 @@ def test_settled_retry_restores_funded_state_from_the_marker(tmp_path):
     runner = _runner(tmp_path, funded_mode="required")
     runner._mark_heat_complete = TrainerRunner._mark_heat_complete.__get__(runner)
     runner._settled_finalists = TrainerRunner._settled_finalists.__get__(runner)
+    # The snapshot records the lanes the seating saw (a local final = 1).
+    runner._duel_lanes = TrainerRunner._duel_lanes.__get__(runner)
+    runner.remote_hosts = None
     finalists = [_challenger("hkA"), _challenger("hkB")]
     runner._funded_field = {"hkA": REF, "hkB": REF}
     runner._funded_round_sku = "L40S"

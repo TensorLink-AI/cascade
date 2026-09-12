@@ -272,14 +272,24 @@ class HealthGate:
     def _check_fresh_boot(self, run_ssh: RunSSH) -> tuple[bool, str]:
         if not self.require_fresh_boot:
             return True, "skipped (adopted pod)"
-        # -q: exit 0 on ANY match even if another file is missing; -s: no
-        # noise for a missing file. rc 1 = no match, rc 2 = neither readable
-        # — both mean "never pinned" (a fresh container has neither line).
-        proc = run_ssh(["grep", "-q", "-s", "CASCADE_TRAIN_IMAGE_DIGEST",
-                        "/etc/environment", f"{self.home_dir}/.bashrc"])
+        # Freshness is judged ONLY by traces the provisioner's own post-gate
+        # hook leaves (``digest_env_command``): the ``export`` line in
+        # ~/.bashrc and the ``.cascade-provisioned`` sentinel. /etc/environment
+        # is deliberately NOT consulted: Lium materialises the launch ``-e``
+        # env (which carries CASCADE_TRAIN_IMAGE_DIGEST by design) into
+        # /etc/environment, so a genuinely fresh Lium pod failed this gate on
+        # every try (2026-09-11 23:16). -q: exit 0 on a match; -s: no noise
+        # for a missing file. rc 1 = no match, rc 2 = unreadable — both mean
+        # "never pinned by us".
+        proc = run_ssh(["grep", "-q", "-s", "^export CASCADE_TRAIN_IMAGE_DIGEST=",
+                        f"{self.home_dir}/.bashrc"])
         if proc.returncode == 0:
             return False, ("recycled container: CASCADE_TRAIN_IMAGE_DIGEST already "
-                           "pinned in /etc/environment or ~/.bashrc by a previous rental")
+                           "pinned in ~/.bashrc by a previous rental's post-gate hook")
+        proc = run_ssh(["test", "-e", f"{self.home_dir}/{PROVISIONED_SENTINEL}"])
+        if proc.returncode == 0:
+            return False, (f"recycled container: {self.home_dir}/{PROVISIONED_SENTINEL} "
+                           "left by a previous rental's post-gate hook")
         proc = run_ssh(["ls", "-A", f"{self.workdir}/_train_work"])
         if proc.returncode == 0:
             entries = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
@@ -288,6 +298,13 @@ class HealthGate:
                                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
                                f"from a previous rental")
         return True, ""
+
+
+# Sentinel the provisioner's post-gate hook (``digest_env_command``) drops in the
+# pod user's home once a pod has been gated + pinned. Its presence on a "new"
+# rental means the provider handed back a previous rental's container (seen on
+# massedcompute / hyperstack / scaleway, 2026-09-12): recycled, never fresh.
+PROVISIONED_SENTINEL = ".cascade-provisioned"
 
 
 def _sha256_of(value: str) -> str | None:

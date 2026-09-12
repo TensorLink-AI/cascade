@@ -35,7 +35,7 @@ from .core import (
     validate_digest_pinned,
     wait_ssh_reachable,
 )
-from .health import HealthGate, HealthReport, _sha256_of
+from .health import PROVISIONED_SENTINEL, HealthGate, HealthReport, _sha256_of
 from .loop import PodProfile, ProvisionerLoop, RenderSettings, parse_plan_output
 from .policy import ProvisionPolicy, SkuCandidate, StagePolicy
 
@@ -399,7 +399,11 @@ def digest_env_command(digest: str, *, user: str = "root") -> str:
         'sed -i "/^export CASCADE_TRAIN_IMAGE_DIGEST=/d" "$HOME/.bashrc" && '
         f'echo "export {line}" >> "$HOME/.bashrc"'
     )
-    return f"{env_part} && {rc_part}"
+    # The health gate's fresh_boot check keys off THIS sentinel + the .bashrc
+    # export line (never /etc/environment, which Lium fills from the launch
+    # env): a later "new" rental carrying it is a recycled container.
+    sentinel_part = f'touch "$HOME/{PROVISIONED_SENTINEL}"'
+    return f"{env_part} && {rc_part} && {sentinel_part}"
 
 
 def make_config_push(render: RenderSettings, *, box_chain_toml: str,

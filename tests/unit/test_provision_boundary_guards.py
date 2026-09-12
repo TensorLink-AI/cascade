@@ -56,6 +56,31 @@ def test_pinned_digest_line_on_disk_means_recycled_container():
     assert "recycled container" in fb.detail and "pinned" in fb.detail
 
 
+def test_digest_var_in_etc_environment_alone_is_fresh():
+    # Lium materialises the launch env (which carries CASCADE_TRAIN_IMAGE_DIGEST
+    # by design) into /etc/environment on a brand-new pod. That is NOT a
+    # recycled-container trace: the gate must never grep /etc/environment
+    # (2026-09-11 23:16: every fresh Lium pod failed fresh_boot on it).
+    base = _run_ssh()
+
+    def run(argv):
+        if argv[0] == "grep" and "/etc/environment" in argv:
+            return _proc("", rc=0)                        # would match if consulted
+        return base(argv)
+
+    report = _gate().check(run)
+    assert report.ok, report.summary()
+
+
+def test_provisioned_sentinel_means_recycled_container():
+    # The post-gate hook drops ~/.cascade-provisioned; a "new" rental carrying
+    # it is a previous rental's container handed back by the provider.
+    report = _gate().check(_run_ssh({"test": _proc("", rc=0)}))
+    assert not report.ok
+    fb = next(c for c in report.checks if c.name == "fresh_boot")
+    assert "recycled container" in fb.detail and ".cascade-provisioned" in fb.detail
+
+
 def test_leftover_train_work_means_recycled_container():
     report = _gate().check(_run_ssh({"ls": _proc("14174795993398307910\n_bench_ckpts\n")}))
     assert not report.ok
@@ -73,8 +98,13 @@ def test_fresh_boot_probes_the_pod_users_home_and_workdir():
     _gate(home_dir="/home/shadeform", workdir="/home/shadeform/cascade").check(
         _run_ssh(calls=calls))
     grep = next(a for a in calls if a[0] == "grep")
+    sentinel = next(a for a in calls if a[0] == "test")
     ls = next(a for a in calls if a[0] == "ls")
-    assert grep[-2:] == ["/etc/environment", "/home/shadeform/.bashrc"]
+    # Only the hook's own traces are probed — never /etc/environment, which
+    # Lium fills from the launch env (a fresh Lium pod carries the digest var).
+    assert grep[-2:] == ["^export CASCADE_TRAIN_IMAGE_DIGEST=", "/home/shadeform/.bashrc"]
+    assert "/etc/environment" not in grep
+    assert sentinel[-1] == "/home/shadeform/.cascade-provisioned"
     assert ls[-1] == "/home/shadeform/cascade/_train_work"
 
 

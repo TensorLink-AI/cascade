@@ -79,16 +79,21 @@ def test_lium_launch_degrades_ref_but_keeps_digest_env(caplog):
         out = '[{"id": "exec-1"}]' if "ls" in argv else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    payloads = []
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv),
+                        _template=lambda p: payloads.append(p) or "tmpl-t")
     from cascade.provision.core import LaunchSpec
 
     with caplog.at_level("WARNING", logger="cascade.provision.core"):
         prov.launch(LaunchSpec(sku="L40S", count=1, image=IMG_TAGGED,
                                ssh_pubkey="ssh-ed25519 AAAA orch"))
     up = spawned[0]
-    assert up[up.index("--image") + 1] == "reg.example/cascade-worker:v0.7.0"
-    assert not any("@sha256:" in a for a in up if a.startswith("reg.example")), up
-    assert f"CASCADE_TRAIN_IMAGE_DIGEST={DIGEST}" in up          # pin rides the env
+    assert up[up.index("--template_id") + 1] == "tmpl-t"
+    # The template carries the repo/tag split (lium 400-rejects the digest
+    # form) and the exact pin in its env.
+    (p,) = payloads
+    assert (p["docker_image"], p["docker_image_tag"]) == ("reg.example/cascade-worker", "v0.7.0")
+    assert p["environment"]["CASCADE_TRAIN_IMAGE_DIGEST"] == DIGEST   # pin rides the env
     assert any("degrading image ref" in r.message for r in caplog.records)
 
 
@@ -99,13 +104,17 @@ def test_lium_launch_unpinned_ref_logs_no_degradation(caplog):
         out = '[{"id": "exec-1"}]' if "ls" in argv else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    payloads = []
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv),
+                        _template=lambda p: payloads.append(p) or "tmpl-u")
     from cascade.provision.core import LaunchSpec
 
     with caplog.at_level("WARNING", logger="cascade.provision.core"):
         prov.launch(LaunchSpec(sku="L40S", count=1, image="ubuntu:22.04",
                                ssh_pubkey="ssh-ed25519 AAAA orch"))
-    assert spawned[0][spawned[0].index("--image") + 1] == "ubuntu:22.04"
+    assert spawned[0][spawned[0].index("--template_id") + 1] == "tmpl-u"
+    assert (payloads[0]["docker_image"], payloads[0]["docker_image_tag"]) == ("ubuntu", "22.04")
+    assert "CASCADE_TRAIN_IMAGE_DIGEST" not in payloads[0]["environment"]   # unpinned ref
     assert not any("degrading image ref" in r.message for r in caplog.records)
 
 
