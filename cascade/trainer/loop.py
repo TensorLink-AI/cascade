@@ -1495,6 +1495,56 @@ class TrainerRunner:
                      rnd.funded_capacity_reserve, clamped, cap)
         return clamped
 
+    # Seconds between marketplace polls while a funded/king rent waits for a GPU.
+    FUNDED_RENT_RETRY_SECONDS = 90.0
+    # Wall-clock the manifest needs after the last leg ends (push + sign + publish).
+    FUNDED_PUBLISH_MARGIN_SECONDS = 900.0
+
+    def _funded_rent_wait_deadline(self) -> float:
+        """Latest wall-clock a rented leg may START and still finish inside the
+        epoch: epoch end − the final leg's ``max_train_seconds`` − publish margin.
+        Falls back to "now" (no waiting) when the round context is unknown."""
+        now = time.time()
+        try:
+            ctx = getattr(self, "_stage_ctx", None) or {}
+            epoch_start = int(ctx.get("epoch_start_block") or 0)
+            seen = getattr(self, "_funded_gate_block", None)
+            if not epoch_start or seen is None:
+                return now
+            epoch_blocks = int(effective_epoch_blocks(self.cfg.round, epoch_start))
+            remaining_s = max(0, epoch_start + epoch_blocks - int(seen)) * 12.0
+            leg_s = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+            return now + remaining_s - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS
+        except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
+            return now
+
+    def _wait_for_funded_capacity(self, sku: str, *, describe: str) -> bool:
+        """Poll the marketplace for ``sku`` until it shows capacity or the round's
+        latest safe start passes. Legs start INDEPENDENTLY as GPUs appear
+        (owner 2026-09-12: "keep trying over the next 3 hours to bring up more
+        pods" — batches of one or more, not all-or-nothing); a leg still without
+        a GPU at the deadline requeues to the next round as before. Returns
+        True when capacity appeared."""
+        deadline = self._funded_rent_wait_deadline()
+        sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+        now_fn = getattr(self, "_rent_wait_now", None) or time.time
+        polled = 0
+        while now_fn() < deadline:
+            n = self._probe_funded_capacity(sku)
+            if n:
+                if polled:
+                    log.info("%s: %s capacity appeared (%d) after %d poll(s)",
+                             describe, sku, n, polled)
+                return True
+            if not polled:
+                log.info("%s: no %s capacity on lium — polling every %.0fs until %s "
+                         "(latest start that still lands inside the epoch)",
+                         describe, sku, self.FUNDED_RENT_RETRY_SECONDS,
+                         time.strftime("%H:%M:%SZ", time.gmtime(deadline)))
+            polled += 1
+            sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
+        return False
+
     def _probe_funded_capacity(self, sku: str) -> int | None:
         """``sku``'s marketplace availability on the OPERATOR's key, or None."""
         try:
@@ -1832,21 +1882,30 @@ class TrainerRunner:
         # One rent at a time (see _funded_rent_lock): later rents must SEE
         # earlier claims, or every concurrent pair picks the market's same
         # top executor and races one create-rate window.
-        with self._funded_rent_lock:
-            with self._funded_exec_lock:
-                claimed = tuple(sorted(self._funded_claimed_execs))
-            from ..provision.core import scan_ssh_host_key
-
-            result = rent_funded_pod(
-                round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
-                sku=round_sku, image=rnd.funded_pod_image,
-                ssh_pubkey=ssh_pubkey, netuid=netuid,
-                ready_timeout=rnd.funded_ready_timeout_seconds,
-                exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
-            )
-            if result.ok and result.machine_id:
+        while True:
+            with self._funded_rent_lock:
                 with self._funded_exec_lock:
-                    self._funded_claimed_execs.add(result.machine_id)
+                    claimed = tuple(sorted(self._funded_claimed_execs))
+                from ..provision.core import scan_ssh_host_key
+
+                result = rent_funded_pod(
+                    round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
+                    sku=round_sku, image=rnd.funded_pod_image,
+                    ssh_pubkey=ssh_pubkey, netuid=netuid,
+                    ready_timeout=rnd.funded_ready_timeout_seconds,
+                    exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
+                )
+                if result.ok and result.machine_id:
+                    with self._funded_exec_lock:
+                        self._funded_claimed_execs.add(result.machine_id)
+            if result.ok or result.error_class != "no_capacity":
+                break
+            # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
+            # rent lock, so sibling legs that find one proceed) and rent again.
+            # Only the round's latest safe start turns this into a requeue.
+            if not self._wait_for_funded_capacity(
+                    round_sku, describe=f"funded leg {gen.hotkey[:12]}"):
+                break
         if not result.ok:
             # rent_funded_pod's own failure path verified-terminated anything
             # it launched; drop the write-ahead entry only when nothing leaked
@@ -2106,6 +2165,13 @@ class TrainerRunner:
                               "%s", pod_id, te)
                 raise ProvisionError(why)
 
+            # A sold-out marketplace is not a round failure: wait for a GPU
+            # (outside the rent lock) up to the round's latest safe start —
+            # the legs then rent independently as machines appear.
+            if (not provider.capacity(sku)
+                    and not self._wait_for_funded_capacity(sku, describe="king rent")):
+                raise ProvisionError(
+                    f"lium: no {sku} capacity before the round's latest safe start")
             # Serialized with every funded rent (see _funded_rent_lock): the
             # king's `lium up` must not race a challenger's for the same
             # executor / create-rate window.

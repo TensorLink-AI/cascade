@@ -87,8 +87,14 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_teardown_kept_funded_pods", "_funded_harvest",
                  "_harvest_funded_checkpoint",
                  "_filter_funded_challengers", "_submissions_path",
-                 "_submission_store", "_push_deployed_chain_toml"):
+                 "_submission_store", "_push_deployed_chain_toml",
+                 "_wait_for_funded_capacity", "_funded_rent_wait_deadline"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
+    # Capacity-wait constants + no round context ⇒ the deadline is "now" and a
+    # sold-out rent skips immediately (the pre-wait behaviour these tests pin).
+    fake.FUNDED_RENT_RETRY_SECONDS = TrainerRunner.FUNDED_RENT_RETRY_SECONDS
+    fake.FUNDED_PUBLISH_MARGIN_SECONDS = TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
+    fake._probe_funded_capacity = lambda sku: 0
     prof = profile or _profile(tmp_path)
     fake._hosts_for = lambda stage: [prof]
     fake.will_run_post_publish_bench = lambda: fake.cascade_bench_plan is not None
@@ -688,6 +694,8 @@ def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path, monkeypatch):
 
     class _Prov:
         name = "lium"
+        def capacity(self, sku, *, gpus=1):
+            return 1                                   # in stock: no capacity wait
         def launch(self, spec):
             launched.append((spec.sku, spec.name_prefix, spec.exclude_ids))
             return [f"{spec.name_prefix}-0"]
