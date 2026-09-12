@@ -321,6 +321,11 @@ def main(argv: list[str] | None = None) -> int:
         remote_hosts=remote_hosts,
         remote_hosts_path=args.remote_hosts,
         hosts_wait_seconds=args.hosts_wait_seconds,
+        # The DEPLOYED chain.toml, pushed onto every JIT-rented pod (king +
+        # funded legs) before dispatch: the image bakes a pre-release snapshot
+        # whose train_image_digest pin is stale, and no provisioner hook ever
+        # touches a pod the trainer rents itself (2026-09-12 08:58).
+        deployed_chain_toml=(args.chain_toml or Path("chain.toml")),
         trainer_spec=args.trainer,
         screen_fn=screen_fn,
         runoff_fn=runoff_fn,
