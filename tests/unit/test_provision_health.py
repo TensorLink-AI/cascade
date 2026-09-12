@@ -81,7 +81,7 @@ def test_healthy_pod_passes_all_checks():
     assert report.ok and report.failures == ()
     assert [c.name for c in report.checks] == [
         "ssh_echo", "gpu_sku", "runtime_pin", "worker_import",
-        "image_digest", "hippius", "disk", "fresh_boot",
+        "image_digest", "code_fingerprint", "hippius", "disk", "fresh_boot",
     ]
 
 
@@ -175,8 +175,12 @@ def test_transport_exception_fails_the_check_not_the_gate():
 
     report = _gate().check(exploding)
     assert not report.ok
-    assert all(not c.ok for c in report.checks if c.name != "hippius")
-    assert "hippius" not in {c.name for c in report.failures}  # orchestrator-side, no ssh
+    # hippius is orchestrator-side (no ssh); code_fingerprint is unpinned here
+    # and therefore never touches the transport — pinned, it fails like the rest.
+    assert all(not c.ok for c in report.checks if c.name not in ("hippius", "code_fingerprint"))
+    assert "hippius" not in {c.name for c in report.failures}
+    pinned = _gate(code_fingerprint="f" * 64).check(exploding)
+    assert "code_fingerprint" in {c.name for c in pinned.failures}
 
 
 def test_report_summary_names_each_failure():

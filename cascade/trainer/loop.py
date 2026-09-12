@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import shlex
 import threading
 import time
 from collections.abc import Callable
@@ -267,6 +268,34 @@ def telemetry_rollup_line(
         f"{hit_f}/{len(finals)} finals; {wait_part} ({reported}/{total} runs "
         "reported metrics)" + (f"; {host_part}" if host_part else "")
     )
+
+
+# Fault class a funded leg gets the FIRST time its generator stalls on a pod
+# ("generator_stalled: no series for Ns"). Not a burn: a stall is what an
+# environment fault looks like from the orchestrator (2026-09-12: three miners'
+# legs "stalled" on one Lium host that was running a stale worker image — the
+# generators were fine). The entry requeues unburned (attempts untouched); the
+# SAME hotkey stalling again on its next leg is then the miner's fault.
+STALL_CLASS = "stall"
+_STALL_MARKER = "generator_stalled"
+
+
+def classify_funded_worker_failure(rc: int | None, text: str, *,
+                                   stalled_before: bool) -> tuple[bool, str, bool]:
+    """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
+
+    ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
+    A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
+    (infra-side, unburned) the first time and ``"generator"`` (the miner's
+    shot) only when this hotkey already stalled once before. Every other
+    rejection stays ``"generator"``; any other exit is ``"infra"`` and burns
+    one of the entry's retry attempts, as before.
+    """
+    if rc == 3:
+        if _STALL_MARKER in (text or "") and not stalled_before:
+            return False, STALL_CLASS, False
+        return True, "generator", False
+    return False, "infra", True
 
 
 def _load_seen_hotkeys(path: Path) -> set[str]:
@@ -1506,6 +1535,9 @@ class TrainerRunner:
     FUNDED_RENT_RETRY_SECONDS = 90.0
     # Wall-clock the manifest needs after the last leg ends (push + sign + publish).
     FUNDED_PUBLISH_MARGIN_SECONDS = 900.0
+    # Consecutive rented pods that booted a stale worker image (pinned tag,
+    # wrong code) before the leg gives up for the round as an infra fault.
+    FUNDED_MAX_STALE_PODS = 3
 
     def _funded_rent_wait_deadline(self) -> float:
         """Latest wall-clock a rented leg may START and still finish inside the
@@ -1981,6 +2013,7 @@ class TrainerRunner:
         # One rent at a time (see _funded_rent_lock): later rents must SEE
         # earlier claims, or every concurrent pair picks the market's same
         # top executor and races one create-rate window.
+        stale_pods = 0
         while True:
             with self._funded_rent_lock:
                 with self._funded_exec_lock:
@@ -1997,6 +2030,29 @@ class TrainerRunner:
                 if result.ok and result.machine_id:
                     with self._funded_exec_lock:
                         self._funded_claimed_execs.add(result.machine_id)
+                if result.ok:
+                    # The pod answered SSH — but is it running the PINNED
+                    # code? A host serving a stale image under the pinned tag
+                    # boots an old worker that echoes our injected digest env
+                    # (2026-09-12). Hash its files before it ever sees a leg;
+                    # a mismatch releases the pod, keeps its executor out of
+                    # this round and rents again — the miner is never blamed.
+                    why = self._funded_pod_code_mismatch(result, profile)
+                    if why:
+                        stale_pods += 1
+                        log.warning("funded leg %s: pod %s rejected — %s; releasing "
+                                    "and renting again (%d stale pod(s) so far)",
+                                    gen.hotkey[:12], result.pod.instance_id if result.pod
+                                    else "?", why, stale_pods)
+                        self._teardown_funded_pod(result.pod)
+                        if stale_pods >= self.FUNDED_MAX_STALE_PODS:
+                            result = replace(
+                                result, ok=False,
+                                error=f"{stale_pods} consecutive pods booted a stale "
+                                      f"worker image ({why})", error_class="infra",
+                                burn_attempt=False, pod=None, address=None)
+                            break
+                        continue
             if result.ok or result.error_class != "no_capacity":
                 break
             # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
@@ -2182,6 +2238,43 @@ class TrainerRunner:
                        check=True, capture_output=True, timeout=300)
         return dc_replace(host, static_env=(*host.static_env,
                                             ("CASCADE_VAULT_DIR", pod_dir)))
+
+    def _funded_pod_code_mismatch(self, result, profile) -> str:
+        """Why a freshly rented funded pod must NOT receive a leg, or ``""``.
+
+        Hashes the pod's ``cascade/**/*.py`` over the pinned ssh identity and
+        compares it with ``[round] worker_code_fingerprint``
+        (:mod:`cascade.provision.codeprint`). Unpinned ⇒ always ``""``. A
+        transport failure is a mismatch too: a pod we cannot verify is a pod
+        we do not dispatch to.
+        """
+        pinned = (self.cfg.round.worker_code_fingerprint or "").strip().lower()
+        if not pinned or result.address is None:
+            return ""
+        from ..provision.codeprint import CHECK_TIMEOUT_SECONDS, remote_code_fingerprint
+        from .remote import RemoteHost, build_ssh_argv, run_ssh
+
+        host = RemoteHost(
+            name="funded-codecheck", host=result.address.ip, port=result.address.ssh_port,
+            user=profile.user, key_path=profile.key_path,
+            remote_python=profile.remote_python, workdir=profile.workdir,
+            pinned_host_key=result.host_key, ssh_options=profile.ssh_options,
+        )
+
+        def _run(argv):
+            return run_ssh(build_ssh_argv(host, shlex.join(list(argv))),
+                           timeout=CHECK_TIMEOUT_SECONDS)
+
+        try:
+            got, n, err = remote_code_fingerprint(_run, workdir=profile.workdir)
+        except Exception as e:  # noqa: BLE001 — unverifiable ⇒ unusable
+            return f"code fingerprint check errored: {e}"
+        if err:
+            return f"code fingerprint unavailable: {err}"
+        if got != pinned:
+            return (f"stale worker image: pod code {got[:12]}… ({n} files) != pinned "
+                    f"{pinned[:12]}…")
+        return ""
 
     def _teardown_funded_pod(self, pod) -> None:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
@@ -2456,10 +2549,13 @@ class TrainerRunner:
                     f"({text[-200:]})", miner_fault=True, error_class="tamper",
                     burn=False)
                 raise
-            self._record_funded_failure(
-                gen.hotkey, text, miner_fault=(rc == 3),
-                error_class=("generator" if rc == 3 else "infra"),
-                burn=(rc != 3))
+            prior = self._funded_queue().get(gen.hotkey)
+            miner_fault, error_class, burn = classify_funded_worker_failure(
+                rc, text,
+                stalled_before=bool(prior is not None
+                                    and prior.last_error_class == STALL_CLASS))
+            self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
+                                        error_class=error_class, burn=burn)
             raise
         finally:
             if not keep:

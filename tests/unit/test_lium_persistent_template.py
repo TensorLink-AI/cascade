@@ -30,7 +30,9 @@ def test_payload_splits_repo_and_tag_and_pins_the_digest_in_env():
     p = lium_template_payload(IMG, ssh_pubkey=PUB, ssh_port=2222)
     assert p["docker_image"] == "ghcr.io/tensorlink-ai/cascade-worker"
     assert p["docker_image_tag"] == "worker-v0.8.0"
-    assert p["docker_image_digest"] == ""                    # lium rejects the @sha256 form
+    # The digest pins the PULL (2026-09-12: tag-only templates let a host serve
+    # a stale image under the pinned tag); the env is the gate's byte-compare.
+    assert p["docker_image_digest"] == DIGEST
     assert p["environment"] == {"SSH_PUBKEY": PUB, "CASCADE_TRAIN_IMAGE_DIGEST": DIGEST}
     assert p["internal_ports"] == [22, 2222]
     assert p["one_time_template"] is False and p["is_private"] is True

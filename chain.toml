@@ -350,6 +350,13 @@ payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+# sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
+# <repo>@<digest>). Every rented final/funded pod must hash its files to this
+# BEFORE a leg is dispatched — the digest env a template injects is echoed
+# faithfully by a host that started a STALE image under the pinned tag
+# (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
+# miners' legs stalled and were burned). Re-derive on every image re-pin.
+worker_code_fingerprint = "b4c3465804e8d71db7663b6f19e8e3fc184404b335d2a8c074152d9055a4c08e"   # 99 files, worker-v0.8.0 (9d5bc70d…); verified == pod 146.120.227.147 2026-09-12
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the

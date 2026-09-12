@@ -187,7 +187,7 @@ def make_plan_fn(chain_toml: Path | None, work_root: Path,
 
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                       image_digest: str, min_disk_gb: float,
-                      hippius_probe) -> callable:
+                      hippius_probe, code_fingerprint: str = "") -> callable:
     """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod.
 
     Gates are built lazily per ``(stage, provider)``: the pod's user/workdir/
@@ -213,6 +213,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                 sku=gate_sku, gpus=gate_gpus,
                 remote_python=prof.remote_python, workdir=prof.workdir,
                 image_digest=image_digest, min_disk_gb=min_disk_gb,
+                code_fingerprint=code_fingerprint,
                 hippius_probe=hippius_probe,
                 home_dir=("/root" if prof.user == "root" else f"/home/{prof.user}"),
             )
@@ -844,6 +845,7 @@ def _run(args) -> int:
             image_digest=cfg.training.train_image_digest,
             min_disk_gb=float(top.get("min_disk_gb", 20.0)),
             hippius_probe=hippius_probe,
+            code_fingerprint=cfg.round.worker_code_fingerprint,
         ),
         bootstrap=bootstrap,
         prewarm=_compose_pod_hooks(
