@@ -125,7 +125,10 @@ def test_build_remote_command_sets_cd_cuda_and_env():
     assert "ak" not in cmd
     assert ". /dev/stdin" in cmd
     assert stdin_env == "HIPPIUS_S3_ACCESS_KEY=ak\n"
-    assert cmd.rstrip().endswith("python -m x")
+    # The worker runs inside the session-closing wrapper (its own process
+    # group, reaped on exit) — the argv is the wrapper's job, not the tail.
+    assert "python -m x </dev/null & w=$!; wait $w" in cmd
+    assert cmd.rstrip().endswith("exit $rc'")
 
 
 def test_build_remote_command_no_stdin_source_without_env():

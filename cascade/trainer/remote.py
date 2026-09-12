@@ -311,8 +311,18 @@ def build_remote_command(
     if env:
         stdin_env = "".join(f"{k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
         source = "set -a && . /dev/stdin && set +a && "
-    command = (f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && "
-               f"{source}{prefix}{shlex.join(argv)}")
+    # The worker runs in its OWN process group and the wrapper kills whatever
+    # that group left behind the moment the worker exits — a lingering child
+    # (the generator sandbox) holding the session's stdout/stderr keeps sshd
+    # waiting for EOF, so the orchestrator never sees the exit (2026-09-12: the
+    # king's worker exited rc=3 at 11:08; the dispatch returned at 14:51).
+    # `set -m` gives the backgrounded job its own pgid ($w); `wait` collects
+    # the worker's rc; `kill -- -$w` reaps the group; the rc is preserved.
+    worker = f"{prefix}{shlex.join(argv)}"
+    guarded = "bash -c " + shlex.quote(
+        f"set -m; {worker} </dev/null & w=$!; wait $w; rc=$?; "
+        f"kill -KILL -- -$w 2>/dev/null; exit $rc")
+    command = f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {source}{guarded}"
     return command, stdin_env
 
 
