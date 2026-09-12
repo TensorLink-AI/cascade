@@ -1741,6 +1741,62 @@ class TrainerRunner:
             log.error("Hub robot id=%d for pod %s NOT revoked (%s) — it expires "
                       "on its own", robot_id, pod.instance_id, e)
 
+    # ── completed remote legs survive a trainer restart ──────────────────────
+    # A remote leg's TrainedEntry lived only in memory until the manifest was
+    # built, so restarting the trainer mid-round (a deploy, a crash) re-trained
+    # every finished leg — and re-billed its payer (2026-09-12). Each finished
+    # leg is now written to work_root/<round>/<size>/completed_legs/ and a
+    # retry of the same job reuses it instead of dispatching (training is
+    # deterministic; the checkpoint is already on the Hub).
+
+    def _completed_leg_path(self, round_id, size: str, role: str, hotkey: str,
+                            suffix: str = "") -> Path:
+        return (self.work_root / str(round_id) / (size or "primary") / "completed_legs"
+                / f"{role}-{hotkey}{suffix}.json")
+
+    def _persist_completed_leg(self, entry, *, round_id, contract, role: str,
+                               hotkey: str, suffix: str = "") -> None:
+        """Best-effort: a write miss only costs the old retrain-on-restart."""
+        import dataclasses
+
+        try:
+            if not isinstance(entry, TrainedEntry):
+                return
+            path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"contract_digest": contract_digest(contract),
+                       "entry": dataclasses.asdict(entry)}
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not persist completed %s leg for %s: %s", role, hotkey, e)
+
+    def _load_completed_leg(self, *, round_id, contract, role: str, hotkey: str,
+                            gen_ref: str, suffix: str = ""):
+        """The persisted entry for EXACTLY this job (same contract digest, same
+        generator ref), else None."""
+        from .remote import receipt_to_entry
+
+        path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            log.warning("completed-leg record %s unreadable (%s); retraining", path, e)
+            return None
+        try:
+            if str(raw.get("contract_digest")) != contract_digest(contract):
+                return None
+            entry = receipt_to_entry(dict(raw["entry"]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("completed-leg record %s malformed (%s); retraining", path, e)
+            return None
+        if entry.gen_ref != gen_ref or entry.role != role or entry.miner_hotkey != hotkey:
+            return None
+        return entry
+
     def _push_deployed_chain_toml(self, host):
         """Copy the orchestrator's deployed chain.toml onto a pod the trainer
         rented itself and return the host pinned to it.
@@ -5947,9 +6003,27 @@ class TrainerRunner:
                 self._final_role_hosts[(role, contract.arch_preset, gen.hotkey)] = used[-1]
             return entry
 
+        def _run_cached(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+            # Restart-safe legs: a leg this round already finished (persisted the
+            # moment its worker returned) is reused, never re-dispatched — no
+            # second rental, no second bill, no lost hours.
+            suffix = _final_repo_suffix(jobs, gen, role)
+            prior = self._load_completed_leg(
+                round_id=seeds.base_seed, contract=contract, role=role,
+                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=suffix)
+            if prior is not None:
+                log.warning("round=%s %s %s: leg already COMPLETE (persisted by a prior "
+                            "run of this round) — reusing its entry, not re-training",
+                            seeds.base_seed, role, gen.hotkey)
+                return prior
+            entry = _run(i, gen, role)
+            self._persist_completed_leg(entry, round_id=seeds.base_seed, contract=contract,
+                                        role=role, hotkey=gen.hotkey, suffix=suffix)
+            return entry
+
         results: list[TrainedEntry | None] = [None] * len(jobs)
         with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
-            futs = {ex.submit(_run, i, gen, role): (i, gen, role)
+            futs = {ex.submit(_run_cached, i, gen, role): (i, gen, role)
                     for i, (gen, role) in enumerate(jobs)}
             for fut in as_completed(futs):
                 i, gen, role = futs[fut]
