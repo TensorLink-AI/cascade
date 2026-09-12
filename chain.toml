@@ -371,6 +371,11 @@ funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
+# Hybrid fallback: a funded leg (or the JIT king) still WAITING for marketplace
+# capacity takes an OPERATOR final lane from hosts.toml the moment one is on
+# file — operator-billed for that leg only; legs already running on their
+# payer's pod are untouched. false ⇒ funded legs never run on operator lanes.
+funded_operator_fallback = false
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as

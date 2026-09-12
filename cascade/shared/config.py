@@ -1016,6 +1016,12 @@ class RoundConfig:
     # this mode — its orphan reaper does not know these pods; the trainer
     # ledgers them and sweeps at each boundary.
     funded_king_rent: bool = False
+    # Hybrid fallback (owner 2026-09-12): a funded leg (or the JIT king) still
+    # WAITING for marketplace capacity takes an OPERATOR final lane from
+    # hosts.toml as soon as one is on file — operator-billed for that leg only,
+    # legs already running on their payer's pod are untouched. Off ⇒ funded
+    # legs never run on operator lanes (the bill never moves silently).
+    funded_operator_fallback: bool = False
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -2160,6 +2166,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_pod_skus=validate_funded_pod_skus(
                 r.get("funded_pod_skus", ())),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
+            funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),
