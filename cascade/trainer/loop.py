@@ -796,6 +796,16 @@ class TrainerRunner:
     # the round starts.
     remote_hosts_path: Path | None = None
     hosts_wait_seconds: int = 0
+    # The orchestrator's DEPLOYED chain.toml. Pushed onto every pod the trainer
+    # rents itself (JIT king, per-payer funded legs) as
+    # ``<workdir>/chain.deployed.toml`` before dispatch, and the leg runs with
+    # ``--chain-toml`` pointing at it. The worker image bakes a build-time
+    # snapshot whose ``[training] train_image_digest`` is the PRE-release pin,
+    # so a rented pod that runs on its baked copy refuses every final
+    # ("runtime image … != pinned train_image_digest", 2026-09-12 08:58);
+    # provisioner-gated lanes only worked because the post-gate hook pushed
+    # this file for them. None ⇒ no push (offline tools, tests).
+    deployed_chain_toml: Path | None = None
     # Post-round public-benchmark telemetry (GIFT-Eval/BOOM/TIME) of the round's
     # king on the idle pod. LOG-ONLY: validators score rounds exclusively on the
     # private eval pool; this never feeds weights or the throne (see bench_hook).
@@ -1638,6 +1648,33 @@ class TrainerRunner:
             log.error("Hub robot id=%d for pod %s NOT revoked (%s) — it expires "
                       "on its own", robot_id, pod.instance_id, e)
 
+    def _push_deployed_chain_toml(self, host):
+        """Copy the orchestrator's deployed chain.toml onto a pod the trainer
+        rented itself and return the host pinned to it.
+
+        Mirrors the provisioner's post-gate config push for gated lanes. A
+        rented pod never sees that hook, so without this it would run its
+        image-baked snapshot (pre-release ``train_image_digest`` pin) and the
+        worker would refuse the final. No-op (host unchanged) when
+        ``deployed_chain_toml`` is unset; a failed copy raises so the leg is
+        an infra failure, never a silent run on the wrong contract."""
+        import shlex
+        import subprocess
+        from dataclasses import replace as dc_replace
+
+        src = getattr(self, "deployed_chain_toml", None)
+        if not src:
+            return host
+        from .remote import build_scp_argv, build_ssh_argv
+
+        dest = f"{host.workdir}/chain.deployed.toml"
+        runner = getattr(self, "_scp_runner", None) or (
+            lambda argv: subprocess.run(argv, check=True, capture_output=True, timeout=120))
+        runner(build_ssh_argv(host, f"mkdir -p {shlex.quote(host.workdir)}"))
+        runner(build_scp_argv(host, str(src), dest))
+        log.info("pushed deployed chain.toml → %s:%s", host.name, dest)
+        return dc_replace(host, chain_toml=dest)
+
     def _funded_pod_profile(self):
         """The pod profile funded rentals mirror: the first FINAL-stage host.
 
@@ -1862,6 +1899,9 @@ class TrainerRunner:
             ssh_options=profile.ssh_options,
             stage="final",
         )
+        # The payer's pod boots the image's baked chain.toml (pre-release
+        # pin): give it the deployed one before any dispatch.
+        host = self._push_deployed_chain_toml(host)
         return host, pod
 
     def _funded_checkpoint_mismatch(self, entry, contract) -> str | None:
@@ -2097,6 +2137,9 @@ class TrainerRunner:
                 cuda_device="0", chain_toml=profile.chain_toml,
                 forward_env=profile.forward_env, ssh_options=profile.ssh_options,
                 stage="final")
+            # JIT pod ⇒ no provisioner config push: deliver the deployed
+            # chain.toml (correct train_image_digest pin) before the probe.
+            king_host = self._push_deployed_chain_toml(king_host)
             # Same runtime attestation as the funded legs: lium can boot a
             # host-cached stale image under the degraded tag ref, and a stale
             # KING pod trains under the wrong baked contract. Failing here

@@ -87,7 +87,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_teardown_kept_funded_pods", "_funded_harvest",
                  "_harvest_funded_checkpoint",
                  "_filter_funded_challengers", "_submissions_path",
-                 "_submission_store"):
+                 "_submission_store", "_push_deployed_chain_toml"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     prof = profile or _profile(tmp_path)
     fake._hosts_for = lambda stage: [prof]
