@@ -151,6 +151,58 @@ def lium_image_ref(image: str) -> str:
 
 
 LIUM_API_BASE = "https://lium.io/api"
+
+# ── executor cooldown ────────────────────────────────────────────────────────
+# Lium accepts a rent on an executor we tore a pod down on moments earlier and
+# then deploys NOTHING (post-teardown cooldown): the readiness wait burns its
+# full timeout and the pod is torn down as a lemon (2026-09-12: the king at
+# 10:11 and two payer legs at 15:11/15:27, 15 min each, all on executors the
+# previous attempt had just vacated). Every terminate records the executor;
+# listings exclude it for LIUM_EXECUTOR_COOLDOWN_SECONDS. Persisted to a file
+# so it survives trainer restarts and is shared by every provider instance
+# (operator + per-payer) on this box.
+LIUM_EXECUTOR_COOLDOWN_SECONDS = 1800.0
+LIUM_COOLDOWN_FILE_ENV = "CASCADE_LIUM_COOLDOWN_FILE"
+
+
+def lium_cooldown_path() -> Path:
+    return Path(os.environ.get(
+        LIUM_COOLDOWN_FILE_ENV, "~/.cache/cascade/lium_executor_cooldown.json")).expanduser()
+
+
+def _load_cooldowns(path: Path) -> dict[str, float]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {str(k): float(v) for k, v in dict(raw).items()}
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+
+
+def record_executor_cooldown(executor_id: str, *, path: Path | None = None,
+                             now: float | None = None) -> None:
+    """Remember that ``executor_id`` just had a pod torn down (best-effort)."""
+    if not executor_id:
+        return
+    path = path or lium_cooldown_path()
+    now = time.time() if now is None else now
+    try:
+        d = _load_cooldowns(path)
+        d = {k: v for k, v in d.items() if now - v < LIUM_EXECUTOR_COOLDOWN_SECONDS}
+        d[str(executor_id)] = now
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        log.warning("lium: could not record executor cooldown for %s: %s", executor_id, e)
+
+
+def cooling_executors(*, path: Path | None = None, now: float | None = None,
+                      ttl: float = LIUM_EXECUTOR_COOLDOWN_SECONDS) -> set[str]:
+    """Executor ids we vacated less than ``ttl`` seconds ago."""
+    path = path or lium_cooldown_path()
+    now = time.time() if now is None else now
+    return {k for k, v in _load_cooldowns(path).items() if now - v < ttl}
 # Lium caps ``POST /templates`` at 20 requests per hour PER CLIENT IP, and
 # ``lium up --image`` creates a throw-away template on EVERY call — so a round's
 # worth of launches (king + funded legs + retries) silently exhausted the hour
@@ -679,7 +731,10 @@ def _spawn_cli(argv: list[str], log_path: Path | None = None,
     if log_path is None:
         return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env=env)
-    with open(log_path, "ab") as f:
+    # Fresh log per launch: pod names are deterministic per (round, hotkey), so
+    # an appended log showed a PREVIOUS rent's shell banner as this rent's
+    # "output" in the not-ready error (2026-09-12 15:11).
+    with open(log_path, "wb") as f:
         return subprocess.Popen(argv, stdout=f, stderr=f, env=env)
 
 
@@ -793,7 +848,16 @@ class LiumProvider:
                 self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
         except ProvisionError as e:
             raise self._scrub_key(e) from None
-        return [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
+        shaped = [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
+        cooling = cooling_executors()
+        if cooling:
+            kept = [e for e in shaped if str(e.get("id")) not in cooling]
+            if len(kept) != len(shaped):
+                log.info("lium: %d %s executor(s) skipped — vacated < %.0f min ago "
+                         "(post-teardown cooldown deploys nothing)",
+                         len(shaped) - len(kept), sku, LIUM_EXECUTOR_COOLDOWN_SECONDS / 60)
+            shaped = kept
+        return shaped
 
     def _list_pods(self) -> list[dict]:
         try:
@@ -929,16 +993,42 @@ class LiumProvider:
         pod = self._pod(pod_id)
         return lium_pod_address(pod) if pod else None
 
+    def _executor_of_pod(self, pod_id: str) -> str:
+        """The executor a live pod sits on: this instance's own launch record,
+        else the API's pod record (the CLI's ``ps`` JSON carries no executor)."""
+        known = self._executor_by_name.get(pod_id)
+        if known:
+            return known
+        try:
+            import requests
+
+            key = self.api_key or os.environ.get("LIUM_API_KEY", "")
+            if not key:
+                return ""
+            r = requests.get(f"{LIUM_API_BASE}/pods", headers={"X-API-KEY": key}, timeout=20)
+            if not r.ok:
+                return ""
+            for p in r.json() or []:
+                if pod_id in (p.get("pod_name"), p.get("name"), p.get("id"), p.get("huid")):
+                    return str(p.get("executor_id") or "")
+        except Exception:  # noqa: BLE001 — best-effort lookup
+            return ""
+        return ""
+
     def terminate(self, pod_id: str) -> None:
         # `lium rm <target>` takes a positional target and does NOT prompt — there
         # is no --yes flag (verified against the installed CLI). Passing one would
         # error and we'd mistake a live pod for a terminated one, i.e. leak it.
+        executor = self._executor_of_pod(pod_id)      # before the pod vanishes
         try:
             self._cli(["rm", pod_id])
             log.info("lium rm %s", pod_id)
         except ProvisionError as e:
             # Idempotent: an already-gone pod is success, not a leak.
             log.warning("lium rm %s: %s (treating as already terminated)", pod_id, e)
+        # The vacated executor deploys nothing for a while: keep every listing
+        # (ours and each payer's) off it until the cooldown passes.
+        record_executor_cooldown(executor)
 
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""

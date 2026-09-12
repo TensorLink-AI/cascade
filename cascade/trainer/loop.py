@@ -6003,22 +6003,30 @@ class TrainerRunner:
                 self._final_role_hosts[(role, contract.arch_preset, gen.hotkey)] = used[-1]
             return entry
 
-        def _run_cached(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
-            # Restart-safe legs: a leg this round already finished (persisted the
-            # moment its worker returned) is reused, never re-dispatched — no
-            # second rental, no second bill, no lost hours.
-            suffix = _final_repo_suffix(jobs, gen, role)
+        # Restart-safe legs: a leg this round already finished (persisted the
+        # moment its worker returned) is reused, never re-dispatched — no
+        # second rental, no second bill, no lost hours. The lookups happen HERE,
+        # in the caller's thread, so the workers reach the lane pool with the
+        # same timing as before (a per-thread file read ahead of free_lanes.get()
+        # changed which lane the king won — CI, 2026-09-12).
+        prior_entries: dict[int, TrainedEntry] = {}
+        for i, (gen, role) in enumerate(jobs):
             prior = self._load_completed_leg(
                 round_id=seeds.base_seed, contract=contract, role=role,
-                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=suffix)
+                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=_final_repo_suffix(jobs, gen, role))
             if prior is not None:
                 log.warning("round=%s %s %s: leg already COMPLETE (persisted by a prior "
                             "run of this round) — reusing its entry, not re-training",
                             seeds.base_seed, role, gen.hotkey)
-                return prior
+                prior_entries[i] = prior
+
+        def _run_cached(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+            if i in prior_entries:
+                return prior_entries[i]
             entry = _run(i, gen, role)
             self._persist_completed_leg(entry, round_id=seeds.base_seed, contract=contract,
-                                        role=role, hotkey=gen.hotkey, suffix=suffix)
+                                        role=role, hotkey=gen.hotkey,
+                                        suffix=_final_repo_suffix(jobs, gen, role))
             return entry
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
