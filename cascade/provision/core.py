@@ -150,6 +150,110 @@ def lium_image_ref(image: str) -> str:
     return image
 
 
+LIUM_API_BASE = "https://lium.io/api"
+# Lium caps ``POST /templates`` at 20 requests per hour PER CLIENT IP, and
+# ``lium up --image`` creates a throw-away template on EVERY call — so a round's
+# worth of launches (king + funded legs + retries) silently exhausted the hour
+# on 2026-09-12 (02:43–03:55: every launch "hung", no pod ever appeared, the
+# CLI's "Rate limit exceeded" went to a log nobody reads). One PERSISTENT
+# template per (image, pubkey, port, digest) is created once and rented by id.
+
+
+def lium_template_payload(image: str, *, ssh_pubkey: str, ssh_port: int) -> dict:
+    """The ``POST /templates`` body for the worker image — the same shape the
+    CLI's ephemeral template uses (``lium/cli/up/actions.py``), minus
+    ``one_time_template`` so it survives its pods and can be reused.
+
+    ``image`` is the canonical digest-pinned ref; Lium's template takes the
+    repo and tag separately and cannot carry the ``@sha256`` form, so the
+    exact digest rides the container env (``CASCADE_TRAIN_IMAGE_DIGEST``) and
+    the health gate byte-compares it before the pod serves — the same posture
+    as :func:`lium_image_ref`.
+    """
+    ref = lium_image_ref(image)
+    repo, sep, tag = ref.rpartition(":")
+    if not sep or "/" in tag:            # no tag (the colon belonged to a registry port)
+        repo, tag = ref, "latest"
+    env = {"SSH_PUBKEY": ssh_pubkey}
+    digest = image_digest_of(image)
+    if digest:
+        env["CASCADE_TRAIN_IMAGE_DIGEST"] = digest
+    ports = [22] + ([int(ssh_port)] if int(ssh_port) != 22 else [])
+    payload = {
+        "docker_image": repo,
+        "docker_image_tag": tag,
+        "docker_image_digest": "",
+        "internal_ports": ports,
+        "startup_commands": "",
+        "category": "UBUNTU",
+        "container_start_immediately": True,
+        "entrypoint": "",
+        "environment": env,
+        "is_private": True,
+        "one_time_template": False,
+        "is_temporary": False,
+        "volumes": ["/workspace"],
+    }
+    payload["name"] = lium_template_name(payload)
+    payload["description"] = payload["readme"] = f"cascade worker {repo}:{tag} (sshd on {ssh_port})"
+    return payload
+
+
+def lium_template_name(payload: dict) -> str:
+    """Deterministic, content-addressed template name: the same image, pubkey,
+    port and digest always resolve to the same template on the account."""
+    import hashlib
+    import json
+
+    keyed = {k: payload[k] for k in ("docker_image", "docker_image_tag", "internal_ports",
+                                     "environment", "entrypoint", "startup_commands")}
+    h = hashlib.sha256(json.dumps(keyed, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return f"cascade-worker-{payload['docker_image_tag']}-{h}"
+
+
+def lium_get_or_create_template(payload: dict, *, api_key: str,
+                                base_url: str = LIUM_API_BASE, timeout: float = 30.0) -> str:
+    """Resolve ``payload`` to a template id on the account — reuse by name, else
+    create once. A 429 on creation is surfaced as a :class:`ProvisionError`
+    naming the retry-after, so the caller's infra path can requeue instead of
+    burning a leg (and so the operator can SEE the limit)."""
+    import requests
+
+    if not api_key:
+        raise ProvisionError("lium: no API key for the template lookup (LIUM_API_KEY unset)")
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    name = payload["name"]
+    try:
+        r = requests.get(f"{base_url}/templates", headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        raise ProvisionError(f"lium: template listing failed: {e}") from e
+    if r.ok:
+        body = r.json()
+        items = body if isinstance(body, list) else (body.get("items") or [])
+        for t in items:
+            if (t.get("name") == name and t.get("docker_image") == payload["docker_image"]
+                    and t.get("docker_image_tag") == payload["docker_image_tag"]
+                    and t.get("id")):
+                return str(t["id"])
+    try:
+        r = requests.post(f"{base_url}/templates", headers=headers, json=payload,
+                          timeout=timeout)
+    except requests.RequestException as e:
+        raise ProvisionError(f"lium: template creation failed: {e}") from e
+    if r.status_code == 429:
+        raise ProvisionError(
+            "lium: template creation rate-limited (20 requests/hour per client IP); "
+            f"retry after {r.headers.get('retry-after', '?')}s — {r.text[:160]}")
+    if not r.ok:
+        raise ProvisionError(f"lium: template creation failed (HTTP {r.status_code}): "
+                             f"{r.text[:200]}")
+    tid = str(r.json().get("id") or "")
+    if not tid:
+        raise ProvisionError(f"lium: template creation returned no id: {r.text[:200]}")
+    log.info("lium: created persistent template %s as %s", tid, name)
+    return tid
+
+
 @dataclass(frozen=True)
 class PodAddress:
     """Where the orchestrator SSHes to reach a launched pod."""
@@ -568,6 +672,10 @@ def _spawn_cli(argv: list[str], log_path: Path | None = None,
     an executor in post-teardown cooldown accepts the up, deploys nothing, and
     a DEVNULL'd spawn leaves a 900s ghost hunt with zero diagnostics).
     """
+    # Unbuffered child stdout: the CLI is Python and block-buffers when its
+    # stdout is a file, so the up-log stayed EMPTY through every failure on
+    # 2026-09-12 ("Rate limit exceeded" never reached disk).
+    env = {**(env if env is not None else os.environ), "PYTHONUNBUFFERED": "1"}
     if log_path is None:
         return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env=env)
@@ -616,6 +724,9 @@ class LiumProvider:
     poll_interval: float = POD_POLL_INTERVAL
     _run: Callable[[list[str]], subprocess.CompletedProcess] | None = field(default=None, repr=False)
     _spawn: Callable[[list[str]], object] | None = field(default=None, repr=False)
+    # Template resolver seam: ``payload -> template id``. None ⇒ the account's
+    # persistent template via lium_get_or_create_template (one per image).
+    _template: Callable[[dict], str] | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     _now: Callable[[], float] = field(default=time.monotonic, repr=False)
     # pod name → executor id for pods this instance launched, so the loop can
@@ -725,18 +836,20 @@ class LiumProvider:
                 "weakened — CASCADE_TRAIN_IMAGE_DIGEST still carries %s and "
                 "the health gate byte-compares it before the pod serves",
                 spec.image, image_ref, image_digest_of(spec.image))
+        # ONE persistent template per image for the whole batch (and every
+        # later batch on this account): `lium up --image` would mint a
+        # throw-away template per pod against Lium's 20/hour/IP cap.
+        template_id = self._template_id_for(spec) if spec.image else ""
         names: list[str] = []
         for i, ex in enumerate(execs[: spec.count]):
             name = f"{spec.name_prefix}-{i}"
             argv = [self.bin, "up", str(ex["id"])]
             if spec.image:
-                # docker-run style: the image must be a REAL docker ref whose
-                # entrypoint runs sshd and reads $SSH_PUBKEY (the worker image).
-                argv += ["--image", image_ref, "-e", f"SSH_PUBKEY={spec.ssh_pubkey}",
-                         "--internal-ports", str(spec.ssh_port)]
-                digest = image_digest_of(spec.image)
-                if digest:
-                    argv += ["-e", f"CASCADE_TRAIN_IMAGE_DIGEST={digest}"]
+                # docker-run style through the account's persistent template:
+                # the worker image's entrypoint runs sshd and reads $SSH_PUBKEY;
+                # the template carries that env + CASCADE_TRAIN_IMAGE_DIGEST
+                # (see lium_template_payload).
+                argv += ["--template_id", template_id]
             # empty image ⇒ lium's default SSH template (bootstrap mode): lium
             # injects the ACCOUNT's registered keys; a template NAME passed as
             # --image 400s ("image reference is not valid") — never do that.
@@ -750,6 +863,15 @@ class LiumProvider:
             self._executor_by_name[name] = str(ex.get("id"))
             names.append(name)
         return names
+
+    def _template_id_for(self, spec: LaunchSpec) -> str:
+        """The account's persistent template for ``spec``'s image (created once)."""
+        payload = lium_template_payload(spec.image, ssh_pubkey=spec.ssh_pubkey,
+                                        ssh_port=spec.ssh_port)
+        if self._template is not None:
+            return str(self._template(payload))
+        return lium_get_or_create_template(
+            payload, api_key=self.api_key or os.environ.get("LIUM_API_KEY", ""))
 
     def machine_of(self, pod_id: str) -> str | None:
         """Executor id a pod was launched on (this process's launches only)."""

@@ -171,17 +171,33 @@ def test_lium_launch_injects_ssh_pubkey_env_and_port():
         out = '[{"id": "exec-1"}, {"id": "exec-2"}]' if "ls" in argv else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    payloads = []
+
+    def _template(payload):
+        payloads.append(payload)
+        return "tmpl-1"
+
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv),
+                        _template=_template)
     names = prov.launch(_spec(count=2))
     assert names == ["cascade-pod-0", "cascade-pod-1"]
     up = spawned[0]
     assert up[:3] == ["lium", "up", "exec-1"]
-    # r48 fix: lium's API 400-rejects digest-pinned refs, so --image carries
-    # the digest-stripped form; the pin rides the env + health gate instead.
-    assert up[up.index("--image") + 1] == "reg.example/cascade-worker"
-    assert IMG not in up
-    assert "-e" in up and f"SSH_PUBKEY={_spec().ssh_pubkey}" in up
-    assert up[up.index("--internal-ports") + 1] == "22"
+    # 2026-09-12: ONE persistent template per image (lium caps template
+    # creation at 20/h per IP and `--image` minted one per pod); the pubkey,
+    # port and digest pin ride the template's env/ports, not the argv.
+    assert up[up.index("--template_id") + 1] == "tmpl-1"
+    assert "--image" not in up and "-e" not in up
+    assert len(payloads) == 1                                # resolved once per batch
+    p = payloads[0]
+    # lium's API 400-rejects digest-pinned refs: repo/tag split, digest in env.
+    assert p["docker_image"] == "reg.example/cascade-worker"
+    assert p["docker_image_tag"] == "latest"
+    assert p["environment"]["SSH_PUBKEY"] == _spec().ssh_pubkey
+    assert p["environment"]["CASCADE_TRAIN_IMAGE_DIGEST"] == IMG.partition("@")[2]
+    assert p["internal_ports"] == [22]
+    assert p["one_time_template"] is False and p["is_private"] is True
+    assert spawned[1][spawned[1].index("--template_id") + 1] == "tmpl-1"
 
 
 def test_plan_argv_forwards_the_network():
@@ -215,17 +231,19 @@ def test_launch_injects_image_digest_env_when_pinned():
     assert image_digest_of("") == ""                       # bootstrap mode
     assert image_digest_of("ubuntu:22.04") == ""           # tag, not a pin
 
-    # lium: -e CASCADE_TRAIN_IMAGE_DIGEST rides along in image mode
+    # lium: CASCADE_TRAIN_IMAGE_DIGEST rides in the persistent template's env
     spawned: list[list[str]] = []
+    payloads: list[dict] = []
 
     def _run(argv):
         out = '[{"id": "exec-1"}]' if "ls" in argv else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv),
+                        _template=lambda p: payloads.append(p) or "tmpl-d")
     prov.launch(_spec(count=1, image=pinned))
-    up = spawned[0]
-    assert f"CASCADE_TRAIN_IMAGE_DIGEST={digest}" in up
+    assert spawned[0][spawned[0].index("--template_id") + 1] == "tmpl-d"
+    assert payloads[0]["environment"]["CASCADE_TRAIN_IMAGE_DIGEST"] == digest
 
     # shadeform docker mode: env list carries the digest too
     body = shadeform_create_body(_spec(count=1, image=pinned),
@@ -246,7 +264,8 @@ def test_lium_launch_excludes_lemons_and_remembers_machines():
         out = '[{"id": "exec-1"}, {"id": "exec-2"}]' if "ls" in argv else ""
         return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
 
-    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv))
+    prov = LiumProvider(bin="lium", _run=_run, _spawn=lambda argv: spawned.append(argv),
+                        _template=lambda p: "tmpl-l")
     names = prov.launch(_spec(count=1, exclude_ids=("exec-1",)))
     assert spawned[0][:3] == ["lium", "up", "exec-2"]        # lemon skipped
     assert prov.machine_of(names[0]) == "exec-2"             # loop can name the machine
@@ -655,7 +674,7 @@ def test_build_providers_options():
 def test_lium_launch_omits_image_in_bootstrap_mode(monkeypatch):
     """Empty image ⇒ default SSH template; a template NAME as --image 400s."""
     calls = []
-    prov = LiumProvider(_spawn=lambda argv: calls.append(argv))
+    prov = LiumProvider(_spawn=lambda argv: calls.append(argv), _template=lambda p: "tmpl-9")
     canned = '[{"id": "e1", "gpu_type": "RTX4090", "gpu_count": 4}]'
 
     class _P:
@@ -663,10 +682,11 @@ def test_lium_launch_omits_image_in_bootstrap_mode(monkeypatch):
     monkeypatch.setattr(prov, "_cli", lambda argv: _P())
     prov.launch(LaunchSpec(sku="RTX4090", count=1, image="", ssh_pubkey="k",
                            gpus_per_pod=4, name_prefix="cascade-900-heat"))
-    assert "--image" not in calls[0] and "--name" in calls[0]
+    assert "--template_id" not in calls[0] and "--image" not in calls[0]
+    assert "--name" in calls[0]
     prov.launch(LaunchSpec(sku="RTX4090", count=1, image="img@sha256:aa", ssh_pubkey="k",
                            gpus_per_pod=4, name_prefix="cascade-900-heat"))
-    assert "--image" in calls[1]
+    assert calls[1][calls[1].index("--template_id") + 1] == "tmpl-9"
 
 
 # ── shadeform docker-mode readiness (container_status gating) ────────────────
