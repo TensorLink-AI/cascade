@@ -103,6 +103,11 @@ class RemoteHost:
     # — only its own static_env. Set on funded (payer-account) pods: the
     # payer has console access, so every forwarded value is theirs to read.
     isolated: bool = False
+    # A PROFILE entry, never a lane: funded rentals mirror its key/python/
+    # workdir/forward_env onto the pods they rent (``_funded_pod_profile``),
+    # but nothing is ever dispatched to it. Loopback addresses count as
+    # profile-only too (the provisioner's republish may drop this field).
+    profile_only: bool = False
     # A pinned SSH host key line (``<keytype> <base64>``) for this host. When
     # set, every ssh to it runs StrictHostKeyChecking=yes against a
     # known_hosts file holding ONLY this key, so a container swapped under
@@ -158,9 +163,17 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 stage=stage,
                 static_env=tuple(sorted(
                     (str(k), str(v)) for k, v in dict(h.get("static_env", {})).items())),
+                profile_only=bool(h.get("profile_only", False)),
             )
         )
     return hosts
+
+
+def is_profile_only(host: RemoteHost) -> bool:
+    """True for a hosts.toml entry that exists only to be mirrored by funded
+    rentals — never a dispatch target (explicit flag, or a loopback address)."""
+    return bool(getattr(host, "profile_only", False)) or str(
+        getattr(host, "host", "")) in ("127.0.0.1", "localhost", "::1")
 
 
 def worker_argv(

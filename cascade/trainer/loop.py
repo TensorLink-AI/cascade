@@ -133,6 +133,13 @@ class _FundedLegSkip(Exception):
     failure) and must simply be dropped from the round — never retried on the
     operator fleet, which would silently move the bill."""
 
+
+class _FundedOperatorFallback(Exception):
+    """A funded leg (or the JIT king) that could not rent on the marketplace
+    and — with ``[round] funded_operator_fallback`` ON and operator final
+    lanes on file — runs on an operator lane instead, operator-billed. The
+    explicit, owner-armed exception to _FundedLegSkip's rule (2026-09-12)."""
+
 # Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
 # a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
 # never re-fits the round's exact training draw, and the salted seed keys the
@@ -1540,6 +1547,13 @@ class TrainerRunner:
                 log.info("%s: capacity wait cancelled (the king cannot be rented "
                          "this attempt)", describe)
                 return False
+            # Hybrid fallback (owner 2026-09-12): operator lanes on file end the
+            # wait — the leg runs there, operator-billed, while siblings that
+            # already rented on their payer's pod are untouched.
+            if self._operator_fallback_lanes():
+                log.info("%s: operator final lane(s) on file — leaving the %s wait "
+                         "for an operator lane (operator-billed)", describe, sku)
+                return "operator"
             n = self._probe_funded_capacity(sku)
             if n:
                 if polled:
@@ -1554,6 +1568,25 @@ class TrainerRunner:
             polled += 1
             sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
         return False
+
+    def _operator_fallback_lanes(self) -> list:
+        """Operator FINAL lanes a waiting funded leg may fall back to: fresh
+        from hosts.toml (lanes join mid-round), profile-only entries excluded,
+        and only when ``[round] funded_operator_fallback`` is on."""
+        if not bool(getattr(self.cfg.round, "funded_operator_fallback", False)):
+            return []
+        from .remote import RemoteDispatchError, is_profile_only, load_hosts
+
+        hosts: list = []
+        if getattr(self, "remote_hosts_path", None) is not None:
+            try:
+                hosts = list(load_hosts(self.remote_hosts_path))
+            except RemoteDispatchError:
+                hosts = []
+        else:
+            hosts = list(getattr(self, "remote_hosts", None) or [])
+        return [h for h in hosts
+                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
 
     def _probe_funded_capacity(self, sku: str) -> int | None:
         """``sku``'s marketplace availability on the OPERATOR's key, or None."""
@@ -1707,6 +1740,62 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — expiry backstop
             log.error("Hub robot id=%d for pod %s NOT revoked (%s) — it expires "
                       "on its own", robot_id, pod.instance_id, e)
+
+    # ── completed remote legs survive a trainer restart ──────────────────────
+    # A remote leg's TrainedEntry lived only in memory until the manifest was
+    # built, so restarting the trainer mid-round (a deploy, a crash) re-trained
+    # every finished leg — and re-billed its payer (2026-09-12). Each finished
+    # leg is now written to work_root/<round>/<size>/completed_legs/ and a
+    # retry of the same job reuses it instead of dispatching (training is
+    # deterministic; the checkpoint is already on the Hub).
+
+    def _completed_leg_path(self, round_id, size: str, role: str, hotkey: str,
+                            suffix: str = "") -> Path:
+        return (self.work_root / str(round_id) / (size or "primary") / "completed_legs"
+                / f"{role}-{hotkey}{suffix}.json")
+
+    def _persist_completed_leg(self, entry, *, round_id, contract, role: str,
+                               hotkey: str, suffix: str = "") -> None:
+        """Best-effort: a write miss only costs the old retrain-on-restart."""
+        import dataclasses
+
+        try:
+            if not isinstance(entry, TrainedEntry):
+                return
+            path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"contract_digest": contract_digest(contract),
+                       "entry": dataclasses.asdict(entry)}
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not persist completed %s leg for %s: %s", role, hotkey, e)
+
+    def _load_completed_leg(self, *, round_id, contract, role: str, hotkey: str,
+                            gen_ref: str, suffix: str = ""):
+        """The persisted entry for EXACTLY this job (same contract digest, same
+        generator ref), else None."""
+        from .remote import receipt_to_entry
+
+        path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            log.warning("completed-leg record %s unreadable (%s); retraining", path, e)
+            return None
+        try:
+            if str(raw.get("contract_digest")) != contract_digest(contract):
+                return None
+            entry = receipt_to_entry(dict(raw["entry"]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("completed-leg record %s malformed (%s); retraining", path, e)
+            return None
+        if entry.gen_ref != gen_ref or entry.role != role or entry.miner_hotkey != hotkey:
+            return None
+        return entry
 
     def _push_deployed_chain_toml(self, host):
         """Copy the orchestrator's deployed chain.toml onto a pod the trainer
@@ -1913,8 +2002,15 @@ class TrainerRunner:
             # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
             # rent lock, so sibling legs that find one proceed) and rent again.
             # Only the round's latest safe start turns this into a requeue.
-            if not self._wait_for_funded_capacity(
-                    round_sku, describe=f"funded leg {gen.hotkey[:12]}"):
+            waited = self._wait_for_funded_capacity(
+                round_sku, describe=f"funded leg {gen.hotkey[:12]}")
+            if waited == "operator":
+                # Owner-armed hybrid: this leg runs on an operator lane
+                # (operator-billed). The payer's write-ahead row goes (no pod
+                # was ever launched for it) and nothing is recorded as a fault.
+                self._ledger_remove(expected_id)
+                raise _FundedOperatorFallback(gen.hotkey)
+            if not waited:
                 break
         if not result.ok:
             # rent_funded_pod's own failure path verified-terminated anything
@@ -2192,9 +2288,14 @@ class TrainerRunner:
                 # A sold-out marketplace is not a round failure: wait for a GPU
                 # (outside the rent lock) up to the round's latest safe start —
                 # the legs then rent independently as machines appear.
-                if (not provider.capacity(sku)
-                        and not self._wait_for_funded_capacity(sku, describe="king rent")):
-                    _give_up(f"lium: no {sku} capacity before the round's latest safe start")
+                if not provider.capacity(sku):
+                    waited = self._wait_for_funded_capacity(sku, describe="king rent")
+                    if waited == "operator":
+                        # Owner-armed hybrid: the king trains on an operator
+                        # lane instead of a JIT pod (operator-billed either way).
+                        raise _FundedOperatorFallback("king")
+                    if not waited:
+                        _give_up(f"lium: no {sku} capacity before the round's latest safe start")
                 try:
                     # Serialized with every funded rent (see _funded_rent_lock):
                     # the king's `lium up` must not race a challenger's for the
@@ -5799,8 +5900,10 @@ class TrainerRunner:
         if not self.trainer_spec:
             raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
         from ..funding.store import parse_vault_ref
+        from .remote import is_profile_only
 
-        hosts = self._hosts_for("final")
+        # Profile-only entries (mirrored by funded rentals) are never lanes.
+        hosts = [h for h in self._hosts_for("final") if not is_profile_only(h)]
         if not hosts and not self._final_rents_its_pods():
             # No lanes and nothing rents the king: a free-lane dispatch would
             # block forever and the local branch is forbidden under
@@ -5822,7 +5925,8 @@ class TrainerRunner:
             from .remote import load_hosts
 
             now = load_hosts(self.remote_hosts_path)
-            return [h for h in now if getattr(h, "stage", "any") in ("any", "final")]
+            return [h for h in now
+                    if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
 
         # Lane pool over the free-lane dispatch (the heat's anti-double-booking
         # pattern) PLUS mid-final membership refresh: a top-up pod rented after
@@ -5835,37 +5939,46 @@ class TrainerRunner:
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
-            if (role == "king"
-                    and self._effective_funded_pods() == "rent"
-                    and self.cfg.round.funded_king_rent
-                    and self._funded_gate_open()):
-                # No-heat end-state: the king's pod rents JIT at the round's
-                # chosen SKU (operator-billed) instead of a standing fleet.
-                host = self._rent_king_host(str(seeds.base_seed))
-                entry = disp.dispatch(
-                    host, lane_count=1,
-                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
-                    role="king", base_seed=seeds.base_seed, block=block,
-                    arch_preset=contract.arch_preset,
-                    warm_start_ref=warm_start_ref,
-                    **({"repo_suffix": suffix} if suffix else {}),
-                )
-                # The bench and scratch shadow target the king's pod — it
-                # stays up through the round; the boundary sweep reaps it.
-                self._final_role_hosts[
-                    ("king", contract.arch_preset, gen.hotkey)] = host
-                return entry
-            if (role == "challenger"
-                    and self._effective_funded_pods() == "rent"
-                    and gen.hotkey in self._funded_field):
-                # DEC-CA-0036: this leg bills its payer, on a pod rented with
-                # THEIR key — never an operator lane, even as a fallback (the
-                # bill must not silently move). The leg itself records the
-                # pod in _final_role_hosts when it stays up for the bench
-                # (and only then — a torn-down pod must never be a target).
-                return self._run_funded_leg(
-                    disp, gen, seeds, block, contract, suffix,
-                    warm_start_ref=warm_start_ref)
+            try:
+                if (role == "king"
+                        and self._effective_funded_pods() == "rent"
+                        and self.cfg.round.funded_king_rent
+                        and self._funded_gate_open()):
+                    # No-heat end-state: the king's pod rents JIT at the round's
+                    # chosen SKU (operator-billed) instead of a standing fleet.
+                    host = self._rent_king_host(str(seeds.base_seed))
+                    entry = disp.dispatch(
+                        host, lane_count=1,
+                        gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                        role="king", base_seed=seeds.base_seed, block=block,
+                        arch_preset=contract.arch_preset,
+                        warm_start_ref=warm_start_ref,
+                        **({"repo_suffix": suffix} if suffix else {}),
+                    )
+                    # The bench and scratch shadow target the king's pod — it
+                    # stays up through the round; the boundary sweep reaps it.
+                    self._final_role_hosts[
+                        ("king", contract.arch_preset, gen.hotkey)] = host
+                    return entry
+                if (role == "challenger"
+                        and self._effective_funded_pods() == "rent"
+                        and gen.hotkey in self._funded_field):
+                    # DEC-CA-0036: this leg bills its payer, on a pod rented with
+                    # THEIR key — never an operator lane as a silent fallback
+                    # (the bill must not move unnoticed). The leg itself records
+                    # the pod in _final_role_hosts when it stays up for the bench
+                    # (and only then — a torn-down pod must never be a target).
+                    return self._run_funded_leg(
+                        disp, gen, seeds, block, contract, suffix,
+                        warm_start_ref=warm_start_ref)
+            except _FundedOperatorFallback:
+                # Owner-armed hybrid ([round] funded_operator_fallback): the leg
+                # could not rent on the marketplace and operator lanes are on
+                # file — run it there, operator-billed, through the same
+                # free-lane dispatch (vault ZIP staged on the chosen lane).
+                log.warning("final %s %s: no marketplace capacity — running on an "
+                            "OPERATOR lane (operator-billed; funded_operator_fallback)",
+                            role, gen.hotkey)
             # Operator lanes can run PRIVATE (vault/direct) submissions too:
             # stage the ZIP on whichever lane the pool hands out, exactly as
             # the funded-pod leg does — until 2026-09-12 only that path staged,
@@ -5890,9 +6003,27 @@ class TrainerRunner:
                 self._final_role_hosts[(role, contract.arch_preset, gen.hotkey)] = used[-1]
             return entry
 
+        def _run_cached(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
+            # Restart-safe legs: a leg this round already finished (persisted the
+            # moment its worker returned) is reused, never re-dispatched — no
+            # second rental, no second bill, no lost hours.
+            suffix = _final_repo_suffix(jobs, gen, role)
+            prior = self._load_completed_leg(
+                round_id=seeds.base_seed, contract=contract, role=role,
+                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=suffix)
+            if prior is not None:
+                log.warning("round=%s %s %s: leg already COMPLETE (persisted by a prior "
+                            "run of this round) — reusing its entry, not re-training",
+                            seeds.base_seed, role, gen.hotkey)
+                return prior
+            entry = _run(i, gen, role)
+            self._persist_completed_leg(entry, round_id=seeds.base_seed, contract=contract,
+                                        role=role, hotkey=gen.hotkey, suffix=suffix)
+            return entry
+
         results: list[TrainedEntry | None] = [None] * len(jobs)
         with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
-            futs = {ex.submit(_run, i, gen, role): (i, gen, role)
+            futs = {ex.submit(_run_cached, i, gen, role): (i, gen, role)
                     for i, (gen, role) in enumerate(jobs)}
             for fut in as_completed(futs):
                 i, gen, role = futs[fut]

@@ -88,7 +88,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_harvest_funded_checkpoint",
                  "_filter_funded_challengers", "_submissions_path",
                  "_submission_store", "_push_deployed_chain_toml",
-                 "_wait_for_funded_capacity", "_funded_rent_wait_deadline"):
+                 "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
+                 "_operator_fallback_lanes"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     # Capacity-wait constants + no round context ⇒ the deadline is "now" and a
     # sold-out rent skips immediately (the pre-wait behaviour these tests pin).
