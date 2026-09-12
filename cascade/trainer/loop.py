@@ -1506,15 +1506,20 @@ class TrainerRunner:
         Falls back to "now" (no waiting) when the round context is unknown."""
         now = time.time()
         try:
-            ctx = getattr(self, "_stage_ctx", None) or {}
-            epoch_start = int(ctx.get("epoch_start_block") or 0)
-            seen = getattr(self, "_funded_gate_block", None)
-            if not epoch_start or seen is None:
-                return now
-            epoch_blocks = int(effective_epoch_blocks(self.cfg.round, epoch_start))
-            remaining_s = max(0, epoch_start + epoch_blocks - int(seen)) * 12.0
             leg_s = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
-            return now + remaining_s - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS
+            end_wall = getattr(self, "_funded_epoch_end_wall", None)
+            if end_wall is None:
+                ctx = getattr(self, "_stage_ctx", None) or {}
+                epoch_start = int(ctx.get("epoch_start_block") or 0)
+                seen = getattr(self, "_funded_gate_block", None)
+                if not epoch_start or seen is None:
+                    return now
+                epoch_blocks = int(effective_epoch_blocks(self.cfg.round, epoch_start))
+                end_wall = now + max(0, epoch_start + epoch_blocks - int(seen)) * 12.0
+                # Fixed for the attempt: a later block stamp must not move the
+                # deadline (it drifted 17:33 → 17:49 on 2026-09-12).
+                self._funded_epoch_end_wall = end_wall
+            return end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
@@ -1528,8 +1533,13 @@ class TrainerRunner:
         deadline = self._funded_rent_wait_deadline()
         sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
+        abort = getattr(self, "_funded_wait_abort", None)
         polled = 0
         while now_fn() < deadline:
+            if abort is not None and abort.is_set():
+                log.info("%s: capacity wait cancelled (the king cannot be rented "
+                         "this attempt)", describe)
+                return False
             n = self._probe_funded_capacity(sku)
             if n:
                 if polled:
@@ -2165,58 +2175,85 @@ class TrainerRunner:
                               "%s", pod_id, te)
                 raise ProvisionError(why)
 
-            # A sold-out marketplace is not a round failure: wait for a GPU
-            # (outside the rent lock) up to the round's latest safe start —
-            # the legs then rent independently as machines appear.
-            if (not provider.capacity(sku)
-                    and not self._wait_for_funded_capacity(sku, describe="king rent")):
-                raise ProvisionError(
-                    f"lium: no {sku} capacity before the round's latest safe start")
-            # Serialized with every funded rent (see _funded_rent_lock): the
-            # king's `lium up` must not race a challenger's for the same
-            # executor / create-rate window.
-            with self._funded_rent_lock:
-                with self._funded_exec_lock:
-                    claimed = tuple(sorted(self._funded_claimed_execs))
-                spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
-                                  ssh_pubkey=ssh_pubkey,
-                                  name_prefix=name_prefix,
-                                  gpus_per_pod=1, exclude_ids=claimed)
-                pod_id = provider.launch(spec)[0]
-                if not provider.wait_ready(
-                        pod_id, timeout=rnd.funded_ready_timeout_seconds):
-                    _fail_king(pod_id, f"king pod {pod_id} not ready in time")
-                addr = provider.get_ip(pod_id)
-                if addr is None:
-                    _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
-                machine = provider.machine_of(pod_id) or ""
-                if machine:
-                    with self._funded_exec_lock:
-                        self._funded_claimed_execs.add(machine)
-            _ledger_king(pod_id)
-            log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
-                     pod_id, addr.ip, addr.ssh_port, sku)
-            king_host = RemoteHost(
-                name="funded-king", host=addr.ip, port=addr.ssh_port,
-                user=profile.user, key_path=profile.key_path,
-                remote_python=profile.remote_python, workdir=profile.workdir,
-                cuda_device="0", chain_toml=profile.chain_toml,
-                forward_env=profile.forward_env, ssh_options=profile.ssh_options,
-                stage="final")
-            # JIT pod ⇒ no provisioner config push: deliver the deployed
-            # chain.toml (correct train_image_digest pin) before the probe.
-            king_host = self._push_deployed_chain_toml(king_host)
-            # Same runtime attestation as the funded legs: lium can boot a
-            # host-cached stale image under the degraded tag ref, and a stale
-            # KING pod trains under the wrong baked contract. Failing here
-            # aborts the round like any king-leg failure (retried next
-            # boundary, likely on a different executor).
+            def _give_up(why: str) -> None:
+                # The king is REQUIRED: once it cannot be had, release every
+                # challenger still polling for a GPU so the round fails now
+                # (and retries next poll) instead of after their deadline.
+                abort = getattr(self, "_funded_wait_abort", None)
+                if abort is not None:
+                    abort.set()
+                raise ProvisionError(why)
+
             from .remote import probe_worker_runtime
-            why = probe_worker_runtime(king_host)
-            if why:
-                raise ProvisionError(f"king pod runtime rejected: {why}")
-            self._funded_king_host = king_host
-            return self._funded_king_host
+
+            attempt = 0
+            while True:
+                attempt += 1
+                # A sold-out marketplace is not a round failure: wait for a GPU
+                # (outside the rent lock) up to the round's latest safe start —
+                # the legs then rent independently as machines appear.
+                if (not provider.capacity(sku)
+                        and not self._wait_for_funded_capacity(sku, describe="king rent")):
+                    _give_up(f"lium: no {sku} capacity before the round's latest safe start")
+                try:
+                    # Serialized with every funded rent (see _funded_rent_lock):
+                    # the king's `lium up` must not race a challenger's for the
+                    # same executor / create-rate window.
+                    with self._funded_rent_lock:
+                        with self._funded_exec_lock:
+                            claimed = tuple(sorted(self._funded_claimed_execs))
+                        spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                                          ssh_pubkey=ssh_pubkey,
+                                          name_prefix=name_prefix,
+                                          gpus_per_pod=1, exclude_ids=claimed)
+                        pod_id = provider.launch(spec)[0]
+                        machine = provider.machine_of(pod_id) or ""
+                        if machine:
+                            # Claimed either way: a lemon executor must not be
+                            # re-picked by the retry or by a sibling leg.
+                            with self._funded_exec_lock:
+                                self._funded_claimed_execs.add(machine)
+                        if not provider.wait_ready(
+                                pod_id, timeout=rnd.funded_ready_timeout_seconds):
+                            _fail_king(pod_id, f"king pod {pod_id} not ready in time")
+                        addr = provider.get_ip(pod_id)
+                        if addr is None:
+                            _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                    _ledger_king(pod_id)
+                    log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
+                             pod_id, addr.ip, addr.ssh_port, sku)
+                    king_host = RemoteHost(
+                        name="funded-king", host=addr.ip, port=addr.ssh_port,
+                        user=profile.user, key_path=profile.key_path,
+                        remote_python=profile.remote_python, workdir=profile.workdir,
+                        cuda_device="0", chain_toml=profile.chain_toml,
+                        forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+                        stage="final")
+                    # JIT pod ⇒ no provisioner config push: deliver the deployed
+                    # chain.toml (correct train_image_digest pin) before the probe.
+                    king_host = self._push_deployed_chain_toml(king_host)
+                    # Same runtime attestation as the funded legs: lium can boot
+                    # a host-cached stale image under the degraded tag ref, and
+                    # a stale KING pod trains under the wrong baked contract.
+                    why = probe_worker_runtime(king_host)
+                    if why:
+                        _fail_king(pod_id, f"king pod runtime rejected: {why}")
+                except ProvisionError as e:
+                    # A pod that never came up / had no IP / ran the wrong
+                    # runtime is a LEMON, not a verdict: it is torn down
+                    # (_fail_king) and its executor stays excluded — rent again
+                    # on another machine while the round's latest safe start
+                    # allows (2026-09-12 10:11: one 900 s readiness timeout
+                    # sank the whole attempt while four legs kept polling).
+                    now_fn = getattr(self, "_rent_wait_now", None) or time.time
+                    if now_fn() >= self._funded_rent_wait_deadline():
+                        _give_up(f"king rent gave up at the latest safe start "
+                                 f"(attempt {attempt}): {e}")
+                    log.warning("king rent attempt %d failed (%s); renting again on "
+                                "another executor", attempt, e)
+                    continue
+                self._funded_king_host = king_host
+                return self._funded_king_host
 
     def _teardown_operator_pod(self, pod) -> None:
         """Verified teardown of an operator-billed ledger pod (king JIT)."""
@@ -4686,6 +4723,11 @@ class TrainerRunner:
         self._funded_round_sku = self.cfg.round.funded_pod_sku
         self._funded_king_host = None
         self._funded_king_lock = threading.Lock()
+        # Capacity-wait coordination (PR #257 follow-up): the king's final
+        # failure sets the abort so challenger waits end at once; the epoch-end
+        # wall estimate is fixed once per attempt so the deadline is monotone.
+        self._funded_wait_abort = threading.Event()
+        self._funded_epoch_end_wall = None
         # Sweep funded-pod leftovers at EVERY round entry (not only on the
         # skip path, which needs skip_unfunded_rounds on — review 2026-09-02):
         # the previous round's JIT king, a crashed leg's payer pod, and any

@@ -98,6 +98,70 @@ def test_other_rent_failures_do_not_wait(tmp_path, monkeypatch):
     assert polled == []                                          # auth is a verdict, not a wait
 
 
+def _king_runner(tmp_path, monkeypatch, *, ready_seq, deadline_offsets):
+    """A runner whose king rent hits a fake Lium: ``ready_seq`` = successive
+    wait_ready answers (a False = lemon pod → torn down, retried elsewhere)."""
+    import threading
+
+    import cascade.provision.core as core_mod
+    import cascade.provision.funded as pf
+    from cascade.provision.core import PodAddress
+
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime", lambda host, **kw: "")
+    torn = []
+    monkeypatch.setattr(pf, "terminate_verified", lambda prov, pod_id: torn.append(pod_id) or True)
+    r = _runner(tmp_path, funded_king_rent=True)
+    r._funded_round_sku = "RTX4090"
+    r._funded_wait_abort = threading.Event()
+    _arm_wait(r, deadline_offsets=deadline_offsets, capacity_seq=[1] * 10)
+    launched = []
+    seq = list(ready_seq)
+
+    class _Prov:
+        name = "lium"
+        def capacity(self, sku, *, gpus=1):
+            return 1
+        def launch(self, spec):
+            launched.append(spec.exclude_ids)
+            return [f"{spec.name_prefix}-0"]
+        def wait_ready(self, pod_id, *, timeout):
+            return seq.pop(0) if seq else True
+        def get_ip(self, pod_id):
+            return PodAddress(ip="9.9.9.9", ssh_port=41000)
+        def machine_of(self, pod_id):
+            return f"exec-{len(launched)}"
+        def terminate(self, pod_id):
+            torn.append(pod_id)
+
+    monkeypatch.setattr(core_mod, "LiumProvider", _Prov)
+    return r, launched, torn
+
+
+def test_king_rent_retries_on_a_lemon_pod_and_excludes_its_executor(tmp_path, monkeypatch):
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[False, True],
+                                     deadline_offsets=3600)
+    host = r._rent_king_host("42")
+    assert (host.host, host.port) == ("9.9.9.9", 41000)
+    assert len(launched) == 2                                   # lemon, then a second rent
+    assert torn == ["cascade-n91-42-funded-king-0"]             # the lemon was torn down
+    assert "exec-1" in launched[1]                              # …and its executor excluded
+    assert not r._funded_wait_abort.is_set()                    # challengers keep waiting
+
+
+def test_king_rent_gives_up_at_the_deadline_and_releases_the_waiters(tmp_path, monkeypatch):
+    from cascade.provision.core import ProvisionError
+
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[False, False],
+                                     deadline_offsets=-1)            # already past
+    with pytest.raises(ProvisionError, match="gave up at the latest safe start"):
+        r._rent_king_host("42")
+    assert len(launched) == 1 and len(torn) == 1
+    assert r._funded_wait_abort.is_set()
+    # A challenger still polling sees the abort and stops immediately.
+    _arm_wait(r, deadline_offsets=3600, capacity_seq=[0, 0, 0])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg x") is False
+
+
 def test_deadline_math_from_epoch_geometry(cfg, tmp_path):
     runner = TrainerRunner(cfg=cfg, base_trainer=None, work_root=tmp_path)
     leg = max(c.max_train_seconds for c in cfg.throne_contracts())
@@ -111,6 +175,11 @@ def test_deadline_math_from_epoch_geometry(cfg, tmp_path):
     remaining = (epoch_blocks - epoch_blocks // 2) * 12.0
     expected = before + remaining - leg - TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
     assert abs(dl - expected) < 5.0
-    # Unknown context ⇒ no waiting (offline tools, tests).
+    # The epoch-end estimate is fixed for the attempt: a later block stamp
+    # must not move the deadline.
+    runner._funded_gate_block = 9050400 + epoch_blocks - 10
+    assert abs(runner._funded_rent_wait_deadline() - dl) < 1.0
+    # Unknown context (fresh attempt, no stage ctx) ⇒ no waiting.
+    runner._funded_epoch_end_wall = None
     runner._stage_ctx = {}
     assert runner._funded_rent_wait_deadline() <= time.time() + 1.0
