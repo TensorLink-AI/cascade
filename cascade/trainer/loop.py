@@ -1098,6 +1098,19 @@ class TrainerRunner:
         """``funded_pods`` as it applies RIGHT NOW ("off" before the gate)."""
         return self.cfg.round.funded_pods if self._funded_gate_open() else "off"
 
+    def _final_must_be_remote(self) -> bool:
+        """Under ``funded_mode = "required"`` the final NEVER trains on this box:
+        it takes the remote branch (JIT king rent, per-payer funded legs, or
+        operator lanes from hosts.toml) or refuses so the round retries."""
+        return self._effective_funded_mode() == "required"
+
+    def _final_rents_its_pods(self) -> bool:
+        """True when the final needs NO operator lanes: ``funded_pods = "rent"``
+        with ``funded_king_rent`` rents the king JIT and every funded leg on its
+        payer's pod, so waiting for a hosts.toml fleet only delays the round."""
+        return (self._effective_funded_pods() == "rent"
+                and bool(self.cfg.round.funded_king_rent))
+
     def _funded_harvest(self) -> bool:
         """Credential-free funded pods (``[round] funded_pod_checkpoint =
         "harvest"``, the default): the worker runs ``--local-only``, the pod
@@ -2867,6 +2880,10 @@ class TrainerRunner:
                 "admission": dict(self._funded_admission_info),
                 "roster": {k: list(v) for k, v in self._funded_roster.items()
                            if k != "outcomes"},
+                # Lanes the seating saw: a retry with MORE lanes and entries
+                # still waiting re-derives instead of restoring a field that
+                # a smaller fleet capped (2026-09-12: 1 seat frozen at 1 lane).
+                "lanes": self._duel_lanes(),
             }
         try:
             out_dir = self.work_root / f"{base_seed}"
@@ -2942,6 +2959,24 @@ class TrainerRunner:
                     base_seed, ", ".join(c.hotkey for c in matched))
         funded = raw.get("funded")
         if isinstance(funded, dict) and self._effective_funded_mode() == "required":
+            # A fleet that GREW since the seating (lanes rented after the
+            # snapshot) can seat the entries that waited behind the smaller
+            # one: re-derive instead of restoring the capped field. Nothing
+            # has settled yet on a retry, so the waiting entries are still
+            # queued and the seated ones re-seat by the same reveal order.
+            waiting = (funded.get("roster") or {}).get("waiting") or []
+            try:
+                snap_lanes = int(funded.get("lanes") or 0)
+            except (TypeError, ValueError):
+                snap_lanes = 0
+            lanes_now = self._duel_lanes()
+            if waiting and snap_lanes and lanes_now > snap_lanes:
+                log.warning("round=%s retry: %d funded entr%s waited behind %d lane(s) at "
+                            "settle time and %d lane(s) serve the final now — re-deriving "
+                            "eligibility so the grown fleet seats them",
+                            base_seed, len(waiting), "y" if len(waiting) == 1 else "ies",
+                            snap_lanes, lanes_now)
+                return None
             # Restore the settled funded state so the retry keeps billing the
             # payers, keeps the chosen SKU, and can settle its entries — see
             # the snapshot's rationale in _mark_heat_complete.
@@ -5381,7 +5416,7 @@ class TrainerRunner:
 
     @staticmethod
     def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str,
-                               used_host: list | None = None, **kw):
+                               used_host: list | None = None, prepare=None, **kw):
         """Dispatch on the next IDLE lane, retrying once on whichever lane is
         free after a failure (a different one whenever one is available).
 
@@ -5396,9 +5431,15 @@ class TrainerRunner:
         reason (import error, OOM) is still good silicon."""
         from .remote import pod_lane_count
 
+        # ``prepare(host) -> host`` runs on the CHOSEN lane right before each
+        # dispatch (first try and the retry): the vault-ZIP staging hook — a
+        # private submission's bytes must be on the lane before the worker
+        # starts, or the leg burns an attempt on a pod that can't resolve it
+        # (2026-09-12 03:52: nine challengers lost both attempts that way).
+        _ready = prepare or (lambda h: h)
         host = free_lanes.get()
         try:
-            entry = disp.dispatch(host, lane_count=pod_lane_count(host, hosts), **kw)
+            entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             free_lanes.put(host)                 # failed lane rejoins the rotation
             if _storage_failure(e):
@@ -5414,7 +5455,7 @@ class TrainerRunner:
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
             try:
-                entry = disp.dispatch(retry_host,
+                entry = disp.dispatch(_ready(retry_host),
                                       lane_count=pod_lane_count(retry_host, hosts), **kw)
                 if used_host is not None:
                     used_host.append(retry_host)
@@ -5535,7 +5576,13 @@ class TrainerRunner:
         challenger failure drops only that challenger from that size.
         ``warm_start`` (pointer, size) applies to the matching size's pass only —
         an init trained at one size can't initialise another."""
-        if not self.remote_hosts:
+        # The remote branch owns the JIT king rent and the per-payer funded
+        # legs, so under funded_mode="required" it is taken even with no
+        # operator lanes on file — an empty hosts.toml must never route a
+        # funded final onto this box (2026-09-11 22:45: 90 min wait, then a
+        # local branch that can only abort on assert_train_image).
+        remote = bool(self.remote_hosts) or self._final_must_be_remote()
+        if not remote:
             # This box is the runtime for a local final; with remote hosts the
             # check runs on each pod (cascade-train-worker), which is the runtime.
             assert_train_image(self.cfg.training)
@@ -5544,7 +5591,7 @@ class TrainerRunner:
             token_budget = contract.train_tokens
             ws_ref = (warm_start[0]
                       if warm_start and warm_start[1] == contract.arch_preset else None)
-            if self.remote_hosts:
+            if remote:
                 entries += self._train_remote(jobs, seeds, block, contract, token_budget,
                                               warm_start_ref=ws_ref)
             else:
@@ -5600,7 +5647,19 @@ class TrainerRunner:
 
         if not self.trainer_spec:
             raise RuntimeError("remote training requires trainer_spec (BaseTrainer 'module:Class')")
+        from ..funding.store import parse_vault_ref
+
         hosts = self._hosts_for("final")
+        if not hosts and not self._final_rents_its_pods():
+            # No lanes and nothing rents the king: a free-lane dispatch would
+            # block forever and the local branch is forbidden under
+            # funded_mode="required". Refuse — the round fails cleanly and
+            # retries once lanes exist (the retry restores the seated field).
+            raise RuntimeError(
+                "no final lanes on file and the final does not rent its own pods "
+                "(funded_pods != \"rent\" or funded_king_rent off): refusing to train "
+                "the final on the orchestrator — add operator lanes to hosts.toml or "
+                "enable the JIT rent; the round retries")
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
@@ -5656,10 +5715,18 @@ class TrainerRunner:
                 return self._run_funded_leg(
                     disp, gen, seeds, block, contract, suffix,
                     warm_start_ref=warm_start_ref)
+            # Operator lanes can run PRIVATE (vault/direct) submissions too:
+            # stage the ZIP on whichever lane the pool hands out, exactly as
+            # the funded-pod leg does — until 2026-09-12 only that path staged,
+            # so a vault challenger on an operator lane always failed with
+            # generator_artifact_unreachable.
+            vault_digest = parse_vault_ref(gen.ref)
+            prepare = ((lambda h, d=vault_digest: self._stage_vault_zip_on(h, d))
+                       if vault_digest else None)
             entry = self._dispatch_on_free_lane(
                 disp, lane_pool, lane_pool.known_hosts(),
                 describe=f"final {role} {gen.hotkey}",
-                used_host=used,
+                used_host=used, prepare=prepare,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset,
@@ -5838,7 +5905,12 @@ class TrainerRunner:
             return
         from .remote import RemoteDispatchError, load_hosts
 
-        deadline = time.time() + max(0, self.hosts_wait_seconds)
+        # A final that rents its own pods (JIT king + per-payer funded legs)
+        # needs no operator lanes: don't hold the round for hosts_wait_seconds
+        # waiting for a fleet nothing will write (2026-09-11: 90 min lost, then
+        # a local fallback that can never train the king on the orchestrator).
+        wait = 0 if self._final_rents_its_pods() else max(0, self.hosts_wait_seconds)
+        deadline = time.time() + wait
         hosts = None
         while True:
             try:
@@ -5863,6 +5935,16 @@ class TrainerRunner:
                                 "with the %d host(s) on file", require_stage,
                                 self.hosts_wait_seconds, len(hosts))
                     self.remote_hosts = hosts
+                elif self._final_must_be_remote():
+                    # funded_mode="required": the orchestrator is never the
+                    # final's runtime. Keep the remote branch — the king rents
+                    # JIT / funded legs rent per payer, or the final refuses
+                    # and the round retries (the infra path) — never local.
+                    log.warning("no remote hosts available (%s); funded_mode=required "
+                                "never trains the final locally — the final rents its "
+                                "pods JIT or the round retries once lanes exist",
+                                reason or str(self.remote_hosts_path))
+                    self.remote_hosts = []
                 else:
                     log.warning("no remote hosts available (%s); training locally this round",
                                 reason or str(self.remote_hosts_path))
