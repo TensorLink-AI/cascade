@@ -2257,6 +2257,23 @@ class TrainerRunner:
             return f"pod status is {ident.get('status')!r}, not RUNNING"
         return None
 
+    def _stage_king_vault(self, host, gen):
+        """The JIT king pod with the king's vault ZIP staged when the king is a
+        PRIVATE (``vault/direct``) submission — a funded miner who took the
+        throne (2026-09-13: 5Eo6). Such a ref resolves only where its ZIP is
+        staged, and the operator-rented king pod never went through the
+        funded/operator-lane staging, so the king leg died with
+        ``generator_artifact_unreachable`` on every retry. Public refs pass
+        through unchanged."""
+        from ..funding.store import parse_vault_ref
+
+        digest = parse_vault_ref(gen.ref)
+        if not digest:
+            return host
+        log.info("king %s is a private vault submission — staging its ZIP on the king pod",
+                 gen.hotkey)
+        return self._stage_vault_zip_on(host, digest)
+
     def _stage_vault_zip_on(self, host, digest_hex: str):
         """Ship ONE vault ZIP to the funded pod; return the host with the
         pod-local ``CASCADE_VAULT_DIR`` pinned into its dispatch env."""
@@ -6116,7 +6133,7 @@ class TrainerRunner:
                         and self._funded_gate_open()):
                     # No-heat end-state: the king's pod rents JIT at the round's
                     # chosen SKU (operator-billed) instead of a standing fleet.
-                    host = self._rent_king_host(str(seeds.base_seed))
+                    host = self._stage_king_vault(self._rent_king_host(str(seeds.base_seed)), gen)
                     entry = disp.dispatch(
                         host, lane_count=1,
                         gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
