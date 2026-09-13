@@ -166,7 +166,9 @@ def test_rent_failure_classes_and_burn(msg, cls, burns):
 def test_rent_not_ready_tears_down_on_payer_key():
     provider = FakeProvider(ready=False)
     res = _rent(provider, ready_timeout=1.0)
-    assert not res.ok and res.error_class == "infra"
+    # A never-ready pod is a LEMON (host fault): no attempt burned, the caller
+    # rents again elsewhere (test_lium_host_quarantine).
+    assert not res.ok and res.error_class == "lemon" and res.burn_attempt is False
     assert provider.terminated == [f"{funded_pod_name('777', HK, 91)}-0"]
     assert res.leaked_pod == ""                        # confirmed gone
 

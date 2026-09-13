@@ -1963,7 +1963,8 @@ class TrainerRunner:
         Every failure records a settle verdict for :meth:`_settle_funded` and
         raises ``_FundedLegSkip`` so the leg (never the round) is dropped.
         """
-        from ..provision.funded import rent_funded_pod
+        from ..provision.core import record_host_quarantine
+        from ..provision.funded import LEMON_CLASS, rent_funded_pod
         from .remote import RemoteHost
 
         rnd = self.cfg.round
@@ -2040,6 +2041,10 @@ class TrainerRunner:
                     why = self._funded_pod_code_mismatch(result, profile)
                     if why:
                         stale_pods += 1
+                        if result.address is not None:
+                            # The stale cache lives on the HOST: every executor
+                            # id it lists would boot the same image.
+                            record_host_quarantine(result.address.ip, why)
                         log.warning("funded leg %s: pod %s rejected — %s; releasing "
                                     "and renting again (%d stale pod(s) so far)",
                                     gen.hotkey[:12], result.pod.instance_id if result.pod
@@ -2053,6 +2058,22 @@ class TrainerRunner:
                                 burn_attempt=False, pod=None, address=None)
                             break
                         continue
+                elif result.error_class == LEMON_CLASS:
+                    # The platform delivered nothing usable (never ready): the
+                    # host is already quarantined by rent_funded_pod — rent
+                    # again elsewhere while the round's latest safe start
+                    # allows, on the same bad-pod budget as a stale image.
+                    stale_pods += 1
+                    now_fn = getattr(self, "_rent_wait_now", None) or time.time
+                    if (stale_pods < self.FUNDED_MAX_STALE_PODS
+                            and now_fn() < self._funded_rent_wait_deadline()):
+                        log.warning("funded leg %s: lemon pod (%s); renting again on "
+                                    "another host (%d bad pod(s) so far)",
+                                    gen.hotkey[:12], result.error[-200:], stale_pods)
+                        continue
+                    result = replace(
+                        result, error=f"{stale_pods} bad pod(s), last: {result.error}",
+                        error_class="infra", burn_attempt=False)
             if result.ok or result.error_class != "no_capacity":
                 break
             # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
@@ -2322,7 +2343,7 @@ class TrainerRunner:
             if self._funded_king_host is not None:
                 return self._funded_king_host
             from ..provision.core import LaunchSpec, LiumProvider, ProvisionError
-            from ..provision.funded import terminate_verified
+            from ..provision.funded import quarantine_lemon_host, terminate_verified
             from ..provision.state import PodInstance
             from .remote import RemoteHost
 
@@ -2351,6 +2372,9 @@ class TrainerRunner:
             _ledger_king(f"{name_prefix}-0")
 
             def _fail_king(pod_id: str, why: str) -> None:  # noqa: ANN001
+                # A king pod that never came up or runs the wrong runtime is
+                # a lemon HOST: keep the retry (and every payer leg) off it.
+                quarantine_lemon_host(provider, pod_id, why)
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
