@@ -266,6 +266,20 @@ def test_rent_missing_key_settles_auth_and_skips(tmp_path):
     assert (miner_fault, cls, burn) == (True, "auth", False)
 
 
+def test_rent_missing_key_runs_on_an_operator_lane_when_the_hybrid_is_armed(tmp_path):
+    # 2026-09-13: a payer's key aged out of the vault while their leg kept failing
+    # on OUR side — with operator lanes on file the leg runs operator-billed
+    # instead of being dropped as "auth".
+    from cascade.trainer.loop import _FundedOperatorFallback
+
+    runner = _runner(tmp_path)
+    PayerKeyVault(dir=tmp_path / "pv")            # empty vault
+    runner._operator_fallback_lanes = lambda: ["op-final-0"]
+    with pytest.raises(_FundedOperatorFallback):
+        runner._rent_funded_host("777", _challenger("hkA"))
+    assert "hkA" not in runner._funded_leg_failures   # nothing recorded against the miner
+
+
 def test_rent_failure_classes_flow_to_settle_verdict(tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkA")
