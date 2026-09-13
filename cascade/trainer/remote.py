@@ -554,6 +554,12 @@ class RemoteDispatcher:
     # training actually runs) gets the key and its per-step logs land — instead of
     # silently no-opping because the key never left the orchestrator.
     extra_forward_env: tuple[str, ...] = ()
+    # ``(remote_name, local_env_name)`` pairs forwarded ONLY to isolated (payer)
+    # hosts — credentials minted for exposure to the payer, e.g. a project-scoped
+    # wandb key delivered as WANDB_API_KEY ([wandb] funded_key_env). Never the
+    # operator's own values: an isolated host still gets none of forward_env /
+    # extra_forward_env.
+    isolated_forward_env: tuple[tuple[str, str], ...] = ()
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -584,9 +590,12 @@ class RemoteDispatcher:
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.
-        names = (dict.fromkeys(()) if host.isolated
-                 else dict.fromkeys((*host.forward_env, *self.extra_forward_env)))
-        env = {k: os.environ[k] for k in names if k in os.environ}
+        if host.isolated:
+            env = {remote: os.environ[local]
+                   for remote, local in self.isolated_forward_env if local in os.environ}
+        else:
+            names = dict.fromkeys((*host.forward_env, *self.extra_forward_env))
+            env = {k: os.environ[k] for k in names if k in os.environ}
         # Host-pinned values win over forwarded copies: a funded pod's
         # CASCADE_VAULT_DIR must be the POD's staging path even when the
         # orchestrator exports its own store dir under the same name.

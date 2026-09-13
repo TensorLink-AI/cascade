@@ -4261,6 +4261,7 @@ class TrainerRunner:
             trainer_spec=self.trainer_spec,
             timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
+            isolated_forward_env=self._pod_isolated_forward_env(),
         )
         entry = disp.dispatch(
             host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey, role="king",
@@ -4814,6 +4815,7 @@ class TrainerRunner:
                 trainer_spec=self.trainer_spec,
                 timeout_seconds=self.remote_timeout_seconds,
                 extra_forward_env=self._pod_extra_forward_env(),
+                isolated_forward_env=self._pod_isolated_forward_env(),
             )
             # warm_start_ref makes the leg warm_started=True in the trainer, so
             # under an armed [training] warm_lr_scale (DEC-CA-0035) its cosine
@@ -5748,6 +5750,22 @@ class TrainerRunner:
         env; absent ⇒ the pod's wandb no-ops exactly as before."""
         return ("WANDB_API_KEY",) if getattr(self.cfg.wandb, "enabled", False) else ()
 
+    def _pod_isolated_forward_env(self) -> tuple[tuple[str, str], ...]:
+        """Credentials an ISOLATED (payer-paid) pod may receive: a project-scoped
+        wandb key named by ``[wandb] funded_key_env``, delivered as WANDB_API_KEY
+        so funded legs stream live like operator legs. The payer can read it, so
+        the operator's own key name is refused — silently keeping the old
+        no-wandb behaviour would hide a misconfiguration, so it warns."""
+        wb = getattr(self.cfg, "wandb", None)
+        name = str(getattr(wb, "funded_key_env", "") or "").strip()
+        if not name or not getattr(wb, "enabled", False):
+            return ()
+        if name == "WANDB_API_KEY":
+            log.warning("[wandb] funded_key_env names the operator's own key — refusing "
+                        "to forward it to payer pods (use a project-scoped key)")
+            return ()
+        return (("WANDB_API_KEY", name),)
+
     def _hosts_for(self, stage: str) -> list:
         """The pods serving ``stage`` ("heat" | "final"): hosts tagged with that
         stage or ``"any"``. The cheap-GPU seam — heats can run on a cheaper SKU
@@ -5910,7 +5928,8 @@ class TrainerRunner:
         # Guard + 30min covers fetch/sandbox/upload overheads around training.
         heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
         disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout,
-                                extra_forward_env=self._pod_extra_forward_env())
+                                extra_forward_env=self._pod_extra_forward_env(),
+                                isolated_forward_env=self._pod_isolated_forward_env())
 
         # Lane pool: dispatch lands on whichever GPU lane is actually idle
         # (see _dispatch_on_free_lane — the old i % n pin double-booked lanes).
@@ -6057,6 +6076,7 @@ class TrainerRunner:
         disp = RemoteDispatcher(
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
+            isolated_forward_env=self._pod_isolated_forward_env(),
         )
 
         def _fresh_final_hosts() -> list:

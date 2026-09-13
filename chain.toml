@@ -874,6 +874,11 @@ enabled = true                  # live wandb logging ON (owner 2026-07-18); obse
 project = "cascade"             # wandb project; make it PUBLIC for miners to view
 entity  = ""                    # wandb team/user (empty = the API key's default)
 mode    = "online"              # online | offline | disabled
+# A SEPARATE, project-scoped wandb key for ISOLATED (miner-paid) pods, named by
+# env var; forwarded to those pods as WANDB_API_KEY so funded legs stream live
+# too. The payer can read it from their pod — never the operator's key (the name
+# "WANDB_API_KEY" is refused). Empty ⇒ funded legs log no wandb (pre-2026-09-13).
+funded_key_env = "WANDB_API_KEY_FUNDED"
 
 [telemetry]
 # Host-side run telemetry (cascade.trainer.host_probe). Observability only —
