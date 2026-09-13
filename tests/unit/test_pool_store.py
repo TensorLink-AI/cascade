@@ -497,3 +497,60 @@ def test_pool_backup_write_failure_is_not_fatal(tmp_path):
                                  as_of="d", n_series=5, context_length=128, horizon=16)
     assert meta.key in primary.objects                    # primary copy intact
     assert hippius.POOL_INDEX_KEY in primary.objects
+
+
+# ── DEC-CA-0041 Phase 3: packing follows the scoring flip, never a calendar ──
+
+def _cfg_mv(flip: int):
+    cfg = dataclasses.replace(
+        _cfg_small(),
+        storage=dataclasses.replace(load_chain_config().storage, pool_bucket="cascade-eval-pool"),
+    )
+    return dataclasses.replace(cfg, scoring=dataclasses.replace(cfg.scoring, mv_score_from_block=flip))
+
+
+def test_mv_pack_policy_is_tied_to_the_scoring_flip():
+    from cascade.pool.cli import mv_pack_policy
+
+    cfg = _cfg_mv(9068400)
+    assert mv_pack_policy(cfg, 9068400)[0] is True            # the flip's own boundary packs
+    assert mv_pack_policy(cfg, 9072000)[0] is True            # every later daily snapshot packs
+    assert mv_pack_policy(cfg, 9064800)[0] is False           # the boundary before does not
+    assert mv_pack_policy(cfg, 9072000, disabled=True) == (False, "--no-mv-pack")
+    assert mv_pack_policy(cfg, 9064800, forced=True)[0] is True   # explicit override, warned
+    assert mv_pack_policy(_cfg_mv(0), 9999999)[0] is False    # unset flip ⇒ never
+
+
+def _publish_capturing_build(tmp_path, monkeypatch, cfg, argv_extra):
+    from cascade.pool import cli
+
+    store = _FakeS3Store()
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)
+    seen = {}
+    real_build = cli._build
+
+    def spy(args, cfg_, **kw):
+        seen["mv_pack"] = bool(getattr(args, "mv_pack", False))
+        seen["max_channels"] = int(getattr(args, "max_channels", 1) or 1)
+        return real_build(args, cfg_, **kw)
+
+    monkeypatch.setattr(cli, "_build", spy)
+    rc = cli.main(["publish", "--sources", "synthetic", "--out", str(tmp_path / "stage"),
+                   "--context-length", "128", "--horizon", "16", "--min-context", "32", *argv_extra])
+    assert rc == 0
+    return seen
+
+
+def test_publish_packs_only_from_the_flip_block(tmp_path, monkeypatch):
+    cfg = _cfg_mv(7200)
+    before = _publish_capturing_build(tmp_path, monkeypatch, cfg, ["--effective-block", "3600"])
+    assert before == {"mv_pack": False, "max_channels": 1}
+    at = _publish_capturing_build(tmp_path, monkeypatch, cfg, ["--effective-block", "7200"])
+    assert at == {"mv_pack": True, "max_channels": 8}         # MAX_MV_CHANNELS
+    off = _publish_capturing_build(tmp_path, monkeypatch, cfg,
+                                   ["--effective-block", "7200", "--no-mv-pack"])
+    assert off["mv_pack"] is False
+    forced = _publish_capturing_build(tmp_path, monkeypatch, cfg,
+                                      ["--effective-block", "3600", "--mv-pack"])
+    assert forced["mv_pack"] is True

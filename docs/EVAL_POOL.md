@@ -201,6 +201,15 @@ multichannel today; cascade's Phase-2 builder reading `mv_channels` and packing
 `(C, L)` windows is the activation, paired with `[scoring] mv_score_from_block`
 (release-then-activate). Until then a tagged source is scored exactly as now.
 
+**When packing turns on.** `cascade-pool publish` packs iff the snapshot's
+`effective_block` is at or past `[scoring] mv_score_from_block` (`--no-mv-pack`
+forces off, `--mv-pack` forces on) — the pool and the scoring rule flip on the
+same epoch boundary by construction. The daily cron targets the NEXT boundary
+after the latest manifest, so the flip boundary itself needs one manual
+`workflow_dispatch` with `effective_block = <mv_score_from_block>` before that
+boundary; every later daily snapshot packs on its own. `--max-channels` is
+raised to the `mv_channels` cap (8) automatically when packing.
+
 **Two consumers, deliberately different accounting.** Forge's own benchmark
 expands a coupled group into C univariate challenges (C slots, group-level
 bootstrap); cascade packs it to one window (1 slot, source-level clusters). The

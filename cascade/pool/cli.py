@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
 import sys
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from .builder import PoolBuildConfig, build_pool
 from .source import HarvestContext, HttpFetcher
 from .sources import DEFAULT_SOURCES, available, get_sources
 
+log = logging.getLogger(__name__)
 
 def _parse_date(s: str | None) -> dt.date:
     if not s:
@@ -128,6 +130,9 @@ def _add_publish(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--max-keep", type=int, default=14, help="Snapshots to retain in the index.")
     _add_build_args(p)
+    p.add_argument("--no-mv-pack", action="store_true",
+                   help="Force multichannel packing OFF even when effective_block is past "
+                        "[scoring] mv_score_from_block (default: pack iff at/past the flip).")
     p.set_defaults(func=_cmd_publish)
 
 
@@ -257,6 +262,34 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def mv_pack_policy(cfg, effective_block: int, *, forced: bool = False,
+                   disabled: bool = False) -> tuple[bool, str]:
+    """Whether a snapshot activating at ``effective_block`` packs ``mv_channels``
+    into (C, L) windows (DEC-CA-0041 Phase 3).
+
+    Tied to the SCORING flip, not to a flag someone has to remember on the
+    right day: the multichannel averaging rule turns on at ``[scoring]
+    mv_score_from_block``, and a packed pool scored under the OLD per-channel
+    rule would weight a C-channel window C times (the scale-domination case),
+    while an unpacked pool after the flip makes the flip a no-op. So packing is
+    ON exactly for snapshots whose ``effective_block`` is at or past the flip
+    (``0`` = never), ``--no-mv-pack`` forces it off, ``--mv-pack`` forces it on
+    (with a warning when that lands before the flip).
+    """
+    flip = int(getattr(cfg.scoring, "mv_score_from_block", 0) or 0)
+    if disabled:
+        return False, "--no-mv-pack"
+    if forced:
+        if flip <= 0 or effective_block < flip:
+            log.warning("--mv-pack before [scoring] mv_score_from_block=%s: packed windows "
+                        "would be scored PER CHANNEL under the old rule", flip or "unset")
+        return True, "--mv-pack"
+    if flip > 0 and effective_block >= flip:
+        return True, f"effective_block {effective_block} >= mv_score_from_block {flip}"
+    return False, (f"effective_block {effective_block} < mv_score_from_block {flip}" if flip > 0
+                   else "mv_score_from_block unset")
+
+
 def _cmd_publish(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     if not cfg.storage.pool_bucket:
@@ -276,6 +309,13 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     except (StorageError, ValueError) as e:
         print(f"error: could not resolve --effective-block: {e}", file=sys.stderr)
         return 2
+    pack, why = mv_pack_policy(cfg, effective_block, forced=bool(getattr(args, "mv_pack", False)),
+                               disabled=bool(getattr(args, "no_mv_pack", False)))
+    args.mv_pack = pack
+    if pack:
+        from .sources.tsbench_forge import MAX_MV_CHANNELS
+        args.max_channels = max(int(getattr(args, "max_channels", 1) or 1), MAX_MV_CHANNELS)
+    print(f"mv-pack: {'ON' if pack else 'off'} ({why}); max_channels={getattr(args, 'max_channels', 1)}")
 
     try:
         summary = _build(args, cfg, out_dir=args.out, overwrite=True)
