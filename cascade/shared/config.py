@@ -1582,6 +1582,12 @@ class WandbConfig:
     project: str = "cascade"
     entity: str = ""
     mode: str = "online"   # online | offline | disabled
+    # Name of an env var holding a SEPARATE wandb key for ISOLATED (payer-paid)
+    # pods, forwarded to them as WANDB_API_KEY so funded legs stream live too.
+    # The payer has console access to their pod and can read it — so it must be
+    # a key scoped to the public project, never the operator's own key (a value
+    # of "WANDB_API_KEY" is refused). Empty ⇒ funded legs keep no wandb.
+    funded_key_env: str = ""
 
 
 @dataclass(frozen=True)
@@ -2321,6 +2327,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             project=str(wb.get("project", "cascade")),
             entity=str(wb.get("entity", "")),
             mode=str(wb.get("mode", "online")),
+            funded_key_env=str(wb.get("funded_key_env", "")).strip(),
         ),
         telemetry=TelemetryConfig(
             host_probe=bool(tm.get("host_probe", True)),
