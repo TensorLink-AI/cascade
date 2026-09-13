@@ -203,6 +203,67 @@ def cooling_executors(*, path: Path | None = None, now: float | None = None,
     path = path or lium_cooldown_path()
     now = time.time() if now is None else now
     return {k for k, v in _load_cooldowns(path).items() if now - v < ttl}
+
+
+# ── host quarantine ──────────────────────────────────────────────────────────
+# One PHYSICAL host serves several executor ids, and a lemon host stays a lemon
+# under every one of them (2026-09-13: 91.224.44.222 listed 37f19d50 / 8ae82436
+# / bec5e572 / cafb2ca6 — it booted a stale cached worker under the pinned tag,
+# burned three miners, then sat RUNNING with no ports for the full 900 s on
+# every later rent). Cooling one executor id re-picks the SAME machine under its
+# next id, so a lemon is remembered by host IP: every executor on that host is
+# skipped for LIUM_HOST_QUARANTINE_SECONDS. Persisted like the cooldown file.
+LIUM_HOST_QUARANTINE_SECONDS = 24 * 3600.0
+LIUM_QUARANTINE_FILE_ENV = "CASCADE_LIUM_QUARANTINE_FILE"
+
+
+def lium_quarantine_path() -> Path:
+    return Path(os.environ.get(
+        LIUM_QUARANTINE_FILE_ENV, "~/.cache/cascade/lium_host_quarantine.json")).expanduser()
+
+
+def _load_quarantine(path: Path) -> dict[str, dict]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out = {}
+        for k, v in dict(raw).items():
+            if isinstance(v, dict) and "until" in v:
+                out[str(k)] = {"until": float(v["until"]), "reason": str(v.get("reason", ""))}
+        return out
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+
+
+def record_host_quarantine(host: str, reason: str, *,
+                           seconds: float = LIUM_HOST_QUARANTINE_SECONDS,
+                           path: Path | None = None, now: float | None = None) -> None:
+    """Keep every executor on ``host`` (an IP) out of listings for ``seconds``."""
+    host = str(host or "").strip()
+    if not host:
+        return
+    path = path or lium_quarantine_path()
+    now = time.time() if now is None else now
+    try:
+        d = {k: v for k, v in _load_quarantine(path).items() if v["until"] > now}
+        prev = d.get(host)
+        until = max(now + seconds, prev["until"] if prev else 0.0)
+        d[host] = {"until": until, "reason": str(reason)[:300]}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+        log.warning("lium: host %s quarantined for %.1f h — %s", host, (until - now) / 3600,
+                    reason)
+    except OSError as e:
+        log.warning("lium: could not record host quarantine for %s: %s", host, e)
+
+
+def quarantined_hosts(*, path: Path | None = None,
+                      now: float | None = None) -> dict[str, str]:
+    """``{host ip: reason}`` for every host still under quarantine."""
+    path = path or lium_quarantine_path()
+    now = time.time() if now is None else now
+    return {k: v["reason"] for k, v in _load_quarantine(path).items() if v["until"] > now}
 # Lium caps ``POST /templates`` at 20 requests per hour PER CLIENT IP, and
 # ``lium up --image`` creates a throw-away template on EVERY call — so a round's
 # worth of launches (king + funded legs + retries) silently exhausted the hour
@@ -796,6 +857,7 @@ class LiumProvider:
     # pod name → executor id for pods this instance launched, so the loop can
     # exclude a failed pod's machine when renting its replacement.
     _executor_by_name: dict = field(default_factory=dict, repr=False)
+    _executor_hosts_cache: tuple = field(default=(), repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -865,6 +927,15 @@ class LiumProvider:
                 log.info("lium: %d %s executor(s) skipped — vacated < %.0f min ago "
                          "(post-teardown cooldown deploys nothing)",
                          len(shaped) - len(kept), sku, LIUM_EXECUTOR_COOLDOWN_SECONDS / 60)
+            shaped = kept
+        quarantined = quarantined_hosts()
+        if quarantined and shaped:
+            hosts = self._executor_hosts()
+            kept = [e for e in shaped if hosts.get(str(e.get("id")), "") not in quarantined]
+            if len(kept) != len(shaped):
+                log.info("lium: %d %s executor(s) skipped — on a quarantined host (%s)",
+                         len(shaped) - len(kept), sku, ", ".join(sorted(
+                             {hosts[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
         return shaped
 
@@ -1023,6 +1094,56 @@ class LiumProvider:
         except Exception:  # noqa: BLE001 — best-effort lookup
             return ""
         return ""
+
+    _EXECUTOR_HOSTS_TTL = 120.0
+
+    def _api_json(self, path: str):
+        """``GET <LIUM_API_BASE>/<path>`` on this instance's key; ``None`` on any
+        failure (best-effort lookups only — never a rent decision by itself)."""
+        try:
+            import requests
+
+            key = self.api_key or os.environ.get("LIUM_API_KEY", "")
+            if not key:
+                return None
+            r = requests.get(f"{LIUM_API_BASE}/{path.lstrip('/')}",
+                             headers={"X-API-KEY": key}, timeout=20)
+            if not r.ok:
+                return None
+            return r.json()
+        except Exception:  # noqa: BLE001 — best-effort lookup
+            return None
+
+    def _executor_hosts(self) -> dict[str, str]:
+        """executor id → host IP for the whole marketplace (the CLI's ``ls`` JSON
+        carries no address; ``GET /executors`` does). Cached briefly per
+        instance; empty when the API is unreachable (the fingerprint check
+        still guards every leg — this only steers listings)."""
+        cached = self._executor_hosts_cache
+        if cached and self._now() - cached[0] < self._EXECUTOR_HOSTS_TTL:
+            return cached[1]
+        hosts: dict[str, str] = {}
+        for e in self._api_json("executors") or []:
+            if isinstance(e, dict) and e.get("id") and e.get("executor_ip_address"):
+                hosts[str(e["id"])] = str(e["executor_ip_address"])
+        if not hosts:
+            log.warning("lium: executor host map unavailable — host quarantine cannot "
+                        "steer this listing")
+        object.__setattr__(self, "_executor_hosts_cache", (self._now(), hosts))
+        return hosts
+
+    def host_of_pod(self, pod_id: str) -> str:
+        """Host IP a live pod sits on (from the pod's API record, else this
+        instance's launch record + the executor map); "" when unknown."""
+        for p in self._api_json("pods") or []:
+            if isinstance(p, dict) and pod_id in (p.get("pod_name"), p.get("name"),
+                                                  p.get("id"), p.get("huid")):
+                ex = p.get("executor") or {}
+                ip = ex.get("executor_ip_address") if isinstance(ex, dict) else ""
+                if ip:
+                    return str(ip)
+        executor = self._executor_by_name.get(pod_id, "")
+        return self._executor_hosts().get(executor, "") if executor else ""
 
     def terminate(self, pod_id: str) -> None:
         # `lium rm <target>` takes a positional target and does NOT prompt — there

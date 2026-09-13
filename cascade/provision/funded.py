@@ -30,11 +30,18 @@ import logging
 import re
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..funding.faults import classify_rent_failure
 from ..funding.vault import PayerKeyVault
-from .core import LaunchSpec, LiumProvider, PodAddress, Provider, ProvisionError
+from .core import (
+    LaunchSpec,
+    LiumProvider,
+    PodAddress,
+    Provider,
+    ProvisionError,
+    record_host_quarantine,
+)
 from .state import PodInstance
 
 __all__ = [
@@ -96,6 +103,37 @@ def terminate_verified(provider: Provider, pod_id: str) -> bool:
     if lister is None:
         return True
     return pod_id not in set(lister(pod_id))
+
+
+# A pod that the platform accepted but never brought up (or brought up wrong)
+# is a LEMON: the host's fault, never the payer's — it neither burns one of the
+# miner's attempts nor ends the leg; the caller rents again elsewhere while the
+# round's latest safe start allows. Its host is quarantined so the retry (and
+# every sibling leg) lands on a different machine, not the same one under
+# another executor id (2026-09-13: 91.224.44.222 × 4 ids).
+LEMON_CLASS = "lemon"
+
+
+class LemonPodError(ProvisionError):
+    """The rented pod never became usable — a host fault, not a verdict."""
+
+
+def quarantine_lemon_host(provider: Provider, pod_id: str, reason: str) -> str:
+    """Quarantine the host ``pod_id`` sits on (best-effort; "" when unknown).
+    Call BEFORE tearing the pod down — its record is how the host is found."""
+    finder = getattr(provider, "host_of_pod", None)
+    host = ""
+    if callable(finder):
+        try:
+            host = str(finder(pod_id) or "")
+        except Exception as e:  # noqa: BLE001 — a lookup failure must not mask the lemon
+            log.warning("lium: could not resolve the host of lemon pod %s: %s", pod_id, e)
+    if host:
+        record_host_quarantine(host, f"{pod_id}: {reason}")
+    else:
+        log.warning("lium: lemon pod %s has no resolvable host — nothing quarantined",
+                    pod_id)
+    return host
 
 
 @dataclass(frozen=True)
@@ -185,9 +223,13 @@ def rent_funded_pod(
             tail_fn = getattr(provider, "_up_log_tail", None)
             if callable(tail_fn):
                 tail = tail_fn(pod_id)
-            raise ProvisionError(
-                f"funded pod {pod_id} not ready within {ready_timeout:.0f}s"
-                + (f"; lium up said: {tail}" if tail else ""))
+            why = (f"funded pod {pod_id} not ready within {ready_timeout:.0f}s"
+                   + (f"; lium up said: {tail}" if tail else ""))
+            # The platform took the rent and delivered nothing usable: a lemon
+            # host (2026-09-13: RUNNING with no ports for 900 s, four ids on
+            # one machine). Remember the HOST before the pod record vanishes.
+            quarantine_lemon_host(provider, pod_id, why)
+            raise LemonPodError(why)
         addr = provider.get_ip(pod_id)
         if addr is None:
             raise ProvisionError(f"funded pod {pod_id} exposed no IP")
@@ -238,7 +280,12 @@ def rent_funded_pod(
                           "may be LEAKED on payer %s's account (revoked key?): %s",
                           pid, hotkey, te)
                 leaked = pid
-        return _fail(e, leaked_pod=leaked)
+        res = _fail(e, leaked_pod=leaked)
+        if isinstance(e, LemonPodError):
+            # Not the taxonomy's "infra" (which spends one of the miner's
+            # attempts): the caller rents again on another host.
+            res = replace(res, error_class=LEMON_CLASS, burn_attempt=False)
+        return res
 
 
 def teardown_funded(
