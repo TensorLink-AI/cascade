@@ -1401,7 +1401,7 @@ def test_heat_dispatch_uses_tight_ssh_timeout(cfg, tmp_path, monkeypatch):
     timeouts: list[tuple[bool, int]] = []
 
     class _FakeDisp:
-        def __init__(self, *, trainer_spec, timeout_seconds, extra_forward_env=()):
+        def __init__(self, *, trainer_spec, timeout_seconds, extra_forward_env=(), isolated_forward_env=()):
             self.timeout_seconds = timeout_seconds
 
         def dispatch(self, host, *, gen_ref, uid, hotkey, role, base_seed, block,
