@@ -1989,6 +1989,16 @@ class TrainerRunner:
             raise _FundedLegSkip(gen.hotkey)
         api_key = vault.get(gen.hotkey)
         if not api_key:
+            if self._operator_fallback_lanes():
+                # The payer's key aged out of the vault while THEIR leg kept
+                # failing on our side (2026-09-13: 5EM4F1 — dead host, then
+                # never-ready, then the 36 h TTL). With the owner-armed hybrid
+                # on and operator lanes on file, the leg runs operator-billed
+                # rather than dropping a seated entrant for our faults.
+                log.warning("final challenger %s: no vaulted key (TTL expired) — running "
+                            "on an OPERATOR lane (operator-billed; "
+                            "funded_operator_fallback)", gen.hotkey)
+                raise _FundedOperatorFallback(gen.hotkey)
             self._record_funded_failure(
                 gen.hotkey, "no vaulted key for this hotkey (TTL expired or "
                 "never funded here) — re-fund to supply a fresh key",
