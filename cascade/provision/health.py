@@ -126,6 +126,12 @@ class HealthGate:
     remote_python: str = DEFAULT_REMOTE_PYTHON
     workdir: str = DEFAULT_WORKDIR
     image_digest: str = ""
+    # chain.toml ``[round] worker_code_fingerprint``: sha256 of the pinned
+    # image's ``cascade/**/*.py`` (cascade.provision.codeprint). Empty ⇒ the
+    # check is skipped. Unlike ``image_digest`` this is read from the pod's
+    # FILES, so a stale-tag container cannot pass it by echoing the env we
+    # injected (2026-09-12 Lium 91.224.44.x incident).
+    code_fingerprint: str = ""
     min_disk_gb: float = 20.0
     expected_python: str = EXPECTED_PYTHON
     expected_torch: str = EXPECTED_TORCH
@@ -159,6 +165,7 @@ class HealthGate:
             ("runtime_pin", self._check_runtime),
             ("worker_import", self._check_worker_import),
             ("image_digest", self._check_image_digest),
+            ("code_fingerprint", self._check_code_fingerprint),
             ("hippius", self._check_hippius),
             ("disk", self._check_disk),
             ("fresh_boot", self._check_fresh_boot),
@@ -250,6 +257,26 @@ class HealthGate:
         if runtime != pinned:
             return False, f"pod digest {runtime} != pinned {pinned}"
         return True, ""
+
+    def _check_code_fingerprint(self, run_ssh: RunSSH) -> tuple[bool, str]:
+        """The pod's ``cascade/**/*.py`` bytes must match the pinned image's.
+
+        Complements ``image_digest``: that check trusts the launch-injected
+        env, which a host serving a stale image under the pinned TAG echoes
+        faithfully. This one hashes the files the worker will actually run.
+        """
+        from .codeprint import remote_code_fingerprint
+
+        pinned = (self.code_fingerprint or "").strip().lower()
+        if not pinned:
+            return True, "unpinned"
+        got, n, err = remote_code_fingerprint(run_ssh, workdir=self.workdir)
+        if err:
+            return False, f"code fingerprint unavailable: {err}"
+        if got != pinned:
+            return False, (f"pod code {got[:12]}… ({n} files) != pinned {pinned[:12]}… "
+                           f"— stale image under the pinned tag")
+        return True, f"{n} files"
 
     def _check_hippius(self, run_ssh: RunSSH) -> tuple[bool, str]:  # noqa: ARG002 — orchestrator-side probe
         if self.hippius_probe is None:

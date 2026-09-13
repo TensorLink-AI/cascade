@@ -217,10 +217,18 @@ def lium_template_payload(image: str, *, ssh_pubkey: str, ssh_port: int) -> dict
     ``one_time_template`` so it survives its pods and can be reused.
 
     ``image`` is the canonical digest-pinned ref; Lium's template takes the
-    repo and tag separately and cannot carry the ``@sha256`` form, so the
-    exact digest rides the container env (``CASCADE_TRAIN_IMAGE_DIGEST``) and
-    the health gate byte-compares it before the pod serves — the same posture
-    as :func:`lium_image_ref`.
+    repo and tag separately (it rejects the ``repo@sha256:…`` form in
+    ``docker_image``) but carries the digest in its own
+    ``docker_image_digest`` field — that is what pins the pull. The digest
+    ALSO rides the container env (``CASCADE_TRAIN_IMAGE_DIGEST``) for the
+    health gate's byte-compare — the same posture as :func:`lium_image_ref`.
+
+    2026-09-12: with ``docker_image_digest`` left empty, a host that already
+    held an older image under the pinned TAG started that container, and the
+    injected env made it pass the digest gate (91.224.44.222/.223 ran the
+    Aug-27 worker-v0.7.0 code as "v0.8.0"; every leg there died at the 1800 s
+    stall and the miners were burned). The digest field closes the pull side;
+    ``[round] worker_code_fingerprint`` closes the verification side.
     """
     ref = lium_image_ref(image)
     repo, sep, tag = ref.rpartition(":")
@@ -234,7 +242,7 @@ def lium_template_payload(image: str, *, ssh_pubkey: str, ssh_port: int) -> dict
     payload = {
         "docker_image": repo,
         "docker_image_tag": tag,
-        "docker_image_digest": "",
+        "docker_image_digest": digest or "",
         "internal_ports": ports,
         "startup_commands": "",
         "category": "UBUNTU",
@@ -257,8 +265,9 @@ def lium_template_name(payload: dict) -> str:
     import hashlib
     import json
 
-    keyed = {k: payload[k] for k in ("docker_image", "docker_image_tag", "internal_ports",
-                                     "environment", "entrypoint", "startup_commands")}
+    keyed = {k: payload.get(k, "") for k in ("docker_image", "docker_image_tag",
+                                             "docker_image_digest", "internal_ports",
+                                             "environment", "entrypoint", "startup_commands")}
     h = hashlib.sha256(json.dumps(keyed, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     return f"cascade-worker-{payload['docker_image_tag']}-{h}"
 

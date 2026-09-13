@@ -972,6 +972,12 @@ class RoundConfig:
     # Digest-pinned worker image funded pods launch from (full ref,
     # ``…@sha256:…`` — the same image the operator's final fleet runs).
     funded_pod_image: str = ""
+    # sha256 fingerprint of the pinned image's ``cascade/**/*.py``
+    # (cascade.provision.codeprint; scripts/worker_code_fingerprint.py derives
+    # it from the registry). Checked from the pod's FILES before any final /
+    # funded dispatch — a host that starts a stale image under the pinned tag
+    # still echoes the injected digest env, this it cannot fake. Empty ⇒ off.
+    worker_code_fingerprint: str = ""
     # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
     funded_ready_timeout_seconds: float = 900.0
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
@@ -2155,6 +2161,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             payer_vault_dir=str(r.get("payer_vault_dir", "")),
             funded_pod_sku=str(r.get("funded_pod_sku", "")),
             funded_pod_image=str(r.get("funded_pod_image", "")),
+            worker_code_fingerprint=str(r.get("worker_code_fingerprint", "")).strip().lower(),
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", 900.0)),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
