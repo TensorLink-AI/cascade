@@ -1098,3 +1098,22 @@ def test_bad_funded_pod_checkpoint_value_fails_loud(tmp_path):
     runner = _runner(tmp_path, funded_pod_checkpoint="maybe")
     with pytest.raises(RuntimeError, match="funded_pod_checkpoint"):
         runner._funded_harvest()
+
+
+def test_private_vault_king_gets_its_zip_staged_on_the_jit_pod(tmp_path):
+    # 2026-09-13: 5Eo6 (a funded, private-vault miner) took the throne; the JIT
+    # king pod is operator-rented and never staged the ZIP, so the king leg died
+    # on every retry with generator_artifact_unreachable.
+    from cascade.trainer.loop import TrainerRunner
+
+    runner = _runner(tmp_path)
+    runner._stage_king_vault = TrainerRunner._stage_king_vault.__get__(runner)
+    staged = []
+    runner._stage_vault_zip_on = lambda host, digest: staged.append(digest) or ("staged", host)
+    host = object()
+    vault_king = _challenger("kingHK", ref="vault/direct@sha256:" + "d" * 64)
+    assert runner._stage_king_vault(host, vault_king) == ("staged", host)
+    assert staged == ["d" * 64]
+    public_king = _challenger("kingHK", ref="tonybilling/gen-64a0412cd332@hf:abc")
+    assert runner._stage_king_vault(host, public_king) is host      # untouched
+    assert staged == ["d" * 64]
