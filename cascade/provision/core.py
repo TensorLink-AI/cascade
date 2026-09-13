@@ -949,16 +949,25 @@ class LiumProvider:
         return next((p for p in self._list_pods()
                      if pod_id in (p.get("name"), p.get("huid"), p.get("id"))), None)
 
-    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
-        return len(self._list_executors(sku, gpus=gpus)) >= count
+    def available(self, sku: str, count: int, *, gpus: int = 1,
+                  exclude_ids: tuple[str, ...] = ()) -> bool:
+        return self.capacity(sku, gpus=gpus, exclude_ids=exclude_ids) >= count
 
-    def capacity(self, sku: str, *, gpus: int = 1) -> int:
-        """How many ``sku`` machines the marketplace offers RIGHT NOW.
+    def capacity(self, sku: str, *, gpus: int = 1,
+                 exclude_ids: tuple[str, ...] = ()) -> int:
+        """How many ``sku`` machines the marketplace offers RIGHT NOW, minus
+        ``exclude_ids`` (executors this round already claimed — a probe that
+        counts them says "1" while ``launch`` says "0 after exclusions", and
+        the king rent loop spun on exactly that at ~1 attempt/1.5 s for 136
+        attempts on 2026-09-13 02:26).
 
         A snapshot, not a reservation — other renters race it, so callers
         must treat the number as advisory and keep a requeue path for rents
         that lose the race (the funded taxonomy's ``no_capacity``)."""
-        return len(self._list_executors(sku, gpus=gpus))
+        execs = self._list_executors(sku, gpus=gpus)
+        if exclude_ids:
+            execs = [e for e in execs if str(e.get("id")) not in exclude_ids]
+        return len(execs)
 
     def launch(self, spec: LaunchSpec) -> list[str]:
         execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)

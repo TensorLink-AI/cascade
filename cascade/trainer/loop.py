@@ -1586,7 +1586,7 @@ class TrainerRunner:
                 log.info("%s: operator final lane(s) on file — leaving the %s wait "
                          "for an operator lane (operator-billed)", describe, sku)
                 return "operator"
-            n = self._probe_funded_capacity(sku)
+            n = self._probe_funded_capacity(sku, self._claimed_executors())
             if n:
                 if polled:
                     log.info("%s: %s capacity appeared (%d) after %d poll(s)",
@@ -1600,6 +1600,15 @@ class TrainerRunner:
             polled += 1
             sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
         return False
+
+    def _claimed_executors(self) -> tuple[str, ...]:
+        """Executors this round's rents already claimed (never re-picked)."""
+        lock = getattr(self, "_funded_exec_lock", None)
+        claimed = getattr(self, "_funded_claimed_execs", None) or ()
+        if lock is None:
+            return tuple(sorted(claimed))
+        with lock:
+            return tuple(sorted(claimed))
 
     def _operator_fallback_lanes(self) -> list:
         """Operator FINAL lanes a waiting funded leg may fall back to: fresh
@@ -1620,12 +1629,15 @@ class TrainerRunner:
         return [h for h in hosts
                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
 
-    def _probe_funded_capacity(self, sku: str) -> int | None:
-        """``sku``'s marketplace availability on the OPERATOR's key, or None."""
+    def _probe_funded_capacity(self, sku: str,
+                               exclude_ids: tuple[str, ...] = ()) -> int | None:
+        """``sku``'s marketplace availability on the OPERATOR's key, or None.
+        ``exclude_ids`` = executors this round already claimed: a count that
+        includes them is capacity no rent can use."""
         try:
             from ..provision.core import LiumProvider
 
-            return LiumProvider().capacity(sku)
+            return LiumProvider().capacity(sku, exclude_ids=exclude_ids)
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
             log.warning("funded capacity probe for %s failed: %s", sku, e)
             return None
@@ -2405,7 +2417,7 @@ class TrainerRunner:
                 # A sold-out marketplace is not a round failure: wait for a GPU
                 # (outside the rent lock) up to the round's latest safe start —
                 # the legs then rent independently as machines appear.
-                if not provider.capacity(sku):
+                if not provider.capacity(sku, exclude_ids=self._claimed_executors()):
                     waited = self._wait_for_funded_capacity(sku, describe="king rent")
                     if waited == "operator":
                         # Owner-armed hybrid: the king trains on an operator
@@ -2469,6 +2481,14 @@ class TrainerRunner:
                                  f"(attempt {attempt}): {e}")
                     log.warning("king rent attempt %d failed (%s); renting again on "
                                 "another executor", attempt, e)
+                    from ..funding.faults import classify_rent_failure
+
+                    if classify_rent_failure(str(e)) == "no_capacity":
+                        # Sold out (or only claimed executors listed): the next
+                        # iteration's capacity check waits at the poll cadence
+                        # — never spin on the marketplace API (2026-09-13).
+                        sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+                        sleep(self.FUNDED_RENT_RETRY_SECONDS)
                     continue
                 self._funded_king_host = king_host
                 return self._funded_king_host
