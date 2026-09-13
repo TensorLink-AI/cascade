@@ -23,8 +23,9 @@ def _arm_wait(runner, *, deadline_offsets, capacity_seq):
     runner._rent_wait_sleep = lambda s: clock.__setitem__("t", clock["t"] + max(s, 1.0))
     runner._funded_rent_wait_deadline = lambda: 1000.0 + deadline_offsets
     seq = list(capacity_seq)
-    runner._probe_funded_capacity = lambda sku: seq.pop(0) if seq else 0
+    runner._probe_funded_capacity = lambda sku, exclude_ids=(): seq.pop(0) if seq else 0
     runner._wait_for_funded_capacity = TrainerRunner._wait_for_funded_capacity.__get__(runner)
+    runner._claimed_executors = TrainerRunner._claimed_executors.__get__(runner)
     runner.FUNDED_RENT_RETRY_SECONDS = TrainerRunner.FUNDED_RENT_RETRY_SECONDS
     return clock
 
@@ -119,7 +120,7 @@ def _king_runner(tmp_path, monkeypatch, *, ready_seq, deadline_offsets):
 
     class _Prov:
         name = "lium"
-        def capacity(self, sku, *, gpus=1):
+        def capacity(self, sku, *, gpus=1, exclude_ids=()):
             return 1
         def launch(self, spec):
             launched.append(spec.exclude_ids)
@@ -183,3 +184,38 @@ def test_deadline_math_from_epoch_geometry(cfg, tmp_path):
     runner._funded_epoch_end_wall = None
     runner._stage_ctx = {}
     assert runner._funded_rent_wait_deadline() <= time.time() + 1.0
+
+
+# ── the king rent never spins on the marketplace API (2026-09-13 02:26) ──────
+
+def test_wait_probes_capacity_minus_the_rounds_claimed_executors(tmp_path):
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=3600, capacity_seq=[0])
+    seen = []
+    runner._funded_claimed_execs = {"exec-b", "exec-a"}
+    runner._probe_funded_capacity = lambda sku, exclude_ids=(): seen.append(exclude_ids) or 1
+    assert runner._wait_for_funded_capacity("RTX4090", describe="x") is True
+    assert seen == [("exec-a", "exec-b")]
+
+
+def test_king_rent_backs_off_when_only_claimed_executors_are_listed(tmp_path, monkeypatch):
+    import cascade.provision.core as core_mod
+    from cascade.provision.core import ProvisionError
+
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[True],
+                                     deadline_offsets=3600)
+    t0 = r._rent_wait_now()
+    fails = ["lium: only 0 × 1xRTX4090 available after exclusions, need 1"] * 3
+    prov_cls = core_mod.LiumProvider          # the fake installed by _king_runner
+    real_launch = prov_cls.launch
+
+    def launch(self, spec):
+        if fails:
+            raise ProvisionError(fails.pop(0))
+        return real_launch(self, spec)
+
+    monkeypatch.setattr(prov_cls, "launch", launch)
+    host = r._rent_king_host("42")
+    assert host is not None and len(launched) == 1              # eventually rented
+    # Every sold-out failure slept a full poll interval: no hot loop on the API.
+    assert r._rent_wait_now() - t0 >= 3 * TrainerRunner.FUNDED_RENT_RETRY_SECONDS
