@@ -61,6 +61,15 @@ class CorpusError(RuntimeError):
     """Importing or running the generator failed, or its output was rejected."""
 
 
+# Prefix of the CorpusError a training leg raises when its loss goes
+# non-finite (and of the orchestrator's failure record when it catches the
+# resulting NaN checkpoint instead). The worker exits 3 on it, so the
+# orchestrator classes it "generator": the miner's series overflowed the
+# contract's numerics — 2026-09-14, a funded leg's loss went NaN at step 150
+# of 152400 and trained 2.5 h of NaN weights that no scorer can use.
+DIVERGED_MARKER = "training diverged"
+
+
 # ─────────────── shared real corpus (DEC-CA-0028; inert until armed) ─────────
 
 # Override for the machine-local materialisation cache of the owner-published

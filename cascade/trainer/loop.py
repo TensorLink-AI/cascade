@@ -68,7 +68,7 @@ from ..shared.manifest import (
     sign_manifest,
 )
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
-from .corpus import CorpusError, build_round_corpus
+from .corpus import DIVERGED_MARKER, CorpusError, build_round_corpus
 from .host_probe import host_snapshot, host_summary_line
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
@@ -128,6 +128,15 @@ class _FundedTamper(Exception):
     """A funded pod failed its identity pin (replaced under the same name, or
     a different container answering at its address). Miner fault, terminal,
     hotkey spent."""
+
+
+class _FundedDiverged(Exception):
+    """A leg came back with a checkpoint whose weights are NaN/inf
+    (:class:`cascade.eval.checkpoint_guard.CheckpointDiverged`): the run
+    diverged on the miner's corpus. A challenger's is a generator fault
+    (their shot, like the worker's own rc=3 on the same condition — see
+    ``toto2_trainer.check_loss_finite``); the king's aborts the final, since
+    a NaN entry would break every validator's verdict for the round."""
 
 
 class _FundedLegSkip(Exception):
@@ -2248,7 +2257,12 @@ class TrainerRunner:
         ``None`` when it passes (cascade.eval.checkpoint_guard: repo-identical
         code, contract config, pinned weight shapes and size). Unfetchable
         counts as a mismatch — an entry we cannot inspect is not published."""
-        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from ..eval.checkpoint_guard import (
+            CheckpointDiverged,
+            CheckpointTampered,
+            verify_checkpoint,
+            verify_weights_finite,
+        )
         from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
         from ..shared.manifest import parse_trained_pointer
 
@@ -2261,11 +2275,39 @@ class TrainerRunner:
                     / HubRef.parse(ref).digest.replace(":", "-"))
             fetch_from_hub(ref, dest, HubConfig.from_storage(self.cfg.storage))
             verify_checkpoint(dest, contract)
+            verify_weights_finite(dest)
         except CheckpointTampered as e:
             return str(e)
+        except CheckpointDiverged as e:
+            # Not a mismatch: the run diverged. Its own class, its own verdict.
+            raise _FundedDiverged(str(e)) from e
         except Exception as e:  # noqa: BLE001 — unfetchable ⇒ not publishable
             return f"could not fetch/inspect the checkpoint: {str(e)[:200]}"
         return None
+
+    def _refuse_diverged_king(self, entry, contract) -> None:
+        """Abort the final on a king checkpoint whose weights are NaN/inf.
+
+        The king's pod pushes its checkpoint itself; fetch it back and run the
+        finiteness check before it can be paired in a manifest — a NaN king
+        entry makes every validator's scorer raise and costs the whole round
+        its verdict. Unfetchable is an infra failure of the final (we never
+        publish what we could not inspect)."""
+        from ..eval.checkpoint_guard import CheckpointDiverged, verify_weights_finite
+        from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
+        from ..shared.manifest import parse_trained_pointer
+
+        pointer = str(getattr(entry, "trained_pointer", "") or "")
+        ref = parse_trained_pointer(pointer)
+        if ref is None:
+            raise RuntimeError(f"king leg returned a malformed trained_pointer {pointer!r}")
+        dest = (self.work_root / "_funded_ckpt_guard"
+                / HubRef.parse(ref).digest.replace(":", "-"))
+        fetch_from_hub(ref, dest, HubConfig.from_storage(self.cfg.storage))
+        try:
+            verify_weights_finite(dest)
+        except CheckpointDiverged as e:
+            raise _FundedDiverged(f"king checkpoint: {e}") from e
 
     def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
                                    suffix: str):
@@ -2276,7 +2318,12 @@ class TrainerRunner:
         Any guard deviation raises :class:`_FundedTamper` (miner fault,
         terminal); a transport/upload failure raises plain (infra — the
         miner's training was fine, the operator's pull was not)."""
-        from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
+        from ..eval.checkpoint_guard import (
+            CheckpointDiverged,
+            CheckpointTampered,
+            verify_checkpoint,
+            verify_weights_finite,
+        )
         from .remote import harvest_remote_dir
 
         dest = (self.work_root / "_funded_harvest" / f"{seeds.base_seed}"
@@ -2284,8 +2331,13 @@ class TrainerRunner:
         harvest_remote_dir(host, receipt.checkpoint_dir, dest)
         try:
             verify_checkpoint(dest, contract)
+            # Only after the header bounded the file: a NaN/inf checkpoint is
+            # the miner's diverged run, refused BEFORE the upload.
+            verify_weights_finite(dest)
         except CheckpointTampered as e:
             raise _FundedTamper(f"checkpoint: {e}") from e
+        except CheckpointDiverged as e:
+            raise _FundedDiverged(str(e)) from e
         size = contract.arch_preset
         ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                      f"{receipt.role}-{size}{suffix}")
@@ -2716,6 +2768,13 @@ class TrainerRunner:
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
                                         miner_fault=True, error_class="tamper",
+                                        burn=False)
+            raise
+        except _FundedDiverged as e:
+            # The same verdict the worker's own rc=3 gives a non-finite loss
+            # (check_loss_finite): the miner's corpus, the miner's shot.
+            self._record_funded_failure(gen.hotkey, f"{DIVERGED_MARKER}: {e}",
+                                        miner_fault=True, error_class="generator",
                                         burn=False)
             raise
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise for the drop
@@ -6253,6 +6312,10 @@ class TrainerRunner:
                         warm_start_ref=warm_start_ref,
                         **({"repo_suffix": suffix} if suffix else {}),
                     )
+                    # A NaN king must never be paired: refuse it here, before
+                    # the final can publish it (aborts the final — the round's
+                    # king failure path retries; see _refuse_diverged_king).
+                    self._refuse_diverged_king(entry, contract)
                     # The bench and scratch shadow target the king's pod — it
                     # stays up through the round; the boundary sweep reaps it.
                     self._final_role_hosts[

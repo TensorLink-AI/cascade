@@ -8,11 +8,13 @@ from pathlib import Path
 import pytest
 
 from cascade.eval.checkpoint_guard import (
+    CheckpointDiverged,
     CheckpointTampered,
     expected_checkpoint_code,
     safetensors_header,
     verify_checkpoint,
     verify_checkpoint_code,
+    verify_weights_finite,
 )
 
 torch = pytest.importorskip("torch")
@@ -168,3 +170,23 @@ def test_historical_model_py_is_still_refused(tmp_path, contract):
     (d / "model.py").write_bytes(b"# any non-identical bytes\n")
     with pytest.raises(CheckpointTampered, match="model.py differs"):
         verify_checkpoint_code(d)
+
+
+def test_non_finite_weights_are_refused_as_divergence_not_tamper(tmp_path, contract):
+    # 2026-09-14: a funded leg's loss went NaN at step 150 and it trained on
+    # for 2.5 h; NaN weights forecast NaN samples and the validator's scorer
+    # raises on them — so ingest refuses the checkpoint, as its own class.
+    from safetensors.torch import load_file, save_file
+
+    d = _honest_checkpoint(tmp_path, contract)
+    verify_checkpoint(d, contract)
+    verify_weights_finite(d)                       # honest weights pass
+    state = load_file(str(d / "weights.safetensors"))
+    names = sorted(state)
+    state[names[0]].view(-1)[0] = float("nan")
+    state[names[-1]].view(-1)[-1] = float("inf")
+    save_file(state, str(d / "weights.safetensors"))
+    verify_checkpoint(d, contract)                 # header/shape guard still passes
+    with pytest.raises(CheckpointDiverged, match="2 tensor"):
+        verify_weights_finite(d)
+    assert not issubclass(CheckpointDiverged, CheckpointTampered)

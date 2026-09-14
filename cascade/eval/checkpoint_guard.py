@@ -51,6 +51,7 @@ _HISTORICAL_WRAPPER_SHA256 = frozenset({
 })
 
 __all__ = [
+    "CheckpointDiverged",
     "CheckpointReport",
     "CheckpointTampered",
     "WEIGHTS_FILE",
@@ -58,6 +59,7 @@ __all__ = [
     "safetensors_header",
     "verify_checkpoint",
     "verify_checkpoint_code",
+    "verify_weights_finite",
 ]
 
 WEIGHTS_FILE = "weights.safetensors"
@@ -75,6 +77,17 @@ _DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "I64": 8, "I32": 4,
 
 class CheckpointTampered(RuntimeError):
     """The checkpoint deviates from what the contract could have produced."""
+
+
+class CheckpointDiverged(RuntimeError):
+    """The checkpoint's weights hold NaN/inf: the training run diverged.
+
+    Not tampering — the contract's own loop produces this when a corpus
+    overflows its numerics (2026-09-14: a funded leg's loss went NaN at step
+    150 of 152400 and trained on for 2.5 h) — but a checkpoint no scorer can
+    use: NaN weights forecast NaN samples, and the validator's scorer refuses
+    non-finite samples for the whole entry. Caught at ingest so it never
+    reaches a manifest."""
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,29 @@ def verify_checkpoint_code(checkpoint_dir: Path | str) -> None:
             raise CheckpointTampered(
                 f"{name} differs from this release's copy — a checkpoint's "
                 "code is never executed unless it is byte-identical")
+
+
+def verify_weights_finite(checkpoint_dir: Path | str) -> None:
+    """Refuse a checkpoint whose floating-point weights are not all finite.
+
+    Loads the tensors, so call it AFTER :func:`verify_checkpoint` has bounded
+    the file by its header (never on an unverified file). Raises
+    :class:`CheckpointDiverged` naming the first offending tensors.
+    """
+    import torch
+    from safetensors import safe_open
+
+    p = Path(checkpoint_dir) / WEIGHTS_FILE
+    bad: list[str] = []
+    with safe_open(str(p), framework="pt", device="cpu") as f:
+        for name in list(f.keys()):
+            t = f.get_tensor(name)
+            if t.is_floating_point() and not bool(torch.isfinite(t).all()):
+                bad.append(str(name))
+    if bad:
+        raise CheckpointDiverged(
+            f"{WEIGHTS_FILE}: {len(bad)} tensor(s) hold non-finite values "
+            f"(e.g. {bad[:3]}) — the training run diverged")
 
 
 def safetensors_header(path: Path | str) -> dict:
