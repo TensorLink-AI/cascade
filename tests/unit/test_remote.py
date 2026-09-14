@@ -668,3 +668,28 @@ def test_probe_worker_runtime_reports_ssh_failure(monkeypatch):
     monkeypatch.setattr(rmod.subprocess, "run", lambda *a, **k: _P())
     why = rmod.probe_worker_runtime(_host())
     assert "rc=255" in why
+
+
+def test_dispatch_rc3_reason_skips_the_shell_job_control_notice():
+    """2026-09-14 09:38: under `set -m` bash appends "[1]+  Exit 3 …" to stderr
+    AFTER the worker's reason line; relaying the last line lost the
+    generator_stalled marker and a host stall was classed as the miner's
+    fault. The worker's tagged reason wins; job-control notices never do."""
+    from cascade.trainer.remote import rejection_reason
+
+    stderr = ("2026-09-14 09:38:12,001 ERROR cascade.trainer.worker: miner submission "
+              "rejected: generator_stalled: no series for 1800s\n"
+              "[1]+  Exit 3                  CUDA_VISIBLE_DEVICES=0 /root/cascade/.venv/bin/"
+              "python -m cascade.trainer.worker --gen-ref vault/direct@sha256:abc < /dev/null\n")
+    assert rejection_reason(stderr) == "generator_stalled: no series for 1800s"
+    disp = RemoteDispatcher(trainer_spec="m:C",
+                            _runner=lambda argv, t, s=None: _fake_proc(rc=3, stderr=stderr))
+    with pytest.raises(RemoteDispatchError) as ei:
+        disp.dispatch(_host(), gen_ref="ns/gen@sha256:" + "a" * 64, uid=0, hotkey="hk",
+                      role="challenger", base_seed=1, block=10)
+    assert "generator_stalled" in str(ei.value) and "Exit 3" not in str(ei.value)
+    # No tagged line: the last NON-job-control line is the reason; a bare
+    # job-control notice alone yields the placeholder.
+    assert rejection_reason("something odd happened\n[2]-  Done   sleep 1\n") == "something odd happened"
+    assert rejection_reason("[1]+  Exit 3   cmd\n") == "(no reason)"
+    assert rejection_reason("") == "(no reason)"
