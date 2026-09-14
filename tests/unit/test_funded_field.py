@@ -430,3 +430,20 @@ def test_shadow_mode_never_promotes(tmp_path):
     runner = _runner(tmp_path, funded_mode="shadow")
     runner._filter_funded_challengers([_challenger("hkPend", reveal_block=120)])
     assert _queue(tmp_path).get("hkPend").status == "pending_reveal"
+
+
+def test_funded_cpu_blocklist_parses_from_toml(tmp_path):
+    """Knob round-trip: the dataclass field alone would make TOML arming a
+    silent no-op (config knobs need loader parsing)."""
+    from pathlib import Path
+
+    from cascade.shared.config import load_chain_config
+
+    repo_toml = Path(__file__).resolve().parents[2] / "chain.toml"
+    assert load_chain_config(repo_toml).round.funded_cpu_blocklist == ("Xeon(R) CPU E5-2",)
+    src = repo_toml.read_text(encoding="utf-8")
+    edited = src.replace('funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]',
+                         'funded_cpu_blocklist = [" e5-2673 ", "", "Gold 61"]')
+    assert edited != src
+    (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
+    assert load_chain_config(tmp_path / "chain.toml").round.funded_cpu_blocklist == ("e5-2673", "Gold 61")

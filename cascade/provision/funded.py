@@ -88,6 +88,15 @@ def lium_provider_for_key(api_key: str) -> Provider:
     return LiumProvider(api_key=api_key)
 
 
+def apply_cpu_blocklist(provider: Provider, blocklist: tuple[str, ...]) -> Provider:
+    """Hand ``[round] funded_cpu_blocklist`` to a provider that can steer its
+    listings by CPU model (``LiumProvider.cpu_blocklist``); providers without
+    the seam (other clouds, test fakes) are returned untouched."""
+    if blocklist and hasattr(provider, "cpu_blocklist"):
+        provider.cpu_blocklist = tuple(blocklist)
+    return provider
+
+
 def terminate_verified(provider: Provider, pod_id: str) -> bool:
     """Terminate and CONFIRM by re-listing; True only when the pod is gone.
 
@@ -175,6 +184,7 @@ def rent_funded_pod(
     gpus_per_pod: int = 1,
     ready_timeout: float = 900.0,
     exclude_ids: tuple[str, ...] = (),
+    cpu_blocklist: tuple[str, ...] = (),
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     host_key_scanner: Callable[[str, int], str] | None = None,
@@ -201,7 +211,7 @@ def rent_funded_pod(
 
     name = funded_pod_name(round_id, hotkey, netuid)
     try:
-        provider = provider_factory(api_key)
+        provider = apply_cpu_blocklist(provider_factory(api_key), cpu_blocklist)
     except Exception as e:  # noqa: BLE001 — a bad key must classify, not crash the round
         return _fail(e)
 
