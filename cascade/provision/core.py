@@ -1082,6 +1082,19 @@ class LiumProvider:
         pod = self._pod(pod_id)
         return lium_pod_address(pod) if pod else None
 
+    def live_pod_address(self, pod_id: str) -> PodAddress | None:
+        """``pod_id``'s SSH endpoint iff the pod EXISTS and is RUNNING with
+        one (``lium_pod_ready``); ``None`` for an absent, booting, or
+        port-less (cooldown) pod. Unlike :meth:`get_ip` — which answers for
+        any listed pod — this is the adoption check: the trainer's king-rent
+        retry uses it to reuse a pod that is still up from a prior attempt of
+        the same round (2026-09-14: a finished 3 h king checkpoint sat on a
+        live pod while the retry rented a fresh one and retrained)."""
+        pod = self._pod(pod_id)
+        if not pod or not lium_pod_ready(pod):
+            return None
+        return lium_pod_address(pod)
+
     def _executor_of_pod(self, pod_id: str) -> str:
         """The executor a live pod sits on: this instance's own launch record,
         else the API's pod record (the CLI's ``ps`` JSON carries no executor)."""
