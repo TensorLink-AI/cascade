@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import subprocess
 import tomllib
@@ -363,6 +364,33 @@ def ssh_transport_options(host: RemoteHost) -> list[str]:
     return argv
 
 
+_JOB_CONTROL_LINE = re.compile(r"^\[\d+\][+-]?\s+(Exit|Done|Killed|Terminated|Stopped|Hangup)\b")
+_REJECTION_TAG = "miner submission rejected:"
+
+
+def rejection_reason(stderr: str | None) -> str:
+    """The worker's one-line rejection reason out of a dispatch's stderr.
+
+    The remote command runs the worker as a background job under ``set -m``
+    (so its process group can be killed as a unit), and bash then reports the
+    job's exit on stderr — ``[1]+  Exit 3  CUDA_VISIBLE_DEVICES=0 …`` — as the
+    LAST line. Taking "the last stderr line" (the pre-2026-09-14 rule) relayed
+    that shell notice instead of the worker's reason, and downstream the
+    ``generator_stalled`` marker went missing: a stall on a slow host was
+    classed as the miner's own generator fault (their shot spent) instead of
+    the unburned stall class (2026-09-14 09:38, uid 78). Prefer the worker's
+    tagged line; otherwise the last line that is not a job-control notice.
+    """
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if _REJECTION_TAG in ln:
+            return ln.split(_REJECTION_TAG, 1)[1].strip() or ln
+    for ln in reversed(lines):
+        if not _JOB_CONTROL_LINE.match(ln):
+            return ln
+    return "(no reason)"
+
+
 def build_ssh_argv(host: RemoteHost, remote_command: str) -> list[str]:
     """The local ``ssh`` argv that runs ``remote_command`` on ``host``."""
     return ["ssh", *ssh_transport_options(host), f"{host.user}@{host.host}", remote_command]
@@ -609,11 +637,11 @@ class RemoteDispatcher:
         except subprocess.TimeoutExpired as e:
             raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
         if proc.returncode == 3:
-            # Worker rc=3 = miner submission rejected (CorpusError): the last
-            # stderr line is the one-line reason — no traceback to relay.
-            reason = (proc.stderr or "").strip().splitlines()[-1:] or ["(no reason)"]
+            # Worker rc=3 = miner submission rejected (CorpusError): the
+            # worker's one-line reason — no traceback to relay.
             raise RemoteDispatchError(
-                f"remote {role} on {host.name}: miner submission rejected: {reason[0]}",
+                f"remote {role} on {host.name}: miner submission rejected: "
+                f"{rejection_reason(proc.stderr)}",
                 returncode=3,
             )
         if proc.returncode != 0:
