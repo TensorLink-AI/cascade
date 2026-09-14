@@ -78,7 +78,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_funded_checkpoint_mismatch",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
-                 "_rent_king_host", "_teardown_operator_pod",
+                 "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
@@ -1117,3 +1117,30 @@ def test_private_vault_king_gets_its_zip_staged_on_the_jit_pod(tmp_path):
     public_king = _challenger("kingHK", ref="tonybilling/gen-64a0412cd332@hf:abc")
     assert runner._stage_king_vault(host, public_king) is host      # untouched
     assert staged == ["d" * 64]
+
+
+def test_round_entry_sweep_keeps_this_rounds_king_pod_for_adoption(tmp_path, monkeypatch):
+    """2026-09-14: the retry's sweep destroyed the king pod that held a
+    complete (upload-failed) checkpoint. The round-entry sweep keeps THIS
+    round's king pod; every other round's operator pod still goes."""
+    r = _runner(tmp_path)
+    mine = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
+                       stage="funded", rented_at_iso="2026-09-14T00:00:00Z",
+                       sku="RTX4090", gpus=1, payer_hotkey="")
+    stale = PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
+                        stage="funded", rented_at_iso="2026-09-13T00:00:00Z",
+                        sku="RTX4090", gpus=1, payer_hotkey="")
+    r._ledger_add(mine)
+    r._ledger_add(stale)
+    ops = []
+    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
+                                            r._ledger_remove(pod.instance_id))
+    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
+    r._reconcile_funded_pods(keep_round_id="4242")
+    assert ops == ["cascade-n91-4141-funded-king-0"]
+    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
+    # The boundary sweep (no round to keep) still clears it.
+    r._reconcile_funded_pods()
+    assert ops[-1] == "cascade-n91-4242-funded-king-0"
+    assert r._load_funded_ledger() == []

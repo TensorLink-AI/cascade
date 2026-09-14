@@ -219,3 +219,59 @@ def test_king_rent_backs_off_when_only_claimed_executors_are_listed(tmp_path, mo
     assert host is not None and len(launched) == 1              # eventually rented
     # Every sold-out failure slept a full poll interval: no hot loop on the API.
     assert r._rent_wait_now() - t0 >= 3 * TrainerRunner.FUNDED_RENT_RETRY_SECONDS
+
+
+# ── adopt-before-rent (2026-09-14: a finished king checkpoint on a live pod) ──
+
+
+def test_king_rent_adopts_this_rounds_live_pod_instead_of_renting(tmp_path, monkeypatch):
+    """A retry finds the previous attempt's king pod still RUNNING: adopt it
+    (attested like a fresh rent) — no `lium up`, nothing torn down — so the
+    worker's retry-without-retrain marker on that pod is reachable."""
+    from cascade.provision.core import PodAddress
+
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[True],
+                                     deadline_offsets=3600)
+    import cascade.provision.core as core_mod
+    seen = []
+    core_mod.LiumProvider.live_pod_address = (
+        lambda self, pod_id: (seen.append(pod_id) or PodAddress(ip="7.7.7.7", ssh_port=42000))
+        if pod_id == "cascade-n91-42-funded-king-0" else None)
+    host = r._rent_king_host("42")
+    assert (host.host, host.port) == ("7.7.7.7", 42000)
+    assert seen == ["cascade-n91-42-funded-king-0"]
+    assert launched == [] and torn == []
+    assert r._rent_king_host("42") is host                      # cached for the round
+
+
+def test_king_rent_tears_down_an_adopted_pod_that_fails_attestation(tmp_path, monkeypatch):
+    """An adopted pod gets the same runtime probe as a fresh rent; a stale
+    runtime is a lemon — torn down, then the ordinary rent proceeds."""
+    from cascade.provision.core import PodAddress
+
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[True],
+                                     deadline_offsets=3600)
+    import cascade.provision.core as core_mod
+    core_mod.LiumProvider.live_pod_address = (
+        lambda self, pod_id: PodAddress(ip="7.7.7.7", ssh_port=42000))
+    probes = []
+
+    def _probe(host, **kw):
+        probes.append(host.host)
+        return "runtime image mismatch" if host.host == "7.7.7.7" else ""
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime", _probe)
+    host = r._rent_king_host("42")
+    assert (host.host, host.port) == ("9.9.9.9", 41000)           # the fresh rent
+    assert probes == ["7.7.7.7", "9.9.9.9"]
+    assert torn == ["cascade-n91-42-funded-king-0"]               # adopted lemon torn down
+    assert len(launched) == 1
+
+
+def test_king_rent_without_adoption_support_rents_as_before(tmp_path, monkeypatch):
+    """A provider without ``live_pod_address`` (the test fake, other clouds)
+    takes the unchanged rent path."""
+    r, launched, torn = _king_runner(tmp_path, monkeypatch, ready_seq=[True],
+                                     deadline_offsets=3600)
+    host = r._rent_king_host("42")
+    assert (host.host, host.port) == ("9.9.9.9", 41000)
+    assert len(launched) == 1 and torn == []

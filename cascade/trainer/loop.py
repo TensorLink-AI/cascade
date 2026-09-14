@@ -20,6 +20,7 @@ Hippius; the GPU / registry / S3 / chain calls are isolated in
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
@@ -753,6 +754,14 @@ def _bench_role_dir(duel: list, entry) -> str:
     if sum(1 for e in duel if e.role == "challenger") <= 1:
         return entry.role
     return f"{entry.role}-u{entry.miner_uid}"
+
+
+def king_pod_name_prefix(netuid: int, round_id: str) -> str:
+    """Name prefix of a round's JIT king pod (``<prefix>-0``). The n<netuid>
+    token keeps it OUT of both the provisioner's reaper scheme (which must
+    never touch trainer-ledgered pods) and any co-hosted deployment's sweep
+    (review 2026-09-02); the round id lets a retry recognise its own pod."""
+    return f"cascade-n{netuid}-{round_id}-funded-king"
 
 
 @dataclass
@@ -1939,10 +1948,19 @@ class TrainerRunner:
                 [x for x in self._load_funded_ledger()
                  if x.instance_id != instance_id])
 
-    def _reconcile_funded_pods(self) -> None:
+    def _reconcile_funded_pods(self, *, keep_round_id: str | None = None) -> None:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
         orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
-        API hiccup must never hold a boundary."""
+        API hiccup must never hold a boundary.
+
+        ``keep_round_id`` — the round about to run: ITS operator king pod is
+        left alone. ``run_round`` also sweeps on every RETRY of the same
+        round, and the JIT king pod of the failed attempt may still hold a
+        complete checkpoint whose only failure was the upload (the
+        ``.train_complete`` marker); tearing it down here forced a full 3 h
+        retrain (2026-09-14 03:27, round 9061200). :meth:`_rent_king_host`
+        adopts that pod instead. Every other round's king pod still goes.
+        """
         if self._effective_funded_pods() != "rent":
             return
         from ..provision.funded import reconcile_funded, teardown_funded
@@ -1955,6 +1973,11 @@ class TrainerRunner:
             # a missing/mis-set vault must not leave operator pods billing
             # (review 2026-09-02).
             for pod in [x for x in pods if not x.payer_hotkey]:
+                if keep_round_id and self._is_king_pod_of(pod.instance_id, keep_round_id):
+                    log.info("funded sweep: keeping %s — this round's own king pod "
+                             "(a retry adopts it; a complete checkpoint there "
+                             "skips the retrain)", pod.instance_id)
+                    continue
                 self._teardown_operator_pod(pod)
             vault = self._payer_vault()
             if vault is None:
@@ -1981,6 +2004,10 @@ class TrainerRunner:
                              netuid=self.cfg.subnet.netuid)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
+
+    def _is_king_pod_of(self, instance_id: str, round_id: str) -> bool:
+        prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(round_id))
+        return str(instance_id).startswith(prefix + "-")
 
     def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
                                error_class: str, burn: bool) -> None:
@@ -2411,10 +2438,16 @@ class TrainerRunner:
                           ).read_text(encoding="utf-8").strip()
             sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
             provider = LiumProvider()
-            # The n<netuid> token keeps this OUT of both the provisioner's
-            # reaper scheme (which must never touch trainer-ledgered pods) and
-            # any co-hosted deployment's sweep (review 2026-09-02).
-            name_prefix = f"cascade-n{self.cfg.subnet.netuid}-{round_id}-funded-king"
+            name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
+
+            def _king_remote(addr) -> RemoteHost:
+                return RemoteHost(
+                    name="funded-king", host=addr.ip, port=addr.ssh_port,
+                    user=profile.user, key_path=profile.key_path,
+                    remote_python=profile.remote_python, workdir=profile.workdir,
+                    cuda_device="0", chain_toml=profile.chain_toml,
+                    forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+                    stage="final")
 
             def _ledger_king(pod_id: str) -> None:
                 self._ledger_add(PodInstance(
@@ -2455,6 +2488,40 @@ class TrainerRunner:
                 raise ProvisionError(why)
 
             from .remote import probe_worker_runtime
+
+            # Adopt-before-rent: a RETRY of this round finds the previous
+            # attempt's king pod still up (the round-entry sweep keeps it).
+            # Reusing it is what makes the worker's retry-without-retrain
+            # marker reachable for a JIT king — the finished checkpoint lives
+            # in that pod's work dir. Same attestation as a fresh rent
+            # (deployed chain.toml push + runtime probe); a pod that fails it
+            # is torn down and the rent below proceeds as before.
+            live = getattr(provider, "live_pod_address", None)
+            addr = live(f"{name_prefix}-0") if live is not None else None
+            if addr is not None:
+                pod_id = f"{name_prefix}-0"
+                log.warning("king pod %s is still LIVE at %s:%d from a prior attempt "
+                            "of this round — adopting it instead of renting (a "
+                            "complete checkpoint there skips the retrain)",
+                            pod_id, addr.ip, addr.ssh_port)
+                machine = provider.machine_of(pod_id) or ""
+                if machine:
+                    with self._funded_exec_lock:
+                        self._funded_claimed_execs.add(machine)
+                try:
+                    king_host = self._push_deployed_chain_toml(_king_remote(addr))
+                    why = probe_worker_runtime(king_host)
+                    if why:
+                        _fail_king(pod_id, f"adopted king pod runtime rejected: {why}")
+                    self._funded_king_host = king_host
+                    return self._funded_king_host
+                except ProvisionError as e:
+                    log.warning("adopting king pod %s failed (%s); renting fresh", pod_id, e)
+                except Exception as e:  # noqa: BLE001 — unreachable pod ⇒ rent fresh
+                    log.warning("adopting king pod %s failed (%s); tearing it down and "
+                                "renting fresh", pod_id, e)
+                    with contextlib.suppress(ProvisionError):
+                        _fail_king(pod_id, f"adopted king pod unreachable: {e}")
 
             attempt = 0
             while True:
@@ -2497,13 +2564,7 @@ class TrainerRunner:
                     _ledger_king(pod_id)
                     log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
                              pod_id, addr.ip, addr.ssh_port, sku)
-                    king_host = RemoteHost(
-                        name="funded-king", host=addr.ip, port=addr.ssh_port,
-                        user=profile.user, key_path=profile.key_path,
-                        remote_python=profile.remote_python, workdir=profile.workdir,
-                        cuda_device="0", chain_toml=profile.chain_toml,
-                        forward_env=profile.forward_env, ssh_options=profile.ssh_options,
-                        stage="final")
+                    king_host = _king_remote(addr)
                     # JIT pod ⇒ no provisioner config push: deliver the deployed
                     # chain.toml (correct train_image_digest pin) before the probe.
                     king_host = self._push_deployed_chain_toml(king_host)
@@ -5022,7 +5083,8 @@ class TrainerRunner:
         # the previous round's JIT king, a crashed leg's payer pod, and any
         # launched-but-never-ledgered orphan all get torn down here, before
         # this round rents anything. Self-guarded to funded_pods="rent".
-        self._reconcile_funded_pods()
+        # THIS round's own king pod (a retry) is kept for adoption.
+        self._reconcile_funded_pods(keep_round_id=str(base_seed))
         # The screener keys a daily-snapshot eval pool by the round's epoch
         # boundary. The live loop supplies it as ``cutoff_block``; derive it for
         # direct callers (scripts, operators) so a bucket-backed pool never
