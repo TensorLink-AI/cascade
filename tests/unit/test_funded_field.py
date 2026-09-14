@@ -402,3 +402,31 @@ def test_settle_burns_a_tampered_leg(tmp_path):
     assert _queue(tmp_path).get("hkT").status == "failed"
     assert _queue(tmp_path).get("hkT").last_error_class == "tamper"
     assert "hkT" in _load_seen_hotkeys(tmp_path / "trainer_submissions.json")
+
+
+def test_required_promotes_pending_reveal_entries_from_the_rounds_field(tmp_path):
+    """2026-09-13 20:52: two submit-with-key miners revealed before the boundary
+    but their entries were still pending_reveal at seating (the intake's sweep
+    is request-driven and nobody hit it), so they missed the round. The
+    trainer now promotes pending entries whose (hotkey, ref) is in the round's
+    resolved field, using the reveal block it already has from chain."""
+    q = _queue(tmp_path)
+    q.add_pending("hkPend", REF)                       # revealed, never promoted
+    q.add_pending("hkOther", "ns/other@sha256:" + "b" * 64)   # revealed a DIFFERENT ref
+    q.add_pending("hkNoReveal", REF)                   # not in the field at all
+    runner = _runner(tmp_path, funded_mode="required", finalists=1, max_finalists=3)
+    field = [_challenger("hkPend", reveal_block=120), _challenger("hkOther", reveal_block=110)]
+    kept = runner._filter_funded_challengers(field)
+    assert [c.hotkey for c in kept] == ["hkPend"]
+    reread = _queue(tmp_path)
+    assert (reread.get("hkPend").status, reread.get("hkPend").reveal_block) == ("in_round", 120)
+    assert reread.get("hkOther").status == "pending_reveal"       # ref mismatch: untouched
+    assert reread.get("hkNoReveal").status == "pending_reveal"    # no reveal: untouched
+
+
+def test_shadow_mode_never_promotes(tmp_path):
+    q = _queue(tmp_path)
+    q.add_pending("hkPend", REF)
+    runner = _runner(tmp_path, funded_mode="shadow")
+    runner._filter_funded_challengers([_challenger("hkPend", reveal_block=120)])
+    assert _queue(tmp_path).get("hkPend").status == "pending_reveal"
