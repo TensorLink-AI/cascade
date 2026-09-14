@@ -22,14 +22,19 @@ transfers):
         X-Signature:     hex sr25519 by the hotkey over canonical_fund_message
                          (v2: binds sha256 of the API key too, so an on-path
                          replay cannot attach or swap a key)
+        X-Submission-Label: optional display name (≤32 chars, [A-Za-z0-9._-])
+                         shown beside the hotkey in the public queue, roster
+                         and heat standings — presentational, unsigned,
+                         never identity (DEC-CA-0043)
     → 202 {"status": "queued" | "replaced"}  |  200 "already-queued"
-    → 400 missing_lium_api_key / missing_hotkey / missing_ref /
+    → 400 missing_lium_api_key / missing_hotkey / missing_ref / bad_label /
           stale_timestamp / bad_signature      |  403 not_revealed / not_registered
     → 409 replayed_timestamp | 503 registration_unavailable
 
     POST /v1/submit     (body = the generator ZIP; same identity headers,
         X-Content-Digest: sha256:<hex> of the body — the SIGNED binding —
-        and optionally X-Lium-Api-Key to fund in the same request)
+        and optionally X-Lium-Api-Key to fund in the same request, and
+        X-Submission-Label as above)
     → 201 {"status": "stored", "ref": "vault/direct@sha256:…",
            "commit_payload": "metro-v1:gen:hippius:vault/direct@sha256:…",
            "funding": "pending_reveal" | "already-funded" | "none" |
@@ -106,6 +111,27 @@ def canonical_fund_message(action: str, hotkey: str, ref: str, timestamp: str,
     if action not in _ACTIONS:
         raise ValueError(f"unknown action {action!r}")
     return f"cascade-{action}:v2:{hotkey}:{ref}:{timestamp}:{key_digest}".encode()
+
+
+LABEL_HEADER = "X-Submission-Label"
+
+
+def submission_label(headers) -> tuple[str, dict | None]:
+    """``(label, None)`` from the optional label header, or ``("", error)``.
+
+    The label is OUTSIDE the signed canonical message on purpose: it is a
+    display name with no security role (a replayed or tampered label can
+    at worst mislabel the replayer's own row — the row is keyed by the
+    signed hotkey), and folding it in would bump the message version for
+    every miner tool. Validation is the queue's :func:`normalize_label`, so
+    the intake and a direct queue write agree on what a label may be.
+    """
+    from .queue import normalize_label
+
+    try:
+        return normalize_label(headers.get(LABEL_HEADER) or ""), None
+    except ValueError as e:
+        return "", {"code": "bad_label", "message": str(e)}
 
 
 def header_key_digest(headers) -> str:
@@ -434,6 +460,10 @@ class FundingIntake:
         from ..shared.hippius import StorageError
         from .store import DigestOwned, SubmissionQuotaExceeded, SubmissionTooLarge, vault_ref
 
+        label, label_err = submission_label(headers)
+        if label_err is not None:
+            return 400, label_err
+
         # Dispatch HTTP status on the exception TYPE, never by substring-matching
         # the message — the message can carry the attacker-chosen member name,
         # so a member named "zip_too_large" must not steer the response code
@@ -459,7 +489,7 @@ class FundingIntake:
             # the truth about what parked: a live entry for a DIFFERENT ref
             # is never silently replaced — the miner re-funds the new ref
             # deliberately (or withdraws the old one first).
-            outcome = self.queue.add_pending(hotkey, ref)
+            outcome = self.queue.add_pending(hotkey, ref, label=label)
             self.vault.insert(hotkey, api_key)
             if outcome in ("pending_reveal", "already-pending"):
                 funding = "pending_reveal"
@@ -499,13 +529,16 @@ class FundingIntake:
             return 400, {"code": "missing_lium_api_key",
                          "message": "a funded entry needs your Lium API key "
                                     "as X-Lium-Api-Key"}
+        label, label_err = submission_label(headers)
+        if label_err is not None:
+            return 400, label_err
         hotkey, ref = ctx["hotkey"], ctx["ref"]
         reveal_block = self.resolve_reveal(hotkey, ref)
         if reveal_block is None:
             return 403, {"code": "not_revealed",
                          "message": "no revealed commitment for this hotkey matches "
                                     "X-Commit-Ref — reveal first, then fund"}
-        outcome = self.queue.add(hotkey, ref, int(reveal_block))
+        outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label)
         # Vault AFTER the queue accepts (mirrors PRISM: creds stored only once
         # the row is real) — and on every accepted outcome, so a re-fund of a
         # queued entry refreshes a key that may be nearing its TTL.
