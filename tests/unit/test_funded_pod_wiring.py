@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,13 @@ from cascade.funding.vault import PayerKeyVault
 from cascade.provision.core import PodAddress
 from cascade.provision.state import PodInstance
 from cascade.shared.config import RoundConfig, validate_funded_pods
-from cascade.trainer.loop import TrainerRunner, _FundedLegSkip, _FundedTamper
+from cascade.trainer.corpus import DIVERGED_MARKER
+from cascade.trainer.loop import (
+    TrainerRunner,
+    _FundedDiverged,
+    _FundedLegSkip,
+    _FundedTamper,
+)
 from cascade.trainer.remote import RemoteDispatchError, RemoteHost
 
 REF = "ns/gen@sha256:" + "a" * 64
@@ -75,7 +82,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     fake._hub_robots = lambda: fake._minter
     for name in ("_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
                  "_funded_pod_credential", "_funded_pod_identity_mismatch",
-                 "_funded_checkpoint_mismatch",
+                 "_funded_checkpoint_mismatch", "_refuse_diverged_king",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
@@ -1028,6 +1035,8 @@ def test_harvest_leg_pulls_verifies_uploads_and_returns_a_real_entry(
                         lambda host, rdir, dest, **kw: harvested.append((rdir, dest)) or dest)
     monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint",
                         lambda d, contract=None, **kw: verified.append(d))
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_weights_finite",
+                        lambda d: None)                  # nothing was harvested here
     fake_up = SimpleNamespace(ref=SimpleNamespace(
         immutable_ref="cascade/ckpt-r777-challenger-toto2-4m@sha256:" + "d" * 64))
     monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
@@ -1180,3 +1189,84 @@ def test_run_forever_defers_the_startup_sweep_until_the_round_is_known():
     head = src.split("while True:", 1)[0]
     assert "_reconcile_funded_pods()" not in head
     assert "self._startup_sweep(str(base_seed))" in src
+
+
+# ── training divergence (2026-09-14: a NaN checkpoint must never be published) ─
+
+def _write_weights(dest, *, finite: bool):
+    """A minimal weights.safetensors: one finite tensor, one NaN'd when asked."""
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    bad = torch.zeros(4)
+    if not finite:
+        bad[1] = float("nan")
+    save_file({"a.weight": torch.ones(2, 3), "b.bias": bad},
+              str(dest / "weights.safetensors"))
+
+
+def test_robot_leg_with_nan_checkpoint_is_the_miners_diverged_run(tmp_path, monkeypatch):
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+
+    def guard(entry, contract):
+        raise _FundedDiverged("weights.safetensors: 3 tensor(s) hold non-finite values")
+    runner._funded_checkpoint_mismatch = guard
+    with pytest.raises(_FundedDiverged):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                               contract, "", warm_start_ref=None)
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    # Same verdict as the worker's own rc=3 on a non-finite loss: their
+    # corpus, their shot — never "tamper", never a refundable infra fault.
+    assert (miner_fault, cls, burn) == (True, "generator", False)
+    assert msg.startswith(DIVERGED_MARKER)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_harvest_leg_refuses_nan_weights_before_upload(tmp_path, monkeypatch):
+    disp = _FakeLocalDisp()
+    runner, torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp)
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir",
+                        lambda host, remote, dest, **kw: _write_weights(dest, finite=False))
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint",
+                        lambda d, c=None, **kw: None)     # shape guard passes
+    uploaded = []
+    monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
+                        lambda *a, **kw: uploaded.append(a))
+    with pytest.raises(_FundedDiverged):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
+                               contract, "", warm_start_ref=None)
+    assert uploaded == []                    # refused BEFORE the registry
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "generator", False)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def _king_entry():
+    return SimpleNamespace(trained_pointer="metro-v1:trained:hippius:cascade/ckpt-r777-king-toto2-4m@sha256:" + "a" * 64)
+
+
+def test_refuse_diverged_king_aborts_on_nan_and_passes_finite(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    runner.cfg.storage = SimpleNamespace()
+    monkeypatch.setattr("cascade.shared.hippius.HubConfig.from_storage",
+                        classmethod(lambda cls, storage: None))
+    finite = {"v": False}
+    monkeypatch.setattr("cascade.shared.hippius.fetch_from_hub",
+                        lambda ref, dest, cfg: _write_weights(dest, finite=finite["v"]))
+    with pytest.raises(_FundedDiverged, match="king checkpoint"):
+        runner._refuse_diverged_king(_king_entry(), SimpleNamespace(arch_preset="toto2-4m"))
+    finite["v"] = True
+    assert runner._refuse_diverged_king(_king_entry(), SimpleNamespace(arch_preset="toto2-4m")) is None
+
+
+def test_king_dispatch_is_followed_by_the_divergence_refusal():
+    # Source-level pin: the JIT king dispatch must hand its entry to
+    # _refuse_diverged_king before anything else can see it.
+    import inspect
+    src = inspect.getsource(TrainerRunner._train_remote)
+    i = src.index('role="king", base_seed=seeds.base_seed')
+    j = src.index("self._refuse_diverged_king(entry, contract)")
+    assert i < j
+    assert "self._final_role_hosts[" not in src[i:j]

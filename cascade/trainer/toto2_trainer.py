@@ -38,6 +38,27 @@ import numpy as np
 
 from ..shared.config import TrainingContractConfig
 from .contract import TrainLogger, TrainResult
+from .corpus import DIVERGED_MARKER, CorpusError
+
+
+def check_loss_finite(loss_value: float, *, step: int, tokens: int) -> None:
+    """Abort the run the moment its loss stops being finite.
+
+    A NaN/inf loss backpropagates NaN into every parameter on that very
+    step — nothing after it is a model, and the run would otherwise burn its
+    whole budget (2026-09-14: a funded leg went NaN at step 150 of 152400 and
+    trained 2.5 h of NaN weights). Raised as :class:`CorpusError` because the
+    contract's loop is fixed and identical for every leg: what differs is the
+    corpus, so the worker exits 3 ("miner submission rejected") and the
+    orchestrator classes it as the generator's fault. The orchestrator's
+    ingest guard (``verify_weights_finite``) is the backstop for a worker
+    predating this check.
+    """
+    if not math.isfinite(loss_value):
+        raise CorpusError(
+            f"{DIVERGED_MARKER}: non-finite loss ({loss_value}) at step {step} "
+            f"after {tokens} tokens — the corpus overflows the contract's "
+            "numerics; a checkpoint from here would be all NaN")
 
 log = logging.getLogger("cascade.trainer.toto2")
 
@@ -760,6 +781,7 @@ class Toto2Trainer:
                             e.copy_(v)
 
             last_loss = float(loss.detach().cpu())
+            check_loss_finite(last_loss, step=step, tokens=tokens)
             # Every channel of every row counts: B × C × L point-passes, so a
             # multivariate series' token cost equals its stream billing (the
             # C×-billed-1×-trained mispricing is dead; DEC-CA-0026). Masked
