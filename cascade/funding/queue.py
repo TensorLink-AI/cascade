@@ -33,6 +33,7 @@ from __future__ import annotations
 import fcntl
 import json
 import math
+import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -45,6 +46,8 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "FundedEntry",
     "FundedQueue",
+    "LABEL_MAX_CHARS",
+    "normalize_label",
     "rounds_needed",
     "select_field",
 ]
@@ -80,10 +83,41 @@ class FundedEntry:
     # for six hours is not going to clear by waiting, and without the bound a
     # hostile payer could occupy a funded seat forever (review 2026-09-02).
     rate_limited_since: float = 0.0
+    # Miner-chosen display name for this submission (``cascade fund --label``,
+    # DEC-CA-0043). PRESENTATIONAL ONLY: it rides the public queue view, the
+    # funded roster and the heat standings so a miner can pick their entry out
+    # of a dashboard by name. It is never identity (hotkey + ref are), never
+    # signed, never in a manifest or receipt, and never read by any scoring
+    # path. Normalised by :func:`normalize_label`; "" = unlabelled.
+    label: str = ""
 
     @property
     def active_at(self) -> float:
         return self.last_active or self.funded_at
+
+
+LABEL_MAX_CHARS = 32
+_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def normalize_label(raw: object) -> str:
+    """The stored form of a submission label, or ``ValueError`` when unusable.
+
+    Whitespace-stripped; empty means "no label". Otherwise 1–``LABEL_MAX_CHARS``
+    characters from ``[A-Za-z0-9._-]`` — a slug, not free text: the label is
+    echoed into public JSON documents and terminal renderers, so no spaces,
+    no unicode, no markup, and nothing that could pass as another hotkey (the
+    charset has no ``5…`` SS58 ambiguity at 32 chars, and renderers always
+    print it beside the hotkey, never instead of it).
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if len(text) > LABEL_MAX_CHARS:
+        raise ValueError(f"label longer than {LABEL_MAX_CHARS} characters")
+    if not _LABEL_RE.match(text):
+        raise ValueError("label may only contain letters, digits, '.', '_' and '-'")
+    return text
 
 
 def select_field(entries: Iterable[FundedEntry], cap: int) -> list[FundedEntry]:
@@ -179,6 +213,7 @@ class FundedQueue:
                 last_error_class=str(item.get("last_error_class", "")),
                 last_active=float(item.get("last_active", 0.0)),
                 rate_limited_since=float(item.get("rate_limited_since", 0.0)),
+                label=str(item.get("label", "")),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -211,8 +246,14 @@ class FundedQueue:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
-    def add(self, hotkey: str, ref: str, reveal_block: int) -> str:
+    def add(self, hotkey: str, ref: str, reveal_block: int, *,
+            label: str = "") -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
+
+        ``label`` (already normalised) names the entry for dashboards; an
+        empty label on a re-fund keeps the one already stored, a non-empty
+        one replaces it — the label is the miner's to change at any time
+        because nothing downstream keys on it.
 
         ``"already-queued"`` — same hotkey, same ref, still live: idempotent
         no-op (the PRISM 200 path). ``"replaced"`` — a live entry updated to a
@@ -227,7 +268,8 @@ class FundedQueue:
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
                     # an actively-tended entry never TTL-expires under you.
-                    entries[hotkey] = replace(prev, last_active=now)
+                    entries[hotkey] = replace(prev, last_active=now,
+                                              label=label or prev.label)
                     self._save(entries)
                     return "already-queued"
                 if prev.status == "in_round":
@@ -236,17 +278,20 @@ class FundedQueue:
                     return "already-queued"
                 entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
-                    funded_at=now, last_active=now, status="queued")
+                    funded_at=now, last_active=now, status="queued",
+                    label=label or prev.label)
                 self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=now, last_active=now)
+                funded_at=now, last_active=now, label=label)
             self._save(entries)
             return "queued"
 
-    def add_pending(self, hotkey: str, ref: str) -> str:
+    def add_pending(self, hotkey: str, ref: str, *, label: str = "") -> str:
         """A submit-with-key entry whose reveal has not landed on chain yet.
+
+        ``label`` follows :meth:`add`'s rule (empty keeps, non-empty replaces).
 
         The one-request flow: the ZIP and the Lium key arrive together, before
         the miner's chain commit reveals — so the entry parks as
@@ -261,12 +306,14 @@ class FundedQueue:
                 return "already-queued"
             now = self.clock()
             if prev is not None and prev.status == "pending_reveal" and prev.ref == ref:
-                entries[hotkey] = replace(prev, last_active=now)
+                entries[hotkey] = replace(prev, last_active=now,
+                                          label=label or prev.label)
                 self._save(entries)
                 return "already-pending"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=0,
-                funded_at=now, last_active=now, status="pending_reveal")
+                funded_at=now, last_active=now, status="pending_reveal",
+                label=label)
             self._save(entries)
             return "pending_reveal"
 
@@ -515,6 +562,7 @@ class FundedQueue:
                     "status": e.status,
                     "attempts": e.attempts,
                     "last_error_class": e.last_error_class,
+                    "label": e.label,
                 }
                 for e in current if e.status != "pending_reveal"
             ],

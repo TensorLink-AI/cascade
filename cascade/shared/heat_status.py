@@ -78,6 +78,7 @@ def build_heat_status(
     warm_start: dict | None = None,
     skipped: list[dict] | None = None,
     duel_only: bool = False,
+    labels: dict[str, str] | None = None,
 ) -> dict:
     """Assemble the public heat document (pure — storage I/O stays with the caller).
 
@@ -109,7 +110,15 @@ def build_heat_status(
     :data:`SKIPPED_ENTRIES_MAX` per-hotkey rows — so 300+ skips (r48) cannot
     bloat the document. Without it an all-burned field publishes as an
     unexplained ``0 entrants``.
+
+    ``labels`` — ``{hotkey: label}`` miner-chosen display names (DEC-CA-0043),
+    emitted as a ``labels`` block only when at least one entrant has one.
+    ADDITIVE and presentational: entrant rows are the signed
+    :class:`~cascade.shared.manifest.HeatEntrant` shape and stay untouched;
+    dashboards join on hotkey. Values are re-normalised here so a public
+    document never carries anything but a ``[A-Za-z0-9._-]{1,32}`` slug.
     """
+    from ..funding.queue import normalize_label
     from .manifest import heat_to_json
 
     doc: dict = {
@@ -145,6 +154,17 @@ def build_heat_status(
         doc["skipped"] = skipped_block(skipped)
     if warm_start:
         doc["warm_start"] = dict(warm_start)
+    if labels:
+        clean: dict[str, str] = {}
+        for hk, lbl in labels.items():
+            try:
+                text = normalize_label(lbl)
+            except ValueError:
+                continue
+            if text:
+                clean[str(hk)] = text
+        if clean:
+            doc["labels"] = clean
     if network:
         doc["network"] = str(network)
     if netuid is not None:

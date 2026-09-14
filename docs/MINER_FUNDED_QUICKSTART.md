@@ -29,6 +29,7 @@ cascade fund https://submissions.cascadesub.net --ref <repo@digest> --wallet-nam
 # → fund: queued
 cascade queue --intake https://submissions.cascadesub.net --hotkey <your ss58>    # live queue + last roster, your rows marked
 cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw --wallet-name w --wallet-hotkey h   # leave while still queued
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> --label my-gen-v3 --wallet-name w --wallet-hotkey h   # name it (see below)
 ```
 
 **Rules**
@@ -66,6 +67,15 @@ Useful flags: `--no-fund` (fund later with `cascade fund`), `--no-commit` (print
 - On chain it is an ordinary `metro-v1:gen:hippius:` commit under the reserved `vault/direct` repo — validators need nothing.
 
 ---
+
+### Naming your submission (`--label`)
+
+`cascade fund --label my-gen-v3` (or `cascade submit --label …`) attaches a display name to your entry.
+It shows beside your hotkey in the live queue (`/v1/queue`, `cascade queue --intake`), the published
+funded roster (`funded/round-<id>.json`) and the heat standings (`status/heat.json`, `labels` block), so
+you can pick your row out of a dashboard. Rules: ≤ 32 characters from `[A-Za-z0-9._-]`; a re-fund with a
+new `--label` renames, one without keeps the old name. The label is cosmetic — never identity, never in
+the signed manifest or receipts, never read by scoring.
 
 ## 3. Multivariate series (`max_channels = 32`)
 

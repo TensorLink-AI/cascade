@@ -435,6 +435,17 @@ def _cmd_queue(args: argparse.Namespace) -> int:
     def _tag(hk: str) -> str:
         return "  ← you" if me and hk == me else ""
 
+    def _label_of(row: dict) -> str:
+        # Presentational: printed BESIDE the hotkey (never instead of it), and
+        # re-sanitised on the way out — the document is public JSON.
+        from ..funding.queue import normalize_label
+
+        try:
+            lbl = normalize_label(row.get("label") or "")
+        except ValueError:
+            return ""
+        return f' "{lbl}"' if lbl else ""
+
     if doc is None:
         print(f"no published funded roster at {key} (pre-funded round, or "
               "funded_mode is not 'required' yet)")
@@ -452,11 +463,11 @@ def _cmd_queue(args: argparse.Namespace) -> int:
               f"market {adm.get('market_capacity')}, reserve {adm.get('reserve')})")
         print(f"  seated ({len(doc.get('seated') or [])}, reveal-block seniority):")
         for e in doc.get("seated") or []:
-            print(f"    {e.get('hotkey')}  reveal={e.get('reveal_block')}"
+            print(f"    {e.get('hotkey')}{_label_of(e)}  reveal={e.get('reveal_block')}"
                   f"{_tag(str(e.get('hotkey')))}")
         for e in doc.get("waiting") or []:
-            print(f"  waiting: {e.get('hotkey')}  reveal={e.get('reveal_block')}"
-                  f"{_tag(str(e.get('hotkey')))}")
+            print(f"  waiting: {e.get('hotkey')}{_label_of(e)}  "
+                  f"reveal={e.get('reveal_block')}{_tag(str(e.get('hotkey')))}")
         for e in doc.get("outcomes") or []:
             extra = f" [{e.get('error_class')}]" if e.get("error_class") else ""
             print(f"  outcome: {e.get('hotkey')}  {e.get('outcome')}{extra}"
@@ -486,7 +497,7 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         print(f"live queue (depth {live.get('queued_depth')}):")
         for e in live.get("entries") or []:
             err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
-            print(f"  {e.get('hotkey')}  {e.get('status')}  "
+            print(f"  {e.get('hotkey')}{_label_of(e)}  {e.get('status')}  "
                   f"reveal={e.get('reveal_block')} attempts={e.get('attempts')}"
                   f"{err}{_tag(str(e.get('hotkey')))}")
     return 0
@@ -915,6 +926,10 @@ def _add_submit(sub: argparse._SubParsersAction) -> None:
                         "funds your entry (auto-queues once the reveal lands).")
     p.add_argument("--no-fund", action="store_true",
                    help="Submit code only; fund later with `cascade fund`.")
+    p.add_argument("--label", default="",
+                   help="Display name for this submission (≤32 chars, letters/digits/"
+                        "._-) shown beside your hotkey in the public queue, roster "
+                        "and heat standings. Cosmetic only — never identity.")
     p.add_argument("--skip-runtime", action="store_true",
                    help="Skip the determinism check during pre-submit verify.")
     p.add_argument("--skip-verify", action="store_true",
@@ -1017,6 +1032,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     from ..funding.intake import canonical_fund_message
 
     ts = str(int(_time.time()))
+    label = _cli_label(args)
+    if label is None:
+        return 2
     api_key = ""
     if not args.no_fund:
         api_key = (os.environ.get(args.lium_key_env) or "").strip()
@@ -1036,6 +1054,9 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     }
     if api_key:
         headers["X-Lium-Api-Key"] = api_key
+    if label:
+        from ..funding.intake import LABEL_HEADER
+        headers[LABEL_HEADER] = label
 
     req = urllib.request.Request(f"{base}/v1/submit", data=body, method="POST",
                                  headers=headers)
@@ -1105,21 +1126,28 @@ def _add_fund(sub: argparse._SubParsersAction) -> None:
                         "LIUM_API_KEY). The key is NEVER accepted on the command line.")
     p.add_argument("--withdraw", action="store_true",
                    help="Withdraw a still-queued entry (the operator forgets your key).")
+    p.add_argument("--label", default="",
+                   help="Display name for this entry (≤32 chars, letters/digits/._-) "
+                        "shown beside your hotkey in the public queue, roster and heat "
+                        "standings. Cosmetic only — never identity; a re-fund with a "
+                        "new --label renames, without one keeps the old name.")
     p.set_defaults(func=_cmd_fund)
 
 
 def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
-                       sign_fn, *, now=None) -> dict[str, str]:
+                       sign_fn, *, now=None, label: str = "") -> dict[str, str]:
     """The signed header set for one intake request (pure; testable).
 
     ``sign_fn(message: bytes) -> bytes`` is the hotkey's sr25519 signer. The
     canonical message binds action + hotkey + ref + timestamp, so a captured
     fund request cannot be replayed as a withdraw (or vice versa), and none of
-    it can be replayed at all past the intake's freshness window.
+    it can be replayed at all past the intake's freshness window. ``label``
+    (already normalised, optional) rides as its own header outside the
+    signed message — it is a display name, not identity.
     """
     import time as _time
 
-    from ..funding.intake import canonical_fund_message
+    from ..funding.intake import LABEL_HEADER, canonical_fund_message
 
     ts = str(int((now or _time.time)()))
     import hashlib as _hashlib
@@ -1135,7 +1163,22 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
     }
     if sends_key:
         headers["X-Lium-Api-Key"] = api_key
+    if label:
+        headers[LABEL_HEADER] = label
     return headers
+
+
+def _cli_label(args: argparse.Namespace) -> str | None:
+    """The normalised ``--label`` ("" = none), or ``None`` after printing why
+    it was refused — the same rule the intake applies, so a bad label fails
+    here instead of costing a signed round-trip."""
+    from ..funding.queue import normalize_label
+
+    try:
+        return normalize_label(getattr(args, "label", "") or "")
+    except ValueError as e:
+        print(f"--label refused: {e}", file=sys.stderr)
+        return None
 
 
 def _intake_transport_ok(url: str) -> bool:
@@ -1174,6 +1217,9 @@ def _cmd_fund(args: argparse.Namespace) -> int:
 
     action = "withdraw" if args.withdraw else "fund"
     api_key = ""
+    label = _cli_label(args) if action == "fund" else ""
+    if label is None:
+        return 2
     if action == "fund":
         api_key = (os.environ.get(args.lium_key_env) or "").strip()
         if not api_key:
@@ -1197,7 +1243,8 @@ def _cmd_fund(args: argparse.Namespace) -> int:
         print(f"could not load wallet for signing: {e}", file=sys.stderr)
         return 2
 
-    headers = build_fund_headers(action, hotkey_ss58, args.ref, api_key, sign_fn)
+    headers = build_fund_headers(action, hotkey_ss58, args.ref, api_key, sign_fn,
+                                 label=label)
     req = urllib.request.Request(f"{base}/v1/{action}", method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

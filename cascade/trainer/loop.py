@@ -1291,13 +1291,18 @@ class TrainerRunner:
         # Transparency roster (published at settle): who seated, who waits,
         # in what order, under what cap — miners can hold the operator to
         # reveal-block seniority with the on-chain blocks beside it.
-        reveal_of = {e.hotkey: e.reveal_block for e in queue.entries()}
+        # ``label`` is the miner's display name (DEC-CA-0043): presentational,
+        # carried so dashboards can show it beside the hotkey; never identity.
+        entry_of = {e.hotkey: e for e in queue.entries()}
         seated_set = {c.hotkey for c in selected}
         self._funded_roster["seated"] = [
             {"hotkey": c.hotkey, "ref": c.ref,
-             "reveal_block": reveal_of.get(c.hotkey)} for c in selected]
+             "reveal_block": (entry_of[c.hotkey].reveal_block
+                              if c.hotkey in entry_of else None),
+             "label": getattr(entry_of.get(c.hotkey), "label", "")}
+            for c in selected]
         self._funded_roster["waiting"] = [
-            {"hotkey": e.hotkey, "reveal_block": e.reveal_block}
+            {"hotkey": e.hotkey, "reveal_block": e.reveal_block, "label": e.label}
             for e in select_field(queue.entries(), cap=0)
             if e.hotkey not in seated_set]
         self._funded_roster["terminal"] = [
@@ -1641,6 +1646,19 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
             log.warning("funded capacity probe for %s failed: %s", sku, e)
             return None
+
+    def _funded_labels(self) -> dict[str, str]:
+        """hotkey → miner display label for this round's funded entrants
+        (DEC-CA-0043), read off the roster rows so a settled retry (roster
+        restored from the seat marker) still carries them. Empty when no
+        funded round or no entrant chose a label."""
+        roster = getattr(self, "_funded_roster", None) or {}
+        out: dict[str, str] = {}
+        for key in ("seated", "waiting"):
+            for row in roster.get(key) or ():
+                if isinstance(row, dict) and row.get("label"):
+                    out[str(row["hotkey"])] = str(row["label"])
+        return out
 
     def _publish_funded_roster(self, round_id: str) -> None:
         """Publish the round's funded seat allocation, public-read.
@@ -3552,6 +3570,7 @@ class TrainerRunner:
                 warm_start=self._stage_ctx.get("warm_start"),
                 skipped=skipped,
                 duel_only=duel_only,
+                labels=self._funded_labels(),
             )
             store = self.manifest_store()
             publish_heat_status(store, doc)
