@@ -169,7 +169,7 @@ in-context.
   budget 1800 → 7200 CPU-s with the streaming stall window split into
   `stream_stall_seconds` and PINNED at the old values (a stalled generator
   must not idle a lane longer), relative-jitter Cholesky documented in
-  MINER.md §1a. All `[generator]`-side: no digest bump, no coordinated
+  INTERFACE.md "Compute-heavy priors". All `[generator]`-side: no digest bump, no coordinated
   restart. Wall stays the law (DEC-CA-0001); `stream_gpu` remains its own
   digest-bound decision.
   (`decisions/DEC-CA-0031-gp-prior-generation-budget.md`)

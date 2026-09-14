@@ -2,7 +2,7 @@
 """Measure timelock reveal jitter on a live network — sizes `reveal_margin_blocks`.
 
 `cascade deploy` times its reveal at ``epoch boundary − [round]
-reveal_margin_blocks`` (docs/MINER.md §5a). Round eligibility gates on the
+reveal_margin_blocks`` (docs/MINER.md §5 "Reveal timing"). Round eligibility gates on the
 REVEAL block strictly before the boundary, so a reveal landing later than
 targeted can silently cost a miner the round. The margin must therefore exceed
 the worst observed lateness (with headroom), while staying short enough that a

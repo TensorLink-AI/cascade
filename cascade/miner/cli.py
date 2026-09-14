@@ -23,7 +23,7 @@
   copied into its own round (``--reveal-now`` / ``--blocks-until-reveal`` /
   ``--next-epoch`` override). Pair with ``--hub-namespace`` (a fresh
   non-guessable repo per submission) so the content is as undiscoverable as the
-  pointer — see docs/MINER.md "Protecting your submission". Requires the ``[chain]`` extra (bittensor) + a
+  pointer — see docs/MINER.md "Reveal timing". Requires the ``[chain]`` extra (bittensor) + a
   wallet, and the ``[hippius]`` extra + Hub credentials in the environment.
   ``--hf-repo <namespace/name>`` is a HuggingFace fallback (``repo@hf:<sha>``) used
   ONLY if the Hub push fails — the Hub is always tried first, so a healthy Hippius
