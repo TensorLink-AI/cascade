@@ -1236,6 +1236,21 @@ class TrainerRunner:
             return challengers
         # required: the funded queue decides who enters, in queue seniority
         # order, capped at the duel cohort the round can actually judge.
+        # Promote pending-reveal entries FIRST, from the reveal blocks this
+        # round already resolved on chain. The intake's sweep is request-driven
+        # (it runs on fund/submit/queue reads) and its documented backstop —
+        # "the trainer's own queue read" — was never wired: 2026-09-13 20:52
+        # two miners who submitted-with-key hours early and revealed before
+        # the boundary sat as pending_reveal through the seating because no
+        # request hit the intake in the last 40 minutes, and missed the round.
+        # Only (hotkey, ref) pairs in this round's eligible field promote —
+        # the same chain truth the intake's resolver would have used.
+        revealed = {(c.hotkey, c.ref): int(rb) for c in challengers
+                    if (rb := getattr(c, "reveal_block", 0))}
+        promoted = queue.promote_pending(lambda hk, ref: revealed.get((hk, ref)))
+        if promoted:
+            log.info("funded queue: promoted %d pending-reveal entr%s whose reveal "
+                     "is in this round's field", promoted, "y" if promoted == 1 else "ies")
         queue.recover_in_round()
         queue.expire_stale()
         burned: set[str] = set()
