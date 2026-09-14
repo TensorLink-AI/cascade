@@ -756,6 +756,16 @@ def _bench_role_dir(duel: list, entry) -> str:
     return f"{entry.role}-u{entry.miner_uid}"
 
 
+def _lium_provider(rnd, **kw):
+    """An operator-key :class:`LiumProvider` carrying ``[round]
+    funded_cpu_blocklist`` (imported at call time so tests can swap the class)."""
+    from ..provision.core import LiumProvider
+    from ..provision.funded import apply_cpu_blocklist
+
+    return apply_cpu_blocklist(LiumProvider(**kw),
+                               tuple(getattr(rnd, "funded_cpu_blocklist", ()) or ()))
+
+
 def king_pod_name_prefix(netuid: int, round_id: str) -> str:
     """Name prefix of a round's JIT king pod (``<prefix>-0``). The n<netuid>
     token keeps it OUT of both the provisioner's reaper scheme (which must
@@ -1664,9 +1674,7 @@ class TrainerRunner:
         ``exclude_ids`` = executors this round already claimed: a count that
         includes them is capacity no rent can use."""
         try:
-            from ..provision.core import LiumProvider
-
-            return LiumProvider().capacity(sku, exclude_ids=exclude_ids)
+            return _lium_provider(self.cfg.round).capacity(sku, exclude_ids=exclude_ids)
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
             log.warning("funded capacity probe for %s failed: %s", sku, e)
             return None
@@ -2115,6 +2123,7 @@ class TrainerRunner:
                     ssh_pubkey=ssh_pubkey, netuid=netuid,
                     ready_timeout=rnd.funded_ready_timeout_seconds,
                     exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
+                    cpu_blocklist=rnd.funded_cpu_blocklist,
                 )
                 if result.ok and result.machine_id:
                     with self._funded_exec_lock:
@@ -2447,7 +2456,7 @@ class TrainerRunner:
         with self._funded_king_lock:
             if self._funded_king_host is not None:
                 return self._funded_king_host
-            from ..provision.core import LaunchSpec, LiumProvider, ProvisionError
+            from ..provision.core import LaunchSpec, ProvisionError
             from ..provision.funded import quarantine_lemon_host, terminate_verified
             from ..provision.state import PodInstance
             from .remote import RemoteHost
@@ -2458,7 +2467,7 @@ class TrainerRunner:
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
             sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
-            provider = LiumProvider()
+            provider = _lium_provider(rnd)
             name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr) -> RemoteHost:

@@ -1015,6 +1015,12 @@ class RoundConfig:
     # Per-round choice needs [training] expected_gpu = "" (a hard pin freezes
     # the type until a coordinated validator update).
     funded_pod_skus: tuple[str, ...] = ()
+    # Executors whose CPU model contains any of these substrings (case-
+    # insensitive; Lium GET /executors specs.cpu.model) are never listed for
+    # rent — king, funded legs and capacity probes alike. 2026-09-13/14: four
+    # stalls, all on Xeon E5-26xx v4 hosts, zero series inside the 1800 s
+    # stall window, while the same generators ran on every Ryzen host.
+    funded_cpu_blocklist: tuple[str, ...] = ()
     # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
     # account, at the round's chosen SKU — the no-heat end-state (no standing
     # final fleet). Required for funded_pod_skus to guarantee the king lands
@@ -2178,6 +2184,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_capacity_reserve=int(r.get("funded_capacity_reserve", 1)),
             funded_pod_skus=validate_funded_pod_skus(
                 r.get("funded_pod_skus", ())),
+            funded_cpu_blocklist=tuple(
+                str(x).strip() for x in (r.get("funded_cpu_blocklist", ()) or ())
+                if str(x).strip()),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),

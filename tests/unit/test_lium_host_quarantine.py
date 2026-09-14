@@ -239,3 +239,62 @@ def test_stale_image_pod_quarantines_its_host(tmp_path, monkeypatch):
     host, pod = runner._rent_funded_host("777", _challenger("hkA"))
     assert host.host == "10.9.9.9"
     assert set(quarantined_hosts()) == {"91.224.44.222"}
+
+
+# ── CPU-model blocklist ([round] funded_cpu_blocklist) ───────────────────────
+
+
+def test_listing_skips_executors_whose_cpu_model_is_blocked(monkeypatch, tmp_path):
+    """2026-09-13/14: four stalls, all on Xeon E5-26xx v4 hosts. A blocklisted
+    CPU model never reaches a rent — matched case-insensitively as a
+    substring of the API's specs.cpu.model; unknown models are kept."""
+    monkeypatch.setenv("CASCADE_LIUM_QUARANTINE_FILE", str(tmp_path / "q.json"))
+    prov = _provider(monkeypatch, {})
+    prov.cpu_blocklist = ("xeon(r) cpu e5-2",)
+    monkeypatch.setattr(prov, "_executor_cpus", lambda: {
+        "ex-a": "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+        "ex-b": "AMD Ryzen 9 5900X 12-Core Processor"})
+    assert [e["id"] for e in prov._list_executors("RTX4090")] == ["ex-b", "ex-c"]
+    assert prov.capacity("RTX4090") == 2
+
+
+def test_listing_without_a_blocklist_never_touches_the_cpu_map(monkeypatch, tmp_path):
+    monkeypatch.setenv("CASCADE_LIUM_QUARANTINE_FILE", str(tmp_path / "q.json"))
+    prov = _provider(monkeypatch, {})
+    monkeypatch.setattr(prov, "_executor_cpus",
+                        lambda: (_ for _ in ()).throw(AssertionError("no CPU lookup")))
+    assert len(prov._list_executors("RTX4090")) == 3
+
+
+def test_executor_cpus_reads_the_api_and_tolerates_missing_specs(monkeypatch, tmp_path):
+    prov = _provider(monkeypatch, {})
+    monkeypatch.setattr(prov, "_api_json", lambda path: [
+        {"id": "x", "specs": {"cpu": {"model": "AMD Ryzen 9 7950X3D", "count": 32}}},
+        {"id": "y", "specs": {"cpu": "weird"}},
+        {"id": "z"},
+        "junk"])
+    assert prov._executor_cpus() == {"x": "AMD Ryzen 9 7950X3D"}
+
+
+def test_cpu_model_blocked_is_a_case_insensitive_substring_match():
+    from cascade.provision.core import cpu_model_blocked
+
+    assert cpu_model_blocked("Intel(R) Xeon(R) CPU E5-2673 v4 @ 2.30GHz", ("Xeon(R) CPU E5-2",))
+    assert not cpu_model_blocked("Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz", ("Xeon(R) CPU E5-2",))
+    assert not cpu_model_blocked("", ("Xeon(R) CPU E5-2",))
+    assert not cpu_model_blocked("anything", ())
+
+
+def test_blocklist_reaches_the_operator_and_payer_providers(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from cascade.provision.funded import apply_cpu_blocklist
+    from cascade.trainer.loop import _lium_provider
+
+    rnd = SimpleNamespace(funded_cpu_blocklist=("Xeon(R) CPU E5-2",))
+    assert _lium_provider(rnd, bin="lium").cpu_blocklist == ("Xeon(R) CPU E5-2",)
+    assert _lium_provider(SimpleNamespace(), bin="lium").cpu_blocklist == ()
+    payer = apply_cpu_blocklist(LiumProvider(bin="lium", api_key="k"), ("e5-2",))
+    assert payer.cpu_blocklist == ("e5-2",)
+    fake = SimpleNamespace(name="other-cloud")
+    assert apply_cpu_blocklist(fake, ("e5-2",)) is fake      # no seam: untouched

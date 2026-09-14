@@ -591,6 +591,12 @@ def parse_lium_pods(stdout: str) -> list[dict]:
     return data
 
 
+def cpu_model_blocked(model: str, blocklist: tuple[str, ...] | list[str]) -> bool:
+    """True when ``model`` contains any blocklist entry (case-insensitive)."""
+    m = (model or "").lower()
+    return any(b and b.lower() in m for b in blocklist)
+
+
 def lium_pod_ready(pod: dict) -> bool:
     """A Lium pod is ready when it is RUNNING and exposes an SSH endpoint."""
     return str(pod.get("status", "")).upper() == "RUNNING" and bool(pod.get("ssh_cmd"))
@@ -858,6 +864,10 @@ class LiumProvider:
     # exclude a failed pod's machine when renting its replacement.
     _executor_by_name: dict = field(default_factory=dict, repr=False)
     _executor_hosts_cache: tuple = field(default=(), repr=False)
+    # CPU-model substrings (case-insensitive) whose executors are never listed
+    # ([round] funded_cpu_blocklist); () = no filter.
+    cpu_blocklist: tuple[str, ...] = ()
+    _executor_cpus_cache: tuple = field(default=(), repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -936,6 +946,15 @@ class LiumProvider:
                 log.info("lium: %d %s executor(s) skipped — on a quarantined host (%s)",
                          len(shaped) - len(kept), sku, ", ".join(sorted(
                              {hosts[str(e["id"])] for e in shaped if e not in kept})))
+            shaped = kept
+        if self.cpu_blocklist and shaped:
+            cpus = self._executor_cpus()
+            kept = [e for e in shaped
+                    if not cpu_model_blocked(cpus.get(str(e.get("id")), ""), self.cpu_blocklist)]
+            if len(kept) != len(shaped):
+                log.info("lium: %d %s executor(s) skipped — CPU model on the blocklist (%s)",
+                         len(shaped) - len(kept), sku, ", ".join(sorted(
+                             {cpus[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
         return shaped
 
@@ -1135,6 +1154,28 @@ class LiumProvider:
             return r.json()
         except Exception:  # noqa: BLE001 — best-effort lookup
             return None
+
+    def _executor_cpus(self) -> dict[str, str]:
+        """executor id → CPU model (``GET /executors`` ``specs.cpu.model``; the
+        CLI's ``ls`` JSON carries no CPU). Cached like the host map; empty
+        when the API is unreachable (then the blocklist cannot steer — logged)."""
+        cached = self._executor_cpus_cache
+        if cached and self._now() - cached[0] < self._EXECUTOR_HOSTS_TTL:
+            return cached[1]
+        cpus: dict[str, str] = {}
+        for e in self._api_json("executors") or []:
+            if not (isinstance(e, dict) and e.get("id")):
+                continue
+            specs = e.get("specs") if isinstance(e.get("specs"), dict) else {}
+            cpu = specs.get("cpu") if isinstance(specs.get("cpu"), dict) else {}
+            model = cpu.get("model")
+            if model:
+                cpus[str(e["id"])] = str(model)
+        if not cpus:
+            log.warning("lium: executor CPU map unavailable — the CPU blocklist cannot "
+                        "steer this listing")
+        object.__setattr__(self, "_executor_cpus_cache", (self._now(), cpus))
+        return cpus
 
     def _executor_hosts(self) -> dict[str, str]:
         """executor id → host IP for the whole marketplace (the CLI's ``ls`` JSON

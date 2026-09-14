@@ -375,6 +375,12 @@ funded_capacity_reserve = 1
 # most-available one (king included). Needs [training] expected_gpu = "".
 # Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
+# Never rent executors whose CPU model contains any of these (case-insensitive
+# substring of Lium's specs.cpu.model). 2026-09-13/14: four legs stalled —
+# zero series inside the 1800 s stall window — and all four sat on Xeon
+# E5-26xx v4 hosts, while the same generators ran on every Ryzen host.
+# Applies to the king rent, every payer leg and the capacity probe. [] = off.
+funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
