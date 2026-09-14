@@ -399,7 +399,7 @@ funded_operator_fallback = false
 # re-derivable while a reigning edge is never exposed. Flip to "delay" (+N
 # reign rounds) or "crown" (immediate) before Friday if less privacy is wanted.
 submission_vault_dir = "submission_vault" # work_root-relative operator-private store
-champion_publish = "delay"      # owner 2026-09-14: a new king's code goes public the round after it is crowned
+champion_publish = "crown"   # a new king's code goes public as soon as it is crowned (owner 2026-09-14: "we want it immediately available")
 champion_publish_delay_rounds = 1
 # Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
 # and rename-only copies of the king or an earlier-committed challenger lose
