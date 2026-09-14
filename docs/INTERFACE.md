@@ -151,15 +151,17 @@ class Generator(DataGenerator):
   `torch.use_deterministic_algorithms(True)`, on CPU). `cascade verify` runs
   your generator twice and rejects it if the digests differ — non-negotiable,
   because the trainer and validators rely on it to audit runs.
-* **Bounds.** Each series is finite (no NaN/inf), 1-D, floating dtype, with
-  length in `[generator.min_length, generator.max_length]`. The whole corpus is
-  capped at `generator.max_total_points`.
+* **Bounds.** Each series is finite (no NaN/inf), floating dtype, shape
+  `(L,)` or `(C, L)` with `C <= generator.max_channels` (32) and `L` in
+  `[generator.min_length, generator.max_length]`. The whole corpus is capped
+  at `generator.max_total_points`. Keep magnitudes in a sane float32 range: a
+  corpus that drives the loss non-finite is rejected as the miner's fault.
 * **Count / budget.** The corpus budget is denominated in **points**: with
   `[generator] corpus_target_points` armed (it ships armed), the materialised
   drain (`cascade verify`, `cache_reuse`) stops once your corpus reaches the
   target points, and the series count is yours to choose — many short series
   or fewer long ones (DEC-CA-0031; compute-heavy GP/kernel priors want short —
-  see MINER.md §1a). The streaming feed likewise stops at the training token
+  see "Compute-heavy priors" below). The streaming feed likewise stops at the training token
   budget. `generate(n)` may therefore be stopped before `n`; if the owner
   disarms the target (`corpus_target_points = 0`) the legacy rule returns:
   exactly `n` series are required. Yielding *more* than `n` is always an
@@ -172,6 +174,44 @@ class Generator(DataGenerator):
   (which includes `torch`/`gpytorch` as compute libraries for GP/kernel priors —
   but no shipped weights), at most `max_packages`. The fetched repo (code only)
   must be `<= max_repo_mb`.
+
+## Compute-heavy priors (GP / kernel families)
+
+`gpytorch`, `scikit-learn` and `networkx` are allowlisted so GP, kernel and
+graph priors can compete, but a naive implementation prices itself out. Three
+facts to design around (DEC-CA-0031):
+
+* **The generation budget is CPU-seconds, and threads sum into it.** The
+  sandbox enforces `max_generate_seconds` as `RLIMIT_CPU` across every thread,
+  and `multiprocessing` is blocked. Multi-core BLAS burns the budget faster.
+  Pin linear algebra to one thread (`OMP_NUM_THREADS=1` is set on lane-pinned
+  pods) and spend the saving on a cheaper factorisation.
+* **The corpus budget is points, not series.** GP draws scale roughly
+  cubically in length: at L=1024 instead of 4096 a kernel prior costs ~64×
+  less per series. Emit many shorter series; the length band is the only
+  shape constraint.
+* **Factorise with relative jitter, not SVD fallbacks.** The "Cholesky, else
+  SVD" pattern fires constantly on near-singular kernels and the fallback is
+  ~10× slower. Scale the jitter to the kernel's own magnitude and escalate:
+
+  ```python
+  def stable_cholesky(K, max_tries=6):
+      base = np.mean(np.diag(K))
+      for i in range(max_tries):
+          try:
+              return np.linalg.cholesky(K + (1e-9 * 10**i) * base * np.eye(len(K)))
+          except np.linalg.LinAlgError:
+              continue
+      raise np.linalg.LinAlgError("kernel not factorisable at max jitter")
+  ```
+
+  Measured on our GP priors: ~5× per draw, SVD fallbacks from 47 per corpus
+  to 0. Deterministic, so your digest stays reproducible.
+
+Generator speed is a compute multiplier in the live stream (DEC-CA-0001): a
+slow prior feeds the trainer less data inside the round's wall. Measure
+`seconds/series × (points needed / points per series)` against the budget
+before you submit; `cascade score` is the ground truth.
 
 ## Deploy
 
@@ -194,7 +234,9 @@ stays hidden for its whole window and cannot be copied into its own round
 (`--reveal-now` / `--blocks-until-reveal N` / `--next-epoch` override). Prefer
 `--hub-namespace <ns>` over a fixed `--hub-repo` name — each deploy then uses a
 fresh non-guessable repo, keeping the content as undiscoverable as the pointer.
-See MINER.md §5a for the full threat model.
+See MINER.md §5 ("Reveal timing"). Private submissions (`cascade submit`)
+skip the Hub entirely: the ZIP goes to the operator's vault and the chain
+commit is a `vault/direct@sha256:…` ref — see MINER.md §5.
 
 ## What good data looks like
 

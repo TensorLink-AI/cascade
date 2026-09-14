@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Probe whether the Hippius Hub OCI registry lets THIRD PARTIES enumerate repos.
 
-Why this matters (docs/MINER.md §5a): `cascade deploy` hides the on-chain
+Why this matters (docs/MINER.md §5 "Reveal timing"): `cascade deploy` hides the on-chain
 pointer with a timed timelock reveal, but the generator CONTENT is uploaded to
 the miner's Hub repo at deploy time — before the reveal. The timed reveal only
 protects a submission end-to-end if that content is undiscoverable without the

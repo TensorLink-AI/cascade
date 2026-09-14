@@ -1,10 +1,11 @@
-# Miner-funded rounds (DEC-CA-0036) — rollout runbook
+# Miner-funded rounds (DEC-CA-0036) — operator runbook
 
-Challenger training legs billed to the submitting miner's own Lium API key;
-king, confirmation, and eval legs stay on the operator's account. Rounds stay
-rounds; cadence becomes elastic (fire only funded boundaries, up to the epoch
-grid). Everything below shipped **inert** — `[round] funded_mode = "off"` —
-and arms in the order given. The decision node
+**Miners: read [MINER.md](MINER.md) instead.** This file is the operator's
+runbook: how the funded machinery is wired, brought up and kept safe.
+
+Challenger training legs bill the submitting miner's own Lium API key; the
+king, evals and benches stay on the operator's account. LIVE on mainnet since
+block 9046800 (2026-09-11 20:30 UTC). The decision node
 (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`) carries the design
 rationale; this file is the how.
 
@@ -144,7 +145,7 @@ auth fault. Operator checklist, in order:
    `funded_king_rent = true` the trainer rents/ledgers/sweeps the king pod
    itself; a standing final fleet would idle-bill and the provisioner must
    never touch `cascade-n91-…` pods.
-5. **Announce to miners** (docs/MINER.md §6b, llms.txt): funding required
+5. **Announce to miners** (docs/MINER.md §5, llms.txt): funding required
    from block 9046800; `cascade fund` after reveal; registered hotkey; keep
    ~3h × chosen-GPU balance on the Lium key.
 6. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
@@ -153,9 +154,10 @@ auth fault. Operator checklist, in order:
    + restart trainer (legacy rounds resume).
 
 Direct submissions are ARMED with this release (owner 2026-09-09):
-`submission_vault_dir = "submission_vault"`, `champion_publish = "dethrone"` —
-your code POSTs privately to the intake, losers stay private forever, and a
-king's code publishes only when it is deposed. The intake opens right after the
+`submission_vault_dir = "submission_vault"`, `champion_publish = "crown"`
+(since 2026-09-14; was `"dethrone"` at go-live) — your code POSTs privately
+to the intake, losers stay private forever, and a king's code publishes the
+moment it is crowned. The intake opens right after the
 Friday 08:30 morning round (block 9043200); the first funded round to consume
 submissions is the evening boundary 9046800. HARD PREREQUISITE: the worker
 image must be rebuilt from THIS release and its digest re-pinned before the
@@ -386,9 +388,9 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
 - Ownership: earliest upload owns a digest; another hotkey committing your
   digest is dropped at field entry; byte-copies still die at dedup.
 - Publication: ONLY thrones publish (`champions/<digest>.zip` + index,
-  public-read on the manifest bucket) per `champion_publish`: `crown` /
-  `delay` (after `champion_publish_delay_rounds`) / `dethrone`. A deposed
-  vault king always reveals at hand-off; losers never do.
+  public-read on the manifest bucket) per `champion_publish`: `crown` (live:
+  published when crowned) / `delay` (after `champion_publish_delay_rounds`) /
+  `dethrone`. Losers never publish.
 - Pods: a dispatch must stage exactly ONE entry's ZIP
   (`SubmissionStore.stage_for_dispatch` → the pod's `$CASCADE_VAULT_DIR`);
   the king's published code also resolves via `$CASCADE_CHAMPION_BASE`
@@ -403,39 +405,10 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
 
 ## Miner flow
 
-```
-# Direct (one request: code + funding; private until it takes the throne):
-export LIUM_API_KEY=sk-…               # your key, env only — never argv
-cascade submit ./my-generator https://submissions.cascadesub.net --wallet-name w --wallet-hotkey h
-# → stores privately, chain-commits the vault ref, auto-funds on reveal
-
-# Or the classic Hub path + explicit funding:
-cascade deploy …                       # unchanged: upload + commit/reveal
-cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
-    --wallet-name w --wallet-hotkey h
-# queue position: GET https://submissions.cascadesub.net/v1/queue (or `cascade round`)
-cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw \
-    --wallet-name w --wallet-hotkey h   # while still queued only
-cascade fetch king                     # published champions resolve anonymously
-```
-
-Your hotkey must be **registered on the subnet** before the intake accepts a
-submission or fund (403 `not_registered` otherwise) — reveal + registration
-are what give an entry seniority to claim.
-
-Failure semantics, as a miner experiences them: a dead pod / sold-out market
-/ 429 **requeues your entry without burning it** (sold-out waits as long as
-it takes; a rate-limit streak longer than 6h turns terminal — fix the key's
-limits and fund again; infra faults get bounded retries on your kept key);
-an invalid or revoked key fails your entry `auth` — fix the key and fund
-again; your
-generator crashing is your run, spent as ever. Three more terminal classes
-exist so a dead entry can never squat in the queue: `ref_mismatch` (you
-re-revealed a different ref — fund the new one), `burned` (the hotkey
-already used its one submission), and `funding_expired` (the entry outlived
-the key TTL without entering a round). All are re-fundable immediately.
-Your key is held at most 36h (TTL), forgotten on withdraw, and never stored
-anywhere but the operator's sealed vault.
+Documented once, in [MINER.md](MINER.md) §5 (submitting and funding) and §8
+(failure classes: what re-queues, what spends the submission). Keep that
+table in sync with `classify_funded_worker_failure` and the queue's terminal
+states when either changes.
 
 ## Cost model after arming
 

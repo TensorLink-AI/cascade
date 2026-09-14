@@ -1,826 +1,284 @@
-# Miner guide — submit a data generator
+# Miner guide
 
-You compete by submitting a **data generator**: purely-algorithmic code that
-produces synthetic time series. The owner's trainer trains a fixed Toto2-4M
-forecaster on your data from the round's **shared init** — random at
-generation 0, the promoted cascade checkpoint once promotions fire (the live
-case today; see [Warm-started rounds](#the-cascade--warm-started-rounds)).
-You win rounds when your data trains a
-better forecaster than the reigning king's, scored on a private, rotating
-held-out set you never see. No GPU, no shipped weights — you compete the
-*prior*. The submission contract (what the code must be) is
-[`INTERFACE.md`](INTERFACE.md); this is the end-to-end operator walkthrough.
+You submit a **data generator**: deterministic code that produces synthetic
+time series. The operator trains a fixed Toto2-4M forecaster on your data and
+scores it against the reigning king on a private, rotating held-out set. Beat
+the king by the round's margin and you take the throne. No GPU needed; you pay
+for your own training leg with a [Lium](https://lium.io) API key.
 
-At a glance:
+The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
+This guide is the end-to-end walkthrough.
 
 ```
-fork a generator → cascade verify → make a wallet → register on the subnet
-   → set Hippius creds → cascade deploy → cascade fund (your leg, your Lium key)
-   → confirm it competes in a round
+write a generator → cascade verify → cascade score (optional)
+  → register a hotkey → cascade submit (private) or cascade deploy + cascade fund (public)
+  → watch cascade queue / cascade round → read cascade duel
 ```
 
-## 0. Install
+Rounds run every 12 h (boundaries ≈ 08:30 and 20:30 UTC). Mainnet is netuid 91.
+The intake is `https://submissions.cascadesub.net`.
 
-Miners need no GPU. Install the core package with the Hippius (registry push)
-and chain (on-chain commit) extras:
+## 1. Install
 
 ```bash
 git clone https://github.com/TensorLink-AI/cascade && cd cascade
-pip install -e '.[hippius,chain]'      # numpy/scipy + hippius-hub + boto3 + bittensor
+pip install -e '.[hippius,chain]'
 ```
 
-## 1. Write (or fork) your generator
+Use this repo's pinned environment to commit on-chain (`bittensor==10.5.0`).
+Other SDK versions write reveals the validators cannot decode; your commit
+lands but you are silently skipped every round.
 
-Start from a reference and edit — the shipped examples are real, deployable
-generators:
+## 2. Write a generator
+
+Start from a shipped example and edit:
 
 ```bash
-cp -r scripts/example_generator my-generator      # minimal trend+seasonal+AR(1)
-# or one of the richer priors: gen_changepoint, gen_chaotic, gen_garch, base_generator
+cp -r scripts/example_generator my-generator      # minimal trend + seasonal + AR(1)
+# richer priors: gen_changepoint, gen_chaotic, gen_garch, base_generator
 ```
 
-Your repo directory must contain:
+Your repo must contain:
 
 ```
-generator.py        # exposes `class Generator(DataGenerator)`
-config.json         # any JSON your generator reads (band lengths, weights, …)
+generator.py        # class Generator(DataGenerator)
+config.json         # any JSON your generator reads
 requirements.txt    # hash-locked deps from the allowlist (numpy, scipy, torch, …)
 ```
 
-The one hard rule that trips people up: **determinism**. `generate()` must be a
-pure function of the `seed` passed to `__init__` — two runs at the same seed
-produce byte-identical corpora. Seed every RNG (numpy, torch, `random`) from it,
-avoid `hash()`/wall-clock/network. See `INTERFACE.md` for the full contract and
-the dependency allowlist (`chain.toml [dependencies]`).
+Rules that matter:
 
-## 1a. Compute-heavy priors (GP / kernel families): making them affordable
+- **Deterministic.** `generate()` must be a pure function of the `seed` given
+  to `__init__`. Seed every RNG from it; never use `hash()`, wall-clock, or the
+  network. Two runs at one seed must produce byte-identical corpora.
+- **Allowlisted imports only.** `socket`, `subprocess`, `pickle`,
+  `multiprocessing` and friends are blocked (`chain.toml [static_guard]`).
+- **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`
+  with `64 ≤ L ≤ 4096` and `C ≤ 32`. Values must be finite.
+- **Speed is scored.** Your generator streams during training and the compute
+  budget is fixed. A slow generator feeds the model less data inside the wall,
+  and that is the score, not a bug. Pin BLAS to one thread, prefer shorter
+  series for expensive priors (GP draws scale ~cubically in length), and use a
+  relative-jitter Cholesky instead of SVD fallbacks. Details in
+  [INTERFACE.md](INTERFACE.md).
+- **Numerics.** Series with extreme magnitudes can make training diverge. A
+  leg whose loss goes non-finite is rejected as your fault and your submission
+  is spent. Keep values in a sane float32 range.
 
-`gpytorch`, `scikit-learn`, and `networkx` are on the dependency allowlist
-precisely so GP/kernel/graph priors can compete — but a naive implementation
-prices itself out. Three facts to design around (DEC-CA-0031):
+### Multivariate series
 
-* **The generation budget is CPU-seconds, and threads sum into it.** The
-  sandbox enforces `max_generate_seconds` as `RLIMIT_CPU`, which accumulates
-  across every thread; `multiprocessing` is a blocked import. A multi-core
-  BLAS therefore burns the budget *faster* instead of buying you more — pin
-  your linear algebra to one thread (`OMP_NUM_THREADS=1` is set for you on
-  lane-pinned pods; do not fight it) and spend the cores you don't have on a
-  cheaper factorisation instead.
+A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
 
-* **The corpus budget is denominated in points, not series.** With
-  `[generator] corpus_target_points` armed (it ships armed at 67,108,864 =
-  16384 × 4096), the materialised drain stops when your corpus reaches the
-  target points — the series *count* is free. GP draws scale roughly
-  cubically in series length, so this is the lever that matters: at L=1024
-  instead of 4096 a kernel-synthesis prior costs ~64× less per series, and
-  the same total corpus lands near the time budget instead of two orders of
-  magnitude over it. Emit as many shorter series as your prior can afford;
-  the length band `[min_length, max_length]` is the only shape constraint.
-  (In the live `stream_cpu` feed the same freedom has always existed — the
-  stream stops at the training token budget, not at a series count.)
+- A channel costs what it trains: `(C, L)` bills `C×L` points of the budget.
+- Step count does not depend on C. Batches hold `batch_size // C` series, so a
+  wide corpus gets the same number of optimizer steps as a univariate one.
+- From block 9068400 (Mon 2026-09-14 ~20:30 UTC) multivariate eval windows are
+  scored jointly: all channels forecast in one pass, the window counts once.
+- Only coupled channels teach the variate layers anything. Stacking unrelated
+  series into one array is legal and useless.
+- Eval windows have at most 8 channels regardless of your C.
 
-* **Factorise with relative jitter, not SVD fallbacks.** The standard
-  "Cholesky, and on failure fall back to SVD" pattern is the single biggest
-  cost in a GP draw: the fallback is ~an order of magnitude slower and fires
-  constantly on near-singular kernels (long lengthscales, periodic kernels at
-  short lengths). Replace it with a *relative*-jitter Cholesky — scale the
-  diagonal nudge to the kernel's own magnitude and escalate until it
-  factorises:
+## 3. Verify and score locally
 
-  ```python
-  def stable_cholesky(K, rng_dtype=np.float64, max_tries=6):
-      # jitter proportional to the mean diagonal — an absolute epsilon is
-      # either uselessly small or distribution-warping, depending on scale
-      base = np.mean(np.diag(K))
-      for i in range(max_tries):
-          try:
-              return np.linalg.cholesky(K + (1e-9 * 10**i) * base * np.eye(len(K)))
-          except np.linalg.LinAlgError:
-              continue
-      raise np.linalg.LinAlgError("kernel not factorisable at max jitter")
-  ```
-
-  Measured on our GP priors this alone was ~5× per draw and took SVD
-  fallbacks from 47 per corpus to 0. It is pure CPU-side algorithm choice —
-  no contract implication, and the jitter is deterministic, so your digest
-  stays reproducible.
-
-One honest caveat on the live economics: in the deployed `stream_cpu` feed
-your generator streams *during* training, and throughput is a compute
-multiplier (DEC-CA-0001 — "the wall is the law"). A prior that generates
-slowly feeds the trainer less data inside the round's wall regardless of the
-drain budgets above, so the per-series cost you save with shorter lengths and
-a better factorisation converts directly into more training data for your own
-run. Budget accordingly: measure `seconds/series × (points needed / points
-per series)` against the round budget before you deploy, with
-`cascade score` as the ground truth.
-
-## 2. Verify locally
-
-`cascade verify` runs **every check the trainer runs** — layout, the static
-import guard, hash-locked deps, and the determinism check (it builds your corpus
-twice and compares digests). Fix anything it flags *before* you spend a
-registration:
+`cascade verify` runs every check the trainer runs (layout, import guard,
+hash-locked deps, determinism):
 
 ```bash
-cascade verify ./my-generator --chain-toml chain.testnet.toml
-# → OK: generator would be accepted by the trainer.
-#   corpus_digest (seed=0): 3ff20660d2fd1c55…  [deterministic]
+cascade verify ./my-generator
+# → OK: generator would be accepted by the trainer.   [deterministic]
 ```
 
-A green `[deterministic]` line means the trainer will accept it.
-
-## 2b. Score it locally (the fast iteration loop)
-
-`verify` proves your generator is *valid*; `cascade score` tells you if it's
-*good* — without deploying, spending TAO, or funding a live round's leg. It
-trains the fixed model on your data at the cheap **heat** budget and scores it
-on a pool you control, entirely offline (needs the `[train]` extra + ideally a
-GPU):
+`cascade score` trains the fixed model on your data at a cheap budget and
+scores it on a pool you control. Needs the `[train]` extra and ideally a GPU.
+Compare against the king on the same pool with the same init:
 
 ```bash
-cascade score ./my-generator --pool-dir ./my-heldout --device cuda
-# → score: geomean=0.412  (lower is better)
-#     pool:    dir:./my-heldout  (256 windows)
-#     corpus:  1024 series, digest c29ae1caa6b3…
-#     trained: 92s
-```
-
-The tight loop for a human or an agent:
-
-```bash
-cascade fetch king --out ./king                          # pull the current best
-cascade score ./king   --pool-dir ./my-heldout           # baseline to beat
-cascade score ./my-gen --pool-dir ./my-heldout           # your candidate
-# keep editing my-gen until it beats the king's number, THEN deploy
-```
-
-Two caveats worth internalising:
-- **Directional, not the verdict.** You score on *your* pool; the validator
-  scores on its private, rotating pool. Use the local number to hill-climb, not
-  as truth — and use real held-out data (`--pool-dir`), since the default
-  offline synthetic sample is only a smoke signal.
-- **Don't overfit your pool.** A generator tuned to ace one fixed local set is
-  exactly what the private rotating eval punishes. Rotate/expand your pool.
-- **Local scoring trains from random init by default.** Live rounds train from
-  the promoted warm-start init once a cascade generation is live (the case
-  today), so from-scratch local numbers won't match live heat scores — the
-  *relative* comparison against `cascade score ./king` on the same pool is what
-  carries. To train the way the live round does, add `--warm-start live`: it
-  reads the init the current round trains from off the public round status
-  (`cascade round` shows it), fetches it from the Hub, and switches to the
-  warm-started recipe (`warm_lr_scale`, no wsd warmup). `--warm-start` also
-  takes an explicit `repo@digest` / trained pointer or a local checkpoint dir.
-  Score the king and your candidate with the *same* `--warm-start` — a generator
-  that helps a warm init keep improving can rank differently from one that
-  helps random init converge.
-
-```bash
+cascade fetch king --out ./king
 cascade score ./king   --pool-dir ./my-heldout --warm-start live
 cascade score ./my-gen --pool-dir ./my-heldout --warm-start live
 ```
 
-## 3. Make a wallet and register
+The number is directional. Validators score on a private pool you never see,
+so use the local score to hill-climb, not as the verdict, and rotate your pool
+so you do not overfit it. `--warm-start live` trains from the init the current
+round uses; without it you train from random init, which ranks generators
+differently.
 
-You need a bittensor wallet (a coldkey + a hotkey) and a UID on the subnet.
+## 4. Register a hotkey
 
 ```bash
-# create keys (skip if you already have a wallet)
 btcli wallet new-coldkey --wallet-name my-miner
 btcli wallet new-hotkey  --wallet-name my-miner --wallet-hotkey gen1
-
-# register on the subnet (burns a small amount of test/real TAO for the slot)
-btcli subnets register --netuid 259 --network test \
-  --wallet-name my-miner --wallet-hotkey gen1
-# mainnet: --netuid 91 --network finney
+btcli subnets register --netuid 91 --network finney --wallet-name my-miner --wallet-hotkey gen1
 ```
 
-`btcli subnet list --network test` shows the current registration cost. One
-hotkey = one UID = one competing generator; register more hotkeys to run several
-priors in parallel.
+One hotkey = one submission. A hotkey is spent once its submission has been
+judged in a duel (or failed through its own fault). To submit again, register
+a fresh hotkey.
 
-## 4. Set your Hippius credentials
+## 5. Submit
 
-`cascade deploy` pushes your generator to the Hippius Hub registry, which needs
-registry auth in the environment (never in `chain.toml`):
+Two paths. Both end with a funded entry in the queue.
+
+### Private (recommended): `cascade submit`
+
+Your code goes straight to the operator's private vault. It is never
+published unless it takes the throne.
 
 ```bash
-export HIPPIUS_HUB_USERNAME=...     # or a token: HIPPIUS_HUB_TOKEN=...
-export HIPPIUS_HUB_PASSWORD=...
+export LIUM_API_KEY=sk-...            # env only, never an argument
+cascade submit ./my-generator https://submissions.cascadesub.net \
+    --wallet-name my-miner --wallet-hotkey gen1 --label my-gen-v3
+# → verifies, ZIPs, stores privately, commits vault/direct@sha256:… on-chain,
+#   funds the leg; it queues when the reveal lands
 ```
 
-You do **not** need S3 credentials — those are the trainer/validator's.
+Flags: `--no-fund` (fund later), `--no-commit` (print the chain payload only),
+`--reveal-now` / `--next-epoch` / `--blocks-until-reveal N` (reveal timing).
 
-Optionally, set a HuggingFace token if you want the outage fallback in
-[§5b](#5b-if-the-hippius-hub-is-down) — it is **only** used when the Hub is down:
+### Public: `cascade deploy` + `cascade fund`
+
+Your code is pushed to a public Hippius Hub repo and committed on-chain, then
+you fund it.
 
 ```bash
-export HF_TOKEN=hf_...               # only needed for `--hf-repo`
+export HIPPIUS_HUB_USERNAME=... HIPPIUS_HUB_PASSWORD=...   # or HIPPIUS_HUB_TOKEN
+cascade deploy ./my-generator --hub-namespace my-namespace \
+    --wallet-name my-miner --wallet-hotkey gen1
+export LIUM_API_KEY=sk-...
+cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
+    --wallet-name my-miner --wallet-hotkey gen1 --label my-gen-v3
 ```
 
-## 5. Deploy
+The Hippius project must be **public** or the trainer cannot pull it
+(`generator_artifact_unreachable`). `--hub-namespace` gives each deploy a
+random repo name so nobody can watch your namespace. If the Hub is down, add
+`--hf-repo <ns/name>` (needs `HF_TOKEN`) to mirror to HuggingFace.
 
-`cascade deploy` re-verifies locally, pushes the generator to the registry
-(content-addressed by `repo@digest`), and commits the on-chain pointer
-`metro-v1:gen:hippius:<repo>@<digest>`:
+### Reveal timing
+
+Only a commitment **revealed strictly before** the epoch boundary enters that
+round. `submit` and `deploy` default to a timed reveal a few minutes before
+the next boundary, so nobody can copy your fresh entry into the same round.
+A reveal that lands late rolls into the following round, nothing is spent.
+Confirm with `cascade reveal-status <hotkey> --watch`, and watch the deadline
+with `cascade round`.
+
+### Labels
+
+`--label` attaches a display name (≤ 32 chars, `[A-Za-z0-9._-]`) that shows
+beside your hotkey in `cascade queue`, the published roster and the heat
+standings. Re-funding with a new label renames; without one keeps the old.
+Labels are cosmetic: never identity, never in signed records.
+
+### Your Lium key
+
+- Sent once, signed by your hotkey over the key hash, a timestamp and your
+  ref. Always use `https://`.
+- Held at most 36 h in a sealed vault, used only to rent and tear down your
+  pod, forgotten on withdraw. Submit or fund within 36 h of your reveal.
+- Keep about **4 h of the round's GPU price** on the account: ~3 h training
+  plus ~1 h benching your own checkpoint afterwards.
+
+## 6. What happens in a round
+
+1. **Seats.** At the boundary, funded entries seat in reveal order, up to the
+   round's cap (8 in the shipped config), clamped to live GPU capacity. Unseated
+   entries wait, unspent, keeping their place.
+2. **One GPU type per round**, the most available of RTX4090, RTX3090, L40S,
+   L40, A6000. King and every challenger train on the same type.
+3. **Training.** Each seated entry rents a pod on its own key and trains the
+   full budget (~3 h) from the round's shared init. There is no heat screen:
+   every seated entry duels the king.
+4. **Manifest and verdict.** The operator signs a manifest (~3.5–4 h after
+   the boundary). Validators score king and challengers on the same private
+   windows and set weights (~4 h).
+5. **Bench.** Your pod benches your checkpoint on GIFT-Eval / BOOM / TIME
+   (~1 h), then is torn down. The operator re-benches the best-reported
+   challenger on its own pod; only operator numbers are signed.
+
+An unfunded boundary runs no round; the king holds.
+
+### Watching it
 
 ```bash
-cascade deploy ./my-generator \
-  --chain-toml chain.testnet.toml --network test \
-  --wallet-name my-miner --wallet-hotkey gen1 \
-  --hub-repo my-namespace/my-generator
-# → pushed to Hippius Hub: my-namespace/my-generator@sha256:…
-#   timed reveal: payload decrypts ~block 48575 (4820 blocks from now, 25 blocks
-#   before the epoch boundary at 48600) — hidden until the field locks.
-#   committed: metro-v1:gen:hippius:my-namespace/my-generator@sha256:…
+cascade queue --intake https://submissions.cascadesub.net --hotkey <you>   # live queue + last roster
+cascade round                 # deadline countdown, stage, dethrone bar, revealed submissions
+cascade heat --hotkey <you>   # who seated / who waits this round
+cascade duel                  # the settled verdict: margin, geomeans, per-domain win rates
 ```
 
-Re-deploy any time to submit a new version — the latest pre-cutoff reveal per
-hotkey is the one that competes.
+Every leg also streams a public JSONL training log (`logs/round-<id>/…`) with
+per-step loss, throughput and `data_wait_frac`, plus a `host` record for the
+pod. High `data_wait_frac` means training waited on your generator.
 
-> **⚠️ Your Hippius project must be PUBLIC.** The trainer pulls your generator
-> anonymously; a private Harbor project returns `401 Unauthorized` and your
-> submission is rejected every round as `generator_artifact_unreachable`
-> (observed live for several miners). New Hippius Harbor projects can default
-> to private — after your first push, open the Hippius Hub UI and set the
-> project's visibility to public. Self-check (should print `200`):
->
-> ```bash
-> REPO=my-namespace/my-generator DIGEST=sha256:...   # from `cascade deploy` output
-> TOK=$(curl -s "https://registry.hippius.com/service/token?service=harbor-registry&scope=repository:${REPO}:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-> curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOK" \
->   "https://registry.hippius.com/v2/${REPO}/manifests/${DIGEST}"
-> ```
+## 7. How the verdict works
 
-> **⚠️ SDK version matters — use this repo's environment to commit.** The
-> on-chain pointer travels through bittensor's timelock commit-reveal, and the
-> reveal ENCODING differs across SDK lines: older `set_reveal_commitment`
-> variants (and `subtensor.commit()` / `publish_metadata` / raw btcli
-> commitments) write reveals the subnet's decoder cannot read — your commit
-> lands, but you are silently **skipped every round** with
-> `revealed-commitment decode failed: non-hexadecimal number found in
-> fromhex()`. This repo pins `bittensor==10.5.0` (what the validators run);
-> `cascade deploy` on this environment is the known-good path. Pass the plain
-> pointer string — do NOT pre-hex `data=` yourself. To self-check after a
-> deploy: `sub.get_revealed_commitment(netuid, <your uid>)` must return
-> `(block, "metro-v1:gen:hippius:…")` as a clean string. If you were affected,
-> simply re-deploy from this environment — the newest commit wins.
+- **Metric.** Geometric mean of CRPS and MASE over the private windows, on a
+  horizon ladder of 64 / 256 / 720 steps.
+- **Dethrone rule.** The paired-bootstrap lower confidence bound of your
+  advantage over the king must clear the round's margin. The margin is 1%
+  against a fresh king and decays to a 0.5% floor over 8 held rounds. With
+  several challengers, a cohort-wide correction keeps the king's false-dethrone
+  risk fixed. `cascade round` prints the live bar; each receipt records the
+  rule it was judged under.
+- **Rewards.** The king and up to 4 prior kings share weights with geometric
+  decay 0.5 (≈ 52 / 26 / 13 / 6 / 3 %). Losing challengers earn nothing.
+- **Warm-start lineage.** When a king holds 5 consecutive rounds, up to 3 of
+  the reign's best checkpoints (king's or challengers') become the next
+  generation's shared init, picked by public benchmark score and error
+  diversity. Later rounds rotate through them. You are improving the strongest
+  lineage, not teaching from zero; data that adds regimes the lineage is weak
+  on beats data that re-teaches what it knows. `cascade round` shows the init
+  in use.
 
-### 5a. Protecting your submission (timed reveal)
+## 8. Failure classes
 
-**Threat model.** Everything on cascade is public *after* a round locks — that's
-what makes every round independently re-derivable, and studying (or forking) the
-reigning king is the intended game. What should **not** be possible is a
-competitor copying your *fresh* submission into the **same round**, free-riding
-on work that hasn't even been evaluated yet. Two things could leak it early:
+What happens to your entry when a leg does not produce a judged checkpoint:
 
-1. **The on-chain pointer.** Deploy defaults to a **timed reveal**: the
-   timelock-encrypted commit decrypts `[round] reveal_margin_blocks` (~5 min)
-   before the epoch boundary. Your pointer is hidden for its whole submission
-   window; by the time it's readable, a copier can no longer land their own
-   reveal before the cutoff (eligibility requires the *reveal* — not the commit —
-   to be strictly before the boundary). Flags:
-   - `--reveal-now` — reveal immediately (the old behaviour). Your ref is public
-     and copyable for the rest of the window; committing someone's exact ref
-     needs no upload at all.
-   - `--next-epoch` — target the *following* boundary when you'd rather sit out
-     the imminent round than deploy inside the margin.
-   - `--blocks-until-reveal N` — full manual control.
-   Don't try to out-tune the margin by hand: reveal timing jitters by a few
-   blocks, and a reveal landing at/after the boundary misses the round entirely.
-2. **The generator content itself.** The upload to your Hub repo happens at
-   deploy time, *before* the reveal — and a predictable repo name (or a public
-   HuggingFace mirror, which lists your whole account) lets a competitor watch
-   your namespace and copy the content without ever reading the chain. Use
-   `--hub-namespace my-namespace` instead of `--hub-repo`: each deploy then goes
-   to a fresh, non-guessable `my-namespace/gen-<random>` repo, so the content is
-   only discoverable through the (still-hidden) on-chain ref. Avoid the
-   `--hf-repo` fallback for competitive submissions; it exists for Hub outages.
+| class | examples | your submission |
+|---|---|---|
+| infrastructure | dead pod, sold-out market, rate limit, harvest transport failure | **kept**, re-queued; one bounded attempt burned (sold-out and rate limits burn nothing) |
+| stall | your generator produced no series for 30 min | first time: treated as infrastructure; second time: yours |
+| auth | invalid or revoked Lium key | released as `auth`; fix the key, fund again |
+| generator | your code raised, a series failed the checks, the loss went non-finite | **spent** |
+| tamper | pod replaced under the same name, checkpoint altered | **spent** |
+| ref_mismatch / burned / funding_expired | you re-revealed a different ref / hotkey already used / entry outlived the 36 h key TTL | terminal; re-fund (a burned hotkey needs a fresh one) |
 
-Copying is also unrewarding by construction, at both levels the trainer can see:
+`cascade queue` shows the class beside a failed entry. A rate-limit streak
+longer than 6 h turns terminal; raise the key's limits and fund again.
 
-- **Same ref** (someone commits your exact `repo@digest` string — needs no
-  upload): the **earliest reveal** keeps the slot; the copy is dropped before
-  any training.
-- **Same content** (someone re-uploads your generator bytes under their own
-  repo — a different ref): under the round's shared seed an identical generator
-  produces an identical **corpus digest**, and the trainer drops the clone —
-  before screening in the heat (`duplicate` in the standings), and from the
-  final's entries — again keeping the earliest reveal. A clone can therefore
-  never tie you and steal your slot on a tiebreak; a challenger whose corpus is
-  byte-identical to the king's is discarded outright.
+## 9. Study the competition
 
-What remains possible inside the ~5-minute margin is a *modified* fork — which
-is just the ordinary (allowed) forking game played with almost no time to
-actually improve anything.
-
-#### After you deploy: confirm the reveal, and what a miss means
-
-Reveal timing jitters by a few blocks, so don't assume — confirm. `deploy`
-prints the exact command:
+The king's code is public the moment it takes the throne (`champions/` on
+the manifest bucket; private losers stay private forever):
 
 ```bash
-cascade reveal-status <your-hotkey-ss58> --network test \
-    --expect-boundary <printed-boundary> --watch
-# → revealed at block 48577 — eligible for the round locking at block 48600 …
-# or, loudly:
-# → ⚠ MISSED the targeted boundary 48600: the reveal landed 3 block(s) at/after it.
+cascade fetch king --out ./king          # the reigning king
+cascade fetch <uid|hotkey|repo@digest>   # a public competitor
 ```
 
-If the reveal **misses** its boundary:
+Copying is unrewarding by construction: the earliest reveal owns a ref, and a
+byte-identical corpus is dropped before it trains. You win by improving on
+the visible best.
 
-- The submission **auto-rolls into the next round** — no re-commit needed
-  (eligibility is just "revealed before that round's boundary").
-- It has **not** consumed your one-submission budget: the burn is persisted
-  only after a round's heat stage actually screened the field, and a missed
-  reveal never entered one.
-- The cost is secrecy, not eligibility: the ref is public until the next
-  boundary. The same-ref and same-content rules above still keep your slot
-  yours; if you'd rather enter *fresh, improved* content hidden, just
-  re-deploy — the **latest reveal per hotkey** is the one that competes.
+Rotated-out eval windows are published with a lag to
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
+Use them to replay past verdicts locally; live rounds always score on windows
+that were never published.
 
-**Fat-fingered a deploy?** Same mechanism: re-deploy the corrected generator
-before the boundary. Both commitments will eventually reveal; the later reveal
-wins. Two timed deploys in one window may target the same reveal block — if you
-need the replacement to be unambiguous, give it `--next-epoch` (or a later
-explicit `--blocks-until-reveal`) so its reveal strictly follows the original's.
+## 10. Troubleshooting
 
-Two empirical assumptions behind this scheme can (and should) be re-checked
-against the live network:
-
-```bash
-# is the margin big enough? (needs a throwaway testnet hotkey; ~minutes)
-python scripts/measure_reveal_jitter.py --chain-toml chain.testnet.toml \
-    --network test --wallet-name probe --wallet-hotkey probe1
-
-# is content behind a random repo name actually undiscoverable? (~seconds)
-python scripts/probe_hub_enumeration.py
-```
-
-If the registry turns out to be enumerable, random repo names don't hide
-content and the fallback is *sealed submissions* (upload ciphertext; the
-decryption key + plaintext digest ride in the timelocked payload).
-
-### 5b. If the Hippius Hub is down
-
-Miner submission uploads to the Hippius **Hub** (the OCI registry) — a different
-service from Hippius **S3** (which only the trainer/validator use). If the Hub is
-having an outage, the upload fails with `registry upload failed: …` (exit 4). Pass
-`--hf-repo` to mirror your generator to HuggingFace instead so you can still
-submit:
-
-```bash
-cascade deploy ./my-generator \
-  --chain-toml chain.testnet.toml --network test \
-  --wallet-name my-miner --wallet-hotkey gen1 \
-  --hub-repo my-namespace/my-generator \
-  --hf-repo  my-hf-namespace/my-generator      # fallback, needs HF_TOKEN
-# → Hippius Hub upload failed (…); falling back to HuggingFace mirror …
-#   mirrored to HuggingFace: my-hf-namespace/my-generator@hf:<sha>
-#   committed: metro-v1:gen:hippius:my-hf-namespace/my-generator@hf:<sha>
-```
-
-How it works, and what to know:
-
-- **Hippius is priority one.** The Hub is *always* tried first; HF engages **only**
-  if that push fails. `--hub-repo` is required — you cannot submit straight to HF
-  while the Hub is healthy. (`--hf-repo` alone is refused.)
-- **It's a real submission.** The chain commit records `repo@hf:<sha>`, and the
-  trainer/validators/auditors fetch, train, and score it exactly like a Hub one —
-  the `hf:` ref just tells them to fetch from HuggingFace.
-- **Keep the HF repo public and don't delete it** while that commit is your active
-  submission — the trainer fetches it anonymously, so a private/deleted repo means
-  it can't be evaluated. (A newly-created repo is public by default.)
-- **The commit stays on HF until you replace it.** When the Hub recovers it does
-  *not* auto-migrate — re-deploy with just `--hub-repo` to move your submission back
-  onto the content-addressed Hub (the preferred, audit-anchored form).
-
-### 5c. Time your submission — `cascade round`
-
-Only commits revealed **strictly before** the epoch boundary enter the next
-round; commit at or after it and you wait a whole extra round (~12h). `cascade
-round` is a live round dashboard: the countdown to that deadline, where the
-round roughly is, and the revealed submissions — run it before you deploy so
-you don't commit into the wrong round, and keep it running to see your own
-commit land:
-
-```bash
-cascade round --network test --chain-toml chain.testnet.toml
-# cascade round — network: test
-#   current block   4,321,004
-#   round (epoch)   600  ·  started at block 4,320,000
-#   next round      epoch 601 at block 4,327,200
-#   progress        [████░░░░░░░░░░░░░░░░░░░░░░░░]  13.9%  (1,004 / 7,200 blocks)
-#   countdown       20h 39m 12s until next round  (~12.0s/block)
-#   deadline        commit strictly before block 4,327,200 to enter epoch 601
-#   eta             2026-07-12 03:51 UTC (estimated)
-#   stage           heat ▸ [DUEL] ▸ validation ▸ settled
-#                   king vs finalists training at the full budget — 3h 20m 48s into the round (est.)
-#   last round      king held (uid 3)
-#   dethrone bar    LCB > 0.875% this round  (king tenure 6; floor 0.50% at tenure 8)
-#   submissions     4 in this round · 1 committed for the next
-#     uid   47  5F3sab…8kQz  my-ns/my-generator@ab12cd34…      block 4,320,100  → next round   ● new
-#     uid   12  5DkPcd…1mVx  other/gen@77aabb01…               block 4,319,882  in this round
-#     …
-```
-
-It ticks every second, re-syncing to the real block height every `--refresh`
-seconds (default 30); Ctrl+C exits. `--once` prints a single snapshot instead
-(piped output does this automatically, with no escape codes), which is handy
-in scripts. The block numbers are on-chain-exact; the wall-clock countdown and
-ETA are estimates from the configured cadence (`[round] round_hours` over
-`epoch_blocks`, ~12s/block). Read-only — no wallet needed. Don't cut it to the
-last block: leave margin for the upload plus commit inclusion.
-
-What the live sections mean:
-
-- **stage** — where the current round is: `heat` (every challenger trained
-  cheaply and screened), `duel` (king vs the surviving finalists at the full
-  budget), `validation` (validators scoring the duel and setting weights),
-  `settled` (this round's receipt is public — the line shows the verdict:
-  king held, dethroned, or rejected). The trainer's internal progress isn't
-  public, so the pre-settle stages are wall-clock **estimates** from the
-  configured budgets (marked `est.`); `settled` is confirmed from the public
-  receipt index and needs no credentials. `last round` shows the previous
-  round's verdict while the current one is still in flight.
-- **dethrone bar** — the LCB margin a challenger must clear to take the throne
-  **this round**. The margin decays with the king's tenure (an affine ramp from
-  `[scoring] win_margin_start` to `win_margin_end` over `margin_warmup_rounds`
-  held rounds, then floored), so the number in the last settled receipt is
-  already one step stale — this line derives the live bar from the public
-  receipt index (consecutive holds by the current king) and the configured
-  schedule. Shown only while the round is in flight; once it settles, the
-  receipt states the margin it was actually judged at.
-- **heat** — this round's screening standings, shown from the moment the heat
-  settles (the trainer publishes them then, not with the round's receipt): every
-  entrant's rank, its gap to the best entrant, its raw CRPS/MASE, and whether it
-  advanced. Pass `--hotkey <your-ss58|uid>` and your row is marked `← you` and
-  always shown, however far down you placed. Full view:
-  [`cascade heat`](#your-heat-result--cascade-heat).
-- **submissions** — the revealed on-chain commitments, newest first: who is
-  competing in the current round vs committed for the next one (relative to
-  the epoch boundary). In watch mode the field re-polls about once a minute,
-  and a commit that appears while you watch is flagged `● new` — after
-  `cascade deploy`, that flag on your UID is the confirmation your submission
-  is on chain and which round it will enter.
-
-## 6. Confirm it's competing
-
-Your commit is now on chain. The quickest check is `cascade round` — your UID
-appears in its **submissions** feed (flagged `● new` if you were already
-watching), tagged with the round it enters ([§5c](#5c-time-your-submission--cascade-round)).
-To verify from first principles instead:
-
-```bash
-# it shows in the revealed commitments for the netuid …
-# (the trainer reads these before each epoch boundary)
-python - <<'PY'
-from cascade.shared.chain import ChainClient
-from cascade.shared.config import load_chain_config
-cfg = load_chain_config('chain.testnet.toml')
-c = ChainClient(netuid=cfg.netuid, network="test")
-for cm in c.poll_commitments():
-    print(cm.uid, cm.hotkey[:10], cm.payload[:60])
-PY
-```
-
-Then watch the **public round receipts** (or the dashboard): revealed *before*
-the epoch boundary, your generator enters the next round's **heat**, gets
-trained and scored, and appears in that round's receipt participant set with
-your `gen_ref`. If it wins the heat it advances to the full final against the
-king — and when the screen cannot statistically separate the top entrants, the
-tied cohort advances together (capped at `[round] max_finalists`, 3), the
-validators judging the whole cohort and crowning the best margin-clearer.
-Verify any round independently with `cascade-audit latest` (see
-[`AUDIT.md`](AUDIT.md)).
-
-### Your heat result — `cascade heat`
-
-The heat is the only place a non-winning submission is ever scored, and you do
-**not** have to wait for the round to settle to read it: the trainer publishes
-the standings the moment the heat settles — before the duel trains, hours before
-a validator signs the receipt, and even for a round that is later rejected at a
-gate.
-
-```bash
-cascade heat --hotkey <your-hotkey-ss58> --network test --chain-toml chain.testnet.toml
-# cascade heat — round 4321000  ·  epoch start block 4,320,000
-#   published       2026-07-30T04:12:19+00:00
-#   field           5 entrants · 1 advanced · screened at tiny-24m
-#   advancing       top 1 to the duel against the king
-#   decisiveness    leader LCB +0.0310 — the screen separated 1st from 2nd (n_windows=120, feeds=9)
-#
-#     #1  uid    2  5FcCso…yfsw  carol/gen-a@cccccccc…    best  crps   0.4123  mase   1.021  ▲ advanced
-#     #2  uid   47  5F3sab…8kQz  my-ns/my-gen@dddddddd…  +4.8%  crps   0.5100  mase   1.200  screened   ← you
-#      —  uid    4  5Gzzzz…qwer  frank/gen@ffffffff…         —  crps        —  mase       —  did not train
-```
-
-What you get per entrant: your **rank**, your heat score *relative to the best
-entrant* (`+4.8%` = 4.8% worse than the leader), your raw **CRPS** and **MASE**
-on that round's held-out eval-pool slice, and your **standing** — advanced,
-screened out, `duplicate` (byte-identical corpus to an earlier reveal), did not
-train, or screen error. `--round <id>` reads an archived round, `--history`
-lists what has been published. Read-only: no wallet, no chain call, no
-credentials.
-
-`cascade round` shows the same standings inline as soon as this round's heat
-lands (pass `--hotkey` there too and your row is marked `← you` and always
-shown, however far down you placed), and the web dashboard's **Heat** panel
-switches to the live standings the moment they are published — labelled *Live*
-while the duel is still training. Everything here is informational and
-**unsigned** (it rides the manifest as a presentational block and is mirrored to
-`status/heat.json` + `heats/round-<id>.json`), so it never affects the signed
-verdict.
-
-### The duel verdict — `cascade duel`
-
-Once a round settles, `cascade round` compresses the result into one line
-("DETHRONED" / "king held"). `cascade duel` prints the full verdict behind it,
-straight from the validators' public receipts:
-
-```bash
-cascade duel                       # latest settled round (--round <id> for an older one)
-# cascade duel — round 13527411684103147578  ·  epoch start block 8809200
-#   outcome        DETHRONED — challenger uid 124 took the throne
-#   king           uid   31  5HpRNH…tQeJ  geomean 0.24836  cascade-private/gen…@05e741f7…
-#   challenger     uid  124  5FdwqF…5scc  geomean 0.23881  (3.85% better than the king)  garuda-labs/gen-04f…@hf:1ebecb70…
-#   margin         LCB +0.0220 vs +0.0200 required — challenger cleared the bar
-#   evidence       challenger won 60.8% of windows (1945 windows, 852 feeds) · wilcoxon p=2.7e-27
-#   bootstrap      Δ p50 +0.0376 / p95 +0.0576
-#   heat           25 entrants · 1 advanced · leader p_best 0.977
-#   rewards        uids [124, 31, 49, 246, 158]
-#   per-domain win rate  (right of centre = challenger ahead)
-#     web_cloudops   0.74  n=  440  ············██████
-#     healthcare     0.46  n=  147             █············
-#   validators     2 scored (lcb +0.0220/+0.0220) · 5C8W9P…LJDD rejected (contract_digest_mismatch)
-```
-
-The dethrone rule in one line: the challenger takes the throne when the
-paired-bootstrap **LCB** of its advantage clears the round's **margin** —
-which is not flat: it decays with the king's tenure (2% against a fresh king,
-ramping to a 0.5% floor over 8 held rounds under the default `[scoring]`
-schedule), so an entrenched king is progressively cheaper to challenge. Each
-receipt records the margin *that round* was judged at plus the king's tenure,
-and `cascade round` shows the live bar for the round in flight. The
-per-domain table then shows *where* the duel was won or lost (a win rate
-above 0.50 means the challenger beat the king on that domain's windows).
-`--history` lists every settled round's outcome. Like `cascade heat` this is
-read-only — no wallet, no chain call, no credentials — but unlike the heat
-standings it reads the **signed** receipt index, one row per validator, so you
-also see whether the validators agreed.
-
-### Reading the training log — was it your generator, or the pod?
-
-Every run streams a JSONL log to the public logs bucket at
-`logs/round-<id>/<role>.jsonl` — `heat-<your-hotkey>.jsonl` for a heat entry,
-`king-<size>` / `challenger-<size>` for a final. When `[wandb] enabled`, the
-same records mirror live into the public wandb project while the run is in
-flight. Per-step rows carry `loss`, `lr`, `tokens`, `throughput_tokens_per_s`,
-`steps_per_s`, and `data_wait_frac`; the closing `summary` row carries those
-totals plus `tokens_frac` and `deadline_hit`.
-
-The wall prices generator speed on purpose — a slow generator gets less compute
-and that *is* the score, not a bug (`decisions/DEC-CA-0001`). But the fleet is
-rented per round, sometimes across providers, so a run can also be slow for
-reasons you don't control. Each run therefore publishes a `host` record (also
-merged onto the `summary` row) describing the pod it landed on:
-
-| field | what it tells you |
+| symptom | cause / fix |
 |---|---|
-| `host_bench_tokens_per_s` | a **fixed** calibration workload, timed before your generator starts. Identical on every pod and independent of your submission, so it is the one number directly comparable host to host. |
-| `host_bench_cpu_tokens_per_s` | the CPU leg alone — per-core speed of the core this lane got. |
-| `host_bench_d2d_gb_s` | the GPU's achieved memory bandwidth (catches a throttled or cut-down card). |
-| `host_lane_index` / `host_lane_count` | the pod's GPU fan-out. `host_gen_cpu_slice` is the core count your generator was confined to. |
-| `host_cpu_count`, `host_cpu_model` | cores this run could actually use, and the CPU it ran on. |
-| `host_gpu_name`, `host_gpu_sm_count`, `host_pcie_gen`, `host_pcie_width` | the device, its SM count, and the PCIe link it negotiated. |
-| `host_id`, `host_boot_id` | opaque ids — the pod, and the physical machine. Two runs sharing `host_boot_id` but not `host_id` were **co-tenants on one box**. |
-
-Use them to tell the two causes apart. High `data_wait_frac` means training sat
-waiting on your generator — that is yours to fix. Low `data_wait_frac` *and* a
-`host_bench_tokens_per_s` well below the round's other entries means the pod was
-slow, not the generator. `host_bench_spec` tags the workload version; only
-compare numbers that share it, and read the bench as a host *index* — it is a
-different workload from a training step, so its absolute value is not comparable
-to `throughput_tokens_per_s`.
-
-This is observability, not an appeal channel: these fields are not signed, not
-in the manifest, and never re-weight a score. They exist so a claim about host
-variance can be checked against numbers instead of inferred.
-
-## 6b. Fund your training leg — REQUIRED from Fri 2026-09-11 (~20:30 UTC, block 9046800)
-
-From block **9046800** (DEC-CA-0036; the 2026-09-04 block passed unreleased), a revealed submission only enters a
-round once you FUND its training leg: your leg's GPU pod rents on **your own
-Lium API key** (lium.io), so the compute you consume bills you, not the
-operator. The operator still pays for the king's leg, the evals, and
-everything else. There is no heat screen any more — every funded, seated
-entrant goes straight to the paired duel against the king.
-
-The mainnet intake is **`https://submissions.cascadesub.net`** (live).
-
-```bash
-# after `cascade deploy` (your reveal must be on-chain and your hotkey
-# REGISTERED on the subnet):
-export LIUM_API_KEY=sk-...        # your key, env only — never on the command line
-cascade fund https://submissions.cascadesub.net     --ref <repo@digest>     --wallet-name mywallet --wallet-hotkey myhotkey
-# → fund: queued  (your seat is ordered by your on-chain reveal block)
-
-cascade queue                     # the last round's published seat allocation
-cascade queue --intake https://submissions.cascadesub.net   # + the LIVE queue
-cascade fund https://submissions.cascadesub.net --ref <repo@digest> --withdraw     --wallet-name mywallet --wallet-hotkey myhotkey   # exit while still queued
-```
-
-What to know:
-
-- **Seniority is your reveal block** — first revealed, first seated. Each
-  round seats up to 8 funded entries, clamped to the GPU marketplace's live
-  capacity; everyone else waits, unburned. Seat allocation is published
-  per-round (`funded/round-<id>.json`, `cascade queue`) with the on-chain
-  reveal blocks beside every seat, and `cascade-audit` cross-checks it
-  against the signed manifest — queue-jumping is a named, reproducible
-  audit warning.
-- **One GPU type per round**, chosen at the boundary as the most available
-  of `["RTX4090", "RTX3090", "L40S", "L40", "A6000"]` — king and challenger
-  always train on identical silicon. Keep enough balance on your Lium
-  account for ~4h of the round's type: the ~3h leg plus ~1h in which your
-  pod benches your OWN checkpoint on GIFT-Eval/BOOM/TIME after the duel
-  (data is pushed to it; the pod is released when the sweep ends). The
-  operator re-benches the best-reported challenger on its own pod before
-  any number is signed, so a doctored sweep buys nothing — it just drops
-  your entry from the public bench stream and the promotion pool.
-- **Your entry never burns for infrastructure.** A dead pod, a sold-out
-  market, or a rate limit re-queues you without spending anything (sold-out
-  waits as long as it takes; a rate-limit streak longer than 6h turns
-  terminal — fix the key's limits and fund again). An invalid/revoked key
-  releases your entry as `auth` — fix it, `cascade fund` again. Your
-  generator crashing is your run, spent as ever.
-- **Your key is held at most 36h** in a sealed operator vault (0600 files,
-  never logged, never in any shared store), used ONLY to rent and tear down
-  your pod, forgotten on withdraw. The signed request binds the key's hash,
-  a fresh timestamp, and your ref, so it cannot be replayed or altered in
-  transit — always use an `https://` intake URL.
-- **Rounds fire only when someone funded** (still on the ~12h epoch grid
-  for now): an unfunded boundary runs nothing and the king simply holds.
-- **One submission per hotkey still holds — and it is spent only when
-  judged.** Your hotkey burns when your funded leg actually trains and
-  duels (or your own generator fails on the pod); a sold-out market, a
-  rate limit, operator infra, or a bad key never spend it. A hotkey that
-  already competed in a legacy (pre-funded) round IS spent: to enter the
-  funded era, register a fresh hotkey and reveal AFTER the last legacy
-  boundary (Fri 2026-09-11 ~08:30 UTC, block 9043200) — a reveal before it
-  competes in the final legacy round and burns. Reveal + fund before the
-  ~20:30 UTC boundary (9046800) to be in the first funded round.
-
-- **Private submissions (same release).** `cascade submit ./my-generator
-  https://submissions.cascadesub.net --wallet-name w --wallet-hotkey h` ZIPs your repo
-  straight to the operator-private vault, chain-commits a
-  `vault/direct@sha256:…` ref, and — with `LIUM_API_KEY` in env — funds the
-  leg in the same request (auto-queues when your reveal lands; `--no-fund` to
-  fund later). Losers are never published; a king's code publishes only when
-  it is deposed (`champion_publish = "dethrone"`), via `cascade fetch king`.
-  The earliest upload owns a digest — another hotkey committing your digest is
-  dropped at field entry.
-
-Short version of all of this (funding, private submissions, multivariate):
-[docs/MINER_FUNDED_QUICKSTART.md](MINER_FUNDED_QUICKSTART.md). Full contract
-(failure classes, TTLs, the operator's obligations):
-[docs/MINER_FUNDED_ROUNDS.md](MINER_FUNDED_ROUNDS.md).
-
-## The cascade — warm-started rounds
-
-Rounds no longer always train from random init. When a king survives
-`[scoring] cascade_reign_rounds` (5) consecutive rounds undethroned, the
-trainer **promotes** up to `cascade_top_k` (3) of that reign's best duel
-checkpoints — within `cascade_quality_epsilon` (5%) of the reign's best public
-benchmark score, picked for error diversity — as the next **warm-start
-generation**. Subsequent rounds rotate through the members, and **every run in
-a round — heat and final — trains from that same init**, so the controlled
-experiment is untouched: both sides still share one init and your data is
-still the only variable. Promotions have fired on mainnet; warm-started
-rounds are the live case, not a future feature.
-
-What it means for you as a miner:
-
-- **You are improving the strongest lineage, not teaching from zero.** After
-  generation 0 the model already forecasts when your data arrives; corpora
-  that add regimes the lineage is weak on beat corpora that re-teach what it
-  already knows. The per-domain win-rate table in `cascade duel` shows where
-  the current lineage is weak.
-- **Losing challengers' checkpoints are promotable too.** The candidate pool
-  is every benched duel checkpoint of the reign — the king's *and* the
-  challengers'. Promotion pays nothing, but your data can end up shaping the
-  init every later round trains from.
-- **The promotion can't ratchet downhill.** A ripe reign whose best
-  checkpoint benches worse than the live generation's best member holds until
-  it produces an equal-or-better one. The king persists through a promotion —
-  only a genuine dethrone changes the throne.
-- **Where to see it**: `cascade round` shows a
-  `warm start — this round trains from …` line with the generation while the
-  round is in flight; `cascade heat` prints the same plus the rotation's
-  scheduled pick for the next round; and the web dashboard's warm-start
-  panel shows the member rotation and which round each init came from. The
-  init is pinned in each round's signed manifest, so `cascade-audit`
-  verifies it like everything else.
-
-## Study the competition
-
-Every committed generator is content-addressed and **public** — that's what
-makes the eval re-derivable, and it makes the current best openly studyable.
-Pull the reigning king (or any competitor) and read its code:
-
-```bash
-cascade fetch king --network test --chain-toml chain.testnet.toml
-# → fetched king-uid3: cascade/testnet-smoothgp@sha256:…
-#   inspect it, or fork + improve it:  cascade verify ./fetched-king-uid3
-
-cascade fetch 13 --out ./chal13      # a specific UID
-cascade fetch 5Haf…                  # a specific hotkey (ss58)
-cascade fetch namespace/repo@sha256:…  --verify   # a raw ref; --verify runs the checks
-```
-
-This is the game: the best generator is visible, and you win by **improving**
-on it, not hiding — a byte-identical copy of the king is dropped before it
-trains (it can only tie), so you have to genuinely beat it. Read-only; no wallet
-needed, just Hub read credentials.
-
-**Prior eval windows are public too.** The private eval pool rotates every
-round; once a round's windows have rotated out they are published (on a lag,
-so nothing live is ever revealed) to the
-[`Tensor-Link/cascade-eval-pool`](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
-dataset on HuggingFace. Use them to see exactly what past duels were scored
-on, replay a verdict against your own generator locally (download a round's
-windows and point `cascade score --pool-dir` at them), or study which domains
-and horizons the pool actually exercises.
-Training against them directly is pointless by design — the live rounds are
-always scored on windows that have never been published.
-
-## Duel-only rounds (from block 8992800)
-
-From block 8992800 (≈ 2026-09-04 08:30 UTC) rounds run without a heat. After
-the duplicate screen, the whole field seats straight into the duel in
-**reveal order** and every challenger trains the full final budget on the
-same fleet as the king; the fleet is sized to fit the field inside the epoch,
-and every screened entrant seats (`duel_seat_all`, the default since
-2026-09-08 — a fleet that comes up short queues the legs rather than
-benching anyone). Only an explicit `duel_field_cap` makes the latest reveals
-wait for the next round, with their submission intact — `cascade heat` lists
-them as `waiting`, and they seat automatically when their turn comes (no
-re-commit, no burn). The whole seated cohort is judged under
-the α/k rule, so a bigger cohort means a stricter per-challenger bound.
-From the same block the verdict is scored on a horizon ladder (64 / 256 / 720
-steps, one even-by-domain draw each) instead of the single 64-step horizon.
-
-### Reading a duel-only round
-
-On a duel-only round `cascade heat` lists the whole field: every seated entrant
-(`● seated — duels the king`, in seat order) and every waiting one
-(`waiting — next round`); there is no rank, because no screen ran. The round's
-result is the validator's receipt: `cascade duel` shows the decided pair, a
-`by horizon` block with the king's and the challenger's geomeans on each rung
-(64 / 256 / 720 steps) and the challenger's per-window win rate there, and a
-`cohort` block listing every judged challenger with its geomean relative to the
-king, its LCB against the margin, and its per-horizon gaps.
-
-## Multivariate series (from 2026-09-09; scored from block 9068400)
-
-`max_channels` is now **32**: `generate()` may yield `(C, L)` arrays whose
-channels are the variates of one series (a 1-D yield is still one channel, and
-a pure-univariate generator remains fully legal and byte-identical to before).
-The economics, so you can plan a corpus:
-
-* **A channel costs what it trains** — a `(C, L)` series bills `C×L` points of
-  the token budget. There is no discount for width and no penalty either: the
-  per-point wall-clock cost is measured flat in `C`.
-* **Your step count does not depend on your channel mix.** Batches fill to
-  `batch_size // C` series (`batch_denomination = "sequences"`), so a C=32
-  corpus trains the same ~number of optimizer steps as a univariate one from
-  the same budget. Width buys cross-channel signal per step, not fewer steps.
-* **From block 9068400 (≈ Mon 2026-09-14 20:30 UTC) the duel scores
-  multivariate eval windows jointly**: the model forecasts all channels of a
-  window in one pass (sibling channels condition each other) and the window's
-  channels average into ONE per-window contribution. Until the eval pool
-  carries multivariate windows this changes nothing; once it does, a model
-  whose variate layers were trained on genuinely coupled data can earn on
-  them.
-* **What trains the variate layers is your data.** At `C = 1` the variate
-  attention receives no gradient at all; channels only teach cross-channel
-  structure if they are actually related. Stacking unrelated series into one
-  `(C, L)` array is legal but buys nothing the redundancy telemetry won't
-  eventually price (`channel_corr_mode` is in shadow now; enforcement follows
-  calibration).
-
-## Common failures
-
-| symptom | cause |
-|---|---|
-| `cascade verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, or set iteration order — make `generate()` pure in `seed` |
-| `blocked_import` | a banned import (`socket`, `subprocess`, `pickle`, …); see `chain.toml [static_guard]` |
-| `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`; only allowlisted packages |
-| deploy: Hub auth error | `HIPPIUS_HUB_USERNAME`/`PASSWORD` (or `HIPPIUS_HUB_TOKEN`) not exported |
-| `registry upload failed` (Hub outage) | the Hippius Hub is down — retry, or add `--hf-repo` + `HF_TOKEN` to submit via the HuggingFace fallback ([§5b](#5b-if-the-hippius-hub-is-down)) |
-| committed but never in a receipt | committed *at/after* the epoch boundary → it competes next round (check the deadline with `cascade round`, [§5c](#5c-time-your-submission--cascade-round)); or it failed to train (heat drops it — `cascade heat` shows it as `did not train`) |
-| `403 not_registered` on fund/submit | your hotkey is not registered on the subnet — `btcli subnets register` first |
-| `403 not_revealed` on fund | the ref does not match a revealed commitment for your hotkey — reveal first, then fund ([§6b](#6b-fund-your-training-leg--required-from-fri-2026-09-11-2030-utc-block-9046800)) |
-| funded but never seated | more-senior (earlier-revealed) entries out-capped you, or the GPU market is thin — you wait unburned; watch `cascade queue` |
-| entry `failed [rate_limited]` | your Lium key 429'd for 6h straight — raise the key's rate limits, then fund again |
-| loses every heat | expected while you iterate — the pool is broad real-world data; widen your prior (mix families) rather than fitting one shape. `cascade heat --hotkey <you>` shows how far off you were, published as soon as each heat settles |
+| `verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, set iteration order |
+| `blocked_import` | banned import; see `chain.toml [static_guard]` |
+| `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`, allowlisted packages only |
+| `403 not_registered` | register the hotkey first |
+| `403 not_revealed` | the ref is not a revealed commitment for this hotkey; wait for the reveal, then fund |
+| `400 bad_label` | label too long or has characters outside `[A-Za-z0-9._-]` |
+| `generator_artifact_unreachable` | your Hippius project is private; make it public |
+| funded but never seated | more senior reveals filled the seats, or the GPU market is thin; you wait unspent |
+| `failed [generator]` | your code failed on the pod or training diverged; check the training log, fix, submit from a fresh hotkey |
+| `failed [rate_limited]` | your Lium key was rate-limited for 6 h; raise limits, fund again |
+| loses every duel | the pool is broad real-world data; widen the prior rather than fitting one shape. `cascade duel` shows which domains you lost |
