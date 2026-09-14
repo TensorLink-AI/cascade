@@ -79,6 +79,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
+                 "_startup_sweep",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
@@ -1144,3 +1145,38 @@ def test_round_entry_sweep_keeps_this_rounds_king_pod_for_adoption(tmp_path, mon
     r._reconcile_funded_pods()
     assert ops[-1] == "cascade-n91-4242-funded-king-0"
     assert r._load_funded_ledger() == []
+
+
+def test_startup_sweep_keeps_the_round_it_is_about_to_run(tmp_path, monkeypatch):
+    """2026-09-14 03:47: the process-start sweep ran before the round id was
+    known and removed the king pod the retry was about to adopt. The startup
+    sweep now runs once the round is derived and keeps that round's pod."""
+    r = _runner(tmp_path)
+    r._ledger_add(PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
+                              stage="funded", rented_at_iso="2026-09-14T00:00:00Z",
+                              sku="RTX4090", gpus=1, payer_hotkey=""))
+    r._ledger_add(PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
+                              stage="funded", rented_at_iso="2026-09-13T00:00:00Z",
+                              sku="RTX4090", gpus=1, payer_hotkey=""))
+    ops = []
+    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
+                                            r._ledger_remove(pod.instance_id))
+    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
+    r._startup_sweep(4242)
+    assert ops == ["cascade-n91-4141-funded-king-0"]
+    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
+
+
+def test_run_forever_defers_the_startup_sweep_until_the_round_is_known():
+    """Source-level guard for the ``pragma: no cover`` loop: no bare
+    process-start sweep before the first chain read; the deferred one passes
+    the derived round."""
+    import inspect
+
+    from cascade.trainer.loop import TrainerRunner
+
+    src = inspect.getsource(TrainerRunner.run_forever)
+    head = src.split("while True:", 1)[0]
+    assert "_reconcile_funded_pods()" not in head
+    assert "self._startup_sweep(str(base_seed))" in src

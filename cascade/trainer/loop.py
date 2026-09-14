@@ -1948,6 +1948,12 @@ class TrainerRunner:
                 [x for x in self._load_funded_ledger()
                  if x.instance_id != instance_id])
 
+    def _startup_sweep(self, round_id: str) -> None:
+        """The process-start leftover sweep, run once the round about to run
+        is known so ITS king pod survives (a mid-round restart is a retry of
+        that round; see :meth:`_reconcile_funded_pods`)."""
+        self._reconcile_funded_pods(keep_round_id=str(round_id))
+
     def _reconcile_funded_pods(self, *, keep_round_id: str | None = None) -> None:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
         orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
@@ -6586,7 +6592,12 @@ class TrainerRunner:
         # Startup sweep: a crashed process leaves funded/king pods billing
         # with nobody's leg attached — reconcile from the ledger + per-payer
         # listings before any round work (self-guarded to funded_pods="rent").
-        self._reconcile_funded_pods()
+        # Deferred to the first chain read so the round about to run is KNOWN:
+        # a restart mid-round (2026-09-14 03:47, a deploy to make the retry
+        # adopt its live king pod) swept that very pod here, before
+        # run_round's keep-aware sweep ever ran, and the 3 h checkpoint on it
+        # was lost. Every other leftover is still swept, seconds later.
+        startup_swept = False
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
@@ -6605,6 +6616,9 @@ class TrainerRunner:
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)
+                if not startup_swept:
+                    self._startup_sweep(str(base_seed))
+                    startup_swept = True
                 round_id = str(base_seed)
                 if round_id == last_round:
                     time.sleep(poll)
