@@ -2854,7 +2854,7 @@ class TrainerRunner:
         # Sweep funded-pod leftovers each boundary: a leg's own teardown covers
         # the normal path, this covers the crash paths (ledgered but live, or
         # launched-but-never-ledgered via the per-payer reconcile).
-        self._reconcile_funded_pods()
+        self._reconcile_funded_pods(keep_round_id=str(round_id))
         from ..funding.queue import rounds_needed
 
         queue = self._funded_queue()

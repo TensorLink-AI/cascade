@@ -86,7 +86,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
-                 "_startup_sweep",
+                 "_startup_sweep", "_skip_unfunded_round",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_rent_funded_host",
@@ -1270,3 +1270,38 @@ def test_king_dispatch_is_followed_by_the_divergence_refusal():
     j = src.index("self._refuse_diverged_king(entry, contract)")
     assert i < j
     assert "self._final_role_hosts[" not in src[i:j]
+
+
+# ── 2026-09-15 01:27: a THIRD sweep call site (the unfunded-round skip check) ran
+# without keep_round_id and tore down the round's own king pod on restart ────────
+
+def test_every_sweep_call_site_names_the_round_to_keep():
+    """#272 fixed the startup sweep, this fixes the skip check — pin the CLASS:
+    every call of _reconcile_funded_pods in the trainer passes keep_round_id
+    except the boundary sweep that runs with no round to keep."""
+    import inspect
+    import re
+    src = inspect.getsource(loop_module)
+    calls = [m for m in re.finditer(r"self\._reconcile_funded_pods\(([^)]*)\)", src)]
+    assert len(calls) >= 3
+    bare = [src[max(0, m.start() - 400):m.start()].splitlines()[-1].strip()
+            for m in calls if "keep_round_id" not in m.group(1)]
+    assert bare == [], f"sweep call(s) without keep_round_id: {bare}"
+
+
+def test_unfunded_skip_check_keeps_this_rounds_king_pod(tmp_path, monkeypatch):
+    r = _runner(tmp_path, skip_unfunded_rounds=True)
+    mine = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
+                       stage="funded", rented_at_iso="2026-09-15T01:00:00Z",
+                       sku="RTX4090", gpus=1, payer_hotkey="")
+    r._ledger_add(mine)
+    ops = []
+    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
+                                            r._ledger_remove(pod.instance_id))
+    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
+    q = r._funded_queue()
+    q.add("hkA", REF, reveal_block=10)          # someone funded ⇒ the round runs
+    assert r._skip_unfunded_round("4242") is False
+    assert ops == []                             # the king pod survived the check
+    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
