@@ -99,9 +99,15 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
                  "_operator_fallback_lanes", "_funded_pod_code_mismatch",
                  "_funded_pod_too_slow", "_host_bench_below_floor",
-                 "_king_pending", "_yield_to_king"):
+                 "_king_pending", "_yield_to_king", "_pin_king_host_key"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     fake.FUNDED_MAX_STALE_PODS = TrainerRunner.FUNDED_MAX_STALE_PODS
+    # King pod host-key pin: a canned scanner (never ssh-keyscan in tests) and
+    # no real retry sleeps; tests that exercise the scan override both.
+    fake.KING_HOST_KEY_SCAN_TRIES = TrainerRunner.KING_HOST_KEY_SCAN_TRIES
+    fake.KING_HOST_KEY_SCAN_RETRY_SECONDS = TrainerRunner.KING_HOST_KEY_SCAN_RETRY_SECONDS
+    fake._host_key_scanner = lambda ip, port: "ssh-ed25519 AAAAtestkey"
+    fake._scan_retry_sleep = lambda s: None
     fake.KING_YIELD_POLL_SECONDS = TrainerRunner.KING_YIELD_POLL_SECONDS
     fake._king_rent_done = False
     # Capacity-wait constants + no round context ⇒ the deadline is "now" and a

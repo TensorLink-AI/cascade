@@ -2650,14 +2650,22 @@ class TrainerRunner:
             provider = _lium_provider(rnd)
             name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
-            def _king_remote(addr) -> RemoteHost:
+            def _king_remote(addr, host_key: str) -> RemoteHost:
+                # pinned_host_key: every ssh/scp to the king pod runs
+                # StrictHostKeyChecking=yes against a file holding ONLY the key
+                # scanned at readiness — exactly like a payer leg. Without it
+                # the pod was reached through the shared ~/.ssh/known_hosts
+                # with accept-new, and a Lium ip:port reused by a fresh
+                # container (new host key) failed the very first mkdir with
+                # "Host key verification failed" (2026-09-15 21:09, round
+                # 9075600: the king leg died, the pod idled all night).
                 return RemoteHost(
                     name="funded-king", host=addr.ip, port=addr.ssh_port,
                     user=profile.user, key_path=profile.key_path,
                     remote_python=profile.remote_python, workdir=profile.workdir,
                     cuda_device="0", chain_toml=profile.chain_toml,
                     forward_env=profile.forward_env, ssh_options=profile.ssh_options,
-                    stage="final")
+                    pinned_host_key=host_key, stage="final")
 
             def _ledger_king(pod_id: str) -> None:
                 self._ledger_add(PodInstance(
@@ -2719,7 +2727,8 @@ class TrainerRunner:
                     with self._funded_exec_lock:
                         self._funded_claimed_execs.add(machine)
                 try:
-                    king_host = self._push_deployed_chain_toml(_king_remote(addr))
+                    king_host = self._push_deployed_chain_toml(
+                        _king_remote(addr, self._pin_king_host_key(pod_id, addr)))
                     why = probe_worker_runtime(king_host)
                     if why:
                         _fail_king(pod_id, f"adopted king pod runtime rejected: {why}")
@@ -2772,10 +2781,14 @@ class TrainerRunner:
                         addr = provider.get_ip(pod_id)
                         if addr is None:
                             _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                        try:
+                            host_key = self._pin_king_host_key(pod_id, addr)
+                        except ProvisionError as e:
+                            _fail_king(pod_id, str(e))
                     _ledger_king(pod_id)
-                    log.info("king pod %s ready at %s:%d (operator-billed, sku=%s)",
-                             pod_id, addr.ip, addr.ssh_port, sku)
-                    king_host = _king_remote(addr)
+                    log.info("king pod %s ready at %s:%d (operator-billed, sku=%s, "
+                             "host key pinned)", pod_id, addr.ip, addr.ssh_port, sku)
+                    king_host = _king_remote(addr, host_key)
                     # JIT pod ⇒ no provisioner config push: deliver the deployed
                     # chain.toml (correct train_image_digest pin) before the probe.
                     king_host = self._push_deployed_chain_toml(king_host)
@@ -2817,6 +2830,31 @@ class TrainerRunner:
                     continue
                 self._funded_king_host = king_host
                 return self._funded_king_host
+
+    KING_HOST_KEY_SCAN_TRIES = 6
+    KING_HOST_KEY_SCAN_RETRY_SECONDS = 10.0
+
+    def _pin_king_host_key(self, pod_id: str, addr) -> str:
+        """``<keytype> <base64>`` of the king pod's sshd, scanned at readiness —
+        the same pin a payer leg gets from ``rent_funded_pod`` (sshd may still
+        be starting: a few retries). Raises ``ProvisionError`` when nothing
+        scans, which the callers turn into a lemon teardown + fresh rent."""
+        from ..provision.core import ProvisionError, scan_ssh_host_key
+
+        scanner = getattr(self, "_host_key_scanner", None) or scan_ssh_host_key
+        sleep = getattr(self, "_scan_retry_sleep", None) or time.sleep
+        last: Exception | None = None
+        for i in range(self.KING_HOST_KEY_SCAN_TRIES):
+            try:
+                key = str(scanner(addr.ip, addr.ssh_port) or "").strip()
+                if key:
+                    return key
+            except Exception as e:  # noqa: BLE001 — retried below
+                last = e
+            if i + 1 < self.KING_HOST_KEY_SCAN_TRIES:
+                sleep(self.KING_HOST_KEY_SCAN_RETRY_SECONDS)
+        raise ProvisionError(f"king pod {pod_id}: could not pin its ssh host key "
+                             f"at {addr.ip}:{addr.ssh_port} ({last})")
 
     def _teardown_operator_pod(self, pod) -> None:
         """Verified teardown of an operator-billed ledger pod (king JIT)."""
@@ -6561,10 +6599,33 @@ class TrainerRunner:
                     results[i] = fut.result()
                 except Exception as e:  # noqa: BLE001
                     if role == "king":
+                        self._release_siblings_on_king_failure(futs, fut, e)
                         raise RuntimeError(f"king training failed on remote: {e}") from e
                     log.warning("challenger %s failed on remote (%s): %s",
                                 gen.hotkey, contract.arch_preset, e)
         return [r for r in results if r is not None]
+
+    def _release_siblings_on_king_failure(self, futs, king_fut, err) -> None:
+        """A failed king leg aborts the round — surface that NOW, not after the
+        pool has joined every sibling. Sets the funded wait abort (capacity
+        polls and king-yields return at once, those legs requeue unburned),
+        cancels unstarted legs, and names the in-flight ones the pool still
+        waits for. Three times a king failure sat behind the pool: 2026-09-13
+        (2 h silent), 2026-09-15 21:09 (the round would have sat until the
+        05:49 rent deadline — the 9 waiting legs were the only thing holding
+        it). A training leg is never killed here (owner rule); it finishes,
+        is persisted, and the round's retry reuses it."""
+        abort = getattr(self, "_funded_wait_abort", None)
+        if abort is not None:
+            abort.set()
+        cancelled = [k for f, k in futs.items() if f is not king_fut and f.cancel()]
+        in_flight = [k for f, k in futs.items()
+                     if f is not king_fut and f.running()]
+        log.error("king leg FAILED (%s): released every capacity wait, cancelled %d "
+                  "unstarted leg(s); %d in-flight leg(s) [%s] finish first, then the "
+                  "round aborts and retries (a live king pod is adopted)",
+                  err, len(cancelled), len(in_flight),
+                  ", ".join(k[1].hotkey[:12] for k in in_flight))
 
     def publish(self, manifest: TrainingManifest) -> None:
         """Sign the manifest with the trainer hotkey and write it to the Hippius
