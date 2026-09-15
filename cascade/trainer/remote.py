@@ -428,6 +428,47 @@ def probe_worker_runtime(host: RemoteHost, *, required_flags: tuple[str, ...] = 
     return ""
 
 
+HOST_BENCH_PROBE_TIMEOUT_SECONDS = 120.0
+_HOST_BENCH_PROBE_PY = (
+    "import json; from cascade.trainer.host_probe import host_bench; "
+    "print('HOSTBENCH ' + json.dumps(host_bench('cuda')))"
+)
+
+
+def probe_host_bench(host: RemoteHost, *,
+                     timeout: float = HOST_BENCH_PROBE_TIMEOUT_SECONDS) -> tuple[float | None, str]:
+    """Run the fixed calibration bench (:func:`cascade.trainer.host_probe.
+    host_bench`, ~5 s) on ``host``'s lane and return ``(tokens_per_s, "")``,
+    or ``(None, why)`` when it could not be measured.
+
+    Same workload the worker times before every run (``host_bench_tokens_per_s``
+    in the run telemetry), so a pre-dispatch number is directly comparable to
+    the fleet's history. The pod's own pinned code runs it — nothing is shipped
+    to the pod — and ``CUDA_VISIBLE_DEVICES`` follows the host's lane so a
+    multi-lane pod benches the device the leg will get."""
+    env = ""
+    if host.cuda_device is not None and str(host.cuda_device).strip():
+        env = f"CUDA_VISIBLE_DEVICES={shlex.quote(str(host.cuda_device).strip())} "
+    cmd = f"cd {shlex.quote(host.workdir)} && {env}{host.remote_python} -c {shlex.quote(_HOST_BENCH_PROBE_PY)}"
+    try:
+        proc = subprocess.run(build_ssh_argv(host, cmd), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"host bench probe timed out after {timeout:.0f}s"
+    except OSError as e:
+        return None, f"host bench probe could not start: {e}"
+    if proc.returncode != 0:
+        return None, f"host bench probe failed rc={proc.returncode}: {(proc.stderr or '')[-200:]}"
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith("HOSTBENCH "):
+            try:
+                facts = json.loads(line[len("HOSTBENCH "):])
+                return float(facts["host_bench_tokens_per_s"]), ""
+            except (ValueError, KeyError, TypeError) as e:
+                return None, f"host bench probe returned malformed facts: {e}"
+    return None, "host bench probe printed no result"
+
+
 def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
     """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
     under exactly :func:`build_ssh_argv`'s transport policy (a pinned host
