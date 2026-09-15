@@ -381,6 +381,17 @@ funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
 # E5-26xx v4 hosts, while the same generators ran on every Ryzen host.
 # Applies to the king rent, every payer leg and the capacity probe. [] = off.
 funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
+# Per-SKU floor for the fixed calibration bench every freshly rented pod runs
+# over ssh before dispatch (~5 s; host_probe.host_bench composite tokens/s, the
+# same number the run telemetry reports as host_bench_tokens_per_s). Below the
+# floor the pod is released, its executor stays excluded for the round and the
+# leg rents again on the stale-image bad-pod budget — the miner is never
+# blamed; the JIT king gets the same gate on a fresh rent. 2026-09-15 round
+# 9068400: the 4090 fleet benched 394M–646M (median ~587M) on one equal wall —
+# the king's 394M host trained 70 % of its budget, 5900X hosts 100 %. An
+# unreachable probe logs and lets the pod through. {} / unknown SKU = off.
+# Arming (Approve-tier): e.g. { RTX4090 = 450e6 }.
+funded_host_bench_floor = {}
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true

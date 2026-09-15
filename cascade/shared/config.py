@@ -318,6 +318,38 @@ def validate_funded_pod_skus(value: object) -> tuple[str, ...]:
     return tuple(str(x) for x in value)  # type: ignore[union-attr]
 
 
+def validate_funded_host_bench_floor(value: object) -> tuple[tuple[str, float], ...]:
+    """``[round] funded_host_bench_floor``: a TOML table ``{SKU = tokens/s}``
+    → sorted ``((sku, floor), …)``. Fail-loud on anything but a mapping of
+    non-negative numbers: a list or a bare number would silently arm nothing
+    (config knobs need loader parsing, 2026-09-08)."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"funded_host_bench_floor={value!r} invalid; must be a table of "
+            f'SKU = tokens/s, e.g. {{ RTX4090 = 450e6 }}')
+    out = []
+    for sku, floor in value.items():
+        if isinstance(floor, bool) or not isinstance(floor, (int, float)) or floor < 0:
+            raise ValueError(
+                f"funded_host_bench_floor[{sku!r}]={floor!r} invalid; must be a "
+                f"non-negative number of tokens/s")
+        if str(sku).strip():
+            out.append((str(sku).strip(), float(floor)))
+    return tuple(sorted(out))
+
+
+def funded_host_bench_floor_for(floors: tuple[tuple[str, float], ...], sku: str) -> float:
+    """The armed floor (tokens/s) for ``sku``, case-insensitive; ``0.0`` when
+    the SKU has none (= the check is off for that round)."""
+    want = (sku or "").strip().lower()
+    for name, floor in floors:
+        if name.lower() == want:
+            return float(floor)
+    return 0.0
+
+
 # Champion publication policies for direct (vault) submissions (DEC-CA-0036):
 # when a vault-ref king's code goes public. See cascade.funding.champion.
 CHAMPION_PUBLISH_MODES = ("off", "crown", "delay", "dethrone")
@@ -1021,6 +1053,17 @@ class RoundConfig:
     # stalls, all on Xeon E5-26xx v4 hosts, zero series inside the 1800 s
     # stall window, while the same generators ran on every Ryzen host.
     funded_cpu_blocklist: tuple[str, ...] = ()
+    # Per-SKU floor for the fixed calibration bench (host_probe.host_bench's
+    # composite leg, tokens/s) that every freshly rented pod — payer legs and
+    # the JIT king — runs over ssh BEFORE dispatch (~5 s). Below the floor the
+    # pod is released, its executor stays excluded for the round and the leg
+    # rents again on the stale-image bad-pod budget; the miner is never
+    # blamed. 2026-09-15 round 9068400: the 4090 fleet benched 394M–646M
+    # (median ~587M) and every leg got the same wall — the king's host at
+    # 394M trained 70 % of its budget while 5900X hosts finished 100 %.
+    # () / unknown SKU = off; an unreachable probe logs and lets the pod
+    # through (a slow-host check must never itself sink a leg).
+    funded_host_bench_floor: tuple[tuple[str, float], ...] = ()
     # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
     # account, at the round's chosen SKU — the no-heat end-state (no standing
     # final fleet). Required for funded_pod_skus to guarantee the king lands
@@ -2187,6 +2230,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_cpu_blocklist=tuple(
                 str(x).strip() for x in (r.get("funded_cpu_blocklist", ()) or ())
                 if str(x).strip()),
+            funded_host_bench_floor=validate_funded_host_bench_floor(
+                r.get("funded_host_bench_floor", None)),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),

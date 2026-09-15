@@ -447,3 +447,38 @@ def test_funded_cpu_blocklist_parses_from_toml(tmp_path):
     assert edited != src
     (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
     assert load_chain_config(tmp_path / "chain.toml").round.funded_cpu_blocklist == ("e5-2673", "Gold 61")
+
+
+def test_funded_host_bench_floor_parses_from_toml(tmp_path):
+    """Knob round-trip (config knobs need loader parsing): the repo ships it
+    off (empty table); an armed table lands as sorted (sku, tokens/s) pairs
+    and resolves case-insensitively per SKU, 0.0 for a SKU without one."""
+    from pathlib import Path
+
+    import pytest
+
+    from cascade.shared.config import (
+        funded_host_bench_floor_for,
+        load_chain_config,
+        validate_funded_host_bench_floor,
+    )
+
+    repo_toml = Path(__file__).resolve().parents[2] / "chain.toml"
+    assert load_chain_config(repo_toml).round.funded_host_bench_floor == ()
+    src = repo_toml.read_text(encoding="utf-8")
+    edited = src.replace("funded_host_bench_floor = {}",
+                         "funded_host_bench_floor = { RTX4090 = 450e6, A6000 = 200_000_000 }")
+    assert edited != src
+    (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
+    floors = load_chain_config(tmp_path / "chain.toml").round.funded_host_bench_floor
+    assert floors == (("A6000", 200_000_000.0), ("RTX4090", 450e6))
+    assert funded_host_bench_floor_for(floors, "rtx4090") == 450e6
+    assert funded_host_bench_floor_for(floors, "L40S") == 0.0
+    assert funded_host_bench_floor_for((), "RTX4090") == 0.0
+    # Fail-loud on shapes that would otherwise arm nothing.
+    with pytest.raises(ValueError):
+        validate_funded_host_bench_floor(450e6)
+    with pytest.raises(ValueError):
+        validate_funded_host_bench_floor({"RTX4090": "450e6"})
+    with pytest.raises(ValueError):
+        validate_funded_host_bench_floor({"RTX4090": -1})

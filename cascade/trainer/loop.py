@@ -2168,12 +2168,18 @@ class TrainerRunner:
                     # a mismatch releases the pod, keeps its executor out of
                     # this round and rents again — the miner is never blamed.
                     why = self._funded_pod_code_mismatch(result, profile)
-                    if why:
+                    # Throughput gate (funded_host_bench_floor): a slow executor
+                    # eats the leg's equal wall — released and rented again on
+                    # the same bad-pod budget. Only its executor stays excluded
+                    # (claimed above): slowness is per card, not per host.
+                    slow = "" if why else self._funded_pod_too_slow(result, profile)
+                    if why or slow:
                         stale_pods += 1
-                        if result.address is not None:
+                        if why and result.address is not None:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)
+                        why = why or slow
                         log.warning("funded leg %s: pod %s rejected — %s; releasing "
                                     "and renting again (%d stale pod(s) so far)",
                                     gen.hotkey[:12], result.pod.instance_id if result.pod
@@ -2486,6 +2492,58 @@ class TrainerRunner:
                     f"{pinned[:12]}…")
         return ""
 
+    def _host_bench_below_floor(self, host, sku: str, label: str) -> str:
+        """Why ``host`` is too slow for this round, or ``""``.
+
+        Runs the fixed calibration bench over ssh (:func:`cascade.trainer.
+        remote.probe_host_bench`) and compares its composite tokens/s with
+        ``[round] funded_host_bench_floor[sku]``. Off (no floor for the SKU)
+        ⇒ no probe at all. A probe that cannot be measured is logged and
+        passes: the check exists to keep a slow executor from eating a leg's
+        equal wall, and must never itself sink a leg over a transient ssh
+        hiccup. Every measured value is logged so the fleet's spread stays
+        visible even while the floor is off.
+        """
+        from ..shared.config import funded_host_bench_floor_for
+        from .remote import probe_host_bench
+
+        floor = funded_host_bench_floor_for(
+            getattr(self.cfg.round, "funded_host_bench_floor", ()) or (), sku)
+        if floor <= 0:
+            return ""
+        tps, err = probe_host_bench(host)
+        if tps is None:
+            log.warning("%s: host bench unavailable (%s) — floor %s tokens/s not "
+                        "enforced on this pod", label, err, f"{floor:,.0f}")
+            return ""
+        log.info("%s: host bench %s tokens/s (floor %s, sku %s)",
+                 label, f"{tps:,.0f}", f"{floor:,.0f}", sku)
+        if tps < floor:
+            return (f"slow host: calibration bench {tps:,.0f} tokens/s < floor "
+                    f"{floor:,.0f} for {sku}")
+        return ""
+
+    def _funded_pod_too_slow(self, result, profile) -> str:
+        """Why a freshly rented funded pod must NOT receive a leg on throughput
+        grounds, or ``""`` — the pre-dispatch half of the host-bench floor
+        (see :meth:`_host_bench_below_floor`); same ssh identity pin as the
+        code fingerprint check."""
+        if result.address is None:
+            return ""
+        rnd = self.cfg.round
+        sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+        from .remote import RemoteHost
+
+        host = RemoteHost(
+            name="funded-hostbench", host=result.address.ip, port=result.address.ssh_port,
+            user=profile.user, key_path=profile.key_path,
+            remote_python=profile.remote_python, workdir=profile.workdir,
+            cuda_device="0", pinned_host_key=result.host_key,
+            ssh_options=profile.ssh_options,
+        )
+        pod_id = result.pod.instance_id if result.pod is not None else "?"
+        return self._host_bench_below_floor(host, sku, f"funded pod {pod_id}")
+
     def _teardown_funded_pod(self, pod) -> None:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
         # The leg is over: its Hub robot dies first, whatever the pod does.
@@ -2679,6 +2737,14 @@ class TrainerRunner:
                     why = probe_worker_runtime(king_host)
                     if why:
                         _fail_king(pod_id, f"king pod runtime rejected: {why}")
+                    # Same throughput gate as the payer legs: the king's wall
+                    # is the same as theirs, and a slow king host handicaps
+                    # the defence of the throne (2026-09-15: 394M vs a
+                    # ~587M fleet median ⇒ 70 % of budget). Fresh rents only —
+                    # an adopted pod already holds this round's checkpoint.
+                    why = self._host_bench_below_floor(king_host, sku, f"king pod {pod_id}")
+                    if why:
+                        _fail_king(pod_id, f"king pod rejected: {why}")
                 except ProvisionError as e:
                     # A pod that never came up / had no IP / ran the wrong
                     # runtime is a LEMON, not a verdict: it is torn down
