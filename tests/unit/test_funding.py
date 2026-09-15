@@ -515,3 +515,41 @@ def test_seal_key_file_forms(tmp_path, monkeypatch):
         load_seal_key(tmp_path / "k.bad")
     monkeypatch.setenv("CASCADE_VAULT_KEY_FILE", str(tmp_path / "k.hex"))
     assert PayerKeyVault(dir=None).sealed
+
+
+# ── cross-process TTL: the trainer re-stamps at rent, the intake must not purge ──
+
+def test_get_adopts_a_record_restamped_on_disk_by_another_process(tmp_path):
+    """Two processes share the directory (intake + trainer). When the trainer
+    re-stamps a key (rent-time refresh) the intake's stale in-memory stamp
+    must defer to the fresher file instead of purging it."""
+    now = [1000.0]
+    clock = lambda: now[0]  # noqa: E731
+    intake = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=100.0, clock=clock)
+    intake.insert(HK_A, "k1")
+    trainer = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=100.0, clock=clock)
+    trainer.hydrate()
+    now[0] = 1090.0
+    assert trainer.refresh(HK_A)                 # rent-time re-stamp, written to disk
+    now[0] = 1150.0                              # past the INTAKE's stamp, inside the trainer's
+    assert intake.get(HK_A) == "k1"              # adopted, not purged
+    assert intake.purge_expired() == 0
+    assert (tmp_path / "vault" / f"{HK_A}.json").exists()
+    now[0] = 1200.0                              # past the re-stamp too
+    assert intake.get(HK_A) is None
+    assert not (tmp_path / "vault" / f"{HK_A}.json").exists()
+
+
+def test_purge_expired_keeps_only_records_fresh_on_disk(tmp_path):
+    now = [0.0]
+    clock = lambda: now[0]  # noqa: E731
+    a = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=10.0, clock=clock)
+    a.insert(HK_A, "k1")
+    a.insert(HK_B, "k2")
+    b = PayerKeyVault(dir=tmp_path / "vault", ttl_seconds=10.0, clock=clock)
+    b.hydrate()
+    now[0] = 8.0
+    assert b.refresh(HK_A)                       # only A is re-stamped
+    now[0] = 15.0
+    assert a.purge_expired() == 1                # B gone, A adopted from disk
+    assert a.get(HK_A) == "k1" and a.get(HK_B) is None
