@@ -88,13 +88,19 @@ def test_floor_rejects_only_a_measured_slow_host(tmp_path, monkeypatch, measured
         assert why == ""
 
 
-def test_unmeasurable_probe_lets_the_pod_through(tmp_path, monkeypatch, caplog):
+def test_unmeasurable_probe_lets_the_pod_through(tmp_path, monkeypatch):
+    from cascade.trainer import loop as loop_mod
+
     runner = _runner(tmp_path, funded_host_bench_floor=FLOOR)
     monkeypatch.setattr(remote_mod, "probe_host_bench",
                         lambda host, **kw: (None, "host bench probe timed out after 120s"))
-    with caplog.at_level("WARNING"):
-        assert runner._host_bench_below_floor(_host(), "RTX4090", "funded pod p-0") == ""
-    assert "not enforced" in caplog.text
+    # Capture on the module logger itself: caplog's root handler misses it
+    # when an earlier test in the session disables propagation.
+    warned = []
+    monkeypatch.setattr(loop_mod.log, "warning",
+                        lambda msg, *a, **kw: warned.append(msg % a if a else msg))
+    assert runner._host_bench_below_floor(_host(), "RTX4090", "funded pod p-0") == ""
+    assert any("not enforced" in w and "timed out" in w for w in warned)
 
 
 def test_funded_pod_too_slow_pins_the_rented_pods_identity(tmp_path, monkeypatch):
