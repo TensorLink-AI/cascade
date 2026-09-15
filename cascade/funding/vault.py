@@ -186,8 +186,16 @@ class PayerKeyVault:
             return None
         api_key, stored_at = entry
         if self.clock() - stored_at > self.ttl_seconds:
-            self.remove(hotkey)
-            return None
+            # The directory is shared between processes (intake writes, the
+            # trainer re-stamps at rent — see :meth:`refresh`), so a stale
+            # in-memory stamp must defer to a fresher record on disk before
+            # anything is purged: the intake's request-driven purge used to
+            # delete a key the trainer had just re-stamped for a live leg.
+            fresh = self._reload(hotkey)
+            if fresh is None:
+                self.remove(hotkey)
+                return None
+            api_key, _ = fresh
         return api_key
 
     def has(self, hotkey: str) -> bool:
@@ -210,39 +218,69 @@ class PayerKeyVault:
         if self.dir is None:
             return 0
         loaded = 0
-        now = self.clock()
         for path in sorted(self.dir.glob("*.json")):
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                stored_at = float(raw["stored_at"])
-                if "sealed" in raw:
-                    if self.seal_key is None:
-                        log.error("vault entry %s is sealed but no seal key is "
-                                  "configured (%s) — skipped", path.name,
-                                  VAULT_KEY_FILE_ENV)
-                        continue
-                    api_key = _unseal(self.seal_key, path.stem, str(raw["sealed"]))
-                else:
-                    api_key = str(raw["api_key"])   # legacy plaintext entry
-            except (OSError, ValueError, KeyError):
+            entry = self._read_file(path)
+            if entry is None:
                 continue
-            except Exception as e:  # noqa: BLE001 — wrong key / tampered blob
-                log.error("vault entry %s could not be unsealed (%s) — skipped",
-                          path.name, type(e).__name__)
-                continue
-            if not api_key or now - stored_at > self.ttl_seconds:
+            api_key, stored_at = entry
+            if not api_key or self.clock() - stored_at > self.ttl_seconds:
                 path.unlink(missing_ok=True)
                 continue
             self._entries[path.stem] = (api_key, stored_at)
             loaded += 1
         return loaded
 
+    def _read_file(self, path: Path) -> tuple[str, float] | None:
+        """Decode one on-disk record → ``(api_key, stored_at)``; ``None`` when
+        unreadable, torn, or sealed under a key this process lacks (logged,
+        never raised — a bad file must not block recovering the others)."""
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            stored_at = float(raw["stored_at"])
+            if "sealed" in raw:
+                if self.seal_key is None:
+                    log.error("vault entry %s is sealed but no seal key is "
+                              "configured (%s) — skipped", path.name,
+                              VAULT_KEY_FILE_ENV)
+                    return None
+                api_key = _unseal(self.seal_key, path.stem, str(raw["sealed"]))
+            else:
+                api_key = str(raw["api_key"])   # legacy plaintext entry
+        except (OSError, ValueError, KeyError):
+            return None
+        except Exception as e:  # noqa: BLE001 — wrong key / tampered blob
+            log.error("vault entry %s could not be unsealed (%s) — skipped",
+                      path.name, type(e).__name__)
+            return None
+        return (api_key, stored_at)
+
+    def _reload(self, hotkey: str) -> tuple[str, float] | None:
+        """Re-read ``hotkey``'s record from disk and adopt it when UNEXPIRED —
+        the cross-process path: another process (the trainer's rent-time
+        :meth:`refresh`) may have re-stamped a key this process still holds
+        under its original intake stamp. ``None`` when there is no directory,
+        no file, or the file is expired too."""
+        if self.dir is None:
+            return None
+        entry = self._read_file(self.dir / f"{hotkey}.json")
+        if entry is None:
+            return None
+        api_key, stored_at = entry
+        if not api_key or self.clock() - stored_at > self.ttl_seconds:
+            return None
+        self._entries[hotkey] = (api_key, stored_at)
+        return entry
+
     def purge_expired(self) -> int:
-        """Drop every expired entry (memory + disk); returns how many."""
-        expired = [
-            hk for hk, (_, stored_at) in list(self._entries.items())
-            if self.clock() - stored_at > self.ttl_seconds
-        ]
-        for hk in expired:
+        """Drop every expired entry (memory + disk); returns how many. An entry
+        expired in memory but re-stamped on disk by another process is adopted,
+        not purged (see :meth:`_reload`)."""
+        purged = 0
+        for hk, (_, stored_at) in list(self._entries.items()):
+            if self.clock() - stored_at <= self.ttl_seconds:
+                continue
+            if self._reload(hk) is not None:
+                continue
             self.remove(hk)
-        return len(expired)
+            purged += 1
+        return purged

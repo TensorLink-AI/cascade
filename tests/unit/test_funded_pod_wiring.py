@@ -1305,3 +1305,57 @@ def test_unfunded_skip_check_keeps_this_rounds_king_pod(tmp_path, monkeypatch):
     assert r._skip_unfunded_round("4242") is False
     assert ops == []                             # the king pod survived the check
     assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
+
+
+# ── payer key TTL must outlive the leg (2026-09-15: 5H8c's key aged out mid-leg) ──
+
+def _stored_at(tmp_path, hotkey="hkA") -> float:
+    import json as _json
+    return float(_json.loads((tmp_path / "pv" / f"{hotkey}.json").read_text())["stored_at"])
+
+
+def test_funded_leg_restamps_the_payer_key_ttl_at_rent(tmp_path, monkeypatch):
+    """The key was stored at intake; by the time the leg rents it may be an
+    hour from expiry. The rent path re-stamps it (PayerKeyVault.refresh) so
+    the after-training identity check, teardown and bench still find it."""
+    import time as _time
+
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    import json as _json
+    path = tmp_path / "pv" / "hkA.json"
+    rec = _json.loads(path.read_text())
+    rec["stored_at"] = _time.time() - 35.9 * 3600      # intake ~36 h ago, minutes from expiry
+    path.write_text(_json.dumps(rec))
+    before = _stored_at(tmp_path)
+    runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                           warm_start_ref=None)
+    assert len(disp.calls) == 1
+    assert _stored_at(tmp_path) > before + 35 * 3600   # re-stamped to "now"
+    assert runner._payer_vault().get("hkA") == "sk_test123"
+
+
+def test_key_lost_after_training_is_auth_not_tamper(tmp_path, monkeypatch):
+    from cascade.trainer.loop import KEY_LOST_REASON, _FundedKeyLost
+
+    disp = _FakeDisp()
+    runner, torn, seeds, contract = _leg_runner(tmp_path, monkeypatch, disp=disp)
+    calls = iter([None, KEY_LOST_REASON])
+    runner._funded_pod_identity_mismatch = lambda pod: next(calls)
+    with pytest.raises(_FundedKeyLost):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "auth", False)
+    assert "re-fund" in msg
+
+
+def test_key_lost_reason_comes_from_the_real_identity_check(tmp_path, monkeypatch):
+    """A vault without the payer's key yields exactly KEY_LOST_REASON — the
+    string the leg paths route to _FundedKeyLost — so a wording drift can't
+    silently turn a lapsed key back into 'tamper'."""
+    from cascade.trainer.loop import KEY_LOST_REASON
+
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkB")                              # hkA absent
+    assert runner._funded_pod_identity_mismatch(_pod("hkA")) == KEY_LOST_REASON

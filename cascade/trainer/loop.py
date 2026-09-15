@@ -124,10 +124,23 @@ BenchEvalFn = Callable[[Path], "BenchScores | None"]
 log = logging.getLogger("cascade.trainer")
 
 
+# _funded_pod_identity_mismatch's reason when the payer's key is gone from the
+# vault: the leg paths class it _FundedKeyLost (auth), not _FundedTamper.
+KEY_LOST_REASON = "payer key unavailable to re-identify the pod"
+
+
 class _FundedTamper(Exception):
     """A funded pod failed its identity pin (replaced under the same name, or
     a different container answering at its address). Miner fault, terminal,
     hotkey spent."""
+
+
+class _FundedKeyLost(Exception):
+    """The payer's Lium key is no longer in the vault while their pod is live
+    (aged out mid-leg, or removed by the intake): the pod can be neither
+    re-identified nor stopped from here. NOT tamper — nothing about the pod
+    changed — and never infra: the miner's own credential lapsed. Classed
+    ``auth`` like the seating-time check, unburned."""
 
 
 class _FundedDiverged(Exception):
@@ -2071,6 +2084,16 @@ class TrainerRunner:
                 error_class="infra", burn=False)
             raise _FundedLegSkip(gen.hotkey)
         api_key = vault.get(gen.hotkey)
+        # A key that survives to a training leg must outlive that leg however
+        # stale its intake was (the vault's own contract — PayerKeyVault.
+        # refresh): re-stamp the TTL now so the after-training identity check,
+        # the teardown and the bench can still act on the payer's account.
+        # 2026-09-15: 5H8c's key aged out eleven minutes after its pod was
+        # rented; the leg was refused as "tamper" at harvest and the pod could
+        # not be stopped.
+        if api_key and vault.refresh(gen.hotkey):
+            log.info("final challenger %s: payer key TTL re-stamped for the leg",
+                     gen.hotkey)
         if not api_key:
             if self._operator_fallback_lanes():
                 # The payer's key aged out of the vault while THEIR leg kept
@@ -2368,7 +2391,7 @@ class TrainerRunner:
         vault = self._payer_vault()
         key = vault.get(pod.payer_hotkey) if vault is not None else None
         if not key:
-            return "payer key unavailable to re-identify the pod"
+            return KEY_LOST_REASON
         try:
             from ..provision.core import LiumProvider
 
@@ -2713,6 +2736,8 @@ class TrainerRunner:
             # and still running. A payer relaunching "their" pod under the
             # same name is TAMPER — their shot, spent — never infra.
             why = self._funded_pod_identity_mismatch(pod)
+            if why == KEY_LOST_REASON:
+                raise _FundedKeyLost(f"before dispatch: {why}")
             if why:
                 raise _FundedTamper(f"before dispatch: {why}")
             # Runtime attestation, before a single byte of dispatch: lium can
@@ -2738,6 +2763,8 @@ class TrainerRunner:
             # …and again when the leg returns: the checkpoint this entry
             # points at must have come from the pod we pinned.
             why = self._funded_pod_identity_mismatch(pod)
+            if why == KEY_LOST_REASON:
+                raise _FundedKeyLost(f"after training: {why}")
             if why:
                 raise _FundedTamper(f"after training: {why}")
             if harvest:
@@ -2769,6 +2796,13 @@ class TrainerRunner:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
                                         miner_fault=True, error_class="tamper",
                                         burn=False)
+            raise
+        except _FundedKeyLost as e:
+            self._record_funded_failure(
+                gen.hotkey, f"payer key lost while the pod was live ({e}) — "
+                "the pod cannot be re-identified or stopped from here; "
+                "re-fund to supply a fresh key",
+                miner_fault=True, error_class="auth", burn=False)
             raise
         except _FundedDiverged as e:
             # The same verdict the worker's own rc=3 gives a non-finite loss
