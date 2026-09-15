@@ -1623,7 +1623,8 @@ class TrainerRunner:
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
-    def _wait_for_funded_capacity(self, sku: str, *, describe: str) -> bool:
+    def _wait_for_funded_capacity(self, sku: str, *, describe: str,
+                                  for_king: bool = False) -> bool:
         """Poll the marketplace for ``sku`` until it shows capacity or the round's
         latest safe start passes. Legs start INDEPENDENTLY as GPUs appear
         (owner 2026-09-12: "keep trying over the next 3 hours to bring up more
@@ -1648,6 +1649,14 @@ class TrainerRunner:
                          "for an operator lane (operator-billed)", describe, sku)
                 return "operator"
             n = self._probe_funded_capacity(sku, self._claimed_executors())
+            if n and not for_king and self._king_pending():
+                # Capacity is the king's first: keep polling until it has a pod.
+                if not polled:
+                    log.info("%s: %s capacity (%d) but the king still needs a pod — "
+                             "yielding", describe, sku, n)
+                polled += 1
+                sleep(max(0.0, min(self.KING_YIELD_POLL_SECONDS, deadline - now_fn())))
+                continue
             if n:
                 if polled:
                     log.info("%s: %s capacity appeared (%d) after %d poll(s)",
@@ -1670,6 +1679,41 @@ class TrainerRunner:
             return tuple(sorted(claimed))
         with lock:
             return tuple(sorted(claimed))
+
+    KING_YIELD_POLL_SECONDS = 5.0
+
+    def _king_pending(self) -> bool:
+        """True while the round's JIT king still needs a pod: the king rents on
+        this round's SKU like every payer leg, is REQUIRED, and must not lose
+        the marketplace race to a challenger (2026-09-15 round 9072000: one
+        RTX4090 appeared after 13 polls, the king and a challenger both went
+        for it, the challenger's `lium up` landed first and the king polled
+        on). Off when the king does not rent (funded_king_rent off, non-rent
+        mode, gate closed) and once its rent reached any outcome."""
+        rnd = self.cfg.round
+        return bool(
+            getattr(rnd, "funded_king_rent", False)
+            and self._effective_funded_pods() == "rent"
+            and self._funded_gate_open()
+            and self._funded_king_host is None
+            and not getattr(self, "_king_rent_done", False)
+        )
+
+    def _yield_to_king(self, describe: str) -> None:
+        """Hold a challenger's rent while the king still needs a pod, up to
+        the round's latest safe start (or the king's abort — then the leg's
+        own wait sees it and requeues). Returns as soon as the king is served."""
+        if not self._king_pending():
+            return
+        deadline = self._funded_rent_wait_deadline()
+        sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+        now_fn = getattr(self, "_rent_wait_now", None) or time.time
+        abort = getattr(self, "_funded_wait_abort", None)
+        log.info("%s: yielding the marketplace — the king rents first", describe)
+        while self._king_pending() and now_fn() < deadline:
+            if abort is not None and abort.is_set():
+                return
+            sleep(max(0.0, min(self.KING_YIELD_POLL_SECONDS, deadline - now_fn())))
 
     def _operator_fallback_lanes(self) -> list:
         """Operator FINAL lanes a waiting funded leg may fall back to: fresh
@@ -2144,6 +2188,9 @@ class TrainerRunner:
         # top executor and races one create-rate window.
         stale_pods = 0
         while True:
+            # King first: a challenger never takes the rent lock (or the last
+            # GPU) while the round's JIT king still needs a pod.
+            self._yield_to_king(f"funded leg {gen.hotkey[:12]}")
             with self._funded_rent_lock:
                 with self._funded_exec_lock:
                     claimed = tuple(sorted(self._funded_claimed_execs))
@@ -2693,7 +2740,8 @@ class TrainerRunner:
                 # (outside the rent lock) up to the round's latest safe start —
                 # the legs then rent independently as machines appear.
                 if not provider.capacity(sku, exclude_ids=self._claimed_executors()):
-                    waited = self._wait_for_funded_capacity(sku, describe="king rent")
+                    waited = self._wait_for_funded_capacity(sku, describe="king rent",
+                                                            for_king=True)
                     if waited == "operator":
                         # Owner-armed hybrid: the king trains on an operator
                         # lane instead of a JIT pod (operator-billed either way).
@@ -5262,6 +5310,10 @@ class TrainerRunner:
         self._funded_round_sku = self.cfg.round.funded_pod_sku
         self._funded_king_host = None
         self._funded_king_lock = threading.Lock()
+        # King-first rent (2026-09-15): flipped once the king's JIT rent has
+        # reached ANY outcome (pod, operator fallback, give-up, cached retry);
+        # until then challenger rents yield the marketplace (_king_pending).
+        self._king_rent_done = False
         # Capacity-wait coordination (PR #257 follow-up): the king's final
         # failure sets the abort so challenger waits end at once; the epoch-end
         # wall estimate is fixed once per attempt so the deadline is monotone.
@@ -6403,7 +6455,13 @@ class TrainerRunner:
                         and self._funded_gate_open()):
                     # No-heat end-state: the king's pod rents JIT at the round's
                     # chosen SKU (operator-billed) instead of a standing fleet.
-                    host = self._stage_king_vault(self._rent_king_host(str(seeds.base_seed)), gen)
+                    try:
+                        host = self._stage_king_vault(
+                            self._rent_king_host(str(seeds.base_seed)), gen)
+                    finally:
+                        # Whatever happened — pod, operator fallback, give-up,
+                        # crash — the challengers stop yielding the market.
+                        self._king_rent_done = True
                     entry = disp.dispatch(
                         host, lane_count=1,
                         gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
@@ -6483,6 +6541,9 @@ class TrainerRunner:
 
         def _run_cached(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:
             if i in prior_entries:
+                if role == "king":
+                    # A cached king never rents: release the challengers' yield.
+                    self._king_rent_done = True
                 return prior_entries[i]
             entry = _run(i, gen, role)
             self._persist_completed_leg(entry, round_id=seeds.base_seed, contract=contract,
