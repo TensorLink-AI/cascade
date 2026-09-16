@@ -413,8 +413,12 @@ funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # 9068400: the 4090 fleet benched 394M–646M (median ~587M) on one equal wall —
 # the king's 394M host trained 70 % of its budget, 5900X hosts 100 %. An
 # unreachable probe logs and lets the pod through. {} / unknown SKU = off.
-# Arming (Approve-tier): e.g. { RTX4090 = 450e6 }.
-funded_host_bench_floor = {}
+# ARMED 2026-09-16 (owner: "add the guard for 4090") RTX4090 = 500M tokens/s:
+# 45 Lium 4090 legs Sep 13–16 (wandb) — hosts >= 570M trained 0.76–1.00 of the
+# budget, 489–516M hosts 0.54–0.84, 376–453M hosts 0.46–0.81; the floor drops
+# the bottom ~27 % of 4090 rentals and keeps every seated leg on an
+# equal-compute host. Other SKUs stay unguarded until benched.
+funded_host_bench_floor = { RTX4090 = 500e6 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
