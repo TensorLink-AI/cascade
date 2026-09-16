@@ -387,7 +387,11 @@ funded_pod_checkpoint = "harvest"
 funded_robot_duration_days = 1
 # Seats per round (0 = finalist_cap); clamped to live market capacity minus
 # the king's reserve when the probe is on. Held-back seats wait unburned.
-funded_field_cap = 8
+# 99 = no cap (owner 2026-09-16: "there shouldn't be any cap on GPUs"): every
+# paid entry seats the round it queues in — each seat rents its own payer pod,
+# so wall-clock stays one leg, and legs the market cannot serve poll for
+# capacity (then the operator lane) instead of waiting a whole round.
+funded_field_cap = 99
 funded_capacity_probe = true
 funded_capacity_reserve = 1
 # Allowed GPU types, preference-ordered; each round runs entirely on the
