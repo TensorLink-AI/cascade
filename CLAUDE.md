@@ -382,8 +382,10 @@ in-context.
   DEC-CA-0041 "sequences" fill reversed), the token budget is denominated in
   SERIES-POINTS (`budget_denomination = "series_points"`, new digest-bound
   drop-when-default key: a (C, L) series costs L, so a C-channel corpus trains
-  C× the tokens in the SAME step count — 1× univariate, 32× at C=32), and legs
-  grow to 5h (`target_train_hours = 5.0`, `max_train_seconds = 18000`). The
+  C× the tokens in the SAME step count — 1× univariate, 32× at C=32), and the
+  WALL grows to 5h (`max_train_seconds = 18000`) while the budget stays the 3h
+  figure (`target_train_hours = 3.0` = 40B series-points; amended 2026-09-16
+  21:30 — the univariate budget never grows, width is what buys tokens). The
   wall stays the law: a C-wide step costs ~C× GPU time, so on the pinned SKU
   wide legs stop at the wall under budget (`deadline_hit`, ~1/(0.83·C) of
   budget) — intended, self-policing, NOT a step guarantee. Stream stop,
