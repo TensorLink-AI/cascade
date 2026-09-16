@@ -149,7 +149,7 @@ Full flow: docs/ARCHITECTURE.md. Cadence and budgets: chain.toml `[round]`.
   (`cascade heat`) whenever a screen actually runs.
 - **Final** (the duel): king and finalists each train from the SAME shared round
   init (random at generation 0; the promoted cascade checkpoint after a
-  promotion — the live case today) with identical seeds, budget (~3h as a fixed
+  promotion — the live case today) with identical seeds, budget (~5h as a fixed
   token count), and contract, at every configured throne size (4M live today).
   Validators verify the signed manifest's contract digests, evaluate the
   checkpoints on the shared private windows, and judge the whole advanced cohort
@@ -225,7 +225,7 @@ Full walkthrough: docs/MINER.md. All commands are console scripts from this repo
 Losing duels while iterating is normal: the pool is broad real-world data.
 Widen the prior (mix families) rather than fitting one shape — and under
 funded rounds, iterate locally (`cascade score`) BEFORE funding a leg: every
-seat you take bills your own key for ~3h of GPU.
+seat you take bills your own key for ~5h of GPU.
 
 ## Key configuration values (chain.toml, shipped)
 

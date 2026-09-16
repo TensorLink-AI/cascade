@@ -96,7 +96,8 @@ ref_throughput_tokens_per_s = 185000   # MEASURE on your reference GPU; sizes th
                                         # (3.0h × 3600 × 185000 ≈ 2.0B point-passes)
 warmup_fraction             = 0.05
 batch_size                  = 64     # Toto 2.0 global batch size (Table 1); was 256
-batch_denomination          = "sequences"  # MV-TEST: step-count parity across C (DEC-CA-0041)
+batch_denomination          = "series"     # DEC-CA-0042: 64 SERIES per step whatever C (was "sequences")
+budget_denomination         = "series_points"  # DEC-CA-0042: budget ∝ width (C=32 → 32× tokens, same steps)
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3         # u-muP width-independent learning rate

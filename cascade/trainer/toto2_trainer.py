@@ -296,6 +296,19 @@ def weighted_pinball_loss(pred_q, target, levels: tuple[float, ...], weight=None
     return (loss * w).sum() / denom
 
 
+def batch_points(vals: np.ndarray, denomination: str = "points") -> int:
+    """Token-budget points one ``(B, C, L)`` training batch consumes under
+    ``[training] budget_denomination`` (DEC-CA-0042) — the loop-side twin of
+    :func:`cascade.trainer.stream.element_points`, so the trainer stops on
+    the same rule the stream billed. ``"points"``: ``B×C×L`` (every channel
+    of every row). ``"series_points"``: ``B×L`` (per time-step positions —
+    a wide batch draws ``C×`` the channel tokens per budget point). Equal at
+    ``C = 1``."""
+    if denomination == "series_points":
+        return int(vals.shape[0]) * int(vals.shape[-1])
+    return int(vals.size)
+
+
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
                           batch_size: int, batch_denomination: str = "series"):
     """Yield ``(B, C, P*patch_size)`` float64 training batches from a series
@@ -316,10 +329,13 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
     ``batch_denomination`` (DEC-CA-0041) sets what ``batch_size`` counts for a
     ``C > 1`` bucket. ``"series"``: the bucket fills to ``batch_size`` series
     (Toto 2's geometry — a C=32 batch is ``batch_size×32`` sequences, so a
-    fixed token budget buys C× fewer optimizer steps). ``"sequences"``: the
-    bucket fills to ``max(1, batch_size // C)`` series, holding tokens-per-step
-    ~constant across C so every channel mix earns the same step count from the
-    same budget. Identical at ``C = 1`` by construction.
+    fixed channel-token budget buys C× fewer optimizer steps — unless the
+    budget itself is denominated in series-points, DEC-CA-0042, in which case
+    the step count is width-independent and the wide batch simply trains C×
+    the tokens per step). ``"sequences"``: the bucket fills to ``max(1,
+    batch_size // C)`` series, holding tokens-per-step ~constant across C so
+    every channel mix earns the same step count from the same channel-token
+    budget. Identical at ``C = 1`` by construction.
 
     History note (DEC-CA-0026): this used to reduce every series to channel 0
     (``s = s[0]``) while the stream billed all ``C`` channels against the token
@@ -654,6 +670,7 @@ class Toto2Trainer:
         # max_ctx_patches. Position p predicts patch p+1; CPM zeroes contiguous
         # input spans (mask channel = 1) so the model learns to fill multiple
         # future patches from one forward pass — targets stay unmasked.
+        budget_denomination = getattr(contract, "budget_denomination", "points")
         for arr in iter_training_batches(
             timed_stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
@@ -782,12 +799,16 @@ class Toto2Trainer:
 
             last_loss = float(loss.detach().cpu())
             check_loss_finite(last_loss, step=step, tokens=tokens)
-            # Every channel of every row counts: B × C × L point-passes, so a
+            # Budget points under the contract's denomination (DEC-CA-0042):
+            # "points" counts every channel of every row (B × C × L) so a
             # multivariate series' token cost equals its stream billing (the
-            # C×-billed-1×-trained mispricing is dead; DEC-CA-0026). Masked
-            # entries count too — the stream billed them and the model
-            # processed them (as masked inputs); only the LOSS excludes them.
-            tokens += int(vals_np.size)
+            # C×-billed-1×-trained mispricing is dead; DEC-CA-0026);
+            # "series_points" counts B × L so a wide batch draws C× the
+            # channel tokens per point — the same rule element_points bills
+            # the stream with, so both stops agree. Masked entries count too —
+            # the stream billed them and the model processed them (as masked
+            # inputs); only the LOSS excludes them.
+            tokens += batch_points(vals_np, budget_denomination)
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)

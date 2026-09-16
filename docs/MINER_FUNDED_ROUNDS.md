@@ -147,7 +147,7 @@ auth fault. Operator checklist, in order:
    never touch `cascade-n91-…` pods.
 5. **Announce to miners** (docs/MINER.md §5, llms.txt): funding required
    from block 9046800; `cascade fund` after reveal; registered hotkey; keep
-   ~3h × chosen-GPU balance on the Lium key.
+   ~5h × chosen-GPU balance on the Lium key (5h legs since DEC-CA-0042).
 6. **Watch the first rounds**: `cascade queue`, `funded/latest.json`,
    `cascade-audit latest` (funded-roster check), and the trainer log's
    admission/SKU lines. Rollback = set `funded_activation_block` far future

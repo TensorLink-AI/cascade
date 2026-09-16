@@ -108,8 +108,11 @@ def _rederive_digest(
     token_budget: int,
     max_wall_seconds: int | None = None,
     seed_mix: int = 1,
+    budget_denomination: str = "points",
 ) -> str:
-    """Re-derive one corpus digest exactly as the trainer derived it."""
+    """Re-derive one corpus digest exactly as the trainer derived it — under
+    the round's OWN budget denomination (DEC-CA-0042): it decides where the
+    budget-capped stream stops, hence which prefix the rolling digest covers."""
     if mode == "cache_reuse" and int(seed_mix or 1) == 1:
         from ..trainer.corpus import build_round_corpus
 
@@ -128,6 +131,7 @@ def _rederive_digest(
         blocked=cfg.static_guard.blocked,
         max_wall_seconds=max_wall_seconds,
         seed_mix=seed_mix,
+        budget_denomination=budget_denomination,
     ) as rs:
         for _ in rs.series():
             pass
@@ -188,6 +192,7 @@ def run_tier1(
                     mode=mode, token_budget=contract.train_tokens,
                     max_wall_seconds=contract.max_train_seconds,
                     seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
+                    budget_denomination=getattr(contract, "budget_denomination", "points"),
                 )
                 digest_cache[cache_key] = digest
         except Exception as e:  # noqa: BLE001 — fetch/build failure is a WARN, not proof
@@ -314,6 +319,7 @@ def run_tier2(
                 blocked=cfg.static_guard.blocked,
                 max_wall_seconds=contract.max_train_seconds,
                 seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
+                budget_denomination=getattr(contract, "budget_denomination", "points"),
             ) as rs:
                 base_trainer.train(
                     rs.series(), contract,

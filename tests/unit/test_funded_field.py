@@ -450,9 +450,11 @@ def test_funded_cpu_blocklist_parses_from_toml(tmp_path):
 
 
 def test_funded_host_bench_floor_parses_from_toml(tmp_path):
-    """Knob round-trip (config knobs need loader parsing): the repo ships it
-    off (empty table); an armed table lands as sorted (sku, tokens/s) pairs
-    and resolves case-insensitively per SKU, 0.0 for a SKU without one."""
+    """Knob round-trip (config knobs need loader parsing): the repo ships the
+    RTX4090 floor ARMED at 500M tokens/s (2026-09-16, owner: "add the guard
+    for 4090") and nothing else; an edited table lands as sorted (sku,
+    tokens/s) pairs and resolves case-insensitively per SKU, 0.0 for a SKU
+    without one."""
     from pathlib import Path
 
     import pytest
@@ -464,9 +466,12 @@ def test_funded_host_bench_floor_parses_from_toml(tmp_path):
     )
 
     repo_toml = Path(__file__).resolve().parents[2] / "chain.toml"
-    assert load_chain_config(repo_toml).round.funded_host_bench_floor == ()
+    shipped = load_chain_config(repo_toml).round.funded_host_bench_floor
+    assert shipped == (("RTX4090", 500e6),)
+    assert funded_host_bench_floor_for(shipped, "rtx4090") == 500e6
+    assert funded_host_bench_floor_for(shipped, "A100") == 0.0
     src = repo_toml.read_text(encoding="utf-8")
-    edited = src.replace("funded_host_bench_floor = {}",
+    edited = src.replace("funded_host_bench_floor = { RTX4090 = 500e6 }",
                          "funded_host_bench_floor = { RTX4090 = 450e6, A6000 = 200_000_000 }")
     assert edited != src
     (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")

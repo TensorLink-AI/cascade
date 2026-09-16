@@ -66,12 +66,27 @@ class _StreamDigest:
         return h.hexdigest()
 
 
+def element_points(arr: np.ndarray | dict, denomination: str = "points") -> int:
+    """Token-budget points of one stream element under ``denomination``
+    (``[training] budget_denomination``, DEC-CA-0042).
+
+    ``"points"``: every values entry is a point — a ``(C, L)`` series costs
+    ``C×L`` (a mask marks points missing; it does not add points).
+    ``"series_points"``: a ``(C, L)`` series costs ``L`` — per time-step
+    positions, so a wide series draws ``C×`` the channel tokens per budget
+    point. Identical for a 1-D / single-channel series. The trainer's token
+    counter (:func:`~cascade.trainer.toto2_trainer.batch_points`) applies the
+    same rule, so the stream's stop and the loop's stop agree.
+    """
+    vals = arr["values"] if isinstance(arr, dict) else arr
+    if denomination == "series_points":
+        return int(np.shape(vals)[-1]) if np.ndim(vals) else 0
+    return int(np.size(vals))
+
+
 def _element_points(arr: np.ndarray | dict) -> int:
-    """Token-budget points of one stream element: values entries only (a mask
-    marks points missing; it does not add points)."""
-    if isinstance(arr, dict):
-        return int(arr["values"].size)
-    return int(arr.size)
+    """Legacy alias: the ``"points"`` rule."""
+    return element_points(arr, "points")
 
 
 def _inprocess_stream(
@@ -133,9 +148,10 @@ class _CacheReuseStream(RoundStream):
     def __init__(
         self, repo_dir: Path | str, generation_seed: int, cfg: GeneratorConfig,
         token_budget: int, *, use_sandbox: bool, blocked: tuple[str, ...],
-        allow_netns: bool = True,
+        allow_netns: bool = True, budget_denomination: str = "points",
     ) -> None:
         self._budget = int(token_budget)
+        self._denom = budget_denomination
         self._corpus = build_round_corpus(
             repo_dir, generation_seed, cfg, "cache_reuse",
             use_sandbox=use_sandbox, blocked=blocked, allow_netns=allow_netns,
@@ -146,7 +162,7 @@ class _CacheReuseStream(RoundStream):
         total = 0
         for arr in itertools.cycle(self._corpus.series):
             yield arr
-            total += _element_points(arr)
+            total += element_points(arr, self._denom)
             self._consumed = total
             if total >= self._budget:
                 break
@@ -177,12 +193,13 @@ class _FreshSeriesStream(RoundStream):
         self, repo_dir: Path | str, generation_seed: int, cfg: GeneratorConfig,
         token_budget: int, *, use_sandbox: bool, blocked: tuple[str, ...],
         allow_netns: bool = True, gpu: bool = False,
-        max_wall_seconds: int | None = None,
+        max_wall_seconds: int | None = None, budget_denomination: str = "points",
     ) -> None:
         self._repo = Path(repo_dir)
         self._seed = int(generation_seed)
         self._cfg = cfg
         self._budget = int(token_budget)
+        self._denom = budget_denomination
         self._use_sandbox = use_sandbox
         self._allow_netns = allow_netns
         self._blocked = tuple(blocked)
@@ -209,7 +226,7 @@ class _FreshSeriesStream(RoundStream):
             yield arr
             self._dig.update(arr)
             self._n += 1
-            total += _element_points(arr)
+            total += element_points(arr, self._denom)
             self._points = total
             if total >= self._budget:
                 break
@@ -251,8 +268,10 @@ class _SeedMixStream(RoundStream):
     semantics.
     """
 
-    def __init__(self, children: list[RoundStream]) -> None:
+    def __init__(self, children: list[RoundStream],
+                 budget_denomination: str = "points") -> None:
         self._children = children
+        self._denom = budget_denomination
         self._dig = _StreamDigest()
         self._n = 0
         self._points = 0
@@ -269,7 +288,7 @@ class _SeedMixStream(RoundStream):
                 yield arr
                 self._dig.update(arr)
                 self._n += 1
-                self._points += _element_points(arr)
+                self._points += element_points(arr, self._denom)
                 live.append(it)
             iters = live
 
@@ -308,8 +327,16 @@ def open_round_stream(
     allow_netns: bool = True,
     max_wall_seconds: int | None = None,
     seed_mix: int = 1,
+    budget_denomination: str = "points",
 ) -> RoundStream:
     """Open the round's corpus stream for ``mode`` (see module docstring).
+
+    ``budget_denomination`` ([training] budget_denomination, DEC-CA-0042) is
+    what one point of ``token_budget`` is at C > 1 — see
+    :func:`element_points`. It decides WHERE the stream stops, and the corpus
+    digest is the rolling digest of the consumed prefix, so the trainer, the
+    audit re-derivation, and the miner's local scorer must all pass the
+    contract's value.
 
     ``max_wall_seconds`` (streaming modes only) is the upper bound on how long
     the stream will be consumed — pass the contract's ``max_train_seconds`` so
@@ -336,18 +363,21 @@ def open_round_stream(
                 mode, repo_dir, _mix(generation_seed, "seed-mix", i), cfg,
                 token_budget=b, use_sandbox=use_sandbox, blocked=tuple(blocked),
                 allow_netns=allow_netns, max_wall_seconds=max_wall_seconds,
+                budget_denomination=budget_denomination,
             )
             for i, b in enumerate(budgets)
-        ])
+        ], budget_denomination=budget_denomination)
     if mode == "cache_reuse":
         return _CacheReuseStream(
             repo_dir, generation_seed, cfg, token_budget,
             use_sandbox=use_sandbox, blocked=tuple(blocked), allow_netns=allow_netns,
+            budget_denomination=budget_denomination,
         )
     if mode in ("stream_cpu", "stream_gpu"):
         return _FreshSeriesStream(
             repo_dir, generation_seed, cfg, token_budget,
             use_sandbox=use_sandbox, blocked=tuple(blocked), allow_netns=allow_netns,
             gpu=(mode == "stream_gpu"), max_wall_seconds=max_wall_seconds,
+            budget_denomination=budget_denomination,
         )
     raise CorpusError(f"unknown corpus_mode={mode!r}")

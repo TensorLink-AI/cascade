@@ -112,6 +112,11 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # max_channels was 1); "sequences" holds tokens-per-step constant across
     # C so step counts equalise — arming it is the deliberate digest bump.
     "batch_denomination": ("series",),
+    # DEC-CA-0042: what one budget point is at C > 1. "points" = every
+    # values entry (the legacy rule, every deployed config); "series_points"
+    # bills a (C, L) series L points so a wide corpus earns C× the channel
+    # tokens per budget point — arming it is the deliberate digest bump.
+    "budget_denomination": ("points",),
     # DEC-CA-0026: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
     "allow_future_known": (False,),

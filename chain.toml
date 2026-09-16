@@ -124,17 +124,32 @@ context_length     = 4096
 horizon            = 64
 # From-scratch budget, enforced as a fixed token count (hours × ref throughput)
 # so king and challenger see identical compute; max_train_seconds is the hard guard.
-target_train_hours          = 3.0
+# 5h legs (owner 2026-09-16, DEC-CA-0042; was 3h): the budget below is
+# series-points, so a univariate leg trains 5h × ref_throughput channel
+# tokens and a C-channel corpus trains C× that many in the SAME step count.
+target_train_hours          = 5.0
 ref_throughput_tokens_per_s = 3700000  # 20x (2026-07-15): L40S is ~20x the old 185k ref, so it was
-                                        # finishing the budget early; 20x the TOKEN budget, same 3h wall
+                                        # finishing the budget early; 20x the TOKEN budget, same wall
 warmup_fraction             = 0.05
 batch_size                  = 64       # Toto 2.0 global batch size
-# ARMED with the C=32 raise (owner 2026-09-09; DEC-CA-0041): batch_size counts
-# SEQUENCES at C > 1 (a bucket fills to 64 // C series), so tokens-per-step is
-# ~constant and every channel mix earns the SAME ~152k steps from the leg
-# budget — the legacy "series" fill collapsed a C=32 leg to ~4.8k updates.
-# Bit-identical at C=1; digest-bound, rides this release's coordinated deploy.
-batch_denomination          = "sequences"
+# Batch geometry at C > 1 (DEC-CA-0042, owner 2026-09-16; revises the
+# DEC-CA-0041 "sequences" fill armed 2026-09-09): batch_size counts SERIES
+# whatever the width — a C=32 batch is 64 series × 32 variates (Toto 2's own
+# geometry). The step-count collapse "sequences" existed to prevent (a C=32
+# leg falling from ~152k to ~4.8k updates on a channel-token budget) is
+# closed by budget_denomination below instead: the budget is series-points,
+# so every width earns the same step count and a wide batch trains C× the
+# tokens per step. The wall (max_train_seconds) still binds first for a
+# width the pinned SKU cannot push through in the leg — deadline_hit as ever.
+batch_denomination          = "series"
+# What one budget point IS at C > 1 (DEC-CA-0042, digest-bound drop-when-
+# default; "points" = legacy C×L billing). "series_points": a (C, L) series
+# costs L, so the channel-token budget scales with width — univariate 1×,
+# C=32 → 32× — and the stream, the trainer's counter, and cascade-audit all
+# stop on this rule (the corpus digest covers the consumed prefix). Needs a
+# worker image built from this release: an older worker parses no such key
+# and would bill C×L, stopping a wide leg C× early. Bit-identical at C=1.
+budget_denomination         = "series_points"
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
@@ -173,7 +188,7 @@ warm_lr_scale   = 0.125         # warm-started runs train at base_lr x this;
                                 # from-scratch keeps full base_lr (default 1.0)
 umup_base_d_model  = 256         # proxy width the HPs were tuned at
 train_seed_salt    = 1337        # mixed into the (shared) training seed
-max_train_seconds  = 10800       # hard wall-clock cap; a time stop is flagged deadline_hit
+max_train_seconds  = 18000       # hard wall-clock cap (5h, DEC-CA-0042); a time stop is flagged deadline_hit
 # Corpus feed mode (folded into contract_digest):
 #   stream_cpu  — live-stream from a CPU generator; byte-exact reproducible
 #   stream_gpu  — live-stream from a GPU generator; tolerance/same-hardware audit
@@ -208,8 +223,12 @@ expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # launch-env injection + the provisioner health gate; digest computed
 # orchestrator-side). Folded into contract_digest — re-pin ⇒ trainer AND
 # validators restart together at an epoch boundary, pods pull the new image.
-train_image_digest = "sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
-# ^ ghcr cascade-worker:worker-v0.8.0 — harvest (--local-only) + batch_denomination.
+train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
+# ^ ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
+#   branch (publish-worker run 35080201768): budget_denomination (DEC-CA-0042)
+#   parsed on the pod, PLUS check_loss_finite (840e900, 2026-09-14) which the
+#   v0.8.0 image (main@9346a52) never carried — three NaN legs trained to the
+#   wall on it. Re-pinned here (declared gating: no validator restart).
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
 # overrides only shape fields + digest + throughput; all else inherits [training].
@@ -349,14 +368,14 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.9.0@sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
 # sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
 # <repo>@<digest>). Every rented final/funded pod must hash its files to this
 # BEFORE a leg is dispatched — the digest env a template injects is echoed
 # faithfully by a host that started a STALE image under the pinned tag
 # (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
 # miners' legs stalled and were burned). Re-derive on every image re-pin.
-worker_code_fingerprint = "b4c3465804e8d71db7663b6f19e8e3fc184404b335d2a8c074152d9055a4c08e"   # 99 files, worker-v0.8.0 (9d5bc70d…); verified == pod 146.120.227.147 2026-09-12
+worker_code_fingerprint = "dd5236181d9267f5bae26d49e545cf6bfb06afc2d0618e7e25cf101034db763b"   # 100 files, worker-v0.9.0 (43c07d42…); registry walk == branch tree 2026-09-16
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
@@ -368,7 +387,11 @@ funded_pod_checkpoint = "harvest"
 funded_robot_duration_days = 1
 # Seats per round (0 = finalist_cap); clamped to live market capacity minus
 # the king's reserve when the probe is on. Held-back seats wait unburned.
-funded_field_cap = 8
+# 99 = no cap (owner 2026-09-16: "there shouldn't be any cap on GPUs"): every
+# paid entry seats the round it queues in — each seat rents its own payer pod,
+# so wall-clock stays one leg, and legs the market cannot serve poll for
+# capacity (then the operator lane) instead of waiting a whole round.
+funded_field_cap = 99
 funded_capacity_probe = true
 funded_capacity_reserve = 1
 # Allowed GPU types, preference-ordered; each round runs entirely on the
@@ -390,8 +413,12 @@ funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # 9068400: the 4090 fleet benched 394M–646M (median ~587M) on one equal wall —
 # the king's 394M host trained 70 % of its budget, 5900X hosts 100 %. An
 # unreachable probe logs and lets the pod through. {} / unknown SKU = off.
-# Arming (Approve-tier): e.g. { RTX4090 = 450e6 }.
-funded_host_bench_floor = {}
+# ARMED 2026-09-16 (owner: "add the guard for 4090") RTX4090 = 500M tokens/s:
+# 45 Lium 4090 legs Sep 13–16 (wandb) — hosts >= 570M trained 0.76–1.00 of the
+# budget, 489–516M hosts 0.54–0.84, 376–453M hosts 0.46–0.81; the floor drops
+# the bottom ~27 % of 4090 rentals and keeps every seated leg on an
+# equal-compute host. Other SKUs stay unguarded until benched.
+funded_host_bench_floor = { RTX4090 = 500e6 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
@@ -727,6 +754,13 @@ cascade_quality_epsilon = 0.05
 # 9046800 without sacrificing an in-flight round. New digest recomputed from
 # [training] above = 22081e46…; verify after any edit.
 # (Retires the aged-out c6d24621…/8942400 DEC-CA-0035+0033 transition pair.)
+# 2026-09-16 (DEC-CA-0042): target_train_hours 5.0 / max_train_seconds 18000 /
+# batch_denomination "series" / budget_denomination "series_points" move the
+# digest again (recomputed = f1df3802…). None of them is a LOCKED term, and
+# declared_contract_from_block (8942400) is armed below, so this cut ships on
+# the trainer + worker image alone — validators keep accepting the declared
+# body; the strict path (and this prior pin) only matters for a body-less
+# manifest, which the trainer no longer publishes.
 prior_contract_digest  = "81d28346acb55892290ef3a6970caed2c3e8a5f569627b76cdefc29426f6f045"
 contract_from_block    = 9046800
 # Declared-contract gating (DEC-CA-0036). From this block a manifest is gated on

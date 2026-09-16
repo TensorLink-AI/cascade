@@ -377,6 +377,20 @@ in-context.
   rebuilt from this release.
   (`decisions/DEC-CA-0036-miner-funded-elastic-rounds.md`,
   `docs/MINER_FUNDED_ROUNDS.md`)
+- **DEC-CA-0042** — Multivariate advantage by construction (owner 2026-09-16):
+  batches are 64 SERIES at every width (`batch_denomination = "series"`, the
+  DEC-CA-0041 "sequences" fill reversed), the token budget is denominated in
+  SERIES-POINTS (`budget_denomination = "series_points"`, new digest-bound
+  drop-when-default key: a (C, L) series costs L, so a C-channel corpus trains
+  C× the tokens in the SAME step count — 1× univariate, 32× at C=32), and legs
+  grow to 5h (`target_train_hours = 5.0`, `max_train_seconds = 18000`). The
+  wall stays the law: a C-wide step costs ~C× GPU time, so on the pinned SKU
+  wide legs stop at the wall under budget (`deadline_hit`, ~1/(0.83·C) of
+  budget) — intended, self-policing, NOT a step guarantee. Stream stop,
+  trainer counter and cascade-audit share one rule (`element_points` /
+  `batch_points`). Worker image REBUILD before the first 5h round (v0.8.0
+  bills C×L). No validator restart (declared gating; no locked term moves).
+  (`decisions/DEC-CA-0042-series-points-budget-five-hour-legs.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

@@ -18,13 +18,18 @@ channel) or a `(C, L)` array with up to `max_channels = 32` variates
 (DEC-CA-0041, armed 2026-09-09). Nothing else about the carrier changes.
 Channel economics, so you can decide what to emit:
 
-* **Channels bill at full freight** — a `(C, L)` series costs `C×L` points of
-  the token budget, exactly what it trains.
-* **Steps don't collapse with width**: training batches fill to
-  `batch_size // C` series (`[training] batch_denomination = "sequences"`), so
-  tokens-per-step is ~constant and every channel mix earns the same optimizer
-  step count from the same budget. Your trade-off is batch diversity per step,
-  not update count.
+* **The budget is per time-step, not per channel** (`[training]
+  budget_denomination = "series_points"`, DEC-CA-0042): a `(C, L)` series
+  costs `L` points of the token budget, so a C-channel corpus trains `C×` the
+  channel tokens a univariate one does from the same budget (C=32 → 32×).
+* **Batches are 64 series wide whatever C** (`[training] batch_denomination =
+  "series"`): a C-channel batch is 64 × C sequences, so every width earns the
+  same optimizer step count and a wide batch trains `C×` the tokens per step.
+* **The wall is still the law.** The leg's `max_train_seconds` (5 h) is
+  unchanged by width; a C-channel step costs ~C× the GPU time of a univariate
+  one, so a width the round's GPU cannot push through in 5 h stops at the wall
+  under budget (`deadline_hit`) — the same rule every leg runs under. Size your
+  C to the SKU, not to the budget.
 * **Cross-channel structure only pays if it's real.** From `[scoring]
   mv_score_from_block` the eval scores multivariate windows jointly (a
   C-channel window counts once); channels of one series should carry related

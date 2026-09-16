@@ -56,7 +56,7 @@ Rounds run every 12 h (`[round] epoch_blocks = 3600`, boundaries ≈ 08:30 and
    (the miner's own Lium key pays for the training pod), seat in reveal order
    up to the round's cap. Everyone seated duels the king; there is no heat
    screen. An unfunded boundary runs nothing.
-2. **Training.** King and every challenger train the full budget (~3 h,
+2. **Training.** King and every challenger train the full budget (~5 h,
    enforced as a fixed token count) on the same GPU type, from the same init,
    with the same seeds. The only difference between runs is the generator.
 3. **Manifest.** The operator signs a manifest of checkpoints and digests to

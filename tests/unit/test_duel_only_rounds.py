@@ -89,7 +89,10 @@ def duel_cfg(cfg):
     """Gate at block 1000, no explicit cap: a local final (1 lane) on a 12h
     grid with 3h legs fits 3 waves ⇒ king + 2 seats. Legacy screen mechanics
     (single finalist, inert tie cap) below the gate."""
-    assert cfg.training.target_train_hours == 3.0
+    # Pin the 3h leg the seating arithmetic below is written against (the
+    # shipped chain.toml moved to 5h legs with DEC-CA-0042: 2 waves, not 3).
+    cfg = replace(cfg, training=replace(cfg.training, target_train_hours=3.0,
+                                        max_train_seconds=10800))
     return replace(cfg, round=replace(cfg.round, max_finalists=1, finalists=1,
                                       duel_from_block=1000, duel_field_cap=0,
                                       # flat 3600 grid (12h): block 5000 ⇒ boundary 3600
