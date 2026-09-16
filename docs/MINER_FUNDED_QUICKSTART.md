@@ -18,7 +18,7 @@ What you need to know:
 - **Rounds every 12 h** (≈ 08:30 / 20:30 UTC). Only a commitment revealed before
   the boundary enters; `submit` times the reveal for you.
 - **You pay for your leg.** Keep ~4 h of the round's GPU price on your Lium
-  account (~3 h training + ~1 h benching). GPU type is the most available of
+  account (~5 h training + ~1 h benching). GPU type is the most available of
   RTX4090 / RTX3090 / L40S / L40 / A6000, same for everyone in the round.
 - **Seats go by reveal order**, up to the round's cap. Unseated entries wait
   with nothing spent.

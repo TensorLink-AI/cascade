@@ -83,7 +83,7 @@ round:
      the promoted cascade warm-start) at that size via the owner's
      `BaseTrainer` (`cascade.trainer.contract`; reference:
      `cascade.trainer.toto2_trainer`) — it pulls series until the stream ends, for
-     the per-size budget (~3h on the reference GPU, enforced as a fixed
+     the per-size budget (~5h on the reference GPU, enforced as a fixed
      `train_tokens` count so king and challenger get identical compute), streaming
      per-step metrics (loss, lr, throughput) to **Hippius S3** (and, when
      `[wandb] enabled`, mirroring the *same* records into a live wandb run — one

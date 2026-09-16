@@ -4007,6 +4007,7 @@ class TrainerRunner:
             blocked=self.cfg.static_guard.blocked,
             max_wall_seconds=contract.max_train_seconds,
             seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
+            budget_denomination=getattr(contract, "budget_denomination", "points"),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),

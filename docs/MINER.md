@@ -69,9 +69,13 @@ Rules that matter:
 
 A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
 
-- A channel costs what it trains: `(C, L)` bills `C×L` points of the budget.
-- Step count does not depend on C. Batches hold `batch_size // C` series, so a
-  wide corpus gets the same number of optimizer steps as a univariate one.
+- The budget is per time-step: `(C, L)` bills `L` points, so a C-channel corpus
+  trains `C×` the channel tokens a univariate one does (C=32 → 32×).
+- Batches hold 64 series at every C, so the optimizer step count does not
+  depend on C; a wide batch simply trains `C×` the tokens per step.
+- The 5 h wall does not scale with C. A wide step costs ~C× the GPU time, so a
+  width the round's GPU cannot finish in 5 h stops at the wall under budget
+  (`deadline_hit`). Pick C for the SKU, not for the budget.
 - From block 9068400 (Mon 2026-09-14 ~20:30 UTC) multivariate eval windows are
   scored jointly: all channels forecast in one pass, the window counts once.
 - Only coupled channels teach the variate layers anything. Stacking unrelated
@@ -177,7 +181,7 @@ Labels are cosmetic: never identity, never in signed records.
   ref. Always use `https://`.
 - Held at most 36 h in a sealed vault, used only to rent and tear down your
   pod, forgotten on withdraw. Submit or fund within 36 h of your reveal.
-- Keep about **4 h of the round's GPU price** on the account: ~3 h training
+- Keep about **6 h of the round's GPU price** on the account: ~5 h training
   plus ~1 h benching your own checkpoint afterwards.
 
 ## 6. What happens in a round
@@ -188,9 +192,9 @@ Labels are cosmetic: never identity, never in signed records.
 2. **One GPU type per round**, the most available of RTX4090, RTX3090, L40S,
    L40, A6000. King and every challenger train on the same type.
 3. **Training.** Each seated entry rents a pod on its own key and trains the
-   full budget (~3 h) from the round's shared init. There is no heat screen:
+   full budget (~5 h) from the round's shared init. There is no heat screen:
    every seated entry duels the king.
-4. **Manifest and verdict.** The operator signs a manifest (~3.5–4 h after
+4. **Manifest and verdict.** The operator signs a manifest (~5.5–6 h after
    the boundary). Validators score king and challengers on the same private
    windows and set weights (~4 h).
 5. **Bench.** Your pod benches your checkpoint on GIFT-Eval / BOOM / TIME

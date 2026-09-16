@@ -183,6 +183,20 @@ def validate_batch_denomination(mode: str) -> str:
     return mode
 
 
+# Token-budget denominations (DEC-CA-0042) — see
+# TrainingContractConfig.budget_denomination.
+BUDGET_DENOMINATIONS = ("points", "series_points")
+
+
+def validate_budget_denomination(mode: str) -> str:
+    """Fail loud: "series_points" silently degrading to "points" would bill a
+    wide miner C× the budget its trainer, validator, and auditor agreed on."""
+    if mode not in BUDGET_DENOMINATIONS:
+        raise ValueError(
+            f"budget_denomination={mode!r} invalid; expected one of {BUDGET_DENOMINATIONS}")
+    return mode
+
+
 CONSUMABLE_FIELDS = ("mask", "roles")
 
 
@@ -575,6 +589,27 @@ class TrainingContractConfig:
     # contract_digest; arming "sequences" is a deliberate contract cut — king
     # and challenger batch identically either way, but every trainer must agree.
     batch_denomination: str = "series"
+    # ── budget denomination at C > 1 (DEC-CA-0042; digest-bound) ─────────────
+    # What ONE budget point is when a series carries C > 1 variates — the
+    # rule the stream's stop, the trainer's token counter, and the audit
+    # re-derivation all share (the corpus digest is the rolling digest of the
+    # consumed prefix, so the stop rule is consensus-relevant).
+    # "points": every values entry is a point — a (C, L) series costs C×L
+    # (the legacy rule; C > 1 was unreachable while max_channels was 1).
+    # "series_points": a (C, L) series costs L — per time-step positions, so
+    # the channel-token budget a corpus earns scales with its width
+    # (univariate 1×, C=32 → 32×). Paired with batch_denomination = "series"
+    # (64 series per step whatever C) this holds the STEP count equal across
+    # widths while a wide corpus trains C× the tokens per step: the
+    # multivariate advantage DEC-CA-0041's ablation measured, bought at C×
+    # compute per step under the unchanged wall (max_train_seconds is still
+    # the law — a wide leg that cannot finish its budget stops at the wall,
+    # flagged deadline_hit, like any other). Bit-identical at C = 1.
+    # Drop-when-default: "points" is absent from contract_digest; setting
+    # "series_points" is a deliberate contract cut — trainer, worker image,
+    # and cascade-audit must all read it (an old worker would silently bill
+    # the legacy rule and stop C× early).
+    budget_denomination: str = "points"
     # roles value 2 (future-known covariates) admission. Digest-bound and OFF
     # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
     # arming it before that rule exists is forbidden (DEC-CA-0026).
@@ -2161,6 +2196,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             extra_sizes=extra_sizes,
             batch_denomination=validate_batch_denomination(
                 str(t.get("batch_denomination", "series"))),
+            budget_denomination=validate_budget_denomination(
+                str(t.get("budget_denomination", "points"))),
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),

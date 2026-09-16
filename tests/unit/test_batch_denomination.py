@@ -101,13 +101,16 @@ def test_digest_inert_at_default_and_bumps_when_armed(cfg):
     assert contract_digest(base) != contract_digest(armed)
 
 
-def test_chain_toml_arms_sequences():
-    """The shipped mainnet config arms step-count parity with the C=32 cap."""
+def test_chain_toml_pairs_series_fill_with_series_points_budget():
+    """The shipped mainnet config (DEC-CA-0042) fills 64 SERIES per step at
+    every width and gets its step-count parity from the series-points budget
+    instead of the "sequences" fill — never one without the other."""
     from pathlib import Path
 
     from cascade.shared.config import load_chain_config
 
     root = Path(__file__).resolve().parents[2]
     cfg = load_chain_config(root / "chain.toml")
-    assert cfg.training.batch_denomination == "sequences"
+    assert cfg.training.batch_denomination == "series"
+    assert cfg.training.budget_denomination == "series_points"
     assert cfg.generator.max_channels == 32
