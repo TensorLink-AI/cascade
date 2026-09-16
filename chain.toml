@@ -223,12 +223,12 @@ expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # launch-env injection + the provisioner health gate; digest computed
 # orchestrator-side). Folded into contract_digest — re-pin ⇒ trainer AND
 # validators restart together at an epoch boundary, pods pull the new image.
-train_image_digest = "sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
-# ^ ghcr cascade-worker:worker-v0.8.0 — harvest (--local-only) + batch_denomination.
-#   REBUILD REQUIRED before the first 5h round: budget_denomination (DEC-CA-0042)
-#   is a new [training] key the v0.8.0 worker does not parse — it would bill
-#   the legacy C×L rule and stop every wide leg C× early. Re-pin the digest
-#   here once the new image is pushed (declared gating: no validator restart).
+train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
+# ^ ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
+#   branch (publish-worker run 35080201768): budget_denomination (DEC-CA-0042)
+#   parsed on the pod, PLUS check_loss_finite (840e900, 2026-09-14) which the
+#   v0.8.0 image (main@9346a52) never carried — three NaN legs trained to the
+#   wall on it. Re-pinned here (declared gating: no validator restart).
 # Extra final-stage model sizes. Each [[training.sizes]] is trained alongside
 # the primary in the final; the throne is decided on the COMBINED score. A size
 # overrides only shape fields + digest + throughput; all else inherits [training].
@@ -368,14 +368,14 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.0@sha256:9d5bc70d3f8abd4477d1a528d665e17ce8f351a1c0c46c437c81d4aa17a887e1"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.9.0@sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
 # sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
 # <repo>@<digest>). Every rented final/funded pod must hash its files to this
 # BEFORE a leg is dispatched — the digest env a template injects is echoed
 # faithfully by a host that started a STALE image under the pinned tag
 # (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
 # miners' legs stalled and were burned). Re-derive on every image re-pin.
-worker_code_fingerprint = "b4c3465804e8d71db7663b6f19e8e3fc184404b335d2a8c074152d9055a4c08e"   # 99 files, worker-v0.8.0 (9d5bc70d…); verified == pod 146.120.227.147 2026-09-12
+worker_code_fingerprint = "dd5236181d9267f5bae26d49e545cf6bfb06afc2d0618e7e25cf101034db763b"   # 100 files, worker-v0.9.0 (43c07d42…); registry walk == branch tree 2026-09-16
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
