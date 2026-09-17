@@ -1201,6 +1201,7 @@ if(R2_PUBLIC_BASE){ ENDPOINTS.push(R2_PUBLIC_BASE.replace(/\/$/, "")); }
 var HUB_BASE = "https://hub.hippius.com/models/";
 var HUB_REF = "main";
 var POLL_MS = 30000;
+var _leader = null;  // promotions/leaderboard.json — all-time top-k + announced change (DEC-CA-0044)
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
     _wsHist = null;
@@ -1771,16 +1772,70 @@ function roundNoOf(rid){
   return roundNoOfBlock(b);
 }
 function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
+// The ANNOUNCED warm-start change (DEC-CA-0044): the trainer publishes the next
+// generation's member set a notice period (24h) BEFORE it takes effect, on
+// status/round.json (warm_start.upcoming) and promotions/leaderboard.json. The
+// block is exact; the time is the trainer's estimate off the chain cadence.
+function upcomingChange(){
+  var srcs=[_roundStatus&&_roundStatus.warm_start, _leader];
+  for(var i=0;i<srcs.length;i++){
+    var up=srcs[i]&&srcs[i].upcoming;
+    if(up&&up.members&&up.members.length&&Number(up.effective_block)>0) return up;
+  }
+  return null;
+}
+function untilLabel(iso){
+  if(!iso) return "";
+  var s=Math.floor((new Date(iso).getTime()-Date.now())/1000);
+  if(!isFinite(s)) return "";
+  if(s<=0) return "due at the next round boundary";
+  var h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  return "in ~"+(h>=24?Math.floor(h/24)+"d "+(h%24)+"h":h+"h "+m+"m")+" (estimated)";
+}
+function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
+function renderUpcoming(){
+  var up=upcomingChange(); if(!up) return "";
+  var m=up.members, first=m[0].checkpoint_id;
+  var html='<div class="panel" style="border:1px solid var(--accent,#c9a227);padding:8px 10px;margin-bottom:8px">'
+    + '<div><b>&#9888; Upcoming warm-start change &mdash; generation '+esc(up.generation)+'</b></div>'
+    + '<div>Takes effect at block <b>'+esc(Number(up.effective_block).toLocaleString())+'</b>'
+    + (up.effective_at?' &middot; '+esc(untilLabel(up.effective_at))+' &middot; '+esc(new Date(up.effective_at).toUTCString()):'')
+    + '</div><div>New rotation: '
+    + m.map(function(x){ return '<b title="'+esc(x.checkpoint_id)+'">'+esc(wsLabel(x.checkpoint_id))+'</b>'
+        + (x.score!=null?' <span class="muted">('+fmt(x.score,5)+')</span>':""); }).join(' &rarr; ')
+    + '</div><div class="muted" style="font-size:.85em">Announced in round '+esc(shortRoundId(up.announced_round))
+    + ' at block '+esc(Number(up.announced_block).toLocaleString())+'. The set is frozen for the notice period. '
+    + 'Prepare: <code>cascade score &lt;repo&gt; --warm-start upcoming</code> (first member: <span title="'+esc(first)+'">'+esc(wsLabel(first))+'</span>).</div></div>';
+  return html;
+}
+function renderLeaderboard(){
+  if(!_leader||!_leader.entries) return "";
+  var live={}; (_leader.live_members||[]).forEach(function(c){ live[c]=true; });
+  var w=_leader.weights||{};
+  var rows=_leader.entries.map(function(e){
+    var g=Math.sqrt(Number(e.gifteval_crps)*Number(e.gifteval_mase)), b=Math.sqrt(Number(e.boom_crps)*Number(e.boom_mase)), t=Math.sqrt(Number(e.time_crps)*Number(e.time_mase));
+    return '<tr><td class="num">'+esc(e.rank)+'</td><td title="'+esc(e.checkpoint_id)+'">'+esc(wsLabel(e.checkpoint_id))+(live[e.checkpoint_id]?' <span class="muted">&larr; live</span>':"")+'</td>'
+      + '<td class="num"><b>'+fmt(e.score,5)+'</b></td><td class="num">'+fmt(g,4)+'</td><td class="num">'+fmt(b,4)+'</td><td class="num">'+fmt(t,4)+'</td>'
+      + '<td>'+esc(shortRoundId(e.source_round))+'</td><td>'+esc(e.role||"")+'</td></tr>';
+  }).join("");
+  return '<div class="section-label" style="margin-top:12px"><span>All-time leaderboard &mdash; the fixed top-'+esc(_leader.k)+' population'
+    + (_leader.rule_active?'':' (shadow until block '+esc(Number(_leader.activation_block||0).toLocaleString())+')')+'</span>'
+    + '<span class="muted">score = gift-eval '+pct(w.gifteval)+' &middot; boom '+pct(w.boom)+' &middot; time '+pct(w.time)+' (weighted geomean, lower is better)</span></div>'
+    + '<div class="scroll-box"><table><thead><tr><th class="num">#</th><th>Checkpoint</th><th class="num">Score</th><th class="num">GIFT</th><th class="num">BOOM</th><th class="num">TIME</th><th>Round</th><th>Role</th></tr></thead>'
+    + '<tbody>'+(rows||'<tr><td colspan="8" class="muted">No benched checkpoint yet.</td></tr>')+'</tbody></table></div>'
+    + '<div class="muted" style="font-size:.85em">A better checkpoint takes the rank it beats; the one below slides down and the last drops out. '
+    + 'A change to the set is announced '+esc(Number(_leader.notice_blocks||0).toLocaleString())+' blocks (~24h) before it becomes the init.</div>';
+}
 function renderWarm(){
   var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
   if(!panel) return;
   var ws = _heat && _heat.warm_start;
+  var upHtml=renderUpcoming();
   if(!ws || !ws.init_checkpoint){
-    panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
-    if(when) when.textContent = "";
+    panel.innerHTML = upHtml+'<div class="muted">Not active &mdash; rounds train from random initialisation.</div>'+renderLeaderboard();
+    if(when) when.textContent = upHtml?"change announced":"";
     return;
   }
-  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
   // heat.json is written at HEAT SETTLE, so it describes the last SETTLED round:
   // init_checkpoint = that round's init, next_scheduled_init = the round after it.
   // If a newer round is already live (status/round.json), that live round IS the
@@ -1814,8 +1869,8 @@ function renderWarm(){
         + 'pinned in that round&rsquo;s signed manifest.</div>';
   }
   html+='</div>';
-  panel.innerHTML=html;
-  if(when) when.textContent = ws.size ? esc(ws.size) : "";
+  panel.innerHTML=upHtml+html+renderLeaderboard();
+  if(when) when.textContent = (upHtml?"change announced · ":"")+(ws.size ? esc(ws.size) : "");
 }
 // Warm-start history: the last 10 rounds and the checkpoint each trained from,
 // so miners can see the trend (random init → warm-start → rotation). The per-round
@@ -2063,6 +2118,9 @@ function poll(){
   }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
   fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
+    .catch(function(){});
+  // All-time leaderboard + announced change (DEC-CA-0044). Best-effort.
+  fetchJSON("promotions/leaderboard.json").then(function(d){ _leader=d; renderWarm(); })
     .catch(function(){});
   // Live heat standings, published when the heat settles rather than with the
   // round's receipt (status/heat.json). Best-effort: on failure the panel falls

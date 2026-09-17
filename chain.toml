@@ -733,6 +733,29 @@ cascade_reign_rounds = 5
 # with a materially worse init.
 cascade_top_k          = 3
 cascade_quality_epsilon = 0.05
+# All-time top-k warm-start leaderboard (DEC-CA-0044, block-gated,
+# release-then-activate). From a round whose epoch boundary is >=
+# cascade_alltime_from_block the promoted set is ONE fixed population: the
+# all-time top cascade_top_k benched checkpoints (any reign / generation)
+# ranked by the suite-WEIGHTED score (GIFT-Eval : BOOM : TIME = 50 : 25 : 25,
+# each suite = geomean of its CRPS and MASE), still within
+# cascade_quality_epsilon of the best. A better checkpoint replaces the member
+# it outranks (the 3rd drops out, the 2nd slides to 3rd); the change is
+# ANNOUNCED (status/round.json + status/heat.json `warm_start.upcoming`,
+# promotions/leaderboard.json, `cascade round` / `cascade leaderboard`) and
+# takes effect cascade_notice_blocks later — 7200 blocks = 24h at 12 s — so
+# miners can prepare (`cascade score --warm-start upcoming`). CONSENSUS: under
+# the rule validators verify member provenance against ANY trainer-signed
+# bench report (members legitimately predate the reign), measure the quality
+# floor with the weighted score, and require cascade_notice_blocks since the
+# last reign anchor instead of cascade_reign_rounds. UNARMED on mainnet (0):
+# every external validator must run this release before the block is set —
+# see docs/ALLTIME_INIT_ROLLOUT.md.
+cascade_alltime_from_block = 0
+cascade_notice_blocks      = 7200
+cascade_weight_gifteval    = 0.5
+cascade_weight_boom        = 0.25
+cascade_weight_time        = 0.25
 # Block-gated contract transition (2026-08-20, WSD flip — DEC-CA-0018): rounds
 # whose epoch boundary precedes contract_from_block score against the pinned
 # PRIOR contract digest (the warmup_cosine contract every round through

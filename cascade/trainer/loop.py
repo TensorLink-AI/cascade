@@ -4876,6 +4876,110 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — replay must never sink a round
             log.warning("promotion: bench-report replay failed (ignored): %s", e)
 
+    def _backfill_leaderboard(self) -> None:
+        """One-time all-time backfill (DEC-CA-0044): offer every published,
+        trainer-signed bench report in the receipt index to the engine's
+        leaderboard, oldest first, then mark the engine seeded. The reign
+        replay above only walks the current reign; the all-time population
+        needs the whole history once. A read failure leaves the flag unset so
+        the next boundary retries; a round with no report contributes nothing
+        (the same gap validators have). Never sinks a round."""
+        if self.promotion is None or getattr(self.promotion, "leaderboard_seeded", False):
+            return
+        try:
+            from ..shared.bench_report import (
+                bench_report_key,
+                load_bench_report,
+                verify_bench_report_signature,
+            )
+            from ..shared.hippius import RECEIPT_INDEX_KEY
+
+            store = self.manifest_store()
+            idx = json.loads(store.get_text(RECEIPT_INDEX_KEY))
+            rows = [r for r in (idx.get("rounds") or [])
+                    if isinstance(r, dict) and r.get("round_id")]
+            rows.sort(key=lambda r: int(r.get("epoch_start_block") or 0))
+            seen: set[str] = set()
+            trainer_hotkey = self.cfg.manifest.trainer_hotkey
+            admitted = 0
+            for r in rows:
+                rid = str(r["round_id"])
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                try:
+                    report = load_bench_report(store.get_text(bench_report_key(rid)))
+                except Exception:  # noqa: BLE001 — no report ⇒ nothing to admit
+                    continue
+                if trainer_hotkey and not verify_bench_report_signature(report, trainer_hotkey):
+                    log.warning("leaderboard backfill: bench report for round=%s fails "
+                                "signature vs pinned trainer hotkey; skipped", rid)
+                    continue
+                admitted += self.promotion.admit_report(report)
+            self.promotion.mark_leaderboard_seeded()
+            log.info("promotion: all-time leaderboard backfilled from %d round(s) "
+                     "(%d admission(s)); board=[%s]", len(seen), admitted,
+                     ", ".join(f"#{e['rank']} {e['checkpoint_id']} ({e['score']:.5f})"
+                               for e in self.promotion.leaderboard_rows()))
+        except Exception as e:  # noqa: BLE001 — retried next boundary
+            log.warning("promotion: leaderboard backfill failed (retry next boundary): %s", e)
+
+    def _seconds_per_block(self, block: int) -> float:
+        rc = self.cfg.round
+        eb = effective_epoch_blocks(rc, int(block))
+        if getattr(rc, "round_hours", 0) and eb > 0:
+            return float(rc.round_hours) * 3600.0 / eb
+        return 12.0
+
+    def _upcoming_warm_start(self, *, now_block: int) -> dict | None:
+        """The engine's announced change as the status-doc block, with the
+        wall-clock estimate stamped, or ``None``. Best-effort."""
+        if self.promotion is None:
+            return None
+        try:
+            from ..shared.promotion import annotate_upcoming
+
+            up = self.promotion.upcoming()
+            if up is None:
+                return None
+            return annotate_upcoming(up, now_block=int(now_block),
+                                     seconds_per_block=self._seconds_per_block(now_block),
+                                     now_s=time.time())
+        except Exception as e:  # noqa: BLE001 — presentational
+            log.debug("upcoming warm-start block failed (ignored): %s", e)
+            return None
+
+    def _publish_leaderboard_doc(self, *, now_block: int) -> None:
+        """Publish ``promotions/leaderboard.json`` (DEC-CA-0044): the all-time
+        population, the live generation, and the announced change. Unsigned
+        and presentational; a failure never disturbs the round."""
+        if self.promotion is None:
+            return
+        try:
+            from datetime import datetime
+
+            from ..shared.config import cascade_suite_weights
+            from ..shared.promotion import build_leaderboard_doc, publish_leaderboard
+
+            rows = self.promotion.leaderboard_rows()
+            if not rows and self.promotion.upcoming() is None:
+                return
+            doc = build_leaderboard_doc(
+                as_of=datetime.now(UTC).isoformat(),
+                rule_active=bool(self.promotion.alltime_active(int(now_block))),
+                activation_block=int(self.cfg.scoring.cascade_alltime_from_block),
+                k=int(self.cfg.scoring.cascade_top_k),
+                weights=cascade_suite_weights(self.cfg.scoring),
+                notice_blocks=int(self.cfg.scoring.cascade_notice_blocks),
+                entries=rows,
+                live_generation=int(getattr(self.promotion, "generation", 0) or 0),
+                live_members=[m.checkpoint_id for m in self.promotion.members],
+                upcoming=self._upcoming_warm_start(now_block=now_block),
+            )
+            publish_leaderboard(self.manifest_store(), doc)
+        except Exception as e:  # noqa: BLE001 — presentational, never sinks a round
+            log.debug("leaderboard publish failed (ignored): %s", e)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -5439,6 +5543,15 @@ class TrainerRunner:
                 nxt = None
             if nxt is not None:
                 ws_info["next_scheduled_init"] = str(nxt[0])
+        # ANNOUNCED member-set change (DEC-CA-0044): the next generation and
+        # the block it takes effect ride the status docs the whole notice
+        # window so miners can prepare against the exact checkpoint. Carried
+        # even in the random-init era (a first promotion is announced too).
+        upcoming = self._upcoming_warm_start(now_block=int(block))
+        if upcoming is not None:
+            ws_info = dict(ws_info or {})
+            ws_info["upcoming"] = upcoming
+            ws_info["rule"] = "alltime_top_k"
         self._stage_ctx = {"round_id": str(base_seed),
                            "epoch_start_block": int(screen_block),
                            "warm_start": ws_info}
@@ -6985,10 +7098,18 @@ class TrainerRunner:
                         # so a promotion that fires NOW selects from the full
                         # reign, not just what the in-process bench thread saw.
                         self._replay_reign_bench_reports()
+                        # All-time leaderboard (DEC-CA-0044): once, feed EVERY
+                        # published bench report — the population is all-time,
+                        # so a fresh engine must see history before it selects.
+                        self._backfill_leaderboard()
                         self.promotion.maybe_promote(
                             epoch_block=epoch_start, round_id=round_id)
                     except Exception as e:  # noqa: BLE001
                         log.warning("promotion step failed for round=%s: %s", round_id, e)
+                    # Public leaderboard + announcement doc (unsigned,
+                    # presentational): the dashboards' and `cascade
+                    # leaderboard`'s source for "what is coming, and when".
+                    self._publish_leaderboard_doc(now_block=int(block))
                     # Publish-with-retry: the record survives (persisted) as
                     # pending until the publish lands, so a store outage never
                     # orphans a generation the pointer file already rotates

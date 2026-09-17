@@ -1,4 +1,5 @@
-"""``cascade`` console-script: ``verify``, ``deploy``, ``fetch``, ``score``, and ``round``.
+"""``cascade`` console-script: ``verify``, ``deploy``, ``fetch``, ``score``, ``round``,
+``heat``, ``leaderboard``, ``duel``, ``queue``, ``fund`` and ``submit``.
 
 * ``cascade verify <repo_dir>`` — run every check the trainer runs before it
   trains on your generator, including the determinism check. Returns non-zero
@@ -8,7 +9,8 @@
   at the cheap heat budget and score it on a local/sample pool, entirely offline
   (no chain, no TAO, no ~12h round). The fast iteration loop; needs the
   ``[train]`` extra. Trains from random init unless ``--warm-start`` names a
-  promoted cascade init (``live`` = the one the current round trains from);
+  promoted cascade init (``live`` = the one the current round trains from,
+  ``upcoming`` = the announced next init, published 24h before it takes effect);
   live rounds train from that warm-start once a generation is live, so compare against
   ``cascade score ./king`` on the same pool, not against live heat numbers.
   See ``cascade/miner/score.py``.
@@ -197,10 +199,12 @@ def _add_score(sub: argparse._SubParsersAction) -> None:
                    help="Eval windows to score on (default: [round] heat_n_windows).")
     p.add_argument("--device", default="cpu", help="Torch device (cuda recommended).")
     p.add_argument("--seed", type=int, default=0, help="Round seed (fixes generation + training).")
-    p.add_argument("--warm-start", default=None, metavar="live|repo@digest|DIR",
+    p.add_argument("--warm-start", default=None, metavar="live|upcoming|repo@digest|DIR",
                    help="Train from a promoted cascade init instead of random init, with the "
                         "live warm-started recipe: 'live' (the init the current round trains "
-                        "from, per the public round status), a Hub ref / trained pointer, or a "
+                        "from, per the public round status), 'upcoming' (the ANNOUNCED next "
+                        "init — a change is published 24h before it takes effect; see "
+                        "`cascade leaderboard`), a Hub ref / trained pointer, or a "
                         "local checkpoint dir. Default: random init.")
     p.add_argument("--skip-verify", action="store_true",
                    help="Skip the pre-score determinism/guard check.")
@@ -551,6 +555,41 @@ def _cmd_heat(args: argparse.Namespace) -> int:
         return 1
     print(render_heat(doc, me=args.hotkey))
     return 0
+
+
+def _add_leaderboard(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "leaderboard",
+        help="All-time warm-start leaderboard: the fixed top-3 population the "
+        "init rotates over (GIFT-Eval/BOOM/TIME weighted 50/25/25) and the "
+        "announced next init, with the block/time it takes effect.",
+    )
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--network", default="finney",
+                   help="Bittensor network, used only to read the current block for the "
+                        "countdown (finney/test/local). Skipped with --no-chain.")
+    p.add_argument("--no-chain", action="store_true",
+                   help="Do not query the chain; show the effective block without a countdown.")
+    p.set_defaults(func=_cmd_leaderboard)
+
+
+def _cmd_leaderboard(args: argparse.Namespace) -> int:
+    """Print the public all-time leaderboard — no wallet, no credentials; the
+    chain is read only for the countdown to an announced change."""
+    cfg = load_chain_config(args.chain_toml)
+    from .dashboard import fetch_public_leaderboard, render_leaderboard, seconds_per_block
+
+    doc = fetch_public_leaderboard(cfg.storage)
+    now_block = None
+    if doc is not None and not args.no_chain:
+        try:
+            from ..shared.chain import ChainClient
+
+            now_block = int(ChainClient.from_config(cfg, network=args.network).current_block())
+        except Exception:  # noqa: BLE001 — the countdown is a nicety, never a blocker
+            now_block = None
+    print(render_leaderboard(doc, now_block=now_block, spb=seconds_per_block(cfg.round)))
+    return 0 if doc is not None else 1
 
 
 def _add_duel(sub: argparse._SubParsersAction) -> None:
@@ -1281,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_round(sub)
     _add_queue(sub)
     _add_heat(sub)
+    _add_leaderboard(sub)
     _add_duel(sub)
     _add_fund(sub)
     _add_submit(sub)
