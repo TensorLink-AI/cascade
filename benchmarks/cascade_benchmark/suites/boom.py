@@ -22,13 +22,16 @@ BOOM is large (350M obs); use ``--max-series`` for anything but a full run.
 
 from __future__ import annotations
 
+import logging
 import os
 import traceback
 
 from ..aggregate import official_aggregate
 from ..resources import load_json
 from ..results import SuiteResult
-from ._common import build_dataset, score_dataset
+from ._common import build_dataset_or_reason, describe_exception, score_dataset
+
+log = logging.getLogger("cascade_benchmark.boom")
 
 
 def _baseline_items(max_tasks: int | None):
@@ -72,24 +75,37 @@ def run(
         baseline = load_json("boom_seasonal_naive.json")
         low_variance = frozenset(load_json("boom_low_variance.json"))
         rows = []
-        for full, name, term in _baseline_items(max_series):
-            ds = build_dataset(name, term, storage_env_var="BOOM")
+        skipped: list[dict] = []
+        items = list(_baseline_items(max_series))
+        for full, name, term in items:
+            ds, reason = build_dataset_or_reason(name, term, storage_env_var="BOOM")
             if ds is None:
+                log.warning("boom: %s not loaded: %s", full, reason)
+                skipped.append({"full": full, "stage": "load", "reason": reason})
                 continue
             try:
                 m = score_dataset(
                     ds, checkpoint_dir,
                     num_samples=num_samples, device=device, batch_size=batch_size,
                 )
-            except Exception:  # noqa: BLE001 — one config must not abort the sweep
+            except Exception as e:  # noqa: BLE001 — one config must not abort the sweep
+                reason = describe_exception(e)
+                log.warning("boom: %s not scored: %s", full, reason)
+                skipped.append({"full": full, "stage": "score", "reason": reason})
                 continue
             rows.append({"full": full, **m})
 
         if not rows:
-            return SuiteResult(suite="boom", status="error", detail="no BOOM configs scored")
+            return SuiteResult(suite="boom", status="error", detail="no BOOM configs scored",
+                               skipped=skipped, n_expected=len(items))
         agg = official_aggregate(rows, baseline, low_variance=low_variance)
         metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
-        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"])
+        detail = ""
+        if skipped:
+            detail = f"partial: {len(skipped)} of {len(items)} configs skipped"
+            log.warning("boom: %s", detail)
+        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"],
+                           detail=detail, skipped=skipped, n_expected=len(items))
     except FileNotFoundError as e:
         return SuiteResult(suite="boom", status="skipped", detail=f"BOOM data file missing: {e}")
     except ImportError as e:
