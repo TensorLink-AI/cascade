@@ -24,11 +24,14 @@ helpers are pure and unit-tested; only :func:`dispatch_train` shells out.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
+import secrets
 import shlex
 import subprocess
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -297,21 +300,9 @@ def build_remote_command(
     device ordinal, so local runs, single-lane pods, and non-lane masks keep
     today's behavior exactly.
     """
-    lane_env: dict[str, str] = {}
-    if host.cuda_device is not None:
-        lane_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
-        device = str(host.cuda_device).strip()
-        if lane_count is not None and lane_count > 1 and device.isdigit():
-            lane_env["CASCADE_LANE_INDEX"] = device
-            lane_env["CASCADE_LANE_COUNT"] = str(int(lane_count))
-    prefix = ""
-    if lane_env:
-        prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(lane_env.items())) + " "
-    source = ""
-    stdin_env: str | None = None
-    if env:
-        stdin_env = "".join(f"{k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
-        source = "set -a && . /dev/stdin && set +a && "
+    prefix = _lane_prefix(host, lane_count)
+    stdin_env = _stdin_env(env)
+    source = "set -a && . /dev/stdin && set +a && " if stdin_env is not None else ""
     # The worker runs in its OWN process group and the wrapper kills whatever
     # that group left behind the moment the worker exits — a lingering child
     # (the generator sandbox) holding the session's stdout/stderr keeps sshd
@@ -319,12 +310,204 @@ def build_remote_command(
     # king's worker exited rc=3 at 11:08; the dispatch returned at 14:51).
     # `set -m` gives the backgrounded job its own pgid ($w); `wait` collects
     # the worker's rc; `kill -- -$w` reaps the group; the rc is preserved.
-    worker = f"{prefix}{shlex.join(argv)}"
-    guarded = "bash -c " + shlex.quote(
-        f"set -m; {worker} </dev/null & w=$!; wait $w; rc=$?; "
-        f"kill -KILL -- -$w 2>/dev/null; exit $rc")
+    guarded = _guarded_worker(prefix, argv)
     command = f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {source}{guarded}"
     return command, stdin_env
+
+
+def _lane_prefix(host: RemoteHost, lane_count: int | None) -> str:
+    """The inline (non-secret) lane env: ``CUDA_VISIBLE_DEVICES`` plus the
+    ``CASCADE_LANE_*`` stamps on multi-lane pods (see build_remote_command)."""
+    lane_env: dict[str, str] = {}
+    if host.cuda_device is not None:
+        lane_env["CUDA_VISIBLE_DEVICES"] = host.cuda_device
+        device = str(host.cuda_device).strip()
+        if lane_count is not None and lane_count > 1 and device.isdigit():
+            lane_env["CASCADE_LANE_INDEX"] = device
+            lane_env["CASCADE_LANE_COUNT"] = str(int(lane_count))
+    if not lane_env:
+        return ""
+    return " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(lane_env.items())) + " "
+
+
+def _guarded_worker(prefix: str, argv: list[str]) -> str:
+    """The worker wrapped in its own reaped process group (see the comment in
+    build_remote_command): ``bash -c 'set -m; <worker> & wait; kill group; exit rc'``."""
+    worker = f"{prefix}{shlex.join(argv)}"
+    return "bash -c " + shlex.quote(
+        f"set -m; {worker} </dev/null & w=$!; wait $w; rc=$?; "
+        f"kill -KILL -- -$w 2>/dev/null; exit $rc")
+
+
+def _stdin_env(env: dict[str, str]) -> str | None:
+    if not env:
+        return None
+    return "".join(f"{k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
+
+
+# ── detached dispatch (2026-09-18) ───────────────────────────────────────────
+#
+# The attached form above ties a leg's FATE to one ssh session: the worker's
+# stdout (receipt), stderr (reason) and exit code all ride the session, so a
+# transport drop — provider edge blip, keepalive starvation under load — turns
+# a healthy, still-training worker into ``rc=255`` on the orchestrator's side
+# (2026-09-13 5Co2Te after 1h39m; 2026-09-17 5DoJQ after 1h12m; 2026-09-18
+# 02:52 all seven Oslo lanes at once, 8 legs lost and re-queued). The pod-side
+# benches died the same way (u201, three pods). Detached dispatch decouples
+# them: the launch ssh starts the worker under ``setsid nohup`` in its own
+# session writing stdout/stderr/pid/exit_code into a per-leg run dir on the
+# pod and returns at once; the orchestrator then POLLS with short ssh calls —
+# an unreachable pod is retried for ``reattach_grace_seconds`` before the leg
+# is declared lost — and fetches the receipt when the exit code lands. The
+# credentials still travel on stdin only: the launcher sources them exported,
+# the detached session inherits them, nothing touches the pod's disk.
+
+DETACHED_RUN_ROOT = "_train_work/_dispatch"
+DETACHED_POLL_SECONDS = 30
+DETACHED_REATTACH_GRACE_SECONDS = 900
+DETACHED_STDOUT_TAIL_BYTES = 262144
+DETACHED_STDERR_TAIL_BYTES = 20000
+DETACHED_LAUNCH_TOKEN = "__CASCADE_DETACHED__"
+DETACHED_STDERR_MARK = "__CASCADE_DETACHED_STDERR__"
+_SLEEP = time.sleep  # test seam
+
+
+def detached_run_dir(host: RemoteHost, tag: str) -> str:
+    """A fresh per-leg run dir under the pod's workdir (absolute)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
+    return f"{host.workdir}/{DETACHED_RUN_ROOT}/{safe}-{secrets.token_hex(4)}"
+
+
+def build_detached_command(host: RemoteHost, body: str, run_dir: str,
+                           *, stdin_env_present: bool) -> str:
+    """The launcher the ssh session runs for a detached leg: cd to the workdir,
+    source the credentials from stdin (exported, so the detached session
+    inherits them — never written to disk), create ``run_dir``, start ``body``
+    under ``setsid nohup`` with stdout/stderr redirected into the run dir,
+    record its pid, and return. The detached script appends the exit code to
+    ``run_dir/exit_code`` when ``body`` ends; ``DETACHED_LAUNCH_TOKEN`` on the
+    launcher's stdout proves the launch happened."""
+    rd = shlex.quote(run_dir)
+    script = f"echo $$ > {rd}/pid; {body}; rc=$?; echo $rc > {rd}/exit_code"
+    inner = "bash -c " + shlex.quote(script)
+    source = "set -a && . /dev/stdin && set +a && " if stdin_env_present else ""
+    return (f"cd {shlex.quote(host.workdir)} && {source}mkdir -p {rd} && "
+            f"(setsid nohup {inner} >{rd}/stdout 2>{rd}/stderr </dev/null &) && "
+            f"echo {DETACHED_LAUNCH_TOKEN}")
+
+
+def _detached_poll_command(host: RemoteHost, run_dir: str) -> str:
+    rd = shlex.quote(run_dir)
+    return (f"cd {shlex.quote(host.workdir)} && if [ -f {rd}/exit_code ]; then "
+            f"echo EXIT:$(cat {rd}/exit_code); elif [ -f {rd}/pid ] && "
+            f"kill -0 $(cat {rd}/pid) 2>/dev/null; then echo RUNNING; else echo GONE; fi")
+
+
+def _detached_fetch_command(host: RemoteHost, run_dir: str) -> str:
+    rd = shlex.quote(run_dir)
+    return (f"cd {shlex.quote(host.workdir)} && tail -c {DETACHED_STDOUT_TAIL_BYTES} {rd}/stdout; "
+            f"printf '\\n{DETACHED_STDERR_MARK}\\n'; tail -c {DETACHED_STDERR_TAIL_BYTES} {rd}/stderr")
+
+
+def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
+    rd = shlex.quote(run_dir)
+    return (f"cd {shlex.quote(host.workdir)} && p=$(cat {rd}/pid 2>/dev/null); "
+            f"[ -n \"$p\" ] && {{ kill -KILL -- -$p 2>/dev/null; kill -KILL $p 2>/dev/null; }}; true")
+
+
+def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: str, *,
+                 timeout: int, poll_seconds: int = DETACHED_POLL_SECONDS,
+                 grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS,
+                 runner=None, describe: str = "remote leg",
+                 preempt: str = PREEMPT_BENCHMARKS) -> subprocess.CompletedProcess:
+    """Run ``body`` detached on ``host`` and return a CompletedProcess-shaped
+    result (returncode, stdout, stderr) exactly like the attached ssh would —
+    the caller's receipt/rc handling is unchanged.
+
+    ``runner(argv, timeout, stdin_text)`` is the ssh call (``run_ssh`` in
+    production, a scripted double in tests). Transport failures during the
+    poll are tolerated for ``grace_seconds`` of consecutive unreachability;
+    the leg is only declared lost (rc=255) past that. ``timeout`` is the
+    overall wall for the leg; on expiry the detached process group is killed
+    best-effort and the leg reported timed out."""
+    run = runner or run_ssh
+    launch_cmd = preempt + build_detached_command(
+        host, body, run_dir, stdin_env_present=stdin_env is not None)
+    try:
+        launch = run(build_ssh_argv(host, launch_cmd), 180, stdin_env)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RemoteDispatchError(f"{describe}: detached launch failed: {e}", returncode=255) from e
+    if launch.returncode != 0 or DETACHED_LAUNCH_TOKEN not in (launch.stdout or ""):
+        raise RemoteDispatchError(
+            f"{describe}: detached launch failed (rc={launch.returncode}): "
+            f"{(launch.stderr or '')[-400:]}", returncode=launch.returncode or 255)
+    t0 = time.time()
+    last_seen = t0
+    misses = 0
+    rc: int | None = None
+    vanished = False
+    poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
+    while True:
+        _SLEEP(poll_seconds)
+        now = time.time()
+        if now - t0 > timeout:
+            with contextlib.suppress(Exception):  # best-effort
+                run(build_ssh_argv(host, _detached_kill_command(host, run_dir)), 60, "")
+            raise RemoteDispatchError(f"{describe} timed out after {int(timeout)}s (detached)",
+                                      returncode=None)
+        try:
+            p = run(poll_argv, 60, "")
+            lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+            token = lines[-1] if (p.returncode == 0 and lines) else None
+        except (subprocess.TimeoutExpired, OSError):
+            token = None
+        if token is None or not token.startswith(("EXIT:", "RUNNING", "GONE")):
+            misses += 1
+            gap = now - last_seen
+            if gap > grace_seconds:
+                raise RemoteDispatchError(
+                    f"{describe}: pod unreachable for {int(gap)}s while the detached "
+                    f"worker ran ({misses} failed polls) — leg lost", returncode=255)
+            if misses in (1, 5) or misses % 20 == 0:
+                log.warning("%s: poll unreachable (%d in a row, %.0fs since last contact; "
+                            "grace %ds) — the detached worker keeps running",
+                            describe, misses, gap, grace_seconds)
+            continue
+        if misses:
+            log.info("%s: pod reachable again after %d failed poll(s)", describe, misses)
+        misses = 0
+        last_seen = now
+        if token == "RUNNING":
+            continue
+        if token == "GONE":
+            vanished = True
+            rc = 1
+            break
+        try:
+            rc = int(token.split(":", 1)[1])
+        except ValueError:
+            rc = 1
+        break
+    fetch_argv = build_ssh_argv(host, _detached_fetch_command(host, run_dir))
+    out = None
+    for _attempt in range(6):
+        try:
+            f = run(fetch_argv, 180, "")
+            if f.returncode == 0:
+                out = f.stdout or ""
+                break
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        _SLEEP(20)
+    if out is None:
+        raise RemoteDispatchError(
+            f"{describe}: detached worker finished (rc={rc}) but its output could not "
+            f"be fetched after 6 attempts", returncode=rc)
+    stdout, _, stderr = out.partition(DETACHED_STDERR_MARK)
+    if vanished:
+        stderr = stderr.rstrip() + "\n[detached worker process vanished without an exit code]"
+    return subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
+                                       stdout=stdout, stderr=stderr)
 
 
 def pinned_known_hosts_file(host: RemoteHost) -> Path:
@@ -629,6 +812,13 @@ class RemoteDispatcher:
     # operator's own values: an isolated host still gets none of forward_env /
     # extra_forward_env.
     isolated_forward_env: tuple[tuple[str, str], ...] = ()
+    # Detached dispatch (see run_detached): the worker runs in its own session
+    # on the pod and the orchestrator polls; an ssh drop no longer kills the
+    # leg. Off by default here (the attached form is the test fixture shape);
+    # the live trainer arms it from ``[round] detached_dispatch``.
+    detached: bool = False
+    poll_seconds: int = DETACHED_POLL_SECONDS
+    reattach_grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -669,14 +859,23 @@ class RemoteDispatcher:
         # CASCADE_VAULT_DIR must be the POD's staging path even when the
         # orchestrator exports its own store dir under the same name.
         env.update(dict(host.static_env))
-        remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
-        ssh_argv = build_ssh_argv(host, remote_cmd)
-        log.info("dispatch role=%s → %s (%s) device=%s", role, host.name, host.host,
-                 host.cuda_device)
-        try:
-            proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
-        except subprocess.TimeoutExpired as e:
-            raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
+        log.info("dispatch role=%s → %s (%s) device=%s%s", role, host.name, host.host,
+                 host.cuda_device, " [detached]" if self.detached else "")
+        if self.detached:
+            body = _guarded_worker(_lane_prefix(host, lane_count), argv)
+            run_dir = detached_run_dir(host, f"{role}-{hotkey[:12]}-{base_seed}")
+            proc = run_detached(
+                host, body, _stdin_env(env), run_dir,
+                timeout=self.timeout_seconds, poll_seconds=self.poll_seconds,
+                grace_seconds=self.reattach_grace_seconds, runner=self._runner,
+                describe=f"remote {role} on {host.name}")
+        else:
+            remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
+            ssh_argv = build_ssh_argv(host, remote_cmd)
+            try:
+                proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
+            except subprocess.TimeoutExpired as e:
+                raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
         if proc.returncode == 3:
             # Worker rc=3 = miner submission rejected (CorpusError): the
             # worker's one-line reason — no traceback to relay.

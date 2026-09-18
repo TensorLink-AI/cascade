@@ -847,6 +847,11 @@ class TrainerRunner:
     remote_hosts: list | None = None
     trainer_spec: str | None = None
     remote_timeout_seconds: int = 6 * 3600
+    # Detached dispatch (remote.run_detached): mirrors [round] detached_dispatch /
+    # dispatch_poll_seconds / dispatch_reattach_grace_seconds (main.py wires them).
+    detached_dispatch: bool = False
+    dispatch_poll_seconds: int = 30
+    dispatch_reattach_grace_seconds: int = 900
     # Frozen-block protection for the live loop's chain reads. A bittensor
     # websocket can go quietly stale (serving a ~20-min-old block) or hang
     # without erroring, which makes run_forever re-enter an already-published
@@ -4645,6 +4650,7 @@ class TrainerRunner:
             timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
+            **self._dispatch_mode(),
         )
         entry = disp.dispatch(
             host, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey, role="king",
@@ -5199,6 +5205,7 @@ class TrainerRunner:
                 timeout_seconds=self.remote_timeout_seconds,
                 extra_forward_env=self._pod_extra_forward_env(),
                 isolated_forward_env=self._pod_isolated_forward_env(),
+            **self._dispatch_mode(),
             )
             # warm_start_ref makes the leg warm_started=True in the trainer, so
             # under an armed [training] warm_lr_scale (DEC-CA-0035) its cosine
@@ -6127,6 +6134,15 @@ class TrainerRunner:
             self._note_heat_progress(done, len(challengers))
         return out
 
+    def _dispatch_mode(self) -> dict:
+        """RemoteDispatcher kwargs for the detached/attached choice (see
+        remote.run_detached; [round] detached_dispatch)."""
+        if not self.detached_dispatch:
+            return {}          # attached: the dispatcher's defaults (and test doubles) unchanged
+        return {"detached": True,
+                "poll_seconds": int(self.dispatch_poll_seconds),
+                "reattach_grace_seconds": int(self.dispatch_reattach_grace_seconds)}
+
     def _pod_extra_forward_env(self) -> tuple[str, ...]:
         """Env vars every pod dispatch forwards on top of each host's own list.
 
@@ -6317,7 +6333,8 @@ class TrainerRunner:
         heat_timeout = min(self.remote_timeout_seconds, heat_contract.max_train_seconds + 1800)
         disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout,
                                 extra_forward_env=self._pod_extra_forward_env(),
-                                isolated_forward_env=self._pod_isolated_forward_env())
+                                isolated_forward_env=self._pod_isolated_forward_env(),
+                                **self._dispatch_mode())
 
         # Lane pool: dispatch lands on whichever GPU lane is actually idle
         # (see _dispatch_on_free_lane — the old i % n pin double-booked lanes).
@@ -6465,6 +6482,7 @@ class TrainerRunner:
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
+            **self._dispatch_mode(),
         )
 
         def _fresh_final_hosts() -> list:

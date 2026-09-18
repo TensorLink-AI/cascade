@@ -124,7 +124,15 @@ generator from the registry by ref, builds the corpus in its own sandbox, trains
 uploads the checkpoint, and returns a `TrainedEntry` receipt over SSH. The
 orchestrator collects the receipts and signs + publishes the manifest, so **the
 trainer hotkey never lands on a rented box**; pods need registry/S3 access, not
-the wallet. The host list is a trainer-local file (`scripts/remote_hosts.example.toml`),
+the wallet. Dispatch is **detached** (`[round] detached_dispatch`, 2026-09-18): the
+launch session starts the worker under `setsid nohup` in its own session on the
+pod, with stdout/stderr/pid/exit code in a per-leg run dir
+(`_train_work/_dispatch/<leg>/`), and returns at once; the orchestrator polls
+with short SSH calls, tolerates an unreachable pod for
+`dispatch_reattach_grace_seconds`, then fetches the receipt. A dropped SSH
+session therefore no longer fails a healthy leg (the attached form lost seven
+Oslo lanes to one provider blip on 2026-09-18). Credentials still travel on the
+launch session's stdin only. The pod-side post-round bench uses the same path. The host list is a trainer-local file (`scripts/remote_hosts.example.toml`),
 never `chain.toml`.
 
 This preserves the controlled experiment: the budget is a fixed `train_tokens`
