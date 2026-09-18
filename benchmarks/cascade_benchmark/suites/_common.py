@@ -14,22 +14,39 @@ from __future__ import annotations
 QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
-def build_dataset(name: str, term: str, *, storage_env_var: str = "GIFT_EVAL"):
+def describe_exception(exc: BaseException, limit: int = 300) -> str:
+    """``"<ExcType>: <message>"`` clipped to ``limit`` chars — the skip reason
+    a report carries for a config that produced no row (never a traceback:
+    reports are published, and a traceback can quote data paths)."""
+    msg = str(exc).strip().splitlines()
+    text = f"{type(exc).__name__}: {msg[0] if msg else ''}".strip()
+    return text[:limit]
+
+
+def build_dataset_or_reason(name: str, term: str, *, storage_env_var: str = "GIFT_EVAL"):
     """Construct a gift-eval ``Dataset`` following the reference runner's
     ``to_univariate`` rule (multivariate series split into univariate, matching
-    the leaderboard). Returns ``None`` if it fails to load so the caller can
-    skip it rather than abort the sweep.
+    the leaderboard). Returns ``(dataset, "")`` or ``(None, reason)`` — the
+    reason is what the sweep records for the config it could not load, so a
+    partial sweep can never masquerade as the whole benchmark.
     """
     from gift_eval.data import Dataset
 
     try:
         probe = Dataset(name=name, term=term, to_univariate=False, storage_env_var=storage_env_var)
         to_univariate = probe.target_dim != 1
-        return Dataset(
+        ds = Dataset(
             name=name, term=term, to_univariate=to_univariate, storage_env_var=storage_env_var
         )
-    except Exception:  # noqa: BLE001 — unknown/invalid (name, term) combo → skip
-        return None
+        return ds, ""
+    except Exception as e:  # noqa: BLE001 — unknown/invalid (name, term) combo → skip
+        return None, describe_exception(e)
+
+
+def build_dataset(name: str, term: str, *, storage_env_var: str = "GIFT_EVAL"):
+    """``build_dataset_or_reason`` without the reason (kept for callers that
+    only need the dataset)."""
+    return build_dataset_or_reason(name, term, storage_env_var=storage_env_var)[0]
 
 
 def score_dataset(
