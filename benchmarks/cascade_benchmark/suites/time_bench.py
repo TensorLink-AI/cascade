@@ -22,6 +22,7 @@ Real-TSF/TIME data. ``CASCADE_BENCH_TIME_DATASETS`` optionally restricts the
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -33,6 +34,9 @@ import numpy as np
 from .. import cache
 from ..predictor import _load_wrapper
 from ..results import SuiteResult
+from ._common import describe_exception
+
+log = logging.getLogger("cascade_benchmark.time")
 
 # TIME's default quantile grid (experiments/chronos2.py) — identical to cascade's.
 QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -242,8 +246,10 @@ def run(
 
         model_rows: list[dict] = []
         snaive_rows: list[dict] = []
+        skipped: list[dict] = []  # a task that fails is RECORDED, never dropped silently
+        tasks = list(_tasks(config, max_series))
         with tempfile.TemporaryDirectory(prefix="cascade-time-") as out_dir:
-            for j, (name, term) in enumerate(_tasks(config, max_series)):
+            for j, (name, term) in enumerate(tasks):
                 try:
                     # Per-task subdir keeps every task's (and role's) metrics.npz
                     # isolated under the shared temp root.
@@ -251,13 +257,17 @@ def run(
                         wrapper, name, term, config, str(Path(out_dir) / str(j)),
                         num_samples, batch_size, normalize=not raw_mode,
                     )
-                except Exception:  # noqa: BLE001 — one task must not abort the sweep
+                except Exception as e:  # noqa: BLE001 — one task must not abort the sweep
+                    reason = describe_exception(e)
+                    log.warning("time: %s/%s not scored: %s", name, term, reason)
+                    skipped.append({"full": f"{name}/{term}", "stage": "score", "reason": reason})
                     continue
                 model_rows.append(model_m)
                 snaive_rows.append(snaive_m)
 
         if not model_rows:
-            return SuiteResult(suite="time", status="error", detail="no TIME tasks scored")
+            return SuiteResult(suite="time", status="error", detail="no TIME tasks scored",
+                               skipped=skipped, n_expected=len(tasks))
 
         # Parity with GIFT-Eval/BOOM (and TIME's own leaderboard): per-task ratio to
         # the Seasonal-Naive baseline, aggregated by the shifted geometric mean.
@@ -277,7 +287,12 @@ def run(
             if not raw_mode:
                 print("time: Seasonal-Naive normalization produced nothing; reporting raw "
                       "means (NOT comparable to gift-eval/boom)", file=sys.stderr)
-        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=len(model_rows))
+        detail = ""
+        if skipped:
+            detail = f"partial: {len(skipped)} of {len(tasks)} tasks skipped: " + ", ".join(
+                x["full"] for x in skipped[:8]) + (" …" if len(skipped) > 8 else "")
+        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=len(model_rows),
+                           detail=detail, skipped=skipped, n_expected=len(tasks))
     except ImportError as e:
         return SuiteResult(suite="time", status="skipped", detail=f"timebench not importable: {e}")
     except Exception as e:  # noqa: BLE001

@@ -87,3 +87,37 @@ def test_describe_exception_is_one_line_and_bounded():
     e = ValueError("first line\nsecond line")
     assert describe_exception(e) == "ValueError: first line"
     assert len(describe_exception(RuntimeError("x" * 1000))) == 300
+
+
+# ── TIME: same class of silent drop, same accounting ─────────────────────────
+
+import sys as _sys
+import types as _types
+
+from cascade_benchmark.suites import time_bench
+
+
+def test_time_tasks_that_fail_to_score_are_recorded(monkeypatch, tmp_path):
+    monkeypatch.setenv("CASCADE_BENCH_TIME_DATASET", str(tmp_path))
+    # stub the timebench package the suite imports lazily
+    data = _types.ModuleType("timebench.evaluation.data")
+    data.load_dataset_config = lambda _p: {"datasets": {}}
+    for name, mod in (("timebench", _types.ModuleType("timebench")),
+                      ("timebench.evaluation", _types.ModuleType("timebench.evaluation")),
+                      ("timebench.evaluation.data", data)):
+        monkeypatch.setitem(_sys.modules, name, mod)
+    monkeypatch.setattr(time_bench, "_load_wrapper", lambda *_a, **_k: object())
+    monkeypatch.setattr(time_bench, "_tasks", lambda *_a, **_k: [("a/H", "short"), ("b/D", "short"), ("c/D", "long")])
+
+    def fake_score(wrapper, name, term, *_a, **_k):
+        if name == "b/D":
+            raise ValueError("Forecast contains NaN values")
+        return {"CRPS": 0.5, "MASE": 1.0}, {"CRPS": 1.0, "MASE": 2.0}
+
+    monkeypatch.setattr(time_bench, "_score_one", fake_score)
+    res = time_bench.run("/nonexistent/ckpt")
+    assert res.status == "ok"
+    assert res.n_expected == 3 and res.n_series == 2 and res.partial is True
+    assert res.skipped == [{"full": "b/D/short", "stage": "score",
+                            "reason": "ValueError: Forecast contains NaN values"}]
+    assert res.detail.startswith("partial: 1 of 3 tasks skipped: b/D/short")
