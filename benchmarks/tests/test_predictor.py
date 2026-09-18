@@ -143,3 +143,48 @@ def test_legacy_sample_wrapper_falls_back_to_sample_forecasts(tmp_path: Path):
     assert forecasts[0].samples.shape == (11, 5)
     assert np.allclose(forecasts[1].samples, 26.0)
     assert forecasts[1].start_date == dataset[1]["start"] + 20
+
+
+# ── missing values (2026-09-18: 23 of 97 GIFT-Eval configs carry NaN) ────────
+
+from cascade_benchmark.predictor import impute_history  # noqa: E402
+
+
+def test_impute_history_ffill_bfill_and_all_missing():
+    x = np.array([np.nan, np.nan, 1.0, np.nan, 3.0, np.inf, np.nan])
+    assert impute_history(x).tolist() == [1.0, 1.0, 1.0, 1.0, 3.0, 3.0, 3.0]
+    assert impute_history(np.array([np.nan, np.nan])).tolist() == [0.0, 0.0]
+    clean = np.array([1.0, 2.0, 3.0])
+    assert impute_history(clean) is clean  # gap-free: untouched, same object
+
+
+def test_quantile_path_imputes_missing_history_before_the_wrapper(tmp_path: Path):
+    ckpt = _ckpt(tmp_path, QUANTILE_STUB)
+    pred = CheckpointPredictor(ckpt, prediction_length=2, device="cpu", batch_size=8)
+    # The stub forecasts last value + level: a trailing NaN would poison it,
+    # and a fully missing series must still yield a finite (zero-based) forecast.
+    fc = list(pred.predict([_entry([np.nan, 5.0, np.nan], "gap"),
+                            _entry([np.nan, np.nan, np.nan], "empty")]))
+    assert all(np.isfinite(f.forecast_array).all() for f in fc)
+    assert fc[0].quantile(0.5)[0] == 5.5
+    assert fc[1].quantile(0.5)[0] == 0.5
+
+
+def test_sample_path_imputes_missing_history_before_the_wrapper(tmp_path: Path):
+    ckpt = _ckpt(tmp_path, SAMPLE_STUB)
+    pred = CheckpointPredictor(ckpt, prediction_length=2, num_samples=4, device="cpu")
+    (fc,) = list(pred.predict([_entry([2.0, np.nan], "gap")]))
+    assert np.isfinite(fc.samples).all() and fc.samples[0, 0] == 2.0
+
+
+def test_wrapper_that_handles_missing_gets_the_raw_history(tmp_path: Path):
+    stub = QUANTILE_STUB.replace(
+        "class Wrapper:\n", "class Wrapper:\n    handles_missing = True\n"
+    ).replace(
+        "np.tile(h[-1] + np.asarray(self.quantile_levels), (horizon, 1))",
+        "np.tile(float(np.isnan(h).sum()) + np.asarray(self.quantile_levels), (horizon, 1))",
+    )
+    ckpt = _ckpt(tmp_path, stub)
+    pred = CheckpointPredictor(ckpt, prediction_length=2, device="cpu", batch_size=8)
+    (fc,) = list(pred.predict([_entry([np.nan, 5.0, np.nan], "gap")]))
+    assert fc.quantile(0.5)[0] == 2.5  # two NaNs reached the wrapper untouched
