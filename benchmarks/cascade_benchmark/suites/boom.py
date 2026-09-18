@@ -104,7 +104,7 @@ def run(
         if skipped:
             detail = f"partial: {len(skipped)} of {len(items)} configs skipped"
             log.warning("boom: %s", detail)
-        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"],
+        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"], rows=rows,
                            detail=detail, skipped=skipped, n_expected=len(items))
     except FileNotFoundError as e:
         return SuiteResult(suite="boom", status="skipped", detail=f"BOOM data file missing: {e}")

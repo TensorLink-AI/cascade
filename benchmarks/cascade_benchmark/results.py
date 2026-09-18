@@ -22,7 +22,9 @@ class SuiteResult:
     # Per-config rows the consensus gate consumes: one dict per scored config,
     # ``{"full": name/freq/term, "MASE", "MAE", "CRPS", "crps_ratio",
     # "mase_ratio"}`` where the ratios are model ÷ vendored Seasonal-Naive
-    # baseline. Only ``gift-eval`` populates this; other suites leave it empty.
+    # baseline. ``boom`` rows carry ``{"full", "MASE", "MAE", "CRPS"}``; ``time``
+    # rows ``{"full": name/term, "num_variates", "prediction_length", "CRPS",
+    # "MASE", "snaive_CRPS", "snaive_MASE"}`` — enough for uni/multi splits.
     rows: list = field(default_factory=list)
     # Skip accounting (2026-09-18: every cascade GIFT-Eval report silently
     # covered 74 of the 97 official configs for two months — the per-config

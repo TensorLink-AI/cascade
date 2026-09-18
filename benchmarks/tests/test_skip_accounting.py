@@ -112,7 +112,7 @@ def test_time_tasks_that_fail_to_score_are_recorded(monkeypatch, tmp_path):
     def fake_score(wrapper, name, term, *_a, **_k):
         if name == "b/D":
             raise ValueError("Forecast contains NaN values")
-        return {"CRPS": 0.5, "MASE": 1.0}, {"CRPS": 1.0, "MASE": 2.0}
+        return {"CRPS": 0.5, "MASE": 1.0}, {"CRPS": 1.0, "MASE": 2.0}, {"num_variates": 3, "prediction_length": 8}
 
     monkeypatch.setattr(time_bench, "_score_one", fake_score)
     res = time_bench.run("/nonexistent/ckpt")
@@ -121,3 +121,38 @@ def test_time_tasks_that_fail_to_score_are_recorded(monkeypatch, tmp_path):
     assert res.skipped == [{"full": "b/D/short", "stage": "score",
                             "reason": "ValueError: Forecast contains NaN values"}]
     assert res.detail.startswith("partial: 1 of 3 tasks skipped: b/D/short")
+    assert res.rows[0] == {"full": "a/H/short", "num_variates": 3, "prediction_length": 8,
+                           "CRPS": 0.5, "MASE": 1.0, "snaive_CRPS": 1.0, "snaive_MASE": 2.0}
+
+
+def test_time_contexts_impute_unless_wrapper_handles_missing():
+    import numpy as np
+
+    class Plain: pass
+
+    class Masked:
+        handles_missing = True
+
+    tgt = np.array([[np.nan, 2.0, np.nan], [1.0, np.nan, 3.0]])
+    assert time_bench._contexts(Plain(), tgt).tolist() == [[2.0, 2.0, 2.0], [1.0, 1.0, 3.0]]
+    assert np.isnan(time_bench._contexts(Masked(), tgt)).sum() == 3  # raw gaps pass through
+
+
+def test_time_non_finite_metric_task_is_recorded(monkeypatch, tmp_path):
+    import math
+    monkeypatch.setenv("CASCADE_BENCH_TIME_DATASET", str(tmp_path))
+    data = _types.ModuleType("timebench.evaluation.data"); data.load_dataset_config = lambda _p: {"datasets": {}}
+    for name, mod in (("timebench", _types.ModuleType("timebench")),
+                      ("timebench.evaluation", _types.ModuleType("timebench.evaluation")),
+                      ("timebench.evaluation.data", data)):
+        monkeypatch.setitem(_sys.modules, name, mod)
+    monkeypatch.setattr(time_bench, "_load_wrapper", lambda *_a, **_k: object())
+    monkeypatch.setattr(time_bench, "_tasks", lambda *_a, **_k: [("a/H", "short"), ("b/D", "short")])
+    monkeypatch.setattr(time_bench, "_score_one", lambda w, name, term, *_a, **_k: (
+        {"CRPS": math.nan if name == "b/D" else 0.5, "MASE": 1.0}, {"CRPS": 1.0, "MASE": 2.0}, {"num_variates": 1, "prediction_length": 8}))
+    res = time_bench.run("/nonexistent/ckpt")
+    assert res.status == "ok" and res.n_series == 2  # still scored (mean-replaced), but…
+    assert res.skipped == [{"full": "b/D/short", "stage": "metric",
+                            "reason": "non-finite CRPS/MASE (mean-replaced in the aggregate)"}]
+    assert res.partial is False  # every task is in the headline — just not honestly
+    assert res.detail == "1 of 2 tasks non-finite (mean-replaced): b/D/short"
