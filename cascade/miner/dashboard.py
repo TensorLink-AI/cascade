@@ -300,6 +300,78 @@ def fetch_public_heat_round(
     return fetch_public_json(storage, heat_round_key(str(round_id)), timeout=timeout)
 
 
+def fetch_public_leaderboard(storage: object, *, timeout: float = 10.0) -> dict | None:
+    """Anonymously GET the trainer's all-time warm-start leaderboard
+    (``promotions/leaderboard.json``, DEC-CA-0044): the fixed population the
+    init rotates over, the live generation and the announced change."""
+    from ..shared.promotion import LEADERBOARD_KEY
+
+    return fetch_public_json(storage, LEADERBOARD_KEY, timeout=timeout)
+
+
+def render_leaderboard(
+    doc: dict | None, *, now_block: int | None = None, spb: float | None = None,
+) -> str:
+    """The ``cascade leaderboard`` view of ``promotions/leaderboard.json``."""
+    if not isinstance(doc, dict):
+        return ("no all-time leaderboard published yet — the trainer writes "
+                "promotions/leaderboard.json at each round boundary once the "
+                "cascade promotion engine has benched checkpoints")
+    w = doc.get("weights") if isinstance(doc.get("weights"), dict) else {}
+    rule = str(doc.get("rule", ""))
+    active = bool(doc.get("rule_active"))
+    lines = [
+        f"cascade leaderboard — all-time top {doc.get('k', '--')} warm-start population",
+        f"  published       {doc.get('as_of', '--')}",
+        f"  score           suite-weighted: gift-eval {_pct(w.get('gifteval'))} · "
+        f"boom {_pct(w.get('boom'))} · time {_pct(w.get('time'))}  (lower is better)",
+        f"  rule            {rule or '--'}"
+        + ("  (ACTIVE — the live init set is this population)" if active
+           else f"  (shadow until block {int(doc.get('activation_block') or 0):,}; "
+                "the reign-scoped rule still selects)"),
+        f"  live init       generation {doc.get('live_generation', 0)}: "
+        + (", ".join(_short_pointer(m) for m in (doc.get("live_members") or []))
+           or "random init"),
+    ]
+    live = set(doc.get("live_members") or [])
+    rows = [e for e in (doc.get("entries") or []) if isinstance(e, dict)]
+    lines.append("")
+    lines.append(f"  {'#':<3} {'score':>8}  {'gift':>7} {'boom':>7} {'time':>7}  "
+                 f"{'round':<6} {'role':<10} checkpoint")
+    for e in rows:
+        try:
+            gift = (float(e["gifteval_crps"]) * float(e["gifteval_mase"])) ** 0.5
+            boom = (float(e["boom_crps"]) * float(e["boom_mase"])) ** 0.5
+            tm = (float(e["time_crps"]) * float(e["time_mase"])) ** 0.5
+            sc = f"{float(e['score']):.5f}"
+            trip = f"{gift:>7.4f} {boom:>7.4f} {tm:>7.4f}"
+        except (KeyError, TypeError, ValueError):
+            sc, trip = "--", f"{'--':>7} {'--':>7} {'--':>7}"
+        mark = "  ← live" if e.get("checkpoint_id") in live else ""
+        lines.append(f"  {e.get('rank', '?'):<3} {sc:>8}  {trip}  "
+                     f"{str(e.get('source_round', ''))[:6]:<6} {str(e.get('role', ''))[:10]:<10} "
+                     f"{_short_pointer(str(e.get('checkpoint_id', '')))}{mark}")
+    if not rows:
+        lines.append("  (empty — no benched checkpoint yet)")
+    up_lines = upcoming_init_lines({"upcoming": doc.get("upcoming")},
+                                   now_block=now_block, spb=spb)
+    if up_lines:
+        lines.append("")
+        lines += up_lines
+    else:
+        lines.append("")
+        lines.append("  upcoming init   none announced — a change is announced "
+                     f"{int(doc.get('notice_blocks') or 0):,} blocks before it takes effect")
+    return "\n".join(lines)
+
+
+def _pct(x: object) -> str:
+    try:
+        return f"{float(x) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return "--"
+
+
 def fetch_public_heat_index(storage: object, *, timeout: float = 10.0) -> dict | None:
     """Anonymously GET ``heats/index.json`` — the discoverable list of published
     heats (a static reader cannot list the bucket)."""
@@ -617,6 +689,44 @@ def warm_start_line(ws: object) -> str | None:
             + (f"  (generation {gen})" if gen else ""))
 
 
+def upcoming_init_lines(
+    ws: object, *, now_block: int | None = None, spb: float | None = None,
+    indent: str = "  ",
+) -> list[str]:
+    """The ``upcoming init`` dashboard lines for an ANNOUNCED warm-start change
+    (DEC-CA-0044): the next generation's checkpoint(s), the block it takes
+    effect, the countdown (when the caller supplies the current block and the
+    cadence) and the one-liner a miner runs to prepare. Empty when the
+    ``warm_start`` block carries no well-formed announcement. Shared by
+    ``cascade round`` (the live doc) and ``cascade heat`` (the heat doc), so
+    both read the announcement identically."""
+    from ..shared.promotion import upcoming_from_doc
+
+    up = upcoming_from_doc({"warm_start": ws} if isinstance(ws, dict) else None)
+    if up is None:
+        return []
+    members = up["members"]
+    first = str(members[0]["checkpoint_id"])
+    gen = up.get("generation")
+    head = (f"{indent}upcoming init   generation {gen}: " if gen
+            else f"{indent}upcoming init   ")
+    head += _short_pointer(first)
+    if len(members) > 1:
+        head += f"  (+{len(members) - 1} more in rotation)"
+    lines = [head]
+    when = f"{indent}                takes effect at block {int(up['effective_block']):,}"
+    if now_block is not None and spb:
+        remaining = max(0, int(up["effective_block"]) - int(now_block))
+        when += (f"  (~{format_duration(remaining * float(spb))} from now, estimated)"
+                 if remaining > 0 else "  (due at the next round boundary)")
+    elif up.get("effective_at"):
+        when += f"  (~{up['effective_at']}, estimated)"
+    lines.append(when)
+    lines.append(f"{indent}                prepare: cascade score <repo> --warm-start upcoming"
+                 "  — the set is frozen for the notice period")
+    return lines
+
+
 def render_heat(doc: dict | None, *, me: str | None = None) -> str:
     """The standalone ``cascade heat`` view of one published heat document."""
     if not isinstance(doc, dict):
@@ -655,6 +765,7 @@ def render_heat(doc: dict | None, *, me: str | None = None) -> str:
             head.append(f"  next round      scheduled init {_short_pointer(nxt)} — "
                         "a schedule, not a promise (a boundary promotion "
                         "replaces the set; the manifest is ground truth)")
+    head += upcoming_init_lines(ws)
     body = heat_block(doc, me=me, limit=None)
     return "\n".join(head + ([""] + body[1:] if len(body) > 1 else []))
 
@@ -1182,10 +1293,14 @@ def compose_frame(
                                 now_s=time.time())
     ws = ((live_doc.get("warm_start") if isinstance(live_doc, dict) else None)
           or (heat_doc.get("warm_start") if isinstance(heat_doc, dict) else None))
+    # An ANNOUNCED init change (DEC-CA-0044) rides the same block; it renders
+    # even in a random-init round (the first promotion is announced too).
+    warm_parts = [ln for ln in (warm_start_line(ws),) if ln]
+    warm_parts += upcoming_init_lines(ws, now_block=st.block, spb=st.spb)
     return render(st, network, drift_seconds=drift_seconds, phase=phase,
                   submissions=submissions, last_outcome=last_outcome,
                   heat_lines=heat_lines, bar_line=bar_line,
-                  warm_line=warm_start_line(ws))
+                  warm_line="\n".join(warm_parts) if warm_parts else None)
 
 
 def run_dashboard(

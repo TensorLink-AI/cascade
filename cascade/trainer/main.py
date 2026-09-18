@@ -246,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         # the pin, signed, on the manifest for the fleet's envelope gate).
         from pathlib import Path as _Path
 
+        from ..shared.config import cascade_suite_weights
         from .promotion import TrainerPromotion
 
         warm_start_path = _Path(cfg.validator.warm_start_init_path)
@@ -257,11 +258,19 @@ def main(argv: list[str] | None = None) -> int:
             pointer_path=warm_start_path,
             round_cfg=cfg.round,
             error_vectors_path=_Path(args.work_root) / "promotion_error_vectors.json",
+            # All-time leaderboard rule (DEC-CA-0044): block-gated, consensus
+            # with the validators' envelope — same [scoring] values.
+            alltime_from_block=cfg.scoring.cascade_alltime_from_block,
+            notice_blocks=cfg.scoring.cascade_notice_blocks,
+            suite_weights=cascade_suite_weights(cfg.scoring),
         )
         log.info("cascade promotion engine enabled: generation=%d members=%d "
-                 "(pointer file %s, k_max=%d, epsilon=%.3f)",
+                 "(pointer file %s, k_max=%d, epsilon=%.3f, alltime_from_block=%d, "
+                 "notice_blocks=%d, leaderboard=%d row(s))",
                  promotion.generation, len(promotion.members), warm_start_path,
-                 cfg.scoring.cascade_top_k, cfg.scoring.cascade_quality_epsilon)
+                 cfg.scoring.cascade_top_k, cfg.scoring.cascade_quality_epsilon,
+                 cfg.scoring.cascade_alltime_from_block,
+                 cfg.scoring.cascade_notice_blocks, len(promotion.leaderboard))
         if remote_hosts or args.remote_hosts:
             # Preferred: bench each duel checkpoint on the pod that just trained
             # it — GPU, and the checkpoint is already at its _train_work path.

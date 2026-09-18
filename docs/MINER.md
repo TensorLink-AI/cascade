@@ -100,6 +100,7 @@ Compare against the king on the same pool with the same init:
 cascade fetch king --out ./king
 cascade score ./king   --pool-dir ./my-heldout --warm-start live
 cascade score ./my-gen --pool-dir ./my-heldout --warm-start live
+cascade score ./my-gen --pool-dir ./my-heldout --warm-start upcoming   # the announced next init
 ```
 
 The number is directional. Validators score on a private pool you never see,
@@ -210,6 +211,7 @@ An unfunded boundary runs no round; the king holds.
 cascade queue --intake https://submissions.cascadesub.net --hotkey <you>   # live queue + last roster
 cascade round                 # deadline countdown, stage, dethrone bar, revealed submissions
 cascade heat --hotkey <you>   # who seated / who waits this round
+cascade leaderboard           # all-time top-3 init population + the announced next init
 cascade duel                  # the settled verdict: margin, geomeans, per-domain win rates
 ```
 
@@ -229,13 +231,22 @@ pod. High `data_wait_frac` means training waited on your generator.
   rule it was judged under.
 - **Rewards.** The king and up to 4 prior kings share weights with geometric
   decay 0.5 (≈ 52 / 26 / 13 / 6 / 3 %). Losing challengers earn nothing.
-- **Warm-start lineage.** When a king holds 5 consecutive rounds, up to 3 of
-  the reign's best checkpoints (king's or challengers') become the next
-  generation's shared init, picked by public benchmark score and error
-  diversity. Later rounds rotate through them. You are improving the strongest
-  lineage, not teaching from zero; data that adds regimes the lineage is weak
-  on beats data that re-teaches what it knows. `cascade round` shows the init
-  in use.
+- **Warm-start lineage.** The shared init is drawn from ONE fixed population:
+  the **all-time top 3** benched checkpoints (king's or challengers', any
+  reign), ranked by a suite-weighted public benchmark score — GIFT-Eval 50%,
+  BOOM 25%, TIME 25% (each suite the geomean of its CRPS and MASE) — and
+  rounds rotate through them. A checkpoint that beats a member takes its
+  rank: beat 2nd and you are 2nd, 2nd becomes 3rd, 3rd drops out. A change to
+  the set is **announced 24h before it takes effect** (7200 blocks): `cascade
+  round`, `cascade heat`, `cascade leaderboard` and the dashboard show the
+  next generation, its members and the block/time it arrives, so you can test
+  your data against the exact upcoming init with `cascade score <repo>
+  --warm-start upcoming` before the first round trains from it. You are
+  improving the strongest lineage, not teaching from zero; data that adds
+  regimes the lineage is weak on beats data that re-teaches what it knows.
+  (Until `[scoring] cascade_alltime_from_block` is reached on mainnet the
+  previous rule applies: a 5-round undethroned reign promotes up to 3 of that
+  reign's best checkpoints; the leaderboard is published in shadow meanwhile.)
 
 ## 8. Failure classes
 

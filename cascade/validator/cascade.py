@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -101,6 +102,47 @@ def cascade_score(
     """The Cascade checkpoint score: geomean of the six public-benchmark numbers
     (GIFT-Eval / BOOM / TIME CRPS+MASE). Lower is better."""
     return geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps, time_mase)
+
+
+# The all-time leaderboard's suite weighting (DEC-CA-0044): GIFT-Eval : BOOM :
+# TIME. The three suites are orthogonal results (different data, different
+# regimes), so the promotion score weights them by suite instead of counting
+# six numbers uniformly — GIFT-Eval carries half the weight. Uniform thirds
+# reproduce :func:`cascade_score` exactly.
+DEFAULT_SUITE_WEIGHTS = (0.5, 0.25, 0.25)
+
+
+def weighted_cascade_score(
+    gifteval_crps: float,
+    gifteval_mase: float,
+    boom_crps: float,
+    boom_mase: float,
+    time_crps: float,
+    time_mase: float,
+    *,
+    weights: tuple[float, float, float] = DEFAULT_SUITE_WEIGHTS,
+) -> float:
+    """The suite-weighted Cascade score (DEC-CA-0044): each suite collapses to
+    the geomean of its CRPS and MASE, and the three suite scores combine as a
+    WEIGHTED geometric mean under ``weights = (gifteval, boom, time)``. Lower
+    is better; weights are normalised, so ``(1, 1, 1)`` — or the default
+    thirds — is bit-for-bit :func:`cascade_score`. Non-positive weights are
+    treated as zero (a suite can be muted, never negated); an all-zero
+    weighting degrades to the uniform score rather than NaN."""
+    w = [max(float(x), 0.0) for x in weights[:3]] if weights else []
+    total = sum(w) if len(w) == 3 else 0.0
+    if total <= 0.0:
+        return cascade_score(gifteval_crps, gifteval_mase, boom_crps, boom_mase,
+                             time_crps, time_mase)
+    suites = (
+        geomean(gifteval_crps, gifteval_mase),
+        geomean(boom_crps, boom_mase),
+        geomean(time_crps, time_mase),
+    )
+    acc = 0.0
+    for wi, si in zip(w, suites, strict=True):
+        acc += (wi / total) * math.log(max(float(si), _EPS))
+    return math.exp(acc)
 
 
 @dataclass(frozen=True)
@@ -499,6 +541,19 @@ class CascadeController:
             return False
         elapsed = reign_rounds(state, block, self.round_cfg)
         return elapsed is not None and elapsed >= self.reign_days
+
+    def is_spaced(self, *, block: int, min_blocks: int) -> bool:
+        """Whether at least ``min_blocks`` have passed since the reign clock's
+        anchor — the all-time rule's timing predicate (DEC-CA-0044): the notice
+        period, not a full reign, paces generations. The anchor resets on both
+        a dethrone and an accepted promotion, so it doubles as "at least one
+        notice period since the last generation". False when the throne is
+        vacant or the clock is unanchored, like :meth:`is_ripe`."""
+        state = self.state
+        if state.king_hotkey is None or state.reign_start_block is None:
+            return False
+        b = reign_blocks(state, block)
+        return b is not None and b >= int(min_blocks)
 
     def can_verify_ripeness(self) -> bool:
         """Whether this validator's clock is in a position to judge reign
