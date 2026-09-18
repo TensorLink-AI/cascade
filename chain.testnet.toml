@@ -227,6 +227,17 @@ funded_capacity_probe = true    # FUNDED-TEST: clamp to the chosen type's live m
 funded_capacity_reserve = 1
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST: per-round pick
 funded_king_rent = true   # FUNDED-TEST: JIT operator king at the round SKU (standing final pod expired 09-02)
+# Detached dispatch (2026-09-18): every remote leg and pod-side bench runs in
+# its own session on the pod (setsid+nohup; stdout/stderr/pid/exit_code in a
+# per-leg run dir under _train_work/_dispatch) and the trainer polls it with
+# short ssh calls, tolerating an unreachable pod for
+# dispatch_reattach_grace_seconds before the leg is declared lost. Replaces
+# the attached form, where one dropped ssh session failed a healthy leg
+# (09-13 5Co2Te; 09-17 5DoJQ; 09-18 02:52 all seven Oslo lanes → 8 legs
+# re-queued). Credentials still go over stdin only. false = attached.
+detached_dispatch = true
+dispatch_poll_seconds = 30
+dispatch_reattach_grace_seconds = 900
 submission_vault_dir = "submission_vault"  # FUNDED-TEST       # direct submissions (vault refs) off until armed
 champion_publish = "dethrone"  # FUNDED-TEST: rehearse the mainnet publish policy
 champion_publish_delay_rounds = 2

@@ -1106,6 +1106,18 @@ class RoundConfig:
     # this mode — its orphan reaper does not know these pods; the trainer
     # ledgers them and sweeps at each boundary.
     funded_king_rent: bool = False
+    # Detached dispatch (2026-09-18): every remote leg (king, funded, heat,
+    # final) and every pod-side bench runs in its OWN session on the pod
+    # (setsid + nohup, stdout/stderr/exit code in a per-leg run dir) and the
+    # orchestrator polls with short ssh calls. An ssh transport drop is
+    # retried for `dispatch_reattach_grace_seconds` of consecutive
+    # unreachability before the leg is declared lost — the attached form
+    # turned one dropped session into a failed leg (09-13 5Co2Te, 09-17
+    # 5DoJQ, 09-18 02:52 seven Oslo lanes at once). Credentials still travel
+    # on stdin only. False = the attached form.
+    detached_dispatch: bool = True
+    dispatch_poll_seconds: int = 30
+    dispatch_reattach_grace_seconds: int = 900
     # Hybrid fallback (owner 2026-09-12): a funded leg (or the JIT king) still
     # WAITING for marketplace capacity takes an OPERATOR final lane from
     # hosts.toml as soon as one is on file — operator-billed for that leg only,
@@ -2270,6 +2282,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_host_bench_floor=validate_funded_host_bench_floor(
                 r.get("funded_host_bench_floor", None)),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
+            detached_dispatch=bool(r.get("detached_dispatch", True)),
+            dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),
+            dispatch_reattach_grace_seconds=max(0, int(r.get("dispatch_reattach_grace_seconds", 900))),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(

@@ -58,6 +58,14 @@ class BenchPlan:
     # installer path — override for a bootstrap-provisioned fleet.
     uv_bin: str = "/bin/uv"
     timeout_seconds: int = 2 * 3600
+    # Detached bench (2026-09-18, see remote.run_detached): the sweep runs in
+    # its own session on the pod and the orchestrator polls, so an ssh drop
+    # mid-bench (u201 ×3 pods, 5FYf, 5GKe — all `exit 255`) no longer loses
+    # the report. Off by default (test fixture shape); the live trainer arms
+    # it from [round] detached_dispatch.
+    detached: bool = False
+    poll_seconds: int = 30
+    reattach_grace_seconds: int = 900
     # fence for the dataset download's wedge mode (2026-08-12: unauthenticated
     # HF pulls deadlocked twice); authenticated pulls finish in ~3 min.
     download_timeout_seconds: int = 2700
@@ -349,14 +357,32 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
         # data; a failed sideload degrades to a token-less download there.
         token = (None if getattr(host, "isolated", False)
                  else os.environ.get("HF_TOKEN") or None)
-        remote_cmd, report_path = build_bench_remote_command(
-            host, round_id, arch_preset, plan, role=role, hf_token=token)
-        ssh = build_ssh_argv(host, remote_cmd)
-        if runner is not None:  # test seam: doubles take (argv, timeout) only
-            proc = runner(ssh, plan.timeout_seconds)
+        payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
+        if plan.detached:
+            # The launcher sources the token from stdin (exported ⇒ inherited by
+            # the detached session); the body itself carries no env prefix.
+            from .remote import PREEMPT_BENCHMARKS, detached_run_dir, run_detached
+
+            body, report_path = build_bench_remote_command(
+                host, round_id, arch_preset, plan, role=role, hf_token=None)
+            body = body[len(PREEMPT_BENCHMARKS):] if body.startswith(PREEMPT_BENCHMARKS) else body
+
+            def _call(argv, t, stdin=None):
+                return runner(argv, t) if runner is not None else run_ssh(argv, t, stdin)
+
+            proc = run_detached(
+                host, body, payload, detached_run_dir(host, f"bench-{role}-{round_id}"),
+                timeout=plan.timeout_seconds, poll_seconds=plan.poll_seconds,
+                grace_seconds=plan.reattach_grace_seconds, runner=_call,
+                describe=f"bench {role} on {host.name}")
         else:
-            payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
-            proc = run_ssh(ssh, plan.timeout_seconds, stdin_text=payload)
+            remote_cmd, report_path = build_bench_remote_command(
+                host, round_id, arch_preset, plan, role=role, hf_token=token)
+            ssh = build_ssh_argv(host, remote_cmd)
+            if runner is not None:  # test seam: doubles take (argv, timeout) only
+                proc = runner(ssh, plan.timeout_seconds)
+            else:
+                proc = run_ssh(ssh, plan.timeout_seconds, stdin_text=payload)
         if proc.returncode != 0:
             log.warning("post-round benchmark failed on %s (exit %s): %s",
                         host.name, proc.returncode, (proc.stderr or "")[-400:])

@@ -424,6 +424,17 @@ funded_host_bench_floor = { RTX4090 = 500e6 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
+# Detached dispatch (2026-09-18): every remote leg and pod-side bench runs in
+# its own session on the pod (setsid+nohup; stdout/stderr/pid/exit_code in a
+# per-leg run dir under _train_work/_dispatch) and the trainer polls it with
+# short ssh calls, tolerating an unreachable pod for
+# dispatch_reattach_grace_seconds before the leg is declared lost. Replaces
+# the attached form, where one dropped ssh session failed a healthy leg
+# (09-13 5Co2Te; 09-17 5DoJQ; 09-18 02:52 all seven Oslo lanes → 8 legs
+# re-queued). Credentials still go over stdin only. false = attached.
+detached_dispatch = true
+dispatch_poll_seconds = 30
+dispatch_reattach_grace_seconds = 900
 # Hybrid fallback: a funded leg (or the JIT king) still WAITING for marketplace
 # capacity takes an OPERATOR final lane from hosts.toml the moment one is on
 # file — operator-billed for that leg only; legs already running on their
