@@ -221,15 +221,18 @@ def test_loader_rejects_unknown_budget_denomination(tmp_path):
         load_chain_config(bad)
 
 
-def test_chain_toml_arms_five_hour_series_points_legs():
+def test_chain_toml_arms_five_hour_wall_three_hour_budget():
     from pathlib import Path
 
     from cascade.shared.config import load_chain_config
 
     root = Path(__file__).resolve().parents[2]
     t = load_chain_config(root / "chain.toml").training
-    assert t.target_train_hours == 5.0
+    # Amended 2026-09-16 21:30: the wall is 5h, the BUDGET stays the 3h figure —
+    # the univariate budget never grows; width is what buys tokens.
+    assert t.target_train_hours == 3.0
     assert t.max_train_seconds == 5 * 3600
+    assert t.train_tokens == int(3.0 * 3600 * t.ref_throughput_tokens_per_s)
     assert t.batch_denomination == "series"
     assert t.budget_denomination == "series_points"
     # audit replay reads the field back off a declared body

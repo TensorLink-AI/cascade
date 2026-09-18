@@ -258,9 +258,11 @@ def test_for_hours_guard_knobs_override_defaults(cfg):
     assert c.for_hours(0.5).max_train_seconds == 1800                 # 1.0 default
     assert c.for_hours(0.5, guard_factor=3.0).max_train_seconds == 5400
     assert c.for_hours(0.1, guard_floor_seconds=300).max_train_seconds == 360
-    # chain.toml ships the owner policy: cap == budget, final cap == 3h budget
+    # chain.toml ships the owner policy: heat cap == heat budget; the FINAL wall is
+    # 5h over a 3h budget (DEC-CA-0042 amended: wide corpora use the extra wall).
     assert cfg.round.heat_guard_factor == 1.0
-    assert cfg.training.max_train_seconds == int(cfg.training.target_train_hours * 3600)
+    assert cfg.training.max_train_seconds == 18000
+    assert cfg.training.max_train_seconds >= int(cfg.training.target_train_hours * 3600)
 
 
 # ── scheduled cadence change ([round] epoch_activation_block) ────────────────

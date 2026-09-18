@@ -124,10 +124,12 @@ context_length     = 4096
 horizon            = 64
 # From-scratch budget, enforced as a fixed token count (hours × ref throughput)
 # so king and challenger see identical compute; max_train_seconds is the hard guard.
-# 5h legs (owner 2026-09-16, DEC-CA-0042; was 3h): the budget below is
-# series-points, so a univariate leg trains 5h × ref_throughput channel
-# tokens and a C-channel corpus trains C× that many in the SAME step count.
-target_train_hours          = 5.0
+# DEC-CA-0042 (owner 2026-09-16, amended 21:30 the same day): the BUDGET stays the
+# 3h figure (3h × ref_throughput = 40B series-points — the univariate budget never
+# grows); only the WALL grew to 5h (max_train_seconds below). The budget is
+# series-points, so a C-channel corpus trains C× 40B channel tokens in the SAME
+# step count as a univariate leg — width buys tokens, hours stay fixed.
+target_train_hours          = 3.0
 ref_throughput_tokens_per_s = 3700000  # 20x (2026-07-15): L40S is ~20x the old 185k ref, so it was
                                         # finishing the budget early; 20x the TOKEN budget, same wall
 warmup_fraction             = 0.05
@@ -765,9 +767,9 @@ cascade_quality_epsilon = 0.05
 # 9046800 without sacrificing an in-flight round. New digest recomputed from
 # [training] above = 22081e46…; verify after any edit.
 # (Retires the aged-out c6d24621…/8942400 DEC-CA-0035+0033 transition pair.)
-# 2026-09-16 (DEC-CA-0042): target_train_hours 5.0 / max_train_seconds 18000 /
-# batch_denomination "series" / budget_denomination "series_points" move the
-# digest again (recomputed = f1df3802…). None of them is a LOCKED term, and
+# 2026-09-16 (DEC-CA-0042, amended): max_train_seconds 18000 (target_train_hours
+# stays 3.0) / batch_denomination "series" / budget_denomination "series_points"
+# move the digest again (recomputed = f88909e9…). None of them is a LOCKED term, and
 # declared_contract_from_block (8942400) is armed below, so this cut ships on
 # the trainer + worker image alone — validators keep accepting the declared
 # body; the strict path (and this prior pin) only matters for a body-less

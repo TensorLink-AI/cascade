@@ -1116,10 +1116,11 @@ var TOKEN_ERAS = [
   { from: "0000-00-00", ref_tps: 185000,  train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "launch contract" },
   { from: "2026-07-15", ref_tps: 3700000, train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "L40S pods: 20× token budget, same 3h wall" },
   { from: "2026-07-26", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "heat screen 0.5h → 1.0h" },
-  // DEC-CA-0042: 5h legs; the budget is series-points (64 series per step at
-  // every width), so this step count holds for every channel mix — a
-  // C-channel round trains C× these tokens in the same steps.
-  { from: "2026-09-16", ref_tps: 3700000, train_h: 5.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "5h legs, series-points budget (DEC-CA-0042)" }
+  // DEC-CA-0042 (amended 2026-09-16 21:30): the budget stays the 3h figure and is
+  // series-points (64 series per step at every width), so this step count holds
+  // for every channel mix — a C-channel round trains C× these tokens in the same
+  // steps; only the wall grew to 5h.
+  { from: "2026-09-16", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "5h wall, 3h series-points budget (DEC-CA-0042)" }
 ];
 
 // Official Toto2 pretraining budget per ladder size, in OPTIMISER STEPS — the

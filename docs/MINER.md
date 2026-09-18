@@ -192,7 +192,8 @@ Labels are cosmetic: never identity, never in signed records.
 2. **One GPU type per round**, the most available of RTX4090, RTX3090, L40S,
    L40, A6000. King and every challenger train on the same type.
 3. **Training.** Each seated entry rents a pod on its own key and trains the
-   full budget (~5 h) from the round's shared init. There is no heat screen:
+   full budget (the 3 h token budget under a 5 h wall; a wide corpus uses the
+   extra wall) from the round's shared init. There is no heat screen:
    every seated entry duels the king.
 4. **Manifest and verdict.** The operator signs a manifest (~5.5–6 h after
    the boundary). Validators score king and challengers on the same private
