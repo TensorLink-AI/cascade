@@ -164,6 +164,15 @@ class _FundedOperatorFallback(Exception):
     lanes on file — runs on an operator lane instead, operator-billed. The
     explicit, owner-armed exception to _FundedLegSkip's rule (2026-09-12)."""
 
+
+class _LaneDeadlinePassed(Exception):
+    """No operator lane came free before the round's latest safe start: a leg
+    started now could not finish inside the epoch. Raised by the final lane
+    pool's deadline form so the leg fails/requeues instead of blocking on the
+    pool and starting hours late (2026-09-19: two fallback legs dispatched
+    2 h before the epoch end held the manifest past the boundary, with three
+    more queued behind them)."""
+
 # Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
 # a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
 # never re-fits the round's exact training draw, and the salted seed keys the
@@ -730,15 +739,34 @@ class _FinalLanePool(queue.Queue):
                     super().put(h)
                     log.info("final lane pool: new lane %s joined mid-final", name)
 
-    def get(self, block: bool = True, timeout: float | None = None):
+    def get(self, block: bool = True, timeout: float | None = None, *,
+            deadline: float | None = None):
+        """``deadline`` (wall-clock, blocking form only): the latest moment a
+        lane may still be handed out — past it the wait ends with
+        ``_LaneDeadlinePassed`` and a lane that frees later stays in the pool
+        for a leg that CAN still fit (the next round's). None = wait forever
+        (the operator-fleet final, whose legs are sized to the epoch)."""
         if not block or timeout is not None:
             return super().get(block=block, timeout=timeout)
         while True:
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise _LaneDeadlinePassed(
+                        f"no operator lane free before the round's latest safe start "
+                        f"({time.strftime('%H:%M:%SZ', time.gmtime(deadline))})")
             self._absorb_new()
+            wait = self.REFRESH_INTERVAL_S
+            if deadline is not None:
+                wait = max(0.0, min(wait, deadline - time.time()))
             try:
-                return super().get(timeout=self.REFRESH_INTERVAL_S)
+                host = super().get(timeout=wait)
             except queue.Empty:
                 continue
+            if deadline is not None and time.time() >= deadline:
+                super().put(host)                # freed too late for THIS leg
+                continue                         # next pass raises
+            return host
 
 
 def _final_repo_suffix(
@@ -1627,6 +1655,17 @@ class TrainerRunner:
             return end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
+
+    def _operator_lane_deadline(self) -> float | None:
+        """Latest wall-clock an operator-lane FALLBACK leg may start — the same
+        latest safe start as a marketplace rent — or None when the round's
+        epoch end is unknown (then the lane wait is unbounded, as before)."""
+        if getattr(self, "_funded_epoch_end_wall", None) is None:
+            ctx = getattr(self, "_stage_ctx", None) or {}
+            if (not int(ctx.get("epoch_start_block") or 0)
+                    or getattr(self, "_funded_gate_block", None) is None):
+                return None
+        return self._funded_rent_wait_deadline()
 
     def _wait_for_funded_capacity(self, sku: str, *, describe: str,
                                   for_king: bool = False) -> bool:
@@ -6230,9 +6269,12 @@ class TrainerRunner:
 
     @staticmethod
     def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str,
-                               used_host: list | None = None, prepare=None, **kw):
+                               used_host: list | None = None, prepare=None,
+                               deadline: float | None = None, **kw):
         """Dispatch on the next IDLE lane, retrying once on whichever lane is
         free after a failure (a different one whenever one is available).
+        ``deadline`` (wall-clock) bounds BOTH lane waits — see
+        :meth:`_FinalLanePool.get`; ``_LaneDeadlinePassed`` propagates.
 
         Same retry policy as :meth:`_dispatch_with_retry`, but lane occupancy
         is tracked through ``free_lanes`` (a ``queue.Queue`` of hosts) instead
@@ -6251,7 +6293,9 @@ class TrainerRunner:
         # starts, or the leg burns an attempt on a pod that can't resolve it
         # (2026-09-12 03:52: nine challengers lost both attempts that way).
         _ready = prepare or (lambda h: h)
-        host = free_lanes.get()
+        _take = ((lambda: free_lanes.get(deadline=deadline)) if deadline is not None
+                 else free_lanes.get)
+        host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
@@ -6264,7 +6308,7 @@ class TrainerRunner:
                             "%.0fs before the retry", describe,
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
-            retry_host = free_lanes.get()        # next idle lane; different when one exists
+            retry_host = _take()                 # next idle lane; different when one exists
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
@@ -6505,6 +6549,7 @@ class TrainerRunner:
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
+            lane_deadline: float | None = None   # operator-fleet legs: sized to the epoch
             try:
                 if (role == "king"
                         and self._effective_funded_pods() == "rent"
@@ -6555,6 +6600,11 @@ class TrainerRunner:
                 log.warning("final %s %s: no marketplace capacity — running on an "
                             "OPERATOR lane (operator-billed; funded_operator_fallback)",
                             role, gen.hotkey)
+                # ...but only while a leg started now still fits the epoch:
+                # the same latest safe start that bounds a marketplace rent
+                # bounds the wait for a free lane (2026-09-19: unbounded pool
+                # waits dispatched two 5 h legs 2 h before the epoch end).
+                lane_deadline = self._operator_lane_deadline()
             # Operator lanes can run PRIVATE (vault/direct) submissions too:
             # stage the ZIP on whichever lane the pool hands out, exactly as
             # the funded-pod leg does — until 2026-09-12 only that path staged,
@@ -6563,16 +6613,29 @@ class TrainerRunner:
             vault_digest = parse_vault_ref(gen.ref)
             prepare = ((lambda h, d=vault_digest: self._stage_vault_zip_on(h, d))
                        if vault_digest else None)
-            entry = self._dispatch_on_free_lane(
-                disp, lane_pool, lane_pool.known_hosts(),
-                describe=f"final {role} {gen.hotkey}",
-                used_host=used, prepare=prepare,
-                gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
-                role=role, base_seed=seeds.base_seed, block=block,
-                arch_preset=contract.arch_preset,
-                warm_start_ref=warm_start_ref,
-                **({"repo_suffix": suffix} if suffix else {}),
-            )
+            try:
+                entry = self._dispatch_on_free_lane(
+                    disp, lane_pool, lane_pool.known_hosts(),
+                    describe=f"final {role} {gen.hotkey}",
+                    used_host=used, prepare=prepare, deadline=lane_deadline,
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role=role, base_seed=seeds.base_seed, block=block,
+                    arch_preset=contract.arch_preset,
+                    warm_start_ref=warm_start_ref,
+                    **({"repo_suffix": suffix} if suffix else {}),
+                )
+            except _LaneDeadlinePassed as e:
+                if role == "king":
+                    # No king inside the epoch = no round: abort now (the
+                    # king-failure path retries at the next boundary).
+                    raise RuntimeError(f"king: {e}") from e
+                # Sold-out taxonomy, exactly like a marketplace leg still
+                # without a GPU at the deadline: requeued, nothing burned.
+                log.warning("final challenger %s: %s — requeued to the next round "
+                            "(unburned)", gen.hotkey, e)
+                self._record_funded_failure(gen.hotkey, str(e), miner_fault=False,
+                                            error_class="no_capacity", burn=False)
+                raise _FundedLegSkip(gen.hotkey) from e
             if used:
                 # Post-publish bench target: the pod actually holding this
                 # final checkpoint at its _train_work path.
