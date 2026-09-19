@@ -608,3 +608,34 @@ def test_bench_thread_exit_sweeps_kept_payer_pods(cascade_cfg, tmp_path, monkeyp
                                warm_start_ckpt="")
     runner.run_post_publish_bench(manifest)
     assert torn == ["a"] and runner._funded_bench_pods == {}
+
+
+def test_bench_thread_holds_its_round_and_benches_on_the_host_snapshot(
+        cascade_cfg, tmp_path, monkeypatch):
+    """2026-09-19: run_round N+1 resets _final_role_hosts hours before round
+    N's bench finishes; a live lookup then found no king host and every payer
+    bench was dropped. The thread arms the hold for its round for exactly the
+    life of the bench and scores off the snapshot taken at thread start."""
+    from types import SimpleNamespace
+
+    runner = _runner(cascade_cfg, tmp_path, monkeypatch, bench_eval_fn=lambda d: _BENCH)
+    runner._final_role_hosts = {("king", "toto2-4m", "a"): "king-pod-N"}
+    seen: dict = {}
+
+    def fake_bench(manifest, *, final_hosts=None):
+        seen["in_flight"] = dict(runner._bench_in_flight)
+        seen["hold"] = runner._bench_hold_rounds()
+        # The next round has started meanwhile and repopulated the live map.
+        runner._final_role_hosts = {("king", "toto2-4m", "a"): "king-pod-N+1"}
+        seen["snapshot"] = final_hosts
+        seen["host"] = runner._bench_host_for(
+            _duel_entry("king", 0, "a"), "toto2-4m", final_hosts=final_hosts)
+        return None
+
+    monkeypatch.setattr(runner, "_post_publish_bench", fake_bench)
+    manifest = SimpleNamespace(round_id="7", created_block=1, entries=[], warm_start_ckpt="")
+    runner.run_post_publish_bench(manifest)
+    assert "7" in seen["in_flight"] and seen["hold"] == ["7"]
+    assert seen["snapshot"] == {("king", "toto2-4m", "a"): "king-pod-N"}
+    assert seen["host"] == "king-pod-N"                # never the next round's live pod
+    assert runner._bench_in_flight == {}               # hold released with the thread
