@@ -1124,6 +1124,13 @@ class RoundConfig:
     # legs already running on their payer's pod are untouched. Off ⇒ funded
     # legs never run on operator lanes (the bill never moves silently).
     funded_operator_fallback: bool = False
+    # Owner 2026-09-19: Lium first, Shadeform for the spillover. A funded leg
+    # REQUEUED from an earlier round (it already missed one) takes an operator
+    # lane the moment one is on file; a FRESH leg keeps polling the marketplace
+    # (payer-billed) and takes an operator lane only inside this many seconds
+    # before the round's latest safe start. 0 ⇒ every waiting leg falls back at
+    # once (the pre-2026-09-19 behaviour). The JIT king is never held back.
+    funded_operator_fallback_fresh_window_seconds: int = 3600
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -2286,6 +2293,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),
             dispatch_reattach_grace_seconds=max(0, int(r.get("dispatch_reattach_grace_seconds", 900))),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
+            funded_operator_fallback_fresh_window_seconds=max(
+                0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

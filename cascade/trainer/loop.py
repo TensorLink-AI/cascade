@@ -1667,8 +1667,35 @@ class TrainerRunner:
                 return None
         return self._funded_rent_wait_deadline()
 
+    def _operator_fallback_eligible(self, hotkey: str | None, now: float,
+                                    deadline: float) -> bool:
+        """Lium first, Shadeform for the spillover (owner 2026-09-19): may this
+        waiting leg take an operator lane NOW? The JIT king (``hotkey`` None)
+        always may. A funded entry REQUEUED from an earlier round (any recorded
+        fault class — it already missed a round) may at once; a FRESH entry
+        keeps polling the marketplace (payer-billed) until the last
+        ``funded_operator_fallback_fresh_window_seconds`` before the latest
+        safe start. Window 0 ⇒ everyone at once."""
+        if hotkey is None:
+            return True
+        window = int(getattr(self.cfg.round,
+                             "funded_operator_fallback_fresh_window_seconds", 0) or 0)
+        if window <= 0:
+            return True
+        carried = False
+        try:
+            queue = self._funded_queue()
+            entry = queue.get(hotkey) if queue is not None else None
+            carried = entry is not None and (
+                int(getattr(entry, "attempts", 0) or 0) > 0
+                or bool(getattr(entry, "last_error_class", "") or ""))
+        except Exception as e:  # noqa: BLE001 — a torn queue read must not block the leg
+            log.debug("fallback eligibility for %s: queue read failed (%s)", hotkey[:12], e)
+        return carried or now >= deadline - window
+
     def _wait_for_funded_capacity(self, sku: str, *, describe: str,
-                                  for_king: bool = False) -> bool:
+                                  for_king: bool = False,
+                                  hotkey: str | None = None) -> bool:
         """Poll the marketplace for ``sku`` until it shows capacity or the round's
         latest safe start passes. Legs start INDEPENDENTLY as GPUs appear
         (owner 2026-09-12: "keep trying over the next 3 hours to bring up more
@@ -1687,8 +1714,10 @@ class TrainerRunner:
                 return False
             # Hybrid fallback (owner 2026-09-12): operator lanes on file end the
             # wait — the leg runs there, operator-billed, while siblings that
-            # already rented on their payer's pod are untouched.
-            if self._operator_fallback_lanes():
+            # already rented on their payer's pod are untouched. Fresh legs
+            # keep polling until the window (owner 2026-09-19, Lium first).
+            if (self._operator_fallback_lanes()
+                    and self._operator_fallback_eligible(hotkey, now_fn(), deadline)):
                 log.info("%s: operator final lane(s) on file — leaving the %s wait "
                          "for an operator lane (operator-billed)", describe, sku)
                 return "operator"
@@ -2306,7 +2335,7 @@ class TrainerRunner:
             # rent lock, so sibling legs that find one proceed) and rent again.
             # Only the round's latest safe start turns this into a requeue.
             waited = self._wait_for_funded_capacity(
-                round_sku, describe=f"funded leg {gen.hotkey[:12]}")
+                round_sku, describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
             if waited == "operator":
                 # Owner-armed hybrid: this leg runs on an operator lane
                 # (operator-billed). The payer's write-ahead row goes (no pod

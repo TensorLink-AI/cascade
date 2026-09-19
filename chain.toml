@@ -440,6 +440,11 @@ dispatch_reattach_grace_seconds = 900
 # file — operator-billed for that leg only; legs already running on their
 # payer's pod are untouched. false ⇒ funded legs never run on operator lanes.
 funded_operator_fallback = false
+# Lium first, Shadeform for the spillover (owner 2026-09-19): a leg REQUEUED
+# from an earlier round takes an operator lane as soon as one is on file; a
+# FRESH leg keeps polling the marketplace (payer-billed) and falls back only
+# inside this window before the latest safe start. 0 = everyone at once.
+funded_operator_fallback_fresh_window_seconds = 3600
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as
