@@ -672,6 +672,16 @@ cohort_maxt_from_block = 9046800  # Fri 2026-09-11 20:30 UTC — the evening fun
 # cohort max-T above = one coordinated validator-upgrade window for both.
 # margin_mode below stays "level" (the pre-gate rule); 0 = no scheduled flip.
 increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the evening funded round)
+# Increment margin ON COHORT rounds (DEC-CA-0039 amended 2026-09-19): until this
+# block a cohort round (k > 1) under the max-T is judged in LEVEL units — the
+# joint bound only knew the level statistic, so from 9046800 on the increment
+# margin never actually judged a funded round (every one had k > 1). From a
+# round whose epoch boundary is >= this block the max-T bound is the
+# %-of-increment statistic (baseline on the shared resample), stacking the two
+# corrections as DEC-CA-0039 describes. CONSENSUS — release-then-activate with
+# the external validators; audit replays each round under its own block.
+# 0 = cohort rounds stay level-judged (no scheduled flip).
+cohort_maxt_increment_from_block = 0
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point

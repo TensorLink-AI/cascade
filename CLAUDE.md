@@ -303,8 +303,12 @@ in-context.
   / `effective_margin_mode`; audit replays each round under its block (level
   fallback for random-init preserved); no receipt change. ARMED at 9046800 —
   SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
-  increment fixes the signal, max-T the multiplicity). Not a basin-escape
-  substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)
+  increment fixes the signal, max-T the multiplicity). AMENDED 2026-09-19:
+  the stacking never ran — the max-T bound was level-only, so cohort rounds
+  (every funded round) were level-judged; fixed behind `[scoring]
+  cohort_maxt_increment_from_block` (consensus, mainnet block TBD, testnet 1).
+  Not a basin-escape substitute (DEC-CA-0014).
+  (`decisions/DEC-CA-0039-increment-margin-activation.md`)
 - **DEC-CA-0040** (proposed) — Make the king beatable more often by flattening
   the FRESH-KING margin ramp (`win_margin_start` 0.01 → the 0.005 floor), NOT by
   touching the noise gate. Replay of 86 mainnet rounds: the margin below ~0.3% is

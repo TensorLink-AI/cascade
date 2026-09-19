@@ -148,3 +148,37 @@ def test_koth_params_flip_margin_mode_at_the_block(cfg):
     # And the audit resolves the SAME rule off the receipt's block, so
     # check_koth_params expects increment for a post-gate round and level before.
     assert armed.koth_params(block=None).margin_mode == "level"
+
+
+# ── DEC-CA-0039 amended 2026-09-19: increment units for the cohort max-T ────
+
+def test_cohort_maxt_increment_knob_parses_and_defaults_off(tmp_path):
+    from cascade.shared.config import (
+        DEFAULT_CHAIN_TOML,
+        cohort_maxt_increment_active,
+        load_chain_config,
+    )
+
+    bare = re.sub(r"^cohort_maxt_increment_from_block\s*=.*$", "",
+                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
+    p = tmp_path / "chain.toml"
+    p.write_text(bare)
+    cfg = load_chain_config(p)
+    assert cfg.scoring.cohort_maxt_increment_from_block == 0
+    assert cohort_maxt_increment_active(cfg.scoring, 10**9) is False
+    p.write_text(bare.replace(
+        "\n[scoring]\n", "\n[scoring]\ncohort_maxt_increment_from_block = 5000\n", 1))
+    cfg = load_chain_config(p)
+    assert cfg.scoring.cohort_maxt_increment_from_block == 5000
+    assert cohort_maxt_increment_active(cfg.scoring, 4999) is False
+    assert cohort_maxt_increment_active(cfg.scoring, 5000) is True
+    assert cohort_maxt_increment_active(cfg.scoring, None) is False
+    # An armed shipped toml flips on an epoch boundary, like the other gates.
+    shipped = load_chain_config(DEFAULT_CHAIN_TOML)
+    if shipped.scoring.cohort_maxt_increment_from_block:
+        assert (shipped.scoring.cohort_maxt_increment_from_block
+                % shipped.round.epoch_blocks == 0)
+        assert (shipped.scoring.cohort_maxt_increment_from_block
+                >= shipped.scoring.cohort_maxt_from_block)
+        assert (shipped.scoring.cohort_maxt_increment_from_block
+                >= shipped.scoring.increment_from_block)

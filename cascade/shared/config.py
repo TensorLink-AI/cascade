@@ -1448,6 +1448,16 @@ class ScoringConfig:
     # like the other gates; audit replays each round under its own rule. 0 =
     # keep `margin_mode` for every round (no scheduled flip).
     increment_from_block: int = 0
+    # Increment margin ON COHORT rounds (DEC-CA-0039 amended 2026-09-19,
+    # block-gated). Until this block a cohort round (k > 1) under the max-T is
+    # judged in LEVEL units whatever `increment_from_block` says — the joint
+    # bound only knew the level statistic, so the increment margin never
+    # judged a live funded round. From a round whose epoch boundary is >= this
+    # block the max-T bound is the %-of-increment statistic (the baseline
+    # rides the shared resample), the same unit the single duel judges in.
+    # CONSENSUS, resolved per round like the other gates; audit replays each
+    # round under its own rule. 0 = cohort rounds stay level-judged.
+    cohort_maxt_increment_from_block: int = 0
     # Multivariate scoring activation (DEC-CA-0041, block-gated). From a round
     # whose epoch boundary is >= this block, a multivariate window's channels
     # are averaged into ONE per-window contribution (GIFT-Eval weighting — the
@@ -1907,6 +1917,17 @@ def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
             and int(block) >= scoring.cohort_maxt_from_block)
 
 
+def cohort_maxt_increment_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """Whether a cohort round at epoch boundary ``block`` judges its max-T
+    bound in INCREMENT units (DEC-CA-0039 stacked on DEC-CA-0038):
+    ``cohort_maxt_increment_from_block`` set and reached. Only meaningful when
+    the max-T and the increment margin are both in force for that block (and a
+    baseline exists — a random-init round still falls back to level); ``0`` /
+    unknown block ⇒ False (cohort rounds level-judged, the pre-gate rule)."""
+    return (scoring.cohort_maxt_increment_from_block > 0 and block is not None
+            and int(block) >= scoring.cohort_maxt_increment_from_block)
+
+
 def mv_score_active(scoring: ScoringConfig, block: int | None) -> bool:
     """Whether a round at epoch boundary ``block`` is scored with the GIFT-Eval
     multivariate weighting (DEC-CA-0041) — a window's channels averaged into one
@@ -2353,6 +2374,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_activation_block2=max(0, int(s.get("margin_activation_block2", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
+            cohort_maxt_increment_from_block=max(
+                0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
             mv_score_from_block=max(0, int(s.get("mv_score_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
