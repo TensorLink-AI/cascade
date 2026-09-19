@@ -318,6 +318,7 @@ def cohort_maxt_lcb_map(
     *,
     seed: int | str,
     wql_mode: str = "geomean",
+    baseline_scores: list[WindowScore] | None = None,
 ) -> dict[str, float]:
     """``{hotkey: family-wise LCB}`` for a cohort under the shared-resample
     max-T (DEC-CA-0038) — the consensus replacement for Bonferroni ``alpha/k``
@@ -337,7 +338,22 @@ def cohort_maxt_lcb_map(
     single-duel :func:`evaluate_round`, so the cohort max-T reads a multivariate
     window as one unit exactly as the point statistic and the cluster bootstrap
     do. Bit-identical on any univariate pool (one channel per window).
+
+    Increment margin (DEC-CA-0039 stacked on DEC-CA-0038): with
+    ``params.margin_mode == "increment"`` AND ``baseline_scores`` (the shared
+    init scored on the same windows, paired like the king's), every bound is
+    the %-of-increment statistic — the same unit the single duel judges in —
+    so the cohort's family-wise LCB and the margin share one denomination.
+    Either missing ⇒ the level statistic (the pre-``cohort_maxt_increment_
+    from_block`` rule; the caller resolves the gate from the round's block).
     """
+    if params.margin_mode == "increment" and baseline_scores is not None:
+        if len(baseline_scores) != len(king_scores):
+            raise ValueError(
+                f"baseline_scores ({len(baseline_scores)}) not paired with "
+                f"king_scores ({len(king_scores)})")
+    else:
+        baseline_scores = None
     if params.mv_score:
         if wql_mode != "geomean":
             raise ValueError(
@@ -347,12 +363,16 @@ def cohort_maxt_lcb_map(
         king_scores = collapse_channels_by_window(king_scores)
         cohort_scores = [(hk, collapse_channels_by_window(cs))
                          for hk, cs in cohort_scores]
+        if baseline_scores is not None:
+            baseline_scores = collapse_channels_by_window(baseline_scores)
     clusters, _ = _window_clusters(king_scores)
     king_c = stack_components(king_scores)
     chal_c = [stack_components(cs) for _, cs in cohort_scores]
+    base_c = stack_components(baseline_scores) if baseline_scores is not None else None
     lcbs = cohort_maxt_lcbs(
         king_c, chal_c, alpha=params.bootstrap_alpha, B=params.bootstrap_B,
         seed=seed, clusters=clusters, wql_mode=wql_mode,
+        baseline=base_c, floor_frac=params.margin_increment_floor,
     )
     return {hk: lcb for (hk, _), lcb in zip(cohort_scores, lcbs, strict=True)}
 

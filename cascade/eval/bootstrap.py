@@ -309,6 +309,14 @@ def increment_bootstrap_rel(
     if rows.size == 0:
         return np.empty(0, dtype=np.float64)
     king_geo, chal_geo, base_geo = rows
+    return _increment_stat(king_geo, chal_geo, base_geo, floor_frac)
+
+
+def _increment_stat(king_geo: np.ndarray, chal_geo: np.ndarray, base_geo: np.ndarray,
+                    floor_frac: float) -> np.ndarray:
+    """The %-of-increment statistic of :func:`increment_bootstrap_rel`, element-
+    wise over paired bag geomeans — ONE definition for the single duel and the
+    cohort max-T so the two can never drift."""
     d_king = base_geo - king_geo
     d_chal = base_geo - chal_geo
     unit = np.maximum(
@@ -390,6 +398,8 @@ def cohort_maxt_lcbs(
     seed: int | str = 42,
     clusters: list | np.ndarray | None = None,
     wql_mode: str = "geomean",
+    baseline: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    floor_frac: float = 0.01,
 ) -> list[float]:
     """Family-wise LOWER bounds for a cohort of challengers vs ONE king, via a
     shared-resample max-T (Westfall–Young step-down simultaneous band).
@@ -428,6 +438,18 @@ def cohort_maxt_lcbs(
     SE cancels). It therefore always sits BETWEEN Bonferroni (lowest bound) and
     no correction (highest).
 
+    ``baseline`` (DEC-CA-0039 stacked on DEC-CA-0038): with the shared
+    warm-start init's paired components, every per-bag statistic is the
+    INCREMENT-denominated one of :func:`increment_bootstrap_rel` — the same
+    numerator ``king_geo − chal_geo`` over the floored mean increment
+    ``max((|base−king| + |base−chal|)/2, floor_frac·base)`` — with the
+    baseline riding the SAME shared cluster resample as king and cohort, so
+    window difficulty cancels three ways exactly as in the single duel. The
+    max-T machinery (studentised, centred, one shared critical value) is
+    unchanged; at ``k = 1`` it reduces to ``quantile(increment_bootstrap_rel,
+    alpha)`` exactly as the level form reduces to the percentile LCB. Without
+    ``baseline`` the level statistic is used (bit-identical to before).
+
     Returns ``L[j]`` per challenger, in ``challengers`` order.
     """
     if not challengers:
@@ -444,7 +466,8 @@ def cohort_maxt_lcbs(
     idx = rng.integers(0, g, size=(B, g))                # shared cluster resample
     ident = np.arange(g).reshape(1, g)                   # identity = full sample
     bags, fulls = [], []
-    for ql, ab, ms in (king, *challengers):
+    competitors = (king, *challengers) if baseline is None else (king, *challengers, baseline)
+    for ql, ab, ms in competitors:
         if ql.shape != q0.shape:
             raise ValueError(
                 f"competitor qloss shape {ql.shape} != {q0.shape}; windows not paired")
@@ -454,10 +477,19 @@ def cohort_maxt_lcbs(
     king_bag, king_full = bags[0], fulls[0]
     if king_bag.size == 0:
         return [float("nan")] * len(challengers)
-    safe_king = np.where(np.abs(king_bag) < 1e-9, 1e-9, king_bag)
-    sk_full = king_full if abs(king_full) >= 1e-9 else 1e-9
-    rel = np.stack([(king_bag - cb) / safe_king for cb in bags[1:]])      # (k, B)
-    t = np.array([(king_full - cf) / sk_full for cf in fulls[1:]])        # (k,)
+    k = len(challengers)
+    if baseline is None:
+        safe_king = np.where(np.abs(king_bag) < 1e-9, 1e-9, king_bag)
+        sk_full = king_full if abs(king_full) >= 1e-9 else 1e-9
+        rel = np.stack([(king_bag - cb) / safe_king for cb in bags[1:]])  # (k, B)
+        t = np.array([(king_full - cf) / sk_full for cf in fulls[1:]])    # (k,)
+    else:
+        base_bag, base_full = bags[-1], fulls[-1]
+        rel = np.stack([_increment_stat(king_bag, cb, base_bag, floor_frac)
+                        for cb in bags[1:1 + k]])                          # (k, B)
+        t = np.array([float(_increment_stat(np.asarray([king_full]), np.asarray([cf]),
+                                            np.asarray([base_full]), floor_frac)[0])
+                      for cf in fulls[1:1 + k]])                           # (k,)
     dev = t[:, None] - rel                                                # (k, B) downward errors
     se = np.std(rel, axis=1, ddof=1)                                      # (k,) per-challenger spread
     se = np.where(se < 1e-12, 1e-12, se)

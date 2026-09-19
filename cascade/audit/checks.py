@@ -19,7 +19,12 @@ import re
 from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
-from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
+from ..shared.config import (
+    ChainConfig,
+    cohort_maxt_active,
+    cohort_maxt_increment_active,
+    effective_epoch_blocks,
+)
 from ..shared.manifest import (
     LOCKED_CONTRACT_FIELDS,
     TrainingManifest,
@@ -487,12 +492,16 @@ def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
     return out
 
 
-def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params):
+def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params,
+                      baseline=None):
     """``{hotkey: max-T family-wise LCB}`` for a cohort round replayed under
     the shared-resample correction (DEC-CA-0038) — the same call the validator
     made (:func:`cascade.eval.koth.cohort_maxt_lcb_map`), off the receipt's own
     scores. ``params`` is the UNMODIFIED recorded set (max-T needs no
-    ``alpha/k``). Raises on unpaired/​unrebuildable scores."""
+    ``alpha/k``). ``baseline`` (the pooled init rows) puts the bound in
+    INCREMENT units — pass it exactly when the validator did: increment judged
+    AND ``cohort_maxt_increment_from_block`` reached for this receipt's block.
+    Raises on unpaired/​unrebuildable scores."""
     from ..eval.koth import cohort_maxt_lcb_map
 
     duelled = _duelled_hotkeys(receipt)
@@ -505,7 +514,8 @@ def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params)
         cohort.append((hk, chal))
     return cohort_maxt_lcb_map(
         king_scores, cohort, params,
-        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean")
+        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean",
+        baseline_scores=baseline)
 
 
 def _cohort_params(params, manifest: TrainingManifest):
@@ -633,8 +643,17 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     if use_maxt:
         from ..eval.koth import with_cohort_lcb
 
+        # Increment units for the joint bound (DEC-CA-0039 stacked): exactly
+        # when the round was increment-judged AND its block reached the gate.
+        maxt_baseline = (
+            baseline if judged_increment and cohort_maxt_increment_active(
+                cfg.scoring, receipt.epoch_start_block) else None)
+        # The UNMODIFIED recorded params (no alpha/k) with the judged margin
+        # mode — the same pair the validator handed cohort_maxt_lcb_map.
+        maxt_params = _dc_replace(
+            params, margin_mode="increment" if judged_increment else "level")
         try:
-            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot replay cohort max-T bound: {e}")
         replayed = [(hk, with_cohort_lcb(res, lcbs[hk], params))
@@ -848,8 +867,13 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     if len(duelled) > 1 and cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
         from ..eval.koth import with_cohort_lcb
 
+        maxt_baseline = (
+            baseline if judged_increment and cohort_maxt_increment_active(
+                cfg.scoring, receipt.epoch_start_block) else None)
+        maxt_params = _dc_replace(
+            params, margin_mode="increment" if judged_increment else "level")
         try:
-            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot replay cohort max-T bound: {e}")
         result = with_cohort_lcb(result, lcbs[duelled[-1]], params)

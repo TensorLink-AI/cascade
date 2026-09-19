@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING
 from ..eval.koth import RoundResult, cohort_maxt_lcb_map, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
-from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
+from ..shared.config import (
+    ChainConfig,
+    cohort_maxt_active,
+    cohort_maxt_increment_active,
+    effective_epoch_blocks,
+)
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -1285,8 +1290,22 @@ class ValidatorRunner:
         if use_maxt and inconclusive is None and len(judged) > 1:
             from ..eval.koth import with_cohort_lcb
 
+            # Increment units for the joint bound (DEC-CA-0039 stacked on
+            # DEC-CA-0038, block-gated): base_params already fell back to
+            # "level" when no baseline could be scored this round, so passing
+            # the rows here is exactly "increment judged AND gate reached".
+            maxt_baseline = (
+                baseline_scores
+                if (base_params.margin_mode == "increment"
+                    and cohort_maxt_increment_active(
+                        self.cfg.scoring, self._epoch_start_block(manifest)))
+                else None)
+            if maxt_baseline is not None:
+                log.info("round=%s cohort max-T bound judged in INCREMENT units "
+                         "(baseline paired)", manifest.round_id)
             lcbs = cohort_maxt_lcb_map(
-                king_scores, cohort_scores, base_params, seed=base_seed)
+                king_scores, cohort_scores, base_params, seed=base_seed,
+                baseline_scores=maxt_baseline)
             judged = [(hk, entry, with_cohort_lcb(res, lcbs[hk], base_params))
                       for hk, entry, res in judged]
         for hk, _, res in judged:
