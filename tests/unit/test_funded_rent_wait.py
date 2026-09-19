@@ -26,6 +26,7 @@ def _arm_wait(runner, *, deadline_offsets, capacity_seq):
     runner._probe_funded_capacity = lambda sku, exclude_ids=(): seq.pop(0) if seq else 0
     runner._wait_for_funded_capacity = TrainerRunner._wait_for_funded_capacity.__get__(runner)
     runner._claimed_executors = TrainerRunner._claimed_executors.__get__(runner)
+    runner._operator_fallback_eligible = TrainerRunner._operator_fallback_eligible.__get__(runner)
     runner.FUNDED_RENT_RETRY_SECONDS = TrainerRunner.FUNDED_RENT_RETRY_SECONDS
     return clock
 

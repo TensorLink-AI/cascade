@@ -140,3 +140,84 @@ def test_train_remote_runs_fallback_legs_on_operator_lanes(cfg, tmp_path, monkey
     hosts_used = {h.name for h, _ in seen}
     assert hosts_used == {"sf-l40s-0"}                          # never the profile entry
     assert staged == [("sf-l40s-0", "d" * 64)]                  # vault ZIP staged for the leg
+
+
+# ── Lium first, Shadeform for the spillover (owner 2026-09-19) ───────────────
+
+
+def _entry(**kw):
+    base = {"attempts": 0, "last_error_class": ""}
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def _lium_first_runner(tmp_path, entry, *, window=3600, deadline_offsets=7200, capacity_seq):
+    r = _fallback_runner(tmp_path, on=True, lanes_file=LANES)
+    rnd = replace(r.cfg.round, funded_operator_fallback_fresh_window_seconds=window)
+    try:
+        r.cfg = replace(r.cfg, round=rnd)
+    except TypeError:                      # the wiring fake's plain-namespace cfg
+        r.cfg.round = rnd
+    _arm_wait(r, deadline_offsets=deadline_offsets, capacity_seq=capacity_seq)
+    r._operator_fallback_lanes = TrainerRunner._operator_fallback_lanes.__get__(r)
+    r._operator_fallback_eligible = TrainerRunner._operator_fallback_eligible.__get__(r)
+    r._funded_queue = lambda: SimpleNamespace(get=lambda hk: entry)
+    return r
+
+
+def test_fresh_window_knob_defaults_and_is_loader_parsed(cfg):
+    import inspect
+
+    from cascade.shared import config as cfg_mod
+
+    assert RoundConfig().funded_operator_fallback_fresh_window_seconds == 3600
+    assert cfg.round.funded_operator_fallback_fresh_window_seconds == 3600
+    assert "funded_operator_fallback_fresh_window_seconds" in \
+        inspect.getsource(cfg_mod.load_chain_config)
+
+
+def test_fresh_leg_keeps_polling_lium_while_lanes_are_on_file(tmp_path):
+    # 2 h to the latest start, window 1 h: the fresh leg ignores the lanes and
+    # takes the marketplace pod when capacity appears (payer-billed).
+    r = _lium_first_runner(tmp_path, _entry(), capacity_seq=[0, 0, 3])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") is True
+
+
+def test_fresh_leg_falls_back_inside_the_window(tmp_path):
+    r = _lium_first_runner(tmp_path, _entry(), deadline_offsets=1800, capacity_seq=[0, 0, 0])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") \
+        == "operator"
+
+
+def test_fresh_leg_polls_then_falls_back_when_the_window_opens(tmp_path):
+    # Deadline 2 h out, no capacity ever: polls ~1 h, then takes the lane.
+    r = _lium_first_runner(tmp_path, _entry(), capacity_seq=[0] * 200)
+    clock = r._rent_wait_now
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") \
+        == "operator"
+    assert 3500.0 <= clock() - 1000.0 <= 3700.0
+
+
+@pytest.mark.parametrize("entry", [_entry(attempts=1), _entry(last_error_class="no_capacity"),
+                                   _entry(last_error_class="stall")])
+def test_carried_over_leg_takes_a_lane_at_once(tmp_path, entry):
+    r = _lium_first_runner(tmp_path, entry, capacity_seq=[0, 0, 3])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg c", hotkey="c") \
+        == "operator"
+
+
+def test_king_and_zero_window_take_a_lane_at_once(tmp_path):
+    r = _lium_first_runner(tmp_path, _entry(), capacity_seq=[0, 0, 3])
+    assert r._wait_for_funded_capacity("RTX4090", describe="king rent", for_king=True) \
+        == "operator"                                             # hotkey None = king
+    r0 = _lium_first_runner(tmp_path, _entry(), window=0, capacity_seq=[0, 0, 3])
+    assert r0._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") \
+        == "operator"
+
+
+def test_unknown_entry_or_torn_queue_counts_as_fresh(tmp_path):
+    r = _lium_first_runner(tmp_path, None, capacity_seq=[0, 0, 3])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") is True
+    r._funded_queue = lambda: (_ for _ in ()).throw(OSError("torn"))
+    _arm_wait(r, deadline_offsets=7200, capacity_seq=[0, 0, 3])
+    assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") is True
