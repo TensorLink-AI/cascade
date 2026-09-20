@@ -69,6 +69,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                            _funded_king_host=None,
                            _funded_king_lock=threading.Lock(),
                            _funded_bench_pods={},
+                           _funded_bench_pod_round={},
+                           _bench_in_flight={},
                            _funded_bench_lock=threading.Lock(),
                            _final_role_hosts={},
                            cascade_bench_plan=None,
@@ -95,7 +97,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_record_funded_failure", "_rent_funded_host",
                  "_teardown_funded_pod", "_run_funded_leg", "_settle_funded",
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
-                 "_teardown_kept_funded_pods", "_funded_harvest",
+                 "_teardown_kept_funded_pods", "_bench_hold_rounds",
+                 "_pod_held_by_bench", "_funded_harvest",
                  "_harvest_funded_checkpoint",
                  "_filter_funded_challengers", "_submissions_path",
                  "_submission_store", "_push_deployed_chain_toml",
@@ -1372,3 +1375,115 @@ def test_key_lost_reason_comes_from_the_real_identity_check(tmp_path, monkeypatc
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkB")                              # hkA absent
     assert runner._funded_pod_identity_mismatch(_pod("hkA")) == KEY_LOST_REASON
+
+
+# ── the boundary sweep vs an in-flight post-publish bench ────────────────────
+# 2026-09-18 21:43 and 2026-09-19 09:50: the next round's boundary sweep tore
+# down the previous round's king pod (the payer-bench verification host) and
+# a kept payer pod mid-bench; _verify_payer_benches then had no king host and
+# dropped every completed challenger bench — the signed report came out
+# king-only, twice. Pods of a bench still in flight are held.
+
+
+def _kept(instance_id: str, payer: str) -> PodInstance:
+    return PodInstance(provider="lium", instance_id=instance_id, stage="funded",
+                       rented_at_iso="2026-09-19T00:00:00Z", sku="RTX4090", gpus=1,
+                       payer_hotkey=payer)
+
+
+def _held_runner(tmp_path, monkeypatch, *, hold_hours: float = 9.0):
+    import time as _time
+
+    r = _runner(tmp_path)
+    r.cfg.eval = SimpleNamespace(bench_hold_max_hours=hold_hours)
+    _vault(tmp_path, "hkA")
+    _vault(tmp_path, "hkB")
+    prev_king = PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
+                            stage="funded", rented_at_iso="2026-09-19T00:00:00Z",
+                            sku="RTX4090", gpus=1, payer_hotkey="")
+    next_king = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
+                            stage="funded", rented_at_iso="2026-09-19T00:00:00Z",
+                            sku="RTX4090", gpus=1, payer_hotkey="")
+    kept = _kept("cascade-n91-4141-funded-hka-0", "hkA")   # kept for 4141's bench
+    stale = _kept("cascade-n91-4040-funded-hkb-0", "hkB")  # an earlier round's leftover
+    for pod in (prev_king, next_king, kept, stale):
+        r._ledger_add(pod)
+    r._funded_bench_pods["hkA"] = kept
+    r._funded_bench_pod_round["hkA"] = "4141"
+    r._bench_in_flight["4141"] = _time.time()
+    ops: list[str] = []
+    payer_torn: list[str] = []
+    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
+                                            r._ledger_remove(pod.instance_id))
+
+    def fake_teardown(pods, vault, **kw):
+        payer_torn.extend(p.instance_id for p in pods)
+        return []
+
+    monkeypatch.setattr(funded_mod, "teardown_funded", fake_teardown)
+    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
+    return r, ops, payer_torn
+
+
+def test_boundary_sweep_keeps_the_pods_of_an_in_flight_bench(tmp_path, monkeypatch):
+    r, ops, payer_torn = _held_runner(tmp_path, monkeypatch)
+    r._reconcile_funded_pods(keep_round_id="4242")
+    # The bench's king pod and its kept payer pod survive; the leftover goes.
+    assert ops == []
+    assert payer_torn == ["cascade-n91-4040-funded-hkb-0"]
+    assert sorted(x.instance_id for x in r._load_funded_ledger()) == [
+        "cascade-n91-4141-funded-hka-0", "cascade-n91-4141-funded-king-0",
+        "cascade-n91-4242-funded-king-0"]
+    # Bench thread exits (hold released) → the next sweep reaps the king pod.
+    r._bench_in_flight.clear()
+    r._teardown_kept_funded_pod("hkA")
+    r._reconcile_funded_pods(keep_round_id="4242")
+    assert ops == ["cascade-n91-4141-funded-king-0"]
+    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
+
+
+def test_bench_hold_expires_at_the_cap(tmp_path, monkeypatch):
+    """A hung bench must not turn the hold into an eternally-billing pod: past
+    [eval] bench_hold_max_hours the sweep reaps regardless."""
+    import time as _time
+
+    r, ops, payer_torn = _held_runner(tmp_path, monkeypatch, hold_hours=9.0)
+    r._bench_in_flight["4141"] = _time.time() - 10 * 3600
+    assert r._bench_hold_rounds() == []
+    r._reconcile_funded_pods(keep_round_id="4242")
+    assert ops == ["cascade-n91-4141-funded-king-0"]
+    assert sorted(payer_torn) == ["cascade-n91-4040-funded-hkb-0", "cascade-n91-4141-funded-hka-0"]
+
+
+def test_bench_hold_off_when_cap_is_zero(tmp_path, monkeypatch):
+    r, ops, _ = _held_runner(tmp_path, monkeypatch, hold_hours=0.0)
+    assert r._bench_hold_rounds() == []
+    r._reconcile_funded_pods(keep_round_id="4242")
+    assert ops == ["cascade-n91-4141-funded-king-0"]
+
+
+def test_round_entry_teardown_spares_the_in_flight_benchs_kept_pods(tmp_path, monkeypatch):
+    """run_round's 'previous round's bench left them' sweep takes only pods
+    kept for rounds whose bench is NOT in flight; the bench thread's exit
+    sweep takes only its own round's pods."""
+    import time as _time
+
+    r = _runner(tmp_path)
+    r.cfg.eval = SimpleNamespace(bench_hold_max_hours=9.0)
+    torn: list[str] = []
+    r._teardown_funded_pod = lambda pod: torn.append(pod.payer_hotkey)
+    r._funded_bench_pods.update({
+        "hkA": _kept("pod-a", "hkA"),   # kept for 4141, bench in flight
+        "hkB": _kept("pod-b", "hkB"),   # kept for 4040, that bench is long over
+        "hkC": _kept("pod-c", "hkC"),   # legacy: no round recorded
+    })
+    r._funded_bench_pod_round.update({"hkA": "4141", "hkB": "4040"})
+    r._bench_in_flight["4141"] = _time.time()
+    r._teardown_kept_funded_pods("round entry", exclude_rounds=r._bench_hold_rounds())
+    assert sorted(torn) == ["hkB", "hkC"]
+    assert list(r._funded_bench_pods) == ["hkA"]
+    # 4242's bench thread exiting must not take 4141's pod either.
+    r._teardown_kept_funded_pods("bench finished", round_id="4242")
+    assert list(r._funded_bench_pods) == ["hkA"]
+    r._teardown_kept_funded_pods("bench finished", round_id="4141")
+    assert torn[-1] == "hkA" and r._funded_bench_pods == {} and r._funded_bench_pod_round == {}

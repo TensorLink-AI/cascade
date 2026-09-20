@@ -27,7 +27,7 @@ import queue
 import shlex
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC
 from pathlib import Path
@@ -652,6 +652,41 @@ def plan_round(
     return RoundPlan(king=king, challengers=challengers)
 
 
+def _split_mixed_gpu_entries(
+    entries: list[TrainedEntry], *, allow_mixed: bool = False,
+) -> tuple[list[TrainedEntry], list[TrainedEntry]]:
+    """``(kept, dropped)``: the entries a validator will accept together.
+
+    The validator's manifest gate (``cascade.validator.loop._check_gpu``)
+    rejects a manifest whose entries — per size — carry more than one
+    ``gpu_name`` (``gpu_mismatch``), and every validator runs it. A round
+    whose legs landed on mixed types (2026-09-20: king + 5 on RTX 4090, 8
+    on L40S operator lanes) would therefore score NOBODY. Keep the KING's
+    type per size (no king = no round, so the king's group is the only one
+    that can be judged); challengers on another type are dropped here and
+    settled as sold-out (requeued, unburned) — their training was wasted,
+    their submission was never judged. Entries without a ``gpu_name`` pass
+    (the gate ignores them). ``allow_mixed`` (an open-market round whose
+    validators no longer gate on type) keeps everything.
+    """
+    if allow_mixed:
+        return list(entries), []
+    king_gpu = {e.size: e.gpu_name for e in entries if e.role == "king" and e.gpu_name}
+    if not king_gpu:
+        return list(entries), []
+    kept: list[TrainedEntry] = []
+    dropped: list[TrainedEntry] = []
+    for e in entries:
+        # A size without a king entry cannot be duelled anyway (the validator
+        # drops it from the cohort, harmlessly) — nothing to enforce there.
+        want = king_gpu.get(e.size)
+        if e.role == "king" or not e.gpu_name or want is None or e.gpu_name == want:
+            kept.append(e)
+        else:
+            dropped.append(e)
+    return kept, dropped
+
+
 def _drop_final_content_clones(
     entries: list[TrainedEntry], jobs: list[tuple[ResolvedGenerator, str]]
 ) -> list[TrainedEntry]:
@@ -1055,6 +1090,20 @@ class TrainerRunner:
     _funded_bench_pods: dict = field(default_factory=dict, repr=False)
     _funded_bench_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False)
+    # The round each kept pod was kept FOR (payer hotkey → round id). The
+    # boundary sweep and the round-entry teardown leave a kept pod alone while
+    # that round's bench is in flight (see _bench_hold_rounds); the bench
+    # thread's own exit sweep takes only its round's pods.
+    _funded_bench_pod_round: dict = field(default_factory=dict, repr=False)
+    # Post-publish benches in flight: round id → wall-clock start, armed by
+    # run_post_publish_bench for the life of its thread. While a round is
+    # here (and inside [eval] bench_hold_max_hours — the provisioner's own
+    # cap) every sweep keeps that round's king pod and kept payer pods: the
+    # payer-bench verification benches on the king pod, and the payer pods
+    # hold the checkpoints being benched. 2026-09-18/19: the next round's
+    # boundary sweep tore both down mid-bench and the signed report came out
+    # king-only, twice.
+    _bench_in_flight: dict = field(default_factory=dict, repr=False)
     # trained_pointers whose scores in the current sweep came off a payer
     # pod — verified on the operator's pod before anything is published.
     _payer_benched: set = field(default_factory=set, repr=False)
@@ -1525,6 +1574,29 @@ class TrainerRunner:
                 log.info("round %s: champion code published (%s)", round_id, digest)
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
+
+    def _enforce_single_gpu_manifest(self, entries: list) -> list:
+        """Drop challenger entries whose GPU type differs from the king's
+        (see :func:`_split_mixed_gpu_entries`) and record each as a sold-out
+        failure so :meth:`_settle_funded` requeues it unburned. Mixed types
+        are allowed only when ``[round] funded_sku_per_leg`` is on (the
+        open-market mode, whose validators do not gate on type)."""
+        allow = bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
+        kept, dropped = _split_mixed_gpu_entries(entries, allow_mixed=allow)
+        if not dropped:
+            return kept
+        king_gpu = sorted({e.gpu_name for e in kept if e.role == "king" and e.gpu_name})
+        for e in dropped:
+            msg = (f"gpu_mismatch: trained on {e.gpu_name!r} while the king ran on "
+                   f"{king_gpu} — the validators reject a mixed-GPU manifest; entry "
+                   f"dropped from the manifest and requeued (unburned)")
+            log.error("final challenger %s (uid %s): %s", e.miner_hotkey, e.miner_uid, msg)
+            self._record_funded_failure(e.miner_hotkey, msg, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+        log.error("manifest keeps %d entr%s on %s and DROPS %d on other GPU types — "
+                  "keep every lane of a round on ONE type",
+                  len(kept), "y" if len(kept) == 1 else "ies", king_gpu, len(dropped))
+        return kept
 
     def _settle_funded(self, jobs: list, entries: list) -> None:
         """Settle each funded entry from its DUEL-leg outcome (required mode).
@@ -2323,12 +2395,25 @@ class TrainerRunner:
         keep_ids = tuple(x for x in (keep_round_id, *keep_round_ids) if x)
         try:
             pods = self._load_funded_ledger()
+            # A previous round's post-publish bench still running holds ITS
+            # king pod (the payer-bench verification benches there) and its
+            # kept payer pods (the checkpoints under bench): both stay, on
+            # the ledger, until that bench thread exits or the hold cap.
+            hold_rounds = self._bench_hold_rounds()
+            held_ids = {x.instance_id for x in pods
+                        if self._pod_held_by_bench(x.instance_id, hold_rounds)}
+            if held_ids:
+                log.info("funded sweep: keeping %d pod(s) for the in-flight "
+                         "post-publish bench of round(s) %s: %s", len(held_ids),
+                         ",".join(hold_rounds), ", ".join(sorted(held_ids)))
             # Operator-billed ledger pods (the JIT king; payer_hotkey = "")
             # never go through the per-payer path — it would demand a vault
             # key that rightly does not exist. Swept BEFORE the vault check:
             # a missing/mis-set vault must not leave operator pods billing
             # (review 2026-09-02).
             for pod in [x for x in pods if not x.payer_hotkey]:
+                if pod.instance_id in held_ids:
+                    continue
                 if any(self._is_king_pod_of(pod.instance_id, rid) for rid in keep_ids):
                     log.info("funded sweep: keeping %s — this round's own king pod "
                              "(a retry adopts it; a complete checkpoint there "
@@ -2344,7 +2429,8 @@ class TrainerRunner:
                 return
             # DEC-CA-0043: a payer pod with an in-flight leg attached is
             # never swept — the leg re-attaches after a restart.
-            pods = [x for x in pods if x.payer_hotkey and x.payer_hotkey not in keep_payers]
+            pods = [x for x in pods if x.payer_hotkey and x.instance_id not in held_ids
+                    and x.payer_hotkey not in keep_payers]
             for pod in pods:
                 self._revoke_robot(pod)
             if pods:
@@ -2352,7 +2438,7 @@ class TrainerRunner:
                 with self._funded_ledger_lock:
                     self._save_funded_ledger(
                         leftovers + [x for x in self._load_funded_ledger()
-                                     if not x.payer_hotkey])
+                                     if not x.payer_hotkey or x.instance_id in held_ids])
                 for inst in leftovers:
                     log.error("funded pod %s (payer %s) could not be confirmed "
                               "gone — still billing the miner; kept on the "
@@ -3216,6 +3302,7 @@ class TrainerRunner:
                 # tears it down when the sweep ends.
                 with self._funded_bench_lock:
                     self._funded_bench_pods[gen.hotkey] = pod
+                    self._funded_bench_pod_round[gen.hotkey] = str(seeds.base_seed)
                 self._final_role_hosts[
                     ("challenger", contract.arch_preset, gen.hotkey)] = host
                 keep = True
@@ -3278,15 +3365,28 @@ class TrainerRunner:
         """Tear down the pod kept for ``hotkey``'s bench (no-op if none)."""
         with self._funded_bench_lock:
             pod = self._funded_bench_pods.pop(hotkey, None)
+            self._funded_bench_pod_round.pop(hotkey, None)
         if pod is not None:
             self._teardown_funded_pod(pod)
 
-    def _teardown_kept_funded_pods(self, why: str) -> None:
-        """Tear down EVERY pod still kept for a bench — the sweep never ran,
+    def _teardown_kept_funded_pods(self, why: str, *, round_id: str | None = None,
+                                   exclude_rounds: Iterable[str] = ()) -> None:
+        """Tear down the pods still kept for a bench — the sweep never ran,
         died, or is over. Idempotent; each pod is popped before its teardown
-        so a concurrent per-pod teardown cannot double-bill the ledger."""
+        so a concurrent per-pod teardown cannot double-bill the ledger.
+
+        ``round_id`` restricts the sweep to pods kept for THAT round (the bench
+        thread's exit sweep: the next round's kept pods are not its to take);
+        ``exclude_rounds`` spares pods kept for rounds whose bench is still in
+        flight (the round-entry sweep). A kept pod with no recorded round is
+        legacy state and goes on either path."""
+        skip = {str(r) for r in exclude_rounds}
         with self._funded_bench_lock:
-            hotkeys = list(self._funded_bench_pods)
+            hotkeys = []
+            for hk in self._funded_bench_pods:
+                r = self._funded_bench_pod_round.get(hk)
+                if r is None or ((round_id is None or r == str(round_id)) and r not in skip):
+                    hotkeys.append(hk)
         if hotkeys:
             log.info("tearing down %d kept funded pod(s): %s", len(hotkeys), why)
         for hk in hotkeys:
@@ -3295,6 +3395,42 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — one stuck pod must not shield the rest
                 log.error("kept funded pod for %s: teardown failed (%s); the "
                           "boundary sweep retries", hk[:12], e)
+
+    def _bench_hold_rounds(self, now: float | None = None) -> list[str]:
+        """Rounds whose post-publish bench is in flight and inside the
+        ``[eval] bench_hold_max_hours`` cap — the same policy the provisioner
+        applies to the final pod (provision.policy.bench_hold_active). Their
+        king pod and kept payer pods are off-limits to every sweep; past the
+        cap they are reaped regardless (a hung bench must never turn the hold
+        into an eternally-billing pod)."""
+        from ..provision.policy import bench_hold_active
+
+        cap = float(getattr(getattr(self.cfg, "eval", None),
+                            "bench_hold_max_hours", 2.0) or 0.0)
+        now = time.time() if now is None else now
+        with self._funded_bench_lock:
+            items = list(self._bench_in_flight.items())
+        return [r for r, since in items
+                if bench_hold_active(held_since=since, bench_done=False,
+                                     now=now, hold_max_hours=cap)]
+
+    def _pod_held_by_bench(self, instance_id: str, rounds: Iterable[str]) -> bool:
+        """Whether a ledgered pod belongs to one of ``rounds``' in-flight
+        benches: that round's operator king pod, or a payer pod kept for it
+        (a kept pod with no recorded round counts while any bench is in
+        flight — conservative, it is billing for a bench)."""
+        rounds = [str(r) for r in rounds]
+        if not rounds:
+            return False
+        iid = str(instance_id)
+        if any(self._is_king_pod_of(iid, r) for r in rounds):
+            return True
+        with self._funded_bench_lock:
+            kept = {str(getattr(pod, "instance_id", "")): self._funded_bench_pod_round.get(hk)
+                    for hk, pod in self._funded_bench_pods.items()}
+        if iid not in kept:
+            return False
+        return kept[iid] is None or kept[iid] in rounds
 
     def _skip_unfunded_round(self, round_id: str) -> bool:
         """True when this boundary should not run at all (elastic-cadence floor).
@@ -4712,10 +4848,13 @@ class TrainerRunner:
         # training run on the pod running the next round's consensus-relevant
         # final.
         final_hosts = dict(self._final_role_hosts)
+        round_id = str(manifest.round_id)
+        with self._funded_bench_lock:
+            self._bench_in_flight[round_id] = time.time()
         report = None
         try:
             try:
-                report = self._post_publish_bench(manifest)
+                report = self._post_publish_bench(manifest, final_hosts=final_hosts)
             except Exception as e:  # noqa: BLE001 — bench telemetry must never fail a round
                 log.warning("round=%s: post-publish bench failed (ignored): %s",
                             manifest.round_id, e)
@@ -4743,7 +4882,12 @@ class TrainerRunner:
         finally:
             # Payer pods kept for this sweep (DEC-CA-0036): each went down as
             # its own bench ended; this catches the ones a failed sweep skipped.
-            self._teardown_kept_funded_pods("post-publish bench finished")
+            # Scoped to THIS round: the next round may already be keeping its
+            # own pods for its own bench.
+            self._teardown_kept_funded_pods("post-publish bench finished",
+                                            round_id=round_id)
+            with self._funded_bench_lock:
+                self._bench_in_flight.pop(round_id, None)
             self._mark_bench_complete(manifest.round_id, uploaded=report is not None)
         return report
 
@@ -5224,7 +5368,8 @@ class TrainerRunner:
                  record.generation, len(record.members),
                  record.signature is not None, self.cfg.storage.manifest_bucket, key)
 
-    def _post_publish_bench(self, manifest: TrainingManifest) -> object | None:
+    def _post_publish_bench(self, manifest: TrainingManifest, *,
+                            final_hosts: dict | None = None) -> object | None:
         from ..shared.bench_report import (
             BenchEntry,
             BenchReport,
@@ -5238,11 +5383,13 @@ class TrainerRunner:
         # (legacy size == "" reads as primary). Benched checkpoint-by-checkpoint;
         # a miss drops that entry from the report, never the report itself.
         duel = [e for e in manifest.entries if (e.size or primary) == primary]
-        scored = self._bench_duel_checkpoints(duel, manifest.round_id, primary)
+        scored = self._bench_duel_checkpoints(duel, manifest.round_id, primary,
+                                              final_hosts=final_hosts)
         # Numbers off a PAYER's pod are a filter, never a published fact: the
         # top-N re-bench on the operator's king pod and only those operator
         # numbers go on to the signed report (DEC-CA-0036).
-        scored = self._verify_payer_benches(duel, scored, manifest.round_id, primary)
+        scored = self._verify_payer_benches(duel, scored, manifest.round_id, primary,
+                                            final_hosts=final_hosts)
         entries = []
         for m_entry in duel:
             scores = scored.get(m_entry.trained_pointer)
@@ -5277,7 +5424,8 @@ class TrainerRunner:
         return report
 
     def _bench_duel_checkpoints(
-        self, duel: list[TrainedEntry], round_id: str, primary: str
+        self, duel: list[TrainedEntry], round_id: str, primary: str, *,
+        final_hosts: dict | None = None,
     ) -> dict:
         """Score each duel checkpoint on GIFT-Eval/BOOM/TIME, returning
         ``{trained_pointer: BenchScores}`` (misses simply absent).
@@ -5301,7 +5449,7 @@ class TrainerRunner:
                                                     or self._final_role_hosts):
             by_pod: dict[str, list[tuple[object, TrainedEntry]]] = {}
             for entry in duel:
-                host = self._bench_host_for(entry, primary)
+                host = self._bench_host_for(entry, primary, final_hosts=final_hosts)
                 if host is None:
                     continue
                 pod = str(getattr(host, "host", None) or getattr(host, "name", host))
@@ -5344,14 +5492,21 @@ class TrainerRunner:
                     out[entry.trained_pointer] = scores
         return out
 
-    def _bench_host_for(self, entry: TrainedEntry, primary: str) -> object | None:
+    def _bench_host_for(self, entry: TrainedEntry, primary: str, *,
+                        final_hosts: dict | None = None) -> object | None:
         """The pod holding ``entry``'s checkpoint: the tracked dispatch host,
         or the round-robin heuristic (king first, challenger next) when a
         restart between duel and bench lost the tracking dict. A funded
         challenger has no heuristic: its checkpoint only ever existed on its
-        payer's pod, and a guess would bench a stranger's path on the king."""
-        host = self._final_role_hosts.get(
-            (entry.role, entry.size or primary, entry.miner_hotkey))
+        payer's pod, and a guess would bench a stranger's path on the king.
+
+        ``final_hosts`` is the bench thread's snapshot of the dispatch map,
+        taken at thread start: the live dict is reset and repopulated by the
+        NEXT round hours before a long bench finishes, and a live lookup then
+        lands the verification bench on that round's training king pod (or
+        finds nothing and drops every payer entry)."""
+        hosts = self._final_role_hosts if final_hosts is None else final_hosts
+        host = hosts.get((entry.role, entry.size or primary, entry.miner_hotkey))
         if host is not None:
             return host
         if entry.role == "challenger" and entry.miner_hotkey in self._funded_field:
@@ -5363,6 +5518,7 @@ class TrainerRunner:
 
     def _verify_payer_benches(
         self, duel: list[TrainedEntry], scored: dict, round_id: str, primary: str,
+        *, final_hosts: dict | None = None,
     ) -> dict:
         """Replace payer-pod numbers with the operator's own, or drop them.
 
@@ -5395,7 +5551,8 @@ class TrainerRunner:
         top = max(0, int(getattr(self.cfg.telemetry, "funded_bench_verify_top", 1)))
         tol = float(getattr(self.cfg.telemetry, "funded_bench_verify_tolerance", 0.02))
         king = next((e for e in duel if e.role == "king"), None)
-        king_host = self._bench_host_for(king, primary) if king is not None else None
+        king_host = (self._bench_host_for(king, primary, final_hosts=final_hosts)
+                     if king is not None else None)
         for i, entry in enumerate(ranked):
             reported = _score(scored[entry.trained_pointer])
             if i >= top:
@@ -5636,10 +5793,12 @@ class TrainerRunner:
         # Fresh telemetry for this round (see _train_checkpoint / the roll-ups).
         self._round_telemetry = {"heat": [], "final": []}
         self._final_role_hosts = {}
-        # A previous round's bench thread should have torn its kept payer
-        # pods down long ago; whatever it left (crash, hung sweep) goes now —
-        # every one of them is billing a miner for nothing.
-        self._teardown_kept_funded_pods("previous round's bench left them")
+        # A previous round's bench thread tears its kept payer pods down as
+        # it goes; whatever an EARLIER, finished-or-dead bench left goes now —
+        # every one of them is billing a miner for nothing. A bench still in
+        # flight keeps its pods (they hold the checkpoints it is scoring).
+        self._teardown_kept_funded_pods("previous round's bench left them",
+                                        exclude_rounds=self._bench_hold_rounds())
         # Stamp the height for the funded activation gate — run_round is also
         # a direct entry point (scripts, tests), which must see the same gate
         # decision the live loop would at this block.
@@ -5830,6 +5989,10 @@ class TrainerRunner:
             self._log_duel_geometry(base_seed, len(jobs), screen_block)
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
+        # One GPU type per manifest (the validators' gate) — BEFORE the settle,
+        # so a challenger trained on the wrong type is requeued unburned
+        # rather than marked judged.
+        entries = self._enforce_single_gpu_manifest(entries)
         # The judgment moment for funded entries: their duel legs have run (or
         # failed) — settle each from its outcome. A king failure raised out of
         # _train_final skips this on purpose: an aborted round judged nobody,
