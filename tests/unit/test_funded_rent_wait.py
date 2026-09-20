@@ -51,6 +51,39 @@ def test_wait_is_instant_when_the_deadline_has_passed(tmp_path):
     assert runner._wait_for_funded_capacity("RTX4090", describe="x") is False   # never polled
 
 
+def _lanes_on_file(runner, lanes):
+    runner._operator_fallback_lanes = lambda: list(lanes)
+
+
+def test_king_past_the_deadline_takes_an_operator_lane(tmp_path):
+    # 2026-09-20 04:21: the king failed after the latest safe start with idle
+    # L40S lanes on file and this wait returned False — a lost round. The king
+    # is never held back: a lane on file is taken now, deadline or not.
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, ["lane"])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="king rent",
+                                            for_king=True) == "operator"
+
+
+def test_king_past_the_deadline_without_lanes_gives_up(tmp_path):
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, [])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="king rent",
+                                            for_king=True) is False
+
+
+def test_challenger_past_the_deadline_never_takes_a_lane(tmp_path):
+    # Only the king is exempt: a challenger leg started past the latest safe
+    # start would end past the boundary — it requeues (unburned) as before.
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, ["lane"])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="leg",
+                                            hotkey="hk") is False
+
+
 def test_funded_rent_retries_after_no_capacity_and_lands(tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkA")
