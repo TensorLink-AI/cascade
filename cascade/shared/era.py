@@ -129,6 +129,19 @@ def era_for_block(round_cfg: RoundConfig, block: int) -> EraSpec:
                    seed_block=max(0, start - length))
 
 
+def settlement_era(round_cfg: RoundConfig, boundary: int) -> EraSpec:
+    """The era a SETTLEMENT at epoch boundary ``boundary`` belongs to: the
+    era containing ``boundary − 1``. An era's settlements are the boundaries
+    in ``(start, start + length]`` — its LAST settlement is the next era's
+    start block, so a leg that finishes just before the era rolls is still
+    judged against this era's king, and the next era's first settlement is
+    one grid step after its start. That makes the intake seamless: a leg
+    that cannot clear ``start + length`` is exactly one whose start falls in
+    the next era's pre-train window (``wall + margin`` before its start).
+    Generation/member unresolved, like :func:`era_for_block`."""
+    return era_for_block(round_cfg, max(0, int(boundary) - 1))
+
+
 def next_era_start(round_cfg: RoundConfig, block: int) -> int:
     """First era boundary strictly after ``block``."""
     length = era_length_blocks(round_cfg, block)

@@ -23,7 +23,7 @@ from cascade.shared.bench_report import (
     dump_bench_report,
 )
 from cascade.shared.chain import Commitment, seed_from_block_hash
-from cascade.shared.era import era_for_block, min_effective_era
+from cascade.shared.era import min_effective_era, settlement_era
 from cascade.shared.hippius import manifest_round_key
 from cascade.shared.manifest import (
     TrainedEntry,
@@ -87,7 +87,7 @@ def _rollover(cfg):
 
 
 def _era_stamp(cfg, block, *, generation=0, member_index=0):
-    era = era_for_block(cfg.round, block)
+    era = settlement_era(cfg.round, block)
     return replace(era, generation=generation, member_index=member_index).to_json()
 
 
@@ -95,7 +95,7 @@ def _manifest(cfg, block, *, era=True, king=("king_hk", 0, REF_K, PTR_K),
               challengers=(("chal_hk", 1, REF_C, PTR_C),), train_block=None,
               warm_start="", prev_round_id="", round_id=None, gpus=("", ""),
               generation=0, member_index=0, stamp=None):
-    tb = train_block if train_block is not None else block
+    tb = train_block if train_block is not None else block - 1   # legs finish before the boundary
     entries = [TrainedEntry(king[0], king[1], "king", king[2], king[3], "d", tb,
                             gpu_name=gpus[0])]
     for i, (hk, uid, ref, ptr) in enumerate(challengers):
@@ -178,7 +178,7 @@ def test_era_settlement_round_trips_validator_receipt_audit_and_fails_with_gate_
     armed = _armed(cfg)
     eb = cfg.round.epoch_blocks
     block = _rollover(armed) + eb              # second settlement of the era
-    era = era_for_block(armed.round, block)
+    era = settlement_era(armed.round, block)
     seed_hash = "0x" + "cd" * 32
     era_seed = seed_from_block_hash(seed_hash)
     r = _runner(armed, chal={"chal_hk": _noisy(_scores(1.0, 0), 0.6, 22)})
@@ -226,7 +226,7 @@ def test_era_stamp_is_verified_against_the_grid(cfg):
     assert r.check_manifest(_manifest(armed, block, stamp=wrong)).startswith("era_mismatch")
     assert r.check_manifest(_manifest(armed, block, stamp={"index": 1})).startswith("era_malformed")
     # entries must have trained inside the era's window [seed_block, era_end)
-    era = era_for_block(armed.round, block)
+    era = settlement_era(armed.round, block)
     early = _manifest(armed, block, train_block=era.seed_block - 1)
     assert r.check_manifest(early).startswith("era_entry_out_of_window")
     pretrained = _manifest(armed, block, train_block=era.seed_block)   # pre-train window
@@ -277,10 +277,10 @@ def _cascade(armed, tmp_path, *, generation, members):
 def test_generation_switch_lands_on_the_announced_era_only(cfg, tmp_path):
     armed = _armed(cfg)
     eb = cfg.round.epoch_blocks
-    n_block = _rollover(armed) + eb * 4 * 3           # era n start (3 eras past rollover)
-    era_n = era_for_block(armed.round, n_block)
-    prev_block = n_block - eb                         # last settlement of era n−1
-    era_prev = era_for_block(armed.round, prev_block)
+    n_block = _rollover(armed) + eb * 4 * 3 + eb      # era n's first settlement (3 eras past rollover)
+    era_n = settlement_era(armed.round, n_block)
+    prev_block = n_block - eb                         # last settlement of era n−1 (= era n's start)
+    era_prev = settlement_era(armed.round, prev_block)
     fired = era_prev.start_block - eb * 4 * 2         # fired two eras earlier
     assert min_effective_era(armed.round, fired) <= era_n.index
     members1 = (M1A, M1B)
@@ -335,8 +335,8 @@ def test_member_rotation_follows_the_era_index(cfg, tmp_path):
     cas = _cascade(armed, tmp_path, generation=1, members=(M1A, M1B))
     v = _runner(armed, cascade=cas, store=_Store())
     for k in range(4):
-        block = _rollover(armed) + eb * 4 * k
-        era = era_for_block(armed.round, block)
+        block = _rollover(armed) + eb * 4 * k + eb
+        era = settlement_era(armed.round, block)
         want = (M1A, M1B)[era.index % 2]
         assert v.check_manifest(_manifest(armed, block, warm_start=want, generation=1,
                                           member_index=era.index % 2)) is None
@@ -352,7 +352,7 @@ def test_dethrone_mid_era_adopts_the_winner_pointer_and_keeps_the_era(cfg):
     armed = _armed(cfg)
     eb = cfg.round.epoch_blocks
     b1 = _rollover(armed) + eb
-    era = era_for_block(armed.round, b1)
+    era = settlement_era(armed.round, b1)
     king = _scores(1.0, 0)
     r = _runner(armed, king_scores=king, chal={"chal_hk": _noisy(king, 0.6, 22),
                                                "x_hk": _noisy(king, 1.3, 33)})
@@ -375,7 +375,7 @@ def test_dethrone_mid_era_adopts_the_winner_pointer_and_keeps_the_era(cfg):
                     challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b1))
     assert r.check_manifest(m2b).startswith("era_king_pointer_mismatch")
     # a NEW era adopts the era's first king leg
-    b3 = era.start_block + eb * 4
+    b3 = era.start_block + eb * 4 + eb            # next era's first settlement
     r.state = replace(r.state, last_handled_round_id=str(b2))
     m3 = _manifest(armed, b3, king=("chal_hk", 1, REF_C, PTR_C2),
                    challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b2))

@@ -56,7 +56,8 @@ __all__ = [
 # requeues do NOT count against this (should_recover's no-burn classes).
 DEFAULT_MAX_ATTEMPTS = 3
 
-_STATUSES = ("pending_reveal", "queued", "in_round", "done", "failed", "withdrawn")
+_STATUSES = ("pending_reveal", "queued", "in_round", "in_flight", "done", "failed",
+             "withdrawn")
 
 
 @dataclass(frozen=True)
@@ -84,12 +85,25 @@ class FundedEntry:
     # hostile payer could occupy a funded seat forever (review 2026-09-02).
     rate_limited_since: float = 0.0
     # Miner-chosen display name for this submission (``cascade fund --label``,
-    # DEC-CA-0043). PRESENTATIONAL ONLY: it rides the public queue view, the
+    # funded UX). PRESENTATIONAL ONLY: it rides the public queue view, the
     # funded roster and the heat standings so a miner can pick their entry out
     # of a dashboard by name. It is never identity (hotkey + ref are), never
     # signed, never in a manifest or receipt, and never read by any scoring
     # path. Normalised by :func:`normalize_label`; "" = unlabelled.
     label: str = ""
+    # Rolling intake (DEC-CA-0043): an ``in_flight`` leg trains NOW, outside
+    # any round, toward ``target_boundary`` (the settlement it is expected to
+    # land in) under era ``era_index``'s seeds and init; ``started_block`` is
+    # the chain height at leg start — the block its ref is judged as of. A
+    # re-commit while the leg is in flight parks as ``queued_ref`` /
+    # ``queued_reveal_block`` and becomes the hotkey's next queued entry when
+    # the flight settles (one live entry per hotkey; the running leg is never
+    # rebound). All 0/"" for boundary-synchronous entries.
+    target_boundary: int = 0
+    era_index: int = 0
+    started_block: int = 0
+    queued_ref: str = ""
+    queued_reveal_block: int = 0
 
     @property
     def active_at(self) -> float:
@@ -214,6 +228,11 @@ class FundedQueue:
                 last_active=float(item.get("last_active", 0.0)),
                 rate_limited_since=float(item.get("rate_limited_since", 0.0)),
                 label=str(item.get("label", "")),
+                target_boundary=int(item.get("target_boundary", 0) or 0),
+                era_index=int(item.get("era_index", 0) or 0),
+                started_block=int(item.get("started_block", 0) or 0),
+                queued_ref=str(item.get("queued_ref", "") or ""),
+                queued_reveal_block=int(item.get("queued_reveal_block", 0) or 0),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -264,6 +283,21 @@ class FundedQueue:
         with self._locked() as entries:
             now = self.clock()
             prev = entries.get(hotkey)
+            if prev is not None and prev.status == "in_flight":
+                # DEC-CA-0043: the running leg is never rebound. Same ref ⇒
+                # proof of life; a new ref queues BEHIND the flight and
+                # becomes the next queued entry when it settles.
+                if prev.ref == ref:
+                    entries[hotkey] = replace(prev, last_active=now, queued_ref="",
+                                              queued_reveal_block=0,
+                                              label=label or prev.label)
+                    self._save(entries)
+                    return "already-queued"
+                entries[hotkey] = replace(prev, queued_ref=ref,
+                                          queued_reveal_block=int(reveal_block),
+                                          last_active=now, label=label or prev.label)
+                self._save(entries)
+                return "queued-behind"
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
@@ -302,7 +336,7 @@ class FundedQueue:
         """
         with self._locked() as entries:
             prev = entries.get(hotkey)
-            if prev is not None and prev.status in ("queued", "in_round"):
+            if prev is not None and prev.status in ("queued", "in_round", "in_flight"):
                 return "already-queued"
             now = self.clock()
             if prev is not None and prev.status == "pending_reveal" and prev.ref == ref:
@@ -383,8 +417,57 @@ class FundedQueue:
                 self._save(entries)
             return confirmed
 
+    def mark_in_flight(self, hotkey: str, ref: str, *, target_boundary: int,
+                       era_index: int, started_block: int) -> bool:
+        """Flip a ``queued`` entry to ``in_flight`` (DEC-CA-0043 rolling
+        intake): its leg starts now toward ``target_boundary`` under era
+        ``era_index``. Ref re-checked inside the lock like
+        :meth:`mark_in_round`; False when the entry moved underneath."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != "queued" or e.ref != ref:
+                return False
+            entries[hotkey] = replace(
+                e, status="in_flight", target_boundary=int(target_boundary),
+                era_index=int(era_index), started_block=int(started_block),
+                last_active=self.clock())
+            self._save(entries)
+            return True
+
+    def in_flight(self) -> list[FundedEntry]:
+        """Every leg currently training outside a round (never touched by
+        :meth:`recover_in_round` or a round-entry sweep)."""
+        return [e for e in self.entries() if e.status == "in_flight"]
+
+    def retarget_flight(self, hotkey: str, *, target_boundary: int) -> bool:
+        """A within-era slip: the leg lands at a LATER settlement of the same
+        era. Era and ref are untouched."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != "in_flight":
+                return False
+            entries[hotkey] = replace(e, target_boundary=int(target_boundary))
+            self._save(entries)
+            return True
+
+    def _after_flight(self, entries: dict[str, FundedEntry], hotkey: str) -> None:
+        """A settled flight with a re-commit parked behind it: the parked ref
+        becomes the hotkey's fresh queued entry (attempts reset — it is a new
+        submission). Called INSIDE the lock, after the flight's own outcome
+        was written."""
+        e = entries.get(hotkey)
+        if e is None or not e.queued_ref:
+            return
+        now = self.clock()
+        entries[hotkey] = FundedEntry(
+            hotkey=hotkey, ref=e.queued_ref, reveal_block=int(e.queued_reveal_block),
+            funded_at=now, last_active=now, label=e.label)
+
     def recover_in_round(self) -> int:
         """Return every ``in_round`` entry to ``queued``; count recovered.
+
+        ``in_flight`` legs (DEC-CA-0043) are NOT touched: they train outside
+        any round and settle on their own outcome.
 
         Called by the trainer at round START, before selection: a completed
         round marks its entries ``done``, so anything still ``in_round`` at
@@ -433,7 +516,10 @@ class FundedQueue:
         with self._locked() as entries:
             e = entries.get(hotkey)
             if e is not None:
+                was_flight = e.status == "in_flight"
                 entries[hotkey] = replace(e, status="done")
+                if was_flight:
+                    self._after_flight(entries, hotkey)
                 self._save(entries)
 
     def withdraw(self, hotkey: str) -> bool:
@@ -482,16 +568,23 @@ class FundedQueue:
                     self._save(entries)
                     return False
             attempts = e.attempts + (1 if burn_attempt else 0)
+            was_flight = e.status == "in_flight"
             if burn_attempt and attempts > max_attempts:
                 entries[hotkey] = replace(
                     e, status="failed", attempts=attempts,
                     last_error=error[:500], last_error_class=error_class)
+                if was_flight:
+                    self._after_flight(entries, hotkey)
                 self._save(entries)
                 return False
             entries[hotkey] = replace(
                 e, status="queued", attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
-                last_active=now, rate_limited_since=rl_since)
+                last_active=now, rate_limited_since=rl_since,
+                target_boundary=0, era_index=0, started_block=0)
+            if was_flight and e.queued_ref:
+                # The re-commit supersedes the requeue: the miner moved on.
+                self._after_flight(entries, hotkey)
             self._save(entries)
             return True
 
@@ -532,8 +625,11 @@ class FundedQueue:
                 return False
             if expect_ref is not None and e.ref != expect_ref:
                 return False
+            was_flight = e.status == "in_flight"
             entries[hotkey] = replace(
                 e, status="failed", last_error=error[:500], last_error_class=error_class)
+            if was_flight:
+                self._after_flight(entries, hotkey)
             self._save(entries)
             return True
 
@@ -563,6 +659,8 @@ class FundedQueue:
                     "attempts": e.attempts,
                     "last_error_class": e.last_error_class,
                     "label": e.label,
+                    **({"target_boundary": e.target_boundary, "era_index": e.era_index}
+                       if e.status == "in_flight" else {}),
                 }
                 for e in current if e.status != "pending_reveal"
             ],

@@ -41,6 +41,7 @@ from ..shared.config import (
     duel_round_overhead_hours,
     effective_epoch_blocks,
 )
+from ..shared.era import rolling_active
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -1784,7 +1785,11 @@ class TrainerRunner:
         now = time.time()
         try:
             leg_s = int(self._leg_wall_seconds(None))
-            end_wall = getattr(self, "_funded_epoch_end_wall", None)
+            # Rolling intake (DEC-CA-0043): a leg carries its OWN target
+            # boundary (thread-local), not the round's epoch end.
+            end_wall = getattr(self._leg_local, "end_wall", None)
+            if end_wall is None:
+                end_wall = getattr(self, "_funded_epoch_end_wall", None)
             if end_wall is None:
                 ctx = getattr(self, "_stage_ctx", None) or {}
                 epoch_start = int(ctx.get("epoch_start_block") or 0)
@@ -2296,7 +2301,9 @@ class TrainerRunner:
         that round; see :meth:`_reconcile_funded_pods`)."""
         self._reconcile_funded_pods(keep_round_id=str(round_id))
 
-    def _reconcile_funded_pods(self, *, keep_round_id: str | None = None) -> None:
+    def _reconcile_funded_pods(self, *, keep_round_id: str | None = None,
+                               keep_round_ids: tuple[str, ...] = (),
+                               keep_payers: set[str] | frozenset[str] = frozenset()) -> None:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
         orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
         API hiccup must never hold a boundary.
@@ -2313,6 +2320,7 @@ class TrainerRunner:
             return
         from ..provision.funded import reconcile_funded, teardown_funded
 
+        keep_ids = tuple(x for x in (keep_round_id, *keep_round_ids) if x)
         try:
             pods = self._load_funded_ledger()
             # Operator-billed ledger pods (the JIT king; payer_hotkey = "")
@@ -2321,7 +2329,7 @@ class TrainerRunner:
             # a missing/mis-set vault must not leave operator pods billing
             # (review 2026-09-02).
             for pod in [x for x in pods if not x.payer_hotkey]:
-                if keep_round_id and self._is_king_pod_of(pod.instance_id, keep_round_id):
+                if any(self._is_king_pod_of(pod.instance_id, rid) for rid in keep_ids):
                     log.info("funded sweep: keeping %s — this round's own king pod "
                              "(a retry adopts it; a complete checkpoint there "
                              "skips the retrain)", pod.instance_id)
@@ -2334,7 +2342,9 @@ class TrainerRunner:
                               "payer_vault_dir is unset — they bill their "
                               "miners until the vault comes back")
                 return
-            pods = [x for x in pods if x.payer_hotkey]
+            # DEC-CA-0043: a payer pod with an in-flight leg attached is
+            # never swept — the leg re-attaches after a restart.
+            pods = [x for x in pods if x.payer_hotkey and x.payer_hotkey not in keep_payers]
             for pod in pods:
                 self._revoke_robot(pod)
             if pods:
@@ -2348,8 +2358,9 @@ class TrainerRunner:
                               "gone — still billing the miner; kept on the "
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
-            reconcile_funded(self._load_funded_ledger(), vault,
-                             netuid=self.cfg.subnet.netuid)
+            if not keep_payers:
+                reconcile_funded(self._load_funded_ledger(), vault,
+                                 netuid=self.cfg.subnet.netuid)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -5142,6 +5153,38 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — replay must never sink a round
             log.warning("promotion: bench-report replay failed (ignored): %s", e)
 
+    def _promotion_boundary_step(self, king_hotkey: str | None, epoch_start: int,
+                                 round_id: str, *, effective_era: int = 0) -> None:
+        """Cascade promotion (DEC-CA-0013) at a boundary: track the reign and
+        fire a promotion BEFORE anything trains, so the signed record is
+        published (and fetchable by validators) before any manifest pins a
+        new-generation member. The reign clock keys off the signed receipt
+        trail's verdict king when available — the on-chain incentive lags a
+        dethrone by 1-2 epochs — falling back to the incentive king.
+        Guarded: promotion must never sink a round. ``effective_era``
+        (DEC-CA-0043) stamps a fired record with the era it takes effect."""
+        if self.promotion is None:
+            return
+        try:
+            # First boundary of a never-anchored engine: count the rounds the
+            # king already reigned (signed receipt tail + published bench
+            # reports) before the clock ticks — see _seed_promotion_reign.
+            self._seed_promotion_reign()
+            self.promotion.note_round(self._receipt_king() or king_hotkey,
+                                      epoch_block=epoch_start)
+            # Out-of-band bench reports (mop-ups, trainer-downtime publishes)
+            # enter the pool here — before maybe_promote, so a promotion that
+            # fires NOW selects from the full reign.
+            self._replay_reign_bench_reports()
+            self.promotion.maybe_promote(epoch_block=epoch_start, round_id=round_id,
+                                         effective_era=effective_era)
+        except Exception as e:  # noqa: BLE001
+            log.warning("promotion step failed for round=%s: %s", round_id, e)
+        # Publish-with-retry: the record survives (persisted) as pending until
+        # the publish lands, so a store outage never orphans a generation the
+        # pointer file already rotates over.
+        self._flush_pending_promotion(round_id)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -6932,6 +6975,245 @@ class TrainerRunner:
                   err, len(cancelled), len(in_flight),
                   ", ".join(k[1].hotkey[:12] for k in in_flight))
 
+    # ── rolling intake + era king (DEC-CA-0043) — pod/bucket adapters ──────
+
+    @property
+    def _leg_local(self) -> threading.local:
+        loc = self.__dict__.get("_leg_local_obj")
+        if loc is None:
+            loc = threading.local()
+            self.__dict__["_leg_local_obj"] = loc
+        return loc
+
+    def _rolling(self):
+        sched = self.__dict__.get("_rolling_sched")
+        if sched is None:
+            from .rolling import RollingScheduler
+
+            self._rolling_init_context()
+            sched = RollingScheduler(self)
+            self.__dict__["_rolling_sched"] = sched
+        return sched
+
+    def _rolling_init_context(self) -> None:
+        """The per-round attributes the funded-leg machinery expects, set
+        once for the rolling regime (legs carry their own targets)."""
+        self._round_telemetry = {"heat": [], "final": []}
+        self._final_role_hosts = getattr(self, "_final_role_hosts", None) or {}
+        self._funded_field = {}
+        self._funded_leg_failures = {}
+        self._funded_claimed_execs = set()
+        self._funded_exec_lock = threading.Lock()
+        self._funded_admission_info = {}
+        self._funded_roster = {"seated": [], "waiting": [], "terminal": [], "outcomes": []}
+        self._funded_round_sku = ""
+        self._funded_king_host = None
+        self._funded_king_lock = threading.Lock()
+        self._king_rent_done = True
+        self._funded_wait_abort = threading.Event()
+        self._funded_epoch_end_wall = None
+        self._rolling_king_host_era = None
+        self._stage_ctx = {"round_id": "", "epoch_start_block": 0, "warm_start": None}
+
+    def _rolling_dispatcher(self):
+        from .remote import RemoteDispatcher
+
+        if not self.trainer_spec:
+            raise RuntimeError("remote training requires trainer_spec")
+        return RemoteDispatcher(
+            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
+            extra_forward_env=self._pod_extra_forward_env(),
+            isolated_forward_env=self._pod_isolated_forward_env(),
+            **self._dispatch_mode(),
+        )
+
+    def _rolling_seeds(self, era):
+        return RoundSeeds.derive(int(era.base_seed), self.cfg.training)
+
+    def _rolling_warm_start_ref(self, era, contract) -> str | None:
+        return (era.warm_start_ckpt
+                if era.warm_start_ckpt and era.warm_start_size == contract.arch_preset
+                else None)
+
+    def _rolling_train_challenger(self, gen, era, block: int, *, end_wall: float):
+        """One funded challenger leg outside any round: payer pod (or the
+        operator-lane fallback), the era's seeds and init, its own target
+        boundary as the rent-wait deadline."""
+        from ..funding.store import parse_vault_ref
+
+        contract = self.cfg.throne_contracts()[0]
+        seeds = self._rolling_seeds(era)
+        suffix = f"-u{gen.uid}"
+        ws_ref = self._rolling_warm_start_ref(era, contract)
+        disp = self._rolling_dispatcher()
+        self._leg_local.end_wall = float(end_wall)
+        self._funded_field[gen.hotkey] = gen.ref
+        try:
+            try:
+                entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
+                                             warm_start_ref=ws_ref)
+            except _FundedOperatorFallback:
+                log.warning("rolling: %s — no marketplace capacity; running on an "
+                            "OPERATOR lane (operator-billed)", gen.hotkey[:12])
+                hosts = [h for h in self._hosts_for("final")]
+                from .remote import is_profile_only
+
+                hosts = [h for h in hosts if not is_profile_only(h)]
+                pool = _FinalLanePool(hosts, lambda: hosts)
+                used: list = []
+                digest = parse_vault_ref(gen.ref)
+                prepare = ((lambda h, d=digest: self._stage_vault_zip_on(h, d))
+                           if digest else None)
+                entry = self._dispatch_on_free_lane(
+                    disp, pool, pool.known_hosts(),
+                    describe=f"rolling challenger {gen.hotkey}", used_host=used,
+                    prepare=prepare, deadline=self._operator_lane_deadline_fn(),
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role="challenger", base_seed=seeds.base_seed, block=int(block),
+                    arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+                    repo_suffix=suffix,
+                )
+                if used:
+                    self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
+        finally:
+            self._leg_local.end_wall = None
+            self._funded_field.pop(gen.hotkey, None)
+        self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
+                                    role="challenger", hotkey=gen.hotkey, suffix=suffix)
+        return entry
+
+    def _rolling_train_king(self, gen, era, block: int):
+        """The era king's leg on the operator's JIT pod (kept for the era: the
+        top-N re-bench targets it)."""
+        contract = self.cfg.throne_contracts()[0]
+        seeds = self._rolling_seeds(era)
+        ws_ref = self._rolling_warm_start_ref(era, contract)
+        disp = self._rolling_dispatcher()
+        with self._funded_king_lock:
+            if self._rolling_king_host_era != era.index:
+                self._funded_king_host = None
+                self._rolling_king_host_era = era.index
+        self._king_rent_done = False
+        try:
+            host = self._stage_king_vault(self._rent_king_host(str(era.base_seed)), gen)
+        finally:
+            self._king_rent_done = True
+        entry = disp.dispatch(
+            host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+            role="king", base_seed=seeds.base_seed, block=int(block),
+            arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+        )
+        self._refuse_diverged_king(entry, contract)
+        self._final_role_hosts[("king", contract.arch_preset, gen.hotkey)] = host
+        self.__dict__.setdefault("_rolling_king_hosts", {})[era.index] = host
+        self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
+                                    role="king", hotkey=gen.hotkey)
+        return entry
+
+    def _rolling_note_king_host(self, era) -> None:
+        """After a dethrone adoption the operator's era pod benches for the
+        NEW king's hotkey."""
+        contract = self.cfg.throne_contracts()[0]
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is not None and era.king_hotkey:
+            self._final_role_hosts[("king", contract.arch_preset, era.king_hotkey)] = host
+
+    def _rolling_retire_king_pod(self, era) -> None:
+        """Tear down an era's operator king pod (era over, or its pre-trained
+        king superseded)."""
+        prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(era.base_seed))
+        for pod in self._load_funded_ledger():
+            if not pod.payer_hotkey and str(pod.instance_id).startswith(prefix + "-"):
+                self._teardown_operator_pod(pod)
+        self.__dict__.get("_rolling_king_hosts", {}).pop(era.index, None)
+        with self._funded_king_lock:
+            if self._rolling_king_host_era == era.index:
+                self._funded_king_host = None
+
+    def _rolling_bench_king(self, entry, era) -> dict | None:
+        import dataclasses
+
+        contract = self.cfg.throne_contracts()[0]
+        host = self._final_role_hosts.get(("king", contract.arch_preset, entry.miner_hotkey))
+        if host is None or self.cascade_bench_plan is None:
+            return None
+        scores = self._remote_bench_scores(host, entry, str(era.base_seed),
+                                           contract.arch_preset, role_dir="king")
+        return dataclasses.asdict(scores) if scores is not None else None
+
+    def _rolling_bench_challenger(self, entry, king, era) -> dict | None:
+        """Bench at completion (DEC-CA-0043): on the payer's kept pod, then the
+        operator re-bench on the era king's pod; only operator numbers are
+        returned (forged sweep ⇒ None)."""
+        import dataclasses
+
+        contract = self.cfg.throne_contracts()[0]
+        host = self._final_role_hosts.get(("challenger", contract.arch_preset, entry.miner_hotkey))
+        if host is None or self.cascade_bench_plan is None:
+            return None
+        role_dir = f"challenger-u{entry.miner_uid}"
+        scores = self._remote_bench_scores(host, entry, str(era.base_seed),
+                                           contract.arch_preset, role_dir=role_dir)
+        if scores is None:
+            return None
+        scored = {entry.trained_pointer: scores}
+        if getattr(host, "isolated", False):
+            self._payer_benched = {entry.trained_pointer}
+            duel = [e for e in (king, entry) if e is not None]
+            scored = self._verify_payer_benches(duel, scored, str(era.base_seed),
+                                                contract.arch_preset)
+        out = scored.get(entry.trained_pointer)
+        return dataclasses.asdict(out) if out is not None else None
+
+    def _rolling_publish_bench(self, round_id: str, created_block: int, pairs: list):
+        from ..shared.bench_report import (
+            BenchEntry,
+            BenchReport,
+            dump_bench_report,
+            publish_bench_report,
+            sign_bench_report,
+        )
+
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        entries = tuple(BenchEntry(role=e.role, size=e.size or primary,
+                                   miner_hotkey=e.miner_hotkey, miner_uid=e.miner_uid,
+                                   trained_pointer=e.trained_pointer, scores=s)
+                        for e, s in pairs)
+        report = BenchReport(round_id=str(round_id), created_block=int(created_block),
+                             entries=entries)
+        if self.wallet is not None:
+            report = sign_bench_report(report, self.wallet)
+        key = publish_bench_report(self.manifest_store(), dump_bench_report(report), round_id)
+        log.info("published bench report round=%s roles=[%s] signed=%s → s3://%s/%s",
+                 round_id, ", ".join(e.role for e in entries), report.signature is not None,
+                 self.cfg.storage.manifest_bucket, key)
+        with contextlib.suppress(Exception):   # telemetry only
+            self._log_bench_pair_wandb(report)
+        return report
+
+    def _rolling_publish_roster(self, round_id: str, roster: dict) -> None:
+        from ..shared.heat_status import _publish_public_json
+
+        doc = {"funded_pods": self.cfg.round.funded_pods, **roster}
+        try:
+            store = self.manifest_store()
+            for key in (f"funded/round-{round_id}.json", "funded/latest.json"):
+                _publish_public_json(store, key, doc)
+        except Exception as e:  # noqa: BLE001 — transparency must not sink a settlement
+            log.warning("funded roster publish failed (ignored): %s", e)
+
+    def _rolling_dedup_registry(self):
+        from .dedup_registry import DedupRegistry
+
+        mode = (self.cfg.round.dedup_mode or "off").lower()
+        if mode not in ("shadow", "enforce"):
+            return None
+        reg = self.__dict__.get("_dedup_registry_obj")
+        if reg is None:
+            reg = DedupRegistry(self, self.work_root / "dedup_registry.json", mode=mode)
+            self.__dict__["_dedup_registry_obj"] = reg
+        return reg
+
     def publish(self, manifest: TrainingManifest) -> None:
         """Sign the manifest with the trainer hotkey and write it to the Hippius
         S3 manifest bucket (``round-<id>.json`` + ``latest.json``)."""
@@ -7230,10 +7512,20 @@ class TrainerRunner:
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)
-                if not startup_swept:
+                # DEC-CA-0043: the rolling scheduler runs its own keep-aware
+                # startup sweep (in-flight payer pods + both era king pods).
+                if not startup_swept and not rolling_active(self.cfg.round, epoch_start):
                     self._startup_sweep(str(base_seed))
                     startup_swept = True
                 round_id = str(base_seed)
+                # Rolling intake + era king (DEC-CA-0043): from
+                # rolling_from_block the boundary-synchronous round is
+                # replaced by the scheduler's tick — legs start as they are
+                # funded, every boundary settles what finished.
+                if rolling_active(self.cfg.round, epoch_start):
+                    self._rolling().tick(client, block)
+                    time.sleep(poll)
+                    continue
                 if round_id == last_round:
                     time.sleep(poll)
                     continue
@@ -7275,31 +7567,7 @@ class TrainerRunner:
                 # fire a promotion every validator judges premature — falling
                 # back to the incentive king when no receipt is readable.
                 # Guarded: promotion must never sink a round.
-                if self.promotion is not None:
-                    try:
-                        # First boundary of a never-anchored engine: count the
-                        # rounds the king already reigned (signed receipt tail
-                        # + published bench reports) before the clock ticks —
-                        # see _seed_promotion_reign. No-op ever after.
-                        self._seed_promotion_reign()
-                        self.promotion.note_round(self._receipt_king() or king_hotkey,
-                                                  epoch_block=epoch_start)
-                        # Out-of-band bench reports (mop-ups, trainer-downtime
-                        # publishes) enter the pool here — before maybe_promote,
-                        # so a promotion that fires NOW selects from the full
-                        # reign, not just what the in-process bench thread saw.
-                        self._replay_reign_bench_reports()
-                        self.promotion.maybe_promote(
-                            epoch_block=epoch_start, round_id=round_id)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("promotion step failed for round=%s: %s", round_id, e)
-                    # Publish-with-retry: the record survives (persisted) as
-                    # pending until the publish lands, so a store outage never
-                    # orphans a generation the pointer file already rotates
-                    # over. Flushed again right before this round's manifest
-                    # publishes (below) — the record must be fetchable before
-                    # any validator gates the manifest that pins its member.
-                    self._flush_pending_promotion(round_id)
+                self._promotion_boundary_step(king_hotkey, epoch_start, round_id)
                 self._reload_remote_hosts()  # per-round elastic fleet pickup
                 log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
                          round_id, epoch, epoch_start, king_hotkey,

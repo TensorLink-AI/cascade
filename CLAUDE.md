@@ -397,6 +397,27 @@ in-context.
   `batch_points`). Worker image REBUILD before the first 5h round (v0.8.0
   bills C×L). No validator restart (declared gating; no locked term moves).
   (`decisions/DEC-CA-0042-series-points-budget-five-hour-legs.md`)
+- **DEC-CA-0043** (proposed) — Rolling intake + era king, block-gated at ONE
+  rollover: challengers train the moment they are funded (legs cross
+  boundaries, `funded_field_cap` = legs in flight, queue `in_flight` state);
+  every 3h boundary SETTLES what finished (one hash-chained manifest,
+  validators walk `round-<id>.json` forward, never jump to latest); the
+  king's leg trains once per 12h ERA (4 settlements, one seed set from the
+  previous era's start hash, one init = `members_gen(g)[era % k]` with
+  `effective_era` one full era of notice, cached checkpoint, next era's king
+  pre-trained in the last wall + margin); a dethrone adopts the winner's
+  checkpoint without ending the era; a settlement at boundary B belongs to
+  the era containing B − 1 (seamless intake, no dead zone); the king is
+  derived from receipts, never the metagraph; refs are bound at
+  `train_block`; tenure/ripeness re-denominated to BLOCKS across the
+  3600 → 900 grid switch; bench at leg completion; seniority = first pick of
+  FITTING executors. `[round] rolling_from_block` / `era_settlements`,
+  `[scoring] era_king_from_block` / `tenure_blocks_from_block` /
+  `margin_warmup_blocks` / `cascade_reign_blocks`, all 0 on mainnet
+  (release-then-activate; testnet armed at the first boundary). Accepted
+  risk: the era king is scoutable — the confirmation leg or the
+  retrain-noise measurement gates arming.
+  (`decisions/DEC-CA-0043-rolling-intake-era-king.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

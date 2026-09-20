@@ -310,6 +310,7 @@ class TrainerPromotion:
                 fired_round=str(pr.get("fired_round", "")),
                 fired_block=int(pr.get("fired_block", 0)),
                 members=tuple(member_from_json(m) for m in (pr.get("members") or ())),
+                effective_era=int(pr.get("effective_era", 0) or 0),
             )
 
     def _adopt_legacy_pointer(self) -> None:
@@ -429,14 +430,21 @@ class TrainerPromotion:
                          len(self.candidates))
             return added
 
-    def maybe_promote(self, *, epoch_block: int, round_id: str) -> PromotionRecord | None:
+    def maybe_promote(self, *, epoch_block: int, round_id: str,
+                      effective_era: int = 0) -> PromotionRecord | None:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
         clock (the king persists — DEC-CA-0004), clear the candidate log, and
         write the pointer file. The record is retained (persisted) as
         :attr:`pending_record` until :meth:`mark_record_published` — state
         advances at fire time, so the caller retries the publish from
-        :meth:`unpublished_record` every round until it lands."""
+        :meth:`unpublished_record` every round until it lands.
+
+        ``effective_era`` (DEC-CA-0043, rolling intake): the era the new
+        generation becomes the init of — one full era of notice after this
+        boundary (``cascade.shared.era.min_effective_era``), stamped on the
+        signed record so validators install it at that era and no earlier.
+        0 = pre-era record (effective at acceptance)."""
         with self._lock:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
@@ -496,6 +504,7 @@ class TrainerPromotion:
                 fired_round=str(round_id),
                 fired_block=int(epoch_block),
                 members=self.members,
+                effective_era=int(effective_era or 0),
             )
             self.pending_record = record
             self._persist()
@@ -581,6 +590,7 @@ class TrainerPromotion:
                 "fired_round": self.pending_record.fired_round,
                 "fired_block": self.pending_record.fired_block,
                 "members": [member_to_json(m) for m in self.pending_record.members],
+                "effective_era": self.pending_record.effective_era,
             },
         }
         # Atomic (tmp + rename): a crash mid-write must not corrupt the state

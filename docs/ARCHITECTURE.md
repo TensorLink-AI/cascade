@@ -104,6 +104,16 @@ round:
    corpus/contract digests, and publishes it to the **Hippius S3** manifest
    bucket (`round-<id>.json` + `latest.json`).
 
+   From `[round] rolling_from_block` (DEC-CA-0043, block-gated, unarmed on
+   mainnet) the round is replaced by *settlements*: funded challengers train
+   the moment they are funded, every epoch boundary publishes ONE manifest
+   carrying the era king plus every challenger finished since the last one,
+   manifests are hash-chained (`prev_round_id`), and the king's leg is
+   trained once per *era* (`era_settlements` boundaries sharing one seed
+   set, one init and one cached king checkpoint; a settlement at boundary B
+   belongs to the era containing B − 1). See `cascade/shared/era.py`,
+   `cascade/trainer/rolling.py`.
+
 `BaseTrainer` is a `Protocol` — the single GPU-dependent seam. Everything else
 in the trainer is numpy/CPU and unit-tested. A reference implementation (a
 Toto2-4M backbone trained from random init under the `chain.toml [training]`
@@ -206,7 +216,9 @@ trainer signature, generation increment, `cascade_top_k` cap, reign-clock
 ripeness, and per-member provenance against the trainer-signed bench reports
 within the epsilon floor — failing closed on anything unverifiable. Once a
 generation is live, each round's init is the rotation
-`members[epoch_index % len(members)]`, pinned in that round's signed manifest;
+`members[epoch_index % len(members)]` (from DEC-CA-0043's rollover: one init
+per ERA, `members_gen(era)[era % k]` with the generation's `effective_era` a
+full era of notice), pinned in that round's signed manifest;
 **every run in the round — heat and final — trains from that one init**. The
 king **persists** on the throne with a fresh reign clock (DEC-CA-0004 — both
 roles train from the shared init, so promotion confers no advantage worth

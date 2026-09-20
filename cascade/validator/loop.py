@@ -42,11 +42,11 @@ from ..shared.config import (
 )
 from ..shared.era import (
     EraSpec,
-    era_for_block,
     era_king_active,
     era_length_blocks,
     member_index_for_era,
     min_effective_era,
+    settlement_era,
     tenure_rounds_at,
 )
 from ..shared.manifest import (
@@ -374,7 +374,7 @@ class ValidatorRunner:
         except ValueError as e:
             return f"era_malformed: {e}"
         block = self._epoch_start_block(manifest)
-        expected = era_for_block(self.cfg.round, block)
+        expected = settlement_era(self.cfg.round, block)
         if (era.index, era.start_block, era.seed_block) != (
                 expected.index, expected.start_block, expected.seed_block):
             return (f"era_mismatch: manifest era {era.index}@{era.start_block} "
@@ -1767,7 +1767,7 @@ class ValidatorRunner:
 
         era_start_block = 0
         if era_king_active(self.cfg.scoring, epoch_start_block):
-            era_start_block = era_for_block(self.cfg.round, epoch_start_block).start_block
+            era_start_block = settlement_era(self.cfg.round, epoch_start_block).start_block
             seeds = RoundSeeds.derive(int(era_base_seed), self.cfg.training)
         else:
             era_base_seed = 0
@@ -1850,7 +1850,7 @@ class ValidatorRunner:
                 epoch_hash = client.block_hash(epoch_start)
                 if era_king_active(self.cfg.scoring, epoch_start):
                     era_base_seed = int(client.block_seed(
-                        era_for_block(self.cfg.round, epoch_start).seed_block))
+                        settlement_era(self.cfg.round, epoch_start).seed_block))
                 participants = participants_from_commitments(
                     client.poll_commitments(include_history=True),
                     cutoff_block=epoch_start,
