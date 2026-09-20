@@ -399,6 +399,15 @@ cascade_reign_days   = 1         # consecutive undethroned days before a Cascade
 # mainnet.
 cascade_top_k          = 2
 cascade_quality_epsilon = 0.05
+# All-time top-k leaderboard rule (DEC-CA-0044): ARMED from block 1 on
+# testnet so the announce -> 24h notice -> fire cycle validates end to end
+# before mainnet sets its block. Notice period shortened to one testnet round
+# (cascade_reign_days = 1 day = 7200 blocks keeps the same 24h wall-clock).
+cascade_alltime_from_block = 1
+cascade_notice_blocks      = 7200
+cascade_weight_gifteval    = 0.5
+cascade_weight_boom        = 0.25
+cascade_weight_time        = 0.25
 
 [dependencies]
 # Allowlist for a generator's requirements.txt — supply-chain restriction.

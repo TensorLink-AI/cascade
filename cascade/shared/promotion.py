@@ -207,3 +207,112 @@ def load_promotion_index(text: str) -> int:
         return int(obj.get("latest_generation", 0)) if isinstance(obj, dict) else 0
     except Exception:  # noqa: BLE001 — best-effort locator, never raises
         return 0
+
+
+# ── all-time leaderboard (DEC-CA-0044) — unsigned, presentational ────────────
+
+LEADERBOARD_KEY = "promotions/leaderboard.json"
+LEADERBOARD_SCHEMA = 1
+
+
+def build_leaderboard_doc(
+    *,
+    as_of: str,
+    rule_active: bool,
+    k: int,
+    weights: tuple[float, float, float],
+    notice_blocks: int,
+    entries: list[dict],
+    live_generation: int,
+    live_members: list[str],
+    upcoming: dict | None,
+    activation_block: int = 0,
+) -> dict:
+    """Assemble the public all-time leaderboard document (pure).
+
+    The trainer publishes it at every round boundary so dashboards and the
+    miner CLI can show the fixed population the warm-start init is drawn
+    from, and — the part miners act on — the ANNOUNCED change: ``upcoming``
+    carries the next generation's member set, the round/block it was
+    announced at and the block it takes effect (``announced_block +
+    notice_blocks``), so a miner has the notice period to prepare against
+    the exact checkpoint (``cascade score --warm-start upcoming``).
+
+    ``entries`` are rank-ordered ``{rank, checkpoint_id, size, source_round,
+    hotkey, role, score, gifteval_crps, …, time_mase}`` rows (the trainer's
+    :class:`~cascade.trainer.promotion.LeaderEntry` shape); ``live_members``
+    is the generation the field trains from NOW. Unsigned and
+    presentational like the status docs — the signed promotion record stays
+    the fleet's ground truth; a consumer must survive it stale or absent.
+    """
+    doc: dict = {
+        "schema": LEADERBOARD_SCHEMA,
+        "as_of": str(as_of),
+        "rule": "alltime_top_k" if rule_active else "reign_scoped",
+        "rule_active": bool(rule_active),
+        "activation_block": int(activation_block),
+        "k": int(k),
+        "weights": {"gifteval": float(weights[0]), "boom": float(weights[1]),
+                    "time": float(weights[2])},
+        "notice_blocks": int(notice_blocks),
+        "entries": [dict(e) for e in entries],
+        "live_generation": int(live_generation),
+        "live_members": [str(m) for m in live_members],
+    }
+    if upcoming:
+        doc["upcoming"] = dict(upcoming)
+    return doc
+
+
+def publish_leaderboard(store: object, doc: dict) -> str:
+    """Write the leaderboard doc public-read (same ACL fallback as the
+    promotion record). Returns the key."""
+    from .hippius import StorageError
+
+    text = json.dumps(doc, indent=2, sort_keys=True)
+    try:
+        store.put_text(LEADERBOARD_KEY, text, content_type="application/json",
+                       acl="public-read")
+    except StorageError:
+        store.put_text(LEADERBOARD_KEY, text, content_type="application/json")
+    return LEADERBOARD_KEY
+
+
+def upcoming_from_doc(doc: object) -> dict | None:
+    """The ``upcoming`` block out of a round/heat status doc's ``warm_start``
+    or out of the leaderboard doc — ``None`` unless it is a well-formed
+    announcement (a member list and an effective block). Shared by every
+    consumer so a malformed announcement renders as nothing, never as a
+    wrong checkpoint."""
+    if not isinstance(doc, dict):
+        return None
+    up = doc.get("upcoming")
+    if not isinstance(up, dict):
+        ws = doc.get("warm_start")
+        up = ws.get("upcoming") if isinstance(ws, dict) else None
+    if not isinstance(up, dict):
+        return None
+    members = [m for m in (up.get("members") or ())
+               if isinstance(m, dict) and m.get("checkpoint_id")]
+    try:
+        effective = int(up.get("effective_block"))
+    except (TypeError, ValueError):
+        return None
+    if not members or effective <= 0:
+        return None
+    return {**up, "members": members, "effective_block": effective}
+
+
+def annotate_upcoming(
+    up: dict, *, now_block: int, seconds_per_block: float, now_s: float,
+) -> dict:
+    """Add the wall-clock ESTIMATE consumers show beside an announcement:
+    ``blocks_remaining`` and ``effective_at`` (ISO-8601 UTC) derived from the
+    chain cadence. The block is exact; the time is an estimate (labelled so
+    by every renderer), recomputed by each consumer from its own block read."""
+    from datetime import UTC, datetime
+
+    remaining = max(0, int(up.get("effective_block", 0)) - int(now_block))
+    eta = float(now_s) + remaining * float(seconds_per_block)
+    return {**up, "blocks_remaining": remaining,
+            "effective_at": datetime.fromtimestamp(eta, tz=UTC).isoformat(timespec="seconds")}

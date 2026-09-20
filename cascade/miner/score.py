@@ -88,6 +88,7 @@ def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
 
 
 LIVE_WARM_START = "live"
+UPCOMING_WARM_START = "upcoming"
 
 
 def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str]:
@@ -114,6 +115,24 @@ def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str
             log.info("warm-start live: the current round trains from random init")
             return None, "random init (live round is not warm-started)"
         spec = str(init)
+    elif spec.lower() == UPCOMING_WARM_START:
+        # The ANNOUNCED next generation (DEC-CA-0044): the first member of the
+        # frozen set, read from the round-status doc or, failing that, the
+        # public leaderboard doc — the checkpoint a miner prepares against
+        # during the notice period.
+        from ..shared.promotion import upcoming_from_doc
+        from .dashboard import fetch_public_leaderboard, fetch_public_round_status
+
+        up = upcoming_from_doc(fetch_public_round_status(cfg.storage))
+        if up is None:
+            up = upcoming_from_doc(fetch_public_leaderboard(cfg.storage))
+        if up is None:
+            raise ValueError("--warm-start upcoming: no warm-start change is announced "
+                             "right now (see `cascade leaderboard`); use 'live' for the "
+                             "init the current round trains from")
+        spec = str(up["members"][0]["checkpoint_id"])
+        log.info("warm-start upcoming: generation %s takes effect at block %s; "
+                 "training from %s", up.get("generation"), up["effective_block"], spec)
 
     from ..shared.hippius import HubConfig, HubRef, fetch_from_hub, is_hub_ref
     from ..shared.manifest import parse_trained_pointer
@@ -128,7 +147,7 @@ def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str
     if local.is_dir():
         return local, f"warm-start dir:{local}"
     raise ValueError(
-        f"--warm-start {spec!r} is neither 'live', a Hub ref (repo@digest / trained "
+        f"--warm-start {spec!r} is neither 'live', 'upcoming', a Hub ref (repo@digest / trained "
         "pointer), nor an existing checkpoint directory"
     )
 

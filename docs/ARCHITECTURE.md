@@ -214,6 +214,35 @@ vacating over, and the throne only changes hands via a genuine dethrone). The
 reign clock and candidate log persist next to the trainer/validator state, so
 Cascade survives restarts.
 
+**All-time leaderboard rule (DEC-CA-0044, block-gated `[scoring]
+cascade_alltime_from_block`; testnet armed, mainnet 0 until the coordinated
+validator release).** From the activation block the member set is one fixed
+population instead of a per-reign pick: the trainer keeps an all-time
+leaderboard of every benched checkpoint (any reign, any generation; a one-time
+deploy backfill walks every published bench report) ranked by the
+suite-WEIGHTED score `weighted_cascade_score` — GIFT-Eval : BOOM : TIME =
+`cascade_weight_*` (50 : 25 : 25), each suite the geomean of its CRPS and MASE
+— and the declared set is the top `cascade_top_k` within
+`cascade_quality_epsilon` of the best. Insertion is by rank: a better
+checkpoint takes the place it beats, the members below slide down, the last
+drops out; equal never displaces. A change to the set is never installed on the
+spot: the engine ANNOUNCES it (`pending_change`; `status/round.json` and
+`status/heat.json` carry `warm_start.upcoming`, `promotions/leaderboard.json`
+carries the whole board + the announcement) and fires the signed record
+`cascade_notice_blocks` (7200 ≈ 24h) later; the announced set is frozen for
+the window (a better arrival waits for the next change) unless it fell outside
+the epsilon envelope, in which case the current target is re-announced.
+Validators under the rule verify the same signature / generation / cap, but
+provenance is ANY trainer-signed bench report (members legitimately predate the
+reign), the quality floor is measured with the weighted score, and the timing
+predicate is the notice period since the last reign anchor (a dethrone or an
+accepted generation) instead of `cascade_reign_rounds`. Rotation across
+members, the single manifest pin, and the no-downgrade property (the board
+only improves) are unchanged. Miners see it in `cascade round` / `cascade heat`
+(`upcoming init` lines), `cascade leaderboard`, the website's warm-start panel,
+and can train against the announced checkpoint with `cascade score
+--warm-start upcoming`.
+
 Those six numbers are **authoritative from the trainer, not recomputed per
 validator**. The trainer (owner-operated, already the manifest trust anchor)
 benchmarks **both final-duel checkpoints — the king's and the challenger's —

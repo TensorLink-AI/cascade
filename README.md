@@ -103,15 +103,21 @@ costs what it trains, step count is independent of width, and from block
 
 ## The cascade: promoted generations
 
-When a king holds 5 consecutive rounds (`cascade_reign_rounds`), up to 3
-(`cascade_top_k`) of the reign's best duel checkpoints, king's or
-challengers', are promoted as the next warm-start generation. Members are
-picked by the geometric mean of six signed benchmark numbers (GIFT-Eval /
-BOOM / TIME × CRPS / MASE), within 5% of the reign's best, for error
-diversity. Later rounds rotate through them. A promotion never ratchets
-downhill, the king persists (only the reign clock resets), and each promotion
-is a signed public record under `promotions/`. Generations have been promoted
-on mainnet; warm-started rounds are the live case.
+The warm-start generation is ONE fixed population: the all-time top 3
+(`cascade_top_k`) benched duel checkpoints, king's or challengers', from any
+reign, ranked by a suite-weighted score over the six signed benchmark numbers
+(GIFT-Eval 50% · BOOM 25% · TIME 25%, each suite the geomean of its CRPS and
+MASE), within 5% of the best. A better checkpoint takes the rank it beats
+(the one below slides down, the last drops out); later rounds rotate through
+the members. A change to the set is announced 24h (`cascade_notice_blocks`)
+before it takes effect — the status docs, `promotions/leaderboard.json`, the
+dashboard and `cascade leaderboard` carry the upcoming generation so miners can
+prepare (`cascade score --warm-start upcoming`). The king persists (only the
+reign clock resets), and each promotion is a signed public record under
+`promotions/`. The all-time rule is block-gated (`cascade_alltime_from_block`,
+DEC-CA-0044; unarmed on mainnet until the coordinated validator release):
+before it, a 5-round undethroned reign (`cascade_reign_rounds`) promotes up
+to 3 of that reign's best checkpoints by geomean and error diversity.
 
 ## Roadmap
 

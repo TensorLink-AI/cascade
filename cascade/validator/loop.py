@@ -34,7 +34,13 @@ from typing import TYPE_CHECKING
 from ..eval.koth import RoundResult, cohort_maxt_lcb_map, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
-from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
+from ..shared.config import (
+    ChainConfig,
+    cascade_alltime_active,
+    cascade_suite_weights,
+    cohort_maxt_active,
+    effective_epoch_blocks,
+)
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -420,18 +426,42 @@ class ValidatorRunner:
         # measures its own uptime, so it verifies what its evidence supports.
         attesting = (record.generation == state.generation + 1
                      and self.cascade.can_verify_ripeness())
-        if attesting and not self.cascade.is_ripe(block=block):
+        # Which rule this round's record is judged under (DEC-CA-0044): the
+        # all-time leaderboard from ``cascade_alltime_from_block`` on — the
+        # member set is the all-time top-k under the suite-weighted score,
+        # provenance is ANY trainer-signed bench report (members legitimately
+        # predate the reign), and the timing predicate is the notice period
+        # (at least ``cascade_notice_blocks`` since the last dethrone or
+        # accepted generation) instead of a full reign. Before the block the
+        # reign-scoped rule (DEC-CA-0013/0015/0017) applies unchanged, so
+        # archived records replay identically.
+        alltime = cascade_alltime_active(self.cfg.scoring, block)
+        if attesting and alltime and not self.cascade.is_spaced(
+                block=block, min_blocks=int(self.cfg.scoring.cascade_notice_blocks)):
+            return (f"warm_start_promotion_early: generation {record.generation} "
+                    f"declared within {int(self.cfg.scoring.cascade_notice_blocks)} "
+                    f"blocks of the last reign anchor (all-time rule notice period)")
+        if attesting and not alltime and not self.cascade.is_ripe(block=block):
             return (f"warm_start_promotion_early: generation {record.generation} "
                     f"declared before the reign clock ripened")
-        member_reason = self._verify_members(record, enforce_reign_scope=attesting)
+        member_reason = self._verify_members(
+            record, enforce_reign_scope=attesting and not alltime,
+            weighted=alltime)
         if member_reason is not None:
             return member_reason
         self.cascade.note_promotion(
             generation=record.generation, members=member_ids, block=block)
         return None
 
-    def _verify_members(self, record: object, *, enforce_reign_scope: bool) -> str | None:
+    def _verify_members(self, record: object, *, enforce_reign_scope: bool,
+                        weighted: bool = False) -> str | None:
         """Provenance + quality floor for every member of a promotion record.
+
+        ``weighted`` scores members and the reign log with the all-time rule's
+        suite-weighted score (DEC-CA-0044, ``cascade_weight_*``) instead of the
+        uniform six-number geomean — the trainer ranks its leaderboard on that
+        score, so the floor must be measured on the same scale or an honest
+        top-k set fails the epsilon check on a scale it was never selected on.
 
         Each member must have trainer-signed bench numbers: from this
         validator's reign log when it recorded that round, else fetched on
@@ -457,15 +487,24 @@ class ValidatorRunner:
         only loosen this validator's floor — an honest trainer passes every
         validator; only a cheating trainer splits the fleet, and splitting
         loudly is the correct outcome there."""
-        from .cascade import best_score, cascade_score, log_record_for
+        from .cascade import best_score, cascade_score, log_record_for, weighted_cascade_score
 
         assert self.cascade is not None
+        weights = cascade_suite_weights(self.cfg.scoring)
+
+        def _score(gc, gm, bc, bm, tc, tm) -> float:
+            if weighted:
+                return weighted_cascade_score(gc, gm, bc, bm, tc, tm, weights=weights)
+            return cascade_score(gc, gm, bc, bm, tc, tm)
+
         reign_start = self.cascade.state.reign_start_block
         scores: dict[str, float] = {}
         for m in getattr(record, "members", ()):
             rec = log_record_for(self.cascade.state, m.checkpoint_id)
             if rec is not None:
-                scores[m.checkpoint_id] = rec.score
+                scores[m.checkpoint_id] = _score(
+                    rec.gifteval_crps, rec.gifteval_mase, rec.boom_crps,
+                    rec.boom_mase, rec.time_crps, rec.time_mase)
                 continue
             report = self._fetch_bench_report(m.source_round)
             be = None if report is None else report.entry_for_pointer(m.checkpoint_id)
@@ -479,11 +518,16 @@ class ValidatorRunner:
                         f"{getattr(report, 'created_block', '?')}), before the "
                         f"current reign anchored at block {reign_start}")
             s = be.scores
-            scores[m.checkpoint_id] = cascade_score(
+            scores[m.checkpoint_id] = _score(
                 s.gifteval_crps, s.gifteval_mase, s.boom_crps,
                 s.boom_mase, s.time_crps, s.time_mase)
         floor_candidates = list(scores.values())
-        log_best = best_score(self.cascade.state)
+        if weighted:
+            log_best = min((_score(r.gifteval_crps, r.gifteval_mase, r.boom_crps,
+                                   r.boom_mase, r.time_crps, r.time_mase)
+                            for r in self.cascade.state.checkpoints), default=None)
+        else:
+            log_best = best_score(self.cascade.state)
         if log_best is not None:
             floor_candidates.append(log_best)
         floor = min(floor_candidates)

@@ -27,6 +27,24 @@ deterministically by epoch index. Validators accept ANY live member, so
 adaptive allocation (dropping a losing lineage mid-generation) is a pure
 engine change.
 
+ALL-TIME RULE (DEC-CA-0044, block-gated ``[scoring] cascade_alltime_from_block``):
+from the activation block the member set is ONE fixed population — the
+all-time top-k benched checkpoints across every reign and generation, ranked
+by the suite-WEIGHTED score (GIFT-Eval : BOOM : TIME = 50 : 25 : 25 by
+default; :func:`cascade.validator.cascade.weighted_cascade_score`), still
+within ``cascade_quality_epsilon`` of the best. The leaderboard is a bounded
+sorted list: a better checkpoint is inserted at its rank, the members below it
+slide down one place and the last one drops out. A change to the member set is
+never installed on the spot: the engine ANNOUNCES it (``pending_change``,
+surfaced on the status docs and the public leaderboard doc) and fires the
+signed record ``notice_blocks`` later (24h at 12 s/block), so miners get the
+notice period to prepare against the exact announced checkpoint. The
+announced set is FROZEN for the window — a better checkpoint arriving during
+the notice waits for the following change — unless the frozen set fell outside
+the envelope (a much better arrival moved the floor), in which case the
+current target is re-announced. Rotation across members is unchanged. The
+no-downgrade guard is implied: the leaderboard only ever improves.
+
 The engine keys its reign clock off whatever king the runner resolves for it —
 the signed receipt trail's verdict king when readable (prompt: validators reset
 their clocks at the dethrone verdict), the on-chain incentive king as fallback
@@ -51,8 +69,13 @@ from ..shared.promotion import (
     member_from_json,
     member_to_json,
 )
+from ..validator.cascade import (
+    DEFAULT_SUITE_WEIGHTS,
+    cascade_score,
+    reign_rounds,
+    weighted_cascade_score,
+)
 from ..validator.cascade import CascadeState as _ClockState
-from ..validator.cascade import cascade_score, reign_rounds
 
 log = logging.getLogger("cascade.trainer.promotion")
 
@@ -68,6 +91,141 @@ class Candidate:
     round_id: str
     epoch_index: int
     score: float
+
+
+@dataclass(frozen=True)
+class LeaderEntry:
+    """One row of the all-time leaderboard (DEC-CA-0044): a benched checkpoint
+    with its six signed numbers and the suite-weighted ``score`` it is ranked
+    on. ``source_round`` is the round whose signed bench report scored it —
+    the provenance a validator re-reads. ``created_block`` is that report's
+    manifest block (observability; ordering ties)."""
+
+    checkpoint_id: str
+    size: str
+    hotkey: str
+    role: str
+    source_round: str
+    created_block: int
+    gifteval_crps: float
+    gifteval_mase: float
+    boom_crps: float
+    boom_mase: float
+    time_crps: float
+    time_mase: float
+    score: float
+
+    def to_json(self) -> dict:
+        return {
+            "checkpoint_id": self.checkpoint_id, "size": self.size,
+            "hotkey": self.hotkey, "role": self.role,
+            "source_round": self.source_round, "created_block": self.created_block,
+            "gifteval_crps": self.gifteval_crps, "gifteval_mase": self.gifteval_mase,
+            "boom_crps": self.boom_crps, "boom_mase": self.boom_mase,
+            "time_crps": self.time_crps, "time_mase": self.time_mase,
+            "score": self.score,
+        }
+
+    @classmethod
+    def from_json(cls, o: dict) -> LeaderEntry:
+        return cls(
+            checkpoint_id=str(o["checkpoint_id"]), size=str(o.get("size", "")),
+            hotkey=str(o.get("hotkey", "")), role=str(o.get("role", "")),
+            source_round=str(o.get("source_round", "")),
+            created_block=int(o.get("created_block", 0) or 0),
+            gifteval_crps=float(o["gifteval_crps"]), gifteval_mase=float(o["gifteval_mase"]),
+            boom_crps=float(o["boom_crps"]), boom_mase=float(o["boom_mase"]),
+            time_crps=float(o["time_crps"]), time_mase=float(o["time_mase"]),
+            score=float(o["score"]),
+        )
+
+    def rescored(self, weights: tuple[float, float, float]) -> LeaderEntry:
+        """The same row under different suite weights."""
+        from dataclasses import replace
+
+        return replace(self, score=weighted_cascade_score(
+            self.gifteval_crps, self.gifteval_mase, self.boom_crps, self.boom_mase,
+            self.time_crps, self.time_mase, weights=weights))
+
+
+@dataclass(frozen=True)
+class PendingChange:
+    """An ANNOUNCED member-set change (DEC-CA-0044): the next generation's
+    frozen member list, the round/block it was announced at, and the block it
+    may fire at (``announced_block + notice_blocks``). Surfaced to miners the
+    whole window; the signed record only publishes when it fires."""
+
+    generation: int
+    members: tuple[PromotedMember, ...]
+    announced_round: str
+    announced_block: int
+    effective_block: int
+
+    def to_json(self) -> dict:
+        return {
+            "generation": self.generation,
+            "members": [member_to_json(m) for m in self.members],
+            "announced_round": self.announced_round,
+            "announced_block": self.announced_block,
+            "effective_block": self.effective_block,
+        }
+
+    @classmethod
+    def from_json(cls, o: dict) -> PendingChange:
+        return cls(
+            generation=int(o["generation"]),
+            members=tuple(member_from_json(m) for m in (o.get("members") or ())),
+            announced_round=str(o.get("announced_round", "")),
+            announced_block=int(o.get("announced_block", 0) or 0),
+            effective_block=int(o.get("effective_block", 0) or 0),
+        )
+
+    def member_ids(self) -> tuple[str, ...]:
+        return tuple(m.checkpoint_id for m in self.members)
+
+
+def admit_leader(
+    board: tuple[LeaderEntry, ...], entry: LeaderEntry, k: int,
+) -> tuple[tuple[LeaderEntry, ...], int | None]:
+    """Insert ``entry`` into the rank-ordered all-time leaderboard (pure).
+
+    Returns ``(new_board, rank)`` — ``rank`` is 1-based when the entry made
+    the board, ``None`` when it did not (worse than every member of a full
+    board, or already listed). Strictly-better only: an equal score never
+    displaces the incumbent (the earlier checkpoint keeps its rank, so a
+    re-bench of an identical artefact cannot churn the set). The board holds
+    at most ``k`` rows: the member the newcomer outranks slides down one
+    place, and the row pushed past ``k`` drops out — "if it beats 2nd, it
+    takes 2nd and 2nd becomes 3rd". Non-finite scores never enter."""
+    k = int(k)
+    if k < 1 or not math.isfinite(entry.score):
+        return board, None
+    if any(e.checkpoint_id == entry.checkpoint_id for e in board):
+        return board, None
+    pos = len(board)
+    for i, e in enumerate(board):
+        if entry.score < e.score:
+            pos = i
+            break
+    if pos >= k:
+        return board, None
+    new = (*board[:pos], entry, *board[pos:])
+    return new[:k], pos + 1
+
+
+def alltime_members(
+    board: tuple[LeaderEntry, ...], *, k_max: int, quality_epsilon: float,
+) -> list[LeaderEntry]:
+    """The member set the all-time rule declares: the board's top ``k_max``
+    rows that sit within ``(1 + quality_epsilon)`` of the best (the envelope
+    validators verify — a 3rd-best that trails the best by more than the
+    epsilon is not a legal member and is left out, never padded). Rank order
+    is the rotation order."""
+    if not board or k_max < 1:
+        return []
+    best = board[0].score
+    floor = best * (1.0 + float(quality_epsilon))
+    return [e for e in board[:int(k_max)] if e.score <= floor]
 
 
 def error_correlations(
@@ -237,6 +395,14 @@ class TrainerPromotion:
     # select_members' error-decorrelation policy. Best-effort: absent/stale
     # entries just fall back to structural diversity for those candidates.
     error_vectors_path: Path | None = None
+    # All-time rule (DEC-CA-0044): the activation block (0 = never), the
+    # notice period in blocks between announcing a member-set change and
+    # firing it, and the suite weights the leaderboard ranks on. The
+    # leaderboard itself accumulates from every signed bench report the
+    # engine sees, activation or not — at the block it is already populated.
+    alltime_from_block: int = 0
+    notice_blocks: int = 7200
+    suite_weights: tuple[float, float, float] = DEFAULT_SUITE_WEIGHTS
 
     generation: int = 0
     members: tuple[PromotedMember, ...] = ()
@@ -248,6 +414,12 @@ class TrainerPromotion:
     # must be retried from here — losing the record would leave the fleet with
     # no way to verify the generation the pointer file already rotates over.
     pending_record: PromotionRecord | None = None
+    # All-time leaderboard state: the rank-ordered top-k population, the
+    # announced-but-not-fired change, and whether the deploy-time history
+    # backfill (every published bench report, not just the reign's) has run.
+    leaderboard: tuple[LeaderEntry, ...] = ()
+    pending_change: PendingChange | None = None
+    leaderboard_seeded: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -264,6 +436,9 @@ class TrainerPromotion:
         round_cfg: object | None = None,
         min_round_spacing: int = 1,
         error_vectors_path: Path | None = None,
+        alltime_from_block: int = 0,
+        notice_blocks: int = 7200,
+        suite_weights: tuple[float, float, float] = DEFAULT_SUITE_WEIGHTS,
     ) -> TrainerPromotion:
         """Restore the engine from ``state_path`` (fresh when absent/corrupt),
         then grandfather a pre-DEC-CA-0013 pointer file — the single winner the
@@ -274,6 +449,8 @@ class TrainerPromotion:
             quality_epsilon=quality_epsilon, min_round_spacing=min_round_spacing,
             state_path=state_path, pointer_path=pointer_path, round_cfg=round_cfg,
             error_vectors_path=error_vectors_path,
+            alltime_from_block=int(alltime_from_block), notice_blocks=int(notice_blocks),
+            suite_weights=tuple(suite_weights),
         )
         if state_path.is_file():
             try:
@@ -302,6 +479,20 @@ class TrainerPromotion:
             )
             for c in (obj.get("candidates") or ())
         )
+        board = []
+        for o in obj.get("leaderboard") or ():
+            try:
+                board.append(LeaderEntry.from_json(o))
+            except (KeyError, TypeError, ValueError):
+                continue  # a malformed row is dropped, never the whole board
+        # Re-rank under the CURRENT weights: a weight change in chain.toml
+        # re-sorts the persisted population instead of freezing stale ranks.
+        self.leaderboard = tuple(sorted(
+            (e.rescored(self.suite_weights) for e in board),
+            key=lambda e: (e.score, e.created_block, e.checkpoint_id)))
+        pc = obj.get("pending_change")
+        self.pending_change = PendingChange.from_json(pc) if pc else None
+        self.leaderboard_seeded = bool(obj.get("leaderboard_seeded", False))
         pr = obj.get("pending_record")
         if pr:
             self.pending_record = PromotionRecord(
@@ -397,6 +588,9 @@ class TrainerPromotion:
         generation's round must not seed the new one. Returns how many
         candidates were added."""
         ws = str(getattr(manifest, "warm_start_ckpt", "") or "")
+        # The all-time leaderboard admits every signed bench (any generation,
+        # any reign): the population is all-time by definition.
+        self.admit_report(report)
         with self._lock:
             live = {m.checkpoint_id for m in self.members}
             if ws not in live and not (ws == "" and self.generation == 0):
@@ -429,6 +623,163 @@ class TrainerPromotion:
                          len(self.candidates))
             return added
 
+    def admit_report(self, report: object) -> int:
+        """Offer every entry of a trainer-signed bench report to the all-time
+        leaderboard (DEC-CA-0044). Returns how many entries made the board.
+        Idempotent (a listed pointer is skipped) and reign-agnostic — the
+        deploy-time history backfill and the per-round bench thread both
+        feed it. Thread-safe."""
+        with self._lock:
+            k = max(1, int(self.k_max))
+            block = int(getattr(report, "created_block", 0) or 0)
+            admitted = 0
+            for e in getattr(report, "entries", ()):
+                sc = e.scores
+                entry = LeaderEntry(
+                    checkpoint_id=e.trained_pointer, size=e.size,
+                    hotkey=e.miner_hotkey, role=e.role,
+                    source_round=str(getattr(report, "round_id", "")),
+                    created_block=block,
+                    gifteval_crps=float(sc.gifteval_crps),
+                    gifteval_mase=float(sc.gifteval_mase),
+                    boom_crps=float(sc.boom_crps), boom_mase=float(sc.boom_mase),
+                    time_crps=float(sc.time_crps), time_mase=float(sc.time_mase),
+                    score=weighted_cascade_score(
+                        sc.gifteval_crps, sc.gifteval_mase, sc.boom_crps,
+                        sc.boom_mase, sc.time_crps, sc.time_mase,
+                        weights=self.suite_weights),
+                )
+                self.leaderboard, rank = admit_leader(self.leaderboard, entry, k)
+                if rank is not None:
+                    admitted += 1
+                    log.info("trainer promotion: all-time leaderboard #%d ← %s "
+                             "(%.5f weighted, round=%s %s)", rank, entry.checkpoint_id,
+                             entry.score, entry.source_round, entry.role or "duel")
+            if admitted:
+                self._persist()
+            return admitted
+
+    def mark_leaderboard_seeded(self) -> None:
+        with self._lock:
+            self.leaderboard_seeded = True
+            self._persist()
+
+    def alltime_active(self, block: int) -> bool:
+        """Whether a round at ``block`` selects under the all-time rule."""
+        return self.alltime_from_block > 0 and int(block) >= int(self.alltime_from_block)
+
+    def upcoming(self) -> dict | None:
+        """The announced-but-unfired member-set change as the status-doc
+        ``warm_start.upcoming`` block, or ``None``."""
+        with self._lock:
+            return None if self.pending_change is None else self.pending_change.to_json()
+
+    def leaderboard_rows(self) -> list[dict]:
+        """The rank-ordered leaderboard as public-doc rows."""
+        with self._lock:
+            return [{"rank": i + 1, **e.to_json()} for i, e in enumerate(self.leaderboard)]
+
+    def _maybe_promote_alltime(self, *, epoch_block: int, round_id: str) -> PromotionRecord | None:
+        """The all-time rule's boundary step (caller holds the lock).
+
+        Target = the leaderboard's top-k within the quality epsilon. When it
+        differs from the live set and nothing is announced, ANNOUNCE it
+        (effective ``notice_blocks`` later) and hold. When a change is
+        announced and its effective block has arrived — and at least
+        ``notice_blocks`` passed since the reign anchor (a dethrone during the
+        window resets that, and the validators' spacing check mirrors it) —
+        FIRE the frozen set. A frozen set that no longer sits inside the
+        envelope (a much better arrival moved the floor) is re-announced as
+        the current target rather than fired into a rejection."""
+        target = alltime_members(self.leaderboard, k_max=self.k_max,
+                                 quality_epsilon=self.quality_epsilon)
+        if not target:
+            return None
+        target_ids = [e.checkpoint_id for e in target]
+        live_ids = {m.checkpoint_id for m in self.members}
+        pending = self.pending_change
+
+        def _announce() -> None:
+            self.pending_change = PendingChange(
+                generation=self.generation + 1,
+                members=tuple(PromotedMember(
+                    checkpoint_id=e.checkpoint_id, size=e.size,
+                    source_round=e.source_round, score=e.score) for e in target),
+                announced_round=str(round_id), announced_block=int(epoch_block),
+                effective_block=int(epoch_block) + int(self.notice_blocks),
+            )
+            self._persist()
+            log.info("PROMOTION ANNOUNCED (all-time rule): generation %d will train from "
+                     "[%s] from block %d (%d blocks' notice); announced at round=%s",
+                     self.generation + 1,
+                     ", ".join(f"{e.checkpoint_id} ({e.score:.5f})" for e in target),
+                     int(epoch_block) + int(self.notice_blocks), int(self.notice_blocks),
+                     round_id)
+
+        if pending is None:
+            if set(target_ids) == live_ids:
+                return None
+            _announce()
+            return None
+        if set(pending.member_ids()) == live_ids:
+            # The announced set is already live (state restored from a pointer
+            # the fire had written): nothing left to fire.
+            self.pending_change = None
+            self._persist()
+            return None
+        # Envelope re-check on the frozen set: every announced member must
+        # still sit within epsilon of the CURRENT all-time best, or validators
+        # reject the record on their (better) floor.
+        best = self.leaderboard[0].score if self.leaderboard else float("nan")
+        floor = best * (1.0 + float(self.quality_epsilon))
+        by_id = {e.checkpoint_id: e for e in self.leaderboard}
+        frozen_ok = all(
+            (m.checkpoint_id in by_id and by_id[m.checkpoint_id].score <= floor)
+            or (m.checkpoint_id not in by_id and math.isfinite(m.score) and m.score <= floor)
+            for m in pending.members)
+        if not frozen_ok:
+            log.warning("trainer promotion: announced set [%s] fell outside the quality "
+                        "envelope (all-time best now %.5f); re-announcing the current "
+                        "target", ", ".join(pending.member_ids()), best)
+            _announce()
+            return None
+        if int(epoch_block) < int(pending.effective_block):
+            log.info("trainer promotion: announced generation %d takes effect at block %d "
+                     "(%d blocks to go); holding", pending.generation,
+                     pending.effective_block, int(pending.effective_block) - int(epoch_block))
+            return None
+        if (self.reign_start_block is not None
+                and int(epoch_block) - int(self.reign_start_block) < int(self.notice_blocks)):
+            log.info("trainer promotion: announced generation %d is due but the reign "
+                     "anchor moved (block %d) inside the notice period; holding until "
+                     "block %d", pending.generation, int(self.reign_start_block),
+                     int(self.reign_start_block) + int(self.notice_blocks))
+            return None
+        self.generation += 1
+        self.members = tuple(pending.members)
+        self.candidates = ()
+        self.pending_change = None
+        self.reign_start_block = int(epoch_block)
+        record = PromotionRecord(
+            generation=self.generation,
+            king_hotkey=self.king_hotkey or "",
+            fired_round=str(round_id),
+            fired_block=int(epoch_block),
+            members=self.members,
+        )
+        self.pending_record = record
+        self._persist()
+        self._write_pointer()
+        log.info(
+            "PROMOTION fired (all-time rule): generation=%d members=[%s]; announced at "
+            "round=%s block %d; king %s persists, reign clock reset",
+            self.generation,
+            ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
+            pending.announced_round, pending.announced_block,
+            (self.king_hotkey or "?")[:12],
+        )
+        return record
+
     def maybe_promote(self, *, epoch_block: int, round_id: str) -> PromotionRecord | None:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
@@ -440,6 +791,8 @@ class TrainerPromotion:
         with self._lock:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
+            if self.alltime_active(epoch_block):
+                return self._maybe_promote_alltime(epoch_block=epoch_block, round_id=round_id)
             clock = _ClockState(king_hotkey=self.king_hotkey,
                                 reign_start_block=self.reign_start_block)
             elapsed = reign_rounds(clock, int(epoch_block), self.round_cfg)
@@ -575,6 +928,10 @@ class TrainerPromotion:
                  "epoch_index": c.epoch_index, "score": c.score}
                 for c in self.candidates
             ],
+            "leaderboard": [e.to_json() for e in self.leaderboard],
+            "pending_change": (None if self.pending_change is None
+                               else self.pending_change.to_json()),
+            "leaderboard_seeded": self.leaderboard_seeded,
             "pending_record": None if self.pending_record is None else {
                 "generation": self.pending_record.generation,
                 "king_hotkey": self.pending_record.king_hotkey,
@@ -605,6 +962,8 @@ class TrainerPromotion:
         body = {
             "generation": self.generation,
             "selection": "epoch_rotation",
+            "rule": ("alltime_top_k" if self.alltime_active(self.reign_start_block or 0)
+                     else "reign_scoped"),
             "members": [
                 {"checkpoint_id": m.checkpoint_id, "size": m.size,
                  "source_round": m.source_round, "score": m.score}

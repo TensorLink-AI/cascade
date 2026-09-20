@@ -393,6 +393,23 @@ in-context.
   `batch_points`). Worker image REBUILD before the first 5h round (v0.8.0
   bills C×L). No validator restart (declared gating; no locked term moves).
   (`decisions/DEC-CA-0042-series-points-budget-five-hour-legs.md`)
+- **DEC-CA-0044** (proposed) — Warm-start init = ONE fixed population: the
+  all-time top-3 benched checkpoints (any reign) ranked by the suite-WEIGHTED
+  score GIFT-Eval:BOOM:TIME = 50:25:25 (`weighted_cascade_score`; each suite the
+  geomean of its CRPS+MASE), within `cascade_quality_epsilon`; rank insertion
+  (beat 2nd ⇒ 2nd, 2nd→3rd, 3rd out; equal never displaces); rounds still
+  rotate. A set change is ANNOUNCED first and fires `cascade_notice_blocks`
+  (7200 ≈ 24h) later — status docs `warm_start.upcoming`,
+  `promotions/leaderboard.json`, dashboard banner, `cascade leaderboard`,
+  `cascade score --warm-start upcoming` — the announced set frozen for the
+  window. CONSENSUS, block-gated `[scoring] cascade_alltime_from_block`
+  (testnet 1, mainnet 0 — release-then-activate, docs/ALLTIME_INIT_ROLLOUT.md):
+  validators verify provenance against ANY signed bench report, the floor on
+  the weighted score, and the notice period as the timing predicate instead of
+  `cascade_reign_rounds`. Supersedes DEC-CA-0017's rejection of the global
+  pool (owner-directed) and retires DEC-CA-0015's decorrelation pick under the
+  rule; the no-downgrade guard becomes implicit (the board only improves).
+  (`decisions/DEC-CA-0044-alltime-top-k-init-with-notice.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
@@ -404,7 +421,8 @@ in-context.
   measurements, pool content, per-size pins, and deploys — never code.
 
 New decisions get the next `DEC-CA-####` node in `decisions/` plus a one-line
-pointer here (DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
+pointer here (DEC-CA-0043 is claimed by submission labels in code without a
+node; DEC-CA-0044 by the all-time init leaderboard; DEC-CA-0012 is claimed by PR-173's tie-aware cohort duel;
 DEC-CA-0020..0028 are claimed by the 2026-08-13/14 submission-surface design
 pass, renumbered +4 on 2026-08-20 after colliding with the accepted
 decay/guard/wsd/jitter nodes 0016..0019; DEC-CA-0036 is claimed by the

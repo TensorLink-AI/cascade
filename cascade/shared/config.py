@@ -1552,6 +1552,28 @@ class ScoringConfig:
     # with a materially worse init.
     cascade_top_k: int = 3
     cascade_quality_epsilon: float = 0.05
+    # All-time top-k warm-start leaderboard (DEC-CA-0044, block-gated). From a
+    # round whose epoch boundary is >= this block the promoted member set is
+    # ONE fixed population: the all-time top ``cascade_top_k`` benched
+    # checkpoints (any reign, any generation) ranked by the suite-WEIGHTED
+    # score below, still within ``cascade_quality_epsilon`` of the best. A
+    # better checkpoint replaces the member it outranks (3rd drops out; 2nd
+    # slides to 3rd), the change is ANNOUNCED first and takes effect
+    # ``cascade_notice_blocks`` later (24h at 12 s/block) so miners can
+    # prepare (`cascade round` / the dashboard / `cascade score --warm-start
+    # upcoming`). CONSENSUS: validators judge a record under its round's
+    # block — provenance widens from the current reign to any trainer-signed
+    # bench report, the quality floor is measured with the weighted score,
+    # and the notice period replaces the reign clock as the timing predicate.
+    # Release-then-activate: every validator must carry this release before
+    # the block. 0 = the reign-scoped rule (DEC-CA-0013/0015/0017) forever.
+    cascade_alltime_from_block: int = 0
+    cascade_notice_blocks: int = 7200
+    # Suite weights for the all-time rule's score (GIFT-Eval : BOOM : TIME);
+    # normalised, so only the ratio matters. Consensus with the rule above.
+    cascade_weight_gifteval: float = 0.5
+    cascade_weight_boom: float = 0.25
+    cascade_weight_time: float = 0.25
     # Block-gated contract transition (the DEC-CA-0016/0019 release-then-
     # activate pattern applied to contract_digest itself). When BOTH are set,
     # a manifest whose epoch-boundary block precedes ``contract_from_block``
@@ -1937,6 +1959,21 @@ def effective_margin_mode(scoring: ScoringConfig, block: int | None) -> str:
             and int(block) >= scoring.increment_from_block):
         return "increment"
     return scoring.margin_mode
+
+
+def cascade_alltime_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """Whether a round at ``block`` selects and verifies the warm-start set
+    under the all-time leaderboard rule (DEC-CA-0044): ``cascade_alltime_from_block``
+    set and reached. ``0`` / unknown block ⇒ False (reign-scoped rule)."""
+    return (scoring.cascade_alltime_from_block > 0 and block is not None
+            and int(block) >= scoring.cascade_alltime_from_block)
+
+
+def cascade_suite_weights(scoring: ScoringConfig) -> tuple[float, float, float]:
+    """The ``(gifteval, boom, time)`` suite weights the all-time rule scores
+    with (see :func:`cascade.validator.cascade.weighted_cascade_score`)."""
+    return (float(scoring.cascade_weight_gifteval), float(scoring.cascade_weight_boom),
+            float(scoring.cascade_weight_time))
 
 
 def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
@@ -2392,6 +2429,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             ),
             cascade_top_k=int(s.get("cascade_top_k", 3)),
             cascade_quality_epsilon=float(s.get("cascade_quality_epsilon", 0.05)),
+            cascade_alltime_from_block=max(0, int(s.get("cascade_alltime_from_block", 0) or 0)),
+            cascade_notice_blocks=max(0, int(s.get("cascade_notice_blocks", 7200) or 0)),
+            cascade_weight_gifteval=float(s.get("cascade_weight_gifteval", 0.5)),
+            cascade_weight_boom=float(s.get("cascade_weight_boom", 0.25)),
+            cascade_weight_time=float(s.get("cascade_weight_time", 0.25)),
             prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
             contract_from_block=int(s.get("contract_from_block", 0) or 0),
             declared_contract_from_block=int(s.get("declared_contract_from_block", 0) or 0),
