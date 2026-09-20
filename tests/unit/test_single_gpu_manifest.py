@@ -46,7 +46,9 @@ def test_allow_mixed_and_no_king_keep_everything():
 
 
 def test_runner_records_dropped_funded_entries_as_sold_out(tmp_path):
-    r = _runner(tmp_path)
+    # locked-type mode: the open market (funded_sku_per_leg, on by default
+    # since #294) allows mixed types because its validators lift the gate
+    r = _runner(tmp_path, funded_sku_per_leg=False)
     r._enforce_single_gpu_manifest = TrainerRunner._enforce_single_gpu_manifest.__get__(r)
     entries = [_e("king", "NVIDIA GeForce RTX 4090", role="king"),
                _e("hkA", "NVIDIA GeForce RTX 4090"), _e("hkB", "NVIDIA L40S", uid=7)]
