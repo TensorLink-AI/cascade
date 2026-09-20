@@ -651,6 +651,41 @@ def plan_round(
     return RoundPlan(king=king, challengers=challengers)
 
 
+def _split_mixed_gpu_entries(
+    entries: list[TrainedEntry], *, allow_mixed: bool = False,
+) -> tuple[list[TrainedEntry], list[TrainedEntry]]:
+    """``(kept, dropped)``: the entries a validator will accept together.
+
+    The validator's manifest gate (``cascade.validator.loop._check_gpu``)
+    rejects a manifest whose entries — per size — carry more than one
+    ``gpu_name`` (``gpu_mismatch``), and every validator runs it. A round
+    whose legs landed on mixed types (2026-09-20: king + 5 on RTX 4090, 8
+    on L40S operator lanes) would therefore score NOBODY. Keep the KING's
+    type per size (no king = no round, so the king's group is the only one
+    that can be judged); challengers on another type are dropped here and
+    settled as sold-out (requeued, unburned) — their training was wasted,
+    their submission was never judged. Entries without a ``gpu_name`` pass
+    (the gate ignores them). ``allow_mixed`` (an open-market round whose
+    validators no longer gate on type) keeps everything.
+    """
+    if allow_mixed:
+        return list(entries), []
+    king_gpu = {e.size: e.gpu_name for e in entries if e.role == "king" and e.gpu_name}
+    if not king_gpu:
+        return list(entries), []
+    kept: list[TrainedEntry] = []
+    dropped: list[TrainedEntry] = []
+    for e in entries:
+        # A size without a king entry cannot be duelled anyway (the validator
+        # drops it from the cohort, harmlessly) — nothing to enforce there.
+        want = king_gpu.get(e.size)
+        if e.role == "king" or not e.gpu_name or want is None or e.gpu_name == want:
+            kept.append(e)
+        else:
+            dropped.append(e)
+    return kept, dropped
+
+
 def _drop_final_content_clones(
     entries: list[TrainedEntry], jobs: list[tuple[ResolvedGenerator, str]]
 ) -> list[TrainedEntry]:
@@ -1491,6 +1526,29 @@ class TrainerRunner:
                 log.info("round %s: champion code published (%s)", round_id, digest)
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
+
+    def _enforce_single_gpu_manifest(self, entries: list) -> list:
+        """Drop challenger entries whose GPU type differs from the king's
+        (see :func:`_split_mixed_gpu_entries`) and record each as a sold-out
+        failure so :meth:`_settle_funded` requeues it unburned. Mixed types
+        are allowed only when ``[round] funded_sku_per_leg`` is on (the
+        open-market mode, whose validators do not gate on type)."""
+        allow = bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
+        kept, dropped = _split_mixed_gpu_entries(entries, allow_mixed=allow)
+        if not dropped:
+            return kept
+        king_gpu = sorted({e.gpu_name for e in kept if e.role == "king" and e.gpu_name})
+        for e in dropped:
+            msg = (f"gpu_mismatch: trained on {e.gpu_name!r} while the king ran on "
+                   f"{king_gpu} — the validators reject a mixed-GPU manifest; entry "
+                   f"dropped from the manifest and requeued (unburned)")
+            log.error("final challenger %s (uid %s): %s", e.miner_hotkey, e.miner_uid, msg)
+            self._record_funded_failure(e.miner_hotkey, msg, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+        log.error("manifest keeps %d entr%s on %s and DROPS %d on other GPU types — "
+                  "keep every lane of a round on ONE type",
+                  len(kept), "y" if len(kept) == 1 else "ies", king_gpu, len(dropped))
+        return kept
 
     def _settle_funded(self, jobs: list, entries: list) -> None:
         """Settle each funded entry from its DUEL-leg outcome (required mode).
@@ -5626,6 +5684,10 @@ class TrainerRunner:
             self._log_duel_geometry(base_seed, len(jobs), screen_block)
 
         entries = self._train_final(jobs, seeds, block, warm_start=warm_start)
+        # One GPU type per manifest (the validators' gate) — BEFORE the settle,
+        # so a challenger trained on the wrong type is requeued unburned
+        # rather than marked judged.
+        entries = self._enforce_single_gpu_manifest(entries)
         # The judgment moment for funded entries: their duel legs have run (or
         # failed) — settle each from its outcome. A king failure raised out of
         # _train_final skips this on purpose: an aborted round judged nobody,
