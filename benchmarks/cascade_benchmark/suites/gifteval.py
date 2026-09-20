@@ -18,13 +18,16 @@ Set ``GIFT_EVAL`` to the downloaded benchmark data.
 
 from __future__ import annotations
 
+import logging
 import os
 import traceback
 
 from ..aggregate import official_aggregate
 from ..resources import load_json
 from ..results import SuiteResult
-from ._common import build_dataset, score_dataset
+from ._common import build_dataset_or_reason, describe_exception, score_dataset
+
+log = logging.getLogger("cascade_benchmark.gifteval")
 
 # Verbatim from gift-eval notebooks/naive.ipynb @ 1527c415 (the full lists; the
 # notebook ships them commented out for a fast 2-dataset demo).
@@ -139,26 +142,45 @@ def run(
         properties = load_json("gifteval_dataset_properties.json")
         baseline = load_json("gifteval_seasonal_naive.json")
         rows = []
-        for ds_name, term in _name_term_pairs(max_series):
-            ds = build_dataset(ds_name, term)
+        skipped: list[dict] = []
+        pairs = list(_name_term_pairs(max_series))
+        for ds_name, term in pairs:
+            full = _baseline_key(ds_name, term, properties)
+            ds, reason = build_dataset_or_reason(ds_name, term)
             if ds is None:
+                # One dataset must not abort the sweep — but it must not
+                # vanish either: record it so the report says what it covers.
+                log.warning("gift-eval: %s not loaded: %s", full, reason)
+                skipped.append({"full": full, "stage": "load", "reason": reason})
                 continue
             try:
                 m = score_dataset(
                     ds, checkpoint_dir,
                     num_samples=num_samples, device=device, batch_size=batch_size,
                 )
-            except Exception:  # noqa: BLE001 — one dataset must not abort the sweep
+            except Exception as e:  # noqa: BLE001 — one dataset must not abort the sweep
+                reason = describe_exception(e)
+                log.warning("gift-eval: %s not scored: %s", full, reason)
+                skipped.append({"full": full, "stage": "score", "reason": reason})
                 continue
-            rows.append({"full": _baseline_key(ds_name, term, properties), **m})
+            rows.append({"full": full, **m})
 
         if not rows:
-            return SuiteResult(suite="gift-eval", status="error", detail="no datasets scored")
+            return SuiteResult(
+                suite="gift-eval", status="error", detail="no datasets scored",
+                skipped=skipped, n_expected=len(pairs),
+            )
         agg = official_aggregate(rows, baseline)
         metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
+        detail = ""
+        if skipped:
+            detail = (f"partial: {len(skipped)} of {len(pairs)} configs skipped: "
+                      + ", ".join(s["full"] for s in skipped))
+            log.warning("gift-eval: %s", detail)
         return SuiteResult(
             suite="gift-eval", status="ok", metrics=metrics, n_series=agg["n_scored"],
-            rows=_ratio_rows(rows, baseline),
+            detail=detail, rows=_ratio_rows(rows, baseline),
+            skipped=skipped, n_expected=len(pairs),
         )
     except ImportError as e:
         return SuiteResult(suite="gift-eval", status="skipped", detail=f"gift-eval not importable: {e}")

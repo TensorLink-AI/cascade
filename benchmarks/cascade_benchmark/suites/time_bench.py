@@ -22,6 +22,7 @@ Real-TSF/TIME data. ``CASCADE_BENCH_TIME_DATASETS`` optionally restricts the
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -31,8 +32,12 @@ from pathlib import Path
 import numpy as np
 
 from .. import cache
-from ..predictor import _load_wrapper
+from ..predictor import _load_wrapper, impute_history
+from ..aggregate import _CRPS_ALIASES, _MASE_ALIASES, _ci_get
 from ..results import SuiteResult
+from ._common import describe_exception
+
+log = logging.getLogger("cascade_benchmark.time")
 
 # TIME's default quantile grid (experiments/chronos2.py) — identical to cascade's.
 QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -49,6 +54,17 @@ def _wrapper_quantile_grid_matches(wrapper) -> bool:
     )
 
 
+def _contexts(wrapper, target) -> np.ndarray:
+    """``(V, L)`` float64 contexts for the wrapper. Missing values (NaN/±inf in
+    TIME's data — 20 of 98 tasks carry them) are imputed exactly as the gluonts
+    suites do (``impute_history``: ffill, bfill, all-missing → zeros) unless the
+    wrapper advertises ``handles_missing`` and takes the raw gaps itself."""
+    t = np.atleast_2d(np.asarray(target, dtype=np.float64))  # (V, L)
+    if getattr(wrapper, "handles_missing", False):
+        return t
+    return np.stack([impute_history(row) for row in t]) if t.size else t
+
+
 def _instance_quantiles(wrapper, target, horizon: int, num_samples: int) -> np.ndarray:
     """One TIME eval instance's forecast, shaped ``(num_q, num_variates, H)``.
 
@@ -57,7 +73,7 @@ def _instance_quantiles(wrapper, target, horizon: int, num_samples: int) -> np.n
     CPM checkpoints hand back the quantile head directly on TIME's grid; older
     checkpoints draw sample paths and collapse them to the grid.
     """
-    t = np.atleast_2d(np.asarray(target, dtype=np.float64))  # (V, L)
+    t = _contexts(wrapper, target)  # (V, L)
     if _wrapper_quantile_grid_matches(wrapper):
         q = np.asarray(wrapper.forecast_quantiles_batch(list(t), horizon))  # (V, H, num_q)
         return np.transpose(q, (2, 0, 1))  # (num_q, V, H)
@@ -122,8 +138,9 @@ def _metrics_from_quantiles(dataset, fc_quantiles, ds_config, output_base_dir, s
 def _score_one(
     wrapper, name: str, term: str, config, out_dir: str, num_samples: int,
     batch_size: int = 64, *, normalize: bool = True,
-) -> tuple[dict, dict]:
-    """Run one TIME task and return ``(model_metrics, seasonal_naive_metrics)``,
+) -> tuple[dict, dict, dict]:
+    """Run one TIME task and return ``(model_metrics, seasonal_naive_metrics, info)``
+    — ``info`` carries ``num_variates`` / ``prediction_length`` for the per-task row;
     each ``{metric_name: mean_value}`` computed by TIME's own metric code. The
     Seasonal-Naive baseline is scored through the identical saver+metric path, so
     the caller can normalize the model metric by the baseline metric per task (the
@@ -151,6 +168,8 @@ def _score_one(
     season = get_seasonality(dataset.freq)
 
     eval_inputs = list(dataset.test_data.input)
+    info = {"num_variates": int(np.atleast_2d(np.asarray(eval_inputs[0]["target"])).shape[0])
+            if eval_inputs else 0, "prediction_length": int(pred_len or 0)}
     if _wrapper_quantile_grid_matches(wrapper):
         # Quantile head, batched across instances *and* variates: flatten every
         # (instance, variate) context into one job list, chunk it through
@@ -158,7 +177,7 @@ def _score_one(
         jobs: list[np.ndarray] = []
         counts: list[int] = []
         for d in eval_inputs:
-            t = np.atleast_2d(np.asarray(d["target"], dtype=np.float64))
+            t = _contexts(wrapper, d["target"])
             jobs.extend(t)
             counts.append(t.shape[0])
         chunks = [
@@ -203,7 +222,7 @@ def _score_one(
             dataset, snaive, ds_config, Path(out_dir) / "snaive", season, "seasonal_naive",
         )
         cache.store_baseline(cache_dir, name, term, pred_len, n_q, snaive_metrics)
-    return model_metrics, snaive_metrics
+    return model_metrics, snaive_metrics, info
 
 
 def run(
@@ -242,22 +261,41 @@ def run(
 
         model_rows: list[dict] = []
         snaive_rows: list[dict] = []
+        skipped: list[dict] = []  # a task that fails is RECORDED, never dropped silently
+        rows: list[dict] = []     # per-task model + Seasonal-Naive metrics (uni/multi splits)
+        tasks = list(_tasks(config, max_series))
         with tempfile.TemporaryDirectory(prefix="cascade-time-") as out_dir:
-            for j, (name, term) in enumerate(_tasks(config, max_series)):
+            for j, (name, term) in enumerate(tasks):
                 try:
                     # Per-task subdir keeps every task's (and role's) metrics.npz
                     # isolated under the shared temp root.
-                    model_m, snaive_m = _score_one(
+                    model_m, snaive_m, info = _score_one(
                         wrapper, name, term, config, str(Path(out_dir) / str(j)),
                         num_samples, batch_size, normalize=not raw_mode,
                     )
-                except Exception:  # noqa: BLE001 — one task must not abort the sweep
+                except Exception as e:  # noqa: BLE001 — one task must not abort the sweep
+                    reason = describe_exception(e)
+                    log.warning("time: %s/%s not scored: %s", name, term, reason)
+                    skipped.append({"full": f"{name}/{term}", "stage": "score", "reason": reason})
                     continue
                 model_rows.append(model_m)
                 snaive_rows.append(snaive_m)
+                if not all(np.isfinite(float(_ci_get(model_m, a) or np.nan))
+                           for a in (_CRPS_ALIASES, _MASE_ALIASES)):
+                    # The leaderboard aggregate mean-replaces an invalid task
+                    # (``_clean``), so the headline still includes it — but the
+                    # report must say so instead of hiding it in a mean.
+                    reason = "non-finite CRPS/MASE (mean-replaced in the aggregate)"
+                    log.warning("time: %s/%s %s", name, term, reason)
+                    skipped.append({"full": f"{name}/{term}", "stage": "metric", "reason": reason})
+                rows.append({"full": f"{name}/{term}", **info,
+                             "CRPS": _ci_get(model_m, _CRPS_ALIASES), "MASE": _ci_get(model_m, _MASE_ALIASES),
+                             "snaive_CRPS": _ci_get(snaive_m, _CRPS_ALIASES),
+                             "snaive_MASE": _ci_get(snaive_m, _MASE_ALIASES)})
 
         if not model_rows:
-            return SuiteResult(suite="time", status="error", detail="no TIME tasks scored")
+            return SuiteResult(suite="time", status="error", detail="no TIME tasks scored",
+                               skipped=skipped, n_expected=len(tasks))
 
         # Parity with GIFT-Eval/BOOM (and TIME's own leaderboard): per-task ratio to
         # the Seasonal-Naive baseline, aggregated by the shifted geometric mean.
@@ -277,7 +315,18 @@ def run(
             if not raw_mode:
                 print("time: Seasonal-Naive normalization produced nothing; reporting raw "
                       "means (NOT comparable to gift-eval/boom)", file=sys.stderr)
-        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=len(model_rows))
+        detail = ""
+        dropped = [x for x in skipped if x["stage"] != "metric"]
+        invalid = [x for x in skipped if x["stage"] == "metric"]
+        if dropped:
+            detail = f"partial: {len(dropped)} of {len(tasks)} tasks skipped: " + ", ".join(
+                x["full"] for x in dropped[:8]) + (" …" if len(dropped) > 8 else "")
+        if invalid:
+            detail += ("; " if detail else "") + (
+                f"{len(invalid)} of {len(tasks)} tasks non-finite (mean-replaced): "
+                + ", ".join(x["full"] for x in invalid[:8]) + (" …" if len(invalid) > 8 else ""))
+        return SuiteResult(suite="time", status="ok", metrics=metrics, n_series=len(model_rows),
+                           detail=detail, skipped=skipped, n_expected=len(tasks), rows=rows)
     except ImportError as e:
         return SuiteResult(suite="time", status="skipped", detail=f"timebench not importable: {e}")
     except Exception as e:  # noqa: BLE001

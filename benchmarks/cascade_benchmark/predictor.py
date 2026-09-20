@@ -22,6 +22,20 @@ for those we fall back to the original per-series ``SampleForecast`` path.
 Multivariate entries are forecast one variate at a time and stacked — mirroring
 cascade's per-channel scoring (both gluonts suites univariate-ize upstream, so
 this branch is rarely hit).
+
+Missing values: 23 of GIFT-Eval's 97 configs (electricity, bitbrains,
+kdd_cup_2018, car_parts, restaurant, hierarchical_sales, temperature_rain,
+jena_weather hourly long) carry NaN in the history — the ``_with_missing``
+sets by design, the others as late-start padding. The cascade wrapper is the
+validator's trusted inference path and the private pool has no gaps, so it
+propagates NaN → a NaN forecast → gluonts raises ``Forecast contains NaN
+values`` → the whole config was dropped (silently, until 2026-09-18). Every
+leaderboard model handles gaps its own way (Toto 2 takes a ``target_mask``
+and masks missing points out of its scaler and attention — no imputation);
+ours is ``impute_history``: forward-fill, then
+back-fill, an all-missing series → zeros. Imputation is a sidecar concern
+only — never the wrapper's, which stays byte-identical to what the validator
+scores with.
 """
 
 from __future__ import annotations
@@ -41,6 +55,26 @@ from gluonts.model.predictor import Predictor
 # The grid the gluonts metrics are configured with (suites/_common.py's
 # QUANTILE_LEVELS — kept local because the suites import this module).
 _METRIC_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+
+def impute_history(history: np.ndarray) -> np.ndarray:
+    """Fill missing values in a 1-D history before it reaches the wrapper:
+    forward-fill, then back-fill the leading gap, and an all-missing series
+    becomes zeros. ``±inf`` counts as missing. A gap-free history is returned
+    as-is (same object — the common case costs one ``isfinite`` pass).
+    """
+    x = np.asarray(history, dtype=np.float64)
+    finite = np.isfinite(x)
+    if finite.all():
+        return x
+    if not finite.any():
+        return np.zeros_like(x)
+    idx = np.where(finite, np.arange(x.size), -1)
+    np.maximum.accumulate(idx, out=idx)            # last finite index so far
+    out = np.where(idx >= 0, x[np.maximum(idx, 0)], np.nan)
+    first = int(np.argmax(finite))                  # back-fill the leading gap
+    out[:first] = x[first]
+    return out
 
 
 def _load_wrapper(checkpoint_dir: Path, device: str):
@@ -81,6 +115,10 @@ class CheckpointPredictor(Predictor):
         self.device = device
         self.batch_size = max(1, int(batch_size))
         self._wrapper = _load_wrapper(Path(checkpoint_dir), device)
+        # A wrapper that advertises ``handles_missing = True`` takes the raw
+        # history and turns non-finite entries into its own observation mask
+        # (the CPM mask channel); everything else gets ``impute_history``.
+        self._handles_missing = bool(getattr(self._wrapper, "handles_missing", False))
         levels = getattr(self._wrapper, "quantile_levels", None)
         # The quantile path requires the wrapper's grid to be exactly the one
         # the gluonts metrics request (mirrors time_bench's check): on any
@@ -110,6 +148,8 @@ class CheckpointPredictor(Predictor):
         for entry in dataset:
             target = np.asarray(entry[FieldName.TARGET], dtype=np.float64)
             histories = [target] if target.ndim == 1 else list(target)
+            if not self._handles_missing:
+                histories = [impute_history(h) for h in histories]
             pending.append(
                 (entry[FieldName.START], entry.get(FieldName.ITEM_ID),
                  target.ndim, target.shape[-1], histories)
@@ -152,6 +192,8 @@ class CheckpointPredictor(Predictor):
 
     def _forecast_1d(self, history: np.ndarray, horizon: int) -> np.ndarray:
         """Return samples of shape ``(num_samples, horizon)`` for one series."""
+        if not self._handles_missing:
+            history = impute_history(history)
         out = np.asarray(
             self._wrapper.forecast(history, horizon, self.num_samples), dtype=np.float64
         )

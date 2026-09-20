@@ -130,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         report.suites.append(result)
         print(f"[{name}] {result.status} {result.metrics or result.detail}", file=sys.stderr)
+        if result.skipped:
+            # A partial sweep is not the benchmark — say so where the pod log
+            # (and the trainer's stderr capture) will show it.
+            print(f"[{name}] PARTIAL: scored {result.n_series} of {result.n_expected} "
+                  f"configs; skipped {len(result.skipped)}:", file=sys.stderr)
+            for s in result.skipped:
+                print(f"[{name}]   {s['full']} ({s['stage']}): {s['reason']}", file=sys.stderr)
 
     out = Path(args.out_json)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -22,8 +22,24 @@ class SuiteResult:
     # Per-config rows the consensus gate consumes: one dict per scored config,
     # ``{"full": name/freq/term, "MASE", "MAE", "CRPS", "crps_ratio",
     # "mase_ratio"}`` where the ratios are model ÷ vendored Seasonal-Naive
-    # baseline. Only ``gift-eval`` populates this; other suites leave it empty.
+    # baseline. ``boom`` rows carry ``{"full", "MASE", "MAE", "CRPS"}``; ``time``
+    # rows ``{"full": name/term, "num_variates", "prediction_length", "CRPS",
+    # "MASE", "snaive_CRPS", "snaive_MASE"}`` — enough for uni/multi splits.
     rows: list = field(default_factory=list)
+    # Skip accounting (2026-09-18: every cascade GIFT-Eval report silently
+    # covered 74 of the 97 official configs for two months — the per-config
+    # ``except: continue`` left no trace, so the headline read as
+    # leaderboard-comparable when it was not). One dict per config that was
+    # requested but produced no row: ``{"full": name/freq/term, "stage":
+    # "load" | "score", "reason": "<ExcType>: <message>"}``. ``n_expected`` is
+    # the number of configs the sweep set out to score; a consumer compares it
+    # with ``n_series`` to see whether the headline covers the whole benchmark.
+    skipped: list = field(default_factory=list)
+    n_expected: int = 0
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.n_expected) and self.n_series < self.n_expected
 
 
 @dataclass
