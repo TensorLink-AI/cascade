@@ -164,6 +164,15 @@ class _FundedOperatorFallback(Exception):
     lanes on file — runs on an operator lane instead, operator-billed. The
     explicit, owner-armed exception to _FundedLegSkip's rule (2026-09-12)."""
 
+
+class _LaneDeadlinePassed(Exception):
+    """No operator lane came free before the round's latest safe start: a leg
+    started now could not finish inside the epoch. Raised by the final lane
+    pool's deadline form so the leg fails/requeues instead of blocking on the
+    pool and starting hours late (2026-09-19: two fallback legs dispatched
+    2 h before the epoch end held the manifest past the boundary, with three
+    more queued behind them)."""
+
 # Corpus-seed salt for the bench-anneal leg (DEC-CA-0030): the anneal resumes
 # a canonical checkpoint on FRESH data (base_seed ^ salt) so the decay pass
 # never re-fits the round's exact training draw, and the salted seed keys the
@@ -730,15 +739,75 @@ class _FinalLanePool(queue.Queue):
                     super().put(h)
                     log.info("final lane pool: new lane %s joined mid-final", name)
 
-    def get(self, block: bool = True, timeout: float | None = None):
+    def _deadline_of(self, deadline, host) -> float | None:
+        """Per-lane form: ``deadline`` may be a callable ``host -> float|None``
+        (a lane's OWN latest safe start — [round] funded_sku_wall_seconds
+        makes a fast lane usable later than a slow one) or one number."""
+        if callable(deadline):
+            return deadline(host)
+        return deadline
+
+    def _latest_deadline(self, deadline) -> float | None:
+        """The last moment ANY known lane could still take this leg: the
+        wait's bound. None when unbounded (no deadline, or a lane without
+        one)."""
+        if not callable(deadline):
+            return deadline
+        latest = None
+        for h in self.known_hosts():
+            d = self._deadline_of(deadline, h)
+            if d is None:
+                return None
+            latest = d if latest is None else max(latest, d)
+        return latest
+
+    def get(self, block: bool = True, timeout: float | None = None, *,
+            deadline=None):
+        """``deadline`` (wall-clock, blocking form only): the latest moment a
+        lane may still be handed out — past it the wait ends with
+        ``_LaneDeadlinePassed`` and a lane that frees later stays in the pool
+        for a leg that CAN still fit (the next round's). None = wait forever
+        (the operator-fleet final, whose legs are sized to the epoch). A
+        callable ``host -> deadline`` gives every lane its own (per-SKU)
+        latest safe start: a lane freed past ITS deadline goes back for a
+        leg that fits it; the wait itself lasts until the latest of them."""
         if not block or timeout is not None:
             return super().get(block=block, timeout=timeout)
         while True:
+            latest = self._latest_deadline(deadline)
+            if latest is not None:
+                remaining = latest - time.time()
+                if remaining <= 0:
+                    # Past the deadline a lane that is FREE RIGHT NOW is still
+                    # handed out (owner 2026-09-20: legs go onto the rented
+                    # lanes at once — a rented lane idling is the waste); only
+                    # WAITING for one to free is what ran legs past the epoch
+                    # (2026-09-19), so that ends here.
+                    self._absorb_new()
+                    try:
+                        return super().get(block=False)
+                    except queue.Empty:
+                        raise _LaneDeadlinePassed(
+                            f"no operator lane free at the round's latest safe start "
+                            f"({time.strftime('%H:%M:%SZ', time.gmtime(latest))})"
+                        ) from None
             self._absorb_new()
+            wait = self.REFRESH_INTERVAL_S
+            if latest is not None:
+                wait = max(0.0, min(wait, latest - time.time()))
             try:
-                return super().get(timeout=self.REFRESH_INTERVAL_S)
+                host = super().get(timeout=wait)
             except queue.Empty:
                 continue
+            own = self._deadline_of(deadline, host)
+            if own is not None and time.time() >= own:
+                super().put(host)                # freed too late for THIS leg
+                if callable(deadline):
+                    # Another lane type may still fit: keep waiting for one,
+                    # but never spin on the one we just put back.
+                    time.sleep(min(1.0, max(0.0, (latest or 0) - time.time())) or 0.05)
+                continue                         # next pass raises
+            return host
 
 
 def _final_repo_suffix(
@@ -778,14 +847,16 @@ def _bench_role_dir(duel: list, entry) -> str:
     return f"{entry.role}-u{entry.miner_uid}"
 
 
-def _lium_provider(rnd, **kw):
+def _lium_provider(rnd, *, price_caps: dict | None = None, **kw):
     """An operator-key :class:`LiumProvider` carrying ``[round]
-    funded_cpu_blocklist`` (imported at call time so tests can swap the class)."""
+    funded_cpu_blocklist`` and the price guards (imported at call time so
+    tests can swap the class)."""
     from ..provision.core import LiumProvider
-    from ..provision.funded import apply_cpu_blocklist
+    from ..provision.funded import apply_cpu_blocklist, apply_price_caps
 
-    return apply_cpu_blocklist(LiumProvider(**kw),
+    prov = apply_cpu_blocklist(LiumProvider(**kw),
                                tuple(getattr(rnd, "funded_cpu_blocklist", ()) or ()))
+    return apply_price_caps(prov, **(price_caps or {}))
 
 
 def king_pod_name_prefix(netuid: int, round_id: str) -> str:
@@ -1561,6 +1632,12 @@ class TrainerRunner:
             return cap
         skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
                                               if rnd.funded_pod_sku else ())
+        if getattr(rnd, "funded_sku_per_leg", False) and skus:
+            # Open market: no round-wide type — every leg picks the cheapest
+            # fitting executor across the list at rent time.
+            self._funded_round_sku = ""
+            self._funded_admission_info["sku"] = "per-leg:" + "/".join(skus)
+            return cap
         multi = len(skus) > 1
         if not multi and not rnd.funded_capacity_probe:
             return cap
@@ -1605,13 +1682,108 @@ class TrainerRunner:
     # wrong code) before the leg gives up for the round as an infra fault.
     FUNDED_MAX_STALE_PODS = 3
 
+    def _funded_price_caps(self) -> dict:
+        """The ``[round]`` price guards as ``apply_price_caps`` kwargs."""
+        rnd = self.cfg.round
+        try:
+            default = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+        except Exception:  # noqa: BLE001 — offline fakes
+            default = 0
+        return {
+            "max_price_per_hour": float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0),
+            "max_leg_cost_usd": float(getattr(rnd, "funded_max_leg_cost_usd", 0.0) or 0.0),
+            "sku_wall_seconds": tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()),
+            "default_wall_seconds": float(default),
+        }
+
+    def _funded_skus_for_rent(self) -> tuple[str, ...]:
+        """GPU types a rent may pick: the round's locked SKU, or — with
+        ``[round] funded_sku_per_leg`` (owner 2026-09-20: open the market) —
+        every listed type, cheapest fitting executor first."""
+        rnd = self.cfg.round
+        if getattr(rnd, "funded_sku_per_leg", False):
+            skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
+            if skus:
+                return skus
+        locked = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+        return (locked,) if locked else ()
+
+    def _leg_wall_seconds(self, sku: str | None = None) -> float:
+        """Wall one full-budget leg needs on ``sku``: the measured
+        ``[round] funded_sku_wall_seconds`` entry, else the contract's
+        ``max_train_seconds``. ``sku`` None/"" = the contract cap, except in
+        per-leg mode where it is the FASTEST listed type (the last moment any
+        rent could still fit; the rent itself picks only types that fit)."""
+        from ..shared.config import funded_sku_wall_for
+
+        rnd = self.cfg.round
+        cap = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+        walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
+        if sku:
+            return funded_sku_wall_for(walls, sku, cap)
+        if getattr(rnd, "funded_sku_per_leg", False) and walls:
+            skus = self._funded_skus_for_rent()
+            if skus:
+                return min(funded_sku_wall_for(walls, s, cap) for s in skus)
+        return float(cap)
+
+    def _funded_epoch_end_known(self) -> bool:
+        if getattr(self, "_funded_epoch_end_wall", None) is not None:
+            return True
+        ctx = getattr(self, "_stage_ctx", None) or {}
+        return bool(int(ctx.get("epoch_start_block") or 0)
+                    and getattr(self, "_funded_gate_block", None) is not None)
+
+    def _skus_fitting_now(self, skus: tuple[str, ...]) -> tuple[str, ...]:
+        """Of ``skus``, the types a leg started NOW would still finish inside
+        the epoch (per-SKU latest safe start). Only per-leg mode filters —
+        a locked round keeps its single type and the wait decides."""
+        if (not getattr(self.cfg.round, "funded_sku_per_leg", False)
+                or not self._funded_epoch_end_known()):
+            return tuple(skus)
+        now_fn = getattr(self, "_rent_wait_now", None) or time.time
+        now = now_fn()
+        return tuple(s for s in skus if now < self._funded_rent_wait_deadline_for(s))
+
+    def _provider_capacity(self, provider, skus, exclude_ids=()) -> int:
+        """Marketplace capacity summed over ``skus`` (adapters count per type)."""
+        total = 0
+        for s in skus:
+            try:
+                total += int(provider.capacity(s, exclude_ids=exclude_ids) or 0)
+            except TypeError:
+                total += int(provider.capacity(s) or 0)
+        return total
+
+    def _funded_rent_wait_deadline_for(self, sku: str | None, *,
+                                       unknown_is_cap: bool = False) -> float:
+        """The latest safe start for a leg on ``sku`` specifically: the
+        round-wide deadline shifted by how much faster (or slower) that type
+        is than the wall the round-wide figure assumes (``_leg_wall_seconds``
+        with no SKU). No ``sku`` = the round-wide figure, or with
+        ``unknown_is_cap`` the contract-cap figure (a lane of unknown type
+        is assumed slowest). Unit fakes that stub the round-wide method keep
+        working."""
+        base = self._funded_rent_wait_deadline()
+        if not sku and not unknown_is_cap:
+            return base
+        try:
+            wall = (self._leg_wall_seconds(sku) if sku
+                    else float(max(int(c.max_train_seconds)
+                                   for c in self.cfg.throne_contracts())))
+            return base + (self._leg_wall_seconds(None) - wall)
+        except Exception:  # noqa: BLE001 — no contract context ⇒ the round-wide figure
+            return base
+
     def _funded_rent_wait_deadline(self) -> float:
         """Latest wall-clock a rented leg may START and still finish inside the
-        epoch: epoch end − the final leg's ``max_train_seconds`` − publish margin.
-        Falls back to "now" (no waiting) when the round context is unknown."""
+        epoch: epoch end − the leg's wall (the contract's ``max_train_seconds``;
+        in per-leg mode the FASTEST listed type's measured wall — see
+        ``_leg_wall_seconds``) − publish margin. Falls back to "now" (no
+        waiting) when the round context is unknown."""
         now = time.time()
         try:
-            leg_s = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+            leg_s = int(self._leg_wall_seconds(None))
             end_wall = getattr(self, "_funded_epoch_end_wall", None)
             if end_wall is None:
                 ctx = getattr(self, "_stage_ctx", None) or {}
@@ -1628,18 +1800,79 @@ class TrainerRunner:
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
+    def _operator_lane_deadline(self, sku: str | None = None, *,
+                                unknown_is_cap: bool = False) -> float | None:
+        """Latest wall-clock an operator-lane FALLBACK leg may start — the same
+        latest safe start as a marketplace rent — or None when the round's
+        epoch end is unknown (then the lane wait is unbounded, as before)."""
+        if not self._funded_epoch_end_known():
+            return None
+        return self._funded_rent_wait_deadline_for(sku, unknown_is_cap=unknown_is_cap)
+
+    def _operator_lane_deadline_fn(self):
+        """The lane pool's deadline argument: per-lane (``host.sku`` through
+        the measured wall table) when ``funded_sku_wall_seconds`` is set,
+        else the single round-wide number (or None = unbounded)."""
+        if not self._funded_epoch_end_known():
+            return None
+        if tuple(getattr(self.cfg.round, "funded_sku_wall_seconds", ()) or ()):
+            return lambda host: self._operator_lane_deadline(
+                getattr(host, "sku", "") or None, unknown_is_cap=True)
+        return self._operator_lane_deadline()
+
+    def _operator_fallback_eligible(self, hotkey: str | None, now: float,
+                                    deadline: float) -> bool:
+        """Lium first, Shadeform for the spillover (owner 2026-09-19): may this
+        waiting leg take an operator lane NOW? The JIT king (``hotkey`` None)
+        always may. A funded entry REQUEUED from an earlier round (any recorded
+        fault class — it already missed a round) may at once; a FRESH entry
+        keeps polling the marketplace (payer-billed) until the last
+        ``funded_operator_fallback_fresh_window_seconds`` before the latest
+        safe start. Window 0 ⇒ everyone at once."""
+        if hotkey is None:
+            return True
+        window = int(getattr(self.cfg.round,
+                             "funded_operator_fallback_fresh_window_seconds", 0) or 0)
+        if window <= 0:
+            return True
+        carried = False
+        try:
+            queue = self._funded_queue()
+            entry = queue.get(hotkey) if queue is not None else None
+            carried = entry is not None and (
+                int(getattr(entry, "attempts", 0) or 0) > 0
+                or bool(getattr(entry, "last_error_class", "") or ""))
+        except Exception as e:  # noqa: BLE001 — a torn queue read must not block the leg
+            log.debug("fallback eligibility for %s: queue read failed (%s)", hotkey[:12], e)
+        return carried or now >= deadline - window
+
     def _wait_for_funded_capacity(self, sku: str, *, describe: str,
-                                  for_king: bool = False) -> bool:
+                                  for_king: bool = False,
+                                  hotkey: str | None = None) -> bool:
         """Poll the marketplace for ``sku`` until it shows capacity or the round's
         latest safe start passes. Legs start INDEPENDENTLY as GPUs appear
         (owner 2026-09-12: "keep trying over the next 3 hours to bring up more
         pods" — batches of one or more, not all-or-nothing); a leg still without
         a GPU at the deadline requeues to the next round as before. Returns
         True when capacity appeared."""
-        deadline = self._funded_rent_wait_deadline()
+        skus = (sku,) if isinstance(sku, str) else tuple(sku)
+        sku = "/".join(skus)
+        deadline = self._funded_rent_wait_deadline_for(skus[0] if len(skus) == 1 else None)
         sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
         abort = getattr(self, "_funded_wait_abort", None)
+        if for_king and self._operator_fallback_lanes():
+            # The king is REQUIRED and never held back (owner 2026-09-20: "the
+            # round WILL NOT FINISH WITHOUT A KING"): with operator lanes on
+            # file it takes one at once, latest safe start or not — a late king
+            # manifest is scored next epoch (round 7963), no king is a lost
+            # round. 2026-09-20 04:21: the king stalled twice on its pod, the
+            # latest safe start passed at 04:31 and four L40S lanes sat idle
+            # while this wait returned False.
+            log.info("%s: operator final lane(s) on file — the king takes one now "
+                     "(operator-billed; never held back by the latest safe start)",
+                     describe)
+            return "operator"
         polled = 0
         while now_fn() < deadline:
             if abort is not None and abort.is_set():
@@ -1648,12 +1881,15 @@ class TrainerRunner:
                 return False
             # Hybrid fallback (owner 2026-09-12): operator lanes on file end the
             # wait — the leg runs there, operator-billed, while siblings that
-            # already rented on their payer's pod are untouched.
-            if self._operator_fallback_lanes():
+            # already rented on their payer's pod are untouched. Fresh legs
+            # keep polling until the window (owner 2026-09-19, Lium first).
+            if (self._operator_fallback_lanes()
+                    and self._operator_fallback_eligible(hotkey, now_fn(), deadline)):
                 log.info("%s: operator final lane(s) on file — leaving the %s wait "
                          "for an operator lane (operator-billed)", describe, sku)
                 return "operator"
-            n = self._probe_funded_capacity(sku, self._claimed_executors())
+            n = self._probe_funded_capacity(self._skus_fitting_now(skus) or skus,
+                                            self._claimed_executors())
             if n and not for_king and self._king_pending():
                 # Capacity is the king's first: keep polling until it has a pod.
                 if not polled:
@@ -1674,6 +1910,15 @@ class TrainerRunner:
                          time.strftime("%H:%M:%SZ", time.gmtime(deadline)))
             polled += 1
             sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
+        if self._operator_fallback_lanes():
+            # Past the latest safe start with operator lanes on file: the leg
+            # goes to the lane pool, which hands out a lane only if one is
+            # FREE NOW (a wait would run it past the epoch — the 2026-09-19
+            # class); no free lane ⇒ the pool's deadline requeues it unburned.
+            # Owner 2026-09-20: rented lanes never idle while legs are queued.
+            log.info("%s: past the latest safe start — taking an operator lane only "
+                     "if one is free now (operator-billed)", describe)
+            return "operator"
         return False
 
     def _claimed_executors(self) -> tuple[str, ...]:
@@ -1739,15 +1984,18 @@ class TrainerRunner:
         return [h for h in hosts
                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
 
-    def _probe_funded_capacity(self, sku: str,
+    def _probe_funded_capacity(self, sku,
                                exclude_ids: tuple[str, ...] = ()) -> int | None:
-        """``sku``'s marketplace availability on the OPERATOR's key, or None.
+        """``sku``'s (or, for a tuple of types, their summed) marketplace
+        availability on the OPERATOR's key under the price caps, or None.
         ``exclude_ids`` = executors this round already claimed: a count that
         includes them is capacity no rent can use."""
+        skus = (sku,) if isinstance(sku, str) else tuple(sku)
         try:
-            return _lium_provider(self.cfg.round).capacity(sku, exclude_ids=exclude_ids)
+            prov = _lium_provider(self.cfg.round, price_caps=self._funded_price_caps())
+            return self._provider_capacity(prov, skus, exclude_ids)
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
-            log.warning("funded capacity probe for %s failed: %s", sku, e)
+            log.warning("funded capacity probe for %s failed: %s", "/".join(skus), e)
             return None
 
     def _funded_labels(self) -> dict[str, str]:
@@ -2164,7 +2412,8 @@ class TrainerRunner:
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
-            round_sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            skus = self._funded_skus_for_rent()
+            round_sku = skus[0] if skus else ""
             if not round_sku or not rnd.funded_pod_image:
                 raise RuntimeError("funded_pods=rent needs [round] "
                                    "funded_pod_sku (or funded_pod_skus) and "
@@ -2201,13 +2450,16 @@ class TrainerRunner:
                     claimed = tuple(sorted(self._funded_claimed_execs))
                 from ..provision.core import scan_ssh_host_key
 
+                # Open market: only the types a leg started now still fits.
+                fit = self._skus_fitting_now(skus) or skus
                 result = rent_funded_pod(
                     round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
-                    sku=round_sku, image=rnd.funded_pod_image,
+                    sku=fit[0], image=rnd.funded_pod_image,
                     ssh_pubkey=ssh_pubkey, netuid=netuid,
                     ready_timeout=rnd.funded_ready_timeout_seconds,
                     exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
                     cpu_blocklist=rnd.funded_cpu_blocklist,
+                    skus=fit, price_caps=self._funded_price_caps(),
                 )
                 if result.ok and result.machine_id:
                     with self._funded_exec_lock:
@@ -2267,7 +2519,7 @@ class TrainerRunner:
             # rent lock, so sibling legs that find one proceed) and rent again.
             # Only the round's latest safe start turns this into a requeue.
             waited = self._wait_for_funded_capacity(
-                round_sku, describe=f"funded leg {gen.hotkey[:12]}")
+                skus, describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
             if waited == "operator":
                 # Owner-armed hybrid: this leg runs on an operator lane
                 # (operator-billed). The payer's write-ahead row goes (no pod
@@ -2583,7 +2835,8 @@ class TrainerRunner:
         if result.address is None:
             return ""
         rnd = self.cfg.round
-        sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+        sku = (getattr(result, "sku", "") or getattr(self, "_funded_round_sku", "")
+               or rnd.funded_pod_sku)
         from .remote import RemoteHost
 
         host = RemoteHost(
@@ -2651,8 +2904,9 @@ class TrainerRunner:
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
-            sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
-            provider = _lium_provider(rnd)
+            skus = self._funded_skus_for_rent()
+            sku = skus[0] if skus else rnd.funded_pod_sku
+            provider = _lium_provider(rnd, price_caps=self._funded_price_caps())
             name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
@@ -2753,8 +3007,9 @@ class TrainerRunner:
                 # A sold-out marketplace is not a round failure: wait for a GPU
                 # (outside the rent lock) up to the round's latest safe start —
                 # the legs then rent independently as machines appear.
-                if not provider.capacity(sku, exclude_ids=self._claimed_executors()):
-                    waited = self._wait_for_funded_capacity(sku, describe="king rent",
+                fit = self._skus_fitting_now(skus) or skus
+                if not self._provider_capacity(provider, fit, self._claimed_executors()):
+                    waited = self._wait_for_funded_capacity(skus, describe="king rent",
                                                             for_king=True)
                     if waited == "operator":
                         # Owner-armed hybrid: the king trains on an operator
@@ -2769,11 +3024,16 @@ class TrainerRunner:
                     with self._funded_rent_lock:
                         with self._funded_exec_lock:
                             claimed = tuple(sorted(self._funded_claimed_execs))
-                        spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                        fit = self._skus_fitting_now(skus) or skus
+                        spec = LaunchSpec(sku=fit[0], count=1, image=rnd.funded_pod_image,
                                           ssh_pubkey=ssh_pubkey,
                                           name_prefix=name_prefix,
-                                          gpus_per_pod=1, exclude_ids=claimed)
+                                          gpus_per_pod=1, exclude_ids=claimed,
+                                          sku_choices=fit if len(fit) > 1 else ())
                         pod_id = provider.launch(spec)[0]
+                        sku_fn = getattr(provider, "sku_of", None)
+                        landed = (str(sku_fn(pod_id) or "") if callable(sku_fn) else "")
+                        sku = landed or fit[0]          # the ledger + floor use the landed type
                         machine = provider.machine_of(pod_id) or ""
                         if machine:
                             # Claimed either way: a lemon executor must not be
@@ -6230,9 +6490,12 @@ class TrainerRunner:
 
     @staticmethod
     def _dispatch_on_free_lane(disp, free_lanes, hosts: list, *, describe: str,
-                               used_host: list | None = None, prepare=None, **kw):
+                               used_host: list | None = None, prepare=None,
+                               deadline: float | None = None, **kw):
         """Dispatch on the next IDLE lane, retrying once on whichever lane is
         free after a failure (a different one whenever one is available).
+        ``deadline`` (wall-clock) bounds BOTH lane waits — see
+        :meth:`_FinalLanePool.get`; ``_LaneDeadlinePassed`` propagates.
 
         Same retry policy as :meth:`_dispatch_with_retry`, but lane occupancy
         is tracked through ``free_lanes`` (a ``queue.Queue`` of hosts) instead
@@ -6251,7 +6514,9 @@ class TrainerRunner:
         # starts, or the leg burns an attempt on a pod that can't resolve it
         # (2026-09-12 03:52: nine challengers lost both attempts that way).
         _ready = prepare or (lambda h: h)
-        host = free_lanes.get()
+        _take = ((lambda: free_lanes.get(deadline=deadline)) if deadline is not None
+                 else free_lanes.get)
+        host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
@@ -6264,7 +6529,7 @@ class TrainerRunner:
                             "%.0fs before the retry", describe,
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
-            retry_host = free_lanes.get()        # next idle lane; different when one exists
+            retry_host = _take()                 # next idle lane; different when one exists
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
@@ -6505,6 +6770,7 @@ class TrainerRunner:
             # _final_repo_suffix); forwarded only when non-empty so a
             # single-challenger round's dispatch stays byte-identical.
             suffix = _final_repo_suffix(jobs, gen, role)
+            lane_deadline: float | None = None   # operator-fleet legs: sized to the epoch
             try:
                 if (role == "king"
                         and self._effective_funded_pods() == "rent"
@@ -6555,6 +6821,15 @@ class TrainerRunner:
                 log.warning("final %s %s: no marketplace capacity — running on an "
                             "OPERATOR lane (operator-billed; funded_operator_fallback)",
                             role, gen.hotkey)
+                # ...but only while a leg started now still fits the epoch:
+                # the same latest safe start that bounds a marketplace rent
+                # bounds the wait for a free lane (2026-09-19: unbounded pool
+                # waits dispatched two 5 h legs 2 h before the epoch end).
+                # The king is exempt: it is REQUIRED, so it waits for a lane
+                # however late (a late manifest beats no round — owner
+                # 2026-09-20).
+                lane_deadline = (None if role == "king"
+                                 else self._operator_lane_deadline_fn())
             # Operator lanes can run PRIVATE (vault/direct) submissions too:
             # stage the ZIP on whichever lane the pool hands out, exactly as
             # the funded-pod leg does — until 2026-09-12 only that path staged,
@@ -6563,16 +6838,27 @@ class TrainerRunner:
             vault_digest = parse_vault_ref(gen.ref)
             prepare = ((lambda h, d=vault_digest: self._stage_vault_zip_on(h, d))
                        if vault_digest else None)
-            entry = self._dispatch_on_free_lane(
-                disp, lane_pool, lane_pool.known_hosts(),
-                describe=f"final {role} {gen.hotkey}",
-                used_host=used, prepare=prepare,
-                gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
-                role=role, base_seed=seeds.base_seed, block=block,
-                arch_preset=contract.arch_preset,
-                warm_start_ref=warm_start_ref,
-                **({"repo_suffix": suffix} if suffix else {}),
-            )
+            try:
+                entry = self._dispatch_on_free_lane(
+                    disp, lane_pool, lane_pool.known_hosts(),
+                    describe=f"final {role} {gen.hotkey}",
+                    used_host=used, prepare=prepare, deadline=lane_deadline,
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role=role, base_seed=seeds.base_seed, block=block,
+                    arch_preset=contract.arch_preset,
+                    warm_start_ref=warm_start_ref,
+                    **({"repo_suffix": suffix} if suffix else {}),
+                )
+            except _LaneDeadlinePassed as e:
+                if role == "king":  # unreachable (no deadline for the king); kept as a guard
+                    raise RuntimeError(f"king: {e}") from e
+                # Sold-out taxonomy, exactly like a marketplace leg still
+                # without a GPU at the deadline: requeued, nothing burned.
+                log.warning("final challenger %s: %s — requeued to the next round "
+                            "(unburned)", gen.hotkey, e)
+                self._record_funded_failure(gen.hotkey, str(e), miner_fault=False,
+                                            error_class="no_capacity", burn=False)
+                raise _FundedLegSkip(gen.hotkey) from e
             if used:
                 # Post-publish bench target: the pod actually holding this
                 # final checkpoint at its _train_work path.

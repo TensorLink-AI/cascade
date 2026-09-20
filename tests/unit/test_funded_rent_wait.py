@@ -26,6 +26,7 @@ def _arm_wait(runner, *, deadline_offsets, capacity_seq):
     runner._probe_funded_capacity = lambda sku, exclude_ids=(): seq.pop(0) if seq else 0
     runner._wait_for_funded_capacity = TrainerRunner._wait_for_funded_capacity.__get__(runner)
     runner._claimed_executors = TrainerRunner._claimed_executors.__get__(runner)
+    runner._operator_fallback_eligible = TrainerRunner._operator_fallback_eligible.__get__(runner)
     runner.FUNDED_RENT_RETRY_SECONDS = TrainerRunner.FUNDED_RENT_RETRY_SECONDS
     return clock
 
@@ -48,6 +49,48 @@ def test_wait_is_instant_when_the_deadline_has_passed(tmp_path):
     runner = _runner(tmp_path)
     _arm_wait(runner, deadline_offsets=-1, capacity_seq=[5])
     assert runner._wait_for_funded_capacity("RTX4090", describe="x") is False   # never polled
+
+
+def _lanes_on_file(runner, lanes):
+    runner._operator_fallback_lanes = lambda: list(lanes)
+
+
+def test_king_past_the_deadline_takes_an_operator_lane(tmp_path):
+    # 2026-09-20 04:21: the king failed after the latest safe start with idle
+    # L40S lanes on file and this wait returned False — a lost round. The king
+    # is never held back: a lane on file is taken now, deadline or not.
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, ["lane"])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="king rent",
+                                            for_king=True) == "operator"
+
+
+def test_king_past_the_deadline_without_lanes_gives_up(tmp_path):
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, [])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="king rent",
+                                            for_king=True) is False
+
+
+def test_challenger_past_the_deadline_goes_to_the_lane_pool_when_lanes_are_on_file(tmp_path):
+    # Owner 2026-09-20: a rented lane never idles while a leg is queued. Past
+    # the latest safe start the leg is handed to the pool, which serves it
+    # only if a lane is free NOW (see _FinalLanePool.get) — never a wait.
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, ["lane"])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="leg",
+                                            hotkey="hk") == "operator"
+
+
+def test_challenger_past_the_deadline_without_lanes_requeues(tmp_path):
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, [])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="leg",
+                                            hotkey="hk") is False
 
 
 def test_funded_rent_retries_after_no_capacity_and_lands(tmp_path, monkeypatch):
@@ -165,7 +208,11 @@ def test_king_rent_gives_up_at_the_deadline_and_releases_the_waiters(tmp_path, m
 
 def test_deadline_math_from_epoch_geometry(cfg, tmp_path):
     runner = TrainerRunner(cfg=cfg, base_trainer=None, work_root=tmp_path)
-    leg = max(c.max_train_seconds for c in cfg.throne_contracts())
+    # The round-wide leg wall: the contract cap for a locked-SKU round, the
+    # fastest listed type's measured wall under funded_sku_per_leg (the
+    # repo default since 2026-09-20) — the geometry below is the same.
+    leg = runner._leg_wall_seconds(None)
+    assert leg <= max(c.max_train_seconds for c in cfg.throne_contracts())
     epoch_blocks = int(__import__("cascade.shared.config", fromlist=["effective_epoch_blocks"])
                        .effective_epoch_blocks(cfg.round, 9050400))
     runner._stage_ctx = {"epoch_start_block": 9050400}

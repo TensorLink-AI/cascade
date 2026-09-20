@@ -85,6 +85,9 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_funded_checkpoint_mismatch", "_refuse_diverged_king",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
+                 "_funded_skus_for_rent", "_funded_rent_wait_deadline_for",
+                 "_funded_epoch_end_known", "_skus_fitting_now", "_leg_wall_seconds",
+                 "_funded_price_caps", "_provider_capacity", "_operator_lane_deadline_fn",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
                  "_startup_sweep", "_skip_unfunded_round",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
@@ -536,7 +539,7 @@ def test_funded_field_cap_overrides_finalist_cap(tmp_path):
 
 
 def test_capacity_probe_clamps_to_market_minus_reserve(tmp_path):
-    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_field_cap=12, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
     r._probe_funded_capacity = lambda sku, exclude_ids=(): 5
     assert r._funded_admission_cap() == 4
@@ -549,7 +552,7 @@ def test_capacity_probe_failure_clamps_nothing(tmp_path):
 
 
 def test_capacity_zero_seats_nobody_and_queue_holds(tmp_path):
-    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True,
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_field_cap=12, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
     r._probe_funded_capacity = lambda sku, exclude_ids=(): 1      # king's reserve eats it
     FundedQueue(tmp_path / "funded_queue.json").add("hkA", REF, reveal_block=10)
@@ -674,7 +677,7 @@ def test_roster_publishes_seats_waiting_and_outcomes(tmp_path):
 # ── per-round SKU choice + JIT king ──────────────────────────────────────────
 
 def test_multi_sku_picks_most_available(tmp_path):
-    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000", "RTX3090"))
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000", "RTX3090"))
     r._probe_funded_capacity = lambda sku, exclude_ids=(): {"RTX4090": 2, "A6000": 9,
                                             "RTX3090": 4}[sku]
     r._funded_admission_cap()
@@ -684,14 +687,14 @@ def test_multi_sku_picks_most_available(tmp_path):
 
 
 def test_multi_sku_tie_breaks_toward_preference_order(tmp_path):
-    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"))
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"))
     r._probe_funded_capacity = lambda sku, exclude_ids=(): 7
     r._funded_admission_cap()
     assert r._funded_round_sku == "RTX4090"
 
 
 def test_multi_sku_probe_blackout_falls_back_to_first(tmp_path):
-    r = _runner(tmp_path, funded_pod_skus=("A6000", "RTX4090"),
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("A6000", "RTX4090"),
                 funded_field_cap=6)
     r._probe_funded_capacity = lambda sku, exclude_ids=(): None
     assert r._funded_admission_cap() == 6            # no clamp
@@ -699,7 +702,7 @@ def test_multi_sku_probe_blackout_falls_back_to_first(tmp_path):
 
 
 def test_multi_sku_capacity_clamp_uses_chosen_sku(tmp_path):
-    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"),
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"),
                 funded_field_cap=10, funded_capacity_probe=True,
                 funded_capacity_reserve=1)
     r._probe_funded_capacity = lambda sku, exclude_ids=(): {"RTX4090": 1, "A6000": 4}[sku]
@@ -708,7 +711,7 @@ def test_multi_sku_capacity_clamp_uses_chosen_sku(tmp_path):
 
 
 def test_rent_uses_the_rounds_chosen_sku(tmp_path, monkeypatch):
-    r = _runner(tmp_path, funded_pod_skus=("RTX4090", "A6000"))
+    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"))
     _vault(tmp_path, "hkA")
     r._funded_round_sku = "A6000"
     seen = {}

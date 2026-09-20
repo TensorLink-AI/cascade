@@ -421,6 +421,32 @@ funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # the bottom ~27 % of 4090 rentals and keeps every seated leg on an
 # equal-compute host. Other SKUs stay unguarded until benched.
 funded_host_bench_floor = { RTX4090 = 500e6 }
+# ── Open-market rounds (owner 2026-09-20; ON by default) ─────────────────────
+# funded_sku_per_leg: choose the GPU type PER LEG — every leg (the JIT king
+# too) rents the cheapest fitting executor across funded_pod_skus instead of
+# the whole round locking to one type. Fair because budgets are compute-
+# denominated and every leg completes its full token budget; needs
+# [training] expected_gpu = "" and the validators' manifest gate (_check_gpu,
+# gpu_mismatch on mixed types) lifted — the owner coordinates that release.
+funded_sku_per_leg = true
+# Price guards on marketplace executors (USD; 0 = off). Cap the PER-LEG cost
+# (price/h × the SKU's measured wall below): an H100 at $1.30/h finishing in
+# an hour bills less than a 4090 at $0.50/h for three — a plain $/h cap would
+# exclude the cheaper pool. funded_max_price_per_hour is only a sanity
+# ceiling. An unpriced listing is skipped while either cap is armed.
+# $1.60/leg ≈ a 4090 at $0.50/h for 3.2 h or an H100 at $1.30/h for 1.2 h;
+# $1.50/h keeps anything exotic out.
+funded_max_price_per_hour = 1.5
+funded_max_leg_cost_usd = 1.6
+# Measured wall (seconds) of one full-budget leg per SKU: drives the per-leg
+# cost cap and the per-SKU latest safe start (a fast type — or a hosts.toml
+# lane carrying `sku = "…"` — may still start late in the epoch). A type
+# without an entry is assumed to need [training] max_train_seconds. From run
+# telemetry at the 150k-step budget: RTX4090 3 h 45 (hosts ≥ 500M tokens/s;
+# 3 h 40–4 h 34 observed), L40S 2 h 50 (2 h 47 measured), L40 ~3 h 10 (est.),
+# H100 ~1 h 40 (est., unmeasured — conservative). A6000 / RTX3090 are
+# wall-bound: no entry ⇒ the 5 h cap. Re-measure when the budget changes.
+funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
