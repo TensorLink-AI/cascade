@@ -93,7 +93,10 @@ Each entry's ref must be the hotkey's revealed commitment AS OF the entry's
 `train_block` (`poll_commitments(include_history=True)`), not the latest
 reveal at the boundary; a re-commit between leg start and settlement never
 rebinds the running leg — it queues behind it (one live entry per hotkey)
-and becomes the hotkey's next entry when the flight settles.
+and becomes the hotkey's next entry when the flight settles. The live loop
+wires the history provider itself (`run_forever`, from its chain client);
+an era manifest judged with no provider FAILS (`era_ref_unverifiable`) —
+the check is never silently off.
 
 ## Validator envelope (fail closed, from `era_king_from_block`)
 
@@ -106,9 +109,30 @@ champion) carries the pointer this validator judged in the crowning
 settlement or adopted at the era's first king leg; every entry's ref
 verified at its `train_block`. The same-GPU fallback of the GPU gate is
 lifted when no GPU is pinned (per-leg SKU choice, PR #294). `round_id`,
-the eval window draw, the jittered mix, the scored horizons and every
-`*_from_block` gate resolve off the settlement boundary exactly as today;
-only the training seeds are the era's (`receipt.era_base_seed`).
+the eval window draw, the jittered mix, the scored horizons, the eval-pool
+pin and every `*_from_block` gate resolve off the settlement boundary
+exactly as today; only the training seeds are the era's
+(`receipt.era_base_seed`).
+
+**Gates are pure.** Nothing in the envelope mutates validator state: the
+era's king pointer is adopted and a staged promotion installed only when
+the settlement is HANDLED (scored, resync-held or rejected), so a transient
+after the gate leaves the state untouched and a legitimately re-published
+manifest is still judged.
+
+**The chain.** The trainer's first settlement links to `latest.json`'s
+`round_id` (the last legacy round — every validator's last handled round);
+a trainer that cannot read the root withholds the settlement rather than
+publish an unchained one (legs wait a grid step; nothing is marked done or
+burned). Validators walk `round-<id>.json` forward from their last handled
+settlement; a walk that does not reach it (a hole, or the depth cap)
+handles NOTHING — the position is kept, the depth doubles for the next
+poll, and an error names the missing round. Judging the oldest collected
+manifest instead would fail its chain check, latch past the gap and lose
+any dethrone in it. A trainer outage across a boundary publishes that
+settlement late, stamped with the boundary it belongs to (`created_block`
+= the boundary; validators floor it to the grid), so finished legs are
+never thrown away and re-billed.
 
 ## Bench at completion, not at publish
 
@@ -125,8 +149,10 @@ pointer.
 serialization: an earlier entry waiting for an H100 under the price cap is
 legitimately overtaken by a later one that fits a 4090 now. The rolling
 roster records, per rent, the more-senior queued entries that could have
-started and did not; the tier-0 funded-roster audit WARNs on any such
-pass-over instead of on raw reveal order.
+started and did not — a senior that could not start in that pass
+(unrevealed, waiting for its pre-train window, held at the cap, dropped by
+dedup) is not a pass-over; the tier-0 funded-roster audit WARNs on any
+such pass-over instead of on raw reveal order.
 
 ## Knobs (all new, all default 0 = off; shipped in chain.toml)
 
@@ -136,13 +162,20 @@ pass-over instead of on raw reveal order.
 | `[round] era_settlements` | trainer | settlements per era (4) |
 | `[scoring] era_king_from_block` | consensus | the era envelope above |
 | `[scoring] cohort_maxt_increment_from_block` | consensus | #290's gate — set to ROLLOVER |
-| `[scoring] tenure_blocks_from_block` + `margin_warmup_blocks` / `cascade_reign_blocks` | consensus | tenure / ripeness in blocks |
+| `[scoring] tenure_blocks_from_block` + `margin_warmup_blocks` / `cascade_reign_blocks` / `king_resync_max_blocks` | consensus | tenure / ripeness / resync valve in blocks |
 | `[round] epoch_blocks = 900, epoch_blocks_prev = 3600, epoch_activation_block = ROLLOVER` | consensus | the 3h grid via the existing scheduled switch |
 
 Loader asserts: every rollover key names ONE block; `ROLLOVER` is a boundary
-of both grids; `era_king_from_block ≥ cohort_maxt_increment_from_block ≥
+of both grids AND starts an era (a multiple of `epoch_blocks ×
+era_settlements` — the era grid is absolute, `block // era length`);
+`era_king_from_block ≥ cohort_maxt_increment_from_block ≥
 cohort_maxt_from_block`; `era_settlements ≥ 1` when armed. `chain.testnet.toml`
-is armed at the first testnet boundary.
+is armed at the first testnet era boundary (600 = 150 × 4).
+
+The trainer's generation ledger (`era_state.json`) is rebuilt from the
+published `promotions/gen-<n>.json` records (they carry `effective_era`) —
+the same source validators install from — so a lost state file never
+makes the trainer train a generation before its era.
 
 ## Accepted risk
 

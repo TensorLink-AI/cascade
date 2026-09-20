@@ -50,6 +50,7 @@ from pathlib import Path
 from ..shared.era import (
     EraSpec,
     era_for_block,
+    era_length_blocks,
     member_index_for_era,
     min_effective_era,
     next_era_start,
@@ -292,6 +293,18 @@ class LegOps:
     def receipt_king(self) -> str | None:
         return self.r._receipt_king()
 
+    def latest_round_id(self) -> str:
+        """``round_id`` of the bucket's ``latest.json`` — the chain root the
+        first settlement links to (the last legacy round, or our own last
+        settlement after a lost state file); "" when unreadable."""
+        return self.r._rolling_latest_round_id()
+
+    def promotion_effective_era(self, generation: int) -> int | None:
+        """``effective_era`` of the PUBLISHED ``promotions/gen-<n>.json`` (0 =
+        a pre-era record, live immediately) — the source validators install
+        from, so a lost ledger rebuilds to the same eras. None = unreadable."""
+        return self.r._rolling_promotion_effective_era(generation)
+
     def metagraph_king(self, client) -> str | None:
         try:
             return client.highest_incentive_hotkey()
@@ -454,6 +467,10 @@ class RollingScheduler:
         # last settlement (settlement_era), judged against era n's king.
         self._settle(client, block, epoch_start)
         self._roll_era(client, era, block)
+        # Boundaries of the era just started (a tick that skipped the era
+        # boundary lands here with them pending): settle them now, not next
+        # grid step.
+        self._settle(client, block, epoch_start)
         self._adopt_dethrone(client)
         self._maybe_king_legs(client, block, now)
         self._intake(client, block, now)
@@ -465,6 +482,7 @@ class RollingScheduler:
         pods, re-attach every in-flight leg (a persisted completed leg is
         reused, never retrained), sweep everything else."""
         keep_ids = tuple(str(e.base_seed) for e in (self.state.current, self.state.next) if e)
+        self._seed_chain_root()
         queue = self.ops.queue()
         flights = queue.in_flight() if queue is not None else []
         self.ops.sweep_pods(keep_round_ids=keep_ids,
@@ -483,6 +501,22 @@ class RollingScheduler:
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
             self._launch_leg(gen, era, e.started_block, e.target_boundary, e.label,
                              resumed=True)
+
+    def _seed_chain_root(self) -> bool:
+        """The first settlement chains to the bucket's ``latest.json`` (the
+        last legacy round — every validator's ``last_handled_round_id``);
+        a state file that never published seeds ``last_published_round_id``
+        from it. An empty root is never published against (see _settle)."""
+        if self.state.last_published_round_id:
+            return True
+        root = self.ops.latest_round_id()
+        if not root:
+            return False
+        with self._lock:
+            self.state.last_published_round_id = str(root)
+            self._save()
+        log.info("rolling: manifest chain root seeded from latest.json (round %s)", root)
+        return True
 
     def _uid_of(self, client, hotkey: str) -> int:
         try:
@@ -507,15 +541,28 @@ class RollingScheduler:
         if gen <= 0 or not members:
             return
         key = str(gen)
+        if key in self.state.generations:
+            return
+        eff = int(eff or 0)
+        known = eff > 0
+        if not known:
+            # The engine clears its pending record at publish, so after a lost
+            # ledger only the PUBLISHED record (what validators install from)
+            # says when this generation takes effect.
+            published = self.ops.promotion_effective_era(gen)
+            if published is not None:
+                eff, known = int(published), True
         with self._lock:
             if key in self.state.generations:
                 return
-            if not self.state.generations:
-                # First sight of the engine: whatever it holds is live now.
+            if known:
+                effective = eff
+            elif not self.state.generations:
+                # First sight of the engine with no record readable: live now.
                 effective = 0
             else:
                 current = self.state.current.index if self.state.current else 0
-                effective = eff or (current + 2)
+                effective = current + 2
             self.state.generations[key] = {
                 "members": [[c, s] for c, s in members], "effective_era": int(effective)}
             self._save()
@@ -688,9 +735,11 @@ class RollingScheduler:
         burned = self.ops.burned()
         wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
         held: list[str] = []
+        not_jumps: set[str] = set()       # seniors that could not start this pass
         for entry in select_field(queue.entries(), cap=0):
             if in_flight >= cap:
                 held.append(entry.hotkey)
+                not_jumps.add(entry.hotkey)
                 continue
             if entry.hotkey in burned:
                 queue.fail(entry.hotkey, error="hotkey already used its one lifetime "
@@ -699,6 +748,7 @@ class RollingScheduler:
             revealed = ref_as_of(history, entry.hotkey, block)
             if revealed is None:
                 held.append(entry.hotkey)          # funded, not yet revealed: waits
+                not_jumps.add(entry.hotkey)
                 continue
             if revealed != entry.ref:
                 queue.fail(entry.hotkey, error=f"funded ref {entry.ref} no longer matches "
@@ -709,6 +759,7 @@ class RollingScheduler:
                         margin_seconds=margin, current_era=cur.index)
             if adm.start_after > now:
                 held.append(entry.hotkey)          # waits for the pre-train window
+                not_jumps.add(entry.hotkey)
                 continue
             era = self._era_state_for(adm.era_index)
             if era is None:
@@ -722,6 +773,7 @@ class RollingScheduler:
                         self._save()
                 else:
                     held.append(entry.hotkey)
+                    not_jumps.add(entry.hotkey)
                     continue
             gen = ResolvedGen(entry.hotkey, self._uid_of(client, entry.hotkey), entry.ref,
                               entry.reveal_block)
@@ -731,12 +783,14 @@ class RollingScheduler:
                 continue
             dup = self._dedup_check(gen, era, history)
             if dup is not None:
+                not_jumps.add(entry.hotkey)
                 continue
             if not queue.mark_in_flight(entry.hotkey, entry.ref,
                                         target_boundary=adm.target_boundary,
                                         era_index=adm.era_index, started_block=block):
+                not_jumps.add(entry.hotkey)
                 continue
-            self._record_rent(entry, adm, queue)
+            self._record_rent(entry, adm, queue, not_jumps)
             in_flight += 1
             self._launch_leg(gen, era, block, adm.target_boundary, entry.label)
         if held:
@@ -759,16 +813,19 @@ class RollingScheduler:
                 return int(c.commit_block)
         return None
 
-    def _record_rent(self, entry, adm: Admission, queue) -> None:
+    def _record_rent(self, entry, adm: Admission, queue, not_jumps: set[str]) -> None:
         """Seniority evidence for the roster: at this rent, which more-senior
-        queued entries (earlier reveal) were passed over. By construction the
-        drain is in reveal order among entries that fit NOW, so a passed-over
-        senior is one that could not start (unrevealed, waiting for its
-        pre-train window, or held at the cap)."""
+        queued entries (earlier reveal) that COULD have started were passed
+        over. A senior that could not start this pass — unrevealed, waiting
+        for its pre-train window, held at the cap, dropped by dedup — is not
+        a jump (DEC-CA-0043 "first pick of fitting executors"); the drain is
+        in reveal order among the startable, so this list is empty unless the
+        order was broken."""
         from ..funding.queue import select_field
 
         ahead = [e.hotkey for e in select_field(queue.entries(), cap=0)
-                 if e.status == "queued" and (e.reveal_block, e.hotkey) < (entry.reveal_block, entry.hotkey)]
+                 if e.status == "queued" and e.hotkey not in not_jumps
+                 and (e.reveal_block, e.hotkey) < (entry.reveal_block, entry.hotkey)]
         with self._lock:
             self.state.rents.append({
                 "hotkey": entry.hotkey, "reveal_block": int(entry.reveal_block),
@@ -905,6 +962,36 @@ class RollingScheduler:
     # ── settlement ───────────────────────────────────────────────────────────
 
     def _settle(self, client, block: int, epoch_start: int) -> None:
+        """Every boundary since the last settled one, OLDEST FIRST. A trainer
+        outage across a boundary publishes that settlement late, stamped with
+        the boundary it belongs to (``created_block`` = the boundary —
+        validators floor it to the grid, so it resolves to the era the legs
+        trained under) instead of throwing the finished legs away and
+        re-billing their payers."""
+        from ..shared.config import effective_epoch_blocks
+
+        cur = self.state.current
+        if cur is None:
+            return
+        start = int(cur.start_block)
+        era_end = start + int(era_length_blocks(self.cfg.round, start))
+        b = int(self.state.last_settled_boundary)
+        if b < start:
+            # Never settled under this era: the first boundary stepped is the
+            # era's start itself (the reign clock ticks there; it is the
+            # previous era's last settlement, nothing of ours).
+            b = start - int(effective_epoch_blocks(self.cfg.round, max(0, start - 1)))
+        while True:
+            b += int(effective_epoch_blocks(self.cfg.round, b))
+            if b > int(epoch_start) or b > era_end:
+                break              # a later era's boundary settles after the roll
+            if b < int(epoch_start):
+                log.warning("rolling: boundary %d passed while the trainer was away — "
+                            "settling it late (block %d)", b, block)
+            self._settle_boundary(client, b, created_block=(b if b < int(epoch_start)
+                                                            else int(block)))
+
+    def _settle_boundary(self, client, epoch_start: int, *, created_block: int) -> None:
         cur = self.state.current
         if cur is None or epoch_start <= self.state.last_settled_boundary:
             return
@@ -938,12 +1025,22 @@ class RollingScheduler:
                 self.state.last_settled_boundary = epoch_start
                 self._save()
                 return
-            manifest = self._build_manifest(cur, king, ready, round_id, block)
+        if not self._seed_chain_root():
+            # An unchained manifest is rejected by every validator AFTER the
+            # legs are marked done and burned — never publish one. The legs
+            # wait for the next boundary; the root is retried every tick.
+            log.error("rolling: boundary %d — manifest chain root unknown (latest.json "
+                      "unreadable); %d finished leg(s) wait, nothing published",
+                      epoch_start, len(ready))
+            return
+        with self._lock:
+            manifest = self._build_manifest(cur, king, ready, round_id, created_block,
+                                            pin_block=epoch_start)
         self.ops.publish_manifest(manifest)
         bench_entries = self._bench_entries(cur, king, ready)
         report = None
         if bench_entries:
-            report = self.ops.publish_bench(round_id, block, bench_entries)
+            report = self.ops.publish_bench(round_id, created_block, bench_entries)
             if report is not None:
                 cur.king_bench_published = cur.king_bench_published or cur.king_bench is not None
         self.ops.record_bench_candidates(manifest, report)
@@ -973,7 +1070,7 @@ class RollingScheduler:
                  round_id, epoch_start, cur.index, cur.king_hotkey[:12], len(ready))
 
     def _build_manifest(self, era: EraState, king: TrainedEntry, ready: list[FinishedLeg],
-                        round_id: str, block: int):
+                        round_id: str, block: int, *, pin_block: int):
         from ..shared.manifest import TrainingManifest, contract_digest, contract_payload
 
         ordered = sorted(ready, key=lambda f: (f.reveal_block, f.hotkey))
@@ -985,7 +1082,11 @@ class RollingScheduler:
         fn = getattr(self.r, "pool_provenance_fn", None)
         if fn is not None:
             try:
-                pool_key, pool_sha = fn(int(round_id), era.start_block)
+                # The pin is the daily snapshot at the SETTLEMENT boundary —
+                # the block validators verify it at (an era can span a
+                # snapshot's effective block; the era start would then fail
+                # the pin on every settlement after the crossing).
+                pool_key, pool_sha = fn(int(round_id), int(pin_block))
             except Exception as e:  # noqa: BLE001
                 log.warning("rolling: eval-pool pin unavailable (%s)", e)
         return TrainingManifest(

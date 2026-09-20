@@ -1704,6 +1704,10 @@ class ScoringConfig:
     tenure_blocks_from_block: int = 0
     margin_warmup_blocks: int = 0
     cascade_reign_blocks: int = 0
+    # King-resync safety valve in BLOCKS from ``tenure_blocks_from_block``
+    # (``king_resync_max_rounds`` counted settlements: 5 × 900 blocks trips in
+    # 15 h, not the 60 h it meant). 0 = keep counting rounds.
+    king_resync_max_blocks: int = 0
 
 
 @dataclass(frozen=True)
@@ -2302,6 +2306,13 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             raise ValueError(
                 "[round] era_settlements must be >= 1 when a DEC-CA-0043 rollover "
                 "block is set")
+        _era_len = _eb * _era_settlements
+        if _rollover % _era_len:
+            raise ValueError(
+                f"DEC-CA-0043 rollover block {_rollover} must start an era: a "
+                f"multiple of epoch_blocks × era_settlements = {_era_len} (the era "
+                "grid is absolute — block // era length — so the rollover boundary "
+                "is only the first era's start when it lies on that grid)")
         _cmi = max(0, int(s.get("cohort_maxt_increment_from_block", 0) or 0))
         _cm = max(0, int(s.get("cohort_maxt_from_block", 0) or 0))
         if not (_era_king >= _cmi >= _cm):
@@ -2602,6 +2613,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             tenure_blocks_from_block=_tenure_blocks,
             margin_warmup_blocks=max(0, int(s.get("margin_warmup_blocks", 0) or 0)),
             cascade_reign_blocks=max(0, int(s.get("cascade_reign_blocks", 0) or 0)),
+            king_resync_max_blocks=max(0, int(s.get("king_resync_max_blocks", 0) or 0)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

@@ -11,11 +11,11 @@ settlement manifest is then fed to an armed validator to prove the two
 sides agree on the envelope."""
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-
 
 from cascade.funding.queue import FundedQueue
 from cascade.shared.chain import Commitment
@@ -89,6 +89,9 @@ class FakeOps(LegOps):
         self.gens: tuple = (0, [], 0)
         self.sweeps: list = []
         self.cached: dict[tuple, TrainedEntry] = {}
+        self.latest_round = "LEGACY"          # latest.json's round_id (the chain root)
+        self.hold: dict[str, threading.Event] = {}   # legs that block until released
+        self.records: dict[int, int] = {}     # published promotions/gen-<n>.json effective eras
         self.bench_scores = {"gifteval_crps": 0.5, "gifteval_mase": 0.5, "boom_crps": 0.5,
                              "boom_mase": 0.5, "time_crps": 0.5, "time_mase": 0.5}
 
@@ -102,12 +105,21 @@ class FakeOps(LegOps):
     def receipt_king(self):
         return self.king_hk
 
+    def latest_round_id(self):
+        return self.latest_round
+
+    def promotion_effective_era(self, generation):
+        return self.records.get(int(generation))
+
     def metagraph_king(self, client):
         return self.chain_king
 
     # legs
     def train_challenger(self, gen, era, block, *, end_wall):
         self.leg_calls.append((gen.hotkey, era.index, block, end_wall))
+        gate = self.hold.get(gen.hotkey)
+        if gate is not None:
+            gate.wait(10)
         if gen.hotkey in self.failures:
             raise RuntimeError("leg failed")
         return TrainedEntry(gen.hotkey, gen.uid, "challenger", gen.ref,
@@ -199,9 +211,9 @@ class FakeClient:
         return UID.get(hk, -1)
 
 
-def _sched(cfg, tmp_path, clock, ops=None):
+def _sched(cfg, tmp_path, clock, ops=None, provenance=None):
     runner = SimpleNamespace(cfg=cfg, work_root=tmp_path, promotion=None,
-                             pool_provenance_fn=None,
+                             pool_provenance_fn=provenance,
                              _rolling_note_king_host=lambda era: None)
     ops = ops or FakeOps(tmp_path, clock)
     return RollingScheduler(runner, ops, clock=clock), ops
@@ -221,14 +233,16 @@ def _advance(clock, ops, sched, client, *, from_block, to_block):
     _join(sched)
 
 
-def _validator(cfg):
-    king = None
-
+def _validator(cfg, ops=None, *, last_handled="LEGACY"):
+    """A validator that handled the last LEGACY round (its persisted position)
+    and binds refs against the fake chain's reveal history."""
     def fake_eval(entry, windows):
         return []
 
-    return ValidatorRunner(cfg=cfg, state=genesis("KING", 0), evaluate_fn=fake_eval,
-                           verify_signatures=False)
+    state = replace(genesis("KING", 0), last_handled_round_id=last_handled)
+    history = (lambda: list(ops.commits)) if ops is not None else (lambda: [])
+    return ValidatorRunner(cfg=cfg, state=state, evaluate_fn=fake_eval,
+                           verify_signatures=False, commitment_history_fn=history)
 
 
 # ── pure policy ──────────────────────────────────────────────────────────────
@@ -317,7 +331,8 @@ def test_settlement_manifest_chains_and_the_validator_accepts_it(cfg, tmp_path):
     m = ops.manifests[0]
     assert m.round_id == str(b1 * 7 + 1)
     assert m.era["index"] == st.current.index and m.era["start_block"] == era_start
-    assert m.prev_round_id == ""
+    # the first settlement chains to latest.json (the last legacy round)
+    assert m.prev_round_id == "LEGACY"
     assert [e.role for e in m.entries] == ["king", "challenger", "challenger"]
     assert [e.miner_hotkey for e in m.entries][1:] == ["ALFA", "BRAV"]
     assert all(e.train_block == b0 for e in m.entries)
@@ -328,9 +343,12 @@ def test_settlement_manifest_chains_and_the_validator_accepts_it(cfg, tmp_path):
     assert {q.get(hk).status for hk in ("ALFA", "BRAV")} == {"done"}
     assert sorted(ops.burnt) == ["ALFA", "BRAV"]
     assert ops.rosters[-1][1]["mode"] == "rolling" and len(ops.rosters[-1][1]["seated"]) == 2
-    # the validator side accepts exactly this manifest
-    v = _validator(armed)
+    # a validator that handled the legacy round accepts exactly this manifest;
+    # one positioned elsewhere walks the chain instead of judging it
+    v = _validator(armed, ops)
     assert v.check_manifest(m) is None
+    assert _validator(armed, ops, last_handled="OTHER").check_manifest(m).startswith(
+        "manifest_chain_broken")
     # second boundary, nothing new: no manifest; a third leg later chains to the first
     b2 = b1 + EB
     _advance(clock, ops, sched, client, from_block=b1 + 3, to_block=b2 + 3)
@@ -434,7 +452,7 @@ def test_dethrone_mid_era_adopts_the_winner_and_keeps_the_era(cfg, tmp_path):
     assert king.miner_hotkey == "ALFA" and king.trained_pointer == winner_ptr
     assert m2.era["index"] == era_idx
     # the validator that crowned ALFA judges the next settlement at that pointer
-    v = _validator(armed)
+    v = _validator(armed, ops)
     v.state = replace(v.state, king_hotkey="ALFA", king_uid=1, king_pointer=winner_ptr,
                       era_index=era_idx, last_handled_round_id=ops.manifests[0].round_id)
     assert v.check_manifest(m2) is None
@@ -572,7 +590,7 @@ def test_late_funding_starts_under_the_next_era_and_the_king_pretrains(cfg, tmp_
     assert sched.state.current.index == era0 + 1 and sched.state.next is None
     assert ops.retired == [era0]
     assert len(ops.king_calls) == 2
-    v = _validator(armed)
+    v = _validator(armed, ops)
     assert v.check_manifest(m) is None
     # the new era's first settlement carries BRAV under the new seeds
     _advance(clock, ops, sched, client, from_block=end + 1, to_block=end + EB + 1)
@@ -703,3 +721,167 @@ def test_state_file_round_trip(tmp_path):
     again = R.load_state(p)
     assert again == st
     assert R.load_state(tmp_path / "missing.json") == R.RollingState()
+
+
+# ── review fixes (PR #296) ───────────────────────────────────────────────────
+
+def test_pool_pin_is_the_settlement_boundary_not_the_era_start(cfg, tmp_path):
+    """Validators verify the pin at the settlement's epoch boundary; an era
+    that spans a daily snapshot's effective block would fail every settlement
+    after the crossing if the trainer pinned at the era start."""
+    armed = _armed(cfg)
+    clock = Clock()
+    pins = []
+
+    def provenance(seed, block):
+        pins.append((seed, block))
+        return f"pool/{block}.tar", "s" * 64
+
+    sched, ops = _sched(armed, tmp_path, clock, provenance=provenance)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b1 + 3)
+    assert len(ops.manifests) == 1
+    assert pins == [(b1 * 7 + 1, b1)]
+    assert ops.manifests[0].eval_pool_key == f"pool/{b1}.tar"
+
+
+def test_a_boundary_missed_during_an_outage_is_settled_late_not_thrown_away(cfg, tmp_path):
+    """The trainer is away across the era's LAST boundary: on return the
+    settlement is published stamped with that boundary (validators floor
+    created_block, so it resolves to the era the legs trained under) and the
+    payers are never re-billed for checkpoints that already exist."""
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    era_end = era_start + EB * 4
+    b3 = era_start + EB * 3
+    b0 = era_start + 5
+    sched.tick(client, b0)                      # king leg only
+    _join(sched)
+    era_idx = sched.state.current.index
+    # two legs admitted with the era's LAST boundary as their target (a
+    # 1200-block wall + margin from here clears era_end, nothing earlier)
+    bs = era_end - 1300
+    _advance(clock, ops, sched, client, from_block=b0, to_block=bs)
+    ops.commits += [_commit("ALFA", REF["ALFA"], bs - 10), _commit("BRAV", REF["BRAV"], bs - 9)]
+    q.add("ALFA", REF["ALFA"], reveal_block=bs - 10)
+    q.add("BRAV", REF["BRAV"], reveal_block=bs - 9)
+    ops.hold = {"ALFA": threading.Event(), "BRAV": threading.Event()}
+    sched.tick(client, bs)
+    assert {e.target_boundary for e in q.in_flight()} == {era_end}
+    # the third settlement passes with the legs still running: nothing published
+    clock.t += (b3 + 3 - bs) * R.BLOCK_SECONDS
+    sched.tick(client, b3 + 3)
+    assert ops.manifests == []
+    # the legs land before era_end …
+    for gate in ops.hold.values():
+        gate.set()
+    _join(sched)
+    assert len(sched.state.finished) == 2
+    # … but the trainer is away across era_end and returns one grid step later
+    late = era_end + EB + 3
+    _advance(clock, ops, sched, client, from_block=b3 + 3, to_block=late)
+    assert len(ops.manifests) == 1
+    m = ops.manifests[0]
+    assert m.created_block == era_end and m.round_id == str(era_end * 7 + 1)
+    assert m.era["index"] == era_idx
+    assert [e.miner_hotkey for e in m.entries][1:] == ["ALFA", "BRAV"]
+    assert {q.get(hk).status for hk in ("ALFA", "BRAV")} == {"done"}
+    assert sorted(ops.burnt) == ["ALFA", "BRAV"]
+    # the era rolled afterwards; nothing was requeued
+    assert sched.state.current.index == era_idx + 1
+    assert sched.state.finished == []
+    # a validator resolves the late manifest to the era it belongs to
+    v = _validator(armed, ops)
+    assert v.check_manifest(m) is None
+
+
+def test_no_settlement_is_published_against_an_unknown_chain_root(cfg, tmp_path):
+    """latest.json unreadable at the first settlement: an unchained manifest
+    would be rejected by every validator AFTER the legs were marked done and
+    burned — so nothing is published and the legs wait."""
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = FakeOps(tmp_path, clock)
+    ops.latest_round = ""
+    sched, ops = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b1 + 3)
+    assert ops.manifests == [] and ops.burnt == []
+    assert q.get("ALFA").status == "in_flight" and len(sched.state.finished) == 1
+    # the root becomes readable: the next boundary settles, chained to it
+    ops.latest_round = "LEGACY"
+    b2 = b1 + EB
+    _advance(clock, ops, sched, client, from_block=b1 + 3, to_block=b2 + 3)
+    assert len(ops.manifests) == 1 and ops.manifests[0].prev_round_id == "LEGACY"
+    assert q.get("ALFA").status == "done"
+
+
+def test_generation_ledger_rebuilds_from_the_published_record(cfg, tmp_path):
+    """The engine clears its pending record at publish; a lost era_state.json
+    must learn the generation's effective era from promotions/gen-<n>.json
+    (what validators install from), never treat first sight as 'live now'."""
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = FakeOps(tmp_path, clock)
+    ops.gens = (2, [("cascade/ckpt@sha256:" + "a" * 64, "toto2-4m")], 0)
+    ops.records = {2: 12}
+    sched, ops = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    sched.tick(client, era_start + 5)
+    _join(sched)
+    assert sched.state.generations["2"]["effective_era"] == 12
+    era_idx = sched.state.current.index
+    assert era_idx < 12 and sched.state.current.generation == 0      # random init until era 12
+    # a pre-era record (effective_era 0) is live at once
+    ops2 = FakeOps(tmp_path / "b", clock)
+    ops2.gens, ops2.records = ops.gens, {2: 0}
+    sched2, _ = _sched(armed, tmp_path / "b", clock, ops=ops2)
+    sched2.tick(client, era_start + 5)
+    _join(sched2)
+    assert sched2.state.generations["2"]["effective_era"] == 0
+    assert sched2.state.current.generation == 2
+
+
+def test_seniors_that_could_not_start_are_not_passed_over(cfg, tmp_path):
+    """The roster's seniority evidence lists only startable seniors that were
+    jumped: an unrevealed or cap-held senior is not a jump (the audit would
+    otherwise WARN on nearly every settlement with a queue)."""
+    armed = _armed(cfg)                       # funded_field_cap = 3
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    # ALFA is the most senior but unrevealed on chain; BRAV and CHAR revealed
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 300)
+    ops.commits += [_commit("BRAV", REF["BRAV"], b0 - 200), _commit("CHAR", REF["CHAR"], b0 - 100)]
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 200)
+    q.add("CHAR", REF["CHAR"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    rents = {r["hotkey"]: r for r in sched.state.rents}
+    assert set(rents) == {"BRAV", "CHAR"}
+    assert rents["BRAV"]["passed_over"] == [] and rents["CHAR"]["passed_over"] == []
+    assert q.get("ALFA").status == "queued"

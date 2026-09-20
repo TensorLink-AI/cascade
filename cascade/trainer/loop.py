@@ -7354,6 +7354,32 @@ class TrainerRunner:
             self._log_bench_pair_wandb(report)
         return report
 
+    def _rolling_latest_round_id(self) -> str:
+        """``round_id`` of the manifest bucket's ``latest.json`` — the chain
+        root the first settlement links to. "" when unreadable (the scheduler
+        then withholds the settlement rather than publish an unchained one)."""
+        from ..shared.hippius import read_latest_manifest
+        from ..shared.manifest import load_manifest
+
+        try:
+            return str(load_manifest(read_latest_manifest(self.manifest_store())).round_id)
+        except Exception as e:  # noqa: BLE001 — absent/unreadable ⇒ unknown root
+            log.warning("rolling: latest.json unreadable (%s); manifest chain root unknown", e)
+            return ""
+
+    def _rolling_promotion_effective_era(self, generation: int) -> int | None:
+        """``effective_era`` of the published ``promotions/gen-<n>.json``
+        (0 = a pre-era record); None when the record cannot be read."""
+        from ..shared.promotion import load_promotion_record, promotion_record_key
+
+        try:
+            rec = load_promotion_record(
+                self.manifest_store().get_text(promotion_record_key(int(generation))))
+        except Exception as e:  # noqa: BLE001 — not published yet / store down
+            log.warning("rolling: promotion record gen=%d unreadable (%s)", generation, e)
+            return None
+        return int(getattr(rec, "effective_era", 0) or 0)
+
     def _rolling_publish_roster(self, round_id: str, roster: dict) -> None:
         from ..shared.heat_status import _publish_public_json
 

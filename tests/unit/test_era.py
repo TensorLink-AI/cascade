@@ -184,14 +184,19 @@ def test_shipped_tomls_parse_the_knobs():
     assert main.round.era_settlements == 4
     assert main.scoring.margin_warmup_blocks == 8 * main.round.epoch_blocks
     assert main.scoring.cascade_reign_blocks == main.scoring.cascade_reign_days * main.round.epoch_blocks
+    assert main.scoring.king_resync_max_blocks == main.scoring.king_resync_max_rounds * main.round.epoch_blocks
     test = load_chain_config(REPO / "chain.testnet.toml")
     eb = test.round.epoch_blocks
-    assert test.round.rolling_from_block == eb
-    assert test.scoring.era_king_from_block == eb
-    assert test.scoring.tenure_blocks_from_block == eb
+    # armed at the first ERA boundary (the rollover must start an era)
+    assert test.round.rolling_from_block == eb * test.round.era_settlements
+    assert test.scoring.era_king_from_block == test.round.rolling_from_block
+    assert test.scoring.tenure_blocks_from_block == test.round.rolling_from_block
     assert test.round.era_settlements == 4
     assert test.scoring.margin_warmup_blocks == test.scoring.margin_warmup_rounds * eb
     assert test.scoring.cascade_reign_blocks == test.scoring.cascade_reign_days * eb
+    assert test.scoring.king_resync_max_blocks == test.scoring.king_resync_max_rounds * eb
+    assert E.era_for_block(test.round, test.round.rolling_from_block).start_block == \
+        test.round.rolling_from_block
 
 
 def test_loader_rejects_unequal_rollover_keys(tmp_path):
@@ -230,11 +235,38 @@ def test_loader_requires_the_rollover_on_both_grids(tmp_path):
 
 
 def test_loader_requires_the_stack_order(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=7200,
-                   era_king_from_block=7200, tenure_blocks_from_block=7200,
-                   cohort_maxt_from_block=1, cohort_maxt_increment_from_block=14400)
+    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=14400,
+                   era_king_from_block=14400, tenure_blocks_from_block=14400,
+                   cohort_maxt_from_block=1, cohort_maxt_increment_from_block=28800)
     with pytest.raises(ValueError, match="stacks on"):
         load_chain_config(p)
+
+
+def test_loader_requires_the_rollover_to_start_an_era(tmp_path):
+    # 7200 is a boundary of the 3600 grid but not of the 4-settlement era
+    # grid (14400): the first era would have started 7200 blocks earlier.
+    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=7200,
+                   era_king_from_block=7200, tenure_blocks_from_block=7200,
+                   cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
+    with pytest.raises(ValueError, match="start an era"):
+        load_chain_config(p)
+
+
+def test_resync_valve_keeps_its_wall_time_across_the_grid_switch(cfg):
+    from dataclasses import replace
+
+    rollover = 14400
+    round_cfg = replace(cfg.round, epoch_blocks=900, epoch_blocks_prev=3600,
+                        epoch_activation_block=rollover)
+    scoring = replace(cfg.scoring, king_resync_max_rounds=5, king_resync_max_blocks=18000,
+                      tenure_blocks_from_block=rollover)
+    # before the switch: 5 rounds; after it: 18000 blocks on the 900 grid = 20 settlements
+    assert E.effective_resync_cap_rounds(round_cfg, scoring, rollover - 1) == 5
+    assert E.effective_resync_cap_rounds(round_cfg, scoring, rollover) == 20
+    off = replace(scoring, king_resync_max_blocks=0)
+    assert E.effective_resync_cap_rounds(round_cfg, off, rollover) == 5
+    disabled = replace(scoring, king_resync_max_rounds=0, king_resync_max_blocks=0)
+    assert E.effective_resync_cap_rounds(round_cfg, disabled, rollover) == 0
 
 
 def test_loader_accepts_the_rollover_recipe(tmp_path):

@@ -42,6 +42,7 @@ from ..shared.config import (
 )
 from ..shared.era import (
     EraSpec,
+    effective_resync_cap_rounds,
     era_king_active,
     era_length_blocks,
     member_index_for_era,
@@ -140,21 +141,42 @@ def ref_as_of(commitments: list, hotkey: str, block: int) -> str | None:
     return best_ref
 
 
+CHAIN_WALK_DEPTH = 16          # manifests per poll on the first attempt
+CHAIN_WALK_MAX_DEPTH = 1024    # doubled per unreached poll up to this
+
+
+@dataclass(frozen=True)
+class ManifestChain:
+    """:func:`chain_manifests` result: the manifests to handle OLDEST FIRST,
+    and whether the walk reached the last handled settlement (or the chain's
+    root). ``reached=False`` — a hole (unreadable round) or the depth cap —
+    means NOTHING may be handled: judging the oldest collected manifest would
+    fail its chain check and latch past every settlement in the gap, a
+    dethrone included, and the validator's throne would silently diverge
+    from the fleet's (the wedge the walk exists to prevent, one level
+    down)."""
+
+    manifests: tuple[tuple[str, str], ...]
+    reached: bool
+
+
 def chain_manifests(store: object, raw_latest: str, last_handled_round_id: str | None,
-                    *, max_depth: int = 16,
+                    *, max_depth: int = CHAIN_WALK_DEPTH,
                     read_round: Callable[[object, str], str] | None = None,
-                    ) -> list[tuple[str, str]]:
+                    ) -> ManifestChain:
     """The manifests to handle, OLDEST FIRST, walking ``prev_round_id`` back
     from ``latest.json`` to ``last_handled_round_id`` (DEC-CA-0043: never jump
     to latest — a validator that missed settlements catches up through every
     one, dethrones included, before the era-king envelope is checked).
 
-    Returns ``[(raw_text, sha256)]``. With no chain link on the latest
-    manifest (pre-rollover), no persisted position, or a latest that already
-    follows the last handled settlement, this is just ``[latest]``. The walk is
-    bounded by ``max_depth``; if it does not reach the last handled settlement
-    the oldest collected manifest is still handled first (its chain check
-    fails closed and latches, and the rest follow in order).
+    ``manifests`` is ``[(raw_text, sha256)]``. With no chain link on the
+    latest manifest (pre-rollover), no persisted position, or a latest that
+    already follows the last handled settlement, this is just ``[latest]``.
+    A readable manifest with no ``prev_round_id`` is the chain's ROOT (the
+    first settlement links to the last legacy round, which is unchained):
+    reaching it counts as reached — everything before it was never chained.
+    The walk is bounded by ``max_depth``; an unreadable round or the cap
+    yields ``reached=False`` and the caller retries next poll, deeper.
     """
     from ..shared.hippius import manifest_round_key
 
@@ -166,23 +188,31 @@ def chain_manifests(store: object, raw_latest: str, last_handled_round_id: str |
     prev = str(latest.prev_round_id or "")
     if (not prev or last_handled_round_id is None or prev == last_handled_round_id
             or str(latest.round_id) == last_handled_round_id):
-        return chain
+        return ManifestChain(tuple(chain), True)
     reader = read_round or (lambda s, rid: s.get_text(manifest_round_key(rid)))
     seen = {str(latest.round_id)}
-    while prev and prev != last_handled_round_id and len(chain) < max_depth:
+    reached = False
+    while prev and prev != last_handled_round_id:
         if prev in seen:
+            log.error("manifest chain: round %s links back into itself; walking stops", prev)
+            break
+        if len(chain) >= max_depth:
+            log.warning("manifest chain: %d manifests walked without reaching %s (depth cap)",
+                        len(chain), last_handled_round_id)
             break
         seen.add(prev)
         try:
             raw = reader(store, prev)
-        except Exception as e:  # noqa: BLE001 — a hole in the chain: handle what we have
+        except Exception as e:  # noqa: BLE001 — a hole in the chain: nothing is handled
             log.warning("manifest chain: round %s unreadable (%s); walking stops", prev, e)
             break
         m = load_manifest(raw)
         chain.append((raw, _digest(raw)))
         prev = str(m.prev_round_id or "")
+    else:
+        reached = True            # prev == last handled, or the root ("" — unchained before it)
     chain.reverse()
-    return chain
+    return ManifestChain(tuple(chain), reached)
 
 
 @dataclass(frozen=True)
@@ -284,6 +314,10 @@ class ValidatorRunner:
     # None ⇒ the binding check is skipped (tests / no chain); a raising fn is
     # a transient — the round is retried next poll, never latched.
     commitment_history_fn: Callable[[], list] | None = None
+    # Manifests the chain walk may collect per poll; doubles (to
+    # CHAIN_WALK_MAX_DEPTH) each time the walk fails to reach the last handled
+    # settlement, resets when it does.
+    chain_walk_depth: int = CHAIN_WALK_DEPTH
     # Block of the last successful (or attempted re-assert) weight-set; drives
     # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
     # never set this process, so the first live-loop tick re-asserts
@@ -409,16 +443,10 @@ class ValidatorRunner:
                         "random init")
             return None
         self._refresh_pending_promotion(era)
-        state = self.cascade.state
-        if (state.pending_generation and state.pending_generation > state.generation
-                and era.index >= state.pending_effective_era):
-            self.cascade.note_promotion(
-                generation=state.pending_generation, members=state.pending_members,
-                block=era.start_block)
-            self.cascade.stage_promotion(generation=0, members=(), effective_era=0)
-            state = self.cascade.state
-        generation = int(state.generation)
-        members = tuple(state.members)
+        # Gating is PURE: the ledger in force for this era is derived here and
+        # installed only once the settlement is handled (_install_era_promotion)
+        # — a transient after the gate leaves the state untouched for the retry.
+        generation, members = self._era_ledger(era)
         if generation == 0 or not members:
             expected_member, expected_index = "", 0
         else:
@@ -433,6 +461,66 @@ class ValidatorRunner:
                     f"{expected_member or '<random init>'!r}, manifest trained from "
                     f"{manifest.warm_start_ckpt or '<random init>'!r}")
         return None
+
+    def _era_ledger(self, era: EraSpec) -> tuple[int, tuple[str, ...]]:
+        """``(generation, members)`` in force for ``era``: the staged
+        promotion once its effective era is reached, else the live one."""
+        assert self.cascade is not None
+        state = self.cascade.state
+        if (state.pending_generation and state.pending_generation > state.generation
+                and int(era.index) >= int(state.pending_effective_era)):
+            return int(state.pending_generation), tuple(state.pending_members)
+        return int(state.generation), tuple(state.members)
+
+    def _install_era_promotion(self, manifest: TrainingManifest) -> None:
+        """Install the staged promotion at its first effective settlement —
+        called when a gated era manifest is HANDLED (scored, resync-held or
+        rejected), never from a gate. Idempotent."""
+        if self.cascade is None or not self._era_active(manifest) or manifest.era is None:
+            return
+        try:
+            era = EraSpec.from_json(manifest.era)
+        except ValueError:
+            return
+        state = self.cascade.state
+        if (state.pending_generation and state.pending_generation > state.generation
+                and int(era.index) >= int(state.pending_effective_era)):
+            self.cascade.note_promotion(
+                generation=state.pending_generation, members=state.pending_members,
+                block=era.start_block)
+            self.cascade.stage_promotion(generation=0, members=(), effective_era=0)
+            log.info("cascade: promotion generation=%d installed at era %d",
+                     self.cascade.state.generation, era.index)
+
+    def _adopt_era_king(self, manifest: TrainingManifest) -> None:
+        """Record the pointer the era's king is judged at — the era's first
+        king leg, or (already set by apply_round / demote_to_trained) the
+        crowned winner's — AFTER the settlement is handled. Adoption inside
+        the gate left a transient with an adopted pointer, and a legitimately
+        re-published manifest carrying a different first-king-leg pointer
+        was then rejected forever."""
+        if not self._era_active(manifest) or manifest.era is None:
+            return
+        try:
+            era = EraSpec.from_json(manifest.era)
+        except ValueError:
+            return
+        king = manifest.entry_for_role("king")
+        pointer = self.state.king_pointer
+        if (king is not None and king.miner_hotkey == self.state.king_hotkey
+                and (self.state.era_index != era.index or not pointer)):
+            pointer = str(king.trained_pointer)
+        if self.state.era_index != era.index or pointer != self.state.king_pointer:
+            self.state = replace(self.state, era_index=int(era.index), king_pointer=pointer)
+
+    def process_settlement(self, manifest: TrainingManifest, windows, base_seed: int):
+        """:meth:`process_round` for a settlement: the era ledger is installed
+        first (idempotent), the era king pointer adopted after success. A
+        transient raised by process_round leaves the pointer untouched."""
+        self._install_era_promotion(manifest)
+        outcome = self.process_round(manifest, windows, base_seed)
+        self._adopt_era_king(manifest)
+        return outcome
 
     def _refresh_pending_promotion(self, era: EraSpec) -> None:
         """Learn of a NEWER promotion record ahead of its effective era. The
@@ -496,24 +584,25 @@ class ValidatorRunner:
         champ = self.state.king_hotkey
         if champ is not None and king.miner_hotkey != champ:
             return None
-        if self.state.era_index == era.index and self.state.king_pointer:
-            if king.trained_pointer != self.state.king_pointer:
-                return (f"era_king_pointer_mismatch: era {era.index} king pointer is "
-                        f"{self.state.king_pointer!r}, manifest carries "
-                        f"{king.trained_pointer!r}")
-            return None
-        self.state = replace(self.state, era_index=int(era.index),
-                             king_pointer=str(king.trained_pointer))
+        if (self.state.era_index == era.index and self.state.king_pointer
+                and king.trained_pointer != self.state.king_pointer):
+            return (f"era_king_pointer_mismatch: era {era.index} king pointer is "
+                    f"{self.state.king_pointer!r}, manifest carries "
+                    f"{king.trained_pointer!r}")
+        # A new era's first king leg is adopted when the settlement is
+        # handled (_adopt_era_king), never here: gates leave state untouched.
         return None
 
     def _check_era_refs(self, manifest: TrainingManifest) -> str | None:
         """Each entry's ref is the hotkey's revealed commitment AS OF its
         ``train_block`` (not the latest reveal at the boundary), so a
         re-commit between leg start and settlement cannot change what is
-        judged. Skipped without a history provider; a provider failure is a
-        transient (raised — the loop retries next poll)."""
+        judged. FAIL CLOSED without a history provider (the live loop wires
+        ``client.poll_commitments(include_history=True)`` itself); a provider
+        failure is a transient (raised — the loop retries next poll)."""
         if self.commitment_history_fn is None:
-            return None
+            return ("era_ref_unverifiable: no commitment-history provider — refs are "
+                    "judged as of train_block from era_king_from_block")
         history = self.commitment_history_fn()
         for e in manifest.entries:
             bound = ref_as_of(history, e.miner_hotkey, int(e.train_block))
@@ -1710,11 +1799,24 @@ class ValidatorRunner:
                            last_round: str | None) -> list[tuple[str, str]]:
         """:func:`chain_manifests`, applied only when the latest settlement is
         past ``era_king_from_block`` (pre-rollover: ``[latest]``, exactly as
-        before). Unreadable latest ⇒ handled by the caller's load."""
+        before). A walk that does not reach the last handled settlement
+        handles NOTHING (position untouched) and doubles the depth for the
+        next poll. Unreadable latest ⇒ handled by the caller's load."""
         latest = load_manifest(raw_latest)
         if not self._era_active(latest):
             return [(raw_latest, hashlib.sha256(raw_latest.encode("utf-8")).hexdigest())]
-        return chain_manifests(store, raw_latest, last_round)
+        walk = chain_manifests(store, raw_latest, last_round, max_depth=self.chain_walk_depth)
+        if not walk.reached:
+            depth = self.chain_walk_depth
+            self.chain_walk_depth = min(depth * 2, CHAIN_WALK_MAX_DEPTH)
+            log.error("manifest chain: latest round %s does not reach this validator's last "
+                      "handled settlement %s within %d manifests (hole or depth cap) — "
+                      "NOTHING handled this poll; retrying with depth %d. A permanent "
+                      "hole needs the missing round-<id>.json restored to the bucket",
+                      latest.round_id, last_round, depth, self.chain_walk_depth)
+            return []
+        self.chain_walk_depth = CHAIN_WALK_DEPTH
+        return list(walk.manifests)
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the
@@ -2051,6 +2153,11 @@ class ValidatorRunner:
         # before the marker existed are seeded from this validator's own
         # signature-verified receipt trail; a same-round re-publish with
         # different content still re-judges (the sha differs).
+        if self.commitment_history_fn is None:
+            # DEC-CA-0043 ref binding needs the FULL reveal history; wired here
+            # (not by the caller) so no live validator runs the era gate
+            # without it — _check_era_refs fails closed on None.
+            self.commitment_history_fn = lambda: client.poll_commitments(include_history=True)
         last_round: str | None = self.state.last_handled_round_id
         last_digest: str | None = self.state.last_handled_manifest_sha
         if last_round is None:
@@ -2154,7 +2261,9 @@ class ValidatorRunner:
                             self.state = replace(
                                 self.state, last_handled_round_id=str(manifest.round_id),
                                 last_handled_manifest_sha=digest)
+                            self._install_era_promotion(manifest)
                             self.state, reject_reason = self._resync_step(manifest)
+                            self._adopt_era_king(manifest)
                             self._persist_state()
                             reward_uids = self._reward_uids(manifest, None, client)
                             weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
@@ -2176,7 +2285,7 @@ class ValidatorRunner:
                             # leaving state untouched for a clean retry). Mark the round
                             # consumed as soon as it returns, so a later weight-set failure
                             # can NEVER re-run it and double-count the streak/tenure.
-                            outcome = self.process_round(manifest, windows, base_seed)
+                            outcome = self.process_settlement(manifest, windows, base_seed)
                             # Back in sync — clear any accumulated resync holds so a
                             # future desync starts the safety-valve count from zero.
                             if self.state.resync_holds or self.state.last_resync_round_id:
@@ -2316,7 +2425,8 @@ class ValidatorRunner:
         round_id = str(manifest.round_id)
         same_round = self.state.last_resync_round_id == round_id
         holds = self.state.resync_holds if same_round else self.state.resync_holds + 1
-        cap = self.cfg.scoring.king_resync_max_rounds
+        cap = effective_resync_cap_rounds(self.cfg.round, self.cfg.scoring,
+                                          self._epoch_start_block(manifest))
         if 0 < cap <= holds and trained is not None:
             log.warning(
                 "round=%s king_resync SAFETY VALVE: champion %s un-synced %d rounds "

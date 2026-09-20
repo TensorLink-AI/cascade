@@ -276,7 +276,8 @@ epoch_activation_block = 0
 # trained once per era and cached. 0 = off (the boundary-synchronous trainer,
 # bit-identical to before). ROLLOVER recipe (owner call, one boundary for
 # everything): rolling_from_block = era_king_from_block =
-# tenure_blocks_from_block = cohort_maxt_increment_from_block = ROLLOVER;
+# tenure_blocks_from_block = cohort_maxt_increment_from_block = ROLLOVER
+# (a multiple of epoch_blocks × era_settlements — the era grid is absolute);
 # epoch_blocks = 900, epoch_blocks_prev = 3600, epoch_activation_block =
 # ROLLOVER (3h grid); ROLLOVER % 3600 == 0. Load-checked. Do NOT arm before
 # the six external validators run a release carrying the era envelope.
@@ -756,6 +757,7 @@ era_king_from_block = 0
 tenure_blocks_from_block = 0
 margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
 cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
+king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks — same valve as today
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool

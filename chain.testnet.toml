@@ -175,11 +175,12 @@ train_image_digest = ""
 # (~800). Pre-existing — the previous 7100 failed the same way.
 epoch_blocks     = 150    # FUNDED-TEST fast round
 round_hours      = 3.0    # informational
-# Rolling intake + era king (DEC-CA-0043) ARMED at the first grid boundary
-# (150 — the earliest block the load-checked alignment allows; every
-# testnet settlement is past it, so it is "from the start" like the other
-# testnet gates at 1). Eras of 4 settlements = 600 blocks.
-rolling_from_block = 150
+# Rolling intake + era king (DEC-CA-0043) ARMED at the first era boundary
+# (600 = epoch_blocks × era_settlements — the earliest block the load-checked
+# alignment allows: the rollover must START an era on the absolute era grid;
+# every testnet settlement is past it, so it is "from the start" like the
+# other testnet gates at 1). Eras of 4 settlements = 600 blocks.
+rolling_from_block = 600
 era_settlements = 4
 heat_train_hours = 0.025  # FUNDED-TEST fast round
 heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
@@ -366,10 +367,11 @@ margin_activation_block = 0
 cohort_maxt_from_block = 1        # DEC-CA-0038: max-T cohort correction armed (testnet validation)
 increment_from_block = 1          # DEC-CA-0039: increment margin armed (testnet validation)
 cohort_maxt_increment_from_block = 1  # DEC-CA-0039 amended: increment units for the cohort max-T (testnet validation)
-era_king_from_block = 150         # DEC-CA-0043: era envelope armed at the first boundary (testnet validation)
-tenure_blocks_from_block = 150    # DEC-CA-0043: tenure/ripeness in blocks from the same boundary
+era_king_from_block = 600         # DEC-CA-0043: era envelope armed at the first era boundary (testnet validation)
+tenure_blocks_from_block = 600    # DEC-CA-0043: tenure/ripeness in blocks from the same boundary
 margin_warmup_blocks = 1200       # = 8 rounds × 150 blocks (same decay as margin_warmup_rounds)
 cascade_reign_blocks = 150        # = 1 round × 150 blocks (same ripeness as cascade_reign_days)
+king_resync_max_blocks = 750      # = king_resync_max_rounds (5) × 150 blocks (same valve)
 win_margin_end       = 0.005     # decayed floor at margin_warmup_rounds of tenure (> 0!)
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor. Rounds, not days:
                                  # ~24h at the 3h testnet cadence (mainnet: ~4d at 12h)

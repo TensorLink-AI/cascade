@@ -40,6 +40,7 @@ from cascade.shared.promotion import (
     promotion_index_key,
     promotion_record_key,
 )
+from cascade.validator import loop as L
 from cascade.validator.cascade import CascadeController, CascadeState
 from cascade.validator.loop import ValidatorRunner, chain_manifests, ref_as_of
 from cascade.validator.state import ChampionState, dumps, genesis, loads
@@ -114,10 +115,23 @@ def _manifest(cfg, block, *, era=True, king=("king_hk", 0, REF_K, PTR_K),
     )
 
 
+# The reveal history the era gate binds refs against (fail closed without one):
+# every fixture hotkey committed its fixture ref at block 0.
+_DEFAULT_HISTORY = [
+    Commitment(uid=0, hotkey="king_hk", coldkey=None,
+               payload=f"metro-v1:gen:hippius:{REF_K}", commit_block=0),
+    Commitment(uid=1, hotkey="chal_hk", coldkey=None,
+               payload=f"metro-v1:gen:hippius:{REF_C}", commit_block=0),
+    Commitment(uid=2, hotkey="x_hk", coldkey=None,
+               payload=f"metro-v1:gen:hippius:{REF_K}", commit_block=0),
+]
+
+
 def _runner(cfg, *, king_scores=None, chal=None, state=None, cascade=None, store=None,
             history=None):
     king_scores = king_scores or _scores(1.0, 0)
     chal = chal or {}
+    history = history or (lambda: list(_DEFAULT_HISTORY))
 
     def fake_eval(entry, windows):
         if entry.role == "king":
@@ -157,7 +171,7 @@ def test_pre_rollover_validator_and_receipt_are_byte_identical(cfg):
     for c in (cfg, armed):
         r = _runner(c, chal=strong)
         m = _manifest(c, block, era=False)
-        out = r.process_round(m, windows=[], base_seed=block)
+        out = r.process_settlement(m, windows=[], base_seed=block)
         receipt = r.build_round_receipt(m, base_seed=block, epoch_start_block=block,
                                         epoch_block_hash="0x" + "ab" * 32,
                                         outcome=out, windows=[])
@@ -183,7 +197,7 @@ def test_era_settlement_round_trips_validator_receipt_audit_and_fails_with_gate_
     era_seed = seed_from_block_hash(seed_hash)
     r = _runner(armed, chal={"chal_hk": _noisy(_scores(1.0, 0), 0.6, 22)})
     m = _manifest(armed, block)
-    out = r.process_round(m, windows=[], base_seed=block)
+    out = r.process_settlement(m, windows=[], base_seed=block)
     assert out is not None and out.transition.dethroned
     receipt = r.build_round_receipt(m, base_seed=block, epoch_start_block=block,
                                     epoch_block_hash="0x" + "ab" * 32,
@@ -314,11 +328,15 @@ def test_generation_switch_lands_on_the_announced_era_only(cfg, tmp_path):
     m_prev_new = _manifest(armed, prev_block, warm_start=M2A, generation=2, member_index=0)
     assert v.check_manifest(m_prev_new).startswith("era_init_mismatch")
     v.state = replace(v.state, last_handled_round_id=None)
-    # era n: the new generation is installed at its first settlement
-    assert v.check_manifest(_manifest(armed, n_block, warm_start=M2A, generation=2,
-                                      member_index=0)) is None
+    # era n: the new generation is installed when its first settlement is
+    # HANDLED (the gate is pure: it judges against the staged ledger)
+    m_n = _manifest(armed, n_block, warm_start=M2A, generation=2, member_index=0)
+    assert v.check_manifest(m_n) is None
+    assert v.cascade.state.generation == 1 and v.cascade.state.pending_generation == 2
+    assert v.process_settlement(m_n, windows=[], base_seed=n_block) is not None
     assert v.cascade.state.generation == 2 and v.cascade.state.members == (M2A,)
     assert v.cascade.state.pending_generation == 0
+    assert v.check_manifest(m_n) is None                 # same verdict after the install
     # (c) an era-n manifest still on the old init fails the envelope
     v2 = _validator(good)
     assert v2.check_manifest(_manifest(armed, n_block, warm_start=old_member, generation=1,
@@ -356,7 +374,7 @@ def test_dethrone_mid_era_adopts_the_winner_pointer_and_keeps_the_era(cfg):
     king = _scores(1.0, 0)
     r = _runner(armed, king_scores=king, chal={"chal_hk": _noisy(king, 0.6, 22),
                                                "x_hk": _noisy(king, 1.3, 33)})
-    out = r.process_round(_manifest(armed, b1), windows=[], base_seed=b1)
+    out = r.process_settlement(_manifest(armed, b1), windows=[], base_seed=b1)
     assert out.transition.dethroned
     assert r.state.king_hotkey == "chal_hk"
     assert r.state.king_pointer == PTR_C
@@ -367,20 +385,38 @@ def test_dethrone_mid_era_adopts_the_winner_pointer_and_keeps_the_era(cfg):
     b2 = b1 + eb
     m2 = _manifest(armed, b2, king=("chal_hk", 1, REF_C, PTR_C),
                    challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b1))
-    out2 = r.process_round(m2, windows=[], base_seed=b2)
+    out2 = r.process_settlement(m2, windows=[], base_seed=b2)
     assert out2 is not None and not out2.transition.dethroned
     assert r.state.era_index == era.index and r.state.king_pointer == PTR_C
     # another checkpoint of the same generator cannot be substituted
     m2b = _manifest(armed, b2, king=("chal_hk", 1, REF_C, PTR_C2),
                     challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b1))
     assert r.check_manifest(m2b).startswith("era_king_pointer_mismatch")
-    # a NEW era adopts the era's first king leg
+    # a NEW era adopts the era's first king leg — when the settlement is
+    # HANDLED, never in the gate: a transient after the gate leaves the
+    # pointer unadopted, so a legitimately re-published manifest carrying a
+    # different first-king-leg pointer is still judged.
     b3 = era.start_block + eb * 4 + eb            # next era's first settlement
     r.state = replace(r.state, last_handled_round_id=str(b2))
     m3 = _manifest(armed, b3, king=("chal_hk", 1, REF_C, PTR_C2),
                    challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b2))
     assert r.check_manifest(m3) is None
-    assert r.state.era_index == era.index + 1 and r.state.king_pointer == PTR_C2
+    assert r.state.era_index == era.index and r.state.king_pointer == PTR_C
+    good_eval = r.evaluate_fn
+
+    def boom(entry, windows):
+        raise RuntimeError("eval pod down")
+    r.evaluate_fn = boom
+    with pytest.raises(RuntimeError):
+        r.process_settlement(m3, windows=[], base_seed=b3)
+    assert r.state.era_index == era.index and r.state.king_pointer == PTR_C
+    m3b = _manifest(armed, b3, king=("chal_hk", 1, REF_C, PTR_K),
+                    challengers=(("x_hk", 2, REF_K, PTR_K),), prev_round_id=str(b2))
+    assert r.check_manifest(m3b) is None
+    r.evaluate_fn = good_eval
+    assert r.process_settlement(m3b, windows=[], base_seed=b3) is not None
+    assert r.state.era_index == era.index + 1 and r.state.king_pointer == PTR_K
+    assert r.check_manifest(m3).startswith("era_king_pointer_mismatch")
 
 
 def test_restart_mid_era_restores_era_index_and_king_pointer():
@@ -407,10 +443,12 @@ def test_chain_walk_catches_up_through_missed_settlements_and_latest_alone_wedge
     store = _Store({manifest_round_key(m.round_id): dump_manifest(m) for m in (mA, mB, mC)})
     latest = dump_manifest(mC)
     # walked oldest-first back to the last handled settlement
-    walked = chain_manifests(store, latest, str(bA))
+    walk = chain_manifests(store, latest, str(bA))
+    walked = list(walk.manifests)
+    assert walk.reached
     assert [load_manifest(raw).round_id for raw, _ in walked] == [str(bB), str(bC)]
-    assert chain_manifests(store, latest, None) == [(latest, walked[-1][1])]
-    assert chain_manifests(store, latest, str(bB)) == [(latest, walked[-1][1])]
+    assert chain_manifests(store, latest, None).manifests == ((latest, walked[-1][1]),)
+    assert chain_manifests(store, latest, str(bB)).manifests == ((latest, walked[-1][1]),)
     # a validator that handled A, was down for B, and sees C:
     r = _runner(armed, king_scores=king, chal={"chal_hk": _noisy(king, 0.6, 22),
                                                "x_hk": _noisy(king, 1.3, 33)})
@@ -419,11 +457,11 @@ def test_chain_walk_catches_up_through_missed_settlements_and_latest_alone_wedge
     # jumping to latest (the old code path) wedges on the envelope
     assert r.check_manifest(mC).startswith("manifest_chain_broken")
     # walking the chain: B dethrones, C is accepted with the new era king
-    outB = r.process_round(mB, windows=[], base_seed=bB)
+    outB = r.process_settlement(mB, windows=[], base_seed=bB)
     assert outB.transition.dethroned and r.state.king_hotkey == "chal_hk"
     r.state = replace(r.state, last_handled_round_id=str(bB))
     assert r.check_manifest(mC) is None
-    outC = r.process_round(mC, windows=[], base_seed=bC)
+    outC = r.process_settlement(mC, windows=[], base_seed=bC)
     assert outC is not None and r.state.king_hotkey == "chal_hk"
     # pre-rollover: latest alone, as before
     pre = _manifest(armed, _rollover(armed) - eb, era=False)
@@ -431,18 +469,63 @@ def test_chain_walk_catches_up_through_missed_settlements_and_latest_alone_wedge
     assert r._pending_manifests(store, raw, "whatever")[0][0] == raw
 
 
-def test_chain_walk_is_bounded_and_survives_a_hole(cfg):
+def test_chain_walk_never_latches_past_a_hole_or_the_depth_cap(cfg):
+    """A walk that does not reach the last handled settlement handles NOTHING:
+    judging the oldest collected manifest would fail its chain check, latch
+    past the gap (a dethrone in it lost) and diverge this validator's throne
+    from the fleet's. The loop retries next poll, deeper."""
     armed = _armed(cfg)
     eb = cfg.round.epoch_blocks
     blocks = [_rollover(armed) + eb * i for i in range(6)]
-    ms = [_manifest(armed, b, prev_round_id=str(blocks[i - 1]) if i else "")
+    ms = [_manifest(armed, b, prev_round_id=str(blocks[i - 1]) if i else "LEGACY")
           for i, b in enumerate(blocks)]
     store = _Store({manifest_round_key(m.round_id): dump_manifest(m) for m in ms[2:]})
-    walked = chain_manifests(store, dump_manifest(ms[-1]), "unknown", max_depth=3)
-    assert [load_manifest(raw).round_id for raw, _ in walked] == [str(b) for b in blocks[3:]]
-    walked = chain_manifests(store, dump_manifest(ms[-1]), str(blocks[0]))
-    # the hole at ms[1] stops the walk; what was collected is handled in order
-    assert [load_manifest(raw).round_id for raw, _ in walked] == [str(b) for b in blocks[2:]]
+    latest = dump_manifest(ms[-1])
+    # depth cap
+    walk = chain_manifests(store, latest, "unknown", max_depth=3)
+    assert not walk.reached
+    assert [load_manifest(raw).round_id for raw, _ in walk.manifests] == [str(b) for b in blocks[3:]]
+    # a hole at ms[1]
+    walk = chain_manifests(store, latest, str(blocks[0]))
+    assert not walk.reached
+    # the runner handles nothing, keeps its position and doubles the depth
+    r = _runner(armed)
+    r.state = replace(r.state, last_handled_round_id=str(blocks[0]))
+    assert r.chain_walk_depth == L.CHAIN_WALK_DEPTH
+    assert r._pending_manifests(store, latest, str(blocks[0])) == []
+    assert r.chain_walk_depth == 2 * L.CHAIN_WALK_DEPTH
+    assert r.state.last_handled_round_id == str(blocks[0])
+    # the hole is filled: the walk reaches, everything is handled in order
+    store.texts[manifest_round_key(ms[1].round_id)] = dump_manifest(ms[1])
+    pending = r._pending_manifests(store, latest, str(blocks[0]))
+    assert [load_manifest(raw).round_id for raw, _ in pending] == [str(b) for b in blocks[1:]]
+    assert r.chain_walk_depth == L.CHAIN_WALK_DEPTH
+    # the chain's ROOT (the first settlement links to the unchained last
+    # legacy round): a validator whose position predates it walks to the
+    # legacy round and handles it too
+    full = _Store({manifest_round_key(m.round_id): dump_manifest(m) for m in ms})
+    legacy = _manifest(armed, _rollover(armed) - eb, era=False, round_id="LEGACY")
+    full.texts[manifest_round_key("LEGACY")] = dump_manifest(legacy)
+    walk = chain_manifests(full, latest, "OLDER")
+    assert walk.reached
+    assert [load_manifest(raw).round_id for raw, _ in walk.manifests] == \
+        ["LEGACY"] + [str(b) for b in blocks]
+    # the depth never exceeds CHAIN_WALK_MAX_DEPTH
+    r.chain_walk_depth = L.CHAIN_WALK_MAX_DEPTH
+    assert r._pending_manifests(store, latest, "unknown") == []
+    assert r.chain_walk_depth == L.CHAIN_WALK_MAX_DEPTH
+
+
+def test_ref_binding_fails_closed_without_a_history_provider(cfg):
+    armed = _armed(cfg)
+    eb = cfg.round.epoch_blocks
+    block = _rollover(armed) + eb
+    bare = ValidatorRunner(cfg=armed, state=genesis("king_hk", 0),
+                           evaluate_fn=lambda e, w: [], verify_signatures=False)
+    assert bare.commitment_history_fn is None
+    assert bare.check_manifest(_manifest(armed, block)).startswith("era_ref_unverifiable")
+    # pre-gate: never consulted
+    assert bare.check_manifest(_manifest(armed, block - eb * 2, era=False)) is None
 
 
 # ── ref binding at train_block ───────────────────────────────────────────────
@@ -500,7 +583,7 @@ def test_first_settlement_after_the_grid_switch_keeps_the_kings_decayed_margin(c
     # a king with 14 rounds of tenure on the old grid, crowning block unknown
     state = ChampionState(king_hotkey="king_hk", king_uid=0, tenure_rounds=14)
     r = _runner(base, king_scores=king, chal=weak, state=state)
-    out = r.process_round(_manifest(base, rollover), windows=[], base_seed=rollover)
+    out = r.process_settlement(_manifest(base, rollover), windows=[], base_seed=rollover)
     assert out.king_tenure_rounds == 56                       # 14 × 3600 / 900
     assert out.result.margin == pytest.approx(cfg.scoring.win_margin_end)
     receipt = r.build_round_receipt(_manifest(base, rollover), base_seed=rollover,
@@ -511,6 +594,6 @@ def test_first_settlement_after_the_grid_switch_keeps_the_kings_decayed_margin(c
     assert C.check_verdict(receipt, base).status == C.PASS
     # the same king one settlement BEFORE the switch: the counter, as today
     r2 = _runner(base, king_scores=king, chal=weak, state=state)
-    out2 = r2.process_round(_manifest(base, rollover - eb_old, era=False), windows=[],
+    out2 = r2.process_settlement(_manifest(base, rollover - eb_old, era=False), windows=[],
                             base_seed=rollover - eb_old)
     assert out2.king_tenure_rounds == 14

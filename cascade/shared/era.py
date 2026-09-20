@@ -191,6 +191,19 @@ def effective_reign_threshold_rounds(round_cfg: RoundConfig, scoring: ScoringCon
     return int(scoring.cascade_reign_days)
 
 
+def effective_resync_cap_rounds(round_cfg: RoundConfig, scoring: ScoringConfig,
+                                block: int | None) -> int:
+    """King-resync safety-valve cap in ROUNDS in force at ``block``: from
+    ``tenure_blocks_from_block`` it is ``king_resync_max_blocks`` on the grid
+    in force there (the valve keeps its wall-time length across the grid
+    switch — counted in settlements alone it tripped 4× sooner); before it,
+    ``king_resync_max_rounds``. ``<= 0`` disables the valve either way."""
+    blocks = int(getattr(scoring, "king_resync_max_blocks", 0) or 0)
+    if blocks > 0 and tenure_blocks_active(scoring, block):
+        return max(1, blocks // max(1, int(effective_epoch_blocks(round_cfg, int(block)))))
+    return int(scoring.king_resync_max_rounds)
+
+
 def tenure_rounds_at(round_cfg: RoundConfig, scoring: ScoringConfig, *,
                      block: int | None, tenure_rounds: int,
                      king_since_block: int | None) -> int:
