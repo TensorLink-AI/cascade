@@ -50,6 +50,15 @@ def test_pool_get_with_a_past_deadline_raises_instead_of_blocking():
     assert time.monotonic() - t0 < 1.0                 # no refresh-loop wait
 
 
+def test_pool_get_past_the_deadline_serves_a_lane_that_is_free_now():
+    # Owner 2026-09-20: a free rented lane is never withheld; only WAITING
+    # for one past the deadline is refused (the empty-pool case above).
+    pool = _FinalLanePool([_Host("a")], lambda: [])
+    assert pool.get(deadline=time.time() - 1.0).name == "a"
+    with pytest.raises(_LaneDeadlinePassed):
+        pool.get(deadline=time.time() - 1.0)          # now empty: no wait
+
+
 def test_pool_get_serves_a_free_lane_before_the_deadline():
     pool = _FinalLanePool([_Host("a")], lambda: [])
     assert pool.get(deadline=time.time() + 60.0).name == "a"
@@ -100,18 +109,34 @@ def test_free_lane_dispatch_raises_past_the_deadline_with_no_lane():
     assert d.calls == []
 
 
-def test_free_lane_dispatch_retry_wait_is_bounded_too():
+def test_free_lane_dispatch_retry_past_the_deadline_takes_the_freed_lane():
     lane = _Host("a")
     pool = _FinalLanePool([lane], lambda: [])
     pool.REFRESH_INTERVAL_S = 0.05
     d = _Disp(fail_first=True)
-    # The one lane is handed back after the failure, but the deadline has
-    # passed by the retry's get(): the leg ends, the lane stays in the pool.
+    # The one lane is handed back after the failure and is FREE at the
+    # retry's get(): past the deadline it is still served (no wait needed).
+    out = TrainerRunner._dispatch_on_free_lane(d, pool, [lane], describe="x",
+                                               deadline=time.time() + 0.01, role="challenger")
+    assert out.host == "a" and d.calls == ["a", "a"]
+
+
+def test_free_lane_dispatch_retry_wait_is_bounded_too():
+    lane = _Host("a")
+
+    class _Taken(_FinalLanePool):
+        def put(self, item, *a, **kw):        # a sibling grabs the freed lane
+            pass
+
+    pool = _Taken([lane], lambda: [])
+    pool.REFRESH_INTERVAL_S = 0.05
+    d = _Disp(fail_first=True)
+    # No lane free at the retry and the deadline has passed: no wait — the
+    # leg ends (requeue), nothing hangs on the pool.
     with pytest.raises(_LaneDeadlinePassed):
         TrainerRunner._dispatch_on_free_lane(d, pool, [lane], describe="x",
                                              deadline=time.time() + 0.01, role="challenger")
     assert d.calls == ["a"]
-    assert pool.get(timeout=0.1) is lane
 
 
 def test_free_lane_dispatch_with_no_deadline_uses_a_plain_queue():
@@ -172,17 +197,50 @@ def _fallback_round(cfg, tmp_path, monkeypatch, *, epoch_end_wall: float,
     return runner, jobs, contract, seen
 
 
+def _hold_every_lane_busy(monkeypatch):
+    """Make every deadline-form pool get() find no free lane (all busy)."""
+    from cascade.trainer import loop as loop_mod
+
+    orig_get = loop_mod._FinalLanePool.get
+
+    def busy_get(self, *a, **kw):
+        if kw.get("deadline") is not None:
+            self._absorb_new()
+            while True:
+                try:
+                    self.get_nowait()
+                except Exception:  # noqa: BLE001
+                    break
+        return orig_get(self, *a, **kw)
+
+    monkeypatch.setattr(loop_mod._FinalLanePool, "get", busy_get)
+
+
 def _leg_wall(cfg) -> float:
     return max(int(c.max_train_seconds) for c in cfg.throne_contracts())
 
 
-def test_fallback_challenger_past_the_latest_safe_start_requeues_unburned(
+def test_fallback_challenger_past_the_latest_safe_start_takes_a_free_lane(
         cfg, tmp_path, monkeypatch):
-    # Epoch ends in 1 h: a full leg + publish margin no longer fits, so the
-    # deadline is already behind us — the leg must NOT start (it would end
-    # hours past the boundary); it settles as sold-out (no attempt burned).
+    # Epoch ends in 1 h (deadline behind us) but the operator lane is FREE:
+    # the leg runs there at once (owner 2026-09-20: rented lanes never idle
+    # while legs are queued; a late manifest is scored next epoch).
     runner, jobs, contract, seen = _fallback_round(
         cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
+    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
+                               contract.train_tokens)
+    assert sorted(e.role for e in out) == ["challenger", "king"]
+    assert ("sf-l40s-0", "challenger") in seen
+    assert runner._funded_leg_failures == {}
+
+
+def test_fallback_challenger_past_the_latest_safe_start_requeues_when_no_lane_is_free(
+        cfg, tmp_path, monkeypatch):
+    # Same, with the only lane held busy: no waiting past the deadline — the
+    # leg settles as sold-out (no attempt burned), exactly the 2026-09-19 rule.
+    runner, jobs, contract, seen = _fallback_round(
+        cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
+    _hold_every_lane_busy(monkeypatch)
     out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
                                contract.train_tokens)
     assert [e.role for e in out] == ["king"]
@@ -215,9 +273,9 @@ def test_fallback_king_past_the_latest_safe_start_still_dispatches(
         cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=True)
     out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
                                contract.train_tokens)
-    assert [e.role for e in out] == ["king"]
-    assert seen == [("sf-l40s-0", "king")]
-    assert "latest safe start" in runner._funded_leg_failures["c"][0]
+    assert sorted(e.role for e in out) == ["challenger", "king"]
+    assert ("sf-l40s-0", "king") in seen               # the lane was free: both ran
+    assert runner._funded_leg_failures == {}
 
 
 def test_unknown_epoch_end_leaves_the_lane_wait_unbounded(tmp_path):
@@ -237,6 +295,7 @@ def test_fallback_skip_is_the_funded_leg_skip(cfg, tmp_path, monkeypatch):
     # (never retried on the operator fleet, settled by _settle_funded).
     runner, jobs, contract, _ = _fallback_round(
         cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
+    _hold_every_lane_busy(monkeypatch)                  # past the deadline, nothing free
     raised = {}
     orig = runner._record_funded_failure
 
