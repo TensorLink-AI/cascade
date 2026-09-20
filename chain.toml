@@ -421,6 +421,26 @@ funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # the bottom ~27 % of 4090 rentals and keeps every seated leg on an
 # equal-compute host. Other SKUs stay unguarded until benched.
 funded_host_bench_floor = { RTX4090 = 500e6 }
+# ── Open-market rounds (owner 2026-09-20; ALL OFF by default, Approve-tier) ──
+# funded_sku_per_leg: choose the GPU type PER LEG — every leg (the JIT king
+# too) rents the cheapest fitting executor across funded_pod_skus instead of
+# the whole round locking to one type. Fair because budgets are compute-
+# denominated and every leg completes its full token budget; needs
+# [training] expected_gpu = "" (coordinated validator change).
+funded_sku_per_leg = false
+# Price guards on marketplace executors (USD; 0 = off). Cap the PER-LEG cost
+# (price/h × the SKU's measured wall below): an H100 at $1.30/h finishing in
+# an hour bills less than a 4090 at $0.50/h for three — a plain $/h cap would
+# exclude the cheaper pool. funded_max_price_per_hour is only a sanity
+# ceiling. An unpriced listing is skipped while either cap is armed.
+funded_max_price_per_hour = 0.0
+funded_max_leg_cost_usd = 0.0
+# Measured wall (seconds) of one full-budget leg per SKU: drives the per-leg
+# cost cap and the per-SKU latest safe start (a fast type — or a hosts.toml
+# lane carrying `sku = "…"` — may still start late in the epoch). A type
+# without an entry is assumed to need [training] max_train_seconds. Measure
+# from run telemetry before arming; e.g. { RTX4090 = 12000, L40S = 7200 }.
+funded_sku_wall_seconds = { }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true

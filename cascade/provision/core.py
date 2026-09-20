@@ -116,6 +116,26 @@ class LaunchSpec:
     # the whole region rather than one machine. Adapters without region
     # placement may ignore it.
     exclude_regions: tuple[str, ...] = ()
+    # Open-market launch (owner 2026-09-20): when set, the adapter may place
+    # the pod on ANY of these GPU types — the cheapest fitting executor by
+    # per-leg cost wins (``LiumProvider.list_offers``) — and reports the type
+    # it landed on through ``sku_of(pod_id)``. ``sku`` stays the nominal /
+    # first choice for adapters without the seam.
+    sku_choices: tuple[str, ...] = ()
+
+
+def executor_price_per_hour(executor: dict) -> float | None:
+    """An executor's USD/h from ``lium ls`` JSON (``price_per_hour``, else
+    ``price_per_gpu_hour``); None when the listing carries neither."""
+    for key in ("price_per_hour", "price_per_gpu_hour"):
+        v = executor.get(key)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def image_digest_of(image: str) -> str:
@@ -868,6 +888,17 @@ class LiumProvider:
     # ([round] funded_cpu_blocklist); () = no filter.
     cpu_blocklist: tuple[str, ...] = ()
     _executor_cpus_cache: tuple = field(default=(), repr=False)
+    # Price guards ([round] funded_max_price_per_hour / funded_max_leg_cost_usd,
+    # USD; 0 = off) and the per-SKU measured leg wall behind the per-leg cap
+    # (funded_sku_wall_seconds; default_wall_seconds = the contract's
+    # max_train_seconds for SKUs without an entry). Listings are sorted by
+    # per-leg cost, cheapest first, so ``launch`` picks the best-value machine.
+    max_price_per_hour: float = 0.0
+    max_leg_cost_usd: float = 0.0
+    sku_wall_seconds: tuple[tuple[str, int], ...] = ()
+    default_wall_seconds: float = 0.0
+    # pod name → SKU it was launched on (sku_choices launches).
+    _sku_by_name: dict = field(default_factory=dict, repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -956,7 +987,80 @@ class LiumProvider:
                          len(shaped) - len(kept), sku, ", ".join(sorted(
                              {cpus[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
-        return shaped
+        return self._price_filter(sku, shaped)
+
+    def wall_seconds_for(self, sku: str) -> float:
+        """Measured full-budget leg wall for ``sku`` (``sku_wall_seconds``),
+        else ``default_wall_seconds``; 0 when neither is known."""
+        want = (sku or "").strip().lower()
+        for name, secs in self.sku_wall_seconds:
+            if name.lower() == want:
+                return float(secs)
+        return float(self.default_wall_seconds or 0.0)
+
+    def leg_cost_usd(self, sku: str, executor: dict) -> float | None:
+        """price_per_hour × the SKU's wall — what one leg would bill; None
+        when the listing carries no price or no wall is known."""
+        price = executor_price_per_hour(executor)
+        wall = self.wall_seconds_for(sku)
+        if price is None or wall <= 0:
+            return None
+        return price * wall / 3600.0
+
+    def _price_filter(self, sku: str, execs: list[dict]) -> list[dict]:
+        """Drop executors over the $/h ceiling or the per-leg cost cap (an
+        UNPRICED listing is kept only when no cap is armed — a cap must never
+        be dodged by a missing field), then order cheapest-per-leg first."""
+        cap_h = float(self.max_price_per_hour or 0.0)
+        cap_leg = float(self.max_leg_cost_usd or 0.0)
+        if not cap_h and not cap_leg:
+            return execs
+        kept, dropped = [], []
+        for e in execs:
+            price = executor_price_per_hour(e)
+            if price is None:
+                dropped.append((e, "unpriced"))
+                continue
+            if cap_h and price > cap_h:
+                dropped.append((e, f"${price:.2f}/h > ${cap_h:.2f}/h"))
+                continue
+            if cap_leg:
+                cost = self.leg_cost_usd(sku, e)
+                if cost is not None and cost > cap_leg:
+                    dropped.append((e, f"${cost:.2f}/leg > ${cap_leg:.2f}/leg"))
+                    continue
+            kept.append(e)
+        if dropped:
+            log.info("lium: %d %s executor(s) skipped by the price caps (%s)",
+                     len(dropped), sku, "; ".join(
+                         f"{str(e.get('id'))[:8]} {why}" for e, why in dropped[:6]))
+        kept.sort(key=lambda e: (self.leg_cost_usd(sku, e)
+                                 if self.leg_cost_usd(sku, e) is not None
+                                 else executor_price_per_hour(e) or 0.0,
+                                 executor_price_per_hour(e) or 0.0))
+        return kept
+
+    def list_offers(self, skus: Sequence[str], *, gpus: int = 1,
+                    exclude_ids: tuple[str, ...] = ()) -> list[tuple[str, dict]]:
+        """``(sku, executor)`` pairs across ``skus`` (each listing filtered
+        exactly like :meth:`_list_executors`), ordered cheapest-per-leg first
+        (unpriced/unknown-wall offers last, in ``skus`` preference order).
+        The open-market rent picks the first."""
+        offers: list[tuple[int, float, str, dict]] = []
+        for pref, sku in enumerate(skus):
+            for e in self._list_executors(sku, gpus=gpus):
+                if exclude_ids and str(e.get("id")) in exclude_ids:
+                    continue
+                cost = self.leg_cost_usd(sku, e)
+                offers.append((0 if cost is not None else 1, cost if cost is not None
+                               else float(pref), sku, e))
+        offers.sort(key=lambda o: (o[0], o[1], skus.index(o[2])))
+        return [(sku, e) for _, _, sku, e in offers]
+
+    def sku_of(self, pod_id: str) -> str:
+        """GPU type a pod launched through ``sku_choices`` landed on (this
+        process's launches only); "" when unknown."""
+        return self._sku_by_name.get(pod_id, "")
 
     def _list_pods(self) -> list[dict]:
         try:
@@ -989,12 +1093,20 @@ class LiumProvider:
         return len(execs)
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
-        if spec.exclude_ids:
-            execs = [e for e in execs if str(e.get("id")) not in spec.exclude_ids]
+        if spec.sku_choices:
+            offers = self.list_offers(spec.sku_choices, gpus=spec.gpus_per_pod,
+                                      exclude_ids=spec.exclude_ids)
+            execs = [e for _, e in offers]
+            sku_for = {str(e.get("id")): sku for sku, e in offers}
+        else:
+            execs = self._list_executors(spec.sku, gpus=spec.gpus_per_pod)
+            if spec.exclude_ids:
+                execs = [e for e in execs if str(e.get("id")) not in spec.exclude_ids]
+            sku_for = {}
         if len(execs) < spec.count:
+            want = "/".join(spec.sku_choices) if spec.sku_choices else spec.sku
             raise ProvisionError(
-                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{spec.sku} available"
+                f"lium: only {len(execs)} × {spec.gpus_per_pod}x{want} available"
                 f"{' after exclusions' if spec.exclude_ids else ''}, need {spec.count}"
             )
         # Lium cannot parse a digest-pinned ref (400s on repo@sha256:… — see
@@ -1031,8 +1143,12 @@ class LiumProvider:
             else:
                 _spawn_cli(argv, log_path=self._up_log_path(name),
                            env=self._subprocess_env())
-            log.info("lium up → executor %s as %s", ex.get("id"), name)
+            landed = sku_for.get(str(ex.get("id")), spec.sku)
+            log.info("lium up → executor %s as %s (%s%s)", ex.get("id"), name, landed,
+                     f", ${executor_price_per_hour(ex):.2f}/h"
+                     if executor_price_per_hour(ex) is not None else "")
             self._executor_by_name[name] = str(ex.get("id"))
+            self._sku_by_name[name] = landed
             names.append(name)
         return names
 

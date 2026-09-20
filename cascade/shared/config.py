@@ -354,6 +354,46 @@ def validate_funded_host_bench_floor(value: object) -> tuple[tuple[str, float], 
     return tuple(sorted(out))
 
 
+def validate_funded_sku_wall_seconds(value: object) -> tuple[tuple[str, int], ...]:
+    """``[round] funded_sku_wall_seconds``: a TOML table ``{SKU = seconds}`` —
+    the MEASURED wall of one full-budget leg on that GPU type — → sorted
+    ``((sku, seconds), …)``. Fail-loud on anything but a mapping of positive
+    ints (config knobs need loader parsing, 2026-09-08)."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"funded_sku_wall_seconds={value!r} invalid; must be a table of "
+            f"SKU = seconds, e.g. {{ RTX4090 = 12000, L40S = 7200 }}")
+    out = []
+    for sku, secs in value.items():
+        if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs <= 0:
+            raise ValueError(
+                f"funded_sku_wall_seconds[{sku!r}]={secs!r} invalid; must be a "
+                f"positive number of seconds")
+        if str(sku).strip():
+            out.append((str(sku).strip(), int(secs)))
+    return tuple(sorted(out))
+
+
+def funded_sku_wall_for(walls: tuple[tuple[str, int], ...], sku: str,
+                        default: float) -> float:
+    """The measured leg wall (seconds) for ``sku``, case-insensitive;
+    ``default`` (the contract's max_train_seconds) when the SKU has none."""
+    want = (sku or "").strip().lower()
+    for name, secs in walls:
+        if name.lower() == want:
+            return float(secs)
+    return float(default)
+
+
+def validate_funded_price_cap(name: str, value: object) -> float:
+    """A non-negative USD figure; 0 = off."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{name}={value!r} invalid; must be a non-negative number (0 = off)")
+    return float(value)
+
+
 def funded_host_bench_floor_for(floors: tuple[tuple[str, float], ...], sku: str) -> float:
     """The armed floor (tokens/s) for ``sku``, case-insensitive; ``0.0`` when
     the SKU has none (= the check is off for that round)."""
@@ -1099,6 +1139,25 @@ class RoundConfig:
     # () / unknown SKU = off; an unreachable probe logs and lets the pod
     # through (a slow-host check must never itself sink a leg).
     funded_host_bench_floor: tuple[tuple[str, float], ...] = ()
+    # Open-market rounds (owner 2026-09-20): choose the GPU type PER LEG, not
+    # per round — every leg (the JIT king too) rents the cheapest executor
+    # that fits across funded_pod_skus. Fair because budgets are compute-
+    # denominated and every leg must complete its full token budget; needs
+    # [training] expected_gpu = "" like funded_pod_skus. Off = the whole
+    # round locks to the most-available SKU as before.
+    funded_sku_per_leg: bool = False
+    # Price guards on marketplace executors (payer-billed legs and the JIT
+    # king alike; USD; 0 = off). max_price_per_hour is a plain $/h ceiling;
+    # max_leg_cost_usd caps price_per_hour × the SKU's measured wall
+    # (funded_sku_wall_seconds; the contract's max_train_seconds when the
+    # SKU has no entry) — the figure that actually matters: an H100 at
+    # $1.30/h finishing in an hour is cheaper than a 4090 at $0.50/h for 3 h.
+    funded_max_price_per_hour: float = 0.0
+    funded_max_leg_cost_usd: float = 0.0
+    # Measured wall (seconds) of one full-budget leg per SKU. Drives the
+    # per-SKU latest safe start — a fast SKU may still start late in the
+    # epoch — and the per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
+    funded_sku_wall_seconds: tuple[tuple[str, int], ...] = ()
     # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
     # account, at the round's chosen SKU — the no-heat end-state (no standing
     # final fleet). Required for funded_pod_skus to guarantee the king lands
@@ -1998,6 +2057,12 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     # gpu_name gate) — requeue-with-burn ×3 → terminal fail for every seated
     # miner. Comment-enforced until 2026-09-02; now fail-loud at launch.
     if (role == "trainer" and cfg.round.funded_pods == "rent"
+            and cfg.round.funded_sku_per_leg and cfg.training.expected_gpu):
+        problems.append(
+            "[round] funded_sku_per_leg mixes GPU types inside one round but "
+            "[training] expected_gpu pins one; set expected_gpu = \"\" (coordinated "
+            "validator change) or turn funded_sku_per_leg off")
+    if (role == "trainer" and cfg.round.funded_pods == "rent"
             and len(cfg.round.funded_pod_skus) > 1 and cfg.training.expected_gpu):
         problems.append(
             "[round] funded_pod_skus lists multiple GPU types but [training] "
@@ -2288,6 +2353,13 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 if str(x).strip()),
             funded_host_bench_floor=validate_funded_host_bench_floor(
                 r.get("funded_host_bench_floor", None)),
+            funded_sku_per_leg=bool(r.get("funded_sku_per_leg", False)),
+            funded_max_price_per_hour=validate_funded_price_cap(
+                "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 0.0)),
+            funded_max_leg_cost_usd=validate_funded_price_cap(
+                "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 0.0)),
+            funded_sku_wall_seconds=validate_funded_sku_wall_seconds(
+                r.get("funded_sku_wall_seconds", None)),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),

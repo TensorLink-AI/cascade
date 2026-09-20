@@ -118,6 +118,11 @@ class RemoteHost:
     # the same address (a payer relaunching "their" pod) is refused at the
     # transport — a pod's host key is generated at its first boot.
     pinned_host_key: str = ""
+    # GPU type of this lane (marketplace SKU name, e.g. "L40S"). Drives the
+    # lane's own latest safe start via [round] funded_sku_wall_seconds — a
+    # fast lane may still take a leg late in the epoch. "" = unknown (the
+    # contract's max_train_seconds bounds it).
+    sku: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -136,6 +141,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         cuda_device = "0"
         forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_HUB_TOKEN"]
         stage = "any"       # "heat" | "final" | "any" — which round stage this pod serves
+        sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
     """
     p = Path(path)
     if not p.is_file():
@@ -168,6 +174,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 static_env=tuple(sorted(
                     (str(k), str(v)) for k, v in dict(h.get("static_env", {})).items())),
                 profile_only=bool(h.get("profile_only", False)),
+                sku=str(h.get("sku", "") or "").strip(),
             )
         )
     return hosts
