@@ -23,6 +23,7 @@ from cascade.provision import funded as funded_mod
 from cascade.provision.core import LaunchSpec, LiumProvider, PodAddress
 from cascade.shared.config import (
     LaunchConfigError,
+    RoundConfig,
     assert_launch_ready,
     funded_sku_wall_for,
     load_chain_config,
@@ -42,16 +43,21 @@ def test_open_market_knobs_parse_from_toml(tmp_path):
     alone would make TOML arming a silent no-op."""
     repo_toml = Path(__file__).resolve().parents[2] / "chain.toml"
     rnd = load_chain_config(repo_toml).round
+    # The repo ships every knob ON (owner 2026-09-20) and the dataclass
+    # defaults agree, so a chain.toml without the keys arms the same policy.
     assert (rnd.funded_sku_per_leg, rnd.funded_max_price_per_hour,
-            rnd.funded_max_leg_cost_usd, rnd.funded_sku_wall_seconds) == (False, 0.0, 0.0, ())
+            rnd.funded_max_leg_cost_usd) == (True, 1.5, 1.6)
+    assert rnd.funded_sku_wall_seconds == (("H100", 6000), ("L40", 11400),
+                                           ("L40S", 10200), ("RTX4090", 13500))
+    assert rnd.funded_sku_wall_seconds == RoundConfig.funded_sku_wall_seconds
     src = repo_toml.read_text(encoding="utf-8")
     edited = src
-    for before, after in (("funded_sku_per_leg = false", "funded_sku_per_leg = true"),
-                          ("funded_max_price_per_hour = 0.0", "funded_max_price_per_hour = 1.5"),
-                          ("funded_max_leg_cost_usd = 0.0", "funded_max_leg_cost_usd = 1.6"),
-                          ("funded_sku_wall_seconds = { }",
+    for before, after in (("funded_sku_per_leg = true", "funded_sku_per_leg = true"),
+                          ("funded_max_price_per_hour = 1.5", "funded_max_price_per_hour = 1.5"),
+                          ("funded_max_leg_cost_usd = 1.6", "funded_max_leg_cost_usd = 1.6"),
+                          ("funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000 }",
                            "funded_sku_wall_seconds = { RTX4090 = 12000, l40s = 7200 }")):
-        assert edited.count(before) == 1, before      # the repo ships every knob OFF
+        assert edited.count(before) == 1, before
         edited = edited.replace(before, after, 1)
     (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
     rnd = load_chain_config(tmp_path / "chain.toml").round
@@ -236,7 +242,7 @@ def _open_runner(tmp_path, **kw):
 
 
 def test_skus_for_rent_is_the_locked_type_or_the_open_list(tmp_path):
-    r = _runner(tmp_path)
+    r = _runner(tmp_path, funded_sku_per_leg=False)
     r._funded_round_sku = "L40S"
     assert r._funded_skus_for_rent() == ("L40S",)
     r = _open_runner(tmp_path)
@@ -249,7 +255,8 @@ def test_leg_wall_is_measured_per_sku_and_the_fastest_type_round_wide(tmp_path):
     assert r._leg_wall_seconds("RTX4090") == 12000.0
     assert r._leg_wall_seconds("l40s") == 18000.0                  # unmeasured ⇒ contract cap
     assert r._leg_wall_seconds(None) == 3600.0                      # fastest listed type
-    locked = _runner(tmp_path, funded_sku_wall_seconds=(("RTX4090", 12000),))
+    locked = _runner(tmp_path, funded_sku_per_leg=False,
+                     funded_sku_wall_seconds=(("RTX4090", 12000),))
     locked.cfg.throne_contracts = lambda: [SimpleNamespace(max_train_seconds=18000)]
     assert locked._leg_wall_seconds(None) == 18000.0               # locked round: the cap
 
@@ -271,7 +278,7 @@ def test_skus_fitting_now_drops_types_past_their_own_latest_start(tmp_path):
     r._rent_wait_now = lambda: 1001.0
     assert r._skus_fitting_now(("RTX4090", "H100")) == ()
     # A locked round never filters (its single type; the wait decides).
-    locked = _runner(tmp_path)
+    locked = _runner(tmp_path, funded_sku_per_leg=False)
     locked._funded_epoch_end_wall = 99.0
     locked._funded_rent_wait_deadline = lambda: 1000.0
     locked._rent_wait_now = lambda: 5000.0
@@ -391,7 +398,7 @@ def test_operator_lane_deadline_fn_is_per_lane_only_with_a_wall_table(tmp_path):
     assert fn(_host("x", "H100")) == 1000.0
     assert fn(_host("y", "RTX4090")) == 1000.0 - 8400
     assert fn(_host("z")) == 1000.0 - (18000 - 3600)                 # unknown lane: contract cap
-    flat = _runner(tmp_path)
+    flat = _runner(tmp_path, funded_sku_per_leg=False, funded_sku_wall_seconds=())
     flat._operator_lane_deadline = TrainerRunner._operator_lane_deadline.__get__(flat)
     flat._funded_epoch_end_wall = 99.0
     flat._funded_rent_wait_deadline = lambda: 1000.0

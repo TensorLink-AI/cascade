@@ -1143,21 +1143,24 @@ class RoundConfig:
     # per round — every leg (the JIT king too) rents the cheapest executor
     # that fits across funded_pod_skus. Fair because budgets are compute-
     # denominated and every leg must complete its full token budget; needs
-    # [training] expected_gpu = "" like funded_pod_skus. Off = the whole
-    # round locks to the most-available SKU as before.
-    funded_sku_per_leg: bool = False
+    # [training] expected_gpu = "" like funded_pod_skus, and the validators'
+    # manifest gate (_check_gpu) lifted — the owner coordinates that release.
+    # ON by default (owner 2026-09-20); off = the whole round locks to the
+    # most-available SKU as before.
+    funded_sku_per_leg: bool = True
     # Price guards on marketplace executors (payer-billed legs and the JIT
     # king alike; USD; 0 = off). max_price_per_hour is a plain $/h ceiling;
     # max_leg_cost_usd caps price_per_hour × the SKU's measured wall
     # (funded_sku_wall_seconds; the contract's max_train_seconds when the
     # SKU has no entry) — the figure that actually matters: an H100 at
     # $1.30/h finishing in an hour is cheaper than a 4090 at $0.50/h for 3 h.
-    funded_max_price_per_hour: float = 0.0
-    funded_max_leg_cost_usd: float = 0.0
+    funded_max_price_per_hour: float = 1.5
+    funded_max_leg_cost_usd: float = 1.6
     # Measured wall (seconds) of one full-budget leg per SKU. Drives the
     # per-SKU latest safe start — a fast SKU may still start late in the
     # epoch — and the per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
-    funded_sku_wall_seconds: tuple[tuple[str, int], ...] = ()
+    funded_sku_wall_seconds: tuple[tuple[str, int], ...] = (
+        ("H100", 6000), ("L40", 11400), ("L40S", 10200), ("RTX4090", 13500))
     # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
     # account, at the round's chosen SKU — the no-heat end-state (no standing
     # final fleet). Required for funded_pod_skus to guarantee the king lands
@@ -2353,13 +2356,14 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 if str(x).strip()),
             funded_host_bench_floor=validate_funded_host_bench_floor(
                 r.get("funded_host_bench_floor", None)),
-            funded_sku_per_leg=bool(r.get("funded_sku_per_leg", False)),
+            funded_sku_per_leg=bool(r.get("funded_sku_per_leg", True)),
             funded_max_price_per_hour=validate_funded_price_cap(
-                "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 0.0)),
+                "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 1.5)),
             funded_max_leg_cost_usd=validate_funded_price_cap(
-                "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 0.0)),
-            funded_sku_wall_seconds=validate_funded_sku_wall_seconds(
-                r.get("funded_sku_wall_seconds", None)),
+                "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 1.6)),
+            funded_sku_wall_seconds=(validate_funded_sku_wall_seconds(
+                r["funded_sku_wall_seconds"]) if "funded_sku_wall_seconds" in r
+                else RoundConfig.funded_sku_wall_seconds),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),

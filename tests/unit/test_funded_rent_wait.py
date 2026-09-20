@@ -208,7 +208,11 @@ def test_king_rent_gives_up_at_the_deadline_and_releases_the_waiters(tmp_path, m
 
 def test_deadline_math_from_epoch_geometry(cfg, tmp_path):
     runner = TrainerRunner(cfg=cfg, base_trainer=None, work_root=tmp_path)
-    leg = max(c.max_train_seconds for c in cfg.throne_contracts())
+    # The round-wide leg wall: the contract cap for a locked-SKU round, the
+    # fastest listed type's measured wall under funded_sku_per_leg (the
+    # repo default since 2026-09-20) — the geometry below is the same.
+    leg = runner._leg_wall_seconds(None)
+    assert leg <= max(c.max_train_seconds for c in cfg.throne_contracts())
     epoch_blocks = int(__import__("cascade.shared.config", fromlist=["effective_epoch_blocks"])
                        .effective_epoch_blocks(cfg.round, 9050400))
     runner._stage_ctx = {"epoch_start_block": 9050400}
