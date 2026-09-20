@@ -900,6 +900,23 @@ class RoundConfig:
     # short or double-counted at the seam; ``load_chain_config`` enforces it.
     epoch_blocks_prev: int = 0
     epoch_activation_block: int = 0
+    # ── Rolling intake + era king (DEC-CA-0043, block-gated) ─────────────────
+    # From ``rolling_from_block`` (trainer POLICY, not consensus) challengers
+    # train the moment they are funded instead of waiting for a boundary; a
+    # leg may cross boundaries; every boundary publishes ONE settlement
+    # manifest (the era king + every challenger finished since the last one);
+    # the king's leg is trained once per ERA and cached. 0 = off (bit-identical
+    # to the boundary-synchronous trainer). Must equal the fleet's ROLLOVER
+    # block — the same value as ``[scoring] era_king_from_block`` — and be a
+    # boundary of the grid (load-checked).
+    rolling_from_block: int = 0
+    # Settlements per era: consecutive boundaries sharing one set of training
+    # seeds, one init and one cached king checkpoint. 4 on a 3h grid = 12h
+    # eras, i.e. today's king-leg cadence with 3h verdicts inside it. Era
+    # arithmetic (cascade.shared.era) is pure block math — trainer,
+    # validators and audit derive the same era with zero discretion. 0 = one
+    # settlement per era (only meaningful once a rolling gate is set).
+    era_settlements: int = 0
     heat_train_hours: float = 0.5     # cheap screening budget per competitor
     heat_n_windows: int = 256         # eval windows the heat screens on (≤ [eval] n_windows)
     # Sample forecasts per window in the heat screen. The heat only RANKS the
@@ -1659,6 +1676,34 @@ class ScoringConfig:
     # A manifest with no published body always takes the strict path, whatever
     # this says — the gate can only relax once the trainer actually declares.
     declared_contract_from_block: int = 0
+    # ── Era king (DEC-CA-0043, CONSENSUS, block-gated) ───────────────────────
+    # From a settlement whose epoch boundary is >= this block the validator
+    # verifies the ERA ENVELOPE (cascade.shared.era): the manifest's era
+    # stamp is on the era grid with seeds from the previous era's start
+    # block; the init is members_gen(era)[era % k] of the latest promotion
+    # whose effective_era <= era; the king entry is the champion and its
+    # pointer is the one this validator judged in the crowning settlement (or
+    # the era's first king leg); every entry's ref is the hotkey's revealed
+    # commitment AS OF its train_block; manifests are hash-chained
+    # (prev_round_id) and walked in order, never jumped; the same-GPU
+    # fallback of the GPU gate is lifted when no GPU is pinned. Release-then-
+    # activate with the external validators; audit replays each settlement
+    # under its own block. 0 = off (bit-identical to the ungated validator).
+    # Must equal ``[round] rolling_from_block`` and be >=
+    # ``cohort_maxt_increment_from_block`` >= ``cohort_maxt_from_block``
+    # (load-checked).
+    era_king_from_block: int = 0
+    # Tenure / ripeness re-denominated to BLOCKS from this block (CONSENSUS):
+    # ``margin_warmup_blocks`` replaces ``margin_warmup_rounds`` and
+    # ``cascade_reign_blocks`` replaces ``cascade_reign_rounds``, each
+    # expressed per settlement on the grid in force at the round's block, so a
+    # 4× faster grid does not 4× the decay and promotion clocks in wall-time.
+    # The king's tenure is then blocks reigned ÷ grid (a king crowned on the
+    # old grid keeps its wall-time tenure across the switch). 0 = off (the
+    # two ``*_blocks`` knobs are inert). Must equal the ROLLOVER block.
+    tenure_blocks_from_block: int = 0
+    margin_warmup_blocks: int = 0
+    cascade_reign_blocks: int = 0
 
 
 @dataclass(frozen=True)
@@ -1927,11 +1972,13 @@ class ChainConfig:
         eval package at import time.
         """
         from ..eval.koth import KothParams
+        from .era import effective_margin_warmup_rounds
 
         return KothParams(
             win_margin_start=effective_win_margin_start(self.scoring, block),
             win_margin_end=self.scoring.win_margin_end,
-            margin_warmup_rounds=self.scoring.margin_warmup_rounds,
+            margin_warmup_rounds=effective_margin_warmup_rounds(
+                self.round, self.scoring, block),
             min_windows=self.scoring.min_windows,
             bootstrap_B=self.scoring.bootstrap_B,
             bootstrap_alpha=self.scoring.bootstrap_alpha,
@@ -2214,6 +2261,61 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 "round spanning the seam has no well-defined length"
             )
 
+    # Rolling intake + era king (DEC-CA-0043): every block key names ONE
+    # rollover block, aligned to the grid on both sides of it, and the era
+    # king gate never precedes the corrections it stacks on. A misaligned or
+    # split rollover would let one node open an era where another still runs
+    # boundary rounds — refuse to load rather than fork the fleet.
+    _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
+    _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
+    _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
+    _era_settlements = max(0, int(r.get("era_settlements", 0) or 0))
+    _rollover_keys = {
+        "[round] rolling_from_block": _rolling,
+        "[scoring] era_king_from_block": _era_king,
+        "[scoring] tenure_blocks_from_block": _tenure_blocks,
+    }
+    _rollover_set = {k: v for k, v in _rollover_keys.items() if v}
+    if _rollover_set:
+        if len(set(_rollover_set.values())) != 1:
+            raise ValueError(
+                "DEC-CA-0043 rollover keys must all name the same block: "
+                + ", ".join(f"{k}={v}" for k, v in _rollover_keys.items()))
+        _rollover = next(iter(_rollover_set.values()))
+        if len(_rollover_set) != len(_rollover_keys):
+            missing = [k for k, v in _rollover_keys.items() if not v]
+            raise ValueError(
+                f"DEC-CA-0043 rollover block {_rollover} is set on "
+                f"{sorted(_rollover_set)} but not on {missing} — every rollover "
+                "key flips at ONE block")
+        if _eab and _eab != _rollover:
+            raise ValueError(
+                f"[round] epoch_activation_block={_eab} must equal the DEC-CA-0043 "
+                f"rollover block {_rollover} (the grid switch and the era switch "
+                "land on one boundary)")
+        _grid_before = _ebp if (_eab and _ebp) else _eb
+        if _rollover % _grid_before or _rollover % _eb:
+            raise ValueError(
+                f"DEC-CA-0043 rollover block {_rollover} must be a boundary of the "
+                f"grid before it ({_grid_before}) and of epoch_blocks={_eb}")
+        if _era_settlements < 1:
+            raise ValueError(
+                "[round] era_settlements must be >= 1 when a DEC-CA-0043 rollover "
+                "block is set")
+        _cmi = max(0, int(s.get("cohort_maxt_increment_from_block", 0) or 0))
+        _cm = max(0, int(s.get("cohort_maxt_from_block", 0) or 0))
+        if not (_era_king >= _cmi >= _cm):
+            raise ValueError(
+                f"[scoring] era_king_from_block={_era_king} must be >= "
+                f"cohort_maxt_increment_from_block={_cmi} >= "
+                f"cohort_maxt_from_block={_cm} (the era king stacks on the "
+                "increment-unit max-T)")
+        if _cmi == 0 or _cm == 0:
+            raise ValueError(
+                "[scoring] cohort_maxt_from_block and cohort_maxt_increment_from_block "
+                "must be set when era_king_from_block is (the era king is judged "
+                "under the increment-unit max-T)")
+
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
     extra_sizes = tuple(
@@ -2330,6 +2432,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             round_hours=float(r.get("round_hours", 24.0)),
             epoch_blocks_prev=int(r.get("epoch_blocks_prev", 0)),
             epoch_activation_block=int(r.get("epoch_activation_block", 0)),
+            rolling_from_block=_rolling,
+            era_settlements=_era_settlements,
             heat_train_hours=float(r.get("heat_train_hours", 0.5)),
             heat_n_windows=int(r.get("heat_n_windows", 256)),
             heat_num_samples=int(r.get("heat_num_samples", 0)),
@@ -2494,6 +2598,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
             contract_from_block=int(s.get("contract_from_block", 0) or 0),
             declared_contract_from_block=int(s.get("declared_contract_from_block", 0) or 0),
+            era_king_from_block=_era_king,
+            tenure_blocks_from_block=_tenure_blocks,
+            margin_warmup_blocks=max(0, int(s.get("margin_warmup_blocks", 0) or 0)),
+            cascade_reign_blocks=max(0, int(s.get("cascade_reign_blocks", 0) or 0)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),

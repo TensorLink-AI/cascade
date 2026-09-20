@@ -269,6 +269,23 @@ round_hours      = 12.0   # informational: wall-clock span of an epoch
 # (load-checked); set both back to 0 once it is safely past.
 epoch_blocks_prev      = 0
 epoch_activation_block = 0
+# Rolling intake + era king (DEC-CA-0043, block-gated). Trainer POLICY: from
+# this block challengers train the moment they are funded, legs cross
+# boundaries, every boundary publishes ONE settlement manifest (era king +
+# every challenger finished since the last settlement), the king's leg is
+# trained once per era and cached. 0 = off (the boundary-synchronous trainer,
+# bit-identical to before). ROLLOVER recipe (owner call, one boundary for
+# everything): rolling_from_block = era_king_from_block =
+# tenure_blocks_from_block = cohort_maxt_increment_from_block = ROLLOVER;
+# epoch_blocks = 900, epoch_blocks_prev = 3600, epoch_activation_block =
+# ROLLOVER (3h grid); ROLLOVER % 3600 == 0. Load-checked. Do NOT arm before
+# the six external validators run a release carrying the era envelope.
+rolling_from_block = 0
+# Settlements per era (consecutive boundaries sharing one set of training
+# seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
+# eras — today's king-leg cadence with 3h verdicts inside it. Inert until a
+# rollover block is set.
+era_settlements = 4
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size)
 heat_n_windows   = 2000   # eval windows the heat screens on (= [eval] n_windows;
                           # the full set — a smaller screen is noisy near the top)
@@ -720,6 +737,25 @@ cohort_maxt_increment_from_block = 0
 mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
+# Era king (DEC-CA-0043) — CONSENSUS, release-then-activate with the external
+# validators; audit replays each settlement under its own block. From a
+# settlement whose epoch boundary is >= this block the validator verifies the
+# era envelope (era stamp on the era grid, seeds from the previous era's
+# start block, init = members_gen(era)[era % k] of the latest promotion with
+# effective_era <= era, king entry = the champion at the pointer this
+# validator judged, refs verified as of each entry's train_block, manifests
+# hash-chained and walked in order, same-GPU fallback lifted when no GPU is
+# pinned). Must equal [round] rolling_from_block and be >=
+# cohort_maxt_increment_from_block >= cohort_maxt_from_block (load-checked).
+# 0 = off (bit-identical to the ungated validator).
+era_king_from_block = 0
+# Tenure / ripeness in BLOCKS from the rollover (CONSENSUS): the margin decay
+# and the promotion clock keep their wall-time length across the 3600 → 900
+# grid switch instead of running 4× faster. Both *_blocks values are inert
+# until tenure_blocks_from_block is set (= ROLLOVER).
+tenure_blocks_from_block = 0
+margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
+cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool
