@@ -1706,6 +1706,18 @@ class TrainerRunner:
         sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
         abort = getattr(self, "_funded_wait_abort", None)
+        if for_king and self._operator_fallback_lanes():
+            # The king is REQUIRED and never held back (owner 2026-09-20: "the
+            # round WILL NOT FINISH WITHOUT A KING"): with operator lanes on
+            # file it takes one at once, latest safe start or not — a late king
+            # manifest is scored next epoch (round 7963), no king is a lost
+            # round. 2026-09-20 04:21: the king stalled twice on its pod, the
+            # latest safe start passed at 04:31 and four L40S lanes sat idle
+            # while this wait returned False.
+            log.info("%s: operator final lane(s) on file — the king takes one now "
+                     "(operator-billed; never held back by the latest safe start)",
+                     describe)
+            return "operator"
         polled = 0
         while now_fn() < deadline:
             if abort is not None and abort.is_set():
@@ -6633,7 +6645,11 @@ class TrainerRunner:
                 # the same latest safe start that bounds a marketplace rent
                 # bounds the wait for a free lane (2026-09-19: unbounded pool
                 # waits dispatched two 5 h legs 2 h before the epoch end).
-                lane_deadline = self._operator_lane_deadline()
+                # The king is exempt: it is REQUIRED, so it waits for a lane
+                # however late (a late manifest beats no round — owner
+                # 2026-09-20).
+                lane_deadline = (None if role == "king"
+                                 else self._operator_lane_deadline())
             # Operator lanes can run PRIVATE (vault/direct) submissions too:
             # stage the ZIP on whichever lane the pool hands out, exactly as
             # the funded-pod leg does — until 2026-09-12 only that path staged,
@@ -6654,9 +6670,7 @@ class TrainerRunner:
                     **({"repo_suffix": suffix} if suffix else {}),
                 )
             except _LaneDeadlinePassed as e:
-                if role == "king":
-                    # No king inside the epoch = no round: abort now (the
-                    # king-failure path retries at the next boundary).
+                if role == "king":  # unreachable (no deadline for the king); kept as a guard
                     raise RuntimeError(f"king: {e}") from e
                 # Sold-out taxonomy, exactly like a marketplace leg still
                 # without a GPU at the deadline: requeued, nothing burned.

@@ -206,14 +206,18 @@ def test_fallback_challenger_inside_the_latest_safe_start_dispatches(
     assert runner._funded_leg_failures == {}
 
 
-def test_fallback_king_past_the_latest_safe_start_aborts_the_round(
+def test_fallback_king_past_the_latest_safe_start_still_dispatches(
         cfg, tmp_path, monkeypatch):
+    # The king is REQUIRED and never held back (owner 2026-09-20): past the
+    # latest safe start it still takes a free operator lane (late manifest,
+    # scored next epoch) while the challenger leg requeues unburned.
     runner, jobs, contract, seen = _fallback_round(
         cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=True)
-    with pytest.raises(RuntimeError, match="king training failed on remote.*latest safe start"):
-        runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
-                             contract.train_tokens)
-    assert seen == []
+    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
+                               contract.train_tokens)
+    assert [e.role for e in out] == ["king"]
+    assert seen == [("sf-l40s-0", "king")]
+    assert "latest safe start" in runner._funded_leg_failures["c"][0]
 
 
 def test_unknown_epoch_end_leaves_the_lane_wait_unbounded(tmp_path):
