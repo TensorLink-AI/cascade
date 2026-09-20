@@ -558,11 +558,21 @@ class RollingScheduler:
             if known:
                 effective = eff
             elif not self.state.generations:
-                # First sight of the engine with no record readable: live now.
+                # First sight of the engine with no record readable: the live
+                # generation was installed before any era (a fired-but-not-
+                # yet-effective one is still the engine's pending record,
+                # which carries its era) — live now.
                 effective = 0
+                log.warning("rolling: promotion record gen=%d unreadable with an empty "
+                            "ledger — assuming the generation is already live", gen)
             else:
-                current = self.state.current.index if self.state.current else 0
-                effective = current + 2
+                # Never guess an era: the entry is skipped and the record
+                # re-read next tick (a guess would be written once and never
+                # revisited — the trainer then trains the generation on the
+                # wrong era while validators install it on the published one).
+                log.warning("rolling: promotion record gen=%d unreadable; its era stays "
+                            "unresolved until the record can be read", gen)
+                return
             self.state.generations[key] = {
                 "members": [[c, s] for c, s in members], "effective_era": int(effective)}
             self._save()

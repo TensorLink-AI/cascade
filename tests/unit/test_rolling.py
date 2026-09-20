@@ -861,6 +861,16 @@ def test_generation_ledger_rebuilds_from_the_published_record(cfg, tmp_path):
     _join(sched2)
     assert sched2.state.generations["2"]["effective_era"] == 0
     assert sched2.state.current.generation == 2
+    # a NEW generation whose record cannot be read (store outage) is never
+    # guessed: the ledger waits, and picks up the published era on a later tick
+    ops.gens = (3, [("cascade/ckpt@sha256:" + "b" * 64, "toto2-4m")], 0)
+    sched.tick(client, era_start + 6)
+    _join(sched)
+    assert "3" not in sched.state.generations
+    ops.records[3] = 14
+    sched.tick(client, era_start + 7)
+    _join(sched)
+    assert sched.state.generations["3"]["effective_era"] == 14
 
 
 def test_seniors_that_could_not_start_are_not_passed_over(cfg, tmp_path):
