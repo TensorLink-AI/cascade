@@ -752,9 +752,19 @@ class _FinalLanePool(queue.Queue):
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    raise _LaneDeadlinePassed(
-                        f"no operator lane free before the round's latest safe start "
-                        f"({time.strftime('%H:%M:%SZ', time.gmtime(deadline))})")
+                    # Past the deadline a lane that is FREE RIGHT NOW is still
+                    # handed out (owner 2026-09-20: legs go onto the rented
+                    # lanes at once — a rented lane idling is the waste); only
+                    # WAITING for one to free is what ran legs past the epoch
+                    # (2026-09-19), so that ends here.
+                    self._absorb_new()
+                    try:
+                        return super().get(block=False)
+                    except queue.Empty:
+                        raise _LaneDeadlinePassed(
+                            f"no operator lane free at the round's latest safe start "
+                            f"({time.strftime('%H:%M:%SZ', time.gmtime(deadline))})"
+                        ) from None
             self._absorb_new()
             wait = self.REFRESH_INTERVAL_S
             if deadline is not None:
@@ -1754,6 +1764,15 @@ class TrainerRunner:
                          time.strftime("%H:%M:%SZ", time.gmtime(deadline)))
             polled += 1
             sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
+        if self._operator_fallback_lanes():
+            # Past the latest safe start with operator lanes on file: the leg
+            # goes to the lane pool, which hands out a lane only if one is
+            # FREE NOW (a wait would run it past the epoch — the 2026-09-19
+            # class); no free lane ⇒ the pool's deadline requeues it unburned.
+            # Owner 2026-09-20: rented lanes never idle while legs are queued.
+            log.info("%s: past the latest safe start — taking an operator lane only "
+                     "if one is free now (operator-billed)", describe)
+            return "operator"
         return False
 
     def _claimed_executors(self) -> tuple[str, ...]:

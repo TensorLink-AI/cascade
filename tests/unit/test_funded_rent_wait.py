@@ -74,12 +74,21 @@ def test_king_past_the_deadline_without_lanes_gives_up(tmp_path):
                                             for_king=True) is False
 
 
-def test_challenger_past_the_deadline_never_takes_a_lane(tmp_path):
-    # Only the king is exempt: a challenger leg started past the latest safe
-    # start would end past the boundary — it requeues (unburned) as before.
+def test_challenger_past_the_deadline_goes_to_the_lane_pool_when_lanes_are_on_file(tmp_path):
+    # Owner 2026-09-20: a rented lane never idles while a leg is queued. Past
+    # the latest safe start the leg is handed to the pool, which serves it
+    # only if a lane is free NOW (see _FinalLanePool.get) — never a wait.
     runner = _runner(tmp_path)
     _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
     _lanes_on_file(runner, ["lane"])
+    assert runner._wait_for_funded_capacity("RTX4090", describe="leg",
+                                            hotkey="hk") == "operator"
+
+
+def test_challenger_past_the_deadline_without_lanes_requeues(tmp_path):
+    runner = _runner(tmp_path)
+    _arm_wait(runner, deadline_offsets=-1, capacity_seq=[0])
+    _lanes_on_file(runner, [])
     assert runner._wait_for_funded_capacity("RTX4090", describe="leg",
                                             hotkey="hk") is False
 
