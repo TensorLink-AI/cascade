@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -198,6 +199,12 @@ class CascadeState:
     generation: int = 0
     members: tuple[str, ...] = ()
     clock_observed: bool = False
+    # A verified promotion whose ``effective_era`` has not arrived yet
+    # (DEC-CA-0043): installed as ``generation``/``members`` by the era gate
+    # at the first settlement of that era, never earlier. 0/() = none.
+    pending_generation: int = 0
+    pending_members: tuple[str, ...] = ()
+    pending_effective_era: int = 0
 
 
 # ── pure transitions over CascadeState ───────────────────────────────────────
@@ -324,6 +331,10 @@ def dumps(state: CascadeState) -> str:
             "generation": state.generation,
             "members": list(state.members),
             "clock_observed": state.clock_observed,
+            **({"pending_generation": state.pending_generation,
+                "pending_members": list(state.pending_members),
+                "pending_effective_era": state.pending_effective_era}
+               if state.pending_generation else {}),
             "checkpoints": [
                 {
                     "checkpoint_id": r.checkpoint_id,
@@ -380,6 +391,9 @@ def loads(text: str) -> CascadeState:
         # attestation once, until the next watched dethrone/acceptance —
         # conservative toward accepting an honest promotion, never rejecting one.
         clock_observed=bool(obj.get("clock_observed", False)),
+        pending_generation=int(obj.get("pending_generation", 0) or 0),
+        pending_members=tuple(str(m) for m in (obj.get("pending_members") or ())),
+        pending_effective_era=int(obj.get("pending_effective_era", 0) or 0),
     )
 
 
@@ -408,6 +422,9 @@ class CascadeController:
     state: CascadeState = field(default_factory=CascadeState)
     state_path: Path | None = None
     round_cfg: object | None = None   # RoundConfig; None ⇒ fixed 7200-block rounds
+    # Block-resolved ripeness threshold (DEC-CA-0043: ``cascade_reign_blocks``
+    # from ``tenure_blocks_from_block``); None ⇒ the fixed ``reign_days``.
+    threshold_fn: Callable[[int], float] | None = None
 
     def note_dethrone(self, new_king: str, *, block: int, observed: bool = True) -> None:
         """Reset the reign clock for a fresh king. Call this on — and only on — a
@@ -498,7 +515,9 @@ class CascadeController:
         if state.king_hotkey is None or state.reign_start_block is None:
             return False
         elapsed = reign_rounds(state, block, self.round_cfg)
-        return elapsed is not None and elapsed >= self.reign_days
+        threshold = (self.threshold_fn(int(block)) if self.threshold_fn is not None
+                     else self.reign_days)
+        return elapsed is not None and elapsed >= threshold
 
     def can_verify_ripeness(self) -> bool:
         """Whether this validator's clock is in a position to judge reign
@@ -528,6 +547,16 @@ class CascadeController:
             "cascade: adopted trainer-written warm-start set (%d member(s)) as "
             "generation %d", len(members), max(1, int(generation)),
         )
+
+    def stage_promotion(self, *, generation: int, members: tuple[str, ...],
+                        effective_era: int) -> None:
+        """Remember a verified promotion for a FUTURE era (DEC-CA-0043). The
+        era gate installs it via :meth:`note_promotion` at the first
+        settlement of ``effective_era``."""
+        self.state = replace(self.state, pending_generation=int(generation),
+                             pending_members=tuple(members),
+                             pending_effective_era=int(effective_era))
+        self._persist()
 
     def note_promotion(self, *, generation: int, members: tuple[str, ...], block: int) -> None:
         """Adopt a VERIFIED promotion (the validator loop verified the signed

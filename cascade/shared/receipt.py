@@ -473,6 +473,15 @@ class RoundReceipt:
     weights: tuple[float, ...] = ()          # the equal-share vector set on chain
     reject_reason: str | None = None
     validator_hotkey: str = ""               # ss58 of the signer (inside the signed body)
+    # Era context (DEC-CA-0043, drop-when-default so every archived receipt
+    # keeps its signed bytes): the era's start block and the seed the era's
+    # TRAINING seeds derive from (``block_seed(era.seed_block)`` — the
+    # previous era's start block hash). ``base_seed`` / the eval draw stay
+    # the settlement boundary's; only ``generation_seed`` / ``training_seed``
+    # move to the era. Absent (0) before the gate, required after — the
+    # audit checks both.
+    era_start_block: int = 0
+    era_base_seed: int = 0
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -511,6 +520,10 @@ class RoundReceipt:
             "reject_reason": self.reject_reason,
             "validator_hotkey": self.validator_hotkey,
         }
+        if self.era_start_block:
+            body["era_start_block"] = int(self.era_start_block)
+        if self.era_base_seed:
+            body["era_base_seed"] = int(self.era_base_seed)
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -533,6 +546,8 @@ def build_receipt(
     reward_uids: tuple[int, ...] = (),
     weights: tuple[float, ...] = (),
     reject_reason: str | None = None,
+    era_start_block: int = 0,
+    era_base_seed: int = 0,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -557,6 +572,8 @@ def build_receipt(
         weights=tuple(float(w) for w in weights),
         reject_reason=reject_reason,
         validator_hotkey=validator_hotkey,
+        era_start_block=int(era_start_block or 0),
+        era_base_seed=int(era_base_seed or 0),
     )
 
 
@@ -677,6 +694,8 @@ def load_receipt(text: str) -> RoundReceipt:
         weights=tuple(float(w) for w in obj.get("weights", ())),
         reject_reason=obj.get("reject_reason"),
         validator_hotkey=str(obj.get("validator_hotkey", "")),
+        era_start_block=int(obj.get("era_start_block", 0) or 0),
+        era_base_seed=int(obj.get("era_base_seed", 0) or 0),
         receipt_version=version,
         signature=obj.get("signature"),
     )

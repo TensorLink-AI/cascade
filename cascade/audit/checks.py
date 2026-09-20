@@ -155,9 +155,18 @@ def check_base_seed(receipt: RoundReceipt) -> CheckResult:
 def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """``RoundSeeds.derive(base_seed)`` reproduces the recorded seed pair."""
     name = "round-seeds"
+    # DEC-CA-0043: an era settlement's training seeds derive from the era's
+    # seed (the previous era's start block hash), recorded as era_base_seed;
+    # the boundary's base_seed still names the round and draws the eval.
+    from ..shared.era import era_king_active
     from ..trainer.contract import RoundSeeds
 
-    seeds = RoundSeeds.derive(receipt.base_seed, cfg.training)
+    if era_king_active(cfg.scoring, receipt.epoch_start_block):
+        if not receipt.era_base_seed:
+            return _fail(name, "era settlement records no era_base_seed")
+        seeds = RoundSeeds.derive(receipt.era_base_seed, cfg.training)
+    else:
+        seeds = RoundSeeds.derive(receipt.base_seed, cfg.training)
     problems = []
     if seeds.generation_seed != receipt.generation_seed:
         problems.append(f"generation_seed {receipt.generation_seed} != derived "
@@ -167,7 +176,71 @@ def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                         f"{seeds.training_seed}")
     if problems:
         return _fail(name, "; ".join(problems))
+    if receipt.era_base_seed:
+        return _ok(name, "generation + training seeds derive from era_base_seed")
     return _ok(name, "generation + training seeds derive from base_seed")
+
+
+def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
+    """DEC-CA-0043 era envelope, replayed under the receipt's own block.
+
+    Before ``era_king_from_block`` a receipt must carry NO era context (no
+    ``era_start_block`` / ``era_base_seed``, no era stamp on the manifest).
+    From it, the receipt's ``era_start_block`` and the manifest's era stamp
+    must be the era every node derives from the boundary, every entry's
+    ``train_block`` must sit inside the era's training window, and — with a
+    chain — ``era_base_seed`` must be the seed of the era's ``seed_block``
+    hash (WARN without a chain, like the boundary hash check).
+    """
+    from ..shared.era import EraSpec, era_for_block, era_king_active, era_length_blocks
+
+    name = "era"
+    stamp = receipt.manifest.get("era")
+    if not era_king_active(cfg.scoring, receipt.epoch_start_block):
+        if receipt.era_start_block or receipt.era_base_seed or stamp is not None:
+            return _fail(name, f"era context recorded before era_king_from_block "
+                               f"{cfg.scoring.era_king_from_block} (start "
+                               f"{receipt.era_start_block}, seed {receipt.era_base_seed}, "
+                               f"stamp={'yes' if stamp is not None else 'no'})")
+        return _ok(name, "pre-era settlement; no era context (as required)")
+    expected = era_for_block(cfg.round, receipt.epoch_start_block)
+    if receipt.era_start_block != expected.start_block:
+        return _fail(name, f"era_start_block {receipt.era_start_block} != derived "
+                           f"{expected.start_block} for boundary {receipt.epoch_start_block}")
+    if receipt.status == "scored" or stamp is not None:
+        if stamp is None:
+            return _fail(name, "scored era settlement whose manifest carries no era stamp")
+        try:
+            era = EraSpec.from_json(stamp)
+        except ValueError as e:
+            return _fail(name, f"era stamp malformed: {e}")
+        if (era.index, era.start_block, era.seed_block) != (
+                expected.index, expected.start_block, expected.seed_block):
+            return _fail(name, f"manifest era {era.index}@{era.start_block} (seed "
+                               f"{era.seed_block}) != derived {expected.index}@"
+                               f"{expected.start_block} (seed {expected.seed_block})")
+        window_end = era.start_block + era_length_blocks(cfg.round, era.start_block)
+        for e in receipt.manifest.get("entries", ()):
+            tb = int(e.get("train_block", 0))
+            if not (era.seed_block <= tb < window_end):
+                return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} train_block "
+                                   f"{tb} outside era window [{era.seed_block}, {window_end})")
+    if not receipt.era_base_seed:
+        return _fail(name, "era settlement records no era_base_seed")
+    if client is None:
+        return _warn(name, f"era {expected.index} start {expected.start_block} consistent; "
+                           f"no chain connection to verify era_base_seed against block "
+                           f"{expected.seed_block}")
+    try:
+        onchain = seed_from_block_hash(str(client.block_hash(expected.seed_block)))
+    except Exception as e:  # noqa: BLE001 — lite node / pruned history
+        return _warn(name, f"chain could not serve era seed block {expected.seed_block} "
+                           f"({e}); era_base_seed not verified")
+    if onchain != receipt.era_base_seed:
+        return _fail(name, f"era_base_seed {receipt.era_base_seed} != seed of block "
+                           f"{expected.seed_block} hash ({onchain})")
+    return _ok(name, f"era {expected.index} start {expected.start_block}; era_base_seed "
+                     f"matches block {expected.seed_block}")
 
 
 def check_epoch_alignment(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
@@ -1078,6 +1151,8 @@ def check_status(receipt: RoundReceipt) -> CheckResult:
 # receipt — its FAIL is converted to a PASS noting the confirmation.
 _REJECTION_CHECK_FOR_REASON = (
     ("signature_invalid", "manifest-signature"),
+    ("era_", "era"),
+    ("manifest_chain_broken", "era"),
     ("contract_digest_mismatch", "contract-digest"),
     ("base_arch_digest_mismatch", "base-arch-digest"),
 )
@@ -1166,6 +1241,7 @@ def run_tier0(
         check_base_seed(receipt),
         check_round_seeds(receipt, cfg),
         check_epoch_alignment(receipt, cfg),
+        check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),
         check_contract_declaration(receipt, cfg),

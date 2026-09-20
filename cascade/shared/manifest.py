@@ -525,6 +525,18 @@ class TrainingManifest:
     # hashes exactly as it did before the field existed. ``None`` ⇒ the trainer
     # predates the field (validators fall back to the legacy strict gate).
     contract_body: dict | None = None
+    # Era stamp (DEC-CA-0043, rolling intake + era king): ``{index,
+    # start_block, seed_block, generation, member_index}`` — the era this
+    # settlement belongs to, pure block arithmetic every validator re-derives
+    # (cascade.shared.era). SIGNED under the drop-when-unset convention: a
+    # boundary-synchronous manifest (``None``) hashes exactly as before the
+    # field existed. Every entry in the manifest shares the era.
+    era: dict | None = None
+    # Hash chain (DEC-CA-0043): the round_id of the settlement published
+    # before this one, so validators walk ``round-<id>.json`` forward from
+    # their last handled settlement instead of jumping to ``latest.json``.
+    # Signed, drop-when-empty.
+    prev_round_id: str = ""
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -660,6 +672,12 @@ class TrainingManifest:
         # before the field existed, so every archived signature stays valid.
         if self.contract_body is not None:
             body["contract_body"] = self.contract_body
+        # Same drop-when-unset convention (DEC-CA-0043): pre-rollover
+        # manifests carry neither key and hash exactly as before.
+        if self.era is not None:
+            body["era"] = self.era
+        if self.prev_round_id:
+            body["prev_round_id"] = self.prev_round_id
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -722,6 +740,8 @@ def load_manifest(text: str) -> TrainingManifest:
         warm_start_size=str(obj.get("warm_start_size", "") or ""),
         contract_body=(obj["contract_body"]
                        if isinstance(obj.get("contract_body"), dict) else None),
+        era=(obj["era"] if isinstance(obj.get("era"), dict) else None),
+        prev_round_id=str(obj.get("prev_round_id", "") or ""),
         signature=obj.get("signature"),
     )
 

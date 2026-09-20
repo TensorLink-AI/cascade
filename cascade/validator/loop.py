@@ -40,10 +40,20 @@ from ..shared.config import (
     cohort_maxt_increment_active,
     effective_epoch_blocks,
 )
+from ..shared.era import (
+    EraSpec,
+    era_for_block,
+    era_king_active,
+    era_length_blocks,
+    member_index_for_era,
+    min_effective_era,
+    tenure_rounds_at,
+)
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
+    load_manifest,
     locked_contract_terms,
     parse_trained_pointer,
     verify_signature,
@@ -108,6 +118,71 @@ def participants_from_commitments(commitments: list, cutoff_block: int,
                 hotkey=c.hotkey, uid=c.uid, gen_ref=parsed.ref, commit_block=c.commit_block
             )
     return tuple(sorted(best.values(), key=lambda p: p.uid))
+
+
+def ref_as_of(commitments: list, hotkey: str, block: int) -> str | None:
+    """The generator ref ``hotkey`` had revealed AS OF ``block`` (DEC-CA-0043
+    ref binding at ``train_block``): the latest parseable commitment with
+    ``commit_block <= block``. ``commitments`` is the full reveal history
+    (``poll_commitments(include_history=True)``). None when nothing was
+    revealed by then."""
+    from ..interface.validation import parse_commit
+
+    best_block, best_ref = -1, None
+    for c in commitments:
+        if c.hotkey != hotkey or int(c.commit_block) > int(block):
+            continue
+        parsed = parse_commit(c.payload)
+        if parsed is None:
+            continue
+        if int(c.commit_block) >= best_block:
+            best_block, best_ref = int(c.commit_block), parsed.ref
+    return best_ref
+
+
+def chain_manifests(store: object, raw_latest: str, last_handled_round_id: str | None,
+                    *, max_depth: int = 16,
+                    read_round: Callable[[object, str], str] | None = None,
+                    ) -> list[tuple[str, str]]:
+    """The manifests to handle, OLDEST FIRST, walking ``prev_round_id`` back
+    from ``latest.json`` to ``last_handled_round_id`` (DEC-CA-0043: never jump
+    to latest — a validator that missed settlements catches up through every
+    one, dethrones included, before the era-king envelope is checked).
+
+    Returns ``[(raw_text, sha256)]``. With no chain link on the latest
+    manifest (pre-rollover), no persisted position, or a latest that already
+    follows the last handled settlement, this is just ``[latest]``. The walk is
+    bounded by ``max_depth``; if it does not reach the last handled settlement
+    the oldest collected manifest is still handled first (its chain check
+    fails closed and latches, and the rest follow in order).
+    """
+    from ..shared.hippius import manifest_round_key
+
+    def _digest(raw: str) -> str:
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    latest = load_manifest(raw_latest)
+    chain: list[tuple[str, str]] = [(raw_latest, _digest(raw_latest))]
+    prev = str(latest.prev_round_id or "")
+    if (not prev or last_handled_round_id is None or prev == last_handled_round_id
+            or str(latest.round_id) == last_handled_round_id):
+        return chain
+    reader = read_round or (lambda s, rid: s.get_text(manifest_round_key(rid)))
+    seen = {str(latest.round_id)}
+    while prev and prev != last_handled_round_id and len(chain) < max_depth:
+        if prev in seen:
+            break
+        seen.add(prev)
+        try:
+            raw = reader(store, prev)
+        except Exception as e:  # noqa: BLE001 — a hole in the chain: handle what we have
+            log.warning("manifest chain: round %s unreadable (%s); walking stops", prev, e)
+            break
+        m = load_manifest(raw)
+        chain.append((raw, _digest(raw)))
+        prev = str(m.prev_round_id or "")
+    chain.reverse()
+    return chain
 
 
 @dataclass(frozen=True)
@@ -203,6 +278,12 @@ class ValidatorRunner:
     # open_manifest_store, so the report reads ride the same R2/HF fallbacks
     # as the manifest. Injected in tests.
     bench_report_store: object | None = None
+    # Era ref binding (DEC-CA-0043): returns each hotkey's FULL reveal history
+    # (``client.poll_commitments(include_history=True)``) so an era manifest's
+    # entries are verified against the ref revealed AS OF their train_block.
+    # None ⇒ the binding check is skipped (tests / no chain); a raising fn is
+    # a transient — the round is retried next poll, never latched.
+    commitment_history_fn: Callable[[], list] | None = None
     # Block of the last successful (or attempted re-assert) weight-set; drives
     # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
     # never set this process, so the first live-loop tick re-asserts
@@ -255,6 +336,194 @@ class ValidatorRunner:
         ws_reason = self._check_warm_start(manifest)
         if ws_reason is not None:
             return ws_reason
+        era_reason = self._check_era(manifest)
+        if era_reason is not None:
+            return era_reason
+        return None
+
+    # ── Era envelope (DEC-CA-0043) ───────────────────────────────────────────
+
+    def _era_active(self, manifest: TrainingManifest) -> bool:
+        return era_king_active(self.cfg.scoring, self._epoch_start_block(manifest))
+
+    def _check_era(self, manifest: TrainingManifest) -> str | None:
+        """Era-king envelope, fail closed, only from ``era_king_from_block``.
+
+        In order: the era stamp exists and parses; it is the era every node
+        derives from the settlement's epoch boundary (index / start on the
+        era grid / seeds from the previous era's start); the init it names is
+        ``members_gen(g)[era % k]`` for the latest verified promotion whose
+        ``effective_era <= era`` (a pending record is installed at its first
+        effective settlement, never earlier) and ``warm_start_ckpt`` is that
+        member; every entry's ``train_block`` lies inside the era's training
+        window ``[seed_block, era_end)``; the manifest chains to this
+        validator's last handled settlement; the king entry, when it is the
+        champion, carries the pointer this validator judged (or adopts the
+        era's first king leg); every entry's ref is the hotkey's revealed
+        commitment as of its ``train_block``.
+
+        Pre-gate manifests are untouched (bit-identical to the ungated
+        validator) — a stray ``era`` stamp before the block is ignored.
+        """
+        if not self._era_active(manifest):
+            return None
+        if manifest.era is None:
+            return "era_missing: settlement past era_king_from_block carries no era stamp"
+        try:
+            era = EraSpec.from_json(manifest.era)
+        except ValueError as e:
+            return f"era_malformed: {e}"
+        block = self._epoch_start_block(manifest)
+        expected = era_for_block(self.cfg.round, block)
+        if (era.index, era.start_block, era.seed_block) != (
+                expected.index, expected.start_block, expected.seed_block):
+            return (f"era_mismatch: manifest era {era.index}@{era.start_block} "
+                    f"(seed {era.seed_block}) but the boundary {block} is in era "
+                    f"{expected.index}@{expected.start_block} (seed {expected.seed_block})")
+        init_reason = self._check_era_init(manifest, era)
+        if init_reason is not None:
+            return init_reason
+        window_end = era.start_block + era_length_blocks(self.cfg.round, era.start_block)
+        for e in manifest.entries:
+            if not (era.seed_block <= int(e.train_block) < window_end):
+                return (f"era_entry_out_of_window: {e.role} uid{e.miner_uid} trained at "
+                        f"block {e.train_block}, outside era {era.index}'s window "
+                        f"[{era.seed_block}, {window_end})")
+        last = self.state.last_handled_round_id
+        if (last is not None and manifest.prev_round_id != last
+                and str(manifest.round_id) != last):
+            return (f"manifest_chain_broken: prev_round_id {manifest.prev_round_id!r} "
+                    f"but this validator last handled {last!r} — walk the chain")
+        king_reason = self._check_era_king(manifest, era)
+        if king_reason is not None:
+            return king_reason
+        return self._check_era_refs(manifest)
+
+    def _check_era_init(self, manifest: TrainingManifest, era: EraSpec) -> str | None:
+        """The init an era manifest declares must be the one the promotion
+        ledger names for that era (zero trainer discretion)."""
+        if self.cascade is None:
+            # Pure KOTH: no promotions, so an era is random-init by definition.
+            if era.generation or era.member_index or manifest.warm_start_ckpt:
+                return ("era_init_mismatch: cascade is off, era must train from "
+                        "random init")
+            return None
+        self._refresh_pending_promotion(era)
+        state = self.cascade.state
+        if (state.pending_generation and state.pending_generation > state.generation
+                and era.index >= state.pending_effective_era):
+            self.cascade.note_promotion(
+                generation=state.pending_generation, members=state.pending_members,
+                block=era.start_block)
+            self.cascade.stage_promotion(generation=0, members=(), effective_era=0)
+            state = self.cascade.state
+        generation = int(state.generation)
+        members = tuple(state.members)
+        if generation == 0 or not members:
+            expected_member, expected_index = "", 0
+        else:
+            expected_index = member_index_for_era(era.index, len(members))
+            expected_member = members[expected_index]
+        if era.generation != generation or era.member_index != expected_index:
+            return (f"era_init_mismatch: era {era.index} declares generation "
+                    f"{era.generation} member {era.member_index}, the ledger names "
+                    f"generation {generation} member {expected_index}")
+        if manifest.warm_start_ckpt != expected_member:
+            return (f"era_init_mismatch: era {era.index} init is "
+                    f"{expected_member or '<random init>'!r}, manifest trained from "
+                    f"{manifest.warm_start_ckpt or '<random init>'!r}")
+        return None
+
+    def _refresh_pending_promotion(self, era: EraSpec) -> None:
+        """Learn of a NEWER promotion record ahead of its effective era. The
+        record must survive the DEC-CA-0013 envelope (signature, set cap,
+        ripeness when attestable, member provenance) AND claim an
+        ``effective_era`` no earlier than one full era after it fired; a
+        record failing either is ignored (logged) — the ledger keeps naming
+        the live generation and a manifest trained from the new set fails
+        ``era_init_mismatch`` until a valid record exists."""
+        from ..shared.promotion import verify_promotion_record_signature
+
+        assert self.cascade is not None
+        state = self.cascade.state
+        record = self._fetch_latest_promotion_record()
+        if record is None or record.generation <= max(state.generation, state.pending_generation):
+            return
+        if record.generation != state.generation + 1:
+            log.warning("cascade: promotion record gen=%d skips accepted gen=%d; ignored",
+                        record.generation, state.generation)
+            return
+        if self.verify_signatures and not verify_promotion_record_signature(
+                record, self.cfg.manifest.trainer_hotkey):
+            log.warning("cascade: promotion record gen=%d unsigned/invalid; ignored",
+                        record.generation)
+            return
+        member_ids = record.member_ids()
+        k_max = max(1, int(self.cfg.scoring.cascade_top_k))
+        if not member_ids or len(member_ids) > k_max:
+            log.warning("cascade: promotion record gen=%d declares %d member(s), cap %d; "
+                        "ignored", record.generation, len(member_ids), k_max)
+            return
+        floor = min_effective_era(self.cfg.round, int(record.fired_block))
+        if int(record.effective_era) < floor:
+            log.warning("cascade: promotion record gen=%d claims effective_era %d, "
+                        "earliest allowed %d (fired at block %d); ignored",
+                        record.generation, record.effective_era, floor, record.fired_block)
+            return
+        attesting = self.cascade.can_verify_ripeness()
+        if attesting and not self.cascade.is_ripe(block=int(record.fired_block)):
+            log.warning("cascade: promotion record gen=%d fired before the reign clock "
+                        "ripened (block %d); ignored", record.generation, record.fired_block)
+            return
+        member_reason = self._verify_members(record, enforce_reign_scope=attesting)
+        if member_reason is not None:
+            log.warning("cascade: promotion record gen=%d rejected: %s",
+                        record.generation, member_reason)
+            return
+        self.cascade.stage_promotion(generation=record.generation, members=member_ids,
+                                     effective_era=int(record.effective_era))
+        log.info("cascade: promotion generation=%d staged for era %d (%d member(s))",
+                 record.generation, record.effective_era, len(member_ids))
+
+    def _check_era_king(self, manifest: TrainingManifest, era: EraSpec) -> str | None:
+        """The king entry is judged at ONE pointer per era: the pointer this
+        validator crowned (a dethrone's winner) or the era's first king leg.
+        A new era adopts the manifest's king pointer; a stale-king manifest
+        (hotkey ≠ champion) is left to the resync valve, not rejected here."""
+        king = manifest.entry_for_role("king")
+        if king is None:
+            return None
+        champ = self.state.king_hotkey
+        if champ is not None and king.miner_hotkey != champ:
+            return None
+        if self.state.era_index == era.index and self.state.king_pointer:
+            if king.trained_pointer != self.state.king_pointer:
+                return (f"era_king_pointer_mismatch: era {era.index} king pointer is "
+                        f"{self.state.king_pointer!r}, manifest carries "
+                        f"{king.trained_pointer!r}")
+            return None
+        self.state = replace(self.state, era_index=int(era.index),
+                             king_pointer=str(king.trained_pointer))
+        return None
+
+    def _check_era_refs(self, manifest: TrainingManifest) -> str | None:
+        """Each entry's ref is the hotkey's revealed commitment AS OF its
+        ``train_block`` (not the latest reveal at the boundary), so a
+        re-commit between leg start and settlement cannot change what is
+        judged. Skipped without a history provider; a provider failure is a
+        transient (raised — the loop retries next poll)."""
+        if self.commitment_history_fn is None:
+            return None
+        history = self.commitment_history_fn()
+        for e in manifest.entries:
+            bound = ref_as_of(history, e.miner_hotkey, int(e.train_block))
+            if bound is None:
+                return (f"era_ref_unbound: {e.role} uid{e.miner_uid} had no revealed "
+                        f"commitment as of block {e.train_block}")
+            if bound != e.gen_ref:
+                return (f"era_ref_mismatch: {e.role} uid{e.miner_uid} ref {e.gen_ref!r} "
+                        f"is not the commitment revealed as of block {e.train_block} "
+                        f"({bound!r})")
         return None
 
     def _check_contract(self, manifest: TrainingManifest) -> str | None:
@@ -333,6 +602,10 @@ class ValidatorRunner:
         legacy_reason = self._adopt_legacy_warm_start()
         if legacy_reason is not None:
             return legacy_reason
+        if self._era_active(manifest):
+            # DEC-CA-0043: the era gate names the init from the ledger
+            # (generation + era rotation) and rejects anything else.
+            return None
         declared = manifest.warm_start_ckpt
         state = self.cascade.state
         if not declared:
@@ -635,7 +908,9 @@ class ValidatorRunner:
                 if bad or any(not e.gpu_name for e in entries):
                     return (f"gpu_mismatch: size {preset!r} expected {pinned!r}, "
                             f"manifest has {sorted(gpus)!r}")
-            elif len(gpus) > 1:
+            elif len(gpus) > 1 and not self._era_active(manifest):
+                # DEC-CA-0043 lifts the same-GPU fallback: legs pick their SKU
+                # per entry, byte-exact audit across SKUs is given up (#294).
                 return (f"gpu_mismatch: size {preset!r} king/challenger on "
                         f"different GPUs {sorted(gpus)!r}")
         return None
@@ -1229,7 +1504,12 @@ class ValidatorRunner:
                          "alpha %.4f -> %.5f", manifest.round_id, k,
                          base_params.bootstrap_alpha, duel_params.bootstrap_alpha)
 
-        tenure_at_decision = self.state.tenure_rounds
+        # Tenure as the margin schedule counts it (DEC-CA-0043: in blocks
+        # from tenure_blocks_from_block; the counter before it).
+        tenure_at_decision = tenure_rounds_at(
+            self.cfg.round, self.cfg.scoring, block=self._epoch_start_block(manifest),
+            tenure_rounds=self.state.tenure_rounds,
+            king_since_block=self.state.king_since_block)
         judged: list[tuple[str, TrainedEntry, RoundResult]] = []
         cohort_scores: list[tuple[str, list[WindowScore]]] = []
         inconclusive: RoundResult | None = None
@@ -1373,6 +1653,8 @@ class ValidatorRunner:
             dethrone_cp=self.cfg.scoring.dethrone_cp,
             keep_former_kings=self.cfg.scoring.reward_prior_kings,
             defeated_hotkeys=duelled,
+            crowned_block=self._epoch_start_block(manifest),
+            crowned_pointer=chal_entry.trained_pointer,
         )
         self.state = transition.state
         log.info(
@@ -1424,6 +1706,16 @@ class ValidatorRunner:
             cohort_stats=({hk: cohort_stats_of(r) for hk, _, r in judged} if k > 1 else {}),
         )
 
+    def _pending_manifests(self, store: object, raw_latest: str,
+                           last_round: str | None) -> list[tuple[str, str]]:
+        """:func:`chain_manifests`, applied only when the latest settlement is
+        past ``era_king_from_block`` (pre-rollover: ``[latest]``, exactly as
+        before). Unreadable latest ⇒ handled by the caller's load."""
+        latest = load_manifest(raw_latest)
+        if not self._era_active(latest):
+            return [(raw_latest, hashlib.sha256(raw_latest.encode("utf-8")).hexdigest())]
+        return chain_manifests(store, raw_latest, last_round)
+
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the
         epoch grid. Monotonic and identical for every validator (from the shared
@@ -1455,8 +1747,14 @@ class ValidatorRunner:
         reward_uids: tuple[int, ...] = (),
         weights: tuple[float, ...] = (),
         validator_hotkey: str = "",
+        era_base_seed: int = 0,
     ) -> RoundReceipt:
         """Assemble the round's public receipt (pure — no I/O, no signing).
+
+        ``era_base_seed`` (DEC-CA-0043, era settlements only) is
+        ``block_seed(era.seed_block)``: the era's training seeds derive from
+        it, so the receipt's ``generation_seed`` / ``training_seed`` are the
+        era's while ``base_seed`` stays the settlement boundary's.
 
         A gated-out manifest — or one with no (king, challenger) pair to score
         (a no-contest round: nothing failed, the king simply holds) — yields a
@@ -1467,7 +1765,13 @@ class ValidatorRunner:
         """
         from ..trainer.contract import RoundSeeds
 
-        seeds = RoundSeeds.derive(base_seed, self.cfg.training)
+        era_start_block = 0
+        if era_king_active(self.cfg.scoring, epoch_start_block):
+            era_start_block = era_for_block(self.cfg.round, epoch_start_block).start_block
+            seeds = RoundSeeds.derive(int(era_base_seed), self.cfg.training)
+        else:
+            era_base_seed = 0
+            seeds = RoundSeeds.derive(base_seed, self.cfg.training)
         if reject_reason is not None:
             return build_receipt(
                 round_id=manifest.round_id, status="rejected",
@@ -1476,6 +1780,7 @@ class ValidatorRunner:
                 participants=participants, reject_reason=reject_reason,
                 reward_uids=reward_uids, weights=weights,
                 validator_hotkey=validator_hotkey,
+                era_start_block=era_start_block, era_base_seed=era_base_seed,
             )
         if outcome is None or windows is None:
             raise ValueError("a scored receipt needs both outcome and windows")
@@ -1503,6 +1808,7 @@ class ValidatorRunner:
             entry_scores=outcome.entry_scores, verdict=verdict,
             reward_uids=reward_uids, weights=weights,
             validator_hotkey=validator_hotkey,
+            era_start_block=era_start_block, era_base_seed=era_base_seed,
         )
 
     def _publish_round_receipt(
@@ -1537,10 +1843,14 @@ class ValidatorRunner:
         try:
             epoch_start = self._epoch_start_block(manifest)
             epoch_hash = ""
+            era_base_seed = 0
             current_block: int | None = None
             participants: tuple[Participant, ...] = ()
             try:
                 epoch_hash = client.block_hash(epoch_start)
+                if era_king_active(self.cfg.scoring, epoch_start):
+                    era_base_seed = int(client.block_seed(
+                        era_for_block(self.cfg.round, epoch_start).seed_block))
                 participants = participants_from_commitments(
                     client.poll_commitments(include_history=True),
                     cutoff_block=epoch_start,
@@ -1578,6 +1888,7 @@ class ValidatorRunner:
                 reward_uids=reward_uids,
                 weights=weights,
                 validator_hotkey=hotkey_ss58,
+                era_base_seed=era_base_seed,
             )
             if wallet is not None:
                 receipt = sign_receipt(receipt, wallet)
@@ -1768,141 +2079,145 @@ class ValidatorRunner:
                 # this is the page's only fresh view of the chain (stage strip
                 # + live submissions). Best-effort; never affects the round.
                 self._publish_chain_status(client, store)
-                raw = read_latest_manifest(store)
-                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                if digest == last_digest:
+                raw_latest = read_latest_manifest(store)
+                digest_latest = hashlib.sha256(raw_latest.encode("utf-8")).hexdigest()
+                if digest_latest == last_digest:
                     log.debug("manifest unchanged (round=%s sha=%s…); skipping",
-                              last_round, digest[:12])
+                              last_round, digest_latest[:12])
                 else:
-                    manifest = load_manifest(raw)
-                    base_seed = int(manifest.round_id)
-                    if manifest.round_id == last_round:
-                        log.warning(
-                            "manifest for already-handled round=%s RE-PUBLISHED "
-                            "with different content (sha %s… -> %s…); re-judging",
-                            manifest.round_id,
-                            (last_digest or "")[:12], digest[:12],
+                    # DEC-CA-0043: from era_king_from_block the manifests are
+                    # hash-chained and walked forward from the last handled
+                    # settlement (oldest first); before it, latest.json alone.
+                    for raw, digest in self._pending_manifests(store, raw_latest, last_round):
+                        manifest = load_manifest(raw)
+                        base_seed = int(manifest.round_id)
+                        if manifest.round_id == last_round:
+                            log.warning(
+                                "manifest for already-handled round=%s RE-PUBLISHED "
+                                "with different content (sha %s… -> %s…); re-judging",
+                                manifest.round_id,
+                                (last_digest or "")[:12], digest[:12],
+                            )
+                        log.info(
+                            "new manifest round=%s entries=%d (%s); gating + scoring …",
+                            manifest.round_id, len(manifest.entries),
+                            ",".join(f"{e.role}:uid{e.miner_uid}" for e in manifest.entries),
                         )
-                    log.info(
-                        "new manifest round=%s entries=%d (%s); gating + scoring …",
-                        manifest.round_id, len(manifest.entries),
-                        ",".join(f"{e.role}:uid{e.miner_uid}" for e in manifest.entries),
-                    )
-                    # Gate first so a rejected manifest never moves weights.
-                    reason = self.check_manifest(manifest)
-                    retry_pin = False
-                    if reason is None:
-                        # Pool-pin gate: the signed snapshot pin must match this
-                        # validator's own deterministic selection for the round.
-                        try:
-                            reason = self.check_pool_pin(
-                                manifest, window_source,
+                        # Gate first so a rejected manifest never moves weights.
+                        reason = self.check_manifest(manifest)
+                        retry_pin = False
+                        if reason is None:
+                            # Pool-pin gate: the signed snapshot pin must match this
+                            # validator's own deterministic selection for the round.
+                            try:
+                                reason = self.check_pool_pin(
+                                    manifest, window_source,
+                                    block=self._epoch_start_block(manifest),
+                                )
+                            except StorageError as e:
+                                # The index could not be READ (auth/network/5xx) —
+                                # a transient, not a verdict. Within the grace
+                                # window: no latch, no receipt, retry next poll.
+                                reason = self._pool_pin_read_failed(manifest.round_id, e)
+                                retry_pin = reason is None
+                            else:
+                                self._pin_read_first_failure.pop(str(manifest.round_id), None)
+                        if retry_pin:
+                            # In-grace read failure: neither last_round nor
+                            # last_digest move, so the next manifest poll re-judges
+                            # this round from scratch. Falls through to the weight
+                            # re-assert + sleep below.
+                            break
+                        elif reason is not None:
+                            log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
+                            last_round, last_digest = manifest.round_id, digest
+                            self.state = replace(
+                                self.state, last_handled_round_id=str(manifest.round_id),
+                                last_handled_manifest_sha=digest)
+                            self._persist_state()
+                            # A rejected round still gets a public receipt carrying
+                            # the gate's reason — visible, not silently absent.
+                            self._publish_round_receipt(
+                                client, manifest, base_seed,
+                                reject_reason=reason, window_source=window_source,
+                            )
+                        elif not self.king_synced(manifest):
+                            # The trainer trained the OLD king (incentive lags a
+                            # dethrone). Hold the KOTH state and keep voting the champion
+                            # so incentive migrates and the trainer re-syncs — bounded by
+                            # the safety valve (see _resync_step). A public receipt
+                            # records why, not a silent skip.
+                            last_round, last_digest = manifest.round_id, digest
+                            # Fold the marker in BEFORE _resync_step: it derives the
+                            # next state from this one, so the marker rides along
+                            # (demote_to_trained passes it through explicitly).
+                            self.state = replace(
+                                self.state, last_handled_round_id=str(manifest.round_id),
+                                last_handled_manifest_sha=digest)
+                            self.state, reject_reason = self._resync_step(manifest)
+                            self._persist_state()
+                            reward_uids = self._reward_uids(manifest, None, client)
+                            weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
+                            self._publish_round_receipt(
+                                client, manifest, base_seed,
+                                reject_reason=reject_reason,
+                                window_source=window_source,
+                                reward_uids=tuple(reward_uids), weights=weights_vec,
+                            )
+                        else:
+                            # The epoch block selects the daily snapshot; base_seed
+                            # rotates the window slice within it.
+                            windows = self._verdict_windows(
+                                window_source, base_seed,
                                 block=self._epoch_start_block(manifest),
                             )
-                        except StorageError as e:
-                            # The index could not be READ (auth/network/5xx) —
-                            # a transient, not a verdict. Within the grace
-                            # window: no latch, no receipt, retry next poll.
-                            reason = self._pool_pin_read_failed(manifest.round_id, e)
-                            retry_pin = reason is None
-                        else:
-                            self._pin_read_first_failure.pop(str(manifest.round_id), None)
-                    if retry_pin:
-                        # In-grace read failure: neither last_round nor
-                        # last_digest move, so the next manifest poll re-judges
-                        # this round from scratch. Falls through to the weight
-                        # re-assert + sleep below.
-                        pass
-                    elif reason is not None:
-                        log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
-                        last_round, last_digest = manifest.round_id, digest
-                        self.state = replace(
-                            self.state, last_handled_round_id=str(manifest.round_id),
-                            last_handled_manifest_sha=digest)
-                        self._persist_state()
-                        # A rejected round still gets a public receipt carrying
-                        # the gate's reason — visible, not silently absent.
-                        self._publish_round_receipt(
-                            client, manifest, base_seed,
-                            reject_reason=reason, window_source=window_source,
-                        )
-                    elif not self.king_synced(manifest):
-                        # The trainer trained the OLD king (incentive lags a
-                        # dethrone). Hold the KOTH state and keep voting the champion
-                        # so incentive migrates and the trainer re-syncs — bounded by
-                        # the safety valve (see _resync_step). A public receipt
-                        # records why, not a silent skip.
-                        last_round, last_digest = manifest.round_id, digest
-                        # Fold the marker in BEFORE _resync_step: it derives the
-                        # next state from this one, so the marker rides along
-                        # (demote_to_trained passes it through explicitly).
-                        self.state = replace(
-                            self.state, last_handled_round_id=str(manifest.round_id),
-                            last_handled_manifest_sha=digest)
-                        self.state, reject_reason = self._resync_step(manifest)
-                        self._persist_state()
-                        reward_uids = self._reward_uids(manifest, None, client)
-                        weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
-                        self._publish_round_receipt(
-                            client, manifest, base_seed,
-                            reject_reason=reject_reason,
-                            window_source=window_source,
-                            reward_uids=tuple(reward_uids), weights=weights_vec,
-                        )
-                    else:
-                        # The epoch block selects the daily snapshot; base_seed
-                        # rotates the window slice within it.
-                        windows = self._verdict_windows(
-                            window_source, base_seed,
-                            block=self._epoch_start_block(manifest),
-                        )
-                        # process_round mutates the sticky KOTH state atomically (it
-                        # raises before any mutation on a transient eval/fetch error,
-                        # leaving state untouched for a clean retry). Mark the round
-                        # consumed as soon as it returns, so a later weight-set failure
-                        # can NEVER re-run it and double-count the streak/tenure.
-                        outcome = self.process_round(manifest, windows, base_seed)
-                        # Back in sync — clear any accumulated resync holds so a
-                        # future desync starts the safety-valve count from zero.
-                        if self.state.resync_holds or self.state.last_resync_round_id:
+                            # process_round mutates the sticky KOTH state atomically (it
+                            # raises before any mutation on a transient eval/fetch error,
+                            # leaving state untouched for a clean retry). Mark the round
+                            # consumed as soon as it returns, so a later weight-set failure
+                            # can NEVER re-run it and double-count the streak/tenure.
+                            outcome = self.process_round(manifest, windows, base_seed)
+                            # Back in sync — clear any accumulated resync holds so a
+                            # future desync starts the safety-valve count from zero.
+                            if self.state.resync_holds or self.state.last_resync_round_id:
+                                self.state = replace(
+                                    self.state, resync_holds=0, last_resync_round_id=None)
+                            last_round, last_digest = manifest.round_id, digest
                             self.state = replace(
-                                self.state, resync_holds=0, last_resync_round_id=None)
-                        last_round, last_digest = manifest.round_id, digest
-                        self.state = replace(
-                            self.state, last_handled_round_id=str(manifest.round_id),
-                            last_handled_manifest_sha=digest)
-                        self._persist_state()
-                        reward_uids = self._reward_uids(manifest, outcome, client)
-                        weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
-                        # The public receipt — strictly after weights, so it
-                        # records what was actually set (empty vector = the
-                        # weight extrinsic failed this round).
-                        if outcome is not None:
-                            self._publish_round_receipt(
-                                client, manifest, base_seed,
-                                outcome=outcome, windows=windows,
-                                window_source=window_source,
-                                reward_uids=tuple(reward_uids), weights=weights_vec,
-                            )
-                        else:
-                            # Gated in but nothing to score (no king/challenger
-                            # pair at any size): a public record still exists.
-                            self._publish_round_receipt(
-                                client, manifest, base_seed,
-                                reject_reason="no_king_challenger_pair",
-                                window_source=window_source,
-                                reward_uids=tuple(reward_uids), weights=weights_vec,
-                            )
-                        # Log-only public benchmarks for a freshly crowned king.
-                        # Strictly after weights are decided; never affects them.
-                        self._maybe_run_benchmarks(manifest, outcome)
-                        # Cascade step — strictly last, so this round's weights and
-                        # receipt already recorded the outgoing king. Resets the
-                        # reign clock on a dethrone, records the king's checkpoint,
-                        # and fires the promotion when the clock is ripe.
-                        self._cascade_round(manifest, outcome)
-                        # Multi-horizon calibration telemetry — after everything
-                        # consensus-relevant; log-only, inert unless configured.
+                                self.state, last_handled_round_id=str(manifest.round_id),
+                                last_handled_manifest_sha=digest)
+                            self._persist_state()
+                            reward_uids = self._reward_uids(manifest, outcome, client)
+                            weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
+                            # The public receipt — strictly after weights, so it
+                            # records what was actually set (empty vector = the
+                            # weight extrinsic failed this round).
+                            if outcome is not None:
+                                self._publish_round_receipt(
+                                    client, manifest, base_seed,
+                                    outcome=outcome, windows=windows,
+                                    window_source=window_source,
+                                    reward_uids=tuple(reward_uids), weights=weights_vec,
+                                )
+                            else:
+                                # Gated in but nothing to score (no king/challenger
+                                # pair at any size): a public record still exists.
+                                self._publish_round_receipt(
+                                    client, manifest, base_seed,
+                                    reject_reason="no_king_challenger_pair",
+                                    window_source=window_source,
+                                    reward_uids=tuple(reward_uids), weights=weights_vec,
+                                )
+                            # Log-only public benchmarks for a freshly crowned king.
+                            # Strictly after weights are decided; never affects them.
+                            self._maybe_run_benchmarks(manifest, outcome)
+                            # Cascade step — strictly last, so this round's weights and
+                            # receipt already recorded the outgoing king. Resets the
+                            # reign clock on a dethrone, records the king's checkpoint,
+                            # and fires the promotion when the clock is ripe.
+                            self._cascade_round(manifest, outcome)
+                            # Multi-horizon calibration telemetry — after everything
+                            # consensus-relevant; log-only, inert unless configured.
                         self._maybe_calibrate_horizons(manifest, base_seed, window_source)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
@@ -2012,6 +2327,9 @@ class ValidatorRunner:
                 state_mod.demote_to_trained(
                     self.state, trained_hotkey=trained,
                     trained_uid=self._manifest_king_uid(manifest),
+                    trained_block=self._epoch_start_block(manifest),
+                    trained_pointer=str(getattr(
+                        manifest.entry_for_role("king"), "trained_pointer", "") or ""),
                 ),
                 f"king_resync_demoted: champion {champ} un-synced {holds} rounds "
                 f"(cap={cap}); adopted trained king {trained}",
@@ -2303,6 +2621,7 @@ def _bootstrap_state_from_receipts(
 def _build_cascade(cfg: ChainConfig) -> CascadeController:
     """Construct the Cascade controller from config, restoring the persisted reign
     clock + checkpoint log so it resumes across restarts."""
+    from ..shared.era import effective_reign_threshold_rounds
     from .cascade import CascadeController, load_state
 
     state_path = Path(cfg.validator.cascade_state_db_path)
@@ -2313,6 +2632,9 @@ def _build_cascade(cfg: ChainConfig) -> CascadeController:
         # The clock divides by the ROUND length in force, not a fixed day, so
         # the threshold keeps meaning "survived N challenges" under any cadence.
         round_cfg=cfg.round,
+        # DEC-CA-0043: from tenure_blocks_from_block the threshold is
+        # cascade_reign_blocks on the grid in force at the block.
+        threshold_fn=lambda b: effective_reign_threshold_rounds(cfg.round, cfg.scoring, b),
     )
 
 
