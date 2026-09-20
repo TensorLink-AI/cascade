@@ -445,7 +445,10 @@ funded_host_bench_floor = { RTX4090 = 500e6 }
 # the whole round locking to one type. Fair because budgets are compute-
 # denominated and every leg completes its full token budget; needs
 # [training] expected_gpu = "" and the validators' manifest gate (_check_gpu,
-# gpu_mismatch on mixed types) lifted — the owner coordinates that release.
+# gpu_mismatch on mixed types) lifted — that gate lifts at [scoring]
+# era_king_from_block (= ROLLOVER), and the per-leg choice takes effect at
+# the SAME block: until then every round still locks one type (#295), so
+# arming this key early changes nothing before the rollover.
 funded_sku_per_leg = true
 # Price guards on marketplace executors (USD; 0 = off). Cap the PER-LEG cost
 # (price/h × the SKU's measured wall below): an H100 at $1.30/h finishing in

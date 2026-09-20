@@ -1,6 +1,7 @@
 """Era arithmetic + the DEC-CA-0043 rollover knobs (cascade.shared.era)."""
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from dataclasses import replace
@@ -160,13 +161,21 @@ def _toml_with(path: Path, tmp_path: Path, **overrides) -> Path:
     # append overrides at the end of the named sections by re-emitting the
     # sections we touch (round / scoring) with the override lines appended
     body = "\n".join(out) + "\n"
+    def _fmt(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, str):
+            return json.dumps(v)
+        return repr(v)
+
     for section, keys in (("round", ("rolling_from_block", "era_settlements",
                                      "epoch_blocks", "epoch_blocks_prev",
-                                     "epoch_activation_block")),
+                                     "epoch_activation_block", "funded_pods",
+                                     "funded_king_rent")),
                           ("scoring", ("era_king_from_block", "tenure_blocks_from_block",
                                        "cohort_maxt_from_block",
                                        "cohort_maxt_increment_from_block"))):
-        extra = [f"{k} = {overrides[k]!r}" for k in keys if k in overrides]
+        extra = [f"{k} = {_fmt(overrides[k])}" for k in keys if k in overrides]
         if extra:
             body = re.sub(rf"^\[{section}\]\n", f"[{section}]\n" + "\n".join(extra) + "\n",
                           body, count=1, flags=re.MULTILINE)
@@ -250,6 +259,31 @@ def test_loader_requires_the_rollover_to_start_an_era(tmp_path):
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
     with pytest.raises(ValueError, match="start an era"):
         load_chain_config(p)
+
+
+def test_loader_requires_the_rollover_to_switch_the_grid(tmp_path):
+    # every rollover key set and aligned, but no epoch_blocks_prev /
+    # epoch_activation_block: rolling intake would run on the 12h grid with
+    # 48h eras, silently
+    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=14400,
+                   era_king_from_block=14400, tenure_blocks_from_block=14400,
+                   cohort_maxt_from_block=3600, cohort_maxt_increment_from_block=7200)
+    with pytest.raises(ValueError, match="switch the grid"):
+        load_chain_config(p)
+
+
+def test_loader_requires_rent_and_the_jit_king_for_rolling(tmp_path):
+    recipe = dict(rolling_from_block=14400, era_king_from_block=14400,
+                  tenure_blocks_from_block=14400, epoch_blocks=900,
+                  epoch_blocks_prev=3600, epoch_activation_block=14400,
+                  cohort_maxt_from_block=3600, cohort_maxt_increment_from_block=7200)
+    assert load_chain_config(_toml_with(REPO / "chain.toml", tmp_path, **recipe))
+    with pytest.raises(ValueError, match="funded_pods"):
+        load_chain_config(_toml_with(REPO / "chain.toml", tmp_path, funded_pods="off",
+                                     **recipe))
+    with pytest.raises(ValueError, match="funded_king_rent"):
+        load_chain_config(_toml_with(REPO / "chain.toml", tmp_path,
+                                     funded_king_rent=False, **recipe))
 
 
 def test_resync_valve_keeps_its_wall_time_across_the_grid_switch(cfg):

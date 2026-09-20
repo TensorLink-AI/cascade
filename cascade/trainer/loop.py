@@ -1575,13 +1575,34 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
 
+    def _sku_per_leg_active(self) -> bool:
+        """``[round] funded_sku_per_leg`` takes effect at ``[scoring]
+        era_king_from_block`` (= ROLLOVER), where the validators lift the
+        gpu_mismatch gate on mixed GPU types — before it a per-leg choice
+        would mix types inside one manifest and every validator would reject
+        the round after the miners paid for their legs. Until then every
+        round locks one type exactly as before (#295)."""
+        if not getattr(self.cfg.round, "funded_sku_per_leg", False):
+            return False
+        scoring = getattr(self.cfg, "scoring", None)
+        gate = int(getattr(scoring, "era_king_from_block", 0) or 0)
+        if gate <= 0:
+            return False
+        if self.__dict__.get("_rolling_sched") is not None:
+            return True                       # rolling runs only past the gate
+        ctx = getattr(self, "_stage_ctx", None) or {}
+        block = int(ctx.get("epoch_start_block") or 0) or int(
+            getattr(self, "_funded_gate_block", None) or 0)
+        return block >= gate
+
     def _enforce_single_gpu_manifest(self, entries: list) -> list:
         """Drop challenger entries whose GPU type differs from the king's
         (see :func:`_split_mixed_gpu_entries`) and record each as a sold-out
         failure so :meth:`_settle_funded` requeues it unburned. Mixed types
-        are allowed only when ``[round] funded_sku_per_leg`` is on (the
-        open-market mode, whose validators do not gate on type)."""
-        allow = bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
+        are allowed only when ``[round] funded_sku_per_leg`` is in force
+        (the open-market mode, from the block its validators stop gating on
+        type — :meth:`_sku_per_leg_active`)."""
+        allow = self._sku_per_leg_active()
         kept, dropped = _split_mixed_gpu_entries(entries, allow_mixed=allow)
         if not dropped:
             return kept
@@ -1705,7 +1726,7 @@ class TrainerRunner:
             return cap
         skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
                                               if rnd.funded_pod_sku else ())
-        if getattr(rnd, "funded_sku_per_leg", False) and skus:
+        if self._sku_per_leg_active() and skus:
             # Open market: no round-wide type — every leg picks the cheapest
             # fitting executor across the list at rent time.
             self._funded_round_sku = ""
@@ -1774,7 +1795,7 @@ class TrainerRunner:
         ``[round] funded_sku_per_leg`` (owner 2026-09-20: open the market) —
         every listed type, cheapest fitting executor first."""
         rnd = self.cfg.round
-        if getattr(rnd, "funded_sku_per_leg", False):
+        if self._sku_per_leg_active():
             skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
             if skus:
                 return skus
@@ -1794,7 +1815,7 @@ class TrainerRunner:
         walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
         if sku:
             return funded_sku_wall_for(walls, sku, cap)
-        if getattr(rnd, "funded_sku_per_leg", False) and walls:
+        if self._sku_per_leg_active() and walls:
             skus = self._funded_skus_for_rent()
             if skus:
                 return min(funded_sku_wall_for(walls, s, cap) for s in skus)
@@ -1811,8 +1832,7 @@ class TrainerRunner:
         """Of ``skus``, the types a leg started NOW would still finish inside
         the epoch (per-SKU latest safe start). Only per-leg mode filters —
         a locked round keeps its single type and the wait decides."""
-        if (not getattr(self.cfg.round, "funded_sku_per_leg", False)
-                or not self._funded_epoch_end_known()):
+        if not self._sku_per_leg_active() or not self._funded_epoch_end_known():
             return tuple(skus)
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
         now = now_fn()

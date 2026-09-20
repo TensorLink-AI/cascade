@@ -174,6 +174,11 @@ train_image_digest = ""
 # rejects. Running the provisioner against testnet needs its own margin override
 # (~800). Pre-existing — the previous 7100 failed the same way.
 epoch_blocks     = 150    # FUNDED-TEST fast round
+# DEC-CA-0043 loader rule: a rollover must also switch the grid. Testnet has
+# always run 150-block rounds, so the switch declared here is nominal (300 →
+# 150 at the rollover block 600; nothing ran on the 300 grid).
+epoch_blocks_prev      = 300
+epoch_activation_block = 600
 round_hours      = 3.0    # informational
 # Rolling intake + era king (DEC-CA-0043) ARMED at the first era boundary
 # (600 = epoch_blocks × era_settlements — the earliest block the load-checked

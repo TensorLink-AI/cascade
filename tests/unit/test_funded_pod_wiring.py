@@ -55,10 +55,15 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     import threading
 
     from cascade.shared.config import TelemetryConfig
+    # era gate armed at block 1 and the round past it: the open market
+    # (funded_sku_per_leg) is in force wherever a test turns it on
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd,
                                                subnet=SimpleNamespace(netuid=91),
+                                               scoring=SimpleNamespace(era_king_from_block=1),
                                                telemetry=TelemetryConfig()),
                            work_root=tmp_path,
+                           _stage_ctx={"round_id": "", "epoch_start_block": 1,
+                                       "warm_start": None},
                            _funded_field={}, _funded_leg_failures={},
                            _funded_claimed_execs=set(),
                            _funded_exec_lock=threading.Lock(),
@@ -82,7 +87,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     # Default: a working fake robot minter (tests override to simulate faults).
     fake._minter = _FakeMinter()
     fake._hub_robots = lambda: fake._minter
-    for name in ("_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
+    for name in ("_sku_per_leg_active",
+                 "_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
                  "_funded_pod_credential", "_funded_pod_identity_mismatch",
                  "_funded_checkpoint_mismatch", "_refuse_diverged_king",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",

@@ -169,8 +169,19 @@ Loader asserts: every rollover key names ONE block; `ROLLOVER` is a boundary
 of both grids AND starts an era (a multiple of `epoch_blocks ×
 era_settlements` — the era grid is absolute, `block // era length`);
 `era_king_from_block ≥ cohort_maxt_increment_from_block ≥
-cohort_maxt_from_block`; `era_settlements ≥ 1` when armed. `chain.testnet.toml`
-is armed at the first testnet era boundary (600 = 150 × 4).
+cohort_maxt_from_block`; `era_settlements ≥ 1` when armed; the rollover
+MUST switch the grid (`epoch_blocks_prev` set, `epoch_activation_block =
+ROLLOVER` — a rollover on the old grid would run 4-round eras of the old
+length, silently); `funded_pods = "rent"` and `funded_king_rent = true`
+(legs and the era king are rented just-in-time). `chain.testnet.toml` is
+armed at the first testnet era boundary (600 = 150 × 4, with a nominal
+300 → 150 switch declared there).
+
+**Per-leg GPU choice is block-gated too.** `[round] funded_sku_per_leg`
+(#294, on by default) takes effect at `era_king_from_block` — the block
+the validators stop rejecting mixed types — never before: until then every
+round locks one type (#295). Deploying this trainer with the key on changes
+nothing before ROLLOVER.
 
 The trainer's generation ledger (`era_state.json`) is rebuilt from the
 published `promotions/gen-<n>.json` records (they carry `effective_era`) —

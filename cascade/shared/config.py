@@ -2326,6 +2326,20 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 "[scoring] cohort_maxt_from_block and cohort_maxt_increment_from_block "
                 "must be set when era_king_from_block is (the era king is judged "
                 "under the increment-unit max-T)")
+        if not _eab:
+            raise ValueError(
+                f"DEC-CA-0043 rollover block {_rollover} must also switch the grid: set "
+                "[round] epoch_blocks_prev (the grid before it) and "
+                f"epoch_activation_block = {_rollover} — without the switch rolling "
+                f"intake would run on the old grid with {_era_settlements}-round eras "
+                "of the old length, silently")
+        _funded_pods = str(r.get("funded_pods", "off") or "off")
+        if _funded_pods != "rent" or not bool(r.get("funded_king_rent", False)):
+            raise ValueError(
+                "DEC-CA-0043 rolling intake needs [round] funded_pods = \"rent\" and "
+                f"funded_king_rent = true (got funded_pods={_funded_pods!r}, "
+                f"funded_king_rent={bool(r.get('funded_king_rent', False))}): legs and "
+                "the era king are rented just-in-time, there is no round-wide pool")
 
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
