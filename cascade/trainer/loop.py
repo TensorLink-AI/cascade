@@ -25,6 +25,7 @@ import json
 import logging
 import queue
 import shlex
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -372,6 +373,47 @@ STORAGE_RETRY_BACKOFF_SECONDS = 45.0
 # both died, so whatever ate them (registry brown-out, provider network blip)
 # gets time to pass while other lanes keep training.
 HEAT_REQUEUE_COOLDOWN_SECONDS = 120.0
+
+
+def _transport_failure(exc: BaseException) -> bool:
+    """A dispatch failure that says the POD is unreachable rather than the
+    leg wrong: an ssh transport exit (255 — refused, unreachable, sshd dead),
+    a detached worker that stopped answering polls, or a failed detached
+    launch. Miner faults (import error, NaN, OOM) are never this."""
+    from .remote import RemoteDispatchError
+
+    if isinstance(exc, RemoteDispatchError):
+        if getattr(exc, "returncode", None) == 255:
+            return True
+        msg = str(exc)
+        return ("pod unreachable" in msg or "detached launch failed" in msg
+                or "Connection refused" in msg)
+    if isinstance(exc, subprocess.CalledProcessError):
+        return exc.returncode == 255
+    return "Connection refused" in str(exc)
+
+
+def _quarantine_lane_host(host, reason: str) -> None:
+    """Quarantine the pod's host IP (Lium relists the same machine under new
+    executor ids) after a transport failure; loopback/profile hosts skipped.
+    Best-effort — never lets a quarantine write sink the dispatch path."""
+    ip = str(getattr(host, "host", "") or "")
+    if not ip or ip.startswith("127.") or ip in ("localhost", "::1"):
+        return
+    try:
+        from ..provision.core import record_host_quarantine
+
+        record_host_quarantine(ip, reason)
+    except Exception as e:  # noqa: BLE001
+        log.warning("host quarantine for %s failed (ignored): %s", ip, e)
+
+
+def _kept_pods_survive_failure(epoch_end_wall: float | None, now: float) -> bool:
+    """After a round failure, keep the payer pods held for the post-publish
+    bench while the SAME round can still retry inside its epoch (the retry
+    reuses the persisted legs and benches on those pods); tear down only
+    when the epoch is over and no sweep will come for them."""
+    return epoch_end_wall is not None and now < float(epoch_end_wall)
 
 
 def _storage_failure(exc: BaseException) -> bool:
@@ -747,15 +789,80 @@ class _FinalLanePool(queue.Queue):
     """
 
     REFRESH_INTERVAL_S = 60.0
+    # A lane that failed the join gate or was drained as dead is re-gated no
+    # sooner than this (a pod still booting, or one that came back).
+    REJECT_RETRY_S = 600.0
 
-    def __init__(self, initial_hosts: list, refresh_fn):
+    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None):
         super().__init__()
         self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
+        self._gate_fn = gate_fn                # (RemoteHost) -> reason | None; may raise
         self._absorb_lock = threading.Lock()
         self._known: dict[str, object] = {}
+        self._rejected: dict[str, float] = {}  # lane name -> earliest re-gate time
+        # The round-start fleet is taken as sized (the provisioner's HealthGate
+        # / the rent scripts probed it); the gate guards lanes that JOIN
+        # mid-final — the blind spot.
         for h in initial_hosts:
             self._known[getattr(h, "name", str(h))] = h
             super().put(h)
+
+    def _admit(self, host) -> bool:
+        """The mid-final join gate (2026-09-21: a lane joined the pool blind,
+        the king's one retry landed on it, its sshd was dead, the round
+        aborted). A rejected lane is remembered and re-gated after
+        ``REJECT_RETRY_S``."""
+        if self._gate_fn is None:
+            return True
+        name = getattr(host, "name", str(host))
+        try:
+            reason = self._gate_fn(host)
+        except Exception as e:  # noqa: BLE001 — a gate crash is a rejection, never a wedge
+            reason = f"gate error: {e}"
+        if reason:
+            self._rejected[name] = time.time() + self.REJECT_RETRY_S
+            log.warning("final lane pool: lane %s NOT admitted (%s); re-gated in %.0f min",
+                        name, reason, self.REJECT_RETRY_S / 60)
+            return False
+        self._rejected.pop(name, None)
+        return True
+
+    @staticmethod
+    def same_pod(a, b) -> bool:
+        """Two lanes on one pod (same ssh endpoint) share its fate."""
+        return (getattr(a, "host", None), getattr(a, "port", None)) == (
+            getattr(b, "host", None), getattr(b, "port", None))
+
+    def mark_dead(self, host, reason: str) -> list[str]:
+        """Drain every lane on ``host``'s pod: a transport failure (ssh refused,
+        detached worker unreachable) is a POD fault, and its sibling lanes
+        would only feed the next leg's single retry the same dead endpoint.
+        The lanes leave membership; the hosts file re-offers them after
+        ``REJECT_RETRY_S`` through the gate. Returns the drained names."""
+        with self._absorb_lock:
+            dead = [n for n, h in self._known.items() if self.same_pod(h, host)]
+            name = getattr(host, "name", str(host))
+            if name not in dead:
+                dead.append(name)
+            until = time.time() + self.REJECT_RETRY_S
+            for n in dead:
+                self._known.pop(n, None)
+                self._rejected[n] = until
+            kept = []
+            while True:
+                try:
+                    h = super().get(block=False)
+                except queue.Empty:
+                    break
+                if getattr(h, "name", str(h)) not in dead:
+                    kept.append(h)
+            for h in kept:
+                super().put(h)
+        if dead:
+            log.warning("final lane pool: %d lane(s) on %s:%s drained as dead (%s): %s",
+                        len(dead), getattr(host, "host", "?"), getattr(host, "port", "?"),
+                        reason, ", ".join(dead))
+        return dead
 
     def known_hosts(self) -> list:
         """Current membership (for lane-count geometry) — grows, never shrinks."""
@@ -768,12 +875,18 @@ class _FinalLanePool(queue.Queue):
             log.debug("final lane pool refresh failed (keeping current set): %s", e)
             return
         with self._absorb_lock:
+            now = time.time()
             for h in fresh:
                 name = getattr(h, "name", None)
-                if name and name not in self._known:
-                    self._known[name] = h
-                    super().put(h)
-                    log.info("final lane pool: new lane %s joined mid-final", name)
+                if not name or name in self._known:
+                    continue
+                if self._rejected.get(name, 0.0) > now:
+                    continue                      # rejected/drained: not yet due
+                if not self._admit(h):
+                    continue
+                self._known[name] = h
+                super().put(h)
+                log.info("final lane pool: new lane %s joined mid-final", name)
 
     def _deadline_of(self, deadline, host) -> float | None:
         """Per-lane form: ``deadline`` may be a callable ``host -> float|None``
@@ -2912,6 +3025,39 @@ class TrainerRunner:
             return (f"stale worker image: pod code {got[:12]}… ({n} files) != pinned "
                     f"{pinned[:12]}…")
         return ""
+
+    def _operator_lane_gate(self, host) -> str | None:
+        """Why an operator lane may NOT join the final's pool, or None.
+
+        Three checks, cheapest first: the ssh endpoint answers (a refused
+        endpoint also quarantines the host); the pod runs THIS release's
+        worker (:func:`probe_worker_runtime`); the host clears the round's
+        bench floor (:meth:`_host_bench_below_floor`, off when no floor is
+        set for the SKU). 2026-09-21: hand-rented lanes bypassed every guard
+        the funded rent applies — a 6x pod at 183M tokens/s (floor 500M)
+        trained six legs to ~20 %, and a pod whose sshd had died took the
+        king's only retry."""
+        from .remote import build_ssh_argv, probe_worker_runtime, run_ssh
+
+        label = f"lane {getattr(host, 'name', host)}"
+        try:
+            p = run_ssh(build_ssh_argv(host, "echo LANE_OK"), timeout=45)
+        except Exception as e:  # noqa: BLE001
+            return f"ssh failed: {e}"
+        if p.returncode != 0 or "LANE_OK" not in (p.stdout or ""):
+            if p.returncode == 255:
+                _quarantine_lane_host(host, f"{label}: ssh refused at lane join")
+            return f"ssh rc={p.returncode}: {(p.stderr or '')[-160:]}"
+        why = probe_worker_runtime(host)
+        if why:
+            return why
+        rnd = self.cfg.round
+        sku = getattr(self, "_funded_round_sku", "") or getattr(rnd, "funded_pod_sku", "")
+        if sku:
+            why = self._host_bench_below_floor(host, sku, label)
+            if why:
+                return why
+        return None
 
     def _host_bench_below_floor(self, host, sku: str, label: str) -> str:
         """Why ``host`` is too slow for this round, or ``""``.
@@ -6746,7 +6892,17 @@ class TrainerRunner:
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
-            free_lanes.put(host)                 # failed lane rejoins the rotation
+            transport = _transport_failure(e)
+            if transport and hasattr(free_lanes, "mark_dead"):
+                # ssh refused / worker unreachable: the POD is gone, not the
+                # leg. Its lanes leave the rotation and the host is
+                # quarantined, so the retry (and every later leg) lands
+                # elsewhere (2026-09-21: the king's one retry went to the
+                # pod it had just died on, and the round aborted).
+                free_lanes.mark_dead(host, str(e)[-160:])
+                _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {str(e)[-200:]}")
+            else:
+                free_lanes.put(host)             # failed lane rejoins the rotation
             if _storage_failure(e):
                 # Same rationale as _dispatch_with_retry: registry blips are
                 # global, so wait before re-dispatching. Sleep BEFORE taking
@@ -6756,6 +6912,17 @@ class TrainerRunner:
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
             retry_host = _take()                 # next idle lane; different when one exists
+            if transport:
+                # Never the dead pod again: a sibling lane handed back by a
+                # concurrent failure may still be in the rotation.
+                skipped = []
+                same = getattr(free_lanes, "same_pod", None)
+                while same is not None and same(retry_host, host) and len(skipped) <= len(hosts):
+                    skipped.append(retry_host)
+                    retry_host = _take()
+                for sk in skipped:
+                    if not (same is not None and same(sk, host)):
+                        free_lanes.put(sk)
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
@@ -6988,7 +7155,7 @@ class TrainerRunner:
         # Lane pool over the free-lane dispatch (the heat's anti-double-booking
         # pattern) PLUS mid-final membership refresh: a top-up pod rented after
         # a boot-failure drop joins the rotation while queued jobs wait.
-        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts)
+        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts, gate_fn=self._operator_lane_gate)
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:  # noqa: ARG001
             used: list = []
@@ -7837,6 +8004,16 @@ class TrainerRunner:
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)
                 # A round that died between its funded legs and its bench
-                # leaves payer pods kept for a sweep that will never come.
-                self._teardown_kept_funded_pods("round failed before its bench")
+                # leaves payer pods kept for a sweep that will never come —
+                # unless the SAME round retries inside its epoch: the retry
+                # reuses the persisted legs and benches on those pods
+                # (2026-09-21 02:30: three complete payer pods were torn down
+                # and the retry's bench had nowhere to run). The boundary
+                # sweep reaps them if the retry never publishes.
+                if _kept_pods_survive_failure(getattr(self, "_funded_epoch_end_wall", None),
+                                              time.time()):
+                    log.info("round failed inside its epoch: kept funded pods stay for "
+                             "the retry's bench")
+                else:
+                    self._teardown_kept_funded_pods("round failed before its bench")
             time.sleep(poll)
