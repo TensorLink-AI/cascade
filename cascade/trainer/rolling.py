@@ -332,8 +332,8 @@ class LegOps:
     def train_challenger(self, gen, era: EraState, block: int, *, end_wall: float) -> TrainedEntry:
         return self.r._rolling_train_challenger(gen, era, block, end_wall=end_wall)
 
-    def train_king(self, gen, era: EraState, block: int) -> TrainedEntry:
-        return self.r._rolling_train_king(gen, era, block)
+    def train_king(self, gen, era: EraState, block: int, *, end_wall: float) -> TrainedEntry:
+        return self.r._rolling_train_king(gen, era, block, end_wall=end_wall)
 
     def cached_leg(self, era: EraState, role: str, gen) -> TrainedEntry | None:
         contract = self.r.cfg.throne_contracts()[0]
@@ -666,7 +666,7 @@ class RollingScheduler:
         if cur is None:
             return
         if cur.king_entry is None and cur.king_hotkey and cur.index not in self._king_threads:
-            self._launch_king_leg(client, cur, block)
+            self._launch_king_leg(client, cur, block, now)
         wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
         if (self.state.next is None
                 and king_pretrain_open(self.cfg.round, block_now=block, now=now,
@@ -680,12 +680,24 @@ class RollingScheduler:
                 self._save()
             log.info("rolling: pre-train window for era %d open — king leg starts",
                      nxt.index)
-            self._launch_king_leg(client, nxt, block)
+            self._launch_king_leg(client, nxt, block, now)
         elif (self.state.next is not None and self.state.next.king_entry is None
               and self.state.next.index not in self._king_threads):
-            self._launch_king_leg(client, self.state.next, block)
+            self._launch_king_leg(client, self.state.next, block, now)
 
-    def _launch_king_leg(self, client, era: EraState, block: int) -> None:
+    def king_end_wall(self, era: EraState, *, block: int, now: float) -> float:
+        """The king leg's own target: the wall-clock of ``era``'s LAST
+        settlement (its end block). Like a challenger's target boundary this
+        bounds the rent wait — a sold-out marketplace is waited out up to
+        the king's latest safe start (end − wall − margin), not given up on
+        at the first empty listing (2026-09-21 testnet: era 13427/13428
+        king legs failed instantly with "no RTX4090 capacity before the
+        round's latest safe start" because the king path had no target and
+        the deadline helper fell back to "now")."""
+        end_block = int(era.start_block) + era_length_blocks(self.cfg.round, int(era.start_block))
+        return wall_of_block(end_block, now=now, block_now=block)
+
+    def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
         if not era.king_hotkey:
             return
         if not era.king_ref:
@@ -706,9 +718,11 @@ class RollingScheduler:
             log.info("rolling: era %d king leg already complete (cached) — reused", era.index)
             return
 
+        end_wall = self.king_end_wall(era, block=block, now=now)
+
         def _run() -> None:
             try:
-                entry = self.ops.train_king(gen, era, block)
+                entry = self.ops.train_king(gen, era, block, end_wall=end_wall)
                 entry = replace(entry, role="king")
                 with self._lock:
                     era.king_entry = _entry_to_json(entry)

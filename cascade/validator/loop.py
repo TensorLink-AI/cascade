@@ -45,9 +45,11 @@ from ..shared.era import (
     effective_resync_cap_rounds,
     era_king_active,
     era_length_blocks,
+    legacy_king_anchor,
     member_index_for_era,
     min_effective_era,
     settlement_era,
+    tenure_blocks_active,
     tenure_rounds_at,
 )
 from ..shared.manifest import (
@@ -532,7 +534,10 @@ class ValidatorRunner:
         ``effective_era`` no earlier than one full era after it fired; a
         record failing either is ignored (logged) — the ledger keeps naming
         the live generation and a manifest trained from the new set fails
-        ``era_init_mismatch`` until a valid record exists."""
+        ``era_init_mismatch`` until a valid record exists. A record or bench
+        report that cannot be READ raises :class:`StorageError` instead (a
+        transient the poll loop retries): an unreadable ledger is not
+        evidence of a bad init."""
         from ..shared.promotion import verify_promotion_record_signature
 
         assert self.cascade is not None
@@ -566,6 +571,10 @@ class ValidatorRunner:
             log.warning("cascade: promotion record gen=%d fired before the reign clock "
                         "ripened (block %d); ignored", record.generation, record.fired_block)
             return
+        # A StorageError out of the record fetch above or the member check
+        # here propagates: the era gate cannot judge this manifest without
+        # the provenance, and the poll loop retries the round (never a
+        # receipt) — see _gate_read_failed.
         member_reason = self._verify_members(record, enforce_reign_scope=attesting)
         if member_reason is not None:
             log.warning("cascade: promotion record gen=%d rejected: %s",
@@ -808,7 +817,12 @@ class ValidatorRunner:
         demand from the member's ``source_round`` bench report — so
         verification does not depend on this validator's log being complete. A
         member with no verifiable score fails CLOSED (an init nobody can score
-        must not become the field's floor).
+        must not become the field's floor) — but only when the report is
+        readable and lacks it, or is definitively absent. A report that cannot
+        be READ raises :class:`StorageError` (a transient: the round is
+        retried next poll, no receipt) — 2026-09-21 two validators published
+        permanent rejections of the first gen-11 rounds on a swallowed read
+        miss of a report that was on S3 the whole time.
 
         ``enforce_reign_scope`` additionally pins the fetched fallback to the
         CURRENT reign: the report's ``created_block`` must not predate this
@@ -818,7 +832,12 @@ class ValidatorRunner:
         validator's clock watched the whole reign (the same condition as
         ripeness) — a bootstrap clock would mis-scope honest early-reign
         members. The reign-log path is reign-scoped by construction (the log
-        clears on every re-crown).
+        clears on every re-crown). **Carried-over members are exempt**
+        (DEC-CA-0044 rolling top-k): a member of the generation this
+        validator already accepted (live or staged) was verified when it
+        entered and keeps its original ``source_round``, which by
+        construction predates the reign it now carries into — scope applies
+        only to NEW entrants. Quality is still re-checked for every member.
 
         The floor is the best score across the reign log and the members
         themselves; every member must sit within ``cascade_quality_epsilon``
@@ -830,19 +849,23 @@ class ValidatorRunner:
         from .cascade import best_score, cascade_score, log_record_for
 
         assert self.cascade is not None
-        reign_start = self.cascade.state.reign_start_block
+        state = self.cascade.state
+        reign_start = state.reign_start_block
+        carried = set(state.members) | set(state.pending_members)
         scores: dict[str, float] = {}
         for m in getattr(record, "members", ()):
-            rec = log_record_for(self.cascade.state, m.checkpoint_id)
+            rec = log_record_for(state, m.checkpoint_id)
             if rec is not None:
                 scores[m.checkpoint_id] = rec.score
                 continue
-            report = self._fetch_bench_report(m.source_round)
+            report = self._fetch_bench_report(
+                m.source_round, require=m.checkpoint_id, raise_unavailable=True)
             be = None if report is None else report.entry_for_pointer(m.checkpoint_id)
             if be is None:
                 return (f"warm_start_member_unverifiable: {m.checkpoint_id} has no "
                         f"signed bench numbers (source_round={m.source_round!r})")
             if (enforce_reign_scope and reign_start is not None
+                    and m.checkpoint_id not in carried
                     and int(getattr(report, "created_block", 0)) < int(reign_start)):
                 return (f"warm_start_member_out_of_reign: {m.checkpoint_id} was "
                         f"benched in round {m.source_round!r} (block "
@@ -867,8 +890,16 @@ class ValidatorRunner:
     def _fetch_latest_promotion_record(self) -> object | None:
         """The latest published promotion record, located via the unsigned
         ``promotions/index.json`` (trust comes from the record's signature,
-        checked by the caller — the index is a locator only). ``None`` when
-        absent/unreadable; never raises."""
+        checked by the caller — the index is a locator only).
+
+        ``None`` when the index is absent (no promotion ever published) or
+        the located record is malformed — both verdicts. A store READ failure
+        (auth/network/5xx), or an index naming a record that cannot be read,
+        raises :class:`StorageError`: the caller's gate must retry next poll,
+        never reject. Before 2026-09-21 every failure here read as "no record
+        justifies this init" and latched a permanent ``warm_start_mismatch`` /
+        ``era_init_mismatch`` receipt."""
+        from ..shared.hippius import ObjectNotFound, StorageError
         from ..shared.promotion import (
             load_promotion_index,
             load_promotion_record,
@@ -877,17 +908,28 @@ class ValidatorRunner:
         )
 
         try:
-            latest = load_promotion_index(
-                self._bench_store().get_text(promotion_index_key()))
-        except Exception:  # noqa: BLE001 — no promotions published yet, or store down
-            return None
+            index_text = self._bench_store().get_text(promotion_index_key())
+        except ObjectNotFound:
+            return None  # no promotions published yet
+        except Exception as e:  # noqa: BLE001 — store down / auth / network
+            log.warning("cascade: promotion index could not be READ (%s: %s)",
+                        type(e).__name__, str(e)[-300:])
+            raise StorageError(f"promotion_index_unavailable: {e}") from e
+        latest = load_promotion_index(index_text)
         if latest <= 0:
             return None
         try:
             text = self._bench_store().get_text(promotion_record_key(latest))
+        except Exception as e:  # noqa: BLE001 — incl. ObjectNotFound: the record is
+            # published BEFORE the index names it, so a miss here is a read
+            # failure or a store inconsistency, never "no promotion".
+            log.warning("cascade: promotion record gen=%d could not be READ (%s: %s)",
+                        latest, type(e).__name__, str(e)[-300:])
+            raise StorageError(f"promotion_record_unavailable: gen={latest}: {e}") from e
+        try:
             return load_promotion_record(text)
-        except Exception as e:  # noqa: BLE001
-            log.warning("cascade: promotion record gen=%d unreadable (%s)", latest, e)
+        except Exception as e:  # noqa: BLE001 — malformed content is a verdict
+            log.warning("cascade: promotion record gen=%d malformed (%s); ignored", latest, e)
             return None
 
     @staticmethod
@@ -934,10 +976,13 @@ class ValidatorRunner:
                     f"{key}@{sha[:12]}…")
         return None
 
-    def _pool_pin_read_failed(
-        self, round_id: str, err: Exception, *, now: float | None = None
+    def _gate_read_failed(
+        self, round_id: str, err: Exception, *, gate: str = "pool_pin_unverifiable",
+        now: float | None = None,
     ) -> str | None:
-        """Grace bookkeeping for an UNREADABLE pool index at the pin gate.
+        """Grace bookkeeping for a gate whose evidence could not be READ —
+        the pool index at the pin gate, or the promotion record / bench report
+        behind the warm-start gate (``gate`` names the reject reason).
 
         Returns ``None`` while ``round_id``'s read failures span less than
         :data:`POOL_PIN_READ_GRACE_SECONDS` — the caller then skips the cycle
@@ -953,14 +998,14 @@ class ValidatorRunner:
         waited = now - first
         if waited < POOL_PIN_READ_GRACE_SECONDS:
             log.warning(
-                "pool index unreadable at pin gate for round=%s (%s); retrying "
+                "%s: evidence unreadable for round=%s (%s); retrying "
                 "next poll (%.0fs into %.0fs grace, no reject latched)",
-                round_id, err, waited, POOL_PIN_READ_GRACE_SECONDS,
+                gate, round_id, err, waited, POOL_PIN_READ_GRACE_SECONDS,
             )
             return None
         self._pin_read_first_failure.pop(str(round_id), None)
         return (
-            f"pool_pin_unverifiable: provenance lookup failed persistently "
+            f"{gate}: provenance lookup failed persistently "
             f"({waited:.0f}s > {POOL_PIN_READ_GRACE_SECONDS:.0f}s grace): {err}"
         )
 
@@ -1281,23 +1326,48 @@ class ValidatorRunner:
             self.bench_report_store = open_manifest_store(self.cfg.storage)
         return self.bench_report_store
 
-    def _fetch_bench_report(self, round_id: str) -> object | None:
+    def _fetch_bench_report(self, round_id: str, *, require: str | None = None,
+                            raise_unavailable: bool = False) -> object | None:
         """The round's trainer-signed bench report
         (:mod:`cascade.shared.bench_report`), or ``None`` — absent (the bench
-        runs post-publish, so "not there yet" is a normal state), unreadable,
-        malformed, or failing signature verification. Never raises: the report
-        is telemetry + promotion input, and a miss must never disturb a round."""
+        runs post-publish, so "not there yet" is a normal state), malformed,
+        or failing signature verification.
+
+        ``require`` names a trained pointer the caller needs: a CACHED report
+        lacking it is discarded and re-fetched once, so a copy cached before
+        the trainer (re)published the entry cannot pin a stale miss for the
+        life of the process. ``raise_unavailable`` turns a store READ failure
+        (network/auth/5xx — the object's existence is unknown) into a raised
+        :class:`StorageError` instead of ``None``: a member check must treat
+        "could not read" as a transient the loop retries next poll, never as
+        "has no bench numbers". Absence (``ObjectNotFound``) is still ``None``
+        — that IS a verdict. Read failures are logged either way; the old
+        silent ``None`` left every such miss undiagnosable."""
         from ..shared.bench_report import (
             bench_report_key,
             load_bench_report,
             verify_bench_report_signature,
         )
+        from ..shared.hippius import ObjectNotFound, StorageError
 
-        if str(round_id) in self._bench_report_cache:
-            return self._bench_report_cache[str(round_id)]
+        rid = str(round_id)
+        cached = self._bench_report_cache.get(rid)
+        if cached is not None:
+            if require is None or cached.entry_for_pointer(require) is not None:
+                return cached
+            log.info("cascade: cached bench report for round=%s lacks %s; re-fetching",
+                     rid, require[:64])
+            self._bench_report_cache.pop(rid, None)
         try:
-            text = self._bench_store().get_text(bench_report_key(str(round_id)))
-        except Exception:  # noqa: BLE001 — not published yet, or store down
+            text = self._bench_store().get_text(bench_report_key(rid))
+        except ObjectNotFound:
+            log.info("cascade: bench report for round=%s not published (yet)", rid)
+            return None
+        except Exception as e:  # noqa: BLE001 — store down / auth / network
+            log.warning("cascade: bench report for round=%s could not be READ (%s: %s)",
+                        rid, type(e).__name__, str(e)[-300:])
+            if raise_unavailable:
+                raise StorageError(f"bench_report_unavailable: round={rid}: {e}") from e
             return None
         try:
             report = load_bench_report(text)
@@ -1311,7 +1381,7 @@ class ValidatorRunner:
             log.warning("cascade: bench report for round=%s failed signature "
                         "verification; ignoring", round_id)
             return None
-        self._bench_report_cache[str(round_id)] = report
+        self._bench_report_cache[rid] = report
         while len(self._bench_report_cache) > 16:  # small FIFO, insertion-ordered
             self._bench_report_cache.pop(next(iter(self._bench_report_cache)))
         return report
@@ -1319,8 +1389,12 @@ class ValidatorRunner:
     def _report_bench_scores(self, round_id: str, trained_pointer: str) -> dict | None:
         """The six Cascade numbers for one checkpoint out of the round's signed
         bench report — the AUTHORITATIVE source (every validator reads the same
-        signed set). Joined on the exact ``trained_pointer``, never role/UID."""
-        report = self._fetch_bench_report(round_id)
+        signed set). Joined on the exact ``trained_pointer``, never role/UID.
+        ``require`` makes a re-probe (:meth:`_drain_pending_bench`) a real GET
+        when the cached copy lacks the pointer — the report is republished as
+        legs finish, and a partial copy cached earlier must not answer every
+        retry from memory."""
+        report = self._fetch_bench_report(round_id, require=trained_pointer)
         if report is None:
             return None
         be = report.entry_for_pointer(trained_pointer)
@@ -1598,6 +1672,7 @@ class ValidatorRunner:
 
         # Tenure as the margin schedule counts it (DEC-CA-0043: in blocks
         # from tenure_blocks_from_block; the counter before it).
+        self.state = self._anchor_legacy_king(self.state, self._epoch_start_block(manifest))
         tenure_at_decision = tenure_rounds_at(
             self.cfg.round, self.cfg.scoring, block=self._epoch_start_block(manifest),
             tenure_rounds=self.state.tenure_rounds,
@@ -1822,6 +1897,25 @@ class ValidatorRunner:
             return []
         self.chain_walk_depth = CHAIN_WALK_DEPTH
         return list(walk.manifests)
+
+    def _anchor_legacy_king(self, state: ChampionState, block: int) -> ChampionState:
+        """CONSENSUS (DEC-CA-0043): a king crowned before
+        ``tenure_blocks_from_block`` has no ``king_since_block``; at its first
+        settlement past the gate impute one (:func:`legacy_king_anchor`) and
+        KEEP it. Every later ``tenure_rounds_at`` then counts blocks from a
+        fixed anchor. Without this the anchor was re-imputed each settlement
+        from a counter that kept advancing on the new grid, and the tenure
+        grew old_grid/new_grid (4× on mainnet) per settlement."""
+        if state.king_since_block is not None or not state.king_hotkey:
+            return state
+        if not tenure_blocks_active(self.cfg.scoring, block):
+            return state
+        anchor = legacy_king_anchor(self.cfg.round, self.cfg.scoring, block=int(block),
+                                    tenure_rounds=state.tenure_rounds)
+        log.info("tenure: legacy king %s… anchored at block %d (%d pre-gate rounds "
+                 "before settlement %d); persisted as king_since_block",
+                 state.king_hotkey[:8], anchor, state.tenure_rounds, int(block))
+        return replace(state, king_since_block=anchor)
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the
@@ -2217,8 +2311,16 @@ class ValidatorRunner:
                             ",".join(f"{e.role}:uid{e.miner_uid}" for e in manifest.entries),
                         )
                         # Gate first so a rejected manifest never moves weights.
-                        reason = self.check_manifest(manifest)
                         retry_pin = False
+                        try:
+                            reason = self.check_manifest(manifest)
+                        except StorageError as e:
+                            # Warm-start provenance (promotion record / bench
+                            # report) could not be READ — a transient, not a
+                            # verdict: same grace as the pool pin below.
+                            reason = self._gate_read_failed(
+                                manifest.round_id, e, gate="warm_start_unverifiable")
+                            retry_pin = reason is None
                         if reason is None:
                             # Pool-pin gate: the signed snapshot pin must match this
                             # validator's own deterministic selection for the round.
@@ -2231,7 +2333,7 @@ class ValidatorRunner:
                                 # The index could not be READ (auth/network/5xx) —
                                 # a transient, not a verdict. Within the grace
                                 # window: no latch, no receipt, retry next poll.
-                                reason = self._pool_pin_read_failed(manifest.round_id, e)
+                                reason = self._gate_read_failed(manifest.round_id, e)
                                 retry_pin = reason is None
                             else:
                                 self._pin_read_first_failure.pop(str(manifest.round_id), None)

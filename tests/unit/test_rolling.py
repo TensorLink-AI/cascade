@@ -127,8 +127,8 @@ class FakeOps(LegOps):
         return TrainedEntry(gen.hotkey, gen.uid, "challenger", gen.ref,
                             _ptr(f"{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090")
 
-    def train_king(self, gen, era, block):
-        self.king_calls.append((gen.hotkey, era.index, block))
+    def train_king(self, gen, era, block, *, end_wall):
+        self.king_calls.append((gen.hotkey, era.index, block, end_wall))
         if self.fail_king:
             raise self.king_exc or RuntimeError("king rent failed")
         return TrainedEntry(gen.hotkey, gen.uid, "king", gen.ref,
@@ -967,3 +967,28 @@ def test_king_pod_rotation_state_round_trips(cfg, tmp_path):
     assert sched.state.current.king_leg_failures == 1
     sched2, _ = _sched(armed, tmp_path, clock, ops=ops)
     assert sched2.state.current.king_leg_failures == 1
+
+
+def test_king_leg_targets_the_eras_last_settlement(cfg, tmp_path):
+    # The king rent waits out a sold-out marketplace up to ITS latest safe
+    # start like a challenger: the leg carries the wall-clock of the era's
+    # last settlement (its end block) as end_wall. Before this the king path
+    # had no target and the deadline helper fell back to "now" — the king
+    # gave up at the first empty listing (testnet era 13427/13428).
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    era_len = EB * 4
+    b0 = era_start + 5
+    sched.tick(client, b0)
+    _join(sched)
+    (hk, era_idx, block, end_wall), = ops.king_calls
+    assert hk == "KING" and block == b0
+    assert end_wall == clock.t + (era_start + era_len - b0) * R.BLOCK_SECONDS
+    # the NEXT era's pre-trained king targets the next era's end
+    window = era_start + era_len - 1100
+    _advance(clock, ops, sched, client, from_block=b0, to_block=window)
+    assert [c[1] for c in ops.king_calls] == [era_idx, era_idx + 1]
+    assert ops.king_calls[1][3] == clock.t + (era_start + 2 * era_len - window) * R.BLOCK_SECONDS

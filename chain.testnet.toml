@@ -238,6 +238,12 @@ funded_field_cap = 8            # FUNDED-TEST: elastic field
 funded_capacity_probe = true    # FUNDED-TEST: clamp to the chosen type's live market
 funded_capacity_reserve = 1
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST: per-round pick
+# No measured wall table on testnet: the repo default is MAINNET's measured
+# walls (3 h-class legs), which on this 150-block grid excluded every SKU at
+# launch and, under rolling intake, would admit each 90-second test leg
+# against a boundary eight settlements out. Empty ⇒ the contract's
+# max_train_seconds per SKU. Measure before setting (2026-09-21).
+funded_sku_wall_seconds = {}
 funded_king_rent = true   # FUNDED-TEST: JIT operator king at the round SKU (standing final pod expired 09-02)
 # Detached dispatch (2026-09-18): every remote leg and pod-side bench runs in
 # its own session on the pod (setsid+nohup; stdout/stderr/pid/exit_code in a

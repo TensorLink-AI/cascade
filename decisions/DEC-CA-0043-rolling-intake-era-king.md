@@ -44,7 +44,13 @@ owner call) the funded pipeline stops being boundary-synchronous:
   `cascade_reign_blocks` replace the round-denominated knobs from the
   rollover, so the 4× faster grid does not 4× the decay and promotion
   clocks in wall time; a king crowned on the old grid keeps its wall-time
-  tenure across the switch.
+  tenure across the switch. A king with no recorded crowning block is
+  anchored ONCE, at its first settlement past the gate, at
+  `block − tenure_rounds × old_grid` (`era.legacy_king_anchor`), and that
+  anchor is persisted as `king_since_block`; every later settlement counts
+  blocks from it. (Re-imputing the anchor each settlement from the counter,
+  which keeps advancing on the new grid, grew the tenure `old/new` = 4× per
+  settlement — found on testnet 2026-09-21.)
 
 Before ROLLOVER every path is bit-identical to main (receipt bytes,
 manifest bytes, verdicts). The audit replays every receipt under its own
