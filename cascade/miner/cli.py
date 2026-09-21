@@ -66,10 +66,14 @@
 
 * ``cascade duel`` — the full verdict for a settled round, from the public
   receipt index: dethrone margin (LCB vs required), both geomeans, win rate,
-  bootstrap quantiles, per-domain win rates, and per-validator agreement
-  (rejected validator rows are shown with their reason). ``--round`` reads an
-  archived round, ``--history`` lists every settled round's outcome.
-  Read-only: no wallet, no chain call, no credentials.
+  bootstrap quantiles, the by-horizon and by-DOMAIN breakdown (king vs
+  challenger score per pool domain — where the challenger beat the king and
+  by how much), every judged challenger's outcome, and per-validator
+  agreement (rejected validator rows are shown with their reason).
+  ``--hotkey`` adds YOUR per-domain scores vs the king; with ``--history`` it
+  becomes your per-domain trend across every round you were judged in.
+  ``--round`` reads an archived round, ``--history`` alone lists every settled
+  round's outcome. Read-only: no wallet, no chain call, no credentials.
 
 * ``cascade fund <intake_url> --ref <repo@digest>`` — fund your revealed
   submission's training leg with YOUR Lium API key (DEC-CA-0036). The key is

@@ -159,7 +159,8 @@ Miner (`cascade`, no GPU):
   then `fund <intake-url> --ref <repo@digest>` pays for the leg.
 - `queue`, `round`, `heat`, `duel`, `reveal-status`: the live queue and
   roster, the round countdown and dethrone bar, who seated, the settled
-  verdict, and whether your reveal landed.
+  verdict (`duel --hotkey <you>`: which domains you beat the king in and by
+  how much), and whether your reveal landed.
 - `fetch king | <uid> | <hotkey> | <repo@digest>`: download a public
   generator.
 

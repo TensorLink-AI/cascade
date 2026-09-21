@@ -31,4 +31,6 @@ What you need to know:
   what they train and are scored jointly from block 9068400.
 
 Watch: `cascade round` (deadline, live dethrone bar), `cascade duel` (the
-verdict). Failure classes and what they mean for your entry: MINER.md §8.
+verdict), `cascade duel --hotkey <you>` (which domains you beat the king in
+and by how much; add `--history` for the trend). Failure classes and what
+they mean for your entry: MINER.md §8.

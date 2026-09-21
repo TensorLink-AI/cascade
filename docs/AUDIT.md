@@ -146,6 +146,18 @@ dashboard or a miner can read every challenger's outcome, not only the
 crowned one's, without re-running the bootstrap. Receipts from before this
 shipped carry neither field and verify unchanged.
 
+The receipt also carries pure DISPLAY breakdowns the audit does not replay:
+`verdict.per_horizon` / `cohort_per_horizon` (the verdict geomean per ladder
+rung) and `verdict.per_domain` / `cohort_per_domain` (the same per pool
+domain — which domains each challenger beat the king in, and by how much;
+what `cascade duel --hotkey` and the website's cohort panel render). They
+are signed like everything else, so they cannot be altered after the fact,
+but no check re-derives them: the per-domain split needs the window's domain
+label, which `entry_scores` does not record (the same Tier-0 limit as
+`per_domain_win_rate` in `cohort_stats`, which the `duel-cohort` check
+compares only when its replay could resolve domains). All of them are
+drop-when-default, so older receipts verify unchanged.
+
 **Tier 1** proves the corpus provenance: the pinned generator, run at the
 receipt's `generation_seed` in the same sandbox, reproduces the exact
 `corpus_digest` the trainer claimed to have trained on.
