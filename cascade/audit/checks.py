@@ -194,17 +194,37 @@ def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
     config the audit replays under — already carrying the recorded block
     (``apply_receipt_activation``), so the era checks that follow use it.
     """
-    from ..shared.activation import agreed_activation, resolved_rollover
+    from ..shared.activation import (
+        agreed_activation,
+        apply_activation,
+        configured_rollover,
+        resolved_rollover,
+    )
 
     name = "activation"
     block = int(receipt.activation_block or 0)
     if not block:
         return _ok(name, "no chain-decided rollover recorded (typed-in config applies)")
+    typed = configured_rollover(cfg)
+    if typed:
+        # The owner pinned the decided block afterwards (the natural end
+        # state): the receipt must have been judged under THAT block.
+        if typed != block:
+            return _fail(name, f"recorded activation_block {block} != the rollover typed "
+                               f"into the audit config ({typed})")
+        return _ok(name, f"rollover {block} matches the typed-in config")
     if not cfg.activation.enabled:
         return _fail(name, f"receipt records activation_block {block} but [activation] "
                            "is off in the loaded config")
     applied = resolved_rollover(cfg)
-    if applied and applied != block:
+    if applied != block:
+        # apply_receipt_activation could not arm this block on the loaded
+        # config (or armed another) — replaying under it is impossible.
+        try:
+            apply_activation(cfg, block)
+        except ValueError as e:
+            return _fail(name, f"recorded activation_block {block} cannot be applied to "
+                               f"the audit config: {e}")
         return _fail(name, f"recorded activation_block {block} != the rollover the audit "
                            f"config carries ({applied})")
     grid_before = int(cfg.round.epoch_blocks_prev or cfg.round.epoch_blocks)

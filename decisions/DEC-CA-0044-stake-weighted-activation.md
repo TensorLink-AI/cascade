@@ -53,9 +53,19 @@ on chain:
   survive); `cascade-audit` replays each round under it and verifies the
   block against the validators' current notes (`activation` check).
 * **Readers.** The trainer and the provisioner READ the decision (notes,
-  then the boundary tally) and arm themselves; they never signal. The
-  trainer checks every tick, so a trainer upgraded early arms live; the
-  provisioner resolves at startup.
+  then the boundary tally) and arm themselves; they never signal. Both
+  check every tick, so a trainer or provisioner upgraded early arms live
+  and no restart inside the provisioner's pre-boundary trigger window is
+  ever needed; the provisioner keeps no state file of its own (it
+  re-resolves from the notes on a restart) so it can never overwrite the
+  trainer's record.
+* **No counting from a later view.** A node whose endpoint cannot serve
+  the boundary block (pruned) does not tally from the live view a few
+  blocks later — two nodes counting different states is the fork this
+  exists to prevent. It retries, and adopts the fleet's decision from the
+  notes at the next boundary. Chain reads happen only at a new boundary
+  (one live read for the notes, one as-of read for the count), never per
+  poll.
 
 Mainnet ships `[activation] feature = "rolling-era-king"`, `threshold = 0.51`,
 `epoch_blocks_after = 900`, every DEC-CA-0043 key at 0: the release IS the

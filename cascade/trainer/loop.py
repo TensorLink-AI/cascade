@@ -1721,7 +1721,7 @@ class TrainerRunner:
     def _activation_tick(self, client, block: int) -> None:
         """One resolver pass per poll (a chain read only at a new boundary or
         while notes are pending). Never raises."""
-        from ..shared.activation import ActivationRecord, resolve_activation
+        from ..shared.activation import ActivationRecord, record_for, resolve_activation
 
         if not getattr(self.cfg, "activation", None) or not self.cfg.activation.enabled:
             return
@@ -1730,6 +1730,7 @@ class TrainerRunner:
             if rec is None:
                 store = self.activation_store
                 rec = store.load() if store is not None else ActivationRecord()
+                rec = record_for(self.cfg, rec)      # a renamed feature's record arms nothing
                 self._activation = rec
                 if rec.locked and rec.source != "config":
                     log.info("activation: restored lock-in (block %d, rollover %d, via %s)",

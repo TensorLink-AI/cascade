@@ -40,7 +40,9 @@ from ..shared.activation import (
     Tally,
     apply_activation,
     ensure_signal,
+    record_for,
     resolve_activation,
+    resolved_rollover,
 )
 from ..shared.activation import summary as activation_summary
 from ..shared.config import (
@@ -371,10 +373,11 @@ class ValidatorRunner:
 
     @property
     def activation_block(self) -> int:
-        """The rollover block resolved FROM VALIDATOR SIGNALS (0 = none, or
-        typed into chain.toml — the receipt then records nothing)."""
-        rec = self._activation
-        return int(rec.activation_block) if rec.locked and rec.source != "config" else 0
+        """The rollover block resolved FROM VALIDATOR SIGNALS and APPLIED to
+        the live config (0 = none, or typed into chain.toml — the receipt
+        then records nothing). Read off the config, not the record: a
+        receipt must never claim a rollover this validator did not run."""
+        return resolved_rollover(self.cfg)
 
     def apply_activation_block(self, block: int) -> bool:
         """Rewrite the live config for a rollover at ``block`` (see
@@ -449,7 +452,7 @@ class ValidatorRunner:
         if not self.cfg.activation.enabled:
             return
         if self.activation_store is not None:
-            self._activation = self.activation_store.load()
+            self._activation = record_for(self.cfg, self.activation_store.load())
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",

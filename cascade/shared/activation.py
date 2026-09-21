@@ -24,7 +24,10 @@ chain instead:
    ``cascade-ready:1:<feature>:<lock_block>:<activation_block>``. A node that
    restarts, joins late, or cannot read an old block adopts the block that
    validators holding ``threshold`` of eligible stake all name
-   (:func:`agreed_activation`) — no archive node, no trainer needed.
+   (:func:`agreed_activation`) — no archive node, no trainer needed. A node
+   NEVER counts from a later chain view when the boundary read fails: two
+   nodes counting different states is the fork this exists to prevent, so
+   it waits for the notes instead.
 5. **Apply.** :func:`apply_activation` rewrites the loaded config so every
    DEC-CA-0043 key names the resolved block (rolling intake, era king,
    tenure in blocks, the grid switch, the increment-unit max-T) — exactly
@@ -285,13 +288,16 @@ def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
         raise ValueError(
             f"[round] epoch_activation_block={r.epoch_activation_block} is already "
             f"scheduled; a resolved rollover at {block} cannot move it")
+    if int(r.era_settlements or 0) < 1:
+        raise ValueError(
+            "[round] era_settlements must be >= 1 for a rollover (the loader refuses a "
+            "typed-in one without it; a resolved one is refused the same way)")
     new_round = replace(
         r,
         rolling_from_block=block,
         epoch_blocks=grid_after,
         epoch_blocks_prev=grid_before,
         epoch_activation_block=block,
-        era_settlements=max(1, int(r.era_settlements or 0)),
     )
     new_scoring = replace(
         s,
@@ -413,10 +419,18 @@ def resolve_activation(
             return Resolution(record=replace(record, feature=feature, activation_block=typed,
                                              source="config"), changed=True)
         return Resolution(record=record)
-    if record.locked and record.feature == feature:
+    if record.feature and record.feature != feature:
+        record = ActivationRecord()                  # another feature's decision: blank
+    if record.locked:
         return Resolution(record=record)
 
-    # Notes first: the cheap live read that needs no historical state.
+    boundary = latest_boundary(cfg.round, int(now_block))
+    if boundary <= record.last_checked_boundary:
+        return Resolution(record=record)             # this boundary is done; no chain read
+
+    # A new boundary (or a fresh record). Notes first: the validators that
+    # already locked in carry the decision, and a decision made elsewhere
+    # beats this node's own count.
     try:
         validators, signals = _read_chain(client, None)
     except Exception as e:  # noqa: BLE001 — chain flake: retry next poll
@@ -433,18 +447,18 @@ def resolve_activation(
                  feature, lock, act)
         return Resolution(record=rec, changed=True)
 
-    boundary = latest_boundary(cfg.round, int(now_block))
-    if boundary <= record.last_checked_boundary:
-        return Resolution(record=record)
-    # The boundary itself: the AS-OF read is what makes every node count
-    # the same stake. When the node cannot serve that block (pruned), the
-    # live read a few blocks later is the fallback — the agreement path
-    # above repairs any straggler that counted differently.
+    # The boundary itself, read AS OF the boundary block — the only read
+    # that gives every node the same stake. A node whose endpoint cannot
+    # serve that block does NOT count from a later view (two nodes counting
+    # different states is exactly the fork this exists to prevent): it
+    # retries next poll and, failing that, adopts the fleet's decision from
+    # the notes at the next boundary.
     try:
         validators, signals = _read_chain(client, boundary)
     except Exception as e:  # noqa: BLE001
-        log.warning("activation: as-of read at boundary %d failed (%s); using the live view",
-                    boundary, e)
+        log.warning("activation: as-of read at boundary %d failed (%s); not counting from "
+                    "a later view — retrying next poll", boundary, e)
+        return Resolution(record=record)
     t = tally(feature, validators, signals, threshold=ac.threshold, block=boundary,
               dormant_after_blocks=ac.dormant_after_blocks)
     rec = replace(record, feature=feature, last_checked_boundary=boundary)
@@ -461,43 +475,85 @@ def resolve_activation(
     return Resolution(record=rec, tally=t, changed=True)
 
 
+def record_for(cfg: ChainConfig, record: ActivationRecord) -> ActivationRecord:
+    """``record`` if it belongs to this config's feature, else a blank one —
+    a persisted decision for a renamed feature must never arm anything."""
+    if record.feature and record.feature != cfg.activation.feature:
+        log.warning("activation: ignoring a persisted record for feature %r (config runs %r)",
+                    record.feature, cfg.activation.feature)
+        return ActivationRecord()
+    return record
+
+
+class ActivationWatcher:
+    """Per-tick resolution for a service without its own hook (the
+    provisioner): holds the record, resolves once per boundary, and hands
+    back the armed config when a lock-in applies. ``store_path`` None ⇒
+    nothing is written (the provisioner re-resolves from the notes on a
+    restart instead of sharing the trainer's record)."""
+
+    def __init__(self, cfg: ChainConfig, *, store_path: Path | str | None = None) -> None:
+        self.cfg = cfg
+        self.store = ActivationStore(store_path)
+        self.record = record_for(cfg, self.store.load())
+        self.tally: Tally | None = None
+
+    def tick(self, client: Any, block: int) -> ChainConfig | None:
+        """Returns the newly armed config when this tick applied a lock-in,
+        else ``None``. Never raises."""
+        if not self.cfg.activation.enabled or configured_rollover(self.cfg):
+            return None
+        try:
+            res = resolve_activation(self.cfg, client, now_block=int(block), record=self.record)
+            if res.tally is not None:
+                self.tally = res.tally
+            if res.changed:
+                self.record = res.record
+                self.store.save(res.record)
+            if self.record.locked and self.record.source != "config":
+                new = apply_activation(self.cfg, self.record.activation_block)
+                if new is not self.cfg:
+                    self.cfg = new
+                    log.warning("activation: DEC-CA-0043 rollover ARMED at block %d (via %s)",
+                                self.record.activation_block, self.record.source)
+                    return new
+        except Exception as e:  # noqa: BLE001
+            log.warning("activation step failed (%s); retrying next tick", e)
+        return None
+
+
 def startup_activation(
     cfg: ChainConfig, client: Any, *, store_path: Path | str | None,
 ) -> ChainConfig:
-    """One-shot startup resolution for a service without a poll loop (the
-    provisioner): restore the persisted record, run one resolver pass, and
-    return the config with the rollover applied when locked in. Best-effort
-    — any failure returns ``cfg`` unchanged."""
+    """One-shot startup resolution: one watcher tick at the current block.
+    Best-effort — any failure returns ``cfg`` unchanged."""
     if not cfg.activation.enabled or configured_rollover(cfg):
         return cfg
-    store = ActivationStore(store_path)
     try:
-        rec = store.load()
         now_block = int(client.current_block())
-        res = resolve_activation(cfg, client, now_block=now_block, record=rec)
-        if res.changed:
-            store.save(res.record)
-            rec = res.record
-        if rec.locked and rec.source != "config":
-            out = apply_activation(cfg, rec.activation_block)
-            log.warning("activation: DEC-CA-0043 rollover ARMED at block %d (via %s)",
-                        rec.activation_block, rec.source)
-            return out
     except Exception as e:  # noqa: BLE001
         log.warning("activation: startup resolution skipped (%s); running the typed-in "
                     "config", e)
-    return cfg
+        return cfg
+    return ActivationWatcher(cfg, store_path=store_path).tick(client, now_block) or cfg
 
 
 def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
     """For the audit: the config a receipt was judged under — its recorded
-    ``activation_block`` applied when the loaded config names no rollover.
-    A receipt without the field (pre-DEC-CA-0044, or a typed-in rollover)
-    replays under the loaded config as before."""
+    ``activation_block`` applied when the loaded config names no rollover
+    and runs the feature. A receipt without the field (pre-DEC-CA-0044, or
+    a typed-in rollover) replays under the loaded config as before. A block
+    the loaded config cannot apply leaves it unchanged; the ``activation``
+    check reports why."""
     block = int(getattr(receipt, "activation_block", 0) or 0)
-    if not block or configured_rollover(cfg):
+    if not block or configured_rollover(cfg) or not cfg.activation.enabled:
         return cfg
-    return apply_activation(cfg, block)
+    try:
+        return apply_activation(cfg, block)
+    except ValueError as e:
+        log.warning("activation: receipt block %d not applied to the audit config (%s)",
+                    block, e)
+        return cfg
 
 
 def own_signal_payload(cfg: ChainConfig, record: ActivationRecord) -> str | None:

@@ -1083,8 +1083,9 @@ scratch_shadow_every_rounds = 0
 # there). A validator that has locked in rewrites its note with the block,
 # so a restarted or late node adopts the block validators holding
 # `threshold` of stake all name — no archive node needed. The trainer and
-# the provisioner READ the same decision (restart them at the lock-in
-# boundary, or earlier); the validator stamps the block on every receipt
+# the provisioner READ the same decision every tick and arm themselves (a
+# trainer still on the OLD release must be restarted on the new one at the
+# lock-in boundary); the validator stamps the block on every receipt
 # (`activation_block`) so the audit replays each round under it. The
 # typed-in DEC-CA-0043 keys ([round] rolling_from_block etc.) always win
 # over the resolved block — the owner override. "" = off.

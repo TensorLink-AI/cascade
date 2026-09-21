@@ -724,6 +724,9 @@ class ChainClient:
         sub = self.subtensor()
         get_all = getattr(sub, "get_all_commitments", None)
         if get_all is not None:
+            # ONE query; a failure is a ChainError the caller retries next
+            # poll — never the ~N per-uid queries below (≈13 min live on a
+            # full metagraph), which would stall the poll loop this runs in.
             try:
                 kwargs: dict[str, Any] = {"netuid": self.netuid}
                 if block is not None:
@@ -731,7 +734,8 @@ class ChainClient:
                 raw = get_all(**kwargs) or {}
                 return {str(hk): str(v) for hk, v in dict(raw).items() if isinstance(v, str)}
             except Exception as e:  # noqa: BLE001
-                log.debug("get_all_commitments failed (%s); falling back per uid", e)
+                raise ChainError(f"get_all_commitments_failed: {e}") from e
+        # Older bittensor without the bulk API: per uid.
         try:
             kwargs = {"netuid": self.netuid, "lite": True}
             if block is not None:

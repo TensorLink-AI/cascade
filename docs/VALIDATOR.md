@@ -147,7 +147,12 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   stamped on every receipt you sign (`activation_block`), and your note is
   rewritten with the block so a validator that restarts or joins late
   adopts it from the notes alone. Lock-in is one-way; stake drifting back
-  under the line changes nothing. A validator still on the old release at
+  under the line changes nothing. The count is taken **as of the boundary
+  block**; if your endpoint cannot serve that block (a pruned node) your
+  validator does not count from a later view — it logs `as-of read …
+  failed`, retries, and picks the decision up from the other validators'
+  notes at the next boundary. Point it at an archive endpoint if you want
+  it to count for itself. A validator still on the old release at
   block R falls out of consensus from that block until upgraded, exactly as
   with a typed-in block — upgrade as soon as the release is announced, not
   when the count crosses. A rollover typed into `chain.toml` always wins

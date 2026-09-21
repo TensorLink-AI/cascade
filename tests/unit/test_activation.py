@@ -249,11 +249,64 @@ def test_resolver_adopts_the_block_validators_agree_on(cfg):
     assert chain.as_of_reads == []                          # no historical read needed
 
 
-def test_resolver_falls_back_to_the_live_view_when_the_boundary_is_pruned(cfg):
+def test_resolver_never_counts_from_a_later_view_when_the_boundary_is_pruned(cfg):
+    """Two nodes counting different chain states is the fork this exists to
+    prevent: a failed as-of read is a retry, never a live-view count."""
     chain = FakeChain(_fleet(60, 40), {"v1": A.format_signal(FEATURE)}, block=B0 + 3)
     chain.fail_as_of = True
     res = A.resolve_activation(cfg, chain, now_block=B0 + 3, record=A.ActivationRecord())
-    assert res.tally is not None and res.tally.locked and res.record.activation_block == B0 + GRID
+    assert not res.changed and not res.record.locked
+    assert res.record.last_checked_boundary == 0            # the boundary is retried
+    # ... and the fleet's decision reaches it through the notes instead
+    chain.signals["v1"] = A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + GRID)
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 30, record=res.record)
+    assert res.record.activation_block == B0 + GRID and res.record.source == "signals"
+
+
+def test_resolver_reads_the_chain_only_at_a_new_boundary(cfg):
+    chain = FakeChain(_fleet(30, 70), {"v1": A.format_signal(FEATURE)}, block=B0 + 1)
+    calls = {"n": 0}
+    orig = chain.read_plain_commitments
+
+    def counting(block=None):
+        calls["n"] += 1
+        return orig(block)
+
+    chain.read_plain_commitments = counting
+    rec = A.resolve_activation(cfg, chain, now_block=B0 + 1, record=A.ActivationRecord()).record
+    assert calls["n"] == 2                                   # notes (live) + tally (as-of)
+    for b in range(B0 + 2, B0 + 200, 7):
+        A.resolve_activation(cfg, chain, now_block=b, record=rec)
+    assert calls["n"] == 2                                   # nothing until the next boundary
+
+
+def test_record_for_blanks_a_renamed_features_record(cfg):
+    stale = A.ActivationRecord(feature="old-feature", lock_block=B0, activation_block=B0 + GRID,
+                               source="tally")
+    assert A.record_for(cfg, stale) == A.ActivationRecord()
+    mine = replace(stale, feature=FEATURE)
+    assert A.record_for(cfg, mine) is mine
+    # the resolver applies the same rule, so a stale record never arms anything
+    chain = FakeChain(_fleet(30, 70), {}, block=B0 + 1)
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 1, record=stale)
+    assert not res.record.locked
+
+
+def test_apply_activation_refuses_zero_era_settlements(cfg):
+    zero = replace(cfg, round=replace(cfg.round, era_settlements=0))
+    with pytest.raises(ValueError, match="era_settlements"):
+        A.apply_activation(zero, B0)
+
+
+def test_watcher_ticks_once_per_boundary_and_hands_back_the_armed_grid(cfg):
+    note = A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + GRID)
+    chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 5)
+    w = A.ActivationWatcher(cfg, store_path=None)
+    armed = w.tick(chain, B0 + 5)
+    assert armed is not None and armed.round.epoch_activation_block == B0 + GRID
+    assert (armed.round.epoch_blocks, armed.round.epoch_blocks_prev) == (900, 3600)
+    assert w.tick(chain, B0 + 6) is None                     # already armed
+    assert A.startup_activation(cfg, chain, store_path=None).round.rolling_from_block == B0 + GRID
 
 
 def test_resolver_is_a_no_op_on_a_dead_chain_or_a_typed_in_rollover(cfg):
@@ -333,6 +386,34 @@ def test_loader_rejects_a_bad_threshold_or_grid(tmp_path):
                  encoding="utf-8")
     with pytest.raises(ValueError, match="epoch_blocks_after"):
         load_chain_config(p)
+    # keeping the 3600 grid with 4-settlement eras: 3 of 4 boundaries could
+    # never start an era, so a lock-in there would resolve an unusable block
+    p.write_text(src.replace("epoch_blocks_after = 900", "epoch_blocks_after = 0"),
+                 encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot start an era"):
+        load_chain_config(p)
+    p.write_text(src.replace('feature = "rolling-era-king"', 'feature = "rolling era:king"'),
+                 encoding="utf-8")
+    with pytest.raises(ValueError, match="feature"):
+        load_chain_config(p)
+
+
+def test_provisioner_loop_switches_its_grid_from_the_activation_hook():
+    from cascade.provision.loop import ProvisionerLoop
+
+    loop = ProvisionerLoop.__new__(ProvisionerLoop)
+    loop.epoch_blocks, loop.epoch_blocks_prev, loop.epoch_activation_block = 3600, 0, 0
+    loop.chain_client = object()
+    seen = []
+    loop.activation_fn = lambda client, block: seen.append(block) or (900, 3600, B0 + GRID)
+    loop._maybe_apply_activation(B0 + 5)
+    assert seen == [B0 + 5]
+    assert (loop.epoch_blocks, loop.epoch_blocks_prev, loop.epoch_activation_block) == (
+        900, 3600, B0 + GRID)
+    assert loop.epoch_at(B0 + GRID - 1) == 3600 and loop.epoch_at(B0 + GRID) == 900
+    loop.activation_fn = lambda client, block: (_ for _ in ()).throw(RuntimeError("down"))
+    loop._maybe_apply_activation(B0 + 6)                     # swallowed, grid kept
+    assert loop.epoch_blocks == 900
 
 
 # ── chain client (fake subtensor) ────────────────────────────────────────────
@@ -542,4 +623,20 @@ def test_audit_replays_under_the_recorded_block_and_checks_agreement(cfg):
     assert check_activation(r1, replay, quiet).status == "WARN"
     assert check_activation(_receipt(activation_block=B0 + 900), cfg).status == "FAIL"
     off = replace(cfg, activation=replace(cfg.activation, feature=""))
+    assert A.apply_receipt_activation(off, r1) is off        # never applied under "off"
     assert check_activation(r1, off).status == "FAIL"
+    # a block the audit config cannot apply is a FAIL, not a traceback
+    bad = _receipt(activation_block=9046800 - GRID)          # precedes the max-T correction
+    assert A.apply_receipt_activation(cfg, bad) is cfg
+    res = check_activation(bad, cfg)
+    assert res.status == "FAIL" and "cannot be applied" in res.detail
+    # the owner later pins the decided block: the receipt must match it
+    typed = replace(cfg, round=replace(cfg.round, rolling_from_block=B0 + GRID, epoch_blocks=900,
+                                       epoch_blocks_prev=3600,
+                                       epoch_activation_block=B0 + GRID),
+                    scoring=replace(cfg.scoring, era_king_from_block=B0 + GRID,
+                                    tenure_blocks_from_block=B0 + GRID,
+                                    cohort_maxt_increment_from_block=B0 + GRID))
+    assert A.apply_receipt_activation(typed, r1) is typed
+    assert check_activation(r1, typed).status == "PASS"
+    assert check_activation(_receipt(activation_block=B0), typed).status == "FAIL"

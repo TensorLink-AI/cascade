@@ -666,12 +666,28 @@ def _run(args) -> int:
     # (the validators' notes / the boundary tally). Best-effort — a chain
     # flake here means the typed-in config, same as before this existed;
     # restart the provisioner after a lock-in to pick it up.
-    from ..shared.activation import startup_activation
+    from ..shared.activation import ActivationWatcher
     from ..shared.chain import ChainClient as _ChainClient
 
-    cfg = startup_activation(
-        cfg, _ChainClient.from_config(cfg, network=args.network),
-        store_path=Path(args.work_root) / "activation_state.json")
+    # No store path: the provisioner never writes the trainer's record; on a
+    # restart it re-resolves from the validators' notes (one cheap read).
+    # One tick now so the policy below is built on the armed grid; the loop
+    # keeps ticking it every cycle (ProvisionerLoop.activation_fn).
+    activation_watcher = ActivationWatcher(cfg, store_path=None)
+    try:
+        _boot_client = _ChainClient.from_config(cfg, network=args.network)
+        activation_watcher.tick(_boot_client, _boot_client.current_block())
+    except Exception as e:  # noqa: BLE001 — the loop's per-cycle tick retries
+        log.warning("activation: startup resolution skipped (%s); the loop retries", e)
+    cfg = activation_watcher.cfg
+
+    def _activation_fn(client, block):
+        armed = activation_watcher.tick(client, block)
+        if armed is None:
+            return None
+        return (armed.round.epoch_blocks, armed.round.epoch_blocks_prev,
+                armed.round.epoch_activation_block)
+
     raw = tomllib.loads(Path(args.config).read_text(encoding="utf-8"))
     top = raw.get("provisioner", {})
     policy = build_policy(raw, epoch_blocks=cfg.round.epoch_blocks)
@@ -843,6 +859,7 @@ def _run(args) -> int:
         epoch_blocks=cfg.round.epoch_blocks,
         epoch_blocks_prev=cfg.round.epoch_blocks_prev,
         epoch_activation_block=cfg.round.epoch_activation_block,
+        activation_fn=_activation_fn,
         # Per-size budget hours (DEC-CA-0027): the final's time envelope is the
         # longest throne size's target_train_hours (SizeSpec override or the
         # base) — with a single primary-size throne this is exactly the old

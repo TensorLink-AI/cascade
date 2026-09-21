@@ -2473,6 +2473,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
     # never reaches the resolver.
     ac = raw.get("activation", {})
+    _act_feature = str(ac.get("feature", "") or "").strip()
+    if _act_feature and not re.fullmatch(r"[A-Za-z0-9._-]+", _act_feature):
+        raise ValueError(
+            f"[activation] feature={_act_feature!r} must be a token of letters, digits, "
+            "'.', '_' or '-' (it is written verbatim into the on-chain note)")
     _act_threshold = float(ac.get("threshold", 0.51))
     if not (0.0 < _act_threshold <= 1.0):
         raise ValueError(
@@ -2484,6 +2489,27 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             f"[activation] epoch_blocks_after={_act_grid_after} must divide "
             f"[round] epoch_blocks={_eb}: the resolved rollover is a boundary of "
             "the grid before it and must be one of the grid after it too")
+    if _act_feature and not _rolling:
+        # The block the fleet resolves is ANY boundary of the loaded grid plus
+        # one; ``apply_activation`` must be able to arm it (the DEC-CA-0043
+        # rule: it starts an era on the grid after it). Refuse a config whose
+        # lock-in could resolve a block the node then cannot apply.
+        if _era_settlements < 1:
+            raise ValueError(
+                "[round] era_settlements must be >= 1 when [activation] feature is set "
+                "(the resolved rollover opens an era)")
+        _era_after = (_act_grid_after or _eb) * _era_settlements
+        if _eb % _era_after:
+            raise ValueError(
+                f"[round] epoch_blocks={_eb} must be a multiple of the era after the "
+                f"rollover ({_act_grid_after or _eb} × era_settlements={_era_settlements} "
+                f"= {_era_after}), or a lock-in at some boundary resolves a rollover "
+                "that cannot start an era")
+        if str(r.get("funded_pods", "off") or "off") != "rent" or not bool(
+                r.get("funded_king_rent", False)):
+            raise ValueError(
+                "[activation] feature is set but [round] funded_pods/funded_king_rent are "
+                "not \"rent\"/true — the resolved rollover could not be applied")
 
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.

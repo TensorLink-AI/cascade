@@ -274,6 +274,12 @@ class ProvisionerLoop:
     # trainer and validator without needing its own restart.
     epoch_blocks_prev: int = 0
     epoch_activation_block: int = 0
+    # Stake-weighted activation (DEC-CA-0044): called every cycle with
+    # ``(chain_client, block)``; returns ``(epoch_blocks, epoch_blocks_prev,
+    # epoch_activation_block)`` the moment the fleet's lock-in applies, else
+    # None. Resolved IN the loop so no operator restart (and no restart inside
+    # the pre-boundary trigger window) is ever needed to learn the grid switch.
+    activation_fn: object | None = None
     manifest_store: object | None = None
     # The VALIDATOR's eval-offload hosts file (never the trainer's hosts_path):
     # the eval pod is published here on rent and the file is cleared on
@@ -562,6 +568,7 @@ class ProvisionerLoop:
         if self.on_cycle is not None:
             with contextlib.suppress(Exception):
                 self.on_cycle()
+        self._maybe_apply_activation(block)
         self._maybe_provision_eval()
         if should_trigger(block, self.epoch_at(block),
                           self.trigger_margin_at(block), self._provisioned_round):
@@ -595,6 +602,29 @@ class ProvisionerLoop:
             return ex.submit(fn).result(timeout=seconds)
         finally:
             ex.shutdown(wait=False)
+
+    def _maybe_apply_activation(self, block: int) -> None:
+        """DEC-CA-0044: learn the fleet's rollover (once it locks in) and
+        switch this loop's grid at the same block the trainer and validators
+        do. Best-effort under a hard deadline — never blocks the cycle."""
+        if self.activation_fn is None:
+            return
+        try:
+            grid = self._with_deadline(
+                lambda: self.activation_fn(self.chain_client, int(block)), 120.0)
+        except Exception as e:  # noqa: BLE001 — retried next cycle
+            log.warning("activation check failed/hung (%s); retrying next cycle",
+                        type(e).__name__)
+            return
+        if not grid:
+            return
+        eb, prev, act = (int(x) for x in grid)
+        if (eb, prev, act) == (self.epoch_blocks, self.epoch_blocks_prev,
+                               self.epoch_activation_block):
+            return
+        log.warning("activation: DEC-CA-0043 rollover ARMED at block %d — grid %d → %d "
+                    "from there", act, prev, eb)
+        self.epoch_blocks, self.epoch_blocks_prev, self.epoch_activation_block = eb, prev, act
 
     def _current_block(self) -> int:
         """The chain height, with staleness detection and client rebuild.
