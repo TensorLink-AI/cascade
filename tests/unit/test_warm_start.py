@@ -198,13 +198,14 @@ def _scores(v: float) -> BenchScores:
                        boom_mase=v, time_crps=v, time_mase=v)
 
 
-def _bench_report_text(round_id: str, scored: dict[str, float]) -> str:
+def _bench_report_text(round_id: str, scored: dict[str, float], *,
+                       created_block: int = 10) -> str:
     entries = tuple(
         BenchEntry(role="king", size="toto2-4m", miner_hotkey="hk", miner_uid=0,
                    trained_pointer=ptr, scores=_scores(v))
         for ptr, v in scored.items()
     )
-    return dump_bench_report(BenchReport(round_id=round_id, created_block=10,
+    return dump_bench_report(BenchReport(round_id=round_id, created_block=created_block,
                                          entries=entries))
 
 
@@ -357,6 +358,55 @@ def test_out_of_reign_member_rejected_when_clock_can_attest(cfg, tmp_path):
     store = _promotion_store([(PTR2, 1.0)], generation=2)  # report created_block=10
     ctl = CascadeController(reign_days=5, state=CascadeState(
         king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,),
+        clock_observed=True))
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    reason = r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10))
+    assert reason is not None and "warm_start_member_out_of_reign" in reason
+
+
+def test_carried_member_is_exempt_from_reign_scope(cfg, tmp_path):
+    # Rolling top-k (DEC-CA-0044): a member of the ACCEPTED generation carries
+    # into the next record with its original (pre-reign) source_round. An
+    # attesting validator exempts it from reign scope — it was verified when
+    # it entered — while a new entrant must still be benched this reign.
+    record = PromotionRecord(
+        generation=2, king_hotkey="hk0", fired_round="r6", fired_block=0,
+        members=(PromotedMember(PTR, "toto2-4m", "r0", 1.0),
+                 PromotedMember(PTR2, "toto2-4m", "r6", 1.01)))
+    store = _Store({
+        promotion_index_key(): json.dumps({"latest_generation": 2}),
+        promotion_record_key(2): dump_promotion_record(record),
+        bench_report_key("r0"): _bench_report_text("r0", {PTR: 1.0}, created_block=10),
+        bench_report_key("r6"): _bench_report_text("r6", {PTR2: 1.01},
+                                                   created_block=6 * DAY),
+    })
+    ctl = CascadeController(reign_days=5, state=CascadeState(
+        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,),
+        clock_observed=True))
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    assert r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10)) is None
+    assert ctl.state.generation == 2 and ctl.state.members == (PTR, PTR2)
+
+
+def test_uncarried_pre_reign_member_is_still_rejected(cfg, tmp_path):
+    # Same shape, but the pre-reign member was NOT in the accepted generation:
+    # scope still fails closed.
+    record = PromotionRecord(
+        generation=2, king_hotkey="hk0", fired_round="r6", fired_block=0,
+        members=(PromotedMember(PTR, "toto2-4m", "r0", 1.0),
+                 PromotedMember(PTR2, "toto2-4m", "r6", 1.01)))
+    other = format_trained_pointer("cascade/ckpt-r0-x-toto2-4m@sha256:" + "d" * 64)
+    store = _Store({
+        promotion_index_key(): json.dumps({"latest_generation": 2}),
+        promotion_record_key(2): dump_promotion_record(record),
+        bench_report_key("r0"): _bench_report_text("r0", {PTR: 1.0}, created_block=10),
+        bench_report_key("r6"): _bench_report_text("r6", {PTR2: 1.01},
+                                                   created_block=6 * DAY),
+    })
+    ctl = CascadeController(reign_days=5, state=CascadeState(
+        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(other,),
         clock_observed=True))
     r = _validator(cfg, tmp_path, cascade=ctl, store=store)
     reason = r.check_manifest(

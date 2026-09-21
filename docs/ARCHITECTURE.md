@@ -208,13 +208,22 @@ reign's best score; the best is the anchor, remaining slots picked greedily for
 **measured error decorrelation** (per-window residuals; DEC-CA-0015) with a
 structural fallback (distinct generator, round spacing) when error vectors are
 missing, never padded — and publishes a signed `PromotionRecord`
-(`promotions/gen-<n>.json`). A **no-downgrade guard** (DEC-CA-0017) holds a
-ripe promotion until the reign's best candidate benches at least as well as
-the live generation's best member, so the shared init never ratchets downhill.
-Validators don't re-derive the selection: they verify an **envelope** —
-trainer signature, generation increment, `cascade_top_k` cap, reign-clock
-ripeness, and per-member provenance against the trainer-signed bench reports
-within the epsilon floor — failing closed on anything unverifiable. Once a
+(`promotions/gen-<n>.json`). The member set is a **rolling top-k**
+(DEC-CA-0044, supersedes the DEC-CA-0017 best-vs-best guard): on a ripe clock
+the live members compete with the reign's candidates for the same
+`cascade_top_k` slots — a candidate is admitted only when it benches strictly
+better than the worst live member (or a slot is free), the pool is
+re-selected under the envelope, and the promotion fires **only when
+membership changes**. Members that keep their slot carry over with their
+original `source_round` provenance, so the shared init never ratchets
+downhill and never shrinks below the best k seen so far (subject to the
+epsilon floor over the pool's best). Validators don't re-derive the
+selection: they verify an **envelope** — trainer signature, generation
+increment, `cascade_top_k` cap, reign-clock ripeness, and per-member
+provenance against the trainer-signed bench reports within the epsilon
+floor — failing closed on anything unverifiable. Reign-scope on provenance
+applies to NEW entrants only: a member of the already-accepted generation is
+exempt (it was verified when it entered). Once a
 generation is live, each round's init is the rotation
 `members[epoch_index % len(members)]` (from DEC-CA-0043's rollover: one init
 per ERA, `members_gen(era)[era % k]` with the generation's `effective_era` a

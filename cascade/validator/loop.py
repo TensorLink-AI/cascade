@@ -815,7 +815,12 @@ class ValidatorRunner:
         validator's clock watched the whole reign (the same condition as
         ripeness) — a bootstrap clock would mis-scope honest early-reign
         members. The reign-log path is reign-scoped by construction (the log
-        clears on every re-crown).
+        clears on every re-crown). **Carried-over members are exempt**
+        (DEC-CA-0044 rolling top-k): a member of the generation this
+        validator already accepted (live or staged) was verified when it
+        entered and keeps its original ``source_round``, which by
+        construction predates the reign it now carries into — scope applies
+        only to NEW entrants. Quality is still re-checked for every member.
 
         The floor is the best score across the reign log and the members
         themselves; every member must sit within ``cascade_quality_epsilon``
@@ -827,10 +832,12 @@ class ValidatorRunner:
         from .cascade import best_score, cascade_score, log_record_for
 
         assert self.cascade is not None
-        reign_start = self.cascade.state.reign_start_block
+        state = self.cascade.state
+        reign_start = state.reign_start_block
+        carried = set(state.members) | set(state.pending_members)
         scores: dict[str, float] = {}
         for m in getattr(record, "members", ()):
-            rec = log_record_for(self.cascade.state, m.checkpoint_id)
+            rec = log_record_for(state, m.checkpoint_id)
             if rec is not None:
                 scores[m.checkpoint_id] = rec.score
                 continue
@@ -840,6 +847,7 @@ class ValidatorRunner:
                 return (f"warm_start_member_unverifiable: {m.checkpoint_id} has no "
                         f"signed bench numbers (source_round={m.source_round!r})")
             if (enforce_reign_scope and reign_start is not None
+                    and m.checkpoint_id not in carried
                     and int(getattr(report, "created_block", 0)) < int(reign_start)):
                 return (f"warm_start_member_out_of_reign: {m.checkpoint_id} was "
                         f"benched in round {m.source_round!r} (block "
