@@ -349,6 +349,13 @@ _RETRYABLE_HUB_ERROR_SUBSTRINGS = (
     # registry drops (retry always succeeded). A genuinely-local cause (disk
     # full) just burns the 3 extra attempts (~14s) before the same failure.
     "local i/o error",
+    # hippius_core's client-side read-stall watchdog ("download read stalled:
+    # no data for 30s" under "chunk N failed"): no bytes for N s on a live
+    # connection — transient by definition, a fresh connection lands it.
+    # 2026-09-21 (DEC-CA-0043 testnet validation): every era-king warm-start
+    # fetch on one pod died after 1 of 4 attempts on this, halting the era's
+    # settlements — the Aug chunk-drop fix above, a variant nobody had added.
+    "read stalled", "no data for",
 )
 
 
