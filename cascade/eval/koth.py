@@ -15,6 +15,7 @@ holds no state.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, replace
 
@@ -384,7 +385,9 @@ def with_cohort_lcb(result: RoundResult, lcb: float, params: KothParams) -> Roun
     with the enforce-mode init-baseline floor. Geomeans, the floor result, and
     the diagnostics are untouched (they never depended on the correction). The
     one place the win is re-derived, shared by the validator and the audit."""
-    wins = bool(lcb >= result.margin)
+    # NaN compares False, but only by accident of IEEE — make the rule explicit:
+    # an uncomputable bound never clears a margin.
+    wins = bool(math.isfinite(lcb) and lcb >= result.margin)
     if params.init_gate_mode == "enforce" and result.init_floor_passed is False:
         wins = False
     return replace(result, lcb=lcb, challenger_wins_round=wins)
@@ -530,7 +533,12 @@ def evaluate_round(
         init_floor_passed = bool(
             chal_geo <= base_geo * (1.0 + max(0.0, params.init_gate_tolerance))
         )
-    wins = bool(lcb >= margin)
+    # An uncomputable bound (empty bootstrap sample ⇒ NaN) is an INCONCLUSIVE
+    # round — king holds, streak untouched — never a compare that happens to
+    # be False today and True on some other path (2026-09-21 review: lcb=nan
+    # reached the verdict line with inconclusive=False).
+    computable = bool(math.isfinite(lcb))
+    wins = bool(computable and lcb >= margin)
     if params.init_gate_mode == "enforce" and init_floor_passed is False:
         wins = False
     return RoundResult(
@@ -540,7 +548,7 @@ def evaluate_round(
         n_windows=n,
         king_geomean=global_geomean(king_scores, wql_mode=wql_mode),
         chal_geomean=chal_geo,
-        inconclusive=False,
+        inconclusive=not computable,
         n_clusters=n_clusters,
         wql_mode=wql_mode,
         margin_mode=params.margin_mode,

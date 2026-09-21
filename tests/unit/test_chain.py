@@ -77,3 +77,31 @@ def test_defuse_substrate_destructor_is_safe_without_package(monkeypatch):
     if cls is not None:
         obj = object.__new__(cls)
         cls.__del__(obj)                          # neutered: returns instantly
+
+
+def test_bulk_decode_warning_fires_once_per_cause(monkeypatch, caplog):
+    """One malformed on-chain commit makes bittensor's batch decoder raise on
+    EVERY poll; the raw-map fallback is the fix, the warning must not repeat."""
+    import logging
+    from types import SimpleNamespace
+
+    from cascade.shared import chain as chain_mod
+
+    c = _client()
+    meta = SimpleNamespace(n=1, hotkeys=["hk"], coldkeys=["ck"])
+
+    def _boom(netuid):
+        raise ValueError("non-hexadecimal number found in fromhex() arg at position 3")
+
+    sub = SimpleNamespace(metagraph=lambda netuid, lite: meta,
+                                get_all_revealed_commitments=_boom)
+    monkeypatch.setattr(c, "subtensor", lambda: sub)
+    monkeypatch.setattr(c, "_revealed_raw_map", lambda *a, **k: [])
+    monkeypatch.setattr(chain_mod, "_bulk_decode_warned", set())
+    with caplog.at_level(logging.DEBUG, logger="cascade.chain"):
+        for _ in range(3):
+            assert c.poll_commitments() == []
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING
+              and "bulk revealed-commitment decode failed" in r.getMessage()]
+    assert len(warned) == 1
+    assert "repeats only when the cause changes" in warned[0].getMessage()
