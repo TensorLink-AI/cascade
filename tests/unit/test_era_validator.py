@@ -24,7 +24,7 @@ from cascade.shared.bench_report import (
 )
 from cascade.shared.chain import Commitment, seed_from_block_hash
 from cascade.shared.era import min_effective_era, settlement_era
-from cascade.shared.hippius import manifest_round_key
+from cascade.shared.hippius import ObjectNotFound, StorageError, manifest_round_key
 from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
@@ -149,6 +149,8 @@ class _Store:
         self.texts = dict(texts or {})
 
     def get_text(self, key):
+        if key not in self.texts:
+            raise ObjectNotFound(key)
         return self.texts[key]
 
 
@@ -597,3 +599,41 @@ def test_first_settlement_after_the_grid_switch_keeps_the_kings_decayed_margin(c
     out2 = r2.process_settlement(_manifest(base, rollover - eb_old, era=False), windows=[],
                             base_seed=rollover - eb_old)
     assert out2.king_tenure_rounds == 14
+
+
+def test_unreadable_promotion_evidence_is_a_transient_for_the_era_gate(cfg, tmp_path):
+    # An unreadable ledger is not evidence of a bad init: the era gate raises
+    # (poll loop retries, no receipt) instead of judging against the stale
+    # ledger and latching era_init_mismatch.
+    armed = _armed(cfg)
+    eb = cfg.round.epoch_blocks
+    n_block = _rollover(armed) + eb * 4 * 3 + eb
+    era_n = settlement_era(armed.round, n_block)
+    era_prev = settlement_era(armed.round, n_block - eb)
+    fired = era_prev.start_block - eb * 4 * 2
+    assert min_effective_era(armed.round, fired) <= era_n.index
+    good = _promo_store([(M2A, 0.4)], generation=2, effective_era=era_n.index,
+                        fired_block=fired)
+    m_n = _manifest(armed, n_block, warm_start=M2A, generation=2, member_index=0)
+
+    class _Down(_Store):
+        def __init__(self, texts, key):
+            super().__init__(texts)
+            self.key = key
+
+        def get_text(self, key):
+            if key == self.key:
+                raise StorageError(f"s3_get_failed: {key}: 503")
+            return super().get_text(key)
+
+    for key in (promotion_index_key(), promotion_record_key(2), bench_report_key("r9")):
+        cas = _cascade(armed, tmp_path, generation=1, members=(M1A, M1B))
+        v = _runner(armed, cascade=cas, store=_Down(good.texts, key))
+        with pytest.raises(StorageError):
+            v.check_manifest(m_n)
+        assert cas.state.generation == 1 and cas.state.pending_generation == 0
+    # Readable: the same manifest is accepted.
+    cas = _cascade(armed, tmp_path, generation=1, members=(M1A, M1B))
+    v = _runner(armed, cascade=cas, store=good)
+    assert v.check_manifest(m_n) is None
+    assert cas.state.pending_generation == 2

@@ -221,7 +221,13 @@ epsilon floor over the pool's best). Validators don't re-derive the
 selection: they verify an **envelope** — trainer signature, generation
 increment, `cascade_top_k` cap, reign-clock ripeness, and per-member
 provenance against the trainer-signed bench reports within the epsilon
-floor — failing closed on anything unverifiable. Reign-scope on provenance
+floor — failing closed on anything unverifiable. "Unverifiable" means the
+evidence was READ and does not support the record (report absent on every
+storage layer, entry missing, numbers outside the envelope); a promotion
+record or bench report that cannot be read at all is a transient — the
+round is retried next poll under the same grace as the pool-pin gate, never
+a receipt — and a cached report lacking the member is re-fetched (the
+trainer republishes the report as legs finish). Reign-scope on provenance
 applies to NEW entrants only: a member of the already-accepted generation is
 exempt (it was verified when it entered). Once a
 generation is live, each round's init is the rotation

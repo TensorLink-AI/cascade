@@ -21,7 +21,9 @@ from cascade.shared.bench_report import (
     BenchReport,
     bench_report_key,
     dump_bench_report,
+    load_bench_report,
 )
+from cascade.shared.hippius import ObjectNotFound, StorageError
 from cascade.shared.manifest import (
     BenchScores,
     TrainedEntry,
@@ -39,7 +41,7 @@ from cascade.shared.promotion import (
 from cascade.trainer.loop import TrainerRunner
 from cascade.trainer.remote import RemoteHost, worker_argv
 from cascade.validator.cascade import CascadeController, CascadeState
-from cascade.validator.loop import ValidatorRunner
+from cascade.validator.loop import POOL_PIN_READ_GRACE_SECONDS, ValidatorRunner
 
 REF = "alice/metro-gen@sha256:" + "a" * 64
 REF_T = "cascade/ckpt-r1-king-toto2-4m@sha256:" + "b" * 64
@@ -166,6 +168,8 @@ class _Store:
         self.texts = dict(texts or {})
 
     def get_text(self, key: str) -> str:
+        if key not in self.texts:
+            raise ObjectNotFound(key)
         return self.texts[key]
 
 
@@ -502,3 +506,79 @@ def test_worker_argv_omits_warm_start_by_default():
         base_seed=99, block=12, trainer_spec="m:C",
     )
     assert "--warm-start-ref" not in argv
+
+
+class _FlakyStore(_Store):
+    """A store whose named keys fail to READ (503) — an outage, not absence."""
+
+    def __init__(self, texts, *, down):
+        super().__init__(texts)
+        self.down = set(down)
+
+    def get_text(self, key: str) -> str:
+        if key in self.down:
+            raise StorageError(f"s3_get_failed: {key}: 503")
+        return super().get_text(key)
+
+
+def test_unreadable_bench_report_is_a_transient_not_a_verdict(cfg, tmp_path):
+    # 2026-09-21: two validators latched permanent rejections of the first
+    # gen-11 rounds on a swallowed read miss of a bench report that was on S3
+    # the whole time. A READ failure must raise (the poll loop retries the
+    # round next poll, no receipt) and the ledger must not move.
+    good = _promotion_store([(PTR, 1.0)], generation=1)
+    store = _FlakyStore(good.texts, down={bench_report_key("r1")})
+    ctl = CascadeController(reign_days=5)
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    with pytest.raises(StorageError, match="bench_report_unavailable"):
+        r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+    assert ctl.state.generation == 0 and ctl.state.members == ()
+    # Store back: the very same manifest is accepted — nothing was latched.
+    store.down.clear()
+    assert r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR)) is None
+    assert ctl.state.generation == 1
+
+
+def test_unreadable_promotion_index_or_record_is_a_transient(cfg, tmp_path):
+    good = _promotion_store([(PTR, 1.0)], generation=1)
+    for key in (promotion_index_key(), promotion_record_key(1)):
+        store = _FlakyStore(good.texts, down={key})
+        ctl = CascadeController(reign_days=5)
+        r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+        with pytest.raises(StorageError, match="promotion_(index|record)_unavailable"):
+            r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+        assert ctl.state.generation == 0
+    # The index naming a record that is ABSENT is a store inconsistency (the
+    # record is published before the index), not "no promotion": transient.
+    texts = dict(good.texts)
+    texts.pop(promotion_record_key(1))
+    r = _validator(cfg, tmp_path, cascade=CascadeController(reign_days=5),
+                   store=_Store(texts))
+    with pytest.raises(StorageError, match="promotion_record_unavailable"):
+        r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+    # An ABSENT index is a verdict: no promotion was ever published.
+    # (test_unseen_pin_without_record_rejected; an absent bench report likewise
+    # rejects — test_member_without_bench_numbers_rejected.)
+
+
+def test_stale_cached_bench_report_is_refetched_for_a_missing_member(cfg, tmp_path):
+    # The bench runs post-publish and the report is (re)published as legs
+    # finish: a copy cached before the member's entry landed must not pin
+    # "no bench numbers" for the life of the process.
+    store = _promotion_store([(PTR, 1.0), (PTR2, 1.02)], generation=1)
+    ctl = CascadeController(reign_days=5)
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    r._bench_report_cache["r1"] = load_bench_report(_bench_report_text("r1", {PTR2: 1.02}))
+    assert r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR)) is None
+    assert ctl.state.generation == 1 and ctl.state.members == (PTR, PTR2)
+    assert r._bench_report_cache["r1"].entry_for_pointer(PTR) is not None
+
+
+def test_gate_read_grace_names_the_gate(cfg, tmp_path):
+    r = _validator(cfg, tmp_path, cascade=None)
+    err = StorageError("bench_report_unavailable: round=r1: 503")
+    assert r._gate_read_failed("7", err, gate="warm_start_unverifiable", now=0.0) is None
+    reason = r._gate_read_failed("7", err, gate="warm_start_unverifiable",
+                                 now=POOL_PIN_READ_GRACE_SECONDS)
+    assert reason is not None and reason.startswith("warm_start_unverifiable")
+    assert "persistently" in reason
