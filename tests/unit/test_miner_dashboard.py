@@ -877,6 +877,17 @@ def test_cmd_duel_prints_the_breakdown(monkeypatch, cfg, capsys):
     assert cli._cmd_duel(args) == 0
     assert "settled round(s)" in capsys.readouterr().out
 
+    # --hotkey: the 'your domains' block, and with --history the per-domain trend
+    me = "5Chal" + "c" * 43
+    args = types.SimpleNamespace(chain_toml=None, round_id=None, history=False, limit=20,
+                                 hotkey=me)
+    assert cli._cmd_duel(args) == 0
+    assert "your domains" in capsys.readouterr().out
+    args = types.SimpleNamespace(chain_toml=None, round_id=None, history=True, limit=20,
+                                 hotkey=me)
+    assert cli._cmd_duel(args) == 0
+    assert "no per-domain scores for" in capsys.readouterr().out   # legacy row: win rates only
+
 
 def test_cmd_duel_exits_1_without_public_data(monkeypatch, cfg, capsys):
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)

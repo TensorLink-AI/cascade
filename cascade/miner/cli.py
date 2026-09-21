@@ -557,13 +557,19 @@ def _add_duel(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "duel",
         help="Duel verdict for a settled round: dethrone margin, both geomeans, "
-        "per-domain win rates — the full breakdown behind DETHRONED/king-held.",
+        "per-domain scores — the full breakdown behind DETHRONED/king-held. "
+        "--hotkey adds YOUR per-domain scores vs the king (and, with --history, "
+        "your per-domain trend across rounds).",
     )
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--round", dest="round_id", default=None,
                    help="A specific round id (default: the latest settled round).")
     p.add_argument("--history", action="store_true",
-                   help="One line per settled round instead of one round's detail.")
+                   help="One line per settled round instead of one round's detail "
+                   "(with --hotkey: your gap vs the king per domain, per round).")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) — adds a 'your domains' block: which "
+                   "domains you beat the king in this round and by how much.")
     p.add_argument("--limit", type=int, default=20,
                    help="Rounds listed by --history (default: 20).")
     p.set_defaults(func=_cmd_duel)
@@ -579,6 +585,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         duel_round_rows,
         fetch_public_receipt_index,
         render_duel,
+        render_duel_domain_history,
         render_duel_index,
     )
 
@@ -588,8 +595,12 @@ def _cmd_duel(args: argparse.Namespace) -> int:
               "offline, or the round has not settled yet; try 'cascade round'",
               file=sys.stderr)
         return 1
+    me = getattr(args, "hotkey", None) or None
     if args.history:
-        print(render_duel_index(doc, limit=args.limit))
+        if me:
+            print(render_duel_domain_history(doc, me, limit=args.limit))
+        else:
+            print(render_duel_index(doc, limit=args.limit))
         return 0
     rows = duel_round_rows(doc, args.round_id)
     if not rows:
@@ -597,7 +608,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         print(f"no receipt-index rows for {target} — receipts land a few minutes "
               "after the duel manifest; try 'cascade duel --history'", file=sys.stderr)
         return 1
-    print(render_duel(rows))
+    print(render_duel(rows, me=me))
     return 0
 
 

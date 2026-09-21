@@ -188,6 +188,13 @@ class RoundResult:
     # None on a single-horizon round. Display only; the verdict is the pooled
     # statistic.
     per_horizon: dict | None = None
+    # Per-domain breakdown: ``{domain: {king, chal, win_rate, n}}`` — the
+    # king's and challenger's geomeans restricted to each pool domain, so a
+    # miner reads WHERE they beat the king and by how much, not just how often
+    # (``per_domain_win_rate`` above is the how-often). None when the pool
+    # carries no domain labels. Display only; the verdict is the pooled
+    # statistic.
+    per_domain: dict | None = None
     # Diagnostic spread of the same bootstrap the LCB gates on: the median and
     # 95th pct of the relative-improvement distribution (the LCB is its 5th pct).
     # A wide gap between a positive median and a negative LCB = a fragile verdict
@@ -306,6 +313,43 @@ def per_horizon_breakdown(
             "king": float(global_geomean(ks)),
             "chal": float(global_geomean(cs)),
             "win_rate": float(wins.mean()) if len(idx) else None,
+            "n": int(len(idx)),
+        }
+    return out
+
+
+def per_domain_breakdown(
+    king_scores: list[WindowScore], chal_scores: list[WindowScore],
+    *, wql_mode: str = "geomean",
+) -> dict | None:
+    """``{domain: {"king", "chal", "win_rate", "n"}}`` — the round statistic
+    restricted to each pool domain, for the decided pair.
+
+    The per-domain WIN RATE (``_shadow_diagnostics``) says how often the
+    challenger beat the king in a domain; this says by how much: the same
+    geomean the verdict is judged on, computed on the domain's windows alone,
+    for both sides. Sorted by domain name. A pool with no domain labels (every
+    window ``""``) returns None so nothing changes for it. Never gates.
+    """
+    if not king_scores or len(king_scores) != len(chal_scores):
+        return None
+    by_dom: dict[str, list[int]] = {}
+    for i, s in enumerate(king_scores):
+        by_dom.setdefault(s.domain or "unknown", []).append(i)
+    if set(by_dom) == {"unknown"}:
+        return None
+    g_king = _per_window_geomeans(king_scores)
+    g_chal = _per_window_geomeans(chal_scores)
+    out: dict[str, dict] = {}
+    for dom in sorted(by_dom):
+        idx = by_dom[dom]
+        ks = [king_scores[i] for i in idx]
+        cs = [chal_scores[i] for i in idx]
+        wins = np.asarray([g_chal[i] < g_king[i] for i in idx])
+        out[dom] = {
+            "king": float(global_geomean(ks, wql_mode=wql_mode)),
+            "chal": float(global_geomean(cs, wql_mode=wql_mode)),
+            "win_rate": float(wins.mean()),
             "n": int(len(idx)),
         }
     return out
@@ -550,6 +594,7 @@ def evaluate_round(
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,
         per_horizon=per_horizon_breakdown(king_scores, chal_scores),
+        per_domain=per_domain_breakdown(king_scores, chal_scores, wql_mode=wql_mode),
         boot_p50=boot_p50,
         boot_p95=boot_p95,
     )

@@ -248,6 +248,9 @@ class RoundOutcome:
     # for the "all miners" duel view; the verdict itself is unchanged.
     cohort_geomeans: dict[str, float] = field(default_factory=dict)
     cohort_per_horizon: dict[str, dict] = field(default_factory=dict)
+    # … and per-DOMAIN breakdown (``{hotkey: {domain: {king, chal, win_rate,
+    # n}}}``): which domains each challenger beat the king in, and by how much.
+    cohort_per_domain: dict[str, dict] = field(default_factory=dict)
     # Every duelled challenger's shadow diagnostics (geomean, win_rate, …), keyed
     # by hotkey — what the headline verdict records for the decided challenger
     # only. Published on the receipt as ``cohort_stats`` (same drop-when-default
@@ -1792,6 +1795,8 @@ class ValidatorRunner:
             cohort_geomeans={hk: r.chal_geomean for hk, _, r in judged},
             cohort_per_horizon={hk: r.per_horizon for hk, _, r in judged
                                 if r.per_horizon},
+            cohort_per_domain={hk: r.per_domain for hk, _, r in judged
+                               if r.per_domain},
             cohort_stats=({hk: cohort_stats_of(r) for hk, _, r in judged} if k > 1 else {}),
         )
 
@@ -1901,6 +1906,7 @@ class ValidatorRunner:
             cohort_geomeans=outcome.cohort_geomeans,
             cohort_per_horizon=outcome.cohort_per_horizon,
             cohort_stats=outcome.cohort_stats,
+            cohort_per_domain=outcome.cohort_per_domain,
         )
         return build_receipt(
             round_id=manifest.round_id, status="scored",
