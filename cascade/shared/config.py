@@ -7,6 +7,7 @@ file, deployed by hand alongside the binaries — the same policy horizon uses).
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 import tomllib  # py311+
@@ -2104,6 +2105,30 @@ def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
     return eb
 
 
+_BLOCK_SECONDS = 12.0
+
+
+def funded_sku_wall_fit(cfg: ChainConfig) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split the configured funded SKUs (``funded_pod_skus``, else
+    ``funded_pod_sku``) into (fitting, excluded) by the per-SKU wall
+    (``funded_sku_wall_seconds``, else the contract's ``max_train_seconds``)
+    against ONE epoch's wall clock. An excluded SKU can never rent: its latest
+    safe start is before the epoch begins. The shipped (mainnet-measured) wall
+    table is inherited by any chain.toml that does not override it — on a
+    2 h testnet grid that silently narrowed rents to the SKUs WITHOUT an
+    entry, read as "works" (2026-09-21 review)."""
+    rnd = cfg.round
+    skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,) if rnd.funded_pod_sku else ())
+    if not skus:
+        return (), ()
+    cap = max(int(c.max_train_seconds) for c in cfg.throne_contracts())
+    epoch_wall = max(1, int(rnd.epoch_blocks)) * _BLOCK_SECONDS
+    walls = tuple(rnd.funded_sku_wall_seconds or ())
+    fit = tuple(s for s in skus if funded_sku_wall_for(walls, s, cap) < epoch_wall)
+    excluded = tuple(s for s in skus if s not in fit)
+    return fit, excluded
+
+
 def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     """Refuse to start a live service while ``chain.toml`` holds placeholders.
 
@@ -2143,6 +2168,21 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             "[round] funded_pod_skus lists multiple GPU types but [training] "
             f"expected_gpu pins {cfg.training.expected_gpu!r} — per-round SKU "
             'choice needs expected_gpu = "" (a coordinated contract change)')
+    if role == "trainer" and cfg.round.funded_pods == "rent":
+        fit, excluded = funded_sku_wall_fit(cfg)
+        if excluded and not fit:
+            problems.append(
+                "[round] funded_sku_wall_seconds excludes EVERY configured SKU "
+                f"({', '.join(excluded)}): each measured wall is at least one epoch "
+                f"({int(cfg.round.epoch_blocks)} blocks) long, so no leg could ever "
+                "start — set walls measured for THIS grid (or {} to use the "
+                "contract's max_train_seconds)")
+        elif excluded:
+            logging.getLogger("cascade.config").warning(
+                "[round] funded_sku_wall_seconds excludes %s from funded rents (wall >= "
+                "one epoch of %d blocks); only %s can rent — set walls measured for "
+                "this grid if that is not intended", ", ".join(excluded),
+                int(cfg.round.epoch_blocks), ", ".join(fit))
     # The round's screen/throne size pointers must name configured sizes.
     registry = cfg.training.size_registry
     for label, name in [("screen_size", cfg.round.screen_size), *(("throne_sizes", n) for n in cfg.round.throne_sizes)]:

@@ -57,10 +57,17 @@ from ..shared.era import (
     settlement_era,
 )
 from ..shared.manifest import TrainedEntry
+from .remote import error_tail
 
 log = logging.getLogger(__name__)
 
 BLOCK_SECONDS = 12.0
+# A booted king pod gets ONE retry after a non-transport failure (a Hippius
+# read stall is not necessarily the pod's fault); the next failure — or any
+# transport failure at once — rotates it: host quarantined, pod torn down,
+# the next tick re-rents elsewhere. Without this the leg looped into the
+# same bad network path every tick for hours (2026-09-21 review).
+KING_SAME_POD_RETRIES = 1
 STATE_FILE = "era_state.json"
 
 
@@ -86,6 +93,7 @@ class EraState:
     king_bench: dict | None = None    # BenchScores (asdict)
     king_bench_published: bool = False
     king_leg_failed: str = ""         # last king-leg failure (retry pending)
+    king_leg_failures: int = 0        # consecutive failures on the CURRENT king pod
 
     def spec(self) -> EraSpec:
         return EraSpec(index=self.index, start_block=self.start_block,
@@ -185,6 +193,15 @@ def save_state(path: Path, state: RollingState) -> None:
 
 
 # ── pure policy ──────────────────────────────────────────────────────────────
+
+
+def king_pod_should_rotate(exc: BaseException, failures: int) -> bool:
+    """Rotate the era king's pod after ``failures`` consecutive king-leg
+    failures on it: at once when the failure is a transport one (the pod is
+    unreachable), else once the same-pod retry budget is spent."""
+    from .loop import _transport_failure
+
+    return _transport_failure(exc) or int(failures) > KING_SAME_POD_RETRIES
 
 
 def wall_of_block(block: int, *, now: float, block_now: int) -> float:
@@ -341,6 +358,9 @@ class LegOps:
 
     def retire_king_pod(self, era: EraState) -> None:
         self.r._rolling_retire_king_pod(era)
+
+    def rotate_king_pod(self, era: EraState, reason: str) -> None:
+        self.r._rolling_rotate_king_pod(era, reason)
 
     # publication
     def publish_manifest(self, manifest) -> None:
@@ -693,6 +713,7 @@ class RollingScheduler:
                 with self._lock:
                     era.king_entry = _entry_to_json(entry)
                     era.king_leg_failed = ""
+                    era.king_leg_failures = 0
                     self._save()
                 log.info("rolling: era %d king leg complete: %s", era.index,
                          entry.trained_pointer)
@@ -703,8 +724,24 @@ class RollingScheduler:
             except Exception as e:  # noqa: BLE001 — retried next tick; never kills the loop
                 log.error("rolling: era %d king leg FAILED: %s", era.index, e)
                 with self._lock:
-                    era.king_leg_failed = str(e)[-300:]
+                    era.king_leg_failed = error_tail(e, 300)
+                    era.king_leg_failures += 1
+                    failures = era.king_leg_failures
                     self._save()
+                if king_pod_should_rotate(e, failures):
+                    reason = (f"era {era.index} king leg failed {failures}x on this pod: "
+                              f"{error_tail(e, 160)}")
+                    log.warning("rolling: era %d king pod ROTATES after %d failure(s) — "
+                                "host quarantined, next tick re-rents elsewhere",
+                                era.index, failures)
+                    try:
+                        self.ops.rotate_king_pod(era, reason)
+                    except Exception as e2:  # noqa: BLE001 — the retry still re-rents
+                        log.error("rolling: era %d king pod rotation failed: %s",
+                                  era.index, e2)
+                    with self._lock:
+                        era.king_leg_failures = 0
+                        self._save()
             finally:
                 self._king_threads.pop(era.index, None)
 
@@ -928,7 +965,7 @@ class RollingScheduler:
                         queue.requeue(gen.hotkey, error=msg or str(e),
                                       error_class=error_class, burn_attempt=burn)
                 log.warning("rolling: %s's leg failed [%s]: %s", gen.hotkey[:12],
-                            error_class, (msg or str(e))[-200:])
+                            error_class, error_tail(msg or str(e), 200))
             finally:
                 self._threads.pop(gen.hotkey, None)
 

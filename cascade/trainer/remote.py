@@ -45,6 +45,36 @@ log = logging.getLogger("cascade.trainer.remote")
 RECEIPT_SENTINEL = "__CASCADE_RECEIPT__"
 
 
+def error_tail(text: object, limit: int = 300) -> str:
+    """The last ``limit`` characters of an error message WITHOUT cutting a line
+    in half: whole trailing lines, plus the first line's context (``remote king
+    on X failed (rc=1)``) when it fits. A raw ``str(e)[-300:]`` on a relayed
+    traceback logged ``t cause of the following exception:`` — a sliced
+    ``The above exception was the direct cause …`` line — exactly where the
+    real cause was needed (2026-09-21 review)."""
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        return s[-limit:]
+    head = lines[0]
+    if len(head) > limit // 2:
+        head = head[: limit // 2 - 1] + "…"
+    budget = limit - len(head) - 3           # " … " joiner
+    tail: list[str] = []
+    used = 0
+    for ln in reversed(lines[1:]):
+        if used + len(ln) + 1 > budget:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    if not tail:
+        last = lines[-1]
+        tail = [last if len(last) <= budget else "…" + last[-(budget - 1):]]
+    return head + " … " + "\n".join(reversed(tail))
+
+
 class RemoteDispatchError(RuntimeError):
     """An SSH dispatch or receipt parse failed.
 

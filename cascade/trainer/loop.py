@@ -72,6 +72,7 @@ from ..shared.manifest import (
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
 from .corpus import DIVERGED_MARKER, CorpusError, build_round_corpus
 from .host_probe import host_snapshot, host_summary_line
+from .remote import error_tail
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -2589,7 +2590,7 @@ class TrainerRunner:
 
     def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
                                error_class: str, burn: bool) -> None:
-        self._funded_leg_failures[hotkey] = (msg[-500:], miner_fault,
+        self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 
     def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator):
@@ -2738,7 +2739,7 @@ class TrainerRunner:
                             and now_fn() < self._funded_rent_wait_deadline()):
                         log.warning("funded leg %s: lemon pod (%s); renting again on "
                                     "another host (%d bad pod(s) so far)",
-                                    gen.hotkey[:12], result.error[-200:], stale_pods)
+                                    gen.hotkey[:12], error_tail(result.error, 200), stale_pods)
                         continue
                     result = replace(
                         result, error=f"{stale_pods} bad pod(s), last: {result.error}",
@@ -6925,8 +6926,8 @@ class TrainerRunner:
                 # quarantined, so the retry (and every later leg) lands
                 # elsewhere (2026-09-21: the king's one retry went to the
                 # pod it had just died on, and the round aborted).
-                free_lanes.mark_dead(host, str(e)[-160:])
-                _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {str(e)[-200:]}")
+                free_lanes.mark_dead(host, error_tail(e, 160))
+                _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {error_tail(e, 200)}")
             else:
                 free_lanes.put(host)             # failed lane rejoins the rotation
             if _storage_failure(e):
@@ -7530,6 +7531,20 @@ class TrainerRunner:
         with self._funded_king_lock:
             if self._rolling_king_host_era == era.index:
                 self._funded_king_host = None
+
+    def _rolling_rotate_king_pod(self, era, reason: str) -> None:
+        """A booted king pod whose leg keeps failing (or went unreachable) is
+        a lemon HOST: quarantine its IP (Lium relists the same machine under
+        fresh executor ids) and tear the pod down, so the next king-leg
+        attempt re-rents elsewhere instead of looping into the same wall."""
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is None:
+            with self._funded_king_lock:
+                if self._rolling_king_host_era == era.index:
+                    host = self._funded_king_host
+        if host is not None:
+            _quarantine_lane_host(host, f"king pod {getattr(host, 'name', host)}: {reason}")
+        self._rolling_retire_king_pod(era)
 
     def _rolling_bench_king(self, entry, era) -> dict | None:
         import dataclasses

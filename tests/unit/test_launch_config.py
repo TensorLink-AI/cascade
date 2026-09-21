@@ -70,3 +70,57 @@ def test_validator_requires_some_eval_pool(cfg):
     assert "pool" in str(ei.value)
     # trainer doesn't need the pool, so it still passes
     assert_launch_ready(no_pool, role="trainer")
+
+
+# ── funded_sku_wall_seconds vs the epoch: loud, never a silent narrowing ─────
+
+
+def _rent_cfg(cfg, *, epoch_blocks, skus, walls):
+    ready = _launch_ready(cfg)
+    training = replace(ready.training, expected_gpu="")
+    rnd = replace(ready.round, funded_pods="rent", funded_pod_skus=tuple(skus),
+                  funded_pod_sku=skus[0], funded_sku_wall_seconds=tuple(sorted(walls.items())),
+                  epoch_blocks=epoch_blocks, epoch_blocks_prev=0, epoch_activation_block=0)
+    return replace(ready, training=training, round=rnd)
+
+
+def test_wall_table_excluding_every_sku_refuses_launch(cfg):
+    from cascade.shared.config import funded_sku_wall_fit
+
+    # a 30-min testnet grid inheriting mainnet's measured walls
+    c = _rent_cfg(cfg, epoch_blocks=150, skus=("RTX4090", "L40S"),
+                  walls={"RTX4090": 13500, "L40S": 10200})
+    assert funded_sku_wall_fit(c) == ((), ("RTX4090", "L40S"))
+    with pytest.raises(LaunchConfigError, match="excludes EVERY configured SKU"):
+        assert_launch_ready(c, role="trainer")
+    # the validator role never rents — no problem raised
+    assert_launch_ready(c, role="validator")
+
+
+def test_wall_table_excluding_some_skus_warns(cfg, caplog):
+    import logging
+
+    from cascade.shared.config import funded_sku_wall_fit
+
+    # RTX3090 has no entry ⇒ the contract's max_train_seconds (fits a 12 h
+    # epoch); RTX4090's measured wall is longer than the epoch ⇒ excluded.
+    c = _rent_cfg(cfg, epoch_blocks=3600, skus=("RTX4090", "RTX3090"),
+                  walls={"RTX4090": 50000})
+    assert funded_sku_wall_fit(c) == (("RTX3090",), ("RTX4090",))
+    with caplog.at_level(logging.WARNING, logger="cascade.config"):
+        assert_launch_ready(c, role="trainer")
+    assert any("excludes RTX4090" in r.getMessage() and "only RTX3090" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_wall_table_that_fits_is_silent(cfg, caplog):
+    import logging
+
+    from cascade.shared.config import funded_sku_wall_fit
+
+    c = _rent_cfg(cfg, epoch_blocks=3600, skus=("RTX4090", "L40S"),
+                  walls={"RTX4090": 13500, "L40S": 10200})
+    assert funded_sku_wall_fit(c) == (("RTX4090", "L40S"), ())
+    with caplog.at_level(logging.WARNING, logger="cascade.config"):
+        assert_launch_ready(c, role="trainer")
+    assert not [r for r in caplog.records if "funded_sku_wall_seconds" in r.getMessage()]

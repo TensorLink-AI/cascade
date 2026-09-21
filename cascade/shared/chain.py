@@ -28,6 +28,8 @@ from typing import Any
 from .config import ChainConfig
 
 log = logging.getLogger("cascade.chain")
+# Distinct bulk-decode failure causes already warned about (see poll_commitments).
+_bulk_decode_warned: set[str] = set()
 
 
 class ChainError(RuntimeError):
@@ -497,8 +499,17 @@ class ChainClient:
                 # ourselves: ONE query_map for the netuid, tolerant per-entry
                 # decode (~1s), instead of N per-UID queries (~13 min live —
                 # long enough to blow the provisioner's rental window).
-                log.warning("bulk revealed-commitment decode failed (%s); "
-                            "reading the raw store map", e)
+                # Once per distinct cause: one malformed on-chain commit makes
+                # this fire on EVERY poll (~2 min) on every node — noise that
+                # hides a real problem. The raw path names the offending uid.
+                cause = f"{type(e).__name__}: {e}"[:200]
+                if cause not in _bulk_decode_warned:
+                    _bulk_decode_warned.add(cause)
+                    log.warning("bulk revealed-commitment decode failed (%s); reading "
+                                "the raw store map (this warning repeats only when the "
+                                "cause changes)", e)
+                else:
+                    log.debug("bulk revealed-commitment decode failed (%s); raw store map", e)
                 try:
                     return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys,
                                                   include_history=include_history)

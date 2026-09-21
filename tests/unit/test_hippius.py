@@ -147,6 +147,18 @@ def test_is_retryable_hub_error_classifies_transient_vs_permanent():
     assert not hippius._is_retryable_hub_error(RuntimeError("404 repo not found"))
 
 
+def test_read_stall_is_retryable():
+    # hippius_core's read-stall watchdog under "chunk N failed" (2026-09-21:
+    # the era-king warm-start fetch gave up after 1 of 4 attempts on this).
+    inner = RuntimeError("download read stalled: no data for 30s")
+    outer = RuntimeError("chunk 0 failed")
+    outer.__cause__ = inner
+    assert hippius._is_retryable_hub_error(outer) is True
+    assert hippius._is_retryable_hub_error(inner) is True
+    # a bare chunk failure with no transport cause stays permanent
+    assert not hippius._is_retryable_hub_error(RuntimeError("chunk 0 failed"))
+
+
 def test_is_retryable_hub_error_walks_the_cause_chain():
     # hippius_hub wraps transport drops as bare RuntimeError("chunk N failed")
     # with the retryable detail in __cause__ — the classifier must walk it

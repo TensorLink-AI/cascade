@@ -77,6 +77,8 @@ class FakeOps(LegOps):
         self.commits: list[Commitment] = [_commit("KING", REF["KING"], 1)]
         self.failures: dict[str, tuple] = {}
         self.fail_king = False
+        self.king_exc: Exception | None = None   # raised by train_king when set
+        self.rotated: list[tuple[int, str]] = []
         self.king_calls: list[tuple] = []
         self.leg_calls: list[tuple] = []
         self.torn_down: list[tuple[str, float]] = []
@@ -128,7 +130,7 @@ class FakeOps(LegOps):
     def train_king(self, gen, era, block):
         self.king_calls.append((gen.hotkey, era.index, block))
         if self.fail_king:
-            raise RuntimeError("king rent failed")
+            raise self.king_exc or RuntimeError("king rent failed")
         return TrainedEntry(gen.hotkey, gen.uid, "king", gen.ref,
                             _ptr(f"K{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090")
 
@@ -151,6 +153,9 @@ class FakeOps(LegOps):
 
     def retire_king_pod(self, era):
         self.retired.append(era.index)
+
+    def rotate_king_pod(self, era, reason):
+        self.rotated.append((era.index, reason))
 
     # publication
     def publish_manifest(self, manifest):
@@ -895,3 +900,70 @@ def test_seniors_that_could_not_start_are_not_passed_over(cfg, tmp_path):
     assert set(rents) == {"BRAV", "CHAR"}
     assert rents["BRAV"]["passed_over"] == [] and rents["CHAR"]["passed_over"] == []
     assert q.get("ALFA").status == "queued"
+
+
+# ── king pod rotation: a booted pod that keeps failing is a lemon host ────────
+
+
+def test_king_pod_rotates_after_the_same_pod_retry_is_spent(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    ops.fail_king = True
+    ops.king_exc = RuntimeError("king training failed on remote: hippius read stalled")
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    sched.tick(client, b0)
+    _join(sched)
+    cur = sched.state.current
+    # first failure: the same pod gets ONE retry — nothing rotated
+    assert cur.king_leg_failures == 1 and ops.rotated == []
+    assert "hippius read stalled" in cur.king_leg_failed
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b0 + 1)
+    # second consecutive failure on that pod: rotated (host quarantined, pod
+    # torn down by the runner), counter reset so the NEXT pod gets its own retry
+    assert [i for i, _ in ops.rotated] == [cur.index]
+    assert "failed 2x on this pod" in ops.rotated[0][1]
+    assert cur.king_leg_failures == 0
+    _advance(clock, ops, sched, client, from_block=b0 + 1, to_block=b0 + 2)
+    assert len(ops.rotated) == 1 and cur.king_leg_failures == 1
+    # the leg lands on the fresh pod: counters clear
+    ops.fail_king = False
+    _advance(clock, ops, sched, client, from_block=b0 + 2, to_block=b0 + 3)
+    assert cur.king_entry is not None
+    assert cur.king_leg_failures == 0 and cur.king_leg_failed == ""
+
+
+def test_king_pod_rotates_at_once_on_a_transport_failure(cfg, tmp_path):
+    from cascade.trainer.remote import RemoteDispatchError
+
+    armed = _armed(cfg)
+    clock = Clock()
+
+    sched, ops = _sched(armed, tmp_path, clock)
+    ops.fail_king = True
+    ops.king_exc = RemoteDispatchError("remote king on funded-king: pod unreachable for 901s",
+                                       returncode=255)
+    client = FakeClient()
+    b0 = armed.round.rolling_from_block + 5
+    sched.tick(client, b0)
+    _join(sched)
+    cur = sched.state.current
+    assert [i for i, _ in ops.rotated] == [cur.index]
+    assert cur.king_leg_failures == 0            # fresh pod next tick
+    assert cur.king_entry is None
+
+
+def test_king_pod_rotation_state_round_trips(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    ops.fail_king = True
+    client = FakeClient()
+    b0 = armed.round.rolling_from_block + 5
+    sched.tick(client, b0)
+    _join(sched)
+    assert sched.state.current.king_leg_failures == 1
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops)
+    assert sched2.state.current.king_leg_failures == 1
