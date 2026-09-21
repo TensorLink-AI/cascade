@@ -171,3 +171,53 @@ def test_state_and_registry_files_live_under_the_work_root(tmp_path):
     from cascade.trainer.rolling import STATE_FILE
 
     assert Path(STATE_FILE).name == "era_state.json"
+
+
+# ── rolling's operator-lane fallback shares ONE gated, live-refreshed pool ──
+
+def test_rolling_fallback_pool_is_shared_gated_and_reloads_hosts_toml(tmp_path, monkeypatch):
+    from cascade.trainer.loop import _FinalLanePool
+
+    hosts_toml = tmp_path / "hosts.toml"
+
+    def _lane(name, host, cuda="0"):
+        return (f'[[host]]\nname = "{name}"\nhost = "{host}"\nport = 22\nuser = "root"\n'
+                f'key_path = "~/.ssh/k"\nremote_python = "python"\nworkdir = "/root/cascade"\n'
+                f'cuda_device = "{cuda}"\nstage = "final"\n')
+    hosts_toml.write_text(_lane("lane-a", "10.0.0.1"))
+    verdict = {}
+    fake = SimpleNamespace(remote_hosts_path=hosts_toml, remote_hosts=(),
+                           _operator_lane_gate=lambda h: verdict.get(h.name))
+    fake._rolling_final_hosts = TrainerRunner._rolling_final_hosts.__get__(fake)
+    fake._rolling_lane_pool = TrainerRunner._rolling_lane_pool.__get__(fake)
+    pool = fake._rolling_lane_pool()
+    assert isinstance(pool, _FinalLanePool) and fake._rolling_lane_pool() is pool   # one pool
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    # a lane hand-rented after startup joins on the next refresh — through the gate
+    hosts_toml.write_text(_lane("lane-a", "10.0.0.1") + _lane("lane-b", "10.0.0.2")
+                          + _lane("lane-dead", "10.0.0.3"))
+    verdict["lane-dead"] = "ssh rc=255: refused"
+    pool._absorb_new()
+    assert sorted(h.name for h in pool.known_hosts()) == ["lane-a", "lane-b"]
+    # occupancy persists across legs: a lane checked out by one leg is not
+    # offered to the next
+    first = pool.get(block=False)
+    assert first.name == "lane-a" and pool.get(block=False).name == "lane-b" and pool.empty()
+
+
+def test_round_failure_never_tears_down_rolling_pods():
+    calls = []
+
+    def fake_teardown(why, **kw):
+        calls.append(why)
+    rolling = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
+                              _funded_epoch_end_wall=None)
+    rolling.__dict__["_rolling_sched"] = object()
+    assert TrainerRunner._after_round_failure(rolling) == "rolling-keep" and calls == []
+    legacy_in_epoch = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
+                                      _funded_epoch_end_wall=time.time() + 3600)
+    assert TrainerRunner._after_round_failure(legacy_in_epoch) == "keep" and calls == []
+    legacy_past = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
+                                  _funded_epoch_end_wall=time.time() - 1)
+    assert TrainerRunner._after_round_failure(legacy_past) == "teardown"
+    assert calls == ["round failed before its bench"]

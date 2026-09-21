@@ -3535,6 +3535,32 @@ class TrainerRunner:
         if pod is not None:
             self._teardown_funded_pod(pod)
 
+    def _after_round_failure(self) -> str:
+        """What happens to the payer pods kept for a bench when the service
+        loop's round body raised. Returns the action taken (for tests).
+
+        * rolling (DEC-CA-0043): NOTHING — the scheduler owns every pod's
+          lifetime (a pod is kept from leg end until its completion bench
+          finishes, and ``_funded_epoch_end_wall`` is None by design), so a
+          transient in one tick (a chain read blip in the intake, a storage
+          hiccup in a settlement) must not yank every mid-bench pod;
+        * legacy round inside its epoch: KEEP — the same round retries,
+          reuses the persisted legs and benches on those pods (2026-09-21
+          02:30: three complete payer pods were torn down and the retry's
+          bench had nowhere to run); the boundary sweep reaps them if the
+          retry never publishes;
+        * otherwise: tear down — no sweep is coming for them."""
+        if self.__dict__.get("_rolling_sched") is not None:
+            log.info("rolling tick failed: pods stay (the scheduler owns their lifetimes)")
+            return "rolling-keep"
+        if _kept_pods_survive_failure(getattr(self, "_funded_epoch_end_wall", None),
+                                      time.time()):
+            log.info("round failed inside its epoch: kept funded pods stay for the "
+                     "retry's bench")
+            return "keep"
+        self._teardown_kept_funded_pods("round failed before its bench")
+        return "teardown"
+
     def _teardown_kept_funded_pods(self, why: str, *, round_id: str | None = None,
                                    exclude_rounds: Iterable[str] = ()) -> None:
         """Tear down the pods still kept for a bench — the sweep never ran,
@@ -7405,11 +7431,7 @@ class TrainerRunner:
             except _FundedOperatorFallback:
                 log.warning("rolling: %s — no marketplace capacity; running on an "
                             "OPERATOR lane (operator-billed)", gen.hotkey[:12])
-                hosts = [h for h in self._hosts_for("final")]
-                from .remote import is_profile_only
-
-                hosts = [h for h in hosts if not is_profile_only(h)]
-                pool = _FinalLanePool(hosts, lambda: hosts)
+                pool = self._rolling_lane_pool()
                 used: list = []
                 digest = parse_vault_ref(gen.ref)
                 prepare = ((lambda h, d=digest: self._stage_vault_zip_on(h, d))
@@ -7431,6 +7453,35 @@ class TrainerRunner:
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
                                     role="challenger", hotkey=gen.hotkey, suffix=suffix)
         return entry
+
+    def _rolling_final_hosts(self) -> list:
+        """The operator FINAL lanes on file NOW: hosts.toml re-read every call
+        when the trainer runs from a file (a lane hand-rented after startup is
+        otherwise invisible to rolling — the legacy round path reloads per
+        round, rolling never entered it), profile-only entries excluded."""
+        from .remote import is_profile_only, load_hosts
+
+        if getattr(self, "remote_hosts_path", None) is not None:
+            hosts = list(load_hosts(self.remote_hosts_path))
+        else:
+            hosts = list(self.remote_hosts or ())
+        return [h for h in hosts
+                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+
+    def _rolling_lane_pool(self):
+        """ONE lane pool for every rolling fallback leg (created lazily): lane
+        occupancy, the join gate's rejections and the dead-pod drain persist
+        across legs. A pool per leg (the first cut) handed every leg the whole
+        fleet as free — two concurrent fallbacks could double-book a lane —
+        and forgot each leg's dead pod for the next one. Lanes join through
+        :meth:`_operator_lane_gate` (ssh, worker runtime, bench floor) from a
+        live hosts.toml refresh."""
+        pool = self.__dict__.get("_rolling_lane_pool_obj")
+        if pool is None:
+            pool = _FinalLanePool(self._rolling_final_hosts(), self._rolling_final_hosts,
+                                  gate_fn=self._operator_lane_gate)
+            self.__dict__["_rolling_lane_pool_obj"] = pool
+        return pool
 
     def _rolling_train_king(self, gen, era, block: int):
         """The era king's leg on the operator's JIT pod (kept for the era: the
@@ -8003,17 +8054,5 @@ class TrainerRunner:
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)
-                # A round that died between its funded legs and its bench
-                # leaves payer pods kept for a sweep that will never come —
-                # unless the SAME round retries inside its epoch: the retry
-                # reuses the persisted legs and benches on those pods
-                # (2026-09-21 02:30: three complete payer pods were torn down
-                # and the retry's bench had nowhere to run). The boundary
-                # sweep reaps them if the retry never publishes.
-                if _kept_pods_survive_failure(getattr(self, "_funded_epoch_end_wall", None),
-                                              time.time()):
-                    log.info("round failed inside its epoch: kept funded pods stay for "
-                             "the retry's bench")
-                else:
-                    self._teardown_kept_funded_pods("round failed before its bench")
+                self._after_round_failure()
             time.sleep(poll)
