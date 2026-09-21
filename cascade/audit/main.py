@@ -211,6 +211,11 @@ def audit_receipt(
 ) -> list[CheckResult]:
     """Run every check up to ``tier``. Pure orchestration; each check is a small
     function in :mod:`cascade.audit.checks` / :mod:`cascade.audit.rederive`."""
+    from ..shared.activation import apply_receipt_activation
+
+    # DEC-CA-0044: a receipt judged under a rollover the validators decided
+    # on chain replays under THAT block, not the config this auditor loaded.
+    cfg = apply_receipt_activation(cfg, receipt)
     roster = None
     with contextlib.suppress(Exception):  # absent on any pre-funded round; SKIP handles it
         roster = json.loads(_fetch_text(

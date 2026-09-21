@@ -319,10 +319,16 @@ def main(argv: list[str] | None = None) -> int:
                      bench_device)
             bench_eval_fn = make_bench_eval_fn(cfg, device=bench_device)
 
+    from ..shared.activation import ActivationStore
+
     runner = TrainerRunner(
         cfg=cfg,
         base_trainer=base_trainer,
         work_root=args.work_root,
+        # DEC-CA-0044: the rollover the validators decided, persisted beside
+        # the trainer's other state; the first loop tick resolves it before
+        # any round work.
+        activation_store=ActivationStore(Path(args.work_root) / "activation_state.json"),
         wallet=client.wallet(),
         remote_hosts=remote_hosts,
         remote_hosts_path=args.remote_hosts,

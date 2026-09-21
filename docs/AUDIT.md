@@ -158,6 +158,20 @@ label, which `entry_scores` does not record (the same Tier-0 limit as
 compares only when its replay could resolve domains). All of them are
 drop-when-default, so older receipts verify unchanged.
 
+A receipt judged after the validators decided the DEC-CA-0043 rollover on
+chain (DEC-CA-0044, stake-weighted activation) records that block as
+`activation_block` (drop-when-default; absent when the rollover is typed
+into `chain.toml` or none has been decided). The audit REPLAYS the round
+under that block — every DEC-CA-0043 rule (era envelope, tenure in blocks,
+the grid switch, the increment-unit max-T) is evaluated as if the block had
+been typed in — so a `chain.toml` with the rollover keys at 0 still verifies
+a post-rollover receipt. The `activation` check then verifies the block
+itself: it must be a boundary of the grid before it, and, with a chain, the
+validators' current on-chain notes (`cascade-ready:1:<feature>:<lock>:<block>`)
+must name the SAME block by the configured stake threshold — a validator
+that stamped a block the fleet did not agree on FAILS; without a chain the
+check WARNs, like every chain-dependent half.
+
 **Tier 1** proves the corpus provenance: the pinned generator, run at the
 receipt's `generation_seed` in the same sandbox, reproduces the exact
 `corpus_digest` the trainer claimed to have trained on.

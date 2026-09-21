@@ -661,6 +661,17 @@ def _run(args) -> int:
     import tomllib
 
     cfg = load_chain_config(args.chain_toml)
+    # Stake-weighted activation (DEC-CA-0044): the provisioner keys its grid
+    # off the config, so learn the fleet's resolved rollover ONCE at startup
+    # (the validators' notes / the boundary tally). Best-effort — a chain
+    # flake here means the typed-in config, same as before this existed;
+    # restart the provisioner after a lock-in to pick it up.
+    from ..shared.activation import startup_activation
+    from ..shared.chain import ChainClient as _ChainClient
+
+    cfg = startup_activation(
+        cfg, _ChainClient.from_config(cfg, network=args.network),
+        store_path=Path(args.work_root) / "activation_state.json")
     raw = tomllib.loads(Path(args.config).read_text(encoding="utf-8"))
     top = raw.get("provisioner", {})
     policy = build_policy(raw, epoch_blocks=cfg.round.epoch_blocks)

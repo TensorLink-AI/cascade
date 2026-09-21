@@ -1932,6 +1932,46 @@ class ValidatorConfig:
 
 
 @dataclass(frozen=True)
+class ActivationConfig:
+    """Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044).
+
+    Each upgraded validator writes a plain on-chain commitment
+    ``cascade-ready:1:<feature>:…`` from its hotkey. At every boundary of
+    the grid in force, every node adds up the stake of the permit-holding
+    validators that have signalled ``feature``; the first boundary where
+    the signed share reaches ``threshold`` LOCKS IN, and the rollover is
+    the next boundary after it. Lock-in is one-way: a node that has seen it
+    persists the block and never re-evaluates. The typed-in DEC-CA-0043
+    keys (``rolling_from_block`` etc.) always win over the resolved block
+    — the owner override. ``feature = ""`` disables signalling and
+    resolution entirely (the typed-in keys are then the only way to arm).
+    """
+
+    feature: str = ""
+    # Fraction of ELIGIBLE validator stake (permit holders; see
+    # ``dormant_after_blocks``) that must have signalled for lock-in.
+    threshold: float = 0.51
+    # The grid from the resolved rollover (``epoch_blocks`` after it, the
+    # loaded ``epoch_blocks`` becoming ``epoch_blocks_prev``). 0 = keep the
+    # loaded grid (the rollover still switches, prev == after).
+    epoch_blocks_after: int = 0
+    # A permit holder whose ``last_update`` (last weight-set) is older than
+    # this many blocks at the tally block is left OUT of the eligible stake,
+    # so a dead validator's stake cannot hold the number down. 0 = count
+    # every permit holder.
+    dormant_after_blocks: int = 0
+    # RUNTIME ONLY (never read from chain.toml): the rollover block
+    # ``apply_activation`` wrote into this config's DEC-CA-0043 keys, so a
+    # resolved rollover is distinguishable from a typed-in one (the typed
+    # one is the owner override and is never re-resolved).
+    resolved_block: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.feature)
+
+
+@dataclass(frozen=True)
 class ChainConfig:
     schema_version: int
     subnet: SubnetConfig
@@ -1947,6 +1987,7 @@ class ChainConfig:
     validator: ValidatorConfig
     wandb: WandbConfig = field(default_factory=WandbConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    activation: ActivationConfig = field(default_factory=ActivationConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -2103,6 +2144,102 @@ def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
     if act and prev > 0 and int(block) < act:
         return max(1, prev)
     return eb
+
+
+def check_rollover_alignment(
+    *,
+    rolling_from_block: int,
+    era_king_from_block: int,
+    tenure_blocks_from_block: int,
+    epoch_blocks: int,
+    epoch_blocks_prev: int,
+    epoch_activation_block: int,
+    era_settlements: int,
+    cohort_maxt_from_block: int,
+    cohort_maxt_increment_from_block: int,
+    funded_pods: str,
+    funded_king_rent: bool,
+) -> int:
+    """The DEC-CA-0043 rollover invariants on plain values.
+
+    Returns the rollover block (0 when no rollover key is set). Raises
+    ``ValueError`` on a split, misaligned or under-configured rollover — the
+    same refusal for a value typed into chain.toml (``load_chain_config``)
+    and for one resolved from validator signals at runtime
+    (:func:`cascade.shared.activation.apply_activation`), so a runtime
+    rollover can never reach a state the loader would have refused.
+    """
+    _eb, _ebp, _eab = int(epoch_blocks), int(epoch_blocks_prev), int(epoch_activation_block)
+    _rollover_keys = {
+        "[round] rolling_from_block": int(rolling_from_block),
+        "[scoring] era_king_from_block": int(era_king_from_block),
+        "[scoring] tenure_blocks_from_block": int(tenure_blocks_from_block),
+    }
+    _rollover_set = {k: v for k, v in _rollover_keys.items() if v}
+    if not _rollover_set:
+        return 0
+    if len(set(_rollover_set.values())) != 1:
+        raise ValueError(
+            "DEC-CA-0043 rollover keys must all name the same block: "
+            + ", ".join(f"{k}={v}" for k, v in _rollover_keys.items()))
+    _rollover = next(iter(_rollover_set.values()))
+    if len(_rollover_set) != len(_rollover_keys):
+        missing = [k for k, v in _rollover_keys.items() if not v]
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} is set on "
+            f"{sorted(_rollover_set)} but not on {missing} — every rollover "
+            "key flips at ONE block")
+    if _eab and _eab != _rollover:
+        raise ValueError(
+            f"[round] epoch_activation_block={_eab} must equal the DEC-CA-0043 "
+            f"rollover block {_rollover} (the grid switch and the era switch "
+            "land on one boundary)")
+    _grid_before = _ebp if (_eab and _ebp) else _eb
+    if _rollover % _grid_before or _rollover % _eb:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must be a boundary of the "
+            f"grid before it ({_grid_before}) and of epoch_blocks={_eb}")
+    _era_settlements = int(era_settlements)
+    if _era_settlements < 1:
+        raise ValueError(
+            "[round] era_settlements must be >= 1 when a DEC-CA-0043 rollover "
+            "block is set")
+    _era_len = _eb * _era_settlements
+    if _rollover % _era_len:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must start an era: a "
+            f"multiple of epoch_blocks × era_settlements = {_era_len} (the era "
+            "grid is absolute — block // era length — so the rollover boundary "
+            "is only the first era's start when it lies on that grid)")
+    _cmi = int(cohort_maxt_increment_from_block)
+    _cm = int(cohort_maxt_from_block)
+    _era_king = int(era_king_from_block)
+    if not (_era_king >= _cmi >= _cm):
+        raise ValueError(
+            f"[scoring] era_king_from_block={_era_king} must be >= "
+            f"cohort_maxt_increment_from_block={_cmi} >= "
+            f"cohort_maxt_from_block={_cm} (the era king stacks on the "
+            "increment-unit max-T)")
+    if _cmi == 0 or _cm == 0:
+        raise ValueError(
+            "[scoring] cohort_maxt_from_block and cohort_maxt_increment_from_block "
+            "must be set when era_king_from_block is (the era king is judged "
+            "under the increment-unit max-T)")
+    if not _eab:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must also switch the grid: set "
+            "[round] epoch_blocks_prev (the grid before it) and "
+            f"epoch_activation_block = {_rollover} — without the switch rolling "
+            f"intake would run on the old grid with {_era_settlements}-round eras "
+            "of the old length, silently")
+    _funded_pods = str(funded_pods or "off")
+    if _funded_pods != "rent" or not bool(funded_king_rent):
+        raise ValueError(
+            "DEC-CA-0043 rolling intake needs [round] funded_pods = \"rent\" and "
+            f"funded_king_rent = true (got funded_pods={_funded_pods!r}, "
+            f"funded_king_rent={bool(funded_king_rent)}): legs and "
+            "the era king are rented just-in-time, there is no round-wide pool")
+    return int(_rollover)
 
 
 _BLOCK_SECONDS = 12.0
@@ -2309,77 +2446,44 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # rollover block, aligned to the grid on both sides of it, and the era
     # king gate never precedes the corrections it stacks on. A misaligned or
     # split rollover would let one node open an era where another still runs
-    # boundary rounds — refuse to load rather than fork the fleet.
+    # boundary rounds — refuse to load rather than fork the fleet. The same
+    # check guards a rollover resolved at runtime from validator signals
+    # (DEC-CA-0044, ``cascade.shared.activation.apply_activation``).
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
     _era_settlements = max(0, int(r.get("era_settlements", 0) or 0))
-    _rollover_keys = {
-        "[round] rolling_from_block": _rolling,
-        "[scoring] era_king_from_block": _era_king,
-        "[scoring] tenure_blocks_from_block": _tenure_blocks,
-    }
-    _rollover_set = {k: v for k, v in _rollover_keys.items() if v}
-    if _rollover_set:
-        if len(set(_rollover_set.values())) != 1:
-            raise ValueError(
-                "DEC-CA-0043 rollover keys must all name the same block: "
-                + ", ".join(f"{k}={v}" for k, v in _rollover_keys.items()))
-        _rollover = next(iter(_rollover_set.values()))
-        if len(_rollover_set) != len(_rollover_keys):
-            missing = [k for k, v in _rollover_keys.items() if not v]
-            raise ValueError(
-                f"DEC-CA-0043 rollover block {_rollover} is set on "
-                f"{sorted(_rollover_set)} but not on {missing} — every rollover "
-                "key flips at ONE block")
-        if _eab and _eab != _rollover:
-            raise ValueError(
-                f"[round] epoch_activation_block={_eab} must equal the DEC-CA-0043 "
-                f"rollover block {_rollover} (the grid switch and the era switch "
-                "land on one boundary)")
-        _grid_before = _ebp if (_eab and _ebp) else _eb
-        if _rollover % _grid_before or _rollover % _eb:
-            raise ValueError(
-                f"DEC-CA-0043 rollover block {_rollover} must be a boundary of the "
-                f"grid before it ({_grid_before}) and of epoch_blocks={_eb}")
-        if _era_settlements < 1:
-            raise ValueError(
-                "[round] era_settlements must be >= 1 when a DEC-CA-0043 rollover "
-                "block is set")
-        _era_len = _eb * _era_settlements
-        if _rollover % _era_len:
-            raise ValueError(
-                f"DEC-CA-0043 rollover block {_rollover} must start an era: a "
-                f"multiple of epoch_blocks × era_settlements = {_era_len} (the era "
-                "grid is absolute — block // era length — so the rollover boundary "
-                "is only the first era's start when it lies on that grid)")
-        _cmi = max(0, int(s.get("cohort_maxt_increment_from_block", 0) or 0))
-        _cm = max(0, int(s.get("cohort_maxt_from_block", 0) or 0))
-        if not (_era_king >= _cmi >= _cm):
-            raise ValueError(
-                f"[scoring] era_king_from_block={_era_king} must be >= "
-                f"cohort_maxt_increment_from_block={_cmi} >= "
-                f"cohort_maxt_from_block={_cm} (the era king stacks on the "
-                "increment-unit max-T)")
-        if _cmi == 0 or _cm == 0:
-            raise ValueError(
-                "[scoring] cohort_maxt_from_block and cohort_maxt_increment_from_block "
-                "must be set when era_king_from_block is (the era king is judged "
-                "under the increment-unit max-T)")
-        if not _eab:
-            raise ValueError(
-                f"DEC-CA-0043 rollover block {_rollover} must also switch the grid: set "
-                "[round] epoch_blocks_prev (the grid before it) and "
-                f"epoch_activation_block = {_rollover} — without the switch rolling "
-                f"intake would run on the old grid with {_era_settlements}-round eras "
-                "of the old length, silently")
-        _funded_pods = str(r.get("funded_pods", "off") or "off")
-        if _funded_pods != "rent" or not bool(r.get("funded_king_rent", False)):
-            raise ValueError(
-                "DEC-CA-0043 rolling intake needs [round] funded_pods = \"rent\" and "
-                f"funded_king_rent = true (got funded_pods={_funded_pods!r}, "
-                f"funded_king_rent={bool(r.get('funded_king_rent', False))}): legs and "
-                "the era king are rented just-in-time, there is no round-wide pool")
+    check_rollover_alignment(
+        rolling_from_block=_rolling,
+        era_king_from_block=_era_king,
+        tenure_blocks_from_block=_tenure_blocks,
+        epoch_blocks=_eb,
+        epoch_blocks_prev=_ebp,
+        epoch_activation_block=_eab,
+        era_settlements=_era_settlements,
+        cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
+        cohort_maxt_increment_from_block=max(
+            0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
+        funded_pods=str(r.get("funded_pods", "off") or "off"),
+        funded_king_rent=bool(r.get("funded_king_rent", False)),
+    )
+
+    # Stake-weighted activation (DEC-CA-0044): validators signal readiness on
+    # chain; the rollover block is resolved from those signals at runtime when
+    # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
+    # never reaches the resolver.
+    ac = raw.get("activation", {})
+    _act_threshold = float(ac.get("threshold", 0.51))
+    if not (0.0 < _act_threshold <= 1.0):
+        raise ValueError(
+            f"[activation] threshold={_act_threshold} must be in (0, 1] (a fraction "
+            "of eligible validator stake)")
+    _act_grid_after = max(0, int(ac.get("epoch_blocks_after", 0) or 0))
+    if _act_grid_after and _eb % _act_grid_after:
+        raise ValueError(
+            f"[activation] epoch_blocks_after={_act_grid_after} must divide "
+            f"[round] epoch_blocks={_eb}: the resolved rollover is a boundary of "
+            "the grid before it and must be one of the grid after it too")
 
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
@@ -2726,6 +2830,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
             funded_bench_verify_tolerance=float(
                 tm.get("funded_bench_verify_tolerance", 0.02)),
+        ),
+        activation=ActivationConfig(
+            feature=str(ac.get("feature", "") or "").strip(),
+            threshold=_act_threshold,
+            epoch_blocks_after=_act_grid_after,
+            dormant_after_blocks=max(0, int(ac.get("dormant_after_blocks", 0) or 0)),
         ),
         raw=raw,
     )

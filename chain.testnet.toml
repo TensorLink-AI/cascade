@@ -578,3 +578,14 @@ scratch_shadow_every_rounds = 2
                                 # checkpoint (see mainnet chain.toml for the full note). Trainer
                                 # restart only; arm here first and check the round's BenchScores
                                 # step down (finished form scores lower) before mainnet.
+
+[activation]
+# DEC-CA-0044 stake-weighted activation (see chain.toml). INERT here: the
+# DEC-CA-0043 keys above are typed in (600), and a typed-in rollover always
+# wins. To exercise the mechanism on testnet set every rollover key back to
+# 0 (and epoch_blocks = 300, epoch_blocks_prev = 0, epoch_activation_block = 0)
+# and let the validators' notes decide.
+feature = "rolling-era-king"
+threshold = 0.51
+epoch_blocks_after = 150
+dormant_after_blocks = 0

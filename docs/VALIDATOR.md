@@ -132,6 +132,28 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   Treat these announcements as time-boxed: pull, `uv sync --frozen`, and restart
   **before the announced round boundary**, and confirm your weight vector agrees
   with the other validators on the round after.
+- **The rolling-rounds switch is decided on chain, by validator stake
+  (DEC-CA-0044).** You do not have to hit an announced block for the
+  DEC-CA-0043 rollover (rolling intake, the era king, tenure in blocks, the
+  3600 → 900 grid). When your validator starts on a release carrying it, it
+  posts a small plain commitment from your hotkey — `cascade-ready:1:rolling-era-king:0:0`
+  — once (you'll see `activation: signalled …` in the log). At every round
+  boundary every validator adds up the stake of the permit-holding
+  validators that have posted it; the first boundary where that share
+  reaches `[activation] threshold` (51%) locks in, and the switch happens at
+  the **next** boundary. Your log then says `activation: … LOCKED IN at
+  boundary B — rollover at block R` and `DEC-CA-0043 rollover ARMED`, the
+  block is saved beside your state file (`activation_state.json`) and
+  stamped on every receipt you sign (`activation_block`), and your note is
+  rewritten with the block so a validator that restarts or joins late
+  adopts it from the notes alone. Lock-in is one-way; stake drifting back
+  under the line changes nothing. A validator still on the old release at
+  block R falls out of consensus from that block until upgraded, exactly as
+  with a typed-in block — upgrade as soon as the release is announced, not
+  when the count crosses. A rollover typed into `chain.toml` always wins
+  over the resolved one (the owner override). `status/chain.json` carries
+  the live tally (`activation.tally.ratio`, who has signed) for the
+  dashboards.
 - **CPU is enough.** A duel scores in well under a minute on CPU. The GPU-heavy
   parts (GIFT-Eval gate, cascade bench) can be offloaded with
   `--eval-hosts eval_hosts.toml` — one `[[host]]` entry, re-read at every eval,

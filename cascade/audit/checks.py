@@ -181,6 +181,60 @@ def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     return _ok(name, "generation + training seeds derive from base_seed")
 
 
+def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
+                     client: object | None = None) -> CheckResult:
+    """DEC-CA-0044: the rollover block a receipt records was decided by the
+    validators, not invented by one.
+
+    A receipt without ``activation_block`` PASSES (pre-field, or the
+    rollover is typed into chain.toml). A recorded block must be a boundary
+    of the grid before it; with a chain, the validators' current notes
+    must agree on the SAME block by the configured stake threshold (WARN
+    without a chain, like every other chain-dependent half). ``cfg`` is the
+    config the audit replays under — already carrying the recorded block
+    (``apply_receipt_activation``), so the era checks that follow use it.
+    """
+    from ..shared.activation import agreed_activation, resolved_rollover
+
+    name = "activation"
+    block = int(receipt.activation_block or 0)
+    if not block:
+        return _ok(name, "no chain-decided rollover recorded (typed-in config applies)")
+    if not cfg.activation.enabled:
+        return _fail(name, f"receipt records activation_block {block} but [activation] "
+                           "is off in the loaded config")
+    applied = resolved_rollover(cfg)
+    if applied and applied != block:
+        return _fail(name, f"recorded activation_block {block} != the rollover the audit "
+                           f"config carries ({applied})")
+    grid_before = int(cfg.round.epoch_blocks_prev or cfg.round.epoch_blocks)
+    if block % max(1, grid_before):
+        return _fail(name, f"activation_block {block} is not a boundary of the grid before "
+                           f"it ({grid_before})")
+    if client is None:
+        return _warn(name, f"rollover {block} recorded; validator agreement not verified "
+                           "(no chain)")
+    try:
+        validators = list(client.validator_stakes())  # type: ignore[attr-defined]
+        signals = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        now_block = int(client.current_block())  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return _warn(name, f"rollover {block} recorded; chain read failed ({e})")
+    agreed = agreed_activation(cfg.activation.feature, validators, signals,
+                               threshold=cfg.activation.threshold, block=now_block,
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks)
+    if agreed is None:
+        return _warn(name, f"rollover {block} recorded; validators holding "
+                           f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
+                           "block in their notes")
+    lock, act = agreed
+    if act != block:
+        return _fail(name, f"recorded activation_block {block} != the block validators "
+                           f"agree on ({act}, locked in at {lock})")
+    return _ok(name, f"rollover {block} agreed by validators holding "
+                     f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
+
+
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
     """DEC-CA-0043 era envelope, replayed under the receipt's own block.
 
@@ -1231,6 +1285,7 @@ def run_tier0(
         check_base_seed(receipt),
         check_round_seeds(receipt, cfg),
         check_epoch_alignment(receipt, cfg),
+        check_activation(receipt, cfg, client),
         check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),

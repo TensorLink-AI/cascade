@@ -281,6 +281,8 @@ epoch_activation_block = 0
 # epoch_blocks = 900, epoch_blocks_prev = 3600, epoch_activation_block =
 # ROLLOVER (3h grid); ROLLOVER % 3600 == 0. Load-checked. Do NOT arm before
 # the six external validators run a release carrying the era envelope.
+# With every key at 0 the block is DECIDED ON CHAIN by validator stake
+# ([activation] below, DEC-CA-0044); typing a block here overrides that.
 rolling_from_block = 0
 # Settlements per era (consecutive boundaries sharing one set of training
 # seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
@@ -1067,3 +1069,34 @@ scratch_shadow_every_rounds = 0
                                 # back to benching the raw checkpoint. Costs ~fraction x one
                                 # training leg per benched checkpoint on the same pod; size
                                 # [eval] bench_hold_max_hours accordingly. 0.0/absent = off.
+
+[activation]
+# Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044). Each
+# validator on a release carrying this feature posts a plain on-chain
+# commitment ("cascade-ready:1:<feature>:0:0") from its hotkey at startup.
+# At every boundary of the grid in force, every node sums the stake of the
+# permit-holding validators that have posted it; the first boundary where
+# that share reaches `threshold` LOCKS IN (one-way), and the rollover is the
+# NEXT boundary — the round in which the count crossed finishes on the old
+# rules, the one after starts on the new (rolling intake, era king, tenure
+# in blocks, the grid switch below, and the increment-unit max-T all flip
+# there). A validator that has locked in rewrites its note with the block,
+# so a restarted or late node adopts the block validators holding
+# `threshold` of stake all name — no archive node needed. The trainer and
+# the provisioner READ the same decision (restart them at the lock-in
+# boundary, or earlier); the validator stamps the block on every receipt
+# (`activation_block`) so the audit replays each round under it. The
+# typed-in DEC-CA-0043 keys ([round] rolling_from_block etc.) always win
+# over the resolved block — the owner override. "" = off.
+feature = "rolling-era-king"
+# Fraction of ELIGIBLE validator stake (permit holders) that must have
+# signalled. A bare majority: check the owner validator's own share before
+# relying on this — over half and it decides alone.
+threshold = 0.51
+# The grid from the rollover ([round] epoch_blocks after it; the loaded 3600
+# becomes epoch_blocks_prev). Must divide epoch_blocks. 0 = keep the grid.
+epoch_blocks_after = 900
+# Leave OUT permit holders whose last weight-set is older than this many
+# blocks at the tally, so a dead validator's stake cannot hold the number
+# down. 0 = count every permit holder.
+dormant_after_blocks = 0

@@ -80,6 +80,7 @@ def build_chain_status(
     network: str = "",
     as_of: str = "",
     economics: dict | None = None,
+    activation: dict | None = None,
 ) -> dict:
     """Assemble the status document (pure — chain I/O stays with the caller).
 
@@ -91,12 +92,19 @@ def build_chain_status(
 
     ``economics`` is ``ChainClient.subnet_economics()`` output (alpha price,
     TAO emissions/day) and is included verbatim when provided — the
-    stakeholder scoreboard's Economics cell reads it. Like everything else
-    here it is presentational and unsigned.
+    stakeholder scoreboard's Economics cell reads it. ``activation`` is the
+    validator's stake-weighted activation view (DEC-CA-0044,
+    ``cascade.shared.activation.summary``): feature, threshold, the last
+    boundary tally, lock-in and rollover blocks. Like everything else here
+    it is presentational and unsigned.
     """
     from ..interface.validation import parse_commit
+    from .config import effective_epoch_blocks
 
-    epoch_blocks = max(1, int(cfg.round.epoch_blocks))
+    # The grid IN FORCE at the current block: while a switch is scheduled
+    # (typed in or resolved by activation) the raw field is the post-switch
+    # length and the strip would count boundaries that do not exist yet.
+    epoch_blocks = max(1, int(effective_epoch_blocks(cfg.round, int(current_block))))
     floor = int(cfg.round.commit_floor_block)
     block_time = (
         cfg.round.round_hours * 3600.0 / epoch_blocks
@@ -129,6 +137,7 @@ def build_chain_status(
         "stage_windows": {"heat_seconds": heat_s, "duel_seconds": duel_s},
         "submissions": subs,
         **({"economics": economics} if economics else {}),
+        **({"activation": activation} if activation else {}),
     }
 
 

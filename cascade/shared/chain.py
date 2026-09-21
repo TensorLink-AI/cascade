@@ -25,6 +25,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from .activation import is_signal_payload
 from .config import ChainConfig
 
 log = logging.getLogger("cascade.chain")
@@ -665,9 +666,113 @@ class ChainClient:
             payload, reveal_block = _split_commitment(rec)
             if payload is None:
                 continue
+            # A validator's activation note (DEC-CA-0044) lives in this store;
+            # it is not a submission and must never reach a field builder.
+            if is_signal_payload(payload):
+                continue
             out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
                                   payload=payload, commit_block=int(reveal_block)))
         return out
+
+    # ── stake-weighted activation (DEC-CA-0044) ──────────────────────────────
+
+    def validator_stakes(self, block: int | None = None) -> list:
+        """Every registered hotkey's ``(stake, validator_permit, last_update)``
+        as of ``block`` (the current metagraph when None), for the activation
+        tally. Version-tolerant: ``S`` / ``stake`` for stake, missing
+        ``validator_permit`` ⇒ False, missing ``last_update`` ⇒ 0."""
+        from .activation import ValidatorStake
+
+        sub = self.subtensor()
+        try:
+            kwargs = {"netuid": self.netuid, "lite": True}
+            if block is not None:
+                kwargs["block"] = int(block)
+            meta = sub.metagraph(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        n = int(meta.n)
+        stakes = getattr(meta, "S", None)
+        if stakes is None:
+            stakes = getattr(meta, "stake", None)
+        permits = getattr(meta, "validator_permit", None)
+        updates = getattr(meta, "last_update", None)
+
+        def _at(seq: Any, i: int, default: Any) -> Any:
+            if seq is None:
+                return default
+            try:
+                return seq[i]
+            except (IndexError, TypeError, KeyError):
+                return default
+
+        out = []
+        for uid in range(n):
+            out.append(ValidatorStake(
+                hotkey=str(meta.hotkeys[uid]),
+                stake=float(_at(stakes, uid, 0.0) or 0.0),
+                permit=bool(_at(permits, uid, False)),
+                last_update=int(_at(updates, uid, 0) or 0),
+            ))
+        return out
+
+    def read_plain_commitments(self, block: int | None = None) -> dict[str, str]:
+        """``hotkey → payload`` from the PLAIN commitment store (what
+        ``set_plain_commitment`` writes; NOT the timelock reveal store miners
+        use) as of ``block`` (current when None). Every hotkey's, unfiltered —
+        the activation tally parses and filters."""
+        sub = self.subtensor()
+        get_all = getattr(sub, "get_all_commitments", None)
+        if get_all is not None:
+            try:
+                kwargs: dict[str, Any] = {"netuid": self.netuid}
+                if block is not None:
+                    kwargs["block"] = int(block)
+                raw = get_all(**kwargs) or {}
+                return {str(hk): str(v) for hk, v in dict(raw).items() if isinstance(v, str)}
+            except Exception as e:  # noqa: BLE001
+                log.debug("get_all_commitments failed (%s); falling back per uid", e)
+        try:
+            kwargs = {"netuid": self.netuid, "lite": True}
+            if block is not None:
+                kwargs["block"] = int(block)
+            meta = sub.metagraph(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        out: dict[str, str] = {}
+        for uid in range(int(meta.n)):
+            try:
+                kwargs = {"netuid": self.netuid, "uid": uid}
+                if block is not None:
+                    kwargs["block"] = int(block)
+                rec = sub.get_commitment(**kwargs)
+            except Exception:  # noqa: BLE001
+                continue
+            payload, _ = _split_commitment(rec)
+            if payload:
+                out[str(meta.hotkeys[uid])] = str(payload)
+        return out
+
+    def set_plain_commitment(self, payload: str) -> None:
+        """Validator-side: write ``payload`` to the plain commitment store
+        (``set_commitment``; ``commit`` on older bittensor). One slot per
+        hotkey — the activation note replaces whatever was there."""
+        sub = self.subtensor()
+        w = self.wallet()
+        writer = getattr(sub, "set_commitment", None) or getattr(sub, "commit", None)
+        if writer is None:
+            raise ChainError("set_commitment unavailable on this bittensor build")
+        try:
+            writer(wallet=w, netuid=self.netuid, data=str(payload))
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"set_commitment_failed: {e}") from e
+
+    def hotkey_ss58(self) -> str:
+        """This client's wallet hotkey address ("" without a wallet)."""
+        try:
+            return str(getattr(getattr(self.wallet(), "hotkey", None), "ss58_address", "") or "")
+        except ChainError:
+            return ""
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
         """Miner-side: write the generator pointer via ``set_reveal_commitment``."""

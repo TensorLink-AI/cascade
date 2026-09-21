@@ -34,6 +34,15 @@ from typing import TYPE_CHECKING
 from ..eval.koth import RoundResult, cohort_maxt_lcb_map, evaluate_round
 from ..eval.scoring import WindowScore
 from ..eval.window import EvalWindow
+from ..shared.activation import (
+    ActivationRecord,
+    ActivationStore,
+    Tally,
+    apply_activation,
+    ensure_signal,
+    resolve_activation,
+)
+from ..shared.activation import summary as activation_summary
 from ..shared.config import (
     ChainConfig,
     cohort_maxt_active,
@@ -348,6 +357,120 @@ class ValidatorRunner:
     # deliberately NOT cached: "not there yet" is the normal pre-publish state
     # the pending-bench queue exists to re-probe.
     _bench_report_cache: dict = field(default_factory=dict, repr=False)
+    # Stake-weighted activation (DEC-CA-0044): the persisted decision, the
+    # last boundary tally (for status/chain.json), and the hotkey this
+    # validator signals from. ``activation_store`` None ⇒ nothing persists
+    # (tests); the loop still resolves in memory.
+    activation_store: ActivationStore | None = None
+    _activation: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _activation_tally: Tally | None = field(default=None, repr=False)
+    _signal_hotkey: str = field(default="", repr=False)
+    _signal_sent: str = field(default="", repr=False)
+
+    # ── stake-weighted activation (DEC-CA-0044) ─────────────────────────────
+
+    @property
+    def activation_block(self) -> int:
+        """The rollover block resolved FROM VALIDATOR SIGNALS (0 = none, or
+        typed into chain.toml — the receipt then records nothing)."""
+        rec = self._activation
+        return int(rec.activation_block) if rec.locked and rec.source != "config" else 0
+
+    def apply_activation_block(self, block: int) -> bool:
+        """Rewrite the live config for a rollover at ``block`` (see
+        :func:`cascade.shared.activation.apply_activation`) and refresh every
+        object that captured a config slice — the Cascade controller's grid
+        and reign threshold. Returns True when the config changed."""
+        from ..shared.era import effective_reign_threshold_rounds
+
+        new_cfg = apply_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        if self.cascade is not None:
+            cfg = new_cfg
+            self.cascade.round_cfg = cfg.round
+            self.cascade.threshold_fn = (
+                lambda b: effective_reign_threshold_rounds(cfg.round, cfg.scoring, b))
+        log.warning("activation: DEC-CA-0043 rollover ARMED at block %d — rolling intake, "
+                    "era king, tenure in blocks and the grid switch (%d → %d) all flip "
+                    "there", block, new_cfg.round.epoch_blocks_prev, new_cfg.round.epoch_blocks)
+        return True
+
+    def _activation_step(self, client: object, *, now_block: int) -> None:
+        """One resolver pass: persist any advance, apply a lock-in, keep this
+        validator's on-chain note current. Never raises."""
+        if not self.cfg.activation.enabled:
+            return
+        try:
+            # Say "ready" BEFORE counting, so this validator's own stake is on
+            # chain for the first boundary it tallies.
+            self._ensure_own_signal(client)
+            res = resolve_activation(self.cfg, client, now_block=int(now_block),
+                                     record=self._activation)
+            if res.tally is not None:
+                self._activation_tally = res.tally
+            if res.changed:
+                self._activation = res.record
+                if self.activation_store is not None:
+                    self.activation_store.save(res.record)
+            if self._activation.locked and self._activation.source != "config":
+                self.apply_activation_block(self._activation.activation_block)
+                # The note now carries the agreed block for late joiners.
+                self._ensure_own_signal(client)
+        except Exception as e:  # noqa: BLE001 — activation must never disturb a round
+            log.warning("activation step failed (%s); retrying next poll", e)
+
+    def _ensure_own_signal(self, client: object) -> None:
+        """Write this validator's note when it is not the one already on
+        chain. One chain read per CHANGE of note, not per poll: the payload
+        last confirmed on chain is remembered in-process."""
+        from ..shared.activation import own_signal_payload
+
+        if not self._signal_hotkey:
+            return
+        want = own_signal_payload(self.cfg, self._activation)
+        if want is None or want == self._signal_sent:
+            return
+        try:
+            have = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001 — retry next poll
+            log.debug("activation: note read failed (%s)", e)
+            return
+        if have.get(self._signal_hotkey) == want:
+            self._signal_sent = want                 # confirmed on chain
+            return
+        # Written now, confirmed by the read on the next poll.
+        ensure_signal(client, self.cfg, self._activation, hotkey=self._signal_hotkey,
+                      current=have)
+
+    def _activation_startup(self, client: object) -> None:
+        """Restore the persisted decision, apply it, and run one pass."""
+        if not self.cfg.activation.enabled:
+            return
+        if self.activation_store is not None:
+            self._activation = self.activation_store.load()
+        self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
+        if self._activation.locked and self._activation.source != "config":
+            log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
+                     self._activation.lock_block, self._activation.activation_block,
+                     self._activation.source)
+        try:
+            now_block = int(client.current_block())  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            log.warning("activation: chain unavailable at startup (%s); first poll retries", e)
+            return
+        self._activation_step(client, now_block=now_block)
+
+    def _activation_tick(self, client: object) -> None:
+        if not self.cfg.activation.enabled:
+            return
+        try:
+            now_block = int(client.current_block())  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            log.debug("activation tick skipped (no block): %s", e)
+            return
+        self._activation_step(client, now_block=now_block)
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -1888,6 +2011,7 @@ class ValidatorRunner:
                 reward_uids=reward_uids, weights=weights,
                 validator_hotkey=validator_hotkey,
                 era_start_block=era_start_block, era_base_seed=era_base_seed,
+                activation_block=self.activation_block,
             )
         if outcome is None or windows is None:
             raise ValueError("a scored receipt needs both outcome and windows")
@@ -1917,6 +2041,7 @@ class ValidatorRunner:
             reward_uids=reward_uids, weights=weights,
             validator_hotkey=validator_hotkey,
             era_start_block=era_start_block, era_base_seed=era_base_seed,
+            activation_block=self.activation_block,
         )
 
     def _publish_round_receipt(
@@ -2067,6 +2192,8 @@ class ValidatorRunner:
 
         try:
             econ = getattr(client, "subnet_economics", lambda: None)()
+            activation = (activation_summary(self.cfg, self._activation, self._activation_tally)
+                          if self.cfg.activation.enabled else None)
             status = build_chain_status(
                 self.cfg,
                 current_block=int(client.current_block()),  # type: ignore[attr-defined]
@@ -2074,6 +2201,7 @@ class ValidatorRunner:
                 network=str(getattr(client, "network", "")),
                 as_of=datetime.now(UTC).isoformat(timespec="seconds"),
                 economics=econ,
+                activation=activation,
             )
             publish_chain_status(store, status)
         except Exception as e:  # noqa: BLE001 — telemetry only
@@ -2186,8 +2314,17 @@ class ValidatorRunner:
         if last_round is not None:
             log.info("round %s already handled (persisted/receipt marker); resuming poll",
                      last_round)
+        # Stake-weighted activation (DEC-CA-0044): restore/resolve the
+        # rollover and post this validator's readiness note BEFORE the first
+        # manifest is judged, so a restart never judges a settlement under
+        # the wrong rules.
+        self._activation_startup(client)
         while True:
             try:
+                # The activation tally runs once per boundary (cheap otherwise)
+                # ahead of the manifests, so a lock-in seen this poll governs
+                # the settlement judged this poll.
+                self._activation_tick(client)
                 # Live dashboard telemetry first, every poll: between receipts
                 # this is the page's only fresh view of the chain (stage strip
                 # + live submissions). Best-effort; never affects the round.
@@ -2789,7 +2926,11 @@ def build_runner(
     # Cascade is opt-in ([scoring] cascade_enabled); off ⇒ no controller is wired
     # and the runner is pure KOTH.
     cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
+    # DEC-CA-0044: the resolved rollover persists beside the champion state.
+    activation_store = ActivationStore(
+        Path(cfg.validator.state_db_path).with_name("activation_state.json"))
     return ValidatorRunner(
         cfg=cfg, state=state,
         cache_dir=cache_dir, device=device, cascade=cascade, eval_host_fn=eval_host_fn,
+        activation_store=activation_store,
     )

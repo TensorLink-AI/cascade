@@ -516,6 +516,12 @@ class RoundReceipt:
     # audit checks both.
     era_start_block: int = 0
     era_base_seed: int = 0
+    # Stake-weighted activation (DEC-CA-0044, drop-when-default): the
+    # DEC-CA-0043 rollover block this validator resolved FROM VALIDATOR
+    # SIGNALS (0 = none resolved, or the rollover is typed into chain.toml).
+    # Stamped on every receipt from lock-in on, so the audit replays each
+    # round under the block the fleet decided, not the config it runs with.
+    activation_block: int = 0
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -558,6 +564,8 @@ class RoundReceipt:
             body["era_start_block"] = int(self.era_start_block)
         if self.era_base_seed:
             body["era_base_seed"] = int(self.era_base_seed)
+        if self.activation_block:
+            body["activation_block"] = int(self.activation_block)
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -582,6 +590,7 @@ def build_receipt(
     reject_reason: str | None = None,
     era_start_block: int = 0,
     era_base_seed: int = 0,
+    activation_block: int = 0,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -608,6 +617,7 @@ def build_receipt(
         validator_hotkey=validator_hotkey,
         era_start_block=int(era_start_block or 0),
         era_base_seed=int(era_base_seed or 0),
+        activation_block=int(activation_block or 0),
     )
 
 
@@ -736,6 +746,7 @@ def load_receipt(text: str) -> RoundReceipt:
         validator_hotkey=str(obj.get("validator_hotkey", "")),
         era_start_block=int(obj.get("era_start_block", 0) or 0),
         era_base_seed=int(obj.get("era_base_seed", 0) or 0),
+        activation_block=int(obj.get("activation_block", 0) or 0),
         receipt_version=version,
         signature=obj.get("signature"),
     )
@@ -886,6 +897,9 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "heat": heat_summary,
         "reject_reason": receipt.reject_reason,
         "validator_hotkey": receipt.validator_hotkey or None,
+        # DEC-CA-0044: the rollover block this validator resolved from
+        # validator signals (0 = none / typed into chain.toml).
+        "activation_block": int(receipt.activation_block or 0),
     }
 
 

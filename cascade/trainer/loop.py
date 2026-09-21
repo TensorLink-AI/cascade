@@ -1149,6 +1149,13 @@ class TrainerRunner:
     # operator-driven re-train/re-publish of a finished round. None ⇒ the guard
     # always applies.
     force_rerun_round: str | None = None
+    # Stake-weighted activation (DEC-CA-0044): the trainer READS the fleet's
+    # decision (validator notes / the boundary tally) and arms the DEC-CA-0043
+    # rollover on itself — it never signals (it is not a validator). The
+    # record persists under work_root so a restart re-arms without a chain
+    # read. None ⇒ resolved in memory only.
+    activation_store: object | None = None
+    _activation: object | None = field(default=None, repr=False)
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -1688,6 +1695,55 @@ class TrainerRunner:
                 log.info("round %s: champion code published (%s)", round_id, digest)
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
+
+    # ── stake-weighted activation (DEC-CA-0044) ─────────────────────────────
+
+    def apply_activation_block(self, block: int) -> bool:
+        """Arm the DEC-CA-0043 rollover at ``block`` on the live config and
+        refresh the promotion engine's captured grid. Returns True when the
+        config changed. The rolling scheduler is built lazily from
+        ``self.cfg`` only once ``rolling_active`` is true, so it always sees
+        the armed config."""
+        from ..shared.activation import apply_activation
+
+        new_cfg = apply_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        promo = getattr(self, "promotion", None)
+        if promo is not None and hasattr(promo, "round_cfg"):
+            promo.round_cfg = new_cfg.round
+        log.warning("activation: DEC-CA-0043 rollover ARMED at block %d (grid %d → %d): "
+                    "rolling intake + era king start there", block,
+                    new_cfg.round.epoch_blocks_prev, new_cfg.round.epoch_blocks)
+        return True
+
+    def _activation_tick(self, client, block: int) -> None:
+        """One resolver pass per poll (a chain read only at a new boundary or
+        while notes are pending). Never raises."""
+        from ..shared.activation import ActivationRecord, resolve_activation
+
+        if not getattr(self.cfg, "activation", None) or not self.cfg.activation.enabled:
+            return
+        try:
+            rec = self._activation
+            if rec is None:
+                store = self.activation_store
+                rec = store.load() if store is not None else ActivationRecord()
+                self._activation = rec
+                if rec.locked and rec.source != "config":
+                    log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
+                             rec.lock_block, rec.activation_block, rec.source)
+            res = resolve_activation(self.cfg, client, now_block=int(block), record=rec)
+            if res.changed:
+                self._activation = res.record
+                if self.activation_store is not None:
+                    self.activation_store.save(res.record)
+            rec = self._activation
+            if rec.locked and rec.source != "config":
+                self.apply_activation_block(rec.activation_block)
+        except Exception as e:  # noqa: BLE001 — activation must never sink a tick
+            log.warning("activation step failed (%s); retrying next poll", e)
 
     def _sku_per_leg_active(self) -> bool:
         """``[round] funded_sku_per_leg`` takes effect at ``[scoring]
@@ -7939,6 +7995,10 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # Stake-weighted activation (DEC-CA-0044): learn the fleet's
+                # rollover BEFORE the grid is derived this tick, so a lock-in
+                # arms rolling intake at the very boundary it names.
+                self._activation_tick(client, block)
                 # Stamp the height for the funded release-then-activate gate
                 # (funded_activation_block) before ANY funded read this tick.
                 self._funded_gate_block = int(block)
