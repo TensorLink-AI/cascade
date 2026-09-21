@@ -594,11 +594,22 @@ def test_first_settlement_after_the_grid_switch_keeps_the_kings_decayed_margin(c
     assert receipt.verdict.params["margin_warmup_rounds"] == cfg.scoring.margin_warmup_rounds * 4
     assert C.check_koth_params(receipt, base).status == C.PASS
     assert C.check_verdict(receipt, base).status == C.PASS
-    # the same king one settlement BEFORE the switch: the counter, as today
+    # the anchor is imputed ONCE and persisted: the next settlement counts
+    # 57, not 60 (re-imputing from the advanced counter slid it back a whole
+    # old-grid round per settlement — tenure grew 4× per settlement)
+    assert r.state.king_since_block == rollover - 14 * eb_old
+    assert r.state.tenure_rounds == 15
+    out_next = r.process_settlement(_manifest(base, rollover + eb_new), windows=[],
+                                    base_seed=rollover + eb_new)
+    assert out_next.king_tenure_rounds == 57
+    assert r.state.king_since_block == rollover - 14 * eb_old
+    # the same king one settlement BEFORE the switch: the counter, as today —
+    # and nothing is anchored before the gate
     r2 = _runner(base, king_scores=king, chal=weak, state=state)
     out2 = r2.process_settlement(_manifest(base, rollover - eb_old, era=False), windows=[],
                             base_seed=rollover - eb_old)
     assert out2.king_tenure_rounds == 14
+    assert r2.state.king_since_block is None
 
 
 def test_unreadable_promotion_evidence_is_a_transient_for_the_era_gate(cfg, tmp_path):

@@ -2170,7 +2170,21 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
             'choice needs expected_gpu = "" (a coordinated contract change)')
     if role == "trainer" and cfg.round.funded_pods == "rent":
         fit, excluded = funded_sku_wall_fit(cfg)
-        if excluded and not fit:
+        rolling = int(getattr(cfg.round, "rolling_from_block", 0) or 0) > 0
+        if excluded and not fit and rolling:
+            # Rolling intake (DEC-CA-0043): a leg picks the first boundary
+            # its wall clears, so a wall longer than one grid step is not
+            # "never starts" — it is "settles a boundary later". The grid
+            # bound is a BOUNDARY-mode rule; under rolling the per-leg target
+            # (_leg_local.end_wall) bounds each SKU instead.
+            logging.getLogger("cascade.config").warning(
+                "[round] funded_sku_wall_seconds: every configured SKU (%s) has a "
+                "measured wall of at least one epoch (%d blocks); rolling intake is "
+                "armed (rolling_from_block=%d) so legs target a later boundary — "
+                "make sure the walls were measured for THIS contract, not inherited",
+                ", ".join(excluded), int(cfg.round.epoch_blocks),
+                int(cfg.round.rolling_from_block))
+        elif excluded and not fit:
             problems.append(
                 "[round] funded_sku_wall_seconds excludes EVERY configured SKU "
                 f"({', '.join(excluded)}): each measured wall is at least one epoch "

@@ -45,9 +45,11 @@ from ..shared.era import (
     effective_resync_cap_rounds,
     era_king_active,
     era_length_blocks,
+    legacy_king_anchor,
     member_index_for_era,
     min_effective_era,
     settlement_era,
+    tenure_blocks_active,
     tenure_rounds_at,
 )
 from ..shared.manifest import (
@@ -1667,6 +1669,7 @@ class ValidatorRunner:
 
         # Tenure as the margin schedule counts it (DEC-CA-0043: in blocks
         # from tenure_blocks_from_block; the counter before it).
+        self.state = self._anchor_legacy_king(self.state, self._epoch_start_block(manifest))
         tenure_at_decision = tenure_rounds_at(
             self.cfg.round, self.cfg.scoring, block=self._epoch_start_block(manifest),
             tenure_rounds=self.state.tenure_rounds,
@@ -1889,6 +1892,25 @@ class ValidatorRunner:
             return []
         self.chain_walk_depth = CHAIN_WALK_DEPTH
         return list(walk.manifests)
+
+    def _anchor_legacy_king(self, state: ChampionState, block: int) -> ChampionState:
+        """CONSENSUS (DEC-CA-0043): a king crowned before
+        ``tenure_blocks_from_block`` has no ``king_since_block``; at its first
+        settlement past the gate impute one (:func:`legacy_king_anchor`) and
+        KEEP it. Every later ``tenure_rounds_at`` then counts blocks from a
+        fixed anchor. Without this the anchor was re-imputed each settlement
+        from a counter that kept advancing on the new grid, and the tenure
+        grew old_grid/new_grid (4× on mainnet) per settlement."""
+        if state.king_since_block is not None or not state.king_hotkey:
+            return state
+        if not tenure_blocks_active(self.cfg.scoring, block):
+            return state
+        anchor = legacy_king_anchor(self.cfg.round, self.cfg.scoring, block=int(block),
+                                    tenure_rounds=state.tenure_rounds)
+        log.info("tenure: legacy king %s… anchored at block %d (%d pre-gate rounds "
+                 "before settlement %d); persisted as king_since_block",
+                 state.king_hotkey[:8], anchor, state.tenure_rounds, int(block))
+        return replace(state, king_since_block=anchor)
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the

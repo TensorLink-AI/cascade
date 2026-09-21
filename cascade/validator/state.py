@@ -68,9 +68,12 @@ class ChampionState:
     last_handled_round_id: str | None = None
     last_handled_manifest_sha: str | None = None
     # Era king (DEC-CA-0043). ``king_since_block``: the epoch boundary of the
-    # settlement that crowned the current king (None for a king crowned
-    # before the field existed — the tenure-in-blocks rule anchors it from
-    # the counter). ``king_pointer``: the checkpoint pointer this validator
+    # settlement that crowned the current king. None for a king crowned
+    # before the field existed — the validator imputes one from the counter
+    # at that king's FIRST settlement past tenure_blocks_from_block
+    # (era.legacy_king_anchor) and persists it here; it is never re-imputed
+    # (the counter keeps advancing on the new grid, so re-imputing inflated
+    # the tenure 4× per settlement). ``king_pointer``: the checkpoint pointer this validator
     # judged in the crowning settlement, or the era's first king leg — the
     # trainer cannot substitute another checkpoint of the same generator
     # within an era. ``era_index``: the era ``king_pointer`` was adopted in.

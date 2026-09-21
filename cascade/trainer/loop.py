@@ -1936,6 +1936,14 @@ class TrainerRunner:
         return float(cap)
 
     def _funded_epoch_end_known(self) -> bool:
+        # Rolling intake (DEC-CA-0043): the leg's own target boundary
+        # (thread-local) IS the known end — without this the per-SKU fit
+        # filter and the operator-lane deadline switched off under rolling
+        # (the round-wide wall is None by design there and the stage context
+        # carries epoch_start_block=0), so slow types were rented past their
+        # latest safe start and lane waits were unbounded.
+        if getattr(getattr(self, "_leg_local", None), "end_wall", None) is not None:
+            return True
         if getattr(self, "_funded_epoch_end_wall", None) is not None:
             return True
         ctx = getattr(self, "_stage_ctx", None) or {}
@@ -7484,9 +7492,12 @@ class TrainerRunner:
             self.__dict__["_rolling_lane_pool_obj"] = pool
         return pool
 
-    def _rolling_train_king(self, gen, era, block: int):
+    def _rolling_train_king(self, gen, era, block: int, *, end_wall: float):
         """The era king's leg on the operator's JIT pod (kept for the era: the
-        top-N re-bench targets it)."""
+        top-N re-bench targets it). ``end_wall`` — the era's last settlement —
+        is the leg's own target (thread-local), so the king rent waits out a
+        sold-out marketplace up to ITS latest safe start like a challenger
+        instead of giving up at the first empty listing."""
         contract = self.cfg.throne_contracts()[0]
         seeds = self._rolling_seeds(era)
         ws_ref = self._rolling_warm_start_ref(era, contract)
@@ -7496,10 +7507,12 @@ class TrainerRunner:
                 self._funded_king_host = None
                 self._rolling_king_host_era = era.index
         self._king_rent_done = False
+        self._leg_local.end_wall = float(end_wall)
         try:
             host = self._stage_king_vault(self._rent_king_host(str(era.base_seed)), gen)
         finally:
             self._king_rent_done = True
+            self._leg_local.end_wall = None
         entry = disp.dispatch(
             host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
             role="king", base_seed=seeds.base_seed, block=int(block),

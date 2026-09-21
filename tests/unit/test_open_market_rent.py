@@ -285,6 +285,37 @@ def test_skus_fitting_now_drops_types_past_their_own_latest_start(tmp_path):
     assert locked._skus_fitting_now(("RTX4090",)) == ("RTX4090",)
 
 
+def test_rolling_leg_target_bounds_the_sku_filter_and_the_lane_deadline(tmp_path):
+    # Rolling intake: no round-wide epoch end (None by design) and the stage
+    # context carries epoch_start_block=0 — the leg's OWN target boundary
+    # (thread-local end_wall) is the known end. Before this the filter let
+    # every type through and operator-lane waits were unbounded.
+    r = _open_runner(tmp_path)
+    for name in ("_funded_rent_wait_deadline", "_operator_lane_deadline"):
+        setattr(r, name, types.MethodType(getattr(TrainerRunner, name), r))
+    r.FUNDED_PUBLISH_MARGIN_SECONDS = TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
+    r._leg_local = SimpleNamespace(end_wall=None)                  # the real class's thread-local
+    r._rolling_sched = SimpleNamespace()                           # rolling intake is running
+    r._funded_epoch_end_wall = None
+    r._stage_ctx = {"round_id": "", "epoch_start_block": 0, "warm_start": None}
+    r._rent_wait_now = lambda: 1000.0
+    assert not r._funded_epoch_end_known()
+    assert r._skus_fitting_now(("RTX4090", "H100")) == ("RTX4090", "H100")
+    assert r._operator_lane_deadline_fn() is None
+    # a leg whose target boundary is 5000 s out: only the 1 h type still fits
+    r._leg_local.end_wall = 1000.0 + 5000.0
+    assert r._funded_epoch_end_known()
+    assert r._funded_rent_wait_deadline_for("H100") == pytest.approx(
+        6000.0 - 3600 - r.FUNDED_PUBLISH_MARGIN_SECONDS)
+    assert r._skus_fitting_now(("RTX4090", "H100")) == ("H100",)
+    fn = r._operator_lane_deadline_fn()
+    assert callable(fn)
+    assert fn(SimpleNamespace(sku="H100")) == pytest.approx(
+        6000.0 - 3600 - r.FUNDED_PUBLISH_MARGIN_SECONDS)
+    r._leg_local.end_wall = None
+    assert not r._funded_epoch_end_known()
+
+
 def test_capacity_wait_sums_the_types_that_still_fit(tmp_path):
     r = _open_runner(tmp_path)
     probed = []
