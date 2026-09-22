@@ -398,6 +398,21 @@ def test_loader_rejects_a_bad_threshold_or_grid(tmp_path):
         load_chain_config(p)
 
 
+def test_miner_cli_times_on_the_grid_the_validators_decided(cfg):
+    """The miner's chain.toml keeps the rollover keys at 0; the CLI reads the
+    validators' notes so countdowns and reveal timing follow the switch."""
+    from cascade.miner.cli import _live_cfg
+
+    note = A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + GRID)
+    chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 2 * GRID)
+    live = _live_cfg(cfg, chain)
+    assert live.round.epoch_activation_block == B0 + GRID
+    assert live.round.epoch_blocks == 900 and live.round.epoch_blocks_prev == 3600
+    dead = FakeChain([], {}, block=B0)
+    dead.fail_all = True
+    assert _live_cfg(cfg, dead) is cfg                       # never fails a command
+
+
 def test_provisioner_loop_switches_its_grid_from_the_activation_hook():
     from cascade.provision.loop import ProvisionerLoop
 

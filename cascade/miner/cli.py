@@ -383,6 +383,22 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_round)
 
 
+def _live_cfg(cfg, client):
+    """``cfg`` with the fleet's resolved rollover applied (DEC-CA-0045).
+
+    A miner's chain.toml keeps the DEC-CA-0043 keys at 0; once the validators
+    lock in, the grid this CLI times reveals and countdowns on would be the
+    pre-switch one. One chain read of the validators' notes fixes that; any
+    failure (no chain, feature off, typed-in keys) returns ``cfg`` as loaded.
+    """
+    from ..shared.activation import startup_activation
+
+    try:
+        return startup_activation(cfg, client, store_path=None)
+    except Exception:  # noqa: BLE001 — a CLI convenience must never fail a command
+        return cfg
+
+
 def _cmd_round(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainClient, ChainError
@@ -396,6 +412,7 @@ def _cmd_round(args: argparse.Namespace) -> int:
 
     try:
         client = ChainClient.from_config(cfg, network=args.network)
+        cfg = _live_cfg(cfg, client)
         return run_dashboard(
             client, cfg.round, args.network, once=args.once, refresh=args.refresh,
             timeline=RoundTimeline.from_chain_config(cfg),
@@ -715,6 +732,7 @@ def _cmd_reveal_status(args: argparse.Namespace) -> int:
     from ..shared.chain import ChainClient, ChainError
 
     client = ChainClient.from_config(cfg, network=args.network)
+    cfg = _live_cfg(cfg, client)
     deadline = time.monotonic() + args.timeout_s
 
     try:
@@ -893,6 +911,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             wallet_hotkey=args.wallet_hotkey,
             wallet_path=args.wallet_path,
         )
+        cfg = _live_cfg(cfg, client)
         current_block = client.current_block()
         blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
         client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)
@@ -1108,6 +1127,7 @@ def _cmd_submit(args: argparse.Namespace) -> int:
             cfg, network=args.network, wallet_name=args.wallet_name,
             wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
         )
+        cfg = _live_cfg(cfg, client)
         current_block = client.current_block()
         blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
         client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)

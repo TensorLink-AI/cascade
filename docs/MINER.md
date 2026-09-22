@@ -233,7 +233,10 @@ How to tell where things stand: `status/chain.json` carries an
 `activation` block (share of stake signed, lock-in block, switch block)
 and every receipt from lock-in on records `activation_block`; the
 dashboards read both. When you see a lock-in, the switch is at the next
-boundary.
+boundary. The CLI follows it on its own: `cascade round`, `reveal-status`,
+`deploy` and `submit` read the validators' notes at startup and time
+countdowns and reveals on the grid actually in force, so your chain.toml
+needs no edit when the switch lands.
 
 ### Watching it
 
