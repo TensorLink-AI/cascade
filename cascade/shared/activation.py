@@ -53,6 +53,10 @@ log = logging.getLogger("cascade.activation")
 
 SIGNAL_PREFIX = "cascade-ready:"
 SIGNAL_VERSION = 1
+# A boundary older than this many blocks at the head is treated as PRUNED
+# when its as-of read fails (public finney endpoints discard state after
+# ~256 blocks); a younger failure is a transient and is retried as-is.
+PRUNED_AFTER_BLOCKS = 300
 
 
 # ── the on-chain note ────────────────────────────────────────────────────────
@@ -490,10 +494,11 @@ def resolve_activation(
     # already locked in carry the decision, and a decision made elsewhere
     # beats this node's own count.
     try:
-        validators, signals = _read_chain(client, None)
+        live_validators, live_signals = _read_chain(client, None)
     except Exception as e:  # noqa: BLE001 — chain flake: retry next poll
         log.warning("activation: chain read failed (%s); retrying next poll", e)
         return Resolution(record=record)
+    validators, signals = live_validators, live_signals
     agreed = agreed_activation(feature, validators, signals, threshold=ac.threshold,
                                block=int(now_block), dormant_after_blocks=ac.dormant_after_blocks,
                                round_cfg=cfg.round)
@@ -515,6 +520,22 @@ def resolve_activation(
     try:
         validators, signals = _read_chain(client, boundary)
     except Exception as e:  # noqa: BLE001
+        if int(now_block) - boundary >= PRUNED_AFTER_BLOCKS and not named_locks(
+                feature, eligible_validators(live_validators, block=int(now_block),
+                                             dormant_after_blocks=ac.dormant_after_blocks),
+                live_signals, round_cfg=cfg.round):
+            # The boundary is gone from this endpoint's state AND no
+            # validator's note names a lock-in: nobody crossed there (a
+            # locked-in validator rewrites its note within a poll), so the
+            # boundary is skipped rather than retried forever. A node that
+            # restarted across a boundary on a pruned endpoint would
+            # otherwise never count again; a fresh record whose latest
+            # boundary is already old would never count at all.
+            log.warning("activation: boundary %d is unreadable here (%s) and no validator "
+                        "names a lock-in — skipping it; the next boundary is counted "
+                        "as of its own block", boundary, e)
+            return Resolution(record=replace(record, feature=feature,
+                                             last_checked_boundary=boundary), changed=True)
         log.warning("activation: as-of read at boundary %d failed (%s); not counting from "
                     "a later view — retrying this boundary next poll (%d behind the latest)",
                     boundary, e, latest - boundary)

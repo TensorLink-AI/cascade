@@ -150,9 +150,11 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   under the line changes nothing. The count is taken **as of the boundary
   block**; if your endpoint cannot serve that block (a pruned node) your
   validator does not count from a later view — it logs `as-of read …
-  failed`, retries THAT boundary (never a later one), and picks the
-  decision up from the other validators' notes meanwhile. Point it at an
-  archive endpoint if you want it to count for itself after downtime.
+  failed` and retries THAT boundary (never a later one) while the block is
+  young; once the boundary is older than the endpoint's prune window
+  (~300 blocks) and no validator's note names a lock-in there, it is
+  skipped and the next boundary is counted as of its own block. A lock-in
+  named in the notes is always adopted, never tallied past.
   Posting the note is a signed `set_commitment` from your hotkey (the
   intent is logged before it signs; a rejected extrinsic is retried next
   poll, never reported as posted). A validator still on the old release at
