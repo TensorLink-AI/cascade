@@ -814,3 +814,32 @@ def test_own_signal_is_silent_under_a_typed_in_rollover(cfg):
     chain = FakeChain(_fleet(30, 70), {}, block=B0 + 3)
     assert not A.ensure_signal(chain, typed, rec, hotkey="v1") and chain.written == []
     assert A.own_signal_payload(cfg, A.ActivationRecord()) == A.format_signal(FEATURE)
+
+
+def test_resolver_skips_a_pruned_boundary_nobody_locked_in_at(cfg):
+    """A public endpoint discards state after ~256 blocks. A boundary this
+    node cannot read any more, that no validator's note marks as a lock-in,
+    is skipped — otherwise a node restarted across it (or a fresh record
+    whose latest boundary is already old) would never count again."""
+    B, B2 = B0 + GRID, B0 + 2 * GRID
+    ready = A.format_signal(FEATURE)
+    chain = _PerBlockChain(_fleet(60, 40), {"v1": ready}, block=B + A.PRUNED_AFTER_BLOCKS + 5)
+    chain.fail_blocks = {B}
+    # transient: younger than the prune window ⇒ retried, not skipped
+    res = A.resolve_activation(cfg, chain, now_block=B + 50, record=A.ActivationRecord())
+    assert not res.changed and res.record.last_checked_boundary == 0
+    # old enough and nobody names a lock ⇒ skipped, no lock-in
+    res = A.resolve_activation(cfg, chain, now_block=chain.block, record=A.ActivationRecord())
+    assert res.changed and not res.record.locked and res.record.last_checked_boundary == B
+    # the next boundary is counted as of its own block
+    chain.block = B2 + 5
+    res = A.resolve_activation(cfg, chain, now_block=chain.block, record=res.record)
+    assert res.record.lock_block == B2 and res.record.activation_block == B2 + GRID
+    assert chain.as_of_reads[-1] == B2
+    # ... but NOT skipped when a validator's note names a lock-in there:
+    # the decision exists and must be adopted, never tallied past
+    locked = A.format_signal(FEATURE, lock_block=B, activation_block=B2)
+    chain2 = _PerBlockChain(_fleet(60, 40), {"v2": locked}, block=B + A.PRUNED_AFTER_BLOCKS + 5)
+    chain2.fail_blocks = {B}
+    res = A.resolve_activation(cfg, chain2, now_block=chain2.block, record=A.ActivationRecord())
+    assert not res.changed and res.record.last_checked_boundary == 0
