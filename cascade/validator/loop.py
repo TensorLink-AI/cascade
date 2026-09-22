@@ -2025,23 +2025,36 @@ class ValidatorRunner:
         return list(walk.manifests)
 
     def _anchor_legacy_king(self, state: ChampionState, block: int) -> ChampionState:
-        """CONSENSUS (DEC-CA-0043): a king crowned before
-        ``tenure_blocks_from_block`` has no ``king_since_block``; at its first
-        settlement past the gate impute one (:func:`legacy_king_anchor`) and
-        KEEP it. Every later ``tenure_rounds_at`` then counts blocks from a
+        """CONSENSUS (DEC-CA-0043): at the reigning king's first settlement
+        past ``tenure_blocks_from_block`` impute ``king_since_block`` from the
+        ``tenure_rounds`` counter (:func:`legacy_king_anchor`) — whether or
+        not a crowning block was recorded before the gate — and KEEP it
+        (``tenure_anchor_gate`` marks it done). Every later ``tenure_rounds_at`` then counts blocks from a
         fixed anchor. Without this the anchor was re-imputed each settlement
         from a counter that kept advancing on the new grid, and the tenure
         grew old_grid/new_grid (4× on mainnet) per settlement."""
-        if state.king_since_block is not None or not state.king_hotkey:
+        if not state.king_hotkey or not tenure_blocks_active(self.cfg.scoring, block):
             return state
-        if not tenure_blocks_active(self.cfg.scoring, block):
-            return state
+        gate = int(self.cfg.scoring.tenure_blocks_from_block)
+        if state.tenure_anchor_gate == gate:
+            return state                         # anchored once at this gate already
+        # EVERY validator re-anchors from the counter at the gate — a
+        # crowning block recorded before the gate (a validator that upgraded
+        # before that king's crowning) is discarded, or two upgraded
+        # validators would count tenure from different anchors (real block
+        # vs. counter × old grid) and reach different margins at the same
+        # settlement. The counter is the quantity the fleet agreed on
+        # before the gate; the real block is only known to some.
         anchor = legacy_king_anchor(self.cfg.round, self.cfg.scoring, block=int(block),
                                     tenure_rounds=state.tenure_rounds)
-        log.info("tenure: legacy king %s… anchored at block %d (%d pre-gate rounds "
-                 "before settlement %d); persisted as king_since_block",
-                 state.king_hotkey[:8], anchor, state.tenure_rounds, int(block))
-        return replace(state, king_since_block=anchor)
+        if state.king_since_block is not None and int(state.king_since_block) != anchor:
+            log.info("tenure: king %s… recorded crowning block %d predates the gate; "
+                     "re-anchored from the counter for consensus",
+                     state.king_hotkey[:8], int(state.king_since_block))
+        log.info("tenure: king %s… anchored at block %d (%d pre-gate rounds before "
+                 "settlement %d, gate %d); persisted as king_since_block",
+                 state.king_hotkey[:8], anchor, state.tenure_rounds, int(block), gate)
+        return replace(state, king_since_block=anchor, tenure_anchor_gate=gate)
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the

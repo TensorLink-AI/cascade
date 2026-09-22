@@ -429,6 +429,9 @@ def test_restart_mid_era_restores_era_index_and_king_pointer():
     legacy = loads('{"king_hotkey": "k", "king_uid": 0, "tenure_rounds": 1}')
     assert legacy.king_since_block is None and legacy.king_pointer == "" and legacy.era_index is None
     assert "king_since_block" not in dumps(legacy)
+    assert legacy.tenure_anchor_gate == 0 and "tenure_anchor_gate" not in dumps(legacy)
+    anchored = replace(legacy, king_since_block=100, tenure_anchor_gate=3600)
+    assert loads(dumps(anchored)).tenure_anchor_gate == 3600
 
 
 # ── the manifest chain ───────────────────────────────────────────────────────
@@ -610,6 +613,23 @@ def test_first_settlement_after_the_grid_switch_keeps_the_kings_decayed_margin(c
                             base_seed=rollover - eb_old)
     assert out2.king_tenure_rounds == 14
     assert r2.state.king_since_block is None
+    # CONSENSUS: a validator that upgraded BEFORE this king's crowning holds
+    # the real crowning block (2 old rounds ago — its counter says 14 too,
+    # inherited from receipts/bootstrap). Counting blocks from it would give
+    # 8 while its peers count 56 from the imputed anchor: different margins
+    # at the same settlement. At the gate every validator re-anchors from
+    # the counter, so both land on the same anchor and the same tenure.
+    early = ChampionState(king_hotkey="king_hk", king_uid=0, tenure_rounds=14,
+                          king_since_block=rollover - 2 * eb_old)
+    r3 = _runner(base, king_scores=king, chal=weak, state=early)
+    out3 = r3.process_settlement(_manifest(base, rollover), windows=[], base_seed=rollover)
+    assert out3.king_tenure_rounds == 56 == out.king_tenure_rounds
+    assert r3.state.king_since_block == r.state.king_since_block == rollover - 14 * eb_old
+    assert r3.state.tenure_anchor_gate == r.state.tenure_anchor_gate == rollover
+    # anchored once: the next settlement counts on, no re-imputation
+    out3n = r3.process_settlement(_manifest(base, rollover + eb_new), windows=[],
+                                  base_seed=rollover + eb_new)
+    assert out3n.king_tenure_rounds == 57 and r3.state.king_since_block == rollover - 14 * eb_old
 
 
 def test_unreadable_promotion_evidence_is_a_transient_for_the_era_gate(cfg, tmp_path):

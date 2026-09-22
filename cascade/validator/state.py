@@ -81,6 +81,14 @@ class ChampionState:
     king_since_block: int | None = None
     king_pointer: str = ""
     era_index: int | None = None
+    # CONSENSUS: the ``tenure_blocks_from_block`` gate at which this
+    # validator imputed ``king_since_block`` from the ``tenure_rounds``
+    # counter (era.legacy_king_anchor). At the first settlement past the
+    # gate EVERY validator re-anchors the reigning king from the counter —
+    # also one that recorded the real crowning block before the gate — so
+    # the fleet counts tenure from ONE anchor whether a validator upgraded
+    # before or after that king's crowning. 0 = not yet; drop-when-default.
+    tenure_anchor_gate: int = 0
 
 
 @dataclass(frozen=True)
@@ -253,6 +261,8 @@ def dumps(state: ChampionState) -> str:
         era_fields["king_pointer"] = state.king_pointer
     if state.era_index is not None:
         era_fields["era_index"] = int(state.era_index)
+    if state.tenure_anchor_gate:
+        era_fields["tenure_anchor_gate"] = int(state.tenure_anchor_gate)
     return json.dumps(
         {
             **era_fields,
@@ -298,4 +308,5 @@ def loads(text: str) -> ChampionState:
         ),
         king_pointer=str(obj.get("king_pointer", "") or ""),
         era_index=(int(obj["era_index"]) if obj.get("era_index") is not None else None),
+        tenure_anchor_gate=int(obj.get("tenure_anchor_gate", 0) or 0),
     )
