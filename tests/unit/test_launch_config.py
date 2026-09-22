@@ -97,6 +97,20 @@ def test_wall_table_excluding_every_sku_refuses_launch(cfg):
     assert_launch_ready(c, role="validator")
 
 
+def test_wall_table_excluding_every_sku_only_warns_under_rolling(cfg, caplog):
+    import logging
+
+    # Rolling intake armed: a wall longer than one grid step settles a
+    # boundary later, it does not "never start" — launch proceeds, loudly.
+    c = _rent_cfg(cfg, epoch_blocks=150, skus=("RTX4090", "L40S"),
+                  walls={"RTX4090": 13500, "L40S": 10200})
+    c = replace(c, round=replace(c.round, rolling_from_block=600))
+    with caplog.at_level(logging.WARNING, logger="cascade.config"):
+        assert_launch_ready(c, role="trainer")
+    assert any("rolling intake is armed" in r.getMessage() and "RTX4090, L40S" in r.getMessage()
+               for r in caplog.records)
+
+
 def test_wall_table_excluding_some_skus_warns(cfg, caplog):
     import logging
 

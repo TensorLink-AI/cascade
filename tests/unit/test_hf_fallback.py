@@ -10,6 +10,7 @@ import pytest
 
 from cascade.shared.hippius import (
     HFFallbackStore,
+    ObjectNotFound,
     S3Store,
     StorageError,
     open_manifest_store,
@@ -110,3 +111,40 @@ def test_factory_hf_backed_when_configured():
                               s3_endpoint="https://s3.hippius.com", s3_region="decentralized")
     store = open_manifest_store(storage)
     assert isinstance(store, HFFallbackStore) and store.hf_repo == "acct/mirror"
+
+
+class _MissingS3:
+    """Primary that is UP and says the key does not exist."""
+
+    def get_bytes(self, key):
+        raise ObjectNotFound(f"s3_get_failed: {key}: NoSuchKey")
+
+
+class _HFMissing(Exception):
+    response = SimpleNamespace(status_code=404)
+
+
+def test_absent_on_both_layers_reads_as_object_not_found():
+    # Absence is a verdict; callers separate it from an outage (retry).
+    s = HFFallbackStore(_MissingS3(), "acct/cascade-mirror")
+
+    def hf_missing(key):
+        raise _HFMissing("404 Client Error: Entry Not Found")
+
+    s._hf_get = hf_missing
+    with pytest.raises(ObjectNotFound):
+        s.get_bytes("benchmarks/round-1.json")
+    # Primary absent but HF unreachable: existence unknown → plain StorageError.
+    def hf_boom(key):
+        raise RuntimeError("timeout")
+
+    s._hf_get = hf_boom
+    with pytest.raises(StorageError) as ei:
+        s.get_bytes("benchmarks/round-1.json")
+    assert not isinstance(ei.value, ObjectNotFound)
+    # Primary DOWN (not absent) + HF 404: S3 may still hold it → not absence.
+    s2 = HFFallbackStore(_FakeS3(up=False), "acct/cascade-mirror")
+    s2._hf_get = hf_missing
+    with pytest.raises(StorageError) as ei:
+        s2.get_bytes("benchmarks/round-1.json")
+    assert not isinstance(ei.value, ObjectNotFound)

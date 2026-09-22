@@ -315,3 +315,23 @@ def test_loader_accepts_the_rollover_recipe(tmp_path):
     assert E.era_length_blocks(cfg.round, 14399) == 14400
     assert cfg.koth_params(block=14400).margin_warmup_rounds == 32
     assert cfg.koth_params(block=14399).margin_warmup_rounds == 8
+
+
+def test_legacy_anchor_is_imputed_once_and_then_counts_one_per_settlement(cfg):
+    # A legacy king's anchor is a pure function of the counter at the FIRST
+    # post-gate settlement; persisted, later settlements add 1 tenure each.
+    # Re-imputing it from the moving counter added old/new grid (4) each time.
+    eb = cfg.round.epoch_blocks
+    prev = eb * 4
+    rollover = prev * 5
+    armed = _armed(cfg, rollover, prev=prev)
+    anchor = E.legacy_king_anchor(armed.round, armed.scoring, block=rollover, tenure_rounds=14)
+    assert anchor == rollover - 14 * prev
+    persisted = [E.tenure_rounds_at(armed.round, armed.scoring, block=rollover + eb * i,
+                                    tenure_rounds=14 + i, king_since_block=anchor)
+                 for i in range(4)]
+    assert persisted == [56, 57, 58, 59]
+    reimputed = [E.tenure_rounds_at(armed.round, armed.scoring, block=rollover + eb * i,
+                                    tenure_rounds=14 + i, king_since_block=None)
+                 for i in range(4)]
+    assert reimputed == [56, 60, 64, 68]          # the defect this pins down

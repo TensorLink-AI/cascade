@@ -11,6 +11,7 @@ from cascade.shared.bench_report import (
     bench_report_key,
     dump_bench_report,
 )
+from cascade.shared.hippius import ObjectNotFound
 from cascade.shared.manifest import BenchScores, TrainedEntry, TrainingManifest
 from cascade.validator.cascade import CascadeController
 from cascade.validator.loop import BENCH_REPORT_RETRY_ROUNDS, ValidatorRunner
@@ -35,7 +36,7 @@ class _FakeStore:
 
     def get_text(self, key):
         if key not in self.texts:
-            raise KeyError(key)
+            raise ObjectNotFound(key)
         return self.texts[key]
 
 
@@ -197,3 +198,19 @@ def test_challenger_checkpoints_are_candidates_too(cfg):
     runner._record_duel_checkpoints(manifest, now=1000.0)
     assert [(r.checkpoint_id, r.role) for r in runner.cascade.state.checkpoints] == [
         (PTR, "king"), (chal_ptr, "challenger")]
+
+
+def test_stale_partial_report_is_refetched_on_reprobe(cfg):
+    # The report is (re)published as legs finish: a copy cached while it lacked
+    # this checkpoint must not answer every re-probe from memory. 2026-09-21: a
+    # validator kept "no signed bench numbers" for a member that was in the
+    # published report the whole time, until a restart emptied the cache.
+    other = "metro-v1:trained:hippius:cascade/ckpt-other@sha256:" + "0" * 64
+    store = _FakeStore({bench_report_key("777"): _report_text(cfg, pointer=other)})
+    runner = _runner(cfg, store)
+    runner._record_duel_checkpoints(_manifest(cfg), now=1000.0)   # caches the partial copy
+    assert runner.cascade.state.checkpoints == () and len(runner._pending_bench) == 1
+    store.texts[bench_report_key("777")] = _report_text(cfg)       # trainer republished
+    runner._drain_pending_bench(now=2000.0)
+    (rec,) = runner.cascade.state.checkpoints
+    assert rec.checkpoint_id == PTR and runner._pending_bench == []

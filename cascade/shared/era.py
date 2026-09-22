@@ -204,6 +204,26 @@ def effective_resync_cap_rounds(round_cfg: RoundConfig, scoring: ScoringConfig,
     return int(scoring.king_resync_max_rounds)
 
 
+def legacy_king_anchor(round_cfg: RoundConfig, scoring: ScoringConfig, *,
+                       block: int, tenure_rounds: int) -> int:
+    """CONSENSUS: the crowning block imputed to a king that reigned before
+    ``tenure_blocks_from_block`` (no recorded ``king_since_block``):
+    ``block − tenure_rounds × grid_before_the_gate`` — its ``tenure_rounds``
+    old-grid rounds laid out backwards from the settlement at ``block``. A
+    pure function of the counter every validator already agreed on.
+
+    It must be computed ONCE — at the king's first settlement past the gate —
+    and persisted as ``king_since_block``. Re-deriving it at every settlement
+    is wrong: ``tenure_rounds`` keeps counting NEW-grid settlements, so the
+    imputed anchor slid back a whole old-grid round per settlement and the
+    tenure grew ``old_grid / new_grid`` (4× on 3600→900) per settlement
+    instead of 1 — the margin decayed four times faster than DEC-CA-0043
+    intends."""
+    gate = int(scoring.tenure_blocks_from_block)
+    prev_grid = max(1, int(effective_epoch_blocks(round_cfg, max(0, gate - 1))))
+    return int(block) - int(tenure_rounds) * prev_grid
+
+
 def tenure_rounds_at(round_cfg: RoundConfig, scoring: ScoringConfig, *,
                      block: int | None, tenure_rounds: int,
                      king_since_block: int | None) -> int:
@@ -211,19 +231,20 @@ def tenure_rounds_at(round_cfg: RoundConfig, scoring: ScoringConfig, *,
     epoch boundary ``block``.
 
     Pre-gate: the recorded ``tenure_rounds`` counter (rounds survived).
-    From ``tenure_blocks_from_block``: blocks reigned divided by the grid in
-    force at ``block`` — a king crowned on the 3600 grid keeps its wall-time
-    tenure across a switch to 900 instead of being reset to a quarter. A
-    legacy king with no recorded crowning block is anchored at
-    ``block − tenure_rounds × grid_before_the_gate``; that anchor is a pure
-    function of the counter every validator already agreed on.
+    From ``tenure_blocks_from_block``: blocks reigned since
+    ``king_since_block`` divided by the grid in force at ``block`` — a king
+    crowned on the 3600 grid keeps its wall-time tenure across a switch to
+    900 instead of being reset to a quarter. A legacy king with no recorded
+    crowning block is anchored by :func:`legacy_king_anchor` for THIS call;
+    the validator persists that anchor at the first post-gate settlement
+    (``ChampionState.king_since_block``) so it is never re-imputed from a
+    counter that has moved on.
     """
     if block is None or not tenure_blocks_active(scoring, block):
         return int(tenure_rounds)
     b = int(block)
     grid = max(1, int(effective_epoch_blocks(round_cfg, b)))
     if king_since_block is None:
-        gate = int(scoring.tenure_blocks_from_block)
-        prev_grid = max(1, int(effective_epoch_blocks(round_cfg, max(0, gate - 1))))
-        king_since_block = b - int(tenure_rounds) * prev_grid
+        king_since_block = legacy_king_anchor(round_cfg, scoring, block=b,
+                                             tenure_rounds=tenure_rounds)
     return max(0, (b - int(king_since_block)) // grid)
