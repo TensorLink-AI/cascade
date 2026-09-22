@@ -188,6 +188,45 @@ def tally(
     )
 
 
+def valid_pair(round_cfg: Any, lock_block: int, activation_block: int) -> bool:
+    """A note's ``(lock, act)`` is admissible only when ``lock`` is a boundary
+    of the grid in force there and ``act`` is exactly the boundary after it —
+    the one pair :func:`resolve_activation` could ever have produced. A pair
+    that fails this is a typo or a bug on the signalling validator and must
+    never be adopted: :func:`apply_activation` would refuse it on every poll
+    and the node would stop tallying for good."""
+    lock, act = int(lock_block), int(activation_block)
+    if lock <= 0 or act <= lock:
+        return False
+    if lock % int(effective_epoch_blocks(round_cfg, lock)):
+        return False
+    return act == activation_block_for(round_cfg, lock)
+
+
+def named_locks(
+    feature: str,
+    validators: list[ValidatorStake] | tuple[ValidatorStake, ...],
+    signals: dict[str, str],
+    *,
+    round_cfg: Any = None,
+) -> dict[tuple[int, int], float]:
+    """Stake behind each admissible ``(lock, act)`` pair named in the notes
+    of ``validators`` (already filtered for eligibility by the caller)."""
+    by_block: dict[tuple[int, int], float] = {}
+    for v in validators:
+        sig = parse_signal(signals.get(v.hotkey))
+        if sig is None or sig.feature != feature or not sig.activation_block:
+            continue
+        if round_cfg is not None and not valid_pair(round_cfg, sig.lock_block,
+                                                    sig.activation_block):
+            log.warning("activation: ignoring an inadmissible note from %s (%r)",
+                        v.hotkey, signals.get(v.hotkey))
+            continue
+        key = (sig.lock_block, sig.activation_block)
+        by_block[key] = by_block.get(key, 0.0) + float(v.stake)
+    return by_block
+
+
 def agreed_activation(
     feature: str,
     validators: list[ValidatorStake] | tuple[ValidatorStake, ...],
@@ -196,25 +235,21 @@ def agreed_activation(
     threshold: float,
     block: int,
     dormant_after_blocks: int = 0,
+    round_cfg: Any = None,
 ) -> tuple[int, int] | None:
     """``(lock_block, activation_block)`` that validators holding ``threshold``
     of the eligible stake all name in their notes, else ``None``.
 
     This is how a node that missed the lock-in boundary (restart, late
     join, no archive node) catches up without re-reading old chain state:
-    the decision is carried by the validators that made it.
+    the decision is carried by the validators that made it. With
+    ``round_cfg`` only admissible pairs count (:func:`valid_pair`).
     """
     elig = eligible_validators(validators, block=block, dormant_after_blocks=dormant_after_blocks)
     total = sum(float(v.stake) for v in elig)
     if total <= 0:
         return None
-    by_block: dict[tuple[int, int], float] = {}
-    for v in elig:
-        sig = parse_signal(signals.get(v.hotkey))
-        if sig is None or sig.feature != feature or not sig.activation_block:
-            continue
-        key = (sig.lock_block, sig.activation_block)
-        by_block[key] = by_block.get(key, 0.0) + float(v.stake)
+    by_block = named_locks(feature, elig, signals, round_cfg=round_cfg)
     if not by_block:
         return None
     key, stake = max(by_block.items(), key=lambda kv: (kv[1], -kv[0][1]))
@@ -228,6 +263,11 @@ def latest_boundary(round_cfg: Any, block: int) -> int:
     """The last boundary at or before ``block`` on the grid in force there."""
     eb = int(effective_epoch_blocks(round_cfg, int(block)))
     return (int(block) // eb) * eb
+
+
+def next_boundary(round_cfg: Any, boundary: int) -> int:
+    """The boundary after ``boundary`` on the grid in force there."""
+    return int(boundary) + int(effective_epoch_blocks(round_cfg, int(boundary)))
 
 
 def activation_block_for(round_cfg: Any, lock_block: int) -> int:
@@ -421,12 +461,30 @@ def resolve_activation(
         return Resolution(record=record)
     if record.feature and record.feature != feature:
         record = ActivationRecord()                  # another feature's decision: blank
+    if record.source == "config":
+        # The typed-in rollover was withdrawn from chain.toml: a typed block
+        # was never the chain's decision, so the record must not stay
+        # "locked" on it — the chain decides again from here.
+        log.warning("activation: typed-in rollover %d withdrawn from the config; "
+                    "resolving from validator signals again", record.activation_block)
+        record = ActivationRecord()
+        return Resolution(record=record, changed=True)
     if record.locked:
         return Resolution(record=record)
 
-    boundary = latest_boundary(cfg.round, int(now_block))
-    if boundary <= record.last_checked_boundary:
-        return Resolution(record=record)             # this boundary is done; no chain read
+    # Boundaries are tallied IN ORDER: the next one after the last this node
+    # counted (or the latest one for a fresh record). A boundary this node
+    # could not read is retried, never skipped for a later one — skipping
+    # would let a node that was down across the lock-in boundary count a
+    # later boundary and name a different rollover (the fork this exists to
+    # prevent). A node stranded on a pruned endpoint relies on the notes.
+    latest = latest_boundary(cfg.round, int(now_block))
+    if record.last_checked_boundary:
+        boundary = next_boundary(cfg.round, record.last_checked_boundary)
+    else:
+        boundary = latest
+    if boundary > latest:
+        return Resolution(record=record)             # nothing new; no chain read
 
     # A new boundary (or a fresh record). Notes first: the validators that
     # already locked in carry the decision, and a decision made elsewhere
@@ -437,7 +495,8 @@ def resolve_activation(
         log.warning("activation: chain read failed (%s); retrying next poll", e)
         return Resolution(record=record)
     agreed = agreed_activation(feature, validators, signals, threshold=ac.threshold,
-                               block=int(now_block), dormant_after_blocks=ac.dormant_after_blocks)
+                               block=int(now_block), dormant_after_blocks=ac.dormant_after_blocks,
+                               round_cfg=cfg.round)
     if agreed is not None:
         lock, act = agreed
         rec = replace(record, feature=feature, lock_block=int(lock), activation_block=int(act),
@@ -451,19 +510,39 @@ def resolve_activation(
     # that gives every node the same stake. A node whose endpoint cannot
     # serve that block does NOT count from a later view (two nodes counting
     # different states is exactly the fork this exists to prevent): it
-    # retries next poll and, failing that, adopts the fleet's decision from
-    # the notes at the next boundary.
+    # retries THIS boundary next poll and, failing that, adopts the fleet's
+    # decision from the notes.
     try:
         validators, signals = _read_chain(client, boundary)
     except Exception as e:  # noqa: BLE001
         log.warning("activation: as-of read at boundary %d failed (%s); not counting from "
-                    "a later view — retrying next poll", boundary, e)
+                    "a later view — retrying this boundary next poll (%d behind the latest)",
+                    boundary, e, latest - boundary)
         return Resolution(record=record)
     t = tally(feature, validators, signals, threshold=ac.threshold, block=boundary,
               dormant_after_blocks=ac.dormant_after_blocks)
+    if not t.eligible:
+        # An empty metagraph is a failed read wearing a 0/0 tally (the SDK
+        # returns no neurons on a falsy runtime result). Counting it would
+        # consume the boundary while peers read real state there.
+        log.warning("activation: no eligible validator at boundary %d — treating as a "
+                    "failed read; retrying this boundary next poll", boundary)
+        return Resolution(record=record)
     rec = replace(record, feature=feature, last_checked_boundary=boundary)
     if t.locked:
         act = activation_block_for(cfg.round, boundary)
+        # The signers this node just counted may have locked in EARLIER
+        # (their notes name the block); when validators holding ``threshold``
+        # of the signed stake name one earlier admissible pair, that is the
+        # fleet's decision and this node's later boundary is not.
+        earlier = _earlier_lock_named_by_signers(cfg, feature, t, validators, signals,
+                                                 before=boundary)
+        if earlier is not None:
+            lock, act = earlier
+            rec = replace(rec, lock_block=int(lock), activation_block=int(act), source="signals")
+            log.info("activation: %s crossed at boundary %d but the signers already locked "
+                     "in at %d — adopting their rollover at %d", feature, boundary, lock, act)
+            return Resolution(record=rec, tally=t, changed=True)
         rec = replace(rec, lock_block=boundary, activation_block=act, source="tally")
         log.info("activation: %s LOCKED IN at boundary %d (%.1f%% of eligible stake, %d/%d "
                  "validators) — rollover at block %d", feature, boundary, 100 * t.ratio,
@@ -473,6 +552,24 @@ def resolve_activation(
                  "validators, threshold %.0f%%) — not yet", feature, boundary, 100 * t.ratio,
                  len(t.signed), len(t.eligible), 100 * ac.threshold)
     return Resolution(record=rec, tally=t, changed=True)
+
+
+def _earlier_lock_named_by_signers(
+    cfg: ChainConfig, feature: str, t: Tally, validators: list[ValidatorStake],
+    signals: dict[str, str], *, before: int,
+) -> tuple[int, int] | None:
+    """The earliest admissible ``(lock, act)`` with ``lock < before`` named by
+    validators holding ``threshold`` of the SIGNED stake in ``t``."""
+    if t.signed_stake <= 0:
+        return None
+    signed = {hk for hk in t.signed}
+    named = named_locks(feature, [v for v in validators if v.hotkey in signed], signals,
+                        round_cfg=cfg.round)
+    named = {k: s for k, s in named.items() if k[0] < int(before)}
+    if not named:
+        return None
+    key, stake = min(named.items(), key=lambda kv: (kv[0][0], -kv[1]))
+    return key if stake / t.signed_stake >= float(cfg.activation.threshold) else None
 
 
 def record_for(cfg: ChainConfig, record: ActivationRecord) -> ActivationRecord:
@@ -559,8 +656,8 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
 def own_signal_payload(cfg: ChainConfig, record: ActivationRecord) -> str | None:
     """The note this node should have on chain right now (``None`` when
     signalling is off): plain readiness until lock-in, then the agreed block."""
-    if not cfg.activation.enabled:
-        return None
+    if not cfg.activation.enabled or configured_rollover(cfg):
+        return None                                  # typed-in rollover: the note is inert
     if record.locked and record.lock_block:
         return format_signal(cfg.activation.feature, lock_block=record.lock_block,
                              activation_block=record.activation_block)

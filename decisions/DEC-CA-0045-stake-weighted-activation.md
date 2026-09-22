@@ -5,7 +5,7 @@ title: "Stake-weighted activation: validators signal readiness on chain, the DEC
 status: proposed
 date: 2026-09-21
 tags: [consensus, block-gate, rollout, validators, stake, rolling, era-king]
-revisit_when: "the owner validator's own share of permit-holding stake on netuid 91 is over the threshold (then 51% is one operator deciding — raise the threshold, exclude the owner hotkey from the denominator, or accept it as the typed-in block with extra steps); or a lock-in fires while under half the external validators are upgraded and the ones left behind hold weight for more than one round (raise the lock-in-to-rollover delay from one boundary to one era); or a second feature needs its own signal (the note format carries one feature — generalise to a list before then); or the public finney endpoint stops serving metagraph reads at a boundary block a few minutes old (the live-view fallback then decides more often than the as-of read)"
+revisit_when: "the owner validator's own share of permit-holding stake on netuid 91 is over the threshold (then 51% is one operator deciding — raise the threshold, exclude the owner hotkey from the denominator, or accept it as the typed-in block with extra steps); or a lock-in fires while under half the external validators are upgraded and the ones left behind hold weight for more than one round (raise the lock-in-to-rollover delay from one boundary to one era); or a second feature needs its own signal (the note format carries one feature — generalise to a list before then); or the public finney endpoint stops serving metagraph reads at a boundary block a few minutes old (a node then never counts for itself — boundaries are tallied in order and a boundary it cannot read is retried, never skipped — and every node's decision rides on the notes alone)"
 relations: {builds_on: [DEC-CA-0043, DEC-CA-0019, DEC-CA-0016], related: [DEC-CA-0038, DEC-CA-0039, DEC-CA-0036]}
 ---
 
@@ -62,10 +62,21 @@ on chain:
 * **No counting from a later view.** A node whose endpoint cannot serve
   the boundary block (pruned) does not tally from the live view a few
   blocks later — two nodes counting different states is the fork this
-  exists to prevent. It retries, and adopts the fleet's decision from the
-  notes at the next boundary. Chain reads happen only at a new boundary
-  (one live read for the notes, one as-of read for the count), never per
-  poll.
+  exists to prevent. Boundaries are tallied **in order**: it retries THAT
+  boundary and never counts a later one instead (a node down across the
+  lock-in boundary would otherwise name a rollover one grid later than its
+  peers); the fleet's decision reaches it through the notes meanwhile. A
+  note is adopted only when its pair is admissible (the lock on a boundary
+  of the grid in force there, the rollover exactly the boundary after) —
+  a typo'd or buggy note can never be persisted. When a node's own first
+  count crosses at a later boundary but the signers it counted already
+  name an earlier admissible lock with `threshold` of the signed stake,
+  it adopts theirs. An empty metagraph read is treated as a failed read,
+  not a 0/0 count. A record made from a typed-in block is blanked the
+  moment the keys are cleared, so the chain decides again. Chain reads
+  happen only while a boundary is pending (one live read for the notes,
+  one as-of read for the count), never per poll once caught up. Under a
+  typed-in rollover the validator posts no note at all.
 
 Mainnet ships `[activation] feature = "rolling-era-king"`, `threshold = 0.51`,
 `epoch_blocks_after = 900`, every DEC-CA-0043 key at 0: the release IS the

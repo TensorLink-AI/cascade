@@ -448,6 +448,8 @@ class _Sub:
     def __init__(self):
         self.meta_calls = []
         self.commit_calls = []
+        self.map_calls = []
+        self.commit_fail = False
         self.plain = {"h0": "cascade-ready:1:rolling-era-king:0:0",
                       "h2": "metro-v1:gen:hippius:a/b@sha256:" + "0" * 64}
 
@@ -455,11 +457,23 @@ class _Sub:
         self.meta_calls.append(kw)
         return _Meta()
 
-    def get_all_commitments(self, netuid, block=None):
-        return dict(self.plain)
+    def get_all_commitments(self, netuid, block=None):  # pragma: no cover — not used
+        raise AssertionError("the client must read CommitmentOf itself (no SDK decoder spam)")
 
-    def set_commitment(self, wallet, netuid, data):
-        self.commit_calls.append((netuid, data))
+    def query_map(self, module, name, params, block=None):
+        assert (module, name, params) == ("Commitments", "CommitmentOf", [91])
+        self.map_calls.append(block)
+        rows = [(hk, {"block": 5, "info": {"fields": [{"Raw64": "0x" + v.encode().hex()}]}})
+                for hk, v in self.plain.items()]
+        # a sealed miner commit: no Raw field — skipped, never an error
+        rows.append(("h1", {"block": 7, "info": {"fields": [
+            {"TimelockEncrypted": {"encrypted": "0xdead", "reveal_round": 9}}]}}))
+        return rows
+
+    def set_commitment(self, wallet, netuid, data, **kw):
+        self.commit_calls.append((netuid, data, kw))
+        return SimpleNamespace(success=not self.commit_fail,
+                               message="rate limited" if self.commit_fail else "ok")
 
     # No bulk/per-uid REVEALED store on this build: poll_commitments falls
     # through to the plain store — the only path where a note could surface.
@@ -484,10 +498,18 @@ def test_chain_client_reads_stake_permits_and_notes_as_of_a_block():
     assert sub.meta_calls[-1] == {"netuid": 91, "lite": True, "block": 123}
     assert rows == [A.ValidatorStake("h0", 10.0, True, 100), A.ValidatorStake("h1", 0.0, False, 0),
                     A.ValidatorStake("h2", 5.5, True, 90)]
-    assert c.read_plain_commitments() == sub.plain
+    assert c.read_plain_commitments() == sub.plain             # Raw only; sealed skipped
+    assert c.read_plain_commitments(block=123) == sub.plain
+    assert sub.map_calls == [None, 123]                         # as-of read forwarded
     c.set_plain_commitment("cascade-ready:1:rolling-era-king:0:0")
-    assert sub.commit_calls == [(91, "cascade-ready:1:rolling-era-king:0:0")]
+    assert sub.commit_calls == [(91, "cascade-ready:1:rolling-era-king:0:0",
+                                 {"wait_for_inclusion": True, "wait_for_finalization": False})]
     assert c.hotkey_ss58() == "h0"
+    # a rejected extrinsic is a failure, never "signalled"
+    from cascade.shared.chain import ChainError
+    sub.commit_fail = True
+    with pytest.raises(ChainError, match="rate limited"):
+        c.set_plain_commitment("cascade-ready:1:rolling-era-king:0:0")
 
 
 def test_poll_commitments_never_surfaces_an_activation_note():
@@ -566,7 +588,7 @@ def test_validator_runner_records_nothing_for_a_typed_in_rollover(cfg):
     chain = FakeChain(_fleet(60, 40), {}, block=B0 + 1, hotkey="v1")
     runner._activation_startup(chain)
     assert runner.activation_block == 0 and runner._activation.source == "config"
-    assert chain.written == [A.format_signal(FEATURE)]      # still says it is ready
+    assert chain.written == []          # a typed-in rollover makes the note inert: no extrinsic
 
 
 def test_validator_runner_off_when_the_feature_is_blank(cfg):
@@ -655,3 +677,140 @@ def test_audit_replays_under_the_recorded_block_and_checks_agreement(cfg):
     assert A.apply_receipt_activation(typed, r1) is typed
     assert check_activation(r1, typed).status == "PASS"
     assert check_activation(_receipt(activation_block=B0), typed).status == "FAIL"
+
+
+# ── audit fixes (2026-09-22): in-order tallying, admissible notes, records ────
+
+
+class _PerBlockChain(FakeChain):
+    """FakeChain whose as-of reads fail for specific blocks only."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fail_blocks: set[int] = set()
+
+    def _view(self, block):
+        if block is not None and int(block) in self.fail_blocks:
+            raise RuntimeError("state pruned")
+        return super()._view(block)
+
+
+def test_agreed_activation_ignores_inadmissible_pairs(cfg):
+    vals = [_v("a", 60), _v("b", 40)]
+    good = A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + GRID)
+    for bad in (A.format_signal(FEATURE, lock_block=5, activation_block=7),
+                A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + 2 * GRID),
+                A.format_signal(FEATURE, lock_block=B0 + 1, activation_block=B0 + GRID)):
+        sig = A.parse_signal(bad)
+        assert not A.valid_pair(cfg.round, sig.lock_block, sig.activation_block)
+        # without the grid the pair is taken at face value; with it, never
+        assert A.agreed_activation(FEATURE, vals, {"a": bad}, threshold=0.51, block=B0) is not None
+        assert A.agreed_activation(FEATURE, vals, {"a": bad}, threshold=0.51, block=B0,
+                                   round_cfg=cfg.round) is None
+        chain = FakeChain(vals, {"a": bad}, block=B0 + 5 * GRID)
+        res = A.resolve_activation(cfg, chain, now_block=chain.block, record=A.ActivationRecord())
+        assert res.record.source == "tally"             # counted as ready; never adopted
+        assert res.record.lock_block == B0 + 5 * GRID
+    assert A.agreed_activation(FEATURE, vals, {"a": good}, threshold=0.51, block=B0,
+                               round_cfg=cfg.round) == (B0, B0 + GRID)
+
+
+def test_resolver_retries_a_missed_boundary_in_order_and_never_counts_a_later_one(cfg):
+    """The fork this closes: a node down across the lock-in boundary B must
+    not count the next boundary B2 and name B2+grid while its peers named
+    B+grid. It retries B; the notes may rescue it meanwhile."""
+    B, B2 = B0 + GRID, B0 + 2 * GRID
+    ready = A.format_signal(FEATURE)
+    at_b = ([_v("a", 49.1), _v("o", 24.5), _v("c", 11.6), _v("d", 9.5), _v("e", 5.3)],
+            {"a": ready, "o": ready, "c": ready})
+    # healthy peer: locks at B, rollover B2
+    peer = _PerBlockChain(*at_b, block=B + 5)
+    peer.history[B] = at_b
+    p = A.resolve_activation(cfg, peer, now_block=B + 5,
+                             record=A.ActivationRecord(feature=FEATURE, last_checked_boundary=B0))
+    assert p.record.lock_block == B and p.record.activation_block == B2
+    # this node: tallied B0, then down across B; back at B2+5 with B pruned.
+    # By now stake drifted so the two rewritten notes are under 51% of total.
+    locked = A.format_signal(FEATURE, lock_block=B, activation_block=B2)
+    at_b2 = ([_v("a", 46.0), _v("o", 4.0), _v("c", 30.0), _v("d", 15.0), _v("e", 5.0)],
+             {"a": locked, "o": locked, "c": ready})
+    node = _PerBlockChain(*at_b2, block=B2 + 5)
+    node.history[B] = at_b
+    node.history[B2] = at_b2
+    node.fail_blocks = {B}
+    rec = A.ActivationRecord(feature=FEATURE, last_checked_boundary=B0)
+    res = A.resolve_activation(cfg, node, now_block=B2 + 5, record=rec)
+    assert not res.changed and not res.record.locked           # waits on B
+    assert node.as_of_reads == [B] and res.record.last_checked_boundary == B0
+    # B becomes readable (or the node moved to an archive endpoint): same
+    # state, same block, same decision as the peer
+    node.fail_blocks.clear()
+    res = A.resolve_activation(cfg, node, now_block=B2 + 40, record=res.record)
+    assert res.record.lock_block == B and res.record.activation_block == B2
+    assert res.record.source == "tally" and node.as_of_reads == [B, B]
+
+
+def test_resolver_late_joiner_adopts_the_signers_earlier_lock_over_its_own_boundary(cfg):
+    """A fresh record's first tally lands on a later boundary; the signers
+    it counts already name an earlier lock-in with most of the SIGNED stake
+    (under 51% of the total after drift) — theirs is the fleet's block."""
+    B, B2 = B0 + GRID, B0 + 2 * GRID
+    locked = A.format_signal(FEATURE, lock_block=B, activation_block=B2)
+    ready = A.format_signal(FEATURE)
+    vals = [_v("a", 46.0), _v("o", 4.0), _v("c", 30.0), _v("d", 15.0), _v("e", 5.0)]
+    sig = {"a": locked, "o": locked, "c": ready}
+    chain = FakeChain(vals, sig, block=B2 + 5)
+    res = A.resolve_activation(cfg, chain, now_block=B2 + 5, record=A.ActivationRecord())
+    assert res.tally is not None and res.tally.locked          # 80% signed at B2
+    assert (res.record.lock_block, res.record.activation_block) == (B, B2)
+    assert res.record.source == "signals" and res.record.last_checked_boundary == B2
+    # signers naming an INADMISSIBLE earlier pair are ignored: own lock stands
+    chain.signals["a"] = chain.signals["o"] = A.format_signal(
+        FEATURE, lock_block=B, activation_block=B2 + GRID)
+    res = A.resolve_activation(cfg, chain, now_block=B2 + 5, record=A.ActivationRecord())
+    assert (res.record.lock_block, res.record.activation_block) == (B2, B2 + GRID)
+    assert res.record.source == "tally"
+
+
+def test_resolver_blanks_a_typed_in_record_once_the_keys_are_cleared(cfg):
+    typed = replace(cfg, round=replace(cfg.round, rolling_from_block=B0 + GRID,
+                                       epoch_blocks_prev=GRID, epoch_activation_block=B0 + GRID,
+                                       epoch_blocks=900),
+                    scoring=replace(cfg.scoring, era_king_from_block=B0 + GRID,
+                                    tenure_blocks_from_block=B0 + GRID,
+                                    cohort_maxt_increment_from_block=B0 + GRID))
+    chain = FakeChain(_fleet(30, 70), {"v1": A.format_signal(FEATURE)}, block=B0 + 3)
+    rec = A.resolve_activation(typed, chain, now_block=B0 + 3, record=A.ActivationRecord()).record
+    assert rec.locked and rec.source == "config"
+    # the owner removes the typed-in block: the chain decides again — the
+    # record is blanked, and the next pass tallies as if fresh
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 3, record=rec)
+    assert res.changed and res.record == A.ActivationRecord()
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 3, record=res.record)
+    assert res.tally is not None and res.record.last_checked_boundary == B0
+    assert not res.record.locked
+
+
+def test_resolver_does_not_consume_a_boundary_on_an_empty_metagraph(cfg):
+    chain = FakeChain([], {}, block=B0 + 3)
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 3, record=A.ActivationRecord())
+    assert not res.changed and res.record.last_checked_boundary == 0
+    # the read comes back real next poll: the SAME boundary is counted
+    chain.validators = _fleet(60, 40)
+    chain.signals = {"v1": A.format_signal(FEATURE)}
+    res = A.resolve_activation(cfg, chain, now_block=B0 + 30, record=res.record)
+    assert res.record.lock_block == B0 and res.record.activation_block == B0 + GRID
+
+
+def test_own_signal_is_silent_under_a_typed_in_rollover(cfg):
+    typed = replace(cfg, round=replace(cfg.round, rolling_from_block=B0 + GRID,
+                                       epoch_blocks_prev=GRID, epoch_activation_block=B0 + GRID,
+                                       epoch_blocks=900),
+                    scoring=replace(cfg.scoring, era_king_from_block=B0 + GRID,
+                                    tenure_blocks_from_block=B0 + GRID,
+                                    cohort_maxt_increment_from_block=B0 + GRID))
+    rec = A.ActivationRecord(feature=FEATURE, activation_block=B0 + GRID, source="config")
+    assert A.own_signal_payload(typed, rec) is None
+    chain = FakeChain(_fleet(30, 70), {}, block=B0 + 3)
+    assert not A.ensure_signal(chain, typed, rec, hotkey="v1") and chain.written == []
+    assert A.own_signal_payload(cfg, A.ActivationRecord()) == A.format_signal(FEATURE)

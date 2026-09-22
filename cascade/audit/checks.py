@@ -243,6 +243,8 @@ def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
     agreed = agreed_activation(cfg.activation.feature, validators, signals,
                                threshold=cfg.activation.threshold, block=now_block,
                                dormant_after_blocks=cfg.activation.dormant_after_blocks)
+    # (No admissibility filter here: the audit must SEE a fleet note that
+    # disagrees with the receipt, not silently drop it.)
     if agreed is None:
         return _warn(name, f"rollover {block} recorded; validators holding "
                            f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "

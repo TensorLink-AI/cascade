@@ -721,40 +721,32 @@ class ChainClient:
         ``set_plain_commitment`` writes; NOT the timelock reveal store miners
         use) as of ``block`` (current when None). Every hotkey's, unfiltered —
         the activation tally parses and filters."""
+        # ONE ``query_map`` of ``Commitments::CommitmentOf`` at the block,
+        # decoded here: the SDK's ``get_all_commitments`` runs its decoder
+        # over every entry and logs an ERROR for each sealed (timelock) miner
+        # commit it cannot read — one line per miner per read, on every
+        # node, at every boundary. Only ``Raw*`` fields carry a note; sealed
+        # fields are skipped silently. A failure is a ChainError the caller
+        # retries next poll — never a per-uid walk (≈13 min on a full
+        # metagraph), which would stall the poll loop this runs in.
         sub = self.subtensor()
-        get_all = getattr(sub, "get_all_commitments", None)
-        if get_all is not None:
-            # ONE query; a failure is a ChainError the caller retries next
-            # poll — never the ~N per-uid queries below (≈13 min live on a
-            # full metagraph), which would stall the poll loop this runs in.
-            try:
-                kwargs: dict[str, Any] = {"netuid": self.netuid}
-                if block is not None:
-                    kwargs["block"] = int(block)
-                raw = get_all(**kwargs) or {}
-                return {str(hk): str(v) for hk, v in dict(raw).items() if isinstance(v, str)}
-            except Exception as e:  # noqa: BLE001
-                raise ChainError(f"get_all_commitments_failed: {e}") from e
-        # Older bittensor without the bulk API: per uid.
         try:
-            kwargs = {"netuid": self.netuid, "lite": True}
+            kwargs: dict[str, Any] = {"module": "Commitments", "name": "CommitmentOf",
+                                      "params": [self.netuid]}
             if block is not None:
                 kwargs["block"] = int(block)
-            meta = sub.metagraph(**kwargs)
+            qm = sub.query_map(**kwargs)
         except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
+            raise ChainError(f"commitments_query_failed: {e}") from e
         out: dict[str, str] = {}
-        for uid in range(int(meta.n)):
+        for key, value in qm:
             try:
-                kwargs = {"netuid": self.netuid, "uid": uid}
-                if block is not None:
-                    kwargs["block"] = int(block)
-                rec = sub.get_commitment(**kwargs)
-            except Exception:  # noqa: BLE001
+                hotkey = str(getattr(key, "value", key))
+                payload = _decode_raw_commitment(getattr(value, "value", value))
+            except Exception:  # noqa: BLE001 — one bad entry is not the store
                 continue
-            payload, _ = _split_commitment(rec)
             if payload:
-                out[str(meta.hotkeys[uid])] = str(payload)
+                out[hotkey] = payload
         return out
 
     def set_plain_commitment(self, payload: str) -> None:
@@ -766,10 +758,24 @@ class ChainClient:
         writer = getattr(sub, "set_commitment", None) or getattr(sub, "commit", None)
         if writer is None:
             raise ChainError("set_commitment unavailable on this bittensor build")
+        data = str(payload)
+        # Preview before signing (the chain-mutation rule): intent, then call.
+        log.info("chain: set_commitment intent netuid=%d hotkey=%s data=%r",
+                 self.netuid, self.hotkey_ss58(), data)
         try:
-            writer(wallet=w, netuid=self.netuid, data=str(payload))
+            try:
+                resp = writer(wallet=w, netuid=self.netuid, data=data,
+                              wait_for_inclusion=True, wait_for_finalization=False)
+            except TypeError:
+                resp = writer(wallet=w, netuid=self.netuid, data=data)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"set_commitment_failed: {e}") from e
+        # The SDK returns a response object (``raise_error=False`` default):
+        # a rejected extrinsic (rate limit, RPC error) is a failure, not a
+        # note on chain.
+        ok, msg = _extrinsic_outcome(resp)
+        if ok is False:
+            raise ChainError(f"set_commitment_rejected: {msg}")
 
     def hotkey_ss58(self) -> str:
         """This client's wallet hotkey address ("" without a wallet)."""
@@ -827,6 +833,50 @@ class ChainClient:
             )
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"set_weights_failed: {e}") from e
+
+
+def _decode_raw_commitment(v: Any) -> str | None:
+    """The UTF-8 payload of a ``CommitmentOf`` entry's first ``Raw*`` field
+    (``None`` for a sealed/timelock entry or anything else)."""
+    if not isinstance(v, dict):
+        return None
+    fields = (v.get("info") or {}).get("fields") or []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        for name, val in f.items():
+            if not str(name).startswith("Raw"):
+                continue
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val).decode("utf-8", errors="ignore")
+            if isinstance(val, str):
+                hex_ = val[2:] if val.startswith("0x") else val
+                try:
+                    return bytes.fromhex(hex_).decode("utf-8", errors="ignore")
+                except ValueError:
+                    return val
+            if isinstance(val, (list, tuple)):
+                try:
+                    return bytes(int(b) for b in val).decode("utf-8", errors="ignore")
+                except (ValueError, TypeError):
+                    return None
+    return None
+
+
+def _extrinsic_outcome(resp: Any) -> tuple[bool | None, str]:
+    """``(success, message)`` from an SDK extrinsic response: an object with
+    ``success``/``message``, a ``(success, message)`` tuple, a bool, or
+    ``None`` (unknown ⇒ ``(None, "")``; the caller's next read confirms)."""
+    if resp is None:
+        return None, ""
+    if isinstance(resp, bool):
+        return resp, ""
+    ok = getattr(resp, "success", None)
+    if ok is not None:
+        return bool(ok), str(getattr(resp, "message", "") or "")
+    if isinstance(resp, tuple) and resp:
+        return bool(resp[0]), str(resp[1] if len(resp) > 1 else "")
+    return None, ""
 
 
 def _split_commitment(rec: Any) -> tuple[str | None, int]:
