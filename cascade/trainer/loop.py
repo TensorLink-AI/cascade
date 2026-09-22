@@ -1149,7 +1149,7 @@ class TrainerRunner:
     # operator-driven re-train/re-publish of a finished round. None ⇒ the guard
     # always applies.
     force_rerun_round: str | None = None
-    # Stake-weighted activation (DEC-CA-0044): the trainer READS the fleet's
+    # Stake-weighted activation (DEC-CA-0045): the trainer READS the fleet's
     # decision (validator notes / the boundary tally) and arms the DEC-CA-0043
     # rollover on itself — it never signals (it is not a validator). The
     # record persists under work_root so a restart re-arms without a chain
@@ -1696,7 +1696,7 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
 
-    # ── stake-weighted activation (DEC-CA-0044) ─────────────────────────────
+    # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
     def apply_activation_block(self, block: int) -> bool:
         """Arm the DEC-CA-0043 rollover at ``block`` on the live config and
@@ -7996,7 +7996,7 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
-                # Stake-weighted activation (DEC-CA-0044): learn the fleet's
+                # Stake-weighted activation (DEC-CA-0045): learn the fleet's
                 # rollover BEFORE the grid is derived this tick, so a lock-in
                 # arms rolling intake at the very boundary it names.
                 self._activation_tick(client, block)

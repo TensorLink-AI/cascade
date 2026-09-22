@@ -133,7 +133,7 @@ published scored receipt round=… signed=True → s3://…/receipts/<your-hotke
   **before the announced round boundary**, and confirm your weight vector agrees
   with the other validators on the round after.
 - **The rolling-rounds switch is decided on chain, by validator stake
-  (DEC-CA-0044).** You do not have to hit an announced block for the
+  (DEC-CA-0045).** You do not have to hit an announced block for the
   DEC-CA-0043 rollover (rolling intake, the era king, tenure in blocks, the
   3600 → 900 grid). When your validator starts on a release carrying it, it
   posts a small plain commitment from your hotkey — `cascade-ready:1:rolling-era-king:0:0`

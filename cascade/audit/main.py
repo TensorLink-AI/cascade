@@ -213,7 +213,7 @@ def audit_receipt(
     function in :mod:`cascade.audit.checks` / :mod:`cascade.audit.rederive`."""
     from ..shared.activation import apply_receipt_activation
 
-    # DEC-CA-0044: a receipt judged under a rollover the validators decided
+    # DEC-CA-0045: a receipt judged under a rollover the validators decided
     # on chain replays under THAT block, not the config this auditor loaded.
     cfg = apply_receipt_activation(cfg, receipt)
     roster = None

@@ -325,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg=cfg,
         base_trainer=base_trainer,
         work_root=args.work_root,
-        # DEC-CA-0044: the rollover the validators decided, persisted beside
+        # DEC-CA-0045: the rollover the validators decided, persisted beside
         # the trainer's other state; the first loop tick resolves it before
         # any round work.
         activation_store=ActivationStore(Path(args.work_root) / "activation_state.json"),

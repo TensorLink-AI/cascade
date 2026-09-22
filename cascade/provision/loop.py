@@ -274,7 +274,7 @@ class ProvisionerLoop:
     # trainer and validator without needing its own restart.
     epoch_blocks_prev: int = 0
     epoch_activation_block: int = 0
-    # Stake-weighted activation (DEC-CA-0044): called every cycle with
+    # Stake-weighted activation (DEC-CA-0045): called every cycle with
     # ``(chain_client, block)``; returns ``(epoch_blocks, epoch_blocks_prev,
     # epoch_activation_block)`` the moment the fleet's lock-in applies, else
     # None. Resolved IN the loop so no operator restart (and no restart inside
@@ -604,7 +604,7 @@ class ProvisionerLoop:
             ex.shutdown(wait=False)
 
     def _maybe_apply_activation(self, block: int) -> None:
-        """DEC-CA-0044: learn the fleet's rollover (once it locks in) and
+        """DEC-CA-0045: learn the fleet's rollover (once it locks in) and
         switch this loop's grid at the same block the trainer and validators
         do. Best-effort under a hard deadline — never blocks the cycle."""
         if self.activation_fn is None:

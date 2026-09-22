@@ -661,7 +661,7 @@ def _run(args) -> int:
     import tomllib
 
     cfg = load_chain_config(args.chain_toml)
-    # Stake-weighted activation (DEC-CA-0044): the provisioner keys its grid
+    # Stake-weighted activation (DEC-CA-0045): the provisioner keys its grid
     # off the config, so learn the fleet's resolved rollover ONCE at startup
     # (the validators' notes / the boundary tally). Best-effort — a chain
     # flake here means the typed-in config, same as before this existed;

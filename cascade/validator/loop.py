@@ -359,7 +359,7 @@ class ValidatorRunner:
     # deliberately NOT cached: "not there yet" is the normal pre-publish state
     # the pending-bench queue exists to re-probe.
     _bench_report_cache: dict = field(default_factory=dict, repr=False)
-    # Stake-weighted activation (DEC-CA-0044): the persisted decision, the
+    # Stake-weighted activation (DEC-CA-0045): the persisted decision, the
     # last boundary tally (for status/chain.json), and the hotkey this
     # validator signals from. ``activation_store`` None ⇒ nothing persists
     # (tests); the loop still resolves in memory.
@@ -369,7 +369,7 @@ class ValidatorRunner:
     _signal_hotkey: str = field(default="", repr=False)
     _signal_sent: str = field(default="", repr=False)
 
-    # ── stake-weighted activation (DEC-CA-0044) ─────────────────────────────
+    # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
     @property
     def activation_block(self) -> int:
@@ -2317,7 +2317,7 @@ class ValidatorRunner:
         if last_round is not None:
             log.info("round %s already handled (persisted/receipt marker); resuming poll",
                      last_round)
-        # Stake-weighted activation (DEC-CA-0044): restore/resolve the
+        # Stake-weighted activation (DEC-CA-0045): restore/resolve the
         # rollover and post this validator's readiness note BEFORE the first
         # manifest is judged, so a restart never judges a settlement under
         # the wrong rules.
@@ -2929,7 +2929,7 @@ def build_runner(
     # Cascade is opt-in ([scoring] cascade_enabled); off ⇒ no controller is wired
     # and the runner is pure KOTH.
     cascade = _build_cascade(cfg) if cfg.scoring.cascade_enabled else None
-    # DEC-CA-0044: the resolved rollover persists beside the champion state.
+    # DEC-CA-0045: the resolved rollover persists beside the champion state.
     activation_store = ActivationStore(
         Path(cfg.validator.state_db_path).with_name("activation_state.json"))
     return ValidatorRunner(

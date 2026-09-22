@@ -516,7 +516,7 @@ class RoundReceipt:
     # audit checks both.
     era_start_block: int = 0
     era_base_seed: int = 0
-    # Stake-weighted activation (DEC-CA-0044, drop-when-default): the
+    # Stake-weighted activation (DEC-CA-0045, drop-when-default): the
     # DEC-CA-0043 rollover block this validator resolved FROM VALIDATOR
     # SIGNALS (0 = none resolved, or the rollover is typed into chain.toml).
     # Stamped on every receipt from lock-in on, so the audit replays each
@@ -897,7 +897,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "heat": heat_summary,
         "reject_reason": receipt.reject_reason,
         "validator_hotkey": receipt.validator_hotkey or None,
-        # DEC-CA-0044: the rollover block this validator resolved from
+        # DEC-CA-0045: the rollover block this validator resolved from
         # validator signals (0 = none / typed into chain.toml).
         "activation_block": int(receipt.activation_block or 0),
     }

@@ -1,4 +1,4 @@
-"""Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044).
+"""Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045).
 
 The rollover block today is typed into ``chain.toml`` and every validator
 has to upgrade before it. This module lets the fleet DECIDE the block on
@@ -541,7 +541,7 @@ def startup_activation(
 def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
     """For the audit: the config a receipt was judged under — its recorded
     ``activation_block`` applied when the loaded config names no rollover
-    and runs the feature. A receipt without the field (pre-DEC-CA-0044, or
+    and runs the feature. A receipt without the field (pre-DEC-CA-0045, or
     a typed-in rollover) replays under the loaded config as before. A block
     the loaded config cannot apply leaves it unchanged; the ``activation``
     check reports why."""

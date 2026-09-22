@@ -580,7 +580,7 @@ scratch_shadow_every_rounds = 2
                                 # step down (finished form scores lower) before mainnet.
 
 [activation]
-# DEC-CA-0044 stake-weighted activation (see chain.toml). INERT here: the
+# DEC-CA-0045 stake-weighted activation (see chain.toml). INERT here: the
 # DEC-CA-0043 keys above are typed in (600), and a typed-in rollover always
 # wins. To exercise the mechanism on testnet set every rollover key back to
 # 0 (and epoch_blocks = 300, epoch_blocks_prev = 0, epoch_activation_block = 0)

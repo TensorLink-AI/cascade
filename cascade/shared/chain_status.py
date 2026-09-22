@@ -93,7 +93,7 @@ def build_chain_status(
     ``economics`` is ``ChainClient.subnet_economics()`` output (alpha price,
     TAO emissions/day) and is included verbatim when provided — the
     stakeholder scoreboard's Economics cell reads it. ``activation`` is the
-    validator's stake-weighted activation view (DEC-CA-0044,
+    validator's stake-weighted activation view (DEC-CA-0045,
     ``cascade.shared.activation.summary``): feature, threshold, the last
     boundary tally, lock-in and rollover blocks. Like everything else here
     it is presentational and unsigned.

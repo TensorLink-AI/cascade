@@ -666,7 +666,7 @@ class ChainClient:
             payload, reveal_block = _split_commitment(rec)
             if payload is None:
                 continue
-            # A validator's activation note (DEC-CA-0044) lives in this store;
+            # A validator's activation note (DEC-CA-0045) lives in this store;
             # it is not a submission and must never reach a field builder.
             if is_signal_payload(payload):
                 continue
@@ -674,7 +674,7 @@ class ChainClient:
                                   payload=payload, commit_block=int(reveal_block)))
         return out
 
-    # ── stake-weighted activation (DEC-CA-0044) ──────────────────────────────
+    # ── stake-weighted activation (DEC-CA-0045) ──────────────────────────────
 
     def validator_stakes(self, block: int | None = None) -> list:
         """Every registered hotkey's ``(stake, validator_permit, last_update)``

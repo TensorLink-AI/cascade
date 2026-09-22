@@ -1,4 +1,4 @@
-"""Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044).
+"""Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045).
 
 Validators post a readiness note on chain; every node tallies eligible stake
 at each boundary; the first boundary at/over the threshold locks in and the

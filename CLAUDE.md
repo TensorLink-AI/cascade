@@ -418,7 +418,7 @@ in-context.
   risk: the era king is scoutable — the confirmation leg or the
   retrain-noise measurement gates arming.
   (`decisions/DEC-CA-0043-rolling-intake-era-king.md`)
-- **DEC-CA-0044** (proposed) — Stake-weighted activation: the DEC-CA-0043
+- **DEC-CA-0045** (proposed) — Stake-weighted activation: the DEC-CA-0043
   rollover is DECIDED on chain, not typed in. Each upgraded validator posts
   a plain commitment `cascade-ready:1:rolling-era-king:0:0`; at every
   boundary every node sums permit-holding validator stake behind it AS OF
@@ -431,7 +431,7 @@ in-context.
   audit (`activation` check). Typed-in DEC-CA-0043 keys always win (owner
   override). Trainer/provisioner read, never signal. Mainnet armed at
   release with keys 0; testnet inert (typed-in 600).
-  (`decisions/DEC-CA-0044-stake-weighted-activation.md`)
+  (`decisions/DEC-CA-0045-stake-weighted-activation.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

@@ -159,7 +159,7 @@ compares only when its replay could resolve domains). All of them are
 drop-when-default, so older receipts verify unchanged.
 
 A receipt judged after the validators decided the DEC-CA-0043 rollover on
-chain (DEC-CA-0044, stake-weighted activation) records that block as
+chain (DEC-CA-0045, stake-weighted activation) records that block as
 `activation_block` (drop-when-default; absent when the rollover is typed
 into `chain.toml` or none has been decided). The audit REPLAYS the round
 under that block — every DEC-CA-0043 rule (era envelope, tenure in blocks,

@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0044
+id: DEC-CA-0045
 type: decision
 title: "Stake-weighted activation: validators signal readiness on chain, the DEC-CA-0043 rollover locks in at the first boundary where 51% of eligible validator stake has signalled and flips at the next boundary — no typed-in block"
 status: proposed

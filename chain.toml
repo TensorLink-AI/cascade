@@ -282,7 +282,7 @@ epoch_activation_block = 0
 # ROLLOVER (3h grid); ROLLOVER % 3600 == 0. Load-checked. Do NOT arm before
 # the six external validators run a release carrying the era envelope.
 # With every key at 0 the block is DECIDED ON CHAIN by validator stake
-# ([activation] below, DEC-CA-0044); typing a block here overrides that.
+# ([activation] below, DEC-CA-0045); typing a block here overrides that.
 rolling_from_block = 0
 # Settlements per era (consecutive boundaries sharing one set of training
 # seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
@@ -1071,7 +1071,7 @@ scratch_shadow_every_rounds = 0
                                 # [eval] bench_hold_max_hours accordingly. 0.0/absent = off.
 
 [activation]
-# Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044). Each
+# Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045). Each
 # validator on a release carrying this feature posts a plain on-chain
 # commitment ("cascade-ready:1:<feature>:0:0") from its hotkey at startup.
 # At every boundary of the grid in force, every node sums the stake of the

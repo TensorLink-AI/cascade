@@ -183,7 +183,7 @@ def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
 
 def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
                      client: object | None = None) -> CheckResult:
-    """DEC-CA-0044: the rollover block a receipt records was decided by the
+    """DEC-CA-0045: the rollover block a receipt records was decided by the
     validators, not invented by one.
 
     A receipt without ``activation_block`` PASSES (pre-field, or the

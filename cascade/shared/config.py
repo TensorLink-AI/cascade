@@ -1933,7 +1933,7 @@ class ValidatorConfig:
 
 @dataclass(frozen=True)
 class ActivationConfig:
-    """Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0044).
+    """Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045).
 
     Each upgraded validator writes a plain on-chain commitment
     ``cascade-ready:1:<feature>:…`` from its hotkey. At every boundary of
@@ -2448,7 +2448,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # split rollover would let one node open an era where another still runs
     # boundary rounds — refuse to load rather than fork the fleet. The same
     # check guards a rollover resolved at runtime from validator signals
-    # (DEC-CA-0044, ``cascade.shared.activation.apply_activation``).
+    # (DEC-CA-0045, ``cascade.shared.activation.apply_activation``).
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
@@ -2468,7 +2468,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         funded_king_rent=bool(r.get("funded_king_rent", False)),
     )
 
-    # Stake-weighted activation (DEC-CA-0044): validators signal readiness on
+    # Stake-weighted activation (DEC-CA-0045): validators signal readiness on
     # chain; the rollover block is resolved from those signals at runtime when
     # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
     # never reaches the resolver.
