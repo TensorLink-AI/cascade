@@ -303,8 +303,12 @@ in-context.
   / `effective_margin_mode`; audit replays each round under its block (level
   fallback for random-init preserved); no receipt change. ARMED at 9046800 —
   SAME block as DEC-CA-0038 (one validator-upgrade window; the two stack:
-  increment fixes the signal, max-T the multiplicity). Not a basin-escape
-  substitute (DEC-CA-0014). (`decisions/DEC-CA-0039-increment-margin-activation.md`)
+  increment fixes the signal, max-T the multiplicity). AMENDED 2026-09-19:
+  the stacking never ran — the max-T bound was level-only, so cohort rounds
+  (every funded round) were level-judged; fixed behind `[scoring]
+  cohort_maxt_increment_from_block` (consensus, mainnet block TBD, testnet 1).
+  Not a basin-escape substitute (DEC-CA-0014).
+  (`decisions/DEC-CA-0039-increment-margin-activation.md`)
 - **DEC-CA-0040** (proposed) — Make the king beatable more often by flattening
   the FRESH-KING margin ramp (`win_margin_start` 0.01 → the 0.005 floor), NOT by
   touching the noise gate. Replay of 86 mainnet rounds: the margin below ~0.3% is
@@ -393,6 +397,41 @@ in-context.
   `batch_points`). Worker image REBUILD before the first 5h round (v0.8.0
   bills C×L). No validator restart (declared gating; no locked term moves).
   (`decisions/DEC-CA-0042-series-points-budget-five-hour-legs.md`)
+- **DEC-CA-0043** (proposed) — Rolling intake + era king, block-gated at ONE
+  rollover: challengers train the moment they are funded (legs cross
+  boundaries, `funded_field_cap` = legs in flight, queue `in_flight` state);
+  every 3h boundary SETTLES what finished (one hash-chained manifest,
+  validators walk `round-<id>.json` forward, never jump to latest); the
+  king's leg trains once per 12h ERA (4 settlements, one seed set from the
+  previous era's start hash, one init = `members_gen(g)[era % k]` with
+  `effective_era` one full era of notice, cached checkpoint, next era's king
+  pre-trained in the last wall + margin); a dethrone adopts the winner's
+  checkpoint without ending the era; a settlement at boundary B belongs to
+  the era containing B − 1 (seamless intake, no dead zone); the king is
+  derived from receipts, never the metagraph; refs are bound at
+  `train_block`; tenure/ripeness re-denominated to BLOCKS across the
+  3600 → 900 grid switch; bench at leg completion; seniority = first pick of
+  FITTING executors. `[round] rolling_from_block` / `era_settlements`,
+  `[scoring] era_king_from_block` / `tenure_blocks_from_block` /
+  `margin_warmup_blocks` / `cascade_reign_blocks`, all 0 on mainnet
+  (release-then-activate; testnet armed at the first boundary). Accepted
+  risk: the era king is scoutable — the confirmation leg or the
+  retrain-noise measurement gates arming.
+  (`decisions/DEC-CA-0043-rolling-intake-era-king.md`)
+- **DEC-CA-0045** (proposed) — Stake-weighted activation: the DEC-CA-0043
+  rollover is DECIDED on chain, not typed in. Each upgraded validator posts
+  a plain commitment `cascade-ready:1:rolling-era-king:0:0`; at every
+  boundary every node sums permit-holding validator stake behind it AS OF
+  the boundary block; the first boundary at/over `[activation] threshold`
+  (0.51) LOCKS IN (one-way, persisted) and the rollover is the NEXT boundary
+  (clean trainer restart at lock-in). Locked-in validators rewrite the note
+  with the block so late/restarted nodes adopt it from the notes alone; the
+  block is applied through the loader's own alignment check, stamped on
+  receipts (`activation_block`, drop-when-default) and replayed by the
+  audit (`activation` check). Typed-in DEC-CA-0043 keys always win (owner
+  override). Trainer/provisioner read, never signal. Mainnet armed at
+  release with keys 0; testnet inert (typed-in 600).
+  (`decisions/DEC-CA-0045-stake-weighted-activation.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

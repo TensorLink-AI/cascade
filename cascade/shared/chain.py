@@ -25,9 +25,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from .activation import is_signal_payload
 from .config import ChainConfig
 
 log = logging.getLogger("cascade.chain")
+# Distinct bulk-decode failure causes already warned about (see poll_commitments).
+_bulk_decode_warned: set[str] = set()
 
 
 class ChainError(RuntimeError):
@@ -497,8 +500,17 @@ class ChainClient:
                 # ourselves: ONE query_map for the netuid, tolerant per-entry
                 # decode (~1s), instead of N per-UID queries (~13 min live —
                 # long enough to blow the provisioner's rental window).
-                log.warning("bulk revealed-commitment decode failed (%s); "
-                            "reading the raw store map", e)
+                # Once per distinct cause: one malformed on-chain commit makes
+                # this fire on EVERY poll (~2 min) on every node — noise that
+                # hides a real problem. The raw path names the offending uid.
+                cause = f"{type(e).__name__}: {e}"[:200]
+                if cause not in _bulk_decode_warned:
+                    _bulk_decode_warned.add(cause)
+                    log.warning("bulk revealed-commitment decode failed (%s); reading "
+                                "the raw store map (this warning repeats only when the "
+                                "cause changes)", e)
+                else:
+                    log.debug("bulk revealed-commitment decode failed (%s); raw store map", e)
                 try:
                     return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys,
                                                   include_history=include_history)
@@ -654,9 +666,123 @@ class ChainClient:
             payload, reveal_block = _split_commitment(rec)
             if payload is None:
                 continue
+            # A validator's activation note (DEC-CA-0045) lives in this store;
+            # it is not a submission and must never reach a field builder.
+            if is_signal_payload(payload):
+                continue
             out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
                                   payload=payload, commit_block=int(reveal_block)))
         return out
+
+    # ── stake-weighted activation (DEC-CA-0045) ──────────────────────────────
+
+    def validator_stakes(self, block: int | None = None) -> list:
+        """Every registered hotkey's ``(stake, validator_permit, last_update)``
+        as of ``block`` (the current metagraph when None), for the activation
+        tally. Version-tolerant: ``S`` / ``stake`` for stake, missing
+        ``validator_permit`` ⇒ False, missing ``last_update`` ⇒ 0."""
+        from .activation import ValidatorStake
+
+        sub = self.subtensor()
+        try:
+            kwargs = {"netuid": self.netuid, "lite": True}
+            if block is not None:
+                kwargs["block"] = int(block)
+            meta = sub.metagraph(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        n = int(meta.n)
+        stakes = getattr(meta, "S", None)
+        if stakes is None:
+            stakes = getattr(meta, "stake", None)
+        permits = getattr(meta, "validator_permit", None)
+        updates = getattr(meta, "last_update", None)
+
+        def _at(seq: Any, i: int, default: Any) -> Any:
+            if seq is None:
+                return default
+            try:
+                return seq[i]
+            except (IndexError, TypeError, KeyError):
+                return default
+
+        out = []
+        for uid in range(n):
+            out.append(ValidatorStake(
+                hotkey=str(meta.hotkeys[uid]),
+                stake=float(_at(stakes, uid, 0.0) or 0.0),
+                permit=bool(_at(permits, uid, False)),
+                last_update=int(_at(updates, uid, 0) or 0),
+            ))
+        return out
+
+    def read_plain_commitments(self, block: int | None = None) -> dict[str, str]:
+        """``hotkey → payload`` from the PLAIN commitment store (what
+        ``set_plain_commitment`` writes; NOT the timelock reveal store miners
+        use) as of ``block`` (current when None). Every hotkey's, unfiltered —
+        the activation tally parses and filters."""
+        # ONE ``query_map`` of ``Commitments::CommitmentOf`` at the block,
+        # decoded here: the SDK's ``get_all_commitments`` runs its decoder
+        # over every entry and logs an ERROR for each sealed (timelock) miner
+        # commit it cannot read — one line per miner per read, on every
+        # node, at every boundary. Only ``Raw*`` fields carry a note; sealed
+        # fields are skipped silently. A failure is a ChainError the caller
+        # retries next poll — never a per-uid walk (≈13 min on a full
+        # metagraph), which would stall the poll loop this runs in.
+        sub = self.subtensor()
+        try:
+            kwargs: dict[str, Any] = {"module": "Commitments", "name": "CommitmentOf",
+                                      "params": [self.netuid]}
+            if block is not None:
+                kwargs["block"] = int(block)
+            qm = sub.query_map(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"commitments_query_failed: {e}") from e
+        out: dict[str, str] = {}
+        for key, value in qm:
+            try:
+                hotkey = str(getattr(key, "value", key))
+                payload = _decode_raw_commitment(getattr(value, "value", value))
+            except Exception:  # noqa: BLE001 — one bad entry is not the store
+                continue
+            if payload:
+                out[hotkey] = payload
+        return out
+
+    def set_plain_commitment(self, payload: str) -> None:
+        """Validator-side: write ``payload`` to the plain commitment store
+        (``set_commitment``; ``commit`` on older bittensor). One slot per
+        hotkey — the activation note replaces whatever was there."""
+        sub = self.subtensor()
+        w = self.wallet()
+        writer = getattr(sub, "set_commitment", None) or getattr(sub, "commit", None)
+        if writer is None:
+            raise ChainError("set_commitment unavailable on this bittensor build")
+        data = str(payload)
+        # Preview before signing (the chain-mutation rule): intent, then call.
+        log.info("chain: set_commitment intent netuid=%d hotkey=%s data=%r",
+                 self.netuid, self.hotkey_ss58(), data)
+        try:
+            try:
+                resp = writer(wallet=w, netuid=self.netuid, data=data,
+                              wait_for_inclusion=True, wait_for_finalization=False)
+            except TypeError:
+                resp = writer(wallet=w, netuid=self.netuid, data=data)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"set_commitment_failed: {e}") from e
+        # The SDK returns a response object (``raise_error=False`` default):
+        # a rejected extrinsic (rate limit, RPC error) is a failure, not a
+        # note on chain.
+        ok, msg = _extrinsic_outcome(resp)
+        if ok is False:
+            raise ChainError(f"set_commitment_rejected: {msg}")
+
+    def hotkey_ss58(self) -> str:
+        """This client's wallet hotkey address ("" without a wallet)."""
+        try:
+            return str(getattr(getattr(self.wallet(), "hotkey", None), "ss58_address", "") or "")
+        except ChainError:
+            return ""
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
         """Miner-side: write the generator pointer via ``set_reveal_commitment``."""
@@ -707,6 +833,50 @@ class ChainClient:
             )
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"set_weights_failed: {e}") from e
+
+
+def _decode_raw_commitment(v: Any) -> str | None:
+    """The UTF-8 payload of a ``CommitmentOf`` entry's first ``Raw*`` field
+    (``None`` for a sealed/timelock entry or anything else)."""
+    if not isinstance(v, dict):
+        return None
+    fields = (v.get("info") or {}).get("fields") or []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        for name, val in f.items():
+            if not str(name).startswith("Raw"):
+                continue
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val).decode("utf-8", errors="ignore")
+            if isinstance(val, str):
+                hex_ = val[2:] if val.startswith("0x") else val
+                try:
+                    return bytes.fromhex(hex_).decode("utf-8", errors="ignore")
+                except ValueError:
+                    return val
+            if isinstance(val, (list, tuple)):
+                try:
+                    return bytes(int(b) for b in val).decode("utf-8", errors="ignore")
+                except (ValueError, TypeError):
+                    return None
+    return None
+
+
+def _extrinsic_outcome(resp: Any) -> tuple[bool | None, str]:
+    """``(success, message)`` from an SDK extrinsic response: an object with
+    ``success``/``message``, a ``(success, message)`` tuple, a bool, or
+    ``None`` (unknown ⇒ ``(None, "")``; the caller's next read confirms)."""
+    if resp is None:
+        return None, ""
+    if isinstance(resp, bool):
+        return resp, ""
+    ok = getattr(resp, "success", None)
+    if ok is not None:
+        return bool(ok), str(getattr(resp, "message", "") or "")
+    if isinstance(resp, tuple) and resp:
+        return bool(resp[0]), str(resp[1] if len(resp) > 1 else "")
+    return None, ""
 
 
 def _split_commitment(rec: Any) -> tuple[str | None, int]:

@@ -19,7 +19,12 @@ import re
 from dataclasses import dataclass
 
 from ..shared.chain import decayed_share_vector, seed_from_block_hash
-from ..shared.config import ChainConfig, cohort_maxt_active, effective_epoch_blocks
+from ..shared.config import (
+    ChainConfig,
+    cohort_maxt_active,
+    cohort_maxt_increment_active,
+    effective_epoch_blocks,
+)
 from ..shared.manifest import (
     LOCKED_CONTRACT_FIELDS,
     TrainingManifest,
@@ -150,9 +155,18 @@ def check_base_seed(receipt: RoundReceipt) -> CheckResult:
 def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """``RoundSeeds.derive(base_seed)`` reproduces the recorded seed pair."""
     name = "round-seeds"
+    # DEC-CA-0043: an era settlement's training seeds derive from the era's
+    # seed (the previous era's start block hash), recorded as era_base_seed;
+    # the boundary's base_seed still names the round and draws the eval.
+    from ..shared.era import era_king_active
     from ..trainer.contract import RoundSeeds
 
-    seeds = RoundSeeds.derive(receipt.base_seed, cfg.training)
+    if era_king_active(cfg.scoring, receipt.epoch_start_block):
+        if not receipt.era_base_seed:
+            return _fail(name, "era settlement records no era_base_seed")
+        seeds = RoundSeeds.derive(receipt.era_base_seed, cfg.training)
+    else:
+        seeds = RoundSeeds.derive(receipt.base_seed, cfg.training)
     problems = []
     if seeds.generation_seed != receipt.generation_seed:
         problems.append(f"generation_seed {receipt.generation_seed} != derived "
@@ -162,7 +176,147 @@ def check_round_seeds(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                         f"{seeds.training_seed}")
     if problems:
         return _fail(name, "; ".join(problems))
+    if receipt.era_base_seed:
+        return _ok(name, "generation + training seeds derive from era_base_seed")
     return _ok(name, "generation + training seeds derive from base_seed")
+
+
+def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
+                     client: object | None = None) -> CheckResult:
+    """DEC-CA-0045: the rollover block a receipt records was decided by the
+    validators, not invented by one.
+
+    A receipt without ``activation_block`` PASSES (pre-field, or the
+    rollover is typed into chain.toml). A recorded block must be a boundary
+    of the grid before it; with a chain, the validators' current notes
+    must agree on the SAME block by the configured stake threshold (WARN
+    without a chain, like every other chain-dependent half). ``cfg`` is the
+    config the audit replays under — already carrying the recorded block
+    (``apply_receipt_activation``), so the era checks that follow use it.
+    """
+    from ..shared.activation import (
+        agreed_activation,
+        apply_activation,
+        configured_rollover,
+        resolved_rollover,
+    )
+
+    name = "activation"
+    block = int(receipt.activation_block or 0)
+    if not block:
+        return _ok(name, "no chain-decided rollover recorded (typed-in config applies)")
+    typed = configured_rollover(cfg)
+    if typed:
+        # The owner pinned the decided block afterwards (the natural end
+        # state): the receipt must have been judged under THAT block.
+        if typed != block:
+            return _fail(name, f"recorded activation_block {block} != the rollover typed "
+                               f"into the audit config ({typed})")
+        return _ok(name, f"rollover {block} matches the typed-in config")
+    if not cfg.activation.enabled:
+        return _fail(name, f"receipt records activation_block {block} but [activation] "
+                           "is off in the loaded config")
+    applied = resolved_rollover(cfg)
+    if applied != block:
+        # apply_receipt_activation could not arm this block on the loaded
+        # config (or armed another) — replaying under it is impossible.
+        try:
+            apply_activation(cfg, block)
+        except ValueError as e:
+            return _fail(name, f"recorded activation_block {block} cannot be applied to "
+                               f"the audit config: {e}")
+        return _fail(name, f"recorded activation_block {block} != the rollover the audit "
+                           f"config carries ({applied})")
+    grid_before = int(cfg.round.epoch_blocks_prev or cfg.round.epoch_blocks)
+    if block % max(1, grid_before):
+        return _fail(name, f"activation_block {block} is not a boundary of the grid before "
+                           f"it ({grid_before})")
+    if client is None:
+        return _warn(name, f"rollover {block} recorded; validator agreement not verified "
+                           "(no chain)")
+    try:
+        validators = list(client.validator_stakes())  # type: ignore[attr-defined]
+        signals = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        now_block = int(client.current_block())  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return _warn(name, f"rollover {block} recorded; chain read failed ({e})")
+    agreed = agreed_activation(cfg.activation.feature, validators, signals,
+                               threshold=cfg.activation.threshold, block=now_block,
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks)
+    # (No admissibility filter here: the audit must SEE a fleet note that
+    # disagrees with the receipt, not silently drop it.)
+    if agreed is None:
+        return _warn(name, f"rollover {block} recorded; validators holding "
+                           f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
+                           "block in their notes")
+    lock, act = agreed
+    if act != block:
+        return _fail(name, f"recorded activation_block {block} != the block validators "
+                           f"agree on ({act}, locked in at {lock})")
+    return _ok(name, f"rollover {block} agreed by validators holding "
+                     f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
+
+
+def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
+    """DEC-CA-0043 era envelope, replayed under the receipt's own block.
+
+    Before ``era_king_from_block`` a receipt must carry NO era context (no
+    ``era_start_block`` / ``era_base_seed``, no era stamp on the manifest).
+    From it, the receipt's ``era_start_block`` and the manifest's era stamp
+    must be the era every node derives from the boundary, every entry's
+    ``train_block`` must sit inside the era's training window, and — with a
+    chain — ``era_base_seed`` must be the seed of the era's ``seed_block``
+    hash (WARN without a chain, like the boundary hash check).
+    """
+    from ..shared.era import EraSpec, era_king_active, era_length_blocks, settlement_era
+
+    name = "era"
+    stamp = receipt.manifest.get("era")
+    if not era_king_active(cfg.scoring, receipt.epoch_start_block):
+        if receipt.era_start_block or receipt.era_base_seed or stamp is not None:
+            return _fail(name, f"era context recorded before era_king_from_block "
+                               f"{cfg.scoring.era_king_from_block} (start "
+                               f"{receipt.era_start_block}, seed {receipt.era_base_seed}, "
+                               f"stamp={'yes' if stamp is not None else 'no'})")
+        return _ok(name, "pre-era settlement; no era context (as required)")
+    expected = settlement_era(cfg.round, receipt.epoch_start_block)
+    if receipt.era_start_block != expected.start_block:
+        return _fail(name, f"era_start_block {receipt.era_start_block} != derived "
+                           f"{expected.start_block} for boundary {receipt.epoch_start_block}")
+    if receipt.status == "scored" or stamp is not None:
+        if stamp is None:
+            return _fail(name, "scored era settlement whose manifest carries no era stamp")
+        try:
+            era = EraSpec.from_json(stamp)
+        except ValueError as e:
+            return _fail(name, f"era stamp malformed: {e}")
+        if (era.index, era.start_block, era.seed_block) != (
+                expected.index, expected.start_block, expected.seed_block):
+            return _fail(name, f"manifest era {era.index}@{era.start_block} (seed "
+                               f"{era.seed_block}) != derived {expected.index}@"
+                               f"{expected.start_block} (seed {expected.seed_block})")
+        window_end = era.start_block + era_length_blocks(cfg.round, era.start_block)
+        for e in receipt.manifest.get("entries", ()):
+            tb = int(e.get("train_block", 0))
+            if not (era.seed_block <= tb < window_end):
+                return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} train_block "
+                                   f"{tb} outside era window [{era.seed_block}, {window_end})")
+    if not receipt.era_base_seed:
+        return _fail(name, "era settlement records no era_base_seed")
+    if client is None:
+        return _warn(name, f"era {expected.index} start {expected.start_block} consistent; "
+                           f"no chain connection to verify era_base_seed against block "
+                           f"{expected.seed_block}")
+    try:
+        onchain = seed_from_block_hash(str(client.block_hash(expected.seed_block)))
+    except Exception as e:  # noqa: BLE001 — lite node / pruned history
+        return _warn(name, f"chain could not serve era seed block {expected.seed_block} "
+                           f"({e}); era_base_seed not verified")
+    if onchain != receipt.era_base_seed:
+        return _fail(name, f"era_base_seed {receipt.era_base_seed} != seed of block "
+                           f"{expected.seed_block} hash ({onchain})")
+    return _ok(name, f"era {expected.index} start {expected.start_block}; era_base_seed "
+                     f"matches block {expected.seed_block}")
 
 
 def check_epoch_alignment(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
@@ -487,12 +641,16 @@ def _baseline_pooled(receipt: RoundReceipt, paired: list[str]):
     return out
 
 
-def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params):
+def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params,
+                      baseline=None):
     """``{hotkey: max-T family-wise LCB}`` for a cohort round replayed under
     the shared-resample correction (DEC-CA-0038) — the same call the validator
     made (:func:`cascade.eval.koth.cohort_maxt_lcb_map`), off the receipt's own
     scores. ``params`` is the UNMODIFIED recorded set (max-T needs no
-    ``alpha/k``). Raises on unpaired/​unrebuildable scores."""
+    ``alpha/k``). ``baseline`` (the pooled init rows) puts the bound in
+    INCREMENT units — pass it exactly when the validator did: increment judged
+    AND ``cohort_maxt_increment_from_block`` reached for this receipt's block.
+    Raises on unpaired/​unrebuildable scores."""
     from ..eval.koth import cohort_maxt_lcb_map
 
     duelled = _duelled_hotkeys(receipt)
@@ -505,7 +663,8 @@ def _cohort_maxt_lcbs(receipt: RoundReceipt, manifest: TrainingManifest, params)
         cohort.append((hk, chal))
     return cohort_maxt_lcb_map(
         king_scores, cohort, params,
-        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean")
+        seed=_bootstrap_seed(receipt.verdict.bootstrap_seed), wql_mode="geomean",
+        baseline_scores=baseline)
 
 
 def _cohort_params(params, manifest: TrainingManifest):
@@ -633,8 +792,17 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     if use_maxt:
         from ..eval.koth import with_cohort_lcb
 
+        # Increment units for the joint bound (DEC-CA-0039 stacked): exactly
+        # when the round was increment-judged AND its block reached the gate.
+        maxt_baseline = (
+            baseline if judged_increment and cohort_maxt_increment_active(
+                cfg.scoring, receipt.epoch_start_block) else None)
+        # The UNMODIFIED recorded params (no alpha/k) with the judged margin
+        # mode — the same pair the validator handed cohort_maxt_lcb_map.
+        maxt_params = _dc_replace(
+            params, margin_mode="increment" if judged_increment else "level")
         try:
-            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot replay cohort max-T bound: {e}")
         replayed = [(hk, with_cohort_lcb(res, lcbs[hk], params))
@@ -848,8 +1016,13 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     if len(duelled) > 1 and cohort_maxt_active(cfg.scoring, receipt.epoch_start_block):
         from ..eval.koth import with_cohort_lcb
 
+        maxt_baseline = (
+            baseline if judged_increment and cohort_maxt_increment_active(
+                cfg.scoring, receipt.epoch_start_block) else None)
+        maxt_params = _dc_replace(
+            params, margin_mode="increment" if judged_increment else "level")
         try:
-            lcbs = _cohort_maxt_lcbs(receipt, manifest, params)
+            lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
             return _fail(name, f"cannot replay cohort max-T bound: {e}")
         result = with_cohort_lcb(result, lcbs[duelled[-1]], params)
@@ -1054,6 +1227,8 @@ def check_status(receipt: RoundReceipt) -> CheckResult:
 # receipt — its FAIL is converted to a PASS noting the confirmation.
 _REJECTION_CHECK_FOR_REASON = (
     ("signature_invalid", "manifest-signature"),
+    ("era_", "era"),
+    ("manifest_chain_broken", "era"),
     ("contract_digest_mismatch", "contract-digest"),
     ("base_arch_digest_mismatch", "base-arch-digest"),
 )
@@ -1074,60 +1249,50 @@ def _confirm_rejection(receipt: RoundReceipt, results: list[CheckResult]) -> lis
 
 def check_funded_roster(receipt: RoundReceipt,
                         roster: dict | None) -> CheckResult:
-    """Cross-check the published funded roster against the signed manifest.
+    """Seniority evidence for a funded round, against the trainer's UNSIGNED
+    ``funded/round-<id>.json`` — so this WARNs, never FAILs.
 
-    The roster (``funded/round-<id>.json``) is the trainer's UNSIGNED
-    transparency record of seat allocation under ``funded_mode = "required"``
-    — so this check WARNs, never FAILs, mirroring contract-declaration. It
-    verifies three things a miner cares about:
-
-    * every challenger the signed manifest trained was a SEATED funded entry
-      (nobody entered the round outside the published queue);
-    * the seated list is in reveal-block seniority order;
-    * nobody left waiting had strictly earlier (reveal_block, hotkey)
-      precedence than someone seated — the queue was not jumped.
-
-    No roster published ⇒ SKIP (a pre-funded or non-required round).
-    """
+    Boundary-synchronous roster (``seated`` / ``waiting``): every manifest
+    challenger seated; ``seated`` in reveal-block order; no waiting entry
+    outranks a seated one. Rolling roster (DEC-CA-0043, ``mode = "rolling"``
+    with ``rents``): seniority is "earliest reveal gets first pick of FITTING
+    executors", not strict serialization — an earlier entry waiting for an
+    H100 under the price cap is legitimately overtaken by a later one that
+    fits a 4090 now. The claim is therefore per rent: no more-senior QUEUED
+    entry that fit the same executors was passed over (``passed_over``
+    empty), and every settled challenger was seated. Reveal order among the
+    settled legs is not a claim (legs land when their walls end)."""
     name = "funded-roster"
     if not roster:
-        return CheckResult(name, SKIP, "no funded roster published for this round")
-    seated = roster.get("seated") or []
-    seated_keys = {str(e.get("hotkey")) for e in seated}
-    # receipt.manifest is the embedded RAW manifest dict (like every other
-    # check here reads it); entries are dicts too.
-    challengers = [e for e in (receipt.manifest.get("entries") or ())
+        return _skip(name, "no funded roster published for this round")
+    # receipt.manifest is the embedded RAW manifest dict; entries are dicts.
+    challengers = [str(e.get("miner_hotkey", "?"))
+                   for e in (receipt.manifest.get("entries") or ())
                    if e.get("role") == "challenger"]
-    strangers = [str(e.get("miner_hotkey", "?")) for e in challengers
-                 if str(e.get("miner_hotkey", "?")) not in seated_keys]
-    if strangers:
-        return CheckResult(
-            name, WARN,
-            f"manifest challenger(s) not on the published funded roster: "
-            f"{', '.join(strangers)}")
-    # A null reveal_block (the hotkey withdrew between selection and roster
-    # build) is UNKNOWN seniority, not block 0 — coercing it to 0 makes it
-    # "most senior" and fires a spurious order/jump WARN (review 2026-09-02).
-    # Unknowns are excluded from both ordering claims.
-    order = [(int(e["reveal_block"]), str(e.get("hotkey")))
-             for e in seated if e.get("reveal_block") is not None]
+    seated = roster.get("seated") or []
+    seated_hk = {str(s.get("hotkey")) for s in seated if isinstance(s, dict)}
+    unseated = [hk for hk in challengers if hk not in seated_hk]
+    if unseated:
+        return _warn(name, f"manifest challenger(s) not on the seated roster: {unseated}")
+    if str(roster.get("mode", "")) == "rolling":
+        jumped = [(r.get("hotkey"), r.get("passed_over")) for r in (roster.get("rents") or [])
+                  if isinstance(r, dict) and r.get("passed_over")]
+        if jumped:
+            return _warn(name, f"rent(s) passed over a more-senior fitting entry: "
+                               f"{jumped[:3]}{'…' if len(jumped) > 3 else ''}")
+        return _ok(name, f"{len(seated)} settled leg(s) seated; every rent took the "
+                         f"most senior fitting entry")
+    order = [(int(s["reveal_block"]), str(s["hotkey"])) for s in seated
+             if isinstance(s, dict) and s.get("reveal_block") is not None]
     if order != sorted(order):
-        return CheckResult(name, WARN, "seated list is not in reveal-block "
-                                       "seniority order")
-    waiting = [(int(e["reveal_block"]), str(e.get("hotkey")))
-               for e in (roster.get("waiting") or [])
-               if e.get("reveal_block") is not None]
-    if order and waiting and min(waiting) < max(order):
-        jumped = min(waiting)
-        return CheckResult(
-            name, WARN,
-            f"waiting entry {jumped[1]} (reveal {jumped[0]}) had seniority "
-            f"over a seated entry — the queue was jumped")
-    return CheckResult(
-        name, PASS,
-        f"{len(challengers)} manifest challenger(s) all seated from the "
-        f"published queue in seniority order ({len(waiting)} waiting)")
-
+        return _warn(name, f"seated order is not reveal-block order: {order}")
+    waiting = [int(w["reveal_block"]) for w in (roster.get("waiting") or [])
+               if isinstance(w, dict) and w.get("reveal_block") is not None]
+    if order and waiting and min(waiting) < max(b for b, _ in order):
+        return _warn(name, f"a waiting entry (reveal {min(waiting)}) had seniority over "
+                           f"a seated one (reveal {max(b for b, _ in order)}) — the queue "
+                           f"was jumped")
+    return _ok(name, f"{len(seated)} seated in reveal order; {len(waiting)} waiting behind")
 
 def run_tier0(
     receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None,
@@ -1142,6 +1307,8 @@ def run_tier0(
         check_base_seed(receipt),
         check_round_seeds(receipt, cfg),
         check_epoch_alignment(receipt, cfg),
+        check_activation(receipt, cfg, client),
+        check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),
         check_contract_declaration(receipt, cfg),

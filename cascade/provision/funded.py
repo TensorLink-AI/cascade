@@ -88,6 +88,21 @@ def lium_provider_for_key(api_key: str) -> Provider:
     return LiumProvider(api_key=api_key)
 
 
+def apply_price_caps(provider: Provider, *, max_price_per_hour: float = 0.0,
+                     max_leg_cost_usd: float = 0.0,
+                     sku_wall_seconds: tuple[tuple[str, int], ...] = (),
+                     default_wall_seconds: float = 0.0) -> Provider:
+    """Hand the ``[round]`` price guards (and the per-SKU wall table behind
+    the per-leg cap) to a provider with the seam (``LiumProvider``); others
+    are returned untouched."""
+    if hasattr(provider, "max_price_per_hour"):
+        provider.max_price_per_hour = float(max_price_per_hour or 0.0)
+        provider.max_leg_cost_usd = float(max_leg_cost_usd or 0.0)
+        provider.sku_wall_seconds = tuple(sku_wall_seconds or ())
+        provider.default_wall_seconds = float(default_wall_seconds or 0.0)
+    return provider
+
+
 def apply_cpu_blocklist(provider: Provider, blocklist: tuple[str, ...]) -> Provider:
     """Hand ``[round] funded_cpu_blocklist`` to a provider that can steer its
     listings by CPU model (``LiumProvider.cpu_blocklist``); providers without
@@ -170,6 +185,9 @@ class FundedRentResult:
     # billing the MINER until someone acts. The caller must surface it (queue
     # error text, operator alert), never drop it on the floor.
     leaked_pod: str = ""
+    # GPU type the pod landed on (open-market rents choose per leg); ``sku``
+    # as requested when the adapter cannot tell.
+    sku: str = ""
 
 
 def rent_funded_pod(
@@ -185,6 +203,8 @@ def rent_funded_pod(
     ready_timeout: float = 900.0,
     exclude_ids: tuple[str, ...] = (),
     cpu_blocklist: tuple[str, ...] = (),
+    skus: tuple[str, ...] = (),
+    price_caps: dict | None = None,
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     host_key_scanner: Callable[[str, int], str] | None = None,
@@ -212,12 +232,17 @@ def rent_funded_pod(
     name = funded_pod_name(round_id, hotkey, netuid)
     try:
         provider = apply_cpu_blocklist(provider_factory(api_key), cpu_blocklist)
+        provider = apply_price_caps(provider, **(price_caps or {}))
     except Exception as e:  # noqa: BLE001 — a bad key must classify, not crash the round
         return _fail(e)
 
+    # ``skus`` (open market, owner 2026-09-20): the adapter picks the cheapest
+    # fitting executor across the types; ``sku`` stays the nominal first pick.
+    choices = tuple(skus) if len(tuple(skus)) > 1 else ()
     spec = LaunchSpec(
-        sku=sku, count=1, image=image, ssh_pubkey=ssh_pubkey,
+        sku=(skus[0] if skus else sku), count=1, image=image, ssh_pubkey=ssh_pubkey,
         name_prefix=name, gpus_per_pod=gpus_per_pod, exclude_ids=exclude_ids,
+        sku_choices=choices,
     )
     launched: list[str] = []
     try:
@@ -265,20 +290,22 @@ def rent_funded_pod(
             if not host_key:
                 raise ProvisionError(f"funded pod {pod_id}: could not pin its "
                                      f"ssh host key ({last})")
+        sku_fn = getattr(provider, "sku_of", None)
+        landed = (str(sku_fn(pod_id) or "") if callable(sku_fn) else "") or spec.sku
         pod = PodInstance(
             provider=provider.name, instance_id=pod_id, stage=FUNDED_STAGE,
-            rented_at_iso=now_iso(), sku=sku, gpus=gpus_per_pod,
+            rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
             payer_hotkey=hotkey, pod_uid=pod_uid,
         )
-        log.info("funded pod %s ready for %s at %s:%d (billed to payer)",
-                 pod_id, hotkey, addr.ip, addr.ssh_port)
+        log.info("funded pod %s ready for %s at %s:%d (%s, billed to payer)",
+                 pod_id, hotkey, addr.ip, addr.ssh_port, landed)
         machine = ""
         getter = getattr(provider, "machine_of", None)
         if getter is not None:
             machine = getter(pod_id) or ""
         return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr,
                                 machine_id=machine, pod_uid=pod_uid,
-                                host_key=host_key)
+                                host_key=host_key, sku=landed)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
         for pid in launched:

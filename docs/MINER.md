@@ -204,14 +204,59 @@ Labels are cosmetic: never identity, never in signed records.
 
 An unfunded boundary runs no round; the king holds.
 
+### After the rolling switch
+
+The next release replaces the boundary round with **rolling intake**
+(DEC-CA-0043). The switch is not on a date the owner announces: it happens
+when validators holding **51 % of stake** are running the release
+(DEC-CA-0045), at the round boundary after that count is reached. Until
+then everything above applies unchanged. From the switch:
+
+1. **Your leg starts when it is funded**, not at the next boundary. It runs
+   on your pod for the full budget and lands in the first *settlement* it
+   can reach. Nothing waits for the field to fill.
+2. **Settlements every 3 h** (the grid drops from 3600 to 900 blocks).
+   Each boundary publishes one manifest carrying the king plus every
+   challenger that finished since the last one, and validators judge it as
+   before. Nothing finished ⇒ nothing published.
+3. **The king trains once per 12 h era** (4 settlements) from the shared
+   init, and every challenger in that era duels that same cached king
+   checkpoint. A dethrone adopts your checkpoint as the king's without
+   ending the era.
+4. **GPU type is per leg**, the cheapest fitting type under the price
+   caps, instead of one type per round. Seniority is still reveal order,
+   among the executors that fit your leg's deadline.
+5. **Tenure and the margin decay count blocks**, so the king's margin
+   schedule keeps the same wall-time under the faster grid.
+
+How to tell where things stand: `status/chain.json` carries an
+`activation` block (share of stake signed, lock-in block, switch block)
+and every receipt from lock-in on records `activation_block`; the
+dashboards read both. When you see a lock-in, the switch is at the next
+boundary. The CLI follows it on its own: `cascade round`, `reveal-status`,
+`deploy` and `submit` read the validators' notes at startup and time
+countdowns and reveals on the grid actually in force, so your chain.toml
+needs no edit when the switch lands.
+
 ### Watching it
 
 ```bash
 cascade queue --intake https://submissions.cascadesub.net --hotkey <you>   # live queue + last roster
 cascade round                 # deadline countdown, stage, dethrone bar, revealed submissions
 cascade heat --hotkey <you>   # who seated / who waits this round
-cascade duel                  # the settled verdict: margin, geomeans, per-domain win rates
+cascade duel                  # the settled verdict: margin, geomeans, per-domain scores
+cascade duel --hotkey <you>   # + YOUR domains: where you beat the king and by how much
+cascade duel --hotkey <you> --history   # your gap vs the king per domain, per round
 ```
+
+`cascade duel --hotkey <you>` prints a `your domains` block: for every pool
+domain (nature, energy, sales, …) the king's score, yours, the gap, and how
+many windows it rests on. Negative gap = you were better there. A domain
+with fewer than 30 windows is flagged — that gap is draw noise, not a
+strength. `--history` turns it into one line per round you were judged in,
+with a per-domain average at the bottom: the "am I getting better at web"
+view. The website's cohort panel shows the same per-domain gaps for every
+judged challenger.
 
 Every leg also streams a public JSONL training log (`logs/round-<id>/…`) with
 per-step loss, throughput and `data_wait_frac`, plus a `host` record for the
@@ -227,6 +272,12 @@ pod. High `data_wait_frac` means training waited on your generator.
   several challengers, a cohort-wide correction keeps the king's false-dethrone
   risk fixed. `cascade round` prints the live bar; each receipt records the
   rule it was judged under.
+- **Per-domain breakdown.** The verdict is the POOLED statistic over every
+  window; the receipt also records the same geomean per pool domain for the
+  king and for each challenger (`per_domain` / `cohort_per_domain`), so you
+  can see which domains you beat the king in and by how much. Display only:
+  no domain gap gates anything, and a domain you win by a mile does not
+  offset one you lose — only the pooled LCB decides.
 - **Rewards.** The king and up to 4 prior kings share weights with geometric
   decay 0.5 (≈ 52 / 26 / 13 / 6 / 3 %). Losing challengers earn nothing.
 - **Warm-start lineage.** When a king holds 5 consecutive rounds, up to 3 of
@@ -286,4 +337,4 @@ that were never published.
 | funded but never seated | more senior reveals filled the seats, or the GPU market is thin; you wait unspent |
 | `failed [generator]` | your code failed on the pod or training diverged; check the training log, fix, submit from a fresh hotkey |
 | `failed [rate_limited]` | your Lium key was rate-limited for 6 h; raise limits, fund again |
-| loses every duel | the pool is broad real-world data; widen the prior rather than fitting one shape. `cascade duel` shows which domains you lost |
+| loses every duel | the pool is broad real-world data; widen the prior rather than fitting one shape. `cascade duel --hotkey <you>` shows which domains you lost and by how much; `--history` shows whether that is changing |

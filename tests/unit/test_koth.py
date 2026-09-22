@@ -148,3 +148,28 @@ def test_unlabeled_scores_are_singleton_clusters():
     ]
     res = evaluate_round(king, chal, PARAMS, seed="s")
     assert res.n_clusters == 100  # every window its own cluster (legacy pools)
+
+
+def test_nan_bound_never_wins_and_is_inconclusive(monkeypatch):
+    """An uncomputable LCB is an inconclusive round, not a compare that
+    happens to be False: NaN reaching the verdict path must be explicit."""
+    from cascade.eval import koth as koth_mod
+    from cascade.eval.koth import with_cohort_lcb
+
+    king = _scores(100, 1.0, 0)
+    chal = [
+        WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6, s.abs_target)
+        for s in king
+    ]
+    clear = evaluate_round(king, chal, PARAMS, seed="s", king_tenure_rounds=0)
+    assert clear.challenger_wins_round
+    # the family-wise max-T swap with a NaN bound: never a win
+    swapped = with_cohort_lcb(clear, float("nan"), PARAMS)
+    assert not swapped.challenger_wins_round
+    # the paired bootstrap itself yielding NaN ⇒ inconclusive, king holds
+    monkeypatch.setattr(koth_mod, "paired_bootstrap_lcb_aggregated",
+                        lambda *a, **k: float("nan"))
+    res = evaluate_round(king, chal, PARAMS, seed="s", king_tenure_rounds=0)
+    assert not res.challenger_wins_round
+    assert res.inconclusive
+    assert res.n_windows == 100                  # not the min-windows path

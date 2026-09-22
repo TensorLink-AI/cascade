@@ -96,6 +96,13 @@ class PromotionRecord:
     fired_block: int
     members: tuple[PromotedMember, ...] = ()
     record_version: int = PROMOTION_RECORD_VERSION
+    # Era the generation takes effect (DEC-CA-0043): validators install the
+    # member set as the init of era ``effective_era`` and later, never
+    # earlier, and reject a claim earlier than one full era after
+    # ``fired_block`` (``cascade.shared.era.min_effective_era``) so every
+    # pre-train window knows both its init and its seeds. 0 = pre-era record
+    # (effective at acceptance, the DEC-CA-0013 rule); signed drop-when-zero.
+    effective_era: int = 0
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def member_ids(self) -> tuple[str, ...]:
@@ -113,6 +120,8 @@ class PromotionRecord:
             "fired_block": self.fired_block,
             "members": [member_to_json(m) for m in self.members],
         }
+        if self.effective_era:
+            body["effective_era"] = int(self.effective_era)
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -138,6 +147,7 @@ def load_promotion_record(text: str) -> PromotionRecord:
         fired_block=int(obj.get("fired_block", 0)),
         members=members,
         record_version=version,
+        effective_era=int(obj.get("effective_era", 0) or 0),
         signature=obj.get("signature"),
     )
 

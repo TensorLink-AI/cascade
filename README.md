@@ -68,6 +68,16 @@ Rounds run every 12 h (`[round] epoch_blocks = 3600`, boundaries ≈ 08:30 and
 5. **Bench.** Each checkpoint is benched on GIFT-Eval / BOOM / TIME. These
    numbers are public telemetry and feed promotion, never the verdict.
 
+**Rolling intake (next).** The boundary round gives way to rolling intake
+(DEC-CA-0043): a funded leg trains the moment it is funded, every 3 h
+boundary *settles* whatever finished against a king trained once per 12 h
+era, and the GPU type is chosen per leg under price caps. The switch is
+decided on chain rather than typed in (DEC-CA-0045): validators on the
+release post a readiness note, and the first boundary where 51 % of
+validator stake has signed locks in the switch for the boundary after it.
+`docs/MINER.md` §6 has the miner view, `docs/VALIDATOR.md` the validator
+side, `docs/MINER_FUNDED_ROUNDS.md` the operator sequence.
+
 ```mermaid
 flowchart LR
     miner["miner: generator<br/>cascade submit / deploy + fund"] -->|on-chain pointer + Lium key| trainer
@@ -159,7 +169,8 @@ Miner (`cascade`, no GPU):
   then `fund <intake-url> --ref <repo@digest>` pays for the leg.
 - `queue`, `round`, `heat`, `duel`, `reveal-status`: the live queue and
   roster, the round countdown and dethrone bar, who seated, the settled
-  verdict, and whether your reveal landed.
+  verdict (`duel --hotkey <you>`: which domains you beat the king in and by
+  how much), and whether your reveal landed.
 - `fetch king | <uid> | <hotkey> | <repo@digest>`: download a public
   generator.
 

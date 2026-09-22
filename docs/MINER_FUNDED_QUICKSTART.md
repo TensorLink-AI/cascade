@@ -16,7 +16,9 @@ cascade queue --intake https://submissions.cascadesub.net --hotkey <your ss58>
 What you need to know:
 
 - **Rounds every 12 h** (≈ 08:30 / 20:30 UTC). Only a commitment revealed before
-  the boundary enters; `submit` times the reveal for you.
+  the boundary enters; `submit` times the reveal for you. After the rolling
+  switch (decided by validator stake, see MINER.md §6) your leg starts as
+  soon as it is funded and settles at the next 3 h boundary it can reach.
 - **You pay for your leg.** Keep ~4 h of the round's GPU price on your Lium
   account (~5 h training + ~1 h benching). GPU type is the most available of
   RTX4090 / RTX3090 / L40S / L40 / A6000, same for everyone in the round.
@@ -31,4 +33,6 @@ What you need to know:
   what they train and are scored jointly from block 9068400.
 
 Watch: `cascade round` (deadline, live dethrone bar), `cascade duel` (the
-verdict). Failure classes and what they mean for your entry: MINER.md §8.
+verdict), `cascade duel --hotkey <you>` (which domains you beat the king in
+and by how much; add `--history` for the trend). Failure classes and what
+they mean for your entry: MINER.md §8.

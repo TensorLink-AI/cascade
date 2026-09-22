@@ -744,8 +744,10 @@ def _duel_validators_line(rows: list[dict]) -> str | None:
     return "  validators     " + " · ".join(parts) if parts else None
 
 
-def render_duel(rows: list[dict]) -> str:
-    """The standalone ``cascade duel`` view of one settled round's index rows."""
+def render_duel(rows: list[dict], *, me: str | None = None) -> str:
+    """The standalone ``cascade duel`` view of one settled round's index rows.
+    ``me`` (a hotkey) appends that miner's own per-domain scores against the
+    king — see :func:`my_domain_lines`."""
     if not rows:
         return ("no settled round found in the public receipt index — receipts land "
                 "a few minutes after the duel manifest; try 'cascade round' for the "
@@ -799,6 +801,7 @@ def render_duel(rows: list[dict]) -> str:
     if p50 is not None and p95 is not None:
         lines.append(f"  bootstrap      Δ p50 {p50:+.4f} / p95 {p95:+.4f}")
     lines += horizon_lines(row.get("per_horizon"))
+    lines += domain_lines(row.get("per_domain"))
     lines += cohort_lines(row)
     gift = row.get("gift_gate_passed")
     if gift is not None:
@@ -813,7 +816,10 @@ def render_duel(rows: list[dict]) -> str:
     if isinstance(uids, list) and uids:
         lines.append(f"  rewards        uids {uids}")
     domains = row.get("per_domain_win_rate")
-    if isinstance(domains, dict) and domains:
+    # The win-rate-only block is the pre-per_domain view: once the receipt
+    # carries per-domain SCORES the ``by domain`` block above says the same
+    # thing with magnitudes, so this one is shown only for older rows.
+    if isinstance(domains, dict) and domains and not row.get("per_domain"):
         lines.append("  per-domain win rate  (right of centre = challenger ahead)")
         ordered = sorted(domains.items(),
                          key=lambda kv: -(_as_float(_domain_pair(kv[1])[0]) or 0.0))
@@ -823,8 +829,162 @@ def render_duel(rows: list[dict]) -> str:
                 continue
             n_s = f"n={n:>5}" if n is not None else ""
             lines.append(f"    {name:<14} {rate:.2f}  {n_s}  {_domain_bar(rate)}")
+    if me:
+        lines += my_domain_lines(row, me)
     if (validators := _duel_validators_line(rows)) is not None:
         lines.append(validators)
+    return "\n".join(lines)
+
+
+# A domain with fewer windows than this is flagged: a gap on a handful of
+# windows is draw noise, not a strength or weakness. Display-only threshold.
+DOMAIN_MIN_WINDOWS = 30
+
+
+def _domain_cells(per_domain: object) -> list[tuple[str, float, float, float, float | None, int | None]]:
+    """``[(domain, king, chal, gap%, win_rate, n)]`` from a ``per_domain``
+    breakdown, best-for-the-challenger (most negative gap) first. Cells missing
+    either geomean are skipped."""
+    if not isinstance(per_domain, dict):
+        return []
+    out = []
+    for name, cell in per_domain.items():
+        k, c, gap = _horizon_gap(cell if isinstance(cell, dict) else {})
+        if k is None or c is None or gap is None:
+            continue
+        out.append((str(name), k, c, gap, _as_float(cell.get("win_rate")),
+                    _as_int(cell.get("n"))))
+    out.sort(key=lambda t: t[3])
+    return out
+
+
+def _domain_row(name: str, k: float, c: float, gap: float, wr: float | None,
+                n: int | None, *, who: str = "chal") -> str:
+    line = f"    {name:<14} king {k:.5f}  {who} {c:.5f}  ({gap:+.2f}%)"
+    if wr is not None:
+        line += f"  win {wr * 100:.0f}%"
+    if n:
+        line += f"  n={n}"
+        if n < DOMAIN_MIN_WINDOWS:
+            line += "  (few windows — noise)"
+    return line
+
+
+def domain_lines(per_domain: object) -> list[str]:
+    """The ``by domain`` block of a verdict: one line per pool domain with the
+    king's and the decided challenger's domain geomeans, the relative gap and
+    the challenger's win rate on it — WHERE the challenger beat the king and by
+    how much. Empty when the receipt predates the field or the pool carries no
+    domain labels."""
+    cells = _domain_cells(per_domain)
+    if not cells:
+        return []
+    lines = ["  by domain      (pooled windows decide; negative gap = challenger better)"]
+    lines += [_domain_row(*cell) for cell in cells]
+    return lines
+
+
+def domain_breakdown_for(row: dict, hotkey: str) -> dict | None:
+    """One miner's per-domain breakdown on a settled row: their entry in
+    ``cohort_per_domain``, or the headline ``per_domain`` when they were the
+    decided challenger (the k=1 case — most rolling settlements)."""
+    if not hotkey:
+        return None
+    cpd = row.get("cohort_per_domain")
+    if isinstance(cpd, dict) and isinstance(cpd.get(hotkey), dict):
+        return cpd[hotkey]
+    if str(row.get("chal_hotkey") or "") == hotkey and isinstance(row.get("per_domain"), dict):
+        return row["per_domain"]
+    return None
+
+
+def my_domain_lines(row: dict, hotkey: str) -> list[str]:
+    """The ``your domains`` block of ``cascade duel --hotkey``: the caller's own
+    per-domain scores against the king this round, strongest domain first, or
+    one line saying why there are none (king / not judged / pre-field row)."""
+    tag = _short_hotkey(hotkey)
+    if str(row.get("king_hotkey") or "") == hotkey:
+        return [f"  your domains   {tag} was the king this round — see 'by domain' "
+                "for how the challenger did against you"]
+    pd = domain_breakdown_for(row, hotkey)
+    if pd is None:
+        judged = row.get("cohort_geomeans")
+        if (isinstance(judged, dict) and hotkey in judged) or \
+                str(row.get("chal_hotkey") or "") == hotkey:
+            return [f"  your domains   {tag} was judged, but this receipt carries no "
+                    "per-domain scores (validator predates the field)"]
+        return [f"  your domains   {tag} was not judged this round"]
+    cells = _domain_cells(pd)
+    if not cells:
+        return [f"  your domains   {tag}: no per-domain scores on this receipt"]
+    better = [c for c in cells if c[3] < 0]
+    worse = [c for c in cells if c[3] >= 0]
+    lines = [f"  your domains   {tag} vs the king — {len(better)} better, {len(worse)} worse "
+             "(negative gap = you beat the king)"]
+    lines += [_domain_row(*cell, who="you ") for cell in cells]
+    return lines
+
+
+def render_duel_domain_history(index_doc: dict | None, hotkey: str, *,
+                               limit: int = 20) -> str:
+    """``cascade duel --hotkey <me> --history``: one line per settled round the
+    miner was judged in, their gap vs the king overall and per domain, newest
+    last, plus an average per domain over the rounds shown — the "am I getting
+    better at web" view."""
+    if not hotkey:
+        return "pass --hotkey <ss58> to see your per-domain history"
+    by_round: dict[str, list[dict]] = {}
+    for r in _index_rounds(index_doc):
+        by_round.setdefault(str(r.get("round_id")), []).append(r)
+    groups = sorted(by_round.values(),
+                    key=lambda g: max((_as_int(r.get("epoch_start_block")) or 0) for r in g))
+    picked: list[tuple[dict, dict]] = []
+    for g in groups:
+        scored = [r for r in g if str(r.get("status")) == "scored"]
+        if not scored:
+            continue
+        row = scored[-1]
+        pd = domain_breakdown_for(row, hotkey)
+        if pd is not None and _domain_cells(pd):
+            picked.append((row, pd))
+    if not picked:
+        return (f"no per-domain scores for {_short_hotkey(hotkey)} in the public receipt "
+                "index — either not judged yet, or the validators' receipts predate "
+                "the per-domain field")
+    shown = picked[-limit:]
+    domains = sorted({name for _, pd in shown for name, *_ in _domain_cells(pd)})
+    lines = [f"cascade duel — {_short_hotkey(hotkey)} by domain over {len(shown)} judged "
+             "round(s), newest last (gap vs the king; negative = you were better)"]
+    lines.append("  " + f"{'round':<14}{'overall':>9}"
+                 + "".join(f"{d[:11]:>13}" for d in domains))
+    sums: dict[str, list[float]] = {d: [] for d in domains}
+    for row, pd in shown:
+        cells = {name: gap for name, _k, _c, gap, _w, _n in _domain_cells(pd)}
+        kg = _as_float(row.get("king_geomean"))
+        mine = _as_float((row.get("cohort_geomeans") or {}).get(hotkey)
+                         if isinstance(row.get("cohort_geomeans"), dict) else None)
+        if mine is None and str(row.get("chal_hotkey") or "") == hotkey:
+            mine = _as_float(row.get("chal_geomean"))
+        overall = f"{(mine - kg) / kg * 100:+.2f}%" if kg and mine is not None else "--"
+        rid = str(row.get("round_id", "--"))
+        rid = rid if len(rid) <= 12 else f"{rid[:6]}…{rid[-4:]}"
+        won = " ←crown" if row.get("dethroned") and str(row.get("chal_hotkey")) == hotkey else ""
+        line = "  " + f"{rid:<14}{overall:>9}"
+        for d in domains:
+            gap = cells.get(d)
+            line += f"{'--':>13}" if gap is None else f"{gap:+.2f}%".rjust(13)
+            if gap is not None:
+                sums[d].append(gap)
+        lines.append(line + won)
+    avg = "  " + f"{'average':<14}{'':>9}"
+    for d in domains:
+        vals = sums[d]
+        avg += (f"{sum(vals) / len(vals):+.2f}%".rjust(13) if vals else f"{'--':>13}")
+    lines.append(avg)
+    strengths = [d for d in domains if sums[d] and sum(sums[d]) / len(sums[d]) < 0]
+    weaknesses = [d for d in domains if sums[d] and sum(sums[d]) / len(sums[d]) >= 0]
+    lines.append("  better than the king on average: " + (", ".join(strengths) or "none")
+                 + "  ·  worse: " + (", ".join(weaknesses) or "none"))
     return "\n".join(lines)
 
 
@@ -873,6 +1033,8 @@ def cohort_lines(row: dict) -> list[str]:
     lcbs = row.get("cohort_lcbs") if isinstance(row.get("cohort_lcbs"), dict) else {}
     phs = (row.get("cohort_per_horizon")
            if isinstance(row.get("cohort_per_horizon"), dict) else {})
+    pds = (row.get("cohort_per_domain")
+           if isinstance(row.get("cohort_per_domain"), dict) else {})
     margin = _as_float(row.get("margin"))
     winner = row.get("chal_hotkey") if row.get("dethroned") else None
     ranked = sorted(((hk, _as_float(g)) for hk, g in geos.items()),
@@ -903,6 +1065,12 @@ def cohort_lines(row: dict) -> list[str]:
         if winner and hk == winner:
             line += "  ← took the throne"
         lines.append(line)
+        cells = _domain_cells(pds.get(hk))
+        if cells:
+            # Per-domain gaps on a continuation line: strongest domain first,
+            # so each miner sees where they beat the king without --hotkey.
+            lines.append("        by domain: "
+                         + " · ".join(f"{name} {gap:+.1f}%" for name, _k, _c, gap, _w, _n in cells))
     return lines
 
 

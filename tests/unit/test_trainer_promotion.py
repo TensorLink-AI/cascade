@@ -21,7 +21,12 @@ from cascade.shared.promotion import (
     promotion_record_key,
     publish_promotion_record,
 )
-from cascade.trainer.promotion import Candidate, TrainerPromotion, select_members
+from cascade.trainer.promotion import (
+    Candidate,
+    TrainerPromotion,
+    admit_candidates,
+    select_members,
+)
 
 DAY = 7_200  # blocks; the engine runs with round_cfg=None in these tests
 
@@ -649,3 +654,125 @@ def test_fire_reads_error_vector_cache(tmp_path):
     rec = eng.maybe_promote(epoch_block=7200 * 400, round_id="r-test")
     assert rec is not None
     assert [m.checkpoint_id for m in rec.members] == ["anchor", "div"]
+
+
+# ── rolling top-k (DEC-CA-0044) ──────────────────────────────────────────────
+
+
+def _live(eng, *scored, gen=1):
+    """Install a live generation of (id, score, hotkey) members with meta."""
+    eng.generation = gen
+    eng.members = tuple(PromotedMember(cid, "toto2-4m", "r0", s) for cid, s, _ in scored)
+    eng.member_meta = {cid: _cand(cid, s, hotkey=hk, epoch=0) for cid, s, hk in scored}
+
+
+def test_admit_candidates_requires_beating_the_worst_member():
+    members = [_cand("m1", 1.0), _cand("m2", 1.01), _cand("m3", 1.02)]
+    cands = [_cand("c-worse", 1.03), _cand("c-tie", 1.02), _cand("c-better", 1.015)]
+    admitted = admit_candidates(members, cands, k_max=3)
+    assert [c.checkpoint_id for c in admitted] == ["c-better"]
+    # A free slot admits everyone; scoreless members hold no slot.
+    assert len(admit_candidates(members[:2], cands, k_max=3)) == 3
+    nan = [_cand("legacy", float("nan"))] + members[:2]
+    assert len(admit_candidates(nan, cands, k_max=3)) == 3
+
+
+def test_rolling_topk_holds_when_no_candidate_enters(tmp_path):
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng.note_round("hkKing", epoch_block=0)
+    # Within epsilon of the best but worse than every live member: no slot.
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-worse": (1.03, "hkKing", "king")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is None
+    assert eng.generation == 1 and len(eng.candidates) == 1
+    assert eng.init_for_epoch(0) == ("m1", "toto2-4m")
+
+
+def test_rolling_topk_swaps_the_worst_member_and_carries_the_rest(tmp_path):
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert rec is not None and rec.generation == 2
+    assert set(rec.member_ids()) == {"m1", "m2", "c-new"}
+    # Carried members keep their original provenance; the entrant carries its
+    # own round.
+    by_id = {m.checkpoint_id: m for m in rec.members}
+    assert by_id["m1"].source_round == "r0" and by_id["m2"].source_round == "r0"
+    assert by_id["c-new"].source_round == "r1"
+    assert eng.candidates == () and eng.reign_start_block == 5 * DAY
+
+
+def test_rolling_topk_fills_a_free_slot_with_a_worse_but_frontier_candidate(tmp_path):
+    # Under the old best-vs-best guard a 1.03 candidate against a 1.0 member
+    # held forever; with free slots it enters as the second member.
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"))
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-fill": (1.03, "hkB", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert rec is not None and set(rec.member_ids()) == {"m1", "c-fill"}
+
+
+def test_rolling_topk_drops_carried_members_outside_the_epsilon_floor(tmp_path):
+    # The envelope floor is over the POOL's best: a much better entrant pushes
+    # carried members off the frontier and the generation legitimately shrinks.
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"), ("m2", 1.04, "hkB"))
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-great": (0.90, "hkC", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=5 * DAY, round_id="r5")
+    assert rec is not None and rec.member_ids() == ("c-great",)
+
+
+def test_rolling_topk_member_meta_persists_and_reloads(tmp_path):
+    eng = _engine(tmp_path, k_max=3)
+    eng.note_round("hkKing", epoch_block=0)
+    eng.record_bench(_manifest("r1"), _report("r1", 1 * DAY, {
+        "p-a": (1.0, "hkA", "king"), "p-b": (1.01, "hkB", "challenger")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is not None
+    eng.mark_record_published()
+    again = TrainerPromotion.load(
+        reign_threshold=5, k_max=3, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json")
+    assert set(again.member_meta) == {"p-a", "p-b"}
+    assert again.member_meta["p-b"].hotkey == "hkB"
+    # A legacy member without meta still re-enters selection (placeholder).
+    again.members = (*again.members, PromotedMember("legacy", "toto2-4m", "", 1.02))
+    assert again._member_candidate(again.members[-1]).hotkey == ""
+
+
+def test_rolling_topk_is_consensus_gated_off_before_the_rollover(tmp_path):
+    """Before era_king_from_block the caller passes rolling_topk=False: the
+    live members do not carry and the old best-vs-best no-downgrade guard
+    holds — a validator on the previous release would reject a carried
+    member's pre-reign source_round and the fleet would split."""
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng.note_round("hkKing", epoch_block=0)
+    # beats the worst member but not the best: rolling would swap it in
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5", rolling_topk=False) is None
+    assert eng.generation == 1 and len(eng.candidates) == 1          # held, nothing carried
+    # a candidate matching the best fires — from this reign's candidates only
+    eng.record_bench(_manifest("r2", warm_start_ckpt="m1"),
+                     _report("r2", 2 * DAY, {"c-best": (1.0, "hkE", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=6 * DAY, round_id="r6", rolling_topk=False)
+    assert rec is not None and rec.generation == 2
+    assert set(rec.member_ids()) == {"c-new", "c-best"}               # no m1/m2/m3
+    assert all(m.source_round in ("r1", "r2") for m in rec.members)
+    # the same situation with the gate open carries the live members
+    eng2 = _engine(tmp_path / "b", k_max=3)
+    _live(eng2, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng2.note_round("hkKing", epoch_block=0)
+    eng2.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                      _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
+    rec2 = eng2.maybe_promote(epoch_block=5 * DAY, round_id="r5", rolling_topk=True)
+    assert rec2 is not None and set(rec2.member_ids()) == {"m1", "m2", "c-new"}

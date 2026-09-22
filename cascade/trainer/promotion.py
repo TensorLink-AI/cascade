@@ -11,6 +11,14 @@ every selected member stays inside the envelope (a benched reign checkpoint
 within ``cascade_quality_epsilon`` of the reign's best, at most
 ``cascade_top_k`` members, promoted only on a ripe reign clock).
 
+The member set is a ROLLING top-k (DEC-CA-0044): on a ripe clock the live
+members compete with the reign's candidates for the same ``cascade_top_k``
+slots, a candidate is admitted only when it benches strictly better than the
+worst live member (or a slot is free), and a promotion fires only when the
+resulting membership actually changes. Members that keep their slot carry
+over with their original ``source_round`` provenance; validators exempt
+carried members of the accepted generation from the reign-scope check.
+
 The v1 policy is structural diversity over a quality-gated candidate pool
 (DEC-CA-0013 discussion): the pool is every benched duel checkpoint of the reign
 — the king's AND the challengers' (different generators are genuinely different
@@ -68,6 +76,37 @@ class Candidate:
     round_id: str
     epoch_index: int
     score: float
+
+
+def _candidate_to_json(c: Candidate) -> dict:
+    return {"checkpoint_id": c.checkpoint_id, "size": c.size, "hotkey": c.hotkey,
+            "role": c.role, "round_id": c.round_id,
+            "epoch_index": c.epoch_index, "score": c.score}
+
+
+def _candidate_from_json(c: dict) -> Candidate:
+    return Candidate(
+        checkpoint_id=str(c["checkpoint_id"]), size=str(c.get("size", "")),
+        hotkey=str(c.get("hotkey", "")), role=str(c.get("role", "")),
+        round_id=str(c.get("round_id", "")),
+        epoch_index=int(c.get("epoch_index", 0)),
+        score=float(c["score"]),
+    )
+
+
+def admit_candidates(
+    members: list[Candidate], candidates: list[Candidate], *, k_max: int,
+) -> list[Candidate]:
+    """Entry gate of the rolling top-k (DEC-CA-0044): a candidate may compete
+    for a slot only when a slot is free (fewer than ``k_max`` scored members)
+    or it benches STRICTLY better (lower) than the worst scored member.
+    Members without a finite score (legacy pointer adoptions) hold no slot —
+    they cannot be compared, so they never keep a candidate out. Pure."""
+    scored = [m.score for m in members if math.isfinite(m.score)]
+    if len(scored) < int(k_max):
+        return list(candidates)
+    worst = max(scored)
+    return [c for c in candidates if c.score < worst]
 
 
 def error_correlations(
@@ -240,6 +279,11 @@ class TrainerPromotion:
 
     generation: int = 0
     members: tuple[PromotedMember, ...] = ()
+    # Selection metadata (generator hotkey, epoch index) for the live members,
+    # keyed by checkpoint_id, so carried-over members re-enter select_members
+    # with their real provenance. Members without an entry (legacy pointer
+    # adoptions) get a structural placeholder.
+    member_meta: dict[str, Candidate] = field(default_factory=dict)
     king_hotkey: str | None = None
     reign_start_block: int | None = None
     candidates: tuple[Candidate, ...] = ()
@@ -293,15 +337,12 @@ class TrainerPromotion:
         rsb = obj.get("reign_start_block")
         self.reign_start_block = None if rsb is None else int(rsb)
         self.candidates = tuple(
-            Candidate(
-                checkpoint_id=str(c["checkpoint_id"]), size=str(c.get("size", "")),
-                hotkey=str(c.get("hotkey", "")), role=str(c.get("role", "")),
-                round_id=str(c.get("round_id", "")),
-                epoch_index=int(c.get("epoch_index", 0)),
-                score=float(c["score"]),
-            )
-            for c in (obj.get("candidates") or ())
+            _candidate_from_json(c) for c in (obj.get("candidates") or ())
         )
+        self.member_meta = {
+            str(c["checkpoint_id"]): _candidate_from_json(c)
+            for c in (obj.get("member_meta") or ())
+        }
         pr = obj.get("pending_record")
         if pr:
             self.pending_record = PromotionRecord(
@@ -310,6 +351,7 @@ class TrainerPromotion:
                 fired_round=str(pr.get("fired_round", "")),
                 fired_block=int(pr.get("fired_block", 0)),
                 members=tuple(member_from_json(m) for m in (pr.get("members") or ())),
+                effective_era=int(pr.get("effective_era", 0) or 0),
             )
 
     def _adopt_legacy_pointer(self) -> None:
@@ -429,14 +471,28 @@ class TrainerPromotion:
                          len(self.candidates))
             return added
 
-    def maybe_promote(self, *, epoch_block: int, round_id: str) -> PromotionRecord | None:
+    def maybe_promote(self, *, epoch_block: int, round_id: str,
+                      effective_era: int = 0, rolling_topk: bool = True) -> PromotionRecord | None:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
         clock (the king persists — DEC-CA-0004), clear the candidate log, and
         write the pointer file. The record is retained (persisted) as
         :attr:`pending_record` until :meth:`mark_record_published` — state
         advances at fire time, so the caller retries the publish from
-        :meth:`unpublished_record` every round until it lands."""
+        :meth:`unpublished_record` every round until it lands.
+
+        ``effective_era`` (DEC-CA-0043, rolling intake): the era the new
+        generation becomes the init of — one full era of notice after this
+        boundary (``cascade.shared.era.min_effective_era``), stamped on the
+        signed record so validators install it at that era and no earlier.
+        0 = pre-era record (effective at acceptance).
+
+        ``rolling_topk`` (DEC-CA-0044) is CONSENSUS-GATED by the caller on
+        ``era_king_from_block``: before the rollover the live members do not
+        carry into the next generation and the old best-vs-best no-downgrade
+        guard (DEC-CA-0017) applies — a validator on the previous release
+        verifies every member against the current reign and would reject a
+        carried member's pre-reign ``source_round``, splitting the fleet."""
         with self._lock:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
@@ -450,64 +506,123 @@ class TrainerPromotion:
                             "benched candidate this reign; holding", elapsed,
                             float(self.reign_threshold))
                 return None
-            # No-downgrade guard: a ripe clock says a promotion MAY fire, never
-            # that it must. If the best candidate this reign benches WORSE than
-            # the live generation's best member (lower = better), installing it
-            # would ratchet the whole field's shared init downhill — the basin
-            # DEC-CA-0014 exists to escape must never be entered by promotion
-            # itself. Hold instead: the live generation keeps training, the
-            # clock stays ripe, candidates keep accumulating, and the promotion
-            # fires the first round a candidate at least matches the incumbent
-            # init's bench. Pure trainer policy (DEC-CA-0013: declining to
-            # declare a generation is always envelope-legal); members without a
-            # finite recorded score — legacy pointer adoptions — cannot anchor
-            # the comparison and never block a firing.
-            best_member = min((m.score for m in self.members
-                               if math.isfinite(m.score) and m.score > 0),
-                              default=None)
-            best_candidate = min((c.score for c in self.candidates
-                                  if math.isfinite(c.score)), default=None)
-            if (best_member is not None and best_candidate is not None
-                    and best_candidate > best_member):
+            # Rolling top-k (DEC-CA-0044): the live members compete with the
+            # reign's candidates for the same k slots. A candidate is admitted
+            # only when it benches strictly better than the worst live member
+            # (or a slot is free); the pool is then re-selected under the
+            # envelope (epsilon floor over the POOL's best, diversity within
+            # the frontier) and the promotion fires only when membership
+            # changes. This subsumes the old best-vs-best no-downgrade guard
+            # (DEC-CA-0017): a candidate that beats nobody enters nothing,
+            # the generation holds, candidates keep accumulating, and the
+            # first genuine top-k entrant fires the promotion. Members without
+            # a finite score (legacy pointer adoptions) hold no slot and are
+            # replaced by the first firing.
+            if not rolling_topk:
+                selected = self._select_legacy(elapsed)
+                if selected is None:
+                    return None
+                return self._fire(selected, epoch_block=epoch_block, round_id=round_id,
+                                  effective_era=effective_era, elapsed=elapsed)
+            carried = [self._member_candidate(m) for m in self.members
+                       if math.isfinite(m.score)]
+            admitted = admit_candidates(carried, list(self.candidates), k_max=self.k_max)
+            if not admitted:
                 log.warning(
-                    "trainer promotion: clock ripe (%.2f rounds) but the best "
-                    "candidate benches %.5f vs the live generation's best member "
-                    "%.5f — holding the current generation (no-downgrade guard); "
-                    "%d candidate(s) logged, retrying as new rounds bench",
-                    elapsed, best_candidate, best_member, len(self.candidates))
+                    "trainer promotion: clock ripe (%.2f rounds) but none of %d "
+                    "candidate(s) benches better than the worst live member — "
+                    "holding the current generation (rolling top-%d); retrying as "
+                    "new rounds bench", elapsed, len(self.candidates), self.k_max)
                 return None
             selected = select_members(
-                list(self.candidates), k_max=self.k_max,
+                carried + admitted, k_max=self.k_max,
                 quality_epsilon=self.quality_epsilon,
                 min_round_spacing=self.min_round_spacing,
                 error_vectors=self._load_error_vectors(),
             )
-            self.generation += 1
-            self.members = tuple(
-                PromotedMember(checkpoint_id=c.checkpoint_id, size=c.size,
-                               source_round=c.round_id, score=c.score)
-                for c in selected
-            )
-            self.candidates = ()
-            self.reign_start_block = int(epoch_block)
-            record = PromotionRecord(
-                generation=self.generation,
-                king_hotkey=self.king_hotkey or "",
-                fired_round=str(round_id),
-                fired_block=int(epoch_block),
-                members=self.members,
-            )
-            self.pending_record = record
-            self._persist()
-            self._write_pointer()
-            log.info(
-                "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
-                "king %s persists, reign clock reset",
-                self.generation, elapsed,
-                ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
-                (self.king_hotkey or "?")[:12],
-            )
-            return record
+            live_ids = {m.checkpoint_id for m in self.members}
+            if {c.checkpoint_id for c in selected} == live_ids:
+                log.warning(
+                    "trainer promotion: clock ripe (%.2f rounds) but the re-selected "
+                    "top-%d equals the live generation — holding (no membership "
+                    "change); %d candidate(s) logged", elapsed, self.k_max,
+                    len(self.candidates))
+                return None
+            return self._fire(selected, epoch_block=epoch_block, round_id=round_id,
+                              effective_era=effective_era, elapsed=elapsed)
+
+    def _select_legacy(self, elapsed: float) -> list[Candidate] | None:
+        """Pre-rollover selection, byte-for-byte the previous release: the
+        best candidate must at least match the live generation's best member
+        (no-downgrade guard, DEC-CA-0017) and the new generation is selected
+        from this reign's candidates alone — nothing carries."""
+        best_member = min((m.score for m in self.members
+                           if math.isfinite(m.score) and m.score > 0),
+                          default=None)
+        best_candidate = min((c.score for c in self.candidates
+                              if math.isfinite(c.score)), default=None)
+        if (best_member is not None and best_candidate is not None
+                and best_candidate > best_member):
+            log.warning(
+                "trainer promotion: clock ripe (%.2f rounds) but the best "
+                "candidate benches %.5f vs the live generation's best member "
+                "%.5f — holding the current generation (no-downgrade guard); "
+                "%d candidate(s) logged, retrying as new rounds bench",
+                elapsed, best_candidate, best_member, len(self.candidates))
+            return None
+        return select_members(
+            list(self.candidates), k_max=self.k_max,
+            quality_epsilon=self.quality_epsilon,
+            min_round_spacing=self.min_round_spacing,
+            error_vectors=self._load_error_vectors(),
+        )
+
+    def _fire(self, selected: list[Candidate], *, epoch_block: int, round_id: str,
+              effective_era: int, elapsed: float) -> PromotionRecord:
+        """Install ``selected`` as the next generation (lock held)."""
+        prior = {m.checkpoint_id: m for m in self.members}
+        self.generation += 1
+        # A carried member keeps its original provenance (source_round,
+        # score) — validators verify it against that bench report.
+        self.members = tuple(
+            prior.get(c.checkpoint_id) or PromotedMember(
+                checkpoint_id=c.checkpoint_id, size=c.size,
+                source_round=c.round_id, score=c.score)
+            for c in selected
+        )
+        self.member_meta = {c.checkpoint_id: c for c in selected}
+        self.candidates = ()
+        self.reign_start_block = int(epoch_block)
+        record = PromotionRecord(
+            generation=self.generation,
+            king_hotkey=self.king_hotkey or "",
+            fired_round=str(round_id),
+            fired_block=int(epoch_block),
+            members=self.members,
+            effective_era=int(effective_era or 0),
+        )
+        self.pending_record = record
+        self._persist()
+        self._write_pointer()
+        log.info(
+            "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
+            "king %s persists, reign clock reset",
+            self.generation, elapsed,
+            ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
+            (self.king_hotkey or "?")[:12],
+        )
+        return record
+
+    def _member_candidate(self, m: PromotedMember) -> Candidate:
+        """The live member as a selection candidate: its recorded selection
+        metadata when the engine has it, else a structural placeholder (no
+        generator, epoch 0) that spacing/diversity treat as its own lineage."""
+        meta = self.member_meta.get(m.checkpoint_id)
+        if meta is not None:
+            return meta
+        return Candidate(checkpoint_id=m.checkpoint_id, size=m.size, hotkey="",
+                         role="member", round_id=m.source_round, epoch_index=0,
+                         score=m.score)
 
     def _load_error_vectors(self) -> dict[str, list[float]] | None:
         """The error-vector cache for select_members, or ``None``. Best-effort:
@@ -569,18 +684,15 @@ class TrainerPromotion:
             "members": [member_to_json(m) for m in self.members],
             "king_hotkey": self.king_hotkey,
             "reign_start_block": self.reign_start_block,
-            "candidates": [
-                {"checkpoint_id": c.checkpoint_id, "size": c.size, "hotkey": c.hotkey,
-                 "role": c.role, "round_id": c.round_id,
-                 "epoch_index": c.epoch_index, "score": c.score}
-                for c in self.candidates
-            ],
+            "candidates": [_candidate_to_json(c) for c in self.candidates],
+            "member_meta": [_candidate_to_json(c) for c in self.member_meta.values()],
             "pending_record": None if self.pending_record is None else {
                 "generation": self.pending_record.generation,
                 "king_hotkey": self.pending_record.king_hotkey,
                 "fired_round": self.pending_record.fired_round,
                 "fired_block": self.pending_record.fired_block,
                 "members": [member_to_json(m) for m in self.pending_record.members],
+                "effective_era": self.pending_record.effective_era,
             },
         }
         # Atomic (tmp + rename): a crash mid-write must not corrupt the state

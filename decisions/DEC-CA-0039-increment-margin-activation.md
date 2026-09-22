@@ -45,6 +45,26 @@ funded go-live, so validators get one coordinated upgrade window for all of them
 shrinking-signal (level vs increment), max-T fixes the large-field multiplicity
 penalty (α/k vs the real correlation). Testnet armed at 1.
 
+AMENDED 2026-09-19 — the stacking was NOT what ran. A miner reproduced the
+published cohort LCBs with the LEVEL formula: under the max-T (k > 1, every
+funded round since 9046800) the validator discarded each challenger's
+increment LCB and replaced it with `cohort_maxt_lcb_map`'s joint bound, which
+only knew `(king − chal) / king` — then compared that level number to the
+margin. The audit replayed the same path, so receipts verified. Net effect:
+the increment margin never judged a live funded round; the live bar was the
+level 0.5 % floor with the max-T multiplicity fix on top. Fix (PR #290):
+`cohort_maxt_lcbs(..., baseline=)` puts the baseline on the shared resample
+and makes every per-bag statistic the %-of-increment one (ONE definition,
+`_increment_stat`, shared with `increment_bootstrap_rel`; k = 1 reduces to
+the single increment duel exactly). CONSENSUS, so it ships behind a NEW gate
+`[scoring] cohort_maxt_increment_from_block` (0 = cohort rounds stay
+level-judged; testnet 1); validator and audit resolve it per round from the
+block, receipts unchanged. The mainnet block is an owner call after the six
+external validators upgrade (release-then-activate). Lesson: a block-gated
+rule that lives in two code paths needs a test that exercises both at once —
+`test_maxt_increment_reduces_to_the_increment_lcb_at_k1` and the
+validator→audit cohort test now do.
+
 NOT a substitute for basin escape (DEC-CA-0014): increment keeps INCREMENTAL
 competition alive as the lineage converges; if the lineage has genuinely
 plateaued (from-scratch benches ≈ the mature king), the answer is a reseed,

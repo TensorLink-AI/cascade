@@ -59,6 +59,24 @@ def _clean_per_horizon(ph: dict | None) -> dict | None:
     return out
 
 
+def _clean_per_domain_scores(pd: dict | None) -> dict | None:
+    """``{domain: {king, chal, win_rate, n}}`` → strict-JSON, sorted by domain
+    name, NaN-scrubbed. ``None`` when empty. The per-domain twin of
+    :func:`_clean_per_horizon` (``eval.koth.per_domain_breakdown``)."""
+    if not pd:
+        return None
+    out: dict[str, dict] = {}
+    for dom in sorted(pd, key=str):
+        r = pd[dom] or {}
+        out[str(dom)] = {
+            "king": _none_for_nan(r.get("king")),
+            "chal": _none_for_nan(r.get("chal")),
+            "win_rate": _none_for_nan(r.get("win_rate")),
+            "n": int(r.get("n", 0) or 0),
+        }
+    return out
+
+
 def _clean_per_domain(pd: dict | None) -> dict | None:
     """``{domain: (win_rate, n)}`` → strict-JSON ``{domain: [win_rate|None, n]}``.
 
@@ -319,6 +337,15 @@ class VerdictRecord:
     per_horizon: dict | None = None
     cohort_geomeans: dict | None = None
     cohort_per_horizon: dict | None = None
+    # ``per_domain`` / ``cohort_per_domain``: the same breakdown by pool DOMAIN
+    # (``{domain: {king, chal, win_rate, n}}``) — the decided pair's, and every
+    # judged challenger's keyed by hotkey — so a miner reads which domains they
+    # beat the king in and by how much. ``per_domain_win_rate`` above is the
+    # how-often half; this is the by-how-much half. None on a domain-less pool
+    # and on every receipt archived before it shipped; DROPPED from the
+    # canonical body then. Display only.
+    per_domain: dict | None = None
+    cohort_per_domain: dict | None = None
 
     # NOTE on adding fields here. ``asdict`` of this dataclass goes into
     # ``RoundReceipt.canonical_body`` — the SIGNED bytes — so a field that always
@@ -346,7 +373,7 @@ class VerdictRecord:
         cls, result, transition, *, params, bootstrap_seed, king_tenure_rounds: int = 0,
         cohort_k: int = 0, cohort_lcbs: dict | None = None,
         cohort_geomeans: dict | None = None, cohort_per_horizon: dict | None = None,
-        cohort_stats: dict | None = None,
+        cohort_stats: dict | None = None, cohort_per_domain: dict | None = None,
     ) -> VerdictRecord:
         """From an ``eval.koth.RoundResult`` + ``validator.state.StateTransition``.
 
@@ -407,6 +434,12 @@ class VerdictRecord:
                  if _clean_per_horizon(ph)}
                 or None
             ) if cohort_per_horizon else None,
+            per_domain=_clean_per_domain_scores(getattr(result, "per_domain", None)),
+            cohort_per_domain=(
+                {str(h): _clean_per_domain_scores(pd) for h, pd in cohort_per_domain.items()
+                 if _clean_per_domain_scores(pd)}
+                or None
+            ) if cohort_per_domain else None,
         )
 
 
@@ -435,7 +468,8 @@ def _verdict_body(v: VerdictRecord | None) -> dict | None:
         d.pop("init_baseline_geomean", None)
     if d.get("init_floor_passed") is None:
         d.pop("init_floor_passed", None)
-    for key in ("per_horizon", "cohort_geomeans", "cohort_per_horizon"):
+    for key in ("per_horizon", "cohort_geomeans", "cohort_per_horizon",
+                "per_domain", "cohort_per_domain"):
         if not d.get(key):
             d.pop(key, None)
     return d
@@ -473,6 +507,21 @@ class RoundReceipt:
     weights: tuple[float, ...] = ()          # the equal-share vector set on chain
     reject_reason: str | None = None
     validator_hotkey: str = ""               # ss58 of the signer (inside the signed body)
+    # Era context (DEC-CA-0043, drop-when-default so every archived receipt
+    # keeps its signed bytes): the era's start block and the seed the era's
+    # TRAINING seeds derive from (``block_seed(era.seed_block)`` — the
+    # previous era's start block hash). ``base_seed`` / the eval draw stay
+    # the settlement boundary's; only ``generation_seed`` / ``training_seed``
+    # move to the era. Absent (0) before the gate, required after — the
+    # audit checks both.
+    era_start_block: int = 0
+    era_base_seed: int = 0
+    # Stake-weighted activation (DEC-CA-0045, drop-when-default): the
+    # DEC-CA-0043 rollover block this validator resolved FROM VALIDATOR
+    # SIGNALS (0 = none resolved, or the rollover is typed into chain.toml).
+    # Stamped on every receipt from lock-in on, so the audit replays each
+    # round under the block the fleet decided, not the config it runs with.
+    activation_block: int = 0
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -511,6 +560,12 @@ class RoundReceipt:
             "reject_reason": self.reject_reason,
             "validator_hotkey": self.validator_hotkey,
         }
+        if self.era_start_block:
+            body["era_start_block"] = int(self.era_start_block)
+        if self.era_base_seed:
+            body["era_base_seed"] = int(self.era_base_seed)
+        if self.activation_block:
+            body["activation_block"] = int(self.activation_block)
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -533,6 +588,9 @@ def build_receipt(
     reward_uids: tuple[int, ...] = (),
     weights: tuple[float, ...] = (),
     reject_reason: str | None = None,
+    era_start_block: int = 0,
+    era_base_seed: int = 0,
+    activation_block: int = 0,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -557,6 +615,9 @@ def build_receipt(
         weights=tuple(float(w) for w in weights),
         reject_reason=reject_reason,
         validator_hotkey=validator_hotkey,
+        era_start_block=int(era_start_block or 0),
+        era_base_seed=int(era_base_seed or 0),
+        activation_block=int(activation_block or 0),
     )
 
 
@@ -672,11 +733,20 @@ def load_receipt(text: str) -> RoundReceipt:
                  for h, ph in verdict["cohort_per_horizon"].items()}
                 if verdict.get("cohort_per_horizon") else None
             ),
+            per_domain=_clean_per_domain_scores(verdict.get("per_domain")),
+            cohort_per_domain=(
+                {str(h): _clean_per_domain_scores(pd)
+                 for h, pd in verdict["cohort_per_domain"].items()}
+                if verdict.get("cohort_per_domain") else None
+            ),
         ) if verdict else None,
         reward_uids=tuple(int(u) for u in obj.get("reward_uids", ())),
         weights=tuple(float(w) for w in obj.get("weights", ())),
         reject_reason=obj.get("reject_reason"),
         validator_hotkey=str(obj.get("validator_hotkey", "")),
+        era_start_block=int(obj.get("era_start_block", 0) or 0),
+        era_base_seed=int(obj.get("era_base_seed", 0) or 0),
+        activation_block=int(obj.get("activation_block", 0) or 0),
         receipt_version=version,
         signature=obj.get("signature"),
     )
@@ -809,6 +879,10 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "per_horizon": v.per_horizon if v else None,
         "cohort_geomeans": v.cohort_geomeans if v else None,
         "cohort_per_horizon": v.cohort_per_horizon if v else None,
+        # per-domain scores — the decided pair's and every judged challenger's
+        # ("which domains did I beat the king in, and by how much")
+        "per_domain": v.per_domain if v else None,
+        "cohort_per_domain": v.cohort_per_domain if v else None,
         "boot_p50": v.boot_p50 if v else None,
         "boot_p95": v.boot_p95 if v else None,
         "challenger_wins_round": v.challenger_wins_round if v else None,
@@ -823,6 +897,9 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "heat": heat_summary,
         "reject_reason": receipt.reject_reason,
         "validator_hotkey": receipt.validator_hotkey or None,
+        # DEC-CA-0045: the rollover block this validator resolved from
+        # validator signals (0 = none / typed into chain.toml).
+        "activation_block": int(receipt.activation_block or 0),
     }
 
 

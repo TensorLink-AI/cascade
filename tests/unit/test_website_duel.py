@@ -38,7 +38,8 @@ def test_every_heat_status_has_a_pill(page: str, status: str):
 
 
 @pytest.mark.parametrize("field", ["per_horizon", "cohort_geomeans", "cohort_per_horizon",
-                                   "cohort_lcbs", "duel_only"])
+                                   "cohort_lcbs", "duel_only",
+                                   "per_domain", "cohort_per_domain"])
 def test_duel_fields_are_read(page: str, field: str):
     assert re.search(rf'["\.]{field}\b', page), f"index.html never reads {field!r}"
 
@@ -48,6 +49,17 @@ def test_cohort_panel_is_wired(page: str):
     assert "function renderCohort()" in page
     m = re.search(r"function renderAll\(\)\{(.*?)\}", page)
     assert m and "renderCohort()" in m.group(1), "renderCohort() is not called from renderAll()"
+
+
+def test_cohort_panel_renders_the_domain_breakdown(page: str):
+    """The per-domain scores get their own table for the decided pair and a
+    column in the cohort table — the "which domains did I beat the king in"
+    view is on the page, not only in ``cascade duel --hotkey``."""
+    m = re.search(r"function renderCohort\(\)\{(.*?)\nfunction renderChart", page, re.S)
+    assert m, "renderCohort() missing from index.html"
+    body = m.group(1)
+    assert "By domain" in body and "s.per_domain" in body and "s.pds[hk]" in body
+    assert "DOMAIN_MIN_WINDOWS" in body, "small-n domains must be flagged as noise"
 
 
 def test_duel_only_heat_panel_drops_the_score_columns(page: str):

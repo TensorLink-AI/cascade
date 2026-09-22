@@ -21,7 +21,9 @@ from cascade.shared.bench_report import (
     BenchReport,
     bench_report_key,
     dump_bench_report,
+    load_bench_report,
 )
+from cascade.shared.hippius import ObjectNotFound, StorageError
 from cascade.shared.manifest import (
     BenchScores,
     TrainedEntry,
@@ -39,7 +41,7 @@ from cascade.shared.promotion import (
 from cascade.trainer.loop import TrainerRunner
 from cascade.trainer.remote import RemoteHost, worker_argv
 from cascade.validator.cascade import CascadeController, CascadeState
-from cascade.validator.loop import ValidatorRunner
+from cascade.validator.loop import POOL_PIN_READ_GRACE_SECONDS, ValidatorRunner
 
 REF = "alice/metro-gen@sha256:" + "a" * 64
 REF_T = "cascade/ckpt-r1-king-toto2-4m@sha256:" + "b" * 64
@@ -166,6 +168,8 @@ class _Store:
         self.texts = dict(texts or {})
 
     def get_text(self, key: str) -> str:
+        if key not in self.texts:
+            raise ObjectNotFound(key)
         return self.texts[key]
 
 
@@ -198,13 +202,14 @@ def _scores(v: float) -> BenchScores:
                        boom_mase=v, time_crps=v, time_mase=v)
 
 
-def _bench_report_text(round_id: str, scored: dict[str, float]) -> str:
+def _bench_report_text(round_id: str, scored: dict[str, float], *,
+                       created_block: int = 10) -> str:
     entries = tuple(
         BenchEntry(role="king", size="toto2-4m", miner_hotkey="hk", miner_uid=0,
                    trained_pointer=ptr, scores=_scores(v))
         for ptr, v in scored.items()
     )
-    return dump_bench_report(BenchReport(round_id=round_id, created_block=10,
+    return dump_bench_report(BenchReport(round_id=round_id, created_block=created_block,
                                          entries=entries))
 
 
@@ -364,6 +369,64 @@ def test_out_of_reign_member_rejected_when_clock_can_attest(cfg, tmp_path):
     assert reason is not None and "warm_start_member_out_of_reign" in reason
 
 
+def test_carried_member_is_exempt_from_reign_scope(cfg, tmp_path):
+    # Rolling top-k (DEC-CA-0044): a member of the ACCEPTED generation carries
+    # into the next record with its original (pre-reign) source_round. An
+    # attesting validator exempts it from reign scope — it was verified when
+    # it entered — while a new entrant must still be benched this reign.
+    record = PromotionRecord(
+        generation=2, king_hotkey="hk0", fired_round="r6", fired_block=0,
+        members=(PromotedMember(PTR, "toto2-4m", "r0", 1.0),
+                 PromotedMember(PTR2, "toto2-4m", "r6", 1.01)))
+    store = _Store({
+        promotion_index_key(): json.dumps({"latest_generation": 2}),
+        promotion_record_key(2): dump_promotion_record(record),
+        bench_report_key("r0"): _bench_report_text("r0", {PTR: 1.0}, created_block=10),
+        bench_report_key("r6"): _bench_report_text("r6", {PTR2: 1.01},
+                                                   created_block=6 * DAY),
+    })
+    ctl = CascadeController(reign_days=5, state=CascadeState(
+        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,),
+        clock_observed=True))
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    # CONSENSUS GATE: before era_king_from_block the exemption is OFF — the
+    # previous release scopes every member, so an upgraded validator must
+    # reject exactly what its un-upgraded peers reject.
+    reason = r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10))
+    assert reason is not None and "warm_start_member_out_of_reign" in reason
+    assert ctl.state.generation == 1
+    # From the rollover (the era path passes carried_exempt=True) the carried
+    # member passes on its original provenance; a new entrant is still scoped.
+    assert r._verify_members(record, enforce_reign_scope=True, carried_exempt=True) is None
+    bad = r._verify_members(record, enforce_reign_scope=True, carried_exempt=False)
+    assert bad is not None and "warm_start_member_out_of_reign" in bad
+
+
+def test_uncarried_pre_reign_member_is_still_rejected(cfg, tmp_path):
+    # Same shape, but the pre-reign member was NOT in the accepted generation:
+    # scope still fails closed.
+    record = PromotionRecord(
+        generation=2, king_hotkey="hk0", fired_round="r6", fired_block=0,
+        members=(PromotedMember(PTR, "toto2-4m", "r0", 1.0),
+                 PromotedMember(PTR2, "toto2-4m", "r6", 1.01)))
+    other = format_trained_pointer("cascade/ckpt-r0-x-toto2-4m@sha256:" + "d" * 64)
+    store = _Store({
+        promotion_index_key(): json.dumps({"latest_generation": 2}),
+        promotion_record_key(2): dump_promotion_record(record),
+        bench_report_key("r0"): _bench_report_text("r0", {PTR: 1.0}, created_block=10),
+        bench_report_key("r6"): _bench_report_text("r6", {PTR2: 1.01},
+                                                   created_block=6 * DAY),
+    })
+    ctl = CascadeController(reign_days=5, state=CascadeState(
+        king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(other,),
+        clock_observed=True))
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    reason = r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10))
+    assert reason is not None and "warm_start_member_out_of_reign" in reason
+
+
 def test_genesis_validator_attests_the_first_promotion(cfg, tmp_path):
     # A validator that WATCHED the whole random-init era (observed crowning at
     # genesis) enforces ripeness even on generation 0 → 1 — the first
@@ -452,3 +515,79 @@ def test_worker_argv_omits_warm_start_by_default():
         base_seed=99, block=12, trainer_spec="m:C",
     )
     assert "--warm-start-ref" not in argv
+
+
+class _FlakyStore(_Store):
+    """A store whose named keys fail to READ (503) — an outage, not absence."""
+
+    def __init__(self, texts, *, down):
+        super().__init__(texts)
+        self.down = set(down)
+
+    def get_text(self, key: str) -> str:
+        if key in self.down:
+            raise StorageError(f"s3_get_failed: {key}: 503")
+        return super().get_text(key)
+
+
+def test_unreadable_bench_report_is_a_transient_not_a_verdict(cfg, tmp_path):
+    # 2026-09-21: two validators latched permanent rejections of the first
+    # gen-11 rounds on a swallowed read miss of a bench report that was on S3
+    # the whole time. A READ failure must raise (the poll loop retries the
+    # round next poll, no receipt) and the ledger must not move.
+    good = _promotion_store([(PTR, 1.0)], generation=1)
+    store = _FlakyStore(good.texts, down={bench_report_key("r1")})
+    ctl = CascadeController(reign_days=5)
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    with pytest.raises(StorageError, match="bench_report_unavailable"):
+        r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+    assert ctl.state.generation == 0 and ctl.state.members == ()
+    # Store back: the very same manifest is accepted — nothing was latched.
+    store.down.clear()
+    assert r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR)) is None
+    assert ctl.state.generation == 1
+
+
+def test_unreadable_promotion_index_or_record_is_a_transient(cfg, tmp_path):
+    good = _promotion_store([(PTR, 1.0)], generation=1)
+    for key in (promotion_index_key(), promotion_record_key(1)):
+        store = _FlakyStore(good.texts, down={key})
+        ctl = CascadeController(reign_days=5)
+        r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+        with pytest.raises(StorageError, match="promotion_(index|record)_unavailable"):
+            r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+        assert ctl.state.generation == 0
+    # The index naming a record that is ABSENT is a store inconsistency (the
+    # record is published before the index), not "no promotion": transient.
+    texts = dict(good.texts)
+    texts.pop(promotion_record_key(1))
+    r = _validator(cfg, tmp_path, cascade=CascadeController(reign_days=5),
+                   store=_Store(texts))
+    with pytest.raises(StorageError, match="promotion_record_unavailable"):
+        r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR))
+    # An ABSENT index is a verdict: no promotion was ever published.
+    # (test_unseen_pin_without_record_rejected; an absent bench report likewise
+    # rejects — test_member_without_bench_numbers_rejected.)
+
+
+def test_stale_cached_bench_report_is_refetched_for_a_missing_member(cfg, tmp_path):
+    # The bench runs post-publish and the report is (re)published as legs
+    # finish: a copy cached before the member's entry landed must not pin
+    # "no bench numbers" for the life of the process.
+    store = _promotion_store([(PTR, 1.0), (PTR2, 1.02)], generation=1)
+    ctl = CascadeController(reign_days=5)
+    r = _validator(cfg, tmp_path, cascade=ctl, store=store)
+    r._bench_report_cache["r1"] = load_bench_report(_bench_report_text("r1", {PTR2: 1.02}))
+    assert r.check_manifest(_manifest(cfg, warm_start_ckpt=PTR)) is None
+    assert ctl.state.generation == 1 and ctl.state.members == (PTR, PTR2)
+    assert r._bench_report_cache["r1"].entry_for_pointer(PTR) is not None
+
+
+def test_gate_read_grace_names_the_gate(cfg, tmp_path):
+    r = _validator(cfg, tmp_path, cascade=None)
+    err = StorageError("bench_report_unavailable: round=r1: 503")
+    assert r._gate_read_failed("7", err, gate="warm_start_unverifiable", now=0.0) is None
+    reason = r._gate_read_failed("7", err, gate="warm_start_unverifiable",
+                                 now=POOL_PIN_READ_GRACE_SECONDS)
+    assert reason is not None and reason.startswith("warm_start_unverifiable")
+    assert "persistently" in reason

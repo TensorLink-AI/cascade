@@ -269,6 +269,26 @@ round_hours      = 12.0   # informational: wall-clock span of an epoch
 # (load-checked); set both back to 0 once it is safely past.
 epoch_blocks_prev      = 0
 epoch_activation_block = 0
+# Rolling intake + era king (DEC-CA-0043, block-gated). Trainer POLICY: from
+# this block challengers train the moment they are funded, legs cross
+# boundaries, every boundary publishes ONE settlement manifest (era king +
+# every challenger finished since the last settlement), the king's leg is
+# trained once per era and cached. 0 = off (the boundary-synchronous trainer,
+# bit-identical to before). ROLLOVER recipe (owner call, one boundary for
+# everything): rolling_from_block = era_king_from_block =
+# tenure_blocks_from_block = cohort_maxt_increment_from_block = ROLLOVER
+# (a multiple of epoch_blocks × era_settlements — the era grid is absolute);
+# epoch_blocks = 900, epoch_blocks_prev = 3600, epoch_activation_block =
+# ROLLOVER (3h grid); ROLLOVER % 3600 == 0. Load-checked. Do NOT arm before
+# the six external validators run a release carrying the era envelope.
+# With every key at 0 the block is DECIDED ON CHAIN by validator stake
+# ([activation] below, DEC-CA-0045); typing a block here overrides that.
+rolling_from_block = 0
+# Settlements per era (consecutive boundaries sharing one set of training
+# seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
+# eras — today's king-leg cadence with 3h verdicts inside it. Inert until a
+# rollover block is set.
+era_settlements = 4
 heat_train_hours = 1.0    # screening budget per competitor (on screen_size)
 heat_n_windows   = 2000   # eval windows the heat screens on (= [eval] n_windows;
                           # the full set — a smaller screen is noisy near the top)
@@ -421,6 +441,35 @@ funded_cpu_blocklist = ["Xeon(R) CPU E5-2"]
 # the bottom ~27 % of 4090 rentals and keeps every seated leg on an
 # equal-compute host. Other SKUs stay unguarded until benched.
 funded_host_bench_floor = { RTX4090 = 500e6 }
+# ── Open-market rounds (owner 2026-09-20; ON by default) ─────────────────────
+# funded_sku_per_leg: choose the GPU type PER LEG — every leg (the JIT king
+# too) rents the cheapest fitting executor across funded_pod_skus instead of
+# the whole round locking to one type. Fair because budgets are compute-
+# denominated and every leg completes its full token budget; needs
+# [training] expected_gpu = "" and the validators' manifest gate (_check_gpu,
+# gpu_mismatch on mixed types) lifted — that gate lifts at [scoring]
+# era_king_from_block (= ROLLOVER), and the per-leg choice takes effect at
+# the SAME block: until then every round still locks one type (#295), so
+# arming this key early changes nothing before the rollover.
+funded_sku_per_leg = true
+# Price guards on marketplace executors (USD; 0 = off). Cap the PER-LEG cost
+# (price/h × the SKU's measured wall below): an H100 at $1.30/h finishing in
+# an hour bills less than a 4090 at $0.50/h for three — a plain $/h cap would
+# exclude the cheaper pool. funded_max_price_per_hour is only a sanity
+# ceiling. An unpriced listing is skipped while either cap is armed.
+# $1.60/leg ≈ a 4090 at $0.50/h for 3.2 h or an H100 at $1.30/h for 1.2 h;
+# $1.50/h keeps anything exotic out.
+funded_max_price_per_hour = 1.5
+funded_max_leg_cost_usd = 1.6
+# Measured wall (seconds) of one full-budget leg per SKU: drives the per-leg
+# cost cap and the per-SKU latest safe start (a fast type — or a hosts.toml
+# lane carrying `sku = "…"` — may still start late in the epoch). A type
+# without an entry is assumed to need [training] max_train_seconds. From run
+# telemetry at the 150k-step budget: RTX4090 3 h 45 (hosts ≥ 500M tokens/s;
+# 3 h 40–4 h 34 observed), L40S 2 h 50 (2 h 47 measured), L40 ~3 h 10 (est.),
+# H100 ~1 h 40 (est., unmeasured — conservative). A6000 / RTX3090 are
+# wall-bound: no entry ⇒ the 5 h cap. Re-measure when the budget changes.
+funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
@@ -672,6 +721,16 @@ cohort_maxt_from_block = 9046800  # Fri 2026-09-11 20:30 UTC — the evening fun
 # cohort max-T above = one coordinated validator-upgrade window for both.
 # margin_mode below stays "level" (the pre-gate rule); 0 = no scheduled flip.
 increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the evening funded round)
+# Increment margin ON COHORT rounds (DEC-CA-0039 amended 2026-09-19): until this
+# block a cohort round (k > 1) under the max-T is judged in LEVEL units — the
+# joint bound only knew the level statistic, so from 9046800 on the increment
+# margin never actually judged a funded round (every one had k > 1). From a
+# round whose epoch boundary is >= this block the max-T bound is the
+# %-of-increment statistic (baseline on the shared resample), stacking the two
+# corrections as DEC-CA-0039 describes. CONSENSUS — release-then-activate with
+# the external validators; audit replays each round under its own block.
+# 0 = cohort rounds stay level-judged (no scheduled flip).
+cohort_maxt_increment_from_block = 0
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
@@ -684,6 +743,26 @@ increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the eve
 mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
+# Era king (DEC-CA-0043) — CONSENSUS, release-then-activate with the external
+# validators; audit replays each settlement under its own block. From a
+# settlement whose epoch boundary is >= this block the validator verifies the
+# era envelope (era stamp on the era grid, seeds from the previous era's
+# start block, init = members_gen(era)[era % k] of the latest promotion with
+# effective_era <= era, king entry = the champion at the pointer this
+# validator judged, refs verified as of each entry's train_block, manifests
+# hash-chained and walked in order, same-GPU fallback lifted when no GPU is
+# pinned). Must equal [round] rolling_from_block and be >=
+# cohort_maxt_increment_from_block >= cohort_maxt_from_block (load-checked).
+# 0 = off (bit-identical to the ungated validator).
+era_king_from_block = 0
+# Tenure / ripeness in BLOCKS from the rollover (CONSENSUS): the margin decay
+# and the promotion clock keep their wall-time length across the 3600 → 900
+# grid switch instead of running 4× faster. Both *_blocks values are inert
+# until tenure_blocks_from_block is set (= ROLLOVER).
+tenure_blocks_from_block = 0
+margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
+cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
+king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks — same valve as today
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool
@@ -990,3 +1069,35 @@ scratch_shadow_every_rounds = 0
                                 # back to benching the raw checkpoint. Costs ~fraction x one
                                 # training leg per benched checkpoint on the same pod; size
                                 # [eval] bench_hold_max_hours accordingly. 0.0/absent = off.
+
+[activation]
+# Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045). Each
+# validator on a release carrying this feature posts a plain on-chain
+# commitment ("cascade-ready:1:<feature>:0:0") from its hotkey at startup.
+# At every boundary of the grid in force, every node sums the stake of the
+# permit-holding validators that have posted it; the first boundary where
+# that share reaches `threshold` LOCKS IN (one-way), and the rollover is the
+# NEXT boundary — the round in which the count crossed finishes on the old
+# rules, the one after starts on the new (rolling intake, era king, tenure
+# in blocks, the grid switch below, and the increment-unit max-T all flip
+# there). A validator that has locked in rewrites its note with the block,
+# so a restarted or late node adopts the block validators holding
+# `threshold` of stake all name — no archive node needed. The trainer and
+# the provisioner READ the same decision every tick and arm themselves (a
+# trainer still on the OLD release must be restarted on the new one at the
+# lock-in boundary); the validator stamps the block on every receipt
+# (`activation_block`) so the audit replays each round under it. The
+# typed-in DEC-CA-0043 keys ([round] rolling_from_block etc.) always win
+# over the resolved block — the owner override. "" = off.
+feature = "rolling-era-king"
+# Fraction of ELIGIBLE validator stake (permit holders) that must have
+# signalled. A bare majority: check the owner validator's own share before
+# relying on this — over half and it decides alone.
+threshold = 0.51
+# The grid from the rollover ([round] epoch_blocks after it; the loaded 3600
+# becomes epoch_blocks_prev). Must divide epoch_blocks. 0 = keep the grid.
+epoch_blocks_after = 900
+# Leave OUT permit holders whose last weight-set is older than this many
+# blocks at the tally, so a dead validator's stake cannot hold the number
+# down. 0 = count every permit holder.
+dormant_after_blocks = 0

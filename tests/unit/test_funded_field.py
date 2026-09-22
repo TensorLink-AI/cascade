@@ -30,7 +30,8 @@ def _runner(tmp_path, **round_kw):
                            _storage_dropped={},
                            _funded_roster={"seated": [], "waiting": [],
                                            "terminal": [], "outcomes": []})
-    for name in ("_funded_gate_open", "_effective_funded_mode", "_burn_hotkeys",
+    for name in ("_sku_per_leg_active",
+                 "_funded_gate_open", "_effective_funded_mode", "_burn_hotkeys",
                  "_effective_funded_pods", "_funded_queue", "_filter_funded_challengers", "_settle_funded",
                  "_skip_unfunded_round", "_submissions_path", "_payer_vault",
                  "_reconcile_funded_pods", "_record_funded_failure",

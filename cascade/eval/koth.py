@@ -15,6 +15,7 @@ holds no state.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, replace
 
@@ -188,6 +189,13 @@ class RoundResult:
     # None on a single-horizon round. Display only; the verdict is the pooled
     # statistic.
     per_horizon: dict | None = None
+    # Per-domain breakdown: ``{domain: {king, chal, win_rate, n}}`` — the
+    # king's and challenger's geomeans restricted to each pool domain, so a
+    # miner reads WHERE they beat the king and by how much, not just how often
+    # (``per_domain_win_rate`` above is the how-often). None when the pool
+    # carries no domain labels. Display only; the verdict is the pooled
+    # statistic.
+    per_domain: dict | None = None
     # Diagnostic spread of the same bootstrap the LCB gates on: the median and
     # 95th pct of the relative-improvement distribution (the LCB is its 5th pct).
     # A wide gap between a positive median and a negative LCB = a fragile verdict
@@ -311,6 +319,43 @@ def per_horizon_breakdown(
     return out
 
 
+def per_domain_breakdown(
+    king_scores: list[WindowScore], chal_scores: list[WindowScore],
+    *, wql_mode: str = "geomean",
+) -> dict | None:
+    """``{domain: {"king", "chal", "win_rate", "n"}}`` — the round statistic
+    restricted to each pool domain, for the decided pair.
+
+    The per-domain WIN RATE (``_shadow_diagnostics``) says how often the
+    challenger beat the king in a domain; this says by how much: the same
+    geomean the verdict is judged on, computed on the domain's windows alone,
+    for both sides. Sorted by domain name. A pool with no domain labels (every
+    window ``""``) returns None so nothing changes for it. Never gates.
+    """
+    if not king_scores or len(king_scores) != len(chal_scores):
+        return None
+    by_dom: dict[str, list[int]] = {}
+    for i, s in enumerate(king_scores):
+        by_dom.setdefault(s.domain or "unknown", []).append(i)
+    if set(by_dom) == {"unknown"}:
+        return None
+    g_king = _per_window_geomeans(king_scores)
+    g_chal = _per_window_geomeans(chal_scores)
+    out: dict[str, dict] = {}
+    for dom in sorted(by_dom):
+        idx = by_dom[dom]
+        ks = [king_scores[i] for i in idx]
+        cs = [chal_scores[i] for i in idx]
+        wins = np.asarray([g_chal[i] < g_king[i] for i in idx])
+        out[dom] = {
+            "king": float(global_geomean(ks, wql_mode=wql_mode)),
+            "chal": float(global_geomean(cs, wql_mode=wql_mode)),
+            "win_rate": float(wins.mean()),
+            "n": int(len(idx)),
+        }
+    return out
+
+
 def cohort_maxt_lcb_map(
     king_scores: list[WindowScore],
     cohort_scores: list[tuple[str, list[WindowScore]]],
@@ -318,6 +363,7 @@ def cohort_maxt_lcb_map(
     *,
     seed: int | str,
     wql_mode: str = "geomean",
+    baseline_scores: list[WindowScore] | None = None,
 ) -> dict[str, float]:
     """``{hotkey: family-wise LCB}`` for a cohort under the shared-resample
     max-T (DEC-CA-0038) — the consensus replacement for Bonferroni ``alpha/k``
@@ -337,7 +383,22 @@ def cohort_maxt_lcb_map(
     single-duel :func:`evaluate_round`, so the cohort max-T reads a multivariate
     window as one unit exactly as the point statistic and the cluster bootstrap
     do. Bit-identical on any univariate pool (one channel per window).
+
+    Increment margin (DEC-CA-0039 stacked on DEC-CA-0038): with
+    ``params.margin_mode == "increment"`` AND ``baseline_scores`` (the shared
+    init scored on the same windows, paired like the king's), every bound is
+    the %-of-increment statistic — the same unit the single duel judges in —
+    so the cohort's family-wise LCB and the margin share one denomination.
+    Either missing ⇒ the level statistic (the pre-``cohort_maxt_increment_
+    from_block`` rule; the caller resolves the gate from the round's block).
     """
+    if params.margin_mode == "increment" and baseline_scores is not None:
+        if len(baseline_scores) != len(king_scores):
+            raise ValueError(
+                f"baseline_scores ({len(baseline_scores)}) not paired with "
+                f"king_scores ({len(king_scores)})")
+    else:
+        baseline_scores = None
     if params.mv_score:
         if wql_mode != "geomean":
             raise ValueError(
@@ -347,12 +408,16 @@ def cohort_maxt_lcb_map(
         king_scores = collapse_channels_by_window(king_scores)
         cohort_scores = [(hk, collapse_channels_by_window(cs))
                          for hk, cs in cohort_scores]
+        if baseline_scores is not None:
+            baseline_scores = collapse_channels_by_window(baseline_scores)
     clusters, _ = _window_clusters(king_scores)
     king_c = stack_components(king_scores)
     chal_c = [stack_components(cs) for _, cs in cohort_scores]
+    base_c = stack_components(baseline_scores) if baseline_scores is not None else None
     lcbs = cohort_maxt_lcbs(
         king_c, chal_c, alpha=params.bootstrap_alpha, B=params.bootstrap_B,
         seed=seed, clusters=clusters, wql_mode=wql_mode,
+        baseline=base_c, floor_frac=params.margin_increment_floor,
     )
     return {hk: lcb for (hk, _), lcb in zip(cohort_scores, lcbs, strict=True)}
 
@@ -364,7 +429,9 @@ def with_cohort_lcb(result: RoundResult, lcb: float, params: KothParams) -> Roun
     with the enforce-mode init-baseline floor. Geomeans, the floor result, and
     the diagnostics are untouched (they never depended on the correction). The
     one place the win is re-derived, shared by the validator and the audit."""
-    wins = bool(lcb >= result.margin)
+    # NaN compares False, but only by accident of IEEE — make the rule explicit:
+    # an uncomputable bound never clears a margin.
+    wins = bool(math.isfinite(lcb) and lcb >= result.margin)
     if params.init_gate_mode == "enforce" and result.init_floor_passed is False:
         wins = False
     return replace(result, lcb=lcb, challenger_wins_round=wins)
@@ -510,7 +577,12 @@ def evaluate_round(
         init_floor_passed = bool(
             chal_geo <= base_geo * (1.0 + max(0.0, params.init_gate_tolerance))
         )
-    wins = bool(lcb >= margin)
+    # An uncomputable bound (empty bootstrap sample ⇒ NaN) is an INCONCLUSIVE
+    # round — king holds, streak untouched — never a compare that happens to
+    # be False today and True on some other path (2026-09-21 review: lcb=nan
+    # reached the verdict line with inconclusive=False).
+    computable = bool(math.isfinite(lcb))
+    wins = bool(computable and lcb >= margin)
     if params.init_gate_mode == "enforce" and init_floor_passed is False:
         wins = False
     return RoundResult(
@@ -520,7 +592,7 @@ def evaluate_round(
         n_windows=n,
         king_geomean=global_geomean(king_scores, wql_mode=wql_mode),
         chal_geomean=chal_geo,
-        inconclusive=False,
+        inconclusive=not computable,
         n_clusters=n_clusters,
         wql_mode=wql_mode,
         margin_mode=params.margin_mode,
@@ -530,6 +602,7 @@ def evaluate_round(
         wilcoxon_p=wilcoxon_p,
         per_domain_win_rate=per_domain,
         per_horizon=per_horizon_breakdown(king_scores, chal_scores),
+        per_domain=per_domain_breakdown(king_scores, chal_scores, wql_mode=wql_mode),
         boot_p50=boot_p50,
         boot_p95=boot_p95,
     )

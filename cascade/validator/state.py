@@ -67,6 +67,28 @@ class ChampionState:
     # same round id is still re-judged, never silently skipped.
     last_handled_round_id: str | None = None
     last_handled_manifest_sha: str | None = None
+    # Era king (DEC-CA-0043). ``king_since_block``: the epoch boundary of the
+    # settlement that crowned the current king. None for a king crowned
+    # before the field existed — the validator imputes one from the counter
+    # at that king's FIRST settlement past tenure_blocks_from_block
+    # (era.legacy_king_anchor) and persists it here; it is never re-imputed
+    # (the counter keeps advancing on the new grid, so re-imputing inflated
+    # the tenure 4× per settlement). ``king_pointer``: the checkpoint pointer this validator
+    # judged in the crowning settlement, or the era's first king leg — the
+    # trainer cannot substitute another checkpoint of the same generator
+    # within an era. ``era_index``: the era ``king_pointer`` was adopted in.
+    # All drop-when-default in the state file.
+    king_since_block: int | None = None
+    king_pointer: str = ""
+    era_index: int | None = None
+    # CONSENSUS: the ``tenure_blocks_from_block`` gate at which this
+    # validator imputed ``king_since_block`` from the ``tenure_rounds``
+    # counter (era.legacy_king_anchor). At the first settlement past the
+    # gate EVERY validator re-anchors the reigning king from the counter —
+    # also one that recorded the real crowning block before the gate — so
+    # the fleet counts tenure from ONE anchor whether a validator upgraded
+    # before or after that king's crowning. 0 = not yet; drop-when-default.
+    tenure_anchor_gate: int = 0
 
 
 @dataclass(frozen=True)
@@ -110,6 +132,8 @@ def apply_round(
     dethrone_cp: int,
     keep_former_kings: int = 0,
     defeated_hotkeys: tuple[str, ...] = (),
+    crowned_block: int | None = None,
+    crowned_pointer: str = "",
 ) -> StateTransition:
     """Fold one round's result into the champion state.
 
@@ -128,6 +152,11 @@ def apply_round(
     does not bank progress toward ``dethrone_cp``. Dormant at ``dethrone_cp = 1``.
     An inconclusive round leaves every streak untouched, the cohort included —
     no duel in it produced a decision.
+
+    ``crowned_block`` / ``crowned_pointer`` (DEC-CA-0043) are recorded on a
+    dethrone only: the deciding settlement's epoch boundary and the winner's
+    trained pointer become ``king_since_block`` / ``king_pointer``; the era
+    index carries over (the era does not end on a dethrone).
     """
     rounds_seen = state.rounds_seen + 1
 
@@ -164,6 +193,9 @@ def apply_round(
                 ),
                 last_handled_round_id=state.last_handled_round_id,
                 last_handled_manifest_sha=state.last_handled_manifest_sha,
+                king_since_block=crowned_block,
+                king_pointer=str(crowned_pointer or ""),
+                era_index=state.era_index,
             ),
             dethroned=True,
             new_king_hotkey=challenger_hotkey,
@@ -186,7 +218,8 @@ def apply_round(
 
 
 def demote_to_trained(
-    state: ChampionState, *, trained_hotkey: str, trained_uid: int
+    state: ChampionState, *, trained_hotkey: str, trained_uid: int,
+    trained_block: int | None = None, trained_pointer: str = "",
 ) -> ChampionState:
     """Abandon a stuck champion and crown the trainer's trained king.
 
@@ -214,12 +247,25 @@ def demote_to_trained(
         # triggered the demotion on the next restart.
         last_handled_round_id=state.last_handled_round_id,
         last_handled_manifest_sha=state.last_handled_manifest_sha,
+        king_since_block=trained_block,
+        king_pointer=str(trained_pointer or ""),
+        era_index=state.era_index,
     )
 
 
 def dumps(state: ChampionState) -> str:
+    era_fields = {}
+    if state.king_since_block is not None:
+        era_fields["king_since_block"] = int(state.king_since_block)
+    if state.king_pointer:
+        era_fields["king_pointer"] = state.king_pointer
+    if state.era_index is not None:
+        era_fields["era_index"] = int(state.era_index)
+    if state.tenure_anchor_gate:
+        era_fields["tenure_anchor_gate"] = int(state.tenure_anchor_gate)
     return json.dumps(
         {
+            **era_fields,
             "king_hotkey": state.king_hotkey,
             "king_uid": state.king_uid,
             "tenure_rounds": state.tenure_rounds,
@@ -257,4 +303,10 @@ def loads(text: str) -> ChampionState:
             str(obj["last_handled_manifest_sha"])
             if obj.get("last_handled_manifest_sha") is not None else None
         ),
+        king_since_block=(
+            int(obj["king_since_block"]) if obj.get("king_since_block") is not None else None
+        ),
+        king_pointer=str(obj.get("king_pointer", "") or ""),
+        era_index=(int(obj["era_index"]) if obj.get("era_index") is not None else None),
+        tenure_anchor_gate=int(obj.get("tenure_anchor_gate", 0) or 0),
     )

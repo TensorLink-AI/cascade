@@ -1334,8 +1334,15 @@ function cohortSource(r){
   function pick(k){ var x=r[k]; if(x==null) x=v[k]; return (x&&typeof x==="object")?x:null; }
   return {per_horizon:pick("per_horizon"), geos:pick("cohort_geomeans")||{}, lcbs:pick("cohort_lcbs")||{},
           phs:pick("cohort_per_horizon")||{}, king:r.king_geomean, margin:r.margin,
+          // per-domain scores (same {king, chal, win_rate, n} cells, keyed by pool
+          // domain): the decided pair's, and every judged challenger's by hotkey —
+          // which domains a miner beat the king in and by how much.
+          per_domain:pick("per_domain"), pds:pick("cohort_per_domain")||{},
           chal:r.chal_hotkey, winner:r.dethroned?r.chal_hotkey:null};
 }
+// Domain cells sorted best-for-the-challenger first (most negative gap).
+function domainKeys(o){ return Object.keys(o||{}).sort(function(a,b){ var ga=gapPct(o[a]), gb=gapPct(o[b]); return (ga==null?1e9:ga)-(gb==null?1e9:gb); }); }
+var DOMAIN_MIN_WINDOWS=30;   // fewer windows than this: the gap is draw noise, flagged
 function gapPct(cell){ if(!cell||cell.king==null||cell.chal==null||!Number(cell.king)) return null; return (cell.chal-cell.king)/cell.king*100; }
 function signedPct(g,dp){ return g==null?"--":(g>0?"+":"")+g.toFixed(dp==null?2:dp)+"%"; }
 function uidOfHotkey(hk,r){
@@ -1360,6 +1367,18 @@ function renderCohort(){
       '<div class="scroll-box"><table><thead><tr><th class="num">h</th><th class="num">King</th><th class="num">Challenger</th>'+
       '<th class="num">Gap</th><th class="num">Win rate</th><th class="num">n</th></tr></thead><tbody>'+hrows+'</tbody></table></div></div>';
   }
+  if(s.per_domain&&domainKeys(s.per_domain).length){
+    var drows=domainKeys(s.per_domain).map(function(d){
+      var c=s.per_domain[d]||{}, g=gapPct(c), few=c.n!=null&&c.n<DOMAIN_MIN_WINDOWS;
+      return '<tr><td>'+esc(d)+(few?' <span class="sub" title="Fewer than '+DOMAIN_MIN_WINDOWS+' windows — the gap is draw noise">few windows</span>':'')+'</td>'+
+        '<td class="num">'+fmt(c.king,5)+'</td><td class="num">'+fmt(c.chal,5)+'</td>'+
+        '<td class="num'+(g!=null&&g<0?' good':'')+'">'+signedPct(g)+'</td>'+
+        '<td class="num">'+pct(c.win_rate)+'</td><td class="num">'+(c.n!=null?c.n:"--")+'</td></tr>';
+    }).join("");
+    html+='<div><div class="cohort-head">By domain <span class="muted">— where the challenger beat the king and by how much; pooled windows decide; negative gap = challenger better</span></div>'+
+      '<div class="scroll-box"><table><thead><tr><th>Domain</th><th class="num">King</th><th class="num">Challenger</th>'+
+      '<th class="num">Gap</th><th class="num">Win rate</th><th class="num">n</th></tr></thead><tbody>'+drows+'</tbody></table></div></div>';
+  }
   var seen={}, hks=[];
   Object.keys(s.geos).concat(Object.keys(s.lcbs)).forEach(function(hk){ if(!seen[hk]){ seen[hk]=1; hks.push(hk); } });
   if(hks.length>1||(hks.length===1&&Object.keys(s.geos).length)){
@@ -1375,6 +1394,7 @@ function renderCohort(){
       var rel=(g!=null&&s.king)?(g-s.king)/s.king*100:null;
       var cleared=(lcb!=null&&s.margin!=null)?(lcb>s.margin):null;
       var gaps=horizonKeys(s.phs[hk]).map(function(h){ var gp=gapPct(s.phs[hk][h]); return gp==null?"":'<span class="h-gap'+(gp<0?' good':'')+'">h'+esc(h)+' '+signedPct(gp,1)+'</span>'; }).join("");
+      var doms=domainKeys(s.pds[hk]).map(function(d){ var c=s.pds[hk][d]||{}, gp=gapPct(c); return gp==null?"":'<span class="h-gap'+(gp<0?' good':'')+'" title="'+esc(d)+': king '+fmt(c.king,5)+' · challenger '+fmt(c.chal,5)+' · win rate '+pct(c.win_rate)+' · n='+(c.n!=null?c.n:"--")+'">'+esc(d)+' '+signedPct(gp,1)+'</span>'; }).join("");
       var tag=s.winner===hk?' <span class="crown">← took the throne</span>':(hk===s.chal?' <span class="sub-tag">decided pair</span>':'');
       return '<tr'+(s.winner===hk?' class="throne"':'')+'>'+
         '<td class="num">'+(i+1)+'</td><td class="num">'+(uid!=null?uid:"--")+'</td>'+
@@ -1382,13 +1402,15 @@ function renderCohort(){
         '<td class="num'+(rel!=null&&rel<0?' good':'')+'">'+(g!=null?fmt(g,5):"--")+(rel!=null?' <span class="sub">'+signedPct(rel)+'</span>':'')+'</td>'+
         '<td class="num">'+(lcb!=null?fmt(lcb,4):"--")+'</td>'+
         '<td>'+(cleared==null?'<span class="muted">--</span>':'<span class="heat-pill '+(cleared?'adv':'nofit')+'">'+(cleared?'✓ cleared':'✗ under margin')+'</span>')+'</td>'+
-        '<td>'+(gaps||'<span class="muted">--</span>')+'</td></tr>';
+        '<td>'+(gaps||'<span class="muted">--</span>')+'</td>'+
+        '<td>'+(doms||'<span class="muted">--</span>')+'</td></tr>';
     }).join("");
     html+='<div><div class="cohort-head">Cohort <span class="muted">— '+k+' challenger'+(k===1?"":"s")+' judged'+(k>1?' at α/'+k:'')+
       ', best point estimate first · margin '+fmt(s.margin,3)+'</span></div>'+
       '<div class="scroll-box scroll-field"><table><thead><tr><th class="num">#</th><th class="num">UID</th><th>Miner</th>'+
       '<th class="num" title="geomean(CRPS · MASE), lower is better; relative to the king">Error · vs king</th>'+
       '<th class="num" title="Bootstrap lower confidence bound on the improvement vs the king">LCB</th><th>Gate</th><th>By horizon</th>'+
+      '<th title="Gap vs the king per pool domain, strongest first; negative = the challenger was better there">By domain</th>'+
       '</tr></thead><tbody>'+crows+'</tbody></table></div></div>';
   }
   if(!html){ el.hidden=true; el.innerHTML=""; el.className=""; return; }

@@ -693,3 +693,33 @@ def test_dispatch_rc3_reason_skips_the_shell_job_control_notice():
     assert rejection_reason("something odd happened\n[2]-  Done   sleep 1\n") == "something odd happened"
     assert rejection_reason("[1]+  Exit 3   cmd\n") == "(no reason)"
     assert rejection_reason("") == "(no reason)"
+
+
+# ── error_tail: whole trailing lines, never a sliced traceback ───────────────
+
+
+def test_error_tail_keeps_whole_lines_and_the_head_context():
+    from cascade.trainer.remote import error_tail
+
+    tb = ("remote king on funded-king failed (rc=1): Traceback (most recent call last):\n"
+          + "\n".join(f"  File \"/x/{i}.py\", line {i}, in f{i}\n    call{i}()" for i in range(12))
+          + "\n\nThe above exception was the direct cause of the following exception:\n\n"
+          + "Traceback (most recent call last):\n  File \"/x/w.py\", line 9, in <module>\n"
+          + "RuntimeError: hippius read stalled for 1800s\n")
+    out = error_tail(tb, 300)
+    assert len(out) <= 300
+    assert out.startswith("remote king on funded-king failed (rc=1)")
+    assert out.endswith("RuntimeError: hippius read stalled for 1800s")
+    # every line in the tail is a complete line of the input
+    for ln in out.split(" … ", 1)[1].splitlines():
+        assert ln in tb.splitlines(), ln
+    assert not any(ln.startswith("t cause") for ln in out.splitlines())   # the old garble
+
+
+def test_error_tail_short_and_single_line_inputs():
+    from cascade.trainer.remote import error_tail
+
+    assert error_tail("boom", 300) == "boom"
+    assert error_tail(RuntimeError("x" * 50), 300) == "x" * 50
+    assert error_tail("y" * 1000, 100) == "y" * 100
+    assert error_tail(None, 10) == ""

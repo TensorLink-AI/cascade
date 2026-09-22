@@ -66,10 +66,14 @@
 
 * ``cascade duel`` — the full verdict for a settled round, from the public
   receipt index: dethrone margin (LCB vs required), both geomeans, win rate,
-  bootstrap quantiles, per-domain win rates, and per-validator agreement
-  (rejected validator rows are shown with their reason). ``--round`` reads an
-  archived round, ``--history`` lists every settled round's outcome.
-  Read-only: no wallet, no chain call, no credentials.
+  bootstrap quantiles, the by-horizon and by-DOMAIN breakdown (king vs
+  challenger score per pool domain — where the challenger beat the king and
+  by how much), every judged challenger's outcome, and per-validator
+  agreement (rejected validator rows are shown with their reason).
+  ``--hotkey`` adds YOUR per-domain scores vs the king; with ``--history`` it
+  becomes your per-domain trend across every round you were judged in.
+  ``--round`` reads an archived round, ``--history`` alone lists every settled
+  round's outcome. Read-only: no wallet, no chain call, no credentials.
 
 * ``cascade fund <intake_url> --ref <repo@digest>`` — fund your revealed
   submission's training leg with YOUR Lium API key (DEC-CA-0036). The key is
@@ -379,6 +383,22 @@ def _add_round(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(func=_cmd_round)
 
 
+def _live_cfg(cfg, client):
+    """``cfg`` with the fleet's resolved rollover applied (DEC-CA-0045).
+
+    A miner's chain.toml keeps the DEC-CA-0043 keys at 0; once the validators
+    lock in, the grid this CLI times reveals and countdowns on would be the
+    pre-switch one. One chain read of the validators' notes fixes that; any
+    failure (no chain, feature off, typed-in keys) returns ``cfg`` as loaded.
+    """
+    from ..shared.activation import startup_activation
+
+    try:
+        return startup_activation(cfg, client, store_path=None)
+    except Exception:  # noqa: BLE001 — a CLI convenience must never fail a command
+        return cfg
+
+
 def _cmd_round(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainClient, ChainError
@@ -392,6 +412,7 @@ def _cmd_round(args: argparse.Namespace) -> int:
 
     try:
         client = ChainClient.from_config(cfg, network=args.network)
+        cfg = _live_cfg(cfg, client)
         return run_dashboard(
             client, cfg.round, args.network, once=args.once, refresh=args.refresh,
             timeline=RoundTimeline.from_chain_config(cfg),
@@ -557,13 +578,19 @@ def _add_duel(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "duel",
         help="Duel verdict for a settled round: dethrone margin, both geomeans, "
-        "per-domain win rates — the full breakdown behind DETHRONED/king-held.",
+        "per-domain scores — the full breakdown behind DETHRONED/king-held. "
+        "--hotkey adds YOUR per-domain scores vs the king (and, with --history, "
+        "your per-domain trend across rounds).",
     )
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--round", dest="round_id", default=None,
                    help="A specific round id (default: the latest settled round).")
     p.add_argument("--history", action="store_true",
-                   help="One line per settled round instead of one round's detail.")
+                   help="One line per settled round instead of one round's detail "
+                   "(with --hotkey: your gap vs the king per domain, per round).")
+    p.add_argument("--hotkey", default=None,
+                   help="Your hotkey (ss58) — adds a 'your domains' block: which "
+                   "domains you beat the king in this round and by how much.")
     p.add_argument("--limit", type=int, default=20,
                    help="Rounds listed by --history (default: 20).")
     p.set_defaults(func=_cmd_duel)
@@ -579,6 +606,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         duel_round_rows,
         fetch_public_receipt_index,
         render_duel,
+        render_duel_domain_history,
         render_duel_index,
     )
 
@@ -588,8 +616,12 @@ def _cmd_duel(args: argparse.Namespace) -> int:
               "offline, or the round has not settled yet; try 'cascade round'",
               file=sys.stderr)
         return 1
+    me = getattr(args, "hotkey", None) or None
     if args.history:
-        print(render_duel_index(doc, limit=args.limit))
+        if me:
+            print(render_duel_domain_history(doc, me, limit=args.limit))
+        else:
+            print(render_duel_index(doc, limit=args.limit))
         return 0
     rows = duel_round_rows(doc, args.round_id)
     if not rows:
@@ -597,7 +629,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         print(f"no receipt-index rows for {target} — receipts land a few minutes "
               "after the duel manifest; try 'cascade duel --history'", file=sys.stderr)
         return 1
-    print(render_duel(rows))
+    print(render_duel(rows, me=me))
     return 0
 
 
@@ -700,6 +732,7 @@ def _cmd_reveal_status(args: argparse.Namespace) -> int:
     from ..shared.chain import ChainClient, ChainError
 
     client = ChainClient.from_config(cfg, network=args.network)
+    cfg = _live_cfg(cfg, client)
     deadline = time.monotonic() + args.timeout_s
 
     try:
@@ -878,6 +911,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
             wallet_hotkey=args.wallet_hotkey,
             wallet_path=args.wallet_path,
         )
+        cfg = _live_cfg(cfg, client)
         current_block = client.current_block()
         blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
         client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)
@@ -1093,6 +1127,7 @@ def _cmd_submit(args: argparse.Namespace) -> int:
             cfg, network=args.network, wallet_name=args.wallet_name,
             wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
         )
+        cfg = _live_cfg(cfg, client)
         current_block = client.current_block()
         blocks_until_reveal = _resolve_blocks_until_reveal(args, cfg, current_block)
         client.commit_submission(payload, blocks_until_reveal=blocks_until_reveal)

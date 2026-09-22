@@ -89,15 +89,15 @@ def test_pin_read_grace_retries_then_rejects():
     err = StorageError("s3_get_failed: pool/index.json: 403")
     t0 = 1000.0
     # Within grace: None → the caller skips the cycle (no latch, no receipt).
-    assert runner._pool_pin_read_failed("7", err, now=t0) is None
-    assert runner._pool_pin_read_failed(
+    assert runner._gate_read_failed("7", err, now=t0) is None
+    assert runner._gate_read_failed(
         "7", err, now=t0 + POOL_PIN_READ_GRACE_SECONDS - 1) is None
     # Grace expired: the terminal reject reason, carrying the honest cause.
-    reason = runner._pool_pin_read_failed("7", err, now=t0 + POOL_PIN_READ_GRACE_SECONDS)
+    reason = runner._gate_read_failed("7", err, now=t0 + POOL_PIN_READ_GRACE_SECONDS)
     assert reason is not None and reason.startswith("pool_pin_unverifiable")
     assert "persistently" in reason
     # The round was forgotten on expiry: a later failure (e.g. after a
     # re-publish of the same round) starts a FRESH grace window.
-    assert runner._pool_pin_read_failed("7", err, now=t0 + 9000.0) is None
+    assert runner._gate_read_failed("7", err, now=t0 + 9000.0) is None
     # Independent rounds keep independent clocks.
-    assert runner._pool_pin_read_failed("8", err, now=t0 + 9000.0) is None
+    assert runner._gate_read_failed("8", err, now=t0 + 9000.0) is None

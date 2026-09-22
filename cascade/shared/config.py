@@ -7,6 +7,7 @@ file, deployed by hand alongside the binaries — the same policy horizon uses).
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 import tomllib  # py311+
@@ -352,6 +353,46 @@ def validate_funded_host_bench_floor(value: object) -> tuple[tuple[str, float], 
         if str(sku).strip():
             out.append((str(sku).strip(), float(floor)))
     return tuple(sorted(out))
+
+
+def validate_funded_sku_wall_seconds(value: object) -> tuple[tuple[str, int], ...]:
+    """``[round] funded_sku_wall_seconds``: a TOML table ``{SKU = seconds}`` —
+    the MEASURED wall of one full-budget leg on that GPU type — → sorted
+    ``((sku, seconds), …)``. Fail-loud on anything but a mapping of positive
+    ints (config knobs need loader parsing, 2026-09-08)."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"funded_sku_wall_seconds={value!r} invalid; must be a table of "
+            f"SKU = seconds, e.g. {{ RTX4090 = 12000, L40S = 7200 }}")
+    out = []
+    for sku, secs in value.items():
+        if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs <= 0:
+            raise ValueError(
+                f"funded_sku_wall_seconds[{sku!r}]={secs!r} invalid; must be a "
+                f"positive number of seconds")
+        if str(sku).strip():
+            out.append((str(sku).strip(), int(secs)))
+    return tuple(sorted(out))
+
+
+def funded_sku_wall_for(walls: tuple[tuple[str, int], ...], sku: str,
+                        default: float) -> float:
+    """The measured leg wall (seconds) for ``sku``, case-insensitive;
+    ``default`` (the contract's max_train_seconds) when the SKU has none."""
+    want = (sku or "").strip().lower()
+    for name, secs in walls:
+        if name.lower() == want:
+            return float(secs)
+    return float(default)
+
+
+def validate_funded_price_cap(name: str, value: object) -> float:
+    """A non-negative USD figure; 0 = off."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{name}={value!r} invalid; must be a non-negative number (0 = off)")
+    return float(value)
 
 
 def funded_host_bench_floor_for(floors: tuple[tuple[str, float], ...], sku: str) -> float:
@@ -860,6 +901,23 @@ class RoundConfig:
     # short or double-counted at the seam; ``load_chain_config`` enforces it.
     epoch_blocks_prev: int = 0
     epoch_activation_block: int = 0
+    # ── Rolling intake + era king (DEC-CA-0043, block-gated) ─────────────────
+    # From ``rolling_from_block`` (trainer POLICY, not consensus) challengers
+    # train the moment they are funded instead of waiting for a boundary; a
+    # leg may cross boundaries; every boundary publishes ONE settlement
+    # manifest (the era king + every challenger finished since the last one);
+    # the king's leg is trained once per ERA and cached. 0 = off (bit-identical
+    # to the boundary-synchronous trainer). Must equal the fleet's ROLLOVER
+    # block — the same value as ``[scoring] era_king_from_block`` — and be a
+    # boundary of the grid (load-checked).
+    rolling_from_block: int = 0
+    # Settlements per era: consecutive boundaries sharing one set of training
+    # seeds, one init and one cached king checkpoint. 4 on a 3h grid = 12h
+    # eras, i.e. today's king-leg cadence with 3h verdicts inside it. Era
+    # arithmetic (cascade.shared.era) is pure block math — trainer,
+    # validators and audit derive the same era with zero discretion. 0 = one
+    # settlement per era (only meaningful once a rolling gate is set).
+    era_settlements: int = 0
     heat_train_hours: float = 0.5     # cheap screening budget per competitor
     heat_n_windows: int = 256         # eval windows the heat screens on (≤ [eval] n_windows)
     # Sample forecasts per window in the heat screen. The heat only RANKS the
@@ -1099,6 +1157,28 @@ class RoundConfig:
     # () / unknown SKU = off; an unreachable probe logs and lets the pod
     # through (a slow-host check must never itself sink a leg).
     funded_host_bench_floor: tuple[tuple[str, float], ...] = ()
+    # Open-market rounds (owner 2026-09-20): choose the GPU type PER LEG, not
+    # per round — every leg (the JIT king too) rents the cheapest executor
+    # that fits across funded_pod_skus. Fair because budgets are compute-
+    # denominated and every leg must complete its full token budget; needs
+    # [training] expected_gpu = "" like funded_pod_skus, and the validators'
+    # manifest gate (_check_gpu) lifted — the owner coordinates that release.
+    # ON by default (owner 2026-09-20); off = the whole round locks to the
+    # most-available SKU as before.
+    funded_sku_per_leg: bool = True
+    # Price guards on marketplace executors (payer-billed legs and the JIT
+    # king alike; USD; 0 = off). max_price_per_hour is a plain $/h ceiling;
+    # max_leg_cost_usd caps price_per_hour × the SKU's measured wall
+    # (funded_sku_wall_seconds; the contract's max_train_seconds when the
+    # SKU has no entry) — the figure that actually matters: an H100 at
+    # $1.30/h finishing in an hour is cheaper than a 4090 at $0.50/h for 3 h.
+    funded_max_price_per_hour: float = 1.5
+    funded_max_leg_cost_usd: float = 1.6
+    # Measured wall (seconds) of one full-budget leg per SKU. Drives the
+    # per-SKU latest safe start — a fast SKU may still start late in the
+    # epoch — and the per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
+    funded_sku_wall_seconds: tuple[tuple[str, int], ...] = (
+        ("H100", 6000), ("L40", 11400), ("L40S", 10200), ("RTX4090", 13500))
     # Rent the KING's pod just-in-time each funded round, on the OPERATOR's
     # account, at the round's chosen SKU — the no-heat end-state (no standing
     # final fleet). Required for funded_pod_skus to guarantee the king lands
@@ -1455,6 +1535,16 @@ class ScoringConfig:
     # like the other gates; audit replays each round under its own rule. 0 =
     # keep `margin_mode` for every round (no scheduled flip).
     increment_from_block: int = 0
+    # Increment margin ON COHORT rounds (DEC-CA-0039 amended 2026-09-19,
+    # block-gated). Until this block a cohort round (k > 1) under the max-T is
+    # judged in LEVEL units whatever `increment_from_block` says — the joint
+    # bound only knew the level statistic, so the increment margin never
+    # judged a live funded round. From a round whose epoch boundary is >= this
+    # block the max-T bound is the %-of-increment statistic (the baseline
+    # rides the shared resample), the same unit the single duel judges in.
+    # CONSENSUS, resolved per round like the other gates; audit replays each
+    # round under its own rule. 0 = cohort rounds stay level-judged.
+    cohort_maxt_increment_from_block: int = 0
     # Multivariate scoring activation (DEC-CA-0041, block-gated). From a round
     # whose epoch boundary is >= this block, a multivariate window's channels
     # are averaged into ONE per-window contribution (GIFT-Eval weighting — the
@@ -1587,6 +1677,38 @@ class ScoringConfig:
     # A manifest with no published body always takes the strict path, whatever
     # this says — the gate can only relax once the trainer actually declares.
     declared_contract_from_block: int = 0
+    # ── Era king (DEC-CA-0043, CONSENSUS, block-gated) ───────────────────────
+    # From a settlement whose epoch boundary is >= this block the validator
+    # verifies the ERA ENVELOPE (cascade.shared.era): the manifest's era
+    # stamp is on the era grid with seeds from the previous era's start
+    # block; the init is members_gen(era)[era % k] of the latest promotion
+    # whose effective_era <= era; the king entry is the champion and its
+    # pointer is the one this validator judged in the crowning settlement (or
+    # the era's first king leg); every entry's ref is the hotkey's revealed
+    # commitment AS OF its train_block; manifests are hash-chained
+    # (prev_round_id) and walked in order, never jumped; the same-GPU
+    # fallback of the GPU gate is lifted when no GPU is pinned. Release-then-
+    # activate with the external validators; audit replays each settlement
+    # under its own block. 0 = off (bit-identical to the ungated validator).
+    # Must equal ``[round] rolling_from_block`` and be >=
+    # ``cohort_maxt_increment_from_block`` >= ``cohort_maxt_from_block``
+    # (load-checked).
+    era_king_from_block: int = 0
+    # Tenure / ripeness re-denominated to BLOCKS from this block (CONSENSUS):
+    # ``margin_warmup_blocks`` replaces ``margin_warmup_rounds`` and
+    # ``cascade_reign_blocks`` replaces ``cascade_reign_rounds``, each
+    # expressed per settlement on the grid in force at the round's block, so a
+    # 4× faster grid does not 4× the decay and promotion clocks in wall-time.
+    # The king's tenure is then blocks reigned ÷ grid (a king crowned on the
+    # old grid keeps its wall-time tenure across the switch). 0 = off (the
+    # two ``*_blocks`` knobs are inert). Must equal the ROLLOVER block.
+    tenure_blocks_from_block: int = 0
+    margin_warmup_blocks: int = 0
+    cascade_reign_blocks: int = 0
+    # King-resync safety valve in BLOCKS from ``tenure_blocks_from_block``
+    # (``king_resync_max_rounds`` counted settlements: 5 × 900 blocks trips in
+    # 15 h, not the 60 h it meant). 0 = keep counting rounds.
+    king_resync_max_blocks: int = 0
 
 
 @dataclass(frozen=True)
@@ -1810,6 +1932,46 @@ class ValidatorConfig:
 
 
 @dataclass(frozen=True)
+class ActivationConfig:
+    """Stake-weighted activation of the DEC-CA-0043 rollover (DEC-CA-0045).
+
+    Each upgraded validator writes a plain on-chain commitment
+    ``cascade-ready:1:<feature>:…`` from its hotkey. At every boundary of
+    the grid in force, every node adds up the stake of the permit-holding
+    validators that have signalled ``feature``; the first boundary where
+    the signed share reaches ``threshold`` LOCKS IN, and the rollover is
+    the next boundary after it. Lock-in is one-way: a node that has seen it
+    persists the block and never re-evaluates. The typed-in DEC-CA-0043
+    keys (``rolling_from_block`` etc.) always win over the resolved block
+    — the owner override. ``feature = ""`` disables signalling and
+    resolution entirely (the typed-in keys are then the only way to arm).
+    """
+
+    feature: str = ""
+    # Fraction of ELIGIBLE validator stake (permit holders; see
+    # ``dormant_after_blocks``) that must have signalled for lock-in.
+    threshold: float = 0.51
+    # The grid from the resolved rollover (``epoch_blocks`` after it, the
+    # loaded ``epoch_blocks`` becoming ``epoch_blocks_prev``). 0 = keep the
+    # loaded grid (the rollover still switches, prev == after).
+    epoch_blocks_after: int = 0
+    # A permit holder whose ``last_update`` (last weight-set) is older than
+    # this many blocks at the tally block is left OUT of the eligible stake,
+    # so a dead validator's stake cannot hold the number down. 0 = count
+    # every permit holder.
+    dormant_after_blocks: int = 0
+    # RUNTIME ONLY (never read from chain.toml): the rollover block
+    # ``apply_activation`` wrote into this config's DEC-CA-0043 keys, so a
+    # resolved rollover is distinguishable from a typed-in one (the typed
+    # one is the owner override and is never re-resolved).
+    resolved_block: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.feature)
+
+
+@dataclass(frozen=True)
 class ChainConfig:
     schema_version: int
     subnet: SubnetConfig
@@ -1825,6 +1987,7 @@ class ChainConfig:
     validator: ValidatorConfig
     wandb: WandbConfig = field(default_factory=WandbConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    activation: ActivationConfig = field(default_factory=ActivationConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -1855,11 +2018,13 @@ class ChainConfig:
         eval package at import time.
         """
         from ..eval.koth import KothParams
+        from .era import effective_margin_warmup_rounds
 
         return KothParams(
             win_margin_start=effective_win_margin_start(self.scoring, block),
             win_margin_end=self.scoring.win_margin_end,
-            margin_warmup_rounds=self.scoring.margin_warmup_rounds,
+            margin_warmup_rounds=effective_margin_warmup_rounds(
+                self.round, self.scoring, block),
             min_windows=self.scoring.min_windows,
             bootstrap_B=self.scoring.bootstrap_B,
             bootstrap_alpha=self.scoring.bootstrap_alpha,
@@ -1912,6 +2077,17 @@ def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
     block."""
     return (scoring.cohort_maxt_from_block > 0 and block is not None
             and int(block) >= scoring.cohort_maxt_from_block)
+
+
+def cohort_maxt_increment_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """Whether a cohort round at epoch boundary ``block`` judges its max-T
+    bound in INCREMENT units (DEC-CA-0039 stacked on DEC-CA-0038):
+    ``cohort_maxt_increment_from_block`` set and reached. Only meaningful when
+    the max-T and the increment margin are both in force for that block (and a
+    baseline exists — a random-init round still falls back to level); ``0`` /
+    unknown block ⇒ False (cohort rounds level-judged, the pre-gate rule)."""
+    return (scoring.cohort_maxt_increment_from_block > 0 and block is not None
+            and int(block) >= scoring.cohort_maxt_increment_from_block)
 
 
 def mv_score_active(scoring: ScoringConfig, block: int | None) -> bool:
@@ -1970,6 +2146,126 @@ def effective_epoch_blocks(round_cfg: RoundConfig, block: int) -> int:
     return eb
 
 
+def check_rollover_alignment(
+    *,
+    rolling_from_block: int,
+    era_king_from_block: int,
+    tenure_blocks_from_block: int,
+    epoch_blocks: int,
+    epoch_blocks_prev: int,
+    epoch_activation_block: int,
+    era_settlements: int,
+    cohort_maxt_from_block: int,
+    cohort_maxt_increment_from_block: int,
+    funded_pods: str,
+    funded_king_rent: bool,
+) -> int:
+    """The DEC-CA-0043 rollover invariants on plain values.
+
+    Returns the rollover block (0 when no rollover key is set). Raises
+    ``ValueError`` on a split, misaligned or under-configured rollover — the
+    same refusal for a value typed into chain.toml (``load_chain_config``)
+    and for one resolved from validator signals at runtime
+    (:func:`cascade.shared.activation.apply_activation`), so a runtime
+    rollover can never reach a state the loader would have refused.
+    """
+    _eb, _ebp, _eab = int(epoch_blocks), int(epoch_blocks_prev), int(epoch_activation_block)
+    _rollover_keys = {
+        "[round] rolling_from_block": int(rolling_from_block),
+        "[scoring] era_king_from_block": int(era_king_from_block),
+        "[scoring] tenure_blocks_from_block": int(tenure_blocks_from_block),
+    }
+    _rollover_set = {k: v for k, v in _rollover_keys.items() if v}
+    if not _rollover_set:
+        return 0
+    if len(set(_rollover_set.values())) != 1:
+        raise ValueError(
+            "DEC-CA-0043 rollover keys must all name the same block: "
+            + ", ".join(f"{k}={v}" for k, v in _rollover_keys.items()))
+    _rollover = next(iter(_rollover_set.values()))
+    if len(_rollover_set) != len(_rollover_keys):
+        missing = [k for k, v in _rollover_keys.items() if not v]
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} is set on "
+            f"{sorted(_rollover_set)} but not on {missing} — every rollover "
+            "key flips at ONE block")
+    if _eab and _eab != _rollover:
+        raise ValueError(
+            f"[round] epoch_activation_block={_eab} must equal the DEC-CA-0043 "
+            f"rollover block {_rollover} (the grid switch and the era switch "
+            "land on one boundary)")
+    _grid_before = _ebp if (_eab and _ebp) else _eb
+    if _rollover % _grid_before or _rollover % _eb:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must be a boundary of the "
+            f"grid before it ({_grid_before}) and of epoch_blocks={_eb}")
+    _era_settlements = int(era_settlements)
+    if _era_settlements < 1:
+        raise ValueError(
+            "[round] era_settlements must be >= 1 when a DEC-CA-0043 rollover "
+            "block is set")
+    _era_len = _eb * _era_settlements
+    if _rollover % _era_len:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must start an era: a "
+            f"multiple of epoch_blocks × era_settlements = {_era_len} (the era "
+            "grid is absolute — block // era length — so the rollover boundary "
+            "is only the first era's start when it lies on that grid)")
+    _cmi = int(cohort_maxt_increment_from_block)
+    _cm = int(cohort_maxt_from_block)
+    _era_king = int(era_king_from_block)
+    if not (_era_king >= _cmi >= _cm):
+        raise ValueError(
+            f"[scoring] era_king_from_block={_era_king} must be >= "
+            f"cohort_maxt_increment_from_block={_cmi} >= "
+            f"cohort_maxt_from_block={_cm} (the era king stacks on the "
+            "increment-unit max-T)")
+    if _cmi == 0 or _cm == 0:
+        raise ValueError(
+            "[scoring] cohort_maxt_from_block and cohort_maxt_increment_from_block "
+            "must be set when era_king_from_block is (the era king is judged "
+            "under the increment-unit max-T)")
+    if not _eab:
+        raise ValueError(
+            f"DEC-CA-0043 rollover block {_rollover} must also switch the grid: set "
+            "[round] epoch_blocks_prev (the grid before it) and "
+            f"epoch_activation_block = {_rollover} — without the switch rolling "
+            f"intake would run on the old grid with {_era_settlements}-round eras "
+            "of the old length, silently")
+    _funded_pods = str(funded_pods or "off")
+    if _funded_pods != "rent" or not bool(funded_king_rent):
+        raise ValueError(
+            "DEC-CA-0043 rolling intake needs [round] funded_pods = \"rent\" and "
+            f"funded_king_rent = true (got funded_pods={_funded_pods!r}, "
+            f"funded_king_rent={bool(funded_king_rent)}): legs and "
+            "the era king are rented just-in-time, there is no round-wide pool")
+    return int(_rollover)
+
+
+_BLOCK_SECONDS = 12.0
+
+
+def funded_sku_wall_fit(cfg: ChainConfig) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split the configured funded SKUs (``funded_pod_skus``, else
+    ``funded_pod_sku``) into (fitting, excluded) by the per-SKU wall
+    (``funded_sku_wall_seconds``, else the contract's ``max_train_seconds``)
+    against ONE epoch's wall clock. An excluded SKU can never rent: its latest
+    safe start is before the epoch begins. The shipped (mainnet-measured) wall
+    table is inherited by any chain.toml that does not override it — on a
+    2 h testnet grid that silently narrowed rents to the SKUs WITHOUT an
+    entry, read as "works" (2026-09-21 review)."""
+    rnd = cfg.round
+    skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,) if rnd.funded_pod_sku else ())
+    if not skus:
+        return (), ()
+    cap = max(int(c.max_train_seconds) for c in cfg.throne_contracts())
+    epoch_wall = max(1, int(rnd.epoch_blocks)) * _BLOCK_SECONDS
+    walls = tuple(rnd.funded_sku_wall_seconds or ())
+    fit = tuple(s for s in skus if funded_sku_wall_for(walls, s, cap) < epoch_wall)
+    excluded = tuple(s for s in skus if s not in fit)
+    return fit, excluded
+
+
 def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     """Refuse to start a live service while ``chain.toml`` holds placeholders.
 
@@ -1998,11 +2294,46 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
     # gpu_name gate) — requeue-with-burn ×3 → terminal fail for every seated
     # miner. Comment-enforced until 2026-09-02; now fail-loud at launch.
     if (role == "trainer" and cfg.round.funded_pods == "rent"
+            and cfg.round.funded_sku_per_leg and cfg.training.expected_gpu):
+        problems.append(
+            "[round] funded_sku_per_leg mixes GPU types inside one round but "
+            "[training] expected_gpu pins one; set expected_gpu = \"\" (coordinated "
+            "validator change) or turn funded_sku_per_leg off")
+    if (role == "trainer" and cfg.round.funded_pods == "rent"
             and len(cfg.round.funded_pod_skus) > 1 and cfg.training.expected_gpu):
         problems.append(
             "[round] funded_pod_skus lists multiple GPU types but [training] "
             f"expected_gpu pins {cfg.training.expected_gpu!r} — per-round SKU "
             'choice needs expected_gpu = "" (a coordinated contract change)')
+    if role == "trainer" and cfg.round.funded_pods == "rent":
+        fit, excluded = funded_sku_wall_fit(cfg)
+        rolling = int(getattr(cfg.round, "rolling_from_block", 0) or 0) > 0
+        if excluded and not fit and rolling:
+            # Rolling intake (DEC-CA-0043): a leg picks the first boundary
+            # its wall clears, so a wall longer than one grid step is not
+            # "never starts" — it is "settles a boundary later". The grid
+            # bound is a BOUNDARY-mode rule; under rolling the per-leg target
+            # (_leg_local.end_wall) bounds each SKU instead.
+            logging.getLogger("cascade.config").warning(
+                "[round] funded_sku_wall_seconds: every configured SKU (%s) has a "
+                "measured wall of at least one epoch (%d blocks); rolling intake is "
+                "armed (rolling_from_block=%d) so legs target a later boundary — "
+                "make sure the walls were measured for THIS contract, not inherited",
+                ", ".join(excluded), int(cfg.round.epoch_blocks),
+                int(cfg.round.rolling_from_block))
+        elif excluded and not fit:
+            problems.append(
+                "[round] funded_sku_wall_seconds excludes EVERY configured SKU "
+                f"({', '.join(excluded)}): each measured wall is at least one epoch "
+                f"({int(cfg.round.epoch_blocks)} blocks) long, so no leg could ever "
+                "start — set walls measured for THIS grid (or {} to use the "
+                "contract's max_train_seconds)")
+        elif excluded:
+            logging.getLogger("cascade.config").warning(
+                "[round] funded_sku_wall_seconds excludes %s from funded rents (wall >= "
+                "one epoch of %d blocks); only %s can rent — set walls measured for "
+                "this grid if that is not intended", ", ".join(excluded),
+                int(cfg.round.epoch_blocks), ", ".join(fit))
     # The round's screen/throne size pointers must name configured sizes.
     registry = cfg.training.size_registry
     for label, name in [("screen_size", cfg.round.screen_size), *(("throne_sizes", n) for n in cfg.round.throne_sizes)]:
@@ -2125,6 +2456,75 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 "round spanning the seam has no well-defined length"
             )
 
+    # Rolling intake + era king (DEC-CA-0043): every block key names ONE
+    # rollover block, aligned to the grid on both sides of it, and the era
+    # king gate never precedes the corrections it stacks on. A misaligned or
+    # split rollover would let one node open an era where another still runs
+    # boundary rounds — refuse to load rather than fork the fleet. The same
+    # check guards a rollover resolved at runtime from validator signals
+    # (DEC-CA-0045, ``cascade.shared.activation.apply_activation``).
+    _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
+    _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
+    _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
+    _era_settlements = max(0, int(r.get("era_settlements", 0) or 0))
+    check_rollover_alignment(
+        rolling_from_block=_rolling,
+        era_king_from_block=_era_king,
+        tenure_blocks_from_block=_tenure_blocks,
+        epoch_blocks=_eb,
+        epoch_blocks_prev=_ebp,
+        epoch_activation_block=_eab,
+        era_settlements=_era_settlements,
+        cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
+        cohort_maxt_increment_from_block=max(
+            0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
+        funded_pods=str(r.get("funded_pods", "off") or "off"),
+        funded_king_rent=bool(r.get("funded_king_rent", False)),
+    )
+
+    # Stake-weighted activation (DEC-CA-0045): validators signal readiness on
+    # chain; the rollover block is resolved from those signals at runtime when
+    # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
+    # never reaches the resolver.
+    ac = raw.get("activation", {})
+    _act_feature = str(ac.get("feature", "") or "").strip()
+    if _act_feature and not re.fullmatch(r"[A-Za-z0-9._-]+", _act_feature):
+        raise ValueError(
+            f"[activation] feature={_act_feature!r} must be a token of letters, digits, "
+            "'.', '_' or '-' (it is written verbatim into the on-chain note)")
+    _act_threshold = float(ac.get("threshold", 0.51))
+    if not (0.0 < _act_threshold <= 1.0):
+        raise ValueError(
+            f"[activation] threshold={_act_threshold} must be in (0, 1] (a fraction "
+            "of eligible validator stake)")
+    _act_grid_after = max(0, int(ac.get("epoch_blocks_after", 0) or 0))
+    if _act_grid_after and _eb % _act_grid_after:
+        raise ValueError(
+            f"[activation] epoch_blocks_after={_act_grid_after} must divide "
+            f"[round] epoch_blocks={_eb}: the resolved rollover is a boundary of "
+            "the grid before it and must be one of the grid after it too")
+    if _act_feature and not _rolling:
+        # The block the fleet resolves is ANY boundary of the loaded grid plus
+        # one; ``apply_activation`` must be able to arm it (the DEC-CA-0043
+        # rule: it starts an era on the grid after it). Refuse a config whose
+        # lock-in could resolve a block the node then cannot apply.
+        if _era_settlements < 1:
+            raise ValueError(
+                "[round] era_settlements must be >= 1 when [activation] feature is set "
+                "(the resolved rollover opens an era)")
+        _era_after = (_act_grid_after or _eb) * _era_settlements
+        if _eb % _era_after:
+            raise ValueError(
+                f"[round] epoch_blocks={_eb} must be a multiple of the era after the "
+                f"rollover ({_act_grid_after or _eb} × era_settlements={_era_settlements} "
+                f"= {_era_after}), or a lock-in at some boundary resolves a rollover "
+                "that cannot start an era")
+        if str(r.get("funded_pods", "off") or "off") != "rent" or not bool(
+                r.get("funded_king_rent", False)):
+            raise ValueError(
+                "[activation] feature is set but [round] funded_pods/funded_king_rent are "
+                "not \"rent\"/true — the resolved rollover could not be applied")
+
     # Extra final-stage sizes ([[training.sizes]] array of tables). The base
     # [training] block is always the primary size; these are trained alongside it.
     extra_sizes = tuple(
@@ -2241,6 +2641,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             round_hours=float(r.get("round_hours", 24.0)),
             epoch_blocks_prev=int(r.get("epoch_blocks_prev", 0)),
             epoch_activation_block=int(r.get("epoch_activation_block", 0)),
+            rolling_from_block=_rolling,
+            era_settlements=_era_settlements,
             heat_train_hours=float(r.get("heat_train_hours", 0.5)),
             heat_n_windows=int(r.get("heat_n_windows", 256)),
             heat_num_samples=int(r.get("heat_num_samples", 0)),
@@ -2288,6 +2690,14 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 if str(x).strip()),
             funded_host_bench_floor=validate_funded_host_bench_floor(
                 r.get("funded_host_bench_floor", None)),
+            funded_sku_per_leg=bool(r.get("funded_sku_per_leg", True)),
+            funded_max_price_per_hour=validate_funded_price_cap(
+                "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 1.5)),
+            funded_max_leg_cost_usd=validate_funded_price_cap(
+                "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 1.6)),
+            funded_sku_wall_seconds=(validate_funded_sku_wall_seconds(
+                r["funded_sku_wall_seconds"]) if "funded_sku_wall_seconds" in r
+                else RoundConfig.funded_sku_wall_seconds),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),
@@ -2362,6 +2772,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_activation_block2=max(0, int(s.get("margin_activation_block2", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
+            cohort_maxt_increment_from_block=max(
+                0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
             mv_score_from_block=max(0, int(s.get("mv_score_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
@@ -2395,6 +2807,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             prior_contract_digest=str(s.get("prior_contract_digest", "") or ""),
             contract_from_block=int(s.get("contract_from_block", 0) or 0),
             declared_contract_from_block=int(s.get("declared_contract_from_block", 0) or 0),
+            era_king_from_block=_era_king,
+            tenure_blocks_from_block=_tenure_blocks,
+            margin_warmup_blocks=max(0, int(s.get("margin_warmup_blocks", 0) or 0)),
+            cascade_reign_blocks=max(0, int(s.get("cascade_reign_blocks", 0) or 0)),
+            king_resync_max_blocks=max(0, int(s.get("king_resync_max_blocks", 0) or 0)),
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
@@ -2453,6 +2870,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
             funded_bench_verify_tolerance=float(
                 tm.get("funded_bench_verify_tolerance", 0.02)),
+        ),
+        activation=ActivationConfig(
+            feature=str(ac.get("feature", "") or "").strip(),
+            threshold=_act_threshold,
+            epoch_blocks_after=_act_grid_after,
+            dormant_after_blocks=max(0, int(ac.get("dormant_after_blocks", 0) or 0)),
         ),
         raw=raw,
     )

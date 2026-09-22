@@ -25,6 +25,7 @@ import json
 import logging
 import queue
 import shlex
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -41,6 +42,7 @@ from ..shared.config import (
     duel_round_overhead_hours,
     effective_epoch_blocks,
 )
+from ..shared.era import era_king_active, rolling_active
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -70,6 +72,7 @@ from ..shared.manifest import (
 from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
 from .corpus import DIVERGED_MARKER, CorpusError, build_round_corpus
 from .host_probe import host_snapshot, host_summary_line
+from .remote import error_tail
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -371,6 +374,47 @@ STORAGE_RETRY_BACKOFF_SECONDS = 45.0
 # both died, so whatever ate them (registry brown-out, provider network blip)
 # gets time to pass while other lanes keep training.
 HEAT_REQUEUE_COOLDOWN_SECONDS = 120.0
+
+
+def _transport_failure(exc: BaseException) -> bool:
+    """A dispatch failure that says the POD is unreachable rather than the
+    leg wrong: an ssh transport exit (255 — refused, unreachable, sshd dead),
+    a detached worker that stopped answering polls, or a failed detached
+    launch. Miner faults (import error, NaN, OOM) are never this."""
+    from .remote import RemoteDispatchError
+
+    if isinstance(exc, RemoteDispatchError):
+        if getattr(exc, "returncode", None) == 255:
+            return True
+        msg = str(exc)
+        return ("pod unreachable" in msg or "detached launch failed" in msg
+                or "Connection refused" in msg)
+    if isinstance(exc, subprocess.CalledProcessError):
+        return exc.returncode == 255
+    return "Connection refused" in str(exc)
+
+
+def _quarantine_lane_host(host, reason: str) -> None:
+    """Quarantine the pod's host IP (Lium relists the same machine under new
+    executor ids) after a transport failure; loopback/profile hosts skipped.
+    Best-effort — never lets a quarantine write sink the dispatch path."""
+    ip = str(getattr(host, "host", "") or "")
+    if not ip or ip.startswith("127.") or ip in ("localhost", "::1"):
+        return
+    try:
+        from ..provision.core import record_host_quarantine
+
+        record_host_quarantine(ip, reason)
+    except Exception as e:  # noqa: BLE001
+        log.warning("host quarantine for %s failed (ignored): %s", ip, e)
+
+
+def _kept_pods_survive_failure(epoch_end_wall: float | None, now: float) -> bool:
+    """After a round failure, keep the payer pods held for the post-publish
+    bench while the SAME round can still retry inside its epoch (the retry
+    reuses the persisted legs and benches on those pods); tear down only
+    when the epoch is over and no sweep will come for them."""
+    return epoch_end_wall is not None and now < float(epoch_end_wall)
 
 
 def _storage_failure(exc: BaseException) -> bool:
@@ -746,15 +790,80 @@ class _FinalLanePool(queue.Queue):
     """
 
     REFRESH_INTERVAL_S = 60.0
+    # A lane that failed the join gate or was drained as dead is re-gated no
+    # sooner than this (a pod still booting, or one that came back).
+    REJECT_RETRY_S = 600.0
 
-    def __init__(self, initial_hosts: list, refresh_fn):
+    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None):
         super().__init__()
         self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
+        self._gate_fn = gate_fn                # (RemoteHost) -> reason | None; may raise
         self._absorb_lock = threading.Lock()
         self._known: dict[str, object] = {}
+        self._rejected: dict[str, float] = {}  # lane name -> earliest re-gate time
+        # The round-start fleet is taken as sized (the provisioner's HealthGate
+        # / the rent scripts probed it); the gate guards lanes that JOIN
+        # mid-final — the blind spot.
         for h in initial_hosts:
             self._known[getattr(h, "name", str(h))] = h
             super().put(h)
+
+    def _admit(self, host) -> bool:
+        """The mid-final join gate (2026-09-21: a lane joined the pool blind,
+        the king's one retry landed on it, its sshd was dead, the round
+        aborted). A rejected lane is remembered and re-gated after
+        ``REJECT_RETRY_S``."""
+        if self._gate_fn is None:
+            return True
+        name = getattr(host, "name", str(host))
+        try:
+            reason = self._gate_fn(host)
+        except Exception as e:  # noqa: BLE001 — a gate crash is a rejection, never a wedge
+            reason = f"gate error: {e}"
+        if reason:
+            self._rejected[name] = time.time() + self.REJECT_RETRY_S
+            log.warning("final lane pool: lane %s NOT admitted (%s); re-gated in %.0f min",
+                        name, reason, self.REJECT_RETRY_S / 60)
+            return False
+        self._rejected.pop(name, None)
+        return True
+
+    @staticmethod
+    def same_pod(a, b) -> bool:
+        """Two lanes on one pod (same ssh endpoint) share its fate."""
+        return (getattr(a, "host", None), getattr(a, "port", None)) == (
+            getattr(b, "host", None), getattr(b, "port", None))
+
+    def mark_dead(self, host, reason: str) -> list[str]:
+        """Drain every lane on ``host``'s pod: a transport failure (ssh refused,
+        detached worker unreachable) is a POD fault, and its sibling lanes
+        would only feed the next leg's single retry the same dead endpoint.
+        The lanes leave membership; the hosts file re-offers them after
+        ``REJECT_RETRY_S`` through the gate. Returns the drained names."""
+        with self._absorb_lock:
+            dead = [n for n, h in self._known.items() if self.same_pod(h, host)]
+            name = getattr(host, "name", str(host))
+            if name not in dead:
+                dead.append(name)
+            until = time.time() + self.REJECT_RETRY_S
+            for n in dead:
+                self._known.pop(n, None)
+                self._rejected[n] = until
+            kept = []
+            while True:
+                try:
+                    h = super().get(block=False)
+                except queue.Empty:
+                    break
+                if getattr(h, "name", str(h)) not in dead:
+                    kept.append(h)
+            for h in kept:
+                super().put(h)
+        if dead:
+            log.warning("final lane pool: %d lane(s) on %s:%s drained as dead (%s): %s",
+                        len(dead), getattr(host, "host", "?"), getattr(host, "port", "?"),
+                        reason, ", ".join(dead))
+        return dead
 
     def known_hosts(self) -> list:
         """Current membership (for lane-count geometry) — grows, never shrinks."""
@@ -767,25 +876,57 @@ class _FinalLanePool(queue.Queue):
             log.debug("final lane pool refresh failed (keeping current set): %s", e)
             return
         with self._absorb_lock:
+            now = time.time()
             for h in fresh:
                 name = getattr(h, "name", None)
-                if name and name not in self._known:
-                    self._known[name] = h
-                    super().put(h)
-                    log.info("final lane pool: new lane %s joined mid-final", name)
+                if not name or name in self._known:
+                    continue
+                if self._rejected.get(name, 0.0) > now:
+                    continue                      # rejected/drained: not yet due
+                if not self._admit(h):
+                    continue
+                self._known[name] = h
+                super().put(h)
+                log.info("final lane pool: new lane %s joined mid-final", name)
+
+    def _deadline_of(self, deadline, host) -> float | None:
+        """Per-lane form: ``deadline`` may be a callable ``host -> float|None``
+        (a lane's OWN latest safe start — [round] funded_sku_wall_seconds
+        makes a fast lane usable later than a slow one) or one number."""
+        if callable(deadline):
+            return deadline(host)
+        return deadline
+
+    def _latest_deadline(self, deadline) -> float | None:
+        """The last moment ANY known lane could still take this leg: the
+        wait's bound. None when unbounded (no deadline, or a lane without
+        one)."""
+        if not callable(deadline):
+            return deadline
+        latest = None
+        for h in self.known_hosts():
+            d = self._deadline_of(deadline, h)
+            if d is None:
+                return None
+            latest = d if latest is None else max(latest, d)
+        return latest
 
     def get(self, block: bool = True, timeout: float | None = None, *,
-            deadline: float | None = None):
+            deadline=None):
         """``deadline`` (wall-clock, blocking form only): the latest moment a
         lane may still be handed out — past it the wait ends with
         ``_LaneDeadlinePassed`` and a lane that frees later stays in the pool
         for a leg that CAN still fit (the next round's). None = wait forever
-        (the operator-fleet final, whose legs are sized to the epoch)."""
+        (the operator-fleet final, whose legs are sized to the epoch). A
+        callable ``host -> deadline`` gives every lane its own (per-SKU)
+        latest safe start: a lane freed past ITS deadline goes back for a
+        leg that fits it; the wait itself lasts until the latest of them."""
         if not block or timeout is not None:
             return super().get(block=block, timeout=timeout)
         while True:
-            if deadline is not None:
-                remaining = deadline - time.time()
+            latest = self._latest_deadline(deadline)
+            if latest is not None:
+                remaining = latest - time.time()
                 if remaining <= 0:
                     # Past the deadline a lane that is FREE RIGHT NOW is still
                     # handed out (owner 2026-09-20: legs go onto the rented
@@ -798,18 +939,23 @@ class _FinalLanePool(queue.Queue):
                     except queue.Empty:
                         raise _LaneDeadlinePassed(
                             f"no operator lane free at the round's latest safe start "
-                            f"({time.strftime('%H:%M:%SZ', time.gmtime(deadline))})"
+                            f"({time.strftime('%H:%M:%SZ', time.gmtime(latest))})"
                         ) from None
             self._absorb_new()
             wait = self.REFRESH_INTERVAL_S
-            if deadline is not None:
-                wait = max(0.0, min(wait, deadline - time.time()))
+            if latest is not None:
+                wait = max(0.0, min(wait, latest - time.time()))
             try:
                 host = super().get(timeout=wait)
             except queue.Empty:
                 continue
-            if deadline is not None and time.time() >= deadline:
+            own = self._deadline_of(deadline, host)
+            if own is not None and time.time() >= own:
                 super().put(host)                # freed too late for THIS leg
+                if callable(deadline):
+                    # Another lane type may still fit: keep waiting for one,
+                    # but never spin on the one we just put back.
+                    time.sleep(min(1.0, max(0.0, (latest or 0) - time.time())) or 0.05)
                 continue                         # next pass raises
             return host
 
@@ -851,14 +997,16 @@ def _bench_role_dir(duel: list, entry) -> str:
     return f"{entry.role}-u{entry.miner_uid}"
 
 
-def _lium_provider(rnd, **kw):
+def _lium_provider(rnd, *, price_caps: dict | None = None, **kw):
     """An operator-key :class:`LiumProvider` carrying ``[round]
-    funded_cpu_blocklist`` (imported at call time so tests can swap the class)."""
+    funded_cpu_blocklist`` and the price guards (imported at call time so
+    tests can swap the class)."""
     from ..provision.core import LiumProvider
-    from ..provision.funded import apply_cpu_blocklist
+    from ..provision.funded import apply_cpu_blocklist, apply_price_caps
 
-    return apply_cpu_blocklist(LiumProvider(**kw),
+    prov = apply_cpu_blocklist(LiumProvider(**kw),
                                tuple(getattr(rnd, "funded_cpu_blocklist", ()) or ()))
+    return apply_price_caps(prov, **(price_caps or {}))
 
 
 def king_pod_name_prefix(netuid: int, round_id: str) -> str:
@@ -1001,6 +1149,13 @@ class TrainerRunner:
     # operator-driven re-train/re-publish of a finished round. None ⇒ the guard
     # always applies.
     force_rerun_round: str | None = None
+    # Stake-weighted activation (DEC-CA-0045): the trainer READS the fleet's
+    # decision (validator notes / the boundary tally) and arms the DEC-CA-0043
+    # rollover on itself — it never signals (it is not a validator). The
+    # record persists under work_root so a restart re-arms without a chain
+    # read. None ⇒ resolved in memory only.
+    activation_store: object | None = None
+    _activation: object | None = field(default=None, repr=False)
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -1541,13 +1696,84 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
 
+    # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
+
+    def apply_activation_block(self, block: int) -> bool:
+        """Arm the DEC-CA-0043 rollover at ``block`` on the live config and
+        refresh the promotion engine's captured grid. Returns True when the
+        config changed. The rolling scheduler is built lazily from
+        ``self.cfg`` only once ``rolling_active`` is true, so it always sees
+        the armed config."""
+        from ..shared.activation import apply_activation
+
+        new_cfg = apply_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        promo = getattr(self, "promotion", None)
+        if promo is not None and hasattr(promo, "round_cfg"):
+            promo.round_cfg = new_cfg.round
+        log.warning("activation: DEC-CA-0043 rollover ARMED at block %d (grid %d → %d): "
+                    "rolling intake + era king start there", block,
+                    new_cfg.round.epoch_blocks_prev, new_cfg.round.epoch_blocks)
+        return True
+
+    def _activation_tick(self, client, block: int) -> None:
+        """One resolver pass per poll (a chain read only at a new boundary or
+        while notes are pending). Never raises."""
+        from ..shared.activation import ActivationRecord, record_for, resolve_activation
+
+        if not getattr(self.cfg, "activation", None) or not self.cfg.activation.enabled:
+            return
+        try:
+            rec = self._activation
+            if rec is None:
+                store = self.activation_store
+                rec = store.load() if store is not None else ActivationRecord()
+                rec = record_for(self.cfg, rec)      # a renamed feature's record arms nothing
+                self._activation = rec
+                if rec.locked and rec.source != "config":
+                    log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
+                             rec.lock_block, rec.activation_block, rec.source)
+            res = resolve_activation(self.cfg, client, now_block=int(block), record=rec)
+            if res.changed:
+                self._activation = res.record
+                if self.activation_store is not None:
+                    self.activation_store.save(res.record)
+            rec = self._activation
+            if rec.locked and rec.source != "config":
+                self.apply_activation_block(rec.activation_block)
+        except Exception as e:  # noqa: BLE001 — activation must never sink a tick
+            log.warning("activation step failed (%s); retrying next poll", e)
+
+    def _sku_per_leg_active(self) -> bool:
+        """``[round] funded_sku_per_leg`` takes effect at ``[scoring]
+        era_king_from_block`` (= ROLLOVER), where the validators lift the
+        gpu_mismatch gate on mixed GPU types — before it a per-leg choice
+        would mix types inside one manifest and every validator would reject
+        the round after the miners paid for their legs. Until then every
+        round locks one type exactly as before (#295)."""
+        if not getattr(self.cfg.round, "funded_sku_per_leg", False):
+            return False
+        scoring = getattr(self.cfg, "scoring", None)
+        gate = int(getattr(scoring, "era_king_from_block", 0) or 0)
+        if gate <= 0:
+            return False
+        if self.__dict__.get("_rolling_sched") is not None:
+            return True                       # rolling runs only past the gate
+        ctx = getattr(self, "_stage_ctx", None) or {}
+        block = int(ctx.get("epoch_start_block") or 0) or int(
+            getattr(self, "_funded_gate_block", None) or 0)
+        return block >= gate
+
     def _enforce_single_gpu_manifest(self, entries: list) -> list:
         """Drop challenger entries whose GPU type differs from the king's
         (see :func:`_split_mixed_gpu_entries`) and record each as a sold-out
         failure so :meth:`_settle_funded` requeues it unburned. Mixed types
-        are allowed only when ``[round] funded_sku_per_leg`` is on (the
-        open-market mode, whose validators do not gate on type)."""
-        allow = bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
+        are allowed only when ``[round] funded_sku_per_leg`` is in force
+        (the open-market mode, from the block its validators stop gating on
+        type — :meth:`_sku_per_leg_active`)."""
+        allow = self._sku_per_leg_active()
         kept, dropped = _split_mixed_gpu_entries(entries, allow_mixed=allow)
         if not dropped:
             return kept
@@ -1671,6 +1897,12 @@ class TrainerRunner:
             return cap
         skus = tuple(rnd.funded_pod_skus) or ((rnd.funded_pod_sku,)
                                               if rnd.funded_pod_sku else ())
+        if self._sku_per_leg_active() and skus:
+            # Open market: no round-wide type — every leg picks the cheapest
+            # fitting executor across the list at rent time.
+            self._funded_round_sku = ""
+            self._funded_admission_info["sku"] = "per-leg:" + "/".join(skus)
+            return cap
         multi = len(skus) > 1
         if not multi and not rnd.funded_capacity_probe:
             return cap
@@ -1715,14 +1947,120 @@ class TrainerRunner:
     # wrong code) before the leg gives up for the round as an infra fault.
     FUNDED_MAX_STALE_PODS = 3
 
+    def _funded_price_caps(self) -> dict:
+        """The ``[round]`` price guards as ``apply_price_caps`` kwargs."""
+        rnd = self.cfg.round
+        try:
+            default = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+        except Exception:  # noqa: BLE001 — offline fakes
+            default = 0
+        return {
+            "max_price_per_hour": float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0),
+            "max_leg_cost_usd": float(getattr(rnd, "funded_max_leg_cost_usd", 0.0) or 0.0),
+            "sku_wall_seconds": tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()),
+            "default_wall_seconds": float(default),
+        }
+
+    def _funded_skus_for_rent(self) -> tuple[str, ...]:
+        """GPU types a rent may pick: the round's locked SKU, or — with
+        ``[round] funded_sku_per_leg`` (owner 2026-09-20: open the market) —
+        every listed type, cheapest fitting executor first."""
+        rnd = self.cfg.round
+        if self._sku_per_leg_active():
+            skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
+            if skus:
+                return skus
+        locked = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+        return (locked,) if locked else ()
+
+    def _leg_wall_seconds(self, sku: str | None = None) -> float:
+        """Wall one full-budget leg needs on ``sku``: the measured
+        ``[round] funded_sku_wall_seconds`` entry, else the contract's
+        ``max_train_seconds``. ``sku`` None/"" = the contract cap, except in
+        per-leg mode where it is the FASTEST listed type (the last moment any
+        rent could still fit; the rent itself picks only types that fit)."""
+        from ..shared.config import funded_sku_wall_for
+
+        rnd = self.cfg.round
+        cap = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+        walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
+        if sku:
+            return funded_sku_wall_for(walls, sku, cap)
+        if self._sku_per_leg_active() and walls:
+            skus = self._funded_skus_for_rent()
+            if skus:
+                return min(funded_sku_wall_for(walls, s, cap) for s in skus)
+        return float(cap)
+
+    def _funded_epoch_end_known(self) -> bool:
+        # Rolling intake (DEC-CA-0043): the leg's own target boundary
+        # (thread-local) IS the known end — without this the per-SKU fit
+        # filter and the operator-lane deadline switched off under rolling
+        # (the round-wide wall is None by design there and the stage context
+        # carries epoch_start_block=0), so slow types were rented past their
+        # latest safe start and lane waits were unbounded.
+        if getattr(getattr(self, "_leg_local", None), "end_wall", None) is not None:
+            return True
+        if getattr(self, "_funded_epoch_end_wall", None) is not None:
+            return True
+        ctx = getattr(self, "_stage_ctx", None) or {}
+        return bool(int(ctx.get("epoch_start_block") or 0)
+                    and getattr(self, "_funded_gate_block", None) is not None)
+
+    def _skus_fitting_now(self, skus: tuple[str, ...]) -> tuple[str, ...]:
+        """Of ``skus``, the types a leg started NOW would still finish inside
+        the epoch (per-SKU latest safe start). Only per-leg mode filters —
+        a locked round keeps its single type and the wait decides."""
+        if not self._sku_per_leg_active() or not self._funded_epoch_end_known():
+            return tuple(skus)
+        now_fn = getattr(self, "_rent_wait_now", None) or time.time
+        now = now_fn()
+        return tuple(s for s in skus if now < self._funded_rent_wait_deadline_for(s))
+
+    def _provider_capacity(self, provider, skus, exclude_ids=()) -> int:
+        """Marketplace capacity summed over ``skus`` (adapters count per type)."""
+        total = 0
+        for s in skus:
+            try:
+                total += int(provider.capacity(s, exclude_ids=exclude_ids) or 0)
+            except TypeError:
+                total += int(provider.capacity(s) or 0)
+        return total
+
+    def _funded_rent_wait_deadline_for(self, sku: str | None, *,
+                                       unknown_is_cap: bool = False) -> float:
+        """The latest safe start for a leg on ``sku`` specifically: the
+        round-wide deadline shifted by how much faster (or slower) that type
+        is than the wall the round-wide figure assumes (``_leg_wall_seconds``
+        with no SKU). No ``sku`` = the round-wide figure, or with
+        ``unknown_is_cap`` the contract-cap figure (a lane of unknown type
+        is assumed slowest). Unit fakes that stub the round-wide method keep
+        working."""
+        base = self._funded_rent_wait_deadline()
+        if not sku and not unknown_is_cap:
+            return base
+        try:
+            wall = (self._leg_wall_seconds(sku) if sku
+                    else float(max(int(c.max_train_seconds)
+                                   for c in self.cfg.throne_contracts())))
+            return base + (self._leg_wall_seconds(None) - wall)
+        except Exception:  # noqa: BLE001 — no contract context ⇒ the round-wide figure
+            return base
+
     def _funded_rent_wait_deadline(self) -> float:
         """Latest wall-clock a rented leg may START and still finish inside the
-        epoch: epoch end − the final leg's ``max_train_seconds`` − publish margin.
-        Falls back to "now" (no waiting) when the round context is unknown."""
+        epoch: epoch end − the leg's wall (the contract's ``max_train_seconds``;
+        in per-leg mode the FASTEST listed type's measured wall — see
+        ``_leg_wall_seconds``) − publish margin. Falls back to "now" (no
+        waiting) when the round context is unknown."""
         now = time.time()
         try:
-            leg_s = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
-            end_wall = getattr(self, "_funded_epoch_end_wall", None)
+            leg_s = int(self._leg_wall_seconds(None))
+            # Rolling intake (DEC-CA-0043): a leg carries its OWN target
+            # boundary (thread-local), not the round's epoch end.
+            end_wall = getattr(self._leg_local, "end_wall", None)
+            if end_wall is None:
+                end_wall = getattr(self, "_funded_epoch_end_wall", None)
             if end_wall is None:
                 ctx = getattr(self, "_stage_ctx", None) or {}
                 epoch_start = int(ctx.get("epoch_start_block") or 0)
@@ -1738,16 +2076,25 @@ class TrainerRunner:
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
-    def _operator_lane_deadline(self) -> float | None:
+    def _operator_lane_deadline(self, sku: str | None = None, *,
+                                unknown_is_cap: bool = False) -> float | None:
         """Latest wall-clock an operator-lane FALLBACK leg may start — the same
         latest safe start as a marketplace rent — or None when the round's
         epoch end is unknown (then the lane wait is unbounded, as before)."""
-        if getattr(self, "_funded_epoch_end_wall", None) is None:
-            ctx = getattr(self, "_stage_ctx", None) or {}
-            if (not int(ctx.get("epoch_start_block") or 0)
-                    or getattr(self, "_funded_gate_block", None) is None):
-                return None
-        return self._funded_rent_wait_deadline()
+        if not self._funded_epoch_end_known():
+            return None
+        return self._funded_rent_wait_deadline_for(sku, unknown_is_cap=unknown_is_cap)
+
+    def _operator_lane_deadline_fn(self):
+        """The lane pool's deadline argument: per-lane (``host.sku`` through
+        the measured wall table) when ``funded_sku_wall_seconds`` is set,
+        else the single round-wide number (or None = unbounded)."""
+        if not self._funded_epoch_end_known():
+            return None
+        if tuple(getattr(self.cfg.round, "funded_sku_wall_seconds", ()) or ()):
+            return lambda host: self._operator_lane_deadline(
+                getattr(host, "sku", "") or None, unknown_is_cap=True)
+        return self._operator_lane_deadline()
 
     def _operator_fallback_eligible(self, hotkey: str | None, now: float,
                                     deadline: float) -> bool:
@@ -1784,7 +2131,9 @@ class TrainerRunner:
         pods" — batches of one or more, not all-or-nothing); a leg still without
         a GPU at the deadline requeues to the next round as before. Returns
         True when capacity appeared."""
-        deadline = self._funded_rent_wait_deadline()
+        skus = (sku,) if isinstance(sku, str) else tuple(sku)
+        sku = "/".join(skus)
+        deadline = self._funded_rent_wait_deadline_for(skus[0] if len(skus) == 1 else None)
         sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
         abort = getattr(self, "_funded_wait_abort", None)
@@ -1815,7 +2164,8 @@ class TrainerRunner:
                 log.info("%s: operator final lane(s) on file — leaving the %s wait "
                          "for an operator lane (operator-billed)", describe, sku)
                 return "operator"
-            n = self._probe_funded_capacity(sku, self._claimed_executors())
+            n = self._probe_funded_capacity(self._skus_fitting_now(skus) or skus,
+                                            self._claimed_executors())
             if n and not for_king and self._king_pending():
                 # Capacity is the king's first: keep polling until it has a pod.
                 if not polled:
@@ -1910,15 +2260,18 @@ class TrainerRunner:
         return [h for h in hosts
                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
 
-    def _probe_funded_capacity(self, sku: str,
+    def _probe_funded_capacity(self, sku,
                                exclude_ids: tuple[str, ...] = ()) -> int | None:
-        """``sku``'s marketplace availability on the OPERATOR's key, or None.
+        """``sku``'s (or, for a tuple of types, their summed) marketplace
+        availability on the OPERATOR's key under the price caps, or None.
         ``exclude_ids`` = executors this round already claimed: a count that
         includes them is capacity no rent can use."""
+        skus = (sku,) if isinstance(sku, str) else tuple(sku)
         try:
-            return _lium_provider(self.cfg.round).capacity(sku, exclude_ids=exclude_ids)
+            prov = _lium_provider(self.cfg.round, price_caps=self._funded_price_caps())
+            return self._provider_capacity(prov, skus, exclude_ids)
         except Exception as e:  # noqa: BLE001 — a probe failure must not gate the round
-            log.warning("funded capacity probe for %s failed: %s", sku, e)
+            log.warning("funded capacity probe for %s failed: %s", "/".join(skus), e)
             return None
 
     def _funded_labels(self) -> dict[str, str]:
@@ -2219,7 +2572,9 @@ class TrainerRunner:
         that round; see :meth:`_reconcile_funded_pods`)."""
         self._reconcile_funded_pods(keep_round_id=str(round_id))
 
-    def _reconcile_funded_pods(self, *, keep_round_id: str | None = None) -> None:
+    def _reconcile_funded_pods(self, *, keep_round_id: str | None = None,
+                               keep_round_ids: tuple[str, ...] = (),
+                               keep_payers: set[str] | frozenset[str] = frozenset()) -> None:
         """Boundary sweep: tear down ledgered leftovers, then the per-payer
         orphan sweep (crash-between-launch-and-ledger). Best-effort — a payer
         API hiccup must never hold a boundary.
@@ -2236,6 +2591,7 @@ class TrainerRunner:
             return
         from ..provision.funded import reconcile_funded, teardown_funded
 
+        keep_ids = tuple(x for x in (keep_round_id, *keep_round_ids) if x)
         try:
             pods = self._load_funded_ledger()
             # A previous round's post-publish bench still running holds ITS
@@ -2257,7 +2613,7 @@ class TrainerRunner:
             for pod in [x for x in pods if not x.payer_hotkey]:
                 if pod.instance_id in held_ids:
                     continue
-                if keep_round_id and self._is_king_pod_of(pod.instance_id, keep_round_id):
+                if any(self._is_king_pod_of(pod.instance_id, rid) for rid in keep_ids):
                     log.info("funded sweep: keeping %s — this round's own king pod "
                              "(a retry adopts it; a complete checkpoint there "
                              "skips the retrain)", pod.instance_id)
@@ -2270,7 +2626,10 @@ class TrainerRunner:
                               "payer_vault_dir is unset — they bill their "
                               "miners until the vault comes back")
                 return
-            pods = [x for x in pods if x.payer_hotkey and x.instance_id not in held_ids]
+            # DEC-CA-0043: a payer pod with an in-flight leg attached is
+            # never swept — the leg re-attaches after a restart.
+            pods = [x for x in pods if x.payer_hotkey and x.instance_id not in held_ids
+                    and x.payer_hotkey not in keep_payers]
             for pod in pods:
                 self._revoke_robot(pod)
             if pods:
@@ -2284,8 +2643,9 @@ class TrainerRunner:
                               "gone — still billing the miner; kept on the "
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
-            reconcile_funded(self._load_funded_ledger(), vault,
-                             netuid=self.cfg.subnet.netuid)
+            if not keep_payers:
+                reconcile_funded(self._load_funded_ledger(), vault,
+                                 netuid=self.cfg.subnet.netuid)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -2295,7 +2655,7 @@ class TrainerRunner:
 
     def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
                                error_class: str, burn: bool) -> None:
-        self._funded_leg_failures[hotkey] = (msg[-500:], miner_fault,
+        self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 
     def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator):
@@ -2348,7 +2708,8 @@ class TrainerRunner:
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
-            round_sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+            skus = self._funded_skus_for_rent()
+            round_sku = skus[0] if skus else ""
             if not round_sku or not rnd.funded_pod_image:
                 raise RuntimeError("funded_pods=rent needs [round] "
                                    "funded_pod_sku (or funded_pod_skus) and "
@@ -2385,13 +2746,16 @@ class TrainerRunner:
                     claimed = tuple(sorted(self._funded_claimed_execs))
                 from ..provision.core import scan_ssh_host_key
 
+                # Open market: only the types a leg started now still fits.
+                fit = self._skus_fitting_now(skus) or skus
                 result = rent_funded_pod(
                     round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
-                    sku=round_sku, image=rnd.funded_pod_image,
+                    sku=fit[0], image=rnd.funded_pod_image,
                     ssh_pubkey=ssh_pubkey, netuid=netuid,
                     ready_timeout=rnd.funded_ready_timeout_seconds,
                     exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
                     cpu_blocklist=rnd.funded_cpu_blocklist,
+                    skus=fit, price_caps=self._funded_price_caps(),
                 )
                 if result.ok and result.machine_id:
                     with self._funded_exec_lock:
@@ -2440,7 +2804,7 @@ class TrainerRunner:
                             and now_fn() < self._funded_rent_wait_deadline()):
                         log.warning("funded leg %s: lemon pod (%s); renting again on "
                                     "another host (%d bad pod(s) so far)",
-                                    gen.hotkey[:12], result.error[-200:], stale_pods)
+                                    gen.hotkey[:12], error_tail(result.error, 200), stale_pods)
                         continue
                     result = replace(
                         result, error=f"{stale_pods} bad pod(s), last: {result.error}",
@@ -2451,7 +2815,7 @@ class TrainerRunner:
             # rent lock, so sibling legs that find one proceed) and rent again.
             # Only the round's latest safe start turns this into a requeue.
             waited = self._wait_for_funded_capacity(
-                round_sku, describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
+                skus, describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
             if waited == "operator":
                 # Owner-armed hybrid: this leg runs on an operator lane
                 # (operator-billed). The payer's write-ahead row goes (no pod
@@ -2728,6 +3092,39 @@ class TrainerRunner:
                     f"{pinned[:12]}…")
         return ""
 
+    def _operator_lane_gate(self, host) -> str | None:
+        """Why an operator lane may NOT join the final's pool, or None.
+
+        Three checks, cheapest first: the ssh endpoint answers (a refused
+        endpoint also quarantines the host); the pod runs THIS release's
+        worker (:func:`probe_worker_runtime`); the host clears the round's
+        bench floor (:meth:`_host_bench_below_floor`, off when no floor is
+        set for the SKU). 2026-09-21: hand-rented lanes bypassed every guard
+        the funded rent applies — a 6x pod at 183M tokens/s (floor 500M)
+        trained six legs to ~20 %, and a pod whose sshd had died took the
+        king's only retry."""
+        from .remote import build_ssh_argv, probe_worker_runtime, run_ssh
+
+        label = f"lane {getattr(host, 'name', host)}"
+        try:
+            p = run_ssh(build_ssh_argv(host, "echo LANE_OK"), timeout=45)
+        except Exception as e:  # noqa: BLE001
+            return f"ssh failed: {e}"
+        if p.returncode != 0 or "LANE_OK" not in (p.stdout or ""):
+            if p.returncode == 255:
+                _quarantine_lane_host(host, f"{label}: ssh refused at lane join")
+            return f"ssh rc={p.returncode}: {(p.stderr or '')[-160:]}"
+        why = probe_worker_runtime(host)
+        if why:
+            return why
+        rnd = self.cfg.round
+        sku = getattr(self, "_funded_round_sku", "") or getattr(rnd, "funded_pod_sku", "")
+        if sku:
+            why = self._host_bench_below_floor(host, sku, label)
+            if why:
+                return why
+        return None
+
     def _host_bench_below_floor(self, host, sku: str, label: str) -> str:
         """Why ``host`` is too slow for this round, or ``""``.
 
@@ -2767,7 +3164,8 @@ class TrainerRunner:
         if result.address is None:
             return ""
         rnd = self.cfg.round
-        sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
+        sku = (getattr(result, "sku", "") or getattr(self, "_funded_round_sku", "")
+               or rnd.funded_pod_sku)
         from .remote import RemoteHost
 
         host = RemoteHost(
@@ -2835,8 +3233,9 @@ class TrainerRunner:
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                           ).read_text(encoding="utf-8").strip()
-            sku = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
-            provider = _lium_provider(rnd)
+            skus = self._funded_skus_for_rent()
+            sku = skus[0] if skus else rnd.funded_pod_sku
+            provider = _lium_provider(rnd, price_caps=self._funded_price_caps())
             name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
@@ -2937,8 +3336,9 @@ class TrainerRunner:
                 # A sold-out marketplace is not a round failure: wait for a GPU
                 # (outside the rent lock) up to the round's latest safe start —
                 # the legs then rent independently as machines appear.
-                if not provider.capacity(sku, exclude_ids=self._claimed_executors()):
-                    waited = self._wait_for_funded_capacity(sku, describe="king rent",
+                fit = self._skus_fitting_now(skus) or skus
+                if not self._provider_capacity(provider, fit, self._claimed_executors()):
+                    waited = self._wait_for_funded_capacity(skus, describe="king rent",
                                                             for_king=True)
                     if waited == "operator":
                         # Owner-armed hybrid: the king trains on an operator
@@ -2953,11 +3353,16 @@ class TrainerRunner:
                     with self._funded_rent_lock:
                         with self._funded_exec_lock:
                             claimed = tuple(sorted(self._funded_claimed_execs))
-                        spec = LaunchSpec(sku=sku, count=1, image=rnd.funded_pod_image,
+                        fit = self._skus_fitting_now(skus) or skus
+                        spec = LaunchSpec(sku=fit[0], count=1, image=rnd.funded_pod_image,
                                           ssh_pubkey=ssh_pubkey,
                                           name_prefix=name_prefix,
-                                          gpus_per_pod=1, exclude_ids=claimed)
+                                          gpus_per_pod=1, exclude_ids=claimed,
+                                          sku_choices=fit if len(fit) > 1 else ())
                         pod_id = provider.launch(spec)[0]
+                        sku_fn = getattr(provider, "sku_of", None)
+                        landed = (str(sku_fn(pod_id) or "") if callable(sku_fn) else "")
+                        sku = landed or fit[0]          # the ledger + floor use the landed type
                         machine = provider.machine_of(pod_id) or ""
                         if machine:
                             # Claimed either way: a lemon executor must not be
@@ -3195,6 +3600,32 @@ class TrainerRunner:
             self._funded_bench_pod_round.pop(hotkey, None)
         if pod is not None:
             self._teardown_funded_pod(pod)
+
+    def _after_round_failure(self) -> str:
+        """What happens to the payer pods kept for a bench when the service
+        loop's round body raised. Returns the action taken (for tests).
+
+        * rolling (DEC-CA-0043): NOTHING — the scheduler owns every pod's
+          lifetime (a pod is kept from leg end until its completion bench
+          finishes, and ``_funded_epoch_end_wall`` is None by design), so a
+          transient in one tick (a chain read blip in the intake, a storage
+          hiccup in a settlement) must not yank every mid-bench pod;
+        * legacy round inside its epoch: KEEP — the same round retries,
+          reuses the persisted legs and benches on those pods (2026-09-21
+          02:30: three complete payer pods were torn down and the retry's
+          bench had nowhere to run); the boundary sweep reaps them if the
+          retry never publishes;
+        * otherwise: tear down — no sweep is coming for them."""
+        if self.__dict__.get("_rolling_sched") is not None:
+            log.info("rolling tick failed: pods stay (the scheduler owns their lifetimes)")
+            return "rolling-keep"
+        if _kept_pods_survive_failure(getattr(self, "_funded_epoch_end_wall", None),
+                                      time.time()):
+            log.info("round failed inside its epoch: kept funded pods stay for the "
+                     "retry's bench")
+            return "keep"
+        self._teardown_kept_funded_pods("round failed before its bench")
+        return "teardown"
 
     def _teardown_kept_funded_pods(self, why: str, *, round_id: str | None = None,
                                    exclude_rounds: Iterable[str] = ()) -> None:
@@ -5124,6 +5555,42 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001 — replay must never sink a round
             log.warning("promotion: bench-report replay failed (ignored): %s", e)
 
+    def _promotion_boundary_step(self, king_hotkey: str | None, epoch_start: int,
+                                 round_id: str, *, effective_era: int = 0) -> None:
+        """Cascade promotion (DEC-CA-0013) at a boundary: track the reign and
+        fire a promotion BEFORE anything trains, so the signed record is
+        published (and fetchable by validators) before any manifest pins a
+        new-generation member. The reign clock keys off the signed receipt
+        trail's verdict king when available — the on-chain incentive lags a
+        dethrone by 1-2 epochs — falling back to the incentive king.
+        Guarded: promotion must never sink a round. ``effective_era``
+        (DEC-CA-0043) stamps a fired record with the era it takes effect."""
+        if self.promotion is None:
+            return
+        try:
+            # First boundary of a never-anchored engine: count the rounds the
+            # king already reigned (signed receipt tail + published bench
+            # reports) before the clock ticks — see _seed_promotion_reign.
+            self._seed_promotion_reign()
+            self.promotion.note_round(self._receipt_king() or king_hotkey,
+                                      epoch_block=epoch_start)
+            # Out-of-band bench reports (mop-ups, trainer-downtime publishes)
+            # enter the pool here — before maybe_promote, so a promotion that
+            # fires NOW selects from the full reign.
+            self._replay_reign_bench_reports()
+            # Rolling top-k (DEC-CA-0044) is consensus-gated on the rollover:
+            # before era_king_from_block the previous release's validators
+            # reject carried members, so the legacy selection runs until then.
+            self.promotion.maybe_promote(
+                epoch_block=epoch_start, round_id=round_id, effective_era=effective_era,
+                rolling_topk=era_king_active(self.cfg.scoring, int(epoch_start)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("promotion step failed for round=%s: %s", round_id, e)
+        # Publish-with-retry: the record survives (persisted) as pending until
+        # the publish lands, so a store outage never orphans a generation the
+        # pointer file already rotates over.
+        self._flush_pending_promotion(round_id)
+
     def _flush_pending_promotion(self, round_id: str) -> None:
         """Publish a fired-but-unpublished promotion record, if one is pending.
         Guarded and idempotent — called at the round boundary AND right before
@@ -6521,7 +6988,17 @@ class TrainerRunner:
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
-            free_lanes.put(host)                 # failed lane rejoins the rotation
+            transport = _transport_failure(e)
+            if transport and hasattr(free_lanes, "mark_dead"):
+                # ssh refused / worker unreachable: the POD is gone, not the
+                # leg. Its lanes leave the rotation and the host is
+                # quarantined, so the retry (and every later leg) lands
+                # elsewhere (2026-09-21: the king's one retry went to the
+                # pod it had just died on, and the round aborted).
+                free_lanes.mark_dead(host, error_tail(e, 160))
+                _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {error_tail(e, 200)}")
+            else:
+                free_lanes.put(host)             # failed lane rejoins the rotation
             if _storage_failure(e):
                 # Same rationale as _dispatch_with_retry: registry blips are
                 # global, so wait before re-dispatching. Sleep BEFORE taking
@@ -6531,6 +7008,17 @@ class TrainerRunner:
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
             retry_host = _take()                 # next idle lane; different when one exists
+            if transport:
+                # Never the dead pod again: a sibling lane handed back by a
+                # concurrent failure may still be in the rotation.
+                skipped = []
+                same = getattr(free_lanes, "same_pod", None)
+                while same is not None and same(retry_host, host) and len(skipped) <= len(hosts):
+                    skipped.append(retry_host)
+                    retry_host = _take()
+                for sk in skipped:
+                    if not (same is not None and same(sk, host)):
+                        free_lanes.put(sk)
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
@@ -6763,7 +7251,7 @@ class TrainerRunner:
         # Lane pool over the free-lane dispatch (the heat's anti-double-booking
         # pattern) PLUS mid-final membership refresh: a top-up pod rented after
         # a boot-failure drop joins the rotation while queued jobs wait.
-        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts)
+        lane_pool = _FinalLanePool(hosts, _fresh_final_hosts, gate_fn=self._operator_lane_gate)
 
         def _run(i: int, gen: ResolvedGenerator, role: str) -> TrainedEntry:  # noqa: ARG001
             used: list = []
@@ -6830,7 +7318,7 @@ class TrainerRunner:
                 # however late (a late manifest beats no round — owner
                 # 2026-09-20).
                 lane_deadline = (None if role == "king"
-                                 else self._operator_lane_deadline())
+                                 else self._operator_lane_deadline_fn())
             # Operator lanes can run PRIVATE (vault/direct) submissions too:
             # stage the ZIP on whichever lane the pool hands out, exactly as
             # the funded-pod leg does — until 2026-09-12 only that path staged,
@@ -6932,6 +7420,315 @@ class TrainerRunner:
                   "round aborts and retries (a live king pod is adopted)",
                   err, len(cancelled), len(in_flight),
                   ", ".join(k[1].hotkey[:12] for k in in_flight))
+
+    # ── rolling intake + era king (DEC-CA-0043) — pod/bucket adapters ──────
+
+    @property
+    def _leg_local(self) -> threading.local:
+        loc = self.__dict__.get("_leg_local_obj")
+        if loc is None:
+            loc = threading.local()
+            self.__dict__["_leg_local_obj"] = loc
+        return loc
+
+    def _rolling(self):
+        sched = self.__dict__.get("_rolling_sched")
+        if sched is None:
+            from .rolling import RollingScheduler
+
+            self._rolling_init_context()
+            sched = RollingScheduler(self)
+            self.__dict__["_rolling_sched"] = sched
+        return sched
+
+    def _rolling_init_context(self) -> None:
+        """The per-round attributes the funded-leg machinery expects, set
+        once for the rolling regime (legs carry their own targets)."""
+        self._round_telemetry = {"heat": [], "final": []}
+        self._final_role_hosts = getattr(self, "_final_role_hosts", None) or {}
+        self._funded_field = {}
+        self._funded_leg_failures = {}
+        self._funded_claimed_execs = set()
+        self._funded_exec_lock = threading.Lock()
+        self._funded_admission_info = {}
+        self._funded_roster = {"seated": [], "waiting": [], "terminal": [], "outcomes": []}
+        self._funded_round_sku = ""
+        self._funded_king_host = None
+        self._funded_king_lock = threading.Lock()
+        self._king_rent_done = True
+        self._funded_wait_abort = threading.Event()
+        self._funded_epoch_end_wall = None
+        self._rolling_king_host_era = None
+        self._stage_ctx = {"round_id": "", "epoch_start_block": 0, "warm_start": None}
+
+    def _rolling_dispatcher(self):
+        from .remote import RemoteDispatcher
+
+        if not self.trainer_spec:
+            raise RuntimeError("remote training requires trainer_spec")
+        return RemoteDispatcher(
+            trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
+            extra_forward_env=self._pod_extra_forward_env(),
+            isolated_forward_env=self._pod_isolated_forward_env(),
+            **self._dispatch_mode(),
+        )
+
+    def _rolling_seeds(self, era):
+        return RoundSeeds.derive(int(era.base_seed), self.cfg.training)
+
+    def _rolling_warm_start_ref(self, era, contract) -> str | None:
+        return (era.warm_start_ckpt
+                if era.warm_start_ckpt and era.warm_start_size == contract.arch_preset
+                else None)
+
+    def _rolling_train_challenger(self, gen, era, block: int, *, end_wall: float):
+        """One funded challenger leg outside any round: payer pod (or the
+        operator-lane fallback), the era's seeds and init, its own target
+        boundary as the rent-wait deadline."""
+        from ..funding.store import parse_vault_ref
+
+        contract = self.cfg.throne_contracts()[0]
+        seeds = self._rolling_seeds(era)
+        suffix = f"-u{gen.uid}"
+        ws_ref = self._rolling_warm_start_ref(era, contract)
+        disp = self._rolling_dispatcher()
+        self._leg_local.end_wall = float(end_wall)
+        self._funded_field[gen.hotkey] = gen.ref
+        try:
+            try:
+                entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
+                                             warm_start_ref=ws_ref)
+            except _FundedOperatorFallback:
+                log.warning("rolling: %s — no marketplace capacity; running on an "
+                            "OPERATOR lane (operator-billed)", gen.hotkey[:12])
+                pool = self._rolling_lane_pool()
+                used: list = []
+                digest = parse_vault_ref(gen.ref)
+                prepare = ((lambda h, d=digest: self._stage_vault_zip_on(h, d))
+                           if digest else None)
+                entry = self._dispatch_on_free_lane(
+                    disp, pool, pool.known_hosts(),
+                    describe=f"rolling challenger {gen.hotkey}", used_host=used,
+                    prepare=prepare, deadline=self._operator_lane_deadline_fn(),
+                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                    role="challenger", base_seed=seeds.base_seed, block=int(block),
+                    arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+                    repo_suffix=suffix,
+                )
+                if used:
+                    self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
+        finally:
+            self._leg_local.end_wall = None
+            self._funded_field.pop(gen.hotkey, None)
+        self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
+                                    role="challenger", hotkey=gen.hotkey, suffix=suffix)
+        return entry
+
+    def _rolling_final_hosts(self) -> list:
+        """The operator FINAL lanes on file NOW: hosts.toml re-read every call
+        when the trainer runs from a file (a lane hand-rented after startup is
+        otherwise invisible to rolling — the legacy round path reloads per
+        round, rolling never entered it), profile-only entries excluded."""
+        from .remote import is_profile_only, load_hosts
+
+        if getattr(self, "remote_hosts_path", None) is not None:
+            hosts = list(load_hosts(self.remote_hosts_path))
+        else:
+            hosts = list(self.remote_hosts or ())
+        return [h for h in hosts
+                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+
+    def _rolling_lane_pool(self):
+        """ONE lane pool for every rolling fallback leg (created lazily): lane
+        occupancy, the join gate's rejections and the dead-pod drain persist
+        across legs. A pool per leg (the first cut) handed every leg the whole
+        fleet as free — two concurrent fallbacks could double-book a lane —
+        and forgot each leg's dead pod for the next one. Lanes join through
+        :meth:`_operator_lane_gate` (ssh, worker runtime, bench floor) from a
+        live hosts.toml refresh."""
+        pool = self.__dict__.get("_rolling_lane_pool_obj")
+        if pool is None:
+            pool = _FinalLanePool(self._rolling_final_hosts(), self._rolling_final_hosts,
+                                  gate_fn=self._operator_lane_gate)
+            self.__dict__["_rolling_lane_pool_obj"] = pool
+        return pool
+
+    def _rolling_train_king(self, gen, era, block: int, *, end_wall: float):
+        """The era king's leg on the operator's JIT pod (kept for the era: the
+        top-N re-bench targets it). ``end_wall`` — the era's last settlement —
+        is the leg's own target (thread-local), so the king rent waits out a
+        sold-out marketplace up to ITS latest safe start like a challenger
+        instead of giving up at the first empty listing."""
+        contract = self.cfg.throne_contracts()[0]
+        seeds = self._rolling_seeds(era)
+        ws_ref = self._rolling_warm_start_ref(era, contract)
+        disp = self._rolling_dispatcher()
+        with self._funded_king_lock:
+            if self._rolling_king_host_era != era.index:
+                self._funded_king_host = None
+                self._rolling_king_host_era = era.index
+        self._king_rent_done = False
+        self._leg_local.end_wall = float(end_wall)
+        try:
+            host = self._stage_king_vault(self._rent_king_host(str(era.base_seed)), gen)
+        finally:
+            self._king_rent_done = True
+            self._leg_local.end_wall = None
+        entry = disp.dispatch(
+            host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+            role="king", base_seed=seeds.base_seed, block=int(block),
+            arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+        )
+        self._refuse_diverged_king(entry, contract)
+        self._final_role_hosts[("king", contract.arch_preset, gen.hotkey)] = host
+        self.__dict__.setdefault("_rolling_king_hosts", {})[era.index] = host
+        self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
+                                    role="king", hotkey=gen.hotkey)
+        return entry
+
+    def _rolling_note_king_host(self, era) -> None:
+        """After a dethrone adoption the operator's era pod benches for the
+        NEW king's hotkey."""
+        contract = self.cfg.throne_contracts()[0]
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is not None and era.king_hotkey:
+            self._final_role_hosts[("king", contract.arch_preset, era.king_hotkey)] = host
+
+    def _rolling_retire_king_pod(self, era) -> None:
+        """Tear down an era's operator king pod (era over, or its pre-trained
+        king superseded)."""
+        prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(era.base_seed))
+        for pod in self._load_funded_ledger():
+            if not pod.payer_hotkey and str(pod.instance_id).startswith(prefix + "-"):
+                self._teardown_operator_pod(pod)
+        self.__dict__.get("_rolling_king_hosts", {}).pop(era.index, None)
+        with self._funded_king_lock:
+            if self._rolling_king_host_era == era.index:
+                self._funded_king_host = None
+
+    def _rolling_rotate_king_pod(self, era, reason: str) -> None:
+        """A booted king pod whose leg keeps failing (or went unreachable) is
+        a lemon HOST: quarantine its IP (Lium relists the same machine under
+        fresh executor ids) and tear the pod down, so the next king-leg
+        attempt re-rents elsewhere instead of looping into the same wall."""
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is None:
+            with self._funded_king_lock:
+                if self._rolling_king_host_era == era.index:
+                    host = self._funded_king_host
+        if host is not None:
+            _quarantine_lane_host(host, f"king pod {getattr(host, 'name', host)}: {reason}")
+        self._rolling_retire_king_pod(era)
+
+    def _rolling_bench_king(self, entry, era) -> dict | None:
+        import dataclasses
+
+        contract = self.cfg.throne_contracts()[0]
+        host = self._final_role_hosts.get(("king", contract.arch_preset, entry.miner_hotkey))
+        if host is None or self.cascade_bench_plan is None:
+            return None
+        scores = self._remote_bench_scores(host, entry, str(era.base_seed),
+                                           contract.arch_preset, role_dir="king")
+        return dataclasses.asdict(scores) if scores is not None else None
+
+    def _rolling_bench_challenger(self, entry, king, era) -> dict | None:
+        """Bench at completion (DEC-CA-0043): on the payer's kept pod, then the
+        operator re-bench on the era king's pod; only operator numbers are
+        returned (forged sweep ⇒ None)."""
+        import dataclasses
+
+        contract = self.cfg.throne_contracts()[0]
+        host = self._final_role_hosts.get(("challenger", contract.arch_preset, entry.miner_hotkey))
+        if host is None or self.cascade_bench_plan is None:
+            return None
+        role_dir = f"challenger-u{entry.miner_uid}"
+        scores = self._remote_bench_scores(host, entry, str(era.base_seed),
+                                           contract.arch_preset, role_dir=role_dir)
+        if scores is None:
+            return None
+        scored = {entry.trained_pointer: scores}
+        if getattr(host, "isolated", False):
+            self._payer_benched = {entry.trained_pointer}
+            duel = [e for e in (king, entry) if e is not None]
+            scored = self._verify_payer_benches(duel, scored, str(era.base_seed),
+                                                contract.arch_preset)
+        out = scored.get(entry.trained_pointer)
+        return dataclasses.asdict(out) if out is not None else None
+
+    def _rolling_publish_bench(self, round_id: str, created_block: int, pairs: list):
+        from ..shared.bench_report import (
+            BenchEntry,
+            BenchReport,
+            dump_bench_report,
+            publish_bench_report,
+            sign_bench_report,
+        )
+
+        primary = self.cfg.throne_contracts()[0].arch_preset
+        entries = tuple(BenchEntry(role=e.role, size=e.size or primary,
+                                   miner_hotkey=e.miner_hotkey, miner_uid=e.miner_uid,
+                                   trained_pointer=e.trained_pointer, scores=s)
+                        for e, s in pairs)
+        report = BenchReport(round_id=str(round_id), created_block=int(created_block),
+                             entries=entries)
+        if self.wallet is not None:
+            report = sign_bench_report(report, self.wallet)
+        key = publish_bench_report(self.manifest_store(), dump_bench_report(report), round_id)
+        log.info("published bench report round=%s roles=[%s] signed=%s → s3://%s/%s",
+                 round_id, ", ".join(e.role for e in entries), report.signature is not None,
+                 self.cfg.storage.manifest_bucket, key)
+        with contextlib.suppress(Exception):   # telemetry only
+            self._log_bench_pair_wandb(report)
+        return report
+
+    def _rolling_latest_round_id(self) -> str:
+        """``round_id`` of the manifest bucket's ``latest.json`` — the chain
+        root the first settlement links to. "" when unreadable (the scheduler
+        then withholds the settlement rather than publish an unchained one)."""
+        from ..shared.hippius import read_latest_manifest
+        from ..shared.manifest import load_manifest
+
+        try:
+            return str(load_manifest(read_latest_manifest(self.manifest_store())).round_id)
+        except Exception as e:  # noqa: BLE001 — absent/unreadable ⇒ unknown root
+            log.warning("rolling: latest.json unreadable (%s); manifest chain root unknown", e)
+            return ""
+
+    def _rolling_promotion_effective_era(self, generation: int) -> int | None:
+        """``effective_era`` of the published ``promotions/gen-<n>.json``
+        (0 = a pre-era record); None when the record cannot be read."""
+        from ..shared.promotion import load_promotion_record, promotion_record_key
+
+        try:
+            rec = load_promotion_record(
+                self.manifest_store().get_text(promotion_record_key(int(generation))))
+        except Exception as e:  # noqa: BLE001 — not published yet / store down
+            log.warning("rolling: promotion record gen=%d unreadable (%s)", generation, e)
+            return None
+        return int(getattr(rec, "effective_era", 0) or 0)
+
+    def _rolling_publish_roster(self, round_id: str, roster: dict) -> None:
+        from ..shared.heat_status import _publish_public_json
+
+        doc = {"funded_pods": self.cfg.round.funded_pods, **roster}
+        try:
+            store = self.manifest_store()
+            for key in (f"funded/round-{round_id}.json", "funded/latest.json"):
+                _publish_public_json(store, key, doc)
+        except Exception as e:  # noqa: BLE001 — transparency must not sink a settlement
+            log.warning("funded roster publish failed (ignored): %s", e)
+
+    def _rolling_dedup_registry(self):
+        from .dedup_registry import DedupRegistry
+
+        mode = (self.cfg.round.dedup_mode or "off").lower()
+        if mode not in ("shadow", "enforce"):
+            return None
+        reg = self.__dict__.get("_dedup_registry_obj")
+        if reg is None:
+            reg = DedupRegistry(self, self.work_root / "dedup_registry.json", mode=mode)
+            self.__dict__["_dedup_registry_obj"] = reg
+        return reg
 
     def publish(self, manifest: TrainingManifest) -> None:
         """Sign the manifest with the trainer hotkey and write it to the Hippius
@@ -7216,6 +8013,10 @@ class TrainerRunner:
         while True:
             try:
                 block = self._block_with_freeze_guard(client)
+                # Stake-weighted activation (DEC-CA-0045): learn the fleet's
+                # rollover BEFORE the grid is derived this tick, so a lock-in
+                # arms rolling intake at the very boundary it names.
+                self._activation_tick(client, block)
                 # Stamp the height for the funded release-then-activate gate
                 # (funded_activation_block) before ANY funded read this tick.
                 self._funded_gate_block = int(block)
@@ -7231,10 +8032,20 @@ class TrainerRunner:
                 epoch = block // epoch_blocks
                 epoch_start = epoch * epoch_blocks
                 base_seed = client.block_seed(epoch_start)
-                if not startup_swept:
+                # DEC-CA-0043: the rolling scheduler runs its own keep-aware
+                # startup sweep (in-flight payer pods + both era king pods).
+                if not startup_swept and not rolling_active(self.cfg.round, epoch_start):
                     self._startup_sweep(str(base_seed))
                     startup_swept = True
                 round_id = str(base_seed)
+                # Rolling intake + era king (DEC-CA-0043): from
+                # rolling_from_block the boundary-synchronous round is
+                # replaced by the scheduler's tick — legs start as they are
+                # funded, every boundary settles what finished.
+                if rolling_active(self.cfg.round, epoch_start):
+                    self._rolling().tick(client, block)
+                    time.sleep(poll)
+                    continue
                 if round_id == last_round:
                     time.sleep(poll)
                     continue
@@ -7276,31 +8087,7 @@ class TrainerRunner:
                 # fire a promotion every validator judges premature — falling
                 # back to the incentive king when no receipt is readable.
                 # Guarded: promotion must never sink a round.
-                if self.promotion is not None:
-                    try:
-                        # First boundary of a never-anchored engine: count the
-                        # rounds the king already reigned (signed receipt tail
-                        # + published bench reports) before the clock ticks —
-                        # see _seed_promotion_reign. No-op ever after.
-                        self._seed_promotion_reign()
-                        self.promotion.note_round(self._receipt_king() or king_hotkey,
-                                                  epoch_block=epoch_start)
-                        # Out-of-band bench reports (mop-ups, trainer-downtime
-                        # publishes) enter the pool here — before maybe_promote,
-                        # so a promotion that fires NOW selects from the full
-                        # reign, not just what the in-process bench thread saw.
-                        self._replay_reign_bench_reports()
-                        self.promotion.maybe_promote(
-                            epoch_block=epoch_start, round_id=round_id)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("promotion step failed for round=%s: %s", round_id, e)
-                    # Publish-with-retry: the record survives (persisted) as
-                    # pending until the publish lands, so a store outage never
-                    # orphans a generation the pointer file already rotates
-                    # over. Flushed again right before this round's manifest
-                    # publishes (below) — the record must be fetchable before
-                    # any validator gates the manifest that pins its member.
-                    self._flush_pending_promotion(round_id)
+                self._promotion_boundary_step(king_hotkey, epoch_start, round_id)
                 self._reload_remote_hosts()  # per-round elastic fleet pickup
                 log.info("starting round=%s epoch=%d epoch_start=%d king=%s field=%d",
                          round_id, epoch, epoch_start, king_hotkey,
@@ -7360,7 +8147,5 @@ class TrainerRunner:
                 last_round = round_id
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round failed; retrying after poll interval: %s", e)
-                # A round that died between its funded legs and its bench
-                # leaves payer pods kept for a sweep that will never come.
-                self._teardown_kept_funded_pods("round failed before its bench")
+                self._after_round_failure()
             time.sleep(poll)

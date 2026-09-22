@@ -15,6 +15,7 @@ under the cohort's real correlation.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from cascade.eval.bootstrap import (
     cohort_maxt_lcbs,
@@ -175,3 +176,56 @@ def test_maxt_between_is_an_expectation_not_a_per_draw_law():
     assert gaps.mean() >= 0.0, f"max-T should be >= Bonferroni on average, mean gap {gaps.mean():.5f}"
     assert (gaps < 0).any(), "expected some draws with max-T below Bonferroni (not a per-draw law)"
     assert (gaps >= 0).any(), "expected some draws with max-T at/above Bonferroni"
+
+
+# ── DEC-CA-0039 stacked on DEC-CA-0038: the increment-denominated max-T ──────
+# 2026-09-19: a miner reproduced the published cohort LCBs with the LEVEL
+# formula while margin_mode was "increment" — the joint bound only knew the
+# level statistic, so the increment margin never judged a cohort round. With
+# the baseline on the shared resample the bound is the %-of-increment
+# statistic, and at k=1 it is the single increment duel exactly.
+
+
+def test_maxt_increment_reduces_to_the_increment_lcb_at_k1():
+    from cascade.eval.bootstrap import increment_bootstrap_rel
+
+    king = _components(60, 9, 1.0, 0)
+    chal = _components(60, 9, 0.85, 1)
+    base = _components(60, 9, 1.4, 2)
+    chal = (chal[0], king[1], chal[2])
+    base = (base[0], king[1], base[2])
+    rel = increment_bootstrap_rel(king, chal, base, B=4000, seed="r", floor_frac=0.01)
+    single = float(np.quantile(rel, 0.05))
+    (maxt,) = cohort_maxt_lcbs(king, [chal], alpha=0.05, B=4000, seed="r",
+                               baseline=base, floor_frac=0.01)
+    assert abs(maxt - single) < 1e-9
+
+
+def test_maxt_increment_is_the_increment_unit_not_the_level_one():
+    """Same cohort, same resample: the increment bound is a different number
+    in a different unit (a fraction of the mean improvement over the init),
+    ordering across challengers preserved; without a baseline the level bound
+    is bit-identical to before."""
+    king = _components(80, 9, 1.0, 0)
+    a = _components(80, 9, 0.9, 1)
+    b = _components(80, 9, 0.8, 2)
+    base = _components(80, 9, 1.5, 3)
+    a, b, base = (a[0], king[1], a[2]), (b[0], king[1], b[2]), (base[0], king[1], base[2])
+    level = cohort_maxt_lcbs(king, [a, b], B=2000, seed="s")
+    again = cohort_maxt_lcbs(king, [a, b], B=2000, seed="s", baseline=None)
+    assert level == again
+    inc = cohort_maxt_lcbs(king, [a, b], B=2000, seed="s", baseline=base, floor_frac=0.01)
+    assert all(abs(x - y) > 1e-6 for x, y in zip(inc, level, strict=True))
+    assert (inc[1] > inc[0]) == (level[1] > level[0])
+    # Increment units: the same edge measured against a ~40-50% improvement
+    # over the init reads a few times larger than the level fraction.
+    assert inc[1] > level[1]
+
+
+def test_maxt_increment_baseline_must_be_paired():
+    king = _components(30, 9, 1.0, 0)
+    chal = _components(30, 9, 0.9, 1)
+    base = _components(31, 9, 1.4, 2)
+    with pytest.raises(ValueError, match="not paired"):
+        cohort_maxt_lcbs(king, [(chal[0], king[1], chal[2])], B=200, seed="p",
+                         baseline=base)

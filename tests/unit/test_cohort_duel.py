@@ -748,3 +748,57 @@ def test_cohort_stats_guard_skips_unresolved_but_flags_resolved_mismatch():
     pub2["per_domain_win_rate"] = {"nature": [0.6, 60], "sales": [0.35, 40]}
     probs = _cohort_stats_problems({"a": pub2}, [("a", res2)])
     assert any("per_domain_win_rate" in p for p in probs)
+
+
+def test_cohort_maxt_increment_units_validator_to_audit(cfg):
+    """DEC-CA-0039 amended (2026-09-19): with the max-T, the increment margin
+    AND the new cohort_maxt_increment_from_block gate all reached, the joint
+    bound is judged in INCREMENT units (baseline on the shared resample), the
+    receipt round-trips, and the audit re-derives the SAME bound. Replaying
+    the identical receipt with only the increment-units gate off (the old
+    level-unit max-T) FAILS — the gate is load-bearing and per-round."""
+    from dataclasses import replace
+
+    from cascade.audit import checks as C
+    from cascade.eval.koth import cohort_maxt_lcb_map
+    from cascade.shared.config import effective_epoch_blocks
+    from cascade.validator.loop import ValidatorRunner
+
+    eb = effective_epoch_blocks(cfg.round, 1)
+    block = eb * 100
+    armed = replace(cfg, scoring=replace(
+        cfg.scoring, cohort_maxt_from_block=eb, increment_from_block=eb,
+        cohort_maxt_increment_from_block=eb))
+    king = _scores(1.0, 0)
+    base = _noisy(king, 1.6, 44)                      # the shared init: worse than both
+    chals = {"a_hk": _noisy(king, 0.7, 11), "b_hk": _noisy(king, 0.6, 22)}
+
+    def fake_eval(entry, windows):
+        if entry.miner_hotkey == ValidatorRunner.BASELINE_HOTKEY:
+            return base
+        return king if entry.role == "king" else chals[entry.miner_hotkey]
+
+    m = replace(_cohort_manifest(armed, [("a_hk", 1, 0), ("b_hk", 2, 1)]),
+                created_block=block, warm_start_ckpt=format_trained_pointer(CID2))
+    runner = _runner(armed, fake_eval)
+    outcome = runner.process_round(m, windows=[], base_seed=7)
+    receipt = runner.build_round_receipt(
+        m, base_seed=7, epoch_start_block=block, epoch_block_hash="0x" + "ab" * 32,
+        outcome=outcome, windows=[],
+    )
+    assert receipt.verdict.params["margin_mode"] == "increment"
+    # The judged bounds ARE the increment-unit joint bounds, not the level ones.
+    params = armed.koth_params(block=block)
+    inc = cohort_maxt_lcb_map(king, [("a_hk", chals["a_hk"]), ("b_hk", chals["b_hk"])],
+                              params, seed=7, baseline_scores=base)
+    lvl = cohort_maxt_lcb_map(king, [("a_hk", chals["a_hk"]), ("b_hk", chals["b_hk"])],
+                              params, seed=7)
+    assert abs(receipt.verdict.lcb - inc["b_hk"]) < 1e-9
+    assert abs(receipt.verdict.lcb - lvl["b_hk"]) > 1e-6
+    # Audit under the armed cfg reproduces it; with only the increment-units
+    # gate off it replays the level-unit bound and fails.
+    assert C.check_duel_cohort(receipt, armed).status == C.PASS
+    assert C.check_verdict(receipt, armed).status == C.PASS
+    off = replace(armed, scoring=replace(armed.scoring, cohort_maxt_increment_from_block=0))
+    assert C.check_duel_cohort(receipt, off).status == C.FAIL
+    assert C.check_verdict(receipt, off).status == C.FAIL

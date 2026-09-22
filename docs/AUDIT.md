@@ -146,6 +146,32 @@ dashboard or a miner can read every challenger's outcome, not only the
 crowned one's, without re-running the bootstrap. Receipts from before this
 shipped carry neither field and verify unchanged.
 
+The receipt also carries pure DISPLAY breakdowns the audit does not replay:
+`verdict.per_horizon` / `cohort_per_horizon` (the verdict geomean per ladder
+rung) and `verdict.per_domain` / `cohort_per_domain` (the same per pool
+domain — which domains each challenger beat the king in, and by how much;
+what `cascade duel --hotkey` and the website's cohort panel render). They
+are signed like everything else, so they cannot be altered after the fact,
+but no check re-derives them: the per-domain split needs the window's domain
+label, which `entry_scores` does not record (the same Tier-0 limit as
+`per_domain_win_rate` in `cohort_stats`, which the `duel-cohort` check
+compares only when its replay could resolve domains). All of them are
+drop-when-default, so older receipts verify unchanged.
+
+A receipt judged after the validators decided the DEC-CA-0043 rollover on
+chain (DEC-CA-0045, stake-weighted activation) records that block as
+`activation_block` (drop-when-default; absent when the rollover is typed
+into `chain.toml` or none has been decided). The audit REPLAYS the round
+under that block — every DEC-CA-0043 rule (era envelope, tenure in blocks,
+the grid switch, the increment-unit max-T) is evaluated as if the block had
+been typed in — so a `chain.toml` with the rollover keys at 0 still verifies
+a post-rollover receipt. The `activation` check then verifies the block
+itself: it must be a boundary of the grid before it, and, with a chain, the
+validators' current on-chain notes (`cascade-ready:1:<feature>:<lock>:<block>`)
+must name the SAME block by the configured stake threshold — a validator
+that stamped a block the fleet did not agree on FAILS; without a chain the
+check WARNs, like every chain-dependent half.
+
 **Tier 1** proves the corpus provenance: the pinned generator, run at the
 receipt's `generation_seed` in the same sandbox, reproduces the exact
 `corpus_digest` the trainer claimed to have trained on.

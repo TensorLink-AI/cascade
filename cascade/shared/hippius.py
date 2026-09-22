@@ -349,6 +349,13 @@ _RETRYABLE_HUB_ERROR_SUBSTRINGS = (
     # registry drops (retry always succeeded). A genuinely-local cause (disk
     # full) just burns the 3 extra attempts (~14s) before the same failure.
     "local i/o error",
+    # hippius_core's client-side read-stall watchdog ("download read stalled:
+    # no data for 30s" under "chunk N failed"): no bytes for N s on a live
+    # connection — transient by definition, a fresh connection lands it.
+    # 2026-09-21 (DEC-CA-0043 testnet validation): every era-king warm-start
+    # fetch on one pod died after 1 of 4 attempts on this, halting the era's
+    # settlements — the Aug chunk-drop fix above, a variant nobody had added.
+    "read stalled", "no data for",
 )
 
 
@@ -791,6 +798,22 @@ class S3Store:
         return self.get_bytes(key).decode("utf-8")
 
 
+def _hf_not_found(e: BaseException) -> bool:
+    """True when a huggingface_hub read failed because the object/repo/revision
+    does not exist (404), as opposed to auth/network/5xx."""
+    try:
+        from huggingface_hub.utils import (
+            EntryNotFoundError,
+            RepositoryNotFoundError,
+            RevisionNotFoundError,
+        )
+    except Exception:  # noqa: BLE001 — hub lib absent: cannot classify
+        return False
+    if isinstance(e, (EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError)):
+        return True
+    return getattr(getattr(e, "response", None), "status_code", None) == 404
+
+
 @dataclass
 class HFFallbackStore:
     """Hippius S3 primary + a HuggingFace-Hub dataset fallback that engages ONLY
@@ -880,9 +903,18 @@ class HFFallbackStore:
             import logging
             logging.getLogger("cascade.storage").warning(
                 "S3 get failed for %s (%s); reading HF fallback %s", key, e, self.hf_repo)
+            primary_missing = isinstance(e, ObjectNotFound)
         try:
             return self._hf_get(key)
         except Exception as e:  # noqa: BLE001
+            if primary_missing and _hf_not_found(e):
+                # Absent on BOTH layers is a verdict ("not published"), not an
+                # outage — callers that treat ObjectNotFound as "absent" and
+                # every other StorageError as "unreadable, retry" must see it
+                # through the fallback layer too (2026-09-21: a warm-start
+                # member check could not tell the two apart and latched a
+                # permanent reject on a read miss).
+                raise ObjectNotFound(f"{key}: absent on S3 and HF fallback") from e
             raise StorageError(f"both S3 and HF get failed for {key}: {e}") from e
 
     def get_text(self, key: str) -> str:

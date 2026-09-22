@@ -403,6 +403,40 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
   36h TTL vs a ≤12–24h timed reveal leaves ample headroom; keep
   `[round] funded_entry_ttl_hours` = `cascade-intake --ttl-hours`.
 
+## Rolling intake rollout (DEC-CA-0043, switched on by DEC-CA-0045)
+
+The rollover to rolling intake + the era king is the next
+consensus-coordinated step, and unlike step 4 above it is NOT typed in.
+Every DEC-CA-0043 key ships at 0; `[activation]` in `chain.toml` names the
+feature and the threshold (51 % of permit-holding validator stake), and
+the validators decide the block:
+
+1. **Release.** Ship the stack. Nothing changes at restart: validators
+   judge boundary rounds exactly as before and post a readiness note on
+   chain (`cascade-ready:1:rolling-era-king:0:0`, once, from their hotkey).
+2. **Count.** At every boundary every validator sums the stake behind the
+   note as of that boundary block. `status/chain.json` → `activation.tally`
+   shows the share and who has signed.
+3. **Lock-in.** The first boundary at or over the threshold locks in
+   (one-way, persisted beside each validator's state file); the rollover
+   is the NEXT boundary. Locked-in validators rewrite their note with the
+   block, so a restarted or late validator adopts it from the notes alone.
+4. **Trainer.** If the trainer is still on the old release, restart it on
+   the new one at the lock-in boundary (nothing in flight; a full round to
+   pre-train the first era king). A trainer already on the release arms
+   itself the tick it sees lock-in. The provisioner arms itself every
+   cycle too — no restart, and none inside its trigger window.
+5. **Rollover.** At the decided block the grid drops to 900, legs start
+   when funded, boundaries settle, the king trains once per era. Every
+   receipt from lock-in on carries `activation_block`; `cascade-audit`
+   replays under it and its `activation` check verifies the validators'
+   notes agree on the block.
+
+Override: typing the DEC-CA-0043 keys into `chain.toml` still wins over
+the resolved block (hold back, or pin the decided block afterwards).
+Before relying on 51 %, check the owner validator's own share of stake —
+over half and the count is one operator. See `docs/VALIDATOR.md`.
+
 ## Miner flow
 
 Documented once, in [MINER.md](MINER.md) §5 (submitting and funding) and §8

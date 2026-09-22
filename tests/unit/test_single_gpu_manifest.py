@@ -46,7 +46,9 @@ def test_allow_mixed_and_no_king_keep_everything():
 
 
 def test_runner_records_dropped_funded_entries_as_sold_out(tmp_path):
-    r = _runner(tmp_path)
+    # locked-type mode: the open market (funded_sku_per_leg, on by default
+    # since #294) allows mixed types because its validators lift the gate
+    r = _runner(tmp_path, funded_sku_per_leg=False)
     r._enforce_single_gpu_manifest = TrainerRunner._enforce_single_gpu_manifest.__get__(r)
     entries = [_e("king", "NVIDIA GeForce RTX 4090", role="king"),
                _e("hkA", "NVIDIA GeForce RTX 4090"), _e("hkB", "NVIDIA L40S", uid=7)]
@@ -62,6 +64,40 @@ def test_runner_allows_mixed_types_in_per_leg_mode(tmp_path):
     r = _runner(tmp_path)
     r.cfg.round = type("R", (), {"funded_sku_per_leg": True})()   # open-market mode
     r._enforce_single_gpu_manifest = TrainerRunner._enforce_single_gpu_manifest.__get__(r)
+    r._sku_per_leg_active = TrainerRunner._sku_per_leg_active.__get__(r)
     entries = [_e("king", "NVIDIA GeForce RTX 4090", role="king"), _e("hkB", "NVIDIA L40S")]
     assert r._enforce_single_gpu_manifest(entries) == entries
     assert r._funded_leg_failures == {}
+
+
+def test_per_leg_mode_takes_effect_only_at_the_era_king_gate(tmp_path):
+    """funded_sku_per_leg is ON by default (#294) but the validators lift the
+    gpu_mismatch gate only from era_king_from_block: before that block a
+    per-leg choice would mix types and every validator would reject the
+    round after the miners paid — so the knob is inert until the rollover."""
+    from types import SimpleNamespace
+
+    r = _runner(tmp_path)
+    r.cfg.round = type("R", (), {"funded_sku_per_leg": True})()
+    r._enforce_single_gpu_manifest = TrainerRunner._enforce_single_gpu_manifest.__get__(r)
+    r._sku_per_leg_active = TrainerRunner._sku_per_leg_active.__get__(r)
+    entries = [_e("king", "NVIDIA GeForce RTX 4090", role="king"), _e("hkB", "NVIDIA L40S")]
+    # gate unarmed (mainnet today): locked-type behaviour, the L40S leg is dropped
+    r.cfg.scoring = SimpleNamespace(era_king_from_block=0)
+    assert [e.miner_hotkey for e in r._enforce_single_gpu_manifest(entries)] == ["king"]
+    assert "hkB" in r._funded_leg_failures
+    # armed, but this round's boundary is before it: still locked
+    r._funded_leg_failures = {}
+    r.cfg.scoring = SimpleNamespace(era_king_from_block=9_200_000)
+    r._stage_ctx = {"epoch_start_block": 9_100_000}
+    assert not r._sku_per_leg_active()
+    assert [e.miner_hotkey for e in r._enforce_single_gpu_manifest(entries)] == ["king"]
+    # the round at the rollover boundary: the open market is in force
+    r._funded_leg_failures = {}
+    r._stage_ctx = {"epoch_start_block": 9_200_000}
+    assert r._sku_per_leg_active()
+    assert r._enforce_single_gpu_manifest(entries) == entries
+    # rolling mode runs only past the gate
+    r._stage_ctx = {"epoch_start_block": 0}
+    r._rolling_sched = object()
+    assert r._sku_per_leg_active()
