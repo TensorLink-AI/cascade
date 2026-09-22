@@ -701,7 +701,8 @@ class ValidatorRunner:
         # here propagates: the era gate cannot judge this manifest without
         # the provenance, and the poll loop retries the round (never a
         # receipt) — see _gate_read_failed.
-        member_reason = self._verify_members(record, enforce_reign_scope=attesting)
+        member_reason = self._verify_members(record, enforce_reign_scope=attesting,
+                                             carried_exempt=True)
         if member_reason is not None:
             log.warning("cascade: promotion record gen=%d rejected: %s",
                         record.generation, member_reason)
@@ -928,14 +929,16 @@ class ValidatorRunner:
         if attesting and not self.cascade.is_ripe(block=block):
             return (f"warm_start_promotion_early: generation {record.generation} "
                     f"declared before the reign clock ripened")
-        member_reason = self._verify_members(record, enforce_reign_scope=attesting)
+        member_reason = self._verify_members(
+            record, enforce_reign_scope=attesting, carried_exempt=self._era_active(manifest))
         if member_reason is not None:
             return member_reason
         self.cascade.note_promotion(
             generation=record.generation, members=member_ids, block=block)
         return None
 
-    def _verify_members(self, record: object, *, enforce_reign_scope: bool) -> str | None:
+    def _verify_members(self, record: object, *, enforce_reign_scope: bool,
+                        carried_exempt: bool = False) -> str | None:
         """Provenance + quality floor for every member of a promotion record.
 
         Each member must have trainer-signed bench numbers: from this
@@ -964,6 +967,10 @@ class ValidatorRunner:
         entered and keeps its original ``source_round``, which by
         construction predates the reign it now carries into — scope applies
         only to NEW entrants. Quality is still re-checked for every member.
+        ``carried_exempt`` is CONSENSUS-GATED on ``era_king_from_block`` by
+        the caller: before the rollover every member is scoped (as the
+        previous release does), so an early-upgraded validator never accepts
+        a record its peers reject.
 
         The floor is the best score across the reign log and the members
         themselves; every member must sit within ``cascade_quality_epsilon``
@@ -977,7 +984,7 @@ class ValidatorRunner:
         assert self.cascade is not None
         state = self.cascade.state
         reign_start = state.reign_start_block
-        carried = set(state.members) | set(state.pending_members)
+        carried = (set(state.members) | set(state.pending_members)) if carried_exempt else set()
         scores: dict[str, float] = {}
         for m in getattr(record, "members", ()):
             rec = log_record_for(state, m.checkpoint_id)

@@ -472,7 +472,7 @@ class TrainerPromotion:
             return added
 
     def maybe_promote(self, *, epoch_block: int, round_id: str,
-                      effective_era: int = 0) -> PromotionRecord | None:
+                      effective_era: int = 0, rolling_topk: bool = True) -> PromotionRecord | None:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
         clock (the king persists — DEC-CA-0004), clear the candidate log, and
@@ -485,7 +485,14 @@ class TrainerPromotion:
         generation becomes the init of — one full era of notice after this
         boundary (``cascade.shared.era.min_effective_era``), stamped on the
         signed record so validators install it at that era and no earlier.
-        0 = pre-era record (effective at acceptance)."""
+        0 = pre-era record (effective at acceptance).
+
+        ``rolling_topk`` (DEC-CA-0044) is CONSENSUS-GATED by the caller on
+        ``era_king_from_block``: before the rollover the live members do not
+        carry into the next generation and the old best-vs-best no-downgrade
+        guard (DEC-CA-0017) applies — a validator on the previous release
+        verifies every member against the current reign and would reject a
+        carried member's pre-reign ``source_round``, splitting the fleet."""
         with self._lock:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
@@ -511,6 +518,12 @@ class TrainerPromotion:
             # first genuine top-k entrant fires the promotion. Members without
             # a finite score (legacy pointer adoptions) hold no slot and are
             # replaced by the first firing.
+            if not rolling_topk:
+                selected = self._select_legacy(elapsed)
+                if selected is None:
+                    return None
+                return self._fire(selected, epoch_block=epoch_block, round_id=round_id,
+                                  effective_era=effective_era, elapsed=elapsed)
             carried = [self._member_candidate(m) for m in self.members
                        if math.isfinite(m.score)]
             admitted = admit_candidates(carried, list(self.candidates), k_max=self.k_max)
@@ -535,38 +548,70 @@ class TrainerPromotion:
                     "change); %d candidate(s) logged", elapsed, self.k_max,
                     len(self.candidates))
                 return None
-            prior = {m.checkpoint_id: m for m in self.members}
-            self.generation += 1
-            # A carried member keeps its original provenance (source_round,
-            # score) — validators verify it against that bench report.
-            self.members = tuple(
-                prior.get(c.checkpoint_id) or PromotedMember(
-                    checkpoint_id=c.checkpoint_id, size=c.size,
-                    source_round=c.round_id, score=c.score)
-                for c in selected
-            )
-            self.member_meta = {c.checkpoint_id: c for c in selected}
-            self.candidates = ()
-            self.reign_start_block = int(epoch_block)
-            record = PromotionRecord(
-                generation=self.generation,
-                king_hotkey=self.king_hotkey or "",
-                fired_round=str(round_id),
-                fired_block=int(epoch_block),
-                members=self.members,
-                effective_era=int(effective_era or 0),
-            )
-            self.pending_record = record
-            self._persist()
-            self._write_pointer()
-            log.info(
-                "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
-                "king %s persists, reign clock reset",
-                self.generation, elapsed,
-                ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
-                (self.king_hotkey or "?")[:12],
-            )
-            return record
+            return self._fire(selected, epoch_block=epoch_block, round_id=round_id,
+                              effective_era=effective_era, elapsed=elapsed)
+
+    def _select_legacy(self, elapsed: float) -> list[Candidate] | None:
+        """Pre-rollover selection, byte-for-byte the previous release: the
+        best candidate must at least match the live generation's best member
+        (no-downgrade guard, DEC-CA-0017) and the new generation is selected
+        from this reign's candidates alone — nothing carries."""
+        best_member = min((m.score for m in self.members
+                           if math.isfinite(m.score) and m.score > 0),
+                          default=None)
+        best_candidate = min((c.score for c in self.candidates
+                              if math.isfinite(c.score)), default=None)
+        if (best_member is not None and best_candidate is not None
+                and best_candidate > best_member):
+            log.warning(
+                "trainer promotion: clock ripe (%.2f rounds) but the best "
+                "candidate benches %.5f vs the live generation's best member "
+                "%.5f — holding the current generation (no-downgrade guard); "
+                "%d candidate(s) logged, retrying as new rounds bench",
+                elapsed, best_candidate, best_member, len(self.candidates))
+            return None
+        return select_members(
+            list(self.candidates), k_max=self.k_max,
+            quality_epsilon=self.quality_epsilon,
+            min_round_spacing=self.min_round_spacing,
+            error_vectors=self._load_error_vectors(),
+        )
+
+    def _fire(self, selected: list[Candidate], *, epoch_block: int, round_id: str,
+              effective_era: int, elapsed: float) -> PromotionRecord:
+        """Install ``selected`` as the next generation (lock held)."""
+        prior = {m.checkpoint_id: m for m in self.members}
+        self.generation += 1
+        # A carried member keeps its original provenance (source_round,
+        # score) — validators verify it against that bench report.
+        self.members = tuple(
+            prior.get(c.checkpoint_id) or PromotedMember(
+                checkpoint_id=c.checkpoint_id, size=c.size,
+                source_round=c.round_id, score=c.score)
+            for c in selected
+        )
+        self.member_meta = {c.checkpoint_id: c for c in selected}
+        self.candidates = ()
+        self.reign_start_block = int(epoch_block)
+        record = PromotionRecord(
+            generation=self.generation,
+            king_hotkey=self.king_hotkey or "",
+            fired_round=str(round_id),
+            fired_block=int(epoch_block),
+            members=self.members,
+            effective_era=int(effective_era or 0),
+        )
+        self.pending_record = record
+        self._persist()
+        self._write_pointer()
+        log.info(
+            "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
+            "king %s persists, reign clock reset",
+            self.generation, elapsed,
+            ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
+            (self.king_hotkey or "?")[:12],
+        )
+        return record
 
     def _member_candidate(self, m: PromotedMember) -> Candidate:
         """The live member as a selection candidate: its recorded selection

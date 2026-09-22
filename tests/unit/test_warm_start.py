@@ -389,9 +389,18 @@ def test_carried_member_is_exempt_from_reign_scope(cfg, tmp_path):
         king_hotkey="hk0", reign_start_block=5 * DAY, generation=1, members=(PTR,),
         clock_observed=True))
     r = _validator(cfg, tmp_path, cascade=ctl, store=store)
-    assert r.check_manifest(
-        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10)) is None
-    assert ctl.state.generation == 2 and ctl.state.members == (PTR, PTR2)
+    # CONSENSUS GATE: before era_king_from_block the exemption is OFF — the
+    # previous release scopes every member, so an upgraded validator must
+    # reject exactly what its un-upgraded peers reject.
+    reason = r.check_manifest(
+        _manifest(cfg, warm_start_ckpt=PTR2, created_block=10 * DAY + 10))
+    assert reason is not None and "warm_start_member_out_of_reign" in reason
+    assert ctl.state.generation == 1
+    # From the rollover (the era path passes carried_exempt=True) the carried
+    # member passes on its original provenance; a new entrant is still scoped.
+    assert r._verify_members(record, enforce_reign_scope=True, carried_exempt=True) is None
+    bad = r._verify_members(record, enforce_reign_scope=True, carried_exempt=False)
+    assert bad is not None and "warm_start_member_out_of_reign" in bad
 
 
 def test_uncarried_pre_reign_member_is_still_rejected(cfg, tmp_path):

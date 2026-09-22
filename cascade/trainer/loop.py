@@ -42,7 +42,7 @@ from ..shared.config import (
     duel_round_overhead_hours,
     effective_epoch_blocks,
 )
-from ..shared.era import rolling_active
+from ..shared.era import era_king_active, rolling_active
 from ..shared.hippius import (
     HubConfig,
     LogSink,
@@ -5578,8 +5578,12 @@ class TrainerRunner:
             # enter the pool here — before maybe_promote, so a promotion that
             # fires NOW selects from the full reign.
             self._replay_reign_bench_reports()
-            self.promotion.maybe_promote(epoch_block=epoch_start, round_id=round_id,
-                                         effective_era=effective_era)
+            # Rolling top-k (DEC-CA-0044) is consensus-gated on the rollover:
+            # before era_king_from_block the previous release's validators
+            # reject carried members, so the legacy selection runs until then.
+            self.promotion.maybe_promote(
+                epoch_block=epoch_start, round_id=round_id, effective_era=effective_era,
+                rolling_topk=era_king_active(self.cfg.scoring, int(epoch_start)))
         except Exception as e:  # noqa: BLE001
             log.warning("promotion step failed for round=%s: %s", round_id, e)
         # Publish-with-retry: the record survives (persisted) as pending until

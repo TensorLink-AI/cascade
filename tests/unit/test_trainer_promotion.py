@@ -746,3 +746,33 @@ def test_rolling_topk_member_meta_persists_and_reloads(tmp_path):
     # A legacy member without meta still re-enters selection (placeholder).
     again.members = (*again.members, PromotedMember("legacy", "toto2-4m", "", 1.02))
     assert again._member_candidate(again.members[-1]).hotkey == ""
+
+
+def test_rolling_topk_is_consensus_gated_off_before_the_rollover(tmp_path):
+    """Before era_king_from_block the caller passes rolling_topk=False: the
+    live members do not carry and the old best-vs-best no-downgrade guard
+    holds — a validator on the previous release would reject a carried
+    member's pre-reign source_round and the fleet would split."""
+    eng = _engine(tmp_path, k_max=3)
+    _live(eng, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng.note_round("hkKing", epoch_block=0)
+    # beats the worst member but not the best: rolling would swap it in
+    eng.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                     _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
+    assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5", rolling_topk=False) is None
+    assert eng.generation == 1 and len(eng.candidates) == 1          # held, nothing carried
+    # a candidate matching the best fires — from this reign's candidates only
+    eng.record_bench(_manifest("r2", warm_start_ckpt="m1"),
+                     _report("r2", 2 * DAY, {"c-best": (1.0, "hkE", "challenger")}))
+    rec = eng.maybe_promote(epoch_block=6 * DAY, round_id="r6", rolling_topk=False)
+    assert rec is not None and rec.generation == 2
+    assert set(rec.member_ids()) == {"c-new", "c-best"}               # no m1/m2/m3
+    assert all(m.source_round in ("r1", "r2") for m in rec.members)
+    # the same situation with the gate open carries the live members
+    eng2 = _engine(tmp_path / "b", k_max=3)
+    _live(eng2, ("m1", 1.0, "hkA"), ("m2", 1.01, "hkB"), ("m3", 1.02, "hkC"))
+    eng2.note_round("hkKing", epoch_block=0)
+    eng2.record_bench(_manifest("r1", warm_start_ckpt="m1"),
+                      _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
+    rec2 = eng2.maybe_promote(epoch_block=5 * DAY, round_id="r5", rolling_topk=True)
+    assert rec2 is not None and set(rec2.member_ids()) == {"m1", "m2", "c-new"}
