@@ -204,6 +204,37 @@ Labels are cosmetic: never identity, never in signed records.
 
 An unfunded boundary runs no round; the king holds.
 
+### After the rolling switch
+
+The next release replaces the boundary round with **rolling intake**
+(DEC-CA-0043). The switch is not on a date the owner announces: it happens
+when validators holding **51 % of stake** are running the release
+(DEC-CA-0045), at the round boundary after that count is reached. Until
+then everything above applies unchanged. From the switch:
+
+1. **Your leg starts when it is funded**, not at the next boundary. It runs
+   on your pod for the full budget and lands in the first *settlement* it
+   can reach. Nothing waits for the field to fill.
+2. **Settlements every 3 h** (the grid drops from 3600 to 900 blocks).
+   Each boundary publishes one manifest carrying the king plus every
+   challenger that finished since the last one, and validators judge it as
+   before. Nothing finished ⇒ nothing published.
+3. **The king trains once per 12 h era** (4 settlements) from the shared
+   init, and every challenger in that era duels that same cached king
+   checkpoint. A dethrone adopts your checkpoint as the king's without
+   ending the era.
+4. **GPU type is per leg**, the cheapest fitting type under the price
+   caps, instead of one type per round. Seniority is still reveal order,
+   among the executors that fit your leg's deadline.
+5. **Tenure and the margin decay count blocks**, so the king's margin
+   schedule keeps the same wall-time under the faster grid.
+
+How to tell where things stand: `status/chain.json` carries an
+`activation` block (share of stake signed, lock-in block, switch block)
+and every receipt from lock-in on records `activation_block`; the
+dashboards read both. When you see a lock-in, the switch is at the next
+boundary.
+
 ### Watching it
 
 ```bash

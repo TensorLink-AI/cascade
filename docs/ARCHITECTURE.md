@@ -112,7 +112,13 @@ round:
    trained once per *era* (`era_settlements` boundaries sharing one seed
    set, one init and one cached king checkpoint; a settlement at boundary B
    belongs to the era containing B − 1). See `cascade/shared/era.py`,
-   `cascade/trainer/rolling.py`.
+   `cascade/trainer/rolling.py`. The rollover block is not typed in: the
+   validators decide it on chain (DEC-CA-0045, `cascade/shared/activation.py`)
+   — each upgraded validator posts a readiness note, every node tallies
+   permit-holding stake behind it as of each boundary, the first boundary
+   at or over `[activation] threshold` locks in, and the rollover is the
+   next boundary. Trainer and provisioner read the same decision and arm
+   themselves; receipts record it (`activation_block`) for the audit.
 
 `BaseTrainer` is a `Protocol` — the single GPU-dependent seam. Everything else
 in the trainer is numpy/CPU and unit-tested. A reference implementation (a
