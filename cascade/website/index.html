@@ -977,6 +977,13 @@ th.num { text-align: right; }
 
 /* latest verdict — scored-ladder breakdown + the whole judged cohort */
 .panel.cohort { margin-top: 12px; display: grid; gap: 18px; }
+/* A grid item's min-width is `auto` (its content's intrinsic width), so a wide
+   table — the cohort rows carry a per-horizon and a per-domain chip cell,
+   both nowrap — would widen the item, the panel and the page instead of
+   scrolling inside .scroll-box. Let the items shrink so the scroll box scrolls;
+   let the chip cells wrap so the table rarely needs to. */
+.panel.cohort > div { min-width: 0; }
+.panel.cohort td.chips { white-space: normal; min-width: 220px; }
 .cohort-head { font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); margin-bottom: 8px; }
 .cohort-head .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
 .h-gap { display: inline-block; font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-right: 8px; }
@@ -1402,8 +1409,8 @@ function renderCohort(){
         '<td class="num'+(rel!=null&&rel<0?' good':'')+'">'+(g!=null?fmt(g,5):"--")+(rel!=null?' <span class="sub">'+signedPct(rel)+'</span>':'')+'</td>'+
         '<td class="num">'+(lcb!=null?fmt(lcb,4):"--")+'</td>'+
         '<td>'+(cleared==null?'<span class="muted">--</span>':'<span class="heat-pill '+(cleared?'adv':'nofit')+'">'+(cleared?'✓ cleared':'✗ under margin')+'</span>')+'</td>'+
-        '<td>'+(gaps||'<span class="muted">--</span>')+'</td>'+
-        '<td>'+(doms||'<span class="muted">--</span>')+'</td></tr>';
+        '<td class="chips">'+(gaps||'<span class="muted">--</span>')+'</td>'+
+        '<td class="chips">'+(doms||'<span class="muted">--</span>')+'</td></tr>';
     }).join("");
     html+='<div><div class="cohort-head">Cohort <span class="muted">— '+k+' challenger'+(k===1?"":"s")+' judged'+(k>1?' at α/'+k:'')+
       ', best point estimate first · margin '+fmt(s.margin,3)+'</span></div>'+
