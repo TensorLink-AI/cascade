@@ -198,6 +198,41 @@ def test_fresh_leg_polls_then_falls_back_when_the_window_opens(tmp_path):
     assert 3500.0 <= clock() - 1000.0 <= 3700.0
 
 
+def test_an_operator_billed_entry_never_rents_on_the_payers_key(tmp_path, monkeypatch):
+    # Owner make-good (2026-09-24): a leg the trainer's own fault cost the miner
+    # is rerun on compute the operator pays for — the entry's flag routes it to
+    # an operator lane before the payer's key is even looked at.
+    from cascade.funding.queue import FundedQueue
+
+    class _Reached(Exception):
+        pass
+
+    r = _fallback_runner(tmp_path, on=True, lanes_file=LANES)
+    _vault(tmp_path, "hkA")
+    monkeypatch.setattr(funded_mod, "rent_funded_pod",
+                        lambda **kw: (_ for _ in ()).throw(_Reached("payer rent")))
+    r._operator_fallback_lanes = TrainerRunner._operator_fallback_lanes.__get__(r)
+    q = FundedQueue(tmp_path / "fq.json", entry_ttl_seconds=3600.0)
+    q.add("hkA", REF_A, reveal_block=1)
+    assert q.get("hkA").operator_billed is False                  # default, older files too
+    assert q.set_operator_billed("hkA", True) and not q.set_operator_billed("nobody", True)
+    assert FundedQueue(tmp_path / "fq.json", entry_ttl_seconds=3600.0).get("hkA").operator_billed
+    r._funded_queue = lambda: q
+    with pytest.raises(_FundedOperatorFallback):
+        r._rent_funded_host("777", _challenger("hkA"))            # never reached the payer rent
+    assert "hkA" not in r._funded_leg_failures
+    # the flag, not the lanes, decides: no lane on file still keeps the payer's key out
+    r_nolane = _fallback_runner(tmp_path, on=True, lanes_file=None)
+    r_nolane._operator_fallback_lanes = TrainerRunner._operator_fallback_lanes.__get__(r_nolane)
+    r_nolane._funded_queue = lambda: q
+    with pytest.raises(_FundedOperatorFallback):
+        r_nolane._rent_funded_host("777", _challenger("hkA"))
+    # unflagged: the payer's key rents as before
+    q.set_operator_billed("hkA", False)
+    with pytest.raises(_Reached):
+        r._rent_funded_host("777", _challenger("hkA"))
+
+
 @pytest.mark.parametrize("entry", [_entry(attempts=1), _entry(last_error_class="no_capacity"),
                                    _entry(last_error_class="stall")])
 def test_carried_over_leg_takes_a_lane_at_once(tmp_path, entry):
