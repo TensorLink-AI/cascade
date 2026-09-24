@@ -105,7 +105,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
                  "_teardown_kept_funded_pods", "_bench_hold_rounds",
                  "_pod_held_by_bench", "_funded_harvest",
-                 "_harvest_funded_checkpoint",
+                 "_harvest_funded_checkpoint", "_pod_checkpoint_dir",
                  "_filter_funded_challengers", "_submissions_path",
                  "_submission_store", "_push_deployed_chain_toml",
                  "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
@@ -369,6 +369,9 @@ def _leg_runner(tmp_path, monkeypatch, *, disp):
     # good (this-release) worker so the leg logic under test is reached.
     monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
                         lambda host, **kw: "")
+    from cascade.trainer.remote import PodHygiene
+    monkeypatch.setattr("cascade.trainer.remote.probe_pod_hygiene",
+                        lambda host, ckpt_dir, **kw: PodHygiene())   # a clean pod
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
@@ -1007,12 +1010,15 @@ def test_funded_bench_off_tears_down_with_the_leg(tmp_path, monkeypatch):
 
 # ── DEC-CA-0036: credential-free pods (funded_pod_checkpoint = "harvest") ─────
 
-def _harvest_runner(tmp_path, monkeypatch, *, disp):
-    runner = _runner(tmp_path, funded_pod_checkpoint="harvest")
+def _harvest_runner(tmp_path, monkeypatch, *, disp, **round_kw):
+    runner = _runner(tmp_path, funded_pod_checkpoint="harvest", **round_kw)
     _vault(tmp_path, "hkA")
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
     monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
                         lambda host, **kw: "")
+    from cascade.trainer.remote import PodHygiene
+    monkeypatch.setattr("cascade.trainer.remote.probe_pod_hygiene",
+                        lambda host, ckpt_dir, **kw: PodHygiene())   # a clean pod
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_field = {"hkA": REF}
@@ -1493,3 +1499,132 @@ def test_round_entry_teardown_spares_the_in_flight_benchs_kept_pods(tmp_path, mo
     assert list(r._funded_bench_pods) == ["hkA"]
     r._teardown_kept_funded_pods("bench finished", round_id="4141")
     assert torn[-1] == "hkA" and r._funded_bench_pods == {} and r._funded_bench_pod_round == {}
+
+
+# ── harvested tensor files must be the ones the worker hashed in memory ───────
+
+
+class _FakeLocalDispDigests(_FakeLocalDisp):
+    def __init__(self, digests):
+        super().__init__()
+        self._digests = digests
+
+    def dispatch(self, host, **kw):
+        from dataclasses import replace
+        return replace(super().dispatch(host, **kw), tensor_digests=dict(self._digests))
+
+
+def _digest_harness(tmp_path, monkeypatch, *, digests, hygiene=None, **round_kw):
+    """A harvest leg whose fake pod holds one weights file (written through
+    the hashed saver) and whose receipt carries ``digests``."""
+    import torch
+
+    from cascade.trainer import ckpt_digest as cd
+    from cascade.trainer.remote import PodHygiene
+
+    pod_dir = tmp_path / "pod_ckpt"
+    written = cd.save_tensors_hashed({"w": torch.zeros(2)}, pod_dir / "weights.safetensors")
+    disp = _FakeLocalDispDigests(digests(written) if callable(digests) else digests)
+    runner, torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp, **round_kw)
+    if hygiene is not None:
+        monkeypatch.setattr("cascade.trainer.remote.probe_pod_hygiene",
+                            lambda host, ckpt_dir, **kw: hygiene)
+
+    def _harvest(host, rdir, dest, **kw):
+        import shutil
+        shutil.copytree(pod_dir, dest, dirs_exist_ok=True)
+        return dest
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", _harvest)
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_checkpoint",
+                        lambda d, contract=None, **kw: None)
+    monkeypatch.setattr("cascade.eval.checkpoint_guard.verify_weights_finite", lambda d: None)
+    fake_up = SimpleNamespace(ref=SimpleNamespace(
+        immutable_ref="cascade/ckpt-r777-challenger-toto2-4m@sha256:" + "d" * 64))
+    monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
+                        lambda d, repo, hub, hf_repo=None: fake_up)
+    runner._hf_ckpt_repo = lambda repo: None
+    return runner, torn, seeds, contract, disp, written, PodHygiene
+
+
+def test_harvest_accepts_tensor_files_matching_the_worker_digests(tmp_path, monkeypatch):
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests=lambda w: {"weights.safetensors": w})
+    entry = runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                                   warm_start_ref=None)
+    assert entry.miner_hotkey == "hkA"
+    assert "hkA" not in runner._funded_leg_failures
+
+
+def test_harvest_refuses_a_tensor_file_replaced_after_the_save_as_tamper(tmp_path, monkeypatch):
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests={"weights.safetensors": "0" * 64})
+    with pytest.raises(_FundedTamper, match="replaced after the save"):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    _msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "tamper", False)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_harvest_refuses_a_planted_tensor_file_as_tamper(tmp_path, monkeypatch):
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests=lambda w: {"weights.safetensors": w})
+    (tmp_path / "pod_ckpt" / "weights_stable.safetensors").write_bytes(b"planted")
+    with pytest.raises(_FundedTamper, match="never wrote"):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert runner._funded_leg_failures["hkA"][2] == "tamper"
+
+
+def test_harvest_without_digests_warns_by_default_and_is_tamper_when_required(
+        tmp_path, monkeypatch, caplog):
+    import logging
+
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests={})
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
+        entry = runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                                       warm_start_ref=None)
+    assert entry.miner_hotkey == "hkA"
+    assert any("no tensor digests" in r.getMessage() for r in caplog.records)
+
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path / "req", monkeypatch, digests={}, funded_require_tensor_digests=True)
+    with pytest.raises(_FundedTamper, match="no tensor digests"):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert runner._funded_leg_failures["hkA"][2] == "tamper"
+
+
+def test_a_foreign_process_on_the_checkpoint_dir_is_tamper_before_the_harvest(
+        tmp_path, monkeypatch):
+    from cascade.trainer.remote import PodHygiene
+
+    harvested = []
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests=lambda w: {"weights.safetensors": w},
+        hygiene=PodHygiene(foreign_procs=("555 python3 watch.py --target-dir x",)))
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir",
+                        lambda host, rdir, dest, **kw: harvested.append(rdir) or dest)
+    with pytest.raises(_FundedTamper, match="foreign process"):
+        runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                               warm_start_ref=None)
+    assert harvested == []                        # refused before a byte moved
+    _msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "tamper", False)
+    assert torn == ["cascade-n91-777-funded-hka-0"]
+
+
+def test_extra_sessions_on_the_pod_only_warn(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from cascade.trainer.remote import PodHygiene
+
+    runner, torn, seeds, contract, disp, written, _ = _digest_harness(
+        tmp_path, monkeypatch, digests=lambda w: {"weights.safetensors": w},
+        hygiene=PodHygiene(sessions=1, ide_server=True))
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
+        entry = runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100, contract, "",
+                                       warm_start_ref=None)
+    assert entry.miner_hotkey == "hkA"
+    assert any("remote IDE server" in r.getMessage() for r in caplog.records)

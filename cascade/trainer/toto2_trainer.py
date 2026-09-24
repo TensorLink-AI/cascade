@@ -910,14 +910,14 @@ class Toto2Trainer:
             # EMA finished-form: the raw endpoint becomes the lineage branch
             # beside the EMA eval artifact — the fork-anneal file convention,
             # so the warm-start loader (stable file first) needs no new case.
-            from safetensors.torch import save_file
+            from .ckpt_digest import save_tensors_hashed
 
             out = Path(out_dir)
             out.mkdir(parents=True, exist_ok=True)
-            save_file(
+            save_tensors_hashed(
                 {k: v.detach().cpu().contiguous()
                  for k, v in model.state_dict().items()},
-                str(out / STABLE_WEIGHTS_FILE),
+                out / STABLE_WEIGHTS_FILE,
             )
             with torch.no_grad():
                 model.load_state_dict(ema_state)
@@ -936,11 +936,11 @@ class Toto2Trainer:
             # and deadline_hit already marks the run as under-budget).
             if stable_state is None:
                 stable_state = self._stable_snapshot(model, optimizer)
-            from safetensors.torch import save_file
+            from .ckpt_digest import save_tensors_hashed
 
             out = Path(out_dir)
-            save_file(stable_state["weights"], str(out / STABLE_WEIGHTS_FILE))
-            save_file(stable_state["optim"], str(out / OPTIM_STATE_FILE))
+            save_tensors_hashed(stable_state["weights"], out / STABLE_WEIGHTS_FILE)
+            save_tensors_hashed(stable_state["optim"], out / OPTIM_STATE_FILE)
             log.info("fork-anneal: saved lineage branch (%s + %s, state as of "
                      "the fork) beside the annealed weights",
                      STABLE_WEIGHTS_FILE, OPTIM_STATE_FILE)
@@ -1035,10 +1035,10 @@ class Toto2Trainer:
         warm-started round continues it. Only wsd rounds write the file (~3x
         the checkpoint upload); under warmup_cosine each round's schedule is
         self-contained and the state would be dead weight."""
-        from safetensors.torch import save_file
+        from .ckpt_digest import save_tensors_hashed
 
         flat = _optim_state_tensors(optimizer, model)
-        save_file(flat, str(Path(out_dir) / OPTIM_STATE_FILE))
+        save_tensors_hashed(flat, Path(out_dir) / OPTIM_STATE_FILE)
         log.info("saved optimizer state (%d tensors) to %s", len(flat), OPTIM_STATE_FILE)
 
     def _load_optimizer_state(self, warm_dir: Path, optimizer, model) -> bool:
@@ -1072,10 +1072,10 @@ class Toto2Trainer:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        from safetensors.torch import save_file
+        from .ckpt_digest import save_tensors_hashed
 
         state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
-        save_file(state, str(out / "weights.safetensors"))
+        save_tensors_hashed(state, out / "weights.safetensors")
 
         (out / "config.json").write_text(
             json.dumps({

@@ -2995,6 +2995,16 @@ class TrainerRunner:
         except CheckpointDiverged as e:
             raise _FundedDiverged(f"king checkpoint: {e}") from e
 
+    def _pod_checkpoint_dir(self, entry, seeds, contract, suffix: str) -> str:
+        """Where the leg's checkpoint lives on its pod: the local-train
+        receipt says; a pushed entry trained into the worker's default
+        ``_train_work`` layout."""
+        given = str(getattr(entry, "checkpoint_dir", "") or "")
+        if given:
+            return given
+        return (f"_train_work/{seeds.base_seed}/{contract.arch_preset}/"
+                f"challenger{suffix}/checkpoint")
+
     def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
                                    suffix: str):
         """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
@@ -3015,6 +3025,21 @@ class TrainerRunner:
         dest = (self.work_root / "_funded_harvest" / f"{seeds.base_seed}"
                 / receipt.miner_hotkey)
         harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        # The harvested tensor files must be the ones the worker hashed in
+        # memory at save time; anything else on disk is not the run's product.
+        from .ckpt_digest import tensor_mismatches
+
+        expected = dict(getattr(receipt, "tensor_digests", None) or {})
+        if expected:
+            bad = tensor_mismatches(dest, expected)
+            if bad:
+                raise _FundedTamper("checkpoint: " + "; ".join(bad))
+        elif self.cfg.round.funded_require_tensor_digests:
+            raise _FundedTamper("checkpoint: the worker receipt carries no tensor digests")
+        else:
+            log.warning("funded leg %s: worker receipt carries no tensor digests (worker "
+                        "image predates them) — checkpoint digest check skipped",
+                        receipt.miner_hotkey)
         try:
             verify_checkpoint(dest, contract)
             # Only after the header bounded the file: a NaN/inf checkpoint is
@@ -3570,6 +3595,24 @@ class TrainerRunner:
                 raise _FundedKeyLost(f"after training: {why}")
             if why:
                 raise _FundedTamper(f"after training: {why}")
+            # Pod hygiene before the checkpoint leaves the pod: a process of
+            # anyone but ours holding the checkpoint dir is tamper; extra
+            # login sessions or a remote IDE server on the pod are logged.
+            from .remote import probe_pod_hygiene
+
+            hyg = probe_pod_hygiene(
+                host, self._pod_checkpoint_dir(entry, seeds, contract, suffix))
+            if hyg.foreign_procs:
+                raise _FundedTamper(
+                    f"pod hygiene: {len(hyg.foreign_procs)} foreign process(es) hold the "
+                    f"checkpoint dir — {hyg.foreign_procs[0][:160]}")
+            if hyg.error:
+                log.warning("funded leg %s: pod hygiene probe inconclusive (%s)",
+                            gen.hotkey, hyg.error)
+            elif hyg.sessions or hyg.ide_server:
+                log.warning("funded leg %s: pod shows %d interactive ssh session(s) besides "
+                            "ours%s", gen.hotkey, hyg.sessions,
+                            " and a remote IDE server" if hyg.ide_server else "")
             if harvest:
                 # Credential-free pod: the checkpoint is still ON the pod.
                 # Pull it over the pinned ssh, ingest-verify the local copy,
@@ -4910,7 +4953,23 @@ class TrainerRunner:
             "gpu_name": gpu_name,
             "size": contract.arch_preset,
             "local_checkpoint_dir": str(out_dir),
+            "tensor_digests": self._tensor_digests_of(out_dir),
         }
+
+    def _tensor_digests_of(self, out_dir: Path) -> dict[str, str]:
+        """``{tensor file: sha256}`` as hashed in memory at save time: this
+        process's own writes, else the ones the ``.train_complete`` marker
+        carries (a complete checkpoint reused from an earlier process)."""
+        from .ckpt_digest import digests_for
+
+        got = digests_for(out_dir)
+        if got:
+            return got
+        try:
+            payload = json.loads((out_dir / self.TRAIN_COMPLETE_MARKER).read_text())
+            return {str(k): str(v) for k, v in dict(payload.get("tensor_digests") or {}).items()}
+        except Exception:  # noqa: BLE001 — no marker ⇒ no digests to report
+            return {}
 
     def _train_for_entry(
         self,
@@ -4972,12 +5031,17 @@ class TrainerRunner:
         training returns, before the upload is attempted) so an upload-failure
         retry can skip the retrain. Atomic (tmp + rename); best-effort — a
         marker miss just costs the old retrain-on-retry behaviour."""
+        from .ckpt_digest import digests_for
+
         try:
             payload = json.dumps({
                 "contract_digest": contract_digest(contract),
                 "gen_ref": gen.ref,
                 "corpus_digest": corpus_digest,
                 "gpu_name": gpu_name,
+                # The in-memory digests of the tensor files this run wrote,
+                # so a reuse of the checkpoint still reports them.
+                "tensor_digests": digests_for(out_dir),
             }, sort_keys=True)
             tmp = out_dir / (self.TRAIN_COMPLETE_MARKER + ".tmp")
             tmp.write_text(payload)
