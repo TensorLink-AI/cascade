@@ -689,6 +689,89 @@ def probe_worker_runtime(host: RemoteHost, *, required_flags: tuple[str, ...] = 
     return ""
 
 
+@dataclass(frozen=True)
+class PodHygiene:
+    """What else is going on on a pod at harvest time."""
+
+    foreign_procs: tuple[str, ...] = ()   # processes not ours whose command names the checkpoint dir
+    sessions: int = 0                     # interactive ssh sessions besides the probe's own
+    ide_server: bool = False              # a remote IDE server is installed on the pod
+    error: str = ""                       # probe transport failure: the checks are inconclusive
+
+
+# Command-line markers of the processes a leg legitimately runs on its pod.
+_OWN_PROCESS_MARKERS = ("cascade.trainer.worker", "cascade.trainer.sandbox",
+                        "cascade-benchmark", "cascade.benchmarks", "wandb")
+_HYGIENE_SESSIONS_MARK = "__HYGIENE_SESSIONS__"
+_HYGIENE_IDE_MARK = "__HYGIENE_IDE__"
+_IDE_SERVER_DIRS = ("/root/.vscode-server", "/root/.vscode-remote", "/root/.cursor-server")
+
+
+def _pod_relative(host: RemoteHost, path: str) -> str:
+    """``path`` as the worker names it: relative to the pod workdir."""
+    prefix = host.workdir.rstrip("/") + "/"
+    return path[len(prefix):] if path.startswith(prefix) else path
+
+
+def _hygiene_command(host: RemoteHost, checkpoint_dir: str) -> str:
+    needle = shlex.quote(_pod_relative(host, checkpoint_dir))
+    dirs = " ".join(shlex.quote(d) for d in _IDE_SERVER_DIRS)
+    return (f"ps -eo pid,args 2>/dev/null | grep -F -- {needle}; "
+            f"echo {_HYGIENE_SESSIONS_MARK}; "
+            f"ps -eo args 2>/dev/null | grep -cE '^sshd: [A-Za-z0-9_.-]+@'; "
+            f"echo {_HYGIENE_IDE_MARK}; "
+            f"for d in {dirs}; do [ -d \"$d\" ] && echo \"$d\"; done; true")
+
+
+def parse_hygiene_output(stdout: str) -> PodHygiene:
+    """Classify the probe's stdout (see :func:`_hygiene_command`)."""
+    procs: list[str] = []
+    sessions = 0
+    ide = False
+    section = "procs"
+    for raw in (stdout or "").splitlines():
+        line = raw.strip()
+        if line == _HYGIENE_SESSIONS_MARK:
+            section = "sessions"
+            continue
+        if line == _HYGIENE_IDE_MARK:
+            section = "ide"
+            continue
+        if not line:
+            continue
+        if section == "procs":
+            if any(m in line for m in _OWN_PROCESS_MARKERS):
+                continue
+            if _HYGIENE_SESSIONS_MARK in line or "grep -F" in line:
+                continue          # the probe's own shell and grep
+            procs.append(line)
+        elif section == "sessions":
+            with contextlib.suppress(ValueError):
+                sessions = max(0, int(line) - 1)    # minus the probe's own session
+        elif section == "ide":
+            ide = True
+    return PodHygiene(foreign_procs=tuple(procs), sessions=sessions, ide_server=ide)
+
+
+def probe_pod_hygiene(host: RemoteHost, checkpoint_dir: str, *, timeout: float = 60.0,
+                      runner=None) -> PodHygiene:
+    """Look at the pod before its checkpoint is harvested: which processes
+    other than ours name the checkpoint dir, how many interactive ssh
+    sessions are open besides this probe's, and whether a remote IDE server
+    is installed. A transport failure is reported in ``error`` (nothing is
+    inferred from silence)."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _hygiene_command(host, checkpoint_dir)), int(timeout), "")
+    except subprocess.TimeoutExpired:
+        return PodHygiene(error=f"probe timed out after {timeout:.0f}s")
+    except OSError as e:
+        return PodHygiene(error=f"probe failed: {e}")
+    if p.returncode != 0:
+        return PodHygiene(error=f"probe rc={p.returncode}: {(p.stderr or '')[-200:]}")
+    return parse_hygiene_output(p.stdout or "")
+
+
 HOST_BENCH_PROBE_TIMEOUT_SECONDS = 120.0
 _HOST_BENCH_PROBE_PY = (
     "import json; from cascade.trainer.host_probe import host_bench; "
@@ -772,6 +855,8 @@ class LocalTrainReceipt:
     checkpoint_dir: str            # pod-local path of the trained checkpoint
     gpu_name: str = ""
     size: str = ""
+    # {tensor file: sha256} hashed in memory at save time (empty: not reported)
+    tensor_digests: dict[str, str] = field(default_factory=dict, hash=False)
 
 
 def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
@@ -787,8 +872,10 @@ def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
             checkpoint_dir=str(receipt["local_checkpoint_dir"]),
             gpu_name=str(receipt.get("gpu_name", "")),
             size=str(receipt.get("size", "")),
+            tensor_digests={str(k): str(v) for k, v in
+                            dict(receipt.get("tensor_digests") or {}).items()},
         )
-    except (KeyError, ValueError) as e:
+    except (KeyError, ValueError, TypeError) as e:
         raise RemoteDispatchError(f"receipt is not a valid local-train receipt: {e}") from e
 
 

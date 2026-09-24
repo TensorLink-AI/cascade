@@ -1211,6 +1211,10 @@ class RoundConfig:
     # before the round's latest safe start. 0 ⇒ every waiting leg falls back at
     # once (the pre-2026-09-19 behaviour). The JIT king is never held back.
     funded_operator_fallback_fresh_window_seconds: int = 3600
+    # A harvested funded checkpoint whose worker receipt carries no in-memory
+    # tensor digests is refused as tamper (true) or accepted with a warning
+    # (false: a worker image that predates the digests still harvests).
+    funded_require_tensor_digests: bool = False
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
@@ -2705,6 +2709,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
+            funded_require_tensor_digests=bool(r.get("funded_require_tensor_digests", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),
