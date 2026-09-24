@@ -1069,8 +1069,17 @@ class LiumProvider:
             raise self._scrub_key(e) from None
 
     def _pod(self, pod_id: str) -> dict | None:
-        return next((p for p in self._list_pods()
-                     if pod_id in (p.get("name"), p.get("huid"), p.get("id"))), None)
+        # Names are owner-chosen and reusable: a rent retried under the same
+        # name while the earlier pod still runs lists TWO pods by that name
+        # (2026-09-24: seven such pairs after a trainer restart). The pod that
+        # matters is the one answering — RUNNING with an SSH endpoint — so
+        # identity, address and adoption all resolve to it, never to the
+        # booting duplicate.
+        hits = [p for p in self._list_pods()
+                if pod_id in (p.get("name"), p.get("huid"), p.get("id"))]
+        if not hits:
+            return None
+        return next((p for p in hits if lium_pod_ready(p)), hits[0])
 
     def available(self, sku: str, count: int, *, gpus: int = 1,
                   exclude_ids: tuple[str, ...] = ()) -> bool:

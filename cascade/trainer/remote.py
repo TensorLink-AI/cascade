@@ -440,6 +440,41 @@ def _detached_poll_command(host: RemoteHost, run_dir: str) -> str:
             f"kill -0 $(cat {rd}/pid) 2>/dev/null; then echo RUNNING; else echo GONE; fi")
 
 
+def _detached_find_command(host: RemoteHost, tag: str) -> str:
+    """List prior run dirs of ``tag`` on the pod that still matter: the worker
+    is alive (pid answers ``kill -0``) or finished (``exit_code`` written)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
+    return (f"cd {shlex.quote(host.workdir)} && for d in {DETACHED_RUN_ROOT}/{safe}-*; do "
+            f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then echo ATTACH:$d; "
+            f"elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then "
+            f"echo ATTACH:$d; fi; done; true")
+
+
+def find_detached_run(host: RemoteHost, tag: str, *, runner=None) -> str | None:
+    """The run dir of a prior detached launch of ``tag`` on ``host`` whose
+    worker is still running or has finished, or ``None``.
+
+    A trainer restart (or a retried leg on a pod that outlived the previous
+    attempt) must ATTACH to that run — a second ``setsid nohup`` of the same
+    leg on the same GPU doubles the wall and wastes the first run (2026-09-24:
+    seven legs re-dispatched after a restart while their originals kept
+    training). Unreachable pod ⇒ ``None`` (the caller launches and the poll's
+    grace handles the transport). Absolute path under ``host.workdir``."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _detached_find_command(host, tag)), 60, "")
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if p.returncode != 0:
+        return None
+    hits = [ln.strip()[len("ATTACH:"):] for ln in (p.stdout or "").splitlines()
+            if ln.strip().startswith("ATTACH:")]
+    if not hits:
+        return None
+    rel = hits[-1]
+    return rel if rel.startswith("/") else f"{host.workdir}/{rel}"
+
+
 def _detached_fetch_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
     return (f"cd {shlex.quote(host.workdir)} && tail -c {DETACHED_STDOUT_TAIL_BYTES} {rd}/stdout; "
@@ -456,7 +491,7 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
                  timeout: int, poll_seconds: int = DETACHED_POLL_SECONDS,
                  grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS,
                  runner=None, describe: str = "remote leg",
-                 preempt: str = PREEMPT_BENCHMARKS) -> subprocess.CompletedProcess:
+                 preempt: str = PREEMPT_BENCHMARKS, launch: bool = True) -> subprocess.CompletedProcess:
     """Run ``body`` detached on ``host`` and return a CompletedProcess-shaped
     result (returncode, stdout, stderr) exactly like the attached ssh would —
     the caller's receipt/rc handling is unchanged.
@@ -468,16 +503,22 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     overall wall for the leg; on expiry the detached process group is killed
     best-effort and the leg reported timed out."""
     run = runner or run_ssh
-    launch_cmd = preempt + build_detached_command(
-        host, body, run_dir, stdin_env_present=stdin_env is not None)
-    try:
-        launch = run(build_ssh_argv(host, launch_cmd), 180, stdin_env)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise RemoteDispatchError(f"{describe}: detached launch failed: {e}", returncode=255) from e
-    if launch.returncode != 0 or DETACHED_LAUNCH_TOKEN not in (launch.stdout or ""):
-        raise RemoteDispatchError(
-            f"{describe}: detached launch failed (rc={launch.returncode}): "
-            f"{(launch.stderr or '')[-400:]}", returncode=launch.returncode or 255)
+    if launch:
+        launch_cmd = preempt + build_detached_command(
+            host, body, run_dir, stdin_env_present=stdin_env is not None)
+        try:
+            launched = run(build_ssh_argv(host, launch_cmd), 180, stdin_env)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            raise RemoteDispatchError(f"{describe}: detached launch failed: {e}",
+                                      returncode=255) from e
+        if launched.returncode != 0 or DETACHED_LAUNCH_TOKEN not in (launched.stdout or ""):
+            raise RemoteDispatchError(
+                f"{describe}: detached launch failed (rc={launched.returncode}): "
+                f"{(launched.stderr or '')[-400:]}", returncode=launched.returncode or 255)
+    else:
+        # ``launch=False``: ATTACH to a run already on the pod (find_detached_run)
+        # — no second worker, no credentials sent; poll and fetch as usual.
+        log.info("%s: attaching to the run already on the pod (%s)", describe, run_dir)
     t0 = time.time()
     last_seen = t0
     misses = 0
@@ -900,12 +941,17 @@ class RemoteDispatcher:
                  host.cuda_device, " [detached]" if self.detached else "")
         if self.detached:
             body = _guarded_worker(_lane_prefix(host, lane_count), argv)
-            run_dir = detached_run_dir(host, f"{role}-{hotkey[:12]}-{base_seed}")
+            tag = f"{role}-{hotkey[:12]}-{base_seed}"
+            prior = find_detached_run(host, tag, runner=self._runner)
+            if prior:
+                log.warning("dispatch role=%s → %s: a run of this leg is already on the "
+                            "pod (%s) — attaching, not relaunching", role, host.name, prior)
+            run_dir = prior or detached_run_dir(host, tag)
             proc = run_detached(
                 host, body, _stdin_env(env), run_dir,
                 timeout=self.timeout_seconds, poll_seconds=self.poll_seconds,
                 grace_seconds=self.reattach_grace_seconds, runner=self._runner,
-                describe=f"remote {role} on {host.name}")
+                describe=f"remote {role} on {host.name}", launch=prior is None)
         else:
             remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
             ssh_argv = build_ssh_argv(host, remote_cmd)

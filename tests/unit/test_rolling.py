@@ -992,3 +992,33 @@ def test_king_leg_targets_the_eras_last_settlement(cfg, tmp_path):
     _advance(clock, ops, sched, client, from_block=b0, to_block=window)
     assert [c[1] for c in ops.king_calls] == [era_idx, era_idx + 1]
     assert ops.king_calls[1][3] == clock.t + (era_start + 2 * era_len - window) * R.BLOCK_SECONDS
+
+
+def test_restart_reattaches_an_in_flight_leg_stamped_with_no_era(cfg, tmp_path):
+    # 2026-09-24: legacy carry-over legs dispatched at the rollover tick carried
+    # era_index 0; the restart requeued them ("targets unknown era 0") and the
+    # intake rented a second pod per leg while the first kept training.
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0))
+    q.add("BRAV", REF["BRAV"], reveal_block=b0)
+    q.mark_in_flight("BRAV", REF["BRAV"], target_boundary=era_start + 2 * EB,
+                     era_index=0, started_block=b0 + 1)
+    ops2 = FakeOps(tmp_path, clock)
+    ops2.commits = list(ops.commits)
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
+    sched2.tick(client, b0 + 3)
+    _join(sched2)
+    assert [c[0] for c in ops2.leg_calls] == ["BRAV"]      # re-attached under the current era
+    assert ops2.sweeps[0][1] == {"ALFA", "BRAV"}
+    assert q.get("BRAV").status == "in_flight"
+    assert len(sched2.state.finished) == 2
