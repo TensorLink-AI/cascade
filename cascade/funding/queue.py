@@ -458,6 +458,23 @@ class FundedQueue:
             self._save(entries)
             return True
 
+    def restamp_flight(self, hotkey: str, *, target_boundary: int, era_index: int,
+                       started_block: int) -> bool:
+        """Replace an ``in_flight`` entry's era / target / start stamp — the
+        restart re-attach found it unsound (zeroed by a requeue, stamped by a
+        trainer that predates the fields) and re-derived it. 2026-09-24: a leg
+        re-attached from a zeroed stamp published ``train_block 0`` and
+        validators rejected the settlement whole."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != "in_flight":
+                return False
+            entries[hotkey] = replace(
+                e, target_boundary=int(target_boundary), era_index=int(era_index),
+                started_block=int(started_block))
+            self._save(entries)
+            return True
+
     def retarget_flight(self, hotkey: str, *, target_boundary: int) -> bool:
         """A within-era slip: the leg lands at a LATER settlement of the same
         era. Era and ref are untouched."""
