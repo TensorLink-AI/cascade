@@ -5425,6 +5425,42 @@ class TrainerRunner:
             pass
         return self._last_receipt_king
 
+    def _round_entry_king(self, client, commitments) -> str | None:
+        """The king this round TRAINS: the validators' receipt king when it
+        has a usable commitment, else the on-chain incentive king.
+
+        The incentive leader lags a dethrone verdict by 1-2 epochs (weights
+        land at the verdict, incentive moves at the next tempo, the next
+        boundary may come first). A round entered inside that window trained
+        the DEPOSED king (2026-09-23 22:04: the validator crowned u87 at
+        21:13, incentive still said the old king, the round was judged
+        ``king_resyncing`` — every challenger's leg wasted). The rolling
+        settlement path already lets the receipt decide
+        (:meth:`RollingOps.metagraph_king` is a cross-check only); this is the
+        same rule for the legacy boundary path, trainer-side and
+        consensus-inert — validators vote their champion regardless of what
+        the trainer trains.
+
+        The receipt king only wins when it has a reveal on file: a champion
+        without a resolvable commitment cannot be trained at all, and
+        ``plan_round`` treats that as a loud warning rather than a silent
+        swap, so we fall back to the incentive king and say why.
+        """
+        incentive = client.highest_incentive_hotkey()
+        receipt = self._receipt_king()
+        if not receipt or receipt == incentive:
+            return incentive
+        revealed = {c.hotkey for c in commitments}
+        if receipt not in revealed:
+            log.warning("round entry: receipt king %s has no commitment on file — "
+                        "training the incentive king %s", receipt[:12],
+                        (incentive or "")[:12])
+            return incentive
+        log.warning("round entry: receipt king %s != incentive king %s (incentive lags "
+                    "the dethrone verdict) — the receipt decides", receipt[:12],
+                    (incentive or "")[:12])
+        return receipt
+
     def _seed_promotion_reign(self) -> None:
         """Deploy-time backfill (DEC-CA-0013): count the rounds the current
         king has ALREADY reigned before this engine existed.
@@ -8076,7 +8112,7 @@ class TrainerRunner:
                 # reveal (resolve_commitments picks it) — latest-only reads made
                 # an early next-round re-commit forfeit the current round.
                 commitments = client.poll_commitments(include_history=True)
-                king_hotkey = client.highest_incentive_hotkey()
+                king_hotkey = self._round_entry_king(client, commitments)
                 # Cascade promotion (DEC-CA-0013): track the reign at the
                 # boundary and fire a promotion BEFORE the round trains, so the
                 # signed record is published (and fetchable by validators)
