@@ -221,6 +221,7 @@ def test_run_detached_timeout_kills_the_group(monkeypatch):
 
 def test_dispatcher_detached_returns_the_entry_from_the_fetched_receipt():
     runner = _Scripted([
+        _proc(stdout=""),                                  # no prior run on the pod
         _proc(stdout=DETACHED_LAUNCH_TOKEN + "\n"),
         _proc(stdout="RUNNING\n"),
         _proc(stdout="EXIT:0\n"),
@@ -231,13 +232,14 @@ def test_dispatcher_detached_returns_the_entry_from_the_fetched_receipt():
     entry = disp.dispatch(_host(cuda_device="0"), gen_ref="g", uid=7, hotkey="hk" * 24,
                           role="challenger", base_seed=1, block=1)
     assert entry.role == "challenger" and entry.miner_uid == 7
-    launch_cmd, _ = runner.calls[0]
+    launch_cmd, _ = runner.calls[1]
     assert "_train_work/_dispatch/challenger-hkhkhkhkhkhk-1-" in launch_cmd
     assert "set -m; CUDA_VISIBLE_DEVICES=0 " in shlex.split(launch_cmd.split("setsid nohup ", 1)[1])[2]
 
 
 def test_dispatcher_detached_maps_rc3_to_a_rejection():
     runner = _Scripted([
+        _proc(stdout=""),                                  # no prior run on the pod
         _proc(stdout=DETACHED_LAUNCH_TOKEN + "\n"),
         _proc(stdout="EXIT:3\n"),
         _proc(stdout=DETACHED_STDERR_MARK + "\nCorpusError: generator_stalled: no series for 1800s\n"),

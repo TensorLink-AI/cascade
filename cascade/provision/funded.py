@@ -174,6 +174,7 @@ class FundedRentResult:
     # funded rents feed these back as ``exclude_ids`` so N challengers claim N
     # DISTINCT executors instead of racing for the listing's first row.
     machine_id: str = ""
+    adopted: bool = False           # a live pod of this name was reused, not rented
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
     # Platform identity of the pod that answered (Lium pod id + huid) and the
     # container's SSH host key, both read once the pod is READY: the trainer
@@ -238,6 +239,53 @@ def rent_funded_pod(
 
     # ``skus`` (open market, owner 2026-09-20): the adapter picks the cheapest
     # fitting executor across the types; ``sku`` stays the nominal first pick.
+    # A pod by this name already RUNNING on the payer's account is THIS leg's
+    # pod from a prior attempt (a trainer restart, a retry after a transport
+    # drop): adopt it — the worker on it is still training or has finished
+    # (the dispatcher attaches to its run). Renting again created a duplicate
+    # under the same name and the identity pin then saw the booting twin
+    # (2026-09-24: four legs burned as "tamper", three pods per leg rented
+    # and torn down). Adoption never launches; a failed probe rents as before.
+    live_fn = getattr(provider, "live_pod_address", None)
+    live_addr = None
+    if callable(live_fn):
+        try:
+            live_addr = live_fn(name)
+        except Exception as e:  # noqa: BLE001 — a listing blip must not block the rent
+            log.warning("funded rent for %s: live-pod probe failed (%s) — renting",
+                        hotkey, str(e)[-200:])
+    if live_addr is not None:
+        try:
+            ident_fn = getattr(provider, "pod_identity", None)
+            ident = ident_fn(name) if callable(ident_fn) else None
+            pod_uid = str((ident or {}).get("id") or "")
+            if ident_fn is not None and not pod_uid:
+                raise ProvisionError(f"funded pod {name}: platform identity unavailable")
+            host_key = ""
+            if host_key_scanner is not None:
+                host_key = host_key_scanner(live_addr.ip, live_addr.ssh_port)
+            sku_fn = getattr(provider, "sku_of", None)
+            landed = (str(sku_fn(name) or "") if callable(sku_fn) else "") or (
+                skus[0] if skus else sku)
+            pod = PodInstance(
+                provider=provider.name, instance_id=name, stage=FUNDED_STAGE,
+                rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
+                payer_hotkey=hotkey, pod_uid=pod_uid,
+            )
+            log.warning("funded pod %s is still LIVE at %s:%d from a prior attempt — "
+                        "adopting it for %s (no rent; the dispatcher attaches to its run)",
+                        name, live_addr.ip, live_addr.ssh_port, hotkey)
+            machine = ""
+            getter = getattr(provider, "machine_of", None)
+            if getter is not None:
+                machine = getter(name) or ""
+            return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=live_addr,
+                                    machine_id=machine, pod_uid=pod_uid,
+                                    host_key=host_key, sku=landed, adopted=True)
+        except Exception as e:  # noqa: BLE001 — never tear the live pod down; retry later
+            res = _fail(f"live pod {name} could not be adopted: {e}")
+            return replace(res, error_class="infra", burn_attempt=False)
+
     choices = tuple(skus) if len(tuple(skus)) > 1 else ()
     spec = LaunchSpec(
         sku=(skus[0] if skus else sku), count=1, image=image, ssh_pubkey=ssh_pubkey,

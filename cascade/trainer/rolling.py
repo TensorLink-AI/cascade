@@ -512,6 +512,14 @@ class RollingScheduler:
             if (e.hotkey, e.ref) in done:
                 continue                      # finished before the restart; settles normally
             era = self._era_state_for(e.era_index)
+            if era is None and int(e.era_index) <= 0 and self.state.current is not None:
+                # A leg stamped with no era (legacy carry-over dispatched at the
+                # rollover tick, 2026-09-24) belongs to the era that is running
+                # now — re-attach it there rather than requeue (a requeue rents
+                # a second pod while the first keeps training).
+                era = self.state.current
+                log.warning("rolling: in-flight leg %s carries no era index — re-attached "
+                            "under the current era %d", e.hotkey[:12], era.index)
             if era is None:
                 log.warning("rolling: in-flight leg %s targets unknown era %d — requeued",
                             e.hotkey[:12], e.era_index)
