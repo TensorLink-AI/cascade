@@ -5,6 +5,18 @@ Experimental training-data generator. No measured forecasting gain is implied.
 
 from __future__ import annotations
 
+
+# H393: production-sandbox thread control before numerical imports.
+# These must be set before the first numerical import to take effect.
+import os as _h393_os
+for _h393_var in (
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+        "NUMBA_NUM_THREADS"):
+    _h393_os.environ[_h393_var] = "1"
+from threadpoolctl import threadpool_limits as _h393_threadpool_limits
+_H393_THREAD_LIMITER = _h393_threadpool_limits(limits=1)
+del _h393_var
+
 import json
 import os
 import sys as _sys
@@ -34,7 +46,7 @@ _CF_MODULE_SOURCES: dict[str, str] = {
     'cf_calendars': '"""Broadcast calendar arrays — no pandas, no Python loops.\n\nFor every row we draw a starting day-of-week and day-of-year, then derive::\n\n    day_index[i, t] = floor(t / P_day[i])\n    dow[i, t]       = (start_dow[i] + day_index) % 7\n    doy[i, t]       = (start_doy[i] + day_index) % 365\n\nThe calendar layer exists because the losing domains are administrative.  Real\npublic-health and hospital feeds do not carry a +-0.12 additive log day-of-week\noffset: they carry a 2-5x *multiplicative* factor, a Monday catch-up spike,\nholiday collapses with a compensating spike on the next working day, batched\nmulti-day releases, and revisions.  All of that lives here.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nfrom cf_prims import decay_convolve\n\nDAYS_IN_YEAR = 365\nMAX_YEARS = 16\n\n\nclass Calendar:\n    """Lazily materialised calendar arrays for one group of rows."""\n\n    __slots__ = ("n", "L", "p_day", "start_dow", "start_doy", "_day_index",\n                 "_dow", "_doy")\n\n    def __init__(self, n: int, L: int, p_day: np.ndarray,\n                 start_dow: np.ndarray, start_doy: np.ndarray):\n        self.n = n\n        self.L = L\n        self.p_day = np.asarray(p_day, dtype=np.float64).reshape(n, 1)\n        self.start_dow = np.asarray(start_dow, dtype=np.int64).reshape(n, 1)\n        self.start_doy = np.asarray(start_doy, dtype=np.int64).reshape(n, 1)\n        self._day_index = None\n        self._dow = None\n        self._doy = None\n\n    @property\n    def day_index(self) -> np.ndarray:\n        if self._day_index is None:\n            t = np.arange(self.L, dtype=np.float64)[None, :]\n            self._day_index = np.floor(t / np.maximum(self.p_day, 1e-9)).astype(np.int64)\n        return self._day_index\n\n    @property\n    def dow(self) -> np.ndarray:\n        if self._dow is None:\n            self._dow = (self.start_dow + self.day_index) % 7\n        return self._dow\n\n    @property\n    def doy(self) -> np.ndarray:\n        if self._doy is None:\n            self._doy = (self.start_doy + self.day_index) % DAYS_IN_YEAR\n        return self._doy\n\n    @property\n    def is_weekend(self) -> np.ndarray:\n        return self.dow >= 5\n\n    def take(self, rows: np.ndarray) -> "Calendar":\n        return Calendar(len(rows), self.L, self.p_day[rows, 0],\n                        self.start_dow[rows, 0], self.start_doy[rows, 0])\n\n\ndef draw_calendar(rng: np.random.Generator, n: int, L: int,\n                  p_day: np.ndarray) -> Calendar:\n    return Calendar(n, L, p_day,\n                    rng.integers(0, 7, size=n),\n                    rng.integers(0, DAYS_IN_YEAR, size=n))\n\n\n# ───────────────────────── multiplicative factors ──────────────────────────\n\ndef dow_factors(rng: np.random.Generator, n: int, cfg: dict) -> np.ndarray:\n    """Seven multiplicative day-of-week factors, geometric mean normalised to 1.\n\n    Weekend ~ LogN(log 0.45, 0.35) -> a 0.2-0.9x weekend; Monday carries a\n    catch-up multiplier.  These are an order of magnitude stronger than the\n    additive log offsets the incumbent field uses, and they are what the data\n    actually shows.\n    """\n    c = cfg["calendar"]\n    f = np.empty((n, 7))\n    f[:, 0] = np.exp(rng.normal(np.log(c["monday_factor"]), c["monday_sigma"], size=n))\n    for d in (1, 2, 3, 4):\n        f[:, d] = np.exp(rng.normal(0.0, c["weekday_sigma"], size=n))\n    for d in (5, 6):\n        f[:, d] = np.exp(rng.normal(np.log(c["weekend_factor"]),\n                                    c["weekend_sigma"], size=n))\n    # Sat != Sun\n    f[:, 6] *= np.exp(rng.normal(0.0, 0.22, size=n))\n    g = np.exp(np.mean(np.log(np.maximum(f, 1e-6)), axis=1, keepdims=True))\n    return f / g\n\n\ndef apply_dow(fac: np.ndarray, cal: Calendar) -> np.ndarray:\n    """Gather the 7 factors onto the (n, L) grid."""\n    return np.take_along_axis(fac, cal.dow, axis=1)\n\n\ndef holiday_factor(rng: np.random.Generator, cal: Calendar, cfg: dict\n                   ) -> tuple[np.ndarray, np.ndarray]:\n    """Multiplicative holiday collapse plus a next-working-day compensation.\n\n    Returns ``(factor, comp)`` on the (n, L) grid.  Holidays are 8-13 fixed\n    day-of-year anchors plus 2-4 moving ones (an Easter-like offset from a drawn\n    anchor), each with a +-1 day shoulder.\n    """\n    n, L = cal.n, cal.L\n    c = cfg["calendar"]\n    n_fixed = int(c["n_fixed_holidays"])\n    n_moving = int(c["n_moving_holidays"])\n    total = n_fixed + n_moving\n    anchors = rng.integers(0, 365, size=(n, total))\n    live = np.arange(total)[None, :] < rng.integers(\n        c["holiday_count_lo"], c["holiday_count_hi"] + 1, size=(n, 1))\n    depth = np.exp(rng.normal(np.log(c["holiday_factor"]), c["holiday_sigma"],\n                              size=(n, total)))\n    depth = np.clip(depth, 0.02, 1.0)\n\n    doy = cal.doy\n    # A daily-cadence window spans ~11 virtual years, so a *moving* feast really\n    # does land on a different day-of-year each year.  Fixed anchors do not.\n    year = np.minimum(cal.day_index // DAYS_IN_YEAR, MAX_YEARS - 1)\n    year_shift = rng.integers(-25, 26, size=(n, MAX_YEARS))\n    shift = np.take_along_axis(year_shift, year, axis=1)\n\n    # Fixed anchors depend only on day-of-year, so they are resolved once on a\n    # (n, 365) table and gathered; only the moving feasts need the full grid.\n    grid = np.arange(DAYS_IN_YEAR, dtype=np.int64)[None, :]\n    tab = np.ones((n, DAYS_IN_YEAR))\n    tab_hit = np.zeros((n, DAYS_IN_YEAR), dtype=bool)\n    for j in range(n_fixed):\n        if not live[:, j].any():\n            continue\n        d = np.abs(((grid - anchors[:, j:j + 1] + 182) % 365) - 182)\n        on = (d <= 1) & live[:, j:j + 1]\n        f = np.where(d == 0, depth[:, j:j + 1], 0.5 * (1.0 + depth[:, j:j + 1]))\n        tab = np.where(on, np.minimum(tab, f), tab)\n        tab_hit |= on\n    fac = np.take_along_axis(tab, doy, axis=1)\n    hit = np.take_along_axis(tab_hit, doy, axis=1)\n\n    for j in range(n_fixed, total):\n        if not live[:, j].any():\n            continue\n        d = np.abs(((doy - (anchors[:, j:j + 1] + shift) + 182) % 365) - 182)\n        on = (d <= 1) & live[:, j:j + 1]\n        # shoulder days are milder than the holiday itself\n        f = np.where(d == 0, depth[:, j:j + 1], 0.5 * (1.0 + depth[:, j:j + 1]))\n        fac = np.where(on, np.minimum(fac, f), fac)\n        hit |= on\n\n    comp = np.zeros((n, L))\n    if L > 1:\n        # compensation lands on the first sample after the holiday block ends\n        boundary = np.zeros((n, L), dtype=bool)\n        boundary[:, 1:] = hit[:, :-1] & (~hit[:, 1:])\n        amp = rng.uniform(c["holiday_comp_lo"], c["holiday_comp_hi"], size=(n, 1)) - 1.0\n        span = np.maximum(cal.p_day, 1.0)\n        comp = np.where(boundary, amp, 0.0)\n        # spread the catch-up over one "day" of samples\n        if float(np.max(span)) > 1.5:\n            comp = decay_convolve(comp, np.maximum(span[:, 0] * 0.4, 1.0))\n    return fac, comp\n\n\ndef month_boundary(cal: Calendar) -> np.ndarray:\n    """True on the first sample of each 30/31-day month block."""\n    m = (cal.doy // 30)\n    b = np.zeros_like(m, dtype=bool)\n    b[:, 1:] = m[:, 1:] != m[:, :-1]\n    return b\n\n\ndef business_day_index(cal: Calendar) -> np.ndarray:\n    """Cumulative count of business days, i.e. the business-day observation grid.\n\n    Econ/fin daily feeds publish on business days only, so their effective weekly\n    period is 5 rather than 7 and their release calendar advances only on\n    weekdays.  Ubiquitous in the pool and modelled by nobody.\n    """\n    di = cal.day_index\n    new_day = np.zeros_like(di, dtype=bool)\n    new_day[:, 0] = True\n    new_day[:, 1:] = di[:, 1:] != di[:, :-1]\n    return np.cumsum((new_day & (~cal.is_weekend)).astype(np.int64), axis=1)\n\n\ndef dst_shift(rng: np.random.Generator, cal: Calendar, rate: float) -> np.ndarray:\n    """A one-hour daily-phase jump at two day-of-year anchors (civil-time feeds).\n\n    Returned in *cycles*: one hour of a 24-hour day is 1/24 of the daily phase,\n    whatever the sampling cadence.\n\n    Deliberately NOT applied to the meteorological families: that source requests\n    UTC, so an ERA5 series has no DST discontinuity and a spurious one would be a\n    mismatch rather than a prior.\n    """\n    n, L = cal.n, cal.L\n    on = rng.random((n, 1)) < rate\n    a1 = rng.integers(60, 120, size=(n, 1))\n    a2 = rng.integers(270, 330, size=(n, 1))\n    inside = (cal.doy >= a1) & (cal.doy < a2)\n    return np.where(on & inside, 1.0 / 24.0, 0.0)\n\n\ndef batch_release(rng: np.random.Generator, x: np.ndarray, cal: Calendar,\n                  period_days: np.ndarray) -> np.ndarray:\n    """Accumulate over a k-day batch and release the whole sum on one sample.\n\n    Everything between releases is an exact zero.  This is how a large fraction\n    of public-health feeds actually report and it destroys naive persistence.\n    """\n    n, L = x.shape\n    blk = (cal.day_index // np.maximum(period_days.reshape(n, 1), 1))\n    boundary = np.zeros((n, L), dtype=bool)\n    boundary[:, 1:] = blk[:, 1:] != blk[:, :-1]\n    boundary[:, 0] = True\n    cum = np.cumsum(x, axis=1)\n    # A_t is the total accumulated strictly before t; S_t is A at the most recent\n    # boundary at or before t.  Shifting S by one sample gives A at the PREVIOUS\n    # boundary, so each release reports exactly the block that just closed.\n    a = cum - x\n    s = np.maximum.accumulate(np.where(boundary, a, 0.0), axis=1)\n    prev = np.zeros_like(s)\n    prev[:, 1:] = s[:, :-1]\n    return np.where(boundary, a - prev, 0.0)\n\n\ndef revision_ramp(rng: np.random.Generator, x: np.ndarray, n_last: np.ndarray,\n                  depth: np.ndarray) -> np.ndarray:\n    """Systematically under-report the most recent k samples, ramping to truth."""\n    n, L = x.shape\n    k = np.maximum(np.asarray(n_last).reshape(n, 1), 1)\n    age = (L - 1) - np.arange(L)[None, :]\n    w = np.clip(1.0 - age / k, 0.0, 1.0)\n    d = np.asarray(depth).reshape(n, 1)\n    return x * (1.0 - w * d)\n\n',
     'cf_observe': '"""Observation layer, scale/offset, structured aggregation, sanitiser.\n\nOne shared, family-gated stage runs after every family has produced its rows.\nThe stages are applied in a fixed order and each one is gated by the per-row\ncapability flags the family returned, so a bounded process never gets an outlier\nspike outside its bounds and an integer count is never rounded onto a\nnon-integer tick.  Every stage operates on the *selected rows only* — the gate\nis an index set, not a mask over a full-batch computation.\n\nTwo deliberate omissions relative to the competitive field:\n\n* **no global time reversal.**  It is applied there to symmetric families; the\n  gain is marginal and it mis-teaches causality on anything with an asymmetric\n  response, which is most of what we generate.\n* **no tail-concentrated regime break.**  Injecting breaks into the last\n  64-1024 samples of a fixed fraction of series teaches a positional artefact\n  over patch index and inflates predictive width everywhere.  Our breaks carry a\n  uniform hazard modulated by *observable* volatility precursors instead.\n\nThe rounding stage is the third departure, and the most consequential: it fires\nonly when the series\' standard deviation is at least ``round_min_ticks`` ticks.\nBlind rounding of unit-scale continuous families is what collapses a nominal\nAR(2)/GP/1-f corpus onto a three-to-five-level staircase.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nfrom cf_prims import bursty_gaps, human_tick, locf, logu, rolling_agg, safe_std\n\nMAX_PEAK = 1.0e12\n\n\ndef _rows(mask):\n    return np.nonzero(mask)[0]\n\n\n# ═════════════════════════════ observation layer ═══════════════════════════\n\ndef apply_observation(rng, y, flags, cfg):\n    n, L = y.shape\n    o = cfg["observation"]\n    boost = flags["obs_boost"]\n    integer = flags["integer"]\n    bounded = flags["bounded"]\n    positive = flags["positive"]\n\n    def gate(rate):\n        return rng.random(n) < np.clip(rate * boost, 0.0, 1.0)\n\n    # ── 1. block aggregation ────────────────────────────────────────────────\n    # Real feeds are frequently a rolling-window statistic of a finer signal: a\n    # max-aggregate has an extreme-value marginal, a mean-aggregate a smoothed\n    # one, and neither looks like the underlying process.  We aggregate causally\n    # at constant length so the emitted series stays a multiple of 32 samples.\n    lo_b = y.min(axis=1, keepdims=True)\n    hi_b = y.max(axis=1, keepdims=True)\n\n    sel = gate(o["block_aggregation_rate"])\n    ks = rng.integers(2, 13, n)\n    modes = rng.integers(0, 4, n)\n    modes = np.where(integer & (modes == 0), 1, modes)   # mean breaks a lattice\n    modes = np.where(bounded & (modes == 1), 2, modes)   # sum breaks a hard bound\n    if sel.any():\n        for k in range(2, 13):\n            for mode in range(4):\n                idx = _rows(sel & (ks == k) & (modes == mode))\n                if idx.size:\n                    y[idx] = rolling_agg(y[idx], k, mode)\n\n    # ── 2. quantisation to a round human tick ───────────────────────────────\n    qb = flags["quant_boost"]\n    idx = _rows((rng.random(n) < np.clip(o["quantise_rate"] * qb, 0.0, 1.0))\n                & (~integer))\n    if idx.size:\n        m = idx.size\n        sub = y[idx]\n        std = safe_std(sub)\n        tick = human_tick(std[:, 0], rng, m, 1e-3, flags["quant_rel_hi"][idx])\n        q = np.round(sub / tick) * tick\n        lg_sel = rng.random(m) < o["log_grid_share"]\n        if lg_sel.any():\n            j = _rows(lg_sel)\n            step = np.maximum(logu(rng, 0.01, 0.25, (j.size, 1)), 1e-6)\n            base = np.maximum(np.abs(sub[j]), 1e-300)\n            q[j] = np.sign(sub[j]) * np.exp(np.round(np.log(base) / step) * step)\n        y[idx] = q\n        flags["integer"][idx] = True\n\n    # ── 3. one-sided censoring at a round value ─────────────────────────────\n    idx = _rows(gate(o["censor_rate"]))\n    if idx.size:\n        m = idx.size\n        sub = y[idx]\n        std = safe_std(sub)\n        mean = sub.mean(axis=1, keepdims=True)\n        up = rng.random((m, 1)) < 0.5\n        lvl = mean + np.where(up, 1.0, -1.0) * logu(rng, 0.8, 2.6, (m, 1)) * std\n        tick = human_tick(std[:, 0], rng, m, 0.05, 0.5)\n        # an integer feed is clipped at an integer, not at an arbitrary tick\n        tick = np.where(integer[idx].reshape(m, 1), np.maximum(np.round(tick), 1.0), tick)\n        lvl = np.round(lvl / tick) * tick\n        y[idx] = np.where(up, np.minimum(sub, lvl), np.maximum(sub, lvl))\n\n    # ── 4. staleness (bursty last-observation-carried-forward) ──────────────\n    idx = _rows(gate(o["staleness_rate"]))\n    if idx.size:\n        m = idx.size\n        gap = bursty_gaps(rng, m, L, logu(rng, 1e-4, 4e-3, (m, 1)),\n                          logu(rng, 2.0, 60.0, (m, 1)))\n        y[idx] = locf(y[idx], gap)\n\n    # ── 5. missing-as-zero ──────────────────────────────────────────────────\n    idx = _rows(gate(o["missing_zero_rate"]) & (~bounded))\n    if idx.size:\n        m = idx.size\n        gap = bursty_gaps(rng, m, L, logu(rng, 1e-4, 3e-3, (m, 1)),\n                          logu(rng, 2.0, 40.0, (m, 1)))\n        sub = y[idx]\n        sub[gap] = 0.0\n        y[idx] = sub\n\n    # ── 6. isolated outliers ────────────────────────────────────────────────\n    idx = _rows(gate(o["outlier_rate"]) & (~bounded))\n    if idx.size:\n        m = idx.size\n        sub = y[idx]\n        thin = sub[:, ::8]\n        med = np.median(thin, axis=1, keepdims=True)\n        mad = np.maximum(np.median(np.abs(thin - med), axis=1, keepdims=True), 1e-12)\n        E = 5\n        pos = rng.integers(0, L, size=(m, E))\n        live = np.arange(E)[None, :] < rng.integers(1, E + 1, size=(m, 1))\n        sign = np.where(rng.random((m, 1)) < 0.5, 1.0, -1.0)\n        amp = logu(rng, 6.0, 60.0, (m, E)) * mad * sign\n        amp = np.where(integer[idx].reshape(m, 1), np.round(amp), amp)\n        rows = np.broadcast_to(np.arange(m)[:, None], (m, E))\n        np.add.at(sub, (rows[live], pos[live]), amp[live])\n        y[idx] = sub\n\n    # ── 7. instrument drift with abrupt recalibration ───────────────────────\n    idx = _rows(gate(o["drift_recal_rate"]) & (~bounded) & (~integer))\n    if idx.size:\n        m = idx.size\n        M = 8\n        seg = rng.integers(1, L, size=(m, M))\n        rows = np.broadcast_to(np.arange(m, dtype=np.int64)[:, None], (m, M))\n        mark = np.bincount((rows * L + seg).ravel(), minlength=m * L).reshape(m, L)\n        t = np.arange(L, dtype=np.float64)[None, :]\n        start = np.maximum.accumulate(np.where(mark > 0, t, 0.0), axis=1)\n        slope = rng.normal(0.0, 1.0, size=(m, 1)) * logu(rng, 1e-5, 3e-3, (m, 1))\n        sub = y[idx]\n        std = safe_std(sub)\n        bias = slope * (t - start) * std\n        mult = rng.random((m, 1)) < 0.5\n        y[idx] = np.where(mult,\n                          sub * (1.0 + np.clip(bias / std, -0.9, 3.0)),\n                          sub + bias)\n\n    # ── 8. scale-guarded rounding ───────────────────────────────────────────\n    idx = _rows(gate(o["round_rate"]) & (~integer) & (~bounded))\n    if idx.size:\n        m = idx.size\n        sub = y[idx]\n        std = safe_std(sub)\n        tick = human_tick(std[:, 0], rng, m, 1e-4, 1.0 / o["round_min_ticks"])\n        # a share of these land on the literal integer lattice, which is what a\n        # natural-unit feed (people, packets, requests) actually looks like\n        unit = (rng.random((m, 1)) < o["integer_tick_share"]) & \\\n            (std >= o["round_min_ticks"])\n        tick = np.where(unit, 1.0, tick)\n        ok = (std >= (o["round_min_ticks"] * tick))\n        y[idx] = np.where(ok, np.round(sub / tick) * tick, sub)\n        flags["integer"][idx] = flags["integer"][idx] | ok[:, 0]\n\n    idx = _rows(positive)\n    if idx.size:\n        np.maximum(y[idx], 0.0, out=y[idx])\n    # A family that declared hard bounds keeps them: the artefact stages must not\n    # move probability mass off a boundary we deliberately put there.\n    idx = _rows(bounded)\n    if idx.size:\n        y[idx] = np.clip(y[idx], lo_b[idx], hi_b[idx])\n    return y\n\n\n# ═══════════════════════════ scale and offset ══════════════════════════════\n\ndef apply_scale(rng, y, flags, cfg):\n    """Give every row a raw physical scale and offset.\n\n    The trainer\'s causal scaler removes absolute level and scale, so this is not\n    about magnitude for its own sake.  It is about the three things that *do*\n    survive that transform: the integer lattice relative to the running standard\n    deviation, the outlier-to-scale ratio under arcsinh, and how ``loc``/``scale``\n    themselves evolve.  The large-offset regime is deliberately over-represented\n    because a tiny relative variance on a large level is the small-MASE-\n    denominator regime, and the sign-crossing regime is over-represented because\n    a small sum|y| is what makes WQL a relative-error amplifier.\n    """\n    n, L = y.shape\n    s = cfg["scale"]\n    comps = s["log10_scale_mixture"]\n    ws = np.array([c["weight"] for c in comps], dtype=np.float64)\n    mus = np.array([c["mean"] for c in comps], dtype=np.float64)\n    sds = np.array([c["sigma"] for c in comps], dtype=np.float64)\n    k = np.searchsorted(np.cumsum(ws / ws.sum()), rng.random(n), side="right")\n    k = np.clip(k, 0, len(ws) - 1)\n    log10s = mus[k] + sds[k] * rng.standard_normal(n)\n    scale = np.power(10.0, np.clip(log10s, -11.0, 10.0)).reshape(n, 1)\n\n    mode = np.where(flags["count"], 2, flags["scale_mode"])\n    pref = flags["offset_pref"]\n\n    r = rng.random(n)\n    c0 = s["zero_anchor_share"]\n    c1 = c0 + s["large_offset_share"]\n    c2 = c1 + s["sign_cross_share"]\n    reg = np.where(r < c0, 0, np.where(r < c1, 1, np.where(r < c2, 2, 3)))\n    reg = np.where(pref == 1, 1, np.where(pref == 2, 0, np.where(pref == 3, 2, reg)))\n\n    big = rng.uniform(s["large_offset_ratio"][0], s["large_offset_ratio"][1], n)\n    off = np.where(reg == 0, 0.0,\n                   np.where(reg == 1, big,\n                            np.where(reg == 2, rng.standard_normal(n),\n                                     -np.abs(rng.standard_normal(n)) * big)))\n    # hard invariant: |offset| / scale <= 1e7, so the fluctuation always keeps\n    # at least nine significant digits of float64 headroom\n    off = np.clip(off, -1.0e7, 1.0e7).reshape(n, 1)\n\n    idx = _rows(mode == 0)\n    if idx.size:\n        sub = y[idx]\n        sub = sub - sub.mean(axis=1, keepdims=True)\n        sub = sub / safe_std(sub)\n        y[idx] = off[idx] * scale[idx] + scale[idx] * sub\n    idx = _rows(mode == 1)\n    if idx.size:\n        sub = y[idx]\n        mag = np.maximum(np.abs(sub).mean(axis=1, keepdims=True), 1e-200)\n        peak = np.maximum(np.abs(sub).max(axis=1, keepdims=True), 1e-200)\n        mult = np.minimum(scale[idx] / mag, MAX_PEAK / peak)\n        y[idx] = sub * mult\n    # keep the batch inside the magnitude envelope before anything downstream\n    # divides by a row statistic\n    peak = np.abs(y).max(axis=1, keepdims=True)\n    hot = _rows(peak[:, 0] > MAX_PEAK)\n    if hot.size:\n        y[hot] = y[hot] * (MAX_PEAK / peak[hot])\n    return y\n\n\n# ═════════════════════ structured hierarchical aggregation ═════════════════\n\ndef apply_aggregation(rng, y, flags, cad, cfg):\n    """Build a fraction of rows as genuine aggregates of same-cadence siblings.\n\n    A sum of K components driven by a common latent factor has a variance that\n    grows like K^2, while independent components give K.  That signature is the\n    correct model for national demand, grid totals, portfolio series and total\n    pageviews, and it is what a blind cross-family Dirichlet mixup destroys:\n    blending a Poisson count series with a chaotic attractor at a 1e4 scale ratio\n    produces a noised copy of the larger, not a composite.  We only ever combine\n    rows that share a cadence, and we restore the host row\'s own level and scale.\n    """\n    n, L = y.shape\n    sel = ((rng.random(n) < cfg["aggregation"]["rate"])\n           & flags["allow_agg"] & (~flags["count"]) & (~flags["bounded"]))\n    rows = _rows(sel)\n    if rows.size == 0:\n        return y\n    order = np.argsort(cad.seconds, kind="stable")\n    rank = np.empty(n, dtype=np.int64)\n    rank[order] = np.arange(n)\n    partners = order[(rank[:, None] + np.arange(1, 7)[None, :]) % n]\n    K = rng.integers(2, 7, n)\n    beta = rng.uniform(0.3, 1.0, size=(n, 6))\n    fshare = rng.uniform(0.2, 0.9, size=(n, 1))\n\n    need = np.unique(np.concatenate([rows, partners[rows].ravel()]))\n    z = np.zeros((n, L))\n    zs = y[need]\n    zs = zs - zs.mean(axis=1, keepdims=True)\n    z[need] = zs / safe_std(zs)\n\n    acc = np.zeros((rows.size, L))\n    for j in range(6):\n        live = (j < K[rows]) & (cad.seconds[partners[rows, j]] == cad.seconds[rows])\n        if live.any():\n            acc[live] += beta[rows[live], j:j + 1] * z[partners[rows[live], j]]\n    factor = z[partners[rows, 0]]\n    agg = (fshare[rows] * factor * np.sqrt(np.maximum(K[rows], 1)[:, None])\n           + (1.0 - fshare[rows]) * acc)\n    span = np.abs(agg).max(axis=1, keepdims=True)\n    ok = agg.std(axis=1, keepdims=True) > 1e-9 * np.maximum(span, 1e-300)\n    agg = np.where(ok, agg / safe_std(agg), 0.0)\n    host = y[rows]\n    blended = host.mean(axis=1, keepdims=True) + safe_std(host) * agg\n    y[rows] = np.where(ok, blended, host)\n    return y\n\n\n# ═══════════════════════════════ sanitiser ═════════════════════════════════\n\ndef sanitise(rng, y, flags, starts, cfg):\n    """Finiteness, degeneracy, cold-start and magnitude guards, in that order.\n\n    ``starts`` gives each row\'s emit offset, so the constant-prefix guard is\n    applied to the window the trainer will actually see: the causal scaler begins\n    at the first emitted sample, and a constant lead-in drives its standard\n    deviation to the 1e-5 floor and clamps the standardised input at +-64.\n    """\n    n, L = y.shape\n    bad = _rows(~np.isfinite(y.sum(axis=1)))\n    if bad.size:\n        y[bad] = np.nan_to_num(y[bad], nan=0.0, posinf=MAX_PEAK, neginf=-MAX_PEAK)\n\n    # degeneracy: regenerate from a cheap fallback rather than emit a flat row\n    span = y.max(axis=1) - y.min(axis=1)\n    ref = np.maximum(np.abs(y).mean(axis=1), 1e-300)\n    dead = _rows((span <= 1e-12 * ref) | (span == 0.0))\n    if dead.size:\n        c = dead.size\n        t = np.arange(L, dtype=np.float64)[None, :]\n        phi = rng.uniform(0.5, 0.99, size=(c, 1))\n        w = np.cumsum(rng.standard_normal((c, L)) * np.sqrt(1.0 - phi ** 2),\n                      axis=1) * 0.05\n        seas = np.sin(2.0 * np.pi * t / rng.uniform(12.0, 400.0, size=(c, 1)))\n        lvl = y[dead].mean(axis=1, keepdims=True)\n        base = np.where(np.abs(lvl) > 1e-300, lvl, 1.0)\n        y[dead] = base * (1.0 + 0.05 * (w + seas))\n\n    _break_constant_prefix(rng, y, flags, starts)\n\n    peak = np.abs(y).max(axis=1, keepdims=True)\n    hot = _rows(peak[:, 0] > MAX_PEAK)\n    if hot.size:\n        # rescale rather than clip: clipping flat-tops exactly the extreme\n        # events we paid to generate\n        y[hot] = y[hot] * (MAX_PEAK / peak[hot])\n    return y\n\n\ndef _break_constant_prefix(rng, y, flags, starts, window=128):\n    """No emitted window may open with ``window`` exactly constant samples.\n\n    Constant series are structurally forbidden here.  They waste token budget and\n    they are a degenerate input to the causal arcsinh scaler, so a cold start is\n    always a real onset carrying at least tick-level jitter.\n    """\n    n, L = y.shape\n    idx = np.minimum(starts[:, None] + np.arange(window)[None, :], L - 1)\n    head = np.take_along_axis(y, idx, axis=1)\n    rows = _rows(np.all(np.diff(head, axis=1) == 0.0, axis=1))\n    if rows.size == 0:\n        return\n    m = rows.size\n    std = y[rows].std(axis=1)\n    lvl = np.maximum(np.abs(y[rows]).mean(axis=1), 1e-12)\n    unit = np.where(flags["integer"][rows], 1.0,\n                    np.maximum(std, lvl * 1e-4) * rng.uniform(0.05, 0.4, m))\n    unit = np.where(unit > 0.0, unit, 1e-9)\n    sgn = np.where(flags["positive"][rows], 1.0,\n                   np.where(rng.random(m) < 0.5, 1.0, -1.0))\n    for _ in range(3):\n        pos = np.minimum(starts[rows] + rng.integers(4, window - 4, m), L - 1)\n        y[rows, pos] = y[rows, pos] + unit * sgn\n\n\n# ═════════════════════════════ count prior ═════════════════════════════════\n\ndef apply_count_prior(rng, y, flags, cfg):\n    """Impose the eval pool\'s dominant signature on a share of rows.\n\n    Measured on the revealed pool (block 8838000, 2,256 series): the median\n    series is 100% integer-valued, p90 negativity is 0.00, and the median series\n    has only ~9% distinct values.  Transport (the largest domain) is 68% exact\n    repeats with ~16 levels; sales spans ~476.  A corpus of signed, continuous,\n    high-entropy series teaches the wrong prior for most of the eval mass.\n\n    For ``count_prior_rate`` of the non-bounded rows: shift so the minimum sits\n    at a small positive floor (``[0, count_floor_frac] * std``), then for\n    ``count_integer_share`` of those, quantise onto ``n_levels`` equally spaced\n    integer levels with ``log10(n_levels)`` uniform on ``count_levels_log10``.\n    Quantising to a *level count* rather than to 1.0 keeps the stage scale-free\n    (the row has already been through the log10 scale mixture) and lets the\n    corpus span the pool\'s whole resolution range instead of one point in it.\n    Runs after scale and aggregation, on its own stream, so rate 0 leaves every\n    byte untouched.\n    """\n    o = cfg["observation"]\n    rate = float(o.get("count_prior_rate", 0.0))\n    if rate <= 0.0:\n        return y\n    n, L = y.shape\n    bounded = flags["bounded"]\n    sel = _rows((rng.random(n) < rate) & (~bounded))\n    if sel.size == 0:\n        return y\n    rows = y[sel]\n    std = np.maximum(rows.std(axis=1, keepdims=True), 1e-12)\n    lo = rows.min(axis=1, keepdims=True)\n    floor = std * rng.uniform(0.0, float(o.get("count_floor_frac", 0.15)), size=(sel.size, 1))\n    rows = rows + np.where(lo < floor, floor - lo, 0.0)\n    flags["positive"][sel] = True\n    ishare = float(o.get("count_integer_share", 0.86))\n    imask = rng.random(sel.size) < ishare\n    if imask.any():\n        lg = o.get("count_levels_log10", [0.9, 2.7])\n        nlev = 10.0 ** rng.uniform(float(lg[0]), float(lg[1]), size=(sel.size, 1))\n        r = rows[imask]\n        rlo = r.min(axis=1, keepdims=True)\n        span = np.maximum(r.max(axis=1, keepdims=True) - rlo, 1e-12)\n        tick = span / np.maximum(nlev[imask], 2.0)\n        r = np.rint((r - rlo) / tick) + np.rint(rlo / tick)   # integers, >= 0\n        rows[imask] = np.maximum(r, 0.0)\n        ii = sel[imask]\n        flags["integer"][ii] = True\n    y[sel] = rows\n    return y\n',
     'cf_fam_met': '"""Block A — meteorological / geophysical families.\n\nWhy this block is the largest: the evaluation pool\'s weather source emits\nroughly 252 global grid points x 12 ERA5 variables and attaches no ``source``\nmetadata, so every weather row is its own bootstrap cluster.  That makes weather\nthe dominant share of both eval windows and — far more importantly — of the\n*clusters* the confidence bound is resampled over.  A consistent weather win\nconverts almost one-for-one into LCB.\n\nComposition of those twelve variables: three smooth thermal, two ultra-smooth\npressure, four **bounded with genuine probability mass on a boundary** (three\ncloud-cover channels and relative humidity), and three non-negative\nright-skewed (wind at two heights plus gusts).  The bounded-with-atoms group is\nthe single largest addressable block in the pool and is exactly what an\nunbounded symmetric predictive distribution wastes quantile mass on.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nfrom cf_prims import complete_dwell_table\nfrom cf_prims import (TWO_PI, ar1, categorical, gather_levels, hawkes, logu,\n                    new_flags, profile_trapezoid, run_mask, segment_map,\n                    unit_std)\nfrom cf_spectral import matern_gp, time_grid\n\n\n# ══════════════════════════ shared bounded latent ══════════════════════════\n\ndef bounded_latent(rng, n, L, ell, beta, diurnal, phi_ar, ar_frac):\n    """Standardised latent for a hard-censored bounded process.\n\n    Combines a synoptic Matern field, an optional diurnal term and AR(1)\n    micro-structure, then standardises.  The *censoring* (not a logistic\n    squash) is applied by the caller, which is what makes the boundary a\n    genuine point mass rather than an asymptote.\n    """\n    z = matern_gp(rng, n, L, ell, nu=1.5)\n    if diurnal is not None:\n        z = z + beta * diurnal\n    z = z + ar_frac * ar1(rng, n, L, phi_ar)\n    return unit_std(z)\n\n\ndef censor(z, eta, c, upper):\n    """y = U * clip(eta z + c, 0, 1) — hard censoring, so both bounds are atoms."""\n    return upper * np.clip(eta * z + c, 0.0, 1.0)\n\n\n# ══════════════════════════════ A1 met_thermal ═════════════════════════════\n\ndef a1_params(rng, B, cfg):\n    p = cfg["families"]["met_thermal"]\n    regime = categorical(rng, p["diurnal_amp_mix"], B)\n    a_small = logu(rng, 1e-3, 0.05, B)\n    a_mid = logu(rng, 0.1, 0.6, B)\n    a_big = logu(rng, 0.6, 2.0, B)\n    amp_d = np.where(regime == 0, a_small, np.where(regime == 1, a_mid, a_big))\n    return {\n        "ell_syn": logu(rng, p["synoptic_ell"][0], p["synoptic_ell"][1], B),\n        "amp_syn": logu(rng, p["synoptic_amp"][0], p["synoptic_amp"][1], B),\n        "amp_d": amp_d,\n        "kappa": rng.uniform(0.15, 0.55, B),\n        "rho": rng.uniform(p["cloud_coupling"][0], p["cloud_coupling"][1], B),\n        "cloud_ell": logu(rng, 6.0, 200.0, B),\n        "cloud_eta": logu(rng, 0.8, 3.0, B),\n        "cloud_c": rng.normal(0.45, 0.35, B),\n        "front_rate": rng.uniform(1.0, 4.0, B) / 1000.0,\n        "front_ramp": logu(rng, 3.0, 24.0, B),\n        "front_mag": rng.normal(0.0, 1.2, B),\n        "phi_e": rng.uniform(0.2, 0.75, B),\n        "sig_e": logu(rng, p["noise_ratio"][0], p["noise_ratio"][1], B),\n        "annual": rng.random(B) < p["annual_rate"],\n        "annual_amp": rng.normal(0.0, 1.0, B),\n    }\n\n\ndef a1_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    p_day = cad.p_day.reshape(n, 1)\n\n    syn = matern_gp(rng, n, L, P["ell_syn"], nu=1.5) * P["amp_syn"].reshape(n, 1)\n\n    # cloudiness latent — the same machinery as A3, which is why the diurnal\n    # amplitude envelope is physically correct rather than an arbitrary AM.\n    cz = bounded_latent(rng, n, L, P["cloud_ell"], 0.0, None,\n                        rng.uniform(0.3, 0.7, n), 0.25)\n    cloud = np.clip(P["cloud_eta"].reshape(n, 1) * cz + P["cloud_c"].reshape(n, 1),\n                    0.0, 1.0)\n\n    has_diurnal = (p_day >= 3.0)\n    per = np.where(has_diurnal, p_day, 1e9)\n    ph = t / per + rng.random((n, 1))\n    k = P["kappa"].reshape(n, 1)\n    phw = ph + (k / TWO_PI) * np.sin(TWO_PI * ph)\n    # asymmetric daily shape: fast morning rise, slow evening fall\n    daily = np.sin(TWO_PI * phw) + 0.25 * np.sin(2.0 * TWO_PI * phw + 0.9)\n    amp_t = (P["amp_d"].reshape(n, 1) * P["amp_syn"].reshape(n, 1)\n             * (1.0 - P["rho"].reshape(n, 1) * cloud))\n    diurnal = np.where(has_diurnal, daily * amp_t, 0.0)\n\n    # frontal passages: smooth monotone ramps, not steps\n    E = 6\n    cnt = rng.poisson(np.maximum(P["front_rate"].reshape(n, 1) * L, 0.0), size=(n, E))\n    pos = rng.integers(0, L, size=(n, E)).astype(np.float64)\n    mag = rng.standard_normal((n, E)) * (P["front_mag"].reshape(n, 1)\n                                         * P["amp_syn"].reshape(n, 1))\n    width = np.maximum(P["front_ramp"].reshape(n, 1)\n                       * np.exp(rng.normal(0.0, 0.4, size=(n, E))), 1.0)\n    front = np.zeros((n, L))\n    for j in range(E):\n        idx = np.nonzero(cnt[:, j] > 0)[0]\n        if idx.size == 0:\n            continue\n        u = (t - pos[idx, j:j + 1]) / width[idx, j:j + 1]\n        front[idx] += mag[idx, j:j + 1] * 0.5 * (1.0 + u / (1.0 + np.abs(u)))\n\n    eps = ar1(rng, n, L, P["phi_e"]) * (P["sig_e"].reshape(n, 1)\n                                        * P["amp_syn"].reshape(n, 1))\n\n    ann = np.where(P["annual"].reshape(n, 1),\n                   P["annual_amp"].reshape(n, 1) * P["amp_syn"].reshape(n, 1)\n                   * ((t / L) - 0.5) ** 2 * 4.0, 0.0)\n\n    y = syn + diurnal + front + eps + ann\n    fl = new_flags(n, scale_mode=0, quant_boost=0.7, quant_rel_hi=0.35)\n    return y, fl\n\n\n# ═══════════════════════ A2 met_pressure_smooth ════════════════════════════\n\ndef a2_params(rng, B, cfg):\n    p = cfg["families"]["met_pressure_smooth"]\n    return {\n        "ell_syn": logu(rng, p["synoptic_ell"][0], p["synoptic_ell"][1], B),\n        "tide_amp": rng.uniform(0.15, 0.45, B) * 0.06,\n        "dip_on": rng.random(B) < p["dip_rate"],\n        "dip_depth": rng.uniform(1.5, 4.0, B),\n        "dip_width": logu(rng, 24.0, 180.0, B),\n        "sig_e": logu(rng, p["noise_ratio"][0], p["noise_ratio"][1], B),\n        "quant": rng.random(B) < p["quantise_rate"],\n    }\n\n\ndef a2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    p_day = cad.p_day.reshape(n, 1)\n\n    # Matern-5/2 is twice mean-square differentiable: it has genuinely\n    # extrapolable local curvature, which is the only thing a 64-step forecast\n    # of a pressure field can exploit.\n    syn = matern_gp(rng, n, L, P["ell_syn"], nu=2.5)\n\n    has_day = p_day >= 4.0\n    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))\n    tide = np.where(has_day,\n                    P["tide_amp"].reshape(n, 1)\n                    * (np.sin(2.0 * TWO_PI * ph) + 0.5 * np.sin(TWO_PI * ph + 1.1)),\n                    0.0)\n\n    E = 2\n    dpos = rng.integers(0, L, size=(n, E)).astype(np.float64)\n    dw = P["dip_width"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.3, size=(n, E)))\n    dip = np.zeros((n, L))\n    live = P["dip_on"].reshape(n, 1) & (rng.random((n, E)) < 0.6)\n    for j in range(E):\n        idx = np.nonzero(live[:, j])[0]\n        if idx.size == 0:\n            continue\n        dip[idx] -= P["dip_depth"][idx].reshape(-1, 1) * np.exp(\n            -0.5 * ((t - dpos[idx, j:j + 1])\n                    / np.maximum(dw[idx, j:j + 1], 1.0)) ** 2)\n\n    eps = rng.standard_normal((n, L)) * P["sig_e"].reshape(n, 1)\n\n    y = syn + tide + dip + eps\n    # The defining property is a tiny relative variance riding on a large level:\n    # that is the small-MASE-denominator regime, where any trend error explodes\n    # log-MASE.  offset_pref = 1 forces the large-offset scale regime.\n    fl = new_flags(n, scale_mode=0, offset_pref=1, quant_rel_hi=0.55)\n    fl["quant_boost"] = np.where(P["quant"], 3.0, 0.4)\n    return y, fl\n\n\n# ═══════════════════════ A3 met_bounded_atom ═══════════════════════════════\n\nUPPER_GRID = np.array([1.0, 8.0, 10.0, 100.0, 1000.0])\n\n\ndef a3_params(rng, B, cfg):\n    p = cfg["families"]["met_bounded_atom"]\n    variant = categorical(rng, p["variant_mix"], B)          # cloud / humidity / utilisation\n    return {\n        "variant": variant,\n        "ell": logu(rng, p["latent_ell"][0], p["latent_ell"][1], B),\n        "eta": logu(rng, p["eta"][0], p["eta"][1], B),\n        "c": rng.normal(p["centre_mean"], p["centre_sigma"], B),\n        "beta_cloud": rng.uniform(0.0, 0.25, B),\n        "beta_hum": rng.uniform(0.4, 1.1, B),\n        "phi_ar": rng.uniform(0.3, 0.85, B),\n        "ar_frac": logu(rng, 0.05, 0.45, B),\n        "upper": UPPER_GRID[categorical(rng, p["upper_mix"], B)],\n        "quantise": rng.random(B) < p["quantise_rate"],\n        "event_on": rng.random(B) < p["saturation_event_rate"],\n        "event_mu": logu(rng, 2e-4, 4e-3, B),\n        "event_branch": rng.uniform(0.2, 0.8, B),\n        "event_tau": logu(rng, 20.0, 400.0, B),\n        "event_len": logu(rng, 2.0, 30.0, B),\n    }\n\n\ndef a3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    p_day = cad.p_day.reshape(n, 1)\n    variant = P["variant"]\n\n    has_day = p_day >= 3.0\n    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))\n    daily = np.sin(TWO_PI * ph)\n    biz = profile_trapezoid(rng, n, L, ph)\n    biz = unit_std(biz)\n\n    beta = np.where((variant == 0).reshape(n, 1), P["beta_cloud"].reshape(n, 1),\n                    np.where((variant == 1).reshape(n, 1),\n                             -P["beta_hum"].reshape(n, 1),  # humidity is anti-phase\n                             0.0))\n    diurnal = np.where((variant == 2).reshape(n, 1), biz, daily)\n    diurnal = np.where(has_day, diurnal, 0.0)\n    beta = np.where((variant == 2).reshape(n, 1), P["beta_hum"].reshape(n, 1) * 0.6, beta)\n\n    z = bounded_latent(rng, n, L, P["ell"], beta, diurnal, P["phi_ar"],\n                       P["ar_frac"].reshape(n, 1))\n    upper = P["upper"].reshape(n, 1)\n    y = censor(z, P["eta"].reshape(n, 1), P["c"].reshape(n, 1), upper)\n\n    # clustered saturation events (rain / overcast spells) pin the ceiling\n    on = P["event_on"]\n    if on.any():\n        mu = np.where(on.reshape(n, 1), P["event_mu"].reshape(n, 1), 0.0)\n        _, cnt = hawkes(rng, n, L, np.broadcast_to(mu, (n, L)).copy(),\n                        P["event_branch"], P["event_tau"])\n        starts = np.argsort(-cnt, axis=1)[:, :6]\n        lens = (P["event_len"].reshape(n, 1)\n                * np.exp(rng.normal(0.0, 0.5, size=(n, 6))))\n        live = np.take_along_axis(cnt, starts, axis=1) > 0\n        mask = run_mask(n, L, starts, np.where(live, lens, 0.0))\n        y = np.where(mask & on.reshape(n, 1), upper, y)\n\n    q = P["quantise"].reshape(n, 1)\n    step = np.where(upper <= 1.0, upper / 100.0, 1.0)\n    y = np.where(q, np.round(y / step) * step, y)\n\n    fl = new_flags(n, scale_mode=2, bounded=True, positive=True,\n                   quant_boost=0.0, obs_boost=0.5, allow_agg=False)\n    fl["integer"] = (P["quantise"] & (P["upper"] > 1.0))\n    return y, fl\n\n\n# ═══════════════════════════ A4 met_wind_speed ═════════════════════════════\n\ndef a4_params(rng, B, cfg):\n    p = cfg["families"]["met_wind_speed"]\n    return {\n        "ell": logu(rng, p["component_ell"][0], p["component_ell"][1], B),\n        "mean_wind": logu(rng, 0.2, 6.0, B),\n        "gamma_mix": rng.uniform(-0.4, 0.8, B),\n        "gust": rng.random(B) < p["gust_rate"],\n        "gust_phi": rng.uniform(0.1, 0.5, B),\n        "gust_sig": rng.uniform(0.35, 0.7, B),\n        "drift_amp": rng.uniform(0.0, 1.2, B),\n        "quantise": rng.random(B) < p["quantise_rate"],\n        "quant_step": np.where(rng.random(B) < 0.5, 0.1, 1.0),\n    }\n\n\ndef a4_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    p_day = cad.p_day.reshape(n, 1)\n\n    u = matern_gp(rng, n, L, P["ell"], nu=1.5)\n    v = matern_gp(rng, n, L, P["ell"], nu=1.5)\n\n    has_day = p_day >= 3.0\n    ph = t / np.where(has_day, p_day, 1e9) + rng.random((n, 1))\n    prof = np.where(has_day, np.sin(TWO_PI * ph - 1.2), 0.0)\n    sig = 1.0 + P["gamma_mix"].reshape(n, 1) * 0.5 * prof\n    sig = np.maximum(sig, 0.15)\n\n    drift = matern_gp(rng, n, L, np.full(n, L / 2.0), nu=1.5) \\\n        * P["drift_amp"].reshape(n, 1)\n    mw = P["mean_wind"].reshape(n, 1)\n    # Rice/Weibull marginal with a genuine hard floor at zero\n    s = np.sqrt((u * sig + drift) ** 2 + (v * sig) ** 2) * mw\n\n    g = P["gust"].reshape(n, 1)\n    lg = ar1(rng, n, L, P["gust_phi"]) * P["gust_sig"].reshape(n, 1) + np.log(0.35)\n    s = np.where(g, s * (1.0 + np.exp(np.clip(lg, -20.0, 6.0))), s)\n\n    q = P["quantise"].reshape(n, 1)\n    step = P["quant_step"].reshape(n, 1)\n    s = np.where(q, np.round(s / step) * step, s)\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.5,\n                   quant_rel_hi=0.4)\n    return s, fl\n\n\n# ═══════════════════════ A5 wet_dry_intermittent ═══════════════════════════\n\ndef a5_params(rng, B, cfg):\n    p = cfg["families"]["wet_dry_intermittent"]\n    return {\n        "d_dry": logu(rng, p["dry_dwell"][0], p["dry_dwell"][1], B),\n        "d_wet": logu(rng, p["wet_dwell"][0], p["wet_dwell"][1], B),\n        "k_int": rng.uniform(p["intensity_shape"][0], p["intensity_shape"][1], B),\n        "theta": logu(rng, 0.2, 20.0, B),\n        "start_wet": rng.random(B) < 0.15,\n        "bell": rng.random(B) < 0.7,\n    }\n\n\ndef a5_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    M = 96\n    dry = np.exp(rng.normal(np.log(P["d_dry"]).reshape(n, 1), 1.1, size=(n, M)))\n    wet = np.exp(rng.normal(np.log(P["d_wet"]).reshape(n, 1), 0.8, size=(n, M)))\n    dwell = np.empty((n, M))\n    sw = P["start_wet"].reshape(n, 1)\n    even = (np.arange(M)[None, :] % 2) == 0\n    dwell = np.where(even ^ sw, dry, wet)\n    dwell = np.maximum(dwell, 1.0)\n\n    seg_id, seg_start = segment_map(dwell, L)\n    seg_len = gather_levels(dwell, seg_id)\n    is_wet = ((seg_id % 2) == 1) ^ sw\n\n    t = time_grid(L)[None, :]\n    pos = (t - seg_start) / np.maximum(seg_len, 1.0)\n    env = np.where(P["bell"].reshape(n, 1), np.sin(np.pi * np.clip(pos, 0.0, 1.0)), 1.0)\n\n    k = np.maximum(P["k_int"].reshape(n, 1), 1e-2)\n    inten = rng.gamma(np.broadcast_to(k, (n, L))) * P["theta"].reshape(n, 1)\n    y = np.where(is_wet, inten * env, 0.0)\n\n    extended = np.zeros(n, dtype=bool)\n    if cfg.get(\'_complete_native_renewals\', False):\n        med = np.column_stack((np.where(P[\'start_wet\'], P[\'d_wet\'], P[\'d_dry\']),\n                               np.where(P[\'start_wet\'], P[\'d_dry\'], P[\'d_wet\'])))\n        sig = np.column_stack((np.where(P[\'start_wet\'], 0.8, 1.1),\n                               np.where(P[\'start_wet\'], 1.1, 0.8)))\n        rr, dd, first = complete_dwell_table(rng, dwell, L, med, sig, 1.0)\n        if rr.size:\n            extended[rr] = True\n            sid, start = segment_map(dd, L)\n            slen = gather_levels(dd, sid)\n            wet_now = ((sid % 2) == 1) ^ sw[rr]\n            progress = (t - start) / np.maximum(slen, 1.0)\n            env_now = np.where(P[\'bell\'][rr, None], np.sin(np.pi * np.clip(progress, 0.0, 1.0)), 1.0)\n            fixed = np.where(wet_now, inten[rr] * env_now, 0.0)\n            y[rr] = np.where(t >= first[:, None], fixed, y[rr])\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=1.2,\n                   quant_rel_hi=0.3, allow_agg=True)\n    if cfg.get(\'_complete_native_renewals\', False):\n        fl[\'renewal_extended\'] = extended\n    return y, fl\n',
-    'cf_fam_ops': '"""Block B — operational telemetry / web-cloudops families.\n\nThe web-cloudops domain is one of the two the field loses.  The diagnosis is\nstructural: these shapes are produced by *control systems*, and every family in\nthe competitive field is open-loop.  An autoscaling sawtooth, a rate-limit\nplateau, a queue backlog, a deploy overshoot-and-settle and a counter reset are\nall closed-loop artefacts.  A model trained only on open-loop processes treats a\nsawtooth as a staircase plus noise and cannot anticipate the next scale-out.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nimport cf_kernels as K\nfrom cf_calendars import apply_dow, dst_shift\nfrom cf_prims import complete_dwell_table\nfrom cf_prims import (TWO_PI, ar1, categorical, decay_convolve, gather_levels,\n                    hawkes, locf, logu, nb_counts, new_flags,\n                    profile_trapezoid, run_mask, segment_map)\nfrom cf_spectral import time_grid\n\n\ndef _daily_phase(rng, n, L, p_day, min_res=3.0):\n    t = time_grid(L)[None, :]\n    pd = np.asarray(p_day).reshape(n, 1)\n    has = pd >= min_res\n    return np.where(has, t / np.where(has, pd, 1e9), 0.0) + rng.random((n, 1)), has\n\n\n# ═══════════════════════ B1 ops_diurnal_traffic ════════════════════════════\n\ndef b1_params(rng, B, cfg):\n    p = cfg["families"]["ops_diurnal_traffic"]\n    return {\n        "base": logu(rng, 1.0, 5.0e4, B),\n        "theta_taylor": rng.uniform(p["taylor_exponent"][0], p["taylor_exponent"][1], B),\n        "cv": logu(rng, 0.03, 0.6, B),\n        "burst_on": rng.random(B) < p["burst_rate"],\n        "branch": rng.uniform(0.2, 0.85, B),\n        "burst_tau": logu(rng, 3.0, 120.0, B),\n        "mark_sig": rng.uniform(0.6, 1.6, B),\n        "burst_mu": logu(rng, 1e-4, 5e-3, B),\n        "count_emit": rng.random(B) < p["count_emit_rate"],\n        "nb_k": logu(rng, 0.5, 200.0, B),\n        "weekend": np.exp(rng.normal(np.log(0.42), 0.5, B)),\n        "sat_sun": np.exp(rng.normal(0.0, 0.25, B)),\n        "trend": rng.normal(0.0, 0.25, B),\n        "growth_on": rng.random(B) < 0.45,\n        "dst": rng.random(B) < p["dst_rate"],\n    }\n\n\ndef b1_demand(P, rng, L, cad, cal, cfg):\n    """Shared demand process — also the driver for B2\'s controller."""\n    n = cad.n\n    t = time_grid(L)[None, :]\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    # Civil-time operational feeds shift by an hour twice a year; the weather\n    # families deliberately do NOT, because that source requests UTC.\n    ph = ph + np.where(P["dst"].reshape(n, 1), dst_shift(rng, cal, 1.0), 0.0)\n    prof = profile_trapezoid(rng, n, L, ph)\n    prof = np.where(has_day, prof, 0.0)\n    prof = prof - prof.min(axis=1, keepdims=True)\n    m = np.maximum(prof.mean(axis=1, keepdims=True), 1e-9)\n    shape = 0.25 + 0.75 * prof / m\n\n    wk = np.ones((n, 7))\n    wk[:, 5] = P["weekend"]\n    wk[:, 6] = P["weekend"] * P["sat_sun"]\n    weekly = apply_dow(wk, cal)\n\n    trend = np.where(P["growth_on"].reshape(n, 1),\n                     np.exp(P["trend"].reshape(n, 1) * t / L), 1.0)\n\n    lam = P["base"].reshape(n, 1) * shape * weekly * trend\n\n    # bursts arrive when traffic is high: immigrant rate proportional to lambda\n    mu = (P["burst_mu"].reshape(n, 1) * shape\n          * np.where(P["burst_on"].reshape(n, 1), 1.0, 0.0))\n    _, cnt = hawkes(rng, n, L, np.ascontiguousarray(mu), P["branch"], P["burst_tau"])\n    marks = cnt * np.exp(rng.normal(0.0, P["mark_sig"].reshape(n, 1), size=(n, L)))\n    burst = decay_convolve(marks, P["burst_tau"])\n    lam = lam * (1.0 + 2.5 * burst)\n    return np.maximum(lam, 0.0)\n\n\ndef b1_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    lam = b1_demand(P, rng, L, cad, cal, cfg)\n    # Taylor\'s law heteroscedasticity: sigma proportional to lambda^theta\n    z = rng.standard_normal((n, L))\n    sig = P["cv"].reshape(n, 1) * np.power(np.maximum(lam, 1e-12),\n                                           P["theta_taylor"].reshape(n, 1))\n    y = np.maximum(lam + sig * z, 0.0)\n    ci = P["count_emit"].reshape(n, 1)\n    counts = nb_counts(rng, lam, P["nb_k"])\n    y = np.where(ci, counts, y)\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.8)\n    fl["integer"] = P["count_emit"]\n    return y, fl\n\n\n# ════════════════════ B2 ops_saturating_feedback ═══════════════════════════\n\ndef b2_params(rng, B, cfg):\n    p = cfg["families"]["ops_saturating_feedback"]\n    q = b1_params(rng, B, cfg)\n    q.update({\n        "th_up": rng.uniform(0.6, 0.9, B),\n        "th_dn": rng.uniform(0.15, 0.45, B),\n        "gam": rng.uniform(p["step_gain"][0], p["step_gain"][1], B),\n        "k_up": rng.integers(3, 61, B),\n        "k_dn": rng.integers(3, 61, B),\n        "lag": np.round(logu(rng, 2.0, 20.0, B)).astype(np.int64),\n        "mode": categorical(rng, p["emit_mix"], B),\n        "u_scale": np.array([1.0, 100.0])[categorical(rng, [0.35, 0.65], B)],\n    })\n    return q\n\n\ndef b2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    d = b1_demand(P, rng, L, cad, cal, cfg)\n    c0 = np.maximum(d[:, :64].mean(axis=1) / 0.7, 1e-6)\n    out = np.zeros((n, L))\n    cap = np.zeros((n, L))\n    K.k_feedback(np.ascontiguousarray(d),\n                 np.ascontiguousarray(P["th_up"]),\n                 np.ascontiguousarray(P["th_dn"]),\n                 np.ascontiguousarray(P["k_up"]).astype(np.int64),\n                 np.ascontiguousarray(P["k_dn"]).astype(np.int64),\n                 np.ascontiguousarray(P["gam"]),\n                 np.ascontiguousarray(P["lag"]).astype(np.int64),\n                 c0, np.ascontiguousarray(P["mode"]).astype(np.int64), out, cap)\n    mode = P["mode"].reshape(n, 1)\n    y = np.where(mode == 0, out * P["u_scale"].reshape(n, 1), out)\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.8)\n    fl["bounded"] = (P["mode"] == 0)\n    fl["scale_mode"] = np.where(P["mode"] == 0, 2, 1).astype(np.int8)\n    return y, fl\n\n\n# ═══════════════════════ B3 ops_counter_reset ══════════════════════════════\n\ndef b3_params(rng, B, cfg):\n    p = cfg["families"]["ops_counter_reset"]\n    return {\n        "rate": logu(rng, 1.0, 4.0e3, B),\n        "nb_k": logu(rng, 0.4, 60.0, B),\n        "reset_mode": categorical(rng, p["reset_mix"], B),\n        "reset_tau": logu(rng, 400.0, 4000.0, B),\n        "cal_week": rng.random(B) < 0.35,\n        "diurnal_amp": rng.uniform(0.0, 0.9, B),\n        "revise": rng.random(B) < p["revision_rate"],\n        "revise_k": rng.integers(2, 9, B),\n        "revise_depth": rng.uniform(0.02, 0.3, B),\n        "integer": rng.random(B) < 0.55,\n    }\n\n\ndef b3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(TWO_PI * ph), 0.0)\n    mean_inc = P["rate"].reshape(n, 1) * np.maximum(prof, 0.05)\n    inc = nb_counts(rng, mean_inc, P["nb_k"])\n    cont = np.maximum(mean_inc * rng.gamma(np.broadcast_to(\n        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), (n, L))) /\n        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), 0.0)\n    inc = np.where(P["integer"].reshape(n, 1), inc, cont)\n\n    mode = P["reset_mode"].reshape(n, 1)\n    poisson_reset = rng.random((n, L)) < (1.0 / P["reset_tau"].reshape(n, 1))\n    day_idx = cal.day_index\n    period = np.where(P["cal_week"].reshape(n, 1), 7, 1)\n    blk = day_idx // np.maximum(period, 1)\n    cal_reset = np.zeros((n, L), dtype=bool)\n    cal_reset[:, 1:] = blk[:, 1:] != blk[:, :-1]\n    reset = np.where(mode == 0, poisson_reset,\n                     np.where(mode == 1, cal_reset, False))\n    out = np.zeros((n, L))\n    K.k_counter_reset_cal(np.ascontiguousarray(inc),\n                          np.ascontiguousarray(reset).astype(np.int8), out)\n\n    # revisions: the last few published points are corrected downward\n    if P["revise"].any():\n        age = (L - 1) - np.arange(L)[None, :]\n        w = np.clip(1.0 - age / np.maximum(P["revise_k"].reshape(n, 1), 1), 0.0, 1.0)\n        out = np.where(P["revise"].reshape(n, 1),\n                       out * (1.0 - w * P["revise_depth"].reshape(n, 1)), out)\n\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.3)\n    fl["integer"] = P["integer"] & (~P["revise"])\n    return out, fl\n\n\n# ═══════════════════════ B4 ops_latency_queue ══════════════════════════════\n\ndef b4_params(rng, B, cfg):\n    p = cfg["families"]["ops_latency_queue"]\n    return {\n        "rho_mu": rng.normal(-0.8, 1.0, B),\n        "rho_phi": rng.uniform(0.85, 0.999, B),\n        "rho_sig": rng.uniform(0.2, 1.2, B),\n        "service": logu(rng, 1e-3, 100.0, B),\n        "lognorm": rng.random(B) < p["lognormal_rate"],\n        "ln_sig": rng.uniform(0.4, 1.3, B),\n        "pareto_a": rng.uniform(1.6, 3.5, B),\n        "agg": rng.random(B) < p["percentile_rate"],\n        "agg_m": rng.integers(8, 201, B),\n    }\n\n\ndef b4_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    lr = ar1(rng, n, L, P["rho_phi"]) * P["rho_sig"].reshape(n, 1) \\\n        + P["rho_mu"].reshape(n, 1)\n    rho = 1.0 / (1.0 + np.exp(-np.clip(lr, -30.0, 30.0)))\n    rho = np.clip(rho, 0.0, 0.9995)\n    mean = P["service"].reshape(n, 1) * (1.0 + rho / (1.0 - rho))\n    mean = np.minimum(mean, P["service"].reshape(n, 1) * 1e4)\n\n    ln = np.exp(rng.normal(0.0, P["ln_sig"].reshape(n, 1), size=(n, L))\n                - 0.5 * P["ln_sig"].reshape(n, 1) ** 2)\n    u = np.maximum(rng.random((n, L)), 1e-12)\n    a = P["pareto_a"].reshape(n, 1)\n    par = np.power(u, -1.0 / a) * (a - 1.0) / a\n    obs = np.where(P["lognorm"].reshape(n, 1), ln, par)\n    y = mean * obs\n\n    # a percentile aggregate has a Gumbel-shaped marginal, quite different from\n    # the mean series it is computed from\n    if P["agg"].any():\n        m = np.maximum(P["agg_m"].reshape(n, 1).astype(np.float64), 2.0)\n        um = np.maximum(rng.random((n, L)), 1e-12)\n        gmax = mean * np.where(P["lognorm"].reshape(n, 1),\n                               np.exp(P["ln_sig"].reshape(n, 1)\n                                      * np.sqrt(2.0 * np.log(m))),\n                               np.power(np.power(um, 1.0 / m), -1.0 / a))\n        y = np.where(P["agg"].reshape(n, 1), gmax, y)\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.9)\n    return y, fl\n\n\n# ═══════════════════════ B5 ops_deploy_transient ═══════════════════════════\n\ndef b5_params(rng, B, cfg):\n    p = cfg["families"]["ops_deploy_transient"]\n    return {\n        "phi": rng.uniform(0.6, 0.995, B),\n        "n_ev": rng.integers(2, 8, B),\n        "shift_sig": rng.uniform(0.5, 3.0, B),\n        "trans_amp": rng.uniform(1.5, 4.0, B),\n        "trans_tau": logu(rng, 8.0, 300.0, B),\n        "osc": rng.random(B) < 0.45,\n        "zeta": rng.uniform(0.1, 0.6, B),\n        "osc_period": logu(rng, 10.0, 200.0, B),\n        "var_switch": rng.random(B) < 0.35,\n        "n_out": rng.integers(1, 5, B),\n        "out_len": logu(rng, 4.0, 300.0, B),\n        "out_mode": categorical(rng, p["outage_mix"], B),\n    }\n\n\ndef b5_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    base = ar1(rng, n, L, P["phi"])\n\n    E = 8\n    pos = rng.integers(int(0.02 * L), L, size=(n, E)).astype(np.float64)\n    live = np.arange(E)[None, :] < P["n_ev"].reshape(n, 1)\n    delta = rng.standard_normal((n, E)) * P["shift_sig"].reshape(n, 1)\n    lvl = np.zeros((n, L))\n    trans = np.zeros((n, L))\n    for j in range(E):\n        idx = np.nonzero(live[:, j])[0]\n        if idx.size == 0:\n            continue\n        p0 = pos[idx, j:j + 1]\n        after = (t >= p0)\n        d = delta[idx, j:j + 1]\n        lvl[idx] += np.where(after, d, 0.0)\n        dt = np.maximum(t - p0, 0.0)\n        amp = P["trans_amp"][idx].reshape(-1, 1) * np.abs(d)\n        expo = amp * np.exp(-dt / P["trans_tau"][idx].reshape(-1, 1))\n        w = TWO_PI / np.maximum(P["osc_period"][idx].reshape(-1, 1), 2.0)\n        zt = P["zeta"][idx].reshape(-1, 1)\n        dosc = amp * np.exp(-np.minimum(zt * w * dt, 60.0)) * np.cos(w * dt)\n        pick = np.where(P["osc"][idx].reshape(-1, 1), dosc, expo)\n        trans[idx] += np.where(after, pick * np.sign(d), 0.0)\n\n    var_mult = np.ones((n, L))\n    if P["var_switch"].any():\n        mid = pos[:, :1]\n        var_mult = np.where(P["var_switch"].reshape(n, 1) & (t >= mid),\n                            np.exp(rng.normal(0.0, 0.8, size=(n, 1))), 1.0)\n\n    y = base * var_mult + lvl + trans\n\n    # outages: hold-last / exact zero / linear backfill\n    starts = rng.integers(0, L, size=(n, 4))\n    lens = P["out_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.5, size=(n, 4)))\n    live_o = np.arange(4)[None, :] < P["n_out"].reshape(n, 1)\n    mask = run_mask(n, L, starts, np.where(live_o, lens, 0.0))\n    held = locf(y, mask)\n    idx = np.where(mask, -1, np.arange(L)[None, :])\n    prev = np.maximum(np.maximum.accumulate(idx, axis=1), 0)\n    nxt = np.where(mask, L, np.arange(L)[None, :])\n    nxt = np.minimum.accumulate(nxt[:, ::-1], axis=1)[:, ::-1]\n    nxt = np.minimum(nxt, L - 1)\n    va = np.take_along_axis(y, prev, axis=1)\n    vb = np.take_along_axis(y, nxt, axis=1)\n    span = np.maximum(nxt - prev, 1)\n    w = (np.arange(L)[None, :] - prev) / span\n    lin = va + (vb - va) * w\n    om = P["out_mode"].reshape(n, 1)\n    y = np.where(mask, np.where(om == 0, held, np.where(om == 1, 0.0, lin)), y)\n\n    fl = new_flags(n, scale_mode=0, quant_boost=1.0)\n    return y, fl\n\n\n# ═══════════════════════ B6 ops_rate_plateau ═══════════════════════════════\n\n_LADDER_MANT = np.array([1.0, 2.0, 5.0])\n\n\ndef b6_params(rng, B, cfg):\n    p = cfg["families"]["ops_rate_plateau"]\n    n_lvl = rng.integers(3, 6, B)\n    exp0 = rng.integers(-2, 6, B)\n    return {\n        "n_lvl": n_lvl,\n        "exp0": exp0,\n        "mant": _LADDER_MANT[rng.integers(0, 3, (B, 5))],\n        "expo": rng.integers(0, 2, (B, 5)),\n        "switch_tau": logu(rng, p["plateau_dwell"][0], p["plateau_dwell"][1], B),\n        "phi": rng.uniform(0.8, 0.995, B),\n        "demand_cv": rng.uniform(0.15, 0.8, B),\n        "diurnal_amp": rng.uniform(0.1, 1.0, B),\n    }\n\n\ndef b6_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(TWO_PI * ph), 0.0)\n    demand = np.maximum(prof, 0.05) * np.exp(\n        ar1(rng, n, L, P["phi"]) * P["demand_cv"].reshape(n, 1))\n\n    M = 64\n    dwell = np.exp(rng.normal(np.log(P["switch_tau"]).reshape(n, 1), 0.8, size=(n, M)))\n    seg_id, _ = segment_map(np.maximum(dwell, 2.0), L)\n    ladder = P["mant"] * np.power(10.0, P["expo"] + P["exp0"].reshape(n, 1))\n    ladder = ladder / np.maximum(ladder.mean(axis=1, keepdims=True), 1e-12)\n    pick = rng.integers(0, np.maximum(P["n_lvl"].reshape(n, 1), 1), size=(n, M))\n    caps = np.take_along_axis(ladder, np.clip(pick, 0, 4), axis=1)\n    cap_t = gather_levels(caps, seg_id)\n\n    y = np.minimum(demand, cap_t)\n    extended = np.zeros(n, dtype=bool)\n    if cfg.get(\'_complete_native_renewals\', False):\n        rr, dd, first = complete_dwell_table(\n            rng, np.maximum(dwell, 2.0), L, P[\'switch_tau\'].reshape(n, 1),\n            np.full((n, 1), 0.8), 2.0)\n        if rr.size:\n            extended[rr] = True\n            extra_pick = rng.integers(0, np.maximum(P[\'n_lvl\'][rr, None], 1),\n                                      size=(rr.size, dd.shape[1] - M))\n            extra_caps = np.take_along_axis(ladder[rr], np.clip(extra_pick, 0, 4), axis=1)\n            full_caps = np.concatenate((caps[rr], extra_caps), axis=1)\n            sid, _ = segment_map(dd, L)\n            fixed = np.minimum(demand[rr], gather_levels(full_caps, sid))\n            t = time_grid(L)[None, :]\n            y[rr] = np.where(t >= first[:, None], fixed, y[rr])\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.4, obs_boost=0.7)\n    if cfg.get(\'_complete_native_renewals\', False):\n        fl[\'renewal_extended\'] = extended\n    return y, fl\n',
+    'cf_fam_ops': '"""Block B — operational telemetry / web-cloudops families.\n\nThe web-cloudops domain is one of the two the field loses.  The diagnosis is\nstructural: these shapes are produced by *control systems*, and every family in\nthe competitive field is open-loop.  An autoscaling sawtooth, a rate-limit\nplateau, a queue backlog, a deploy overshoot-and-settle and a counter reset are\nall closed-loop artefacts.  A model trained only on open-loop processes treats a\nsawtooth as a staircase plus noise and cannot anticipate the next scale-out.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nimport cf_kernels as K\nfrom cf_calendars import apply_dow, dst_shift\nfrom cf_prims import complete_dwell_table\nfrom cf_prims import (TWO_PI, ar1, categorical, decay_convolve, gather_levels,\n                    hawkes, locf, logu, nb_counts, new_flags,\n                    profile_trapezoid, run_mask, segment_map)\nfrom cf_spectral import time_grid\n\n\ndef _daily_phase(rng, n, L, p_day, min_res=3.0):\n    t = time_grid(L)[None, :]\n    pd = np.asarray(p_day).reshape(n, 1)\n    has = pd >= min_res\n    return np.where(has, t / np.where(has, pd, 1e9), 0.0) + rng.random((n, 1)), has\n\n\n# ═══════════════════════ B1 ops_diurnal_traffic ════════════════════════════\n\ndef b1_params(rng, B, cfg):\n    p = cfg["families"]["ops_diurnal_traffic"]\n    return {\n        "base": logu(rng, 1.0, 5.0e4, B),\n        "theta_taylor": rng.uniform(p["taylor_exponent"][0], p["taylor_exponent"][1], B),\n        "cv": logu(rng, 0.03, 0.6, B),\n        "burst_on": rng.random(B) < p["burst_rate"],\n        "branch": rng.uniform(0.2, 0.85, B),\n        "burst_tau": logu(rng, 3.0, 120.0, B),\n        "mark_sig": rng.uniform(0.6, 1.6, B),\n        "burst_mu": logu(rng, 1e-4, 5e-3, B),\n        "count_emit": rng.random(B) < p["count_emit_rate"],\n        "nb_k": logu(rng, 0.5, 200.0, B),\n        "weekend": np.exp(rng.normal(np.log(0.42), 0.5, B)),\n        "sat_sun": np.exp(rng.normal(0.0, 0.25, B)),\n        "trend": rng.normal(0.0, 0.25, B),\n        "growth_on": rng.random(B) < 0.45,\n        "dst": rng.random(B) < p["dst_rate"],\n    }\n\n\ndef b1_demand(P, rng, L, cad, cal, cfg):\n    """Shared demand process — also the driver for B2\'s controller."""\n    n = cad.n\n    t = time_grid(L)[None, :]\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    # Civil-time operational feeds shift by an hour twice a year; the weather\n    # families deliberately do NOT, because that source requests UTC.\n    ph = ph + np.where(P["dst"].reshape(n, 1), dst_shift(rng, cal, 1.0), 0.0)\n    prof = profile_trapezoid(rng, n, L, ph)\n    prof = np.where(has_day, prof, 0.0)\n    prof = prof - prof.min(axis=1, keepdims=True)\n    m = np.maximum(prof.mean(axis=1, keepdims=True), 1e-9)\n    shape = 0.25 + 0.75 * prof / m\n\n    wk = np.ones((n, 7))\n    wk[:, 5] = P["weekend"]\n    wk[:, 6] = P["weekend"] * P["sat_sun"]\n    weekly = apply_dow(wk, cal)\n\n    trend = np.where(P["growth_on"].reshape(n, 1),\n                     np.exp(P["trend"].reshape(n, 1) * t / L), 1.0)\n\n    lam = P["base"].reshape(n, 1) * shape * weekly * trend\n\n    # bursts arrive when traffic is high: immigrant rate proportional to lambda\n    mu = (P["burst_mu"].reshape(n, 1) * shape\n          * np.where(P["burst_on"].reshape(n, 1), 1.0, 0.0))\n    _, cnt = hawkes(rng, n, L, np.ascontiguousarray(mu), P["branch"], P["burst_tau"])\n    marks = cnt * np.exp(rng.normal(0.0, P["mark_sig"].reshape(n, 1), size=(n, L)))\n    burst = decay_convolve(marks, P["burst_tau"])\n    lam = lam * (1.0 + 2.5 * burst)\n    return np.maximum(lam, 0.0)\n\n\ndef b1_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    lam = b1_demand(P, rng, L, cad, cal, cfg)\n    # Taylor\'s law heteroscedasticity: sigma proportional to lambda^theta\n    z = rng.standard_normal((n, L))\n    sig = P["cv"].reshape(n, 1) * np.power(np.maximum(lam, 1e-12),\n                                           P["theta_taylor"].reshape(n, 1))\n    y = np.maximum(lam + sig * z, 0.0)\n    ci = P["count_emit"].reshape(n, 1)\n    counts = nb_counts(rng, lam, P["nb_k"])\n    y = np.where(ci, counts, y)\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.8)\n    fl["integer"] = P["count_emit"]\n    return y, fl\n\n\n# ════════════════════ B2 ops_saturating_feedback ═══════════════════════════\n\ndef b2_params(rng, B, cfg):\n    p = cfg["families"]["ops_saturating_feedback"]\n    q = b1_params(rng, B, cfg)\n    q.update({\n        "th_up": rng.uniform(0.6, 0.9, B),\n        "th_dn": rng.uniform(0.15, 0.45, B),\n        "gam": rng.uniform(p["step_gain"][0], p["step_gain"][1], B),\n        "k_up": rng.integers(3, 61, B),\n        "k_dn": rng.integers(3, 61, B),\n        "lag": np.round(logu(rng, 2.0, 20.0, B)).astype(np.int64),\n        "mode": categorical(rng, p["emit_mix"], B),\n        "u_scale": np.array([1.0, 100.0])[categorical(rng, [0.35, 0.65], B)],\n    })\n    return q\n\n\ndef b2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    d = b1_demand(P, rng, L, cad, cal, cfg)\n    c0 = np.maximum(d[:, :64].mean(axis=1) / 0.7, 1e-6)\n    out = np.zeros((n, L))\n    cap = np.zeros((n, L))\n    K.k_feedback(np.ascontiguousarray(d),\n                 np.ascontiguousarray(P["th_up"]),\n                 np.ascontiguousarray(P["th_dn"]),\n                 np.ascontiguousarray(P["k_up"]).astype(np.int64),\n                 np.ascontiguousarray(P["k_dn"]).astype(np.int64),\n                 np.ascontiguousarray(P["gam"]),\n                 np.ascontiguousarray(P["lag"]).astype(np.int64),\n                 c0, np.ascontiguousarray(P["mode"]).astype(np.int64), out, cap)\n    mode = P["mode"].reshape(n, 1)\n    y = np.where(mode == 0, out * P["u_scale"].reshape(n, 1), out)\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.8)\n    fl["bounded"] = (P["mode"] == 0)\n    fl["scale_mode"] = np.where(P["mode"] == 0, 2, 1).astype(np.int8)\n    return y, fl\n\n\n# ═══════════════════════ B3 ops_counter_reset ══════════════════════════════\n\ndef b3_params(rng, B, cfg):\n    p = cfg["families"]["ops_counter_reset"]\n    return {\n        "rate": logu(rng, 1.0, 4.0e3, B),\n        "nb_k": logu(rng, 0.4, 60.0, B),\n        "reset_mode": categorical(rng, p["reset_mix"], B),\n        "reset_tau": logu(rng, 400.0, 4000.0, B),\n        "cal_week": rng.random(B) < 0.35,\n        "diurnal_amp": rng.uniform(0.0, 0.9, B),\n        "revise": rng.random(B) < p["revision_rate"],\n        "revise_k": rng.integers(2, 9, B),\n        "revise_depth": rng.uniform(0.02, 0.3, B),\n        "integer": rng.random(B) < 0.55,\n    }\n\n\ndef b3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(TWO_PI * ph), 0.0)\n    mean_inc = P["rate"].reshape(n, 1) * np.maximum(prof, 0.05)\n    inc = nb_counts(rng, mean_inc, P["nb_k"])\n    cont = np.maximum(mean_inc * rng.gamma(np.broadcast_to(\n        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), (n, L))) /\n        np.maximum(P["nb_k"].reshape(n, 1), 1e-2), 0.0)\n    inc = np.where(P["integer"].reshape(n, 1), inc, cont)\n\n    mode = P["reset_mode"].reshape(n, 1)\n    poisson_reset = rng.random((n, L)) < (1.0 / P["reset_tau"].reshape(n, 1))\n    day_idx = cal.day_index\n    period = np.where(P["cal_week"].reshape(n, 1), 7, 1)\n    blk = day_idx // np.maximum(period, 1)\n    cal_reset = np.zeros((n, L), dtype=bool)\n    cal_reset[:, 1:] = blk[:, 1:] != blk[:, :-1]\n    reset = np.where(mode == 0, poisson_reset,\n                     np.where(mode == 1, cal_reset, False))\n    out = np.zeros((n, L))\n    K.k_counter_reset_cal(np.ascontiguousarray(inc),\n                          np.ascontiguousarray(reset).astype(np.int8), out)\n\n    # revisions: the last few published points are corrected downward\n    if P["revise"].any():\n        age = (L - 1) - np.arange(L)[None, :]\n        w = np.clip(1.0 - age / np.maximum(P["revise_k"].reshape(n, 1), 1), 0.0, 1.0)\n        out = np.where(P["revise"].reshape(n, 1),\n                       out * (1.0 - w * P["revise_depth"].reshape(n, 1)), out)\n\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.3)\n    fl["integer"] = P["integer"] & (~P["revise"])\n    return out, fl\n\n\n# ═══════════════════════ B4 ops_latency_queue ══════════════════════════════\n\ndef b4_params(rng, B, cfg):\n    p = cfg["families"]["ops_latency_queue"]\n    return {\n        "rho_mu": rng.normal(-0.8, 1.0, B),\n        "rho_phi": rng.uniform(0.85, 0.999, B),\n        "rho_sig": rng.uniform(0.2, 1.2, B),\n        "service": logu(rng, 1e-3, 100.0, B),\n        "lognorm": rng.random(B) < p["lognormal_rate"],\n        "ln_sig": rng.uniform(0.4, 1.3, B),\n        "pareto_a": rng.uniform(1.6, 3.5, B),\n        "agg": rng.random(B) < p["percentile_rate"],\n        "agg_m": rng.integers(8, 201, B),\n    }\n\n\ndef b4_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    lr = ar1(rng, n, L, P["rho_phi"]) * P["rho_sig"].reshape(n, 1) \\\n        + P["rho_mu"].reshape(n, 1)\n    rho = 1.0 / (1.0 + np.exp(-np.clip(lr, -30.0, 30.0)))\n    rho = np.clip(rho, 0.0, 0.9995)\n    mean = P["service"].reshape(n, 1) * (1.0 + rho / (1.0 - rho))\n    mean = np.minimum(mean, P["service"].reshape(n, 1) * 1e4)\n\n    ln = np.exp(rng.normal(0.0, P["ln_sig"].reshape(n, 1), size=(n, L))\n                - 0.5 * P["ln_sig"].reshape(n, 1) ** 2)\n    u = np.maximum(rng.random((n, L)), 1e-12)\n    a = P["pareto_a"].reshape(n, 1)\n    par = np.power(u, -1.0 / a) * (a - 1.0) / a\n    obs = np.where(P["lognorm"].reshape(n, 1), ln, par)\n    y = mean * obs\n\n    # a percentile aggregate has a Gumbel-shaped marginal, quite different from\n    # the mean series it is computed from\n    if P["agg"].any():\n        m = np.maximum(P["agg_m"].reshape(n, 1).astype(np.float64), 2.0)\n        um = np.maximum(rng.random((n, L)), 1e-12)\n        gmax = mean * np.where(P["lognorm"].reshape(n, 1),\n                               np.exp(P["ln_sig"].reshape(n, 1)\n                                      * np.sqrt(2.0 * np.log(m))),\n                               np.power(np.power(um, 1.0 / m), -1.0 / a))\n        y = np.where(P["agg"].reshape(n, 1), gmax, y)\n\n    if _CAS1_WORKLOAD_ENABLED:\n        y = _cas1_workload_response(P, rho, obs, y,\n            np.random.Generator(rng.bit_generator.jumped()))\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.9)\n    return y, fl\n\n\n# ═══════════════════════ B5 ops_deploy_transient ═══════════════════════════\n\ndef b5_params(rng, B, cfg):\n    p = cfg["families"]["ops_deploy_transient"]\n    return {\n        "phi": rng.uniform(0.6, 0.995, B),\n        "n_ev": rng.integers(2, 8, B),\n        "shift_sig": rng.uniform(0.5, 3.0, B),\n        "trans_amp": rng.uniform(1.5, 4.0, B),\n        "trans_tau": logu(rng, 8.0, 300.0, B),\n        "osc": rng.random(B) < 0.45,\n        "zeta": rng.uniform(0.1, 0.6, B),\n        "osc_period": logu(rng, 10.0, 200.0, B),\n        "var_switch": rng.random(B) < 0.35,\n        "n_out": rng.integers(1, 5, B),\n        "out_len": logu(rng, 4.0, 300.0, B),\n        "out_mode": categorical(rng, p["outage_mix"], B),\n    }\n\n\ndef b5_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    base = ar1(rng, n, L, P["phi"])\n\n    E = 8\n    pos = rng.integers(int(0.02 * L), L, size=(n, E)).astype(np.float64)\n    live = np.arange(E)[None, :] < P["n_ev"].reshape(n, 1)\n    delta = rng.standard_normal((n, E)) * P["shift_sig"].reshape(n, 1)\n    lvl = np.zeros((n, L))\n    trans = np.zeros((n, L))\n    for j in range(E):\n        idx = np.nonzero(live[:, j])[0]\n        if idx.size == 0:\n            continue\n        p0 = pos[idx, j:j + 1]\n        after = (t >= p0)\n        d = delta[idx, j:j + 1]\n        lvl[idx] += np.where(after, d, 0.0)\n        dt = np.maximum(t - p0, 0.0)\n        amp = P["trans_amp"][idx].reshape(-1, 1) * np.abs(d)\n        expo = amp * np.exp(-dt / P["trans_tau"][idx].reshape(-1, 1))\n        w = TWO_PI / np.maximum(P["osc_period"][idx].reshape(-1, 1), 2.0)\n        zt = P["zeta"][idx].reshape(-1, 1)\n        dosc = amp * np.exp(-np.minimum(zt * w * dt, 60.0)) * np.cos(w * dt)\n        pick = np.where(P["osc"][idx].reshape(-1, 1), dosc, expo)\n        trans[idx] += np.where(after, pick * np.sign(d), 0.0)\n\n    var_mult = np.ones((n, L))\n    if P["var_switch"].any():\n        mid = pos[:, :1]\n        var_mult = np.where(P["var_switch"].reshape(n, 1) & (t >= mid),\n                            np.exp(rng.normal(0.0, 0.8, size=(n, 1))), 1.0)\n\n    y = base * var_mult + lvl + trans\n\n    # outages: hold-last / exact zero / linear backfill\n    starts = rng.integers(0, L, size=(n, 4))\n    lens = P["out_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.5, size=(n, 4)))\n    live_o = np.arange(4)[None, :] < P["n_out"].reshape(n, 1)\n    mask = run_mask(n, L, starts, np.where(live_o, lens, 0.0))\n    held = locf(y, mask)\n    idx = np.where(mask, -1, np.arange(L)[None, :])\n    prev = np.maximum(np.maximum.accumulate(idx, axis=1), 0)\n    nxt = np.where(mask, L, np.arange(L)[None, :])\n    nxt = np.minimum.accumulate(nxt[:, ::-1], axis=1)[:, ::-1]\n    nxt = np.minimum(nxt, L - 1)\n    va = np.take_along_axis(y, prev, axis=1)\n    vb = np.take_along_axis(y, nxt, axis=1)\n    span = np.maximum(nxt - prev, 1)\n    w = (np.arange(L)[None, :] - prev) / span\n    lin = va + (vb - va) * w\n    om = P["out_mode"].reshape(n, 1)\n    y = np.where(mask, np.where(om == 0, held, np.where(om == 1, 0.0, lin)), y)\n\n    fl = new_flags(n, scale_mode=0, quant_boost=1.0)\n    return y, fl\n\n\n# ═══════════════════════ B6 ops_rate_plateau ═══════════════════════════════\n\n_LADDER_MANT = np.array([1.0, 2.0, 5.0])\n\n\ndef b6_params(rng, B, cfg):\n    p = cfg["families"]["ops_rate_plateau"]\n    n_lvl = rng.integers(3, 6, B)\n    exp0 = rng.integers(-2, 6, B)\n    return {\n        "n_lvl": n_lvl,\n        "exp0": exp0,\n        "mant": _LADDER_MANT[rng.integers(0, 3, (B, 5))],\n        "expo": rng.integers(0, 2, (B, 5)),\n        "switch_tau": logu(rng, p["plateau_dwell"][0], p["plateau_dwell"][1], B),\n        "phi": rng.uniform(0.8, 0.995, B),\n        "demand_cv": rng.uniform(0.15, 0.8, B),\n        "diurnal_amp": rng.uniform(0.1, 1.0, B),\n    }\n\n\ndef b6_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    ph, has_day = _daily_phase(rng, n, L, cad.p_day)\n    prof = 1.0 + P["diurnal_amp"].reshape(n, 1) * np.where(has_day, np.sin(TWO_PI * ph), 0.0)\n    demand = np.maximum(prof, 0.05) * np.exp(\n        ar1(rng, n, L, P["phi"]) * P["demand_cv"].reshape(n, 1))\n\n    M = 64\n    dwell = np.exp(rng.normal(np.log(P["switch_tau"]).reshape(n, 1), 0.8, size=(n, M)))\n    seg_id, _ = segment_map(np.maximum(dwell, 2.0), L)\n    ladder = P["mant"] * np.power(10.0, P["expo"] + P["exp0"].reshape(n, 1))\n    ladder = ladder / np.maximum(ladder.mean(axis=1, keepdims=True), 1e-12)\n    pick = rng.integers(0, np.maximum(P["n_lvl"].reshape(n, 1), 1), size=(n, M))\n    caps = np.take_along_axis(ladder, np.clip(pick, 0, 4), axis=1)\n    cap_t = gather_levels(caps, seg_id)\n\n    y = np.minimum(demand, cap_t)\n    extended = np.zeros(n, dtype=bool)\n    if cfg.get(\'_complete_native_renewals\', False):\n        rr, dd, first = complete_dwell_table(\n            rng, np.maximum(dwell, 2.0), L, P[\'switch_tau\'].reshape(n, 1),\n            np.full((n, 1), 0.8), 2.0)\n        if rr.size:\n            extended[rr] = True\n            extra_pick = rng.integers(0, np.maximum(P[\'n_lvl\'][rr, None], 1),\n                                      size=(rr.size, dd.shape[1] - M))\n            extra_caps = np.take_along_axis(ladder[rr], np.clip(extra_pick, 0, 4), axis=1)\n            full_caps = np.concatenate((caps[rr], extra_caps), axis=1)\n            sid, _ = segment_map(dd, L)\n            fixed = np.minimum(demand[rr], gather_levels(full_caps, sid))\n            t = time_grid(L)[None, :]\n            y[rr] = np.where(t >= first[:, None], fixed, y[rr])\n\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.4, obs_boost=0.7)\n    if cfg.get(\'_complete_native_renewals\', False):\n        fl[\'renewal_extended\'] = extended\n    return y, fl\n\n\nfrom numba import njit as _cas1_njit\n\n@_cas1_njit(cache=False, fastmath=False, nogil=True)\ndef _cas1_lindley_kernel(service, gap, initial):\n    n, length = service.shape\n    waits = np.empty_like(service)\n    for i in range(n):\n        if length == 0:\n            continue\n        waits[i, 0] = initial[i]\n        for t in range(1, length):\n            work = waits[i, t-1] + service[i, t-1] - gap[i, t]\n            waits[i, t] = max(work, 0.)\n    return waits\n\n\ndef _cas1_workload_waits(service, gap, initial):\n    """gap[:,t] precedes job t; gap[:,0] is unused. +inf clears the queue."""\n    b, a = (np.asarray(x, dtype=np.float64) for x in (service, gap))\n    w = np.asarray(initial, dtype=np.float64)\n    if b.ndim != 2 or a.shape != b.shape or w.shape != (len(b),):\n        raise ValueError(\'Matched service/gap matrices and an initial-work vector required\')\n    if (not np.isfinite(b).all() or not np.isfinite(w).all() or np.isnan(a).any()\n            or (b < 0).any() or (a < 0).any() or (w < 0).any()):\n        raise ValueError(\'Finite nonnegative service/work and nonnegative gaps required\')\n    out = _cas1_lindley_kernel(b, a, w)\n    if not np.isfinite(out).all():\n        raise ValueError(\'Workload overflow; do not silently clip\')\n    return out\n\n\ndef _cas1_initial_workload(rng, rho, lognormal, sigma, shape, service):\n    """Ideal constant-rho M/G/1 initial workload, before subsequent time variation."""\n    rho, sigma, shape, service = (np.asarray(x, dtype=np.float64)\n                                 for x in (rho, sigma, shape, service))\n    ln = np.asarray(lognormal)\n    if rho.ndim != 1 or any(x.shape != rho.shape for x in (sigma, shape, service, ln)):\n        raise ValueError(\'Matching parameter vectors required\')\n    if (ln.dtype.kind != \'b\' or any(not np.isfinite(x).all() for x in (rho, sigma, shape, service))\n            or ((rho < 0) | (rho >= 1)).any() or (sigma < 0).any()\n            or (shape <= 1).any() or (service <= 0).any()):\n        raise ValueError(\'Invalid stable queue/service parameters\')\n    count = rng.geometric(1.-rho) - 1\n    out = np.zeros(len(rho), dtype=np.float64)\n    for i in range(len(rho)):\n        number = int(count[i])\n        if number == 0:\n            continue\n        if ln[i]:\n            biased = service[i] * np.exp(.5*sigma[i]**2 + sigma[i]*rng.standard_normal(number))\n        else:\n            lower = service[i]*(shape[i]-1.)/shape[i]\n            biased = lower*(1.+rng.pareto(shape[i]-1., size=number))\n        out[i] = np.sum(rng.random(number)*biased)\n    if not np.isfinite(out).all():\n        raise ValueError(\'Initial workload overflow; do not truncate its tail\')\n    return out\n\n\ndef _cas1_workload_response(P, rho, obs, parent, rng):\n    """Only non-aggregate rows change; all old draws precede this child stream."""\n    rows = np.flatnonzero(~P[\'agg\'])\n    out = parent.copy()\n    if rows.size == 0 or parent.shape[1] == 0:\n        return out\n    service = P[\'service\'][rows]\n    initial = _cas1_initial_workload(rng, rho[rows, 0], P[\'lognorm\'][rows],\n                                    P[\'ln_sig\'][rows], P[\'pareto_a\'][rows], service)\n    durations = service[:, None]*obs[rows]\n    utilization = rho[rows]\n    gap = np.full_like(durations, np.inf)\n    exponential = rng.exponential(size=durations.shape)\n    np.divide(service[:, None]*exponential, utilization, out=gap, where=utilization > 0.)\n    out[rows] = _cas1_workload_waits(durations, gap, initial) + durations\n    if not np.isfinite(out).all():\n        raise ValueError(\'Nonfinite response time\')\n    return out\n\n\n_CAS1_WORKLOAD_ENABLED = True\n',
     'cf_fam_health': '"""Block C — healthcare / epidemiological / administrative families.\n\nHealthcare is the worst domain for the incumbent field.  The failure is almost\ncertainly *reporting structure*, not dynamics: public-health and hospital-admin\nfeeds carry weekend factors of 0.2-0.9x, Monday catch-up spikes of 1.3-2.4x,\nbatched multi-day releases with exact zeros in between, systematic revisions of\nthe most recent points, holiday collapses with compensation, and genuinely\nunder-dispersed counts.  A +-0.12 additive log day-of-week offset — which is\nwhat the field ships — is an order of magnitude too weak.\n\nC1 adds the dynamics half: a real renewal equation, so the 64-step forecast\ndepends on whether R_t has crossed 1.  That is the actual forecasting question\nfor those feeds and it is not representable by a piecewise-linear log trend.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nimport cf_kernels as K\nfrom cf_calendars import (apply_dow, batch_release, dow_factors, holiday_factor,\n                        month_boundary, revision_ramp)\nfrom cf_prims import (TWO_PI, categorical, logu, nb_counts, new_flags, ou,\n                    run_mask, unit_std)\nfrom cf_spectral import matern_gp, pink_gp, time_grid\n\nMAX_TAPS = 64\n\n\n# ═════════════════════════════ C1 epi_renewal ══════════════════════════════\n\ndef c1_params(rng, B, cfg):\n    p = cfg["families"]["epi_renewal"]\n    q = {\n        "r_tau": logu(rng, p["logr_corr_time"][0], p["logr_corr_time"][1], B),\n        "r_sig": np.abs(rng.normal(0.0, p["logr_sigma"], B)) + 0.05,\n        "r_mu": rng.normal(0.0, 0.12, B),\n        "mu_g": logu(rng, p["serial_interval_mean"][0], p["serial_interval_mean"][1], B),\n        "cv_g": rng.uniform(0.35, 0.8, B),\n        "disp": logu(rng, p["dispersion"][0], p["dispersion"][1], B),\n        "import_tau": logu(rng, 500.0, 4000.0, B),\n        "import_size": logu(rng, 1.0, 200.0, B),\n        "endemic": rng.random(B) < p["endemic_rate"],\n        "endemic_rate": logu(rng, 0.05, 6.0, B),\n        "i0": logu(rng, 1.0, 500.0, B),\n        "report": rng.random(B) < p["reporting_layer_rate"],\n    }\n    q.update(c2_params(rng, B, cfg))\n    return q\n\n\ndef _serial_interval(mu_g, cv_g, n):\n    """Discretised Gamma serial-interval kernel, truncated at 4 mu_g."""\n    a = 1.0 / np.maximum(cv_g.reshape(n, 1) ** 2, 1e-3)\n    scale = np.maximum(mu_g.reshape(n, 1), 1.0) / a\n    s = np.arange(MAX_TAPS, dtype=np.float64)[None, :] + 0.5\n    logw = (a - 1.0) * np.log(s) - s / scale\n    logw -= logw.max(axis=1, keepdims=True)\n    w = np.exp(logw)\n    trunc = np.minimum(np.ceil(4.0 * mu_g.reshape(n, 1)), MAX_TAPS)\n    w = np.where(np.arange(MAX_TAPS)[None, :] < trunc, w, 0.0)\n    w /= np.maximum(w.sum(axis=1, keepdims=True), 1e-12)\n    taps = np.clip(trunc[:, 0].astype(np.int64), 1, MAX_TAPS)\n    return np.ascontiguousarray(w), taps\n\n\ndef c1_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    logr = ou(rng, n, L, P["r_tau"]) * P["r_sig"].reshape(n, 1) \\\n        + P["r_mu"].reshape(n, 1)\n    rt = np.exp(np.clip(logr, -3.0, 2.0))\n\n    w, taps = _serial_interval(P["mu_g"], P["cv_g"], n)\n    imp = np.where(rng.random((n, L)) < (1.0 / P["import_tau"].reshape(n, 1)),\n                   P["import_size"].reshape(n, 1), 0.0)\n    # A pure renewal process with heavy over-dispersion has zero as an absorbing\n    # state, so most windows would be extinct.  Real notifiable-disease feeds\n    # carry a background importation rate; endemic rows get one, and the rest\n    # keep the sporadic-introduction behaviour.\n    imp = imp + np.where(P["endemic"].reshape(n, 1),\n                         P["endemic_rate"].reshape(n, 1), 0.0)\n\n    k = np.maximum(P["disp"].reshape(n, 1), 1e-2)\n    gam = rng.gamma(np.broadcast_to(k, (n, L))) / k\n    u = rng.random((n, L))\n    z = rng.standard_normal((n, L))\n    out = np.zeros((n, L))\n    K.k_renewal(w, taps, np.ascontiguousarray(rt), imp, gam, u, z,\n                np.ascontiguousarray(P["i0"]), out)\n\n    rep = P["report"].reshape(n, 1)\n    if P["report"].any():\n        obs = _reporting_layer(P, rng, out, cal, cfg)\n        out = np.where(rep, obs, out)\n\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.6, quant_boost=0.2)\n    fl["integer"] = (\n        ~(P["report"] & P["revise_on"])\n        if cfg.get("_native_integer_flags", False) else np.ones(n, dtype=bool)\n    )\n    return out, fl\n\n\n# ═══════════════════ C2 admin_reporting_counts ═════════════════════════════\n\ndef c2_params(rng, B, cfg):\n    p = cfg["families"]["admin_reporting_counts"]\n    return {\n        "base": logu(rng, 3.0, 2.0e5, B),\n        "smooth_ell": logu(rng, 30.0, 1500.0, B),\n        "smooth_amp": rng.uniform(0.1, 0.9, B),\n        "batch_on": rng.random(B) < p["batch_rate"],\n        "batch_days": rng.integers(2, 8, B),\n        "revise_on": rng.random(B) < p["revision_rate"],\n        "revise_k": rng.integers(3, 13, B),\n        "revise_depth": rng.uniform(0.05, 0.5, B),\n        "emit": categorical(rng, p["emission_mix"], B),\n        "nb_k": logu(rng, 0.3, 100.0, B),\n        "under_phi": rng.uniform(0.05, 0.9, B),\n        "hol_on": rng.random(B) < p["holiday_rate"],\n        "trend": rng.normal(0.0, 0.35, B),\n        "month_end": rng.random(B) < p["month_end_rate"],\n        "month_end_lift": rng.uniform(1.2, 3.0, B),\n    }\n\n\ndef _reporting_layer(P, rng, latent, cal, cfg):\n    """Multiplicative calendar + emission, applied to a non-negative latent."""\n    n, L = latent.shape\n    fac = dow_factors(rng, n, cfg)\n    dow = apply_dow(fac, cal)\n    # holidays only for the rows that use them: the moving-feast masks and the\n    # compensation convolve are full-(rows, L) work, so computing them for\n    # every row and then masking was most of this family\'s cost.\n    hol_rows = np.nonzero(P["hol_on"])[0]\n    hol = np.ones((n, L))\n    comp = np.zeros((n, L))\n    if hol_rows.size:\n        h_sub, c_sub = holiday_factor(rng, cal.take(hol_rows), cfg)\n        hol[hol_rows] = h_sub\n        comp[hol_rows] = c_sub\n    mu = np.maximum(latent * dow * hol * (1.0 + comp), 0.0)\n    if P["month_end"].any():\n        lift = np.where(month_boundary(cal),\n                        P["month_end_lift"].reshape(n, 1), 1.0)\n        mu = np.where(P["month_end"].reshape(n, 1), mu * lift, mu)\n\n    # one count model per row, sampled only on the rows that select it (the\n    # three full-grid draws + a where() were three times the sampling cost)\n    emit = np.asarray(P["emit"]).reshape(n)\n    y = np.zeros((n, L))\n    r_nb = np.nonzero(emit == 0)[0]\n    r_po = np.nonzero(emit == 1)[0]\n    r_bi = np.nonzero(emit >= 2)[0]\n    if r_nb.size:\n        y[r_nb] = nb_counts(rng, mu[r_nb], P["nb_k"][r_nb])\n    if r_po.size:\n        y[r_po] = rng.poisson(np.minimum(mu[r_po], 1e8)).astype(np.float64)\n    if r_bi.size:\n        phi = P["under_phi"][r_bi].reshape(-1, 1)\n        ntr = np.maximum(np.round(mu[r_bi] / np.maximum(1.0 - phi, 1e-3)), 0.0)\n        ntr = np.minimum(ntr, 1e7)\n        # under-dispersed counts: var = mu * phi < mu.  Exists nowhere in the field.\n        y[r_bi] = rng.binomial(ntr.astype(np.int64),\n                               np.broadcast_to(1.0 - phi, (r_bi.size, L))).astype(np.float64)\n\n    if P["batch_on"].any():\n        rel = batch_release(rng, y, cal, P["batch_days"])\n        y = np.where(P["batch_on"].reshape(n, 1), rel, y)\n    if P["revise_on"].any():\n        rv = revision_ramp(rng, y, P["revise_k"], P["revise_depth"])\n        y = np.where(P["revise_on"].reshape(n, 1), rv, y)\n    return y\n\n\ndef c2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    smooth = matern_gp(rng, n, L, P["smooth_ell"], nu=1.5)\n    latent = P["base"].reshape(n, 1) * np.exp(\n        P["smooth_amp"].reshape(n, 1) * smooth + P["trend"].reshape(n, 1) * t / L)\n    y = _reporting_layer(P, rng, latent, cal, cfg)\n    fl = new_flags(n, scale_mode=2, positive=True, obs_boost=0.5, quant_boost=0.15)\n    fl["integer"] = (~P["revise_on"])\n    return y, fl\n\n\n# ═══════════════════ C3 physio_quasiperiodic ═══════════════════════════════\n\nTEMPLATE_S = 256\n\n\ndef c3_params(rng, B, cfg):\n    p = cfg["families"]["physio_quasiperiodic"]\n    return {\n        "p0": logu(rng, p["base_period"][0], p["base_period"][1], B),\n        "resp_ratio": rng.uniform(3.0, 6.0, B),\n        "rsa": rng.uniform(p["rsa_depth"][0], p["rsa_depth"][1], B),\n        "hrv": rng.uniform(0.005, 0.08, B),\n        "biphasic": rng.random(B) < 0.45,\n        "n_harm": rng.integers(3, 7, B),\n        "peak_sharp": rng.uniform(1.0, 4.0, B),\n        "amp_resp": rng.uniform(0.05, 0.45, B),\n        "wander": rng.uniform(0.1, 1.5, B),\n        "artefact_p": rng.uniform(0.005, 0.05, B),\n        "artefact_amp": rng.uniform(5.0, 40.0, B),\n        "flat_tau": logu(rng, 600.0, 5000.0, B),\n        "flat_len": logu(rng, 10.0, 200.0, B),\n        "noise": logu(rng, 0.005, 0.15, B),\n    }\n\n\ndef c3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n\n    # waveform template: sharp systolic peak, slow recovery (or biphasic)\n    s = np.arange(TEMPLATE_S, dtype=np.float64)[None, :] / TEMPLATE_S\n    tmpl = np.zeros((n, TEMPLATE_S))\n    sharp = P["peak_sharp"].reshape(n, 1)\n    nh = P["n_harm"].reshape(n, 1)\n    for h in range(1, 7):\n        amp = (h ** (-sharp)) * np.where(h <= nh, 1.0, 0.0)\n        psi = (h - 1) * 0.35\n        tmpl += amp * np.cos(TWO_PI * h * s - psi)\n    bip = P["biphasic"].reshape(n, 1)\n    tmpl = np.where(bip, tmpl - 0.6 * np.roll(tmpl, TEMPLATE_S // 6, axis=1), tmpl)\n    tmpl = unit_std(tmpl)\n\n    # instantaneous period: respiratory sinus arrhythmia + 1/f variability\n    resp_p = P["p0"] * P["resp_ratio"]\n    t = time_grid(L)[None, :]\n    resp = np.sin(TWO_PI * t / resp_p.reshape(n, 1) + rng.random((n, 1)) * TWO_PI)\n    hrv = pink_gp(rng, n, L, np.full(n, 1.2))\n    per = P["p0"].reshape(n, 1) * (1.0 + P["rsa"].reshape(n, 1) * resp\n                                   + P["hrv"].reshape(n, 1) * hrv)\n    per = np.maximum(per, 2.0)\n    phase = np.cumsum(1.0 / per, axis=1) + rng.random((n, 1))\n\n    y = np.zeros((n, L))\n    K.k_template(np.ascontiguousarray(phase), np.ascontiguousarray(tmpl),\n                 np.arange(n, dtype=np.int64), y)\n    y = y * (1.0 + P["amp_resp"].reshape(n, 1) * resp)\n\n    y = y + P["wander"].reshape(n, 1) * pink_gp(rng, n, L, np.full(n, 2.0))\n    y = y + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1)\n\n    art = rng.random((n, L)) < P["artefact_p"].reshape(n, 1)\n    y = np.where(art, y + rng.standard_normal((n, L)) * P["artefact_amp"].reshape(n, 1), y)\n\n    # electrode-off flatlines\n    starts = rng.integers(0, L, size=(n, 4))\n    hit = rng.random((n, 4)) < (L / P["flat_tau"].reshape(n, 1) / 4.0)\n    lens = P["flat_len"].reshape(n, 1) * np.exp(rng.normal(0.0, 0.6, size=(n, 4)))\n    mask = run_mask(n, L, starts, np.where(hit, lens, 0.0))\n    y = np.where(mask, 0.0, y)\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.8)\n    return y, fl\n\n\n# ═══════════════════ C4 clinical_bounded_vitals ════════════════════════════\n\nVITAL_RANGES = np.array([\n    [70.0, 100.0],    # SpO2\n    [35.0, 190.0],    # heart rate\n    [34.5, 41.5],     # core temperature\n    [50.0, 200.0],    # blood pressure\n])\n\n\ndef c4_params(rng, B, cfg):\n    p = cfg["families"]["clinical_bounded_vitals"]\n    idx = categorical(rng, p["range_mix"], B)\n    return {\n        "range_idx": idx,\n        "lo": VITAL_RANGES[idx, 0],\n        "hi": VITAL_RANGES[idx, 1],\n        "tau": logu(rng, 60.0, 2000.0, B),\n        "bias": rng.uniform(p["ceiling_bias"][0], p["ceiling_bias"][1], B),\n        "spread": logu(rng, 0.3, 3.0, B),\n        "ev_tau": logu(rng, p["excursion_tau"][0], p["excursion_tau"][1], B),\n        "fall": logu(rng, 1.0, 8.0, B),\n        "recover": logu(rng, 6.0, 80.0, B),\n        "depth": logu(rng, 0.02, 0.5, B),\n        "tick": np.where(rng.random(B) < 0.6, 1.0, 0.1),\n        "noise": logu(rng, 1e-3, 0.03, B),\n    }\n\n\ndef c4_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    lo = P["lo"].reshape(n, 1)\n    hi = P["hi"].reshape(n, 1)\n    span = hi - lo\n\n    slow = ou(rng, n, L, P["tau"]) * P["spread"].reshape(n, 1) \\\n        + P["bias"].reshape(n, 1)\n    base = lo + span * np.clip(1.0 / (1.0 + np.exp(-np.clip(slow, -30.0, 30.0))), 0.0, 1.0)\n\n    # asymmetric excursions: fast fall, slow recovery.  A symmetric predictive\n    # distribution cannot represent this, and the ceiling pinning makes the\n    # lag-m MASE denominator tiny, so a missed desaturation is catastrophic.\n    E = 8\n    cnt = rng.random((n, E)) < (L / (P["ev_tau"].reshape(n, 1) * E))\n    pos = rng.integers(0, L, size=(n, E)).astype(np.float64)\n    exc = np.zeros((n, L))\n    for j in range(E):\n        idx = np.nonzero(cnt[:, j])[0]\n        if idx.size == 0:\n            continue\n        p0 = pos[idx, j:j + 1]\n        dt = np.maximum(t - p0, 0.0)\n        tr = P["recover"][idx].reshape(-1, 1)\n        tf = np.minimum(P["fall"][idx].reshape(-1, 1), tr * 0.9)\n        shape = np.exp(-dt / tr) - np.exp(-dt / tf)\n        shape = shape / np.maximum(shape.max(axis=1, keepdims=True), 1e-9)\n        exc[idx] -= np.where(t >= p0,\n                             P["depth"][idx].reshape(-1, 1) * span[idx] * shape, 0.0)\n\n    y = base + exc + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) * span\n    y = np.clip(y, lo, hi)\n    tick = P["tick"].reshape(n, 1)\n    y = np.round(y / tick) * tick\n\n    fl = new_flags(n, scale_mode=2, bounded=True, positive=True,\n                   quant_boost=0.0, obs_boost=0.4, allow_agg=False)\n    fl["integer"] = (P["tick"] == 1.0)\n    return y, fl\n',
     'cf_fam_regime': '"""Block D — persistence / regime core.\n\nThis is the incumbent prior, and it is here to protect against regression on a\nwarm-started checkpoint rather than to differentiate.  We match it in *effect*\nand improve its statistics in three specific ways:\n\n* dwell times are heavy-tailed (LogN mixed with a Pareto tail) instead of\n  uniform — uniform dwell teaches a wrong hazard function;\n* there is a third regime type, ``transitional``: a smooth monotone ramp\n  between levels, because real regime changes are frequently gradual;\n* the *variance* switches with the regime, not only the level.\n\nD2\'s staircase snaps 40% of its levels onto a recurring ``{1,2,5}x10^k`` tick\nladder, so successive levels sit on the same grid.  That is a real, learnable\nregularity (policy rates, price ladders, config values, thermostat setpoints)\nwhich an arbitrary-real staircase destroys.\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nimport cf_kernels as K\nfrom cf_prims import complete_dwell_table\nfrom cf_prims import (categorical, decay_convolve, gather_levels, hawkes,\n                    local_linear_trend, logu, new_flags, ou, segment_map,\n                    unit_std)\nfrom cf_cadence import multi_seasonal\nfrom cf_spectral import matern_gp, time_grid\n\nDORMANT_FLAT = 0\nDORMANT_MICRO = 1\nDORMANT_COUNTER = 2\nDORMANT_ZERO = 3\nDORMANT_TRANS = 4\n\nN_ACTIVE_KINDS = 6\n\n\n# ───────────────────────── active-regime base menu ─────────────────────────\n\ndef active_base(rng, n, L, kind, cad, cfg):\n    """Unit-std active-regime carrier; each kind is built for its rows only."""\n    out = np.zeros((n, L))\n    for k in range(N_ACTIVE_KINDS):\n        m = kind == k\n        cnt = int(m.sum())\n        if cnt == 0:\n            continue\n        if k == 0:\n            sub = multi_seasonal(rng, cnt, L, cad.take(np.nonzero(m)[0]), cfg)\n        elif k == 1:\n            phi = np.stack([rng.uniform(0.1, 1.35, cnt),\n                            rng.uniform(-0.75, 0.15, cnt)], axis=1)\n            # keep the AR(2) inside the stationarity triangle\n            phi[:, 1] = np.minimum(phi[:, 1], 0.98 - np.abs(phi[:, 0]))\n            e = rng.standard_normal((cnt, L))\n            sub = np.zeros((cnt, L))\n            K.k_arma(np.ascontiguousarray(phi), np.full(cnt, 2, dtype=np.int64),\n                     np.zeros((cnt, 1)), np.zeros(cnt, dtype=np.int64), e, sub)\n            sub = unit_std(sub)\n        elif k == 2:\n            sub = matern_gp(rng, cnt, L, logu(rng, 8.0, 800.0, cnt),\n                            nu=float(rng.choice(np.array([0.5, 1.5, 2.5]))))\n        elif k == 3:\n            sub = unit_std(np.cumsum(rng.standard_normal((cnt, L)), axis=1))\n        elif k == 4:\n            mu = np.broadcast_to(logu(rng, 1e-3, 5e-2, (cnt, 1)), (cnt, L))\n            _, c = hawkes(rng, cnt, L, np.ascontiguousarray(mu),\n                          rng.uniform(0.2, 0.9, cnt), logu(rng, 3.0, 120.0, cnt))\n            marks = c * np.exp(rng.normal(0.0, 0.8, size=(cnt, L)))\n            sub = unit_std(decay_convolve(marks, logu(rng, 2.0, 60.0, cnt)))\n        else:\n            sub = ou(rng, cnt, L, logu(rng, 4.0, 600.0, cnt))\n        out[m] = sub\n    return out\n\n\n# ═════════════════════════════ D1 regime_dwell ═════════════════════════════\n\ndef d1_params(rng, B, cfg):\n    p = cfg["families"]["regime_dwell"]\n    return {\n        "d_dorm": logu(rng, p["dormant_dwell"][0], p["dormant_dwell"][1], B),\n        "d_act": logu(rng, p["active_dwell"][0], p["active_dwell"][1], B),\n        "dwell_sigma": rng.uniform(0.6, 1.3, B),\n        "pareto_a": rng.uniform(1.2, 2.0, B),\n        "heavy_tail": rng.random(B) < p["pareto_mix"],\n        "kind": rng.integers(0, N_ACTIVE_KINDS, B),\n        "amp": logu(rng, 0.3, 12.0, B),\n        "level_step": logu(rng, 0.05, 3.0, B),\n        "var_switch": logu(rng, 1.0, 8.0, B),\n        "start_active": rng.random(B) < 0.35,\n        "micro_slope": rng.normal(0.0, 0.02, B),\n        "counter_step": logu(rng, 1.0, 50.0, B),\n        "sparse_p": logu(rng, 1e-4, 2e-2, B),\n        "sparse_amp": logu(rng, 0.5, 20.0, B),\n        "ramp_frac": rng.uniform(0.05, 0.15, B),\n        "noise": logu(rng, 1e-3, 0.2, B),\n    }\n\n\ndef _heavy_dwell(rng, n, M, mean, sigma, pareto_a, heavy):\n    ln = np.exp(rng.normal(np.log(np.maximum(mean, 1.0)).reshape(n, 1),\n                           sigma.reshape(n, 1), size=(n, M)))\n    u = np.maximum(rng.random((n, M)), 1e-9)\n    par = np.maximum(mean, 1.0).reshape(n, 1) * np.power(u, -1.0 / pareto_a.reshape(n, 1))\n    take_par = (rng.random((n, M)) < 0.15) & heavy.reshape(n, 1)\n    return np.maximum(np.where(take_par, par, ln), 2.0)\n\n\ndef d1_build_factory(mode):\n    def build(P, rng, L, cad, cal, cfg):\n        n = cad.n\n        M = 64\n        dorm = _heavy_dwell(rng, n, M, P["d_dorm"], P["dwell_sigma"],\n                            P["pareto_a"], P["heavy_tail"])\n        act = _heavy_dwell(rng, n, M, P["d_act"], P["dwell_sigma"],\n                           P["pareto_a"], P["heavy_tail"])\n        sa = P["start_active"].reshape(n, 1)\n        even = (np.arange(M)[None, :] % 2) == 0\n        dwell = np.where(even ^ sa, dorm, act)\n\n        seg_id, seg_start = segment_map(dwell, L)\n        seg_len = gather_levels(dwell, seg_id)\n        is_active = ((seg_id % 2) == 1) ^ sa\n\n        # segment levels follow a random walk; the variance switches too\n        steps = rng.standard_normal((n, M)) * P["level_step"].reshape(n, 1)\n        levels = np.cumsum(steps, axis=1)\n        lvl_t = gather_levels(levels, seg_id)\n        prev_lvl = gather_levels(np.concatenate(\n            [levels[:, :1], levels[:, :-1]], axis=1), seg_id)\n\n        t = time_grid(L)[None, :]\n        pos = (t - seg_start) / np.maximum(seg_len, 1.0)\n\n        base = active_base(rng, n, L, P["kind"], cad, cfg) * P["amp"].reshape(n, 1)\n        var_hi = P["var_switch"].reshape(n, 1)\n        carrier = np.where(is_active, base * var_hi, base / var_hi)\n\n        if mode == DORMANT_FLAT:\n            dormant = lvl_t\n        elif mode == DORMANT_MICRO:\n            dormant = lvl_t + P["micro_slope"].reshape(n, 1) \\\n                * P["level_step"].reshape(n, 1) * (t - seg_start)\n        elif mode == DORMANT_COUNTER:\n            step = P["counter_step"].reshape(n, 1)\n            dormant = np.round(lvl_t / step) * step\n        elif mode == DORMANT_ZERO:\n            spike = np.where(rng.random((n, L)) < P["sparse_p"].reshape(n, 1),\n                             rng.standard_normal((n, L)) * P["sparse_amp"].reshape(n, 1),\n                             0.0)\n            dormant = np.abs(spike)\n        else:  # DORMANT_TRANS — a smooth monotone ramp between levels\n            w = np.clip(pos / np.maximum(P["ramp_frac"].reshape(n, 1), 1e-3), 0.0, 1.0)\n            w = 0.5 * (1.0 + np.tanh(6.0 * (w - 0.5)))\n            dormant = prev_lvl + (lvl_t - prev_lvl) * w\n\n        noise = rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) \\\n            * P["amp"].reshape(n, 1)\n        y = np.where(is_active, lvl_t + carrier + noise, dormant)\n        if mode == DORMANT_ZERO:\n            y = np.where(is_active, np.abs(carrier) + noise * 0.0, dormant)\n\n        extended = np.zeros(n, dtype=bool)\n        if cfg.get(\'_complete_native_renewals\', False):\n            med = np.column_stack((np.where(P[\'start_active\'], P[\'d_act\'], P[\'d_dorm\']),\n                                   np.where(P[\'start_active\'], P[\'d_dorm\'], P[\'d_act\'])))\n            rr, dd, first = complete_dwell_table(\n                rng, dwell, L, med, P[\'dwell_sigma\'].reshape(n, 1), 2.0,\n                P[\'heavy_tail\'], P[\'pareto_a\'])\n            if rr.size:\n                extended[rr] = True\n                extra = dd.shape[1] - M\n                add = np.cumsum(rng.standard_normal((rr.size, extra))\n                                * P[\'level_step\'][rr, None], axis=1)\n                lev = np.concatenate((levels[rr], levels[rr, -1:] + add), axis=1)\n                sid, start = segment_map(dd, L)\n                slen = gather_levels(dd, sid)\n                active = ((sid % 2) == 1) ^ sa[rr]\n                now = gather_levels(lev, sid)\n                previous = gather_levels(np.concatenate((lev[:, :1], lev[:, :-1]), axis=1), sid)\n                if mode == DORMANT_FLAT:\n                    calm = now\n                elif mode == DORMANT_MICRO:\n                    calm = now + P[\'micro_slope\'][rr, None] * P[\'level_step\'][rr, None] * (t - start)\n                elif mode == DORMANT_COUNTER:\n                    tick = P[\'counter_step\'][rr, None]\n                    calm = np.round(now / tick) * tick\n                elif mode == DORMANT_ZERO:\n                    calm = dormant[rr]  # already-drawn sparse observations\n                else:\n                    progress = (t - start) / np.maximum(slen, 1.0)\n                    w = np.clip(progress / np.maximum(P[\'ramp_frac\'][rr, None], 1e-3), 0.0, 1.0)\n                    w = 0.5 * (1.0 + np.tanh(6.0 * (w - 0.5)))\n                    calm = previous + (now - previous) * w\n                carrier_new = np.where(active, base[rr] * var_hi[rr], base[rr] / var_hi[rr])\n                fixed = np.where(active, now + carrier_new + noise[rr], calm)\n                if mode == DORMANT_ZERO:\n                    fixed = np.where(active, np.abs(carrier_new), calm)\n                y[rr] = np.where(t >= first[:, None], fixed, y[rr])\n\n        fl = new_flags(n, scale_mode=1 if mode == DORMANT_ZERO else 0,\n                       positive=(mode == DORMANT_ZERO),\n                       quant_boost=1.4 if mode == DORMANT_COUNTER else 0.9)\n        if mode == DORMANT_ZERO:\n            fl["offset_pref"] = np.full(n, 2, dtype=np.int8)\n        if cfg.get(\'_complete_native_renewals\', False):\n            fl[\'renewal_extended\'] = extended\n        return y, fl\n\n    return build\n\n\n# ═══════════════════ D2 level_ladder_staircase ═════════════════════════════\n\n_MANT = np.array([1.0, 2.0, 5.0])\n\n\ndef d2_params(rng, B, cfg):\n    p = cfg["families"]["level_ladder_staircase"]\n    return {\n        "run_mean": logu(rng, p["run_length"][0], p["run_length"][1], B),\n        "run_sigma": rng.uniform(0.5, 1.4, B),\n        "jump_kind": categorical(rng, p["jump_mix"], B),\n        "small": logu(rng, 0.05, 0.6, B),\n        "medium": logu(rng, 0.6, 4.0, B),\n        "huge": logu(rng, 4.0, 60.0, B),\n        "snap": rng.random(B) < p["tick_snap_rate"],\n        "tick_mant": _MANT[rng.integers(0, 3, B)],\n        "tick_exp": rng.integers(-3, 3, B),\n        "noiseless": rng.random(B) < p["noiseless_rate"],\n        "monotone": rng.random(B) < p["monotone_rate"],\n        "noise": logu(rng, 1e-3, 0.3, B),\n    }\n\n\ndef d2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    M = 96\n    dwell = np.maximum(np.exp(rng.normal(np.log(P["run_mean"]).reshape(n, 1),\n                                         P["run_sigma"].reshape(n, 1), size=(n, M))), 2.0)\n    seg_id, _ = segment_map(dwell, L)\n\n    kind = P["jump_kind"].reshape(n, 1)\n    size = np.where(kind == 0, P["small"].reshape(n, 1),\n                    np.where(kind == 1, P["medium"].reshape(n, 1),\n                             P["huge"].reshape(n, 1)))\n    jumps = rng.standard_normal((n, M)) * size\n    mono = P["monotone"].reshape(n, 1)\n    jumps = np.where(mono, np.abs(jumps), jumps)\n    levels = np.cumsum(jumps, axis=1)\n\n    tick = P["tick_mant"].reshape(n, 1) * np.power(10.0, P["tick_exp"].reshape(n, 1))\n    raw_levels = levels\n    snapped = np.round(levels / tick) * tick\n    levels = np.where(P["snap"].reshape(n, 1), snapped, levels)\n\n    y = gather_levels(levels, seg_id)\n    noise = rng.standard_normal((n, L)) * P["noise"].reshape(n, 1) * size\n    y = np.where(P["noiseless"].reshape(n, 1), y, y + noise)\n\n    extended = np.zeros(n, dtype=bool)\n    if cfg.get(\'_complete_native_renewals\', False):\n        rr, dd, first = complete_dwell_table(\n            rng, dwell, L, P[\'run_mean\'].reshape(n, 1), P[\'run_sigma\'].reshape(n, 1), 2.0)\n        if rr.size:\n            extended[rr] = True\n            add = rng.standard_normal((rr.size, dd.shape[1] - M)) * size[rr]\n            add = np.where(mono[rr], np.abs(add), add)\n            extra_levels = raw_levels[rr, -1:] + np.cumsum(add, axis=1)\n            extra_levels = np.where(P[\'snap\'][rr, None],\n                                    np.round(extra_levels / tick[rr]) * tick[rr], extra_levels)\n            lev = np.concatenate((levels[rr], extra_levels), axis=1)\n            sid, _ = segment_map(dd, L)\n            fixed = gather_levels(lev, sid)\n            fixed = np.where(P[\'noiseless\'][rr, None], fixed, fixed + noise[rr])\n            t = time_grid(L)[None, :]\n            y[rr] = np.where(t >= first[:, None], fixed, y[rr])\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.6)\n    fl["obs_boost"] = np.where(P["noiseless"], 0.4, 1.0)\n    if cfg.get(\'_complete_native_renewals\', False):\n        fl[\'renewal_extended\'] = extended\n    return y, fl\n\n\n# ═══════════════ D3 smooth_drift_extrapolable ══════════════════════════════\n\ndef d3_params(rng, B, cfg):\n    p = cfg["families"]["smooth_drift_extrapolable"]\n    return {\n        "nu_idx": categorical(rng, p["matern_nu_mix"], B),\n        "ell": logu(rng, p["lengthscale"][0], p["lengthscale"][1], B),\n        "gp_w": rng.uniform(0.2, 1.0, B),\n        "llt_w": rng.uniform(0.2, 1.0, B),\n        "sig_level": logu(rng, 1e-3, 1.0, B),\n        "slope_ratio": logu(rng, 1e-4, 1e-1, B),\n        "damped": rng.random(B) < p["damped_rate"],\n        "damp_phi": rng.uniform(0.80, 0.995, B),\n        "saturating": rng.random(B) < p["saturating_rate"],\n        "sat_kind": rng.integers(0, 2, B),\n        "sat_infl": rng.uniform(-0.4, 1.4, B),\n        "sat_rate": logu(rng, 2.0, 30.0, B),\n        "sat_amp": logu(rng, 0.5, 12.0, B),\n        "obs_ratio": logu(rng, p["obs_noise_ratio"][0], p["obs_noise_ratio"][1], B),\n    }\n\n\nNU_VALUES = (0.5, 1.5, 2.5)\n\n\ndef d3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    gp = np.zeros((n, L))\n    for k, nu in enumerate(NU_VALUES):\n        m = P["nu_idx"] == k\n        c = int(m.sum())\n        if c:\n            gp[m] = matern_gp(rng, c, L, P["ell"][m], nu=nu)\n\n    damp = np.where(P["damped"], P["damp_phi"], 1.0)\n    llt = local_linear_trend(rng, n, L, P["sig_level"],\n                             P["sig_level"] * P["slope_ratio"],\n                             damp=damp)\n    llt = unit_std(llt)\n\n    y = P["gp_w"].reshape(n, 1) * gp + P["llt_w"].reshape(n, 1) * llt\n\n    if P["saturating"].any():\n        x0 = P["sat_infl"].reshape(n, 1) * L\n        k = np.maximum(L / P["sat_rate"].reshape(n, 1), 1.0)\n        logis = 1.0 / (1.0 + np.exp(-np.clip((t - x0) / k, -40.0, 40.0)))\n        gomp = np.exp(-np.exp(-np.clip((t - x0) / k, -40.0, 40.0)))\n        curve = np.where(P["sat_kind"].reshape(n, 1) == 0, logis, gomp)\n        y = np.where(P["saturating"].reshape(n, 1),\n                     y + P["sat_amp"].reshape(n, 1) * curve, y)\n\n    sig = unit_std(y)\n    obs = rng.standard_normal((n, L)) * P["obs_ratio"].reshape(n, 1)\n    y = sig + obs\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.7)\n    fl["offset_pref"] = np.where(P["obs_ratio"] < 0.02, 1, 0).astype(np.int8)\n    return y, fl\n',
     'cf_fam_stoch': '"""Block E — the stochastic backbone.\n\nFour things here have no analogue anywhere in the competitive field:\n\n* **moving-average and seasonal-differenced structure** (E1).  The field\'s whole\n  linear vocabulary is AR(1)/AR(2)/threshold-AR.  MA terms and ``(1 - B^m)``\n  differencing change the 64-step conditional-mean path and the error-variance\n  profile in ways no pure-AR family can express, and via the batched ARMA kernel\n  they cost the same as AR(2).\n* **true conditional heteroscedasticity with leverage** (E2).  CRPS is a\n  distributional score, so the largest relative gains come from conditioning\n  interval *width* on the recent context.\n* **self-exciting clustered arrivals with a power-law kernel** (E3), including\n  genuine long-memory clustering built from four exponentials.\n* **spectral-mixture kernels** (E5), which give quasi-periodic structure at\n  non-integer, mutually incommensurate periods — a direct attack on the\n  field-wide fixed integer period grid, at O(L log L).\n"""\n\nfrom __future__ import annotations\n\nimport numpy as np\n\nimport cf_kernels as K\nfrom cf_fam_regime import N_ACTIVE_KINDS, active_base\nfrom cf_prims import (TWO_PI, categorical, decay_convolve, gather_levels,\n                    hawkes, logu, new_flags, segment_map, unit_std)\nfrom cf_spectral import (freq_grid, gp_from_psd, matern_gp, psd_convolve,\n                       psd_matern, psd_periodic, psd_pink, psd_rbf, psd_rq,\n                       psd_spectral_mixture, time_grid)\n\nMAX_SEASONAL_M = 48\nMAX_ORDER = 3 + 2 * MAX_SEASONAL_M\n\n\n# ═════════════════════════════ E1 arma_sarima ══════════════════════════════\n\ndef _poly_from_inverse_roots(rng, n, order, lo=0.05, hi=0.97):\n    """Degree-3 polynomial coefficients from drawn inverse roots.\n\n    Building the polynomial from roots (rather than drawing coefficients and\n    rejecting) makes stationarity and invertibility hold *by construction* — no\n    rejection loop, so the cost is a fixed handful of vector ops.\n    """\n    r = rng.uniform(lo, hi, size=(n, 3)) * np.sign(rng.standard_normal((n, 3)))\n    live = np.arange(3)[None, :] < np.asarray(order).reshape(n, 1)\n    r = np.where(live, r, 0.0)\n    complex_pair = (rng.random(n) < 0.45) & (np.asarray(order) >= 2)\n    rho = rng.uniform(lo, hi, n)\n    th = rng.uniform(0.15, np.pi - 0.15, n)\n    a, b, c = r[:, 0], r[:, 1], r[:, 2]\n    # all-real product\n    c1_r = a + b + c\n    c2_r = a * b + a * c + b * c\n    c3_r = a * b * c\n    # one real root x one complex-conjugate pair.  At order 2 the pair IS the\n    # polynomial: drop the real root so the degree stays 2 (c3 == 0).  Leaving\n    # it in made a degree-3 seasonal factor whose B^3m term _expand_seasonal\n    # then truncated, and a truncated polynomial is not stationary.\n    a_c = np.where(np.asarray(order) >= 3, a, 0.0)\n    two_rc = 2.0 * rho * np.cos(th)\n    c1_c = a_c + two_rc\n    c2_c = rho ** 2 + a_c * two_rc\n    c3_c = a_c * rho ** 2\n    use = complex_pair\n    c1 = np.where(use, c1_c, c1_r)\n    c2 = np.where(use, c2_c, c2_r)\n    c3 = np.where(use, c3_c, c3_r)\n    # (1 - aB)(1 - bB)(1 - cB) = 1 - e1*B + e2*B^2 - e3*B^3: the elementary\n    # symmetric coefficients ALTERNATE in sign.  _expand_seasonal builds\n    # ``1 - k1*B - k2*B^2 - k3*B^3`` from what we return, so hand it\n    # (e1, -e2, e3) — returning (e1, e2, e3) flips the B^2 term and about a\n    # quarter of the draws land outside the unit circle and explode.\n    return np.stack([c1, -c2, c3], axis=1)\n\n\ndef _expand_seasonal(base, seas, m, n):\n    """Convolve a degree-3 polynomial with a seasonal polynomial at lag m."""\n    out = np.zeros((n, MAX_ORDER + 1))\n    poly = np.concatenate([np.ones((n, 1)), -base], axis=1)          # 1 - c1 B - ...\n    spol = np.concatenate([np.ones((n, 1)), -seas], axis=1)          # 1 - S1 B^m - ...\n    rows = np.arange(n)\n    for j in range(4):\n        for k in range(3):\n            idx = j + k * np.asarray(m).astype(np.int64)\n            idx = np.clip(idx, 0, MAX_ORDER)\n            np.add.at(out, (rows, idx), poly[:, j] * spol[:, k])\n    return -out[:, 1:]\n\n\ndef e1_params(rng, B, cfg):\n    p = cfg["families"]["arma_sarima"]\n    mgrid = np.array([2, 3, 4, 6, 7, 12, 24, 48])\n    return {\n        "p": rng.integers(0, 4, B),\n        "q": rng.integers(0, 4, B),\n        "P": rng.integers(0, 3, B),\n        "Q": rng.integers(0, 3, B),\n        "d": (rng.random(B) < p["d_rate"]).astype(np.int64),\n        "D": (rng.random(B) < p["big_d_rate"]).astype(np.int64),\n        "m": mgrid[rng.integers(0, len(mgrid), B)],\n        "seasonal_on": rng.random(B) < p["seasonal_rate"],\n        "student": rng.random(B) < p["student_rate"],\n        "nu": rng.uniform(3.0, 10.0, B),\n        "sig": logu(rng, 0.05, 20.0, B),\n        "drift": rng.normal(0.0, 0.02, B),\n    }\n\n\ndef e1_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    son = P["seasonal_on"]\n    m = np.where(son, P["m"], 0).astype(np.int64)\n    Pord = np.where(son, P["P"], 0)\n    Qord = np.where(son, P["Q"], 0)\n    D = np.where(son, P["D"], 0)\n\n    ar = _poly_from_inverse_roots(rng, n, P["p"])\n    ma = _poly_from_inverse_roots(rng, n, P["q"])\n    sar = _poly_from_inverse_roots(rng, n, np.minimum(Pord, 3))\n    sma = _poly_from_inverse_roots(rng, n, np.minimum(Qord, 3))\n\n    phi = np.ascontiguousarray(_expand_seasonal(ar, sar, m, n))\n    theta = np.ascontiguousarray(-_expand_seasonal(ma, sma, m, n))\n    ordv = np.where(m > 0, 3 + 2 * m, 3).astype(np.int64)\n    ordv = np.minimum(ordv, MAX_ORDER)\n\n    z = rng.standard_normal((n, L))\n    if P["student"].any():\n        nu = np.maximum(P["nu"].reshape(n, 1), 2.5)\n        g = rng.chisquare(np.broadcast_to(nu, (n, L))) / nu\n        tt = z / np.sqrt(np.maximum(g, 1e-9))\n        tt *= np.sqrt(np.maximum((nu - 2.0) / nu, 1e-3))\n        z = np.where(P["student"].reshape(n, 1), tt, z)\n    e = np.ascontiguousarray(z * P["sig"].reshape(n, 1))\n\n    out = np.zeros((n, L))\n    K.k_arma(phi, ordv, theta, ordv, e, out)\n    out = np.clip(out, -1e120, 1e120)\n\n    if (D > 0).any():\n        acc = np.zeros((n, L))\n        K.k_seasonal_int(np.ascontiguousarray(out),\n                         np.where(D > 0, np.maximum(m, 1), L + 1).astype(np.int64), acc)\n        out = np.where((D > 0).reshape(n, 1), acc, out)\n    dmask = (P["d"] > 0).reshape(n, 1)\n    if dmask.any():\n        t = time_grid(L)[None, :]\n        integ = np.cumsum(out, axis=1) + P["drift"].reshape(n, 1) \\\n            * P["sig"].reshape(n, 1) * t\n        out = np.where(dmask, integ, out)\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.9)\n    return out, fl\n\n\n# ═══════════════════════════ E2 garch_leverage ═════════════════════════════\n\ndef e2_params(rng, B, cfg):\n    p = cfg["families"]["garch_leverage"]\n    persist = rng.uniform(p["persistence"][0], p["persistence"][1], B)\n    lev = rng.uniform(0.0, 1.5, B)\n    alpha = rng.uniform(0.02, 0.14, B)\n    gamma = alpha * lev\n    beta = np.maximum(persist - alpha - 0.5 * gamma, 0.05)\n    return {\n        "omega": logu(rng, 1e-8, 1e-3, B),\n        "alpha": alpha,\n        "gamma": gamma,\n        "beta": beta,\n        "student": rng.random(B) < p["student_rate"],\n        "nu": rng.uniform(3.5, 12.0, B),\n        "emit": categorical(rng, p["emit_mix"], B),\n        "arma_mean": rng.random(B) < p["arma_mean_rate"],\n        "mean_phi": rng.uniform(-0.3, 0.4, B),\n        "s0": logu(rng, 1.0, 5.0e4, B),\n        "mu_drift": rng.normal(0.0, 3e-4, B),\n    }\n\n\ndef e2_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    z = rng.standard_normal((n, L))\n    if P["student"].any():\n        nu = np.maximum(P["nu"].reshape(n, 1), 2.5)\n        g = rng.chisquare(np.broadcast_to(nu, (n, L))) / nu\n        tt = z / np.sqrt(np.maximum(g, 1e-9)) * np.sqrt((nu - 2.0) / nu)\n        z = np.where(P["student"].reshape(n, 1), tt, z)\n\n    r = np.zeros((n, L))\n    sd = np.zeros((n, L))\n    K.k_garch(np.ascontiguousarray(P["omega"]), np.ascontiguousarray(P["alpha"]),\n              np.ascontiguousarray(P["gamma"]), np.ascontiguousarray(P["beta"]),\n              np.ascontiguousarray(z), r, sd)\n\n    if P["arma_mean"].any():\n        mean = np.zeros((n, L))\n        K.k_arma(np.ascontiguousarray(P["mean_phi"].reshape(n, 1)),\n                 np.ones(n, dtype=np.int64), np.zeros((n, 1)),\n                 np.zeros(n, dtype=np.int64), np.ascontiguousarray(r), mean)\n        r = np.where(P["arma_mean"].reshape(n, 1), mean, r)\n    r = r + P["mu_drift"].reshape(n, 1)\n\n    price = P["s0"].reshape(n, 1) * np.exp(np.clip(np.cumsum(r, axis=1), -50.0, 50.0))\n    rv = decay_convolve(sd ** 2, np.full(n, 24.0)) * 24.0\n    emit = P["emit"].reshape(n, 1)\n    y = np.where(emit == 0, r, np.where(emit == 1, price, np.sqrt(np.maximum(rv, 0.0))))\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.9)\n    # mean-zero return series have a small sum|y| and are therefore the\n    # relative-WQL amplifiers; anchor them at zero rather than on a big offset\n    fl["offset_pref"] = np.where(P["emit"] == 0, 3,\n                                 np.where(P["emit"] == 1, 1, 2)).astype(np.int8)\n    fl["scale_mode"] = np.where(P["emit"] == 0, 0, 1).astype(np.int8)\n    fl["positive"] = (P["emit"] > 0)\n    return y, fl\n\n\n# ════════════════════════════ E3 hawkes_marked ═════════════════════════════\n\ndef e3_params(rng, B, cfg):\n    p = cfg["families"]["hawkes_marked"]\n    return {\n        "mu": logu(rng, 1e-4, 2.0, B),\n        "branch": rng.uniform(p["branching"][0], p["branching"][1], B),\n        "tau": logu(rng, 2.0, 200.0, B),\n        "power_law": rng.random(B) < p["power_law_rate"],\n        "diurnal": rng.random(B) < 0.45,\n        "diurnal_amp": rng.uniform(0.2, 0.9, B),\n        "emit": categorical(rng, p["emit_mix"], B),\n        "mark_sig": rng.uniform(0.4, 1.8, B),\n        "decay_tau": logu(rng, 2.0, 120.0, B),\n    }\n\n\ndef e3_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n    pd = cad.p_day.reshape(n, 1)\n    has_day = pd >= 3.0\n    ph = t / np.where(has_day, pd, 1e9) + rng.random((n, 1))\n    prof = 1.0 + np.where(P["diurnal"].reshape(n, 1) & has_day,\n                          P["diurnal_amp"].reshape(n, 1) * np.sin(TWO_PI * ph), 0.0)\n    mu = np.ascontiguousarray(P["mu"].reshape(n, 1) * np.maximum(prof, 0.05))\n    mu = np.ascontiguousarray(np.broadcast_to(mu, (n, L)).copy())\n\n    lam, cnt = hawkes(rng, n, L, mu, P["branch"], P["tau"], P["power_law"])\n    marks = cnt * np.exp(rng.normal(0.0, P["mark_sig"].reshape(n, 1), size=(n, L)))\n    marked = decay_convolve(marks, P["decay_tau"])\n\n    emit = P["emit"].reshape(n, 1)\n    y = np.where(emit == 0, cnt, np.where(emit == 1, lam, marked))\n    fl = new_flags(n, scale_mode=1, positive=True, quant_boost=0.5)\n    fl["integer"] = (P["emit"] == 0)\n    fl["offset_pref"] = np.full(n, 2, dtype=np.int8)\n    return y, fl\n\n\n# ═══════════════════════════ E4 chaotic_delay ══════════════════════════════\n\n_SYS_PAR = {\n    0: (10.0, 28.0, 8.0 / 3.0, 0.0),      # Lorenz\n    1: (0.2, 0.2, 5.7, 0.0),              # Rossler\n    2: (1.0, 0.35, 10.0, 15.0),           # Chua (cubic)\n    3: (1.0, 3.0, 5.0, 3.2),              # Hindmarsh-Rose\n}\n\n\ndef e4_params(rng, B, cfg):\n    p = cfg["families"]["chaotic_delay"]\n    sysid = categorical(rng, p["system_mix"], B)\n    par = np.zeros((B, 4))\n    for k, v in _SYS_PAR.items():\n        m = sysid == k\n        par[m] = np.array(v)\n    par *= np.exp(rng.normal(0.0, 0.04, size=(B, 4)))\n    return {\n        "system": sysid,\n        "par": par,\n        "dt": logu(rng, 0.004, 0.05, B),\n        "sub": rng.integers(1, 4, B),\n        "state0": rng.normal(0.0, 1.0, size=(B, 3)) + np.array([0.6, 0.4, 1.2]),\n        "project": rng.random(B) < p["projection_rate"],\n        "proj": rng.normal(0.0, 1.0, size=(B, 3)),\n        "mg": rng.random(B) < p["mackey_glass_rate"],\n        "mg_beta": rng.uniform(0.15, 0.3, B),\n        "mg_gamma": rng.uniform(0.08, 0.12, B),\n        "mg_n": rng.uniform(8.0, 12.0, B),\n        "mg_tau": rng.uniform(15.0, 40.0, B),\n        "obs_noise": logu(rng, 1e-4, 5e-2, B),\n    }\n\n\ndef e4_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    traj = np.zeros((n, L, 3))\n    K.k_rk4_3d(np.ascontiguousarray(P["system"]).astype(np.int64),\n               np.ascontiguousarray(P["par"]),\n               np.ascontiguousarray(P["dt"]),\n               np.ascontiguousarray(P["state0"]),\n               np.ascontiguousarray(P["sub"]).astype(np.int64), traj)\n    pick = rng.integers(0, 3, n)\n    coord = traj[np.arange(n), :, pick]\n    proj = np.einsum("ntk,nk->nt", traj, P["proj"])\n    y = np.where(P["project"].reshape(n, 1), proj, coord)\n\n    if P["mg"].any():\n        Bw = 256\n        dsteps = np.clip(np.round(P["mg_tau"] * 4.0).astype(np.int64), 4, Bw - 2)\n        hist = 1.0 + 0.15 * rng.standard_normal((n, Bw))\n        mg = np.zeros((n, L))\n        K.k_mackey_glass(np.ascontiguousarray(P["mg_beta"]),\n                         np.ascontiguousarray(P["mg_gamma"]),\n                         np.ascontiguousarray(P["mg_n"]),\n                         np.ascontiguousarray(dsteps),\n                         np.ascontiguousarray(hist), mg)\n        y = np.where(P["mg"].reshape(n, 1), mg, y)\n\n    y = unit_std(y) + rng.standard_normal((n, L)) * P["obs_noise"].reshape(n, 1)\n    fl = new_flags(n, scale_mode=0, quant_boost=0.6)\n    return y, fl\n\n\n# ═══════════════════════ E5 spectral_kernel_zoo ════════════════════════════\n\nN_PSD_TYPES = 7\n\n\ndef e5_params(rng, B, cfg):\n    p = cfg["families"]["spectral_kernel_zoo"]\n    return {\n        "n_comp": rng.integers(1, 4, B),\n        "types": rng.integers(0, N_PSD_TYPES, (B, 3)),\n        "weights": rng.uniform(0.2, 1.0, (B, 3)),\n        "ell": logu(rng, 4.0, 2000.0, (B, 3)),\n        "alpha": logu(rng, 0.1, 10.0, (B, 3)),\n        "f0": logu(rng, 1.0 / 900.0, 1.0 / 5.0, (B, 3)),\n        "pwidth": logu(rng, 1e-4, 3e-3, (B, 3)),\n        "pdecay": rng.uniform(0.2, 1.5, (B, 3)),\n        "sm_q": rng.integers(1, 5, B),\n        "sm_c": logu(rng, 1.0 / 2000.0, 0.35, (B, 4)),\n        "sm_w": logu(rng, 2e-5, 8e-3, (B, 4)),\n        "sm_a": rng.uniform(0.2, 1.0, (B, 4)),\n        "beta": rng.uniform(0.4, 2.6, (B, 3)),\n        "fbreak": logu(rng, 1e-5, 5e-3, (B, 3)),\n        "product": rng.random(B) < p["product_rate"],\n        "envelope": rng.random(B) < p["envelope_rate"],\n        "warp": rng.random(B) < p["warp_rate"],\n        "noise": logu(rng, 1e-3, 0.25, B),\n    }\n\n\ndef _psd_slot(rng, P, f, n, slot):\n    types = P["types"][:, slot]\n    out = np.zeros((n, f.shape[0]))\n    for ty in range(N_PSD_TYPES):\n        m = types == ty\n        c = int(m.sum())\n        if c == 0:\n            continue\n        ell = P["ell"][m, slot:slot + 1]\n        if ty == 0:\n            s = psd_rbf(f, ell)\n        elif ty == 1:\n            s = psd_matern(f, ell, 0.5)\n        elif ty == 2:\n            s = psd_matern(f, ell, 1.5)\n        elif ty == 3:\n            s = psd_matern(f, ell, 2.5)\n        elif ty == 4:\n            s = psd_rq(f, ell, P["alpha"][m, slot:slot + 1])\n        elif ty == 5:\n            s = psd_periodic(f, P["f0"][m, slot:slot + 1], 6,\n                             P["pdecay"][m, slot:slot + 1],\n                             P["pwidth"][m, slot:slot + 1])\n        else:\n            s = psd_pink(f, P["beta"][m, slot:slot + 1],\n                         P["fbreak"][m, slot:slot + 1])\n        out[m] = s / np.maximum(s.sum(axis=1, keepdims=True), 1e-300)\n    return out\n\n\ndef e5_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    f = freq_grid(L)\n    psd = np.zeros((n, f.shape[0]))\n    slots = []\n    for slot in range(3):\n        s = _psd_slot(rng, P, f, n, slot)\n        live = (slot < P["n_comp"]).reshape(n, 1)\n        slots.append(s * live)\n        psd += s * P["weights"][:, slot:slot + 1] * live\n\n    # spectral-mixture component: Q Gaussian peaks at arbitrary centres, giving\n    # quasi-periodic structure at mutually incommensurate, non-integer periods\n    sm = psd_spectral_mixture(f, P["sm_c"], P["sm_w"],\n                              P["sm_a"] * (np.arange(4)[None, :] < P["sm_q"].reshape(n, 1)))\n    psd += sm / np.maximum(sm.sum(axis=1, keepdims=True), 1e-300)\n\n    # A kernel *product* is a PSD convolution; it needs two live components.\n    prod_on = P["product"] & (P["n_comp"] >= 2)\n    if prod_on.any():\n        prod = psd_convolve(np.maximum(slots[0], 1e-300), np.maximum(slots[1], 1e-300))\n        prod /= np.maximum(prod.sum(axis=1, keepdims=True), 1e-300)\n        psd = np.where(prod_on.reshape(n, 1), prod + 1e-6 * psd, psd)\n\n    y = gp_from_psd(rng, np.maximum(psd, 1e-300), L)\n\n    t = time_grid(L)[None, :]\n    if P["envelope"].any():\n        env = 1.0 + 0.9 * matern_gp(rng, n, L, np.full(n, L / 3.0), nu=1.5)\n        y = np.where(P["envelope"].reshape(n, 1), y * np.maximum(env, 0.05), y)\n    if P["warp"].any():\n        bb = np.cumsum(rng.standard_normal((n, L)), axis=1)\n        bb = bb - (t / (L - 1.0)) * bb[:, -1:]\n        bb = bb / np.maximum(np.abs(bb).max(axis=1, keepdims=True), 1e-9)\n        src = np.clip(t + bb * (L * 0.06), 0.0, L - 1.0001)\n        i0 = src.astype(np.int64)\n        fr = src - i0\n        w = np.take_along_axis(y, i0, axis=1) * (1.0 - fr) + \\\n            np.take_along_axis(y, np.minimum(i0 + 1, L - 1), axis=1) * fr\n        y = np.where(P["warp"].reshape(n, 1), w, y)\n\n    y = unit_std(y) + rng.standard_normal((n, L)) * P["noise"].reshape(n, 1)\n    fl = new_flags(n, scale_mode=0, quant_boost=0.9)\n    return y, fl\n\n\n# ═══════════════════════ E6 changepoint_composite ══════════════════════════\n\nMAX_SEG = 5\n\n\ndef e6_params(rng, B, cfg):\n    p = cfg["families"]["changepoint_composite"]\n    return {\n        "n_seg": rng.integers(2, MAX_SEG + 1, B),\n        "kinds": rng.integers(0, N_ACTIVE_KINDS + 2, (B, MAX_SEG)),\n        "amps": logu(rng, 0.2, 8.0, (B, MAX_SEG)),\n        "levels": rng.normal(0.0, 1.0, (B, MAX_SEG)),\n        "join": categorical(rng, p["join_mix"], B),\n        "fade_frac": rng.uniform(0.05, 0.10, B),\n        "hazard_state": rng.uniform(p["state_hazard"][0], p["state_hazard"][1], B),\n        "trend_slope": rng.normal(0.0, 2.0, (B, MAX_SEG)),\n        "ladder_step": logu(rng, 0.2, 4.0, (B, MAX_SEG)),\n        "ladder_run": logu(rng, 20.0, 600.0, (B, MAX_SEG)),\n    }\n\n\ndef e6_build(P, rng, L, cad, cal, cfg):\n    n = cad.n\n    t = time_grid(L)[None, :]\n\n    # Build MAX_SEG candidate processes per row, each with its own family.\n    kinds = P["kinds"].reshape(-1)\n    cad_rep = cad.take(np.repeat(np.arange(n), MAX_SEG))\n    base_kind = np.minimum(kinds, N_ACTIVE_KINDS - 1)\n    cands = active_base(rng, n * MAX_SEG, L, base_kind, cad_rep, cfg)\n\n    # two extra menu entries beyond the shared active-base menu\n    tr = kinds == N_ACTIVE_KINDS\n    if tr.any():\n        slope = P["trend_slope"].reshape(-1)[tr].reshape(-1, 1)\n        cands[tr] = unit_std(slope * (t / L) + 0.15 * np.cumsum(\n            rng.standard_normal((int(tr.sum()), L)), axis=1) / np.sqrt(L))\n    ld = kinds == N_ACTIVE_KINDS + 1\n    if ld.any():\n        c = int(ld.sum())\n        run = P["ladder_run"].reshape(-1)[ld].reshape(c, 1)\n        dwell = np.maximum(np.exp(rng.normal(np.log(run), 0.7, size=(c, 48))), 2.0)\n        seg, _ = segment_map(dwell, L)\n        lv = np.cumsum(rng.standard_normal((c, 48)), axis=1)\n        cands[ld] = unit_std(gather_levels(lv, seg))\n\n    cands = cands.reshape(n, MAX_SEG, L) * P["amps"].reshape(n, MAX_SEG, 1)\n    cands = cands + P["levels"].reshape(n, MAX_SEG, 1)\n\n    # Break hazard: uniform in time, elevated after a high-volatility stretch.\n    # The model therefore learns break hazard conditioned on observable\n    # precursors rather than on a fixed relative position.\n    v = np.abs(np.diff(cands[:, 0, :], axis=1, prepend=cands[:, 0, :1]))\n    v = decay_convolve(v, np.full(n, 64.0))\n    v = (v - v.mean(axis=1, keepdims=True)) / np.maximum(v.std(axis=1, keepdims=True), 1e-9)\n    logw = P["hazard_state"].reshape(n, 1) * np.clip(v, -3.0, 3.0)\n    guard = np.zeros((n, L))\n    guard[:, :L // 16] = -30.0\n    guard[:, -L // 16:] = -30.0\n    gum = -np.log(-np.log(np.maximum(rng.random((n, L)), 1e-12)))\n    key = logw + gum + guard\n    cut = np.sort(np.argsort(-key, axis=1)[:, :MAX_SEG - 1], axis=1)\n\n    live = np.arange(MAX_SEG - 1)[None, :] < (P["n_seg"] - 1).reshape(n, 1)\n    cut = np.where(live, cut, L + 1)\n    seg_id = np.zeros((n, L), dtype=np.int64)\n    for j in range(MAX_SEG - 1):\n        seg_id += (t >= cut[:, j:j + 1]).astype(np.int64)\n\n    y = np.take_along_axis(cands, seg_id[:, None, :], axis=1)[:, 0, :]\n\n    join = P["join"].reshape(n, 1)\n    if (P["join"] > 0).any():\n        fade = np.maximum(P["fade_frac"].reshape(n, 1) * L, 2.0)\n        blend = y.copy()\n        for j in range(MAX_SEG - 1):\n            cj = cut[:, j:j + 1].astype(np.float64)\n            w = np.clip((t - cj) / fade + 0.5, 0.0, 1.0)\n            inside = (np.abs(t - cj) < fade) & live[:, j:j + 1]\n            lhs = cands[:, j, :]\n            rhs = cands[:, min(j + 1, MAX_SEG - 1), :]\n            blend = np.where(inside, lhs * (1.0 - w) + rhs * w, blend)\n        y = np.where(join == 1, blend, y)\n\n    if (P["join"] == 2).any():\n        # level-matched continuous joins: remove the jump at each break\n        step = np.zeros((n, L))\n        for j in range(MAX_SEG - 1):\n            cj = np.clip(cut[:, j:j + 1], 0, L - 1)\n            before = np.take_along_axis(y, np.maximum(cj - 1, 0), axis=1)\n            after = np.take_along_axis(y, cj, axis=1)\n            step += np.where((t >= cj) & live[:, j:j + 1], before - after, 0.0)\n        y = np.where(join == 2, y + step, y)\n\n    fl = new_flags(n, scale_mode=0, quant_boost=0.9)\n    return y, fl\n',
@@ -320,6 +332,15 @@ FAMILY_DOMAIN: dict[str, str] = {
     "smooth_drift_extrapolable": "econ_fin",
     "price_shock": "econ_fin",
     "garch_leverage": "econ_fin",
+    "epi_season_decay": "healthcare",
+    "weekday_ledger_counts": "healthcare",
+    "surveillance_counts": "healthcare",
+    "pull_counter_ramp": "web_cloudops",
+    "weekly_cycle_downloads": "web_cloudops",
+    "hourly_social_counts": "web_cloudops",
+    "intraday_event_counts": "healthcare",
+    "intraday_spot_price": "energy",
+    "road_commute_counts": "transport",
 }
 
 # Cross-domain stochastic / regime backbone — included in every domain pool.
@@ -659,6 +680,15 @@ _FAMILIES: tuple[str, ...] = (
     "settle_hold",
     "web_traffic_plateau",
     *_LAB3,
+    "epi_season_decay",
+    "weekday_ledger_counts",
+    "surveillance_counts",
+    "pull_counter_ramp",
+    "weekly_cycle_downloads",
+    "hourly_social_counts",
+    "intraday_event_counts",
+    "intraday_spot_price",
+    "road_commute_counts",
 )
 
 
@@ -711,6 +741,15 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "settle_hold": 0.0,
     "web_traffic_plateau": 0.0,
     **{name: 0.0 for name in _LAB3},
+    "epi_season_decay": 0.0,
+    "weekday_ledger_counts": 0.0,
+    "surveillance_counts": 0.0,
+    "pull_counter_ramp": 0.0,
+    "weekly_cycle_downloads": 0.0,
+    "hourly_social_counts": 0.0,
+    "intraday_event_counts": 0.0,
+    "intraday_spot_price": 0.0,
+    "road_commute_counts": 0.0,
 }
 
 
@@ -784,6 +823,15 @@ _DISPATCH_REF_RAW: dict[str, float] = {
     "settle_hold": 0.0,
     "web_traffic_plateau": 0.0,
     **{name: 0.0 for name in _LAB3},
+    "epi_season_decay": 0.0,
+    "weekday_ledger_counts": 0.0,
+    "surveillance_counts": 0.0,
+    "pull_counter_ramp": 0.0,
+    "weekly_cycle_downloads": 0.0,
+    "hourly_social_counts": 0.0,
+    "intraday_event_counts": 0.0,
+    "intraday_spot_price": 0.0,
+    "road_commute_counts": 0.0,
 }
 
 
@@ -1238,6 +1286,15 @@ _CLEAN: frozenset[str] = frozenset({
     "tidal_harmonic",
     "weekly_demand",
     "flow_recession",
+    "epi_season_decay",
+    "weekday_ledger_counts",
+    "surveillance_counts",
+    "pull_counter_ramp",
+    "weekly_cycle_downloads",
+    "hourly_social_counts",
+    "intraday_event_counts",
+    "intraday_spot_price",
+    "road_commute_counts",
 })
 
 
@@ -1651,15 +1708,25 @@ def _held_rate(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     base = rng.uniform(-2.0, 8.0, size=(n, 1))
     grid = rng.choice(np.array([0.05, 0.1, 0.25, 0.5]), size=(n, 1))
     k = rng.integers(0, 4, size=(n, 1))                     # 0-3 steps per window
-    at = rng.random((n, L)) < (_held_hazard(k, 2.0, False) / max(L, 1))
+    draw = rng.random((n, L))
+    at = draw < (_held_hazard(k, 2.0, False) / max(L, 1))
+    del draw
     at[:, 0] = False
-    size = grid * rng.choice(np.array([-2.,-1.,1.,2.]), size=(n, L))
-    lvl = base + np.cumsum(at * size, axis=1)
+    lvl = rng.choice(np.array([-2.,-1.,1.,2.]), size=(n, L))
+    lvl *= grid                                             # step sizes on the grid
+    lvl *= at                                               # zero where no step fires
+    del at
+    np.cumsum(lvl, axis=1, out=lvl)
+    lvl += base
     exact = rng.random((n, 1)) < 0.8
     sd = np.where(exact, 0.0, rng.uniform(0.001, 0.01, size=(n, 1)))
-    out = lvl + rng.normal(0.0, 1.0, size=(n, L)) * sd
+    noise = rng.normal(0.0, 1.0, size=(n, L))
+    noise *= sd
+    lvl += noise
+    del noise
     scale = np.exp(rng.uniform(np.log(0.5), np.log(200.0), size=(n, 1)))
-    return out * scale
+    lvl *= scale
+    return lvl
 
 
 def _spiky_price(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
@@ -1742,6 +1809,10 @@ def _sticky_station(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     cap = np.exp(rng.normal(np.log(18.0), 0.55, size=(n, 1)))
     cap = np.clip(np.rint(cap), 4.0, 80.0)
     hold = rng.beta(3.2, 1.0, size=(n, 1)) * 0.42 + 0.53      # ~0.55..0.95
+    # Minute-cadence docks (Oslo/Trondheim/Zagreb/Divvy/Indego) hold 0.94-0.998
+    # of steps: 60% of rows draw from that regime.
+    very = rng.random((n, 1)) < 0.6
+    hold = np.where(very, 1.0 - np.exp(rng.uniform(np.log(0.002), np.log(0.06), size=(n, 1))), hold)
     step2 = rng.uniform(0.03, 0.15, size=(n, 1))              # of the moves
     move = rng.random((n, L)) >= hold
     mag = np.where(rng.random((n, L)) < step2, 2.0, 1.0)
@@ -1754,7 +1825,9 @@ def _sticky_station(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         2*np.pi*t/period + rng.uniform(0, 2*np.pi, (n, 1)))
     sgn = np.where(rng.random((n, L)) < 0.5 + bias, sgn, -sgn)
     steps = move * mag * sgn
-    walk = rng.uniform(0.15, 0.85, size=(n, 1)) * cap + np.cumsum(steps, axis=1)
+    start = np.where(rng.random((n, 1)) < 0.2, rng.uniform(0.0, 0.1, size=(n, 1)),
+                     rng.uniform(0.15, 0.85, size=(n, 1)))
+    walk = start * cap + np.cumsum(steps, axis=1)
     span = 2.0 * cap
     out = cap - np.abs(np.mod(walk, span) - cap)              # reflect at 0/cap
     return np.rint(out)
@@ -2986,7 +3059,7 @@ def _parse_temporal_integrity(value: Any) -> dict[str, bool]:
     return out
 
 
-class Generator(DataGenerator):
+class _BaseGenerator(DataGenerator):
 
 
     def __init__(self, config_dir: str, *, seed: int) -> None:
@@ -3154,6 +3227,9 @@ class Generator(DataGenerator):
             "observation.time_warp_rate": float(
                 observation.get("time_warp_rate", 0.12)
             ),
+            "observation.global_dilation_rate": float(
+                observation.get("global_dilation_rate", 0.0)
+            ),
             "observation.duty_cycle_rate": float(
                 observation.get("duty_cycle_rate", 0.10)
             ),
@@ -3272,6 +3348,7 @@ class Generator(DataGenerator):
 
         queue: Queue[object] = Queue(maxsize=self._prefetch_depth)
         stop = Event()
+        consumed = Event()
         done = object()
 
         def put(item: object) -> bool:
@@ -3399,6 +3476,15 @@ class Generator(DataGenerator):
                         _biz_day_counts,
                         _weekly_web_counts,
                         _dispatch_price,
+                        _epi_season_decay,
+                        _weekday_ledger_counts,
+                        _surveillance_counts,
+                        _pull_counter_ramp,
+                        _weekly_cycle_downloads,
+                        _hourly_social_counts,
+                        _intraday_event_counts,
+                        _intraday_spot_price,
+                        _road_commute_counts,
                     )
                     current_observation = {
                         key.removeprefix("observation."): value
@@ -3682,7 +3768,16 @@ class Generator(DataGenerator):
                                     preserve_integers=preserve_integers,
                                     allow_reverse=allow_reverse,
                                     allow_range_artifacts=allow_range_artifacts,
-                                    **current_observation,
+                                    preserve_pre_gamma_shape=(
+                                        (_HARRY_TIDAL_GAMMA_BYPASS
+                                         and family == "tidal_constituents")
+                                        or (_HARRY_I029_GRID_FLOW_GAMMA_BYPASS
+                                            and family == "grid_flow")
+                                    ),
+                                    **(dict(current_observation, time_warp_rate=0.0,
+                                            global_dilation_rate=0.0)
+                                       if family in _V444_CLOCK_FAMILIES
+                                       else current_observation),
                                 )
                             )
                         if not preserve_nonnegative:
@@ -3708,11 +3803,15 @@ class Generator(DataGenerator):
                         # series alike, and the families exempt from the global
                         # prior are exactly the ones that own their level.
                         if (parameters["tail_rebase_rate"] > 0.0
-                                and family != "ops_counter_reset"):
+                                and family not in ("ops_counter_reset", "pull_counter_ramp")):
                             block = _apply_tail_rebase(
                                 _stream(3, anchor, fam), block,
                                 parameters["tail_rebase_rate"],
                                 periodic_continue=True,
+                                preserve_periodic_native=(
+                                    _TIDAL_NATIVE_PERIODIC_ENABLED
+                                    and family == "tidal_constituents"
+                                ),
                             )
                         block = _apply_unique_idea(
                             family, block, base_seed, chunk_index, fam
@@ -3819,7 +3918,48 @@ class Generator(DataGenerator):
                             chunk, fam_ids, base_seed, chunk_index,
                             self._renewal_persistence,
                         )
+                    # Run after every parent augmentation so the finite episode
+                    # cannot perturb TSMixup, padding, renewal, or V449's
+                    # terminal-tail classifier through a downstream statistic.
+                    if _CAS1_INTERIOR_REBASE_RATE > 0.0:
+                        for fam, fam_idx in groups:
+                            family = _FAMILIES[fam]
+                            if family == "ops_counter_reset":
+                                continue
+                            parent_rows = np.stack(
+                                [chunk[int(i)] for i in fam_idx]
+                            )
+                            rows = parent_rows.copy()
+                            for episode_i, endpoint in enumerate(
+                                    _CAS1_INTERIOR_REBASE_ENDPOINTS):
+                                episode_rng = np.random.default_rng(
+                                    np.random.SeedSequence(
+                                        (base_seed, chunk_index, fam,
+                                         _CAS1_INTERIOR_REBASE_STAGE + episode_i)
+                                    )
+                                )
+                                proposed = _apply_interior_rebase_episode(
+                                    episode_rng, parent_rows.copy(),
+                                    _CAS1_INTERIOR_REBASE_RATE,
+                                    endpoint=endpoint,
+                                    periodic_continue=True,
+                                    preserve_periodic_native=(
+                                        _TIDAL_NATIVE_PERIODIC_ENABLED
+                                        and family == "tidal_constituents"
+                                    ),
+                                    route_mode=_CAS1_INTERIOR_REBASE_ROUTE,
+                                )
+                                changed = proposed != parent_rows
+                                rows[changed] = proposed[changed]
+                            for k, slot in enumerate(fam_idx):
+                                chunk[int(slot)] = rows[k]
                     if not put((chunk, take)):
+                        return
+                    while not stop.is_set():
+                        if consumed.wait(timeout=0.1):
+                            consumed.clear()
+                            break
+                    if stop.is_set():
                         return
                     produced += take
                     emitted_points += chunk_points
@@ -3844,6 +3984,7 @@ class Generator(DataGenerator):
                     if arr is None:
                         raise RuntimeError("internal: unfilled series slot")
                     yield arr
+                consumed.set()
         finally:
             stop.set()
             producer.join(timeout=1.0)
@@ -4391,8 +4532,10 @@ def _measurement_artifacts(
     kernel_spike_rate: float = 0.2,
     periodic_spike_frac: float = 0.0,
     time_warp_rate: float = 0.12,
+    global_dilation_rate: float = 0.0,
     duty_cycle_rate: float = 0.1,
     nonuniform_quantize_frac: float = 2.0 / 3.0,
+    preserve_pre_gamma_shape: bool = False,
     gamma_warp_rate: float = 0.0,
     hold_block_rate: float = 0.0,
     post_amp_drift_rate: float = 0.0,
@@ -4415,6 +4558,7 @@ def _measurement_artifacts(
         kernel_spike_rate=kernel_spike_rate,
         periodic_spike_frac=periodic_spike_frac,
         time_warp_rate=time_warp_rate,
+        global_dilation_rate=global_dilation_rate,
         duty_cycle_rate=duty_cycle_rate,
     )
     n, L = out.shape
@@ -4431,11 +4575,14 @@ def _measurement_artifacts(
             gamma = rng.uniform(1.5, 3.2, size=warp_rows.size)
             mirrored = warp_u[warp_rows] < gamma_warp_rate * 0.25
             gamma = np.where(mirrored, -gamma, gamma)
-            _gamma_warp_apply(
-                out,
-                np.ascontiguousarray(warp_rows, dtype=np.int64),
-                np.ascontiguousarray(gamma, dtype=np.float64),
-            )
+            # Consume the original selection/exponent draws in both arms.
+            # Other observation maps and the caller RNG stream stay intact.
+            if not preserve_pre_gamma_shape:
+                _gamma_warp_apply(
+                    out,
+                    np.ascontiguousarray(warp_rows, dtype=np.int64),
+                    np.ascontiguousarray(gamma, dtype=np.float64),
+                )
 
     reverse = (
         rng.random(n) < 0.06
@@ -5046,7 +5193,7 @@ def _ou_stochastic_vol(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     return out * scale + shift
 
 
-def _physical_sensors(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+def _physical_sensors(rng: np.random.Generator, n: int, L: int, *, native_metadata: bool = False):
 
 
     seasonal = _seasonal(rng, n, L, k_max=2)
@@ -5093,6 +5240,10 @@ def _physical_sensors(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         power = rng.uniform(1.0, 1.6, size=(count, 1))
         out[magnitude] = np.abs(base[magnitude]) ** power + gusts
 
+    if native_metadata:
+        flags = {"bounded": bounded & _CAS1_BOUNDED_SENSOR_ENABLED,
+                 "integer": np.zeros(n, dtype=bool)}
+        return out, flags
     return out
 
 
@@ -5739,12 +5890,58 @@ _ZERO_INFLATE_FLOOR_FRAC_LO = 0.15
 _ZERO_INFLATE_FLOOR_FRAC_HI = 0.85
 
 
+def _apply_interior_rebase_episode(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    rate: float,
+    *,
+    endpoint: int | None = None,
+    periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    route_mode: str = "all",
+) -> np.ndarray:
+    """Insert one finite, context-validated continuation episode.
+
+    V449 teaches its strongest continuation law only near the terminal edge of
+    each 4096-point training row.  This arm reuses the exact same causal
+    classifier on an earlier prefix, then crossfades back to the untouched
+    native path.  The episode ends no later than 2816, leaving a gap before the
+    earliest sample (2864) read by V449's terminal classifier.
+    """
+    if rate <= 0.0:
+        return block
+    values = np.asarray(block, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] < 4096:
+        return block
+    endpoints = (1792, 2304, 2816)
+    end = (endpoints[int(rng.integers(0, len(endpoints)))]
+           if endpoint is None else int(endpoint))
+    if end not in _CAS1_INTERIOR_REBASE_ENDPOINTS:
+        raise ValueError("invalid interior rebase endpoint")
+    original = values[:, :end].copy()
+    episode = _apply_tail_rebase(
+        rng, original.copy(), rate,
+        periodic_continue=periodic_continue,
+        preserve_periodic_native=preserve_periodic_native,
+        _route_mode=route_mode,
+    )
+    fade = 96
+    alpha = np.linspace(0.0, 1.0, fade, dtype=np.float64)[None, :]
+    episode[:, -fade:] = (
+        (1.0 - alpha) * episode[:, -fade:] + alpha * original[:, -fade:]
+    )
+    values[:, :end] = episode
+    return values
+
+
 def _apply_tail_rebase(
     rng: np.random.Generator,
     block: np.ndarray,
     rate: float,
     *,
     periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    _route_mode: str = "all",
 ) -> np.ndarray:
     """Teach only continuations supported by generated pre-boundary context.
 
@@ -5860,11 +6057,23 @@ def _apply_tail_rebase(
     # downstream RNG stream. Half retain their native generated future; the
     # other half keep V213's clipped-linear continuation.
     native_linear_rows = linear_rows & ((np.arange(n, dtype=np.int64) & 1) == 0)
+    if _route_mode not in ("all", "periodic", "quiet"):
+        raise ValueError("invalid continuation route mode")
+    if _route_mode == "periodic":
+        eligible = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+    elif _route_mode == "quiet":
+        periodic_rows = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
     # A jumped, deterministic substream leaves every parent draw intact.
     cycle_rng = np.random.Generator(rng.bit_generator.jumped())
     for row in np.nonzero(eligible | periodic_rows | linear_rows)[0]:
         b = int(boundary[row])
         if periodic_rows[row]:
+            if preserve_periodic_native:
+                continue
             lag = int(best_lag[row])
             block[row, b:] = _empirical_cycle_tail(
                 long_histories.get(row, pre[row]), lag, L - b, cycle_rng, _CYCLE_PREDICTIVE_MODE)
@@ -5940,6 +6149,7 @@ def _tirex2_marginal_augments(
     kernel_spike_rate: float = 0.0,
     periodic_spike_frac: float = 0.0,
     time_warp_rate: float = 0.0,
+    global_dilation_rate: float = 0.0,
     duty_cycle_rate: float = 0.0,
 ) -> np.ndarray:
     """TiRex-2 §3.4 / App.F stage-1+3 *univariate* portables.
@@ -6090,6 +6300,19 @@ def _tirex2_marginal_augments(
                     else:
                         ker = (np.abs(dt) <= width).astype(np.float64)
                     out[i, lo:hi] = out[i, lo:hi] + sign * mag * ker
+
+    # Global clock dilation uses a child seed and no parent or stage draw.
+    # A contiguous legal crop keeps every interpolation index inside the row.
+    if global_dilation_rate > 0.0:
+        dilation_rng = np.random.default_rng(
+            np.random.SeedSequence((int(stage_seeds[2]), 605)))
+        dilation_rows = np.nonzero(
+            dilation_rng.random(n) < global_dilation_rate)[0]
+        for i in dilation_rows:
+            factor = float(dilation_rng.uniform(0.65, 0.90))
+            offset = float(dilation_rng.uniform(
+                0.0, (L - 1) * (1.0 - factor)))
+            out[i] = np.interp(offset + factor * t, t, out[i])
 
     # --- Brownian-bridge time warping (smooth reindex) ---------------------
     if time_warp_rate > 0.0:
@@ -6261,21 +6484,134 @@ def _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
         groups.append((positions, indices, int(count)))
     return tuple(groups)
 
+@njit(cache=False, nogil=True)
+def _pairwise_leaf(a, lo, n):
+    # NumPy's float64 pairwise-summation leaf (n <= 128), so fused means stay bit-identical.
+    if n < 8:
+        res = 0.0
+        for i in range(n):
+            res += a[lo + i]
+        return res
+    r0 = a[lo]
+    r1 = a[lo + 1]
+    r2 = a[lo + 2]
+    r3 = a[lo + 3]
+    r4 = a[lo + 4]
+    r5 = a[lo + 5]
+    r6 = a[lo + 6]
+    r7 = a[lo + 7]
+    i = 8
+    m = n - (n % 8)
+    while i < m:
+        r0 += a[lo + i]
+        r1 += a[lo + i + 1]
+        r2 += a[lo + i + 2]
+        r3 += a[lo + i + 3]
+        r4 += a[lo + i + 4]
+        r5 += a[lo + i + 5]
+        r6 += a[lo + i + 6]
+        r7 += a[lo + i + 7]
+        i += 8
+    res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+    while i < n:
+        res += a[lo + i]
+        i += 1
+    return res
+
+
+@njit(cache=False, nogil=True)
+def _pairwise_sum(a, n):
+    # NumPy splits n > 128 at n//2 rounded down to a multiple of 8: 256 -> 128+128, 512 -> 256+256.
+    if n <= 128:
+        return _pairwise_leaf(a, 0, n)
+    if n == 256:
+        return _pairwise_leaf(a, 0, 128) + _pairwise_leaf(a, 128, 128)
+    if n == 512:
+        return ((_pairwise_leaf(a, 0, 128) + _pairwise_leaf(a, 128, 128))
+                + (_pairwise_leaf(a, 256, 128) + _pairwise_leaf(a, 384, 128)))
+    raise ValueError("unsupported validation length")
+
+
+@njit(cache=False, nogil=True)
+def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
+    # errors[r, lag] is exact whenever it can pass (<= limit[r]); a lag whose
+    # pairwise partial sum already exceeds the limit is stored as +inf, which
+    # cannot change the argmin of a passing row or the pass flags.
+    rows = history.shape[0]
+    points = observed.shape[1]
+    leaves = points // 128
+    median = np.empty(points, dtype=np.float64)
+    diff = np.empty(points, dtype=np.float64)
+    buf = np.empty(count, dtype=np.float64)
+    mid = count // 2
+    for r in range(rows):
+        if not limit[r] >= 0.0:
+            for j in range(lags.shape[0]):
+                errors[r, cols[j]] = np.inf
+            continue
+        for j in range(lags.shape[0]):
+            lag = lags[j]
+            base = fit_points - count * lag
+            done = 0
+            partial = 0.0
+            left = 0.0
+            aborted = False
+            for leaf in range(leaves):
+                lo = leaf * 128
+                hi = lo + 128
+                need = hi if hi < lag else lag
+                while done < need:
+                    for c in range(count):
+                        x = history[r, base + done + c * lag]
+                        k = c
+                        while k > 0 and buf[k - 1] > x:
+                            buf[k] = buf[k - 1]
+                            k -= 1
+                        buf[k] = x
+                    median[done] = buf[mid]
+                    done += 1
+                for v in range(lo, hi):
+                    diff[v] = abs(observed[r, v] - median[v % lag])
+                value = _pairwise_leaf(diff, lo, 128)
+                if leaves == 2:
+                    bound = value if leaf == 0 else partial + value
+                    partial = value if leaf == 0 else partial
+                else:
+                    if leaf == 0:
+                        partial = value
+                        bound = value
+                    elif leaf == 1:
+                        partial = partial + value
+                        bound = partial
+                    elif leaf == 2:
+                        left = value
+                        bound = partial
+                    else:
+                        bound = partial + (left + value)
+                if leaf < leaves - 1 and ((0.0 + bound) / points) / span[r] > limit[r]:
+                    aborted = True
+                    break
+                if leaf == leaves - 1:
+                    errors[r, cols[j]] = ((0.0 + bound) / points) / span[r]
+            if aborted:
+                errors[r, cols[j]] = np.inf
+
+
 def _cycle_menu_first_validation(context, span, fit_points, validation_points, lag_low, lag_stop):
-    history = context[:, :fit_points]
-    observed = context[:, fit_points:fit_points + validation_points]
+    history = np.ascontiguousarray(context[:, :fit_points])
+    observed = np.ascontiguousarray(context[:, fit_points:fit_points + validation_points])
+    if validation_points not in (256, 512):
+        raise ValueError("unsupported validation length")
     errors = np.empty((len(context), lag_stop - lag_low), dtype=np.float64)
-    for start in range(0, len(context), 16):
-        stop = min(len(context), start + 16)
-        h, o = history[start:stop], observed[start:stop]
-        for positions, indices, count in _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
-            candidates = h[:, indices]
-            prediction = np.partition(candidates, count // 2, axis=2)[:, :, count // 2, :]
-            error = np.mean(np.abs(o[:, None, :] - prediction), axis=2) / span[start:stop, None]
-            errors[start:stop, positions] = error
+    lags_all = np.arange(lag_low, lag_stop, dtype=np.int64)
+    span = np.ascontiguousarray(span, dtype=np.float64)
     anchor = np.median(history[:, -16:], axis=1)
     hold = np.mean(np.abs(observed - anchor[:, None]), axis=1) / span
     away = np.mean(np.abs(history - anchor[:, None]) > .05 * span[:, None], axis=1)
+    limit = np.where(away >= .15, np.minimum(.12, .75 * hold), -1.0)
+    for positions, indices, count in _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
+        _cycle_menu_errors(history, observed, span, limit, lags_all[positions],
+                           np.ascontiguousarray(positions, dtype=np.int64), count, fit_points, errors)
     passes = (errors <= .12) & (errors <= .75 * hold[:, None]) & (away[:, None] >= .15)
     return errors, passes
 
@@ -6301,3 +6637,1698 @@ def _validated_cycle_menu(context, fit_points, validation_points, lag_low, lag_s
 
 def _validated_longer_cycle(context):
     return _validated_cycle_menu(context, 1024, 512, _LONGER_CYCLE_LAGS[0], _LONGER_CYCLE_LAGS[-1] + 1)
+
+
+_TIDAL_NATIVE_PERIODIC_ENABLED = True
+
+
+_HARRY_TIDAL_GAMMA_BYPASS = True
+
+
+_HARRY_I029_GRID_FLOW_GAMMA_BYPASS = True
+
+
+# Native sigmoid sensor support; other sensor modes retain the host treatment.
+_CAS1_BOUNDED_SENSOR_ENABLED = True
+_physical_sensors.with_metadata = partial(_physical_sensors, native_metadata=True)
+
+# Cas1 route-isolation arm: fixed V463 opportunities, periodic only.
+# Station and traffic families keep V444's clock: no time warp or dilation on them.
+_V444_CLOCK_FAMILIES = frozenset({
+    "sticky_station", "capacity_counts", "conditional_stability", "cs_flat", "cs_drift",
+    "cs_countwalk", "cs_pulse", "transport_flow", "transport_flow_tail", "heavy_traffic_counts",
+    "econ_release_staircase", "level_ladder_staircase", "regime_dwell_flat",
+    "regime_dwell_intcounter", "dispatch_price", "spiky_price", "price_shock",
+})
+_CAS1_INTERIOR_REBASE_RATE = 0.0
+_CAS1_INTERIOR_REBASE_STAGE = 0xCA5101
+_CAS1_INTERIOR_REBASE_ENDPOINTS = (1536, 2304, 2816)
+_CAS1_INTERIOR_REBASE_ROUTE = 'periodic'
+
+
+# --------------------------------------------------------------------
+# Grafted from the c3 lineage: the families serving the two domains we
+# still beat this king on (healthcare, web_cloudops). Append-only.
+# --------------------------------------------------------------------
+
+_HC_YEAR = 365.0
+
+
+_WC_HARM = np.arange(1, 5, dtype=np.float64)
+
+
+_WC_H = 720          # the validator's longest scored horizon (h720 window)
+
+
+def _wc_profile(rng: np.random.Generator, n: int, period: int, h1_lo: float, h1_hi: float) -> np.ndarray:
+    """``(n, period)`` zero-mean unit-sd Fourier daily profiles with the first
+    harmonic carrying a share of the power drawn in [h1_lo, h1_hi]."""
+    k = _WC_HARM[None, :, None]
+    amp = rng.uniform(0.15, 1.0, size=(n, 4, 1)) * (k ** -rng.uniform(0.6, 1.6, size=(n, 1, 1)))
+    share = rng.uniform(h1_lo, h1_hi, size=(n, 1, 1))
+    rest = np.sqrt((amp[:, 1:, :] ** 2).sum(axis=1, keepdims=True)) + 1e-12
+    amp = np.concatenate([np.sqrt(share / (1.0 - share)) * rest, amp[:, 1:, :]], axis=1)
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=(n, 4, 1))
+    u = 2.0 * np.pi * np.arange(period, dtype=np.float64)[None, None, :] / period
+    p = (amp * np.sin(k * u + ph)).sum(axis=1)
+    p -= p.mean(axis=1, keepdims=True)
+    return p / (p.std(axis=1, keepdims=True) + 1e-12)
+
+
+def _wc_ar1(rng: np.random.Generator, n: int, m: int, phi: np.ndarray) -> np.ndarray:
+    """Unit-variance stationary AR(1) rows ``(n, m)`` with per-row ``phi``."""
+    e = rng.standard_normal((n, m))
+    a = np.empty((n, m), dtype=np.float64)
+    a[:, 0] = e[:, 0]
+    p = phi[:, 0]
+    q = np.sqrt(np.maximum(1.0 - p * p, 0.0))
+    for k in range(1, m):
+        a[:, k] = p * a[:, k - 1] + q * e[:, k]
+    return a
+
+
+def _epi_season_decay(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Annual epidemic waves on an endemic floor after a decaying pandemic
+    excess: rki / ukhsa / cdc_nssp / rivm / wikimedia-RSV at h720.
+
+    Floor = endemic level (slow log random walk sd U[0.004,0.02]/d + slope
+    U[-0.15,0.15]/yr, soft-capped) x (1 + pandemic excess): on 70% of rows an
+    excess of ratio log-U[3,100] rises over U[20,90] d from an onset anywhere in
+    [-1500, 0.85 L] and decays with tau U[150,900] d -- a decline the model can
+    read off the context and continue, never an AR(1) that snaps back.
+    Waves: log-parabola bumps centred at phi0 + 365 k + N(0, sigma) with
+    sigma U[3,15] d (phase-locked year to year), log peak/floor a_row
+    log-U[3,150] per row, drifting U[-0.15,0.05] per year (waves shrink after
+    the pandemic years) and jittered N(0, U[0.15,0.4]) per year, rise U[20,60] d,
+    fall = rise x U[1.2,2.5]; 35% of rows add a summer wave 180 +- 25 d later
+    at U[0.15,0.6] of the winter amplitude. Weekly profile weekend U[0.6,1.0],
+    Monday U[1,1.2] on 30%. Observation: 45% NB counts (floor log-U[0.3,300],
+    r log-U[5,60]); 25% percent-of-visits rows (cdc_nssp: NB numerator over
+    visits log-U[300,30000], 0.01 tick); 30% 7-day rolling mean of the counts
+    on a 0.01 tick (rki / ukhsa smoothed incidence).
+
+    Every (n, L) intermediate is carried in a reused buffer: the latent level,
+    the wave accumulator and the observed counts are the only full-width arrays
+    alive at any point, and the per-row observation branches are evaluated on
+    their own row slices instead of on the whole block.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+
+    # ── endemic floor: slow random walk + gentle slope, soft-capped at ±3 ───
+    slope = rng.uniform(-0.15, 0.15, size=(n, 1)) / _HC_YEAR
+    rw_sd = rng.uniform(0.004, 0.02, size=(n, 1))
+    log_end = rng.normal(0.0, 1.0, size=(n, L))
+    log_end *= rw_sd
+    np.cumsum(log_end, axis=1, out=log_end)
+    log_end += slope * t
+    log_end /= 3.0
+    np.tanh(log_end, out=log_end)
+    log_end *= 3.0
+
+    # ── pandemic excess: onset, rise, then a long decay to the endemic floor ─
+    has_pand = rng.random((n, 1)) < 0.7
+    t0 = rng.uniform(-1500.0, 0.85 * L, size=(n, 1))
+    ratio = np.exp(rng.uniform(np.log(3.0), np.log(100.0), size=(n, 1)))
+    tau = rng.uniform(150.0, 900.0, size=(n, 1))
+    onset = rng.uniform(20.0, 90.0, size=(n, 1))
+    dt = t - t0
+    excess = dt / onset
+    np.clip(excess, 0.0, 1.0, out=excess)
+    excess *= ratio
+    dt -= onset
+    np.maximum(dt, 0.0, out=dt)
+    np.negative(dt, out=dt)
+    dt /= tau
+    np.exp(dt, out=dt)
+    excess *= dt
+    del dt
+    np.copyto(excess, 0.0, where=~has_pand)
+    excess += 1.0
+    np.exp(log_end, out=log_end)
+    excess *= log_end
+    floor = excess
+    del excess, log_end
+
+    # ── phase-locked annual waves (+ optional summer wave) ──────────────────
+    K = int(L // _HC_YEAR) + 4
+    sig_phase = rng.uniform(3.0, 15.0, size=(n, 1))
+    phi0 = rng.uniform(-_HC_YEAR, 0.0, size=(n, 1))
+    kk = np.arange(K, dtype=np.float64)[None, :]
+    centers = phi0 + _HC_YEAR * kk + rng.normal(0.0, 1.0, size=(n, K)) * sig_phase
+    a_row = rng.uniform(np.log(3.0), np.log(150.0), size=(n, 1))
+    sig_a = rng.uniform(0.15, 0.4, size=(n, 1))
+    a_trend = rng.uniform(-0.15, 0.05, size=(n, 1)) * (kk - 4.0)
+    amp = np.clip(a_row + a_trend + rng.normal(0.0, 1.0, size=(n, K)) * sig_a,
+                  np.log(1.3), np.log(400.0))
+    rise = rng.uniform(20.0, 60.0, size=(n, K))
+    fall = rise * rng.uniform(1.2, 2.5, size=(n, K))
+    has2 = rng.random((n, 1)) < 0.35
+    c2 = centers + rng.normal(180.0, 25.0, size=(n, K))
+    amp2 = np.maximum(amp + np.log(rng.uniform(0.15, 0.6, size=(n, K))), np.log(1.2))
+    rise2 = rng.uniform(20.0, 60.0, size=(n, K))
+    fall2 = rise2 * rng.uniform(1.2, 2.5, size=(n, K))
+    root = np.sqrt(np.log(5.0) / amp)
+    root2 = np.sqrt(np.log(5.0) / amp2)
+    w_l, w_r = rise / root, fall / root
+    w2_l, w2_r = rise2 / root2, fall2 / root2
+    waves = np.zeros((n, L), dtype=np.float64)
+    bump = np.empty((n, L), dtype=np.float64)
+    left = np.empty((n, L), dtype=np.bool_)
+    no2 = ~has2
+    for k in range(K):
+        c = centers[:, k:k + 1]
+        if c.min() > L + 400.0:
+            break
+        np.subtract(t, c, out=bump)
+        np.less(bump, 0.0, out=left)
+        np.divide(bump, w_l[:, k:k + 1], out=bump, where=left)
+        np.invert(left, out=left)
+        np.divide(bump, w_r[:, k:k + 1], out=bump, where=left)
+        np.square(bump, out=bump)
+        np.subtract(1.0, bump, out=bump)
+        np.maximum(bump, 0.0, out=bump)
+        bump *= amp[:, k:k + 1]
+        np.expm1(bump, out=bump)
+        waves += bump
+        np.subtract(t, c2[:, k:k + 1], out=bump)
+        np.less(bump, 0.0, out=left)
+        np.divide(bump, w2_l[:, k:k + 1], out=bump, where=left)
+        np.invert(left, out=left)
+        np.divide(bump, w2_r[:, k:k + 1], out=bump, where=left)
+        np.square(bump, out=bump)
+        np.subtract(1.0, bump, out=bump)
+        np.maximum(bump, 0.0, out=bump)
+        bump *= amp2[:, k:k + 1]
+        np.expm1(bump, out=bump)
+        np.copyto(bump, 0.0, where=no2)
+        waves += bump
+    del bump, left
+    waves += 1.0
+    waves *= floor
+    del floor
+    level = waves
+    # total dynamic range of the latent, per row, capped at 3000x its minimum
+    lo = level.min(axis=1, keepdims=True)
+    np.minimum(level, lo * 3000.0, out=level)
+
+    # ── weekly profile ──────────────────────────────────────────────────────
+    phase = rng.integers(0, 7, size=(n, 1))
+    wk = np.exp(rng.normal(0.0, 0.03, size=(n, 5)))
+    mon = np.where(rng.random((n, 1)) < 0.3, rng.uniform(1.0, 1.2, size=(n, 1)), 1.0)
+    wk[:, :1] *= mon
+    we = rng.uniform(0.6, 1.0, size=(n, 1))
+    prof = np.concatenate([wk, we * rng.uniform(0.9, 1.1, size=(n, 1)), we], axis=1)
+    prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
+    # the day-of-week factor of column j is prof[(j + phase) % 7]: rotate the
+    # seven columns once per row and apply them to the seven strided views
+    prof_rot = np.take_along_axis(
+        prof, (np.arange(7, dtype=phase.dtype)[None, :] + phase) % 7, axis=1)
+
+    # ── observation ─────────────────────────────────────────────────────────
+    kind = rng.random((n, 1))
+    is_pct = kind < 0.25
+    is_smooth = kind >= 0.7
+    base = np.exp(rng.uniform(np.log(0.3), np.log(300.0), size=(n, 1)))
+    visits = np.exp(rng.uniform(np.log(300.0), np.log(30000.0), size=(n, 1)))
+    floor_pct = np.exp(rng.uniform(np.log(0.02), np.log(5.0), size=(n, 1)))
+    lam_base = np.where(is_pct, floor_pct / 100.0 * visits, base)
+    lam = level
+    lam *= lam_base
+    for m in range(7):
+        lam[:, m::7] *= prof_rot[:, m:m + 1]
+    np.minimum(lam, 1.0e6, out=lam)
+    r = np.exp(rng.uniform(np.log(5.0), np.log(60.0), size=(n, 1)))
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    g *= lam
+    del lam, level
+    np.maximum(g, 0.0, out=g)
+    pois = rng.poisson(g)
+    out = g
+    np.copyto(out, pois)
+    del pois, g
+    # 7-day rolling mean and percent-of-visits are needed on their own rows
+    # only, and those row sets are disjoint, so both run on row slices
+    rows = np.flatnonzero(is_smooth[:, 0])
+    if rows.size:
+        smooth = out[rows]
+        csum = np.cumsum(smooth, axis=1)
+        np.subtract(csum[:, 7:], csum[:, :-7], out=smooth[:, 7:])
+        smooth[:, 7:] /= 7.0
+        np.divide(csum[:, :7], np.arange(1, 8, dtype=np.float64)[None, :],
+                  out=smooth[:, :7])
+        del csum
+        smooth /= 0.01
+        np.rint(smooth, out=smooth)
+        smooth *= 0.01
+        out[rows] = smooth
+        del smooth
+    rows = np.flatnonzero(is_pct[:, 0])
+    if rows.size:
+        pct = out[rows]
+        pct *= 100.0
+        pct /= visits[rows]
+        pct /= 0.01
+        np.rint(pct, out=pct)
+        pct *= 0.01
+        out[rows] = pct
+        del pct
+    return _epi_feed_fade(rng, out, is_pct | is_smooth)
+
+
+def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
+    """Right-truncated reporting at the live edge of a surveillance feed.
+
+    Real-time hospitalisation / ED feeds are scored on their newest points,
+    where late reports have not arrived yet: completeness ramps down toward
+    the edge ((s/K)^g over the last K days, s = days before the edge), and
+    discontinued feeds end in a run of exact zeros. Integer rows are thinned
+    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
+    after every native draw, so unfaded rows keep their exact values. ``x`` is
+    faded in place and returned: the caller hands over its only reference.
+    """
+    n, L = x.shape
+    fade = rng.random(n) < 0.4
+    K = rng.integers(60, 361, size=n)
+    gam = rng.uniform(0.5, 2.0, size=n)
+    stop = rng.random(n) < 0.5
+    Z = rng.integers(10, 151, size=n)
+    out = x
+    for i in np.flatnonzero(fade):
+        k = int(min(K[i], L - 1))
+        s = np.arange(k, 0, -1, dtype=np.float64) - 0.5
+        keep = np.clip(s / k, 0.0, 1.0) ** gam[i]
+        seg = out[i, L - k:]
+        if ticked[i, 0]:
+            out[i, L - k:] = np.rint(seg * keep / 0.01) * 0.01
+        else:
+            cnt = np.maximum(np.rint(seg), 0.0).astype(np.int64)
+            out[i, L - k:] = rng.binomial(cnt, keep).astype(np.float64)
+        if stop[i]:
+            out[i, L - int(min(Z[i], k)):] = 0.0
+    return out
+
+
+def _epi_feed_fade(rng: np.random.Generator, x: np.ndarray, ticked: np.ndarray) -> np.ndarray:
+    """Right-truncated reporting at the live edge of a surveillance feed.
+
+    Real-time hospitalisation / ED feeds are scored on their newest points,
+    where late reports have not arrived yet: completeness ramps down toward
+    the edge ((s/K)^g over the last K days, s = days before the edge), and
+    discontinued feeds end in a run of exact zeros. Integer rows are thinned
+    binomially; rate / smoothed rows are scaled and re-ticked. Draws come
+    after every native draw, so unfaded rows keep their exact values.
+    """
+    n, L = x.shape
+    fade = rng.random(n) < 0.4
+    K = rng.integers(60, 361, size=n)
+    gam = rng.uniform(0.5, 2.0, size=n)
+    stop = rng.random(n) < 0.5
+    Z = rng.integers(10, 151, size=n)
+    out = x.copy()
+    for i in np.flatnonzero(fade):
+        k = int(min(K[i], L - 1))
+        s = np.arange(k, 0, -1, dtype=np.float64) - 0.5
+        keep = np.clip(s / k, 0.0, 1.0) ** gam[i]
+        seg = out[i, L - k:]
+        if ticked[i, 0]:
+            out[i, L - k:] = np.rint(seg * keep / 0.01) * 0.01
+        else:
+            cnt = np.maximum(np.rint(seg), 0.0).astype(np.int64)
+            out[i, L - k:] = rng.binomial(cnt, keep).astype(np.float64)
+        if stop[i]:
+            out[i, L - int(min(Z[i], k)):] = 0.0
+    return out
+
+
+def _weekday_ledger_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Weekday-processed ledger counts whose level PERSISTS for years: vaers,
+    openfda daily event/recall/label feeds, nyc_ems / nola dispatch volumes.
+
+    Level: log(base log-U[5,2e4]) + a single log-linear trend U[-0.3,0.3]/yr
+    held for the whole row (soft-capped at +-3) + a log random walk sd
+    U[0.002,0.012]/d + rare permanent shifts (U[0,0.5]/yr, +-U[0.15,0.6]) --
+    no AR(1) term at all, so the 720-step continuation is the current level
+    carried by the visible trend. Day-of-week: five weekdays exp(N(0,0.06)),
+    Monday x U[1,1.3] on 40%, weekend factor log-U[0.05,0.7] (Sun = Sat x
+    U[0.7,1.3]); holidays U[6,12]/yr at the weekend factor; a year-end dip
+    U[7,14] d deep U[0.3,0.7] on half the rows; weekday spikes x U[1.5,2.5] at
+    U[0.5,3]%/d; NB noise r log-U[5,80]; isolated zeros U[0,1]%/d. 30% of
+    rows start mid-row: a constant prefix of U[0.3,0.95] L at the first real
+    value -- exactly the validator's left-padding of a short feed, so the
+    scaler geometry of a 192-real-step window (vaers) is a training case.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    days = np.arange(L, dtype=np.int64)[None, :]
+    t = _time_index(L)
+
+    base = np.exp(rng.uniform(np.log(5.0), np.log(2.0e4), size=(n, 1)))
+    slope = rng.uniform(-0.3, 0.3, size=(n, 1)) / _HC_YEAR
+    trend = np.tanh(slope * t / 3.0)
+    trend *= 3.0
+    rw_sd = rng.uniform(0.002, 0.012, size=(n, 1))
+    rw = rng.normal(0.0, 1.0, size=(n, L))
+    rw *= rw_sd
+    np.cumsum(rw, axis=1, out=rw)
+    ev = rng.random((n, L)) < (rng.uniform(0.0, 0.5, size=(n, 1)) / _HC_YEAR)
+    mag = rng.uniform(0.15, 0.6, size=(n, L))
+    sgn = rng.random((n, L)) < 0.5
+    np.negative(mag, out=mag, where=sgn)
+    del sgn
+    mag *= ev                       # == np.where(ev, mag, 0.0)
+    del ev
+    np.cumsum(mag, axis=1, out=mag)
+    np.add(trend, np.log(base), out=trend)
+    trend += rw
+    del rw
+    trend += mag
+    del mag
+    np.clip(trend, np.log(0.5), np.log(5.0e5), out=trend)
+    level = np.exp(trend, out=trend)
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (days + phase) % 7
+    wk = np.exp(rng.normal(0.0, 0.06, size=(n, 5)))
+    mon = np.where(rng.random((n, 1)) < 0.4, rng.uniform(1.0, 1.3, size=(n, 1)), 1.0)
+    wk[:, :1] *= mon
+    we = np.exp(rng.uniform(np.log(0.05), np.log(0.7), size=(n, 1)))
+    sun = np.minimum(we * rng.uniform(0.7, 1.3, size=(n, 1)), 1.0)
+    prof = np.concatenate([wk, we, sun], axis=1)
+    prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
+    prof_t = np.take_along_axis(prof, dow, axis=1)
+    weekday = dow < 5
+    del dow
+
+    hol = rng.random((n, L)) < (rng.uniform(6.0, 12.0, size=(n, 1)) / _HC_YEAR)
+    hol &= weekday
+    fac = rng.uniform(0.5, 1.5, size=(n, L))
+    fac *= we                       # == we * rng.uniform(...)
+    np.logical_not(hol, out=hol)
+    np.copyto(fac, 1.0, where=hol)  # == np.where(hol, we*u, 1.0)
+    del hol
+    h0 = rng.uniform(0.0, _HC_YEAR, size=(n, 1))
+    wdip = rng.uniform(7.0, 14.0, size=(n, 1))
+    d = np.mod(t - h0, _HC_YEAR)
+    depth = np.where(rng.random((n, 1)) < 0.5, rng.uniform(0.3, 0.7, size=(n, 1)), 0.0)
+    indip = d < wdip
+    np.multiply(d, 2.0 * np.pi, out=d)
+    np.divide(d, wdip, out=d)
+    np.cos(d, out=d)
+    d *= -0.5
+    d += 0.5                        # == 0.5 - 0.5*cos(2*pi*d/wdip)
+    d *= depth
+    np.logical_not(indip, out=indip)
+    np.copyto(d, 0.0, where=indip)
+    del indip
+    np.subtract(1.0, d, out=d)      # dip
+    spike = rng.random((n, L)) < rng.uniform(0.005, 0.03, size=(n, 1))
+    spike &= weekday
+    del weekday
+    sfac = rng.uniform(1.5, 2.5, size=(n, L))
+    np.logical_not(spike, out=spike)
+    np.copyto(sfac, 1.0, where=spike)
+    del spike
+
+    level *= prof_t
+    del prof_t
+    level *= fac
+    del fac
+    level *= d
+    del d
+    level *= sfac
+    del sfac
+    np.minimum(level, 1.0e6, out=level)     # lam
+    r = np.exp(rng.uniform(np.log(5.0), np.log(80.0), size=(n, 1)))
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    np.multiply(level, g, out=g)            # lam * g
+    del level
+    np.maximum(g, 0.0, out=g)
+    counts = rng.poisson(g)
+    del g
+    y = counts.astype(np.float64)
+    del counts
+    zero = rng.random((n, L)) < rng.uniform(0.0, 0.01, size=(n, 1))
+    np.copyto(y, 0.0, where=zero)
+    del zero
+
+    # mid-row start: constant prefix at the first real value (validator padding)
+    pre = rng.random((n, 1)) < 0.3
+    cut = (rng.uniform(0.3, 0.95, size=(n, 1)) * L).astype(np.int64)
+    cut = np.where(pre, cut, 0)
+    first = np.take_along_axis(y, cut, axis=1)
+    np.copyto(y, first, where=days < cut)
+    return y
+
+
+def _surveillance_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Epidemic-wave surveillance feeds (cdc_nssp ED visits by state, nys
+    covid testing, rki hospitalisations): waves on a floor, mild day-of-week
+    reporting artifacts, tick-quantised or small-count observation.
+
+    Fitted on 150 healthcare/D/P=7 series. The cdc_nssp members are NOT
+    counts but PERCENT of ED visits quantised to a 0.01 tick: rsv sits at a
+    0.05 median (5 ticks) with 15% exact zeros, covid at 0.34, influenza at
+    0.15, ari at 10.4. Waves: peak/floor 22x (covid), 157x (rsv), 240x
+    (influenza), 3.6x (ari); rise (20%->peak) 21-69 d, fall 69-76 d; between
+    waves the 7-day level sits within 2x of its floor 20-30% of the time
+    (76% for ari); 28-day log-level step sd 0.5-0.9, log-range 3-5. ACF1
+    0.93-0.98 (smooth), weekend/weekday 0.92-0.95 (nys counts: 0.58, Monday
+    1.11), residual cv 0.26-0.70 (mostly tick noise at small values),
+    >2x spikes 1-12% (small-number effects). nys testing: median 1 count,
+    39% zeros, Fano 1.3, zero runs mean 2.7 / max 17.
+
+    Construction: floor x (1 + sum_k (exp(bump_k) - 1)) where each wave is
+    a log-parabola with peak/floor log-uniform [3, 300], rise U[20,80] d
+    and fall = rise x U[1,2.2]; seasonal rows (60%) space waves 365 +- 25 d
+    with correlated amplitudes, the rest U[120,500] d apart; the floor
+    wanders (AR(1) sd U[0.1,0.35]). Percent rows (55%) are a RATIO of counts,
+    which is what makes one law fit rsv (0.05%, 15% zeros, cv 0.7), covid
+    (0.34%, cv 0.26) and ari (10%, cv 0.07) at once: numerator ~ NB with
+    mean floor_pct/100 x N x waves x DOW (floor_pct log-uniform [0.01,1]
+    (75%) or [1,20]; denominator visits N log-uniform [300, 30000];
+    r log-uniform [5,50]), weekend U[0.85,0.98], mild extra lognormal noise
+    (sigma U[0.02,0.15], AR(1) phi U[0.2,0.8]), reporting dumps U[0,2]/yr at
+    x U[1.5,3], repeat-last-value holds on 15% of rows, then 100 x num / N
+    rounded to a 0.01 (90%) / 0.1 tick -- Poisson zeros in the numerator
+    and the tick make the between-wave tail zero-inflated as measured.
+    Count rows (45%): NB counts (r
+    log-uniform [2,40]) at a floor level log-uniform [0.15,60], weekend
+    U[0.4,0.8], Monday U[1,1.3] on half the rows, dumps U[0.5,4]/yr at
+    x U[2,5] with a next-day backfill dip x U[0.2,0.7]; 25% publish the
+    7-day rolling sum (rki-style).
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    days = np.arange(L, dtype=np.int64)[None, :]
+    t = _time_index(L)
+
+    is_pct = rng.random((n, 1)) < 0.55
+    seasonal = rng.random((n, 1)) < 0.6
+    K = L // 150 + 3
+    gaps = np.where(
+        seasonal,
+        365.0 + rng.normal(0.0, 25.0, size=(n, K)),
+        rng.uniform(120.0, 500.0, size=(n, K)),
+    )
+    gaps = np.maximum(gaps, 60.0)
+    centers = rng.uniform(-300.0, 60.0, size=(n, 1)) + np.cumsum(gaps, axis=1)
+    a_row = rng.uniform(np.log(3.0), np.log(300.0), size=(n, 1))
+    amp = np.where(
+        seasonal,
+        a_row * np.exp(rng.normal(0.0, 0.3, size=(n, K))),
+        rng.uniform(np.log(3.0), np.log(300.0), size=(n, K)),
+    )
+    amp = np.clip(amp, np.log(1.5), np.log(1000.0))
+    rise = rng.uniform(20.0, 80.0, size=(n, K))
+    fall = rise * rng.uniform(1.0, 2.2, size=(n, K))
+    # log-parabola half-widths chosen so the 20%-of-peak points sit rise/fall
+    # days from the centre: a (1 - (d/w)^2) = a - ln 5  =>  w = d / sqrt(ln5 / a)
+    root = np.sqrt(np.log(5.0) / amp)
+    w_l = rise / root
+    w_r = fall / root
+    excess = np.zeros((n, L), dtype=np.float64)
+    for k in range(K):
+        c = centers[:, k:k + 1]
+        if c.min() > L + 600.0:
+            break
+        dist = t - c
+        w = np.where(dist < 0.0, w_l[:, k:k + 1], w_r[:, k:k + 1])
+        bump = amp[:, k:k + 1] * np.maximum(1.0 - (dist / w) ** 2, 0.0)
+        excess += np.expm1(bump)
+    tau = rng.uniform(60.0, 200.0, size=(n, 1))
+    phi = np.exp(-1.0 / tau)
+    sd = rng.uniform(0.1, 0.35, size=(n, 1))
+    drift = np.exp(_ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sd * np.sqrt(1.0 - phi * phi), phi
+    ))
+    rel = (1.0 + excess) * drift
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (days + phase) % 7
+    wk = np.exp(rng.normal(0.0, 0.03, size=(n, 5)))
+    we_pct = rng.uniform(0.85, 0.98, size=(n, 1))
+    we_cnt = rng.uniform(0.4, 0.8, size=(n, 1))
+    we = np.where(is_pct, we_pct, we_cnt)
+    mon = np.where(
+        (rng.random((n, 1)) < 0.5) & np.logical_not(is_pct),
+        rng.uniform(1.0, 1.3, size=(n, 1)), 1.0,
+    )
+    wk[:, :1] *= mon
+    prof = np.concatenate([wk, we * rng.uniform(0.9, 1.1, size=(n, 1)), we], axis=1)
+    prof = prof / prof[:, :5].mean(axis=1, keepdims=True)
+    prof_t = np.take_along_axis(prof, dow, axis=1)
+
+    # percent-of-visits rows: 100 x (NB numerator) / (visit denominator)
+    floor = np.where(
+        rng.random((n, 1)) < 0.75,
+        np.exp(rng.uniform(np.log(0.01), np.log(1.0), size=(n, 1))),
+        np.exp(rng.uniform(np.log(1.0), np.log(20.0), size=(n, 1))),
+    )
+    visits = np.exp(rng.uniform(np.log(300.0), np.log(30000.0), size=(n, 1)))
+    phi_e = rng.uniform(0.2, 0.8, size=(n, 1))
+    sig = rng.uniform(0.02, 0.15, size=(n, 1))
+    noise = _ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sig * np.sqrt(1.0 - phi_e * phi_e), phi_e
+    )
+    dump = rng.random((n, L)) < (rng.uniform(0.0, 2.0, size=(n, 1)) / 365.0)
+    dump_f = np.where(dump, rng.uniform(1.5, 3.0, size=(n, L)), 1.0)
+    lam_p = np.minimum(floor / 100.0 * visits * rel * prof_t * np.exp(noise) * dump_f, 1.0e6)
+    r_p = np.exp(rng.uniform(np.log(5.0), np.log(50.0), size=(n, 1)))
+    g_p = rng.gamma(r_p, 1.0 / r_p, size=(n, L))
+    num = rng.poisson(np.maximum(lam_p * g_p, 0.0)).astype(np.float64)
+    pct = 100.0 * num / visits
+    hold_rows = rng.random((n, 1)) < 0.15
+    hold = (rng.random((n, L)) < rng.uniform(0.05, 0.25, size=(n, 1))) & hold_rows
+    hold[:, 0] = False
+    src = np.maximum.accumulate(np.where(hold, 0, days), axis=1)
+    pct = np.take_along_axis(pct, src, axis=1)
+    tick = np.where(rng.random((n, 1)) < 0.9, 0.01, 0.1)
+    pct = np.rint(pct / tick) * tick
+
+    # count rows
+    lvl = np.exp(rng.uniform(np.log(0.15), np.log(60.0), size=(n, 1)))
+    dump_c = rng.random((n, L)) < (rng.uniform(0.5, 4.0, size=(n, 1)) / 365.0)
+    dfac = np.where(dump_c, rng.uniform(2.0, 5.0, size=(n, L)), 1.0)
+    dfac[:, 1:] *= np.where(dump_c[:, :-1], rng.uniform(0.2, 0.7, size=(n, L - 1)), 1.0)
+    lam = np.minimum(lvl * rel * prof_t * dfac, 1.0e6)
+    r = np.exp(rng.uniform(np.log(2.0), np.log(40.0), size=(n, 1)))
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    cnt = rng.poisson(np.maximum(lam * g, 0.0)).astype(np.float64)
+    roll_rows = rng.random((n, 1)) < 0.25
+    csum = np.cumsum(cnt, axis=1)
+    rolled = cnt.copy()
+    rolled[:, 7:] = csum[:, 7:] - csum[:, :-7]
+    rolled[:, :7] = csum[:, :7]
+    cnt = np.where(roll_rows, rolled, cnt)
+
+    return np.where(is_pct, pct, cnt)
+
+
+def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Monotone cumulative pull / download / table-size counters at a huge base
+    level: dockerhub_library_pull_counts, potaroo_bgp_table_size, hn_max_item.
+
+    Increment rate per step = base (log-U[0.3, 6e4]) x diurnal profile (P=48
+    on 60% of rows, 24 on 40%; log-depth U[0.1, 0.6], h1 share 0.5..0.85) x
+    weekday profile (weekend U[0.45, 0.95]) x CI-calendar dips (60% of rows:
+    U[2,4]-day dips of depth U[0.3, 0.55] every U[7, 16] days) x day scatter
+    (AR(1) over days, phi U[0.2, 0.6], sd U[0.15, 0.5]) x slow rate walk (sd
+    U[0.005, 0.025] per day) x a log-linear deceleration U[-0.1, 0.08] per
+    30 days (the feeds' last-15-day rate is 0.81..1.01x the 15 days before;
+    there are NO rate steps -- the rate over the next 720 steps is the rate the
+    context shows) x step noise (AR(1) lognormal, phi U[0.3, 0.8], sd
+    U[0.15, 0.6]). Increments are Poisson at that rate (sparse rows get their
+    flats from the law itself), plus explicit flats at U[0, 1]%. Base level
+    solved from the measured level/increment ratio log-U[8e4, 4e6]. 85% of
+    rows open with a constant prefix of U[0.3, 0.55] L at the first value
+    (the validator's left-padding of a 2459-step feed: the h720 pad fraction
+    lands on the feeds' 0.59 at the median) and 90% carry a
+    U[3, 8]-day launch PLATEAU right after it, at an amplitude (clipped to
+    2..10x) sized so the excess mass is U[0.38, 0.8] of the visible context's
+    steady mass: every dockerhub feed opens its VISIBLE context with that
+    scrape-start burst (days 0-6 at 2-8x), so the target rate is ~0.64x the
+    context-mean rate (IQR 0.53-0.68) while equal to the recent rate -- the
+    lesson is "continue the recent slope, not the average slope".
+    Exempt from the tail rebase (_NO_TAIL_REBASE): a collapse inside the last
+    1024 steps is exactly the target region this family exists to teach.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = _time_index(L)
+    ti = np.arange(L, dtype=np.int64)
+    P = np.where(rng.random((n, 1)) < 0.6, 48, 24)
+    nd = L // 24 + 2
+    day = ti[None, :] // P                                   # (n, L) day index per row
+
+    # diurnal profile (evaluated at the row's own period)
+    prof48 = _wc_profile(rng, n, 48, 0.5, 0.85)
+    prof24 = _wc_profile(rng, n, 24, 0.5, 0.85)
+    ph = rng.integers(0, 48, size=(n, 1))
+    idx = (ti[None, :] + ph) % P
+    shape = np.where(P == 48, np.take_along_axis(prof48, idx, axis=1), np.take_along_axis(prof24, idx % 24, axis=1))
+    diur = np.exp(rng.uniform(0.1, 0.6, size=(n, 1)) * shape)
+
+    # weekday profile + CI-calendar dips + day scatter + slow walk + deceleration
+    dow = (day + rng.integers(0, 7, size=(n, 1))) % 7
+    we = rng.uniform(0.45, 0.95, size=(n, 1))
+    wk = np.where(dow >= 5, we, np.exp(rng.normal(0.0, 0.05, size=(n, 7)))[np.arange(n)[:, None], dow])
+    dd = np.arange(nd, dtype=np.float64)[None, :]
+    has_dip = rng.random((n, 1)) < 0.6
+    every = rng.uniform(7.0, 16.0, size=(n, 1))
+    dlen = rng.uniform(2.0, 4.0, size=(n, 1))
+    depth = rng.uniform(0.3, 0.55, size=(n, 1))
+    phase = rng.uniform(0.0, 16.0, size=(n, 1))
+    in_dip = np.mod(dd + phase, every) < dlen
+    dip_d = np.where(has_dip & in_dip, 1.0 - depth, 1.0)
+    scat_d = np.exp(rng.uniform(0.15, 0.5, size=(n, 1)) * _wc_ar1(rng, n, nd, rng.uniform(0.2, 0.6, size=(n, 1))))
+    walk_d = np.cumsum(rng.normal(0.0, 1.0, size=(n, nd)) * rng.uniform(0.005, 0.025, size=(n, 1)), axis=1)
+    # mild deceleration of the settled rate (the feeds' last-15-day rate is
+    # 0.81..1.01x the 15 days before): log-linear U[-0.15, 0.05] per 30 days
+    trend_d = rng.uniform(-0.1, 0.08, size=(n, 1)) / 30.0 * (dd - 0.5 * nd)
+    day_fac = dip_d * scat_d * np.exp(walk_d + trend_d)
+    day_t = np.take_along_axis(day_fac, np.minimum(day, nd - 1), axis=1)
+
+    # step noise
+    noise = np.exp(rng.uniform(0.15, 0.6, size=(n, 1)) * _wc_ar1(rng, n, L, rng.uniform(0.3, 0.8, size=(n, 1))))
+
+    base_rate = np.exp(rng.uniform(np.log(0.3), np.log(6.0e4), size=(n, 1)))
+    rate = base_rate * diur * wk * day_t * noise
+
+    # constant prefix + launch plateau. The plateau's excess mass is sized
+    # against the context the validator's h720 window will actually show
+    # (the row minus the prefix minus the 720-step target), so the target
+    # rate / visible-mean-rate ratio lands on the feeds' 0.53..0.68 band
+    # whatever the prefix length; one-day linear step-down at its end.
+    pre = rng.random((n, 1)) < 0.85
+    cut = np.where(pre, (rng.uniform(0.3, 0.55, size=(n, 1)) * L).astype(np.int64), 0)
+    burst = rng.random((n, 1)) < 0.9
+    vis = np.maximum(L - _WC_H - cut, 1).astype(np.float64)
+    blen = rng.uniform(3.0, 8.0, size=(n, 1)) * P
+    excess = rng.uniform(0.38, 0.8, size=(n, 1))
+    bamp = np.clip(1.0 + excess * vis / blen, 2.0, 10.0)
+    since = t - cut
+    bfac = np.where(burst & (since >= 0.0),
+                    1.0 + (bamp - 1.0) * np.clip(1.0 - (since - blen) / P, 0.0, 1.0), 1.0)
+    rate = np.minimum(rate * bfac, 5.0e6)
+
+    inc = rng.poisson(np.maximum(rate, 0.0)).astype(np.float64)
+    flat = rng.random((n, L)) < rng.uniform(0.0, 0.01, size=(n, 1))
+    inc = np.where(flat | (ti[None, :] < cut), 0.0, inc)
+    rel = np.exp(rng.uniform(np.log(8.0e4), np.log(4.0e6), size=(n, 1)))
+    base = np.rint(base_rate * rel)
+    return base + np.cumsum(inc, axis=1)
+
+
+"""intraday_event_counts -- coverage family for the pool class
+``intraday_event_counts_lowcorr`` (288 eval windows over 3 chain panels,
+99 series / 80 source clusters: 911 / fire / police dispatch and CAD volumes,
+crime-incident and 311 request feeds, jail bookings, naloxone/crisis calls,
+DOI / package / CVE / malware-sample registration streams and TfL
+arrival-prediction feeds).  Self-contained: ``numpy`` only, every random
+number comes from the ``rng`` argument.  Style follows the c030 isolated
+stream builders (``_weekday_ledger_counts`` etc.).
+"""
+
+
+
+def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Row bodies WITHOUT the validator-style constant prefix (see the public
+    builder below for the docstring with the measured statistics)."""
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = np.arange(L, dtype=np.float64)[None, :]
+    ti = np.arange(L, dtype=np.int64)[None, :]
+    two_pi = 2.0 * np.pi
+
+    def ar1(innov: np.ndarray, phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
+        # causal exponential kernel by FFT: stationary AR(1) with sd ``sd``
+        K = min(L, 320)
+        ker = phi ** np.arange(K, dtype=np.float64)[None, :]
+        m = L + K
+        spec = np.fft.rfft(innov, n=m, axis=1) * np.fft.rfft(ker, n=m, axis=1)
+        x = np.fft.irfft(spec, n=m, axis=1)[:, :L]
+        return x * sd * np.sqrt(1.0 - phi * phi)
+
+    mode = rng.random((n, 1))
+    is_b = mode < 0.15            # registration / submission streams with batch bursts
+    is_c = mode >= 0.85           # bounded arrival-prediction draws
+    # else: dispatch / incident counts (0.70)
+
+    # day length in SAMPLES: hourly 24, minute 60, half-hour 48, 5-min 288, ...
+    per_tab = np.array([24.0, 60.0, 48.0, 288.0, 96.0, 144.0])
+    per_cdf = np.cumsum(np.array([0.48, 0.22, 0.14, 0.12, 0.03, 0.01]))
+    P = per_tab[np.searchsorted(per_cdf, rng.random(n) * per_cdf[-1])][:, None]
+    tau = (t + rng.uniform(0.0, 1.0, size=(n, 1)) * P) / P    # time in days
+    day = np.floor(tau)
+    frac = tau - day
+    di = day.astype(np.int64)
+
+    # daily profile: log-cosine with a second harmonic, (max-min)/mean ~ 2a
+    a = np.exp(rng.uniform(np.log(0.08), np.log(1.5), size=(n, 1)))
+    a = np.where(is_b, a * rng.uniform(0.15, 0.7, size=(n, 1)), a)
+    a = np.where(P >= 60.0, a * rng.uniform(0.2, 0.7, size=(n, 1)), a)   # minute/5-min feeds: tiny counts hide the cycle
+    b = rng.uniform(0.0, 0.5, size=(n, 1))
+    psi = rng.uniform(0.0, two_pi, size=(n, 1))
+    ang = two_pi * frac
+    prof = np.exp(a * (np.cos(ang) + b * np.cos(2.0 * ang + psi)))
+    prof /= prof.mean(axis=1, keepdims=True)
+    del ang
+
+    # day-of-week profile
+    sw = rng.uniform(0.01, 0.10, size=(n, 1))
+    sw = np.where(is_b, rng.uniform(0.03, 0.2, size=(n, 1)), sw)
+    wk = np.exp(rng.normal(0.0, 1.0, size=(n, 7)) * sw)
+    we_rows = rng.random((n, 1)) < 0.10
+    wk[:, 5:] *= np.where(we_rows, rng.uniform(0.5, 0.9, size=(n, 1)), 1.0)
+    wk /= wk.mean(axis=1, keepdims=True)
+    dow = (di + rng.integers(0, 7, size=(n, 1))) % 7
+    wk_t = np.take_along_axis(wk, dow, axis=1)
+    del dow
+
+    # slow level: AR(1) on daily knots, linearly interpolated inside the day
+    nk = int(L // 24) + 3
+    tau_d = np.exp(rng.uniform(np.log(0.3), np.log(3.0), size=n))
+    phi_d = np.exp(-1.0 / tau_d)
+    sd_s = rng.uniform(0.02, 0.08, size=n)
+    sd_s = np.where(is_b[:, 0], rng.uniform(0.08, 0.3, size=n), sd_s)
+    e = rng.normal(0.0, 1.0, size=(n, nk))
+    knots = np.empty((n, nk), dtype=np.float64)
+    knots[:, 0] = e[:, 0]
+    s = np.sqrt(1.0 - phi_d * phi_d)
+    for k in range(1, nk):
+        knots[:, k] = phi_d * knots[:, k - 1] + s * e[:, k]
+    knots *= sd_s[:, None]
+    # multi-week drift on the same knots (tau log-U[10,60] d)
+    tau_m = np.exp(rng.uniform(np.log(10.0), np.log(60.0), size=n))
+    phi_m = np.exp(-1.0 / tau_m)
+    sd_m = rng.uniform(0.03, 0.25, size=n)
+    e = rng.normal(0.0, 1.0, size=(n, nk))
+    drift = np.empty((n, nk), dtype=np.float64)
+    drift[:, 0] = e[:, 0]
+    s = np.sqrt(1.0 - phi_m * phi_m)
+    for k in range(1, nk):
+        drift[:, k] = phi_m * drift[:, k - 1] + s * e[:, k]
+    knots += drift * sd_m[:, None]
+    slow = (np.take_along_axis(knots, di, axis=1) * (1.0 - frac)
+            + np.take_along_axis(knots, di + 1, axis=1) * frac)
+    del tau, day, frac, di
+
+    # fast within-day clustering of the latent rate
+    phi_f = rng.uniform(0.2, 0.7, size=(n, 1))
+    sd_f = rng.uniform(0.08, 0.45, size=(n, 1))
+    sd_f = np.where(is_b, rng.uniform(0.05, 0.35, size=(n, 1)), sd_f)
+    fast = ar1(rng.normal(0.0, 1.0, size=(n, L)), phi_f, sd_f)
+
+    m = np.exp(rng.uniform(np.log(0.8), np.log(40.0), size=(n, 1)))
+    m = np.where(P >= 60.0, np.exp(rng.uniform(np.log(0.5), np.log(8.0), size=(n, 1))), m)   # minute/5-min bins
+    m = np.where(is_b, np.exp(rng.uniform(np.log(0.5), np.log(30.0), size=(n, 1))), m)
+    # one small permanent log-step on 20% of rows (long-horizon level uncertainty)
+    st_rows = rng.random((n, 1)) < 0.2
+    st_pos = (rng.uniform(0.1, 0.95, size=(n, 1)) * L).astype(np.int64)
+    st_mag = rng.normal(0.0, 0.35, size=(n, 1))
+    step = np.where(st_rows & (ti >= st_pos), st_mag, 0.0)
+    lam = m * prof * wk_t * np.exp(slow + fast + step)
+    del prof, wk_t, slow, fast, step
+
+    # batch bursts (stream rows): x(1+B), B log-U[2,60], 70% with a 6-step decaying tail
+    pb = rng.uniform(0.005, 0.08, size=(n, 1))
+    ev = (rng.random((n, L)) < pb) & is_b
+    burst = np.where(ev, np.exp(rng.uniform(np.log(2.0), np.log(60.0), size=(n, L))), 0.0)
+    dec = rng.uniform(0.2, 0.7, size=(n, 1)) * (rng.random((n, 1)) < 0.7)
+    tail = burst.copy()
+    for k in range(1, 7):
+        tail[:, k:] += burst[:, :-k] * dec ** k
+    exc_rows = is_b & (rng.random((n, 1)) < 0.12)
+    e0 = (rng.uniform(0.05, 0.9, size=(n, 1)) * L).astype(np.int64)
+    elen = np.exp(rng.uniform(np.log(10.0), np.log(300.0), size=(n, 1)))
+    emag = np.exp(rng.uniform(np.log(3.0), np.log(30.0), size=(n, 1)))
+    exc = np.where(exc_rows & (ti >= e0) & (ti < e0 + elen), emag, 1.0)
+    lam = lam * (1.0 + tail) * exc
+    del ev, burst, tail, exc
+
+    # gamma-Poisson observation, then the feed's empty-bin drop (max(1, .))
+    r = np.exp(rng.uniform(np.log(4.0), np.log(80.0), size=(n, 1)))
+    r = np.where(is_b, np.exp(rng.uniform(np.log(4.0), np.log(40.0), size=(n, 1))), r)
+    g = rng.gamma(r, 1.0 / r, size=(n, L))
+    y = rng.poisson(np.minimum(lam * g, 1.0e6)).astype(np.float64)
+    del lam, g
+    trunc = rng.random((n, 1)) < 0.9
+    y = np.where(trunc, np.maximum(y, 1.0), y)
+
+    # unit lattice (baton-rouge style): counts x a piecewise-constant unit 2..12
+    lat = np.nonzero(((~is_b) & (~is_c) & (rng.random((n, 1)) < 0.05))[:, 0])[0]
+    if lat.size:
+        nl = lat.size
+        q = 1.0 / rng.uniform(2.0, 40.0, size=(nl, 1))
+        chg = rng.random((nl, L)) < q
+        chg[:, 0] = True
+        src = np.maximum.accumulate(np.where(chg, ti, 0), axis=1)
+        unit = np.take_along_axis(rng.integers(2, 13, size=(nl, L)).astype(np.float64), src, axis=1)
+        y[lat] = y[lat] * unit
+
+    # bounded arrival-prediction rows: iid mixture (near-zero exponential +
+    # uniform up to the cap) rank-matched to a Gaussian AR(1) for lag1 0-0.4
+    idx_c = np.nonzero(is_c[:, 0])[0]
+    if idx_c.size:
+        nc = idx_c.size
+        cap = np.where(rng.random((nc, 1)) < 0.8, 1800.0,
+                       np.exp(rng.uniform(np.log(900.0), np.log(12000.0), size=(nc, 1))))
+        w = rng.uniform(0.03, 0.35, size=(nc, 1))
+        sc = cap * rng.uniform(0.03, 0.12, size=(nc, 1))
+        yi = np.where(rng.random((nc, L)) < w,
+                      rng.exponential(1.0, size=(nc, L)) * sc,
+                      rng.uniform(0.0, 1.0, size=(nc, L)) * cap)
+        yi = np.clip(np.rint(yi), 1.0, cap)
+        z = ar1(rng.normal(0.0, 1.0, size=(nc, L)), rng.uniform(0.0, 0.4, size=(nc, 1)),
+                np.ones((nc, 1)))
+        ranks = np.argsort(np.argsort(z, axis=1), axis=1)
+        y[idx_c] = np.take_along_axis(np.sort(yi, axis=1), ranks, axis=1)
+    return y
+
+
+"""intraday_spot_price -- coverage family for the electricity_price_intraday
+pool class (day-ahead / market-index / hourly spot / real-time dispatch prices
+at 5-30 min and hourly cadence).  Deterministic seeded numpy only.
+"""
+
+
+
+def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    """y[t] = phi * y[t-1] + innov[t] along axis 1; phi is (n, 1).  Runs on the
+    transposed array so every step touches one contiguous vector."""
+    n, L = innov.shape
+    x = np.ascontiguousarray(innov.T)
+    p = np.reshape(phi, -1)
+    for k in range(1, L):
+        x[k] += p * x[k - 1]
+    return x.T
+
+
+def _isp_day_ar1(rng: np.random.Generator, n: int, nd: int,
+                 phi: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    """Stationary AR(1) across days: (n, nd) with per-row phi, sd (both (n,1))."""
+    e = rng.normal(0.0, 1.0, size=(n, nd)) * sd * np.sqrt(1.0 - phi * phi)
+    e[:, :1] = rng.normal(0.0, 1.0, size=(n, 1)) * sd
+    return _isp_ar1(e, phi)
+
+
+def _isp_runs(rng: np.random.Generator, idx: np.ndarray, start: np.ndarray,
+              mean_len: np.ndarray) -> np.ndarray:
+    """Mask covering geometric-length runs (mean ``mean_len``) that begin at
+    the ``start`` samples; the run's first sample is included."""
+    ln = rng.geometric(np.clip(1.0 / mean_len, 1e-3, 1.0), size=start.shape)
+    reach = np.maximum.accumulate(np.where(start, idx + ln - 1, -1), axis=1)
+    return idx <= reach
+
+
+def _road_commute_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Road / bridge / tunnel vehicle counts: mta_bridges_tunnels_hourly_crossings,
+    npra_norway_traffic_volume_hourly, truck-toll and airport-operation feeds.
+
+    Measured on the revealed pool: integer counts, no zeros, CV 0.40-0.56, lag-1
+    acf ~0.92, day-lag acf ~0.90 and week-lag acf 0.90-0.97 -- a near-deterministic
+    commute rhythm that repeats week to week, with the variance carried by the
+    cycle itself rather than by noise.
+
+    Weekday profile = night floor + AM peak + broader PM peak (von Mises bumps,
+    AM at U[0.26, 0.36] of the day, PM at U[0.66, 0.78]); weekend = one broad
+    blend (U[0.3, 0.7]) of a broad midday hump and the weekday shape at
+    U[0.75, 1.05] of the weekday mass, Saturday above Sunday.
+    Day level carries a small AR(1) (phi U[0.3, 0.8], sd U[0.02, 0.08]) and the
+    step level a smaller iid term (sd U[0.005, 0.02]), so the weekly shape is
+    what the context teaches and what the horizon continues. 80% of rows are
+    hourly (P=24), 20% quarter-hourly (P=96). 20% of rows carry 1-2 closure dips
+    (flow to U[0.15, 0.6] for 2..12 hours). Counts are Poisson at the rate,
+    level log-U[150, 9000], so the lattice and the low-count floor are both real.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    ti = np.arange(L, dtype=np.float64)[None, :]
+    P = np.where(rng.random((n, 1)) < 0.8, 24.0, 96.0)
+    ph0 = rng.random((n, 1))
+    dow0 = rng.integers(0, 7, size=(n, 1))
+
+    day_pos = ti / P + ph0                                    # (n, L) days elapsed
+    day_idx = np.floor(day_pos).astype(np.int64)
+    frac = day_pos - day_idx                                  # position within the day
+    dow = (day_idx + dow0) % 7                                # 5, 6 = weekend
+
+    m_am = rng.uniform(0.26, 0.36, size=(n, 1))
+    m_pm = rng.uniform(0.66, 0.78, size=(n, 1))
+    k_am = rng.uniform(3.0, 10.0, size=(n, 1))
+    k_pm = rng.uniform(2.0, 7.0, size=(n, 1))
+    h_pm = rng.uniform(0.7, 1.4, size=(n, 1))
+    floor_ = rng.uniform(0.12, 0.40, size=(n, 1))
+    tw = 2.0 * np.pi
+    prof = np.exp(k_am * (np.cos(tw * (frac - m_am)) - 1.0))
+    prof += h_pm * np.exp(k_pm * (np.cos(tw * (frac - m_pm)) - 1.0))
+
+    m_we = rng.uniform(0.50, 0.60, size=(n, 1))
+    k_we = rng.uniform(2.0, 6.0, size=(n, 1))
+    we_mass = rng.uniform(0.75, 1.05, size=(n, 1))
+    we_blend = rng.uniform(0.3, 0.7, size=(n, 1))
+    sun = rng.uniform(0.75, 0.95, size=(n, 1))
+    we_prof = np.exp(k_we * (np.cos(tw * (frac - m_we)) - 1.0))
+    we_prof *= we_mass * (1.0 + h_pm) / np.maximum(we_prof.mean(axis=1, keepdims=True), 1e-9) \
+        * prof.mean(axis=1, keepdims=True) / (1.0 + h_pm)
+    we_prof = we_blend * we_prof + (1.0 - we_blend) * we_mass * prof
+    we_prof *= np.where(dow == 6, sun, 1.0)
+    prof = np.where(dow >= 5, we_prof, prof)
+    del we_prof
+    prof += floor_ * prof.max(axis=1, keepdims=True)
+    prof /= np.maximum(prof.mean(axis=1, keepdims=True), 1e-9)
+
+    nd = int(L // 24) + 3
+    phi = rng.uniform(0.3, 0.8, size=(n, 1))
+    dsd = rng.uniform(0.02, 0.08, size=(n, 1))
+    e = rng.normal(0.0, 1.0, size=(n, nd))
+    dl = np.empty((n, nd))
+    dl[:, :1] = e[:, :1]
+    for j in range(1, nd):
+        dl[:, j:j + 1] = phi * dl[:, j - 1:j] + np.sqrt(1.0 - phi * phi) * e[:, j:j + 1]
+    prof *= np.exp(dsd * np.take_along_axis(dl, np.minimum(day_idx, nd - 1), axis=1))
+    del day_idx, day_pos, frac, dow
+
+    prof *= np.exp(rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.005, 0.02, size=(n, 1)))
+
+    has_dip = rng.random((n, 1)) < 0.2
+    for _ in range(2):
+        s0 = rng.integers(0, L, size=(n, 1)).astype(np.float64)
+        dur = rng.uniform(2.0, 12.0, size=(n, 1)) * (P / 24.0)
+        lvl = rng.uniform(0.15, 0.6, size=(n, 1))
+        on = has_dip & (rng.random((n, 1)) < 0.7) & (ti >= s0) & (ti < s0 + dur)
+        prof = np.where(on, prof * lvl, prof)
+
+    level = np.exp(rng.uniform(np.log(150.0), np.log(9000.0), size=(n, 1)))
+    prof *= level
+    return rng.poisson(np.maximum(prof, 0.0)).astype(np.float64)
+
+def _intraday_spot_price(rng: np.random.Generator, n: int, L: int,
+                         short_start: float = 0.35) -> np.ndarray:
+    """Wholesale electricity prices at 5/15/30-min and hourly cadence: solar
+    duck-curve day-ahead prices (energy_charts_*, energinet, elering, pse, ree,
+    octopus_agile, elexon market index), offer-tier hourly spot prices
+    (simem / xm colombia, cenace) and tier-held real-time dispatch prices with
+    short multiplicative spikes (nz_emi dispatch, nyiso / caiso 5-min LBMP,
+    aemo, aeso).
+
+    Fitted on the 105 pool series of the class (last 4096 points; p10/50/90):
+    level 18/60/190, lag1 0.58/0.94/0.98, flat_run 0.008/0.043/0.28,
+    dlog_sd 0.11/0.27/0.62, max/med 1.8/4.9/21, range_rel 1.8/5.1/21,
+    neg_frac 0/0/0.034, integer_frac 0.005/0.03/0.20, shift_rate
+    0.06/0.42/0.61, trend_slope -3e-5/1e-4/6e-4 per step (late-summer rise),
+    tick 0.01, series length 690..4096 (p10 1539: nz_emi ~1540, colombia
+    ~1300, elexon ~2500, octopus ~3300).  Four archetypes by cadence P
+    (samples/day), measured as band shares of the detrended signed-log
+    spectrum (>6 d / 3-6 d / 1.5-3 d / daily line / 12 h-1 d / 3-12 h / <3 h):
+    (a) sub-hourly day-ahead, P=96 (48 series) and 40% of P=48: 0.15 / 0.06
+    / 0.07 / 0.18 / 0.23 / 0.09 / 0.02; lag1 0.96, dlog_sd 0.24; median
+    intraday profile / median 1.44 at the evening peak (18-20 h), 0.45 at the
+    midday solar trough (13-14 h; ES/NL/DK 0.02-0.3, Nordic/UK 0.65-0.9),
+    morning shoulder 1.1-1.25; daily-mean log sd 0.13/0.24/1.0 with
+    day-to-day acf 0.5; acf at one day 0.68, one week 0.68; weekend /
+    weekday 0.66-0.74; days with a negative price 0/7/22% (never below -0.2
+    x level), days with min < 0.15 median 44%, daily min / daily mean p50
+    0.24 and wildly varying day to day (sunny 0, cloudy 0.5); daily max /
+    daily mean p50 1.7, p90 2.1-2.7, max 3.2-8; residual log sd
+    0.09/0.35/0.63 after the day mean and the profile; |dlog| lag-1 acf 0.5
+    (ramps cluster the big moves); identical consecutive values 0.8/1.9/5.4%
+    in runs of 2; near-flat |dx| < 1% med share 0.2 (heavy-tailed
+    quarter-hour zigzag).  octopus / elexon 30-min rows: one strong evening
+    peak (1.74), weak trough (0.72), 12 h-1 d sideband share 0.27.
+    (b) hourly spot, P=24 (simem / xm colombia, ree, cenace): 0.49 / 0.04 /
+    0.03 / 0.18 / 0.07 / 0.09 / 0.01 -- a slow multi-week level, a clean
+    daily line and little else; prices sit on a few offer tiers (559.25,
+    564.35, 602.78 ...): near-flat share 0.61, exact repeats 27% in runs to
+    4, lag1 0.91, dlog_sd 0.11, max/med 1.5, cv 0.2, peak-hour tier x 1.45
+    for 2-3 h on some days, no negatives.  (c) 30-min dispatch, 60% of P=48
+    (nz_emi, aemo): 0.29 / 0.14 / 0.27 / 0.01 / 0.05 / 0.08 / 0.07 -- huge
+    day-to-day swings (daily-mean log sd 1.0-1.2, acf 0.35, a quasi 2-3 day
+    cycle) with the level ramping between days; within a day the price
+    alternates every 1-3 samples among 2-4 offer tiers (21 / 34 / 68: |dx| >
+    0.5 med on 14% of steps, near-flat 0.32, exact repeats 12-21%), short
+    collapses to 0.02-2 (1-2% of samples), spikes 0.4/day of 3.4x; lag1 0.91,
+    dlog_sd 0.59, dkurt 22, max/med 10, daily min / mean p50 0.11.  (d) 5-min
+    real-time, P=288 (nyiso, caiso): 0.06 / 0.10 / 0.04 / 0.13 / 0.13 / 0.18
+    / 0.30 -- lag1 0.50, near-flat base (share 0.41, exact repeats 7%) with
+    bursts, spikes 1.1/day of 3.6x (p90 10x, 2-4 samples), dkurt 345,
+    daily-mean log sd 0.15, profile 0.77-1.27, max/med 21, cv 0.68.
+
+    Law.  P in {24, 48, 96, 288} w.p. 0.10/0.34/0.45/0.11; dispatch kind
+    w.p. 0.12/0.60/0.02/1.0 given P (P=288 always the 5-min kind); rows are
+    built in chunks of 256 with day-ahead-only and dispatch-only terms drawn
+    on their row subsets.  Log daily level = slow walk (sd/d: DA U[0.005,
+    0.04] (x0.5 at P=48), hourly U[0.005,0.02], nz U[0.06,0.2], 5-min
+    U[0.003,0.015]) + log drift over the row (DA U[-0.1,0.8] (x0.3 at P=48),
+    hourly U[-0.2,0.2], nz U[-0.3,2.0], 5-min U[-0.15,0.15]), tanh-capped at
+    +-2, + stationary day AR(1) (sd: DA U[0.03,0.20], hourly U[0.005,0.02],
+    nz U[0.8,1.3], 5-min U[0.06,0.15]; phi DA U[0.6,0.9], hourly U[0.7,0.9],
+    nz U[-0.3,0.1], 5-min U[0.2,0.5]) + a quasi-cycle (nz: period U[1.8,3.5]
+    d, amplitude U[0.4,1.0] x exp(N(0,0.3)) per day; hourly: period U[6,14]
+    d, U[0.02,0.06]) + weekend log-factor (Sat U[0.7,0.95], Sun = Sat x
+    U[0.8,1.0]) + hourly holiday-like low days (3%, x U[0.5,0.9]); nz rows
+    interpolate the daily level linearly between day centres, the others
+    hold it per day; base level exp(N(ln 60, 0.9)) DA, exp(N(ln 30, 0.6))
+    dispatch, clipped to [2, 5000].  Volatility multiplier exp(tanh(day AR(1)
+    sd U[0.1,0.3] + intraday AR(1) log-vol sd U[0.15,0.45] (hourly phi 0.9)
+    + row slope U[-0.2,0.8] x (t/L - 1/2))) on residual and jitter terms,
+    its square root on spikes.  Profile (log, circular in 24 h): Gaussian
+    bumps at 6.5-9 h (width U[2.5,3.5] h; amplitude DA U[0.10,0.40], hourly
+    U[0.02,0.12], nz U[0,0.1], 5-min U[0.05,0.15]), 17-20.5 h (width
+    U[3,4] h; DA U[0.15,0.60], 30-min DA U[0.20,0.50] with morning
+    U[0.02,0.15], hourly U[0.10,0.30], nz U[0.02,0.15], 5-min U[0.15,0.35]),
+    night dip 2-5 h (width U[3,4.5] h; DA U[0.05,0.30], hourly U[0.08,0.25],
+    nz U[0.02,0.12], 5-min U[0.15,0.35]); amplitudes jittered by an AR(1)
+    across days (phi U[0.3,0.7]; log sd 0.3 DA, 0.6 at 30-min DA, 0.05
+    hourly, 0.35 dispatch), the evening peak x U[0.6,0.9] on weekends, peak
+    timing drifting U[-1,1] h over the row and jittered N(0, 0.7 h) per day.
+    Day-ahead: price = D_d exp(prof_d(tau) + r_t + w_t) x scarcity - D_d s_d
+    S(tau); solar trough S = exp(-|tau - U[12.5,14]|^k / U[3.5,5]^k), k
+    U[1.2,2], depth s_d = s_row exp(AR(1) across days, phi U[0.3,0.7], sd
+    U[0.3,0.6]) x weekend U[1,1.3], capped at 1.12 on days cleared for
+    negative prices (w.p. U[0.03,0.25] per day) and 0.99 otherwise; s_row
+    U[0.75,1.0] on solar rows (70% at P=96, 15% at P=48, 20% at P=24 with
+    U[0.3,0.8]) else U[0.03,0.4]; r_t = AR(1) log residual, hourly phi
+    U[0.7,0.95] (per-sample phi^(24/P)), sd U[0.05,0.22] (hourly U[0.02,0.08])
+    x volatility; w_t = Laplace sub-hourly zigzag, sd U[0.01,0.04] (P=96) /
+    U[0.01,0.05] (P=48) x volatility x (0.4 + 0.6 x normalised |profile
+    ramp|); scarcity days w.p. U[0,0.10] scale the evening peak by U[1.3,3]
+    over U[0.5,2.5] h (hourly: peak-hour tier x U[1.15,1.4] over U[0.5,2] h
+    on U[2,8]% of days); floors: 10% hard 0 (hourly 20%), 25% soft
+    U[0.02,0.2] level with N(0, 0.003 level) jitter (hourly 50%), the rest
+    negative-allowed down to -U[0.01,0.08] level on cleared days and
+    U[5e-4,0.01] level otherwise.  60% of hourly rows are then quantised to a
+    log grid of spacing U[0.01,0.06] (offer tiers) with micro-jitter exp(N(0,
+    U[1e-3,5e-3])) on U[60,90]% of samples.  Dispatch: log price = log D +
+    prof + tier(t) + jitter + spikes; nz tiers = sample-and-hold, at geometric
+    change points of mean dwell U[1.2,4] samples, of a uniform draw over K in
+    {2,3,4} levels spaced U[0.4,0.9] apart, blended U[0,0.4] with the
+    previous sample (ramping), plus collapses to level x U[5e-4,0.1] starting
+    w.p. U[0.002,0.012] per sample with mean length U[1.5,4]; 5-min tiers =
+    sample-and-hold of a latent AR(1) (dwell U[24,150], sd U[0.02,0.08],
+    across-tier phi U[0.3,0.8]); jitter nz N(0, U[0.01,0.03]), 5-min N(0,
+    U[0.002,0.01]) plus N(0, U[0.05,0.12]) on U[15,35]% of samples, both x
+    volatility; spikes at nz U[0.1,0.5]/day (log-magnitude U[ln 1.5, ln 3],
+    decay tau U[0.5,3] samples, 15% long U[3,8]), 5-min U[1,2]/day (U[ln 3,
+    ln 30], tau U[1,4]), spike log-magnitude capped at ln 30; the total log
+    excursion above base is soft-capped (slope 0.3) beyond ln 10 (nz) / ln
+    18 (5-min).  Observation (all): repeat runs of the previous free value
+    (start prob / mean run: DA sub-hourly U[0,0.03] / 1/(1-U[0.2,0.5]),
+    hourly U[0.03,0.22] / 1/(1-U[0.3,0.6]), nz U[0.03,0.2] / 1/(1-U[0.3,0.7]),
+    5-min U[0.01,0.06] / 1/(1-U[0.2,0.5])); snap to the integer w.p. q_row
+    (45% of rows U[0.01,0.25], a third of those to multiples of 5); 0.01
+    tick; 35% of rows start mid-row with a constant prefix (U[0.25,0.85] L)
+    at the first real value -- the validator's left-padding of the short
+    nz_emi / colombia / elexon feeds.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    P = rng.choice(np.array([24.0, 48.0, 96.0, 288.0]), size=(n, 1),
+                   p=np.array([0.10, 0.34, 0.45, 0.11]))
+    p_rt = np.select([P == 24.0, P == 48.0, P == 96.0], [0.12, 0.60, 0.02], 1.0)
+    rt = rng.random((n, 1)) < p_rt
+    kind = np.where(rt, np.where(P == 288.0, 3, 2), np.where(P == 24.0, 1, 0))
+    out = np.empty((n, L), dtype=np.float64)
+    for a in range(0, n, 256):
+        b = min(n, a + 256)
+        out[a:b] = _isp_rows(rng, P[a:b], kind[a:b], L, short_start)
+    return out
+
+
+def _isp_rows(rng: np.random.Generator, P: np.ndarray, kind: np.ndarray, L: int,
+              short_start: float) -> np.ndarray:
+    """One chunk of rows; P (n,1) samples/day, kind (n,1) archetype code:
+    0 sub-hourly day-ahead, 1 hourly spot, 2 nz dispatch, 3 5-min real-time."""
+    n = P.shape[0]
+    t = np.arange(L, dtype=np.float64)[None, :]
+    idx = np.arange(L, dtype=np.int64)[None, :]
+    da_i = np.flatnonzero(kind[:, 0] <= 1)
+    rt_i = np.flatnonzero(kind[:, 0] >= 2)
+    n_da, n_rt = da_i.size, rt_i.size
+    half = (kind == 0) & (P == 48.0)               # octopus / elexon rows
+
+    def U(*ranges):
+        """per-row uniform draw whose (lo, hi) range depends on the kind."""
+        lo = np.choose(kind, [r[0] for r in ranges])
+        hi = np.choose(kind, [r[1] for r in ranges])
+        return rng.uniform(lo, hi, size=(n, 1))
+
+    hs = 24.0 / P                                  # hours per sample
+    phase = rng.uniform(0.0, 1.0, size=(n, 1)) * P
+    tau = np.mod(t + phase, P) * hs                # hour of day in [0, 24)
+    fday = (t + phase) / P
+    day = np.floor(fday).astype(np.int64)
+    nd = int(day.max()) + 2
+
+    # ── daily level: slow walk + drift + day AR(1) + cycle + weekend ──────
+    rw_sd = U((0.005, 0.04), (0.005, 0.02), (0.06, 0.2), (0.003, 0.015))
+    drift = U((-0.1, 0.8), (-0.2, 0.2), (-0.3, 2.0), (-0.15, 0.15))
+    drift = np.where(half, 0.3 * drift, drift)
+    rw_sd = np.where(half, 0.5 * rw_sd, rw_sd)
+    dd = np.arange(nd, dtype=np.float64)[None, :]
+    slow = np.cumsum(rng.normal(0.0, 1.0, size=(n, nd)) * rw_sd, axis=1) + drift * dd / (L / P)
+    slow = 2.0 * np.tanh(slow / 2.0)
+    sd_day = U((0.03, 0.20), (0.005, 0.02), (0.8, 1.3), (0.06, 0.15))
+    phi_day = U((0.6, 0.9), (0.7, 0.9), (-0.3, 0.1), (0.2, 0.5))
+    ar_day = _isp_day_ar1(rng, n, nd, phi_day, sd_day)
+    T_c = np.where(kind == 1, rng.uniform(6.0, 14.0, size=(n, 1)), rng.uniform(1.8, 3.5, size=(n, 1)))
+    amp_c = np.select([kind == 2, kind == 1], [rng.uniform(0.4, 1.0, size=(n, 1)),
+                                             rng.uniform(0.02, 0.06, size=(n, 1))], 0.0)
+    cyc = amp_c * np.sin(2.0 * np.pi * dd / T_c + rng.uniform(0.0, 2.0 * np.pi, size=(n, 1)))
+    cyc = cyc * np.exp(rng.normal(0.0, 0.3, size=(n, nd)))
+    dow0 = rng.integers(0, 7, size=(n, 1))
+    dow_d = (np.arange(nd, dtype=np.int64)[None, :] + dow0) % 7
+    sat = rng.uniform(0.7, 0.95, size=(n, 1))
+    sun = sat * rng.uniform(0.8, 1.0, size=(n, 1))
+    wk_d = np.where(dow_d == 5, np.log(sat), np.where(dow_d == 6, np.log(sun), 0.0))
+    lowday = (kind == 1) & (rng.random((n, nd)) < 0.03)
+    wk_d = wk_d + np.where(lowday, np.log(rng.uniform(0.5, 0.9, size=(n, nd))), 0.0)
+    logD_d = slow + ar_day + cyc + wk_d
+    logD_hold = np.take_along_axis(logD_d, day, axis=1)
+    frac = fday - day
+    logD_lin = (1.0 - frac) * logD_hold + frac * np.take_along_axis(logD_d, day + 1, axis=1)
+    logD = np.where(kind == 2, logD_lin, logD_hold)
+    wkend = np.take_along_axis(dow_d >= 5, day, axis=1)
+    base = np.where(kind <= 1, np.exp(rng.normal(np.log(60.0), 0.9, size=(n, 1))),
+                    np.exp(rng.normal(np.log(30.0), 0.6, size=(n, 1))))
+    base = np.clip(base, 2.0, 5000.0)
+
+    # ── volatility multiplier ─────────────────────────────────────────────
+    logvol_d = _isp_day_ar1(rng, n, nd, np.full((n, 1), 0.6), rng.uniform(0.1, 0.3, size=(n, 1)))
+    phi_v = 0.9 ** hs
+    e_v = rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.15, 0.45, size=(n, 1)) * np.sqrt(1.0 - phi_v ** 2)
+    v_t = _isp_ar1(e_v, phi_v)
+    vslope = rng.uniform(-0.2, 0.8, size=(n, 1))
+    vol = np.exp(np.tanh(np.take_along_axis(logvol_d, day, axis=1) + v_t + vslope * (t / L - 0.5)))
+    del e_v, v_t
+
+    # ── intraday profile (log bumps, circular in 24 h) ────────────────────
+    def bump(mu, w):
+        d = np.abs(np.mod(tau - mu + 12.0, 24.0) - 12.0)
+        return np.exp(-0.5 * (d / w) ** 2)
+    mu_m = rng.uniform(6.5, 9.0, size=(n, 1))
+    mu_e = rng.uniform(17.0, 20.5, size=(n, 1))
+    mu_n = rng.uniform(2.0, 5.0, size=(n, 1))
+    a_m = U((0.10, 0.40), (0.02, 0.12), (0.0, 0.1), (0.05, 0.15))
+    a_e = U((0.15, 0.60), (0.10, 0.30), (0.02, 0.15), (0.15, 0.35))
+    a_n = U((0.05, 0.30), (0.08, 0.25), (0.02, 0.12), (0.15, 0.35))
+    a_m = np.where(half, rng.uniform(0.02, 0.15, size=(n, 1)), a_m)
+    a_e = np.where(half, rng.uniform(0.20, 0.50, size=(n, 1)), a_e)
+    w_m = rng.uniform(2.5, 3.5, size=(n, 1))
+    w_e = np.where(half, rng.uniform(3.0, 4.5, size=(n, 1)), rng.uniform(3.0, 4.0, size=(n, 1)))
+    w_n = rng.uniform(3.0, 4.5, size=(n, 1))
+    aj = np.select([half, kind == 0, kind == 1], [0.6, 0.3, 0.05], 0.35)
+    phi_j = np.where(half, rng.uniform(0.1, 0.4, size=(n, 1)), rng.uniform(0.3, 0.7, size=(n, 1)))
+    jm = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    je = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    jn = np.take_along_axis(np.exp(_isp_day_ar1(rng, n, nd, phi_j, aj)), day, axis=1)
+    je = je * np.where(wkend, rng.uniform(0.6, 0.9, size=(n, 1)), 1.0)
+    t_drift = rng.uniform(-1.0, 1.0, size=(n, 1)) * (t / L - 0.5)
+    t_jit = np.take_along_axis(rng.normal(0.0, 0.7, size=(n, nd)), day, axis=1)
+    prof = (a_m * jm * bump(mu_m + t_drift + t_jit, w_m)
+            + a_e * je * bump(mu_e + t_drift + t_jit, w_e)
+            - a_n * jn * bump(mu_n + t_jit, w_n))
+    del jm, je, jn
+
+    y = np.empty((n, L), dtype=np.float64)
+
+    # ── day-ahead / hourly spot rows ──────────────────────────────────────
+    if n_da:
+        kd = kind[da_i]; Pd = P[da_i]; hd = hs[da_i]; taud = tau[da_i]
+        dayd = day[da_i]; vold = vol[da_i]; based = base[da_i]
+        m = n_da
+        phi_r = rng.uniform(0.7, 0.95, size=(m, 1)) ** hd
+        sd_r = np.where(kd == 1, rng.uniform(0.02, 0.08, size=(m, 1)), rng.uniform(0.05, 0.22, size=(m, 1)))
+        r_t = _isp_ar1(rng.normal(0.0, 1.0, size=(m, L)) * sd_r * np.sqrt(1.0 - phi_r ** 2), phi_r) * vold
+        solar_p = np.select([Pd == 96.0, Pd == 48.0], [0.70, 0.15], 0.20)
+        solar = rng.random((m, 1)) < solar_p
+        s_row = np.where(solar, np.where(kd == 1, rng.uniform(0.3, 0.8, size=(m, 1)),
+                                         rng.uniform(0.75, 1.0, size=(m, 1))),
+                         rng.uniform(0.03, 0.4, size=(m, 1)))
+        s_d = s_row * np.exp(_isp_day_ar1(rng, m, nd, rng.uniform(0.3, 0.7, size=(m, 1)),
+                                         rng.uniform(0.3, 0.6, size=(m, 1))))
+        s_d = s_d * np.where(dow_d[da_i] >= 5, rng.uniform(1.0, 1.3, size=(m, 1)), 1.0)
+        neg_ok = rng.random((m, nd)) < rng.uniform(0.03, 0.25, size=(m, 1))
+        s_d = np.minimum(s_d, np.where(neg_ok, 1.12, 0.99))
+        s_t = np.take_along_axis(s_d, dayd, axis=1)
+        mu_s = rng.uniform(12.5, 14.0, size=(m, 1)) + 0.5 * t_jit[da_i]
+        w_s = rng.uniform(3.5, 5.0, size=(m, 1))
+        k_s = rng.uniform(1.2, 2.0, size=(m, 1))
+        S = np.exp(-(np.abs(taud - mu_s) / w_s) ** k_s)
+        scar_p = np.where(kd == 1, rng.uniform(0.02, 0.08, size=(m, 1)), rng.uniform(0.0, 0.10, size=(m, 1)))
+        scar_d = rng.random((m, nd)) < scar_p
+        amp_lo = np.where(kd == 1, 1.15, 1.3)
+        amp_hi = np.where(kd == 1, 1.4, 3.0)
+        scar_amp = np.where(scar_d, amp_lo + (amp_hi - amp_lo) * rng.random((m, nd)), 1.0)
+        scar_w = np.where(kd == 1, rng.uniform(0.5, 2.0, size=(m, nd)), rng.uniform(0.5, 2.5, size=(m, nd)))
+        scar_mu = mu_e[da_i] + rng.normal(0.0, 1.5, size=(m, nd))
+        dm = np.abs(np.mod(taud - np.take_along_axis(scar_mu, dayd, axis=1) + 12.0, 24.0) - 12.0)
+        scar = 1.0 + (np.take_along_axis(scar_amp, dayd, axis=1) - 1.0) * np.exp(
+            -0.5 * (dm / np.take_along_axis(scar_w, dayd, axis=1)) ** 2)
+        w_sd = np.select([Pd == 96.0, Pd == 48.0], [rng.uniform(0.01, 0.04, size=(m, 1)),
+                                                    rng.uniform(0.01, 0.05, size=(m, 1))], 0.0)
+        shape = prof[da_i] - s_t * S
+        ramp = np.abs(np.diff(shape, axis=1, prepend=shape[:, :1]))
+        ramp = ramp / (ramp.mean(axis=1, keepdims=True) + 1e-9)
+        w_raw = rng.laplace(0.0, 1.0, size=(m, L))
+        w_t = w_raw * (w_sd / np.sqrt(2.0)) * vold * (0.4 + 0.6 * ramp)
+        D = based * np.exp(logD[da_i])
+        price = D * (np.exp(prof[da_i] + r_t + w_t) * scar - s_t * S)
+        fk = rng.random((m, 1))
+        hard = fk < np.where(kd == 1, 0.20, 0.10)
+        soft = ~hard & (fk < np.where(kd == 1, 0.70, 0.35))
+        fl = np.where(hard, 0.0, np.where(soft, based * rng.uniform(0.02, 0.2, size=(m, 1)),
+                                          -based * rng.uniform(0.01, 0.08, size=(m, 1))))
+        fl_pos = based * rng.uniform(0.0005, 0.01, size=(m, 1))
+        neg_ok_t = np.take_along_axis(neg_ok, dayd, axis=1)
+        fl_t = np.where(hard, 0.0, np.where(neg_ok_t, fl, np.maximum(fl, fl_pos)) + based * 0.003 * w_raw)
+        price = np.maximum(price, fl_t)
+        # hourly spot rows: offer-tier grid in log space + micro-jitter
+        grid = (kd == 1) & (rng.random((m, 1)) < 0.6)
+        if grid.any():
+            g = rng.uniform(0.01, 0.06, size=(m, 1))
+            tiered = np.exp(np.rint(np.log(np.maximum(price, 1e-9)) / g) * g)
+            micro = rng.random((m, L)) < rng.uniform(0.6, 0.9, size=(m, 1))
+            mj = np.exp(rng.normal(0.0, 1.0, size=(m, L)) * rng.uniform(1.0e-3, 5.0e-3, size=(m, 1)))
+            price = np.where(grid & (price > 0), np.where(micro, tiered * mj, tiered), price)
+        y[da_i] = price
+        del r_t, S, scar, shape, ramp, w_raw, w_t, D, price, fl_t
+
+    # ── dispatch rows: tiers, collapses, jitter, spikes ───────────────────
+    if n_rt:
+        kr = kind[rt_i]; Pr = P[rt_i]; volr = vol[rt_i]; baser = base[rt_i]
+        m = n_rt
+        dwell = np.where(kr == 2, rng.uniform(1.2, 4.0, size=(m, 1)), rng.uniform(24.0, 150.0, size=(m, 1)))
+        phi_z = rng.uniform(0.3, 0.8, size=(m, 1)) ** (1.0 / dwell)
+        sd_z = rng.uniform(0.02, 0.08, size=(m, 1))
+        z_t = _isp_ar1(rng.normal(0.0, 1.0, size=(m, L)) * sd_z * np.sqrt(1.0 - phi_z ** 2), phi_z)
+        cp = rng.random((m, L)) < (1.0 / dwell)
+        cp[:, 0] = True
+        src = np.maximum.accumulate(np.where(cp, idx, 0), axis=1)
+        K = rng.integers(2, 5, size=(m, 1)).astype(np.float64)
+        spacing = rng.uniform(0.4, 0.9, size=(m, 1))
+        state = np.take_along_axis(np.floor(rng.random((m, L)) * K), src, axis=1)
+        tier = np.where(kr == 2, (state - 0.5 * (K - 1.0)) * spacing, np.take_along_axis(z_t, src, axis=1))
+        del z_t, state, src
+        dip_rate = np.where(kr == 2, rng.uniform(0.002, 0.012, size=(m, 1)), 0.0)
+        u_dip = rng.random((m, L))
+        dstart = u_dip < dip_rate
+        dmask = _isp_runs(rng, idx, dstart, rng.uniform(1.5, 4.0, size=(m, 1)))
+        dip_val = np.log(5.0e-4) + (np.log(0.1) - np.log(5.0e-4)) * u_dip / np.maximum(dip_rate, 1e-9)
+        src_d = np.maximum.accumulate(np.where(dstart, idx, 0), axis=1)
+        tier = np.where(dmask, np.take_along_axis(dip_val, src_d, axis=1), tier)
+        del u_dip, dstart, dmask, dip_val, src_d
+        alpha = np.where(kr == 2, rng.uniform(0.0, 0.4, size=(m, 1)), 0.0)
+        tier = (1.0 - alpha) * tier + alpha * np.concatenate([tier[:, :1], tier[:, :-1]], axis=1)
+        rate = np.where(kr == 2, rng.uniform(0.1, 0.5, size=(m, 1)), rng.uniform(1.0, 2.0, size=(m, 1))) / Pr
+        mag_lo = np.where(kr == 3, np.log(3.0), np.log(1.5))
+        mag_hi = np.where(kr == 3, np.log(30.0), np.log(3.0))
+        u_hit = rng.random((m, L))
+        hit = u_hit < rate
+        mag = mag_lo + (mag_hi - mag_lo) * np.minimum(u_hit / rate, 1.0)
+        tau_s = np.where(kr == 3, rng.uniform(1.0, 4.0, size=(m, 1)), rng.uniform(0.5, 3.0, size=(m, 1)))
+        tau_s = np.where((kr == 2) & (rng.random((m, 1)) < 0.15), rng.uniform(3.0, 8.0, size=(m, 1)), tau_s)
+        spk = _isp_ar1(np.where(hit, mag, 0.0), np.exp(-1.0 / tau_s))
+        spk = np.minimum(spk * np.sqrt(volr), np.log(30.0))
+        del u_hit, hit, mag
+        jit_sd = np.where(kr == 3, rng.uniform(0.002, 0.01, size=(m, 1)), rng.uniform(0.01, 0.03, size=(m, 1)))
+        jit = rng.normal(0.0, 1.0, size=(m, L)) * jit_sd
+        burst = (kr == 3) & (rng.random((m, L)) < rng.uniform(0.15, 0.35, size=(m, 1)))
+        jit = (jit + np.where(burst, rng.normal(0.0, 1.0, size=(m, L)) * rng.uniform(0.05, 0.12, size=(m, 1)), 0.0)) * volr
+        u_rt = logD[rt_i] + prof[rt_i] + tier + jit + spk
+        u_cap = np.where(kr == 3, np.log(18.0), np.log(10.0))
+        u_rt = np.where(u_rt > u_cap, u_cap + 0.3 * (u_rt - u_cap), u_rt)
+        y[rt_i] = baser * np.exp(u_rt)
+        del tier, jit, burst, spk, u_rt
+    del prof, vol, logD, tau
+
+    # ── observation: repeat runs, integer snaps, tick ─────────────────────
+    h_row = U((0.0, 0.03), (0.03, 0.22), (0.03, 0.2), (0.01, 0.06))
+    c_row = U((0.2, 0.5), (0.3, 0.6), (0.3, 0.7), (0.2, 0.5))
+    u_obs = rng.random((n, L))
+    hold = _isp_runs(rng, idx, u_obs < h_row, 1.0 / (1.0 - c_row))
+    hold[:, 0] = False
+    src_h = np.maximum.accumulate(np.where(hold, 0, idx), axis=1)
+    y = np.take_along_axis(y, src_h, axis=1)
+    q_row = np.where(rng.random((n, 1)) < 0.45, rng.uniform(0.01, 0.25, size=(n, 1)), 0.0)
+    snap = u_obs > 1.0 - q_row
+    unit = np.where(rng.random((n, 1)) < 0.33, 5.0, 1.0)
+    y = np.where(snap, np.rint(y / unit) * unit, y)
+    y = np.rint(y / 0.01) * 0.01
+
+    # ── mid-row start: constant prefix at the first real value ────────────
+    pre = rng.random((n, 1)) < short_start
+    cut = np.where(pre, (rng.uniform(0.25, 0.85, size=(n, 1)) * L).astype(np.int64), 0)
+    first = np.take_along_axis(y, cut, axis=1)
+    return np.where(idx < cut, first, y)
+
+def _intraday_event_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Intraday event-count feeds that the validator left-pads: 911 / fire /
+    police dispatch and CAD volumes, crime-incident and 311 request feeds,
+    jail bookings, crisis calls, DOI / package / CVE / malware-sample
+    registration streams, TfL arrival predictions.
+
+    Fitted on the 99 series / 288 eval windows of the pool class
+    intraday_event_counts_lowcorr (freq H 48%, min 24%, 30min 14%, 5min 12%,
+    15min 2%, 10min 1%).  Window contexts are SHORT: n_hist p10/50/90 =
+    147/748/2492, so the model sees a first-value constant prefix on ~90% of
+    them (toto2_trainer pads with h[0]).  Context stats (features.py on the
+    real part, p10/50/90): level 1/7/690, integer 1/1/1, zeros 0/0/0, lag1
+    0.008/0.26/0.60, flat_run 0.004/0.11/0.58, spec_p24 0.013/0.08/0.45,
+    spec_p48 0.02/0.12/0.47, spec_p168 0.02/0.06/0.17, dlog_sd
+    0.30/0.56/1.56, max/med 1.75/5/45, n_shifts 0/0/0, no trend; target
+    mean vs the last-h context mean log-ratio p10/50/90 -0.21/0.00/+0.24 at
+    every horizon and a stationary marginal beats last-value and
+    seasonal-naive (the daily cycle is weak).  Three sub-populations:
+
+    dispatch counts (70% of rows; 170 windows): mean p10/50/90 1.4/4.5/32,
+    Fano 0.5/2.8/10, daily (max-min)/mean 0.30/0.68/1.85, day-of-week
+    amplitude 0.1/0.18/0.57, residual lag1 0.04/0.32/0.60 (short memory:
+    little power in the 1-7 day band), daily-mean AC1 -0.1/0.2/0.8, 720-step
+    level drift log-ratio p10/p90 -0.21/+0.10, min value 1 with P(1) far
+    above a Poisson's (the feed drops empty bins => y = max(1, count)).
+    Law: rate = m x daily x weekly x exp(slow + drift + fast + step);
+    m log-U[0.8,40] (log-U[0.5,8] on minute/5-min bins); daily =
+    exp(a(cos + b cos(2.+psi))), a log-U[0.08,1.5] (x U[0.2,0.7] on
+    minute/5-min bins where tiny counts hide the cycle), b U[0,0.5]; weekly
+    exp(N(0, U[0.01,0.10])) with a U[0.5,0.9] weekend on 10%; slow = AR(1)
+    on DAILY knots (tau log-U[0.3,3] d, sd U[0.02,0.08]) plus drift = AR(1)
+    on the same knots (tau log-U[10,60] d, sd U[0.03,0.25]), both linearly
+    interpolated inside the day; fast = AR(1) per sample (phi U[0.2,0.7],
+    sd U[0.08,0.45]); one permanent log-step N(0,0.35) at U[0.1,0.95] L on
+    20% of rows; gamma-Poisson with r log-U[4,80]; max(1, .) on 90% of
+    rows; 5% carry a piecewise-constant integer unit 2..12 (baton-rouge
+    lattice, blocks of mean U[2,40] samples).  Day length in samples
+    24/60/48/288/96/144 at 0.48/0.22/0.14/0.12/0.03/0.01.
+
+    registration streams (15%; 41 windows: crossref/datacite DOIs, nuget,
+    gharchive, nvd, malwarebazaar, urlhaus, hn): median 1-20, mean/med
+    1.3-30, q99/med 10-250, max/med 20-2700, >5x-median share 1-10% in
+    short batches (run mean 1.1-2), lag1 0-0.4, 24-block log-level sd
+    0.3-1.0.  Same law with m log-U[0.5,30], daily x U[0.15,0.7], weekly sd
+    U[0.03,0.2], slow sd U[0.08,0.3], fast sd U[0.05,0.35], r log-U[4,40],
+    batch bursts x(1+B) at U[0.5,8]%/sample with B log-U[2,60] and a
+    U[0.2,0.7]-geometric 6-step tail on 70%, one plateau excursion
+    (x log-U[3,30] for log-U[10,300] samples) on 12%.
+
+    arrival predictions (15%; 32 windows: tfl seconds-to-arrival): integer
+    values on [1, 1800] (13.5% below 100, then ~4.5%/100 flat to the cap),
+    median 300-1000, lag1 -0.03..0.28, dlog_sd 1.4-2.9, no flats.  Law:
+    iid mixture (w U[0.03,0.35] exponential of scale cap x U[0.03,0.12],
+    else uniform) clipped to [1, cap], cap 1800 (80%) or log-U[900,12000]
+    (nola 311 5-min: 8000), rank-matched to a Gaussian AR(1) phi U[0,0.4].
+
+    88% of rows start mid-row: a constant prefix at the first real value
+    with the real part log-U[100,3500] samples -- the validator's own
+    left-padding of a short feed.
+    """
+    y = _intraday_event_counts_body(rng, n, L)
+    if n <= 0:
+        return y
+    ti = np.arange(L, dtype=np.int64)[None, :]
+    pre = rng.random((n, 1)) < 0.88
+    nreal = np.exp(rng.uniform(np.log(100.0), np.log(3500.0), size=(n, 1)))
+    cut = np.where(pre, (L - nreal).astype(np.int64), 0)
+    cut = np.clip(cut, 0, max(L - 64, 0))
+    first = np.take_along_axis(y, cut, axis=1)
+    return np.where(ti < cut, first, y)
+
+def _hourly_social_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """Hourly activity counts of a small federated social instance (misskey_*
+    notes / active_users): integer counts on a low level with a strong daily
+    cycle and NO weekly cycle.
+
+    Fitted on 287 hourly misskey series (2026-09-16 pool): median level 5
+    (p10-p90 1-74), zeros 11% of hours (p90 44%), lag-1 0.49 (0.27-0.79),
+    daily spectral share 0.23 (0.05-0.53), weekly share 0.003, dlog sd 0.86,
+    max/median ~15. Level: log-uniform [0.5, 80] x a daily profile of three
+    cos harmonics (amp U[0.5,1.8], 0.2-0.6 and 0-0.3 of it) x a daily AR(1)
+    log walk (phi U[0.9,0.99], sd U[0.03,0.2]) x one level shift N(0,0.6) on
+    half the rows x a log-linear drift U[-0.5,0.5]/row on 15%. Bursts: rate
+    U[0,0.003]/h, size log-U[1.5,8], exponential decay tau U[1,6] h. Counts
+    are Gamma-Poisson (k log-U[0.8,20]); 20% of rows carry one 6-72 h outage
+    of exact zeros.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    t = np.arange(L, dtype=np.float64)[None, :]
+    mu0 = rng.uniform(np.log(0.5), np.log(80.0), size=(n, 1))
+    a1 = rng.uniform(0.5, 1.8, size=(n, 1))
+    a2 = a1 * rng.uniform(0.2, 0.6, size=(n, 1))
+    a3 = a1 * rng.uniform(0.0, 0.3, size=(n, 1))
+    ph = rng.uniform(0.0, 2.0 * np.pi, size=(n, 3))
+    w = 2.0 * np.pi / 24.0
+    # One (n, L) accumulator carries the whole log-rate
+    # mu0 + prof + walk_h + shift_h + drift_h + burst, summed in the same
+    # left-to-right order as before; every term is released the moment it
+    # is dead instead of being held to the end of the function.
+    lam = w * t + ph[:, :1]
+    np.cos(lam, out=lam)
+    lam *= a1
+    harm = 2.0 * w * t + ph[:, 1:2]
+    np.cos(harm, out=harm)
+    harm *= a2
+    lam += harm
+    del harm
+    harm = 3.0 * w * t + ph[:, 2:3]
+    np.cos(harm, out=harm)
+    harm *= a3
+    lam += harm
+    del harm
+    lam += mu0
+    days = L // 24 + 2
+    phi = rng.uniform(0.9, 0.99, size=(n, 1))
+    sd = rng.uniform(0.03, 0.2, size=(n, 1))
+    eps = rng.normal(0.0, 1.0, size=(n, days)) * sd
+    walk = np.empty((n, days), dtype=np.float64)
+    walk[:, 0] = eps[:, 0] / np.sqrt(1.0 - phi[:, 0] ** 2)
+    for d in range(1, days):
+        walk[:, d] = phi[:, 0] * walk[:, d - 1] + eps[:, d]
+    del eps
+    walk_h = np.repeat(walk, 24, axis=1)[:, :L]
+    del walk
+    lam += walk_h
+    del walk_h
+    shift_at = rng.uniform(0.2, 0.8, size=(n, 1)) * L
+    shift_on = rng.random((n, 1)) < 0.5
+    shift = np.where(shift_on, rng.normal(0.0, 0.6, size=(n, 1)), 0.0)
+    shift_h = np.where(t >= shift_at, shift, 0.0)
+    lam += shift_h
+    del shift_h
+    drift_on = rng.random((n, 1)) < 0.15
+    drift = np.where(drift_on, rng.uniform(-0.5, 0.5, size=(n, 1)), 0.0)
+    drift_h = drift * t
+    drift_h /= max(L - 1, 1)
+    lam += drift_h
+    del drift_h
+    rate = rng.uniform(0.0, 0.003, size=(n, 1))
+    # quiet == the complement of the original np.where condition, inverted in
+    # place so the impulse amplitudes can be zeroed inside their own buffer.
+    quiet = rng.random((n, L)) < rate
+    np.invert(quiet, out=quiet)
+    impulse = rng.uniform(np.log(1.5), np.log(8.0), size=(n, L))
+    np.exp(impulse, out=impulse)
+    np.log(impulse, out=impulse)
+    np.copyto(impulse, 0.0, where=quiet)
+    del quiet
+    tau = rng.uniform(1.0, 6.0, size=n)
+    decay = np.exp(-1.0 / tau)
+    # The AR(1) burst kernel recurses strictly within a row, so folding it
+    # into the accumulator a row block at a time is exact and never holds a
+    # second (n, L) array beside the impulses.
+    step = 128
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        lam[lo:hi] += _ar1_kernel(np.ascontiguousarray(impulse[lo:hi]), decay[lo:hi])
+    del impulse
+    np.exp(lam, out=lam)
+    np.minimum(lam, 1.0e5, out=lam)
+    k = np.exp(rng.uniform(np.log(0.8), np.log(20.0), size=(n, 1)))
+    gam = rng.gamma(k, 1.0 / k, size=(n, L))
+    np.multiply(lam, gam, out=gam)
+    del lam
+    cnt = rng.poisson(gam)
+    del gam
+    cnt = cnt.astype(np.float64)
+    out_row = rng.random((n, 1)) < 0.2
+    o_start = rng.uniform(0.0, max(L - 72, 1), size=(n, 1))
+    o_len = rng.uniform(6.0, 72.0, size=(n, 1))
+    outage = t >= o_start
+    outage &= t < (o_start + o_len)
+    outage &= out_row
+    cnt[outage] = 0.0
+    return cnt
+
+
+def _weekly_cycle_downloads(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    """npm-class daily download counts: a clean weekly shape on a trending level.
+
+    Fitted on npm_downloads_per_pkg (25 series, the pool's single largest
+    king loss contributor: MASE 3.5, 100% of windows worse than the weekly
+    naive) + npm_total_daily. Mon..Sun profile relative to the Tue-Thu
+    plateau (zeros masked, phase-aligned): 0.94 / 1.02 / 1.01 / 0.98 /
+    0.86 / 0.35 / 0.35 (Sat == Sun; weekend/weekday 0.36 [0.33, 0.39];
+    npm_total 0.42; pypi/crates samples 0.5-0.73); weekly spectral share
+    0.47. Level: 7-day-smoothed log-level
+    trend +0.79/yr [+0.55, +0.91] with sd 0.15 around the line, 28-day step
+    sd 0.13; residual cv 0.17 with ACF1 0.32; NO spikes (>2x: 0%); isolated
+    dropout zeros 3.3/yr (runs of 1-2). The king's median cannot reproduce
+    a weekly-seasonal series with a trend -- this family is exactly that.
+
+    Construction: multiplicative DOW profile (trough U[0.30,0.42] for 80% of
+    rows, U[0.42,0.8] for the rest; Sat = trough x U[0.95,1.1]; Mon
+    U[0.90,0.98]; Fri U[0.82,0.90]) on a log-level made of piecewise-linear growth/decay
+    regimes (growth rows 80%: slope U[0.2,1.2]/yr; decay rows U[-0.8,0.1]/yr;
+    regime length U[120,600] d; cumulative excursion soft-capped at ~1100x)
+    + AR(1) wander (sd U[0.03,0.12]) + release events (U[0.5,4]/yr,
+    +U[0.05,0.6] log, half permanent, half decaying with tau U[5,60] d) + a
+    yearly holiday-week dip (depth U[0.35,0.8] over U[7,14] d, 70% of rows);
+    AR(1) lognormal noise sigma U[0.03,0.12], phi U[0.2,0.5]; dropout zeros
+    U[1,6]/yr; integer. Base level log-uniform [3e2, 3e5], LOWERED (never
+    clipped) where the path would cross the 1e6 sanitize rail.
+    """
+    if n <= 0:
+        return np.empty((0, L), dtype=np.float64)
+    days = np.arange(L, dtype=np.int64)[None, :]
+    t = _time_index(L)
+
+    phase = rng.integers(0, 7, size=(n, 1))
+    dow = (days + phase) % 7
+    trough = np.where(
+        rng.random((n, 1)) < 0.8,
+        rng.uniform(0.30, 0.42, size=(n, 1)),
+        rng.uniform(0.42, 0.8, size=(n, 1)),
+    )
+    sat = np.minimum(trough * rng.uniform(0.95, 1.1, size=(n, 1)), 0.95)
+    mon = rng.uniform(0.90, 0.98, size=(n, 1))
+    fri = rng.uniform(0.82, 0.90, size=(n, 1))
+    mid = np.exp(rng.normal(0.0, 0.03, size=(n, 3)))
+    prof = np.concatenate([mon, mid, fri, sat, trough], axis=1)
+    prof_t = np.take_along_axis(prof, dow, axis=1)
+
+    base = np.exp(rng.uniform(np.log(3.0e2), np.log(3.0e5), size=(n, 1)))
+    growth = rng.random((n, 1)) < 0.8
+    cp = rng.random((n, L)) < (1.0 / rng.uniform(120.0, 600.0, size=(n, 1)))
+    cp[:, 0] = True
+    slopes = np.where(
+        growth,
+        rng.uniform(0.2, 1.2, size=(n, L)),
+        rng.uniform(-0.8, 0.1, size=(n, L)),
+    ) / 365.0
+    src = np.maximum.accumulate(np.where(cp, days, 0), axis=1)
+    trend = np.cumsum(np.take_along_axis(slopes, src, axis=1), axis=1)
+    # soft cap on the cumulative excursion (~1100x): the local slope survives
+    # inside any window while an 11-year row cannot run away
+    trend = 7.0 * np.tanh(trend / 7.0)
+    tau = rng.uniform(30.0, 150.0, size=(n, 1))
+    phi = np.exp(-1.0 / tau)
+    sd = rng.uniform(0.03, 0.12, size=(n, 1))
+    wander = _ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sd * np.sqrt(1.0 - phi * phi), phi
+    )
+    ev = rng.random((n, L)) < (rng.uniform(0.5, 4.0, size=(n, 1)) / 365.0)
+    jump = rng.uniform(0.05, 0.6, size=(n, L)) * np.where(
+        rng.random((n, L)) < 0.8, 1.0, -1.0
+    )
+    perm = rng.random((n, L)) < 0.5
+    steps = np.cumsum(np.where(ev & perm, jump, 0.0), axis=1)
+    tau_e = rng.uniform(5.0, 60.0, size=(n, 1))
+    transient = _ar1_batch(np.where(ev & ~perm, jump, 0.0), np.exp(-1.0 / tau_e))
+    log_level = trend + wander + steps + transient
+    log_level = log_level - log_level[:, :1]
+    # keep the row under the 1e6 sanitize rail by lowering the BASE, never by
+    # flattening the path (a clipped level would read as a held plateau)
+    peak = np.exp(log_level.max(axis=1, keepdims=True))
+    base = np.minimum(base, 9.0e5 / (1.7 * peak))
+
+    h0 = rng.uniform(0.0, 365.0, size=(n, 1))
+    w = rng.uniform(7.0, 14.0, size=(n, 1))
+    d = np.mod(t - h0, 365.0)
+    depth = np.where(rng.random((n, 1)) < 0.7, rng.uniform(0.35, 0.8, size=(n, 1)), 0.0)
+    dip = np.where(d < w, depth * (0.5 - 0.5 * np.cos(2.0 * np.pi * d / w)), 0.0)
+
+    phi_e = rng.uniform(0.2, 0.5, size=(n, 1))
+    sig = rng.uniform(0.03, 0.12, size=(n, 1))
+    noise = _ar1_batch(
+        rng.normal(0.0, 1.0, size=(n, L)) * sig * np.sqrt(1.0 - phi_e * phi_e), phi_e
+    )
+    zero = rng.random((n, L)) < (rng.uniform(1.0, 6.0, size=(n, 1)) / 365.0)
+    run2 = rng.random((n, L)) < 0.3
+    zero[:, 1:] |= zero[:, :-1] & run2[:, :-1]
+
+    y = base * np.exp(log_level + noise) * prof_t * (1.0 - dip)
+    return np.where(zero, 0.0, np.rint(y))
+
+
+# I141: source-independent, stream-isolated insertion of the exact five
+# revision-pinned ticket scalar families. The parent class remains unchanged.
+class Generator(DataGenerator):
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        cfg = json.loads((Path(config_dir) / "config.json").read_text(encoding="utf-8"))
+        self._fraction = float(cfg["isolated_scalar_fraction"])
+        if self._fraction != 0.14779:
+            raise ValueError("I141 isolated scalar fraction is pinned")
+        if any(float(cfg["family_weights"].get(k, -1.0)) != 0.0 for k in
+               ("epi_season_decay", "weekday_ledger_counts", "pull_counter_ramp",
+                "weekly_cycle_downloads", "surveillance_counts", "hourly_social_counts", "intraday_event_counts", "intraday_spot_price", "road_commute_counts")):
+            raise ValueError("I141 base stream must give novel families zero weight")
+        self._seed = int(seed)
+        self._config_dir = config_dir
+        self._base = _BaseGenerator(config_dir, seed=self._seed)
+        if (self._base._curriculum_enabled or self._base._domain_mix_enabled
+                or self._base._min_len != 4096 or self._base._max_len != 4096):
+            raise ValueError("I141 requires I081 fixed-length, noncurricular configuration")
+
+    @property
+    def name(self) -> str:
+        return self._base.name
+
+    _SELECTOR_CHUNK = 8192
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        if n_series <= 0:
+            return
+        count = int(n_series)
+        selector_seed = (self._seed ^ 0x65A22A42CA9A1521) & ((1 << 64) - 1)
+        novel_seed = (self._seed ^ 0xDA37B75547EFC9B1) & ((1 << 64) - 1)
+        selector = np.random.default_rng(selector_seed)
+        base_iter = self._base.generate(count)
+        novel_iter = None
+        selected = np.empty(0, dtype=np.bool_)
+        selected_at = 0
+        emitted = 0
+        try:
+            for idx, base_row in enumerate(base_iter):
+                if idx >= count:
+                    raise RuntimeError("I141 base stream overproduced")
+                if selected_at >= selected.size:
+                    take = min(self._SELECTOR_CHUNK, count - idx)
+                    selected = selector.random(take) < self._fraction
+                    selected_at = 0
+                use_novel = bool(selected[selected_at])
+                selected_at += 1
+                if use_novel:
+                    if novel_iter is None:
+                        novel = _BaseGenerator(self._config_dir, seed=novel_seed)
+                        weights = np.asarray([{
+                            "epi_season_decay": 0.05985999999998,
+                            "weekday_ledger_counts": 0.010993422122,
+                            "pull_counter_ramp": 0.007238727924,
+                            "weekly_cycle_downloads": 0.005430485626,
+                            "surveillance_counts": 0.003938973668,
+                            "hourly_social_counts": 0.011517466864,
+                            "intraday_event_counts": 0.011517466864,
+                            "intraday_spot_price": 0.017293456932,
+                            "road_commute_counts": 0.02,
+                        }.get(f, 0.0) for f in _FAMILIES], dtype=np.float64)
+                        weights /= weights.sum()
+                        novel._weights = weights
+                        novel._start_weights = weights.copy()
+                        novel_iter = novel.generate(count)
+                    row = next(novel_iter)
+                else:
+                    row = base_row
+                if row.shape != (4096,):
+                    raise RuntimeError("I141 stream produced a nonnative row")
+                emitted += 1
+                yield row
+            if emitted != count:
+                raise RuntimeError("I141 base stream underproduced")
+        finally:
+            base_iter.close()
+            if novel_iter is not None:
+                novel_iter.close()
+
+
+# H413 retains H393 scheduling and chunks only the I141 selector; family groups
+# run on 1 thread (isolated streams and indexed slots keep rows byte-identical).
+_PRODUCER_WORKERS = 1
+_H413_PARENT_GENERATOR = Generator
+
+
+class Generator(_H413_PARENT_GENERATOR):
+    @property
+    def name(self) -> str:
+        return super().name + "-h393-rendezvous-h413-chunked-selector"
