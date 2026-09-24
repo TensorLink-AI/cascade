@@ -2794,7 +2794,14 @@ class TrainerRunner:
                     # eats the leg's equal wall — released and rented again on
                     # the same bad-pod budget. Only its executor stays excluded
                     # (claimed above): slowness is per card, not per host.
-                    slow = "" if why else self._funded_pod_too_slow(result, profile)
+                    # An ADOPTED pod is mid-leg: its GPU is busy with the run
+                    # we are about to attach to, so the calibration bench
+                    # would read low and "release" the pod — killing the leg
+                    # (2026-09-24 12:59: 5FbwZ4's 3 h leg torn down at 483M
+                    # vs a 500M floor). It passed the gate when it was rented.
+                    adopted = bool(getattr(result, "adopted", False))
+                    slow = ("" if (why or adopted)
+                            else self._funded_pod_too_slow(result, profile))
                     if why or slow:
                         stale_pods += 1
                         if why and result.address is not None:
