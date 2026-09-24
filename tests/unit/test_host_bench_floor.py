@@ -147,6 +147,33 @@ def test_slow_funded_pod_is_released_and_the_leg_rents_again(tmp_path, monkeypat
     assert quarantined == []                        # slowness is per card: no host quarantine
 
 
+def test_an_adopted_pod_skips_the_throughput_gate(tmp_path, monkeypatch):
+    # 2026-09-24 12:59: the pod adopted on restart was mid-leg; the calibration
+    # bench read 483M on a busy RTX4090 (floor 500M) and the trainer tore the
+    # 3 h leg down. An adopted pod passed the gate when it was rented.
+    from dataclasses import replace
+
+    from cascade.provision import funded as funded_mod
+
+    runner = _runner(tmp_path, funded_host_bench_floor=FLOOR)
+    _vault(tmp_path, "hkA")
+    rents, torn, probed = [], [], []
+    monkeypatch.setattr(funded_mod, "rent_funded_pod",
+                        lambda **kw: rents.append(1) or replace(_rent_ok(), adopted=True))
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
+    runner._funded_pod_code_mismatch = lambda result, profile: ""
+
+    def too_slow(result, profile):
+        probed.append(1)
+        return "slow host: calibration bench 483,426,297 tokens/s < floor 500,000,000 for RTX4090"
+
+    runner._funded_pod_too_slow = too_slow
+    host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert rents == [1] and probed == [] and torn == []   # never benched, never released
+    assert host.host == "10.9.9.9"
+
+
 def test_repeated_slow_pods_settle_infra_without_a_burn(tmp_path, monkeypatch):
     from cascade.provision import funded as funded_mod
     from cascade.trainer.loop import TrainerRunner, _FundedLegSkip
