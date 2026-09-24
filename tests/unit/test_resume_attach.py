@@ -147,7 +147,8 @@ class _Provider:
         self.terminated: list = []
 
     def live_pod_address(self, pod_id):
-        return self.live
+        # the provider names the pod "<prefix>-0"; the bare prefix is nobody
+        return self.live if pod_id.endswith("-0") else None
 
     def launch(self, spec):
         self.launched.append(spec)
@@ -163,9 +164,10 @@ class _Provider:
         self.terminated.append(pod_id)
 
     def list_tagged(self, prefix):
-        return []
+        return [f"{prefix}-0"] if self.live is not None else []
 
     def pod_identity(self, pod_id):
+        assert pod_id.endswith("-0"), pod_id
         if not self.ident_ok:
             return None
         return {"id": "uid-old", "huid": "h1", "status": "RUNNING",
@@ -190,7 +192,7 @@ def test_rent_adopts_a_live_pod_of_this_name_instead_of_renting_a_twin():
     assert res.ok and res.adopted
     assert provider.launched == []                       # no second pod
     assert res.address.ip == "10.0.0.7" and res.address.ssh_port == 20300
-    assert res.pod.instance_id == funded_pod_name("777", HK, 91)
+    assert res.pod.instance_id == funded_pod_name("777", HK, 91) + "-0"   # the listed pod, not the prefix
     assert res.pod.stage == FUNDED_STAGE and res.pod.pod_uid == "uid-old"
     assert res.host_key == "ssh-ed25519 PINNED" and scanned == [("10.0.0.7", 20300)]
 
