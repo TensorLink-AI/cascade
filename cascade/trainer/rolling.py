@@ -270,6 +270,14 @@ def king_pretrain_open(round_cfg, *, block_now: int, now: float, wall_seconds: f
     return now >= wall_of_block(nxt, now=now, block_now=block_now) - wall_seconds - margin_seconds
 
 
+def era_window(round_cfg, era) -> tuple[int, int]:
+    """``[lo, hi)``: the train blocks an entry settled under ``era`` may carry
+    — the validator's ``era_entry_out_of_window`` check (from the era's seed
+    block to its end). One entry outside it rejects the whole settlement."""
+    start = int(era.start_block)
+    return int(era.seed_block), start + era_length_blocks(round_cfg, start)
+
+
 def resolve_generation(generations: dict[str, dict], era_index: int) -> tuple[int, list]:
     """``(generation, members)`` for era ``era_index``: the latest generation
     whose ``effective_era <= era_index``; ``(0, [])`` = random init."""
@@ -346,6 +354,15 @@ class LegOps:
                                           role=role, hotkey=gen.hotkey,
                                           gen_ref=gen.ref, suffix=suffix,
                                           warm_start_ckpt=init)
+
+    def discard_cached_leg(self, era: EraState, role: str, gen) -> None:
+        """Drop the persisted record of a leg that must be retrained (an
+        entry trained outside the era window would otherwise be reused from
+        the record on every re-admission)."""
+        contract = self.r.cfg.throne_contracts()[0]
+        suffix = "" if role == "king" else f"-u{gen.uid}"
+        self.r._discard_completed_leg(round_id=era.base_seed, contract=contract,
+                                      role=role, hotkey=gen.hotkey, suffix=suffix)
 
     def bench_challenger(self, entry: TrainedEntry, king: TrainedEntry | None,
                          era: EraState) -> dict | None:
@@ -532,8 +549,42 @@ class RollingScheduler:
                               error_class="infra", burn_attempt=False)
                 continue
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
-            self._launch_leg(gen, era, e.started_block, e.target_boundary, e.label,
-                             resumed=True)
+            started, target = self._flight_stamp(e, era, block, queue)
+            self._launch_leg(gen, era, started, target, e.label, resumed=True)
+
+    def _flight_stamp(self, e, era: EraState, block: int, queue) -> tuple[int, int]:
+        """The (train block, target boundary) a re-attached leg runs under:
+        the queue's stamp where it is sound, else re-derived — the block now
+        for a start outside ``era``'s window, the first settlement of ``era``
+        the wall clears (its last one at worst) for a target outside it — and
+        the entry re-stamped so the next restart reads a sound one.
+        2026-09-24: a requeue zeroes era/target/start; a leg re-attached from
+        such a stamp published ``train_block 0`` and every validator rejected
+        the settlement whole (``era_entry_out_of_window``)."""
+        lo, hi = era_window(self.cfg.round, era)
+        started, target = int(e.started_block), int(e.target_boundary)
+        started_ok = lo <= started < hi
+        target_ok = target > 0 and settlement_era(self.cfg.round, target).index == era.index
+        if started_ok and target_ok and int(e.era_index) == era.index:
+            return started, target
+        if not started_ok:
+            started = int(block) if lo <= int(block) < hi else lo
+        if not target_ok:
+            now = self.clock()
+            target = target_boundary(self.cfg.round, block_now=block, now=now,
+                                     wall_seconds=self.ops.wall_seconds(),
+                                     margin_seconds=self.ops.margin_seconds())
+            if settlement_era(self.cfg.round, target).index != era.index:
+                target = hi                       # the era's last settlement
+        log.warning("rolling: in-flight leg %s carried stamp era %d / block %d / target %d, "
+                    "not sound for era %d (window [%d, %d)) — re-attached at block %d "
+                    "toward boundary %d", e.hotkey[:12], e.era_index, e.started_block,
+                    e.target_boundary, era.index, lo, hi, started, target)
+        if queue is not None and not queue.restamp_flight(
+                e.hotkey, target_boundary=target, era_index=era.index, started_block=started):
+            log.warning("rolling: %s's flight could not be re-stamped in the queue",
+                        e.hotkey[:12])
+        return started, target
 
     def _seed_chain_root(self) -> bool:
         """The first settlement chains to the bucket's ``latest.json`` (the
@@ -1116,6 +1167,45 @@ class RollingScheduler:
                          "settlement; no manifest", epoch_start)
                 self.state.last_settled_boundary = epoch_start
                 self._save()
+                return
+        lo, hi = era_window(self.cfg.round, cur)
+        if not (lo <= int(king.train_block) < hi):
+            # Validators reject a settlement whole for ONE entry outside the
+            # window; a king entry outside it can only come from a stamp bug
+            # or a reused record of another era — retrain it, publish nothing.
+            log.error("rolling: boundary %d — era %d's king entry was trained at block %d, "
+                      "outside the era window [%d, %d); king entry dropped, the king leg "
+                      "retrains; %d finished leg(s) wait, nothing published",
+                      epoch_start, cur.index, int(king.train_block), lo, hi, len(ready))
+            with self._lock:
+                cur.king_entry, cur.king_bench, cur.king_bench_published = None, None, False
+                self.state.last_settled_boundary = epoch_start
+                self._save()
+            self.ops.discard_cached_leg(cur, "king", ResolvedGen(cur.king_hotkey, cur.king_uid,
+                                                                 cur.king_ref))
+            return
+        bad = [f for f in ready if not (lo <= int(f.entry.get("train_block", 0) or 0) < hi)]
+        if bad:
+            queue = self.ops.queue()
+            for f in bad:
+                tb = int(f.entry.get("train_block", 0) or 0)
+                log.error("rolling: boundary %d — %s's leg was trained at block %d, outside "
+                          "era %d's window [%d, %d): a trainer fault, never the miner's — "
+                          "dropped before publication, record discarded, requeued unburned "
+                          "(retrains)", epoch_start, f.hotkey[:12], tb, cur.index, lo, hi)
+                self.ops.discard_cached_leg(cur, "challenger",
+                                            ResolvedGen(f.hotkey, f.uid, f.ref, f.reveal_block))
+                if queue is not None:
+                    queue.requeue(f.hotkey, error=f"trained at block {tb}, outside era "
+                                  f"{cur.index}'s window [{lo}, {hi}) — trainer fault, retrained",
+                                  error_class="infra", burn_attempt=False)
+            with self._lock:
+                self.state.finished = [f for f in self.state.finished if f not in bad]
+                ready = [f for f in ready if f not in bad]
+                if not ready:
+                    self.state.last_settled_boundary = epoch_start
+                self._save()
+            if not ready:
                 return
         if not self._seed_chain_root():
             # An unchained manifest is rejected by every validator AFTER the

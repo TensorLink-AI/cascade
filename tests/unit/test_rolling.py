@@ -137,6 +137,9 @@ class FakeOps(LegOps):
     def cached_leg(self, era, role, gen):
         return self.cached.get((era.index, role, gen.hotkey))
 
+    def discard_cached_leg(self, era, role, gen):
+        self.cached.pop((era.index, role, gen.hotkey), None)
+
     def bench_challenger(self, entry, king, era):
         self.benches.append(("challenger", entry.miner_hotkey, era.index, self.clock()))
         return dict(self.bench_scores)
@@ -992,6 +995,132 @@ def test_king_leg_targets_the_eras_last_settlement(cfg, tmp_path):
     _advance(clock, ops, sched, client, from_block=b0, to_block=window)
     assert [c[1] for c in ops.king_calls] == [era_idx, era_idx + 1]
     assert ops.king_calls[1][3] == clock.t + (era_start + 2 * era_len - window) * R.BLOCK_SECONDS
+
+
+def test_restart_restamps_an_in_flight_leg_whose_stamp_was_zeroed(cfg, tmp_path):
+    # 2026-09-24: a requeue zeroes era/target/started; a leg re-attached from such
+    # a stamp trained "at block 0" and every validator rejected the settlement
+    # whole (era_entry_out_of_window). The re-attach must never dispatch a block
+    # outside the era window, and must leave a sound stamp behind.
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0))
+    q.add("BRAV", REF["BRAV"], reveal_block=b0)
+    q.mark_in_flight("BRAV", REF["BRAV"], target_boundary=0, era_index=0, started_block=0)
+    ops2 = FakeOps(tmp_path, clock)
+    ops2.commits = list(ops.commits)
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
+    sched2.tick(client, b0 + 3)
+    _join(sched2)
+    assert [(c[0], c[2]) for c in ops2.leg_calls] == [("BRAV", b0 + 3)]   # never block 0
+    era = sched2.state.current
+    e = q.get("BRAV")
+    assert e.status == "in_flight" and e.era_index == era.index and e.started_block == b0 + 3
+    assert e.target_boundary % EB == 0 and era_start < e.target_boundary <= era_start + 4 * EB
+    assert R.settlement_era(armed.round, e.target_boundary).index == era.index
+    # a sound stamp is kept as it is
+    q.restamp_flight("BRAV", target_boundary=e.target_boundary, era_index=era.index,
+                     started_block=b0 + 1)
+    assert sched2._flight_stamp(q.get("BRAV"), era, b0 + 50, q) == (b0 + 1, e.target_boundary)
+    assert q.get("BRAV").started_block == b0 + 1
+    b1 = era_start + EB
+    _advance(clock, ops2, sched2, client, from_block=b0 + 3, to_block=b1 + 3)
+    m = ops2.manifests[0]
+    assert [x.miner_hotkey for x in m.entries] == ["KING", "ALFA", "BRAV"]
+    assert [x.train_block for x in m.entries] == [b0, b0, b0 + 3]
+    assert _validator(armed, ops2).check_manifest(m) is None
+
+
+def test_settlement_drops_a_leg_trained_outside_the_era_window_and_retrains_it(cfg, tmp_path):
+    # Belt for the same class: whatever produced an out-of-window entry, it is
+    # never published (one such entry rejects the whole manifest); the leg is
+    # requeued unburned, its record discarded, and it retrains for real.
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    era_idx = era_for_block(armed.round, b0).index
+    ops.commits += [_commit("ALFA", REF["ALFA"], b0 - 100), _commit("BRAV", REF["BRAV"], b0 - 50)]
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 50)
+    ops.cached[(era_idx, "challenger", "ALFA")] = TrainedEntry(
+        "ALFA", UID["ALFA"], "challenger", REF["ALFA"], _ptr("stale"), "d", 0,
+        gpu_name="RTX 4090")
+    sched.tick(client, b0)
+    _join(sched)
+    assert [c[0] for c in ops.leg_calls] == ["BRAV"]          # ALFA reused from the record
+    assert {f.hotkey for f in sched.state.finished} == {"ALFA", "BRAV"}
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b1 + 3)
+    assert len(ops.manifests) == 1
+    m = ops.manifests[0]
+    assert [x.miner_hotkey for x in m.entries] == ["KING", "BRAV"]
+    assert _validator(armed, ops).check_manifest(m) is None
+    a = q.get("ALFA")
+    assert a.status in ("queued", "in_flight") and a.attempts == 0
+    assert a.last_error_class == "infra" and "outside era" in a.last_error
+    assert "ALFA" not in ops.burnt and q.get("BRAV").status == "done"
+    assert (era_idx, "challenger", "ALFA") not in ops.cached
+    assert "ALFA" not in [f.hotkey for f in sched.state.published]
+    # re-admitted, trained for real, settled at the next boundary
+    sched.tick(client, b1 + 4)
+    _join(sched)
+    assert [c[0] for c in ops.leg_calls] == ["BRAV", "ALFA"]
+    b2 = b1 + EB
+    _advance(clock, ops, sched, client, from_block=b1 + 4, to_block=b2 + 3)
+    assert len(ops.manifests) == 2
+    m2 = ops.manifests[1]
+    assert [x.miner_hotkey for x in m2.entries] == ["KING", "ALFA"]
+    assert m2.entries[1].train_block >= b1
+    v = _validator(armed, ops, last_handled=m.round_id)
+    assert v.check_manifest(m2) is None
+    assert q.get("ALFA").status == "done"
+
+
+def test_a_king_entry_trained_outside_the_era_window_is_dropped_and_retrained(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    era_idx = era_for_block(armed.round, b0).index
+    ops.cached[(era_idx, "king", "KING")] = TrainedEntry(
+        "KING", 0, "king", REF["KING"], _ptr("oldking"), "d", 0, gpu_name="RTX 4090")
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    assert ops.king_calls == []                               # reused from the record
+    assert sched.state.current.king_entry["train_block"] == 0
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b1 + 3)
+    assert ops.manifests == []                                # nothing published
+    assert (era_idx, "king", "KING") not in ops.cached
+    sched.tick(client, b1 + 4)
+    _join(sched)
+    assert [c[0] for c in ops.king_calls] == ["KING"]         # retrained
+    assert sched.state.current.king_entry["train_block"] >= b1
+    assert [f.hotkey for f in sched.state.finished] == ["ALFA"]   # waited, not lost
+    b2 = b1 + EB
+    _advance(clock, ops, sched, client, from_block=b1 + 4, to_block=b2 + 3)
+    assert len(ops.manifests) == 1
+    m = ops.manifests[0]
+    assert [x.miner_hotkey for x in m.entries] == ["KING", "ALFA"]
+    assert _validator(armed, ops).check_manifest(m) is None
 
 
 def test_king_entry_from_another_init_is_dropped_and_retrained_before_any_settlement(cfg, tmp_path):
