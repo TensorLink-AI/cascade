@@ -102,8 +102,14 @@ class FundedEntry:
     target_boundary: int = 0
     era_index: int = 0
     started_block: int = 0
+    # Owner make-good (2026-09-24): a leg the trainer's own fault cost the
+    # miner is rerun on compute the OPERATOR pays for — the rent path routes a
+    # flagged entry to an operator lane and never touches the payer's key.
+    # Set by the operator (never by intake); cleared with the entry's next
+    # ``fund``.
     queued_ref: str = ""
     queued_reveal_block: int = 0
+    operator_billed: bool = False
 
     @property
     def active_at(self) -> float:
@@ -233,6 +239,7 @@ class FundedQueue:
                 started_block=int(item.get("started_block", 0) or 0),
                 queued_ref=str(item.get("queued_ref", "") or ""),
                 queued_reveal_block=int(item.get("queued_reveal_block", 0) or 0),
+                operator_billed=bool(item.get("operator_billed", False)),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -438,6 +445,18 @@ class FundedQueue:
         """Every leg currently training outside a round (never touched by
         :meth:`recover_in_round` or a round-entry sweep)."""
         return [e for e in self.entries() if e.status == "in_flight"]
+
+    def set_operator_billed(self, hotkey: str, flag: bool) -> bool:
+        """Mark (or unmark) an entry as operator-billed: its leg runs on an
+        operator lane, never on the payer's key (owner make-good for a leg
+        the trainer's own fault cost). Any status; False when unknown."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None:
+                return False
+            entries[hotkey] = replace(e, operator_billed=bool(flag))
+            self._save(entries)
+            return True
 
     def restamp_flight(self, hotkey: str, *, target_boundary: int, era_index: int,
                        started_block: int) -> bool:

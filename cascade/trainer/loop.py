@@ -2706,6 +2706,18 @@ class TrainerRunner:
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
         from .remote import RemoteHost
 
+        queue = self._funded_queue()
+        flagged = queue.get(gen.hotkey) if queue is not None else None
+        if flagged is not None and bool(getattr(flagged, "operator_billed", False)):
+            # Owner make-good (2026-09-24): this entry's leg is on the
+            # operator's bill — an operator lane, never the payer's key. With
+            # no lane on file the lane dispatch waits for one (its own
+            # deadline), and a miss requeues the leg unburned as any lane
+            # fault does; the payer is never charged for it.
+            log.warning("final challenger %s: entry is OPERATOR-BILLED (owner make-good) — "
+                        "running on an operator lane (%d on file), never on the payer's key",
+                        gen.hotkey, len(self._operator_fallback_lanes()))
+            raise _FundedOperatorFallback(gen.hotkey)
         rnd = self.cfg.round
         vault = self._payer_vault()
         if vault is None:
