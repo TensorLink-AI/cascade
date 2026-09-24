@@ -1123,6 +1123,35 @@ def test_a_king_entry_trained_outside_the_era_window_is_dropped_and_retrained(cf
     assert _validator(armed, ops).check_manifest(m) is None
 
 
+def test_king_entry_from_another_init_is_dropped_and_retrained_before_any_settlement(cfg, tmp_path):
+    # The regulator: the king in a manifest must have trained from the era's
+    # init, the one every challenger trained from (2026-09-24 mismatch).
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    assert len(ops.king_calls) == 1 and sched.state.current.king_entry is not None
+    assert sched.state.current.king_init == sched.state.current.warm_start_ckpt
+    sched.state.current.king_init = "ckpt-from-another-rotation"
+    sched._save()
+    _advance(clock, ops, sched, client, from_block=b0, to_block=era_start + EB + 2)
+    assert ops.manifests == []                       # nothing judged against the wrong-init king
+    assert len(sched.state.finished) == 1            # ALFA waits
+    _join(sched)
+    assert len(ops.king_calls) == 2                  # king leg retrained from the era's init
+    assert sched.state.current.king_init == sched.state.current.warm_start_ckpt
+    _advance(clock, ops, sched, client, from_block=era_start + EB + 2, to_block=era_start + 2 * EB + 1)
+    assert len(ops.manifests) == 1
+    assert [e.miner_hotkey for e in ops.manifests[0].entries] == ["KING", "ALFA"]
+
+
 def test_restart_reattaches_an_in_flight_leg_stamped_with_no_era(cfg, tmp_path):
     # 2026-09-24: legacy carry-over legs dispatched at the rollover tick carried
     # era_index 0; the restart requeued them ("targets unknown era 0") and the
