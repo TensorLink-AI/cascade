@@ -2461,6 +2461,22 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001
             log.warning("could not persist completed %s leg for %s: %s", role, hotkey, e)
 
+    def _discard_completed_leg(self, *, round_id, contract, role: str, hotkey: str,
+                               suffix: str = "") -> bool:
+        """Drop the persisted record of a leg that must be retrained
+        (2026-09-24: an entry trained outside its era window was reusable
+        from the record on every re-admission)."""
+        try:
+            path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
+            if path.exists():
+                path.unlink()
+                log.warning("completed %s leg record for %s discarded (%s)", role, hotkey[:12],
+                            path.name)
+                return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not discard completed %s leg for %s: %s", role, hotkey, e)
+        return False
+
     def _load_completed_leg(self, *, round_id, contract, role: str, hotkey: str,
                             gen_ref: str, suffix: str = ""):
         """The persisted entry for EXACTLY this job (same contract digest, same
