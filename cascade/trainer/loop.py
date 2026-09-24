@@ -2444,8 +2444,13 @@ class TrainerRunner:
                 / f"{role}-{hotkey}{suffix}.json")
 
     def _persist_completed_leg(self, entry, *, round_id, contract, role: str,
-                               hotkey: str, suffix: str = "") -> None:
-        """Best-effort: a write miss only costs the old retrain-on-restart."""
+                               hotkey: str, suffix: str = "",
+                               warm_start_ckpt: str | None = "") -> None:
+        """Best-effort: a write miss only costs the old retrain-on-restart.
+
+        ``warm_start_ckpt`` is the init the leg trained from ("" = random):
+        the record is reusable only for a job with the SAME init (see
+        :meth:`_load_completed_leg`)."""
         import dataclasses
 
         try:
@@ -2454,6 +2459,7 @@ class TrainerRunner:
             path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"contract_digest": contract_digest(contract),
+                       "warm_start_ckpt": str(warm_start_ckpt or ""),
                        "entry": dataclasses.asdict(entry)}
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -2462,9 +2468,18 @@ class TrainerRunner:
             log.warning("could not persist completed %s leg for %s: %s", role, hotkey, e)
 
     def _load_completed_leg(self, *, round_id, contract, role: str, hotkey: str,
-                            gen_ref: str, suffix: str = ""):
+                            gen_ref: str, suffix: str = "",
+                            warm_start_ckpt: str | None = None):
         """The persisted entry for EXACTLY this job (same contract digest, same
-        generator ref), else None."""
+        generator ref — and, when ``warm_start_ckpt`` is given, the same init),
+        else None.
+
+        The init is part of the job: a round seed can recur under a different
+        rotation (2026-09-24: the legacy round's king leg, trained from gen-11
+        member 2, was reused as the era king whose challengers trained from
+        member 0 — the seed matched, the init did not). ``None`` skips the
+        check (legacy callers that never persisted an init); a record without
+        the field counts as random init ("")."""
         from .remote import receipt_to_entry
 
         path = self._completed_leg_path(round_id, contract.arch_preset, role, hotkey, suffix)
@@ -2484,6 +2499,13 @@ class TrainerRunner:
             return None
         if entry.gen_ref != gen_ref or entry.role != role or entry.miner_hotkey != hotkey:
             return None
+        if warm_start_ckpt is not None:
+            recorded = str(raw.get("warm_start_ckpt", "") or "")
+            if recorded != str(warm_start_ckpt or ""):
+                log.warning("completed-leg record %s was trained from init %r; this job's "
+                            "init is %r — not reusable, retraining", path,
+                            recorded or "<random init>", warm_start_ckpt or "<random init>")
+                return None
         return entry
 
     def _push_deployed_chain_toml(self, host):
@@ -7407,7 +7429,8 @@ class TrainerRunner:
         for i, (gen, role) in enumerate(jobs):
             prior = self._load_completed_leg(
                 round_id=seeds.base_seed, contract=contract, role=role,
-                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=_final_repo_suffix(jobs, gen, role))
+                hotkey=gen.hotkey, gen_ref=gen.ref, suffix=_final_repo_suffix(jobs, gen, role),
+                warm_start_ckpt=warm_start_ref or "")
             if prior is not None:
                 log.warning("round=%s %s %s: leg already COMPLETE (persisted by a prior "
                             "run of this round) — reusing its entry, not re-training",
@@ -7423,7 +7446,8 @@ class TrainerRunner:
             entry = _run(i, gen, role)
             self._persist_completed_leg(entry, round_id=seeds.base_seed, contract=contract,
                                         role=role, hotkey=gen.hotkey,
-                                        suffix=_final_repo_suffix(jobs, gen, role))
+                                        suffix=_final_repo_suffix(jobs, gen, role),
+                                        warm_start_ckpt=warm_start_ref or "")
             return entry
 
         results: list[TrainedEntry | None] = [None] * len(jobs)
@@ -7564,7 +7588,8 @@ class TrainerRunner:
             self._leg_local.end_wall = None
             self._funded_field.pop(gen.hotkey, None)
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
-                                    role="challenger", hotkey=gen.hotkey, suffix=suffix)
+                                    role="challenger", hotkey=gen.hotkey, suffix=suffix,
+                                    warm_start_ckpt=ws_ref or "")
         return entry
 
     def _rolling_final_hosts(self) -> list:
@@ -7626,7 +7651,8 @@ class TrainerRunner:
         self._final_role_hosts[("king", contract.arch_preset, gen.hotkey)] = host
         self.__dict__.setdefault("_rolling_king_hosts", {})[era.index] = host
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
-                                    role="king", hotkey=gen.hotkey)
+                                    role="king", hotkey=gen.hotkey,
+                                    warm_start_ckpt=ws_ref or "")
         return entry
 
     def _rolling_note_king_host(self, era) -> None:

@@ -100,3 +100,34 @@ def test_unreadable_record_falls_back_to_training(cfg, tmp_path):
     p.write_text("{not json", encoding="utf-8")
     assert r._load_completed_leg(round_id=1, contract=contract, role="king", hotkey="k",
                                  gen_ref=REF_A) is None
+
+
+def test_record_is_reused_only_for_the_same_init(cfg, tmp_path):
+    # 2026-09-24: a legacy round's king leg (gen-11 member 2) was reused as the
+    # era king whose challengers trained from member 0 — same seed, other init.
+    r = _runner(cfg, tmp_path)
+    contract = cfg.throne_contracts()[0]
+    e = _entry("king", "k", REF_C, contract.arch_preset)
+    r._persist_completed_leg(e, round_id=9, contract=contract, role="king", hotkey="k",
+                             warm_start_ckpt="ckpt-member-2")
+
+    def load(init):
+        return r._load_completed_leg(round_id=9, contract=contract, role="king",
+                                     hotkey="k", gen_ref=REF_C, warm_start_ckpt=init)
+
+    assert load("ckpt-member-2") == e
+    assert load("ckpt-member-0") is None
+    assert load("") is None                                  # random init ≠ warm start
+    assert r._load_completed_leg(round_id=9, contract=contract, role="king", hotkey="k",
+                                 gen_ref=REF_C) == e         # no init given ⇒ no check
+    # a record persisted before the field existed counts as random init
+    r._persist_completed_leg(e, round_id=10, contract=contract, role="king", hotkey="k")
+    path = r._completed_leg_path(10, contract.arch_preset, "king", "k")
+    import json
+    raw = json.loads(path.read_text())
+    raw.pop("warm_start_ckpt")
+    path.write_text(json.dumps(raw))
+    assert r._load_completed_leg(round_id=10, contract=contract, role="king", hotkey="k",
+                                 gen_ref=REF_C, warm_start_ckpt="ckpt-member-0") is None
+    assert r._load_completed_leg(round_id=10, contract=contract, role="king", hotkey="k",
+                                 gen_ref=REF_C, warm_start_ckpt="") == e
