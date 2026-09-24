@@ -90,6 +90,7 @@ class EraState:
     king_uid: int = -1
     king_ref: str = ""
     king_entry: dict | None = None    # TrainedEntry (asdict), role "king"
+    king_init: str = ""               # the init king_entry trained from (must == warm_start_ckpt)
     king_bench: dict | None = None    # BenchScores (asdict)
     king_bench_published: bool = False
     king_leg_failed: str = ""         # last king-leg failure (retry pending)
@@ -338,9 +339,13 @@ class LegOps:
     def cached_leg(self, era: EraState, role: str, gen) -> TrainedEntry | None:
         contract = self.r.cfg.throne_contracts()[0]
         suffix = "" if role == "king" else f"-u{gen.uid}"
+        # The era's init is part of the job: a record from the same seed but
+        # another init (the legacy rotation, an edited state) is never reused.
+        init = self.r._rolling_warm_start_ref(era, contract) or ""
         return self.r._load_completed_leg(round_id=era.base_seed, contract=contract,
                                           role=role, hotkey=gen.hotkey,
-                                          gen_ref=gen.ref, suffix=suffix)
+                                          gen_ref=gen.ref, suffix=suffix,
+                                          warm_start_ckpt=init)
 
     def bench_challenger(self, entry: TrainedEntry, king: TrainedEntry | None,
                          era: EraState) -> dict | None:
@@ -714,6 +719,7 @@ class RollingScheduler:
         if cached is not None:
             with self._lock:
                 era.king_entry = _entry_to_json(replace(cached, role="king"))
+                era.king_init = era.warm_start_ckpt     # cached_leg matched on it
                 self._save()
             log.info("rolling: era %d king leg already complete (cached) — reused", era.index)
             return
@@ -726,6 +732,7 @@ class RollingScheduler:
                 entry = replace(entry, role="king")
                 with self._lock:
                     era.king_entry = _entry_to_json(entry)
+                    era.king_init = era.warm_start_ckpt
                     era.king_leg_failed = ""
                     era.king_leg_failures = 0
                     self._save()
@@ -1006,10 +1013,12 @@ class RollingScheduler:
                             king[:12], cur.index)
                 cur.king_hotkey, cur.king_uid, cur.king_ref = king, -1, ""
                 cur.king_entry, cur.king_bench, cur.king_bench_published = None, None, False
+                cur.king_init = ""
             else:
                 entry = replace(_entry_from_json(winner.entry), role="king")
                 cur.king_hotkey, cur.king_uid, cur.king_ref = king, winner.uid, winner.ref
                 cur.king_entry = _entry_to_json(entry)
+                cur.king_init = cur.warm_start_ckpt     # a settled leg of THIS era
                 cur.king_bench = winner.bench
                 cur.king_bench_published = winner.bench is not None
                 log.info("rolling: DETHRONE — %s's checkpoint %s adopted as era %d king "
@@ -1074,6 +1083,20 @@ class RollingScheduler:
         with self._lock:
             ready = [f for f in self.state.finished if f.era_index == cur.index]
             king = cur.king()
+            if king is not None and cur.king_init != cur.warm_start_ckpt:
+                # The regulator: a king entry must have trained from the era's
+                # init — the same one every challenger in the manifest trained
+                # from — or the duel is not like-for-like. Drop it and let the
+                # king leg retrain (next tick, init-checked cache); the
+                # finished legs wait. Nothing is published this boundary.
+                log.error("rolling: boundary %d — era %d king entry %s trained from init "
+                          "%r but the era's init is %r; dropped, king leg retrains, %d "
+                          "finished leg(s) wait, nothing published", epoch_start, cur.index,
+                          king.trained_pointer, cur.king_init or "<random init>",
+                          cur.warm_start_ckpt or "<random init>", len(ready))
+                cur.king_entry, cur.king_bench, cur.king_bench_published = None, None, False
+                cur.king_init = ""
+                king = None
             if king is None:
                 log.info("rolling: boundary %d — era %d has no king leg yet; %d finished "
                          "leg(s) wait, nothing published", epoch_start, cur.index, len(ready))
