@@ -1,277 +1,276 @@
 {
-  "name": "c106stickyw3",
-  "description": "Exact-speed H413 corpus with epi_season_decay raised by 0.036 of rows; end-of-feed reporting fade on 0.40 of epi rows; protected base families keep their V444 absolute share: held_rate,sticky_station,capacity_counts,settle_hold,conditional_stability,cs_flat,cs_drift,cs_countwalk,cs_pulse,step_level,tidal_constituents,envelope_mod,flow_recession,transport_flow,econ_release_staircase,energy_load_price_solar,physical_sensors,grid_flow,rk4_flows,met_thermal,spiky_price,price_shock,smooth_drift_extrapolable,garch_leverage,met_pressure_smooth,met_bounded_atom,met_wind_speed,wet_dry_intermittent,level_ladder_staircase,coastal_residual,transport_flow_tail,gauge_rain,storm_outage_counts,dispatch_price; factors CLK+IR; clock also off for staircase/price families; new stream family hourly_social_counts at 0.020; new stream family intraday_event_counts at 0.0200; new stream family intraday_spot_price at 0.0200; stream held at 0.14779 \u2014 intraday_spot_price at 0.02 takes mass FROM the other stream families (x0.8647) instead of growing the stream; new stream family road_commute_counts at 0.0200; stream held at 0.14779 \u2014 road_commute_counts at 0.02 takes mass FROM the other stream families (x0.8647) instead of growing the stream; epi_season_decay restored to 0.05985999999998, older stream families x0.7702 (spot/road held); sticky_station: 60% of rows hold 0.94-0.998 (log-uniform move rate), 20% start near-empty; sticky_station base weight x3 (renormalised)",
-  "min_length": 4096,
-  "max_length": 4096,
-  "prefetch_depth": 1,
-  "family_weights": {
-    "step_level": 0.05863389196868987,
-    "conditional_stability": 0.06603553703910083,
-    "ar2": 0.004350220109554057,
-    "cs_drift": 0.02019211218813542,
-    "tidal_constituents": 0.0030476792104015115,
-    "cs_countwalk": 0.002576933187182278,
-    "rate_counts": 0.004819225109944535,
-    "envelope_mod": 0.006840568638816773,
-    "cs_flat": 0.0022033861495445108,
-    "cycle_profile": 0.025148737054836334,
-    "arma_sarima": 0.010467158207867162,
-    "flow_recession": 0.021232331498533385,
-    "transport_flow": 0.03620343829024734,
-    "regime_dwell_intcounter": 0.010702323144503631,
-    "cs_pulse": 0.010904325263912908,
-    "hawkes_marked": 0.0008373196617140746,
-    "spectral_kernel_zoo": 0.0008220836235657964,
-    "econ_release_staircase": 0.04401847779768316,
-    "energy_load_price_solar": 0.02846915970107233,
-    "ops_counter_reset": 0.0051584071414557415,
-    "threshold_ar": 0.001529565742798891,
-    "clinical_bounded_vitals": 0.003368060707274478,
-    "epi_renewal": 0.0032490652620271016,
-    "admin_reporting_counts": 0.01019032734395024,
-    "regime_dwell_flat": 0.00621365381873261,
-    "physical_sensors": 0.01084843556975015,
-    "grid_flow": 0.011751482726764318,
-    "regime_shift": 0.005465763076584517,
-    "trend_seasonal_ar": 0.005130570237322395,
-    "seasonal_counts": 0.005170079933986646,
-    "sticky_station": 0.05094607630235226,
-    "ops_saturating_feedback": 0.00010945503562078977,
-    "epi_decay": 0.0022820219968999384,
-    "rk4_flows": 0.00810251934133686,
-    "physio_quasiperiodic": 0.002169060685195721,
-    "met_thermal": 0.00810251934133686,
-    "spiky_price": 0.013886830593354686,
-    "price_shock": 0.014838308664088362,
-    "long_memory": 0.002676905659008367,
-    "ops_diurnal_traffic": 0.0018410857533972356,
-    "smooth_drift_extrapolable": 0.01311209402538376,
-    "multiplicative": 0.00694100903120259,
-    "bounded_counts": 0.0021568930526432175,
-    "garch_leverage": 0.0008923108737799395,
-    "met_pressure_smooth": 0.004045624845700559,
-    "met_bounded_atom": 0.004045624845700559,
-    "integrated": 0.001944913391449781,
-    "spectral_gp": 0.001911129132947077,
-    "intermittent": 0.0002722614210661253,
-    "ou_stochastic_vol": 0.0016375428827192977,
-    "met_wind_speed": 0.003042671193031816,
-    "wet_dry_intermittent": 0.003042671193031816,
-    "level_ladder_staircase": 0.007884778161346861,
-    "coastal_residual": 0.0027146132226976605,
-    "vol_regime_switch": 0.0010784465263216087,
-    "pulse_outlier": 0.0002735862502277791,
-    "chaotic": 0.0,
-    "weekly_demand": 0.0,
-    "tidal_harmonic": 0.0,
-    "held_rate": 0.2803887374310545,
-    "sl_exact_cont": 0.0,
-    "sl_exact_int": 0.0,
-    "sl_noisy_cont": 0.0,
-    "sl_noisy_int": 0.0,
-    "ops_latency_queue": 0.006979847017315434,
-    "ops_deploy_transient": 0.001603732789195386,
-    "ops_rate_plateau": 0.0020046664833215633,
-    "transport_flow_tail": 0.014771745446924679,
-    "capacity_counts": 0.006008008203176708,
-    "overdispersed_counts": 0.0036757717083357533,
-    "reported_epi_counts": 0.0041520866948551996,
-    "retail_promo_tail": 0.0,
-    "heavy_traffic_counts": 0.017408734284663444,
-    "gauge_rain": 0.012521278175850381,
-    "storm_outage_counts": 0.01658397696229396,
-    "sales_promo_stockout_panel": 0.0013248728824589789,
-    "settle_hold": 0.024956024728300958,
-    "web_traffic_plateau": 0.003468969650366966,
-    "biz_day_counts": 0.011322363585925916,
-    "weekly_web_counts": 0.0029409402381900575,
-    "dispatch_price": 0.0032139487344899484,
-    "sparse_admin_counts": 0.0011430221554855418,
-    "epi_season_decay": 0.0,
-    "weekday_ledger_counts": 0.0,
-    "pull_counter_ramp": 0.0,
-    "weekly_cycle_downloads": 0.0,
-    "surveillance_counts": 0.0,
-    "hourly_social_counts": 0.0,
-    "intraday_event_counts": 0.0,
-    "intraday_spot_price": 0.0,
-    "road_commute_counts": 0.0
+  "name": "",
+  "p00": 4096,
+  "p01": 4096,
+  "p02": 1,
+  "p03": {
+    "k15": 0.05863389196868987,
+    "k14": 0.06603553703910083,
+    "k03": 0.004350220109554057,
+    "k29": 0.02019211218813542,
+    "k33": 0.0030476792104015115,
+    "k30": 0.002576933187182278,
+    "k35": 0.004819225109944535,
+    "k34": 0.006840568638816773,
+    "k28": 0.0022033861495445108,
+    "k70": 0.025148737054836334,
+    "k60": 0.010467158207867162,
+    "k19": 0.021232331498533385,
+    "k67": 0.03620343829024734,
+    "k55": 0.010702323144503631,
+    "k31": 0.010904325263912908,
+    "k62": 0.0008373196617140746,
+    "k64": 0.0008220836235657964,
+    "k69": 0.04401847779768316,
+    "k66": 0.02846915970107233,
+    "k40": 0.0051584071414557415,
+    "k05": 0.001529565742798891,
+    "k47": 0.003368060707274478,
+    "k44": 0.0032490652620271016,
+    "k45": 0.01019032734395024,
+    "k53": 0.00621365381873261,
+    "k10": 0.01084843556975015,
+    "k25": 0.011751482726764318,
+    "k01": 0.005465763076584517,
+    "k00": 0.005130570237322395,
+    "k11": 0.005170079933986646,
+    "k24": 0.05094607630235226,
+    "k39": 0.00010945503562078977,
+    "k23": 0.0022820219968999384,
+    "k32": 0.00810251934133686,
+    "k46": 0.002169060685195721,
+    "k48": 0.00810251934133686,
+    "k22": 0.013886830593354686,
+    "k26": 0.014838308664088362,
+    "k08": 0.002676905659008367,
+    "k38": 0.0018410857533972356,
+    "k59": 0.01311209402538376,
+    "k02": 0.00694100903120259,
+    "k20": 0.0021568930526432175,
+    "k61": 0.0008923108737799395,
+    "k49": 0.004045624845700559,
+    "k50": 0.004045624845700559,
+    "k04": 0.001944913391449781,
+    "k07": 0.001911129132947077,
+    "k12": 0.0002722614210661253,
+    "k09": 0.0016375428827192977,
+    "k51": 0.003042671193031816,
+    "k52": 0.003042671193031816,
+    "k58": 0.007884778161346861,
+    "k27": 0.0027146132226976605,
+    "k16": 0.0010784465263216087,
+    "k13": 0.0002735862502277791,
+    "k06": 0.0,
+    "k17": 0.0,
+    "k18": 0.0,
+    "k21": 0.2803887374310545,
+    "p04": 0.0,
+    "p05": 0.0,
+    "p06": 0.0,
+    "p07": 0.0,
+    "k41": 0.006979847017315434,
+    "k42": 0.001603732789195386,
+    "k43": 0.0020046664833215633,
+    "k71": 0.014771745446924679,
+    "k72": 0.006008008203176708,
+    "k73": 0.0036757717083357533,
+    "k74": 0.0041520866948551996,
+    "k75": 0.0,
+    "k76": 0.017408734284663444,
+    "k79": 0.012521278175850381,
+    "k78": 0.01658397696229396,
+    "k84": 0.0013248728824589789,
+    "k85": 0.024956024728300958,
+    "k86": 0.003468969650366966,
+    "k87": 0.011322363585925916,
+    "k88": 0.0029409402381900575,
+    "k89": 0.0032139487344899484,
+    "k77": 0.0011430221554855418,
+    "k90": 0.0,
+    "k91": 0.0,
+    "k93": 0.0,
+    "k94": 0.0,
+    "k92": 0.0,
+    "k95": 0.0,
+    "k96": 0.0,
+    "k97": 0.0,
+    "k98": 0.0
   },
-  "curriculum": {
-    "enabled": false,
-    "expected_budget_fraction": 0.65,
-    "start_fraction": 0.05,
-    "end_fraction": 0.7,
-    "start_family_weights": {
-      "trend_seasonal_ar": 0.19,
-      "regime_shift": 0.1,
-      "multiplicative": 0.08,
-      "ar2": 0.2,
-      "integrated": 0.05,
-      "threshold_ar": 0.025,
-      "chaotic": 0,
-      "spectral_gp": 0.035,
-      "long_memory": 0.025,
-      "ou_stochastic_vol": 0.03,
-      "physical_sensors": 0.105,
-      "seasonal_counts": 0.09,
-      "intermittent": 0.015,
-      "pulse_outlier": 0.005,
-      "conditional_stability": 0.05
+  "p08": {
+    "p09": false,
+    "p10": 0.65,
+    "p11": 0.05,
+    "p12": 0.7,
+    "p13": {
+      "k00": 0.19,
+      "k01": 0.1,
+      "k02": 0.08,
+      "k03": 0.2,
+      "k04": 0.05,
+      "k05": 0.025,
+      "k06": 0,
+      "k07": 0.035,
+      "k08": 0.025,
+      "k09": 0.03,
+      "k10": 0.105,
+      "k11": 0.09,
+      "k12": 0.015,
+      "k13": 0.005,
+      "k14": 0.05
     },
-    "start_parameters": {
-      "tr_exc_lo": 0.15,
-      "tr_exc_hi": 0.8,
-      "gr_exc_lo": 0.1,
-      "gr_exc_hi": 0.6,
-      "sa_clean_frac": 0.75,
-      "sa_clean_lo": 0.01,
-      "sa_clean_hi": 0.05,
-      "integrated_heavy_frac": 0,
-      "integrated_sv_frac": 0,
-      "observation": {
-        "censor_rate": 0,
-        "quantize_rate": 0.02,
-        "regular_hold_rate": 0,
-        "irregular_hold_rate": 0,
-        "irregular_hold_prob_lo": 0,
-        "irregular_hold_prob_hi": 0.02,
-        "shock_row_rate": 0,
-        "shock_prob_lo": 0,
-        "shock_prob_hi": 0.002
+    "p14": {
+      "p15": 0.15,
+      "p16": 0.8,
+      "p17": 0.1,
+      "p18": 0.6,
+      "p19": 0.75,
+      "p20": 0.01,
+      "p21": 0.05,
+      "p22": 0,
+      "p23": 0,
+      "p24": {
+        "p25": 0,
+        "p26": 0.02,
+        "p27": 0,
+        "p28": 0,
+        "p29": 0,
+        "p30": 0.02,
+        "p31": 0,
+        "p32": 0,
+        "p33": 0.002
       },
-      "augment": {
-        "tsmixup": 0,
-        "pad_prefix": 0
+      "p34": {
+        "p35": 0,
+        "p36": 0
       }
     }
   },
-  "tr_exc_lo": 0.15,
-  "tr_exc_hi": 0.8,
-  "gr_exc_lo": 0.1,
-  "gr_exc_hi": 0.6,
-  "sa_clean_frac": 0.75,
-  "sa_clean_lo": 0.01,
-  "sa_clean_hi": 0.05,
-  "integrated_heavy_frac": 0,
-  "integrated_sv_frac": 0,
-  "observation": {
-    "censor_rate": 0.35,
-    "quantize_rate": 0.02,
-    "regular_hold_rate": 0.06,
-    "irregular_hold_rate": 0,
-    "irregular_hold_prob_lo": 0,
-    "irregular_hold_prob_hi": 0.02,
-    "shock_row_rate": 0,
-    "shock_prob_lo": 0,
-    "shock_prob_hi": 0.002,
-    "amp_trend_rate": 0.36,
-    "kernel_spike_rate": 0.35,
-    "periodic_spike_frac": 0.0,
-    "time_warp_rate": 0.12,
-    "duty_cycle_rate": 0.0,
-    "nonuniform_quantize_frac": 0.0,
-    "gamma_warp_rate": 0.85,
-    "hold_block_rate": 0.5,
-    "post_amp_drift_rate": 0.8,
-    "nonneg_skip_range_artifacts": 1.0,
-    "global_dilation_rate": 0.25
+  "p15": 0.15,
+  "p16": 0.8,
+  "p17": 0.1,
+  "p18": 0.6,
+  "p19": 0.75,
+  "p20": 0.01,
+  "p21": 0.05,
+  "p22": 0,
+  "p23": 0,
+  "p24": {
+    "p25": 0.35,
+    "p26": 0.02,
+    "p27": 0.06,
+    "p28": 0,
+    "p29": 0,
+    "p30": 0.02,
+    "p31": 0,
+    "p32": 0,
+    "p33": 0.002,
+    "p37": 0.36,
+    "p38": 0.35,
+    "p39": 0.0,
+    "p40": 0.12,
+    "p41": 0.0,
+    "p42": 0.0,
+    "p43": 0.85,
+    "p44": 0.5,
+    "p45": 0.8,
+    "p46": 1.0,
+    "p47": 0.25
   },
-  "augment": {
-    "tsmixup": 0.18,
-    "pad_prefix": 0.05
+  "p34": {
+    "p35": 0.18,
+    "p36": 0.05
   },
-  "tsmixup_mean_scale": 1.0,
-  "tsmixup_source_alpha": 2.5,
-  "tail_rebase_rate": 1.0,
-  "nonneg_integer_frac": 0.9,
-  "chronoforge": {
-    "schema_version": 1,
-    "generator_name": "v196-settle-price035-lock85",
-    "internal_length": 4096,
-    "batch_schedule": {
-      "ramp": [
+  "p48": 1.0,
+  "p49": 2.5,
+  "p50": 1.0,
+  "p51": 0.9,
+  "p52": {
+    "p53": 1,
+    "p54": "x",
+    "p55": 4096,
+    "p56": {
+      "p57": [
         64,
         64,
         256,
         256
       ],
-      "steady": 512
+      "p58": 512
     },
-    "threads": {
-      "max_workers": 4,
-      "max_inflight_batches": 6
+    "p59": {
+      "p60": 4,
+      "p61": 6
     },
-    "family_weights": {
-      "met_thermal": 7.0,
-      "met_pressure_smooth": 4.5,
-      "met_bounded_atom": 8.5,
-      "met_wind_speed": 4.0,
-      "wet_dry_intermittent": 2.0,
-      "ops_diurnal_traffic": 5.5,
-      "ops_saturating_feedback": 3.5,
-      "ops_counter_reset": 2.0,
-      "ops_latency_queue": 2.0,
-      "ops_deploy_transient": 1.5,
-      "ops_rate_plateau": 1.0,
-      "epi_renewal": 3.5,
-      "admin_reporting_counts": 3.5,
-      "physio_quasiperiodic": 2.0,
-      "clinical_bounded_vitals": 2.0,
-      "regime_dwell_flat": 3.0,
-      "regime_dwell_microdrift": 2.5,
-      "regime_dwell_intcounter": 2.0,
-      "regime_dwell_zerosparse": 1.5,
-      "regime_dwell_transitional": 2.0,
-      "level_ladder_staircase": 7.0,
-      "smooth_drift_extrapolable": 6.0,
-      "arma_sarima": 4.0,
-      "garch_leverage": 0.5,
-      "hawkes_marked": 2.5,
-      "chaotic_delay": 0.5,
-      "spectral_kernel_zoo": 1.0,
-      "changepoint_composite": 3.0,
-      "energy_load_price_solar": 5.5,
-      "transport_flow": 3.5,
-      "retail_promo_intermittent": 2.0,
-      "econ_release_staircase": 1.0
+    "p03": {
+      "k48": 7.0,
+      "k49": 4.5,
+      "k50": 8.5,
+      "k51": 4.0,
+      "k52": 2.0,
+      "k38": 5.5,
+      "k39": 3.5,
+      "k40": 2.0,
+      "k41": 2.0,
+      "k42": 1.5,
+      "k43": 1.0,
+      "k44": 3.5,
+      "k45": 3.5,
+      "k46": 2.0,
+      "k47": 2.0,
+      "k53": 3.0,
+      "k54": 2.5,
+      "k55": 2.0,
+      "k56": 1.5,
+      "k57": 2.0,
+      "k58": 7.0,
+      "k59": 6.0,
+      "k60": 4.0,
+      "k61": 0.5,
+      "k62": 2.5,
+      "k63": 0.5,
+      "k64": 1.0,
+      "k65": 3.0,
+      "k66": 5.5,
+      "k67": 3.5,
+      "k68": 2.0,
+      "k69": 1.0
     },
-    "family_coarse_pref": {
-      "met_thermal": 0.02,
-      "met_pressure_smooth": 0.02,
-      "met_bounded_atom": 0.05,
-      "met_wind_speed": 0.02,
-      "wet_dry_intermittent": 0.25,
-      "ops_diurnal_traffic": 0.2,
-      "ops_saturating_feedback": 0.1,
-      "ops_counter_reset": 0.3,
-      "ops_latency_queue": 0.1,
-      "ops_deploy_transient": 0.1,
-      "ops_rate_plateau": 0.15,
-      "epi_renewal": 0.75,
-      "admin_reporting_counts": 0.85,
-      "physio_quasiperiodic": 0.0,
-      "clinical_bounded_vitals": 0.02,
-      "regime_dwell_flat": 0.25,
-      "regime_dwell_microdrift": 0.25,
-      "regime_dwell_intcounter": 0.25,
-      "regime_dwell_zerosparse": 0.25,
-      "regime_dwell_transitional": 0.25,
-      "level_ladder_staircase": 0.3,
-      "smooth_drift_extrapolable": 0.25,
-      "arma_sarima": 0.25,
-      "garch_leverage": 0.2,
-      "hawkes_marked": 0.2,
-      "chaotic_delay": 0.1,
-      "spectral_kernel_zoo": 0.2,
-      "changepoint_composite": 0.25,
-      "energy_load_price_solar": 0.1,
-      "transport_flow": 0.1,
-      "retail_promo_intermittent": 0.7,
-      "econ_release_staircase": 0.8
+    "p62": {
+      "k48": 0.02,
+      "k49": 0.02,
+      "k50": 0.05,
+      "k51": 0.02,
+      "k52": 0.25,
+      "k38": 0.2,
+      "k39": 0.1,
+      "k40": 0.3,
+      "k41": 0.1,
+      "k42": 0.1,
+      "k43": 0.15,
+      "k44": 0.75,
+      "k45": 0.85,
+      "k46": 0.0,
+      "k47": 0.02,
+      "k53": 0.25,
+      "k54": 0.25,
+      "k55": 0.25,
+      "k56": 0.25,
+      "k57": 0.25,
+      "k58": 0.3,
+      "k59": 0.25,
+      "k60": 0.25,
+      "k61": 0.2,
+      "k62": 0.2,
+      "k63": 0.1,
+      "k64": 0.2,
+      "k65": 0.25,
+      "k66": 0.1,
+      "k67": 0.1,
+      "k68": 0.7,
+      "k69": 0.8
     },
-    "cadence": {
-      "fine_seconds": [
+    "p63": {
+      "p64": [
         30,
         60,
         150,
@@ -282,7 +281,7 @@
         1800,
         3600
       ],
-      "fine_weights": [
+      "p65": [
         0.039,
         0.065,
         0.026,
@@ -293,462 +292,462 @@
         0.104,
         0.441
       ],
-      "coarse_seconds": [
+      "p66": [
         28800,
         86400
       ],
-      "coarse_weights": [
+      "p67": [
         0.087,
         0.913
       ]
     },
-    "length_ladder": {
-      "fine": {
-        "lengths": [
+    "p68": {
+      "p69": {
+        "p70": [
           4096
         ],
-        "weights": [
+        "p71": [
           1.0
         ]
       },
-      "coarse": {
-        "lengths": [
+      "p72": {
+        "p70": [
           4096
         ],
-        "weights": [
+        "p71": [
           1.0
         ]
       }
     },
-    "seasonality": {
-      "active_fine": {
-        "day": 0.85,
-        "half": 0.3,
-        "third": 0.1,
-        "week": 0.55,
-        "bizweek": 0.06,
-        "month": 0.05,
-        "quarter": 0.02,
-        "free": 0.18
+    "p73": {
+      "p74": {
+        "p75": 0.85,
+        "p76": 0.3,
+        "p77": 0.1,
+        "p78": 0.55,
+        "p79": 0.06,
+        "p80": 0.05,
+        "p81": 0.02,
+        "p82": 0.18
       },
-      "active_coarse": {
-        "day": 0.0,
-        "half": 0.0,
-        "third": 0.0,
-        "week": 0.9,
-        "bizweek": 0.22,
-        "month": 0.28,
-        "quarter": 0.12,
-        "free": 0.18
+      "p83": {
+        "p75": 0.0,
+        "p76": 0.0,
+        "p77": 0.0,
+        "p78": 0.9,
+        "p79": 0.22,
+        "p80": 0.28,
+        "p81": 0.12,
+        "p82": 0.18
       },
-      "shape_mix": [
+      "p84": [
         0.4,
         0.3,
         0.15,
         0.1,
         0.05
       ],
-      "phase_drift_rate": 0.35,
-      "period_drift_rate": 0.12,
-      "amplitude_modulation_rate": 0.45
+      "p85": 0.35,
+      "p86": 0.12,
+      "p87": 0.45
     },
-    "calendar": {
-      "monday_factor": 1.28,
-      "monday_sigma": 0.2,
-      "weekday_sigma": 0.12,
-      "weekend_factor": 0.45,
-      "weekend_sigma": 0.35,
-      "n_fixed_holidays": 13,
-      "n_moving_holidays": 4,
-      "holiday_count_lo": 8,
-      "holiday_count_hi": 17,
-      "holiday_factor": 0.35,
-      "holiday_sigma": 0.4,
-      "holiday_comp_lo": 1.25,
-      "holiday_comp_hi": 2.4
+    "p88": {
+      "p89": 1.28,
+      "p90": 0.2,
+      "p91": 0.12,
+      "p92": 0.45,
+      "p93": 0.35,
+      "p94": 13,
+      "p95": 4,
+      "p96": 8,
+      "p97": 17,
+      "p98": 0.35,
+      "p99": 0.4,
+      "p100": 1.25,
+      "p101": 2.4
     },
-    "observation": {
-      "block_aggregation_rate": 0.22,
-      "quantise_rate": 0.3,
-      "log_grid_share": 0.12,
-      "censor_rate": 0.18,
-      "staleness_rate": 0.18,
-      "missing_zero_rate": 0.06,
-      "outlier_rate": 0.08,
-      "drift_recal_rate": 0.1,
-      "round_rate": 0.25,
-      "round_min_ticks": 20.0,
-      "integer_tick_share": 0.4,
-      "count_prior_rate": 0.95,
-      "count_integer_share": 0.9,
-      "count_floor_frac": 0.15,
-      "count_levels_log10": [
+    "p24": {
+      "p102": 0.22,
+      "p103": 0.3,
+      "p104": 0.12,
+      "p25": 0.18,
+      "p105": 0.18,
+      "p106": 0.06,
+      "p107": 0.08,
+      "p108": 0.1,
+      "p109": 0.25,
+      "p110": 20.0,
+      "p111": 0.4,
+      "p112": 0.95,
+      "p113": 0.9,
+      "p114": 0.15,
+      "p115": [
         0.8,
         2.2
       ]
     },
-    "scale": {
-      "log10_scale_mixture": [
+    "p116": {
+      "p117": [
         {
-          "weight": 0.55,
-          "mean": 0.0,
-          "sigma": 1.2
+          "p118": 0.55,
+          "p119": 0.0,
+          "p120": 1.2
         },
         {
-          "weight": 0.25,
-          "mean": 3.0,
-          "sigma": 1.5
+          "p118": 0.25,
+          "p119": 3.0,
+          "p120": 1.5
         },
         {
-          "weight": 0.12,
-          "mean": -2.0,
-          "sigma": 1.5
+          "p118": 0.12,
+          "p119": -2.0,
+          "p120": 1.5
         },
         {
-          "weight": 0.08,
-          "mean": 6.0,
-          "sigma": 2.0
+          "p118": 0.08,
+          "p119": 6.0,
+          "p120": 2.0
         }
       ],
-      "zero_anchor_share": 0.45,
-      "large_offset_share": 0.3,
-      "sign_cross_share": 0.04,
-      "large_offset_ratio": [
+      "p121": 0.45,
+      "p122": 0.3,
+      "p123": 0.04,
+      "p124": [
         0.5,
         50.0
       ]
     },
-    "aggregation": {
-      "rate": 0.12
+    "p125": {
+      "p126": 0.12
     },
-    "families": {
-      "met_thermal": {
-        "synoptic_ell": [
+    "p127": {
+      "k48": {
+        "p128": [
           24.0,
           400.0
         ],
-        "synoptic_amp": [
+        "p129": [
           0.3,
           12.0
         ],
-        "diurnal_amp_mix": [
+        "p130": [
           0.35,
           0.4,
           0.25
         ],
-        "cloud_coupling": [
+        "p131": [
           0.3,
           0.9
         ],
-        "noise_ratio": [
+        "p132": [
           0.005,
           0.08
         ],
-        "annual_rate": 0.3
+        "p133": 0.3
       },
-      "met_pressure_smooth": {
-        "synoptic_ell": [
+      "k49": {
+        "p128": [
           60.0,
           600.0
         ],
-        "noise_ratio": [
+        "p132": [
           0.0003,
           0.02
         ],
-        "dip_rate": 0.18,
-        "quantise_rate": 0.25
+        "p134": 0.18,
+        "p103": 0.25
       },
-      "met_bounded_atom": {
-        "variant_mix": [
+      "k50": {
+        "p135": [
           0.45,
           0.3,
           0.25
         ],
-        "latent_ell": [
+        "p136": [
           4.0,
           240.0
         ],
-        "eta": [
+        "p137": [
           0.8,
           4.0
         ],
-        "centre_mean": 0.45,
-        "centre_sigma": 0.35,
-        "upper_mix": [
+        "p138": 0.45,
+        "p139": 0.35,
+        "p140": [
           0.18,
           0.1,
           0.07,
           0.55,
           0.1
         ],
-        "quantise_rate": 0.55,
-        "saturation_event_rate": 0.32
+        "p103": 0.55,
+        "p141": 0.32
       },
-      "met_wind_speed": {
-        "component_ell": [
+      "k51": {
+        "p142": [
           6.0,
           200.0
         ],
-        "gust_rate": 0.35,
-        "quantise_rate": 0.3
+        "p143": 0.35,
+        "p103": 0.3
       },
-      "wet_dry_intermittent": {
-        "dry_dwell": [
+      "k52": {
+        "p144": [
           8.0,
           600.0
         ],
-        "wet_dwell": [
+        "p145": [
           2.0,
           40.0
         ],
-        "intensity_shape": [
+        "p146": [
           0.25,
           0.9
         ]
       },
-      "ops_diurnal_traffic": {
-        "taylor_exponent": [
+      "k38": {
+        "p147": [
           0.45,
           1.0
         ],
-        "burst_rate": 0.55,
-        "count_emit_rate": 0.55,
-        "dst_rate": 0.18
+        "p148": 0.55,
+        "p149": 0.55,
+        "p150": 0.18
       },
-      "ops_saturating_feedback": {
-        "step_gain": [
+      "k39": {
+        "p151": [
           0.15,
           0.6
         ],
-        "emit_mix": [
+        "p152": [
           0.4,
           0.3,
           0.3
         ]
       },
-      "ops_counter_reset": {
-        "reset_mix": [
+      "k40": {
+        "p153": [
           0.55,
           0.2,
           0.25
         ],
-        "revision_rate": 0.3
+        "p154": 0.3
       },
-      "ops_latency_queue": {
-        "lognormal_rate": 0.55,
-        "percentile_rate": 0.35
+      "k41": {
+        "p155": 0.55,
+        "p156": 0.35
       },
-      "ops_deploy_transient": {
-        "outage_mix": [
+      "k42": {
+        "p157": [
           0.45,
           0.35,
           0.2
         ]
       },
-      "ops_rate_plateau": {
-        "plateau_dwell": [
+      "k43": {
+        "p158": [
           40.0,
           1500.0
         ]
       },
-      "epi_renewal": {
-        "logr_corr_time": [
+      "k44": {
+        "p159": [
           120.0,
           900.0
         ],
-        "logr_sigma": 0.3,
-        "serial_interval_mean": [
+        "p160": 0.3,
+        "p161": [
           3.0,
           20.0
         ],
-        "dispersion": [
+        "p162": [
           0.3,
           20.0
         ],
-        "reporting_layer_rate": 0.7,
-        "endemic_rate": 0.6
+        "p163": 0.7,
+        "p164": 0.6
       },
-      "admin_reporting_counts": {
-        "batch_rate": 0.3,
-        "revision_rate": 0.2,
-        "emission_mix": [
+      "k45": {
+        "p165": 0.3,
+        "p154": 0.2,
+        "p166": [
           0.62,
           0.18,
           0.2
         ],
-        "holiday_rate": 0.75,
-        "month_end_rate": 0.2
+        "p167": 0.75,
+        "p168": 0.2
       },
-      "physio_quasiperiodic": {
-        "base_period": [
+      "k46": {
+        "p169": [
           10.0,
           150.0
         ],
-        "rsa_depth": [
+        "p170": [
           0.02,
           0.18
         ]
       },
-      "clinical_bounded_vitals": {
-        "range_mix": [
+      "k47": {
+        "p171": [
           0.35,
           0.3,
           0.15,
           0.2
         ],
-        "ceiling_bias": [
+        "p172": [
           0.4,
           3.2
         ],
-        "excursion_tau": [
+        "p173": [
           150.0,
           2000.0
         ]
       },
-      "regime_dwell": {
-        "dormant_dwell": [
+      "p174": {
+        "p175": [
           20.0,
           1200.0
         ],
-        "active_dwell": [
+        "p176": [
           15.0,
           700.0
         ],
-        "pareto_mix": 0.15
+        "p177": 0.15
       },
-      "level_ladder_staircase": {
-        "run_length": [
+      "k58": {
+        "p178": [
           15.0,
           900.0
         ],
-        "jump_mix": [
+        "p179": [
           0.7,
           0.25,
           0.05
         ],
-        "tick_snap_rate": 0.4,
-        "noiseless_rate": 0.5,
-        "monotone_rate": 0.18
+        "p180": 0.4,
+        "p181": 0.5,
+        "p182": 0.18
       },
-      "smooth_drift_extrapolable": {
-        "matern_nu_mix": [
+      "k59": {
+        "p183": [
           0.2,
           0.5,
           0.3
         ],
-        "lengthscale": [
+        "p184": [
           64.0,
           4096.0
         ],
-        "obs_noise_ratio": [
+        "p185": [
           0.001,
           0.3
         ],
-        "damped_rate": 0.15,
-        "saturating_rate": 0.25
+        "p186": 0.15,
+        "p187": 0.25
       },
-      "arma_sarima": {
-        "seasonal_rate": 0.45,
-        "d_rate": 0.35,
-        "big_d_rate": 0.35,
-        "student_rate": 0.35
+      "k60": {
+        "p188": 0.45,
+        "p189": 0.35,
+        "p190": 0.35,
+        "p191": 0.35
       },
-      "garch_leverage": {
-        "persistence": [
+      "k61": {
+        "p192": [
           0.9,
           0.999
         ],
-        "student_rate": 0.6,
-        "emit_mix": [
+        "p191": 0.6,
+        "p152": [
           0.55,
           0.25,
           0.2
         ],
-        "arma_mean_rate": 0.3
+        "p193": 0.3
       },
-      "hawkes_marked": {
-        "branching": [
+      "k62": {
+        "p194": [
           0.2,
           0.92
         ],
-        "power_law_rate": 0.4,
-        "emit_mix": [
+        "p195": 0.4,
+        "p152": [
           0.4,
           0.3,
           0.3
         ]
       },
-      "chaotic_delay": {
-        "system_mix": [
+      "k63": {
+        "p196": [
           0.32,
           0.24,
           0.2,
           0.24
         ],
-        "projection_rate": 0.35,
-        "mackey_glass_rate": 0.3
+        "p197": 0.35,
+        "p198": 0.3
       },
-      "spectral_kernel_zoo": {
-        "product_rate": 0.6,
-        "envelope_rate": 0.5,
-        "warp_rate": 0.3
+      "k64": {
+        "p199": 0.6,
+        "p200": 0.5,
+        "p201": 0.3
       },
-      "changepoint_composite": {
-        "join_mix": [
+      "k65": {
+        "p202": [
           0.45,
           0.35,
           0.2
         ],
-        "state_hazard": [
+        "p203": [
           0.0,
           2.0
         ]
       },
-      "energy_load_price_solar": {
-        "mode_mix": [
+      "k66": {
+        "p204": [
           0.45,
           0.3,
           0.25
         ],
-        "negative_price_rate": 0.1
+        "p205": 0.1
       },
-      "transport_flow": {
-        "capacity_ratio": [
+      "k67": {
+        "p206": [
           0.9,
           2.2
         ]
       },
-      "retail_promo_intermittent": {
-        "slow_mover_rate": 0.35,
-        "stockout_rate": 0.12,
-        "launch_rate": 0.1
+      "k68": {
+        "p207": 0.35,
+        "p208": 0.12,
+        "p209": 0.1
       },
-      "econ_release_staircase": {
-        "release_mix": [
+      "k69": {
+        "p210": [
           0.35,
           0.45,
           0.2
         ],
-        "nelson_siegel_rate": 0.4,
-        "business_day_rate": 0.25,
-        "month_end_rate": 0.2
+        "p211": 0.4,
+        "p212": 0.25,
+        "p168": 0.2
       }
     }
   },
-  "step_level_exact_frac": 0.85,
-  "step_level_noise_lo": 0.0005,
-  "step_level_noise_hi": 0.01,
-  "step_level_jumps_hi": 4.0,
-  "flat_level_spread": 20000.0,
-  "cs_calm_noise": 0.03,
-  "renewal_persistence": {
-    "rate": 0.12,
-    "eligible_families": [
-      "held_rate",
-      "step_level",
-      "conditional_stability"
+  "p213": 0.85,
+  "p214": 0.0005,
+  "p215": 0.01,
+  "p216": 4.0,
+  "p217": 20000.0,
+  "p218": 0.03,
+  "p219": {
+    "p126": 0.12,
+    "p220": [
+      "k21",
+      "k15",
+      "k14"
     ],
-    "mode_weights": [
+    "p221": [
       0.5,
       0.25,
       0.25
@@ -757,29 +756,29 @@
     "quiet_median_max": 3072.0,
     "active_median_min": 48.0,
     "active_median_max": 384.0,
-    "dwell_sigma": 0.85,
-    "signed_share": 0.1
+    "p222": 0.85,
+    "p223": 0.1
   },
-  "support_contract": {
-    "restore_signed": true,
-    "restore_bounded_native": true,
-    "guard_mixing": true,
-    "repair_degenerate_rollback": true
+  "p224": {
+    "p225": true,
+    "p226": true,
+    "p227": true,
+    "p228": true
   },
-  "temporal_integrity": {
-    "complete_renewals": true,
-    "native_integer_flags": true,
-    "instance_config": true
+  "p229": {
+    "p230": true,
+    "p231": true,
+    "p232": true
   },
-  "independent_runtime_control": {
-    "batch_schedule_change": false,
-    "corpus_change": false,
-    "dynamic_blas_threads": 1,
-    "environment_threads": 1,
-    "family_group_workers": 1,
-    "prefetch_depth": 1,
-    "rendezvous_after_batch": true,
-    "schema": "h393-i257-rendezvous-v1"
+  "p234": {
+    "p235": false,
+    "p236": false,
+    "p237": 1,
+    "p238": 1,
+    "p239": 1,
+    "p02": 1,
+    "p240": true,
+    "p241": "x-v1"
   },
-  "isolated_scalar_fraction": 0.14779
+  "p233": 0.14779
 }
