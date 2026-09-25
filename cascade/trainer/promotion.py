@@ -256,7 +256,11 @@ class TrainerPromotion:
     """The engine: reign clock + candidate log + live member set, persisted.
 
     ``reign_threshold`` is ripeness in ROUNDS (``[scoring]
-    cascade_reign_rounds``); ``k_max``/``quality_epsilon`` mirror the fleet's
+    cascade_reign_rounds``) before the block-denominated tenure gate; with
+    ``scoring_cfg`` set the threshold in force at a block is
+    :func:`cascade.shared.era.effective_reign_threshold_rounds` — the rule
+    validators apply — so a grid change rescales it (see
+    :meth:`reign_threshold_at`). ``k_max``/``quality_epsilon`` mirror the fleet's
     envelope knobs (``cascade_top_k`` / ``cascade_quality_epsilon``) — the
     engine must select inside the envelope validators verify. ``pointer_path``
     is the warm-start pointer file the training loop reads
@@ -276,6 +280,11 @@ class TrainerPromotion:
     # select_members' error-decorrelation policy. Best-effort: absent/stale
     # entries just fall back to structural diversity for those candidates.
     error_vectors_path: Path | None = None
+    # ScoringConfig for the block-denominated ripeness threshold: from
+    # ``tenure_blocks_from_block`` the threshold is ``cascade_reign_blocks``
+    # expressed on the grid in force at the block. ``None`` keeps
+    # ``reign_threshold`` as a fixed round count.
+    scoring_cfg: object | None = None
 
     generation: int = 0
     members: tuple[PromotedMember, ...] = ()
@@ -308,6 +317,7 @@ class TrainerPromotion:
         round_cfg: object | None = None,
         min_round_spacing: int = 1,
         error_vectors_path: Path | None = None,
+        scoring_cfg: object | None = None,
     ) -> TrainerPromotion:
         """Restore the engine from ``state_path`` (fresh when absent/corrupt),
         then grandfather a pre-DEC-CA-0013 pointer file — the single winner the
@@ -317,7 +327,7 @@ class TrainerPromotion:
             reign_threshold=reign_threshold, k_max=k_max,
             quality_epsilon=quality_epsilon, min_round_spacing=min_round_spacing,
             state_path=state_path, pointer_path=pointer_path, round_cfg=round_cfg,
-            error_vectors_path=error_vectors_path,
+            error_vectors_path=error_vectors_path, scoring_cfg=scoring_cfg,
         )
         if state_path.is_file():
             try:
@@ -389,6 +399,20 @@ class TrainerPromotion:
         self._write_pointer()
         log.info("trainer promotion: adopted legacy warm-start pointer %s as "
                  "generation 1", cid)
+
+    def reign_threshold_at(self, block: int) -> float:
+        """Ripeness threshold in rounds in force at ``block``: with
+        ``round_cfg`` and ``scoring_cfg`` the block-denominated rule
+        (``cascade_reign_blocks`` on the grid in force there, from
+        ``tenure_blocks_from_block``; the fixed ``cascade_reign_rounds``
+        before it), else ``reign_threshold``. The clock counts rounds on the
+        same grid, so the two must rescale together."""
+        if self.round_cfg is not None and self.scoring_cfg is not None:
+            from ..shared.era import effective_reign_threshold_rounds
+
+            return float(effective_reign_threshold_rounds(
+                self.round_cfg, self.scoring_cfg, int(block)))
+        return float(self.reign_threshold)
 
     def seed_reign(self, king_hotkey: str, reign_start_block: int) -> bool:
         """Anchor an engine that has never seen a king to an ALREADY-RUNNING
@@ -499,12 +523,12 @@ class TrainerPromotion:
             clock = _ClockState(king_hotkey=self.king_hotkey,
                                 reign_start_block=self.reign_start_block)
             elapsed = reign_rounds(clock, int(epoch_block), self.round_cfg)
-            if elapsed is None or elapsed < float(self.reign_threshold):
+            threshold = self.reign_threshold_at(int(epoch_block))
+            if elapsed is None or elapsed < threshold:
                 return None
             if not self.candidates:
                 log.warning("trainer promotion: clock ripe (%.2f ≥ %.2f rounds) but no "
-                            "benched candidate this reign; holding", elapsed,
-                            float(self.reign_threshold))
+                            "benched candidate this reign; holding", elapsed, threshold)
                 return None
             # Rolling top-k (DEC-CA-0044): the live members compete with the
             # reign's candidates for the same k slots. A candidate is admitted
