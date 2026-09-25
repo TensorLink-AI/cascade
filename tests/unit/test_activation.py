@@ -627,13 +627,17 @@ def test_trainer_tick_arms_rolling_from_the_fleet_decision(cfg, tmp_path):
 
     runner = TrainerRunner(cfg=cfg, base_trainer=None, work_root=tmp_path,
                            activation_store=A.ActivationStore(tmp_path / "act.json"))
-    runner.promotion = SimpleNamespace(round_cfg=cfg.round)
+    runner.promotion = SimpleNamespace(round_cfg=cfg.round, scoring_cfg=cfg.scoring)
     note = A.format_signal(FEATURE, lock_block=B0, activation_block=B0 + GRID)
     chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 100)
     runner._activation_tick(chain, B0 + 100)
     assert rolling_active(runner.cfg.round, B0 + GRID)
     assert not rolling_active(runner.cfg.round, B0 + GRID - 1)
     assert runner.promotion.round_cfg is runner.cfg.round
+    # The tenure gate rides the same armed config: the engine's ripeness
+    # threshold rescales with the grid only if it sees the armed scoring.
+    assert runner.promotion.scoring_cfg is runner.cfg.scoring
+    assert runner.promotion.scoring_cfg.tenure_blocks_from_block == B0 + GRID
     assert A.ActivationStore(tmp_path / "act.json").load().activation_block == B0 + GRID
 
 

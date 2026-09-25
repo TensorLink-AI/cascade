@@ -1700,7 +1700,9 @@ class TrainerRunner:
 
     def apply_activation_block(self, block: int) -> bool:
         """Arm the DEC-CA-0043 rollover at ``block`` on the live config and
-        refresh the promotion engine's captured grid. Returns True when the
+        refresh the promotion engine's captured grid and tenure gate (its
+        reign clock and ripeness threshold both follow the armed config).
+        Returns True when the
         config changed. The rolling scheduler is built lazily from
         ``self.cfg`` only once ``rolling_active`` is true, so it always sees
         the armed config."""
@@ -1713,6 +1715,8 @@ class TrainerRunner:
         promo = getattr(self, "promotion", None)
         if promo is not None and hasattr(promo, "round_cfg"):
             promo.round_cfg = new_cfg.round
+        if promo is not None and hasattr(promo, "scoring_cfg"):
+            promo.scoring_cfg = new_cfg.scoring
         log.warning("activation: DEC-CA-0043 rollover ARMED at block %d (grid %d → %d): "
                     "rolling intake + era king start there", block,
                     new_cfg.round.epoch_blocks_prev, new_cfg.round.epoch_blocks)
