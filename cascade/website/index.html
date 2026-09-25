@@ -1068,6 +1068,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
     <div class="verdict" id="verdict"></div>
+    <div id="era-settlements" hidden></div>
     <div id="cohort-panel" hidden></div>
   </div>
 
@@ -1210,7 +1211,7 @@ var HUB_REF = "main";
 var POLL_MS = 30000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
-    _wsHist = null;
+    _wsHist = null, _roster = null;
 
 // No seed/sample data — the page renders explicit loading/empty states until
 // the live endpoints respond (see renderStatus + poll). It never ships
@@ -1287,9 +1288,10 @@ function stat(k,v,o){
 function renderVerdict(){
   var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
   if(!r){ el.innerHTML='<div class="empty">Waiting for the first published round…</div>'; return; }
-  var vrn=roundNoOf(r.round_id);
-  document.getElementById("verdict-title").textContent="Round "+shortRoundId(r.round_id)+(vrn?" · r"+vrn:"");
+  var cn=chainNow(), rolling=!!(cn&&cn.rolling&&rollingRow(r)), vlab=roundLabel(r);
+  document.getElementById("verdict-title").textContent=(rolling?"Latest settlement ":"Round ")+shortRoundId(r.round_id)+(vlab!==shortRoundId(r.round_id)?" · "+vlab:"");
   document.getElementById("verdict-when").textContent=r.published_at?"settled "+timeAgo(r.published_at):"";
+  renderEraSettlements(r,cn);
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
   if(r.status==="rejected"){
@@ -1328,6 +1330,35 @@ function renderVerdict(){
     cells.push(stat("Rewarded",r.n_rewarded!=null?r.n_rewarded:"--"));
   }
   el.innerHTML=cells.join("");
+}
+// Every settlement of the latest settlement's era (rolling mode only): the
+// boundary it settled at, its verdict and how many challengers it judged, so
+// the four 3 h verdicts read as one 12 h round.
+function renderEraSettlements(r,cn){
+  var el=document.getElementById("era-settlements"); if(!el) return;
+  if(!r||!cn||!cn.rolling||!rollingRow(r)){ el.hidden=true; el.innerHTML=""; el.className=""; return; }
+  var es=eraStartOfRow(r,cn), rows=eraRows(es,cn), rn=roundNoOfBlock(es);
+  var body=rows.map(function(x){
+    var lcbs=x.cohort_lcbs||{}, ks=Object.keys(lcbs), best=null;
+    ks.forEach(function(hk){ var v=lcbs[hk]; if(v!=null&&(best==null||v>best)) best=v; });
+    if(best==null&&x.lcb!=null) best=x.lcb;
+    var k=x.cohort_k!=null?x.cohort_k:(ks.length||(x.chal_uid!=null?1:0));
+    var cur=String(x.round_id)===String(r.round_id), sn=settlementNoOf(x,cn);
+    return '<tr'+(cur?' class="throne"':'')+'><td class="num">'+(sn?"S"+sn:"--")+'</td>'+
+      '<td title="'+esc(x.round_id)+'">'+esc(shortRoundId(x.round_id))+'</td>'+
+      '<td class="num" title="~'+esc(blockClock(cn,Number(x.epoch_start_block)))+'">'+esc(x.epoch_start_block)+'</td>'+
+      '<td><span class="badge '+verdictClass(x)+'">'+esc(verdictLabel(x))+'</span></td>'+
+      '<td class="num">'+k+'</td>'+
+      '<td class="num'+(best!=null&&x.margin!=null&&best>x.margin?' good':'')+'">'+(best!=null?fmt(best,3):"--")+'</td>'+
+      '<td class="num">'+fmt(x.margin,3)+'</td>'+
+      '<td class="muted">'+(x.published_at?timeAgo(x.published_at):"--")+'</td></tr>';
+  }).join("");
+  el.hidden=false; el.className="panel";
+  el.innerHTML='<div class="cohort-head">Era '+(rn?"r"+rn:"")+' <span class="muted">— '+rows.length+' of '+cn.settlements+
+    ' settlements published · a challenger is judged at the first settlement after its leg lands · the king holds the throne across the era</span></div>'+
+    '<div class="scroll-box"><table><thead><tr><th class="num">#</th><th>Round</th><th class="num">Boundary</th><th>Verdict</th>'+
+    '<th class="num" title="Challengers judged at this settlement">Judged</th><th class="num" title="Best challenger LCB at this settlement">Best LCB</th>'+
+    '<th class="num">Margin</th><th>When</th></tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 // ── latest verdict, expanded: the scored-ladder breakdown of the decided pair
 // and EVERY judged challenger of the cohort (the "all miners" duel view of a
@@ -1527,6 +1558,10 @@ function heatStatusMeta(s){
   // king directly, waiting ones carry to a later round with their submission.
   if(s==="seated") return {cls:"adv",label:"● Seated — duels the king"};
   if(s==="waiting") return {cls:"wait",label:"Waiting — next round"};
+  // rolling eras (funded/latest.json roster): the leg's state inside the era
+  if(s==="training") return {cls:"adv",label:"● Training"};
+  if(s==="renting") return {cls:"wait",label:"Renting a pod"};
+  if(s==="failed") return {cls:"nofit",label:"Failed"};
   return {cls:"screened",label:s||"--"};
 }
 function heatSource(){
@@ -1536,6 +1571,10 @@ function heatSource(){
   var live=(_heat&&Array.isArray(_heat.entrants))
     ?{doc:_heat, round:_heat.round_id, esb:Number(_heat.epoch_start_block),
       live:true, asOf:_heat.as_of}:null;
+  // Rolling eras: a live doc from before the current era is the pre-rollover
+  // field, not this era's — never show it as live.
+  var cn=chainNow();
+  if(live&&cn&&cn.rolling&&isFinite(live.esb)&&live.esb<cn.eraStart) live=null;
   if(!live) return recSrc;
   if(!recSrc) return live;
   // Both present: the newer round wins. An unparseable epoch block on either
@@ -1547,8 +1586,62 @@ function heatSource(){
 function heatRoundSettled(esb){
   return (_index&&_index.rounds||[]).some(function(r){ return Number(r.epoch_start_block)===Number(esb); });
 }
+// Rolling eras: the trainer publishes the era roster (funded/latest.json) at
+// every settlement — who is still training (and the boundary the leg targets),
+// renting a pod, waiting for one, seated (judged at that settlement) or failed.
+// In rolling mode the field panel renders the roster; the heat/duel-field doc
+// is the pre-rollover source.
+function rosterRows(){
+  var d=_roster; if(!d||String(d.mode)!=="rolling") return null;
+  var out=[];
+  function add(list,status){ (Array.isArray(list)?list:[]).forEach(function(e){ if(e&&e.hotkey) out.push({e:e,status:status}); }); }
+  add(d.in_flight,"training"); add(d.rents,"renting"); add(d.waiting,"waiting"); add(d.seated,"seated"); add(d.terminal,"failed");
+  return out;
+}
+function renderRoster(cn){
+  var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when"), title=document.getElementById("heat-title");
+  var rows=rosterRows(); if(rows===null) return false;
+  var d=_roster, n={};
+  rows.forEach(function(x){ n[x.status]=(n[x.status]||0)+1; });
+  if(title) title.innerHTML="Era field &mdash; rolling";
+  var rn=cn?roundNoOfBlock(cn.eraStart):null;
+  var counts=["training","renting","waiting","seated","failed"].filter(function(k){ return n[k]; }).map(function(k){ return n[k]+" "+k; }).join(" · ");
+  when.textContent=(rn?"era r"+rn+" · ":"")+(counts||"empty")+" · roster from settlement "+shortRoundId(d.round_id);
+  if(!rows.length){
+    panel.className="";
+    panel.innerHTML='<div class="heat-empty"><div class="he-glyph">· · ·</div><div class="he-head">No entrants on the roster</div>'+
+      '<p>Funded entries seat the moment they are revealed; the roster republishes at every settlement.</p></div>';
+    return true;
+  }
+  panel.className="panel";
+  var body=rows.map(function(x,i){
+    var e=x.e, m=heatStatusMeta(x.status), tb=Number(e.target_boundary), std=m.label;
+    if(x.status==="failed"&&e.error_class) std+=" · "+esc(e.error_class);
+    if(x.status==="seated") std+=" · judged at "+esc(shortRoundId(d.round_id));
+    var live=x.status==="training"||x.status==="renting", tgt='<span class="muted">--</span>';
+    if(live&&tb>0){
+      // The leg targets a boundary; once that boundary has passed it settles
+      // at the next one after it lands.
+      var passed=cn&&tb<=cn.epochStart, at=passed?cn.epochStart+cn.epochBlocks:tb;
+      tgt=(passed?'<span class="muted" title="target boundary '+tb+' passed">next</span> ':'')+'block '+at+(cn?' · ~'+esc(blockClock(cn,at)):'');
+    }
+    return '<tr><td class="num">'+(i+1)+'</td>'+
+      '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+(e.label?' <span class="sub-tag">'+esc(e.label)+'</span>':'')+'</td>'+
+      '<td><span class="heat-pill '+m.cls+'">'+std+'</span></td>'+
+      '<td>'+tgt+'</td>'+
+      '<td class="num">'+(e.reveal_block!=null?esc(e.reveal_block):"--")+'</td></tr>';
+  }).join("");
+  panel.innerHTML='<div class="heat-note">Rolling era — no screen. Every funded entry trains the full budget on its own pod and is judged '+
+    'against the era king at the first settlement after its leg lands. Seated rows were judged at the settlement named; '+
+    'their scores are in the verdict panel above.</div>'+
+    '<div class="scroll-box scroll-field"><table><thead><tr><th class="num">#</th><th>Miner</th><th>Standing</th><th>Settles at</th>'+
+    '<th class="num">Reveal block</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+  return true;
+}
 function renderHeat(){
   var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when");
+  var cn0=chainNow();
+  if(cn0&&cn0.rolling&&renderRoster(cn0)) return;
   var src=heatSource(), heat=src&&src.doc;
   var ents=(heat&&heat.entrants)||[];
   if(!heat||!ents.length){
@@ -1638,8 +1731,8 @@ function renderRounds(){
     var better=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
     // amber win rate = geomean favours the challenger but it wins few windows
     var wcls=r.win_rate==null?"":(r.win_rate>=0.5?"good":(better?"warn":""));
-    var hrn=roundNoOf(r.round_id);
-    return '<tr><td title="'+esc(r.round_id)+'">'+(hrn?"<b>r"+hrn+"</b> · ":"")+esc(shortRoundId(r.round_id))+'</td>'+
+    var hlab=roundLabel(r), hrn=hlab!==shortRoundId(r.round_id);
+    return '<tr><td title="'+esc(r.round_id)+'">'+(hrn?"<b>"+esc(hlab)+"</b> · ":"")+esc(shortRoundId(r.round_id))+'</td>'+
       '<td><span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span></td>'+
       '<td>'+refLink(r.king_gen_ref)+'</td><td>'+refLink(r.chal_gen_ref)+'</td>'+
       '<td class="num">'+fmt(r.king_geomean)+'</td>'+
@@ -1669,23 +1762,71 @@ function fmtDur(s){ if(s==null||!isFinite(s)) return "--"; s=Math.max(0,Math.rou
 // responds, else the receipt index's per-round `chain` anchor. The epoch grid
 // is absolute (block // epoch_blocks — the trainer's own math), so the current
 // epoch start is a plain floor on the estimated height.
+//
+// Rolling eras: one ROUND is one era of `era_blocks` (12 h); the trainer
+// settles at every `epoch_blocks` boundary inside it (a 3 h grid = 4
+// settlements per era), each settlement with its own receipt. The page numbers
+// rounds on the era grid and reads the era length from the status feed,
+// falling back to the pre-rollover grid the round-number anchor assumes.
+var ERA_BLOCKS_FALLBACK=3600;
+function eraBlocksOf(c){
+  if(c&&Number(c.era_blocks)>0) return Number(c.era_blocks);
+  var eb=c&&Number(c.epoch_blocks)>0?Number(c.epoch_blocks):ERA_BLOCKS_FALLBACK;
+  return eb<ERA_BLOCKS_FALLBACK?ERA_BLOCKS_FALLBACK:eb;
+}
 function chainNow(){
   var c=_status||( _index&&_index.chain); if(!c||!c.epoch_blocks) return null;
-  var bt=c.block_time_s>0?c.block_time_s:12, eb=c.epoch_blocks;
+  // Bittensor blocks are ~12 s whatever the grid; a feed value outside a sane
+  // band (a round-length-derived figure after a grid switch) is ignored.
+  var bt=(c.block_time_s>=6&&c.block_time_s<=30)?c.block_time_s:12, eb=c.epoch_blocks, era=eraBlocksOf(c);
   var asOf=c.as_of?new Date(c.as_of).getTime():null;
   var elapsed=asOf!=null?Math.max(0,(Date.now()-asOf)/1000):0;
   var base=c.current_block!=null?c.current_block:(c.epoch_start_block||0);
-  var est=base+elapsed/bt;
-  return {est:est, epochStart:Math.floor(est/eb)*eb, epochBlocks:eb, bt:bt};
+  var est=base+elapsed/bt, eraStart=Math.floor(est/era)*era, k=Math.max(1,Math.round(era/eb));
+  return {est:est, epochStart:Math.floor(est/eb)*eb, epochBlocks:eb, bt:bt,
+          eraBlocks:era, eraStart:eraStart, eraEnd:eraStart+era, settlements:k,
+          settleNo:Math.min(k,Math.floor((est-eraStart)/eb)+1), rolling:eb<era};
 }
-function nextRoundSecs(){
-  var cn=chainNow(); if(!cn) return null;
-  return Math.max(0,(cn.epochStart+cn.epochBlocks-cn.est)*cn.bt);
-}
+function blockEta(cn,b){ return cn?Math.max(0,(b-cn.est)*cn.bt):null; }
+// Wall-clock (UTC) estimate of a block from the chain clock — signed, so a
+// boundary already behind us reads as the time it passed.
+function blockClock(cn,b){ if(!cn) return "--"; var d=new Date(Date.now()+(b-cn.est)*cn.bt*1000); return d.toISOString().slice(11,16)+"Z"; }
+function nextRoundSecs(){ var cn=chainNow(); if(!cn) return null; return blockEta(cn,cn.eraEnd); }
+function nextSettlementSecs(){ var cn=chainNow(); if(!cn) return null; return blockEta(cn,cn.epochStart+cn.epochBlocks); }
 function renderCountdown(){
   var el=document.getElementById("next-round"); if(!el) return;
-  var s=nextRoundSecs();
-  el.textContent = s==null ? "" : ("next round ~"+fmtDur(s)+" · ");
+  var cn=chainNow(); if(!cn){ el.textContent=""; return; }
+  el.textContent = cn.rolling
+    ? ("era ends ~"+fmtDur(nextRoundSecs())+" · next boundary"+(cn.settleNo<cn.settlements?" (S"+(cn.settleNo+1)+")":"")+" ~"+fmtDur(nextSettlementSecs())+" · ")
+    : ("next round ~"+fmtDur(nextRoundSecs())+" · ");
+}
+// Which era a receipt row settles: the receipt's own era_start_block when the
+// index row (or the anchored latest receipt) carries it, else the era-grid
+// floor of its epoch block — a settlement at an era boundary then counts to
+// the era it opens until the row says otherwise.
+function eraStartOfRow(r,cn){
+  if(!r) return null;
+  if(Number(r.era_start_block)>0) return Number(r.era_start_block);
+  if(_latest&&String(_latest.round_id)===String(r.round_id)&&Number(_latest.era_start_block)>0) return Number(_latest.era_start_block);
+  var era=cn?cn.eraBlocks:eraBlocksOf(_status||(_index&&_index.chain));
+  var b=Number(r.epoch_start_block); return isFinite(b)?Math.floor(b/era)*era:null;
+}
+function eraRows(eraStart,cn){
+  return (_index&&_index.rounds||[]).filter(function(r){ return eraStartOfRow(r,cn)===eraStart; })
+    .sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); });
+}
+// A row published under the rolling-era rules: on or after the activation
+// block the status feed reports. Pre-rollover rows are one round per epoch.
+function rollingRow(r){ var a=_status&&_status.activation, ab=a&&Number(a.activation_block); return !!(ab&&Number(r.epoch_start_block)>=ab); }
+function settlementNoOf(r,cn){ var es=eraStartOfRow(r,cn); if(es==null||!cn) return null; return Math.floor((Number(r.epoch_start_block)-es)/cn.epochBlocks)+1; }
+// "r2539" for a round, "r2539 · S3" for the third settlement of era 2539.
+function roundLabel(r){
+  var cn=chainNow(), rolling=!!(cn&&cn.rolling&&rollingRow(r));
+  var rn=rolling?roundNoOfBlock(eraStartOfRow(r,cn)):roundNoOf(r.round_id);
+  if(!rn) return shortRoundId(r.round_id);
+  var lab="r"+rn;
+  if(rolling){ var k=settlementNoOf(r,cn); if(k) lab+=" · S"+k; }
+  return lab;
 }
 // ── live round panel: stage strip + revealed submissions ───────────────────
 // The trainer's internal progress is not public, so the pre-settle stages are
@@ -1746,7 +1887,8 @@ function renderStage(){
   // numbering warm-start checkpoints use, e.g. "(r30)") — the id alone
   // doesn't tell a reader where we are in the sequence.
   var lt=document.getElementById("live-title"), cn0=chainNow();
-  if(lt){ var rn0=cn0?roundNoOfBlock(cn0.epochStart):null; lt.innerHTML="This round — live"+(rn0?" · <b>r"+rn0+"</b>":""); }
+  if(lt){ var rn0=cn0?roundNoOfBlock(cn0.eraStart):null; lt.innerHTML=(cn0&&cn0.rolling?"This era — live":"This round — live")+(rn0?" · <b>r"+rn0+"</b>":""); }
+  if(cn0&&cn0.rolling){ renderSettlementStrip(cn0, strip, detail); return; }
   var stg=currentStage();
   var idx=stg?STAGES.map(function(s){return s[0];}).indexOf(stg.key):-1;
   strip.innerHTML=STAGES.map(function(s,i){
@@ -1754,6 +1896,26 @@ function renderStage(){
     return '<span class="stage-pill'+cls+'">'+s[1]+'</span>';
   }).join('<span class="stage-sep">&#9656;</span>');
   detail.innerHTML=stageDetail(stg);
+}
+// One pill per settlement boundary of the current era: settled (a receipt for
+// that boundary is in the index), the boundary just passed (receipt pending),
+// or upcoming — with the boundary's estimated wall-clock time.
+function renderSettlementStrip(cn, strip, detail){
+  var rows=eraRows(cn.eraStart,cn), byB={}, settled=0, pills=[];
+  rows.forEach(function(r){ byB[Number(r.epoch_start_block)]=r; });
+  for(var i=0;i<cn.settlements;i++){
+    var b=cn.eraStart+i*cn.epochBlocks, r=byB[b], on=b===cn.epochStart, past=b<cn.epochStart;
+    if(r) settled++;
+    var cls=r?" done":(on?" on":""), lab="S"+(i+1)+" · "+blockClock(cn,b);
+    var title=r?("settled — "+verdictLabel(r)+" · round "+shortRoundId(r.round_id))
+      :(on?"boundary "+b+" passed — settlement receipt pending":(past?"boundary "+b+" — no settlement published":"boundary "+b+" — upcoming"));
+    pills.push('<span class="stage-pill'+cls+'" title="'+esc(title)+'">'+esc(lab)+'</span>');
+  }
+  strip.innerHTML=pills.join('<span class="stage-sep">&#9656;</span>');
+  var last=rows.length?rows[rows.length-1]:null, into=(cn.est-cn.eraStart)*cn.bt;
+  detail.innerHTML="<b>Era</b> — boundary "+cn.settleNo+" of "+cn.settlements+" passed · <b>"+fmtDur(into)+"</b> into the era · "+
+    settled+" settled"+(last?" · latest "+esc(verdictLabel(last)):"")+
+    " · next boundary ~"+fmtDur(nextSettlementSecs())+" · era ends ~"+fmtDur(nextRoundSecs());
 }
 function renderSubs(){
   var tb=document.getElementById("subs"), note=document.getElementById("subs-note"),
@@ -1800,9 +1962,32 @@ function roundNoOf(rid){
   return roundNoOfBlock(b);
 }
 function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
+function wsLabelOf(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
+// Rolling eras: the era's init is pinned in every settlement manifest
+// (warm_start_ckpt / warm_start_size, with the era index and generation); the
+// heat doc is the pre-rollover source. The next generation's effective era
+// comes from its promotion record.
+function renderWarmEra(cn,panel,when){
+  var m=_latest&&_latest.manifest; if(!m||!m.era||!cn) return false;
+  var era=m.era, ck=m.warm_start_ckpt||"", rn=roundNoOfBlock(Number(era.start_block));
+  var html='<div style="display:flex;flex-direction:column;gap:6px">';
+  html+='<div><span class="muted">Era '+(rn?"r"+rn:esc(era.index))+' trains from:</span> '+
+    (ck?'<b title="'+esc(ck)+'">'+esc(wsLabelOf(ck))+'</b>':'<span class="muted">random init</span>')+
+    (era.generation!=null?' <span class="muted">· generation '+esc(era.generation)+(era.member_index!=null?', member '+esc(era.member_index):'')+'</span>':'')+'</div>';
+  if(_promo&&_promo.effective_era>Number(era.index)){
+    var en=roundNoOfBlock(_promo.effective_era*cn.eraBlocks);
+    html+='<div><span class="muted">Generation '+_promo.gen+' takes effect from era '+(en?"r"+en:_promo.effective_era)+'.</span></div>';
+  }
+  html+='<div class="muted" style="font-size:.85em">One init per era, pinned in every settlement&rsquo;s signed manifest; the member rotates with the era index.</div></div>';
+  panel.innerHTML=html;
+  if(when) when.textContent=m.warm_start_size?esc(m.warm_start_size):"";
+  return true;
+}
 function renderWarm(){
   var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
   if(!panel) return;
+  var cn=chainNow();
+  if(cn&&cn.rolling&&renderWarmEra(cn,panel,when)) return;
   var ws = _heat && _heat.warm_start;
   if(!ws || !ws.init_checkpoint){
     panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
@@ -1885,8 +2070,9 @@ function loadPromotion(){
     if(!gen||gen<1){ _promo=null; renderWarmHistory(); return; }
     if(_promo&&_promo.gen===gen) return;           // roster already loaded
     fetchJSON("promotions/gen-"+gen+".json").then(function(rec){
-      _promo={gen:gen, members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
-      renderWarmHistory();
+      _promo={gen:gen, effective_era:Number(rec&&rec.effective_era)||0,
+              members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
+      renderWarmHistory(); renderWarm();
     }).catch(function(){});
   }).catch(function(){});
 }
@@ -2089,7 +2275,10 @@ function poll(){
   fetchJSON("status/chain.json").then(function(d){
     if(_status===null){ _subsSeen=null; }
     _status=d; renderStage(); renderSubs(); renderCountdown();
+    renderVerdict(); renderHeat(); renderWarm(); renderRounds();   // era labels depend on the grid
   }).catch(function(){});
+  // Era roster (rolling mode): republished by the trainer at every settlement.
+  fetchJSON("funded/latest.json").then(function(d){ _roster=d; renderHeat(); }).catch(function(){});
   // Trainer-reported round stage (best-effort; staleness handled in liveStage).
   fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
     .catch(function(){});

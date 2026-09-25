@@ -40,6 +40,15 @@
       "destination": "https://s3.hippius.com/cascade-manifests/promotions/:path*"
     },
     {
+      "source": "/funded/:path*",
+      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/funded/:path*"
+    },
+    {
+      "source": "/funded/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/funded/:path*"
+    },
+    {
       "source": "/mix/:path*",
       "has": [{ "type": "host", "value": "testnet\\..*" }],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/mix/:path*"
@@ -72,6 +81,12 @@
       "source": "/promotions/(.*)",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+      ]
+    },
+    {
+      "source": "/funded/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20" }
       ]
     },
     {
