@@ -776,3 +776,83 @@ def test_rolling_topk_is_consensus_gated_off_before_the_rollover(tmp_path):
                       _report("r1", 1 * DAY, {"c-new": (1.015, "hkD", "challenger")}))
     rec2 = eng2.maybe_promote(epoch_block=5 * DAY, round_id="r5", rolling_topk=True)
     assert rec2 is not None and set(rec2.member_ids()) == {"m1", "m2", "c-new"}
+
+
+# ── ripeness threshold across a grid switch ─────────────────────────────────
+
+
+def _switch_cfgs(rollover, *, before=3600, after=900, reign_blocks=18000):
+    """RoundConfig/ScoringConfig with the tenure gate at ``rollover`` and the
+    grid switching ``before`` → ``after`` there."""
+    from dataclasses import replace
+    from pathlib import Path
+
+    from cascade.shared.config import load_chain_config
+
+    cfg = load_chain_config(Path(__file__).resolve().parents[2] / "chain.toml")
+    round_cfg = replace(cfg.round, epoch_blocks=after, epoch_blocks_prev=before,
+                        epoch_activation_block=rollover, rolling_from_block=rollover,
+                        era_settlements=4)
+    scoring = replace(cfg.scoring, era_king_from_block=rollover,
+                      tenure_blocks_from_block=rollover, cascade_reign_blocks=reign_blocks,
+                      cascade_reign_days=5)
+    return round_cfg, scoring
+
+
+def test_threshold_rescales_with_the_grid_when_scoring_cfg_is_wired(tmp_path):
+    rollover = 3600 * 100
+    round_cfg, scoring = _switch_cfgs(rollover)
+    eng = TrainerPromotion(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+        round_cfg=round_cfg, scoring_cfg=scoring,
+    )
+    assert eng.reign_threshold_at(rollover - 1) == 5.0        # fixed rounds before the gate
+    assert eng.reign_threshold_at(rollover) == 20.0           # 18000 blocks on the 900 grid
+    # King crowned one old-grid round before the switch; one candidate benched.
+    eng.note_round("hkKing", epoch_block=rollover - 3600)
+    eng.record_bench(_manifest("r1"), _report("r1", rollover - 3600, {
+        "ptr-king1": (1.0, "hkKing", "king"),
+        "ptr-chal1": (1.02, "hkChal", "challenger"),
+    }))
+    # 1 old round + 4 settlements = 5 rounds on the clock: NOT ripe (threshold 20).
+    assert eng.maybe_promote(epoch_block=rollover + 4 * 900, round_id="r5") is None
+    assert eng.generation == 0
+    # 1 + 18 = 19: still holding.
+    assert eng.maybe_promote(epoch_block=rollover + 18 * 900, round_id="r19") is None
+    # 1 + 19 = 20: ripe on the same rule validators apply.
+    rec = eng.maybe_promote(epoch_block=rollover + 19 * 900, round_id="r20")
+    assert rec is not None and rec.generation == 1
+    assert rec.fired_block == rollover + 19 * 900
+
+
+def test_threshold_stays_fixed_without_scoring_cfg(tmp_path):
+    rollover = 3600 * 100
+    round_cfg, _scoring = _switch_cfgs(rollover)
+    eng = TrainerPromotion(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+        round_cfg=round_cfg,
+    )
+    assert eng.reign_threshold_at(rollover + 10 * 900) == 5.0
+    eng.note_round("hkKing", epoch_block=rollover - 3600)
+    eng.record_bench(_manifest("r1"), _report("r1", rollover - 3600, {
+        "ptr-king1": (1.0, "hkKing", "king"),
+    }))
+    rec = eng.maybe_promote(epoch_block=rollover + 4 * 900, round_id="r5")
+    assert rec is not None and rec.generation == 1
+
+
+def test_load_wires_scoring_cfg(tmp_path):
+    rollover = 3600 * 100
+    round_cfg, scoring = _switch_cfgs(rollover)
+    eng = TrainerPromotion.load(
+        reign_threshold=5, k_max=2, quality_epsilon=0.05,
+        state_path=tmp_path / "trainer_promotion.json",
+        pointer_path=tmp_path / "warm_start_init.json",
+        round_cfg=round_cfg, scoring_cfg=scoring,
+    )
+    assert eng.scoring_cfg is scoring
+    assert eng.reign_threshold_at(rollover) == 20.0
