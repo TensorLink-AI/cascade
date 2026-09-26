@@ -4,6 +4,7 @@ type: decision
 title: "Pre-heat content dedup on EXACT identity only; similarity threshold removed; LLM judge stays advisory"
 status: active
 date: 2026-07-24
+amended: 2026-09-26 — two exact tiers added, `embedded_token_identical` / `embedded_rename_identical` (a source packed into a string constant — plain/base64/zlib/hex — equal to another entry's whole .py stream or packed source, exactly or name-masked, either direction; `[round] dedup_embedded_mode`, shadow first), and the rolling registry now holds the era king and every published champion, so newcomers are judged against them too. Still exact identity only; the `private_copy` containment tier (2026-09-26, shadow) is the only ratio-based label and stays shadow. Revisit when the shadow log shows the embedded tiers' false-positive rate (expected zero: exact digests) or when a wrapper edits the blob by a few tokens — that is a `private_copy` question, not an exact-tier one.
 tags: [anti-spam, incentives, trainer]
 revisit_when: >-
   the shadow log accumulates enough rounds to decide dedup_config_only_enforce

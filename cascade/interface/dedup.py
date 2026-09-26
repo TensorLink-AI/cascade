@@ -171,6 +171,34 @@ class RepoFingerprint:
     n_tokens: int = 0
     scoreable: bool = True    # False ⇒ over the cap, no quadratic pass may run
     truncated: bool = False   # some file was too large to decode in full
+    py_masked_sha256: str = ""    # name-masked .py-only stream ("" = no .py)
+    # Every Python source packed into a string constant of a .py file (plain,
+    # base64, zlib, hex — see `_packed_sources`), fingerprinted exactly as a
+    # one-file repo's .py stream would be, so a wrapper carrying someone's
+    # generator as a blob and that generator submitted plain share a digest.
+    components: tuple[ComponentFingerprint, ...] = ()
+
+
+@dataclass(frozen=True)
+class ComponentFingerprint:
+    """One string-packed source inside a repo, as an exact-identity digest pair.
+
+    ``token_sha256`` / ``masked_sha256`` equal the ``py_sha256`` /
+    ``py_masked_sha256`` a repo whose ONLY ``.py`` file is this source would
+    carry (same stream, same file separator), which is what makes the
+    embedded tiers a plain digest comparison in both directions.
+    """
+
+    name: str                 # "<rel path>#packed<i>"
+    token_sha256: str
+    masked_sha256: str
+    n_tokens: int
+    n_bytes: int
+
+
+# A packed source shorter than this is a snippet (a template, a docstring
+# that happens to parse), not a generator anyone could have copied whole.
+MIN_COMPONENT_TOKENS = 200
 
 
 class _Accum:
@@ -183,6 +211,7 @@ class _Accum:
         self._tok = hashlib.sha256()
         self._masked = hashlib.sha256()
         self._py = hashlib.sha256()
+        self._pym = hashlib.sha256()
         self._max_tokens = max_tokens
         self.tokens: list[str] = []
         self.n_tokens = 0
@@ -192,10 +221,12 @@ class _Accum:
 
     def push(self, token: str, *, maskable: bool, py: bool) -> None:
         blob = token.encode("utf-8", "replace") + b"\x00"
+        mblob = _masked(token, maskable).encode("utf-8", "replace") + b"\x00"
         self._tok.update(blob)
-        self._masked.update(_masked(token, maskable).encode("utf-8", "replace") + b"\x00")
+        self._masked.update(mblob)
         if py:
             self._py.update(blob)
+            self._pym.update(mblob)
             self.n_py_tokens += 1
         self.n_tokens += 1
         if self._max_tokens <= 0 or len(self.tokens) < self._max_tokens:
@@ -203,7 +234,7 @@ class _Accum:
         else:
             self.overflow = True
 
-    def finish(self) -> RepoFingerprint:
+    def finish(self, components: tuple[ComponentFingerprint, ...] = ()) -> RepoFingerprint:
         return RepoFingerprint(
             tree_sha256=self.tree.hexdigest(),
             token_sha256=self._tok.hexdigest(),
@@ -213,7 +244,20 @@ class _Accum:
             n_tokens=self.n_tokens,
             scoreable=not self.overflow,
             truncated=self.truncated,
+            py_masked_sha256=self._pym.hexdigest() if self.n_py_tokens else "",
+            components=components,
         )
+
+
+def component_fingerprint(name: str, source: str) -> ComponentFingerprint:
+    """Digest one packed source exactly like a one-file repo's ``.py`` stream."""
+    acc = _Accum(0)
+    acc.push("\x00FILE", maskable=False, py=True)
+    for t in iter_normalized_tokens(source):
+        acc.push(t, maskable=True, py=True)
+    return ComponentFingerprint(
+        name=name, token_sha256=acc._py.hexdigest(), masked_sha256=acc._pym.hexdigest(),
+        n_tokens=acc.n_py_tokens - 1, n_bytes=len(source.encode("utf-8", "replace")))
 
 
 # Path components / names that never shape the generative process and change
@@ -277,6 +321,12 @@ def fingerprint_dir(
     acc = _Accum(max_tokens)
     text_cap = int(max(0.0, float(max_text_mb)) * 1024 * 1024)  # float: tests use fractions
     text_used = 0
+    # Packed sources are unpacked and digested on their OWN copy of the decode
+    # budget: the three whole-repo digests must not move because a repo near
+    # the cap grew a blob, and a blob past the budget is simply not a component.
+    comp_used = 0
+    comp_over = False
+    components: list[ComponentFingerprint] = []
     for p in files:
         rel = p.relative_to(root)
         if _is_junk(rel.parts):
@@ -320,7 +370,48 @@ def fingerprint_dir(
             acc.push(f"\x00OPAQUE:{file_h.hexdigest()}", maskable=False, py=is_py)
             acc.overflow = True
             acc.truncated = True
-    return acc.finish()
+        elif is_py and not comp_over:
+            for i, src in enumerate(_packed_sources(text), 1):
+                n_bytes = len(src.encode("utf-8", "replace"))
+                if text_cap and comp_used + n_bytes > text_cap:
+                    comp_over = True
+                    acc.truncated = True
+                    break
+                comp_used += n_bytes
+                comp = component_fingerprint(f"{rel}#packed{i}", src)
+                if comp.n_tokens >= MIN_COMPONENT_TOKENS:
+                    components.append(comp)
+    return acc.finish(tuple(components))
+
+
+EMBEDDED_TIERS = ("embedded_token_identical", "embedded_rename_identical")
+
+
+def embedded_tier(a: RepoFingerprint, b: RepoFingerprint) -> str | None:
+    """The exact embedded tier ``a`` and ``b`` share, or ``None``.
+
+    ``embedded_token_identical``: one side's whole ``.py`` stream (or one of
+    its packed components) is byte-for-byte the other side's packed component.
+    ``embedded_rename_identical``: the same after identifier masking. Direction
+    does not matter — a plain repo equal to someone's blob is the same finding
+    as a wrapper around someone's plain repo. Whole-repo streams are compared
+    through ``py_sha256`` / ``py_masked_sha256``, which a one-file repo shares
+    with its own content packed as a component (see
+    :func:`component_fingerprint`); configs play no part in these tiers.
+    """
+    if not (a.components or b.components):
+        return None
+    a_tok = {c.token_sha256 for c in a.components}
+    b_tok = {c.token_sha256 for c in b.components}
+    if (a.py_sha256 and a.py_sha256 in b_tok) or (b.py_sha256 and b.py_sha256 in a_tok) \
+            or (a_tok & b_tok):
+        return "embedded_token_identical"
+    a_m = {c.masked_sha256 for c in a.components}
+    b_m = {c.masked_sha256 for c in b.components}
+    if (a.py_masked_sha256 and a.py_masked_sha256 in b_m) \
+            or (b.py_masked_sha256 and b.py_masked_sha256 in a_m) or (a_m & b_m):
+        return "embedded_rename_identical"
+    return None
 
 
 def _same_code(a: RepoFingerprint, b: RepoFingerprint) -> bool:
@@ -429,6 +520,7 @@ class DedupVerdict:
     """One pairwise judgement, kept for the audit log whether or not it drops.
 
     Tiers: ``tree_identical`` | ``token_identical`` | ``rename_identical`` |
+    ``embedded_token_identical`` | ``embedded_rename_identical`` |
     ``config_only`` | ``behavior_identical``.
     """
 
@@ -463,6 +555,7 @@ def screen_duplicates(
     config_only_enforce: bool = False,
     priority: Mapping[str, int] | None = None,
     enforce: bool = True,
+    embedded_mode: str = "off",
 ) -> DedupResult:
     """Pairwise duplicate screen over ``(hotkey, uid, fingerprint)`` entries.
 
@@ -491,6 +584,14 @@ def screen_duplicates(
     when both streams are under the token cap) and the entry is kept —
     "identical code, different weights" is both the ticket-spam pattern and
     the legitimate fork path, so the log decides enforcement.
+
+    ``embedded_mode`` (``off`` | ``shadow`` | ``enforce``) gates the two
+    embedded tiers (:func:`embedded_tier`): a packed source equal — exactly,
+    or after identifier masking — to a rival's whole ``.py`` stream or to one
+    of the rival's packed sources, in either direction. ``shadow`` records the
+    verdict in ``shadow`` and keeps the entry; ``enforce`` drops it like the
+    whole-repo tiers. They run after the whole-repo tiers miss and before the
+    ``config_only`` label.
 
     With ``enforce=False`` (shadow mode) every entry is kept, but the RIVAL
     set still follows enforce semantics — a would-be-dropped entry does not
@@ -536,6 +637,12 @@ def screen_duplicates(
                 tier = "token_identical"
             elif fp.masked_sha256 == r_fp.masked_sha256:
                 tier = "rename_identical"
+            elif (embedded_mode in ("shadow", "enforce")
+                  and (emb := embedded_tier(fp, r_fp)) is not None):
+                if embedded_mode != "enforce":
+                    shadow.append(DedupVerdict(hotkey, uid, r_hotkey, r_uid, emb, 1.0))
+                    continue
+                tier = emb
             elif _same_code(fp, r_fp):
                 # Identical code, different functional configs.
                 delta = _delta(fp, r_fp)
