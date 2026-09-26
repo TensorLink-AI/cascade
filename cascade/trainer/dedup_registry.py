@@ -105,11 +105,13 @@ class DedupRegistry:
     # ── registry ─────────────────────────────────────────────────────────────
 
     def register(self, ref: str, *, hotkey: str, commit_block: int, kind: str,
-                 digests: dict | None = None) -> None:
+                 digests: dict | None = None, coldkey: str | None = None) -> None:
         if ref in self.entries:
             cur = self.entries[ref]
             if commit_block and (not cur.get("commit_block") or commit_block < cur["commit_block"]):
                 cur["commit_block"], cur["hotkey"] = int(commit_block), hotkey
+                if coldkey:
+                    cur["coldkey"] = coldkey
             cur["kind"] = kind
             self._save()
             return
@@ -118,7 +120,8 @@ class DedupRegistry:
             if digests is None:
                 return
         self.entries[ref] = {**digests, "hotkey": hotkey, "commit_block": int(commit_block),
-                             "kind": kind, "private": _is_vault_ref(ref)}
+                             "kind": kind, "private": _is_vault_ref(ref),
+                             **({"coldkey": coldkey} if coldkey else {})}
         self._save()
 
     # ── private-copy tier ────────────────────────────────────────────────────
@@ -183,13 +186,16 @@ class DedupRegistry:
             log.info("dedup registry: sketched %d pre-existing private entries for the "
                      "private_copy tier", len(todo))
 
-    def match_private_copy(self, modules: list[dict], *,
-                           exclude_hotkey: str) -> tuple[str, str, int, str] | None:
+    def match_private_copy(self, modules: list[dict], *, exclude_hotkey: str,
+                           exclude_coldkey: str | None = None) -> tuple[str, str, int, str] | None:
         """``(hotkey, tier, commit_block, detail)`` of the earliest-committed
-        PRIVATE registered entry (other hotkeys only) one of whose modules is
-        contained in one of ``modules`` at >= the threshold — skipping private
-        modules that are themselves public material (a public tree's module
-        carried inside a vault submission is not that submitter's to own)."""
+        PRIVATE registered entry (other hotkeys only — and other coldkeys,
+        when both are known: an operator re-submitting their own private
+        code under a fresh hotkey after a burn is not copying anyone) one of
+        whose modules is contained in one of ``modules`` at >= the threshold
+        — skipping private modules that are themselves public material (a
+        public tree's module carried inside a vault submission is not that
+        submitter's to own)."""
         from ..interface.dedup import MIN_PRIVATE_FRACTION, MIN_PRIVATE_SHINGLES, sketch_containment
 
         if not modules:
@@ -200,6 +206,8 @@ class DedupRegistry:
         hits: list[tuple[int, str, str]] = []      # (commit_block, hotkey, detail)
         for ref, rec in self.entries.items():
             if rec.get("hotkey") == exclude_hotkey or not self._is_private(ref, rec):
+                continue
+            if exclude_coldkey and rec.get("coldkey") == exclude_coldkey:
                 continue
             for theirs in rec.get("modules", []):
                 their_set = frozenset(theirs["sketch"])
@@ -251,13 +259,15 @@ class DedupRegistry:
         if digests is None:
             return None
         my_block = _commit_block(history, gen.hotkey, gen.ref) or int(getattr(gen, "reveal_block", 0) or 0)
+        coldkey = _coldkey_of(history, gen.hotkey) or (getattr(gen, "coldkey", None) or None)
         hit = self.match(digests, exclude_hotkey=gen.hotkey)
         if hit is not None and (hit[2] == 0 or my_block == 0 or hit[2] <= my_block):
             return hit[0], hit[1], self.mode == "enforce"
         pc_mode = self._pc_mode()
         if pc_mode in ("shadow", "enforce"):
             self.backfill_modules()
-            pc = self.match_private_copy(digests.get("modules", []), exclude_hotkey=gen.hotkey)
+            pc = self.match_private_copy(digests.get("modules", []), exclude_hotkey=gen.hotkey,
+                                         exclude_coldkey=coldkey)
             if pc is not None and (pc[2] == 0 or my_block == 0 or pc[2] <= my_block):
                 log.warning("dedup registry: %s private_copy of %s — %s [%s]",
                             gen.hotkey[:12], pc[0][:12], pc[3], pc_mode)
@@ -265,11 +275,19 @@ class DedupRegistry:
                 # what it carries is on record for the next comer.
                 if pc_mode != "enforce":
                     self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block,
-                                  kind="queue", digests=digests)
+                                  kind="queue", digests=digests, coldkey=coldkey)
                 return pc[0], pc[1], pc_mode == "enforce"
         self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block, kind="queue",
-                      digests=digests)
+                      digests=digests, coldkey=coldkey)
         return None
+
+
+def _coldkey_of(history: list, hotkey: str) -> str | None:
+    """The coldkey the reveal history records for ``hotkey`` (None when unknown)."""
+    for c in history:
+        if c.hotkey == hotkey and getattr(c, "coldkey", None):
+            return str(c.coldkey)
+    return None
 
 
 def _commit_block(history: list, hotkey: str, ref: str) -> int:

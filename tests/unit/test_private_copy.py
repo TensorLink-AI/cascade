@@ -142,8 +142,8 @@ VAULT_C = "vault/direct@sha256:" + "c" * 64
 PUBLIC_P = "pub/gen@sha256:" + "d" * 64          # a public Hub generator
 
 
-def _commit(hk, ref, block):
-    return Commitment(uid=1, hotkey=hk, coldkey=None,
+def _commit(hk, ref, block, coldkey=None):
+    return Commitment(uid=1, hotkey=hk, coldkey=coldkey,
                       payload=f"metro-v1:gen:hippius:{ref}", commit_block=block)
 
 
@@ -243,6 +243,23 @@ def test_same_hotkey_and_earlier_commit_are_not_copies(tmp_path):
     assert reg.admit(_gen("ALFA", VAULT_B, 200), None, history) is None
     # committed EARLIER than A: not a copy of A (A would have been, had it come later)
     assert reg.admit(_gen("CHAR", VAULT_C, 50), None, history) is None
+
+
+def test_same_coldkey_new_hotkey_is_not_a_copy(tmp_path):
+    # An operator whose hotkey burned re-submits their own private code under
+    # a fresh hotkey of the SAME coldkey: not copying anyone. A different
+    # coldkey carrying the same private text still is.
+    a_mod = _module("alpha")
+    prints = {VAULT_A: _digests("a", a_mod), VAULT_B: _digests("b", a_mod, _lineage()),
+              VAULT_C: _digests("c", a_mod)}
+    reg = _registry(tmp_path, prints)
+    history = [_commit("ALFA", VAULT_A, 100, coldkey="CK-1"),
+               _commit("ALF2", VAULT_B, 200, coldkey="CK-1"),
+               _commit("CHAR", VAULT_C, 300, coldkey="CK-2")]
+    assert reg.admit(_gen("ALFA", VAULT_A, 100), None, history) is None
+    assert reg.entries[VAULT_A]["coldkey"] == "CK-1"
+    assert reg.admit(_gen("ALF2", VAULT_B, 200), None, history) is None
+    assert reg.admit(_gen("CHAR", VAULT_C, 300), None, history) == ("ALFA", "private_copy", True)
 
 
 def test_partial_reuse_below_threshold_passes(tmp_path):
