@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from cascade.trainer.channel_stats import (
+    _UNPARTNERED_Z,
     ChannelStatsAccumulator,
     series_channel_stats,
     series_min_partner_z,
@@ -52,7 +53,19 @@ def test_glued_independent_walks_read_unpartnered():
     # Their levels can correlate spuriously; their innovations do not.
     rng = np.random.default_rng(3)
     arr = rng.standard_normal((2, 4096)).cumsum(axis=1)
-    assert series_min_partner_z(arr) < 4.0
+    assert series_min_partner_z(arr) < _UNPARTNERED_Z
+
+
+def test_lagged_coupling_reads_partnered():
+    # A lead/lag pair (lagged causal edge): a lag-0 read would call it
+    # unpartnered; the lag scan must not.
+    rng = np.random.default_rng(6)
+    drive = rng.standard_normal(4096)
+    lagged = np.concatenate([rng.standard_normal(30), drive[:-30]])
+    arr = np.stack([drive.cumsum(), (lagged + 0.8 * rng.standard_normal(4096)).cumsum()])
+    d = np.diff(arr, axis=1)
+    assert abs(np.corrcoef(d[0], d[1])[0, 1]) * np.sqrt(d.shape[1] - 1) < 4.0
+    assert series_min_partner_z(arr) > 10.0
 
 
 def test_shared_driver_reads_partnered():
@@ -73,7 +86,7 @@ def test_one_glued_channel_is_enough_to_flag():
         rng.standard_normal(4096).cumsum(),
     ])
     assert series_channel_stats(arr)[0] > 0.9
-    assert series_min_partner_z(arr) < 4.0
+    assert series_min_partner_z(arr) < _UNPARTNERED_Z
 
 
 def test_constant_channel_reads_zero_partner_z_not_nan():

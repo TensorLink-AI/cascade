@@ -85,6 +85,9 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
 - Only coupled channels teach the variate layers anything. Stacking unrelated
   series into one array is legal today, but it teaches no cross-channel
   structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
+  An enforce lever exists (`[generator] unpartnered_mode`, off today): once
+  armed, a run whose share of such series exceeds `max_unpartnered_frac` is
+  rejected. Couple your channels or emit them as separate series.
 - Eval windows have at most 8 channels regardless of your C.
 
 ## 3. Verify and score locally

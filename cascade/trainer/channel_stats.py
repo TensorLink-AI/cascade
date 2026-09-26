@@ -20,12 +20,14 @@ This module computes, per multichannel series:
   independent univariate rows buys tokens without any cross-channel signal —
   it is no longer self-financed the way duplication is. Level correlation
   cannot see it (independent random walks correlate spuriously), so this
-  reads the lag-0 correlation of first differences (shared innovations), as
-  a length-normalised z-score ``|r|·sqrt(n−1)`` (≈ |N(0, 1)| under
-  independence), takes each channel's strongest partner, and reports the
-  weakest channel: a low value means some channel moves independently of
-  every other channel. Honest coupling that is purely lagged or nonlinear
-  also reads low — which is why this is measured before anything is gated.
+  reads the cross-correlation of first differences (shared innovations) at
+  every lag within ±``_PARTNER_MAX_LAG``, as a length-normalised z-score
+  ``max|r|·sqrt(n−1)``, takes each channel's strongest partner at its best
+  lag, and reports the weakest channel: a low value means some channel moves
+  independently of every other channel at every nearby lag. Scanning lags
+  keeps honest lead/lag coupling (a lagged causal DAG) partnered; a lag-0
+  read flags it. Coupling that is purely nonlinear, or lagged beyond the
+  window, still reads low — the gate below judges a fraction for that reason.
 
 An accumulator aggregates the per-series numbers into one summary record the
 trainer folds into its run metrics (→ the public training log). SHADOW ONLY:
@@ -34,7 +36,11 @@ nothing reads these values in any scoring or acceptance path, and at ``C = 1``
 The proposed ``max_channel_corr = 0.999`` gate arms only after these logs
 clear honest generators (DEC-CA-0026 open question 6).
 
-Cost: O(C²L) per multichannel series, zero for univariate.
+Cost: O(C²L) per multichannel series for ``series_channel_stats`` and
+O(C² L log L) for ``series_min_partner_z`` (≈0.6 ms at C = 2, ≈4 ms at C = 8,
+≈40 ms at C = 32 for L = 4096); zero for univariate. The always-on
+accumulator reads the partner statistic on every series up to the eval's
+8-channel cap and on a content-hashed 1-in-8 sample above it.
 """
 
 from __future__ import annotations
@@ -47,11 +53,26 @@ import numpy as np
 # channels is the reject_constant gate's business, not this diagnostic's.
 _STD_EPS = 1e-12
 
+# Lags scanned for a channel's strongest partner (both directions).
+_PARTNER_MAX_LAG = 64
+
 # A channel whose strongest partner reads below this innovation z-score is
-# "unpartnered". Under independence each pairwise z is ≈ |N(0, 1)|, so even
-# the best of 31 partners (C = 32) exceeds 4 only ~0.2% of the time, while a
-# real r = 0.1 shared-innovation coupling at L = 4096 reads z ≈ 6.4.
-_UNPARTNERED_Z = 4.0
+# "unpartnered". The score is a maximum over 2·64+1 lags, so the bar sits
+# above the Gaussian null of that maximum (median ≈ 3.1) with headroom for
+# heavy-tailed innovations (spikes, steps, counts), which inflate chance
+# peaks; a real r = 0.1 coupling at L = 4096 still reads z ≈ 6.4.
+_UNPARTNERED_Z = 5.0
+
+# Always-on telemetry reads the O(C² L log L) partner statistic on every
+# series up to this width (the eval's channel cap) and on a content-hashed
+# sample above it, so wide honest generators do not pay for the diagnostic.
+_PARTNER_FULL_MAX_C = 8
+_PARTNER_WIDE_SAMPLE = 8
+
+# The unpartnered enforce gate decides on a fraction, so it waits for this
+# many multichannel series before judging: a generator whose first few
+# groups happen to be weakly coupled is not rejected on a handful of rows.
+_UNPARTNERED_MIN_SERIES = 64
 
 
 def _corr_matrix(a: np.ndarray) -> np.ndarray:
@@ -84,42 +105,79 @@ def series_channel_stats(arr: np.ndarray) -> tuple[float, float] | None:
 
 
 def series_min_partner_z(arr: np.ndarray) -> float | None:
-    """Weakest channel's strongest shared-innovation coupling, as a z-score;
-    ``None`` below 2 channels or 3 steps. A channel that never moves has no
-    innovations and reads 0."""
+    """Weakest channel's strongest shared-innovation coupling at any lag
+    within ±``_PARTNER_MAX_LAG``, as a z-score; ``None`` below 2 channels or
+    3 steps. A channel that never moves has no innovations and reads 0."""
     a = np.atleast_2d(np.asarray(arr, dtype=np.float64))
     if a.shape[0] < 2 or a.shape[1] < 3:
         return None
     d = np.diff(a, axis=1)
-    corr = _corr_matrix(d)
-    np.fill_diagonal(corr, 0.0)
-    partner = np.abs(corr).max(axis=1)
-    return float(partner.min() * np.sqrt(d.shape[1] - 1))
+    centered = d - d.mean(axis=1, keepdims=True)
+    z = centered / np.maximum(centered.std(axis=1), _STD_EPS)[:, None]
+    n = z.shape[1]
+    lag = min(_PARTNER_MAX_LAG, n - 1)
+    m = 1 << int(np.ceil(np.log2(2 * n)))   # zero-pad: linear, not circular
+    spec = np.fft.rfft(z, n=m, axis=1)
+    xc = np.fft.irfft(spec[:, None, :] * np.conj(spec[None, :, :]), n=m, axis=2) / n
+    window = np.concatenate([xc[..., :lag + 1], xc[..., m - lag:]], axis=2)
+    peak = np.abs(window).max(axis=2)
+    np.fill_diagonal(peak, 0.0)
+    return float(peak.max(axis=1).min() * np.sqrt(n - 1))
 
 
 def corr_enforce_gate(cfg):
-    """Per-series channel-correlation gate for the drain/stream paths, from
-    ``[generator] channel_corr_mode`` / ``max_channel_corr`` (DEC-CA-0026).
+    """Channel gate for the drain/stream paths (DEC-CA-0026), covering both
+    ends of the channel axis:
 
-    Returns ``None`` unless the mode is ``"enforce"`` — "off" does nothing and
-    "shadow" is already served by the trainer's always-on accumulator (the
-    telemetry IS the shadow log). The enforce bar targets near-identity only
-    (the jitter-duplicate exploit); arming it before the shadow distribution
-    clears honest generators is a config decision this code cannot stop, but
-    the roadmap forbids.
+    * ``[generator] channel_corr_mode`` / ``max_channel_corr`` — per series,
+      near-identical channels (the jitter-duplicate exploit);
+    * ``[generator] unpartnered_mode`` / ``max_unpartnered_frac`` — per run,
+      the fraction of multichannel series carrying a channel whose
+      innovations are uncorrelated with every other channel (unrelated rows
+      stacked on the channel axis). Judged on a fraction, never one series,
+      because honest lagged or nonlinear coupling can read low at lag 0.
+
+    Returns ``None`` unless at least one mode is ``"enforce"`` — "off" does
+    nothing and "shadow" is already served by the trainer's always-on
+    accumulator (the telemetry IS the shadow log). Arming either before its
+    shadow distribution clears honest generators is a config decision this
+    code cannot stop, but the roadmap forbids. The returned gate is stateful
+    (it counts the run's multichannel series), so build one per stream.
     """
-    if getattr(cfg, "channel_corr_mode", "off") != "enforce":
+    corr_on = getattr(cfg, "channel_corr_mode", "off") == "enforce"
+    partner_on = getattr(cfg, "unpartnered_mode", "off") == "enforce"
+    if not (corr_on or partner_on):
         return None
-    bar = float(cfg.max_channel_corr)
+    corr_bar = float(cfg.max_channel_corr) if corr_on else 0.0
+    frac_bar = float(cfg.max_unpartnered_frac) if partner_on else 0.0
+    counts = {"multichannel": 0, "unpartnered": 0}
 
     def gate(canon: np.ndarray, index: int | None = None) -> None:
-        stats = series_channel_stats(canon)
-        if stats is not None and stats[0] > bar:
-            where = "" if index is None else f" (series {index})"
-            raise ValueError(
-                f"max off-diagonal channel |corr| {stats[0]:.6f} exceeds "
-                f"max_channel_corr {bar:.6f}{where} (near-duplicate channels)"
-            )
+        where = "" if index is None else f" (series {index})"
+        if corr_on:
+            stats = series_channel_stats(canon)
+            if stats is not None and stats[0] > corr_bar:
+                raise ValueError(
+                    f"max off-diagonal channel |corr| {stats[0]:.6f} exceeds "
+                    f"max_channel_corr {corr_bar:.6f}{where} (near-duplicate channels)"
+                )
+        if partner_on:
+            z = series_min_partner_z(canon)
+            if z is None:
+                return
+            counts["multichannel"] += 1
+            if z < _UNPARTNERED_Z:
+                counts["unpartnered"] += 1
+            n = counts["multichannel"]
+            if n >= _UNPARTNERED_MIN_SERIES:
+                frac = counts["unpartnered"] / n
+                if frac > frac_bar:
+                    raise ValueError(
+                        f"unpartnered multichannel fraction {frac:.3f} over {n} "
+                        f"series exceeds max_unpartnered_frac {frac_bar:.3f}{where} "
+                        "(channels whose innovations are uncorrelated with every "
+                        "other channel: unrelated rows stacked on the channel axis)"
+                    )
 
     return gate
 
@@ -166,9 +224,10 @@ class ChannelStatsAccumulator:
         self._corrs.append(stats[0])
         self._ranks.append(stats[1])
         self._n_channels.append(int(a.shape[0]))
-        partner_z = series_min_partner_z(a)
-        if partner_z is not None:
-            self._partner_z.append(partner_z)
+        if a.shape[0] <= _PARTNER_FULL_MAX_C or key[0] % _PARTNER_WIDE_SAMPLE == 0:
+            partner_z = series_min_partner_z(a)
+            if partner_z is not None:
+                self._partner_z.append(partner_z)
 
     @property
     def n_observed(self) -> int:
