@@ -26,7 +26,7 @@ def _repo(tmp_path, generator=CLEAN, **extra):
     (d / "config.json").write_text("{}")
     (d / "requirements.txt").write_text("")
     for name, body in extra.items():
-        f = d / name.replace("__", "/")
+        f = d / name          # keys may carry "/" (passed via **{...})
         f.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(body, bytes):
             f.write_bytes(body)
@@ -43,7 +43,7 @@ def test_sibling_module_is_scanned(tmp_path):
 
 
 def test_nested_package_module_is_scanned(tmp_path):
-    d = _repo(tmp_path, **{"pkg____init__.py": "", "pkg__net.py": "from subprocess import run\n"})
+    d = _repo(tmp_path, **{"pkg/__init__.py": "", "pkg/net.py": "from subprocess import run\n"})
     res = scan_tree(d, BLOCKED)
     assert not res.ok and res.blocked_module == "subprocess" and res.file == "pkg/net.py"
 
