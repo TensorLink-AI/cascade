@@ -318,6 +318,16 @@ Copying is unrewarding by construction: the earliest reveal owns a ref, and a
 byte-identical corpus is dropped before it trains. You win by improving on
 the visible best.
 
+What is *not* allowed is code that was never public. A private (vault)
+submission stays private unless it is crowned and published. An entry whose
+module — a `.py` file or a string-packed source — contains most of an
+earlier, unpublished submission's module from another hotkey (identifiers
+masked, so renaming changes nothing) is a `private_copy`: the earlier
+commit keeps the entry and the copy is dropped like any duplicate
+(`chain.toml [round] private_copy_mode`; it ships in shadow, logging
+verdicts, and the owner announces before it enforces). Building on a
+published king or any public Hub generator is never a private copy.
+
 Rotated-out eval windows are published with a lag to
 [Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
 Use them to replay past verdicts locally; live rounds always score on windows
@@ -329,6 +339,7 @@ that were never published.
 |---|---|
 | `verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, set iteration order |
 | `blocked_import` | banned import; see `chain.toml [static_guard]` |
+| `duplicate` (`private_copy`) | your entry carries most of an earlier unpublished submission's module from another hotkey — only public code is yours to build on |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`, allowlisted packages only |
 | `403 not_registered` | register the hotkey first |
 | `403 not_revealed` | the ref is not a revealed commitment for this hotkey; wait for the reveal, then fund |

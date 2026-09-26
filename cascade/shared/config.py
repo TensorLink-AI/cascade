@@ -1255,6 +1255,19 @@ class RoundConfig:
     # "enforce" = drop. The dataclass default is "off" (behavior-preserving
     # for configs without the key); the shipped mainnet chain.toml enforces.
     dedup_mode: str = "off"
+    # private_copy tier (rolling registry only): an entrant whose Python module
+    # (a .py file or a string-packed source) contains >= private_copy_min_containment
+    # of an EARLIER-committed, never-published vault submission's module from
+    # another hotkey — after masking identifiers, so renames do not help — is
+    # a copy of code that was never public. Copying PUBLIC code (a crowned
+    # king's published tree, a public Hub generator) is the design and is never
+    # flagged: a private module that itself matches public material is skipped.
+    # "shadow" logs the verdict and admits; "enforce" drops like the exact
+    # tiers (earliest commit keeps the entry). Only consulted when dedup_mode
+    # is shadow/enforce (the registry must exist).
+    private_copy_mode: str = "shadow"
+    private_copy_min_containment: float = 0.8
+    private_copy_min_tokens: int = 2_000
     # config_only tier: identical normalized .py streams, differing functional
     # config/data files. This is BOTH the observed same-round ticket-spam
     # pattern (self-declared A/B/C config sweeps) and the legitimate way to
@@ -2718,6 +2731,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                                           "trainer_commit_witness.json")),
             dedup_mode=validate_dedup_mode(str(r.get("dedup_mode", "off")),
                                            "dedup_mode"),
+            private_copy_mode=validate_dedup_mode(
+                str(r.get("private_copy_mode", "shadow")), "private_copy_mode"),
+            private_copy_min_containment=min(1.0, max(0.0, float(
+                r.get("private_copy_min_containment", 0.8)))),
+            private_copy_min_tokens=max(0, int(r.get("private_copy_min_tokens", 2_000))),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
             dedup_config_only_from_block=max(
                 0, int(r.get("dedup_config_only_from_block", 0) or 0)),

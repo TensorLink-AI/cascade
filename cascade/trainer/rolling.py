@@ -983,7 +983,9 @@ class RollingScheduler:
             return None
         q = self.ops.queue()
         if q is not None:
-            q.fail(gen.hotkey, error=f"generator duplicates {matched} ({tier}); the "
+            what = ("contains an earlier private submission's module"
+                    if tier == "private_copy" else "duplicates")
+            q.fail(gen.hotkey, error=f"generator {what} {matched} ({tier}); the "
                    "earliest commit keeps the entry", error_class="duplicate",
                    expect_ref=gen.ref)
         self.ops.burn([gen])

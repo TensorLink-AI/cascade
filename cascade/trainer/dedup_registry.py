@@ -23,6 +23,13 @@ log = logging.getLogger(__name__)
 
 TIERS = (("tree_sha256", "tree_identical"), ("token_sha256", "token_identical"),
          ("masked_sha256", "rename_identical"))
+PRIVATE_COPY_TIER = "private_copy"
+
+
+def _is_vault_ref(ref: str) -> bool:
+    from ..funding.store import parse_vault_ref
+
+    return parse_vault_ref(ref) is not None
 
 
 class DedupRegistry:
@@ -31,6 +38,20 @@ class DedupRegistry:
         self.path = Path(path)
         self.mode = mode
         self.entries: dict[str, dict] = self._load()
+        self._backfilled = False
+
+    # ── private-copy tier config ─────────────────────────────────────────────
+    def _pc_mode(self) -> str:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return str(getattr(rnd, "private_copy_mode", "off") or "off").lower()
+
+    def _pc_threshold(self) -> float:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return float(getattr(rnd, "private_copy_min_containment", 0.8))
+
+    def _pc_min_tokens(self) -> int:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return int(getattr(rnd, "private_copy_min_tokens", 2_000))
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -67,8 +88,14 @@ class DedupRegistry:
                 self.r._archive_generator_tree(ref, d)
             fp = fingerprint_dir(d, max_tokens=rnd.dedup_max_tokens,
                                  max_text_mb=rnd.dedup_max_text_mb)
-            return {"tree_sha256": fp.tree_sha256, "token_sha256": fp.token_sha256,
-                    "masked_sha256": fp.masked_sha256}
+            out = {"tree_sha256": fp.tree_sha256, "token_sha256": fp.token_sha256,
+                   "masked_sha256": fp.masked_sha256}
+            if self._pc_mode() != "off":
+                from ..interface.dedup import module_sketches
+
+                out["modules"] = module_sketches(
+                    d, min_tokens=self._pc_min_tokens(), max_text_mb=rnd.dedup_max_text_mb)
+            return out
         except Exception as e:  # noqa: BLE001
             log.warning("dedup registry: %s unfetchable/unfingerprintable (%s)", ref[:60], e)
             return None
@@ -91,8 +118,94 @@ class DedupRegistry:
             if digests is None:
                 return
         self.entries[ref] = {**digests, "hotkey": hotkey, "commit_block": int(commit_block),
-                             "kind": kind}
+                             "kind": kind, "private": _is_vault_ref(ref)}
         self._save()
+
+    # ── private-copy tier ────────────────────────────────────────────────────
+    def _published_digests(self) -> set[str]:
+        """Vault digests the champion policy has made public (the crowned
+        king's code). Unknown (no store / read failure) ⇒ empty: a copy of a
+        published king could then read as private_copy, which only matters
+        in enforce mode and is logged with the digest either way."""
+        cached = self.__dict__.get("_published_cache")
+        if cached is not None:
+            return cached
+        digests: set[str] = set()
+        try:
+            from ..funding.champion import CHAMPION_INDEX_KEY
+
+            store = self.r.manifest_store()
+            index = json.loads(store.get_text(CHAMPION_INDEX_KEY))
+            digests = {str(c.get("digest", "")) for c in index.get("champions", [])}
+        except Exception as e:  # noqa: BLE001 — best-effort
+            log.debug("dedup registry: champion index unavailable (%s)", e)
+        self.__dict__["_published_cache"] = digests
+        return digests
+
+    def _is_private(self, ref: str, rec: dict) -> bool:
+        if not rec.get("private", _is_vault_ref(ref)):
+            return False
+        from ..funding.store import parse_vault_ref
+
+        digest = parse_vault_ref(ref) or ""
+        return digest not in self._published_digests()
+
+    def _public_modules(self) -> list[frozenset[int]]:
+        return [frozenset(m["sketch"]) for ref, rec in self.entries.items()
+                if not self._is_private(ref, rec) for m in rec.get("modules", [])]
+
+    def backfill_modules(self) -> None:
+        """Sketch registered PRIVATE entries that predate the tier (their vault
+        ZIPs are on this box, so a re-fingerprint is local and cheap). Once
+        per process; every entry fails open on its own."""
+        if self._backfilled or self._pc_mode() == "off":
+            return
+        self._backfilled = True
+        todo = [ref for ref, rec in self.entries.items()
+                if "modules" not in rec and _is_vault_ref(ref)]
+        for ref in todo:
+            digests = self.fingerprint(ref)
+            if digests is None:
+                continue
+            self.entries[ref]["modules"] = digests.get("modules", [])
+            self.entries[ref].setdefault("private", True)
+        if todo:
+            self._save()
+            log.info("dedup registry: sketched %d pre-existing private entries for the "
+                     "private_copy tier", len(todo))
+
+    def match_private_copy(self, modules: list[dict], *,
+                           exclude_hotkey: str) -> tuple[str, str, int, str] | None:
+        """``(hotkey, tier, commit_block, detail)`` of the earliest-committed
+        PRIVATE registered entry (other hotkeys only) one of whose modules is
+        contained in one of ``modules`` at >= the threshold — skipping private
+        modules that are themselves public material (a public tree's module
+        carried inside a vault submission is not that submitter's to own)."""
+        from ..interface.dedup import sketch_containment
+
+        if not modules:
+            return None
+        thr = self._pc_threshold()
+        public = self._public_modules()
+        mine_sets = [(m, frozenset(m["sketch"])) for m in modules]
+        best = None
+        for ref, rec in self.entries.items():
+            if rec.get("hotkey") == exclude_hotkey or not self._is_private(ref, rec):
+                continue
+            for theirs in rec.get("modules", []):
+                their_set = frozenset(theirs["sketch"])
+                if any(sketch_containment(pub, their_set) >= thr for pub in public):
+                    continue
+                for mine, mine_set in mine_sets:
+                    c = sketch_containment(mine_set, their_set)
+                    if c >= thr:
+                        detail = (f"{mine['name']} contains {c:.0%} of {theirs['name']} "
+                                  f"({theirs['tokens']} masked tokens) from {ref[:40]}")
+                        cand = (rec["hotkey"], PRIVATE_COPY_TIER,
+                                int(rec.get("commit_block") or 0), detail)
+                        if best is None or cand[2] < best[2]:
+                            best = cand
+        return best
 
     def match(self, digests: dict, *, exclude_hotkey: str) -> tuple[str, str, int] | None:
         """``(hotkey, tier, commit_block)`` of the earliest-committed registered
@@ -121,6 +234,19 @@ class DedupRegistry:
         hit = self.match(digests, exclude_hotkey=gen.hotkey)
         if hit is not None and (hit[2] == 0 or my_block == 0 or hit[2] <= my_block):
             return hit[0], hit[1], self.mode == "enforce"
+        pc_mode = self._pc_mode()
+        if pc_mode in ("shadow", "enforce"):
+            self.backfill_modules()
+            pc = self.match_private_copy(digests.get("modules", []), exclude_hotkey=gen.hotkey)
+            if pc is not None and (pc[2] == 0 or my_block == 0 or pc[2] <= my_block):
+                log.warning("dedup registry: %s private_copy of %s — %s [%s]",
+                            gen.hotkey[:12], pc[0][:12], pc[3], pc_mode)
+                # A flagged-but-admitted entry (shadow) is still registered:
+                # what it carries is on record for the next comer.
+                if pc_mode != "enforce":
+                    self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block,
+                                  kind="queue", digests=digests)
+                return pc[0], pc[1], pc_mode == "enforce"
         self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block, kind="queue",
                       digests=digests)
         return None
