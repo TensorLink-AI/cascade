@@ -52,7 +52,11 @@ Rules that matter:
   to `__init__`. Seed every RNG from it; never use `hash()`, wall-clock, or the
   network. Two runs at one seed must produce byte-identical corpora.
 - **Allowlisted imports only.** `socket`, `subprocess`, `pickle`,
-  `multiprocessing` and friends are blocked (`chain.toml [static_guard]`).
+  `multiprocessing` and friends are blocked (`chain.toml [static_guard]`) in
+  EVERY `.py` in your tree and in any source you pack into a string constant
+  (plain, base64, zlib, hex — packed modules are unpacked and scanned the
+  same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
+  rejected outright: generators are source-only.
 - **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`
   with `64 ≤ L ≤ 4096` and `C ≤ 32`. Values must be finite.
 - **Speed is scored.** Your generator streams during training and the compute
@@ -328,7 +332,8 @@ that were never published.
 | symptom | cause / fix |
 |---|---|
 | `verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, set iteration order |
-| `blocked_import` | banned import; see `chain.toml [static_guard]` |
+| `blocked_import` | banned import (the message names the file, or `packed[n]` for a string-packed module); see `chain.toml [static_guard]` |
+| `binary_modules_forbidden` | a `.so`/`.pyd`/`.pyc`/… in the tree — ship source only |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`, allowlisted packages only |
 | `403 not_registered` | register the hotkey first |
 | `403 not_revealed` | the ref is not a revealed commitment for this hotkey; wait for the reveal, then fund |

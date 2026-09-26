@@ -44,6 +44,12 @@ fi
 ssh "${SSH_OPTS[@]}" "$DEST" bash -s <<REMOTE
 set -euo pipefail
 cd "$POD_WORKDIR"
+# The generator sandbox wants an unprivileged user+net namespace. Ubuntu 24.04
+# VM images ship with AppArmor refusing unprivileged userns; re-enable it
+# (best-effort, no-op in containers and on kernels without the knob) so the
+# sandbox gets the strong wrapper instead of the root-netns fallback.
+sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+sysctl -qw kernel.unprivileged_userns_clone=1 2>/dev/null || true
 command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="\$HOME/.local/bin:\$PATH"
 uv sync --frozen --all-extras --no-dev
