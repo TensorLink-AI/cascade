@@ -386,7 +386,10 @@ With `--submission-dir` on the intake and `[round] submission_vault_dir` +
   A submit-with-key parks `pending_reveal` and auto-queues when the chain
   reveal resolves (the intake sweeps on every request).
 - Ownership: earliest upload owns a digest; another hotkey committing your
-  digest is dropped at field entry; byte-copies still die at dedup.
+  digest is dropped at field entry; byte-copies still die at dedup, and so
+  does an entry that carries most of your unpublished module inside another
+  tree (`private_copy` — identifier renames do not help; only published
+  code is anyone else's to build on).
 - Publication: ONLY thrones publish (`champions/<digest>.zip` + index,
   public-read on the manifest bucket) per `champion_publish`: `crown` (live:
   published when crowned) / `delay` (after `champion_publish_delay_rounds`) /

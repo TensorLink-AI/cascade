@@ -591,3 +591,141 @@ def collapse_identical_behavior(
             seen[digest] = (hotkey, uid)
             kept.append(hotkey)
     return tuple(kept), tuple(dropped)
+
+
+# ── per-module sketches: the private-copy tier ───────────────────────────────
+#
+# The exact tiers above catch re-uploads, comment shuffles and rename-only
+# copies of a WHOLE tree. They cannot see a submission that wraps another
+# miner's private module inside a different outer tree (2026-09-24: a crown
+# built on a never-published vault submission's packed module, renamed
+# identifier-for-identifier, glued to a public lineage). Copying public code
+# is the design; copying code that was never public can only mean it left
+# the operator's store — so that, and only that, is what this tier screens.
+#
+# Each Python module (a ``.py`` file, or a source packed into a string
+# constant — plain, base64, zlib, hex — nested up to three deep) becomes a
+# sketch: the set of 8-gram shingles over its NAME-MASKED token stream,
+# subsampled by hash (``h % SKETCH_SAMPLE_MOD == 0``), so containment
+# ``|A∩B| / |B|`` is an unbiased estimate of how much of module B's masked
+# text appears in module A — rename-proof, and robust to the small edits a
+# copier makes. Sketch hashes are BLAKE2b, never ``hash()`` (which is
+# salted per process — the sketches persist across restarts).
+
+SKETCH_SHINGLE = 8
+SKETCH_SAMPLE_MOD = 8
+MIN_MODULE_TOKENS = 2_000         # helpers below this size are not "a module" worth owning
+# A module's PRIVATE part (its shingles minus every public module's) must be
+# at least this many sampled shingles AND this fraction of the module before
+# anyone can be said to own it — a vault file that is a public lineage with a
+# few edits owns the edits, not the lineage, and the edits alone are too
+# little to build a copy claim on.
+MIN_PRIVATE_SHINGLES = 64
+MIN_PRIVATE_FRACTION = 0.25
+MIN_PACKED_CHARS = 200
+MAX_PACK_DEPTH = 3
+
+
+def _packed_sources(source: str, _depth: int = 0) -> list[str]:
+    """Every string constant in ``source`` that decodes to Python source
+    (plain, base64, zlib, base64+zlib, hex), recursively."""
+    import ast
+    import base64
+    import binascii
+    import zlib
+
+    if _depth >= MAX_PACK_DEPTH:
+        return []
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+                and len(node.value) >= MIN_PACKED_CHARS):
+            continue
+        raw = node.value.encode("utf-8", "surrogatepass") if isinstance(node.value, str) else node.value
+        stripped = b"".join(raw.split())
+        cands = [raw]
+        for fn in (lambda b: base64.b64decode(b, validate=True),
+                   lambda b: zlib.decompress(base64.b64decode(b, validate=True)),
+                   zlib.decompress, binascii.unhexlify):
+            try:
+                dec = fn(stripped)
+            except Exception:  # noqa: BLE001 — not that encoding
+                continue
+            if dec and dec not in cands:
+                cands.append(dec)
+        for dec in cands:
+            head = dec[:262_144]
+            if not (b"import " in head or b"def " in head or b"class " in head):
+                continue
+            text = dec.decode("utf-8", "replace")
+            try:
+                if not ast.parse(text).body:
+                    continue
+            except (SyntaxError, ValueError):
+                continue
+            out.append(text)
+            out.extend(_packed_sources(text, _depth + 1))
+    return out
+
+
+def sketch_source(source: str, *, min_tokens: int = MIN_MODULE_TOKENS) -> tuple[int, list[int]]:
+    """``(token_count, sorted sampled shingle hashes)`` of one Python source's
+    name-masked token stream; ``(n, [])`` when it is shorter than ``min_tokens``."""
+    toks = [_masked(t, True) for t in iter_normalized_tokens(source)]
+    n = len(toks)
+    if n < min_tokens:
+        return n, []
+    sample: set[int] = set()
+    for i in range(0, n - SKETCH_SHINGLE + 1):
+        h = int.from_bytes(hashlib.blake2b("\x1f".join(toks[i:i + SKETCH_SHINGLE]).encode(
+            "utf-8", "surrogatepass"), digest_size=8).digest(), "big")
+        if h % SKETCH_SAMPLE_MOD == 0:
+            sample.add(h)
+    return n, sorted(sample)
+
+
+def module_sketches(
+    repo_dir: Path | str,
+    *,
+    min_tokens: int = MIN_MODULE_TOKENS,
+    max_text_mb: float = DEFAULT_MAX_TEXT_MB,
+) -> list[dict]:
+    """Sketch every Python module of a fetched tree — each ``.py`` file and
+    each source packed into one of its string constants — as
+    ``{"name", "tokens", "sketch"}``. Modules under ``min_tokens`` are left
+    out; decoding stops after ``max_text_mb`` of source (bounded like
+    :func:`fingerprint_dir`)."""
+    root = Path(repo_dir)
+    budget = int(max(0.0, float(max_text_mb)) * 1024 * 1024)
+    out: list[dict] = []
+    for p in sorted((q for q in root.rglob("*.py") if q.is_file()),
+                    key=lambda q: str(q.relative_to(root))):
+        rel = p.relative_to(root)
+        if _is_junk(rel.parts):
+            continue
+        size = p.stat().st_size
+        if budget - size < 0:
+            break
+        budget -= size
+        text = p.read_bytes().decode("utf-8", "replace")
+        sources = [(str(rel), text)]
+        sources += [(f"{rel}#packed{i}", s) for i, s in enumerate(_packed_sources(text), 1)]
+        for name, src in sources:
+            n, sk = sketch_source(src, min_tokens=min_tokens)
+            if sk:
+                out.append({"name": name, "tokens": n, "sketch": sk})
+    return out
+
+
+def sketch_containment(a: list[int] | set[int], b: list[int] | set[int]) -> float:
+    """How much of sketch ``b`` appears in sketch ``a`` (0.0 when ``b`` is empty).
+    Pass sets when comparing many pairs — lists are converted per call."""
+    sb = b if isinstance(b, (set, frozenset)) else set(b)
+    if not sb:
+        return 0.0
+    sa = a if isinstance(a, (set, frozenset)) else set(a)
+    return len(sa & sb) / len(sb)
