@@ -1049,6 +1049,7 @@ class RemoteDispatcher:
         env.update(dict(host.static_env))
         log.info("dispatch role=%s → %s (%s) device=%s%s", role, host.name, host.host,
                  host.cuda_device, " [detached]" if self.detached else "")
+        prior = None
         if self.detached:
             body = _guarded_worker(_lane_prefix(host, lane_count), argv)
             tag = f"{role}-{hotkey[:12]}-{base_seed}"
@@ -1084,6 +1085,22 @@ class RemoteDispatcher:
                 returncode=proc.returncode,
             )
         receipt = parse_receipt(proc.stdout or "")
+        if (local_checkpoint and self.detached and prior
+                and "local_checkpoint_dir" not in receipt and "trained_pointer" in receipt):
+            # We attached to a run some EARLIER dispatch launched — one that
+            # ran without --local-only and uploaded its checkpoint itself (a
+            # pod adopted across a code change, e.g. a credentialed king pod
+            # rented before the isolated-king rollout). Its receipt is judged
+            # by its shape, not by how THIS dispatcher would have launched it:
+            # a complete pushed receipt is a finished leg, and rejecting it
+            # would throw the trained checkpoint away and retrain from scratch.
+            log.warning("remote %s on %s: attached run %s was launched without "
+                        "--local-only and uploaded its own checkpoint — accepting "
+                        "its pushed receipt (no harvest)", role, host.name, prior)
+            entry = receipt_to_entry(receipt)
+            if entry.role != role:
+                raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
+            return entry
         entry = (receipt_to_local(receipt) if local_checkpoint
                  else receipt_to_entry(receipt))
         if entry.role != role:

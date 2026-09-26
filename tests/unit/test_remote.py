@@ -819,3 +819,73 @@ def test_non_isolated_host_is_untouched_by_the_hook():
     out = disp.dispatch(host, lane_count=1, gen_ref=REF_A,
                         uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
     assert isinstance(out, TrainedEntry)
+
+
+# ── attaching to a run an EARLIER dispatcher launched ────────────────────────
+# A pod adopted across a code change may hold a finished run that was launched
+# WITHOUT --local-only (it uploaded its own checkpoint). The receipt is judged
+# by its shape: a complete pushed receipt is a finished leg, never "not a valid
+# local-train receipt" — that rejection threw a 4h king checkpoint away.
+
+def _detached_dispatcher(monkeypatch, *, prior, receipt: dict, harvest):
+    import json
+    import subprocess
+
+    from cascade.trainer import remote as R
+
+    monkeypatch.setenv("HIPPIUS_S3_ACCESS_KEY", "op-s3")
+    monkeypatch.setattr(R, "find_detached_run", lambda host, tag, runner=None: prior)
+    monkeypatch.setattr(R, "run_detached", lambda *a, **k: subprocess.CompletedProcess(
+        [], 0, R.RECEIPT_SENTINEL + json.dumps(receipt), ""))
+    return R.RemoteDispatcher(trainer_spec="m:C", harvest=harvest, detached=True)
+
+
+def test_attached_pushed_receipt_on_isolated_host_is_accepted_without_harvest(monkeypatch):
+    from cascade.trainer.remote import TrainedEntry
+
+    calls = []
+    disp = _detached_dispatcher(
+        monkeypatch, prior="/w/_dispatch/king-hkA-7-deadbeef",
+        receipt=_receipt_dict(role="king", uid=1, hotkey="hkA"),
+        harvest=lambda *a, **k: calls.append(1))
+    out = disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                        uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+    assert isinstance(out, TrainedEntry) and out.trained_pointer
+    assert calls == []                                   # nothing to harvest
+
+
+def test_fresh_launch_on_isolated_host_still_requires_a_local_receipt(monkeypatch):
+    from cascade.trainer.remote import RemoteDispatchError
+
+    disp = _detached_dispatcher(
+        monkeypatch, prior=None,                         # this dispatcher launched it
+        receipt=_receipt_dict(role="king", uid=1, hotkey="hkA"),
+        harvest=lambda *a, **k: None)
+    with pytest.raises(RemoteDispatchError, match="local_checkpoint_dir"):
+        disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                      uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+
+
+def test_attached_local_receipt_is_still_harvested(monkeypatch):
+    sentinel = object()
+    local = {"miner_hotkey": "hkA", "miner_uid": 1, "role": "king", "gen_ref": REF_A,
+             "corpus_digest": "c" * 64, "train_block": 12,
+             "local_checkpoint_dir": "/w/checkpoint", "tensor_digests": {}}
+    disp = _detached_dispatcher(
+        monkeypatch, prior="/w/_dispatch/king-hkA-7-deadbeef", receipt=local,
+        harvest=lambda *a, **k: sentinel)
+    out = disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                        uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+    assert out is sentinel
+
+
+def test_attached_pushed_receipt_role_mismatch_is_rejected(monkeypatch):
+    from cascade.trainer.remote import RemoteDispatchError
+
+    disp = _detached_dispatcher(
+        monkeypatch, prior="/w/_dispatch/king-hkA-7-deadbeef",
+        receipt=_receipt_dict(role="challenger", uid=1, hotkey="hkA"),
+        harvest=lambda *a, **k: None)
+    with pytest.raises(RemoteDispatchError, match="receipt role"):
+        disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                      uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
