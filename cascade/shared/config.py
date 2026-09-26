@@ -142,6 +142,20 @@ class GeneratorConfig:
     #                       the shadow logs clear honest generators.
     channel_corr_mode: str = "off"
     max_channel_corr: float = 0.999
+    # The other end of the same axis: unrelated univariate rows stacked on the
+    # channel axis (billed L under series_points, trained C×L).
+    #   unpartnered_mode     — "off" (default) | "shadow" (telemetry only;
+    #                          channel_telemetry.frac_unpartnered is always
+    #                          logged) | "enforce" (reject the run once, over
+    #                          at least 64 multichannel series, the fraction
+    #                          carrying an unpartnered channel exceeds
+    #                          max_unpartnered_frac).
+    #   max_unpartnered_frac — set from frac_unpartnered on honest generators
+    #                          before arming; tolerates honest coupling that is
+    #                          nonlinear or lagged beyond ±64 steps, which the
+    #                          partner statistic cannot see.
+    unpartnered_mode: str = "off"
+    max_unpartnered_frac: float = 0.5
     sandbox_mode: str = "subprocess"   # "subprocess" | "container"
     sandbox_image: str = ""            # container image for sandbox_mode="container"
     sandbox_python: str = "python3"    # python inside that image (worker: /root/cascade/.venv/bin/python)
@@ -2592,6 +2606,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             channel_corr_mode=validate_dedup_mode(
                 str(g.get("channel_corr_mode", "off")), "channel_corr_mode"),
             max_channel_corr=float(g.get("max_channel_corr", 0.999)),
+            unpartnered_mode=validate_dedup_mode(
+                str(g.get("unpartnered_mode", "off")), "unpartnered_mode"),
+            max_unpartnered_frac=min(1.0, max(0.0, float(
+                g.get("max_unpartnered_frac", 0.5)))),
             sandbox_mode=validate_sandbox_mode(str(g.get("sandbox_mode", "subprocess"))),
             sandbox_image=str(g.get("sandbox_image", "")),
             sandbox_python=str(g.get("sandbox_python", "python3")),

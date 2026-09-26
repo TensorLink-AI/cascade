@@ -79,6 +79,14 @@ max_missing_frac     = 0.5
 channel_corr_mode    = "shadow"  # armed with the C=32 raise: labels only, drops
                                  # nothing; enforce waits on the shadow telemetry
 max_channel_corr     = 0.999
+# The other end of the channel axis: unrelated univariate rows stacked into
+# one (C, L) array ("off" | "shadow" | "enforce" against max_unpartnered_frac,
+# the run's fraction of multichannel series carrying a channel whose
+# innovations are uncorrelated with every other channel at every lag within
+# ±64 steps). Read the bar off
+# channel_telemetry.frac_unpartnered on honest generators before arming.
+unpartnered_mode     = "off"
+max_unpartnered_frac = 0.5
 # Structural data-quality gates (enforced by the trainer and `cascade verify`).
 max_abs_value        = 0.0       # reject series whose peak |value| exceeds this; 0.0 = float32 ceiling
 reject_constant      = false     # reject flat (zero-range) series
