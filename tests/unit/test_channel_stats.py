@@ -7,6 +7,7 @@ import numpy as np
 from cascade.trainer.channel_stats import (
     ChannelStatsAccumulator,
     series_channel_stats,
+    series_min_partner_z,
 )
 
 
@@ -41,6 +42,46 @@ def test_constant_channel_contributes_zero_corr_not_nan():
     assert corr < 1e-6
 
 
+def test_min_partner_z_needs_two_channels():
+    assert series_min_partner_z(np.arange(100.0)) is None
+    assert series_min_partner_z(np.arange(100.0)[None, :]) is None
+
+
+def test_glued_independent_walks_read_unpartnered():
+    # The glued-rows shape: two unrelated random walks stacked as (2, L).
+    # Their levels can correlate spuriously; their innovations do not.
+    rng = np.random.default_rng(3)
+    arr = rng.standard_normal((2, 4096)).cumsum(axis=1)
+    assert series_min_partner_z(arr) < 4.0
+
+
+def test_shared_driver_reads_partnered():
+    rng = np.random.default_rng(4)
+    driver = rng.standard_normal(4096)
+    own = rng.standard_normal((3, 4096))
+    arr = (0.5 * driver + own).cumsum(axis=1)
+    assert series_min_partner_z(arr) > 10.0
+
+
+def test_one_glued_channel_is_enough_to_flag():
+    # Channels 0 and 1 share a driver; channel 2 is an unrelated row.
+    rng = np.random.default_rng(5)
+    driver = rng.standard_normal(4096)
+    arr = np.stack([
+        (driver + 0.3 * rng.standard_normal(4096)).cumsum(),
+        (driver + 0.3 * rng.standard_normal(4096)).cumsum(),
+        rng.standard_normal(4096).cumsum(),
+    ])
+    assert series_channel_stats(arr)[0] > 0.9
+    assert series_min_partner_z(arr) < 4.0
+
+
+def test_constant_channel_reads_zero_partner_z_not_nan():
+    arr = np.stack([np.arange(100.0) ** 1.5, np.full(100, 5.0)])
+    z = series_min_partner_z(arr)
+    assert np.isfinite(z) and z == 0.0
+
+
 def test_accumulator_skips_univariate_and_summarises_mv():
     acc = ChannelStatsAccumulator()
     rng = np.random.default_rng(2)
@@ -59,6 +100,10 @@ def test_accumulator_skips_univariate_and_summarises_mv():
     assert s["max_abs_corr_max"] > 0.999
     assert s["frac_over_0999"] == 0.5
     assert 1.0 <= s["effective_rank_min"] <= s["effective_rank_p50"]
+    # The duplicate pair shares every innovation; the independent triple
+    # shares none.
+    assert s["frac_unpartnered"] == 0.5
+    assert s["min_partner_z_p10"] <= s["min_partner_z_p50"]
 
 
 def test_trainer_metrics_carry_summary_only_for_mv_corpora():

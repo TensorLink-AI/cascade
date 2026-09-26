@@ -35,6 +35,9 @@ Channel economics, so you can decide what to emit:
   C-channel window counts once); channels of one series should carry related
   signal. Near-duplicate channels are flagged by the channel-redundancy
   telemetry (`channel_corr_mode = "shadow"` today; enforcement will follow it).
+  So are unrelated rows stacked into one array: a channel whose innovations
+  are uncorrelated with every other channel is logged as unpartnered
+  (`channel_telemetry.frac_unpartnered`, shadow only).
 * A univariate generator stays fully legal — `C = 1` batches, budgets, and
   scores are byte-identical to the pre-raise behaviour.
 

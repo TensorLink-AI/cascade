@@ -79,7 +79,8 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
 - From block 9068400 (Mon 2026-09-14 ~20:30 UTC) multivariate eval windows are
   scored jointly: all channels forecast in one pass, the window counts once.
 - Only coupled channels teach the variate layers anything. Stacking unrelated
-  series into one array is legal and useless.
+  series into one array is legal today, but it teaches no cross-channel
+  structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
 - Eval windows have at most 8 channels regardless of your C.
 
 ## 3. Verify and score locally
