@@ -48,7 +48,9 @@ in-context.
   identical-output processes (refuses to run without a kernel-enforced
   sandbox); copy contests resolve on earliest COMMIT (witnessed while
   sealed) — never on UID, which recycles; LLM judge is advisory-only, never
-  in the enforcement path.
+  in the enforcement path. Amended 2026-09-26: exact `embedded_*` tiers see
+  through string-packed sources (either direction; `dedup_embedded_mode`,
+  shadow first) and the rolling registry holds the king + published champions.
   (`decisions/DEC-CA-0008-content-dedup.md`)
 
 - **DEC-CA-0009** — The CRPS half of the round metric is a per-window geomean of

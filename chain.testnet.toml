@@ -260,6 +260,7 @@ submission_vault_dir = "submission_vault"  # FUNDED-TEST       # direct submissi
 champion_publish = "dethrone"  # FUNDED-TEST: rehearse the mainnet publish policy
 champion_publish_delay_rounds = 2
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
+dedup_embedded_mode = "enforce"     # TESTNET: exact embedded tiers drop (mainnet ships the "shadow" default)
 dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
 # The probe executes generator code on the orchestrator and this config keeps
 # the permissive sandbox defaults (sandbox_strict = false, line 50), so the

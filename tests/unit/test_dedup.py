@@ -1166,3 +1166,144 @@ def test_delta_phase_budget_bounds_the_whole_screen(tmp_path, monkeypatch):
     assert result.kept_hotkeys == ("orig", "swp")   # verdicts unchanged
     (v,) = [s for s in result.shadow if s.tier == "config_only"]
     assert v.abs_delta is None                       # only the metric degrades
+
+
+# ── embedded tiers: a generator packed into a string constant ────────────────
+# (DEC-CA-0008 amended 2026-09-26: exact identity only, either direction)
+
+def _wrap(source: str, *, how: str = "plain") -> str:
+    import base64
+    import zlib
+    b = source.encode()
+    blob = {"plain": repr(source),
+            "b64": repr(base64.b64encode(b).decode()),
+            "b64z": repr(base64.b64encode(zlib.compress(b)).decode())}[how]
+    return f"import base64, zlib\n_P = {blob}\nexec(compile(_P, '<p>', 'exec'))\n"
+
+
+def _screen(entries, king=None, **kw):
+    from cascade.interface.dedup import screen_duplicates
+    return screen_duplicates(entries, king, **kw)
+
+
+def test_component_digest_equals_one_file_repo_py_digest(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
+    wrap = fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE)))
+    assert len(wrap.components) == 1
+    c = wrap.components[0]
+    assert c.name == "generator.py#packed1"
+    assert c.token_sha256 == plain.py_sha256
+    assert c.masked_sha256 == plain.py_masked_sha256
+    assert c.n_tokens > 200
+    # the whole-repo digests are the same code as before: the wrapper is NOT
+    # token-identical to the plain repo (its stream is one string token).
+    assert wrap.token_sha256 != plain.token_sha256
+    assert wrap.py_sha256 != plain.py_sha256
+
+
+@pytest.mark.parametrize("how", ["plain", "b64", "b64z"])
+def test_wrapper_of_plain_repo_matches_embedded_token(tmp_path, how):
+    from cascade.interface.dedup import fingerprint_dir
+    plain = _entry(tmp_path, "plain", 1, BASE_SOURCE)
+    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, f"wrap-{how}", _wrap(BASE_SOURCE, how=how))))
+    prio = {"plain": 100, "wrap": 200}
+    r = _screen([plain, wrap], priority=prio, embedded_mode="enforce")
+    assert r.kept_hotkeys == ("plain",)
+    assert [(v.hotkey, v.matched_hotkey, v.tier) for v in r.dropped] == [
+        ("wrap", "plain", "embedded_token_identical")]
+    # shadow: same verdict, nothing dropped
+    r = _screen([plain, wrap], priority=prio, embedded_mode="shadow")
+    assert r.kept_hotkeys == ("plain", "wrap") and r.dropped == ()
+    assert [(v.hotkey, v.tier) for v in r.shadow] == [("wrap", "embedded_token_identical")]
+    # off (the default): the tiers do not exist
+    r = _screen([plain, wrap], priority=prio)
+    assert r.kept_hotkeys == ("plain", "wrap") and r.dropped == () and r.shadow == ()
+
+
+def test_plain_repo_of_someones_blob_matches_the_other_direction(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    wrap = ("wrap", 1, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE))))
+    plain = _entry(tmp_path, "plain", 2, BASE_SOURCE)
+    r = _screen([wrap, plain], priority={"wrap": 100, "plain": 200}, embedded_mode="enforce")
+    assert r.kept_hotkeys == ("wrap",)
+    assert [(v.hotkey, v.matched_hotkey, v.tier) for v in r.dropped] == [
+        ("plain", "wrap", "embedded_token_identical")]
+
+
+def test_renamed_blob_matches_embedded_rename(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    plain = _entry(tmp_path, "plain", 1, BASE_SOURCE)
+    renamed = BASE_SOURCE.replace("self.w", "self.v").replace("rng", "gen")
+    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(renamed))))
+    r = _screen([plain, wrap], priority={"plain": 100, "wrap": 200}, embedded_mode="enforce")
+    assert [(v.hotkey, v.tier) for v in r.dropped] == [("wrap", "embedded_rename_identical")]
+    # a real edit inside the blob is not identity
+    edited = BASE_SOURCE.replace("size=64", "size=65")
+    wrap2 = ("wrap2", 3, fingerprint_dir(_repo(tmp_path, "wrap2", _wrap(edited))))
+    r = _screen([plain, wrap2], priority={"plain": 100, "wrap2": 200}, embedded_mode="enforce")
+    assert r.dropped == () and r.shadow == ()
+
+
+def test_two_wrappers_of_the_same_blob_match(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    a = ("a", 1, fingerprint_dir(_repo(tmp_path, "a", _wrap(BASE_SOURCE, how="b64"))))
+    b = ("b", 2, fingerprint_dir(_repo(tmp_path, "b", "# other wrapper\n" + _wrap(BASE_SOURCE))))
+    r = _screen([a, b], priority={"a": 1, "b": 2}, embedded_mode="enforce")
+    assert [(v.hotkey, v.tier) for v in r.dropped] == [("b", "embedded_token_identical")]
+
+
+def test_wrapper_of_the_king_is_dropped(tmp_path):
+    from cascade.interface.dedup import KING_UID, fingerprint_dir
+    king = fingerprint_dir(_repo(tmp_path, "king", BASE_SOURCE))
+    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE))))
+    r = _screen([wrap], king, embedded_mode="enforce")
+    assert r.kept_hotkeys == ()
+    assert [(v.matched_hotkey, v.matched_uid, v.tier) for v in r.dropped] == [
+        ("king", KING_UID, "embedded_token_identical")]
+
+
+def test_strings_that_are_not_generators_are_not_components(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    doc = '"""' + "A long docstring that explains the generator. " * 20 + '"""\n'
+    tiny = "_S = " + repr("def f(x):\n    return x + 1\n" * 3) + "\n"      # parses, < 200 tokens
+    nodef = "_T = " + repr("x = 1\n" * 200) + "\n"                          # parses, no def/class
+    junk = "_U = " + repr("not python ( at all" * 40) + "\n"
+    fp = fingerprint_dir(_repo(tmp_path, "r", doc + tiny + nodef + junk + BASE_SOURCE))
+    assert fp.components == ()
+
+
+def test_nested_packing_is_found(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
+    outer = fingerprint_dir(_repo(tmp_path, "outer", _wrap(_wrap(BASE_SOURCE), how="b64z")))
+    # packed1 is the middle wrapper (a dozen tokens: not a component);
+    # packed2 is the generator inside it.
+    assert [c.name for c in outer.components] == ["generator.py#packed2"]
+    assert outer.components[0].token_sha256 == plain.py_sha256
+
+
+def test_components_respect_the_decode_budget_without_moving_digests(tmp_path):
+    from cascade.interface.dedup import fingerprint_dir
+    # a compressed blob: the FILE is a few KB, the decoded source ~13 KB
+    d = _repo(tmp_path, "wrap", _wrap(BASE_SOURCE, how="b64z"))
+    size = (d / "generator.py").stat().st_size
+    full = fingerprint_dir(d)
+    assert full.components[0].n_bytes > 2 * size
+    # budget fits the file but not its decoded blob: no component, flagged
+    # truncated, and the whole-repo digests do not move.
+    tight = fingerprint_dir(d, max_text_mb=(size + 64) / (1024 * 1024))
+    assert full.components and tight.components == ()
+    assert tight.truncated and not full.truncated
+    assert (tight.tree_sha256, tight.token_sha256, tight.masked_sha256, tight.py_sha256) == (
+        full.tree_sha256, full.token_sha256, full.masked_sha256, full.py_sha256)
+
+
+def test_embedded_tier_helper_direct(tmp_path):
+    from cascade.interface.dedup import embedded_tier, fingerprint_dir
+    plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
+    other = fingerprint_dir(_repo(tmp_path, "other", BASE_SOURCE.replace("size=64", "size=65")))
+    wrap = fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE)))
+    assert embedded_tier(plain, wrap) == embedded_tier(wrap, plain) == "embedded_token_identical"
+    assert embedded_tier(plain, other) is None       # neither side has components
+    assert embedded_tier(other, wrap) is None        # different code

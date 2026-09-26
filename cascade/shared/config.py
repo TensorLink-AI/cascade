@@ -1268,6 +1268,14 @@ class RoundConfig:
     private_copy_mode: str = "shadow"
     private_copy_min_containment: float = 0.8
     private_copy_min_tokens: int = 2_000
+    # embedded tiers (exact identity, DEC-CA-0008): a Python source packed into
+    # a string constant of an entrant's .py file (plain / base64 / zlib / hex)
+    # that equals — byte-for-byte, or after identifier masking — another
+    # entry's whole .py stream or one of ITS packed sources, in either
+    # direction (a wrapper around someone's generator, or a plain re-submission
+    # of someone's blob). "shadow" logs and admits; "enforce" drops like the
+    # whole-repo tiers. Only consulted when dedup_mode is shadow/enforce.
+    dedup_embedded_mode: str = "shadow"
     # config_only tier: identical normalized .py streams, differing functional
     # config/data files. This is BOTH the observed same-round ticket-spam
     # pattern (self-declared A/B/C config sweeps) and the legitimate way to
@@ -2736,6 +2744,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             private_copy_min_containment=min(1.0, max(0.0, float(
                 r.get("private_copy_min_containment", 0.8)))),
             private_copy_min_tokens=max(0, int(r.get("private_copy_min_tokens", 2_000))),
+            dedup_embedded_mode=validate_dedup_mode(
+                str(r.get("dedup_embedded_mode", "shadow")), "dedup_embedded_mode"),
             dedup_config_only_enforce=bool(r.get("dedup_config_only_enforce", False)),
             dedup_config_only_from_block=max(
                 0, int(r.get("dedup_config_only_from_block", 0) or 0)),

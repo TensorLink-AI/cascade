@@ -4171,6 +4171,7 @@ class TrainerRunner:
                 config_only_enforce=config_only_enforce,
                 priority=self._commit_priority(entrants),
                 enforce=(mode == "enforce"),
+                embedded_mode=(rnd.dedup_embedded_mode or "off").lower(),
             )
         except Exception as e:  # noqa: BLE001 — the screen must never sink a round
             log.warning("dedup: screen failed (%s); heat proceeds unscreened", e)
