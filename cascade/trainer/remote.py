@@ -173,8 +173,9 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         stage = "any"       # "heat" | "final" | "any" — which round stage this pod serves
         sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
         isolated = true     # optional: the pod receives NOTHING from the orchestrator's
-                            # environment (forward_env ignored) — for lanes whose legs
-                            # train --local-only and are harvested by the orchestrator
+                            # environment (forward_env ignored); its legs train
+                            # --local-only and the orchestrator harvests, verifies and
+                            # uploads the checkpoint itself. Prefer it for every lane.
     """
     p = Path(path)
     if not p.is_file():
@@ -981,6 +982,15 @@ class RemoteDispatcher:
     # operator's own values: an isolated host still gets none of forward_env /
     # extra_forward_env.
     isolated_forward_env: tuple[tuple[str, str], ...] = ()
+    # Harvester for ISOLATED hosts: ``harvest(host, receipt, *, base_seed,
+    # repo_suffix) -> TrainedEntry``. An isolated host carries no upload
+    # credential, so its legs are forced ``--local-only`` and the checkpoint is
+    # pulled, verified and uploaded from the orchestrator (the same path payer
+    # pods use). A caller that passes ``local_checkpoint=True`` itself gets the
+    # raw receipt back and harvests on its own terms; a caller that does not,
+    # on an isolated host, needs this — unset it and the dispatch fails
+    # closed rather than launching a worker that cannot deliver its result.
+    harvest: object = None
     # Detached dispatch (see run_detached): the worker runs in its own session
     # on the pod and the orchestrator polls; an ssh drop no longer kills the
     # leg. Off by default here (the attached form is the test fixture shape);
@@ -1010,6 +1020,15 @@ class RemoteDispatcher:
     ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
+        auto_harvest = False
+        if host.isolated and not local_checkpoint:
+            if self.harvest is None:
+                raise RemoteDispatchError(
+                    f"remote {role} on {host.name}: isolated host (no credential is "
+                    "forwarded) needs a harvesting dispatcher — refusing to launch a "
+                    "worker that could not upload its checkpoint")
+            local_checkpoint = True
+            auto_harvest = True
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
@@ -1069,6 +1088,8 @@ class RemoteDispatcher:
                  else receipt_to_entry(receipt))
         if entry.role != role:
             raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
+        if auto_harvest:
+            return self.harvest(host, entry, base_seed=base_seed, repo_suffix=repo_suffix)
         return entry
 
 

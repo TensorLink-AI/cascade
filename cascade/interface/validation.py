@@ -62,6 +62,21 @@ FORBIDDEN_WEIGHT_GLOBS: tuple[str, ...] = (
     "*.npy",
 )
 
+# Compiled / native modules: the static guard reads Python source, so a
+# shipped extension module or bytecode file is code it cannot vouch for (and
+# a native module bypasses the sandbox's Python-level socket guard outright).
+# Generators are source-only; nothing in the field ever shipped one.
+FORBIDDEN_BINARY_GLOBS: tuple[str, ...] = (
+    "*.so",
+    "*.so.*",
+    "*.pyd",
+    "*.dll",
+    "*.dylib",
+    "*.pyc",
+    "*.pyo",
+    "*.pyx",
+)
+
 # requirements.txt line: ``pkg==1.2.3 --hash=sha256:abc...`` (one or more hash flags).
 _REQ_LINE = re.compile(
     r"""
@@ -95,8 +110,9 @@ def check_repo_layout(repo_dir: Path | str) -> ValidationResult:
     """Required files present and no shipped weight files.
 
     Generators are code-only (purely algorithmic): both pickle checkpoints and
-    code-free weight containers (safetensors, npy/npz, …) are rejected. The size
-    cap is :func:`check_repo_size`.
+    code-free weight containers (safetensors, npy/npz, …) are rejected, and so
+    are compiled/native modules (.so/.pyd/.pyc, …) the static guard cannot
+    read. The size cap is :func:`check_repo_size`.
     """
     d = Path(repo_dir)
     if not d.is_dir():
@@ -110,6 +126,16 @@ def check_repo_layout(repo_dir: Path | str) -> ValidationResult:
     weights = sorted({p.name for g in FORBIDDEN_WEIGHT_GLOBS for p in d.rglob(g)})
     if weights:
         return ValidationResult.fail("weight_files_forbidden", files=weights)
+    # ``__pycache__/*.pyc`` is what the interpreter itself writes when the
+    # (scanned) source is imported — only a sourceless bytecode file placed
+    # elsewhere in the tree is importable without its source, so that is the
+    # only .pyc/.pyo the guard refuses.
+    binaries = sorted({
+        p.name for g in FORBIDDEN_BINARY_GLOBS for p in d.rglob(g)
+        if not (p.suffix in (".pyc", ".pyo") and p.parent.name == "__pycache__")
+    })
+    if binaries:
+        return ValidationResult.fail("binary_modules_forbidden", files=binaries)
     return ValidationResult.pass_()
 
 

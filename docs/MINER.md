@@ -52,7 +52,11 @@ Rules that matter:
   to `__init__`. Seed every RNG from it; never use `hash()`, wall-clock, or the
   network. Two runs at one seed must produce byte-identical corpora.
 - **Allowlisted imports only.** `socket`, `subprocess`, `pickle`,
-  `multiprocessing` and friends are blocked (`chain.toml [static_guard]`).
+  `multiprocessing` and friends are blocked (`chain.toml [static_guard]`) in
+  EVERY `.py` in your tree and in any source you pack into a string constant
+  (plain, base64, zlib, hex — packed modules are unpacked and scanned the
+  same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
+  rejected outright: generators are source-only.
 - **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`
   with `64 ≤ L ≤ 4096` and `C ≤ 32`. Values must be finite.
 - **Speed is scored.** Your generator streams during training and the compute
@@ -79,7 +83,8 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
 - From block 9068400 (Mon 2026-09-14 ~20:30 UTC) multivariate eval windows are
   scored jointly: all channels forecast in one pass, the window counts once.
 - Only coupled channels teach the variate layers anything. Stacking unrelated
-  series into one array is legal and useless.
+  series into one array is legal today, but it teaches no cross-channel
+  structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
 - Eval windows have at most 8 channels regardless of your C.
 
 ## 3. Verify and score locally
@@ -338,7 +343,8 @@ that were never published.
 | symptom | cause / fix |
 |---|---|
 | `verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, set iteration order |
-| `blocked_import` | banned import; see `chain.toml [static_guard]` |
+| `blocked_import` | banned import (the message names the file, or `packed[n]` for a string-packed module); see `chain.toml [static_guard]` |
+| `binary_modules_forbidden` | a `.so`/`.pyd`/`.pyc`/… in the tree — ship source only |
 | `duplicate` (`private_copy`) | your entry carries most of an earlier unpublished submission's module from another hotkey — only public code is yours to build on |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`, allowlisted packages only |
 | `403 not_registered` | register the hotkey first |

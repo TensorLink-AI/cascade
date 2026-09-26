@@ -3010,6 +3010,23 @@ class TrainerRunner:
         return (f"_train_work/{seeds.base_seed}/{contract.arch_preset}/"
                 f"challenger{suffix}/checkpoint")
 
+    def _harvest_leg(self, host, receipt, *, base_seed: int, repo_suffix: str = ""):
+        """Dispatcher hook for ISOLATED hosts that were not dispatched
+        ``local_checkpoint`` explicitly (operator lanes declared
+        ``isolated = true``, the JIT king pod): the worker trained
+        ``--local-only``; pull, verify and upload its checkpoint exactly like
+        a payer leg, resolving the contract from the receipt's size."""
+        contract = self.cfg.training.primary_size
+        size = str(getattr(receipt, "size", "") or "")
+        if size and size != contract.arch_preset:
+            spec = next((sp for sp in self.cfg.training.extra_sizes
+                         if sp.arch_preset == size), None)
+            if spec is None:
+                raise RuntimeError(f"harvest: receipt names unknown size {size!r}")
+            contract = self.cfg.training.for_size(spec)
+        seeds = RoundSeeds.derive(int(base_seed), self.cfg.training)
+        return self._harvest_funded_checkpoint(host, receipt, contract, seeds, repo_suffix)
+
     def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
                                    suffix: str):
         """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
@@ -3339,7 +3356,14 @@ class TrainerRunner:
                     user=profile.user, key_path=profile.key_path,
                     remote_python=profile.remote_python, workdir=profile.workdir,
                     cuda_device="0", chain_toml=profile.chain_toml,
-                    forward_env=profile.forward_env, ssh_options=profile.ssh_options,
+                    # Credential-free like a payer pod: nothing from the
+                    # orchestrator's environment reaches the king pod — the
+                    # generator (public Hub refs pull anonymously; vault refs
+                    # are staged) and the warm-start init need no login, and
+                    # the checkpoint is harvested + uploaded from here rather
+                    # than pushed by the pod (2026-09-26: a pod that runs
+                    # miner code must not hold the bucket/Hub keys).
+                    forward_env=(), isolated=True, ssh_options=profile.ssh_options,
                     pinned_host_key=host_key, stage="final")
 
             def _ledger_king(pod_id: str) -> None:
@@ -5491,6 +5515,7 @@ class TrainerRunner:
             timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
+                harvest=self._harvest_leg,
             **self._dispatch_mode(),
         )
         entry = disp.dispatch(
@@ -6131,6 +6156,7 @@ class TrainerRunner:
                 timeout_seconds=self.remote_timeout_seconds,
                 extra_forward_env=self._pod_extra_forward_env(),
                 isolated_forward_env=self._pod_isolated_forward_env(),
+                harvest=self._harvest_leg,
             **self._dispatch_mode(),
             )
             # warm_start_ref makes the leg warm_started=True in the trainer, so
@@ -7292,6 +7318,7 @@ class TrainerRunner:
         disp = RemoteDispatcher(trainer_spec=self.trainer_spec, timeout_seconds=heat_timeout,
                                 extra_forward_env=self._pod_extra_forward_env(),
                                 isolated_forward_env=self._pod_isolated_forward_env(),
+                harvest=self._harvest_leg,
                                 **self._dispatch_mode())
 
         # Lane pool: dispatch lands on whichever GPU lane is actually idle
@@ -7440,6 +7467,7 @@ class TrainerRunner:
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
+                harvest=self._harvest_leg,
             **self._dispatch_mode(),
         )
 
@@ -7676,6 +7704,7 @@ class TrainerRunner:
             trainer_spec=self.trainer_spec, timeout_seconds=self.remote_timeout_seconds,
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
+                harvest=self._harvest_leg,
             **self._dispatch_mode(),
         )
 

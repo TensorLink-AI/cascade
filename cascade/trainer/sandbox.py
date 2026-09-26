@@ -15,9 +15,11 @@ build in a fresh interpreter that is:
   before ``exec``;
 * **wall-clock bounded** — a hard ``communicate`` timeout backs up RLIMIT_CPU;
 * **network-isolated** — wrapped in a network namespace via ``unshare`` when the
-  host allows it (probed once, with graceful fallback), and Python-level
-  networking is disabled in the child as defense-in-depth on top of the
-  submit-time static guard.
+  host allows it (probed once: an unprivileged user+net namespace first, else a
+  root-created net namespace — kernel-enforced either way; only when neither
+  works does it degrade to the Python-level socket guard, loudly, or refuse
+  under ``sandbox_strict``), and Python-level networking is disabled in the
+  child as defense-in-depth on top of the submit-time static guard.
 
 Only validated ``float64`` arrays cross back, via a temp ``.npz`` loaded with
 ``allow_pickle=False`` — never a pickle of untrusted output. The parent
@@ -83,7 +85,11 @@ _BLAS_ENV_KEYS = (
 LANE_INDEX_ENV = "CASCADE_LANE_INDEX"
 LANE_COUNT_ENV = "CASCADE_LANE_COUNT"
 
-_NETNS_PROBE: bool | None = None
+# Cached netns wrapper argv prefix: ``None`` = not probed yet, ``()`` = no
+# namespace available on this host, else the ``unshare`` prefix to use.
+_NETNS_PROBE: tuple[str, ...] | None = None
+_USERNS_WRAPPER: tuple[str, ...] = ("unshare", "--user", "--map-root-user", "--net")
+_ROOTNS_WRAPPER: tuple[str, ...] = ("unshare", "--net")
 _MEMSCOPE_PROBE: bool | None = None
 
 
@@ -248,20 +254,44 @@ def _reject_gpu_use(pid: int, query_fn=None) -> None:
         )
 
 
-def _netns_available() -> bool:
-    """Probe (once) whether an unprivileged network namespace can be created."""
+def _wrapper_works(prefix: tuple[str, ...]) -> bool:
+    try:
+        r = subprocess.run([*prefix, "true"], capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001 - any failure means "no netns"
+        return False
+
+
+def _netns_prefix() -> tuple[str, ...]:
+    """Probe (once) for a network-namespace wrapper this host can provide.
+
+    Preferred: an unprivileged user+net namespace (``unshare --user
+    --map-root-user --net``) — the child also lands in its own user namespace,
+    which is what keeps it from reading the worker's ``/proc/<pid>/environ``.
+    Fallback when the kernel refuses unprivileged user namespaces (Ubuntu
+    24.04's AppArmor restriction, some VM images) but we run as root: a plain
+    ``unshare --net``. Network isolation is still kernel-enforced; the child
+    then shares the worker's uid, so such a host must not carry forwarded
+    credentials (``isolated = true`` lanes). Empty tuple = no namespace at all.
+    """
     global _NETNS_PROBE
     if _NETNS_PROBE is None:
-        try:
-            r = subprocess.run(
-                ["unshare", "--user", "--map-root-user", "--net", "true"],
-                capture_output=True,
-                timeout=5,
-            )
-            _NETNS_PROBE = r.returncode == 0
-        except Exception:  # noqa: BLE001 - any failure means "no netns"
-            _NETNS_PROBE = False
+        if _wrapper_works(_USERNS_WRAPPER):
+            _NETNS_PROBE = _USERNS_WRAPPER
+        elif os.name == "posix" and os.geteuid() == 0 and _wrapper_works(_ROOTNS_WRAPPER):
+            _NETNS_PROBE = _ROOTNS_WRAPPER
+            log.warning("sandbox: unprivileged user namespaces unavailable on this host — "
+                        "using a root-created network namespace (network isolation stays "
+                        "kernel-enforced; the generator child shares the worker's uid, so "
+                        "keep forwarded credentials off this host)")
+        else:
+            _NETNS_PROBE = ()
     return _NETNS_PROBE
+
+
+def _netns_available() -> bool:
+    """Whether some kernel network namespace wrapper works on this host."""
+    return bool(_netns_prefix())
 
 
 def _apply_rlimits(
@@ -356,7 +386,7 @@ def _child_env(*, gpu: bool = False) -> dict[str, str]:
 
 def _preflight(repo: Path, cfg: GeneratorConfig, blocked: tuple[str, ...]) -> None:
     """Cheap checks on the repo *files* (no miner code runs) before spawning."""
-    from ..interface.static_guard import scan_file
+    from ..interface.static_guard import scan_tree
     from ..interface.validation import check_repo_layout, check_repo_size
 
     layout = check_repo_layout(repo)
@@ -365,9 +395,11 @@ def _preflight(repo: Path, cfg: GeneratorConfig, blocked: tuple[str, ...]) -> No
     size = check_repo_size(repo, cfg.max_repo_mb)
     if not size.ok:
         raise CorpusError(f"repo_too_large: {size.details}")
-    guard = scan_file(repo / "generator.py", tuple(blocked))
+    guard = scan_tree(repo, tuple(blocked))
     if not guard.ok:
-        raise CorpusError(f"blocked_import: {guard.blocked_module} ({guard.reason})")
+        raise CorpusError(
+            f"blocked_import: {guard.blocked_module} ({guard.reason} in {guard.file})"
+        )
 
 
 def _load_series(path: Path, n: int) -> list:
@@ -458,7 +490,7 @@ def run_in_sandbox(
             str(repo), str(int(generation_seed)), json.dumps(asdict(cfg)), str(out_dir),
         ]
         if use_netns:
-            argv = ["unshare", "--user", "--map-root-user", "--net", *argv]
+            argv = [*(_netns_prefix() or _USERNS_WRAPPER), *argv]
             log.debug("sandbox: running generator inside a network namespace")
 
         max_fsize = int(cfg.max_total_points) * 8 * 2 + 64 * 1024 * 1024
@@ -674,7 +706,7 @@ def stream_series(
         str(repo), str(int(generation_seed)), json.dumps(asdict(cfg)), str(n_upper),
     ]
     if use_netns:
-        argv = ["unshare", "--user", "--map-root-user", "--net", *argv]
+        argv = [*(_netns_prefix() or _USERNS_WRAPPER), *argv]
     if gpu:
         # GPU profile: RLIMIT_AS is skipped below (torch VA over-reserve), so
         # a cgroup scope is the only resident-memory bound — systemd-run
