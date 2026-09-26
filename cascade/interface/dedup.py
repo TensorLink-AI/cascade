@@ -615,6 +615,13 @@ def collapse_identical_behavior(
 SKETCH_SHINGLE = 8
 SKETCH_SAMPLE_MOD = 8
 MIN_MODULE_TOKENS = 2_000         # helpers below this size are not "a module" worth owning
+# A module's PRIVATE part (its shingles minus every public module's) must be
+# at least this many sampled shingles AND this fraction of the module before
+# anyone can be said to own it — a vault file that is a public lineage with a
+# few edits owns the edits, not the lineage, and the edits alone are too
+# little to build a copy claim on.
+MIN_PRIVATE_SHINGLES = 64
+MIN_PRIVATE_FRACTION = 0.25
 MIN_PACKED_CHARS = 200
 MAX_PACK_DEPTH = 3
 

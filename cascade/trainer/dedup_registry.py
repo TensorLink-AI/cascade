@@ -150,9 +150,18 @@ class DedupRegistry:
         digest = parse_vault_ref(ref) or ""
         return digest not in self._published_digests()
 
-    def _public_modules(self) -> list[frozenset[int]]:
-        return [frozenset(m["sketch"]) for ref, rec in self.entries.items()
-                if not self._is_private(ref, rec) for m in rec.get("modules", [])]
+    def _public_union(self) -> frozenset[int]:
+        """Every shingle of every PUBLIC registered module (public Hub trees,
+        published champions): the text nobody owns. A private module's
+        "private part" is what is left after removing it — a vault
+        submission that concatenates a public lineage into one file must not
+        come to own that lineage."""
+        u: set[int] = set()
+        for ref, rec in self.entries.items():
+            if not self._is_private(ref, rec):
+                for m in rec.get("modules", []):
+                    u.update(m["sketch"])
+        return frozenset(u)
 
     def backfill_modules(self) -> None:
         """Sketch registered PRIVATE entries that predate the tier (their vault
@@ -181,31 +190,42 @@ class DedupRegistry:
         contained in one of ``modules`` at >= the threshold — skipping private
         modules that are themselves public material (a public tree's module
         carried inside a vault submission is not that submitter's to own)."""
-        from ..interface.dedup import sketch_containment
+        from ..interface.dedup import MIN_PRIVATE_FRACTION, MIN_PRIVATE_SHINGLES, sketch_containment
 
         if not modules:
             return None
         thr = self._pc_threshold()
-        public = self._public_modules()
+        public = self._public_union()
         mine_sets = [(m, frozenset(m["sketch"])) for m in modules]
-        best = None
+        hits: list[tuple[int, str, str]] = []      # (commit_block, hotkey, detail)
         for ref, rec in self.entries.items():
             if rec.get("hotkey") == exclude_hotkey or not self._is_private(ref, rec):
                 continue
             for theirs in rec.get("modules", []):
                 their_set = frozenset(theirs["sketch"])
-                if any(sketch_containment(pub, their_set) >= thr for pub in public):
+                private_part = their_set - public
+                # mostly public text (a wrapped public lineage) is nobody's to own
+                if len(private_part) < max(MIN_PRIVATE_SHINGLES,
+                                           MIN_PRIVATE_FRACTION * len(their_set)):
                     continue
                 for mine, mine_set in mine_sets:
-                    c = sketch_containment(mine_set, their_set)
+                    c = sketch_containment(mine_set, private_part)
                     if c >= thr:
-                        detail = (f"{mine['name']} contains {c:.0%} of {theirs['name']} "
-                                  f"({theirs['tokens']} masked tokens) from {ref[:40]}")
-                        cand = (rec["hotkey"], PRIVATE_COPY_TIER,
-                                int(rec.get("commit_block") or 0), detail)
-                        if best is None or cand[2] < best[2]:
-                            best = cand
-        return best
+                        hits.append((int(rec.get("commit_block") or 0), rec["hotkey"],
+                                     f"{mine['name']} carries {c:.0%} of the private text of "
+                                     f"{theirs['name']} ({theirs['tokens']} masked tokens, "
+                                     f"{ref[:40]}, {rec['hotkey'][:12]})"))
+                        break
+        if not hits:
+            return None
+        hits.sort()
+        owners = list(dict.fromkeys(h[1] for h in hits))
+        detail = hits[0][2]
+        if len(owners) > 1:
+            detail += f"; also in {len(owners) - 1} other earlier private entr" + (
+                "y" if len(owners) == 2 else "ies") + " (" + ", ".join(
+                o[:12] for o in owners[1:4]) + ("…" if len(owners) > 4 else "") + ")"
+        return hits[0][1], PRIVATE_COPY_TIER, hits[0][0], detail
 
     def match(self, digests: dict, *, exclude_hotkey: str) -> tuple[str, str, int] | None:
         """``(hotkey, tier, commit_block)`` of the earliest-committed registered
