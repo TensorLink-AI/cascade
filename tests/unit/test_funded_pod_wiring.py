@@ -97,6 +97,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_funded_epoch_end_known", "_skus_fitting_now", "_leg_wall_seconds",
                  "_funded_price_caps", "_provider_capacity", "_operator_lane_deadline_fn",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
+                 "_harvest_leg",
                  "_startup_sweep", "_skip_unfunded_round",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
@@ -282,7 +283,7 @@ def test_isolated_host_receives_no_orchestrator_env(monkeypatch):
     with contextlib.suppress(Exception):  # the parsed entry shape is not under test
         disp.dispatch(host, lane_count=1, gen_ref=REF, uid=1, hotkey="hkA",
                       role="challenger", base_seed=1, block=1, arch_preset="toto2-4m",
-                      warm_start_ref=None)
+                      warm_start_ref=None, local_checkpoint=True)
     assert "robot$x" in seen["stdin"]
     assert "op-s3" not in seen["stdin"] and "op-wandb" not in seen["stdin"]
 
@@ -1628,3 +1629,31 @@ def test_extra_sessions_on_the_pod_only_warn(tmp_path, monkeypatch, caplog):
                                        warm_start_ref=None)
     assert entry.miner_hotkey == "hkA"
     assert any("remote IDE server" in r.getMessage() for r in caplog.records)
+
+
+def test_harvest_leg_resolves_contract_and_seeds_from_the_receipt(tmp_path, monkeypatch):
+    # The dispatcher hook for isolated lanes / the king pod: contract from the
+    # receipt's size, seeds from the dispatch base_seed, suffix passed through.
+    from types import SimpleNamespace
+
+    from cascade.trainer import loop as loop_mod
+
+    r = _runner(tmp_path)
+    r.cfg.training = SimpleNamespace(primary_size=SimpleNamespace(arch_preset="toto2-4m"),
+                                     extra_sizes=[])
+    monkeypatch.setattr(loop_mod.RoundSeeds, "derive",
+                        classmethod(lambda cls, base_seed, contract: SimpleNamespace(base_seed=base_seed)))
+    seen = {}
+    monkeypatch.setattr(r, "_harvest_funded_checkpoint",
+                        lambda host, receipt, contract, seeds, suffix: seen.update(
+                            host=host, receipt=receipt, contract=contract, seeds=seeds,
+                            suffix=suffix) or "ENTRY")
+    receipt = SimpleNamespace(size=r.cfg.training.primary_size.arch_preset, role="king")
+    out = r._harvest_leg("HOST", receipt, base_seed=4242, repo_suffix="-scratch")
+    assert out == "ENTRY"
+    assert seen["contract"].arch_preset == r.cfg.training.primary_size.arch_preset
+    assert seen["seeds"].base_seed == 4242 and seen["suffix"] == "-scratch"
+    assert seen["host"] == "HOST" and seen["receipt"] is receipt
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError, match="unknown size"):
+        r._harvest_leg("HOST", SimpleNamespace(size="toto2-999x", role="king"), base_seed=1)

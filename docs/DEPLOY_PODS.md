@@ -113,11 +113,14 @@ forward_env   = ["HIPPIUS_HUB_TOKEN", "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRE
 The first host trains the king, the second the challenger; more hosts form a
 round-robin pool for the heat and multi-finalist finals.
 
-A lane whose legs train `--local-only` (funded legs the orchestrator harvests)
-needs no credential at all: declare it `isolated = true` and the dispatcher
-forwards nothing from the orchestrator's environment, exactly like a
-payer-rented pod. Prefer that over `forward_env` for any pod that runs
-miner-submitted code.
+Prefer `isolated = true` over `forward_env` for any pod that runs
+miner-submitted code: the dispatcher then forwards nothing from the
+orchestrator's environment, forces every leg on that lane to train
+`--local-only`, and pulls, verifies and uploads the checkpoint itself —
+exactly the payer-pod path. Public Hub generators and warm-start inits pull
+anonymously and vault ZIPs are staged, so an isolated lane needs no login of
+any kind. The JIT king pod is always isolated. `forward_env` remains only for
+lanes that must push on their own (none in the current fleet).
 
 ## 5. Run the round
 

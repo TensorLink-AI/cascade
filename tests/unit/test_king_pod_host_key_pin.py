@@ -76,6 +76,8 @@ def test_fresh_rent_pins_the_scanned_key_and_the_transport_enforces_it(tmp_path,
     r._host_key_scanner = lambda ip, port: scanned.append((ip, port)) or KEY
 
     host = r._rent_king_host("42")
+    # Credential-free like a payer pod: nothing forwarded, harvested by us.
+    assert host.isolated and host.forward_env == ()
 
     assert scanned == [("9.9.9.9", 41001)]
     assert host.pinned_host_key == KEY
