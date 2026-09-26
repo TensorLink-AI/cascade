@@ -1087,6 +1087,17 @@ def generator_archive_key(ref: str) -> str:
     return f"{GENERATOR_ARCHIVE_PREFIX}{safe[:200]}.tar"
 
 
+# Private (``vault/direct``) submissions archive to the operator-only
+# king-archive bucket under this prefix — never to the shared manifest bucket.
+PRIVATE_ARCHIVE_PREFIX = "vault/"
+
+
+def private_archive_key(digest_hex: str) -> str:
+    """King-archive key of a private submission's resolve-time tree tar,
+    content-addressed by the vault digest."""
+    return f"{PRIVATE_ARCHIVE_PREFIX}{digest_hex.strip().lower()}.tar"
+
+
 def manifest_round_key(round_id: str) -> str:
     return f"manifests/round-{round_id}.json"
 

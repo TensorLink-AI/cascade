@@ -256,3 +256,31 @@ def test_unknown_entry_or_torn_queue_counts_as_fresh(tmp_path):
     r._funded_queue = lambda: (_ for _ in ()).throw(OSError("torn"))
     _arm_wait(r, deadline_offsets=7200, capacity_seq=[0, 0, 3])
     assert r._wait_for_funded_capacity("RTX4090", describe="funded leg f", hotkey="f") is True
+
+
+def test_isolated_lane_parses_and_drops_forwarded_env(tmp_path, monkeypatch):
+    # A hosts.toml lane may declare itself isolated: the flag must round-trip
+    # through the loader and the dispatcher must then forward nothing from
+    # the orchestrator's environment, exactly like a payer pod.
+    import os
+
+    from cascade.trainer.remote import RemoteDispatcher
+
+    p = tmp_path / "hosts.toml"
+    p.write_text('[[host]]\nname = "lane"\nhost = "10.2.2.2"\nstage = "final"\n'
+                 'isolated = true\nforward_env = ["HIPPIUS_S3_ACCESS_KEY"]\n'
+                 '[[host]]\nname = "open"\nhost = "10.3.3.3"\nstage = "final"\n'
+                 'forward_env = ["HIPPIUS_S3_ACCESS_KEY"]\n', encoding="utf-8")
+    lane, open_host = load_hosts(p)
+    assert lane.isolated is True and open_host.isolated is False
+    assert lane.forward_env == ("HIPPIUS_S3_ACCESS_KEY",)
+    monkeypatch.setenv("HIPPIUS_S3_ACCESS_KEY", "k")
+    disp = RemoteDispatcher(trainer_spec="cascade.trainer.worker", extra_forward_env=("HIPPIUS_S3_ACCESS_KEY",))
+    for host, expect in ((lane, {}), (open_host, {"HIPPIUS_S3_ACCESS_KEY": "k"})):
+        if host.isolated:
+            env = {remote: os.environ[local]
+                   for remote, local in disp.isolated_forward_env if local in os.environ}
+        else:
+            names = dict.fromkeys((*host.forward_env, *disp.extra_forward_env))
+            env = {k: os.environ[k] for k in names if k in os.environ}
+        assert env == expect
