@@ -984,7 +984,9 @@ class RollingScheduler:
         q = self.ops.queue()
         if q is not None:
             what = ("contains an earlier private submission's module"
-                    if tier == "private_copy" else "duplicates")
+                    if tier == "private_copy"
+                    else "packs, or is packed inside, an earlier submission's code as"
+                    if tier.startswith("embedded_") else "duplicates")
             q.fail(gen.hotkey, error=f"generator {what} {matched} ({tier}); the "
                    "earliest commit keeps the entry", error_class="duplicate",
                    expect_ref=gen.ref)

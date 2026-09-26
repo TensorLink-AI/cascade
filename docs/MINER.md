@@ -333,6 +333,15 @@ commit keeps the entry and the copy is dropped like any duplicate
 verdicts, and the owner announces before it enforces). Building on a
 published king or any public Hub generator is never a private copy.
 
+Packing does not hide anything either. A generator carried as a string
+constant (plain, base64, zlib or hex) is fingerprinted like a submission of
+its own: if it equals another entry's whole code — or another entry's packed
+source — exactly or after renaming, that is an `embedded_token_identical` /
+`embedded_rename_identical` duplicate, in either direction, and the earlier
+commit keeps it (`chain.toml [round] dedup_embedded_mode`; shadow first).
+The registry also holds the current king and every published champion, so a
+re-wrap of the king is judged against the king.
+
 Rotated-out eval windows are published with a lag to
 [Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
 Use them to replay past verdicts locally; live rounds always score on windows
@@ -345,6 +354,7 @@ that were never published.
 | `verify` fails determinism | an unseeded RNG, `hash()`, wall-clock, set iteration order |
 | `blocked_import` | banned import (the message names the file, or `packed[n]` for a string-packed module); see `chain.toml [static_guard]` |
 | `binary_modules_forbidden` | a `.so`/`.pyd`/`.pyc`/… in the tree — ship source only |
+| `duplicate` (`embedded_*`) | a source packed into your code equals another entry's whole code or packed source (exactly, or renamed) — or yours equals someone's blob; the earlier commit keeps it |
 | `duplicate` (`private_copy`) | your entry carries most of an earlier unpublished submission's module from another hotkey — only public code is yours to build on |
 | `requirement_not_hash_locked` | every `requirements.txt` line needs `--hash=sha256:…`, allowlisted packages only |
 | `403 not_registered` | register the hotkey first |
