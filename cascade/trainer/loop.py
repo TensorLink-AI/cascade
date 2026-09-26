@@ -53,6 +53,7 @@ from ..shared.hippius import (
     fetch_from_hub,
     generator_archive_key,
     manifest_round_key,
+    private_archive_key,
     publish_manifest,
     upload_dir_to_hub_or_hf,
 )
@@ -3907,12 +3908,31 @@ class TrainerRunner:
         mirror store dual-writes to R2 like every other put. Skip-if-present
         keeps it idempotent across retries; ANY failure is swallowed — the
         archive must never disturb the round it is recording.
+
+        PRIVATE (``vault/direct``) submissions never touch the manifest bucket:
+        it is a shared surface (every reader of the bucket sees every object
+        under ``generators/``), and an unpublished submission's code must stay
+        with the operator until the crown policy publishes it. They archive to
+        the operator-only king-archive bucket instead (``vault/<digest>.tar``,
+        :func:`_private_archive_store`); when that store is unavailable the
+        tree is simply not archived — the vault ZIP on-box already retains it.
         """
         import io
         import tarfile
+
+        from ..funding.store import parse_vault_ref
+        digest = parse_vault_ref(ref)
         try:
-            store = self.manifest_store()
-            key = generator_archive_key(ref)
+            if digest is not None:
+                store = self._private_archive_store()
+                if store is None:
+                    log.debug("generator archive: private submission %s stays on-box "
+                              "(no private archive store)", ref[:60])
+                    return
+                key = private_archive_key(digest)
+            else:
+                store = self.manifest_store()
+                key = generator_archive_key(ref)
             try:
                 store.get_bytes(key)
                 return  # already archived (tars are KBs; a GET probe is fine)
@@ -3925,6 +3945,29 @@ class TrainerRunner:
             log.info("archived generator %s (%d bytes)", ref[:60], buf.tell())
         except Exception as e:  # noqa: BLE001 — never sink a round for the archive
             log.warning("generator archive failed for %s (ignored): %s", ref[:60], e)
+
+    def _private_archive_store(self):
+        """The operator-only store private submissions archive to (the R2
+        king-archive bucket, :func:`cascade.shared.king_archive.king_archive_config`),
+        or ``None`` when it is not configured / not reachable. Resolved once
+        per process; a failure is remembered so a misconfigured archive costs
+        one warning, not one per entrant. Never falls back to the manifest
+        store — a private tree must not land on a shared surface."""
+        cached = getattr(self, "_private_archive", None)
+        if cached is not None:
+            return cached or None
+        try:
+            from ..shared.king_archive import king_archive_config
+            s3cfg, _endpoint, _bucket = king_archive_config(self.cfg.storage)
+            store = S3Store(cfg=s3cfg)
+            store.client()  # credentials + endpoint resolve here, not mid-archive
+        except Exception as e:  # noqa: BLE001 — archive is best-effort
+            log.warning("private generator archive unavailable (private submissions "
+                        "stay on-box only): %s", e)
+            self._private_archive = False
+            return None
+        self._private_archive = store
+        return store
 
     # ── anti-spam: content-level duplicate screen (pre-heat) ─────────────────
     # Probe concurrency: sandboxes are subprocesses, each holding up to

@@ -113,6 +113,12 @@ forward_env   = ["HIPPIUS_HUB_TOKEN", "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRE
 The first host trains the king, the second the challenger; more hosts form a
 round-robin pool for the heat and multi-finalist finals.
 
+A lane whose legs train `--local-only` (funded legs the orchestrator harvests)
+needs no credential at all: declare it `isolated = true` and the dispatcher
+forwards nothing from the orchestrator's environment, exactly like a
+payer-rented pod. Prefer that over `forward_env` for any pod that runs
+miner-submitted code.
+
 ## 5. Run the round
 
 Point the orchestrator at the host file (the wallet + `chain.toml` live here, not

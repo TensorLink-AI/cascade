@@ -98,3 +98,56 @@ def test_store_failure_never_raises(tmp_path) -> None:
     loop = _loop_with_store(_FailingStore())
     d = _make_tree(tmp_path)
     loop._archive_generator_tree("someone/gen@sha256:abc123", d)  # must not raise
+
+
+# ── private (vault/direct) submissions: operator-only archive, never the shared bucket ──
+
+def _loop_with_stores(shared, private):
+    loop = _loop_with_store(shared)
+    loop._private_archive = private if private is not None else False
+    return loop
+
+
+def test_private_submission_archives_to_private_store_only(tmp_path) -> None:
+    from cascade.shared.hippius import PRIVATE_ARCHIVE_PREFIX, private_archive_key
+
+    shared, private = _StubStore(), _StubStore()
+    loop = _loop_with_stores(shared, private)
+    d = _make_tree(tmp_path)
+    digest = "a" * 64
+    loop._archive_generator_tree("vault/direct@sha256:" + digest, d)
+    assert shared.puts == 0 and shared.objects == {}
+    key = private_archive_key(digest)
+    assert key.startswith(PRIVATE_ARCHIVE_PREFIX) and set(private.objects) == {key}
+    with tarfile.open(fileobj=io.BytesIO(private.objects[key])) as tar:
+        names = {m.name.lstrip("./") for m in tar.getmembers()}
+    assert "generator.py" in names and "config.json" in names
+    loop._archive_generator_tree("vault/direct@sha256:" + digest, d)
+    assert private.puts == 1  # idempotent, like the public archive
+
+
+def test_private_submission_without_private_store_touches_nothing(tmp_path) -> None:
+    shared = _StubStore()
+    loop = _loop_with_stores(shared, None)
+    d = _make_tree(tmp_path)
+    loop._archive_generator_tree("vault/direct@sha256:" + "b" * 64, d)
+    assert shared.puts == 0 and shared.objects == {}
+
+
+def test_public_ref_never_reaches_the_private_store(tmp_path) -> None:
+    shared, private = _StubStore(), _StubStore()
+    loop = _loop_with_stores(shared, private)
+    d = _make_tree(tmp_path)
+    loop._archive_generator_tree("someone/gen@sha256:abc123", d)
+    assert private.puts == 0
+    assert set(shared.objects) == {generator_archive_key("someone/gen@sha256:abc123")}
+
+
+def test_private_store_resolution_failure_is_remembered(monkeypatch) -> None:
+    from cascade.trainer.loop import TrainerRunner
+
+    loop = TrainerRunner.__new__(TrainerRunner)
+    loop.cfg = type("C", (), {"storage": object()})()  # no endpoint ⇒ config raises
+    assert loop._private_archive_store() is None
+    assert loop._private_archive is False
+    assert loop._private_archive_store() is None
