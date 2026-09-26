@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..interface.static_guard import scan_file
+from ..interface.static_guard import scan_tree
 from ..interface.validation import (
     ValidationResult,
     check_config,
@@ -81,7 +81,7 @@ def verify_repo(
     if not config.ok:
         failures.append(("config", config))
 
-    guard = scan_file(d / "generator.py", cfg.static_guard.blocked)
+    guard = scan_tree(d, cfg.static_guard.blocked)
     if not guard.ok:
         failures.append((
             "static_guard",
@@ -89,6 +89,7 @@ def verify_repo(
                 "blocked_import",
                 blocked_module=guard.blocked_module,
                 reason=guard.reason,
+                file=guard.file,
             ),
         ))
 

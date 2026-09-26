@@ -440,3 +440,57 @@ def test_memory_scope_probe_degrades_with_one_warning(monkeypatch, caplog):
     warnings = [r for r in caplog.records if "systemd-run scopes unavailable" in r.message]
     assert len(warnings) == 1             # named risk, warned exactly once
     assert "OOM" in warnings[0].message
+
+
+# ── subprocess mode: netns wrapper selection ─────────────────────────────────
+
+
+def _probe_with(monkeypatch, works: set[tuple[str, ...]], euid: int = 0):
+    monkeypatch.setattr(sandbox_mod, "_NETNS_PROBE", None)
+    monkeypatch.setattr(sandbox_mod, "_wrapper_works", lambda prefix: prefix in works)
+    monkeypatch.setattr(sandbox_mod.os, "geteuid", lambda: euid, raising=False)
+
+
+def test_netns_prefers_unprivileged_userns(monkeypatch):
+    _probe_with(monkeypatch, {sandbox_mod._USERNS_WRAPPER, sandbox_mod._ROOTNS_WRAPPER})
+    assert sandbox_mod._netns_prefix() == sandbox_mod._USERNS_WRAPPER
+    assert sandbox_mod._netns_available()
+
+
+def test_netns_falls_back_to_root_netns_and_warns(monkeypatch, caplog):
+    _probe_with(monkeypatch, {sandbox_mod._ROOTNS_WRAPPER}, euid=0)
+    with caplog.at_level("WARNING", logger="cascade.trainer.sandbox"):
+        assert sandbox_mod._netns_prefix() == sandbox_mod._ROOTNS_WRAPPER
+    assert any("root-created network namespace" in r.message for r in caplog.records)
+    assert sandbox_mod._netns_available()
+
+
+def test_netns_root_fallback_needs_root(monkeypatch):
+    _probe_with(monkeypatch, {sandbox_mod._ROOTNS_WRAPPER}, euid=1000)
+    assert sandbox_mod._netns_prefix() == ()
+    assert not sandbox_mod._netns_available()
+
+
+def test_netns_probe_is_cached(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sandbox_mod, "_NETNS_PROBE", None)
+    monkeypatch.setattr(sandbox_mod, "_wrapper_works", lambda p: calls.append(p) or True)
+    sandbox_mod._netns_prefix()
+    sandbox_mod._netns_prefix()
+    assert calls == [sandbox_mod._USERNS_WRAPPER]
+
+
+def test_preflight_scans_sibling_modules(tmp_path, small_cfg):
+    repo = _write_repo(tmp_path, OK_GEN + "import helper\n")
+    (repo / "helper.py").write_text("import socket\n")
+    with pytest.raises(CorpusError, match=r"blocked_import: socket .*helper\.py"):
+        run_in_sandbox(repo, 0, small_cfg.generator, blocked=small_cfg.static_guard.blocked,
+                       allow_netns=False)
+
+
+def test_preflight_rejects_native_module(tmp_path, small_cfg):
+    repo = _write_repo(tmp_path, OK_GEN)
+    (repo / "fast.so").write_bytes(b"\x7fELF")
+    with pytest.raises(CorpusError, match="binary_modules_forbidden"):
+        run_in_sandbox(repo, 0, small_cfg.generator, blocked=small_cfg.static_guard.blocked,
+                       allow_netns=False)
