@@ -723,3 +723,99 @@ def test_error_tail_short_and_single_line_inputs():
     assert error_tail(RuntimeError("x" * 50), 300) == "x" * 50
     assert error_tail("y" * 1000, 100) == "y" * 100
     assert error_tail(None, 10) == ""
+
+
+# ── isolated hosts: forced --local-only + orchestrator harvest ───────────────
+
+
+def _local_receipt_runner(seen: dict):
+    import json as _json
+    from types import SimpleNamespace
+
+    def runner(argv, timeout, stdin_env=None):
+        seen["argv"] = argv
+        seen["stdin"] = stdin_env or ""
+        return SimpleNamespace(returncode=0, stderr="", stdout=RECEIPT_SENTINEL + _json.dumps({
+            "miner_hotkey": "hkA", "miner_uid": 1, "role": "king",
+            "gen_ref": REF_A, "corpus_digest": "c" * 64,
+            "train_block": 12, "local_checkpoint_dir": "/w/checkpoint",
+            "tensor_digests": {}}))
+    return runner
+
+
+def _isolated_host():
+    return RemoteHost(name="funded-king", host="10.0.0.9", port=22, user="root",
+                      key_path=None, remote_python="python", workdir="/w",
+                      cuda_device="0", chain_toml="chain.toml",
+                      forward_env=("HIPPIUS_S3_ACCESS_KEY",), isolated=True)
+
+
+def test_isolated_host_is_forced_local_only_and_harvested(monkeypatch):
+    from cascade.trainer.remote import LocalTrainReceipt, RemoteDispatcher
+
+    monkeypatch.setenv("HIPPIUS_S3_ACCESS_KEY", "op-s3")
+    seen, harvested = {}, {}
+    sentinel = object()
+
+    def harvest(host, receipt, *, base_seed, repo_suffix):
+        harvested.update(host=host, receipt=receipt, base_seed=base_seed, suffix=repo_suffix)
+        return sentinel
+
+    disp = RemoteDispatcher(trainer_spec="m:C", harvest=harvest,
+                            _runner=_local_receipt_runner(seen))
+    out = disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                        uid=1, hotkey="hkA", role="king", base_seed=7, block=12,
+                        repo_suffix="-scratch")
+    assert out is sentinel
+    assert isinstance(harvested["receipt"], LocalTrainReceipt)
+    assert harvested["receipt"].checkpoint_dir == "/w/checkpoint"
+    assert harvested["base_seed"] == 7 and harvested["suffix"] == "-scratch"
+    assert "--local-only" in " ".join(seen["argv"])
+    assert "op-s3" not in seen["stdin"]
+
+
+def test_isolated_host_without_harvester_fails_closed():
+    from cascade.trainer.remote import RemoteDispatcher, RemoteDispatchError
+
+    seen = {}
+    disp = RemoteDispatcher(trainer_spec="m:C", _runner=_local_receipt_runner(seen))
+    with pytest.raises(RemoteDispatchError, match="isolated host"):
+        disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                      uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+    assert "argv" not in seen      # never launched
+
+
+def test_isolated_host_explicit_local_checkpoint_returns_the_raw_receipt():
+    # The payer path asks for local_checkpoint itself (hygiene probe first,
+    # then its own harvest): no hook needed, no auto-harvest.
+    from cascade.trainer.remote import LocalTrainReceipt, RemoteDispatcher
+
+    seen = {}
+    disp = RemoteDispatcher(trainer_spec="m:C", _runner=_local_receipt_runner(seen))
+    out = disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
+                        uid=1, hotkey="hkA", role="king", base_seed=7, block=12,
+                        local_checkpoint=True)
+    assert isinstance(out, LocalTrainReceipt)
+
+
+def test_non_isolated_host_is_untouched_by_the_hook():
+    import json as _json
+    from types import SimpleNamespace
+
+    from cascade.trainer.remote import RemoteDispatcher, TrainedEntry
+
+    def runner(argv, timeout, stdin_env=None):
+        assert "--local-only" not in " ".join(argv)
+        return SimpleNamespace(returncode=0, stderr="", stdout=RECEIPT_SENTINEL + _json.dumps({
+            "miner_hotkey": "hkA", "miner_uid": 1, "role": "king",
+            "gen_ref": REF_A, "corpus_digest": "c" * 64,
+            "train_block": 12, "trained_pointer": format_trained_pointer(REF_T)}))
+
+    disp = RemoteDispatcher(trainer_spec="m:C", harvest=lambda *a, **k: (_ for _ in ()).throw(AssertionError("hook called")),
+                            _runner=runner)
+    host = RemoteHost(name="lane", host="10.0.0.9", port=22, user="root", key_path=None,
+                      remote_python="python", workdir="/w", cuda_device="0",
+                      chain_toml="chain.toml", forward_env=())
+    out = disp.dispatch(host, lane_count=1, gen_ref=REF_A,
+                        uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+    assert isinstance(out, TrainedEntry)

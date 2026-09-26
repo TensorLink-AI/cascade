@@ -32,8 +32,12 @@ def _dispatch(monkeypatch, *, isolated: bool, isolated_forward=(("WANDB_API_KEY"
                       chain_toml="chain.toml", forward_env=("HIPPIUS_S3_ACCESS_KEY",),
                       static_env=(("HIPPIUS_HUB_USERNAME", "robot$x"),), isolated=isolated)
     with contextlib.suppress(Exception):  # the parsed entry shape is not under test
+        # an isolated host is dispatched --local-only (the payer path asks for
+        # it; the dispatcher forces it otherwise) — the env it receives is the
+        # same either way, which is what these tests pin down.
         disp.dispatch(host, lane_count=1, gen_ref=REF, uid=1, hotkey="hkA", role="challenger",
-                      base_seed=1, block=1, arch_preset="toto2-4m", warm_start_ref=None)
+                      base_seed=1, block=1, arch_preset="toto2-4m", warm_start_ref=None,
+                      local_checkpoint=isolated)
     return seen["stdin"]
 
 
