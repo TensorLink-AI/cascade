@@ -3577,7 +3577,8 @@ class TrainerRunner:
                       pod.instance_id, e)
 
     def _run_funded_leg(self, disp, gen: ResolvedGenerator, seeds, block: int,
-                        contract, suffix: str, *, warm_start_ref: str | None):
+                        contract, suffix: str, *, warm_start_ref: str | None,
+                        contract_block: int | None = None):
         """One funded challenger leg on its payer's own pod: rent → (stage the
         vault ZIP when the ref is one) → dispatch → teardown — immediately on
         any failure, or (with the payer-pod bench armed) after the
@@ -3614,7 +3615,7 @@ class TrainerRunner:
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role="challenger", base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
-                local_checkpoint=harvest,
+                local_checkpoint=harvest, contract_block=contract_block,
                 **({"repo_suffix": suffix} if suffix else {}),
             )
             # …and again when the leg returns: the checkpoint this entry
@@ -7723,7 +7724,7 @@ class TrainerRunner:
         boundary as the rent-wait deadline."""
         from ..funding.store import parse_vault_ref
 
-        contract = self.cfg.throne_contracts()[0]
+        contract = self.cfg.throne_contracts_at(int(era.start_block))[0]
         seeds = self._rolling_seeds(era)
         suffix = f"-u{gen.uid}"
         ws_ref = self._rolling_warm_start_ref(era, contract)
@@ -7733,7 +7734,8 @@ class TrainerRunner:
         try:
             try:
                 entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
-                                             warm_start_ref=ws_ref)
+                                             warm_start_ref=ws_ref,
+                                             contract_block=int(era.start_block))
             except _FundedOperatorFallback:
                 log.warning("rolling: %s — no marketplace capacity; running on an "
                             "OPERATOR lane (operator-billed)", gen.hotkey[:12])
@@ -7749,6 +7751,7 @@ class TrainerRunner:
                     gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                     role="challenger", base_seed=seeds.base_seed, block=int(block),
                     arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+                    contract_block=int(era.start_block),
                     repo_suffix=suffix,
                 )
                 if used:
@@ -7796,7 +7799,7 @@ class TrainerRunner:
         is the leg's own target (thread-local), so the king rent waits out a
         sold-out marketplace up to ITS latest safe start like a challenger
         instead of giving up at the first empty listing."""
-        contract = self.cfg.throne_contracts()[0]
+        contract = self.cfg.throne_contracts_at(int(era.start_block))[0]
         seeds = self._rolling_seeds(era)
         ws_ref = self._rolling_warm_start_ref(era, contract)
         disp = self._rolling_dispatcher()
@@ -7815,6 +7818,7 @@ class TrainerRunner:
             host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
             role="king", base_seed=seeds.base_seed, block=int(block),
             arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+            contract_block=int(era.start_block),
         )
         self._refuse_diverged_king(entry, contract)
         self._final_role_hosts[("king", contract.arch_preset, gen.hotkey)] = host

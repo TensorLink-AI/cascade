@@ -102,6 +102,9 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
   a copied or junk second channel spends real budget for nothing. Under this rule
   the budget, not the 5 h wall, stops every leg, so the GPU your leg lands on
   never decides how much it trains.
+  Switches to this rule are announced as a chain block: eras starting at or
+  after `[training] budget_denomination_after_block` train and settle under the
+  new rule, earlier eras finish under the old one.
 
 ## 3. Verify and score locally
 

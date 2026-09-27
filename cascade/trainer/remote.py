@@ -238,6 +238,7 @@ def worker_argv(
     warm_start_ref: str | None = None,
     anneal: bool = False,
     local_only: bool = False,
+    contract_block: int | None = None,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -276,6 +277,10 @@ def worker_argv(
         # credential-free pod (DEC-CA-0036): no upload; the orchestrator
         # harvests the checkpoint and uploads it under its own identity
         argv.append("--local-only")
+    if contract_block is not None:
+        # DEC-CA-0047: the era's contract block — the worker resolves the
+        # scheduled contract switch from it, never from its launch block
+        argv += ["--contract-block", str(int(contract_block))]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -1017,6 +1022,7 @@ class RemoteDispatcher:
         lane_count: int | None = None,
         anneal: bool = False,
         local_checkpoint: bool = False,
+        contract_block: int | None = None,
     ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
@@ -1034,6 +1040,7 @@ class RemoteDispatcher:
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
             warm_start_ref=warm_start_ref, anneal=anneal, local_only=local_checkpoint,
+            contract_block=contract_block,
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.

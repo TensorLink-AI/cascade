@@ -103,6 +103,13 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
 # routine re-pin protocol). NEVER remove or change an entry once shipped —
 # that would move digests for configs relying on the drop; the golden-vector
 # test freezes the behaviour.
+# Fields that are NEVER part of the payload/digest: a scheduled contract change
+# (DEC-CA-0047) pins WHEN a term moves; the effective contract at a block is
+# `TrainingContractConfig.at_block(block)`, and only ITS digest may differ.
+_NEVER_IN_DIGEST: frozenset[str] = frozenset({
+    "budget_denomination_after", "budget_denomination_after_block",
+})
+
 _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # DEC-CA-0020 layer 3: the accepted record-field set ([training]
     # accepted_fields). Empty = values-only (every deployed config).
@@ -175,6 +182,8 @@ def contract_payload(contract: object) -> dict:
         payload = dict(contract)
     else:
         raise TypeError(f"contract_payload expects a dataclass or dict; got {type(contract)}")
+    for key in _NEVER_IN_DIGEST:
+        payload.pop(key, None)
     for key, defaults in _DIGEST_DROP_WHEN_DEFAULT.items():
         if key not in payload:
             continue

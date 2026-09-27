@@ -46,6 +46,20 @@ gesture (one stacked series) earns nothing measurable; and because every channel
 junk or copied second channel spends real budget and the bonus cannot cover it — the rule is
 self-policing without any statistical coupling test (which is gameable in both directions).
 
+## Activation: a scheduled switch, not a flip
+
+`[training] budget_denomination_after = "points+mv<PCT>"` + `budget_denomination_after_block = <era
+start block>`. The two schedule fields are NEVER part of `contract_digest` (pinning the schedule moves no
+in-flight digest); the contract EFFECTIVE at a block is `TrainingContractConfig.at_block(block)`. Every leg
+carries its ERA's start block (`cascade-train-worker --contract-block`), so the king pre-train (which
+launches before the boundary), the challengers, the settlement manifest (`contract_body` / `contract_digest`
+at the era start) and the audit (replays the published body) agree by construction. Legs of eras that
+started before the gate finish under the old rule; the first era starting at/after the gate trains, settles
+and publishes under the new one. The worker image must carry this code before the gate block.
+
+`[static_guard] packed_sources = "reject"` + `packed_sources_from_block = <block>` gates the admission
+rejection the same way (orchestrator-side only; no image dependency).
+
 ## Not decided here
 
 * The PCT value. 20 reproduces the ~1.2× the current king realises at 22 % stacking under
