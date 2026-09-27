@@ -17,6 +17,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from cascade.funding.queue import FundedQueue
 from cascade.shared.chain import Commitment
 from cascade.shared.era import era_for_block
@@ -1180,3 +1182,53 @@ def test_restart_reattaches_an_in_flight_leg_stamped_with_no_era(cfg, tmp_path):
     assert ops2.sweeps[0][1] == {"ALFA", "BRAV"}
     assert q.get("BRAV").status == "in_flight"
     assert len(sched2.state.finished) == 2
+
+
+# ── packed-source rejection at the door ([static_guard] packed_sources) ───────
+
+class _PackedRegistry:
+    """A registry whose packed-source verdict is scripted per ref."""
+
+    def __init__(self, bad_refs):
+        from cascade.interface.static_guard import GuardResult
+        self._bad = set(bad_refs)
+        self._ok = GuardResult(ok=True)
+        self._packed = GuardResult(ok=False, reason="packed_source[1]", file="generator.py")
+        self.asked: list[str] = []
+
+    def packed_source_verdict(self, ref):
+        self.asked.append(ref)
+        return self._packed if ref in self._bad else self._ok
+
+    def admit(self, gen, era, history):
+        return None
+
+
+@pytest.mark.parametrize("mode", ["scan", "reject"])
+def test_packed_source_is_refused_at_admission_only_when_armed(cfg, tmp_path, mode):
+    armed = _armed(cfg)
+    armed = replace(armed, static_guard=replace(armed.static_guard, packed_sources=mode))
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    reg = _PackedRegistry({REF["ALFA"]})
+    ops.dedup_registry = lambda: reg
+    client = FakeClient()
+    q = ops.queue()
+    b0 = armed.round.rolling_from_block + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0 - 90))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 90)
+    sched.tick(client, b0)
+    _join(sched)
+    if mode == "reject":
+        assert q.get("ALFA").status == "failed"
+        assert "string constant" in q.get("ALFA").last_error
+        assert q.get("ALFA").last_error_class == "generator"
+        assert "ALFA" in ops.burnt                      # miner fault: the fee burns
+        assert q.get("BRAV").status == "in_flight"      # a clean sibling is seated
+        assert reg.asked == [REF["ALFA"], REF["BRAV"]]
+    else:
+        assert reg.asked == []                          # scan mode never even asks
+        assert q.get("ALFA").status == "in_flight"
+        assert "ALFA" not in ops.burnt

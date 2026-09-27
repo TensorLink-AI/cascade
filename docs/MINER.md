@@ -57,6 +57,12 @@ Rules that matter:
   (plain, base64, zlib, hex — packed modules are unpacked and scanned the
   same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
   rejected outright: generators are source-only.
+- **Every module is a file.** Where `[static_guard] packed_sources = "reject"`
+  (testnet now), a string constant that decodes to Python is itself a
+  rejection at admission — use as many generators as you like, but ship each
+  one as a `.py` in your tree and import it. The code that runs must be the
+  code the duplicate screen can see. `cascade verify` reports it as
+  `packed_source`.
 - **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`
   with `64 ≤ L ≤ 4096` and `C ≤ 32`. Values must be finite.
 - **Speed is scored.** Your generator streams during training and the compute

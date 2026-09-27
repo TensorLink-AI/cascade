@@ -474,6 +474,10 @@ blocked = [
     "cascade.validator",
     "cascade.shared.chain",
 ]
+# Python packed into string constants is REJECTED at admission (testnet first;
+# mainnet chain.toml stays "scan" until the owner arms it). Every module must
+# be a .py file so the code that runs is the code dedup fingerprints.
+packed_sources = "reject"
 
 [storage]
 # Hippius is cascade's storage layer. Two backends:

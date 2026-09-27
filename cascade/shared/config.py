@@ -205,6 +205,11 @@ def budget_denomination_parts(mode: str) -> tuple[str, int]:
     return str(mode), 0
 
 
+def _validate_packed_sources_mode(mode: str) -> str:
+    from ..interface.static_guard import validate_packed_sources_mode
+    return validate_packed_sources_mode(mode)
+
+
 def validate_budget_denomination(mode: str) -> str:
     """Fail loud: "series_points" silently degrading to "points" would bill a
     wide miner C× the budget its trainer, validator, and auditor agreed on."""
@@ -1769,6 +1774,13 @@ class DependencyConfig:
 @dataclass(frozen=True)
 class StaticGuardConfig:
     blocked: tuple[str, ...]
+    # "scan" (legacy): Python packed into string constants is unpacked and its
+    # imports scanned. "reject": such a constant is itself a rejection at
+    # ADMISSION (rolling intake) and in `cascade verify` — every module must be
+    # a .py file in the tree so the code that runs is the code dedup sees. The
+    # per-leg sandbox preflight keeps "scan" whatever this says, so a seated
+    # king's own legs are never affected (rules apply at the door only).
+    packed_sources: str = "scan"
 
 
 @dataclass(frozen=True)
@@ -2876,6 +2888,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         ),
         static_guard=StaticGuardConfig(
             blocked=tuple(str(x) for x in sg["blocked"]),
+            packed_sources=_validate_packed_sources_mode(
+                str(sg.get("packed_sources", "scan"))),
         ),
         storage=StorageConfig(
             hub_registry_url=str(st.get("hub_registry_url", "https://registry.hippius.com")),
