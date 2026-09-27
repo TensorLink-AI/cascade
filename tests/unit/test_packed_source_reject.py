@@ -82,6 +82,41 @@ def test_long_data_strings_still_pass_in_reject_mode():
     assert scan_source(src, BLOCKED, packed_sources="reject").ok
 
 
+def test_data_strings_that_parse_are_not_code(tmp_path):
+    """A JSON object, a list literal or a bare expression parses as Python but
+    carries no definitions or imports — it is data, never a packed source."""
+    import json
+
+    j = json.dumps({"note": "a class of seasonal priors with long tails and a slow trend " * 6, "k": 1})
+    assert len(j) > 200 and "class " in j
+    assert scan_source(f"CFG = {j!r}\n", BLOCKED, packed_sources="reject").ok
+    lst = "[" + ", ".join(f"'def-{i}'" for i in range(60)) + "]"
+    assert scan_source(f"NAMES = {lst!r}\n", BLOCKED, packed_sources="reject").ok
+    expr = "class_a + class_b + " * 30 + "1"
+    assert scan_source(f"F = {expr!r}\n", BLOCKED, packed_sources="reject").ok
+    # a JSON blob shipped as config data in a .py sibling passes scan_tree too
+    d = tmp_path / "repo"
+    d.mkdir()
+    (d / "generator.py").write_text(CLEAN)
+    (d / "config.json").write_text("{}")
+    (d / "requirements.txt").write_text("")
+    (d / "data.py").write_text(f"CFG = {j!r}\n")
+    assert scan_tree(d, BLOCKED, packed_sources="reject").ok
+
+
+def test_docstring_examples():
+    """Indented examples (the normal docstring style) do not parse as a module
+    and always pass. Documented limit: a FLUSH-LEFT example that imports is
+    indistinguishable from a packed module and is rejected."""
+    indented = '"""Example:\n\n    import numpy as np\n    g = Generator(seed=1)\n' + " " * 200 + '"""\nx = 1\n'
+    assert scan_source(indented, BLOCKED, packed_sources="reject").ok
+    flush = '"""\nimport numpy as np\ng = Generator(seed=1)\nfor s in g.generate(): print(s)\n' + "#" * 200 + '\n"""\nx = 1\n'
+    res = scan_source(flush, BLOCKED, packed_sources="reject")
+    assert not res.ok and res.reason == "packed_source[1]"
+    flush_no_import = '"""\ng = Generator(seed=1)\nfor s in g.generate(): print(s)\n' + "#" * 200 + '\n"""\nx = 1\n'
+    assert scan_source(flush_no_import, BLOCKED, packed_sources="reject").ok
+
+
 def test_scan_tree_names_the_file(tmp_path):
     d = tmp_path / "repo"
     d.mkdir()
@@ -134,3 +169,32 @@ def test_default_is_scan_and_loader_round_trips(tmp_path):
 def test_replace_keeps_frozen_dataclass_semantics(cfg):
     sg = replace(cfg.static_guard, packed_sources="reject")
     assert sg.blocked == cfg.static_guard.blocked and sg.packed_sources == "reject"
+
+
+# ── registry: the fetched tree never lingers ──────────────────────────────────
+
+@pytest.mark.parametrize("packed", [True, False])
+def test_packed_source_verdict_cleans_the_fetched_tree(tmp_path, monkeypatch, packed):
+    from types import SimpleNamespace
+
+    from cascade.trainer import dedup_registry as DR
+
+    work = tmp_path / "work"
+    ref = "vault/direct@sha256:" + "ab" * 32
+
+    def fake_fetch(r, root, hub=None):
+        d = Path(root)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "generator.py").write_text(CLEAN + (f"_S = {INNER!r}\n" if packed else ""))
+        (d / "config.json").write_text("{}")
+        (d / "requirements.txt").write_text("")
+        return d
+
+    monkeypatch.setattr("cascade.shared.hippius.fetch_from_hub", fake_fetch)
+    runner = SimpleNamespace(work_root=work, hub=lambda: None,
+                             cfg=SimpleNamespace(static_guard=SimpleNamespace(blocked=BLOCKED)))
+    reg = DR.DedupRegistry.__new__(DR.DedupRegistry)
+    reg.r = runner
+    res = reg.packed_source_verdict(ref)
+    assert res.ok is (not packed)
+    assert not (work / "_dedup_registry").exists() or not any((work / "_dedup_registry").iterdir())

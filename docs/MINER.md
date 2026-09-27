@@ -58,9 +58,11 @@ Rules that matter:
   same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
   rejected outright: generators are source-only.
 - **Every module is a file.** Where `[static_guard] packed_sources = "reject"`
-  (testnet now), a string constant that decodes to Python is itself a
-  rejection at admission — use as many generators as you like, but ship each
-  one as a `.py` in your tree and import it. The code that runs must be the
+  (testnet now), a string constant that decodes to Python *code* — definitions
+  or imports, in any encoding the scanner knows — is itself a rejection at
+  admission. Data that merely parses (a JSON blob, a literal) is fine; a
+  flush-left docstring example that imports is not. Use as many generators as
+  you like, but ship each one as a `.py` in your tree and import it. The code that runs must be the
   code the duplicate screen can see. `cascade verify` reports it as
   `packed_source`.
 - **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`

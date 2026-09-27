@@ -100,6 +100,16 @@ def validate_packed_sources_mode(mode: str) -> str:
     return mode
 
 
+_CODE_NODES = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _has_code_statements(tree: ast.AST) -> bool:
+    """True when a parsed string carries definitions or imports anywhere —
+    what a packed module looks like. Data that happens to parse (a JSON
+    object, a literal, a bare expression) has none of these."""
+    return any(isinstance(n, _CODE_NODES) for n in ast.walk(tree))
+
+
 def scan_source(
     source: str | bytes,
     blocked: tuple[str, ...],
@@ -117,8 +127,11 @@ def scan_source(
     the sandbox backstop.
 
     ``packed_sources="reject"``: a string constant that decodes to Python
-    (plain, base64, zlib, raw-deflate, hex; nested) fails the scan with
-    ``reason="packed_source[<depth>]"`` whatever it imports — generators must
+    CODE — definitions or imports (plain, base64, zlib, raw-deflate, hex;
+    nested) — fails the scan with ``reason="packed_source[<depth>]"`` whatever
+    it imports; data that merely parses (a JSON object, a literal) passes.
+    A docstring holding a runnable example with an import is code by this
+    rule and is rejected — keep examples import-free. Generators must
     ship every module as a ``.py`` file so the code that runs is the code the
     dedup screen fingerprints. Runtime-assembled code (encodings this decoder
     does not know, or code built from config data) is out of this static
@@ -196,7 +209,11 @@ def scan_source(
             if not inner.body:
                 continue
             if packed_sources == "reject":
-                return GuardResult(ok=False, reason=f"packed_source[{_depth + 1}]")
+                # Only CODE is a packed source: a string that merely parses as
+                # Python (a JSON object, a list literal, an expression) is data.
+                if _has_code_statements(inner):
+                    return GuardResult(ok=False, reason=f"packed_source[{_depth + 1}]")
+                continue
             res = scan_source(dec, blocked, unpack=True, packed_sources=packed_sources,
                               _depth=_depth + 1)
             if not res.ok and res.blocked_module is not None:
