@@ -86,6 +86,14 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
   series into one array is legal today, but it teaches no cross-channel
   structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
 - Eval windows have at most 8 channels regardless of your C.
+- Billing can also be `points+mv<N>` (check the round's `[training]
+  budget_denomination`): every channel is then a budget point, a `(C, L)` series
+  costs `C×L`, and a series with `C > 1` is billed at `100/(100+N)` of that. An
+  all-multichannel corpus trains `N %` more tokens than a univariate one on any
+  GPU, a corpus that stacks a share of its series earns proportionally less, and
+  a copied or junk second channel spends real budget for nothing. Under this rule
+  the budget, not the 5 h wall, stops every leg, so the GPU your leg lands on
+  never decides how much it trains.
 
 ## 3. Verify and score locally
 

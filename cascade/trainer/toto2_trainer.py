@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..shared.config import TrainingContractConfig
+from ..shared.config import TrainingContractConfig, budget_denomination_parts
 from .contract import TrainLogger, TrainResult
 from .corpus import DIVERGED_MARKER, CorpusError
 
@@ -302,10 +302,17 @@ def batch_points(vals: np.ndarray, denomination: str = "points") -> int:
     :func:`cascade.trainer.stream.element_points`, so the trainer stops on
     the same rule the stream billed. ``"points"``: ``B×C×L`` (every channel
     of every row). ``"series_points"``: ``B×L`` (per time-step positions —
-    a wide batch draws ``C×`` the channel tokens per budget point). Equal at
-    ``C = 1``."""
+    a wide batch draws ``C×`` the channel tokens per budget point).
+    ``"points+mvPCT"`` (DEC-CA-0047): ``B×C×L`` billed at ``100/(100+PCT)``
+    when ``C > 1``. Equal at ``C = 1``."""
     if denomination == "series_points":
         return int(vals.shape[0]) * int(vals.shape[-1])
+    _base, pct = budget_denomination_parts(denomination)
+    if pct and vals.ndim == 3 and int(vals.shape[1]) > 1:
+        # DEC-CA-0047: per-row cost is the stream's per-element cost
+        # (ceil(C×L×100/(100+PCT))) so B rows sum exactly like B elements.
+        row = int(vals.shape[1]) * int(vals.shape[-1])
+        return int(vals.shape[0]) * (-(-row * 100 // (100 + pct)))
     return int(vals.size)
 
 

@@ -187,14 +187,31 @@ def validate_batch_denomination(mode: str) -> str:
 # Token-budget denominations (DEC-CA-0042) — see
 # TrainingContractConfig.budget_denomination.
 BUDGET_DENOMINATIONS = ("points", "series_points")
+# "points+mv<PCT>" (DEC-CA-0047): token billing with a width bonus — every
+# values entry is a point, and a series with C > 1 is billed at
+# 100 / (100 + PCT) of its points, so an all-multichannel corpus trains PCT %
+# more tokens than a univariate one on ANY GPU (the budget, not the wall,
+# stops every leg). PCT is an integer 1..100 so the rule is exact integer
+# arithmetic the audit replays bit-for-bit.
+_MV_BONUS_RE = __import__("re").compile(r"^points\+mv([1-9][0-9]?|100)$")
+
+
+def budget_denomination_parts(mode: str) -> tuple[str, int]:
+    """``(base, bonus_pct)`` of a budget denomination: ``("points", 0)``,
+    ``("series_points", 0)`` or ``("points", PCT)`` for ``points+mvPCT``."""
+    m = _MV_BONUS_RE.match(str(mode))
+    if m:
+        return "points", int(m.group(1))
+    return str(mode), 0
 
 
 def validate_budget_denomination(mode: str) -> str:
     """Fail loud: "series_points" silently degrading to "points" would bill a
     wide miner C× the budget its trainer, validator, and auditor agreed on."""
-    if mode not in BUDGET_DENOMINATIONS:
+    if mode not in BUDGET_DENOMINATIONS and not _MV_BONUS_RE.match(str(mode)):
         raise ValueError(
-            f"budget_denomination={mode!r} invalid; expected one of {BUDGET_DENOMINATIONS}")
+            f"budget_denomination={mode!r} invalid; expected one of {BUDGET_DENOMINATIONS} "
+            "or 'points+mv<1..100>'")
     return mode
 
 
@@ -650,6 +667,13 @@ class TrainingContractConfig:
     # "series_points" is a deliberate contract cut — trainer, worker image,
     # and cascade-audit must all read it (an old worker would silently bill
     # the legacy rule and stop C× early).
+    # "points+mv<PCT>" (DEC-CA-0047): token billing (C×L) with a width bonus —
+    # a C > 1 series is billed 100/(100+PCT) of its points, so an all-
+    # multichannel corpus trains PCT % more tokens than a univariate one and
+    # the GPU drawn never decides the token count (the budget binds, not the
+    # wall). A copied or junk second channel spends real budget. Digest-bound
+    # like the other values; the same string travels to the worker, the audit
+    # and the miner's local scorer.
     budget_denomination: str = "points"
     # roles value 2 (future-known covariates) admission. Digest-bound and OFF
     # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —

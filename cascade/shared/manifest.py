@@ -116,6 +116,8 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # values entry (the legacy rule, every deployed config); "series_points"
     # bills a (C, L) series L points so a wide corpus earns C× the channel
     # tokens per budget point — arming it is the deliberate digest bump.
+    # "points+mv<PCT>" (DEC-CA-0047) is token billing with a width bonus —
+    # also a deliberate digest bump.
     "budget_denomination": ("points",),
     # DEC-CA-0026: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
