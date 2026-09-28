@@ -207,3 +207,23 @@ Weight splits across the current king plus recent distinct kings (geometric
 decay, `[scoring] king_decay`), burning to `burn_uid` when none are registered.
 You don't tune any of it — every honest validator computes the identical
 vector, which is exactly what `cascade-audit`'s `weights` check reproduces.
+
+
+## Consensus knobs added 2026-09-28 (DEC-CA-0048)
+
+`[scoring] forfeit_hotkeys` / `forfeit_from_block` / `forfeit_successor_hotkey` are consensus
+constants: the poll the chain reaches the block (no manifest needed; the standing weights are re-pushed
+as soon as the chain's rate limit allows) every validator strips the listed hotkeys from the throne and
+the payout court and crowns the named successor (else the most recent eligible former king, else a
+vacant throne); a settlement whose boundary reaches the block applies the same, idempotently. Inert
+while the list is empty.
+
+With `forfeit_from_block = 0` and a non-empty list the block is DECIDED ON CHAIN exactly like the
+DEC-CA-0043 rollover: your readiness note gains a second segment
+(`cascade-ready:1:rolling-era-king:<l>:<a>:forfeit-<hash>:<l>:<a>`), every node tallies the stake
+behind that segment at each boundary, the first boundary at/over `[activation] threshold` locks in,
+and the forfeiture applies from the very next boundary (`activation_forfeit_state.json`
+beside your state; `status/chain.json` shows the tally under `activation.forfeit`). A validator on a
+release WITHOUT this section cannot read the extended note and counts you as not signed for the
+rollover either — install the release. A typed `forfeit_from_block` is the owner override; then every
+validator must carry the same value before that boundary or weights fork there.

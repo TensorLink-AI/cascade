@@ -1298,6 +1298,80 @@ def test_settlement_manifest_carries_the_eras_contract(cfg, tmp_path):
     assert m1.contract_digest != m0.contract_digest
 
 
+# ── DEC-CA-0048: admission denylist + no king leg for a forfeited king ────────
+
+def test_blocked_hotkey_is_refused_at_the_door_without_a_pod(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    armed = replace(armed, round=replace(armed.round, blocked_hotkeys=("ALFA",), blocked_from_block=b0))
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0 - 90))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 90)
+    sched.tick(client, b0)
+    _join(sched)
+    assert q.get("ALFA").status == "failed" and q.get("ALFA").last_error_class == "blocked"
+    assert "ALFA" not in ops.burnt                       # no burn: the fee is policy, not code
+    assert q.get("BRAV").status == "in_flight"
+    # one block before the gate the same entry is admitted
+    sched2, ops2 = _sched(replace(armed, round=replace(armed.round, blocked_from_block=b0 + 1)), tmp_path / "b", Clock())
+    q2 = ops2.queue()
+    ops2.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q2.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched2.tick(FakeClient(), b0)
+    _join(sched2)
+    assert q2.get("ALFA").status == "in_flight"
+
+
+def test_forfeited_king_gets_no_king_leg(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    plain, _ = _sched(armed, tmp_path / "plain", Clock())
+    plain.tick(FakeClient(), b0)
+    _join(plain)
+    assert plain.state.current.king_entry is not None
+    forf = replace(armed, scoring=replace(armed.scoring, forfeit_hotkeys=("KING",), forfeit_from_block=b0))
+    sched, ops = _sched(forf, tmp_path / "forf", Clock())
+    sched.tick(FakeClient(), b0)
+    _join(sched)
+    assert sched.state.current.king_entry is None        # the forfeited king is never trained
+
+
+def test_forfeited_king_hands_the_king_leg_to_the_named_successor(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    forf = replace(armed, scoring=replace(armed.scoring, forfeit_hotkeys=("KING",), forfeit_from_block=b0,
+                                          forfeit_successor_hotkey="ALFA"))
+    sched, ops = _sched(forf, tmp_path / "succ", Clock())
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))    # the successor's revealed generator
+    sched.tick(FakeClient(), b0)
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king_hotkey == "ALFA" and cur.king_ref == REF["ALFA"]
+    assert cur.king_entry is not None                    # the successor's king leg trained for this era
+    assert cur.king_entry["miner_hotkey"] == "ALFA" and cur.king_entry["role"] == "king"
+    # a gate INSIDE the era (its third settlement) switches the running era too: the era is judged at its
+    # last settlement, so the successor's king leg trains now and lands before that boundary
+    mid = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + 2 * EB + 1))
+    sched2, ops2 = _sched(mid, tmp_path / "mid", Clock())
+    ops2.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched2.tick(FakeClient(), b0)
+    _join(sched2)
+    assert sched2.state.current.king_hotkey == "ALFA" and sched2.state.current.king_entry["miner_hotkey"] == "ALFA"
+    # a gate past the era's last settlement leaves the incumbent this era
+    late = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + 4 * EB + 1))
+    sched3, ops3 = _sched(late, tmp_path / "late", Clock())
+    ops3.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched3.tick(FakeClient(), b0)
+    _join(sched3)
+    assert sched3.state.current.king_hotkey == "KING" and sched3.state.current.king_entry is not None
+
+
+
 # ── fit on measured speed; never leave an orphan (2026-09-28 uid-137 class) ──
 
 def test_leg_walls_ledger(tmp_path):

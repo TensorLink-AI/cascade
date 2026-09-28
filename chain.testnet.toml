@@ -339,6 +339,12 @@ gift_gate_data_dir    = "/root/cascade/bench_data"   # TESTNET: pinned GIFT-Eval
 gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 
 [scoring]
+# DEC-CA-0048 king forfeiture (CONSENSUS; inert while the list is empty):
+#   forfeit_hotkeys          = ["<hotkey>", ...]   # stripped from the throne and the payout court
+#   forfeit_successor_hotkey = "<hotkey>"          # crowned in their place ("" = last eligible former king, else vacant)
+#   forfeit_from_block       = 0                   # 0 = DECIDED ON CHAIN (51% of validator stake, DEC-CA-0045 note,
+#                                                  #     applies from the boundary after the count crosses); a typed block
+#                                                  #     is the owner override — use a settlement boundary.
 # Declared-contract gating (DEC-CA-0036) — TESTNET: armed from block 1, i.e. LIVE
 # for every round as soon as this release deploys (owner-only fleet; nothing to
 # coordinate). Manifests are gated on the LOCKED terms (arch_preset,

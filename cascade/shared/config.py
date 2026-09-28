@@ -1046,6 +1046,11 @@ class RoundConfig:
     # post-round bench that runs before an entry counts as finished (0 = none;
     # the 2026-09-28 orphan finished 3 min late after a ~55 min bench).
     funded_bench_margin_seconds: int = 0
+    # DEC-CA-0048 admission denylist (trainer-side, not consensus): entries from
+    # these hotkeys are refused at rolling admission from `blocked_from_block`
+    # (0 = immediately once the list is non-empty). Their legs never rent a pod.
+    blocked_hotkeys: tuple[str, ...] = ()
+    blocked_from_block: int = 0
     # 0 = every screened entrant seats; the provisioner sizes the final fleet
     # to fit the field inside the epoch (legs queue on each lane, see
     # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
@@ -1419,6 +1424,16 @@ class RoundConfig:
             return max(self.finalists, self.max_finalists)
         return self.finalists
 
+    def blocked_at(self, block: int | None) -> frozenset[str]:
+        """Hotkeys refused at admission at ``block`` (DEC-CA-0048): the list once
+        ``blocked_from_block`` is reached (0 = as soon as the list is set)."""
+        if not self.blocked_hotkeys:
+            return frozenset()
+        gate = int(self.blocked_from_block or 0)
+        if gate > 0 and (block is None or int(block) < gate):
+            return frozenset()
+        return frozenset(self.blocked_hotkeys)
+
     def duel_only(self, block: int | None) -> bool:
         """True when the round at epoch boundary ``block`` runs without a heat
         (``duel_from_block`` set and reached). ``None`` (unknown height) and
@@ -1603,6 +1618,23 @@ class ScoringConfig:
     # each round under its own rule. 0 = Bonferroni forever. Bit-identical at
     # k <= 1 (no multiplicity), so single-challenger rounds never change.
     cohort_maxt_from_block: int = 0
+    # DEC-CA-0048 king forfeiture — CONSENSUS: every validator applies the same
+    # list from the same settlement boundary or weights fork. Hotkeys listed
+    # here leave the throne (abdicating to the most recent eligible former
+    # king) and the court from `forfeit_from_block`; 0 / empty = inert.
+    # With a non-empty list and ``forfeit_from_block = 0`` under an enabled
+    # ``[activation]``, the block is DECIDED ON CHAIN (DEC-CA-0045 machinery):
+    # each validator on the release adds a ``forfeit-<hash of the list>``
+    # segment to its readiness note, the first boundary where the segment
+    # holds ``threshold`` of eligible stake locks in, and the NEXT boundary is
+    # the forfeiture. A typed block is the owner override.
+    forfeit_hotkeys: tuple[str, ...] = ()
+    forfeit_from_block: int = 0
+    # CONSENSUS: the hotkey crowned when the KING is forfeited (tenure reset,
+    # its era king leg trained from the first era judged under the
+    # forfeiture). "" = the most recent former king not itself forfeited,
+    # else a vacant throne. Never itself in ``forfeit_hotkeys``.
+    forfeit_successor_hotkey: str = ""
     # Increment-margin activation (DEC-CA-0039, block-gated). Under margin_mode
     # "level" the dethrone bar is a fixed fraction of the king's ABSOLUTE score
     # (win_margin_* ), so a maturing lineage whose per-round gains fall below
@@ -2063,6 +2095,10 @@ class ActivationConfig:
     # resolved rollover is distinguishable from a typed-in one (the typed
     # one is the owner override and is never re-resolved).
     resolved_block: int = 0
+    # RUNTIME ONLY: the forfeiture block ``apply_forfeit_activation`` wrote
+    # into ``[scoring] forfeit_from_block`` (DEC-CA-0048 decided on chain),
+    # so a resolved block is distinguishable from a typed-in one.
+    resolved_forfeit_block: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -2591,6 +2627,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # chain; the rollover block is resolved from those signals at runtime when
     # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
     # never reaches the resolver.
+    _forf_succ = str(s.get("forfeit_successor_hotkey", "") or "").strip()
+    if _forf_succ and _forf_succ in {str(x) for x in (s.get("forfeit_hotkeys", ()) or ())}:
+        raise ValueError(
+            f"[scoring] forfeit_successor_hotkey={_forf_succ!r} is itself listed in "
+            "forfeit_hotkeys — a forfeited hotkey cannot be crowned")
     ac = raw.get("activation", {})
     _act_feature = str(ac.get("feature", "") or "").strip()
     if _act_feature and not re.fullmatch(r"[A-Za-z0-9._-]+", _act_feature):
@@ -2765,6 +2806,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
             funded_bench_margin_seconds=max(0, int(r.get("funded_bench_margin_seconds", 0) or 0)),
+            blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
+            blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
@@ -2889,6 +2932,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_start_prev2=float(s.get("win_margin_start_prev2", 0.0) or 0.0),
             margin_activation_block2=max(0, int(s.get("margin_activation_block2", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
+            forfeit_hotkeys=tuple(str(x) for x in s.get("forfeit_hotkeys", ()) or ()),
+            forfeit_from_block=max(0, int(s.get("forfeit_from_block", 0) or 0)),
+            forfeit_successor_hotkey=str(s.get("forfeit_successor_hotkey", "") or "").strip(),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
             cohort_maxt_increment_from_block=max(
                 0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
