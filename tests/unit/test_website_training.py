@@ -141,11 +141,35 @@ def test_x_axis_budget_matches_chain_toml(page: str):
     assert 100_000 < steps < 200_000
 
 
-def test_rows_are_placed_at_round_times_steps_per_leg(page: str):
+def test_lineage_totals_sum_the_king_legs_from_the_training_summary(page: str):
+    """Steps and tokens accumulate over the KING legs only (one per checkpoint),
+    each priced from the trainer's ``training/round-<id>.json`` row when it
+    is measured and at the contracted budget otherwise; the tokens are the
+    leg's channel tokens (steps × batch × C × context)."""
     body = re.search(r"function trainRows\(\)\{(.*?)\n\}", page, re.S)
     assert body
-    assert "x.legs*stepsPerLeg()" in body.group(1) and "x.legs*tokensPerLeg()" in body.group(1)
+    b = body.group(1)
+    assert 'l.role==="king"' in b, "legs other than the king's would be counted"
+    assert "seen[l.pointer]" in b, "a king leg benched at several settlements would be counted twice"
+    assert "cum.steps+=l.steps" in b and "cum.tokens+=l.tokens" in b
+    for field in ("steps", "tokens_seen", "channel_tokens", "max_channels_seen", "deadline_hit", "measured"):
+        assert re.search(rf"\.{field}\b", b), f"trainRows() never reads the training summary's {field!r}"
+    assert "stepsPerLeg()" in b and "tokensPerLeg()" in b, "no contracted fallback for an unmeasured leg"
     chart = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
     assert chart and "rows[i].steps" in chart.group(1), "the chart does not place rounds by cumulative steps"
     tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
     assert tip and "fmtTokens(row.tokens)" in tip.group(1), "the tooltip does not show the token count"
+
+
+def test_training_summary_is_fetched_immutably(page: str):
+    from cascade.shared.training_summary import training_summary_key
+
+    prefix, suffix = training_summary_key("XYZ").split("XYZ")
+    assert re.search(rf'fetchJSON\("{re.escape(prefix)}"\s*\+\s*id\s*\+\s*"{re.escape(suffix)}",\{{bust:false\}}', page), (
+        "the tab does not fetch training_summary_key() objects cache-friendly")
+
+
+@pytest.mark.parametrize("tile", ["Steps trained", "Tokens trained", "Width C", "Batch × context", "King legs"])
+def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
+    body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
+    assert body and f'stat("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"

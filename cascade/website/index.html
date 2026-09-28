@@ -1219,7 +1219,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
         <span id="train-note">--</span>
       </div>
       <div class="train-note" id="train-axis"></div>
-      <div class="train-note">Lower is better on every suite; the x axis is cumulative training &mdash; each round&rsquo;s king leg is one more fixed-budget slice of optimiser steps (hours &times; reference throughput of series-points, over 64 series &times; 4096 context per step) on the lineage, so a round sits at round number &times; steps per leg, with the token equivalent in the tooltip. Contracted spend: a leg the wall stopped early trained less. After each round&rsquo;s manifest publishes, the trainer benches both duel checkpoints on GIFT-Eval, BOOM and TIME and signs the six numbers into <code>benchmarks/round-&lt;id&gt;.json</code>. Under warm-start the king&rsquo;s checkpoint is re-trained from the promoted init every round, so its curve is the lineage&rsquo;s training trajectory. These numbers are telemetry and the warm-start promotion input only &mdash; rounds are decided on the private eval pool, never here.</div>
+      <div class="train-note">Lower is better on every suite; the x axis is cumulative training &mdash; optimiser steps summed over the king&rsquo;s legs only (each round&rsquo;s king checkpoint, once), and the tokens tile counts every value entry those legs processed: steps &times; batch &times; width C &times; context. Each leg&rsquo;s numbers come from the trainer&rsquo;s per-round training summary (<code>training/round-&lt;id&gt;.json</code>: steps, the billed series-points, channel tokens, wall stop); a leg without one is priced at the contracted budget and the tiles say how many were measured. After each round&rsquo;s manifest publishes, the trainer benches both duel checkpoints on GIFT-Eval, BOOM and TIME and signs the six numbers into <code>benchmarks/round-&lt;id&gt;.json</code>. Under warm-start the king&rsquo;s checkpoint is re-trained from the promoted init every round, so its curve is the lineage&rsquo;s training trajectory. These numbers are telemetry and the warm-start promotion input only &mdash; rounds are decided on the private eval pool, never here.</div>
     </div>
 
     <div>
@@ -2352,6 +2352,11 @@ function renderMix(){
 // permanent except among the newest few rounds, where a late report is expected.
 var BENCH_SCAN_MAX=120, BENCH_RETRY_NEWEST=6;
 var _bench={}, _benchMissing={}, _benchInflight={}, _scratchIdx=null;
+// training/round-<id>.json: the trainer's unsigned per-leg telemetry (steps,
+// budget count, channel tokens, wall stop) published right after the manifest
+// (cascade.shared.training_summary). Same immutable-fetch discipline as the
+// bench reports; a missing doc ⇒ that leg is priced at the contracted budget.
+var _train={}, _trainMissing={}, _trainInflight={};
 var _trainMetric="crps", _trainScope="king";
 // The x axis is CUMULATIVE TRAINING, not the round ordinal: every round's king
 // leg is one more slice of optimiser steps on the same lineage, so a round is
@@ -2401,6 +2406,15 @@ function loadBench(){
       .then(function(d){ delete _benchInflight[id]; delete _benchMissing[id]; _bench[id]=d; renderTrain(); })
       .catch(function(){ delete _benchInflight[id]; _benchMissing[id]=true; renderTrain(); });
   });
+  rs.forEach(function(r){
+    var id=String(r.round_id||""); if(!id) return;
+    if(_train[id]||_trainInflight[id]) return;
+    if(_trainMissing[id]&&!newest[id]) return;
+    _trainInflight[id]=true;
+    fetchJSON("training/round-"+id+".json",{bust:false})
+      .then(function(d){ delete _trainInflight[id]; delete _trainMissing[id]; _train[id]=d; renderTrain(); })
+      .catch(function(){ delete _trainInflight[id]; _trainMissing[id]=true; renderTrain(); });
+  });
   // the scratch-shadow roll-up grows a row every M rounds — small, refetch per visit
   fetchJSON("benchmarks/scratch/index.json").then(function(d){ _scratchIdx=d; renderTrain(); }).catch(function(){});
   renderTrain();
@@ -2425,14 +2439,45 @@ function trainRows(){
     });
     var king=null; entries.forEach(function(e){ if(e.role==="king"&&!king) king=e; });
     var sc=scratchBy[id]||null;
-    if(entries.length||sc) out.push({r:r, id:id, label:trainRoundLabel(r), rn:roundNoOf(r.round_id), entries:entries, king:king, scratch:sc});
+    // the king LEG this round trained: the training doc's king row (measured
+    // steps/tokens) joined to the bench entry by trained_pointer, else priced
+    // at the contracted budget. A round whose report and doc are both missing
+    // still trained a king leg, but it is invisible here — not counted.
+    var doc=_train[id], kl=null;
+    ((doc&&doc.legs)||[]).forEach(function(l){ if(l.role==="king"&&!kl) kl=l; });
+    var kptr=(king&&king.pointer)||(kl&&kl.trained_pointer)||"";
+    var leg=null;
+    if(kptr){
+      var measured=!!(kl&&kl.measured&&kl.steps!=null);
+      var steps=measured?Number(kl.steps):stepsPerLeg();
+      var points=(measured&&kl.tokens_seen!=null)?Number(kl.tokens_seen):tokensPerLeg();
+      var chan=(measured&&kl.channel_tokens!=null)?Number(kl.channel_tokens):null;
+      leg={pointer:kptr, measured:measured, steps:steps, points:points,
+           // channel tokens = every value entry the model saw (steps × batch × C × context);
+           // a doc from a worker image predating the counter has only the billed
+           // count, which equals channel tokens at C = 1 — flagged, not guessed
+           tokens:chan!=null?chan:points, tokensExact:chan!=null||!measured?chan!=null:false,
+           width:(kl&&kl.max_channels_seen!=null)?Number(kl.max_channels_seen):(measured?1:null),
+           deadline:!!(kl&&kl.deadline_hit), frac:kl&&kl.tokens_frac!=null?Number(kl.tokens_frac):null,
+           gpu:kl&&kl.gpu_name||"", seconds:kl&&kl.train_seconds!=null?Number(kl.train_seconds):null,
+           contract:(doc&&doc.contract)||null};
+    }
+    if(entries.length||sc||leg) out.push({r:r, id:id, label:trainRoundLabel(r), rn:roundNoOf(r.round_id), entries:entries, king:king, scratch:sc, leg:leg});
   });
-  // round NUMBER (rN, anchored) × steps per leg; when the anchor round has
-  // rolled out of the index no absolute number exists, so fall back to the
-  // ordinal within the scanned window (labelled as such in the note)
-  var absolute=out.length>0&&out.every(function(x){ return x.rn!=null&&x.rn>0; });
-  out.forEach(function(x,i){ x.legs=absolute?x.rn:(i+1); x.steps=x.legs*stepsPerLeg(); x.tokens=x.legs*tokensPerLeg(); });
-  return {rows:out, pending:pending, missing:missing, absolute:absolute};
+  // Cumulative training of the LINEAGE: sum over king legs only (each round's
+  // king checkpoint, deduplicated by trained_pointer — under the rolling era
+  // the same king leg is benched at every settlement), oldest first.
+  var cum={steps:0, tokens:0, points:0, legs:0, measured:0, exact:0, deadline:0}, seen={};
+  out.forEach(function(x){
+    var l=x.leg;
+    if(l&&!seen[l.pointer]){
+      seen[l.pointer]=1; cum.legs++; cum.steps+=l.steps; cum.tokens+=l.tokens; cum.points+=l.points;
+      if(l.measured) cum.measured++; if(l.tokensExact) cum.exact++; if(l.deadline) cum.deadline++;
+      l.isNew=true;
+    }
+    x.steps=cum.steps; x.tokens=cum.tokens; x.points=cum.points; x.nLegs=cum.legs;
+  });
+  return {rows:out, pending:pending, missing:missing, cum:cum};
 }
 function trainSeries(rows, suite){
   // suite = "gifteval" | "boom" | "time" | null (geomean)
@@ -2476,10 +2521,10 @@ function trainChartSVG(rows, S, W, H){
   S.king.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.8" fill="var(--king)"/>'; });
   // x ticks in cumulative optimiser steps (nice multiples of the leg budget,
   // ~4 per chart); the token equivalent rides the axis title and the tooltip
-  var legS=stepsPerLeg(), span=(xmax-xmin)/legS, every=Math.max(1,Math.ceil(span/4));
-  for(var t=Math.ceil(xmin/legS/every)*every; t*legS<=xmax+1e-6; t+=every){
-    var xt=PAD_L+(t*legS-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
-    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="11">'+esc(fmtSteps(t*legS).replace(" steps",""))+'</text>';
+  var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
+  for(var t=Math.ceil(xmin/nice)*nice; t<=xmax+1e-6; t+=nice){
+    var xt=PAD_L+(t-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
+    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="11">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
   }
   // hover layer: one column per round reaching halfway to its neighbours (hit
   // target wider than the marks), a crosshair, and the tooltip listing every
@@ -2499,7 +2544,8 @@ function trainTipHTML(row, S, i, unit){
   ss.forEach(function(p){ lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">scratch control</span></div>'); });
   var when=row.r.published_at?' · '+timeAgo(row.r.published_at):'';
   return '<div class="h">'+esc(row.label)+(row.r.dethroned?' · dethrone':'')+'<span class="muted">'+esc(when)+'</span></div>'+
-    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+'</div>'+(lines.join("")||'<div class="muted">no bench numbers</div>')+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
+    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' cumulative'+
+    (row.leg?' · this leg '+esc(fmtSteps(row.leg.steps))+(row.leg.measured?'':' (contracted)')+(row.leg.deadline?' · wall stop':''):'')+'</div>'+(lines.join("")||'<div class="muted">no bench numbers</div>')+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
 }
 function wireTrainChart(wrap, rows, S, unit){
   var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), xh=svg.querySelector(".xh");
@@ -2533,14 +2579,32 @@ function renderTrainStats(rows, info){
     });
     if(row.scratch) nS++;
   });
-  var cells=[];
+  var cells=[], cum=info.cum||{}, lastLeg=null;
+  rows.forEach(function(row){ if(row.leg) lastLeg=row.leg; });
+  var contract=(lastLeg&&lastLeg.contract)||{};
+  var batch=contract.batch_size||TRAIN_BUDGET.batch, ctx=contract.context_length||TRAIN_BUDGET.ctx;
+  // ── trained: cumulative over the king legs only ──
+  if(cum.legs){
+    var est=cum.legs-cum.measured;
+    cells.push(stat("Steps trained",esc(fmtSteps(cum.steps).replace(" steps",""))+(est?' <span class="sub">'+cum.measured+' of '+cum.legs+' legs measured</span>':' <span class="sub">measured</span>'),
+      {title:"Optimiser steps summed over the king's legs (one per round, deduplicated by checkpoint). Measured legs read the trainer's training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
+    var approx=cum.exact<cum.legs;
+    cells.push(stat("Tokens trained",esc(fmtTokens(cum.tokens).replace(" tokens",""))+(approx?' <span class="sub">'+(cum.exact?cum.exact+' of '+cum.legs+' legs exact':'univariate assumed')+'</span>':' <span class="sub">channel tokens</span>'),
+      {title:"Every value entry the king's legs processed: steps × batch × width C × context, summed over king legs. Exact where the leg published channel_tokens; otherwise the billed series-points count, which equals channel tokens at C = 1."}));
+    if(cum.points&&Math.round(cum.points)!==Math.round(cum.tokens)) cells.push(stat("Series-points",esc(fmtTokens(cum.points).replace(" tokens","")),
+      {title:"The contract's billed budget count (a C-wide series bills its length once, DEC-CA-0042) — what the token budget was spent in"}));
+    cells.push(stat("Width C",lastLeg&&lastLeg.width!=null?(lastLeg.width+(lastLeg.width===1?' <span class="sub">univariate</span>':' <span class="sub">max channels seen</span>')):'<span class="muted">--</span>',
+      {title:"Channel width of the latest king leg's corpus (max channels seen in the shadow channel telemetry); a C-wide series trains C× the tokens per step"}));
+    cells.push(stat("Batch × context",esc(batch)+' <span class="sub">series</span> × '+esc(ctx),
+      {range:true,title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context = "+fmtTokens(batch*ctx).replace(" tokens","")+" per step (from the round's contract terms)"}));
+    cells.push(stat("King legs",cum.legs+(cum.deadline?' <span class="sub">'+cum.deadline+' wall-stopped</span>':' <span class="sub">counted</span>'),
+      {title:"Distinct king checkpoints counted into the totals"+(cum.deadline?"; a wall-stopped leg (deadline_hit) trained less than its contracted budget":"")}));
+  }
   if(lastK){
     var s=lastK.e.six, g=lastK.e.geo;
     var rel=(firstK&&firstK.row!==lastK.row&&firstK.e.geo)?(g-firstK.e.geo)/firstK.e.geo*100:null;
     cells.push(stat("King checkpoint",'<b>'+esc(lastK.row.label)+'</b>'+(lastK.e.size?' <span class="sub">'+esc(lastK.e.size)+'</span>':''),{title:"The latest round with a signed bench report for the king's checkpoint"+(lastK.e.pointer?" — "+lastK.e.pointer:"")}));
     cells.push(stat("Geomean",fmt(g)+(rel!=null?' <span class="sub '+(rel<0?'good':'')+'">'+signedPct(rel,1)+' vs '+esc(firstK.row.label)+'</span>':''),{title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
-    cells.push(stat("Trained",esc(fmtSteps(lastK.row.steps).replace(" steps",""))+' <span class="sub">steps</span> · '+esc(fmtTokens(lastK.row.tokens).replace(" tokens",""))+' <span class="sub">tok</span>',
-      {wide:true,range:true,title:"Cumulative training on the lineage: "+(info.absolute?"round number":"rounds in view")+" × "+fmtSteps(stepsPerLeg())+" per leg (contracted budget "+fmtTokens(tokensPerLeg())+" per leg)"}));
     SUITES.forEach(function(su){ cells.push(stat(su.label,'<span class="sub">CRPS&nbsp;</span>'+fmt(s[su.key+"_crps"],4)+' <span class="sub">MASE&nbsp;</span>'+fmt(s[su.key+"_mase"],4),{wide:true,range:true,title:su.label+" — CRPS and MASE of the king's latest benched checkpoint"})); });
   }
   if(best){
@@ -2571,7 +2635,8 @@ function renderTrain(){
   document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
   document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
   var scanned=benchRounds().length, note=rows.length+" of "+scanned+" rounds benched";
-  document.getElementById("train-axis").textContent=rows.length?("x axis: cumulative training · "+(info.absolute?"round number":"round in view")+" × "+fmtSteps(stepsPerLeg()).replace(" steps","")+" steps per leg ("+fmtTokens(tokensPerLeg()).replace(" tokens","")+" series-points) · hover a column for the round's steps and tokens"):"";
+  var cum=info.cum||{};
+  document.getElementById("train-axis").textContent=rows.length?("x axis: cumulative optimiser steps over the king's legs only ("+cum.legs+" legs · "+cum.measured+" measured, the rest priced at the contracted "+fmtSteps(stepsPerLeg()).replace(" steps","")+" steps / "+fmtTokens(tokensPerLeg()).replace(" tokens","")+" series-points per leg) · hover a column for the round's cumulative steps and tokens"):"";
   if(info.pending) note+=" · loading "+info.pending; else if(info.missing) note+=" · "+info.missing+" without a report";
   document.getElementById("train-note").textContent=rows.length?note:(info.pending?"loading bench reports…":"--");
   renderTrainTable(rows);
