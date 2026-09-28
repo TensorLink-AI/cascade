@@ -560,6 +560,7 @@ class RollingScheduler:
         # last settlement (settlement_era), judged against era n's king.
         self._settle(client, block, epoch_start)
         self._roll_era(client, era, block)
+        self._requeue_stale_finished()
         # Boundaries of the era just started (a tick that skipped the era
         # boundary lands here with them pending): settle them now, not next
         # grid step.
@@ -784,16 +785,7 @@ class RollingScheduler:
                 self.ops.retire_king_pod(cur)
                 # Legs finished under the old era but never settled (no king
                 # leg all era) are judged never against another era's king.
-                stale = [f for f in self.state.finished if f.era_index < era.index]
-                for f in stale:
-                    log.warning("rolling: %s's leg from era %d never settled — requeued "
-                                "unburned", f.hotkey[:12], f.era_index)
-                    q = self.ops.queue()
-                    if q is not None:
-                        q.requeue(f.hotkey, error="era ended without a settlement",
-                                  error_class="no_capacity", burn_attempt=False)
-                self.state.finished = [f for f in self.state.finished
-                                       if f.era_index >= era.index]
+                self._requeue_stale_finished(era.index)
                 self.state.published = []
             self.state.current = new
             self.state.next = None
@@ -802,6 +794,33 @@ class RollingScheduler:
                      "member %d, king %s%s)", era.index, era.start_block, era.seed_block,
                      new.generation, new.member_index, (new.king_hotkey or "?")[:12],
                      " — cached king leg" if new.king_entry else "")
+
+    def _requeue_stale_finished(self, era_index: int | None = None) -> None:
+        """Requeue (unburned) every finished-but-unsettled leg of an era older
+        than ``era_index`` (default: the current era) and drop it from
+        ``state.finished``: a dead era has no settlement left, so the leg can
+        never be judged. Called at the rollover and on every tick — a leg
+        recorded under a dead era by any other path (2026-09-28 22:24: three
+        legs whose bench outlived their era) is swept up at once, not at the
+        next rollover 12 h later."""
+        if era_index is None:
+            if self.state.current is None:
+                return
+            era_index = int(self.state.current.index)
+        with self._lock:
+            stale = [f for f in self.state.finished if f.era_index < int(era_index)]
+            if not stale:
+                return
+            self.state.finished = [f for f in self.state.finished
+                                   if f.era_index >= int(era_index)]
+        q = self.ops.queue()
+        for f in stale:
+            log.warning("rolling: %s's leg from era %d never settled — requeued "
+                        "unburned", f.hotkey[:12], f.era_index)
+            if q is not None:
+                q.requeue(f.hotkey, error="era ended without a settlement",
+                          error_class="no_capacity", burn_attempt=False)
+        self._save()
 
     def _king_hotkey(self, client) -> str | None:
         """The king per the validators' receipts; the metagraph only cross-
@@ -1233,11 +1252,26 @@ class RollingScheduler:
                     log.error("rolling: kept pod teardown for %s failed: %s",
                               gen.hotkey[:12], e)
             with self._lock:
-                self.state.finished.append(FinishedLeg(
-                    hotkey=gen.hotkey, uid=gen.uid, ref=gen.ref, era_index=era.index,
-                    started_block=block, reveal_block=gen.reveal_block,
-                    entry=_entry_to_json(entry), bench=bench, label=label))
-                self._save()
+                rolled = (self.state.current is not None
+                          and era.index < self.state.current.index)
+                if not rolled:
+                    self.state.finished.append(FinishedLeg(
+                        hotkey=gen.hotkey, uid=gen.uid, ref=gen.ref, era_index=era.index,
+                        started_block=block, reveal_block=gen.reveal_block,
+                        entry=_entry_to_json(entry), bench=bench, label=label))
+                    self._save()
+            if rolled:
+                # The bench (an hour and more on a payer pod) outlived the era:
+                # same outcome as above, decided again AFTER the bench (2026-09-28
+                # 22:24–22:33: three legs benched across the 22:03 rollover were
+                # filed under the dead era and stranded until the next one).
+                log.warning("rolling: %s's leg finished after era %d ended (its bench "
+                            "outlived the era) — requeued unburned at finish (era now %d)",
+                            gen.hotkey[:12], era.index, self.state.current.index)
+                if queue is not None:
+                    queue.requeue(gen.hotkey, error="leg finished after its era ended",
+                                  error_class="no_capacity", burn_attempt=False)
+                return
             log.info("rolling: %s's leg finished (era %d, target boundary %d)%s",
                      gen.hotkey[:12], era.index, target,
                      "" if bench else " — no bench numbers")
