@@ -7713,6 +7713,19 @@ class TrainerRunner:
     def _rolling_seeds(self, era):
         return RoundSeeds.derive(int(era.base_seed), self.cfg.training)
 
+    def _era_contract_block(self, era) -> int | None:
+        """The ``--contract-block`` a rolling leg carries: the era's start block
+        when a contract switch is SCHEDULED, else ``None`` (no flag). A worker
+        image that predates the flag rejects it at launch (unrecognized
+        argument, exit 2 — 2026-09-28 01:36 live), and the flag changes nothing
+        without a schedule, so it is emitted only once the owner has scheduled a
+        switch — by which point the flag-aware image must already be pinned."""
+        t = self.cfg.training
+        if str(getattr(t, "budget_denomination_after", "") or "") and int(
+                getattr(t, "budget_denomination_after_block", 0) or 0) > 0:
+            return int(era.start_block)
+        return None
+
     def _rolling_warm_start_ref(self, era, contract) -> str | None:
         return (era.warm_start_ckpt
                 if era.warm_start_ckpt and era.warm_start_size == contract.arch_preset
@@ -7735,7 +7748,7 @@ class TrainerRunner:
             try:
                 entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
                                              warm_start_ref=ws_ref,
-                                             contract_block=int(era.start_block))
+                                             contract_block=self._era_contract_block(era))
             except _FundedOperatorFallback:
                 log.warning("rolling: %s — no marketplace capacity; running on an "
                             "OPERATOR lane (operator-billed)", gen.hotkey[:12])
@@ -7751,7 +7764,7 @@ class TrainerRunner:
                     gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                     role="challenger", base_seed=seeds.base_seed, block=int(block),
                     arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
-                    contract_block=int(era.start_block),
+                    contract_block=self._era_contract_block(era),
                     repo_suffix=suffix,
                 )
                 if used:
@@ -7818,7 +7831,7 @@ class TrainerRunner:
             host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
             role="king", base_seed=seeds.base_seed, block=int(block),
             arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
-            contract_block=int(era.start_block),
+            contract_block=self._era_contract_block(era),
         )
         self._refuse_diverged_king(entry, contract)
         self._final_role_hosts[("king", contract.arch_preset, gen.hotkey)] = host
