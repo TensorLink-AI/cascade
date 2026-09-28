@@ -2630,9 +2630,10 @@ function wireTrainChart(wrap, rows, S, unit){
   }
 }
 function tile(k,v,sub,o){
+  // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
   return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
-    '<div class="v">'+v+'</div>'+(sub?'<div class="s'+(o.good?' good':'')+'">'+sub+'</div>':'')+'</div>';
+    '<div class="v">'+v+'</div></div>';
 }
 function renderTrainStats(rows, info){
   var el=document.getElementById("train-stats"), when=document.getElementById("train-when"); if(!el) return;
@@ -2685,8 +2686,8 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Geomean",fmt(g),rel!=null?signedPct(rel,1)+" vs "+esc(firstK.row.label):"six-suite geomean",
       {good:rel!=null&&rel<0,title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
     SUITES.forEach(function(su){
-      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"MASE "+fmt(s[su.key+"_mase"],4),
-        {title:su.label+" — CRPS (value) and MASE (below) of the king's latest benched checkpoint; lower is better"}));
+      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",{title:su.label+" CRPS of the king's latest benched checkpoint; lower is better"}));
+      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",{title:su.label+" MASE of the king's latest benched checkpoint; lower is better"}));
     });
     if(best){
       var who=best.e.role==="king"?"king":(best.e.crowned?"challenger, took the throne":"challenger");
