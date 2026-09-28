@@ -57,6 +57,14 @@ Rules that matter:
   (plain, base64, zlib, hex — packed modules are unpacked and scanned the
   same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
   rejected outright: generators are source-only.
+- **Every module is a file.** Where `[static_guard] packed_sources = "reject"`
+  (testnet now), a string constant that decodes to Python *code* — definitions
+  or imports, in any encoding the scanner knows — is itself a rejection at
+  admission. Data that merely parses (a JSON blob, a literal) is fine; a
+  flush-left docstring example that imports is not. Use as many generators as
+  you like, but ship each one as a `.py` in your tree and import it. The code that runs must be the
+  code the duplicate screen can see. `cascade verify` reports it as
+  `packed_source`.
 - **Series shape.** Each yield is a float array of shape `(L,)` or `(C, L)`
   with `64 ≤ L ≤ 4096` and `C ≤ 32`. Values must be finite.
 - **Speed is scored.** Your generator streams during training and the compute
@@ -86,6 +94,17 @@ A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
   series into one array is legal today, but it teaches no cross-channel
   structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
 - Eval windows have at most 8 channels regardless of your C.
+- Billing can also be `points+mv<N>` (check the round's `[training]
+  budget_denomination`): every channel is then a budget point, a `(C, L)` series
+  costs `C×L`, and a series with `C > 1` is billed at `100/(100+N)` of that. An
+  all-multichannel corpus trains `N %` more tokens than a univariate one on any
+  GPU, a corpus that stacks a share of its series earns proportionally less, and
+  a copied or junk second channel spends real budget for nothing. Under this rule
+  the budget, not the 5 h wall, stops every leg, so the GPU your leg lands on
+  never decides how much it trains.
+  Switches to this rule are announced as a chain block: eras starting at or
+  after `[training] budget_denomination_after_block` train and settle under the
+  new rule, earlier eras finish under the old one.
 
 ## 3. Verify and score locally
 

@@ -117,6 +117,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_chain_config(args.chain_toml)
+    if getattr(getattr(cfg, "generator", None), "sandbox_strict", None) is False:
+        logging.getLogger("cascade.trainer").warning(
+            "sandbox_strict = false: a host without network namespaces runs the generator as a "
+            "plain child that can read the worker environment — set sandbox_strict = true on "
+            "production ([generator] sandbox_strict in chain.toml)")
 
     if args.offline:
         from .contract import compute_base_arch_digest

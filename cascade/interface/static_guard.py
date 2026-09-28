@@ -86,11 +86,36 @@ def _looks_like_python(blob: bytes) -> bool:
     return b"import " in head or b"def " in head or b"class " in head
 
 
+PACKED_SOURCE_MODES = ("scan", "reject")
+
+
+def validate_packed_sources_mode(mode: str) -> str:
+    """``[static_guard] packed_sources``: ``"scan"`` (unpack string-packed
+    Python and scan its imports — the legacy behaviour) or ``"reject"`` (a
+    string constant that decodes to Python is itself a rejection: every module
+    must be a ``.py`` file in the tree)."""
+    if mode not in PACKED_SOURCE_MODES:
+        raise ValueError(
+            f"packed_sources={mode!r} invalid; expected one of {PACKED_SOURCE_MODES}")
+    return mode
+
+
+_CODE_NODES = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _has_code_statements(tree: ast.AST) -> bool:
+    """True when a parsed string carries definitions or imports anywhere —
+    what a packed module looks like. Data that happens to parse (a JSON
+    object, a literal, a bare expression) has none of these."""
+    return any(isinstance(n, _CODE_NODES) for n in ast.walk(tree))
+
+
 def scan_source(
     source: str | bytes,
     blocked: tuple[str, ...],
     *,
     unpack: bool = True,
+    packed_sources: str = "scan",
     _depth: int = 0,
 ) -> GuardResult:
     """Parse ``source`` as Python and reject if it imports any blocked module.
@@ -100,6 +125,17 @@ def scan_source(
     itself and in every string constant that decodes to Python (packed
     modules). Dynamic imports with a computed argument are by design left to
     the sandbox backstop.
+
+    ``packed_sources="reject"``: a string constant that decodes to Python
+    CODE — definitions or imports (plain, base64, zlib, raw-deflate, hex;
+    nested) — fails the scan with ``reason="packed_source[<depth>]"`` whatever
+    it imports; data that merely parses (a JSON object, a literal) passes.
+    A docstring holding a runnable example with an import is code by this
+    rule and is rejected — keep examples import-free. Generators must
+    ship every module as a ``.py`` file so the code that runs is the code the
+    dedup screen fingerprints. Runtime-assembled code (encodings this decoder
+    does not know, or code built from config data) is out of this static
+    check's reach and remains the sandbox's problem.
     """
     try:
         tree = ast.parse(source)
@@ -172,7 +208,14 @@ def scan_source(
                 continue
             if not inner.body:
                 continue
-            res = scan_source(dec, blocked, unpack=True, _depth=_depth + 1)
+            if packed_sources == "reject":
+                # Only CODE is a packed source: a string that merely parses as
+                # Python (a JSON object, a list literal, an expression) is data.
+                if _has_code_statements(inner):
+                    return GuardResult(ok=False, reason=f"packed_source[{_depth + 1}]")
+                continue
+            res = scan_source(dec, blocked, unpack=True, packed_sources=packed_sources,
+                              _depth=_depth + 1)
             if not res.ok and res.blocked_module is not None:
                 reason = res.reason or ""
                 if not reason.startswith("packed["):
@@ -181,16 +224,18 @@ def scan_source(
     return GuardResult(ok=True)
 
 
-def scan_file(path: Path | str, blocked: tuple[str, ...]) -> GuardResult:
+def scan_file(path: Path | str, blocked: tuple[str, ...], *,
+              packed_sources: str = "scan") -> GuardResult:
     p = Path(path)
     if not p.exists():
         return GuardResult(ok=False, reason="missing_file", file=p.name)
-    res = scan_source(p.read_bytes(), blocked)
+    res = scan_source(p.read_bytes(), blocked, packed_sources=packed_sources)
     return GuardResult(ok=res.ok, blocked_module=res.blocked_module,
                        reason=res.reason, file=p.name) if not res.ok else res
 
 
-def scan_tree(repo_dir: Path | str, blocked: tuple[str, ...]) -> GuardResult:
+def scan_tree(repo_dir: Path | str, blocked: tuple[str, ...], *,
+              packed_sources: str = "scan") -> GuardResult:
     """Scan ``generator.py`` and every other ``.py`` under ``repo_dir``.
 
     ``generator.py`` is scanned first (a missing one is ``missing_file``); the
@@ -204,7 +249,7 @@ def scan_tree(repo_dir: Path | str, blocked: tuple[str, ...]) -> GuardResult:
         return GuardResult(ok=False, reason="missing_file", file="generator.py")
     others = sorted(p for p in d.rglob("*.py") if p.is_file() and p != entry)
     for p in (entry, *others):
-        res = scan_source(p.read_bytes(), blocked)
+        res = scan_source(p.read_bytes(), blocked, packed_sources=packed_sources)
         if not res.ok:
             return GuardResult(ok=False, blocked_module=res.blocked_module,
                                reason=res.reason, file=p.relative_to(d).as_posix())

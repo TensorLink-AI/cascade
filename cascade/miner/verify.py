@@ -81,12 +81,14 @@ def verify_repo(
     if not config.ok:
         failures.append(("config", config))
 
-    guard = scan_tree(d, cfg.static_guard.blocked)
+    guard = scan_tree(d, cfg.static_guard.blocked,
+                      packed_sources=getattr(cfg.static_guard, "packed_sources", "scan"))
     if not guard.ok:
         failures.append((
             "static_guard",
             ValidationResult.fail(
-                "blocked_import",
+                "packed_source" if (guard.reason or "").startswith("packed_source")
+                else "blocked_import",
                 blocked_module=guard.blocked_module,
                 reason=guard.reason,
                 file=guard.file,

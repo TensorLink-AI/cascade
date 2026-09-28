@@ -104,6 +104,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "a trained_pointer and the orchestrator harvests, verifies, and "
                         "uploads the checkpoint itself.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--contract-block", type=int, default=None,
+                   help="Chain block the leg's contract is effective at (the era start; "
+                        "DEC-CA-0047 scheduled switch). Omitted = the base contract.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -131,13 +134,17 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve the size this worker trains: the primary contract, or the matching
     # [[training.sizes]] entry. Same per-size contract the local trainer uses, so
     # remote and local runs are the identical code path at identical compute.
-    contract = cfg.training.primary_size
+    training = cfg.training.at_block(args.contract_block)
+    contract = training.primary_size
     if args.arch_preset and args.arch_preset != contract.arch_preset:
-        match = next((s for s in cfg.training.extra_sizes if s.arch_preset == args.arch_preset), None)
+        match = next((s for s in training.extra_sizes if s.arch_preset == args.arch_preset), None)
         if match is None:
             log.error("unknown --arch-preset %r (not in [[training.sizes]])", args.arch_preset)
             return 2
-        contract = cfg.training.for_size(match)
+        contract = training.for_size(match)
+    if args.contract_block is not None and contract.budget_denomination != cfg.training.budget_denomination:
+        log.info("contract at block %d: budget_denomination=%s (scheduled switch)",
+                 args.contract_block, contract.budget_denomination)
 
     # A budget override (--train-hours) IS the heat/final discriminator: heats
     # dispatch the cheap screen budget, finals don't. One flag drives both the

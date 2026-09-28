@@ -318,3 +318,31 @@ compromised provisioner can spend your provider balance (bounded by the budget
 breaker) but cannot sign a manifest, and the systemd unit deliberately has no
 dependency on any trainer unit — either service restarts freely without the
 other.
+
+
+## Pods carry no credentials (2026-09-28)
+
+A miner is root on a payer pod, and an operator lane that loses its network
+namespace runs the generator as a plain child. Either can read anything the
+orchestrator forwards into the worker environment. Since PR #320 every pod the
+trainer rents is `isolated = true`: the worker trains `--local-only` and the
+orchestrator harvests the checkpoint and uploads it under its own identity.
+
+* `DEFAULT_FORWARD_ENV` is empty and rendered lanes carry `isolated = true`.
+  Forwarding a secret to a lane is a deliberate exception; the trainer logs a
+  WARNING at startup for every non-isolated host that does.
+* `deploy/provision.*.toml` forward nothing.
+* Run `sandbox_strict = true` in production: without network namespaces the
+  sandbox refuses to run rather than degrading to a plain child.
+
+### Rotating the storage credentials
+
+Rotate when a pod ever held them. Trainer (`.env`, restart after): the Hippius
+S3 pair (`HIPPIUS_S3_ACCESS_KEY` / `HIPPIUS_S3_SECRET_KEY` — read/write on the
+manifest and logs buckets, read on the eval-pool bucket), the Hub login
+(`HIPPIUS_HUB_USERNAME` / `HIPPIUS_HUB_PASSWORD` or `HIPPIUS_HUB_TOKEN` — push
++ pull on the checkpoint repos), `HF_TOKEN` (fallback dataset write) and
+`WANDB_API_KEY`. Validators need only a READ credential on the manifest bucket
+(manifests/, benchmarks/, promotions/): issue read-only, single-bucket,
+expiring sub-tokens per validator and revoke the shared pair. Validator code is
+unchanged; each operator swaps the environment value and restarts.

@@ -187,6 +187,14 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
     hosts: list[RemoteHost] = []
     for h in entries:
         stage = str(h.get("stage", "any"))
+        fwd = tuple(str(x) for x in h.get("forward_env", ()))
+        if fwd and not bool(h.get("isolated", False)):
+            secrets = [n for n in fwd if _CREDENTIAL_ENV_RE.search(n)]
+            if secrets:
+                log.warning("host %s forwards credential(s) %s into the pod's worker "
+                            "environment — a pod can read them; use isolated = true "
+                            "(orchestrator harvest, PR #320) unless this is deliberate",
+                            h.get("name", "?"), ", ".join(secrets))
         if stage not in HOST_STAGES:
             raise RemoteDispatchError(
                 f"host {h.get('name', '?')!r}: stage={stage!r} invalid; expected one of {HOST_STAGES}"
@@ -238,6 +246,7 @@ def worker_argv(
     warm_start_ref: str | None = None,
     anneal: bool = False,
     local_only: bool = False,
+    contract_block: int | None = None,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
@@ -276,6 +285,10 @@ def worker_argv(
         # credential-free pod (DEC-CA-0036): no upload; the orchestrator
         # harvests the checkpoint and uploads it under its own identity
         argv.append("--local-only")
+    if contract_block is not None:
+        # DEC-CA-0047: the era's contract block — the worker resolves the
+        # scheduled contract switch from it, never from its launch block
+        argv += ["--contract-block", str(int(contract_block))]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
@@ -405,6 +418,10 @@ def _stdin_env(env: dict[str, str]) -> str | None:
 # the detached session inherits them, nothing touches the pod's disk.
 
 DETACHED_RUN_ROOT = "_train_work/_dispatch"
+# Environment names that look like secrets — flagged when a non-isolated host
+# forwards them (see load_hosts).
+_CREDENTIAL_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD)", re.IGNORECASE)
+
 DETACHED_POLL_SECONDS = 30
 DETACHED_REATTACH_GRACE_SECONDS = 900
 DETACHED_STDOUT_TAIL_BYTES = 262144
@@ -1017,6 +1034,7 @@ class RemoteDispatcher:
         lane_count: int | None = None,
         anneal: bool = False,
         local_checkpoint: bool = False,
+        contract_block: int | None = None,
     ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
@@ -1034,6 +1052,7 @@ class RemoteDispatcher:
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
             warm_start_ref=warm_start_ref, anneal=anneal, local_only=local_checkpoint,
+            contract_block=contract_block,
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.

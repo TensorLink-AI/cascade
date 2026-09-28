@@ -103,6 +103,13 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
 # routine re-pin protocol). NEVER remove or change an entry once shipped —
 # that would move digests for configs relying on the drop; the golden-vector
 # test freezes the behaviour.
+# Fields that are NEVER part of the payload/digest: a scheduled contract change
+# (DEC-CA-0047) pins WHEN a term moves; the effective contract at a block is
+# `TrainingContractConfig.at_block(block)`, and only ITS digest may differ.
+_NEVER_IN_DIGEST: frozenset[str] = frozenset({
+    "budget_denomination_after", "budget_denomination_after_block",
+})
+
 _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # DEC-CA-0020 layer 3: the accepted record-field set ([training]
     # accepted_fields). Empty = values-only (every deployed config).
@@ -116,6 +123,8 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # values entry (the legacy rule, every deployed config); "series_points"
     # bills a (C, L) series L points so a wide corpus earns C× the channel
     # tokens per budget point — arming it is the deliberate digest bump.
+    # "points+mv<PCT>" (DEC-CA-0047) is token billing with a width bonus —
+    # also a deliberate digest bump.
     "budget_denomination": ("points",),
     # DEC-CA-0026: future-known covariate admission (roles value 2). False
     # until the EVAL_POOL exogeneity rule exists in writing.
@@ -173,6 +182,8 @@ def contract_payload(contract: object) -> dict:
         payload = dict(contract)
     else:
         raise TypeError(f"contract_payload expects a dataclass or dict; got {type(contract)}")
+    for key in _NEVER_IN_DIGEST:
+        payload.pop(key, None)
     for key, defaults in _DIGEST_DROP_WHEN_DEFAULT.items():
         if key not in payload:
             continue

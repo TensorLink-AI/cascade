@@ -908,6 +908,8 @@ class RollingScheduler:
                 queue.fail(entry.hotkey, error="vault ref not owned by this hotkey",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
+            if self._packed_source_check(gen, block):
+                continue
             dup = self._dedup_check(gen, era, history)
             if dup is not None:
                 not_jumps.add(entry.hotkey)
@@ -960,6 +962,38 @@ class RollingScheduler:
                 "target_boundary": int(adm.target_boundary), "era_index": int(adm.era_index),
                 "passed_over": ahead, "at": self.clock()})
             self._save()
+
+    def _packed_source_check(self, gen, block: int | None = None) -> bool:
+        """``[static_guard] packed_sources = "reject"``: a generator that ships
+        Python inside a string constant is refused at the door (entry failed
+        [generator], fee burns like any other miner-fault rejection). Only at
+        admission — the per-leg preflight keeps scanning, so a seated king's
+        legs are untouched. Returns True when ``gen`` was dropped."""
+        sg = self.r.cfg.static_guard
+        mode = (sg.packed_sources_at(block) if hasattr(sg, "packed_sources_at")
+                else getattr(sg, "packed_sources", "scan"))
+        if mode != "reject":
+            return False
+        reg = self.ops.dedup_registry()
+        if reg is None or not hasattr(reg, "packed_source_verdict"):
+            return False
+        try:
+            res = reg.packed_source_verdict(gen.ref)
+        except Exception as e:  # noqa: BLE001 — fail open like the dedup screen
+            log.warning("rolling: packed-source check failed for %s (%s); admitted unscreened",
+                        gen.hotkey[:12], e)
+            return False
+        if res is None or res.ok or not (res.reason or "").startswith("packed_source"):
+            return False
+        q = self.ops.queue()
+        if q is not None:
+            q.fail(gen.hotkey, error=f"generator ships Python inside a string constant "
+                   f"({res.file or 'generator.py'}, {res.reason}); every module must be a "
+                   ".py file in the repo", error_class="generator", expect_ref=gen.ref)
+        self.ops.burn([gen])
+        log.warning("rolling: %s dropped — packed source in %s (%s)", gen.hotkey[:12],
+                    res.file or "generator.py", res.reason)
+        return True
 
     def _dedup_check(self, gen, era: EraState, history: list) -> str | None:
         """Persistent exact-identity dedup (DEC-CA-0008 tiers) over the queue,
@@ -1277,12 +1311,12 @@ class RollingScheduler:
                 log.warning("rolling: eval-pool pin unavailable (%s)", e)
         return TrainingManifest(
             round_id=round_id, created_block=int(block),
-            contract_digest=contract_digest(self.cfg.training),
+            contract_digest=contract_digest(self.cfg.training.at_block(int(era.start_block))),
             base_arch_digest=self.cfg.training.base_arch_digest,
             eval_dataset=self.cfg.eval.eval_dataset, entries=entries,
             eval_pool_key=str(pool_key or ""), eval_pool_sha256=str(pool_sha or ""),
             warm_start_ckpt=era.warm_start_ckpt, warm_start_size=era.warm_start_size,
-            contract_body=contract_payload(self.cfg.training),
+            contract_body=contract_payload(self.cfg.training.at_block(int(era.start_block))),
             era=era.spec().to_json(),
             prev_round_id=self.state.last_published_round_id,
         )

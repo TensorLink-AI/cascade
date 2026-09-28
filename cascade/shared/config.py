@@ -187,14 +187,36 @@ def validate_batch_denomination(mode: str) -> str:
 # Token-budget denominations (DEC-CA-0042) — see
 # TrainingContractConfig.budget_denomination.
 BUDGET_DENOMINATIONS = ("points", "series_points")
+# "points+mv<PCT>" (DEC-CA-0047): token billing with a width bonus — every
+# values entry is a point, and a series with C > 1 is billed at
+# 100 / (100 + PCT) of its points, so an all-multichannel corpus trains PCT %
+# more tokens than a univariate one on ANY GPU (the budget, not the wall,
+# stops every leg). PCT is an integer 1..100 so the rule is exact integer
+# arithmetic the audit replays bit-for-bit.
+_MV_BONUS_RE = __import__("re").compile(r"^points\+mv([1-9][0-9]?|100)$")
+
+
+def budget_denomination_parts(mode: str) -> tuple[str, int]:
+    """``(base, bonus_pct)`` of a budget denomination: ``("points", 0)``,
+    ``("series_points", 0)`` or ``("points", PCT)`` for ``points+mvPCT``."""
+    m = _MV_BONUS_RE.match(str(mode))
+    if m:
+        return "points", int(m.group(1))
+    return str(mode), 0
+
+
+def _validate_packed_sources_mode(mode: str) -> str:
+    from ..interface.static_guard import validate_packed_sources_mode
+    return validate_packed_sources_mode(mode)
 
 
 def validate_budget_denomination(mode: str) -> str:
     """Fail loud: "series_points" silently degrading to "points" would bill a
     wide miner C× the budget its trainer, validator, and auditor agreed on."""
-    if mode not in BUDGET_DENOMINATIONS:
+    if mode not in BUDGET_DENOMINATIONS and not _MV_BONUS_RE.match(str(mode)):
         raise ValueError(
-            f"budget_denomination={mode!r} invalid; expected one of {BUDGET_DENOMINATIONS}")
+            f"budget_denomination={mode!r} invalid; expected one of {BUDGET_DENOMINATIONS} "
+            "or 'points+mv<1..100>'")
     return mode
 
 
@@ -650,7 +672,24 @@ class TrainingContractConfig:
     # "series_points" is a deliberate contract cut — trainer, worker image,
     # and cascade-audit must all read it (an old worker would silently bill
     # the legacy rule and stop C× early).
+    # "points+mv<PCT>" (DEC-CA-0047): token billing (C×L) with a width bonus —
+    # a C > 1 series is billed 100/(100+PCT) of its points, so an all-
+    # multichannel corpus trains PCT % more tokens than a univariate one and
+    # the GPU drawn never decides the token count (the budget binds, not the
+    # wall). A copied or junk second channel spends real budget. Digest-bound
+    # like the other values; the same string travels to the worker, the audit
+    # and the miner's local scorer.
     budget_denomination: str = "points"
+    # Scheduled switch (DEC-CA-0047): from chain block `budget_denomination_after_block`
+    # the effective denomination is `budget_denomination_after` (the two fields are
+    # NEVER part of contract_digest — see manifest._NEVER_IN_DIGEST — so pinning a
+    # schedule moves no in-flight digest; the EFFECTIVE contract at a block is
+    # `at_block(block)`, whose digest differs only past the gate). Every leg of an
+    # era carries the era's start block (`--contract-block`), so king pre-train,
+    # challengers, the settlement manifest and the audit all agree by construction.
+    # "" / 0 = no schedule.
+    budget_denomination_after: str = ""
+    budget_denomination_after_block: int = 0
     # roles value 2 (future-known covariates) admission. Digest-bound and OFF
     # until docs/EVAL_POOL.md carries the covariate exogeneity curation rule —
     # arming it before that rule exists is forbidden (DEC-CA-0026).
@@ -820,6 +859,18 @@ class TrainingContractConfig:
             ),
             extra_sizes=(),
         )
+
+    def at_block(self, block: int | None) -> TrainingContractConfig:
+        """The contract EFFECTIVE at chain ``block`` (DEC-CA-0047 schedule):
+        ``budget_denomination`` swapped to ``budget_denomination_after`` once
+        ``block >= budget_denomination_after_block``; the schedule fields are
+        cleared on the result. ``None`` or no schedule ⇒ ``self``."""
+        after = str(self.budget_denomination_after or "")
+        gate = int(self.budget_denomination_after_block or 0)
+        if not after or gate <= 0 or block is None or int(block) < gate:
+            return self
+        return replace(self, budget_denomination=after,
+                       budget_denomination_after="", budget_denomination_after_block=0)
 
     @property
     def primary_size(self) -> TrainingContractConfig:
@@ -1745,6 +1796,24 @@ class DependencyConfig:
 @dataclass(frozen=True)
 class StaticGuardConfig:
     blocked: tuple[str, ...]
+    # "scan" (legacy): Python packed into string constants is unpacked and its
+    # imports scanned. "reject": such a constant is itself a rejection at
+    # ADMISSION (rolling intake) and in `cascade verify` — every module must be
+    # a .py file in the tree so the code that runs is the code dedup sees. The
+    # per-leg sandbox preflight keeps "scan" whatever this says, so a seated
+    # king's own legs are never affected (rules apply at the door only).
+    packed_sources: str = "scan"
+    # "reject" applies to admissions at chain block >= this (0 = immediately).
+    packed_sources_from_block: int = 0
+
+    def packed_sources_at(self, block: int | None) -> str:
+        """Effective mode at ``block``: ``"reject"`` only once the gate is reached."""
+        if self.packed_sources != "reject":
+            return self.packed_sources
+        gate = int(self.packed_sources_from_block or 0)
+        if gate > 0 and (block is None or int(block) < gate):
+            return "scan"
+        return "reject"
 
 
 @dataclass(frozen=True)
@@ -2032,6 +2101,13 @@ class ChainConfig:
         combined-score throne pools across them."""
         names = self.round.throne_sizes or (self.training.arch_preset,)
         return [self.training.contract_for(n) for n in names]
+
+    def throne_contracts_at(self, block: int | None) -> list[TrainingContractConfig]:
+        """:meth:`throne_contracts` under the contract effective at ``block``
+        (an era's start block — DEC-CA-0047 scheduled switch)."""
+        names = self.round.throne_sizes or (self.training.arch_preset,)
+        base = self.training.at_block(block)
+        return [base.contract_for(n) for n in names]
 
     def koth_params(self, block: int | None = None) -> Any:
         """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``
@@ -2642,6 +2718,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 str(t.get("batch_denomination", "series"))),
             budget_denomination=validate_budget_denomination(
                 str(t.get("budget_denomination", "points"))),
+            budget_denomination_after=(
+                validate_budget_denomination(str(t["budget_denomination_after"]))
+                if str(t.get("budget_denomination_after", "") or "") else ""),
+            budget_denomination_after_block=int(t.get("budget_denomination_after_block", 0) or 0),
             accepted_fields=validate_accepted_fields(t.get("accepted_fields", ())),
             allow_future_known=bool(t.get("allow_future_known", False)),
             real_corpus_ref=validate_real_corpus_ref(t.get("real_corpus_ref", "")),
@@ -2852,6 +2932,9 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         ),
         static_guard=StaticGuardConfig(
             blocked=tuple(str(x) for x in sg["blocked"]),
+            packed_sources=_validate_packed_sources_mode(
+                str(sg.get("packed_sources", "scan"))),
+            packed_sources_from_block=int(sg.get("packed_sources_from_block", 0) or 0),
         ),
         storage=StorageConfig(
             hub_registry_url=str(st.get("hub_registry_url", "https://registry.hippius.com")),

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..shared.config import GeneratorConfig
+from ..shared.config import GeneratorConfig, budget_denomination_parts
 from . import sandbox
 from .corpus import CorpusError, build_round_corpus
 
@@ -74,14 +74,22 @@ def element_points(arr: np.ndarray | dict, denomination: str = "points") -> int:
     ``C×L`` (a mask marks points missing; it does not add points).
     ``"series_points"``: a ``(C, L)`` series costs ``L`` — per time-step
     positions, so a wide series draws ``C×`` the channel tokens per budget
-    point. Identical for a 1-D / single-channel series. The trainer's token
+    point. ``"points+mvPCT"`` (DEC-CA-0047): ``C×L`` billed at
+    ``100/(100+PCT)`` when ``C > 1`` — token billing with a width bonus.
+    Identical for a 1-D / single-channel series. The trainer's token
     counter (:func:`~cascade.trainer.toto2_trainer.batch_points`) applies the
     same rule, so the stream's stop and the loop's stop agree.
     """
     vals = arr["values"] if isinstance(arr, dict) else arr
     if denomination == "series_points":
         return int(np.shape(vals)[-1]) if np.ndim(vals) else 0
-    return int(np.size(vals))
+    size = int(np.size(vals))
+    _base, pct = budget_denomination_parts(denomination)
+    if pct and np.ndim(vals) == 2 and int(np.shape(vals)[0]) > 1:
+        # DEC-CA-0047: a multichannel series is billed 100/(100+PCT) of its
+        # points (ceil, exact integers) — the width bonus under token billing.
+        return -(-size * 100 // (100 + pct))
+    return size
 
 
 def _element_points(arr: np.ndarray | dict) -> int:

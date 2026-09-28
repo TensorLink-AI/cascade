@@ -81,6 +81,26 @@ class DedupRegistry:
 
     # ── fingerprints ─────────────────────────────────────────────────────────
 
+    def packed_source_verdict(self, ref: str):
+        """Static guard in ``packed_sources="reject"`` mode over ``ref``'s tree
+        (fetched to the registry's cache dir, like :meth:`fingerprint`).
+        Returns a ``GuardResult``; ``None`` when the fetch fails (fail open)."""
+        from ..interface.static_guard import scan_tree
+        from ..shared.hippius import fetch_from_hub
+
+        root = Path(self.r.work_root) / "_dedup_registry" / ref.replace("/", "_").replace(":", "_")[:120]
+        try:
+            try:
+                d = Path(fetch_from_hub(ref, root, hub=self.r.hub()))
+            except Exception as e:  # noqa: BLE001 — fetch failure is not the miner's fault
+                log.warning("dedup registry: packed-source check could not fetch %s (%s)", ref[:40], e)
+                return None
+            return scan_tree(d, tuple(self.r.cfg.static_guard.blocked), packed_sources="reject")
+        finally:
+            # a miner-supplied tree never lingers on the orchestrator host —
+            # fingerprint() re-fetches for admitted refs and cleans up after itself
+            shutil.rmtree(root, ignore_errors=True)
+
     def fingerprint(self, ref: str) -> dict | None:
         """Fetch + fingerprint ``ref`` (digests only — the token prefix is not
         kept). ``None`` when the fetch or fingerprint fails (fail open)."""

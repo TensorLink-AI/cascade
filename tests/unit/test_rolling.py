@@ -17,10 +17,12 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from cascade.funding.queue import FundedQueue
 from cascade.shared.chain import Commitment
 from cascade.shared.era import era_for_block
-from cascade.shared.manifest import TrainedEntry, format_trained_pointer
+from cascade.shared.manifest import TrainedEntry, contract_digest, format_trained_pointer
 from cascade.trainer import rolling as R
 from cascade.trainer.rolling import LegOps, RollingScheduler, admit, target_boundary
 from cascade.validator.loop import ValidatorRunner
@@ -1180,3 +1182,117 @@ def test_restart_reattaches_an_in_flight_leg_stamped_with_no_era(cfg, tmp_path):
     assert ops2.sweeps[0][1] == {"ALFA", "BRAV"}
     assert q.get("BRAV").status == "in_flight"
     assert len(sched2.state.finished) == 2
+
+
+# ── packed-source rejection at the door ([static_guard] packed_sources) ───────
+
+class _PackedRegistry:
+    """A registry whose packed-source verdict is scripted per ref."""
+
+    def __init__(self, bad_refs):
+        from cascade.interface.static_guard import GuardResult
+        self._bad = set(bad_refs)
+        self._ok = GuardResult(ok=True)
+        self._packed = GuardResult(ok=False, reason="packed_source[1]", file="generator.py")
+        self.asked: list[str] = []
+
+    def packed_source_verdict(self, ref):
+        self.asked.append(ref)
+        return self._packed if ref in self._bad else self._ok
+
+    def admit(self, gen, era, history):
+        return None
+
+
+@pytest.mark.parametrize("mode", ["scan", "reject"])
+def test_packed_source_is_refused_at_admission_only_when_armed(cfg, tmp_path, mode):
+    armed = _armed(cfg)
+    armed = replace(armed, static_guard=replace(armed.static_guard, packed_sources=mode))
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    reg = _PackedRegistry({REF["ALFA"]})
+    ops.dedup_registry = lambda: reg
+    client = FakeClient()
+    q = ops.queue()
+    b0 = armed.round.rolling_from_block + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0 - 90))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 90)
+    sched.tick(client, b0)
+    _join(sched)
+    if mode == "reject":
+        assert q.get("ALFA").status == "failed"
+        assert "string constant" in q.get("ALFA").last_error
+        assert q.get("ALFA").last_error_class == "generator"
+        assert "ALFA" in ops.burnt                      # miner fault: the fee burns
+        assert q.get("BRAV").status == "in_flight"      # a clean sibling is seated
+        assert reg.asked == [REF["ALFA"], REF["BRAV"]]
+    else:
+        assert reg.asked == []                          # scan mode never even asks
+        assert q.get("ALFA").status == "in_flight"
+        assert "ALFA" not in ops.burnt
+
+
+@pytest.mark.parametrize("gate_offset", [-1, +5])
+def test_packed_source_gate_by_block(cfg, tmp_path, gate_offset):
+    """`packed_sources_from_block`: an admission before the gate is scanned
+    (never asked), one at/after the gate is refused."""
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    gate = b0 + gate_offset            # -1 ⇒ already past the gate; +5 ⇒ not yet
+    armed = replace(armed, static_guard=replace(armed.static_guard, packed_sources="reject",
+                                                packed_sources_from_block=gate))
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    reg = _PackedRegistry({REF["ALFA"]})
+    ops.dedup_registry = lambda: reg
+    client = FakeClient()
+    q = ops.queue()
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    if gate <= b0:
+        assert q.get("ALFA").status == "failed" and reg.asked == [REF["ALFA"]]
+    else:
+        assert q.get("ALFA").status == "in_flight" and reg.asked == []
+
+
+def test_settlement_manifest_carries_the_eras_contract(cfg, tmp_path):
+    """A scheduled budget switch: the manifest body/digest follow the ERA's start
+    block, so an era that started before the gate publishes the old contract and
+    the first era at/after the gate publishes the new one."""
+    armed = _armed(cfg)
+    era_start = armed.round.rolling_from_block
+    era_len = EB * armed.round.era_settlements          # 4 settlements per era
+    gate = era_start + era_len                          # the switch lands on the next era's start
+    armed = replace(armed, training=replace(armed.training, budget_denomination_after="points+mv20",
+                                            budget_denomination_after_block=gate))
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    _advance(clock, ops, sched, client, from_block=b0, to_block=era_start + EB + 1)
+    assert len(ops.manifests) == 1
+    m0 = ops.manifests[0]
+    assert m0.era["start_block"] == era_start
+    assert m0.contract_body["budget_denomination"] == armed.training.budget_denomination
+    assert m0.contract_digest == contract_digest(armed.training)
+    # roll into the next era (starts at the gate) and settle a leg there
+    _advance(clock, ops, sched, client, from_block=era_start + EB + 1, to_block=gate + 5)
+    assert sched.state.current.start_block == gate
+    ops.commits.append(_commit("BRAV", REF["BRAV"], gate + 2))
+    q.add("BRAV", REF["BRAV"], reveal_block=gate + 2)
+    _advance(clock, ops, sched, client, from_block=gate + 5, to_block=gate + 10)
+    _advance(clock, ops, sched, client, from_block=gate + 10, to_block=gate + EB + 1)
+    m1 = ops.manifests[-1]
+    assert m1.era["start_block"] == gate
+    assert m1.contract_body["budget_denomination"] == "points+mv20"
+    assert m1.contract_digest == contract_digest(armed.training.at_block(gate))
+    assert m1.contract_digest != m0.contract_digest
