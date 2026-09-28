@@ -129,3 +129,21 @@ def test_loader_parses_packed_sources_from_block(tmp_path):
     sg = load_chain_config(p).static_guard
     assert (sg.packed_sources, sg.packed_sources_from_block) == ("reject", GATE)
     assert load_chain_config(root / "chain.toml").static_guard.packed_sources_from_block == 0
+
+
+def test_rolling_legs_carry_the_flag_only_when_a_switch_is_scheduled(cfg):
+    """A worker image that predates ``--contract-block`` rejects it at launch
+    (exit 2, 2026-09-28 live). Without a schedule the flag changes nothing, so
+    the trainer must not emit it; with one, every leg of the era carries the
+    era's start block."""
+    from types import SimpleNamespace
+
+    from cascade.trainer.loop import TrainerRunner
+
+    era = SimpleNamespace(start_block=GATE)
+    plain = SimpleNamespace(cfg=cfg)
+    assert TrainerRunner._era_contract_block(plain, era) is None
+    scheduled = SimpleNamespace(cfg=replace(cfg, training=_sched(cfg)))
+    assert TrainerRunner._era_contract_block(scheduled, era) == GATE
+    half = SimpleNamespace(cfg=replace(cfg, training=replace(cfg.training, budget_denomination_after="points+mv20")))
+    assert TrainerRunner._era_contract_block(half, era) is None      # no block ⇒ no schedule ⇒ no flag
