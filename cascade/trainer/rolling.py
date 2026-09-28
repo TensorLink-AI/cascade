@@ -570,12 +570,29 @@ class RollingScheduler:
         self._seed_chain_root()
         queue = self.ops.queue()
         flights = queue.in_flight() if queue is not None else []
-        self.ops.sweep_pods(keep_round_ids=keep_ids,
-                            keep_payers={e.hotkey for e in flights})
         done = {(f.hotkey, f.ref) for f in self.state.finished}
+        dead = self._dead_era_flights(client, flights, done, block)
+        self.ops.sweep_pods(keep_round_ids=keep_ids,
+                            keep_payers={e.hotkey for e in flights} - set(dead))
         for e in flights:
             if (e.hotkey, e.ref) in done:
                 continue                      # finished before the restart; settles normally
+            if e.hotkey in dead:
+                era_idx, era_end = dead[e.hotkey]
+                # Its era ended while the trainer was away and no checkpoint
+                # landed: the leg can never be judged (a leg that finishes
+                # after its era is requeued at finish anyway), so re-attaching
+                # only bills the payer for a second run — or a fresh pod when
+                # the first is gone (2026-09-28 13:06: two era-2545 legs were
+                # re-rented for a dead era, one of them then burned for a NaN
+                # on the new host). Pod released by the sweep above; requeue
+                # unburned now.
+                log.warning("rolling: in-flight leg %s belongs to era %d, which ended at "
+                            "block %d (now %d) — it can never be judged; pod released, "
+                            "requeued unburned", e.hotkey[:12], era_idx, era_end, int(block))
+                queue.requeue(e.hotkey, error="trainer restarted after the leg's era ended",
+                              error_class="no_capacity", burn_attempt=False)
+                continue
             era = self._era_state_for(e.era_index)
             if era is None and int(e.era_index) <= 0 and self.state.current is not None:
                 # A leg stamped with no era (legacy carry-over dispatched at the
@@ -594,6 +611,28 @@ class RollingScheduler:
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
             started, target = self._flight_stamp(e, era, block, queue)
             self._launch_leg(gen, era, started, target, e.label, resumed=True)
+
+    def _dead_era_flights(self, client, flights, done: set, block: int) -> dict[str, tuple[int, int]]:
+        """In-flight legs whose era's last boundary is already behind ``block``
+        and that left no persisted checkpoint: ``hotkey -> (era index, era
+        end block)``. They are requeued unburned at restore instead of being
+        re-attached (or re-rented)."""
+        dead: dict[str, tuple[int, int]] = {}
+        for e in flights:
+            if (e.hotkey, e.ref) in done:
+                continue
+            era = self._era_state_for(e.era_index)
+            if era is None:
+                continue
+            start = int(era.start_block)
+            era_end = start + int(era_length_blocks(self.cfg.round, start))
+            if int(block) < era_end:
+                continue
+            gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
+            if self.ops.cached_leg(era, "challenger", gen) is not None:
+                continue                      # a landed checkpoint settles late, never retrains
+            dead[e.hotkey] = (int(era.index), era_end)
+        return dead
 
     def _flight_stamp(self, e, era: EraState, block: int, queue) -> tuple[int, int]:
         """The (train block, target boundary) a re-attached leg runs under:
@@ -1236,6 +1275,21 @@ class RollingScheduler:
         king = self._king_hotkey(client)
         if not king or king == cur.king_hotkey:
             return
+        from ..shared.era import forfeited_hotkeys
+
+        if king in forfeited_hotkeys(self.r.cfg.scoring, self._forfeit_gate_block(cur)):
+            # DEC-CA-0048: the last scored receipt predates the crowning and
+            # the on-chain incentive lags it a tempo, so both can still name
+            # the FORFEITED king. That is not a dethrone — the validators
+            # crowned the named successor at the gate — so the era's throne
+            # never goes back (2026-09-28 13:08: era 2546 flipped to the
+            # forfeited king for one tick and its king leg "restarted"; had
+            # the successor's leg already landed it would have been thrown
+            # away). ``_forfeit_switch`` keeps the era on the successor.
+            log.debug("rolling: receipts/incentive still name forfeited %s king — stale, "
+                      "ignored (era %d stays with %s)", king[:12], cur.index,
+                      (cur.king_hotkey or "<vacant>")[:12])
+            return
         winner = next((f for f in reversed(self.state.published) if f.hotkey == king), None)
         with self._lock:
             if winner is None:
@@ -1290,11 +1344,56 @@ class RollingScheduler:
                 log.warning("rolling: boundary %d passed while the trainer was away — "
                             "settling it late (block %d)", b, block)
             self._settle_boundary(client, b, created_block=(b if b < int(epoch_start)
-                                                            else int(block)))
+                                                            else int(block)),
+                                  now_block=block)
 
-    def _settle_boundary(self, client, epoch_start: int, *, created_block: int) -> None:
+    def _late_under_forfeited_king(self, cur: EraState, epoch_start: int,
+                                   now_block: int | None) -> bool:
+        """DEC-CA-0048 on the block clock: a boundary of an era whose king is
+        forfeited by ``now_block`` but NOT at the era's own gate (a late
+        settlement of an era that ended before the forfeiture) can never be
+        judged — the validators crowned the successor at the gate and reject
+        a manifest carrying the old king whole (``king_resyncing``), after the
+        trainer marked its legs done and burned (2026-09-28 13:06: the late
+        settlement of 9165600, two paid legs lost). Publish nothing; requeue
+        every finished leg unburned so it retrains against the successor.
+        Returns True when the boundary was closed this way."""
+        from ..shared.era import forfeited_hotkeys
+
+        scoring = self.r.cfg.scoring
+        king_hk = cur.king_hotkey
+        if (now_block is None or not king_hk
+                or king_hk not in forfeited_hotkeys(scoring, int(now_block))
+                or king_hk in forfeited_hotkeys(scoring, self._forfeit_gate_block(cur))):
+            return False                      # not forfeited, or the era switches itself
+        with self._lock:
+            ready = [f for f in self.state.finished if f.era_index == cur.index]
+        queue = self.ops.queue()
+        log.warning("rolling: boundary %d — era %d king %s is forfeited at block %d, after "
+                    "the era's last settlement: the validators crowned the successor and "
+                    "would reject this manifest whole; nothing published, %d finished "
+                    "leg(s) requeued unburned", epoch_start, cur.index, king_hk[:12],
+                    int(now_block), len(ready))
+        for f in ready:
+            self.ops.discard_cached_leg(cur, "challenger",
+                                        ResolvedGen(f.hotkey, f.uid, f.ref, f.reveal_block))
+            if queue is not None:
+                queue.requeue(f.hotkey, error=f"era {cur.index} king forfeited before its "
+                              f"settlement at {epoch_start} could be judged — retrained "
+                              f"against the successor", error_class="no_capacity",
+                              burn_attempt=False)
+        with self._lock:
+            self.state.finished = [f for f in self.state.finished if f not in ready]
+            self.state.last_settled_boundary = epoch_start
+            self._save()
+        return True
+
+    def _settle_boundary(self, client, epoch_start: int, *, created_block: int,
+                         now_block: int | None = None) -> None:
         cur = self.state.current
         if cur is None or epoch_start <= self.state.last_settled_boundary:
+            return
+        if self._late_under_forfeited_king(cur, epoch_start, now_block):
             return
         base_seed = self.ops.block_seed(client, epoch_start)
         round_id = str(base_seed)
