@@ -14,8 +14,10 @@ relations: {depends_on: [DEC-CA-0004, DEC-CA-0043, DEC-CA-0045], relates_to: [DE
 Two knobs, both inert by default:
 
 * **`[scoring] forfeit_hotkeys = [...]`, `forfeit_from_block = <an era's FIRST settlement boundary>`,
-  `forfeit_successor_hotkey = "<hotkey>"`** — CONSENSUS. At the first settlement whose boundary reaches
-  the block, every validator strips the listed hotkeys from the throne and the court
+  `forfeit_successor_hotkey = "<hotkey>"`** — CONSENSUS. The poll the chain reaches the block (block
+  clock, `_forfeit_on_block`; no manifest needed — the weights move at the block itself, re-pushed as
+  soon as `weights_rate_limit` allows) and again at any settlement whose boundary reaches it
+  (`_apply_forfeiture`, idempotent), every validator strips the listed hotkeys from the throne and the court
   (`state.apply_forfeit`): a forfeited king abdicates to the NAMED successor (crowned fresh: tenure and
   streaks reset, `king_since_block` = the forfeiture boundary, era king pointer cleared so the
   successor's first king leg is adopted) — or, with no successor named, to the most recent former king
