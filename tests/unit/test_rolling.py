@@ -1465,3 +1465,151 @@ def test_leg_finishing_after_its_era_is_requeued_at_finish_not_at_rollover(cfg, 
     assert q.get("ALFA").attempts == 0                             # unburned, no attempt consumed
     assert all(f.hotkey != "ALFA" for f in sched.state.finished)   # no orphan recorded
     assert (tmp_path / "leg_walls.json").exists()                  # its wall was still measured
+
+
+# ── relaunch after a forfeiture (2026-09-28 13:05–13:08 class) ───────────────
+
+def test_stale_receipt_or_incentive_never_hands_the_throne_back_to_a_forfeited_king(cfg, tmp_path):
+    """The last scored receipt and the on-chain incentive both still named the
+    forfeited king one tick after the relaunch: the dethrone adoption flipped
+    era 2546 back to it and "restarted" its king leg. A forfeited hotkey is
+    never adopted — the era stays with the successor, its king leg untouched."""
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    forf = replace(armed, scoring=replace(armed.scoring, forfeit_hotkeys=("KING",),
+                                          forfeit_from_block=b0, forfeit_successor_hotkey="ALFA"))
+    sched, ops = _sched(forf, tmp_path, Clock())
+    client = FakeClient()
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king_hotkey == "ALFA" and cur.king_entry is not None
+    king_ptr = cur.king().trained_pointer
+    ops.king_hk = "KING"                  # the receipts' last scored verdict predates the crowning
+    ops.chain_king = "KING"               # incentive still points at the forfeited king
+    sched.tick(client, b0 + 2)
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king_hotkey == "ALFA"                       # never handed back
+    assert cur.king_entry is not None and cur.king().trained_pointer == king_ptr
+    assert len(ops.king_calls) == 1                        # no "restart" of the king leg
+    assert ops.retired == []
+
+
+def test_restart_after_the_legs_era_ended_requeues_them_unburned_instead_of_reattaching(cfg, tmp_path):
+    """Two era-2545 legs whose pods were gone were re-rented on their payers'
+    keys at the 13:05 relaunch although their era had ended at 9165600 — one
+    then failed on the fresh host and was burned. A leg whose era's last
+    boundary is behind the restart block and that left no checkpoint can
+    never be judged: its pod is released by the startup sweep and it is
+    requeued unburned, never re-attached."""
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    era_end = era_start + EB * armed.round.era_settlements
+    b0 = era_start + 5
+    sched.tick(client, b0)                      # king leg only
+    _join(sched)
+    era_idx = sched.state.current.index
+    ops.commits += [_commit("ALFA", REF["ALFA"], b0), _commit("BRAV", REF["BRAV"], b0)]
+    q.add("ALFA", REF["ALFA"], reveal_block=b0)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0)
+    for hk in ("ALFA", "BRAV"):                 # both in flight, targeting the era's last boundary
+        q.mark_in_flight(hk, REF[hk], target_boundary=era_end, era_index=era_idx,
+                         started_block=b0 + 1)
+    # the trainer is away across era_end and comes back one grid step later
+    clock.t += (era_end + EB + 3 - b0) * R.BLOCK_SECONDS
+    ops2 = FakeOps(tmp_path, clock)
+    ops2.commits = list(ops.commits)
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
+    sched2.tick(client, era_end + EB + 3)
+    _join(sched2)
+    assert ops2.sweeps[0][1] == set()                      # their pods were NOT kept
+    assert sched2.state.current.index == era_idx + 1       # the era rolled on
+    # nothing re-attached under the dead era: both were requeued unburned and
+    # the new era's intake seated them afresh
+    assert [c[1] for c in ops2.leg_calls] == [era_idx + 1, era_idx + 1]
+    for hk in ("ALFA", "BRAV"):
+        assert q.get(hk).attempts == 0
+        assert "era ended" in q.get(hk).last_error
+
+
+def test_late_settlement_of_an_era_whose_king_is_forfeited_by_now_requeues_not_publishes(cfg, tmp_path):
+    """The relaunch settled the missed 9165600 boundary late with the forfeited
+    king; the validators had crowned the successor by block clock at 9166500
+    and rejected it whole (king_resyncing) — after the trainer marked both
+    paid legs done and burned. A late boundary of an era whose king is
+    forfeited NOW (but not at that era's own gate) publishes nothing and
+    requeues its finished legs unburned."""
+    armed = _armed(cfg)
+    era_start = armed.round.rolling_from_block
+    era_end = era_start + EB * 4
+    gate = era_end + EB                        # the forfeiture lands after the era ended
+    forf = replace(armed, scoring=replace(armed.scoring, forfeit_hotkeys=("KING",),
+                                          forfeit_from_block=gate, forfeit_successor_hotkey="ALFA"))
+    clock = Clock()
+    sched, ops = _sched(forf, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    b0 = era_start + 5
+    sched.tick(client, b0)                      # king leg only
+    _join(sched)
+    era_idx = sched.state.current.index
+    bs = era_end - 1300
+    _advance(clock, ops, sched, client, from_block=b0, to_block=bs)
+    ops.commits += [_commit("ALFA", REF["ALFA"], bs - 10), _commit("BRAV", REF["BRAV"], bs - 9)]
+    q.add("ALFA", REF["ALFA"], reveal_block=bs - 10)
+    q.add("BRAV", REF["BRAV"], reveal_block=bs - 9)
+    ops.hold = {"ALFA": threading.Event(), "BRAV": threading.Event()}
+    sched.tick(client, bs)
+    assert {e.target_boundary for e in q.in_flight()} == {era_end}
+    for h in ops.hold.values():
+        h.set()
+    _join(sched)
+    assert len(sched.state.finished) == 2 and ops.manifests == []
+    # away across era_end; back after the forfeiture is in force
+    late = gate + 3
+    _advance(clock, ops, sched, client, from_block=bs, to_block=late)
+    assert ops.manifests == []                             # nothing published under the old king
+    assert ops.burnt == []                                 # nobody burned for it
+    assert sched.state.current.index == era_idx + 1
+    assert sched.state.current.king_hotkey == "ALFA"       # the new era trains the successor
+    assert not any(f.era_index == era_idx for f in sched.state.finished)   # no orphan of the old era
+    for hk in ("ALFA", "BRAV"):                            # requeued unburned (the new era re-seats them)
+        assert q.get(hk).attempts == 0
+        assert "forfeited before its settlement" in q.get(hk).last_error
+
+
+def test_leg_records_are_looked_up_under_the_eras_contract_not_the_base_one(tmp_path):
+    """DEC-CA-0047 schedules a contract switch at an era start; the persist
+    path stamps a leg's record with the contract effective then, but the
+    reuse path looked it up under the BASE contract — a silent digest miss,
+    so no leg trained after the switch was ever reused (2026-09-28 17:54:
+    era 2546's landed king leg retrained on a fresh pod). Both the lookup
+    and the discard go through the contract effective at the era's start."""
+    from cascade.trainer.rolling import LegOps
+
+    base, at_era = object(), object()
+    calls: list[tuple] = []
+    cfg = SimpleNamespace(throne_contracts=lambda: [base],
+                          throne_contracts_at=lambda block: (calls.append(("at", block)), [at_era])[1])
+    runner = SimpleNamespace(
+        cfg=cfg,
+        _rolling_warm_start_ref=lambda era, contract: "init-ref",
+        _load_completed_leg=lambda **kw: (calls.append(("load", kw["contract"], kw["warm_start_ckpt"])), None)[1],
+        _discard_completed_leg=lambda **kw: calls.append(("discard", kw["contract"])),
+    )
+    ops = LegOps(runner)
+    era = SimpleNamespace(start_block=9165600, base_seed=1, warm_start_ckpt="init-ref",
+                          warm_start_size="toto2-4m")
+    gen = SimpleNamespace(hotkey="KING", uid=1, ref="vault/direct@sha256:aa")
+    assert ops.cached_leg(era, "king", gen) is None
+    assert ("at", 9165600) in calls
+    assert ("load", at_era, "init-ref") in calls            # the era's contract, never `base`
+    ops.discard_cached_leg(era, "challenger", gen)
+    assert ("discard", at_era) in calls
+    assert not any(c[1] is base for c in calls if c[0] in ("load", "discard"))
