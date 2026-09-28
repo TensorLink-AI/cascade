@@ -94,6 +94,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("cascade.validator")
 
+# Subtensor ``weights_rate_limit`` on netuid 91: a set_weights inside this many
+# blocks of the previous one is silently dropped by the chain. A forced early
+# re-assert (a forfeiture crowning) waits at least this long.
+WEIGHTS_RATE_LIMIT_BLOCKS = 100
+
 # Resolve a trained entry to its per-window scores on the eval set.
 EvaluateFn = Callable[[TrainedEntry, list[EvalWindow]], list[WindowScore]]
 # Resolve a trained entry to its gift-eval ratio rows for the public-benchmark
@@ -532,6 +537,61 @@ class ValidatorRunner:
             log.debug("activation tick skipped (no block): %s", e)
             return
         self._activation_step(client, now_block=now_block)
+
+    def _forfeit_tick(self, client: object) -> None:
+        """Block-clock pass of DEC-CA-0048 (typed or resolved block alike;
+        independent of ``[activation] enabled``). Never raises."""
+        if not (getattr(self.cfg.scoring, "forfeit_hotkeys", ()) or ()):
+            return
+        try:
+            now_block = int(client.current_block())  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            log.debug("forfeiture tick skipped (no block): %s", e)
+            return
+        try:
+            self._forfeit_on_block(now_block=now_block)
+        except Exception as e:  # noqa: BLE001 — the settlement path applies it again
+            log.warning("forfeiture tick failed (%s); retrying next poll", e)
+
+    def _forfeit_on_block(self, *, now_block: int) -> bool:
+        """DEC-CA-0048 on the BLOCK clock: the poll ``now_block`` reaches
+        ``[scoring] forfeit_from_block`` the listed hotkeys leave the throne and
+        the court and the named successor is crowned — no manifest needed, so
+        the weights move at the block itself rather than at the trainer's next
+        manifest (the settlement path, ``_apply_forfeiture``, stays for a
+        validator that first meets the block through a manifest; both are
+        idempotent). The crowning is stamped with the GATE block, not the poll
+        block, so every validator records the same ``king_since_block``
+        whatever its poll timing. The standing weight vector is re-pushed as
+        soon as the chain's rate limit allows. Returns True when the state
+        changed."""
+        from ..shared.era import forfeit_successor, forfeited_hotkeys
+        from . import state as state_mod
+
+        forfeited = forfeited_hotkeys(self.cfg.scoring, int(now_block))
+        if not forfeited:
+            return False
+        gate = int(getattr(self.cfg.scoring, "forfeit_from_block", 0) or 0)
+        t = state_mod.apply_forfeit(self.state, forfeited=forfeited,
+                                    keep_former_kings=self.cfg.scoring.reward_prior_kings,
+                                    successor=forfeit_successor(self.cfg.scoring, int(now_block)) or None,
+                                    crowned_block=gate)
+        if t is None:
+            return False
+        log.warning("FORFEITURE at block %d (gate %d, block clock): %s — king now %s, court %s",
+                    int(now_block), gate, t.note, (t.state.king_hotkey or "vacant")[:12],
+                    [hk[:12] for hk in t.state.former_kings])
+        self.state = t.state
+        try:
+            self._persist_state()
+        except Exception as e:  # noqa: BLE001 — the round path persists again
+            log.warning("forfeiture: state persist deferred (%s)", e)
+        # Pull the next re-assert forward to the earliest block the chain's
+        # weights_rate_limit allows (an earlier push is a silent no-op).
+        interval = int(self.cfg.validator.weight_set_interval_blocks)
+        if self._last_weight_block is not None and interval > WEIGHTS_RATE_LIMIT_BLOCKS:
+            self._last_weight_block -= interval - WEIGHTS_RATE_LIMIT_BLOCKS
+        return True
 
     # ── manifest gating ─────────────────────────────────────────────────────
 
@@ -2500,6 +2560,9 @@ class ValidatorRunner:
                 # ahead of the manifests, so a lock-in seen this poll governs
                 # the settlement judged this poll.
                 self._activation_tick(client)
+                # DEC-CA-0048 on the block clock: the successor is crowned the
+                # poll the chain reaches forfeit_from_block, manifest or not.
+                self._forfeit_tick(client)
                 # Live dashboard telemetry first, every poll: between receipts
                 # this is the page's only fresh view of the chain (stage strip
                 # + live submissions). Best-effort; never affects the round.

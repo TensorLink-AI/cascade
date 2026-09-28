@@ -219,6 +219,36 @@ def test_validator_runner_is_silent_when_the_forfeiture_is_typed(cfg):
     assert chain.written == [] and runner.cfg.scoring.forfeit_from_block == B0 + 900
 
 
+def test_validator_crowns_the_successor_on_the_block_clock_without_a_manifest(cfg, tmp_path):
+    from cascade.validator import state as state_mod
+    from cascade.validator.loop import WEIGHTS_RATE_LIMIT_BLOCKS, ValidatorRunner
+    from cascade.validator.state import ChampionState
+
+    c = _forfeit(_typed(cfg), block=B0 + 900)
+    c = replace(c, validator=replace(c.validator, state_db_path=str(tmp_path / "state.json")))
+    state = ChampionState(king_hotkey=K, king_uid=105, tenure_rounds=3, former_kings=("OLD1", "OLD2"))
+    runner = ValidatorRunner(cfg=c, state=state, evaluate_fn=lambda e, w: [], verify_signatures=False)
+    runner._last_weight_block = B0 + 800
+    # one block short of the gate: nothing moves
+    runner._forfeit_tick(FakeChain([], {}, block=B0 + 899))
+    assert runner.state.king_hotkey == K and runner._last_weight_block == B0 + 800
+    # the gate reached between manifests: crowned at once, stamped with the GATE block (not the
+    # poll block), court untouched, the standing weights pulled forward to the rate limit
+    runner._forfeit_tick(FakeChain([], {}, block=B0 + 903))
+    st = runner.state
+    assert st.king_hotkey == S and st.king_uid is None and st.tenure_rounds == 0
+    assert st.king_since_block == B0 + 900 and st.former_kings == ("OLD1", "OLD2")
+    interval = int(c.validator.weight_set_interval_blocks)
+    assert runner._last_weight_block == B0 + 800 - (interval - WEIGHTS_RATE_LIMIT_BLOCKS)
+    assert state_mod.loads((tmp_path / "state.json").read_text()).king_hotkey == S   # persisted
+    # idempotent afterwards; a chain hiccup is swallowed
+    assert runner._forfeit_on_block(now_block=B0 + 950) is False
+    dead = FakeChain([], {}, block=B0 + 950)
+    dead.current_block = lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    runner._forfeit_tick(dead)
+    assert runner.state.king_hotkey == S
+
+
 # ── trainer ────────────────────────────────────────────────────────
 
 def test_trainer_tick_adopts_the_forfeiture_block_from_the_notes_and_never_signals(cfg, tmp_path):

@@ -212,9 +212,11 @@ vector, which is exactly what `cascade-audit`'s `weights` check reproduces.
 ## Consensus knobs added 2026-09-28 (DEC-CA-0048)
 
 `[scoring] forfeit_hotkeys` / `forfeit_from_block` / `forfeit_successor_hotkey` are consensus
-constants: at the first settlement whose boundary reaches the block every validator strips the listed
-hotkeys from the throne and the payout court and crowns the named successor (else the most recent
-eligible former king, else a vacant throne). Inert while the list is empty.
+constants: the poll the chain reaches the block (no manifest needed; the standing weights are re-pushed
+as soon as the chain's rate limit allows) every validator strips the listed hotkeys from the throne and
+the payout court and crowns the named successor (else the most recent eligible former king, else a
+vacant throne); a settlement whose boundary reaches the block applies the same, idempotently. Inert
+while the list is empty.
 
 With `forfeit_from_block = 0` and a non-empty list the block is DECIDED ON CHAIN exactly like the
 DEC-CA-0043 rollover: your readiness note gains a second segment
