@@ -145,10 +145,17 @@ def test_blocked_at(cfg):
 
 # ── loader ───────────────────────────────────────────────────────────────────
 
+def _unarmed(path: Path) -> str:
+    """The repo chain.toml with its shipped `forfeit_*` keys removed, so a test can
+    inject its own without tripping TOML's duplicate-key rule."""
+    import re
+    return re.sub(r"(?m)^forfeit_\w+\s*=.*\n", "", path.read_text())
+
+
 def test_loader_parses_both_knobs(tmp_path):
     root = Path(__file__).resolve().parents[2]
-    text = (root / "chain.toml").read_text()
     import re
+    text = _unarmed(root / "chain.toml")
     text = re.sub(r"(?m)^\[scoring\]$", f'[scoring]\nforfeit_hotkeys = ["{K}"]\nforfeit_from_block = 9190800\nforfeit_successor_hotkey = "{S}"', text, count=1)
     text = re.sub(r"(?m)^\[round\]$", f'[round]\nblocked_hotkeys = ["{K}", "{X}"]\nblocked_from_block = 9190800', text, count=1)
     p = tmp_path / "chain.toml"
@@ -157,9 +164,12 @@ def test_loader_parses_both_knobs(tmp_path):
     assert c.scoring.forfeit_hotkeys == (K,) and c.scoring.forfeit_from_block == 9_190_800
     assert c.scoring.forfeit_successor_hotkey == S
     assert c.round.blocked_hotkeys == (K, X) and c.round.blocked_from_block == 9_190_800
+    # the shipped chain.toml ARMS the forfeiture (owner 2026-09-28): one listed hotkey, a
+    # successor outside the list, block decided on chain
     base = load_chain_config(root / "chain.toml")
-    assert base.scoring.forfeit_hotkeys == () and base.scoring.forfeit_from_block == 0
-    assert base.scoring.forfeit_successor_hotkey == ""
+    assert len(base.scoring.forfeit_hotkeys) == 1 and base.scoring.forfeit_from_block == 0
+    assert base.scoring.forfeit_successor_hotkey not in ("", *base.scoring.forfeit_hotkeys)
+    assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0
     assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0
 
 
@@ -168,7 +178,7 @@ def test_loader_refuses_a_successor_that_is_itself_forfeited(tmp_path):
 
     import pytest
     root = Path(__file__).resolve().parents[2]
-    text = (root / "chain.toml").read_text()
+    text = _unarmed(root / "chain.toml")
     text = re.sub(r"(?m)^\[scoring\]$", f'[scoring]\nforfeit_hotkeys = ["{K}", "{S}"]\nforfeit_successor_hotkey = "{S}"', text, count=1)
     p = tmp_path / "chain.toml"
     p.write_text(text)

@@ -764,16 +764,23 @@ class RollingScheduler:
         end_block = int(era.start_block) + era_length_blocks(self.cfg.round, int(era.start_block))
         return wall_of_block(end_block, now=now, block_now=block)
 
+    def _forfeit_gate_block(self, era: EraState) -> int:
+        """The block ``era`` is judged at for a forfeiture: its LAST settlement
+        (the era end). A forfeiture that lands anywhere inside the era hands
+        the throne over for the rest of it — the validators crown the
+        successor at that boundary and hold until this king leg lands."""
+        return int(era.start_block) + int(era_length_blocks(self.cfg.round, int(era.start_block)))
+
     def _forfeit_switch(self, era: EraState) -> bool:
-        """DEC-CA-0048: hand ``era``'s throne to the named successor when its
-        first settlement is judged under a forfeiture that lists its king.
+        """DEC-CA-0048: hand ``era``'s throne to the named successor when any
+        of its settlements is judged under a forfeiture that lists its king.
         Returns True when the era's king changed (its king leg must be
         (re)trained). With no successor named the era trains NO king leg
         and waits for the validators' receipts (a vacant throne)."""
-        from ..shared.era import era_first_settlement, forfeit_successor, forfeited_hotkeys
+        from ..shared.era import forfeit_successor, forfeited_hotkeys
 
         scoring = self.r.cfg.scoring
-        gate_block = era_first_settlement(self.cfg.round, era.start_block)
+        gate_block = self._forfeit_gate_block(era)
         forfeited = forfeited_hotkeys(scoring, gate_block)
         if not era.king_hotkey or era.king_hotkey not in forfeited:
             return False
@@ -794,11 +801,11 @@ class RollingScheduler:
         return True
 
     def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
-        from ..shared.era import era_first_settlement, forfeited_hotkeys
+        from ..shared.era import forfeited_hotkeys
 
         self._forfeit_switch(era)
         if era.king_hotkey and era.king_hotkey in forfeited_hotkeys(
-                self.r.cfg.scoring, era_first_settlement(self.cfg.round, era.start_block)):
+                self.r.cfg.scoring, self._forfeit_gate_block(era)):
             return                                   # forfeited, no successor: vacant
         if not era.king_hotkey:
             return

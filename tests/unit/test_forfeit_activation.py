@@ -30,7 +30,11 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 
 @pytest.fixture
 def cfg():
-    return load_chain_config(REPO / "chain.toml")
+    """The shipped chain.toml with its DEC-CA-0048 forfeiture DISARMED: these tests
+    model the plain fleet (no forfeiture configured) and arm one explicitly."""
+    c = load_chain_config(REPO / "chain.toml")
+    return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
+                                      forfeit_successor_hotkey=""))
 
 
 def _typed(cfg):
@@ -142,17 +146,17 @@ def test_own_note_carries_the_forfeit_segment_only_when_one_is_decided_on_chain(
     assert A.own_signal_payload(_forfeit(_typed(cfg), block=B0), rec) is None   # typed forfeiture too: inert
 
 
-def test_apply_forfeit_activation_gives_a_full_era_of_notice(cfg):
+def test_apply_forfeit_activation_applies_at_the_boundary_after_the_lock(cfg):
     c = _forfeit(_typed(cfg))
-    # eras of 3600 from B0; a rollover ON an era edge → the NEXT era's first settlement (one era of notice)
+    # the forfeiture lands at the resolved rollover itself — no era of notice (owner 2026-09-28)
     c1 = A.apply_forfeit_activation(c, B0 + 3600)
-    assert c1.scoring.forfeit_from_block == B0 + 7200 + 900 and c1.activation.resolved_forfeit_block == B0 + 3600
-    assert forfeited_hotkeys(c1.scoring, B0 + 7200 + 899) == frozenset()
-    assert forfeited_hotkeys(c1.scoring, B0 + 7200 + 900) == frozenset({K})
-    assert forfeit_successor(c1.scoring, B0 + 7200 + 900) == S
-    # a rollover inside an era → the first era start at least one era later
-    assert A.apply_forfeit_activation(c, B0 + 900).scoring.forfeit_from_block == B0 + 7200 + 900
-    assert A.apply_forfeit_activation(c, B0 + 4500).scoring.forfeit_from_block == B0 + 10800 + 900
+    assert c1.scoring.forfeit_from_block == B0 + 3600 and c1.activation.resolved_forfeit_block == B0 + 3600
+    assert forfeited_hotkeys(c1.scoring, B0 + 3599) == frozenset()
+    assert forfeited_hotkeys(c1.scoring, B0 + 3600) == frozenset({K})
+    assert forfeit_successor(c1.scoring, B0 + 3600) == S
+    # a rollover inside an era lands mid-era, on that boundary
+    assert A.apply_forfeit_activation(c, B0 + 900).scoring.forfeit_from_block == B0 + 900
+    assert A.apply_forfeit_activation(c, B0 + 4500).scoring.forfeit_from_block == B0 + 4500
     # idempotent on the same block; one-way on another; typed block untouched
     assert A.apply_forfeit_activation(c1, B0 + 3600) is c1
     with pytest.raises(ValueError):
@@ -191,7 +195,7 @@ def test_validator_runner_decides_the_forfeiture_on_chain_and_crowns_at_the_bloc
     assert chain.written[0] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:0:0"
     assert chain.written[-1] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:{B0 + 3600}:{B0 + 3600 + 900}"
     assert runner._forfeit.locked and runner._forfeit.activation_block == B0 + 3600 + 900
-    assert runner.cfg.scoring.forfeit_from_block == B0 + 10800 + 900        # act B0+4500 is mid-era: one full era of notice
+    assert runner.cfg.scoring.forfeit_from_block == B0 + 3600 + 900         # the boundary after the lock, mid-era
     assert runner.activation_block == 0                                      # the typed rollover records nothing
     assert A.ActivationStore(tmp_path / "activation_forfeit_state.json").load().activation_block == B0 + 3600 + 900
     # a restart restores the decision without a chain read
@@ -199,7 +203,7 @@ def test_validator_runner_decides_the_forfeiture_on_chain_and_crowns_at_the_bloc
     dead = FakeChain([], {}, block=B0 + 9000)
     dead.validator_stakes = lambda block=None: (_ for _ in ()).throw(RuntimeError("down"))
     fresh._activation_startup(dead)
-    assert fresh.cfg.scoring.forfeit_from_block == B0 + 10800 + 900
+    assert fresh.cfg.scoring.forfeit_from_block == B0 + 3600 + 900
     # status carries the forfeit view
     view = A.summary(fresh.cfg, fresh._activation, None, fresh._forfeit, None)
     assert view["forfeit"]["feature"] == spec.name and view["forfeit"]["activation_block"] == B0 + 3600 + 900
@@ -228,7 +232,7 @@ def test_trainer_tick_adopts_the_forfeiture_block_from_the_notes_and_never_signa
     note = A.format_signals(A.ReadySignal(PRIMARY), A.ReadySignal(spec.name, B0 + 3600, B0 + 3600 + 900))
     chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 3600 + 100)
     runner._activation_tick(chain, B0 + 3600 + 100)
-    assert runner.cfg.scoring.forfeit_from_block == B0 + 10800 + 900
+    assert runner.cfg.scoring.forfeit_from_block == B0 + 3600 + 900
     assert runner.promotion.scoring_cfg is runner.cfg.scoring
     assert chain.written == []
     assert A.ActivationStore(tmp_path / "activation_forfeit_state.json").load().source == "signals"

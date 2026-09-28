@@ -220,7 +220,7 @@ With `forfeit_from_block = 0` and a non-empty list the block is DECIDED ON CHAIN
 DEC-CA-0043 rollover: your readiness note gains a second segment
 (`cascade-ready:1:rolling-era-king:<l>:<a>:forfeit-<hash>:<l>:<a>`), every node tallies the stake
 behind that segment at each boundary, the first boundary at/over `[activation] threshold` locks in,
-and the forfeiture applies from the first settlement of the first era starting a full era later (`activation_forfeit_state.json`
+and the forfeiture applies from the very next boundary (`activation_forfeit_state.json`
 beside your state; `status/chain.json` shows the tally under `activation.forfeit`). A validator on a
 release WITHOUT this section cannot read the extended note and counts you as not signed for the
 rollover either — install the release. A typed `forfeit_from_block` is the owner override; then every

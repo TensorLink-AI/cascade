@@ -763,6 +763,18 @@ tenure_blocks_from_block = 0
 margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
 cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
 king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks — same valve as today
+# King forfeiture (DEC-CA-0048, CONSENSUS — every validator installs this release):
+# from forfeit_from_block the listed hotkeys are stripped from the throne and the
+# payout court and the named successor is crowned in their place. 0 = the block is
+# DECIDED ON CHAIN — 51 % of validator stake signals readiness (second segment of
+# the DEC-CA-0045 note) and the forfeiture applies from the boundary after the count
+# crosses; the trainer retrains the running era's king leg for the successor.
+# Owner decision 2026-09-28: the incumbent's generator embeds a private submission
+# it did not author (decisions/DEC-CA-0048); the throne passes to the earliest
+# legitimate holder of that code.
+forfeit_hotkeys          = ["5HDvXrTbUgK72UEkc7HrSpEtd6HpUDXuwh5pvePmWraqLHwu"]
+forfeit_successor_hotkey = "5DZv2yrGtcc9GHqhojwTQ7XWTvVL9xdab9LJhVNn4tF5S5H9"
+forfeit_from_block       = 0     # decided on chain (see above); a typed settlement boundary overrides
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool

@@ -1354,10 +1354,18 @@ def test_forfeited_king_hands_the_king_leg_to_the_named_successor(cfg, tmp_path)
     assert cur.king_hotkey == "ALFA" and cur.king_ref == REF["ALFA"]
     assert cur.king_entry is not None                    # the successor's king leg trained for this era
     assert cur.king_entry["miner_hotkey"] == "ALFA" and cur.king_entry["role"] == "king"
-    # one block before the gate the incumbent keeps the throne
-    late = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + EB + 1))
-    sched2, ops2 = _sched(late, tmp_path / "late", Clock())
+    # a gate INSIDE the era (its third settlement) switches the running era too: the era is judged at its
+    # last settlement, so the successor's king leg trains now and lands before that boundary
+    mid = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + 2 * EB + 1))
+    sched2, ops2 = _sched(mid, tmp_path / "mid", Clock())
     ops2.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
     sched2.tick(FakeClient(), b0)
     _join(sched2)
-    assert sched2.state.current.king_hotkey == "KING" and sched2.state.current.king_entry is not None
+    assert sched2.state.current.king_hotkey == "ALFA" and sched2.state.current.king_entry["miner_hotkey"] == "ALFA"
+    # a gate past the era's last settlement leaves the incumbent this era
+    late = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + 4 * EB + 1))
+    sched3, ops3 = _sched(late, tmp_path / "late", Clock())
+    ops3.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched3.tick(FakeClient(), b0)
+    _join(sched3)
+    assert sched3.state.current.king_hotkey == "KING" and sched3.state.current.king_entry is not None

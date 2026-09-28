@@ -22,12 +22,13 @@ Two knobs, both inert by default:
   that is not itself forfeited, else the throne is VACANT until the next duel decides one. Forfeited
   former kings leave the payout court; the forfeited king is never retired into it. The resync safety
   valve never re-adopts a forfeited trained king. `_reward_uids` filters the list defensively.
-  **Trainer:** the era whose first settlement reaches the block trains the SUCCESSOR's king leg
+  **Trainer:** an era whose LAST settlement reaches the block trains the SUCCESSOR's king leg
   (`_forfeit_switch`, its revealed generator resolved as of the block, uid from the metagraph); an
-  already-running era switches too (king leg restarts, the old king pod retired); with no successor named
-  no king leg is trained (vacant) until receipts name one. Set the block to an era's FIRST settlement
-  (era start + one grid step) — the trainer trains one king leg per era, so a mid-era block leaves that
-  era's remaining settlements naming a forfeited king (held, unjudged). Release-then-activate: every
+  already-running era switches too (king leg restarts, the old king pod retired; the validators hold
+  that era's settlements until the new leg lands); with no successor named
+  no king leg is trained (vacant) until receipts name one. Set the block to a settlement boundary;
+  a mid-era block holds that era's settlements (successor crowned, no duel) until the retrained king
+  leg lands — a few hours, not an era. Release-then-activate: every
   external validator installs the release before the block, or weights fork on that boundary.
 * **Decided on chain (owner 2026-09-28: "when 51% of validator stake rolls over like our last major
   update").** With the list (and successor) shipped and `forfeit_from_block = 0`, the block is resolved
@@ -37,9 +38,9 @@ Two knobs, both inert by default:
   reads the extended note as malformed and counts it as NOT signed, acceptable because forfeiture is
   itself a consensus change every validator installs; the note is byte-identical to today's while no
   forfeiture is configured). Same tally, threshold and one-way lock-in, its own record
-  (`activation_forfeit_state.json`); the resolved rollover is rounded UP to the first settlement of the
-  first era starting a FULL ERA after it (`forfeit_block_for`, the DEC-CA-0043 notice rule: the trainer
-  pre-trains that era's king leg a whole era ahead) and written into `forfeit_from_block`
+  (`activation_forfeit_state.json`); the resolved rollover — the boundary right after the one where the
+  count crossed — is written as-is into `forfeit_from_block` (`forfeit_block_for`; owner 2026-09-28: no
+  era of notice, the changeover follows the validators' upgrades as closely as the grid allows)
   (`apply_forfeit_activation`; `activation.resolved_forfeit_block` marks it as resolved). A typed
   `forfeit_from_block` is the owner override. The trainer resolves the same tally (never signals) so it
   hands the king leg over at the block the validators apply. An edited list or successor is a new

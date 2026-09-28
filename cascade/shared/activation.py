@@ -428,27 +428,20 @@ def forfeit_feature(cfg: ChainConfig) -> FeatureSpec | None:
 
 def forfeit_block_for(cfg: ChainConfig, activation_block: int) -> int:
     """The forfeiture block for a lock-in whose rollover would be
-    ``activation_block``: the FIRST SETTLEMENT of the first era that starts
-    at least ONE FULL ERA after it (the DEC-CA-0043 notice rule — the trainer
-    pre-trains that era's king leg in the previous era's last wall, so it
-    must know the successor a whole era ahead). A forfeiture switches kings
-    on an era edge: the trainer trains one king leg per era, so a mid-era
-    gate would leave that era's remaining settlements naming a forfeited
-    king (held, their challengers unjudged). Before rolling eras (no era
-    grid) the block itself."""
-    from .era import era_first_settlement, era_length_blocks, next_era_start, rolling_active
-    act = int(activation_block)
-    if not rolling_active(cfg.round, act):
-        return act
-    length = int(era_length_blocks(cfg.round, act))
-    start = int(next_era_start(cfg.round, act + length - 1))
-    return int(era_first_settlement(cfg.round, start))
+    ``activation_block``: that boundary itself — the settlement right after
+    the one where the count crossed (owner 2026-09-28: the changeover follows
+    the validators' upgrades as closely as the grid allows, no era of
+    notice). A forfeiture therefore lands mid-era: the validators crown the
+    successor there and hold (no duel judged) while the trainer retrains the
+    running era's king leg for the successor (``_forfeit_switch`` judges an
+    era by its LAST settlement); settlements after that leg lands are judged
+    normally."""
+    return int(activation_block)
 
 
 def apply_forfeit_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for a forfeiture decided at
-    rollover ``block``: ``[scoring] forfeit_from_block`` = the first
-    settlement of the first era starting a full era after it
+    rollover ``block``: ``[scoring] forfeit_from_block`` = that boundary
     (:func:`forfeit_block_for`). A typed block is returned unchanged (the
     owner override); a block already applied is idempotent; a different
     block after lock-in raises (one-way)."""

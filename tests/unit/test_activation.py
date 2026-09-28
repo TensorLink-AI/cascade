@@ -28,7 +28,11 @@ B0 = 9046800 + GRID
 
 @pytest.fixture
 def cfg():
-    return load_chain_config(REPO / "chain.toml")
+    """The shipped chain.toml with its DEC-CA-0048 forfeiture DISARMED: these tests
+    model the plain fleet (no forfeiture configured) and arm one explicitly."""
+    c = load_chain_config(REPO / "chain.toml")
+    return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
+                                      forfeit_successor_hotkey=""))
 
 
 def _v(hk, stake, *, permit=True, last_update=0):
