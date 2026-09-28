@@ -39,7 +39,9 @@ from ..shared.activation import (
     ActivationStore,
     Tally,
     apply_activation,
+    apply_forfeit_activation,
     ensure_signal,
+    forfeit_feature,
     record_for,
     resolve_activation,
     resolved_rollover,
@@ -370,6 +372,10 @@ class ValidatorRunner:
     _activation_tally: Tally | None = field(default=None, repr=False)
     _signal_hotkey: str = field(default="", repr=False)
     _signal_sent: str = field(default="", repr=False)
+    # DEC-CA-0048 forfeiture decided on chain: its own record + tally, persisted
+    # beside the rollover's (``activation_forfeit_state.json``).
+    _forfeit: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _forfeit_tally: Tally | None = field(default=None, repr=False)
 
     # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
@@ -423,8 +429,49 @@ class ValidatorRunner:
                 self.apply_activation_block(self._activation.activation_block)
                 # The note now carries the agreed block for late joiners.
                 self._ensure_own_signal(client)
+            self._forfeit_step(client, now_block=now_block)
         except Exception as e:  # noqa: BLE001 — activation must never disturb a round
             log.warning("activation step failed (%s); retrying next poll", e)
+
+    def _forfeit_store(self) -> ActivationStore | None:
+        store = self.activation_store
+        if store is None or store.path is None:
+            return None
+        return ActivationStore(store.path.with_name("activation_forfeit_state.json"))
+
+    def apply_forfeit_block(self, block: int) -> bool:
+        """Write the fleet-decided forfeiture block into the live config
+        (``[scoring] forfeit_from_block``). Returns True when it changed."""
+        new_cfg = apply_forfeit_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        log.warning("activation: DEC-CA-0048 forfeiture ARMED at block %d — %d listed hotkey(s) "
+                    "leave the throne and the court at the first settlement whose boundary "
+                    "reaches it (successor %s)", new_cfg.scoring.forfeit_from_block,
+                    len(new_cfg.scoring.forfeit_hotkeys),
+                    (new_cfg.scoring.forfeit_successor_hotkey or "court")[:12])
+        return True
+
+    def _forfeit_step(self, client: object, *, now_block: int) -> None:
+        """The forfeiture's own resolver pass (same tally rule, its own
+        record). No-op without a forfeit list or under a typed block."""
+        spec = forfeit_feature(self.cfg)
+        if spec is None or not spec.decided_on_chain:
+            return
+        res = resolve_activation(self.cfg, client, now_block=int(now_block),
+                                 record=self._forfeit, feature=spec)
+        if res.tally is not None:
+            self._forfeit_tally = res.tally
+        if res.changed:
+            self._forfeit = res.record
+            store = self._forfeit_store()
+            if store is not None:
+                store.save(res.record)
+        if (self._forfeit.locked and self._forfeit.source != "config"
+                and self.apply_forfeit_block(self._forfeit.activation_block)):
+            self._ensure_own_signal(client)
+
 
     def _ensure_own_signal(self, client: object) -> None:
         """Write this validator's note when it is not the one already on
@@ -434,7 +481,7 @@ class ValidatorRunner:
 
         if not self._signal_hotkey:
             return
-        want = own_signal_payload(self.cfg, self._activation)
+        want = own_signal_payload(self.cfg, self._activation, self._forfeit)
         if want is None or want == self._signal_sent:
             return
         try:
@@ -447,6 +494,7 @@ class ValidatorRunner:
             return
         # Written now, confirmed by the read on the next poll.
         ensure_signal(client, self.cfg, self._activation, hotkey=self._signal_hotkey,
+                      forfeit_record=self._forfeit,
                       current=have)
 
     def _activation_startup(self, client: object) -> None:
@@ -455,6 +503,14 @@ class ValidatorRunner:
             return
         if self.activation_store is not None:
             self._activation = record_for(self.cfg, self.activation_store.load())
+        fstore, fspec = self._forfeit_store(), forfeit_feature(self.cfg)
+        if fstore is not None and fspec is not None:
+            self._forfeit = record_for(self.cfg, fstore.load(), fspec)
+            if self._forfeit.locked and self._forfeit.source != "config":
+                log.info("activation: restored forfeiture lock-in (block %d, forfeit at %d, via %s)",
+                         self._forfeit.lock_block, self._forfeit.activation_block,
+                         self._forfeit.source)
+                self.apply_forfeit_block(self._forfeit.activation_block)
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
@@ -2310,7 +2366,8 @@ class ValidatorRunner:
 
         try:
             econ = getattr(client, "subnet_economics", lambda: None)()
-            activation = (activation_summary(self.cfg, self._activation, self._activation_tally)
+            activation = (activation_summary(self.cfg, self._activation, self._activation_tally,
+                                             self._forfeit, self._forfeit_tally)
                           if self.cfg.activation.enabled else None)
             status = build_chain_status(
                 self.cfg,
@@ -2696,6 +2753,16 @@ class ValidatorRunner:
         holds = self.state.resync_holds if same_round else self.state.resync_holds + 1
         cap = effective_resync_cap_rounds(self.cfg.round, self.cfg.scoring,
                                           self._epoch_start_block(manifest))
+        from ..shared.era import forfeited_hotkeys
+        if trained is not None and trained in forfeited_hotkeys(
+                self.cfg.scoring, self._epoch_start_block(manifest)):
+            # DEC-CA-0048: the trainer still names a FORFEITED king. The valve
+            # must not crown it back — hold (and keep voting the successor)
+            # until the trainer follows the successor rule.
+            log.warning("round=%s trainer king %s is FORFEITED; the resync valve will not "
+                        "adopt it — holding for the successor (%d/%s)",
+                        manifest.round_id, (trained or "?")[:12], holds, cap)
+            trained = None
         if 0 < cap <= holds and trained is not None:
             log.warning(
                 "round=%s king_resync SAFETY VALVE: champion %s un-synced %d rounds "
@@ -2753,14 +2820,16 @@ class ValidatorRunner:
         forfeited hotkey until the trainer follows the receipts) then reads as a
         stale-king manifest and takes the resync path — no duel is judged against
         a forfeited king's checkpoint. Idempotent: nothing changes once applied."""
-        from ..shared.era import forfeited_hotkeys
+        from ..shared.era import forfeit_successor, forfeited_hotkeys
 
         block = self._epoch_start_block(manifest)
         forfeited = forfeited_hotkeys(self.cfg.scoring, block)
         if not forfeited:
             return
         t = state_mod.apply_forfeit(self.state, forfeited=forfeited,
-                                    keep_former_kings=self.cfg.scoring.reward_prior_kings)
+                                    keep_former_kings=self.cfg.scoring.reward_prior_kings,
+                                    successor=forfeit_successor(self.cfg.scoring, block) or None,
+                                    crowned_block=block)
         if t is None:
             return
         log.warning("round=%s FORFEITURE at block %s: %s — king now %s, court %s",

@@ -729,6 +729,9 @@ class RollingScheduler:
         cur = self.state.current
         if cur is None:
             return
+        if (cur.king_entry is not None and cur.index not in self._king_threads
+                and self._forfeit_switch(cur)):      # armed mid-reign: the running era switches too
+            self.ops.retire_king_pod(cur)
         if cur.king_entry is None and cur.king_hotkey and cur.index not in self._king_threads:
             self._launch_king_leg(client, cur, block, now)
         wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
@@ -761,14 +764,42 @@ class RollingScheduler:
         end_block = int(era.start_block) + era_length_blocks(self.cfg.round, int(era.start_block))
         return wall_of_block(end_block, now=now, block_now=block)
 
-    def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
-        from ..shared.era import forfeited_hotkeys
+    def _forfeit_switch(self, era: EraState) -> bool:
+        """DEC-CA-0048: hand ``era``'s throne to the named successor when its
+        first settlement is judged under a forfeiture that lists its king.
+        Returns True when the era's king changed (its king leg must be
+        (re)trained). With no successor named the era trains NO king leg
+        and waits for the validators' receipts (a vacant throne)."""
+        from ..shared.era import era_first_settlement, forfeit_successor, forfeited_hotkeys
 
-        if era.king_hotkey and era.king_hotkey in forfeited_hotkeys(self.r.cfg.scoring, block):
-            log.warning("rolling: era %d king %s is FORFEITED from block %s — no king leg; "
-                        "waiting for the validators' receipts to name the successor",
-                        era.index, era.king_hotkey[:12], self.r.cfg.scoring.forfeit_from_block)
-            return
+        scoring = self.r.cfg.scoring
+        gate_block = era_first_settlement(self.cfg.round, era.start_block)
+        forfeited = forfeited_hotkeys(scoring, gate_block)
+        if not era.king_hotkey or era.king_hotkey not in forfeited:
+            return False
+        succ = forfeit_successor(scoring, gate_block)
+        if not succ:
+            log.warning("rolling: era %d king %s is FORFEITED from block %s and no successor "
+                        "is named — no king leg; waiting for the validators' receipts",
+                        era.index, era.king_hotkey[:12], scoring.forfeit_from_block)
+            return False
+        with self._lock:
+            log.warning("rolling: era %d king %s is FORFEITED from block %s — throne passes to "
+                        "the named successor %s; its king leg trains for this era",
+                        era.index, era.king_hotkey[:12], scoring.forfeit_from_block, succ[:12])
+            era.king_hotkey, era.king_uid, era.king_ref = succ, -1, ""
+            era.king_entry, era.king_bench, era.king_bench_published = None, None, False
+            era.king_init = ""
+            self._save()
+        return True
+
+    def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
+        from ..shared.era import era_first_settlement, forfeited_hotkeys
+
+        self._forfeit_switch(era)
+        if era.king_hotkey and era.king_hotkey in forfeited_hotkeys(
+                self.r.cfg.scoring, era_first_settlement(self.cfg.round, era.start_block)):
+            return                                   # forfeited, no successor: vacant
         if not era.king_hotkey:
             return
         if not era.king_ref:

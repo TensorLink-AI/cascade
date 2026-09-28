@@ -1618,8 +1618,19 @@ class ScoringConfig:
     # list from the same settlement boundary or weights fork. Hotkeys listed
     # here leave the throne (abdicating to the most recent eligible former
     # king) and the court from `forfeit_from_block`; 0 / empty = inert.
+    # With a non-empty list and ``forfeit_from_block = 0`` under an enabled
+    # ``[activation]``, the block is DECIDED ON CHAIN (DEC-CA-0045 machinery):
+    # each validator on the release adds a ``forfeit-<hash of the list>``
+    # segment to its readiness note, the first boundary where the segment
+    # holds ``threshold`` of eligible stake locks in, and the NEXT boundary is
+    # the forfeiture. A typed block is the owner override.
     forfeit_hotkeys: tuple[str, ...] = ()
     forfeit_from_block: int = 0
+    # CONSENSUS: the hotkey crowned when the KING is forfeited (tenure reset,
+    # its era king leg trained from the first era judged under the
+    # forfeiture). "" = the most recent former king not itself forfeited,
+    # else a vacant throne. Never itself in ``forfeit_hotkeys``.
+    forfeit_successor_hotkey: str = ""
     # Increment-margin activation (DEC-CA-0039, block-gated). Under margin_mode
     # "level" the dethrone bar is a fixed fraction of the king's ABSOLUTE score
     # (win_margin_* ), so a maturing lineage whose per-round gains fall below
@@ -2080,6 +2091,10 @@ class ActivationConfig:
     # resolved rollover is distinguishable from a typed-in one (the typed
     # one is the owner override and is never re-resolved).
     resolved_block: int = 0
+    # RUNTIME ONLY: the forfeiture block ``apply_forfeit_activation`` wrote
+    # into ``[scoring] forfeit_from_block`` (DEC-CA-0048 decided on chain),
+    # so a resolved block is distinguishable from a typed-in one.
+    resolved_forfeit_block: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -2608,6 +2623,11 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # chain; the rollover block is resolved from those signals at runtime when
     # the DEC-CA-0043 keys are 0. Validated here so a bad threshold or grid
     # never reaches the resolver.
+    _forf_succ = str(s.get("forfeit_successor_hotkey", "") or "").strip()
+    if _forf_succ and _forf_succ in {str(x) for x in (s.get("forfeit_hotkeys", ()) or ())}:
+        raise ValueError(
+            f"[scoring] forfeit_successor_hotkey={_forf_succ!r} is itself listed in "
+            "forfeit_hotkeys — a forfeited hotkey cannot be crowned")
     ac = raw.get("activation", {})
     _act_feature = str(ac.get("feature", "") or "").strip()
     if _act_feature and not re.fullmatch(r"[A-Za-z0-9._-]+", _act_feature):
@@ -2909,6 +2929,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
             forfeit_hotkeys=tuple(str(x) for x in s.get("forfeit_hotkeys", ()) or ()),
             forfeit_from_block=max(0, int(s.get("forfeit_from_block", 0) or 0)),
+            forfeit_successor_hotkey=str(s.get("forfeit_successor_hotkey", "") or "").strip(),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
             cohort_maxt_increment_from_block=max(
                 0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),

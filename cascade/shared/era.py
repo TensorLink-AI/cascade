@@ -87,6 +87,28 @@ def rolling_active(round_cfg: RoundConfig, block: int | None) -> bool:
     return gate > 0 and block is not None and int(block) >= gate
 
 
+def forfeit_successor(scoring: ScoringConfig, block: int | None) -> str:
+    """CONSENSUS (DEC-CA-0048): the hotkey crowned in place of a forfeited
+    king at ``block`` — ``[scoring] forfeit_successor_hotkey`` once the
+    forfeiture is in force and the successor is not itself listed; "" =
+    fall back to the court (most recent eligible former king, else vacant)."""
+    if not forfeited_hotkeys(scoring, block):
+        return ""
+    succ = str(getattr(scoring, "forfeit_successor_hotkey", "") or "").strip()
+    return "" if not succ or succ in forfeited_hotkeys(scoring, block) else succ
+
+
+def era_first_settlement(round_cfg: RoundConfig, era_start: int) -> int:
+    """The boundary of an era's FIRST settlement (its start plus one grid
+    step) — the first block at which a settlement carries that era's king
+    leg. The forfeiture gate is judged there for the trainer's king choice:
+    era ``E`` trains the successor iff ``era_first_settlement(E) >=
+    forfeit_from_block`` (the first settlement judged under the forfeiture
+    belongs to ``E``)."""
+    start = int(era_start)
+    return start + int(effective_epoch_blocks(round_cfg, start))
+
+
 def forfeited_hotkeys(scoring: ScoringConfig, block: int | None) -> frozenset[str]:
     """CONSENSUS gate (DEC-CA-0048): the forfeit list in force for a settlement
     whose boundary is ``block``; empty before ``forfeit_from_block`` or when the

@@ -106,30 +106,47 @@ def genesis(king_hotkey: str, king_uid: int) -> ChampionState:
 
 def apply_forfeit(
     state: ChampionState, *, forfeited: frozenset[str] | set[str], keep_former_kings: int = 0,
+    successor: str | None = None, crowned_block: int | None = None,
 ) -> StateTransition | None:
     """DEC-CA-0048: strip forfeited hotkeys from the throne and the court.
 
-    A forfeited KING abdicates to the most recent former king that is not
-    itself forfeited (tenure and streaks reset; ``king_uid`` is re-resolved by
-    the vote path); with no eligible successor the throne is EMPTY until the
-    next duel decides one. Forfeited former kings simply leave the court.
+    A forfeited KING abdicates to ``successor`` when one is named (``[scoring]
+    forfeit_successor_hotkey``, never itself forfeited), else to the most
+    recent former king that is not forfeited; with neither the throne is
+    EMPTY until the next duel decides one. The new king starts a fresh reign:
+    tenure and streaks reset, ``king_since_block`` = ``crowned_block`` (the
+    forfeiture boundary), the era king pointer is cleared so the successor's
+    first king leg is adopted (:meth:`_adopt_era_king`), and ``king_uid`` is
+    re-resolved by the vote path. Forfeited former kings simply leave the
+    court; a named successor already in the court leaves it too (it is the
+    king now). Every other field — loop position, re-entry guards — is kept.
     Returns ``None`` when nothing changes — the caller neither persists nor
-    logs. Pure; consensus-critical: every validator applies the same list at
-    the same block or weights fork."""
+    logs. Pure; consensus-critical: every validator applies the same list,
+    successor and block or weights fork."""
     forfeited = frozenset(forfeited)
     if not forfeited:
         return None
+    succ = str(successor or "").strip()
+    if succ in forfeited:
+        succ = ""
     court = tuple(hk for hk in state.former_kings if hk not in forfeited)
     if state.king_hotkey is not None and state.king_hotkey in forfeited:
-        successor = court[0] if court else None
-        rest = court[1:] if court else ()
-        new = ChampionState(
-            king_hotkey=successor, king_uid=None, tenure_rounds=0, streaks={},
-            rounds_seen=state.rounds_seen, former_kings=rest[:max(0, keep_former_kings)],
+        if succ:
+            new_king: str | None = succ
+            rest = tuple(hk for hk in court if hk != succ)
+        else:
+            new_king = court[0] if court else None
+            rest = court[1:] if court else ()
+        new = replace(
+            state, king_hotkey=new_king, king_uid=None, tenure_rounds=0, streaks={},
+            former_kings=rest[:max(0, keep_former_kings)],
+            resync_holds=0, last_resync_round_id=None,
+            king_since_block=(int(crowned_block) if crowned_block is not None and new_king else None),
+            king_pointer="", era_index=None,
         )
         return StateTransition(
-            state=new, dethroned=True, new_king_hotkey=successor,
-            note=f"forfeit:{state.king_hotkey[:12]}→{(successor or 'vacant')[:12]}")
+            state=new, dethroned=True, new_king_hotkey=new_king,
+            note=f"forfeit:{state.king_hotkey[:12]}→{(new_king or 'vacant')[:12]}")
     if court != state.former_kings:
         return StateTransition(state=replace(state, former_kings=court), dethroned=False,
                                new_king_hotkey=state.king_hotkey, note="forfeit:court")

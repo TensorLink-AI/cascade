@@ -5,7 +5,7 @@ title: "King forfeiture + admission denylist: a listed hotkey leaves the throne 
 status: proposed
 date: 2026-09-28
 tags: [scoring, validator, trainer, consensus, governance]
-revisit_when: "the first use — record the evidence standard applied and whether the successor rule (most recent eligible former king, else vacant) produced the intended throne"
+revisit_when: "the first use — record the evidence standard applied and whether the successor rule (named successor; else most recent eligible former king, else vacant) produced the intended throne"
 relations: {depends_on: [DEC-CA-0004, DEC-CA-0043, DEC-CA-0045], relates_to: [DEC-CA-0008, DEC-CA-0016]}
 ---
 
@@ -13,16 +13,38 @@ relations: {depends_on: [DEC-CA-0004, DEC-CA-0043, DEC-CA-0045], relates_to: [DE
 
 Two knobs, both inert by default:
 
-* **`[scoring] forfeit_hotkeys = [...]`, `forfeit_from_block = <settlement boundary>`** — CONSENSUS.
-  At the first settlement whose boundary reaches the block, every validator strips the listed hotkeys
-  from the throne and the court (`state.apply_forfeit`): a forfeited king abdicates to the most recent
-  former king that is not itself forfeited (tenure and streaks reset), or the throne is VACANT until the
-  next duel decides one; forfeited former kings leave the payout court. The manifest that still names
-  the forfeited king reads as a stale-king manifest and takes the resync path, so no duel is judged
-  against a forfeited king's checkpoint. `_reward_uids` filters the list defensively. The trainer follows
-  the validators' receipts to the successor (`_receipt_king`), and refuses to launch a king leg for a
-  forfeited hotkey. Release-then-activate: every external validator installs the release before the
-  block, or weights fork on that boundary.
+* **`[scoring] forfeit_hotkeys = [...]`, `forfeit_from_block = <an era's FIRST settlement boundary>`,
+  `forfeit_successor_hotkey = "<hotkey>"`** — CONSENSUS. At the first settlement whose boundary reaches
+  the block, every validator strips the listed hotkeys from the throne and the court
+  (`state.apply_forfeit`): a forfeited king abdicates to the NAMED successor (crowned fresh: tenure and
+  streaks reset, `king_since_block` = the forfeiture boundary, era king pointer cleared so the
+  successor's first king leg is adopted) — or, with no successor named, to the most recent former king
+  that is not itself forfeited, else the throne is VACANT until the next duel decides one. Forfeited
+  former kings leave the payout court; the forfeited king is never retired into it. The resync safety
+  valve never re-adopts a forfeited trained king. `_reward_uids` filters the list defensively.
+  **Trainer:** the era whose first settlement reaches the block trains the SUCCESSOR's king leg
+  (`_forfeit_switch`, its revealed generator resolved as of the block, uid from the metagraph); an
+  already-running era switches too (king leg restarts, the old king pod retired); with no successor named
+  no king leg is trained (vacant) until receipts name one. Set the block to an era's FIRST settlement
+  (era start + one grid step) — the trainer trains one king leg per era, so a mid-era block leaves that
+  era's remaining settlements naming a forfeited king (held, unjudged). Release-then-activate: every
+  external validator installs the release before the block, or weights fork on that boundary.
+* **Decided on chain (owner 2026-09-28: "when 51% of validator stake rolls over like our last major
+  update").** With the list (and successor) shipped and `forfeit_from_block = 0`, the block is resolved
+  by the DEC-CA-0045 machinery: each validator's readiness note gains a second segment
+  `forfeit-<sha256("<sorted hotkeys>|<successor>")[:8]>:<lock>:<act>` (one plain commitment per hotkey,
+  so it rides in the same note — `cascade-ready:1:<f1>:<l1>:<a1>:<f2>:<l2>:<a2>`; a pre-segment parser
+  reads the extended note as malformed and counts it as NOT signed, acceptable because forfeiture is
+  itself a consensus change every validator installs; the note is byte-identical to today's while no
+  forfeiture is configured). Same tally, threshold and one-way lock-in, its own record
+  (`activation_forfeit_state.json`); the resolved rollover is rounded UP to the first settlement of the
+  first era starting a FULL ERA after it (`forfeit_block_for`, the DEC-CA-0043 notice rule: the trainer
+  pre-trains that era's king leg a whole era ahead) and written into `forfeit_from_block`
+  (`apply_forfeit_activation`; `activation.resolved_forfeit_block` marks it as resolved). A typed
+  `forfeit_from_block` is the owner override. The trainer resolves the same tally (never signals) so it
+  hands the king leg over at the block the validators apply. An edited list or successor is a new
+  feature name = a fresh vote. Receipts do NOT yet stamp the forfeit block (audit replays a typed block
+  only) — follow-up.
 * **`[round] blocked_hotkeys = [...]`, `blocked_from_block`** — trainer-side, not consensus. Listed
   hotkeys are refused at rolling admission (`failed [blocked]`, NO burn — the fee is policy, not code),
   never rent a pod.

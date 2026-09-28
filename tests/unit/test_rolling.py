@@ -1339,3 +1339,25 @@ def test_forfeited_king_gets_no_king_leg(cfg, tmp_path):
     sched.tick(FakeClient(), b0)
     _join(sched)
     assert sched.state.current.king_entry is None        # the forfeited king is never trained
+
+
+def test_forfeited_king_hands_the_king_leg_to_the_named_successor(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    forf = replace(armed, scoring=replace(armed.scoring, forfeit_hotkeys=("KING",), forfeit_from_block=b0,
+                                          forfeit_successor_hotkey="ALFA"))
+    sched, ops = _sched(forf, tmp_path / "succ", Clock())
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))    # the successor's revealed generator
+    sched.tick(FakeClient(), b0)
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king_hotkey == "ALFA" and cur.king_ref == REF["ALFA"]
+    assert cur.king_entry is not None                    # the successor's king leg trained for this era
+    assert cur.king_entry["miner_hotkey"] == "ALFA" and cur.king_entry["role"] == "king"
+    # one block before the gate the incumbent keeps the throne
+    late = replace(forf, scoring=replace(forf.scoring, forfeit_from_block=armed.round.rolling_from_block + EB + 1))
+    sched2, ops2 = _sched(late, tmp_path / "late", Clock())
+    ops2.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched2.tick(FakeClient(), b0)
+    _join(sched2)
+    assert sched2.state.current.king_hotkey == "KING" and sched2.state.current.king_entry is not None

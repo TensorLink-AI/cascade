@@ -37,10 +37,27 @@ chain instead:
 The validator stamps the resolved block on every receipt from then on
 (``activation_block``, drop-when-default), so the audit replays each round
 under the block the fleet actually decided.
+
+**Secondary features (DEC-CA-0048).** A hotkey holds ONE plain commitment,
+so any later decision rides in the same note as extra ``<feature>:<lock>:
+<act>`` segments after the primary one: ``cascade-ready:1:<f1>:<l1>:<a1>:
+<f2>:<l2>:<a2>``. Each segment is tallied, locked in and persisted on its
+own (:func:`resolve_activation` takes a :class:`FeatureSpec`); the primary
+segment keeps today's exact bytes, so a note without a second feature is
+byte-identical to a v1 note. A parser from before this module carried
+segments reads an extended note as malformed and counts it as NOT signed —
+acceptable only because every feature that rides here is itself a consensus
+change every validator must install. The king forfeiture
+(``[scoring] forfeit_hotkeys`` with ``forfeit_from_block = 0``) is the first
+such feature: its name is ``forfeit-<sha256(sorted hotkeys)[:8]>`` so a
+changed list is a fresh vote, and lock-in writes the resolved block into
+``forfeit_from_block`` (:func:`apply_forfeit_activation`). A typed-in
+``forfeit_from_block`` is the owner override, exactly as for the rollover.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, replace
@@ -72,36 +89,86 @@ class ReadySignal:
     activation_block: int = 0
 
 
-def format_signal(feature: str, *, lock_block: int = 0, activation_block: int = 0) -> str:
-    """``cascade-ready:1:<feature>:<lock_block>:<activation_block>``."""
+def _segment(feature: str, lock_block: int, activation_block: int) -> str:
     feat = str(feature or "").strip()
     if not feat or ":" in feat or any(c.isspace() for c in feat):
         raise ValueError(f"feature must be a non-empty token without ':' or spaces; got {feat!r}")
-    return f"{SIGNAL_PREFIX}{SIGNAL_VERSION}:{feat}:{int(lock_block)}:{int(activation_block)}"
+    return f"{feat}:{int(lock_block)}:{int(activation_block)}"
+
+
+def format_signal(feature: str, *, lock_block: int = 0, activation_block: int = 0) -> str:
+    """``cascade-ready:1:<feature>:<lock_block>:<activation_block>``."""
+    return f"{SIGNAL_PREFIX}{SIGNAL_VERSION}:{_segment(feature, lock_block, activation_block)}"
+
+
+def format_signals(primary: ReadySignal, *extras: ReadySignal) -> str:
+    """The primary segment (today's exact note) followed by one segment per
+    secondary feature: ``cascade-ready:1:<f1>:<l1>:<a1>[:<f2>:<l2>:<a2>…]``.
+    Feature names must be distinct."""
+    sigs = (primary, *extras)
+    names = [x.feature for x in sigs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate feature in note: {names}")
+    body = ":".join(_segment(x.feature, x.lock_block, x.activation_block) for x in sigs)
+    return f"{SIGNAL_PREFIX}{SIGNAL_VERSION}:{body}"
 
 
 def is_signal_payload(payload: object) -> bool:
     return isinstance(payload, str) and payload.startswith(SIGNAL_PREFIX)
 
 
-def parse_signal(payload: object) -> ReadySignal | None:
-    """Parse a note; ``None`` for anything that is not a well-formed v1 note
-    (a future version, a generator pointer, garbage)."""
-    if not is_signal_payload(payload):
-        return None
-    parts = str(payload)[len(SIGNAL_PREFIX):].split(":")
-    if len(parts) != 4:
-        return None
-    ver, feat, lock, act = parts
+def _parse_segment(feat: str, lock: str, act: str) -> ReadySignal | None:
     try:
-        if int(ver) != SIGNAL_VERSION:
-            return None
         lock_b, act_b = int(lock), int(act)
     except ValueError:
         return None
     if not feat or lock_b < 0 or act_b < 0 or (act_b and not lock_b) or (lock_b and act_b <= lock_b):
         return None
     return ReadySignal(feature=feat, lock_block=lock_b, activation_block=act_b)
+
+
+def parse_signals(payload: object) -> tuple[ReadySignal, ...] | None:
+    """Every segment of a note, primary first; ``None`` for anything that is
+    not a well-formed v1 note (a future version, a generator pointer, a
+    malformed or duplicated segment, garbage). A whole note stands or falls
+    together: one bad segment and no segment counts."""
+    if not is_signal_payload(payload):
+        return None
+    parts = str(payload)[len(SIGNAL_PREFIX):].split(":")
+    if len(parts) < 4 or (len(parts) - 1) % 3:
+        return None
+    try:
+        if int(parts[0]) != SIGNAL_VERSION:
+            return None
+    except ValueError:
+        return None
+    out: list[ReadySignal] = []
+    for i in range(1, len(parts), 3):
+        sig = _parse_segment(parts[i], parts[i + 1], parts[i + 2])
+        if sig is None:
+            return None
+        out.append(sig)
+    if len({x.feature for x in out}) != len(out):
+        return None
+    return tuple(out)
+
+
+def parse_signal(payload: object) -> ReadySignal | None:
+    """The PRIMARY segment of a note (``None`` when the note is malformed) —
+    the pre-segment reading, kept for callers that only know one feature."""
+    sigs = parse_signals(payload)
+    return sigs[0] if sigs else None
+
+
+def signal_for(payload: object, feature: str) -> ReadySignal | None:
+    """The segment of ``payload`` that names ``feature``, else ``None``."""
+    sigs = parse_signals(payload)
+    if not sigs:
+        return None
+    for sig in sigs:
+        if sig.feature == feature:
+            return sig
+    return None
 
 
 # ── the tally ────────────────────────────────────────────────────────────────
@@ -181,8 +248,8 @@ def tally(
     total = 0.0
     for v in elig:
         total += float(v.stake)
-        sig = parse_signal(signals.get(v.hotkey))
-        if sig is not None and sig.feature == feature:
+        sig = signal_for(signals.get(v.hotkey), feature)
+        if sig is not None:
             signed.append(v.hotkey)
             signed_stake += float(v.stake)
     return Tally(
@@ -218,8 +285,8 @@ def named_locks(
     of ``validators`` (already filtered for eligibility by the caller)."""
     by_block: dict[tuple[int, int], float] = {}
     for v in validators:
-        sig = parse_signal(signals.get(v.hotkey))
-        if sig is None or sig.feature != feature or not sig.activation_block:
+        sig = signal_for(signals.get(v.hotkey), feature)
+        if sig is None or not sig.activation_block:
             continue
         if round_cfg is not None and not valid_pair(round_cfg, sig.lock_block,
                                                     sig.activation_block):
@@ -300,6 +367,107 @@ def resolved_rollover(cfg: ChainConfig) -> int:
     """The rollover this config runs with from validator signals (0 = none
     applied / typed in)."""
     return int(getattr(cfg.activation, "resolved_block", 0) or 0)
+
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    """One feature the fleet decides on chain. ``typed_block`` > 0 is the
+    owner override: the feature is not signalled, tallied or resolved."""
+    name: str
+    typed_block: int = 0
+
+    @property
+    def decided_on_chain(self) -> bool:
+        return bool(self.name) and not int(self.typed_block)
+
+
+def primary_feature(cfg: ChainConfig) -> FeatureSpec:
+    """The DEC-CA-0043 rollover feature (``[activation] feature``)."""
+    return FeatureSpec(name=str(cfg.activation.feature or ""), typed_block=configured_rollover(cfg))
+
+
+def forfeit_feature_name(hotkeys, successor: str = "") -> str:
+    """``forfeit-<sha256("<sorted hotkeys>|<successor>")[:8]>`` — the list
+    AND the successor are the feature, so an edited list or a different
+    successor is a fresh vote and two validators shipping different
+    forfeitures never count each other."""
+    hks = sorted({str(h).strip() for h in (hotkeys or ()) if str(h).strip()})
+    if not hks:
+        return ""
+    body = ",".join(hks) + "|" + str(successor or "").strip()
+    return "forfeit-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def configured_forfeit_block(cfg: ChainConfig) -> int:
+    """The forfeiture block TYPED into chain.toml (0 = none / decided on chain).
+    A block written by :func:`apply_forfeit_activation` is not typed
+    (``activation.resolved_forfeit_block`` marks it)."""
+    if int(getattr(cfg.activation, "resolved_forfeit_block", 0) or 0):
+        return 0
+    return int(getattr(cfg.scoring, "forfeit_from_block", 0) or 0)
+
+
+def resolved_forfeit_block(cfg: ChainConfig) -> int:
+    return int(getattr(cfg.activation, "resolved_forfeit_block", 0) or 0)
+
+
+def forfeit_feature(cfg: ChainConfig) -> FeatureSpec | None:
+    """The DEC-CA-0048 forfeiture as a feature the fleet decides: present
+    when ``[activation]`` is on and ``[scoring] forfeit_hotkeys`` is
+    non-empty; ``typed_block`` = the typed ``forfeit_from_block`` (the
+    override — then nothing is signalled). ``None`` = no forfeiture in the
+    config, or activation off (a typed block is then the only way)."""
+    if not cfg.activation.enabled:
+        return None
+    name = forfeit_feature_name(getattr(cfg.scoring, "forfeit_hotkeys", ()) or (),
+                                getattr(cfg.scoring, "forfeit_successor_hotkey", "") or "")
+    if not name:
+        return None
+    return FeatureSpec(name=name, typed_block=configured_forfeit_block(cfg))
+
+
+def forfeit_block_for(cfg: ChainConfig, activation_block: int) -> int:
+    """The forfeiture block for a lock-in whose rollover would be
+    ``activation_block``: the FIRST SETTLEMENT of the first era that starts
+    at least ONE FULL ERA after it (the DEC-CA-0043 notice rule — the trainer
+    pre-trains that era's king leg in the previous era's last wall, so it
+    must know the successor a whole era ahead). A forfeiture switches kings
+    on an era edge: the trainer trains one king leg per era, so a mid-era
+    gate would leave that era's remaining settlements naming a forfeited
+    king (held, their challengers unjudged). Before rolling eras (no era
+    grid) the block itself."""
+    from .era import era_first_settlement, era_length_blocks, next_era_start, rolling_active
+    act = int(activation_block)
+    if not rolling_active(cfg.round, act):
+        return act
+    length = int(era_length_blocks(cfg.round, act))
+    start = int(next_era_start(cfg.round, act + length - 1))
+    return int(era_first_settlement(cfg.round, start))
+
+
+def apply_forfeit_activation(cfg: ChainConfig, block: int) -> ChainConfig:
+    """The config the owner would have typed for a forfeiture decided at
+    rollover ``block``: ``[scoring] forfeit_from_block`` = the first
+    settlement of the first era starting a full era after it
+    (:func:`forfeit_block_for`). A typed block is returned unchanged (the
+    owner override); a block already applied is idempotent; a different
+    block after lock-in raises (one-way)."""
+    block = int(block or 0)
+    if block <= 0 or configured_forfeit_block(cfg):
+        return cfg
+    if not (getattr(cfg.scoring, "forfeit_hotkeys", ()) or ()):
+        return cfg
+    have = resolved_forfeit_block(cfg)
+    if have == block:
+        return cfg
+    if have:
+        raise ValueError(f"forfeiture {have} already applied; a lock-in is one-way and cannot "
+                         f"move it to {block}")
+    if block % int(effective_epoch_blocks(cfg.round, block - 1)):
+        raise ValueError(f"forfeiture block {block} is not a settlement boundary")
+    gate = forfeit_block_for(cfg, block)
+    return replace(cfg, scoring=replace(cfg.scoring, forfeit_from_block=gate),
+                   activation=replace(cfg.activation, resolved_forfeit_block=block))
 
 
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
@@ -443,6 +611,7 @@ def _read_chain(client: Any, block: int | None) -> tuple[list[ValidatorStake], d
 
 def resolve_activation(
     cfg: ChainConfig, client: Any, *, now_block: int, record: ActivationRecord,
+    feature: FeatureSpec | None = None,
 ) -> Resolution:
     """Advance ``record`` one step against the chain.
 
@@ -454,10 +623,11 @@ def resolve_activation(
     caller retries next poll.
     """
     ac = cfg.activation
-    feature = ac.feature
+    spec = feature if feature is not None else primary_feature(cfg)
+    feature = spec.name
     if not feature:
         return Resolution(record=record)
-    typed = configured_rollover(cfg)
+    typed = int(spec.typed_block)
     if typed:
         if record.activation_block != typed or record.source != "config":
             return Resolution(record=replace(record, feature=feature, activation_block=typed,
@@ -469,8 +639,8 @@ def resolve_activation(
         # The typed-in rollover was withdrawn from chain.toml: a typed block
         # was never the chain's decision, so the record must not stay
         # "locked" on it — the chain decides again from here.
-        log.warning("activation: typed-in rollover %d withdrawn from the config; "
-                    "resolving from validator signals again", record.activation_block)
+        log.warning("activation: typed-in block %d for %s withdrawn from the config; "
+                    "resolving from validator signals again", record.activation_block, feature)
         record = ActivationRecord()
         return Resolution(record=record, changed=True)
     if record.locked:
@@ -593,12 +763,15 @@ def _earlier_lock_named_by_signers(
     return key if stake / t.signed_stake >= float(cfg.activation.threshold) else None
 
 
-def record_for(cfg: ChainConfig, record: ActivationRecord) -> ActivationRecord:
-    """``record`` if it belongs to this config's feature, else a blank one —
-    a persisted decision for a renamed feature must never arm anything."""
-    if record.feature and record.feature != cfg.activation.feature:
+def record_for(cfg: ChainConfig, record: ActivationRecord,
+               feature: FeatureSpec | None = None) -> ActivationRecord:
+    """``record`` if it belongs to ``feature`` (default: this config's primary
+    feature), else a blank one — a persisted decision for a renamed feature
+    (or an edited forfeit list) must never arm anything."""
+    name = feature.name if feature is not None else str(cfg.activation.feature or "")
+    if record.feature and record.feature != name:
         log.warning("activation: ignoring a persisted record for feature %r (config runs %r)",
-                    record.feature, cfg.activation.feature)
+                    record.feature, name)
         return ActivationRecord()
     return record
 
@@ -674,23 +847,40 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
         return cfg
 
 
-def own_signal_payload(cfg: ChainConfig, record: ActivationRecord) -> str | None:
+def _segment_for(spec: FeatureSpec, record: ActivationRecord | None) -> ReadySignal:
+    if record is not None and record.locked and record.lock_block:
+        return ReadySignal(spec.name, lock_block=record.lock_block,
+                           activation_block=record.activation_block)
+    return ReadySignal(spec.name)
+
+
+def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
+                       forfeit_record: ActivationRecord | None = None) -> str | None:
     """The note this node should have on chain right now (``None`` when
-    signalling is off): plain readiness until lock-in, then the agreed block."""
-    if not cfg.activation.enabled or configured_rollover(cfg):
+    signalling is off): plain readiness until lock-in, then the agreed block
+    — per segment. With no forfeiture decided on chain the note is exactly
+    the single-segment v1 note; a typed-in rollover AND no forfeiture vote
+    makes it inert (``None``)."""
+    if not cfg.activation.enabled:
+        return None
+    primary = primary_feature(cfg)
+    forfeit = forfeit_feature(cfg)
+    extras: list[ReadySignal] = []
+    if forfeit is not None and forfeit.decided_on_chain:
+        extras.append(_segment_for(forfeit, forfeit_record))
+    if not primary.decided_on_chain and not extras:
         return None                                  # typed-in rollover: the note is inert
-    if record.locked and record.lock_block:
-        return format_signal(cfg.activation.feature, lock_block=record.lock_block,
-                             activation_block=record.activation_block)
-    return format_signal(cfg.activation.feature)
+    head = _segment_for(primary, record) if primary.decided_on_chain else ReadySignal(primary.name)
+    return format_signals(head, *extras)
 
 
 def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
-                  hotkey: str, current: dict[str, str] | None = None) -> bool:
+                  hotkey: str, current: dict[str, str] | None = None,
+                  forfeit_record: ActivationRecord | None = None) -> bool:
     """Write this validator's note unless the chain already carries it.
     Returns True when a write happened. Never raises (a failed write is
     retried on the next call)."""
-    want = own_signal_payload(cfg, record)
+    want = own_signal_payload(cfg, record, forfeit_record)
     if want is None:
         return False
     try:
@@ -705,7 +895,9 @@ def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
         return False
 
 
-def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None) -> dict:
+def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
+            forfeit_record: ActivationRecord | None = None,
+            forfeit_tally: Tally | None = None) -> dict:
     """Presentational block for ``status/chain.json`` / dashboards."""
     out: dict = {
         "feature": cfg.activation.feature,
@@ -716,4 +908,18 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None) -> dict
     }
     if t is not None:
         out["tally"] = t.to_json()
+    forfeit = forfeit_feature(cfg)
+    if forfeit is not None:
+        rec = forfeit_record or ActivationRecord()
+        fo: dict = {
+            "feature": forfeit.name,
+            "hotkeys": len(getattr(cfg.scoring, "forfeit_hotkeys", ()) or ()),
+            "typed_block": int(forfeit.typed_block),
+            "lock_block": int(rec.lock_block),
+            "activation_block": int(rec.activation_block),
+            "source": rec.source,
+        }
+        if forfeit_tally is not None:
+            fo["tally"] = forfeit_tally.to_json()
+        out["forfeit"] = fo
     return out

@@ -1157,6 +1157,7 @@ class TrainerRunner:
     # read. None ⇒ resolved in memory only.
     activation_store: object | None = None
     _activation: object | None = field(default=None, repr=False)
+    _forfeit: object | None = field(default=None, repr=False)
     _hub: HubConfig | None = field(default=None, repr=False)
     _manifest_store: S3Store | None = field(default=None, repr=False)
     _logs_store: S3Store | None = field(default=None, repr=False)
@@ -1748,8 +1749,55 @@ class TrainerRunner:
             rec = self._activation
             if rec.locked and rec.source != "config":
                 self.apply_activation_block(rec.activation_block)
+            self._forfeit_tick(client, block)
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
+
+    def _forfeit_tick(self, client, block: int) -> None:
+        """DEC-CA-0048 forfeiture decided on chain: the trainer resolves the
+        same tally the validators do (it never signals) so the rolling
+        scheduler hands the king leg to the successor at the block they
+        will apply."""
+        from ..shared.activation import (
+            ActivationRecord,
+            ActivationStore,
+            apply_forfeit_activation,
+            forfeit_feature,
+            record_for,
+            resolve_activation,
+        )
+
+        spec = forfeit_feature(self.cfg)
+        if spec is None or not spec.decided_on_chain:
+            return
+        store = None
+        base = getattr(self.activation_store, "path", None)
+        if base is not None:
+            store = ActivationStore(Path(base).with_name("activation_forfeit_state.json"))
+        rec = self._forfeit
+        if rec is None:
+            rec = record_for(self.cfg, store.load() if store is not None else ActivationRecord(),
+                             spec)
+            self._forfeit = rec
+            if rec.locked and rec.source != "config":
+                log.info("activation: restored forfeiture lock-in (block %d, forfeit at %d, via %s)",
+                         rec.lock_block, rec.activation_block, rec.source)
+        res = resolve_activation(self.cfg, client, now_block=int(block), record=rec, feature=spec)
+        if res.changed:
+            self._forfeit = res.record
+            if store is not None:
+                store.save(res.record)
+        rec = self._forfeit
+        if rec.locked and rec.source != "config":
+            new_cfg = apply_forfeit_activation(self.cfg, rec.activation_block)
+            if new_cfg is not self.cfg:
+                self.cfg = new_cfg
+                promo = getattr(self, "promotion", None)
+                if promo is not None and hasattr(promo, "scoring_cfg"):
+                    promo.scoring_cfg = new_cfg.scoring
+                log.warning("activation: DEC-CA-0048 forfeiture ARMED at block %d — the era whose "
+                            "first settlement reaches it trains the successor's king leg",
+                            new_cfg.scoring.forfeit_from_block)
 
     def _sku_per_leg_active(self) -> bool:
         """``[round] funded_sku_per_leg`` takes effect at ``[scoring]
