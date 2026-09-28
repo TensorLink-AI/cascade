@@ -286,6 +286,18 @@ Every leg also streams a public JSONL training log (`logs/round-<id>/…`) with
 per-step loss, throughput and `data_wait_frac`, plus a `host` record for the
 pod. High `data_wait_frac` means training waited on your generator.
 
+### Legs that cannot land in their era
+
+A leg is judged in the era it was admitted to. If your generator runs slower
+than the GPU's wall estimate and the leg finishes after that era's last
+settlement, it cannot be judged: the next era trains from a different init.
+The trainer fits a generator it has seen before on its **measured** wall (last
+leg's duration × 1.1), so a slow generator is admitted into the next era
+instead of a slot it cannot make, and a leg that still lands late is requeued
+the moment it finishes, with no attempt consumed. A generator it has never
+seen is fitted on the GPU's estimate — keep your generator fast enough for the
+SKU, or expect the first leg to be the measurement.
+
 ## 7. How the verdict works
 
 - **Metric.** Geometric mean of CRPS and MASE over the private windows, on a

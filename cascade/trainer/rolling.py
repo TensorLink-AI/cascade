@@ -106,6 +106,49 @@ class EraState:
 
 
 @dataclass
+class LegWalls:
+    """Measured wall per generator ref (`<work_root>/leg_walls.json`): what a
+    leg of this ref actually took last time, dispatch → finish. The SKU wall
+    table is a per-GPU estimate; a CPU-bound generator ran 1.9× it on a 4090
+    (2026-09-28: a 5 h leg landed after its era ended and was lost). Admission
+    fits a KNOWN ref on ``max(sku wall, measured × 1.1)``; an unseen ref keeps
+    the SKU estimate. Best-effort file; a read/write error never touches a leg."""
+
+    SAFETY = 1.10
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+
+    def _load(self) -> dict:
+        try:
+            return dict(json.loads(self.path.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def record(self, ref: str, seconds: float, *, sku: str = "") -> None:
+        try:
+            d = self._load()
+            d[str(ref)] = {"seconds": float(seconds), "sku": str(sku or ""), "at": time.time()}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(d, sort_keys=True, indent=1), encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("leg walls: could not record %s (%s)", str(ref)[-16:], e)
+
+    def estimate(self, ref: str) -> float | None:
+        v = self._load().get(str(ref))
+        try:
+            return float(v["seconds"]) * self.SAFETY if v else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def fit_wall(self, ref: str, sku_wall: float) -> float:
+        est = self.estimate(ref)
+        return max(float(sku_wall), est) if est is not None else float(sku_wall)
+
+
+@dataclass
 class FinishedLeg:
     """A challenger leg that returned, verified, benched (or not), waiting
     for its settlement."""
@@ -882,8 +925,11 @@ class RollingScheduler:
                            f"the revealed {revealed} — fund the new ref",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
-            adm = admit(self.cfg.round, block_now=block, now=now, wall_seconds=wall,
-                        margin_seconds=margin, current_era=cur.index)
+            # fit on what THIS ref measured last time (max with the SKU wall) and
+            # leave room for the post-round bench before the boundary
+            entry_wall = self._leg_walls().fit_wall(entry.ref, wall)
+            adm = admit(self.cfg.round, block_now=block, now=now, wall_seconds=entry_wall,
+                        margin_seconds=margin + self._bench_margin(), current_era=cur.index)
             if adm.start_after > now:
                 held.append(entry.hotkey)          # waits for the pre-train window
                 not_jumps.add(entry.hotkey)
@@ -1029,6 +1075,12 @@ class RollingScheduler:
                     matched[:12], tier)
         return matched
 
+    def _leg_walls(self) -> LegWalls:
+        return LegWalls(Path(self.r.work_root) / "leg_walls.json")
+
+    def _bench_margin(self) -> float:
+        return float(getattr(self.cfg.round, "funded_bench_margin_seconds", 0) or 0)
+
     # ── legs ─────────────────────────────────────────────────────────────────
 
     def _launch_leg(self, gen, era: EraState, block: int, target: int, label: str,
@@ -1037,8 +1089,28 @@ class RollingScheduler:
             return
         queue = self.ops.queue()
         end_wall = wall_of_block(target, now=self.clock(), block_now=block)
+        t_launch = self.clock()
 
         def _finish(entry: TrainedEntry) -> None:
+            self._leg_walls().record(gen.ref, self.clock() - t_launch,
+                                     sku=str(getattr(entry, "gpu_name", "") or ""))
+            with self._lock:
+                rolled = self.state.current is not None and era.index < self.state.current.index
+            if rolled:
+                # Its era has no settlement left: the leg can never be judged
+                # (a later era trains from a different init). Tell the miner NOW,
+                # not at the next rollover, and never record an orphan.
+                log.warning("rolling: %s's leg finished after era %d ended — requeued "
+                            "unburned at finish (era now %d)", gen.hotkey[:12], era.index,
+                            self.state.current.index)
+                try:
+                    self.ops.teardown_kept_pod(gen.hotkey)
+                except Exception as e:  # noqa: BLE001
+                    log.error("rolling: kept pod teardown for %s failed: %s", gen.hotkey[:12], e)
+                if queue is not None:
+                    queue.requeue(gen.hotkey, error="leg finished after its era ended",
+                                  error_class="no_capacity", burn_attempt=False)
+                return
             king = era.king()
             bench = None
             try:
