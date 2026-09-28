@@ -204,6 +204,11 @@ promotions/                        signed warm-start promotions
 
 `cascade-audit latest` re-derives a receipt without trusting the operator.
 The dashboard (`cascade/website/index.html`) reads only these public records.
+Its **Training** tab charts the king checkpoint's public-benchmark numbers
+(GIFT-Eval / BOOM / TIME, CRPS + MASE, from the signed per-round bench
+reports) against cumulative training — round number × the contracted steps
+per leg, with the token equivalent — and, on request, every checkpoint the
+trainer benched (each challenger's and the from-scratch controls).
 Every throne-holding generator is also archived to a private bucket by
 `scripts/scrape_kings.py`.
 

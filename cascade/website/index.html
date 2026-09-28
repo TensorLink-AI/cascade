@@ -835,8 +835,8 @@ body {
 .page { width: 100%; max-width: 1200px; padding: 30px 44px 88px; display: flex; flex-direction: column; gap: 52px; }
 /* the tab panes hold the actual sections — without their own flex gap the
    sections stack edge-to-edge (the page-level gap can't reach inside them) */
-#page-main, #page-mix { display: flex; flex-direction: column; gap: 68px; }
-#page-main[hidden], #page-mix[hidden] { display: none; }
+#page-main, #page-mix, #page-train { display: flex; flex-direction: column; gap: 68px; }
+#page-main[hidden], #page-mix[hidden], #page-train[hidden] { display: none; }
 /* two narrow tables share a row on desktop so the page scrolls shorter */
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 68px 44px; align-items: stretch; min-width: 0; }
 .grid-2 > div { min-width: 0; display: flex; flex-direction: column; }
@@ -1013,7 +1013,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 @media (max-width: 720px) {
   .page { padding: 22px 18px 64px; gap: 34px; }
   .panel { padding: 12px 14px; }
-  #page-main, #page-mix { gap: 44px; }
+  #page-main, #page-mix, #page-train { gap: 44px; }
   .header .wordmark { font-size: 34px; }
   .chart-wrap { aspect-ratio: 3/2; }
   .scroll-box { overflow-x: auto; }
@@ -1024,6 +1024,34 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .mixbar { height:8px; min-width:120px; background:rgba(127,127,127,.15); border-radius:4px; overflow:hidden; }
 .mixbar i { display:block; height:100%; background:#7E9B7E; }
 .mix-note { font-size:12px; opacity:.7; margin-top:8px; }
+/* training page — public-benchmark trajectories (DEC-CA-0013 telemetry) */
+.train-filters { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:0 0 14px; font-family:var(--font-mono); font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
+.train-filters .grp { display:inline-flex; gap:6px; align-items:center; }
+.train-filters .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
+.train-grid { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:18px 22px; }
+.train-grid.one { grid-template-columns:1fr; }
+.train-chart { position:relative; min-width:0; }
+.train-chart .t { font-family:var(--font-mono); font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--ink); margin-bottom:6px; }
+.train-chart .t .muted { font-weight:400; text-transform:none; letter-spacing:0; }
+.train-chart .chart-wrap { aspect-ratio:4/3; }
+.train-grid.one .chart-wrap { aspect-ratio:5/2; }
+.train-tip { position:absolute; z-index:5; pointer-events:none; background:var(--surface); border:var(--line); padding:8px 10px; font-family:var(--font-mono); font-size:11px; color:var(--ink); min-width:150px; max-width:260px; box-shadow:0 2px 10px rgba(0,0,0,0.12); }
+.train-tip .h { font-weight:700; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }
+.train-tip .r { display:flex; gap:8px; justify-content:space-between; white-space:nowrap; }
+.train-tip .r b { font-weight:700; }
+.train-tip .r .k { display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:middle; }
+.train-tip .r .k.chal { height:0; border-top:2px dashed var(--chal-line); }
+.train-tip .r .k.scratch { height:3px; background:var(--muted); }
+.train-tip .r .k.king { background:var(--king); }
+.train-tip .r .who { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
+.train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
+.train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
+.train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
+.role-pill { display:inline-block; font-family:var(--font-mono); font-weight:700; font-size:10px; letter-spacing:0.04em; text-transform:uppercase; padding:2px 8px; border-radius:2px; border:1px dashed currentColor; color:var(--muted); white-space:nowrap; }
+.role-pill.king { color:var(--ink); border-style:solid; }
+.role-pill.chal { color:var(--chal-line); }
+.role-pill.scratch { color:var(--muted); }
+@media (max-width: 900px) { .train-grid { grid-template-columns:1fr; } .train-chart .chart-wrap { aspect-ratio:5/2; } }
 </style>
 </head>
 <body>
@@ -1061,6 +1089,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
   <div class="page-tabs">
     <button class="btn active" data-ptab="main">Dashboard</button>
     <button class="btn" data-ptab="mix">Eval mix</button>
+    <button class="btn" data-ptab="train">Training</button>
   </div>
 
   <div id="page-main">
@@ -1160,6 +1189,49 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
   </div><!-- /page-mix -->
 
+  <div id="page-train" hidden>
+
+    <div>
+      <div class="section-label"><span>Training &mdash; the king&rsquo;s checkpoint on the public benchmarks</span><span id="train-when" class="muted"></span></div>
+      <div class="verdict" id="train-stats"><div class="empty">Loading bench reports&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="train-filters">
+        <span class="grp">Metric
+          <button class="btn active" data-tmetric="crps" title="Continuous Ranked Probability Score — the probabilistic forecast error">CRPS</button>
+          <button class="btn" data-tmetric="mase" title="Mean Absolute Scaled Error — the point forecast error, scaled by a seasonal-naive baseline">MASE</button>
+          <button class="btn" data-tmetric="geomean" title="Geometric mean of all six numbers — the score the warm-start promotion ranks checkpoints by">Geomean</button>
+        </span>
+        <span class="grp">Show
+          <button class="btn active" data-tscope="king" title="Only the king's checkpoint each round — the lineage">King lineage</button>
+          <button class="btn" data-tscope="all" title="Every checkpoint the trainer benched: the king's, each challenger's, and the from-scratch controls">Everything trained</button>
+        </span>
+      </div>
+      <div id="train-charts" class="train-grid"></div>
+      <div class="chart-meta">
+        <span class="legend train-legend" id="train-legend">
+          <span><i class="swatch" style="background:var(--king)"></i>King checkpoint</span>
+          <span id="train-legend-chal"><i class="swatch hollow"></i>Challenger checkpoint</span>
+          <span id="train-legend-scratch" hidden><i class="swatch diamond"></i>Scratch control</span>
+          <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
+        </span>
+        <span id="train-note">--</span>
+      </div>
+      <div class="train-note" id="train-axis"></div>
+      <div class="train-note">Lower is better on every suite; the x axis is cumulative training &mdash; each round&rsquo;s king leg is one more fixed-budget slice of optimiser steps (hours &times; reference throughput of series-points, over 64 series &times; 4096 context per step) on the lineage, so a round sits at round number &times; steps per leg, with the token equivalent in the tooltip. Contracted spend: a leg the wall stopped early trained less. After each round&rsquo;s manifest publishes, the trainer benches both duel checkpoints on GIFT-Eval, BOOM and TIME and signs the six numbers into <code>benchmarks/round-&lt;id&gt;.json</code>. Under warm-start the king&rsquo;s checkpoint is re-trained from the promoted init every round, so its curve is the lineage&rsquo;s training trajectory. These numbers are telemetry and the warm-start promotion input only &mdash; rounds are decided on the private eval pool, never here.</div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Every benched checkpoint</span><span id="train-table-when" class="muted"></span></div>
+      <div class="panel"><div class="scroll-box scroll-hist">
+        <table><thead><tr><th>Round</th><th>Role</th><th>Miner</th><th>Size</th><th class="num" title="GIFT-Eval CRPS">GIFT CRPS</th><th class="num" title="GIFT-Eval MASE">GIFT MASE</th><th class="num">BOOM CRPS</th><th class="num">BOOM MASE</th><th class="num">TIME CRPS</th><th class="num">TIME MASE</th><th class="num" title="Six-number geomean — the promotion score">Geomean</th><th class="num" title="Geomean relative to the king's checkpoint of the same round; negative = better than the king">vs king</th></tr></thead>
+        <tbody id="train-rows"></tbody></table>
+      </div></div>
+    </div>
+
+  </div><!-- /page-train -->
+
 </div>
 
 <script>
@@ -1239,8 +1311,10 @@ function shortRoundId(id){ id=String(id||""); return id.length>12?id.slice(0,6)+
 function timeAgo(i){ if(!i) return "--"; var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0; if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago"; var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
 function ema(a,al){ if(al>=1||!a.length) return a.slice(); var o=[a[0]]; for(var i=1;i<a.length;i++)o.push(al*a[i]+(1-al)*o[i-1]); return o; }
 
-function fetchJSON(path){
-  var bust="?t="+Date.now();
+function fetchJSON(path, opts){
+  // opts.bust=false for immutable objects (per-round bench reports): lets the
+  // browser/CDN cache them instead of refetching on every poll.
+  var bust=(opts && opts.bust===false) ? "" : "?t="+Date.now();
   return new Promise(function(resolve,reject){
     var pending=ENDPOINTS.length, settled=false;
     ENDPOINTS.forEach(function(base){
@@ -2177,7 +2251,9 @@ function setPage(p){
   for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle("active", tabs[i].dataset.ptab===p);
   document.getElementById("page-main").hidden = p!=="main";
   document.getElementById("page-mix").hidden = p!=="mix";
+  document.getElementById("page-train").hidden = p!=="train";
   if(p==="mix") loadMix();
+  if(p==="train") loadBench();
 }
 (function(){
   var tabs=document.querySelectorAll(".page-tabs .btn");
@@ -2261,8 +2337,279 @@ function renderMix(){
   document.getElementById("mix-hist").innerHTML = body || '<tr><td class="muted" colspan="3">No rounds yet.</td></tr>';
 }
 
+// ── training page: public-benchmark trajectory of every trained checkpoint ──
+// After a round's manifest publishes, the trainer benches BOTH duel checkpoints
+// (the king's and each challenger's) on GIFT-Eval / BOOM / TIME and signs the
+// six numbers into benchmarks/round-<id>.json (cascade.shared.bench_report).
+// Telemetry + the warm-start promotion input only — never a verdict input — but
+// it is the one absolute, cross-round comparable reading of what each round
+// actually TRAINED: under warm-start the king's checkpoint is re-trained from
+// the promoted init every round, so its curve is the lineage's training
+// trajectory, and every other entry is a checkpoint the network trained and
+// (mostly) discarded. The from-scratch shadow (DEC-CA-0014, benchmarks/scratch/
+// index.json) rides the same charts as a control. Reports are immutable once
+// published: fetched once per session, cache-friendly (no bust); a miss is
+// permanent except among the newest few rounds, where a late report is expected.
+var BENCH_SCAN_MAX=120, BENCH_RETRY_NEWEST=6;
+var _bench={}, _benchMissing={}, _benchInflight={}, _scratchIdx=null;
+var _trainMetric="crps", _trainScope="king";
+// The x axis is CUMULATIVE TRAINING, not the round ordinal: every round's king
+// leg is one more slice of optimiser steps on the same lineage, so a round is
+// plotted at round-number × steps-per-leg. The leg budget is not carried in the
+// receipts (the summary records the contract digest, not its parameters), so it
+// is transcribed from the public chain.toml [training] — hours × ref throughput
+// is the fixed token (series-points) budget, and each step consumes batch × ctx
+// of it (DEC-CA-0042: batches are 64 series at every width, so the step count
+// holds for every channel mix). Contracted spend: a leg the wall stopped early
+// (deadline_hit) trained fewer steps than plotted.
+var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
+function tokensPerLeg(){ return TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
+function stepsPerLeg(){ return Math.round(tokensPerLeg()/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
+function fmtSteps(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e6) return (v/1e6).toFixed(v>=1e7?0:1)+"M steps"; if(v>=1e3) return Math.round(v/1e3)+"k steps"; return Math.round(v)+" steps"; }
+function fmtTokens(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e12) return (v/1e12).toFixed(2)+"T tokens"; if(v>=1e9) return Math.round(v/1e9)+"B tokens"; return Math.round(v/1e6)+"M tokens"; }
+var SIX_KEYS=["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
+var SUITES=[{key:"gifteval",label:"GIFT-Eval"},{key:"boom",label:"BOOM"},{key:"time",label:"TIME"}];
+// The six numbers follow BenchScores' key convention; the nesting on a report
+// entry / scratch row is read tolerantly (flat, .scores, or .bench_scores).
+function readSix(o){
+  if(!o) return null;
+  var src=(typeof o.gifteval_mase==="number")?o
+    :(o.scores&&typeof o.scores.gifteval_mase==="number")?o.scores
+    :(o.bench_scores&&typeof o.bench_scores.gifteval_mase==="number")?o.bench_scores:null;
+  if(!src) return null;
+  var out={};
+  for(var i=0;i<SIX_KEYS.length;i++){ var v=src[SIX_KEYS[i]]; if(typeof v!=="number"||!isFinite(v)) return null; out[SIX_KEYS[i]]=v; }
+  return out;
+}
+// cascade_score: the geometric mean of all six (lower is better) — the number
+// the warm-start promotion ranks checkpoints by.
+function sixGeomean(s){ var sum=0; for(var i=0;i<SIX_KEYS.length;i++){ if(!(s[SIX_KEYS[i]]>0)) return null; sum+=Math.log(s[SIX_KEYS[i]]); } return Math.exp(sum/6); }
+function benchRounds(){
+  // every round in the index (a validator-rejected round still benches — the
+  // report follows the manifest, not the verdict), oldest first
+  return (_index&&_index.rounds||[]).slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-BENCH_SCAN_MAX);
+}
+function loadBench(){
+  var rs=benchRounds(); if(!rs.length){ renderTrain(); return; }
+  var newest={}; rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)]=1; });
+  rs.forEach(function(r){
+    var id=String(r.round_id||""); if(!id) return;
+    if(_bench[id]||_benchInflight[id]) return;
+    if(_benchMissing[id]&&!newest[id]) return;
+    _benchInflight[id]=true;
+    fetchJSON("benchmarks/round-"+id+".json",{bust:false})
+      .then(function(d){ delete _benchInflight[id]; delete _benchMissing[id]; _bench[id]=d; renderTrain(); })
+      .catch(function(){ delete _benchInflight[id]; _benchMissing[id]=true; renderTrain(); });
+  });
+  // the scratch-shadow roll-up grows a row every M rounds — small, refetch per visit
+  fetchJSON("benchmarks/scratch/index.json").then(function(d){ _scratchIdx=d; renderTrain(); }).catch(function(){});
+  renderTrain();
+}
+function trainRoundLabel(r){ var rn=roundNoOf(r.round_id); return rn?"r"+rn:shortRoundId(r.round_id); }
+// One row per round that has any bench data, oldest first: the report's
+// entries (king + challengers) and the scratch-control row when one exists.
+function trainRows(){
+  var scratchBy={};
+  ((_scratchIdx&&_scratchIdx.rounds)||[]).forEach(function(x){ var six=readSix(x.scratch_scores); if(six) scratchBy[String(x.round_id)]={six:six,geo:sixGeomean(six),ckpt:x.warm_start_ckpt||"",gen:x.generation}; });
+  var out=[], pending=0, missing=0;
+  benchRounds().forEach(function(r){
+    var id=String(r.round_id||""), rep=_bench[id], entries=[];
+    if(_benchInflight[id]) pending++;
+    else if(!rep&&!scratchBy[id]) missing++;
+    ((rep&&(rep.entries||rep.checkpoints))||[]).forEach(function(e){
+      var six=readSix(e); if(!six) return;
+      var role=String(e.role||"challenger"), hk=String(e.miner_hotkey||e.hotkey||"");
+      entries.push({role:role, hotkey:hk, uid:(e.miner_uid!=null?e.miner_uid:e.uid), size:String(e.size||""),
+                    pointer:String(e.trained_pointer||""), six:six, geo:sixGeomean(six),
+                    crowned:!!(r.dethroned&&role==="challenger"&&hk&&hk===r.chal_hotkey)});
+    });
+    var king=null; entries.forEach(function(e){ if(e.role==="king"&&!king) king=e; });
+    var sc=scratchBy[id]||null;
+    if(entries.length||sc) out.push({r:r, id:id, label:trainRoundLabel(r), rn:roundNoOf(r.round_id), entries:entries, king:king, scratch:sc});
+  });
+  // round NUMBER (rN, anchored) × steps per leg; when the anchor round has
+  // rolled out of the index no absolute number exists, so fall back to the
+  // ordinal within the scanned window (labelled as such in the note)
+  var absolute=out.length>0&&out.every(function(x){ return x.rn!=null&&x.rn>0; });
+  out.forEach(function(x,i){ x.legs=absolute?x.rn:(i+1); x.steps=x.legs*stepsPerLeg(); x.tokens=x.legs*tokensPerLeg(); });
+  return {rows:out, pending:pending, missing:missing, absolute:absolute};
+}
+function trainSeries(rows, suite){
+  // suite = "gifteval" | "boom" | "time" | null (geomean)
+  function val(six){ return suite?six[suite+"_"+_trainMetric]:sixGeomean(six); }
+  var king=[], chal=[], scratch=[];
+  rows.forEach(function(row,i){
+    row.entries.forEach(function(e){
+      var v=val(e.six); if(v==null||!isFinite(v)) return;
+      (e.role==="king"?king:chal).push({i:i,v:v,e:e,row:row});
+    });
+    if(row.scratch){ var sv=val(row.scratch.six); if(sv!=null&&isFinite(sv)) scratch.push({i:i,v:sv,row:row,e:{role:"scratch",hotkey:"",size:""}}); }
+  });
+  return {king:king, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[]};
+}
+function trainChartSVG(rows, S, W, H){
+  var PAD_L=54,PAD_R=14,PAD_T=12,PAD_B=24, n=rows.length;
+  var all=[]; ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); });
+  if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">no bench numbers yet</text>';
+  var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
+  if(min===max){ min-=Math.abs(min)*0.05||0.5; max+=Math.abs(max)*0.05||0.5; }
+  var pad=(max-min)*0.1; min-=pad; max+=pad;
+  var xs=rows.map(function(r){ return r.steps; }), xmin=Math.min.apply(null,xs), xmax=Math.max.apply(null,xs);
+  if(xmin===xmax){ xmin-=stepsPerLeg()/2; xmax+=stepsPerLeg()/2; }
+  function X(i){ return PAD_L+(rows[i].steps-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R); }
+  function Y(v){ return PAD_T+(1-(v-min)/(max-min))*(H-PAD_T-PAD_B); }
+  var out="", tickStep=(max-min)/4, tickDp=Math.min(6,Math.max(2,Math.ceil(-Math.log10(tickStep||1))));
+  for(var g=0;g<=4;g++){
+    var val=min+(max-min)*g/4, y=Y(val);
+    out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/>';
+    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+val.toFixed(tickDp)+'</text>';
+  }
+  rows.forEach(function(row,i){
+    if(row.r.dethroned){ var x=X(i); out+='<line x1="'+x.toFixed(1)+'" y1="'+PAD_T+'" x2="'+x.toFixed(1)+'" y2="'+(H-PAD_B)+'" stroke="var(--chal)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>'; }
+  });
+  // scratch controls: diamonds, muted (a control, not a contender)
+  S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="var(--muted)"/>'; });
+  // challengers: hollow dots with a surface ring so overlaps stay readable
+  S.chal.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="'+(p.e.crowned?'var(--chal-line)':'var(--surface)')+'" stroke="var(--chal-line)" stroke-width="1.6"/>'; });
+  // the king lineage: the line
+  if(S.king.length>1) out+='<polyline points="'+S.king.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="var(--king)" stroke-width="2" stroke-linejoin="round"/>';
+  S.king.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.8" fill="var(--king)"/>'; });
+  // x ticks in cumulative optimiser steps (nice multiples of the leg budget,
+  // ~4 per chart); the token equivalent rides the axis title and the tooltip
+  var legS=stepsPerLeg(), span=(xmax-xmin)/legS, every=Math.max(1,Math.ceil(span/4));
+  for(var t=Math.ceil(xmin/legS/every)*every; t*legS<=xmax+1e-6; t+=every){
+    var xt=PAD_L+(t*legS-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
+    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="11">'+esc(fmtSteps(t*legS).replace(" steps",""))+'</text>';
+  }
+  // hover layer: one column per round reaching halfway to its neighbours (hit
+  // target wider than the marks), a crosshair, and the tooltip listing every
+  // checkpoint at that round
+  out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
+  rows.forEach(function(row,i){
+    var x=X(i), x0=i>0?(x+X(i-1))/2:0, x1=i<n-1?(x+X(i+1))/2:W;
+    out+='<rect class="col" data-i="'+i+'" x="'+x0.toFixed(1)+'" y="0" width="'+Math.max(0,x1-x0).toFixed(1)+'" height="'+H+'" fill="transparent" data-x="'+x.toFixed(1)+'"/>';
+  });
+  return out;
+}
+function trainTipHTML(row, S, i, unit){
+  function pick(list){ return list.filter(function(p){ return p.i===i; }); }
+  var lines=[], ks=pick(S.king), cs=pick(S.chal), ss=pick(S.scratch);
+  ks.forEach(function(p){ lines.push('<div class="r"><span><i class="k king"></i><b>'+fmt(p.v)+'</b></span><span class="who">king · '+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
+  cs.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ lines.push('<div class="r"><span><i class="k chal"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+(p.e.crowned?'♛ ':'')+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
+  ss.forEach(function(p){ lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">scratch control</span></div>'); });
+  var when=row.r.published_at?' · '+timeAgo(row.r.published_at):'';
+  return '<div class="h">'+esc(row.label)+(row.r.dethroned?' · dethrone':'')+'<span class="muted">'+esc(when)+'</span></div>'+
+    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+'</div>'+(lines.join("")||'<div class="muted">no bench numbers</div>')+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
+}
+function wireTrainChart(wrap, rows, S, unit){
+  var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), xh=svg.querySelector(".xh");
+  if(!svg||!tip) return;
+  function hide(){ tip.hidden=true; if(xh) xh.setAttribute("opacity","0"); }
+  svg.addEventListener("mouseleave", hide);
+  var cols=svg.querySelectorAll("rect.col");
+  for(var c=0;c<cols.length;c++){
+    cols[c].addEventListener("mousemove", function(ev){
+      var i=Number(this.dataset.i), x=this.dataset.x;
+      if(xh){ xh.setAttribute("x1",x); xh.setAttribute("x2",x); xh.setAttribute("opacity","0.35"); }
+      tip.innerHTML=trainTipHTML(rows[i],S,i,unit); tip.hidden=false;
+      var b=wrap.getBoundingClientRect(), px=ev.clientX-b.left, py=ev.clientY-b.top;
+      var tw=tip.offsetWidth||160, left=px+14; if(left+tw>b.width) left=Math.max(0,px-14-tw);
+      tip.style.left=left+"px"; tip.style.top=Math.max(0,py-10)+"px";
+    });
+  }
+}
+function renderTrainStats(rows, info){
+  var el=document.getElementById("train-stats"), when=document.getElementById("train-when"); if(!el) return;
+  if(!_index){ el.innerHTML='<div class="empty">Waiting for round data&hellip;</div>'; when.textContent=""; return; }
+  if(!rows.length){
+    el.innerHTML='<div class="empty">'+(info.pending?'Loading bench reports&hellip; ('+info.pending+' pending)':'No bench reports published yet')+'</div>';
+    when.textContent=""; return;
+  }
+  var lastK=null, best=null, nK=0, nC=0, nS=0, firstK=null;
+  rows.forEach(function(row){
+    row.entries.forEach(function(e){
+      if(e.role==="king"){ nK++; lastK={e:e,row:row}; if(!firstK) firstK={e:e,row:row}; } else nC++;
+      if(e.geo!=null&&(!best||e.geo<best.geo)) best={geo:e.geo,e:e,row:row};
+    });
+    if(row.scratch) nS++;
+  });
+  var cells=[];
+  if(lastK){
+    var s=lastK.e.six, g=lastK.e.geo;
+    var rel=(firstK&&firstK.row!==lastK.row&&firstK.e.geo)?(g-firstK.e.geo)/firstK.e.geo*100:null;
+    cells.push(stat("King checkpoint",'<b>'+esc(lastK.row.label)+'</b>'+(lastK.e.size?' <span class="sub">'+esc(lastK.e.size)+'</span>':''),{title:"The latest round with a signed bench report for the king's checkpoint"+(lastK.e.pointer?" — "+lastK.e.pointer:"")}));
+    cells.push(stat("Geomean",fmt(g)+(rel!=null?' <span class="sub '+(rel<0?'good':'')+'">'+signedPct(rel,1)+' vs '+esc(firstK.row.label)+'</span>':''),{title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
+    cells.push(stat("Trained",esc(fmtSteps(lastK.row.steps).replace(" steps",""))+' <span class="sub">steps</span> · '+esc(fmtTokens(lastK.row.tokens).replace(" tokens",""))+' <span class="sub">tok</span>',
+      {wide:true,range:true,title:"Cumulative training on the lineage: "+(info.absolute?"round number":"rounds in view")+" × "+fmtSteps(stepsPerLeg())+" per leg (contracted budget "+fmtTokens(tokensPerLeg())+" per leg)"}));
+    SUITES.forEach(function(su){ cells.push(stat(su.label,'<span class="sub">CRPS&nbsp;</span>'+fmt(s[su.key+"_crps"],4)+' <span class="sub">MASE&nbsp;</span>'+fmt(s[su.key+"_mase"],4),{wide:true,range:true,title:su.label+" — CRPS and MASE of the king's latest benched checkpoint"})); });
+  }
+  if(best){
+    var who=best.e.role==="king"?"king":(best.e.crowned?"challenger, took the throne":"challenger");
+    cells.push(stat("Best ever",fmt(best.geo)+' <span class="sub">'+esc(best.row.label)+' · '+esc(who)+'</span>',{title:"Lowest six-number geomean across every benched checkpoint"+(best.e.uid!=null?" — uid "+best.e.uid:"")}));
+  }
+  cells.push(stat("Benched",nK+' <span class="sub">king</span> · '+nC+' <span class="sub">chal</span>'+(nS?' · '+nS+' <span class="sub">scratch</span>':''),{wide:true,range:true,title:"Checkpoints with signed public-benchmark numbers in the scanned rounds"}));
+  el.innerHTML=cells.join("");
+  when.textContent=lastK&&lastK.row.r.published_at?"benched round settled "+timeAgo(lastK.row.r.published_at):"";
+}
+function renderTrain(){
+  var grid=document.getElementById("train-charts"); if(!grid) return;
+  var info=trainRows(), rows=info.rows;
+  renderTrainStats(rows, info);
+  var geo=_trainMetric==="geomean", W=geo?1000:520, H=geo?400:390;
+  var charts=geo?[{suite:null,label:"Six-suite geomean",sub:"the promotion score"}]:SUITES.map(function(s){ return {suite:s.key,label:s.label,sub:_trainMetric.toUpperCase()}; });
+  grid.className="train-grid"+(geo?" one":"");
+  grid.innerHTML=charts.map(function(c,k){
+    return '<div class="train-chart" data-k="'+k+'"><div class="t">'+esc(c.label)+' <span class="muted">— '+esc(c.sub)+'</span></div>'+
+      '<div class="chart-wrap"><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none"></svg></div><div class="train-tip" hidden></div></div>';
+  }).join("");
+  charts.forEach(function(c,k){
+    var S=trainSeries(rows,c.suite), wrap=grid.querySelector('.train-chart[data-k="'+k+'"]');
+    wrap.querySelector("svg").innerHTML=trainChartSVG(rows,S,W,H);
+    wireTrainChart(wrap,rows,S,(c.suite?c.label+" "+_trainMetric.toUpperCase():"geomean")+" · lower is better");
+  });
+  var anyScratch=rows.some(function(r){ return !!r.scratch; });
+  document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
+  document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
+  var scanned=benchRounds().length, note=rows.length+" of "+scanned+" rounds benched";
+  document.getElementById("train-axis").textContent=rows.length?("x axis: cumulative training · "+(info.absolute?"round number":"round in view")+" × "+fmtSteps(stepsPerLeg()).replace(" steps","")+" steps per leg ("+fmtTokens(tokensPerLeg()).replace(" tokens","")+" series-points) · hover a column for the round's steps and tokens"):"";
+  if(info.pending) note+=" · loading "+info.pending; else if(info.missing) note+=" · "+info.missing+" without a report";
+  document.getElementById("train-note").textContent=rows.length?note:(info.pending?"loading bench reports…":"--");
+  renderTrainTable(rows);
+}
+function renderTrainTable(rows){
+  var tb=document.getElementById("train-rows"); if(!tb) return;
+  var out=[];
+  rows.slice().reverse().forEach(function(row){
+    var kg=row.king?row.king.geo:null;
+    var es=row.entries.filter(function(e){ return _trainScope==="all"||e.role==="king"; }).slice().sort(function(a,b){ return (a.role==="king"?0:1)-(b.role==="king"?0:1)||((a.geo==null?1e9:a.geo)-(b.geo==null?1e9:b.geo)); });
+    es.forEach(function(e){
+      var rel=(e.role!=="king"&&kg&&e.geo!=null)?(e.geo-kg)/kg*100:null;
+      var pill=e.role==="king"?'<span class="role-pill king">&#9819; king</span>':'<span class="role-pill chal">challenger</span>'+(e.crowned?' <span class="crown" title="Took the throne this round">&#9819;</span>':'');
+      out.push('<tr'+(e.crowned?' class="throne"':'')+'><td title="'+esc(row.id)+'">'+esc(row.label)+'</td><td>'+pill+'</td>'+
+        '<td title="'+esc(e.hotkey)+'">'+(e.uid!=null?'uid '+esc(e.uid)+' · ':'')+esc(shortHk(e.hotkey))+'</td><td>'+esc(e.size||"--")+'</td>'+
+        SIX_KEYS.map(function(k){ return '<td class="num">'+fmt(e.six[k],4)+'</td>'; }).join("")+
+        '<td class="num"><b>'+fmt(e.geo)+'</b></td><td class="num'+(rel!=null&&rel<0?' good':'')+'">'+(rel==null?'<span class="muted">--</span>':signedPct(rel))+'</td></tr>');
+    });
+    if(row.scratch&&_trainScope==="all"){
+      var sc=row.scratch, srel=(kg&&sc.geo!=null)?(sc.geo-kg)/kg*100:null;
+      out.push('<tr><td title="'+esc(row.id)+'">'+esc(row.label)+'</td><td><span class="role-pill scratch">scratch control</span></td>'+
+        '<td class="muted" title="'+esc(sc.ckpt)+'">random init'+(sc.gen!=null?' · vs gen '+esc(sc.gen):'')+'</td><td class="muted">--</td>'+
+        SIX_KEYS.map(function(k){ return '<td class="num">'+fmt(sc.six[k],4)+'</td>'; }).join("")+
+        '<td class="num"><b>'+fmt(sc.geo)+'</b></td><td class="num'+(srel!=null&&srel<0?' good':'')+'">'+(srel==null?'<span class="muted">--</span>':signedPct(srel))+'</td></tr>');
+    }
+  });
+  tb.innerHTML=out.length?out.join(""):'<tr><td colspan="12" class="empty">'+(_index?'No bench reports loaded yet':'Waiting for round data')+'</td></tr>';
+  document.getElementById("train-table-when").textContent=out.length?out.length+" checkpoints · newest first":"";
+}
+(function(){
+  var ms=document.querySelectorAll("[data-tmetric]"), ss=document.querySelectorAll("[data-tscope]");
+  function bind(list, attr, set){ for(var i=0;i<list.length;i++) list[i].addEventListener("click", function(){ set(this.dataset[attr]); for(var j=0;j<list.length;j++) list[j].classList.toggle("active", list[j]===this); renderTrain(); }); }
+  bind(ms,"tmetric",function(v){ _trainMetric=v; });
+  bind(ss,"tscope",function(v){ _trainScope=v; });
+})();
+
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="mix") loadMix(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="mix") loadMix(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
