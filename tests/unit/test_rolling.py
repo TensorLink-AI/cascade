@@ -1369,3 +1369,99 @@ def test_forfeited_king_hands_the_king_leg_to_the_named_successor(cfg, tmp_path)
     sched3.tick(FakeClient(), b0)
     _join(sched3)
     assert sched3.state.current.king_hotkey == "KING" and sched3.state.current.king_entry is not None
+
+
+
+# ── fit on measured speed; never leave an orphan (2026-09-28 uid-137 class) ──
+
+def test_leg_walls_ledger(tmp_path):
+    from cascade.trainer.rolling import LegWalls
+
+    lw = LegWalls(tmp_path / "leg_walls.json")
+    assert lw.estimate("r@sha256:aa") is None
+    assert lw.fit_wall("r@sha256:aa", 13500.0) == 13500.0          # unseen ⇒ SKU wall
+    lw.record("r@sha256:aa", 25_200.0, sku="RTX4090")               # a 7 h leg
+    assert abs(lw.estimate("r@sha256:aa") - 25_200.0 * LegWalls.SAFETY) < 1e-6
+    assert lw.fit_wall("r@sha256:aa", 13500.0) > 27_000.0            # measured wins
+    lw.record("r@sha256:aa", 3_000.0)                                # a fast rerun
+    assert lw.fit_wall("r@sha256:aa", 13500.0) == 13500.0            # never below the SKU wall
+    (tmp_path / "leg_walls.json").write_text("not json")
+    assert lw.fit_wall("r@sha256:aa", 13500.0) == 13500.0            # corrupt file ⇒ fail open
+
+
+def test_admission_fits_a_known_slow_ref_on_its_measured_wall(cfg, tmp_path):
+    """A ref that took 7 h last time is not dispatched into a slot the SKU
+    table says it fits: it waits for a boundary its measured wall clears."""
+    from cascade.trainer.rolling import LegWalls
+
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    era_len = EB * armed.round.era_settlements
+    LegWalls(tmp_path / "leg_walls.json").record(REF["ALFA"], 7 * 3600.0, sku="RTX4090")
+    # 4h05 before the era's LAST boundary: the SKU wall (3h45 + 15m) fits, 7 h does not
+    b0 = era_start + era_len - int((4 * 3600 + 300) / R.BLOCK_SECONDS)
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0 - 90))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 90)
+    sched.tick(client, b0)
+    _join(sched)
+    calls = {c[0]: c for c in ops.leg_calls}
+    cur = sched.state.current.index
+    assert calls["BRAV"][1] == cur                                 # unseen ref: SKU wall fits this era's last boundary
+    # known slow ref: its measured wall cannot clear this era, so it is admitted
+    # CROSS-ERA — it trains under the NEXT era's seeds/init and can be judged there
+    assert calls["ALFA"][1] == cur + 1
+    assert calls["ALFA"][3] > calls["BRAV"][3]                     # its end wall is the next era's boundary
+    assert q.get("ALFA").target_boundary > q.get("BRAV").target_boundary
+
+
+def test_bench_margin_knob_moves_the_target_boundary(cfg, tmp_path):
+    armed = _armed(cfg)
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    now = 1_000_000.0
+    a0 = admit(armed.round, block_now=b0, now=now, wall_seconds=WALL, margin_seconds=MARGIN,
+               current_era=armed.round.rolling_from_block // (EB * armed.round.era_settlements))
+    a1 = admit(armed.round, block_now=b0, now=now, wall_seconds=WALL, margin_seconds=MARGIN + 2 * 3600.0,
+               current_era=a0.era_index)
+    assert a1.target_boundary >= a0.target_boundary + EB           # a bench-sized margin pushes the slot out
+    root = Path(__file__).resolve().parents[2]
+    import re
+    text = re.sub(r"(?m)^\[round\]$", "[round]\nfunded_bench_margin_seconds = 3600", (root / "chain.toml").read_text(), count=1)
+    p = tmp_path / "chain.toml"
+    p.write_text(text)
+    from cascade.shared.config import load_chain_config
+    assert load_chain_config(p).round.funded_bench_margin_seconds == 3600
+    assert load_chain_config(root / "chain.toml").round.funded_bench_margin_seconds == 0
+
+
+def test_leg_finishing_after_its_era_is_requeued_at_finish_not_at_rollover(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    era_len = EB * armed.round.era_settlements
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    ops.hold = {"ALFA": threading.Event()}                          # the leg blocks until released
+    sched.tick(client, b0)
+    time.sleep(0.05)
+    assert q.get("ALFA").status == "in_flight"
+    # the era rolls while the leg is still running
+    clock.t += era_len * R.BLOCK_SECONDS
+    sched.tick(client, era_start + era_len + 1)
+    assert sched.state.current.index == armed.round.rolling_from_block // era_len + 1
+    ops.hold["ALFA"].set()
+    _join(sched)
+    assert q.get("ALFA").status == "queued"                        # requeued the moment it finished
+    assert q.get("ALFA").attempts == 0                             # unburned, no attempt consumed
+    assert all(f.hotkey != "ALFA" for f in sched.state.finished)   # no orphan recorded
+    assert (tmp_path / "leg_walls.json").exists()                  # its wall was still measured

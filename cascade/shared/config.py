@@ -1042,6 +1042,10 @@ class RoundConfig:
     # validator-side changes. 0 = never (heat → final every round).
     # Trainer-side: [round] is outside contract_digest.
     duel_from_block: int = 0
+    # Extra seconds a funded leg must clear before its target boundary, for the
+    # post-round bench that runs before an entry counts as finished (0 = none;
+    # the 2026-09-28 orphan finished 3 min late after a ~55 min bench).
+    funded_bench_margin_seconds: int = 0
     # DEC-CA-0048 admission denylist (trainer-side, not consensus): entries from
     # these hotkeys are refused at rolling admission from `blocked_from_block`
     # (0 = immediately once the list is non-empty). Their legs never rent a pod.
@@ -2801,6 +2805,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
+            funded_bench_margin_seconds=max(0, int(r.get("funded_bench_margin_seconds", 0) or 0)),
             blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
             blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
