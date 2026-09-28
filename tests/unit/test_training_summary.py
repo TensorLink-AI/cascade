@@ -39,9 +39,9 @@ def _entry(role, ptr, uid, size="22m"):
                         corpus_digest="e" * 64, train_block=100, size=size)
 
 
-def _manifest(entries):
+def _manifest(entries, **kw):
     return TrainingManifest(round_id="777", created_block=1234, contract_digest="c" * 64,
-                            base_arch_digest="b" * 64, eval_dataset="pool", entries=list(entries))
+                            base_arch_digest="b" * 64, eval_dataset="pool", entries=list(entries), **kw)
 
 
 DONE = {"event": "done", "final_loss": 0.4, "steps": 152, "tokens_seen": 39_000,
@@ -122,6 +122,7 @@ def test_build_and_dump_are_sorted_json():
     text = dump_training_summary(doc)
     back = json.loads(text)
     assert back["kind"] == "training_summary" and back["telemetry_only"] is True
+    assert back["warm_start_ckpt"] == "" and back["warm_start_size"] == ""   # random init
     assert back["round_id"] == "777" and back["created_block"] == 1234
     assert back["legs"][0]["role"] == "king"
     assert text == json.dumps(back, indent=2, sort_keys=True)
@@ -170,13 +171,16 @@ def test_trainer_hook_publishes_local_and_pod_legs():
     ms, ls = _Store(), _Store()
     ls.texts[log_key("777", "challenger-22m")] = json.dumps({"event": "host"}) + "\n" + json.dumps(DONE) + "\n"
     runner = _fake_runner(ms, ls, {"777": {"king-22m": SUMMARY}, "778": {"king-22m": SUMMARY}})
-    m = _manifest([_entry("king", KING_PTR, 7), _entry("challenger", CHAL_PTR, 11)])
+    m = _manifest([_entry("king", KING_PTR, 7), _entry("challenger", CHAL_PTR, 11)],
+                  warm_start_ckpt=CHAL_PTR, warm_start_size="22m")
 
     key = TrainerRunner._publish_training_summary(runner, m)
 
     assert key == "training/round-777.json" and ms.acls[key] == "public-read"
     doc = json.loads(ms.texts[key])
     assert doc["round_id"] == "777" and doc["created_block"] == 1234
+    # the init every leg continued — the dashboard's link back along the lineage
+    assert doc["warm_start_ckpt"] == CHAL_PTR and doc["warm_start_size"] == "22m"
     assert doc["contract"]["batch_size"] == 64 and doc["contract"]["token_budget"] == 39_960_000_000
     king, chal = doc["legs"]
     assert king["source"] == "trainer" and king["steps"] == 152 and king["channel_tokens"] == 78_000

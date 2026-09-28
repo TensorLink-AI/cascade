@@ -174,13 +174,20 @@ def collect_round_legs(
 
 
 def build_training_summary(round_id: str, created_block: int, contract: dict,
-                           legs: list[dict]) -> dict:
+                           legs: list[dict], *, warm_start_ckpt: str = "",
+                           warm_start_size: str = "") -> dict:
+    """``warm_start_ckpt`` is the init every leg of the round trained from
+    (the manifest's, "" = random init): the link the dashboard follows from a
+    checkpoint back to the promoted member it continued, so a lineage's total
+    training sums leg by leg instead of being assumed."""
     return {
         "kind": "training_summary",
         "summary_version": TRAINING_SUMMARY_VERSION,
         "telemetry_only": True,
         "round_id": str(round_id),
         "created_block": int(created_block),
+        "warm_start_ckpt": str(warm_start_ckpt or ""),
+        "warm_start_size": str(warm_start_size or ""),
         "contract": dict(contract),
         "legs": list(legs),
     }

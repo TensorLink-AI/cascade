@@ -207,12 +207,13 @@ promotions/                        signed warm-start promotions
 The dashboard (`cascade/website/index.html`) reads only these public records.
 Its **Training** tab charts the king checkpoint's public-benchmark numbers
 (GIFT-Eval / BOOM / TIME, CRPS + MASE, from the signed per-round bench
-reports) against the lineage's cumulative training — optimiser steps and
-tokens summed over the king legs only, measured per leg from the training
-summary (steps, tokens seen, channel tokens = steps × batch × width × context)
-with the contracted budget as the labelled fallback — and, on request, every
-checkpoint the trainer benched (each challenger's and the from-scratch
-controls).
+reports) against the training behind the checkpoint — one leg per warm-start
+generation (every round of a generation trains from that generation's
+promoted set, so promotions add depth, rounds do not), each leg measured from
+the training summary (steps, tokens seen, channel tokens = steps × batch ×
+width × context) with the contracted budget as the labelled fallback; the
+line follows the best king per generation — and, on request, every checkpoint
+the trainer benched (each challenger's and the from-scratch controls).
 Every throne-holding generator is also archived to a private bucket by
 `scripts/scrape_kings.py`.
 

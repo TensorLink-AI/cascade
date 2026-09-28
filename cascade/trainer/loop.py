@@ -8104,8 +8104,10 @@ class TrainerRunner:
                 c = by_size.get(leg.get("size"))
                 if c is not None and c is not contracts[0]:
                     leg["contract"] = contract_block(c)
-            doc = build_training_summary(rid, manifest.created_block,
-                                         contract_block(contracts[0]), legs)
+            doc = build_training_summary(
+                rid, manifest.created_block, contract_block(contracts[0]), legs,
+                warm_start_ckpt=str(getattr(manifest, "warm_start_ckpt", "") or ""),
+                warm_start_size=str(getattr(manifest, "warm_start_size", "") or ""))
             key = publish_training_summary(self.manifest_store(), dump_training_summary(doc), rid)
             log.info("published training summary round=%s legs=%d measured=%d → s3://%s/%s",
                      rid, len(legs), sum(1 for x in legs if x.get("measured")),

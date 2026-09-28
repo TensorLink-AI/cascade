@@ -1229,10 +1229,8 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
           <span id="train-legend-scratch" hidden><i class="swatch diamond"></i>Scratch control</span>
           <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
         </span>
-        <span id="train-note">--</span>
+        <span id="train-note" title="x axis: training behind the king checkpoint — optimiser steps summed over its lineage, one leg per generation; rounds of a generation share a column">--</span>
       </div>
-      <div class="train-note" id="train-axis"></div>
-      <div class="train-note">Lower is better on every suite; the x axis is cumulative training &mdash; optimiser steps summed over the king&rsquo;s legs only (each round&rsquo;s king checkpoint, once), and the tokens tile counts every value entry those legs processed: steps &times; batch &times; width C &times; context. Each leg&rsquo;s numbers come from the trainer&rsquo;s per-round training summary (<code>training/round-&lt;id&gt;.json</code>: steps, the billed series-points, channel tokens, wall stop); a leg without one is priced at the contracted budget and the tiles say how many were measured. After each round&rsquo;s manifest publishes, the trainer benches both duel checkpoints on GIFT-Eval, BOOM and TIME and signs the six numbers into <code>benchmarks/round-&lt;id&gt;.json</code>. Under warm-start the king&rsquo;s checkpoint is re-trained from the promoted init every round, so its curve is the lineage&rsquo;s training trajectory. These numbers are telemetry and the warm-start promotion input only &mdash; rounds are decided on the private eval pool, never here.</div>
     </div>
 
     <div>
@@ -2370,6 +2368,30 @@ var _bench={}, _benchMissing={}, _benchInflight={}, _scratchIdx=null;
 // (cascade.shared.training_summary). Same immutable-fetch discipline as the
 // bench reports; a missing doc ⇒ that leg is priced at the contracted budget.
 var _train={}, _trainMissing={}, _trainInflight={};
+// Every promotion record (promotions/gen-<n>.json): a round's GENERATION is
+// the latest generation in force at its block, and a generation's members
+// (checkpoint id + source round) are the links the lineage walk follows.
+var _gens={}, _gensInflight={}, _gensLatest=0;
+function loadGenerations(){
+  fetchJSON("promotions/index.json").then(function(d){
+    var n=Number(d&&d.latest_generation)||0; _gensLatest=n;
+    for(var g=1; g<=n; g++) (function(g){
+      if(_gens[g]||_gensInflight[g]) return;
+      _gensInflight[g]=true;
+      fetchJSON("promotions/gen-"+g+".json",{bust:false}).then(function(rec){
+        delete _gensInflight[g];
+        _gens[g]={gen:g, fired_block:Number(rec&&rec.fired_block)||0, effective_era:Number(rec&&rec.effective_era)||0,
+                  members:((rec&&rec.members)||[]).map(function(m){ return {id:String(m.checkpoint_id||""), source_round:String(m.source_round||"")}; })};
+        renderTrain();
+      }).catch(function(){ delete _gensInflight[g]; });
+    })(g);
+    renderTrain();
+  }).catch(function(){});
+}
+// Activation block of a generation: its effective era's first block under the
+// rolling grid, else the block the reign clock fired at.
+function genStartBlock(G){ var cn=chainNow(); return (G.effective_era&&cn&&cn.eraBlocks)?G.effective_era*cn.eraBlocks:G.fired_block; }
+function genOfBlock(b){ var best=0; Object.keys(_gens).forEach(function(k){ var G=_gens[k]; if(genStartBlock(G)<=b&&G.gen>best) best=G.gen; }); return best; }
 var _trainMetric="crps", _trainScope="king";
 // The x axis is CUMULATIVE TRAINING, not the round ordinal: every round's king
 // leg is one more slice of optimiser steps on the same lineage, so a round is
@@ -2430,15 +2452,46 @@ function loadBench(){
   });
   // the scratch-shadow roll-up grows a row every M rounds — small, refetch per visit
   fetchJSON("benchmarks/scratch/index.json").then(function(d){ _scratchIdx=d; renderTrain(); }).catch(function(){});
+  loadGenerations();
   renderTrain();
 }
 function trainRoundLabel(r){ var rn=roundNoOf(r.round_id); return rn?"r"+rn:shortRoundId(r.round_id); }
 // One row per round that has any bench data, oldest first: the report's
 // entries (king + challengers) and the scratch-control row when one exists.
+// The price of one leg: measured from its training-summary row when the doc
+// carries it, else the contracted budget. `tokens` are channel tokens (every
+// value entry: steps × batch × C × context); a row from a worker image that
+// predates the counter has only the billed count, which equals channel
+// tokens at C = 1 — flagged, never guessed.
+function legPrice(kl){
+  var measured=!!(kl&&kl.measured&&kl.steps!=null);
+  var points=(measured&&kl.tokens_seen!=null)?Number(kl.tokens_seen):tokensPerLeg();
+  var chan=(measured&&kl.channel_tokens!=null)?Number(kl.channel_tokens):null;
+  return {measured:measured, steps:measured?Number(kl.steps):stepsPerLeg(), points:points,
+          tokens:chan!=null?chan:points, exact:chan!=null,
+          width:(kl&&kl.max_channels_seen!=null)?Number(kl.max_channels_seen):(measured?1:null),
+          deadline:!!(kl&&kl.deadline_hit), gpu:kl&&kl.gpu_name||""};
+}
+// Every training-summary leg in view, by checkpoint pointer, with its doc —
+// the lineage walk looks a promoted member up here to price its own leg and
+// to continue to the init IT trained from.
+function legIndex(){
+  var idx={};
+  Object.keys(_train).forEach(function(id){ var d=_train[id]; ((d&&d.legs)||[]).forEach(function(l){ if(l.trained_pointer&&!idx[l.trained_pointer]) idx[l.trained_pointer]={leg:l, doc:d}; }); });
+  return idx;
+}
+// One row per round with bench data, oldest first, each placed on the
+// LINEAGE axis: the depth of a round's king checkpoint is one leg per
+// generation behind it (random init → gen-1 members were trained from
+// scratch, a gen-g round trains from a gen-g member, so depth = g + 1) —
+// every round of a generation trains the same amount; only a promotion adds
+// a leg. Steps/tokens sum leg by leg along the chain init → member → its
+// init …, measured where the training summaries carry the numbers,
+// contracted for the rest.
 function trainRows(){
   var scratchBy={};
   ((_scratchIdx&&_scratchIdx.rounds)||[]).forEach(function(x){ var six=readSix(x.scratch_scores); if(six) scratchBy[String(x.round_id)]={six:six,geo:sixGeomean(six),ckpt:x.warm_start_ckpt||"",gen:x.generation}; });
-  var out=[], pending=0, missing=0;
+  var byPtr=legIndex(), out=[], pending=0, missing=0;
   benchRounds().forEach(function(r){
     var id=String(r.round_id||""), rep=_bench[id], entries=[];
     if(_benchInflight[id]) pending++;
@@ -2452,58 +2505,48 @@ function trainRows(){
     });
     var king=null; entries.forEach(function(e){ if(e.role==="king"&&!king) king=e; });
     var sc=scratchBy[id]||null;
-    // the king LEG this round trained: the training doc's king row (measured
-    // steps/tokens) joined to the bench entry by trained_pointer, else priced
-    // at the contracted budget. A round whose report and doc are both missing
-    // still trained a king leg, but it is invisible here — not counted.
     var doc=_train[id], kl=null;
     ((doc&&doc.legs)||[]).forEach(function(l){ if(l.role==="king"&&!kl) kl=l; });
-    var kptr=(king&&king.pointer)||(kl&&kl.trained_pointer)||"";
-    var leg=null;
-    if(kptr){
-      var measured=!!(kl&&kl.measured&&kl.steps!=null);
-      var steps=measured?Number(kl.steps):stepsPerLeg();
-      var points=(measured&&kl.tokens_seen!=null)?Number(kl.tokens_seen):tokensPerLeg();
-      var chan=(measured&&kl.channel_tokens!=null)?Number(kl.channel_tokens):null;
-      leg={pointer:kptr, measured:measured, steps:steps, points:points,
-           // channel tokens = every value entry the model saw (steps × batch × C × context);
-           // a doc from a worker image predating the counter has only the billed
-           // count, which equals channel tokens at C = 1 — flagged, not guessed
-           tokens:chan!=null?chan:points, tokensExact:chan!=null||!measured?chan!=null:false,
-           width:(kl&&kl.max_channels_seen!=null)?Number(kl.max_channels_seen):(measured?1:null),
-           deadline:!!(kl&&kl.deadline_hit), frac:kl&&kl.tokens_frac!=null?Number(kl.tokens_frac):null,
-           gpu:kl&&kl.gpu_name||"", seconds:kl&&kl.train_seconds!=null?Number(kl.train_seconds):null,
-           contract:(doc&&doc.contract)||null};
+    var gen=genOfBlock(Number(r.epoch_start_block)||0), depth=gen+1;
+    // lineage walk: this leg, then the init it trained from, and so on
+    var chain=[], price=legPrice(kl), init=doc?String(doc.warm_start_ckpt||""):null;
+    chain.push(price);
+    var guard=0;
+    while(init&&chain.length<depth&&guard++<64){
+      var hit=byPtr[init]; if(!hit){ break; }
+      chain.push(legPrice(hit.leg)); init=String(hit.doc.warm_start_ckpt||"");
     }
-    if(entries.length||sc||leg) out.push({r:r, id:id, label:trainRoundLabel(r), rn:roundNoOf(r.round_id), entries:entries, king:king, scratch:sc, leg:leg});
+    var lin={steps:0,tokens:0,points:0,measured:0,exact:0,deadline:0,legs:depth,resolved:chain.length};
+    chain.forEach(function(c){ lin.steps+=c.steps; lin.tokens+=c.tokens; lin.points+=c.points; if(c.measured) lin.measured++; if(c.exact) lin.exact++; if(c.deadline) lin.deadline++; });
+    for(var k=chain.length; k<depth; k++){ lin.steps+=stepsPerLeg(); lin.tokens+=tokensPerLeg(); lin.points+=tokensPerLeg(); }
+    if(entries.length||sc) out.push({r:r, id:id, label:trainRoundLabel(r), gen:gen, depth:depth, leg:price, lineage:lin,
+                                     steps:lin.steps, tokens:lin.tokens, entries:entries, king:king, scratch:sc});
   });
-  // Cumulative training of the LINEAGE: sum over king legs only (each round's
-  // king checkpoint, deduplicated by trained_pointer — under the rolling era
-  // the same king leg is benched at every settlement), oldest first.
-  var cum={steps:0, tokens:0, points:0, legs:0, measured:0, exact:0, deadline:0}, seen={};
-  out.forEach(function(x){
-    var l=x.leg;
-    if(l&&!seen[l.pointer]){
-      seen[l.pointer]=1; cum.legs++; cum.steps+=l.steps; cum.tokens+=l.tokens; cum.points+=l.points;
-      if(l.measured) cum.measured++; if(l.tokensExact) cum.exact++; if(l.deadline) cum.deadline++;
-      l.isNew=true;
-    }
-    x.steps=cum.steps; x.tokens=cum.tokens; x.points=cum.points; x.nLegs=cum.legs;
-  });
-  return {rows:out, pending:pending, missing:missing, cum:cum};
+  // One column per generation: every round of a generation trained the same
+  // depth, so they share an x — the generation's mean lineage steps/tokens
+  // (legs differ by a wall stop or a measured-vs-contracted price only). The
+  // tiles keep the latest king's own exact lineage.
+  var byGen={};
+  out.forEach(function(x){ var g=byGen[x.gen]||(byGen[x.gen]={n:0,steps:0,tokens:0}); g.n++; g.steps+=x.steps; g.tokens+=x.tokens; });
+  out.forEach(function(x){ var g=byGen[x.gen]; x.steps=g.steps/g.n; x.tokens=g.tokens/g.n; });
+  return {rows:out, pending:pending, missing:missing};
 }
 function trainSeries(rows, suite){
   // suite = "gifteval" | "boom" | "time" | null (geomean)
   function val(six){ return suite?six[suite+"_"+_trainMetric]:sixGeomean(six); }
-  var king=[], chal=[], scratch=[];
+  var king=[], chal=[], scratch=[], bestByX={};
   rows.forEach(function(row,i){
     row.entries.forEach(function(e){
       var v=val(e.six); if(v==null||!isFinite(v)) return;
-      (e.role==="king"?king:chal).push({i:i,v:v,e:e,row:row});
+      var pt={i:i,v:v,e:e,row:row};
+      if(e.role==="king"){ king.push(pt); var b=bestByX[row.steps]; if(!b||v<b.v) bestByX[row.steps]=pt; }
+      else chal.push(pt);
     });
     if(row.scratch){ var sv=val(row.scratch.six); if(sv!=null&&isFinite(sv)) scratch.push({i:i,v:sv,row:row,e:{role:"scratch",hotkey:"",size:""}}); }
   });
-  return {king:king, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[]};
+  // the trajectory: the best king checkpoint at each lineage depth, in order
+  var best=Object.keys(bestByX).map(Number).sort(function(a,b){ return a-b; }).map(function(x){ return bestByX[x]; });
+  return {king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[]};
 }
 function trainChartSVG(rows, S, W, H){
   var PAD_L=54,PAD_R=14,PAD_T=12,PAD_B=24, n=rows.length;
@@ -2529,9 +2572,12 @@ function trainChartSVG(rows, S, W, H){
   S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="var(--muted)"/>'; });
   // challengers: hollow dots with a surface ring so overlaps stay readable
   S.chal.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="'+(p.e.crowned?'var(--chal-line)':'var(--surface)')+'" stroke="var(--chal-line)" stroke-width="1.6"/>'; });
-  // the king lineage: the line
-  if(S.king.length>1) out+='<polyline points="'+S.king.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="var(--king)" stroke-width="2" stroke-linejoin="round"/>';
-  S.king.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.8" fill="var(--king)"/>'; });
+  // every king checkpoint as a point; the line follows the BEST king at each
+  // lineage depth (rounds of one generation share a column)
+  var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
+  S.king.forEach(function(p){ if(bestKey[p.i+":"+p.e.pointer]) return; var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="3.6" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.4" fill="var(--king)" opacity="0.45"/>'; });
+  if(S.best.length>1) out+='<polyline points="'+S.best.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="var(--king)" stroke-width="2" stroke-linejoin="round"/>';
+  S.best.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="var(--king)"/>'; });
   // x ticks in cumulative optimiser steps (nice multiples of the leg budget,
   // ~4 per chart); the token equivalent rides the axis title and the tooltip
   var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
@@ -2543,22 +2589,29 @@ function trainChartSVG(rows, S, W, H){
   // target wider than the marks), a crosshair, and the tooltip listing every
   // checkpoint at that round
   out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
-  rows.forEach(function(row,i){
-    var x=X(i), x0=i>0?(x+X(i-1))/2:0, x1=i<n-1?(x+X(i+1))/2:W;
-    out+='<rect class="col" data-i="'+i+'" x="'+x0.toFixed(1)+'" y="0" width="'+Math.max(0,x1-x0).toFixed(1)+'" height="'+H+'" fill="transparent" data-x="'+x.toFixed(1)+'"/>';
+  var cols=[]; rows.forEach(function(row,i){ if(!cols.length||cols[cols.length-1].steps!==row.steps) cols.push({steps:row.steps,i:i}); });
+  cols.forEach(function(c,k){
+    var x=X(c.i), x0=k>0?(x+X(cols[k-1].i))/2:0, x1=k<cols.length-1?(x+X(cols[k+1].i))/2:W;
+    out+='<rect class="col" data-i="'+c.i+'" x="'+x0.toFixed(1)+'" y="0" width="'+Math.max(0,x1-x0).toFixed(1)+'" height="'+H+'" fill="transparent" data-x="'+x.toFixed(1)+'"/>';
   });
   return out;
 }
 function trainTipHTML(row, S, i, unit){
-  function pick(list){ return list.filter(function(p){ return p.i===i; }); }
-  var lines=[], ks=pick(S.king), cs=pick(S.chal), ss=pick(S.scratch);
-  ks.forEach(function(p){ lines.push('<div class="r"><span><i class="k king"></i><b>'+fmt(p.v)+'</b></span><span class="who">king · '+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
-  cs.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ lines.push('<div class="r"><span><i class="k chal"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+(p.e.crowned?'♛ ':'')+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
-  ss.forEach(function(p){ lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">scratch control</span></div>'); });
-  var when=row.r.published_at?' · '+timeAgo(row.r.published_at):'';
-  return '<div class="h">'+esc(row.label)+(row.r.dethroned?' · dethrone':'')+'<span class="muted">'+esc(when)+'</span></div>'+
-    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' cumulative'+
-    (row.leg?' · this leg '+esc(fmtSteps(row.leg.steps))+(row.leg.measured?'':' (contracted)')+(row.leg.deadline?' · wall stop':''):'')+'</div>'+(lines.join("")||'<div class="muted">no bench numbers</div>')+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
+  // all rows at this lineage depth: a generation's rounds share the column
+  var x=row.steps, idxs={}; S.king.concat(S.chal,S.scratch).forEach(function(p){ if(p.row.steps===x) idxs[p.i]=1; });
+  var rowsHere=Object.keys(idxs).map(Number).sort(function(a,b){ return a-b; });
+  function pick(list){ return list.filter(function(p){ return p.row.steps===x; }); }
+  var lines=[], ks=pick(S.king), cs=pick(S.chal), ss=pick(S.scratch), shown=0, MAX=8;
+  var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
+  ks.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k king"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+(bestKey[p.i+":"+p.e.pointer]?'★ ':'')+esc(p.row.label)+' · king'+(p.e.uid!=null?' uid '+esc(p.e.uid):'')+'</span></div>'); });
+  cs.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k chal"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · '+(p.e.crowned?'♛ ':'')+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
+  ss.forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · scratch</span></div>'); });
+  var total=ks.length+cs.length+ss.length, more=total>MAX?'<div class="muted">+'+(total-MAX)+' more</div>':'';
+  var first=rows[rowsHere[0]]||row, last=rows[rowsHere[rowsHere.length-1]]||row;
+  var span=rowsHere.length>1?esc(first.label)+' – '+esc(last.label)+' · '+rowsHere.length+' rounds':esc(row.label);
+  return '<div class="h">Generation '+row.gen+' <span class="muted">· '+span+'</span></div>'+
+    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' · '+row.depth+' leg'+(row.depth===1?'':'s')+' deep</div>'+
+    (lines.join("")||'<div class="muted">no bench numbers</div>')+more+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
 }
 function wireTrainChart(wrap, rows, S, unit){
   var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), xh=svg.querySelector(".xh");
@@ -2597,28 +2650,32 @@ function renderTrainStats(rows, info){
     });
     if(row.scratch) nS++;
   });
-  var tiles=[], cum=info.cum||{}, lastLeg=null;
-  rows.forEach(function(row){ if(row.leg) lastLeg=row.leg; });
-  var contract=(lastLeg&&lastLeg.contract)||{};
-  var batch=contract.batch_size||TRAIN_BUDGET.batch, ctx=contract.context_length||TRAIN_BUDGET.ctx;
-  // ── trained: cumulative over the king legs only ──
-  if(cum.legs){
-    var est=cum.legs-cum.measured, approx=cum.exact<cum.legs;
-    tiles.push(tile("Steps trained",esc(fmtSteps(cum.steps).replace(" steps","")),
-      est?cum.measured+"/"+cum.legs+" legs measured":"all "+cum.legs+" legs measured",
-      {hl:true,title:"Optimiser steps summed over the king's legs (one per round, deduplicated by checkpoint). Measured legs read the trainer's training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
-    tiles.push(tile("Tokens trained",esc(fmtTokens(cum.tokens).replace(" tokens","")),
-      approx?(cum.exact?cum.exact+"/"+cum.legs+" legs exact":"univariate assumed"):"channel tokens, exact",
-      {hl:true,title:"Every value entry the king's legs processed: steps × batch × width C × context, summed over king legs. Exact where the leg published channel_tokens; otherwise the billed series-points count, which equals channel tokens at C = 1."}));
-    if(cum.points&&Math.round(cum.points)!==Math.round(cum.tokens)) tiles.push(tile("Series-points",esc(fmtTokens(cum.points).replace(" tokens","")),"billed budget count",
-      {title:"The contract's billed budget count (a C-wide series bills its length once, DEC-CA-0042) — what the token budget was spent in"}));
-    tiles.push(tile("Width C",lastLeg&&lastLeg.width!=null?esc(lastLeg.width):'<span class="muted">--</span>',
-      lastLeg&&lastLeg.width!=null?(lastLeg.width===1?"univariate":"max channels seen"):"not measured",
+  var tiles=[], lastRow=null;
+  rows.forEach(function(row){ if(row.king) lastRow=row; });
+  if(!lastRow) rows.forEach(function(row){ if(row.leg) lastRow=row; });
+  var lin=lastRow&&lastRow.lineage, leg=lastRow&&lastRow.leg;
+  var batch=TRAIN_BUDGET.batch, ctx=TRAIN_BUDGET.ctx, ld=lastRow&&_train[lastRow.id], contract=(ld&&ld.contract)||{};
+  if(contract.batch_size) batch=contract.batch_size; if(contract.context_length) ctx=contract.context_length;
+  // ── trained: the king checkpoint's lineage — one leg per generation ──
+  if(lin){
+    var unres=lin.legs-lin.resolved, est=lin.legs-lin.measured;
+    tiles.push(tile("Generations",lastRow.gen,lastRow.gen?"random init + "+lastRow.gen+" promotion"+(lastRow.gen===1?"":"s"):"random init, no promotion yet",
+      {title:"Warm-start generations behind the latest king checkpoint (promotions/gen-<n>.json in force at its round); every round of a generation trains from that generation's promoted set"}));
+    tiles.push(tile("Steps trained",esc(fmtSteps(lin.steps).replace(" steps","")),
+      est?lin.measured+"/"+lin.legs+" legs measured":"all "+lin.legs+" legs measured",
+      {hl:true,title:"Optimiser steps along the lineage: this leg, the promoted member it continued, that member's init, … — "+lin.legs+" legs. Measured legs read their training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
+    tiles.push(tile("Tokens trained",esc(fmtTokens(lin.tokens).replace(" tokens","")),
+      lin.exact<lin.legs?(lin.exact?lin.exact+"/"+lin.legs+" legs exact":"univariate assumed"):"channel tokens, exact",
+      {hl:true,title:"Every value entry the lineage's legs processed: steps × batch × width C × context, one leg per generation. Exact where a leg published channel_tokens; otherwise its billed series-points count, which equals channel tokens at C = 1."}));
+    if(lin.points&&Math.round(lin.points)!==Math.round(lin.tokens)) tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"billed budget count",
+      {title:"The contract's billed budget count along the lineage (a C-wide series bills its length once, DEC-CA-0042)"}));
+    tiles.push(tile("Lineage legs",lin.legs,(unres?unres+" unresolved · ":"")+(lin.deadline?lin.deadline+" wall-stopped":"one per generation"),
+      {title:"Legs of training behind the latest king checkpoint: one per generation plus its own. Unresolved = the chain could not be followed to a published training summary, so the leg is priced at the contract"+(lin.deadline?"; a wall-stopped leg (deadline_hit) trained less than contracted":"")}));
+    tiles.push(tile("Width C",leg&&leg.width!=null?esc(leg.width):'<span class="muted">--</span>',
+      leg&&leg.width!=null?(leg.width===1?"univariate":"max channels seen"):"not measured",
       {title:"Channel width of the latest king leg's corpus (max channels seen in the shadow channel telemetry); a C-wide series trains C× the tokens per step"}));
     tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" tokens per step",
       {title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context (from the round's contract terms)"}));
-    tiles.push(tile("King legs",cum.legs,cum.deadline?cum.deadline+" wall-stopped":"counted into the totals",
-      {title:"Distinct king checkpoints counted into the totals"+(cum.deadline?"; a wall-stopped leg (deadline_hit) trained less than its contracted budget":"")}));
   }
   // ── the latest king checkpoint on the public benchmarks ──
   if(lastK){
@@ -2663,8 +2720,8 @@ function renderTrain(){
   document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
   document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
   var scanned=benchRounds().length, note=rows.length+" of "+scanned+" rounds benched";
-  var cum=info.cum||{};
-  document.getElementById("train-axis").textContent=rows.length?("x axis: cumulative optimiser steps over the king's legs only ("+cum.legs+" legs · "+cum.measured+" measured, the rest priced at the contracted "+fmtSteps(stepsPerLeg()).replace(" steps","")+" steps / "+fmtTokens(tokensPerLeg()).replace(" tokens","")+" series-points per leg) · hover a column for the round's cumulative steps and tokens"):"";
+  var gens={}; rows.forEach(function(r){ gens[r.gen]=1; });
+  note+=" · "+Object.keys(gens).length+" generation"+(Object.keys(gens).length===1?"":"s");
   if(info.pending) note+=" · loading "+info.pending; else if(info.missing) note+=" · "+info.missing+" without a report";
   document.getElementById("train-note").textContent=rows.length?note:(info.pending?"loading bench reports…":"--");
   renderTrainTable(rows);

@@ -141,22 +141,30 @@ def test_x_axis_budget_matches_chain_toml(page: str):
     assert 100_000 < steps < 200_000
 
 
-def test_lineage_totals_sum_the_king_legs_from_the_training_summary(page: str):
-    """Steps and tokens accumulate over the KING legs only (one per checkpoint),
-    each priced from the trainer's ``training/round-<id>.json`` row when it
-    is measured and at the contracted budget otherwise; the tokens are the
-    leg's channel tokens (steps × batch × C × context)."""
+def test_lineage_depth_is_one_leg_per_generation(page: str):
+    """Steps and tokens are the LINEAGE of the king checkpoint: one leg per
+    warm-start generation behind it plus its own (every round of a
+    generation trains from that generation's promoted set, so rounds do not
+    accumulate — promotions do). The walk follows each training summary's
+    warm_start_ckpt to the promoted member's own leg; an unresolved leg is
+    priced at the contracted budget."""
     body = re.search(r"function trainRows\(\)\{(.*?)\n\}", page, re.S)
     assert body
     b = body.group(1)
-    assert 'l.role==="king"' in b, "legs other than the king's would be counted"
-    assert "seen[l.pointer]" in b, "a king leg benched at several settlements would be counted twice"
-    assert "cum.steps+=l.steps" in b and "cum.tokens+=l.tokens" in b
+    assert "genOfBlock(" in b and "depth=gen+1" in b, "depth is not one leg per generation"
+    assert "warm_start_ckpt" in b, "the lineage walk never follows the round's init"
+    assert 'l.role==="king"' in b, "a challenger's leg would price the king's lineage"
+    assert "stepsPerLeg()" in b and "tokensPerLeg()" in b, "no contracted fallback for an unresolved leg"
     for field in ("steps", "tokens_seen", "channel_tokens", "max_channels_seen", "deadline_hit", "measured"):
-        assert re.search(rf"\.{field}\b", b), f"trainRows() never reads the training summary's {field!r}"
-    assert "stepsPerLeg()" in b and "tokensPerLeg()" in b, "no contracted fallback for an unmeasured leg"
+        assert re.search(rf"\.{field}\b", page[page.index("function legPrice"):page.index("function legIndex")]), (
+            f"legPrice() never reads the training summary's {field!r}")
+    gens = re.search(r"function loadGenerations\(\)\{(.*?)\n\}", page, re.S)
+    assert gens and 'fetchJSON("promotions/index.json")' in gens.group(1)
+    assert re.search(r"\.fired_block\b", gens.group(1)) and re.search(r"\.effective_era\b", gens.group(1)), (
+        "a generation's activation block is not read off its promotion record")
     chart = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
-    assert chart and "rows[i].steps" in chart.group(1), "the chart does not place rounds by cumulative steps"
+    assert chart and "rows[i].steps" in chart.group(1), "the chart does not place rounds by lineage steps"
+    assert "S.best" in chart.group(1), "the line does not follow the best king per generation"
     tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
     assert tip and "fmtTokens(row.tokens)" in tip.group(1), "the tooltip does not show the token count"
 
@@ -169,7 +177,7 @@ def test_training_summary_is_fetched_immutably(page: str):
         "the tab does not fetch training_summary_key() objects cache-friendly")
 
 
-@pytest.mark.parametrize("tile", ["Steps trained", "Tokens trained", "Width C", "Batch × context", "King legs"])
+@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Lineage legs", "Width C", "Batch × context"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
