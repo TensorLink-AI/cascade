@@ -1229,7 +1229,6 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
           <span id="train-legend-scratch" hidden><i class="swatch diamond"></i>Scratch control</span>
           <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
         </span>
-        <span id="train-note" title="x axis: training behind the king checkpoint — optimiser steps summed over its lineage, one leg per generation; rounds of a generation share a column">--</span>
       </div>
     </div>
 
@@ -2719,11 +2718,6 @@ function renderTrain(){
   var anyScratch=rows.some(function(r){ return !!r.scratch; });
   document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
   document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
-  var scanned=benchRounds().length, note=rows.length+" of "+scanned+" rounds benched";
-  var gens={}; rows.forEach(function(r){ gens[r.gen]=1; });
-  note+=" · "+Object.keys(gens).length+" generation"+(Object.keys(gens).length===1?"":"s");
-  if(info.pending) note+=" · loading "+info.pending; else if(info.missing) note+=" · "+info.missing+" without a report";
-  document.getElementById("train-note").textContent=rows.length?note:(info.pending?"loading bench reports…":"--");
   renderTrainTable(rows);
 }
 function renderTrainTable(rows){
