@@ -1047,7 +1047,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
 .train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
-.train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
+.train-tiles { display:grid; grid-template-columns:repeat(7, minmax(0,1fr)); gap:12px; }
 .train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
@@ -1057,7 +1057,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile .s.good { color:var(--good); }
 .train-tiles .tile.hl { border-color:var(--ink); }
 .train-tiles .empty { grid-column:1 / -1; }
-@media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(4, minmax(0,1fr)); } }
+@media (max-width: 1100px) { .train-tiles { grid-template-columns:repeat(4, minmax(0,1fr)); } }
 @media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
 @media (max-width: 440px)  { .train-tiles { grid-template-columns:repeat(2, minmax(0,1fr)); } }
 .role-pill { display:inline-block; font-family:var(--font-mono); font-weight:700; font-size:10px; letter-spacing:0.04em; text-transform:uppercase; padding:2px 8px; border-radius:2px; border:1px dashed currentColor; color:var(--muted); white-space:nowrap; }
@@ -2667,7 +2667,7 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Tokens trained",esc(fmtTokens(lin.tokens).replace(" tokens","")),
       lin.exact<lin.legs?(lin.exact?lin.exact+"/"+lin.legs+" legs exact":"univariate assumed"):"channel tokens, exact",
       {hl:true,title:"Every value entry the lineage's legs processed: steps × batch × width C × context, one leg per generation. Exact where a leg published channel_tokens; otherwise its billed series-points count, which equals channel tokens at C = 1."}));
-    if(lin.points&&Math.round(lin.points)!==Math.round(lin.tokens)) tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"billed budget count",
+    tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"billed budget count",
       {title:"The contract's billed budget count along the lineage (a C-wide series bills its length once, DEC-CA-0042)"}));
     tiles.push(tile("Lineage legs",lin.legs,(unres?unres+" unresolved · ":"")+(lin.deadline?lin.deadline+" wall-stopped":"one per generation"),
       {title:"Legs of training behind the latest king checkpoint: one per generation plus its own. Unresolved = the chain could not be followed to a published training summary, so the leg is priced at the contract"+(lin.deadline?"; a wall-stopped leg (deadline_hit) trained less than contracted":"")}));
@@ -2677,26 +2677,15 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" tokens per step",
       {title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context (from the round's contract terms)"}));
   }
-  // ── the latest king checkpoint on the public benchmarks ──
+  // ── row two: the latest king checkpoint's six public-benchmark numbers, then the benched count ──
   if(lastK){
-    var s=lastK.e.six, g=lastK.e.geo;
-    var rel=(firstK&&firstK.row!==lastK.row&&firstK.e.geo)?(g-firstK.e.geo)/firstK.e.geo*100:null;
-    tiles.push(tile("King checkpoint",esc(lastK.row.label),lastK.e.size?esc(lastK.e.size)+(lastK.e.uid!=null?" · uid "+esc(lastK.e.uid):""):"",
-      {title:"The latest round with a signed bench report for the king's checkpoint"+(lastK.e.pointer?" — "+lastK.e.pointer:"")}));
-    tiles.push(tile("Geomean",fmt(g),rel!=null?signedPct(rel,1)+" vs "+esc(firstK.row.label):"six-suite geomean",
-      {good:rel!=null&&rel<0,title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
+    var s=lastK.e.six;
     SUITES.forEach(function(su){
-      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",{title:su.label+" CRPS of the king's latest benched checkpoint; lower is better"}));
-      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",{title:su.label+" MASE of the king's latest benched checkpoint; lower is better"}));
+      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",{title:su.label+" CRPS of the king's latest benched checkpoint ("+lastK.row.label+"); lower is better"}));
+      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",{title:su.label+" MASE of the king's latest benched checkpoint ("+lastK.row.label+"); lower is better"}));
     });
-    if(best){
-      var who=best.e.role==="king"?"king":(best.e.crowned?"challenger, took the throne":"challenger");
-      tiles.push(tile("Best ever",fmt(best.geo),esc(best.row.label)+" · "+esc(who),
-        {title:"Lowest six-number geomean across every benched checkpoint"+(best.e.uid!=null?" — uid "+best.e.uid:"")}));
-    }
   }
-  tiles.push(tile("Benched",nK+nC+nS,nK+" king · "+nC+" chal"+(nS?" · "+nS+" scratch":""),
-    {title:"Checkpoints with signed public-benchmark numbers in the scanned rounds"}));
+  tiles.push(tile("Benched",nK+nC+nS,"",{title:nK+" king · "+nC+" challenger"+(nS?" · "+nS+" scratch":"")+" checkpoints with signed public-benchmark numbers in the scanned rounds"}));
   el.innerHTML=tiles.join("");
   when.textContent=lastK&&lastK.row.r.published_at?"benched round settled "+timeAgo(lastK.row.r.published_at):"";
 }
