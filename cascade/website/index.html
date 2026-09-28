@@ -1053,7 +1053,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
 .train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile .v .u { font-size:11px; color:var(--muted); margin-left:4px; }
-.train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; line-height:1.35; }
 .train-tiles .tile .s.good { color:var(--good); }
 .train-tiles .tile.hl { border-color:var(--ink); }
 .train-tiles .empty { grid-column:1 / -1; }
@@ -2615,7 +2615,7 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Width C",lastLeg&&lastLeg.width!=null?esc(lastLeg.width):'<span class="muted">--</span>',
       lastLeg&&lastLeg.width!=null?(lastLeg.width===1?"univariate":"max channels seen"):"not measured",
       {title:"Channel width of the latest king leg's corpus (max channels seen in the shadow channel telemetry); a C-wide series trains C× the tokens per step"}));
-    tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" per step at C = 1",
+    tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" tokens per step",
       {title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context (from the round's contract terms)"}));
     tiles.push(tile("King legs",cum.legs,cum.deadline?cum.deadline+" wall-stopped":"counted into the totals",
       {title:"Distinct king checkpoints counted into the totals"+(cum.deadline?"; a wall-stopped leg (deadline_hit) trained less than its contracted budget":"")}));
