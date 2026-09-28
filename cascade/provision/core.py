@@ -56,12 +56,13 @@ DEFAULT_POD_COUNT = 2                       # king + challenger
 # absent: for L40S it only offers bigger cards. Register it in _PROVIDER_FACTORIES
 # and add its name here to use it for other SKUs — the seam is provider-agnostic.
 DEFAULT_PROVIDER_PRIORITY = ("lium", "shadeform")
-DEFAULT_FORWARD_ENV = (
-    "HIPPIUS_S3_ACCESS_KEY",
-    "HIPPIUS_S3_SECRET_KEY",
-    "HIPPIUS_HUB_USERNAME",
-    "HIPPIUS_HUB_PASSWORD",
-)
+# Pods carry NO credentials (2026-09-28): a miner is root on a payer pod, and
+# any operator lane may lose its network namespace and run the generator as a
+# plain child — either could read a forwarded key from the worker environment
+# (the 2026-09-24 leak route). Isolated hosts are harvested by the orchestrator
+# (PR #320) instead of uploading under their own identity. Listing a secret here
+# again is a deliberate decision, never a convenience.
+DEFAULT_FORWARD_ENV: tuple[str, ...] = ()
 DEFAULT_REMOTE_PYTHON = "/root/cascade/.venv/bin/python"
 DEFAULT_WORKDIR = "/root/cascade"
 DEFAULT_SSH_OPTIONS = (
@@ -549,6 +550,9 @@ def render_hosts_toml(
             lines += [
                 f"forward_env   = {_arr(forward_env)}",
                 f"ssh_options   = {_arr(ssh_options)}",
+                # a lane that forwards nothing is harvested (PR #320); a lane that
+                # forwards something is a deliberate exception and stays attached
+                f"isolated      = {'true' if not forward_env else 'false'}",
             ]
     return "\n".join(lines) + "\n"
 

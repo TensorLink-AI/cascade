@@ -187,6 +187,14 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
     hosts: list[RemoteHost] = []
     for h in entries:
         stage = str(h.get("stage", "any"))
+        fwd = tuple(str(x) for x in h.get("forward_env", ()))
+        if fwd and not bool(h.get("isolated", False)):
+            secrets = [n for n in fwd if _CREDENTIAL_ENV_RE.search(n)]
+            if secrets:
+                log.warning("host %s forwards credential(s) %s into the pod's worker "
+                            "environment — a pod can read them; use isolated = true "
+                            "(orchestrator harvest, PR #320) unless this is deliberate",
+                            h.get("name", "?"), ", ".join(secrets))
         if stage not in HOST_STAGES:
             raise RemoteDispatchError(
                 f"host {h.get('name', '?')!r}: stage={stage!r} invalid; expected one of {HOST_STAGES}"
@@ -410,6 +418,10 @@ def _stdin_env(env: dict[str, str]) -> str | None:
 # the detached session inherits them, nothing touches the pod's disk.
 
 DETACHED_RUN_ROOT = "_train_work/_dispatch"
+# Environment names that look like secrets — flagged when a non-isolated host
+# forwards them (see load_hosts).
+_CREDENTIAL_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD)", re.IGNORECASE)
+
 DETACHED_POLL_SECONDS = 30
 DETACHED_REATTACH_GRACE_SECONDS = 900
 DETACHED_STDOUT_TAIL_BYTES = 262144

@@ -78,8 +78,9 @@ ssh_key_path  = "~/.ssh/lium_cascade_ed25519"
 remote_python = "/root/cascade/.venv/bin/python"
 workdir       = "/root/cascade"
 chain_toml    = "/root/cascade/chain.toml"       # MAINNET template (netuid 91)
-forward_env   = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY",
-                 "HIPPIUS_HUB_USERNAME", "HIPPIUS_HUB_PASSWORD", "HF_TOKEN"]
+forward_env   = []   # pods carry NO credentials: isolated lanes are harvested by the
+                     # orchestrator (PR #320); a forwarded secret is readable by
+                     # whoever is root on the pod (2026-09-24 leak route)
 
 [provisioner.pods.shadeform]
 user          = "shadeform"

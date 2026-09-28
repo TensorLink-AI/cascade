@@ -54,7 +54,7 @@ max_dup_fraction     = 0.05      # cache_reuse only: loose few-% cap on exact by
 sandbox_mode   = "subprocess"
 sandbox_image  = ""
 sandbox_python = "python3"
-sandbox_strict = false
+sandbox_strict = true    # 2026-09-28: no netns ⇒ refuse (a plain child can read the worker env)
 
 [training]
 # The FIXED training contract — identical for king and challenger. The only
