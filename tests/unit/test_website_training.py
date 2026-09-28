@@ -172,4 +172,11 @@ def test_training_summary_is_fetched_immutably(page: str):
 @pytest.mark.parametrize("tile", ["Steps trained", "Tokens trained", "Width C", "Batch × context", "King legs"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
-    assert body and f'stat("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
+    assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
+
+
+def test_top_box_is_a_grid_of_bordered_tiles(page: str):
+    assert 'class="train-tiles" id="train-stats"' in page
+    assert re.search(r"\.train-tiles \.tile \{[^}]*border:", page), "tiles carry no border"
+    m = re.search(r"function tile\(k,v,sub,o\)\{(.*?)\n\}", page, re.S)
+    assert m and 'class="tile' in m.group(1) and 'class="k"' in m.group(1) and 'class="v"' in m.group(1)

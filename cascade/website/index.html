@@ -1047,6 +1047,19 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
 .train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
+.train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
+.train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; }
+.train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
+.train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.train-tiles .tile .v .u { font-size:11px; color:var(--muted); margin-left:4px; }
+.train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.train-tiles .tile .s.good { color:var(--good); }
+.train-tiles .tile.hl { border-color:var(--ink); }
+.train-tiles .empty { grid-column:1 / -1; }
+@media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(4, minmax(0,1fr)); } }
+@media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
+@media (max-width: 440px)  { .train-tiles { grid-template-columns:repeat(2, minmax(0,1fr)); } }
 .role-pill { display:inline-block; font-family:var(--font-mono); font-weight:700; font-size:10px; letter-spacing:0.04em; text-transform:uppercase; padding:2px 8px; border-radius:2px; border:1px dashed currentColor; color:var(--muted); white-space:nowrap; }
 .role-pill.king { color:var(--ink); border-style:solid; }
 .role-pill.chal { color:var(--chal-line); }
@@ -1193,7 +1206,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
     <div>
       <div class="section-label"><span>Training &mdash; the king&rsquo;s checkpoint on the public benchmarks</span><span id="train-when" class="muted"></span></div>
-      <div class="verdict" id="train-stats"><div class="empty">Loading bench reports&hellip;</div></div>
+      <div class="train-tiles" id="train-stats"><div class="empty">Loading bench reports&hellip;</div></div>
     </div>
 
     <div>
@@ -2371,7 +2384,7 @@ var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
 function tokensPerLeg(){ return TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
 function stepsPerLeg(){ return Math.round(tokensPerLeg()/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
 function fmtSteps(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e6) return (v/1e6).toFixed(v>=1e7?0:1)+"M steps"; if(v>=1e3) return Math.round(v/1e3)+"k steps"; return Math.round(v)+" steps"; }
-function fmtTokens(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e12) return (v/1e12).toFixed(2)+"T tokens"; if(v>=1e9) return Math.round(v/1e9)+"B tokens"; return Math.round(v/1e6)+"M tokens"; }
+function fmtTokens(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e12) return (v/1e12).toFixed(2)+"T tokens"; if(v>=1e9) return Math.round(v/1e9)+"B tokens"; if(v>=1e6) return (v/1e6).toFixed(1)+"M tokens"; if(v>=1e3) return Math.round(v/1e3)+"k tokens"; return Math.round(v)+" tokens"; }
 var SIX_KEYS=["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
 var SUITES=[{key:"gifteval",label:"GIFT-Eval"},{key:"boom",label:"BOOM"},{key:"time",label:"TIME"}];
 // The six numbers follow BenchScores' key convention; the nesting on a report
@@ -2564,6 +2577,11 @@ function wireTrainChart(wrap, rows, S, unit){
     });
   }
 }
+function tile(k,v,sub,o){
+  o=o||{};
+  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
+    '<div class="v">'+v+'</div>'+(sub?'<div class="s'+(o.good?' good':'')+'">'+sub+'</div>':'')+'</div>';
+}
 function renderTrainStats(rows, info){
   var el=document.getElementById("train-stats"), when=document.getElementById("train-when"); if(!el) return;
   if(!_index){ el.innerHTML='<div class="empty">Waiting for round data&hellip;</div>'; when.textContent=""; return; }
@@ -2579,40 +2597,50 @@ function renderTrainStats(rows, info){
     });
     if(row.scratch) nS++;
   });
-  var cells=[], cum=info.cum||{}, lastLeg=null;
+  var tiles=[], cum=info.cum||{}, lastLeg=null;
   rows.forEach(function(row){ if(row.leg) lastLeg=row.leg; });
   var contract=(lastLeg&&lastLeg.contract)||{};
   var batch=contract.batch_size||TRAIN_BUDGET.batch, ctx=contract.context_length||TRAIN_BUDGET.ctx;
   // ── trained: cumulative over the king legs only ──
   if(cum.legs){
-    var est=cum.legs-cum.measured;
-    cells.push(stat("Steps trained",esc(fmtSteps(cum.steps).replace(" steps",""))+(est?' <span class="sub">'+cum.measured+' of '+cum.legs+' legs measured</span>':' <span class="sub">measured</span>'),
-      {title:"Optimiser steps summed over the king's legs (one per round, deduplicated by checkpoint). Measured legs read the trainer's training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
-    var approx=cum.exact<cum.legs;
-    cells.push(stat("Tokens trained",esc(fmtTokens(cum.tokens).replace(" tokens",""))+(approx?' <span class="sub">'+(cum.exact?cum.exact+' of '+cum.legs+' legs exact':'univariate assumed')+'</span>':' <span class="sub">channel tokens</span>'),
-      {title:"Every value entry the king's legs processed: steps × batch × width C × context, summed over king legs. Exact where the leg published channel_tokens; otherwise the billed series-points count, which equals channel tokens at C = 1."}));
-    if(cum.points&&Math.round(cum.points)!==Math.round(cum.tokens)) cells.push(stat("Series-points",esc(fmtTokens(cum.points).replace(" tokens","")),
+    var est=cum.legs-cum.measured, approx=cum.exact<cum.legs;
+    tiles.push(tile("Steps trained",esc(fmtSteps(cum.steps).replace(" steps","")),
+      est?cum.measured+"/"+cum.legs+" legs measured":"all "+cum.legs+" legs measured",
+      {hl:true,title:"Optimiser steps summed over the king's legs (one per round, deduplicated by checkpoint). Measured legs read the trainer's training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
+    tiles.push(tile("Tokens trained",esc(fmtTokens(cum.tokens).replace(" tokens","")),
+      approx?(cum.exact?cum.exact+"/"+cum.legs+" legs exact":"univariate assumed"):"channel tokens, exact",
+      {hl:true,title:"Every value entry the king's legs processed: steps × batch × width C × context, summed over king legs. Exact where the leg published channel_tokens; otherwise the billed series-points count, which equals channel tokens at C = 1."}));
+    if(cum.points&&Math.round(cum.points)!==Math.round(cum.tokens)) tiles.push(tile("Series-points",esc(fmtTokens(cum.points).replace(" tokens","")),"billed budget count",
       {title:"The contract's billed budget count (a C-wide series bills its length once, DEC-CA-0042) — what the token budget was spent in"}));
-    cells.push(stat("Width C",lastLeg&&lastLeg.width!=null?(lastLeg.width+(lastLeg.width===1?' <span class="sub">univariate</span>':' <span class="sub">max channels seen</span>')):'<span class="muted">--</span>',
+    tiles.push(tile("Width C",lastLeg&&lastLeg.width!=null?esc(lastLeg.width):'<span class="muted">--</span>',
+      lastLeg&&lastLeg.width!=null?(lastLeg.width===1?"univariate":"max channels seen"):"not measured",
       {title:"Channel width of the latest king leg's corpus (max channels seen in the shadow channel telemetry); a C-wide series trains C× the tokens per step"}));
-    cells.push(stat("Batch × context",esc(batch)+' <span class="sub">series</span> × '+esc(ctx),
-      {range:true,title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context = "+fmtTokens(batch*ctx).replace(" tokens","")+" per step (from the round's contract terms)"}));
-    cells.push(stat("King legs",cum.legs+(cum.deadline?' <span class="sub">'+cum.deadline+' wall-stopped</span>':' <span class="sub">counted</span>'),
+    tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" per step at C = 1",
+      {title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context (from the round's contract terms)"}));
+    tiles.push(tile("King legs",cum.legs,cum.deadline?cum.deadline+" wall-stopped":"counted into the totals",
       {title:"Distinct king checkpoints counted into the totals"+(cum.deadline?"; a wall-stopped leg (deadline_hit) trained less than its contracted budget":"")}));
   }
+  // ── the latest king checkpoint on the public benchmarks ──
   if(lastK){
     var s=lastK.e.six, g=lastK.e.geo;
     var rel=(firstK&&firstK.row!==lastK.row&&firstK.e.geo)?(g-firstK.e.geo)/firstK.e.geo*100:null;
-    cells.push(stat("King checkpoint",'<b>'+esc(lastK.row.label)+'</b>'+(lastK.e.size?' <span class="sub">'+esc(lastK.e.size)+'</span>':''),{title:"The latest round with a signed bench report for the king's checkpoint"+(lastK.e.pointer?" — "+lastK.e.pointer:"")}));
-    cells.push(stat("Geomean",fmt(g)+(rel!=null?' <span class="sub '+(rel<0?'good':'')+'">'+signedPct(rel,1)+' vs '+esc(firstK.row.label)+'</span>':''),{title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
-    SUITES.forEach(function(su){ cells.push(stat(su.label,'<span class="sub">CRPS&nbsp;</span>'+fmt(s[su.key+"_crps"],4)+' <span class="sub">MASE&nbsp;</span>'+fmt(s[su.key+"_mase"],4),{wide:true,range:true,title:su.label+" — CRPS and MASE of the king's latest benched checkpoint"})); });
+    tiles.push(tile("King checkpoint",esc(lastK.row.label),lastK.e.size?esc(lastK.e.size)+(lastK.e.uid!=null?" · uid "+esc(lastK.e.uid):""):"",
+      {title:"The latest round with a signed bench report for the king's checkpoint"+(lastK.e.pointer?" — "+lastK.e.pointer:"")}));
+    tiles.push(tile("Geomean",fmt(g),rel!=null?signedPct(rel,1)+" vs "+esc(firstK.row.label):"six-suite geomean",
+      {good:rel!=null&&rel<0,title:"Geometric mean of the six public-benchmark numbers — the warm-start promotion score; lower is better"}));
+    SUITES.forEach(function(su){
+      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"MASE "+fmt(s[su.key+"_mase"],4),
+        {title:su.label+" — CRPS (value) and MASE (below) of the king's latest benched checkpoint; lower is better"}));
+    });
+    if(best){
+      var who=best.e.role==="king"?"king":(best.e.crowned?"challenger, took the throne":"challenger");
+      tiles.push(tile("Best ever",fmt(best.geo),esc(best.row.label)+" · "+esc(who),
+        {title:"Lowest six-number geomean across every benched checkpoint"+(best.e.uid!=null?" — uid "+best.e.uid:"")}));
+    }
   }
-  if(best){
-    var who=best.e.role==="king"?"king":(best.e.crowned?"challenger, took the throne":"challenger");
-    cells.push(stat("Best ever",fmt(best.geo)+' <span class="sub">'+esc(best.row.label)+' · '+esc(who)+'</span>',{title:"Lowest six-number geomean across every benched checkpoint"+(best.e.uid!=null?" — uid "+best.e.uid:"")}));
-  }
-  cells.push(stat("Benched",nK+' <span class="sub">king</span> · '+nC+' <span class="sub">chal</span>'+(nS?' · '+nS+' <span class="sub">scratch</span>':''),{wide:true,range:true,title:"Checkpoints with signed public-benchmark numbers in the scanned rounds"}));
-  el.innerHTML=cells.join("");
+  tiles.push(tile("Benched",nK+nC+nS,nK+" king · "+nC+" chal"+(nS?" · "+nS+" scratch":""),
+    {title:"Checkpoints with signed public-benchmark numbers in the scanned rounds"}));
+  el.innerHTML=tiles.join("");
   when.textContent=lastK&&lastK.row.r.published_at?"benched round settled "+timeAgo(lastK.row.r.published_at):"";
 }
 function renderTrain(){
