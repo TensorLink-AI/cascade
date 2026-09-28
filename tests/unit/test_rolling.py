@@ -1582,3 +1582,34 @@ def test_late_settlement_of_an_era_whose_king_is_forfeited_by_now_requeues_not_p
     for hk in ("ALFA", "BRAV"):                            # requeued unburned (the new era re-seats them)
         assert q.get(hk).attempts == 0
         assert "forfeited before its settlement" in q.get(hk).last_error
+
+
+def test_leg_records_are_looked_up_under_the_eras_contract_not_the_base_one(tmp_path):
+    """DEC-CA-0047 schedules a contract switch at an era start; the persist
+    path stamps a leg's record with the contract effective then, but the
+    reuse path looked it up under the BASE contract — a silent digest miss,
+    so no leg trained after the switch was ever reused (2026-09-28 17:54:
+    era 2546's landed king leg retrained on a fresh pod). Both the lookup
+    and the discard go through the contract effective at the era's start."""
+    from cascade.trainer.rolling import LegOps
+
+    base, at_era = object(), object()
+    calls: list[tuple] = []
+    cfg = SimpleNamespace(throne_contracts=lambda: [base],
+                          throne_contracts_at=lambda block: (calls.append(("at", block)), [at_era])[1])
+    runner = SimpleNamespace(
+        cfg=cfg,
+        _rolling_warm_start_ref=lambda era, contract: "init-ref",
+        _load_completed_leg=lambda **kw: (calls.append(("load", kw["contract"], kw["warm_start_ckpt"])), None)[1],
+        _discard_completed_leg=lambda **kw: calls.append(("discard", kw["contract"])),
+    )
+    ops = LegOps(runner)
+    era = SimpleNamespace(start_block=9165600, base_seed=1, warm_start_ckpt="init-ref",
+                          warm_start_size="toto2-4m")
+    gen = SimpleNamespace(hotkey="KING", uid=1, ref="vault/direct@sha256:aa")
+    assert ops.cached_leg(era, "king", gen) is None
+    assert ("at", 9165600) in calls
+    assert ("load", at_era, "init-ref") in calls            # the era's contract, never `base`
+    ops.discard_cached_leg(era, "challenger", gen)
+    assert ("discard", at_era) in calls
+    assert not any(c[1] is base for c in calls if c[0] in ("load", "discard"))

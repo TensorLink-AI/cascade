@@ -387,8 +387,16 @@ class LegOps:
     def train_king(self, gen, era: EraState, block: int, *, end_wall: float) -> TrainedEntry:
         return self.r._rolling_train_king(gen, era, block, end_wall=end_wall)
 
+    def _era_contract(self, era: EraState):
+        """The contract a leg of ``era`` trains and is persisted under — the
+        one effective at the era's start (DEC-CA-0047 scheduled switch), the
+        same ``_rolling_train_*`` persist with. Looking a record up under the
+        base contract misses every leg trained after a switch (2026-09-28
+        17:54: era 2546's landed king leg was retrained instead of reused)."""
+        return self.r.cfg.throne_contracts_at(int(era.start_block))[0]
+
     def cached_leg(self, era: EraState, role: str, gen) -> TrainedEntry | None:
-        contract = self.r.cfg.throne_contracts()[0]
+        contract = self._era_contract(era)
         suffix = "" if role == "king" else f"-u{gen.uid}"
         # The era's init is part of the job: a record from the same seed but
         # another init (the legacy rotation, an edited state) is never reused.
@@ -402,7 +410,7 @@ class LegOps:
         """Drop the persisted record of a leg that must be retrained (an
         entry trained outside the era window would otherwise be reused from
         the record on every re-admission)."""
-        contract = self.r.cfg.throne_contracts()[0]
+        contract = self._era_contract(era)
         suffix = "" if role == "king" else f"-u{gen.uid}"
         self.r._discard_completed_leg(round_id=era.base_seed, contract=contract,
                                       role=role, hotkey=gen.hotkey, suffix=suffix)
