@@ -729,6 +729,9 @@ class RollingScheduler:
         cur = self.state.current
         if cur is None:
             return
+        if (cur.king_entry is not None and cur.index not in self._king_threads
+                and self._forfeit_switch(cur)):      # armed mid-reign: the running era switches too
+            self.ops.retire_king_pod(cur)
         if cur.king_entry is None and cur.king_hotkey and cur.index not in self._king_threads:
             self._launch_king_leg(client, cur, block, now)
         wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
@@ -761,7 +764,49 @@ class RollingScheduler:
         end_block = int(era.start_block) + era_length_blocks(self.cfg.round, int(era.start_block))
         return wall_of_block(end_block, now=now, block_now=block)
 
+    def _forfeit_gate_block(self, era: EraState) -> int:
+        """The block ``era`` is judged at for a forfeiture: its LAST settlement
+        (the era end). A forfeiture that lands anywhere inside the era hands
+        the throne over for the rest of it — the validators crown the
+        successor at that boundary and hold until this king leg lands."""
+        return int(era.start_block) + int(era_length_blocks(self.cfg.round, int(era.start_block)))
+
+    def _forfeit_switch(self, era: EraState) -> bool:
+        """DEC-CA-0048: hand ``era``'s throne to the named successor when any
+        of its settlements is judged under a forfeiture that lists its king.
+        Returns True when the era's king changed (its king leg must be
+        (re)trained). With no successor named the era trains NO king leg
+        and waits for the validators' receipts (a vacant throne)."""
+        from ..shared.era import forfeit_successor, forfeited_hotkeys
+
+        scoring = self.r.cfg.scoring
+        gate_block = self._forfeit_gate_block(era)
+        forfeited = forfeited_hotkeys(scoring, gate_block)
+        if not era.king_hotkey or era.king_hotkey not in forfeited:
+            return False
+        succ = forfeit_successor(scoring, gate_block)
+        if not succ:
+            log.warning("rolling: era %d king %s is FORFEITED from block %s and no successor "
+                        "is named — no king leg; waiting for the validators' receipts",
+                        era.index, era.king_hotkey[:12], scoring.forfeit_from_block)
+            return False
+        with self._lock:
+            log.warning("rolling: era %d king %s is FORFEITED from block %s — throne passes to "
+                        "the named successor %s; its king leg trains for this era",
+                        era.index, era.king_hotkey[:12], scoring.forfeit_from_block, succ[:12])
+            era.king_hotkey, era.king_uid, era.king_ref = succ, -1, ""
+            era.king_entry, era.king_bench, era.king_bench_published = None, None, False
+            era.king_init = ""
+            self._save()
+        return True
+
     def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
+        from ..shared.era import forfeited_hotkeys
+
+        self._forfeit_switch(era)
+        if era.king_hotkey and era.king_hotkey in forfeited_hotkeys(
+                self.r.cfg.scoring, self._forfeit_gate_block(era)):
+            return                                   # forfeited, no successor: vacant
         if not era.king_hotkey:
             return
         if not era.king_ref:
@@ -908,6 +953,8 @@ class RollingScheduler:
                 queue.fail(entry.hotkey, error="vault ref not owned by this hotkey",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
+            if self._blocked_check(gen, block):
+                continue
             if self._packed_source_check(gen, block):
                 continue
             dup = self._dedup_check(gen, era, history)
@@ -962,6 +1009,21 @@ class RollingScheduler:
                 "target_boundary": int(adm.target_boundary), "era_index": int(adm.era_index),
                 "passed_over": ahead, "at": self.clock()})
             self._save()
+
+    def _blocked_check(self, gen, block: int | None = None) -> bool:
+        """``[round] blocked_hotkeys`` (DEC-CA-0048): refused at the door, never
+        rents a pod. Terminal ``failed`` [blocked], no burn — the fee question is
+        policy, not code. Returns True when ``gen`` was dropped."""
+        rnd = self.r.cfg.round
+        blocked = rnd.blocked_at(block) if hasattr(rnd, "blocked_at") else frozenset()
+        if gen.hotkey not in blocked:
+            return False
+        q = self.ops.queue()
+        if q is not None:
+            q.fail(gen.hotkey, error="hotkey is on the operator's admission denylist "
+                   "([round] blocked_hotkeys)", error_class="blocked", expect_ref=gen.ref)
+        log.warning("rolling: %s refused — blocked_hotkeys", gen.hotkey[:12])
+        return True
 
     def _packed_source_check(self, gen, block: int | None = None) -> bool:
         """``[static_guard] packed_sources = "reject"``: a generator that ships

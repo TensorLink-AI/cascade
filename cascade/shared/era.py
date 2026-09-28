@@ -87,6 +87,39 @@ def rolling_active(round_cfg: RoundConfig, block: int | None) -> bool:
     return gate > 0 and block is not None and int(block) >= gate
 
 
+def forfeit_successor(scoring: ScoringConfig, block: int | None) -> str:
+    """CONSENSUS (DEC-CA-0048): the hotkey crowned in place of a forfeited
+    king at ``block`` — ``[scoring] forfeit_successor_hotkey`` once the
+    forfeiture is in force and the successor is not itself listed; "" =
+    fall back to the court (most recent eligible former king, else vacant)."""
+    if not forfeited_hotkeys(scoring, block):
+        return ""
+    succ = str(getattr(scoring, "forfeit_successor_hotkey", "") or "").strip()
+    return "" if not succ or succ in forfeited_hotkeys(scoring, block) else succ
+
+
+def era_first_settlement(round_cfg: RoundConfig, era_start: int) -> int:
+    """The boundary of an era's FIRST settlement (its start plus one grid
+    step) — the first block at which a settlement carries that era's king
+    leg. The forfeiture gate is judged there for the trainer's king choice:
+    era ``E`` trains the successor iff ``era_first_settlement(E) >=
+    forfeit_from_block`` (the first settlement judged under the forfeiture
+    belongs to ``E``)."""
+    start = int(era_start)
+    return start + int(effective_epoch_blocks(round_cfg, start))
+
+
+def forfeited_hotkeys(scoring: ScoringConfig, block: int | None) -> frozenset[str]:
+    """CONSENSUS gate (DEC-CA-0048): the forfeit list in force for a settlement
+    whose boundary is ``block``; empty before ``forfeit_from_block`` or when the
+    list is empty. ``None`` (unknown height) ⇒ empty."""
+    hks = tuple(getattr(scoring, "forfeit_hotkeys", ()) or ())
+    gate = int(getattr(scoring, "forfeit_from_block", 0) or 0)
+    if not hks or gate <= 0 or block is None or int(block) < gate:
+        return frozenset()
+    return frozenset(hks)
+
+
 def era_king_active(scoring: ScoringConfig, block: int | None) -> bool:
     """CONSENSUS gate: the validator verifies the era envelope for a settlement
     whose epoch boundary is ``>= era_king_from_block``."""
