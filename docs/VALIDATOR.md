@@ -207,3 +207,10 @@ Weight splits across the current king plus recent distinct kings (geometric
 decay, `[scoring] king_decay`), burning to `burn_uid` when none are registered.
 You don't tune any of it — every honest validator computes the identical
 vector, which is exactly what `cascade-audit`'s `weights` check reproduces.
+
+
+## Consensus knobs added 2026-09-28 (DEC-CA-0048)
+
+`[scoring] forfeit_hotkeys` / `forfeit_from_block` are consensus constants: when the owner
+announces a forfeiture block, every validator must run a release carrying this section and the
+same values before that settlement boundary, or weights fork there. Inert while the list is empty.

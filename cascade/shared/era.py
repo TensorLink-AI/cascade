@@ -87,6 +87,17 @@ def rolling_active(round_cfg: RoundConfig, block: int | None) -> bool:
     return gate > 0 and block is not None and int(block) >= gate
 
 
+def forfeited_hotkeys(scoring: ScoringConfig, block: int | None) -> frozenset[str]:
+    """CONSENSUS gate (DEC-CA-0048): the forfeit list in force for a settlement
+    whose boundary is ``block``; empty before ``forfeit_from_block`` or when the
+    list is empty. ``None`` (unknown height) ⇒ empty."""
+    hks = tuple(getattr(scoring, "forfeit_hotkeys", ()) or ())
+    gate = int(getattr(scoring, "forfeit_from_block", 0) or 0)
+    if not hks or gate <= 0 or block is None or int(block) < gate:
+        return frozenset()
+    return frozenset(hks)
+
+
 def era_king_active(scoring: ScoringConfig, block: int | None) -> bool:
     """CONSENSUS gate: the validator verifies the era envelope for a settlement
     whose epoch boundary is ``>= era_king_from_block``."""

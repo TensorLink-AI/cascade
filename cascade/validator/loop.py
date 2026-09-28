@@ -1712,6 +1712,7 @@ class ValidatorRunner:
         challenger paired with the king at every size, or fails the contract gate.
         Otherwise returns the round outcome with the (already-applied) transition.
         """
+        self._apply_forfeiture(manifest)
         reason = self.check_manifest(manifest)
         if reason is not None:
             log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
@@ -2745,6 +2746,33 @@ class ValidatorRunner:
         king_entry = manifest.entry_for_role("king")
         return king_entry.miner_uid if king_entry is not None else None
 
+    def _apply_forfeiture(self, manifest: TrainingManifest) -> None:
+        """DEC-CA-0048: at a settlement whose boundary has reached
+        ``[scoring] forfeit_from_block``, strip the listed hotkeys from the
+        throne and the court BEFORE judging. The manifest's king entry (still the
+        forfeited hotkey until the trainer follows the receipts) then reads as a
+        stale-king manifest and takes the resync path — no duel is judged against
+        a forfeited king's checkpoint. Idempotent: nothing changes once applied."""
+        from ..shared.era import forfeited_hotkeys
+
+        block = self._epoch_start_block(manifest)
+        forfeited = forfeited_hotkeys(self.cfg.scoring, block)
+        if not forfeited:
+            return
+        t = state_mod.apply_forfeit(self.state, forfeited=forfeited,
+                                    keep_former_kings=self.cfg.scoring.reward_prior_kings)
+        if t is None:
+            return
+        log.warning("round=%s FORFEITURE at block %s: %s — king now %s, court %s",
+                    manifest.round_id, block, t.note,
+                    (t.state.king_hotkey or "vacant")[:12],
+                    [hk[:12] for hk in t.state.former_kings])
+        self.state = t.state
+        try:
+            self._persist_state()
+        except Exception as e:  # noqa: BLE001 — the round path persists again
+            log.warning("forfeiture: state persist deferred (%s)", e)
+
     def _reward_uids(
         self, manifest: TrainingManifest, outcome: RoundOutcome | None, client: object
     ) -> list[int]:
@@ -2763,11 +2791,20 @@ class ValidatorRunner:
         """
         if self.cfg.validator.force_burn:
             return []
+        from ..shared.era import forfeited_hotkeys
+
+        try:
+            forfeited = forfeited_hotkeys(self.cfg.scoring, self._epoch_start_block(manifest))
+        except Exception:  # noqa: BLE001 — no block context ⇒ the gate is simply not reached
+            forfeited = frozenset()
         uids: list[int] = []
-        king_uid = self._king_uid_to_vote(manifest, client=client)
-        if king_uid is not None:
-            uids.append(king_uid)
+        if not (self.state.king_hotkey and self.state.king_hotkey in forfeited):
+            king_uid = self._king_uid_to_vote(manifest, client=client)
+            if king_uid is not None:
+                uids.append(king_uid)
         for hk in self.state.former_kings:
+            if hk in forfeited:
+                continue
             uid = client.uid_for_hotkey(hk)  # type: ignore[attr-defined]
             if uid is not None:
                 uids.append(uid)

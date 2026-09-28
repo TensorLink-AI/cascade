@@ -1042,6 +1042,11 @@ class RoundConfig:
     # validator-side changes. 0 = never (heat → final every round).
     # Trainer-side: [round] is outside contract_digest.
     duel_from_block: int = 0
+    # DEC-CA-0048 admission denylist (trainer-side, not consensus): entries from
+    # these hotkeys are refused at rolling admission from `blocked_from_block`
+    # (0 = immediately once the list is non-empty). Their legs never rent a pod.
+    blocked_hotkeys: tuple[str, ...] = ()
+    blocked_from_block: int = 0
     # 0 = every screened entrant seats; the provisioner sizes the final fleet
     # to fit the field inside the epoch (legs queue on each lane, see
     # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
@@ -1415,6 +1420,16 @@ class RoundConfig:
             return max(self.finalists, self.max_finalists)
         return self.finalists
 
+    def blocked_at(self, block: int | None) -> frozenset[str]:
+        """Hotkeys refused at admission at ``block`` (DEC-CA-0048): the list once
+        ``blocked_from_block`` is reached (0 = as soon as the list is set)."""
+        if not self.blocked_hotkeys:
+            return frozenset()
+        gate = int(self.blocked_from_block or 0)
+        if gate > 0 and (block is None or int(block) < gate):
+            return frozenset()
+        return frozenset(self.blocked_hotkeys)
+
     def duel_only(self, block: int | None) -> bool:
         """True when the round at epoch boundary ``block`` runs without a heat
         (``duel_from_block`` set and reached). ``None`` (unknown height) and
@@ -1599,6 +1614,12 @@ class ScoringConfig:
     # each round under its own rule. 0 = Bonferroni forever. Bit-identical at
     # k <= 1 (no multiplicity), so single-challenger rounds never change.
     cohort_maxt_from_block: int = 0
+    # DEC-CA-0048 king forfeiture — CONSENSUS: every validator applies the same
+    # list from the same settlement boundary or weights fork. Hotkeys listed
+    # here leave the throne (abdicating to the most recent eligible former
+    # king) and the court from `forfeit_from_block`; 0 / empty = inert.
+    forfeit_hotkeys: tuple[str, ...] = ()
+    forfeit_from_block: int = 0
     # Increment-margin activation (DEC-CA-0039, block-gated). Under margin_mode
     # "level" the dethrone bar is a fixed fraction of the king's ABSOLUTE score
     # (win_margin_* ), so a maturing lineage whose per-round gains fall below
@@ -2760,6 +2781,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             screen_size=str(r.get("screen_size", "")),
             throne_sizes=tuple(str(x) for x in r.get("throne_sizes", ())),
             duel_from_block=max(0, int(r.get("duel_from_block", 0) or 0)),
+            blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
+            blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
@@ -2884,6 +2907,8 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_start_prev2=float(s.get("win_margin_start_prev2", 0.0) or 0.0),
             margin_activation_block2=max(0, int(s.get("margin_activation_block2", 0) or 0)),
             cohort_maxt_from_block=max(0, int(s.get("cohort_maxt_from_block", 0) or 0)),
+            forfeit_hotkeys=tuple(str(x) for x in s.get("forfeit_hotkeys", ()) or ()),
+            forfeit_from_block=max(0, int(s.get("forfeit_from_block", 0) or 0)),
             increment_from_block=max(0, int(s.get("increment_from_block", 0) or 0)),
             cohort_maxt_increment_from_block=max(
                 0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),

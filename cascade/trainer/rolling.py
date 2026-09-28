@@ -762,6 +762,13 @@ class RollingScheduler:
         return wall_of_block(end_block, now=now, block_now=block)
 
     def _launch_king_leg(self, client, era: EraState, block: int, now: float) -> None:
+        from ..shared.era import forfeited_hotkeys
+
+        if era.king_hotkey and era.king_hotkey in forfeited_hotkeys(self.r.cfg.scoring, block):
+            log.warning("rolling: era %d king %s is FORFEITED from block %s — no king leg; "
+                        "waiting for the validators' receipts to name the successor",
+                        era.index, era.king_hotkey[:12], self.r.cfg.scoring.forfeit_from_block)
+            return
         if not era.king_hotkey:
             return
         if not era.king_ref:
@@ -908,6 +915,8 @@ class RollingScheduler:
                 queue.fail(entry.hotkey, error="vault ref not owned by this hotkey",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
+            if self._blocked_check(gen, block):
+                continue
             if self._packed_source_check(gen, block):
                 continue
             dup = self._dedup_check(gen, era, history)
@@ -962,6 +971,21 @@ class RollingScheduler:
                 "target_boundary": int(adm.target_boundary), "era_index": int(adm.era_index),
                 "passed_over": ahead, "at": self.clock()})
             self._save()
+
+    def _blocked_check(self, gen, block: int | None = None) -> bool:
+        """``[round] blocked_hotkeys`` (DEC-CA-0048): refused at the door, never
+        rents a pod. Terminal ``failed`` [blocked], no burn — the fee question is
+        policy, not code. Returns True when ``gen`` was dropped."""
+        rnd = self.r.cfg.round
+        blocked = rnd.blocked_at(block) if hasattr(rnd, "blocked_at") else frozenset()
+        if gen.hotkey not in blocked:
+            return False
+        q = self.ops.queue()
+        if q is not None:
+            q.fail(gen.hotkey, error="hotkey is on the operator's admission denylist "
+                   "([round] blocked_hotkeys)", error_class="blocked", expect_ref=gen.ref)
+        log.warning("rolling: %s refused — blocked_hotkeys", gen.hotkey[:12])
+        return True
 
     def _packed_source_check(self, gen, block: int | None = None) -> bool:
         """``[static_guard] packed_sources = "reject"``: a generator that ships

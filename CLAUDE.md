@@ -434,6 +434,16 @@ in-context.
   override). Trainer/provisioner read, never signal. Mainnet armed at
   release with keys 0; testnet inert (typed-in 600).
   (`decisions/DEC-CA-0045-stake-weighted-activation.md`)
+- **DEC-CA-0047** (proposed) — `budget_denomination = "points+mv<PCT>"`: token
+  billing with a proportional width bonus, scheduled via
+  `budget_denomination_after(_block)` (never in contract_digest; effective
+  contract = `at_block(era start)`; legs carry `--contract-block`).
+  (`decisions/DEC-CA-0047-multichannel-bonus-billing.md`)
+- **DEC-CA-0048** (proposed) — King forfeiture: `[scoring] forfeit_hotkeys` +
+  `forfeit_from_block` (CONSENSUS, release-then-activate) abdicates a listed
+  king to the most recent eligible former king (else vacant) and drops it
+  from the court; `[round] blocked_hotkeys` refuses admissions trainer-side.
+  Inert by default. (`decisions/DEC-CA-0048-king-forfeiture.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2
