@@ -1,0 +1,12 @@
+{
+  "high": 0,
+  "warn": 1,
+  "findings": [
+    {
+      "severity": "warn",
+      "path": "generator.py",
+      "finding": "getattr with computed attribute (obfuscation vector)"
+    }
+  ],
+  "note": "static scan only \u2014 NEVER run this code outside a sandbox regardless of a clean scan"
+}

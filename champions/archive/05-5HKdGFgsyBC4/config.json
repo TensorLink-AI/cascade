@@ -1,0 +1,121 @@
+{
+  "name": "gen-d3e2aa7fb61a-math-3-variable",
+  "min_length": 64,
+  "max_length": 4096,
+  "prefetch_depth": 2,
+  "length_buckets": [
+    2048,
+    3072,
+    4096
+  ],
+  "length_cycle": {
+    "peak_probs": [
+      0.005,
+      0.01,
+      0.985
+    ],
+    "start_fraction": 0.05,
+    "end_fraction": 0.7,
+    "cycles": 2,
+    "expected_budget_fraction": 0.65
+  },
+  "family_weights": {
+    "k00": 0.053026,
+    "k01": 0.019035,
+    "k02": 0.015227,
+    "k03": 0.109115,
+    "k04": 0.003807,
+    "k05": 0.004758,
+    "k06": 0.0,
+    "k07": 0.006662,
+    "k08": 0.004758,
+    "k09": 0.00571,
+    "k10": 0.019986,
+    "k11": 0.017131,
+    "k12": 0.002856,
+    "k13": 0.000952,
+    "k14": 0.390994,
+    "k15": 0.265982,
+    "k16": 0.0,
+    "k17": 0.0,
+    "k18": 0.0,
+    "k19": 0.0,
+    "k20": 0.0,
+    "k21": 0.04,
+    "k22": 0.04
+  },
+  "curriculum": {
+    "enabled": false,
+    "expected_budget_fraction": 0.65,
+    "start_fraction": 0.05,
+    "end_fraction": 0.7,
+    "start_family_weights": {
+      "k00": 0.19,
+      "k01": 0.1,
+      "k02": 0.08,
+      "k03": 0.2,
+      "k04": 0.05,
+      "k05": 0.025,
+      "k06": 0.0,
+      "k07": 0.035,
+      "k08": 0.025,
+      "k09": 0.03,
+      "k10": 0.105,
+      "k11": 0.09,
+      "k12": 0.015,
+      "k13": 0.005,
+      "k14": 0.05
+    },
+    "start_parameters": {
+      "tr_exc_lo": 0.15,
+      "tr_exc_hi": 0.8,
+      "gr_exc_lo": 0.1,
+      "gr_exc_hi": 0.6,
+      "sa_clean_frac": 0.75,
+      "sa_clean_lo": 0.01,
+      "sa_clean_hi": 0.05,
+      "integrated_heavy_frac": 0.0,
+      "integrated_sv_frac": 0.0,
+      "observation": {
+        "censor_rate": 0.0,
+        "quantize_rate": 0.02,
+        "regular_hold_rate": 0.0,
+        "irregular_hold_rate": 0.0,
+        "irregular_hold_prob_lo": 0.0,
+        "irregular_hold_prob_hi": 0.02,
+        "shock_row_rate": 0.0,
+        "shock_prob_lo": 0.0,
+        "shock_prob_hi": 0.002
+      },
+      "augment": {
+        "tsmixup": 0.0,
+        "pad_prefix": 0.0
+      }
+    }
+  },
+  "tr_exc_lo": 0.15,
+  "tr_exc_hi": 0.8,
+  "gr_exc_lo": 0.1,
+  "gr_exc_hi": 0.6,
+  "sa_clean_frac": 0.75,
+  "sa_clean_lo": 0.01,
+  "sa_clean_hi": 0.05,
+  "integrated_heavy_frac": 0.0,
+  "integrated_sv_frac": 0.0,
+  "observation": {
+    "censor_rate": 0.0,
+    "quantize_rate": 0.02,
+    "regular_hold_rate": 0.0,
+    "irregular_hold_rate": 0.0,
+    "irregular_hold_prob_lo": 0.0,
+    "irregular_hold_prob_hi": 0.02,
+    "shock_row_rate": 0.0,
+    "shock_prob_lo": 0.0,
+    "shock_prob_hi": 0.002
+  },
+  "augment": {
+    "tsmixup": 0.0,
+    "pad_prefix": 0.0
+  },
+  "description": "gen-d3e2aa7fb61a-math plus the cascade-r1-top6 -> cascade-r1-top6-3-variable port: SAD1 stationary AR(1) init + rate-preserving Gamma-Poisson, pulsed 2048/3072/4096 length_cycle exposure, and exact Numba AR(1)/AR(2)/threshold-AR acceleration (proven_speed_up.md). Retains math-only changes: k15 exact=0.6 / integral=0.65 and k14 calm mode-2 mode2_seen count-walk fix."
+}

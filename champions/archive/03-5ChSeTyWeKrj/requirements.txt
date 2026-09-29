@@ -1,0 +1,6 @@
+# Hash-locked, allowlisted deps. The trainer FORMAT-checks these lines
+# (pkg==ver + 64-hex sha256) but does not reinstall them -- the sandbox image
+# ships the allowlisted stack. Real wheel hashes are optional hygiene:
+#   pip hash $(pip download numpy==1.26.4 scipy==1.17.1 -d /tmp/x)
+numpy==1.26.4 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+scipy==1.17.1 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000

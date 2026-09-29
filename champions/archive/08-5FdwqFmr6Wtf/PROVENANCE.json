@@ -1,0 +1,18 @@
+{
+  "reign": 8,
+  "hotkey": "5FdwqFmr6WtfyrRYohejpQx5kcD1nBrr7ZnvH5rMqjJz5scc",
+  "uid": 124,
+  "ref": "garuda-labs/gen-04f5171856b6@hf:1ebecb706d193f1b9f633f4e98a11dd19e0caa1a",
+  "digest": "1ebecb706d193f1b9f633f4e98a11dd19e0caa1a",
+  "network": "finney",
+  "first_round_id": "5317796109133622230",
+  "last_round_id": "7641425586763102079",
+  "first_epoch_start_block": 8812800,
+  "last_epoch_start_block": 8848800,
+  "first_published_at": "2026-08-10T14:28:57+00:00",
+  "last_published_at": "2026-08-15T12:36:32+00:00",
+  "rounds_reigned": 21,
+  "source": "operator king archive: kings/garuda-labs/gen-04f5171856b6/hf-1ebecb706d193f1b9f633f4e98a11dd19e0caa1a.tar",
+  "fetched_at": "2026-09-29T05:55:39Z",
+  "note": "archived by scripts/champions_archive.py \u2014 read-only copy of the code that held the throne; verify against the round receipts (cascade-audit). Static scan only \u2014 never run outside a sandbox."
+}

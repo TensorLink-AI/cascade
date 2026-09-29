@@ -30,6 +30,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DEST = REPO / "champions" / "king"
+ARCHIVE = DEST.parent / "archive"
+RECEIPTS_INDEX = "https://s3.hippius.com/cascade-manifests/receipts/index.json"
 PROVENANCE = DEST / "PROVENANCE.json"
 
 
@@ -156,6 +158,29 @@ def main() -> int:
         staged.rename(DEST)
 
         sh(["git", "-C", str(REPO), "add", str(DEST)])
+        # champions/archive/: the same tree filed under its reign number, so
+        # the archive of every king the subnet has crowned never loses one.
+        # Best-effort — a failure here never blocks the king sync itself.
+        try:
+            import urllib.request
+
+            import champions_archive as ca
+            rows = json.loads(urllib.request.urlopen(RECEIPTS_INDEX, timeout=60).read())
+            rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
+            reign = next((r for r in reversed(ca.reigns_from_index(rows))
+                          if ca.ref_digest(r["gen_ref"]) == digest), None)
+            if reign is not None:
+                ARCHIVE.mkdir(parents=True, exist_ok=True)
+                folder = ca.write_reign(ARCHIVE, reign, DEST, findings,
+                                        source="king sync (cascade fetch king)", network=args.network)
+                (ARCHIVE / "README.md").write_text(ca.render_readme(ca.existing_entries(ARCHIVE)))
+                sh(["git", "-C", str(REPO), "add", str(ARCHIVE)])
+                print(f"archive: filed reign {reign['reign']} as {folder.name}")
+            else:
+                print("archive: the receipts do not name this digest as king yet — "
+                      "scripts/backfill_champions.py files it later", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"archive: skipped ({e}) — run scripts/backfill_champions.py", file=sys.stderr)
         # a bare box may have no git identity; commit with an explicit one
         ident = ["-c", "user.name=cascade-king-sync",
                  "-c", "user.email=chaotic.attractoor@gmail.com"]

@@ -1,0 +1,57 @@
+{
+  "generate_length": 4096,
+  "batch_size": 2048,
+  "max_abs_value": 1000000.0,
+  "family_weights": {
+    "trend_seasonal_ar": 0.16867,
+    "regime_shift": 0.08878,
+    "multiplicative": 0.07102,
+    "ar2": 0.17755,
+    "integrated": 0.04439,
+    "threshold_ar": 0.02219,
+    "chaotic": 0.0,
+    "spectral_gp": 0.03107,
+    "long_memory": 0.02219,
+    "ou_stochastic_vol": 0.02663,
+    "physical_sensors": 0.09321,
+    "seasonal_counts": 0.06658,
+    "intermittent_demand": 0.01332,
+    "conditional_stability": 0.04439,
+    "tidal_harmonic": 0.035,
+    "flow_recession": 0.03,
+    "weekly_demand": 0.03,
+    "step_level": 0.02,
+    "vol_regime_switch": 0.015
+  },
+  "curriculum": {
+    "enabled": false,
+    "start_family_weights": {
+      "trend_seasonal_ar": 0.16867,
+      "regime_shift": 0.08878,
+      "multiplicative": 0.07102,
+      "ar2": 0.17755,
+      "integrated": 0.04439,
+      "threshold_ar": 0.02219,
+      "chaotic": 0.0,
+      "spectral_gp": 0.03107,
+      "long_memory": 0.02219,
+      "ou_stochastic_vol": 0.02663,
+      "physical_sensors": 0.09321,
+      "seasonal_counts": 0.06658,
+      "intermittent_demand": 0.01332,
+      "conditional_stability": 0.04439,
+      "tidal_harmonic": 0.035,
+      "flow_recession": 0.03,
+      "weekly_demand": 0.03,
+      "step_level": 0.02,
+      "vol_regime_switch": 0.015
+    }
+  },
+  "observation_layer": {
+    "enabled": true,
+    "apply_frac": 0.05
+  },
+  "record_families": false,
+  "name": "cascade-fork57-policy",
+  "description": "Nature/demand-rich mixture (tidal, flow recession, weekly demand, vol regime switching) plus an administered-rate family: exact flats between grid-snapped policy moves with persistent hike/cut runs."
+}
