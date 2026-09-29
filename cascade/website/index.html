@@ -1060,7 +1060,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
 .train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
-.train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; }
+.train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:96px; box-sizing:border-box; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
 .train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -2732,32 +2732,31 @@ function renderTrainStats(rows, info){
   var lin=lastRow&&lastRow.lineage, leg=lastRow&&lastRow.leg;
   var batch=TRAIN_BUDGET.batch, ctx=TRAIN_BUDGET.ctx, ld=lastRow&&_train[lastRow.id], contract=(ld&&ld.contract)||{};
   if(contract.batch_size) batch=contract.batch_size; if(contract.context_length) ctx=contract.context_length;
-  // ── trained: the king checkpoint's lineage — one leg per generation ──
+  // ── row one: the training behind the current king's checkpoint ──
   if(lin){
     var unres=lin.legs-lin.resolved, est=lin.legs-lin.measured;
-    tiles.push(tile("Generations",lastRow.gen,lastRow.gen?"random init + "+lastRow.gen+" promotion"+(lastRow.gen===1?"":"s"):"random init, no promotion yet",
-      {title:"Warm-start generations behind the latest king checkpoint (promotions/gen-<n>.json in force at its round); every round of a generation trains from that generation's promoted set"}));
-    tiles.push(tile("Steps trained",esc(fmtSteps(lin.steps).replace(" steps","")),
-      est?lin.measured+"/"+lin.legs+" legs measured":"all "+lin.legs+" legs measured",
-      {hl:true,title:"Optimiser steps along the lineage: this leg, the promoted member it continued, that member's init, … — "+lin.legs+" legs. Measured legs read their training summary; the rest are priced at the contracted "+fmtSteps(stepsPerLeg())+" per leg."}));
-    tiles.push(tile("Tokens trained",esc(fmtTokens(lin.tokens).replace(" tokens","")),
-      lin.exact<lin.legs?(lin.exact?lin.exact+"/"+lin.legs+" legs exact":"univariate assumed"):"channel tokens, exact",
-      {hl:true,title:"Every value entry the lineage's legs processed: steps × batch × width C × context, one leg per generation. Exact where a leg published channel_tokens; otherwise its billed series-points count, which equals channel tokens at C = 1."}));
-    tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"billed budget count",
-      {title:"The contract's billed budget count along the lineage (a C-wide series bills its length once, DEC-CA-0042)"}));
-    tiles.push(tile("Lineage legs",lin.legs,(unres?unres+" unresolved · ":"")+(lin.deadline?lin.deadline+" wall-stopped":"one per generation"),
-      {title:"Legs of training behind the latest king checkpoint: one per generation plus its own. Unresolved = the chain could not be followed to a published training summary, so the leg is priced at the contract"+(lin.deadline?"; a wall-stopped leg (deadline_hit) trained less than contracted":"")}));
-    var effPct=lin.tokens/toto2Tokens()*100;
+    tiles.push(tile("Generations",lastRow.gen,"",
+      {title:"How many times the shared starting checkpoint has been promoted so far. Every round in a generation trains from that generation's promoted checkpoint, so each promotion adds one more leg of training to the king's lineage; rounds within a generation do not."}));
+    tiles.push(tile("Steps trained",esc(fmtSteps(lin.steps).replace(" steps","")),"",
+      {hl:true,title:"Optimiser steps behind the current king's checkpoint, added up along its lineage: its own training leg plus one leg per generation before it ("+lin.legs+" legs). "+(est?lin.measured+" of them were measured from the trainer's published training summary; the rest are counted at the contract's budget of about "+fmtSteps(stepsPerLeg())+" per leg.":"All "+lin.legs+" legs were measured from the trainer's published training summaries.")}));
+    tiles.push(tile("Tokens trained",esc(fmtTokens(lin.tokens).replace(" tokens","")),"",
+      {hl:true,title:"Every data point the lineage's training legs processed, added up the same way as steps: steps × batch size × channels × context length. "+(lin.exact<lin.legs?(lin.exact?lin.exact+" of "+lin.legs+" legs reported the exact count; the others use their billed count, which is the same number for single-channel data.":"No leg reported the exact count yet, so this uses each leg's billed count, which is the same number for single-channel data."):"Exact for every leg.")}));
+    tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"",
+      {title:"The unit the training contract bills in. A multi-channel series costs its length once, however many channels it has, so this equals tokens trained on single-channel data and is smaller than it when the data is multivariate."}));
+    tiles.push(tile("Lineage legs",lin.legs,"",
+      {title:"Training legs behind the current king's checkpoint: one per generation plus its own. "+(unres?unres+" could not be traced to a published training summary and are counted at the contract's budget. ":"")+(lin.deadline?lin.deadline+" hit the wall-clock limit and trained less than the budget.":"")}));
+    var effPct=lin.tokens/toto2Tokens()*100, effTxt=(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+"%";
     tiles.push(tile("Tokens vs Toto2",esc(fmtTokens(lin.tokens).replace(" tokens",""))+'<span class="u">/ '+esc(fmtTokens(toto2Tokens()).replace(" tokens",""))+'</span>',"",
-      {sub:(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+"% of Toto2 pretraining tokens",
-       title:"Tokens the king lineage has trained on as a share of the official Toto2 pretraining run: "+fmtTokens(lin.tokens)+" ÷ "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context)"}));
+      {title:"Tokens trained by the king's lineage compared with the official Toto2 pretraining run, which used "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context). The lineage has used "+effTxt+" of Toto2's pretraining tokens."}));
   }
-  // ── row two: the latest king checkpoint's six public-benchmark numbers, then the benched count ──
+  // ── row two: the latest king checkpoint's six public-benchmark numbers ──
   if(lastK){
     var s=lastK.e.six;
     SUITES.forEach(function(su){
-      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",{title:su.label+" CRPS of the king's latest benched checkpoint ("+lastK.row.label+"); lower is better"}));
-      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",{title:su.label+" MASE of the king's latest benched checkpoint ("+lastK.row.label+"); lower is better"}));
+      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",
+        {title:"How accurate the king's latest checkpoint's probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+lastK.row.label+"'s signed bench report."}));
+      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",
+        {title:"How accurate the king's latest checkpoint's point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+lastK.row.label+"'s signed bench report."}));
     });
   }
   el.innerHTML=tiles.join("");
