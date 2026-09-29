@@ -149,6 +149,7 @@ class TsbenchForgeSource:
         max_stale_days: int = 4,
         max_series_per_source: int = 200,
         mv_pack: bool = False,
+        panel_sample_seed: str | None = None,
     ) -> None:
         self.forge_dir = Path(forge_dir or os.environ.get(ENV_FORGE_DIR, DEFAULT_FORGE_DIR))
         self.max_stale_days = int(max_stale_days)
@@ -158,6 +159,12 @@ class TsbenchForgeSource:
         # (default, until mv_score is armed), a tagged source is PROJECTED to its
         # first mv_channel — one univariate window, so the pool stays inert.
         self.mv_pack = bool(mv_pack)
+        # Balanced selection (cascade-pool --selection balanced): when set, the
+        # per-feed cap keeps a SEEDED random sample of the feed's panel rows
+        # (and counts only rows that yield values) instead of the first N in
+        # sort order — which pinned the same alphabetically-first stations
+        # into every snapshot. ``None`` = the historical first-N behaviour.
+        self.panel_sample_seed = panel_sample_seed
 
     # ------------------------------------------------------------------ deps
 
@@ -232,7 +239,8 @@ class TsbenchForgeSource:
                 columns = mvc if self.mv_pack else [mvc[0]]
             else:
                 columns = None
-            for panel_key, values in self._iter_panel_series(pd, df, ctx, columns=columns):
+            for panel_key, values in self._iter_panel_series(pd, df, ctx, columns=columns,
+                                                             feed=sid):
                 if emitted >= ctx.max_series:
                     log.warning(
                         "tsbench_forge: max_series=%d reached at catalog entry %s; "
@@ -301,7 +309,7 @@ class TsbenchForgeSource:
 
     # ---------------------------------------------------------------- series
 
-    def _iter_panel_series(self, pd, df, ctx: HarvestContext, *, columns=None):
+    def _iter_panel_series(self, pd, df, ctx: HarvestContext, *, columns=None, feed: str = ""):
         """Yield ``(panel_key, values)`` per panel row (or once when unpaneled).
 
         ``columns`` (DEC-CA-0041): the specific value-columns to emit — a
@@ -314,6 +322,10 @@ class TsbenchForgeSource:
                 yield {}, values
             return
         groups = df.groupby(panel_cols, sort=True)
+        if self.panel_sample_seed is not None:
+            yield from self._iter_sampled_panel(pd, groups, panel_cols, ctx,
+                                                columns=columns, feed=feed)
+            return
         for n_done, (key, sub) in enumerate(groups):
             if n_done >= self.max_series_per_source:
                 return
@@ -323,6 +335,29 @@ class TsbenchForgeSource:
             }
             values = self._extract_values(pd, sub, panel_cols, ctx, columns=columns)
             if values is not None:
+                yield panel_key, values
+
+    def _iter_sampled_panel(self, pd, groups, panel_cols, ctx: HarvestContext, *,
+                            columns=None, feed: str = ""):
+        """Seeded per-feed sample: visit the feed's panel rows in an order drawn
+        from ``(panel_sample_seed, feed)`` and yield the first
+        ``max_series_per_source`` that produce values."""
+        from ..builder import seeded_rng
+
+        items = list(groups)          # sorted by key (groupby sort=True) — canonical
+        order = seeded_rng(str(self.panel_sample_seed), "panel", feed).permutation(len(items))
+        kept = 0
+        for i in order:
+            if kept >= self.max_series_per_source:
+                return
+            key, sub = items[i]
+            key_t = key if isinstance(key, tuple) else (key,)
+            panel_key = {
+                c.removeprefix("_panel_"): str(v) for c, v in zip(panel_cols, key_t, strict=False)
+            }
+            values = self._extract_values(pd, sub, panel_cols, ctx, columns=columns)
+            if values is not None:
+                kept += 1
                 yield panel_key, values
 
     def _extract_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext,

@@ -23,6 +23,15 @@ Cleaning rules (a series is **dropped**, never silently corrupted, if it fails):
   (constant / ~zero-variance) series are dropped — a flat target makes MASE/CRPS
   uninformative;
 * exact-duplicate series (same float bytes) are de-duplicated.
+
+Cap selection (``PoolBuildConfig.selection``): ``"first"`` keeps series in
+harvest order until a cap fills — the catalog order decides who gets the slots,
+so a capped domain is starved of every source listed after the fill.
+``"balanced"`` gathers every valid series first, then deals the slots
+round-robin across SOURCES (one series per source per pass) in an order drawn
+from ``selection_seed``: a capped domain holds as many distinct sources as its
+caps allow (sources are the KOTH cluster-bootstrap key), and which series fill
+them rotates from snapshot to snapshot. Same inputs + same seed ⇒ same pool.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from ..eval.seasonality import get_seasonality
 from .source import DataSource, FetchJson, HarvestContext, HarvestedSeries, HttpFetcher
 
 BUILDER_VERSION = "cascade-pool/1"
+SELECTION_MODES = ("first", "balanced")
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -78,6 +88,12 @@ class PoolBuildConfig:
     # predate source stamping keep building — but flip it on before any pool
     # carries multichannel windows.
     require_source: bool = False
+    # Which series win a capped slot: "first" (harvest order, the historical
+    # behaviour) or "balanced" (seeded round-robin across sources — see the
+    # module docstring). ``selection_seed`` is recorded in provenance.json so
+    # the choice is reproducible from the published snapshot alone.
+    selection: str = "first"
+    selection_seed: str = ""
 
     @property
     def min_length(self) -> int:
@@ -232,6 +248,11 @@ def collect_records(
     total caps, and disambiguates any sanitised-id collision with a numeric
     suffix so every record maps to a unique filename / metadata key.
     """
+    if cfg.selection not in SELECTION_MODES:
+        raise ValueError(f"selection must be one of {SELECTION_MODES}; got {cfg.selection!r}")
+    if cfg.selection == "balanced":
+        return _collect_balanced(sources, ctx, cfg, fetch)
+
     records: list[SeriesRecord] = []
     drops: Counter = Counter()
     seen_hash: set[str] = set()
@@ -285,6 +306,111 @@ def collect_records(
             records.append(rec)
 
     records.sort(key=lambda r: r.series_id)  # deterministic on-disk order
+    return records, drops
+
+
+def _source_key(rec: SeriesRecord) -> str:
+    """The cluster a record belongs to — the same key the KOTH bootstrap
+    resamples on (``source``, falling back to the series id)."""
+    return str(rec.metadata.get("source") or rec.series_id)
+
+
+def seeded_rng(seed: str, *salt: str) -> np.random.Generator:
+    """A generator fixed by ``seed`` (+ optional salt) — stable across
+    platforms and Python hash randomisation."""
+    h = hashlib.sha256("\x1f".join((seed, *salt)).encode()).digest()
+    return np.random.default_rng(int.from_bytes(h[:8], "big"))
+
+
+def _collect_balanced(
+    sources: Iterable[DataSource],
+    ctx: HarvestContext,
+    cfg: PoolBuildConfig,
+    fetch: FetchJson,
+) -> tuple[list[SeriesRecord], Counter]:
+    """``selection = "balanced"``: clean + dedup EVERYTHING, then deal capped
+    slots round-robin across sources in a seeded order.
+
+    Candidates are put in a canonical order first (sources by key, series by
+    content hash), so the harvest order has no say — only the seed does.
+    """
+    drops: Counter = Counter()
+    seen_hash: set[str] = set()
+    by_source: dict[str, list[SeriesRecord]] = {}
+    for src in sources:
+        for hs in src.harvest(fetch, ctx):
+            rec, reason = prepare_series(hs, cfg)
+            if rec is None:
+                drops[reason or "unknown"] += 1
+                continue
+            if rec.content_hash in seen_hash:
+                drops["duplicate"] += 1
+                continue
+            seen_hash.add(rec.content_hash)
+            by_source.setdefault(_source_key(rec), []).append(rec)
+
+    rng = seeded_rng(cfg.selection_seed, "sources")
+    keys = sorted(by_source)
+    order = [keys[i] for i in rng.permutation(len(keys))]
+    queues: dict[str, list[SeriesRecord]] = {}
+    for k in order:
+        recs = sorted(by_source[k], key=lambda r: r.content_hash)
+        perm = seeded_rng(cfg.selection_seed, "series", k).permutation(len(recs))
+        queues[k] = [recs[i] for i in perm]
+
+    chosen: list[SeriesRecord] = []
+    per_domain: Counter = Counter()
+    per_cell: Counter = Counter()
+    progressed = True
+    while progressed:
+        progressed = False
+        for k in order:
+            q = queues[k]
+            if not q:
+                continue
+            rec = q[0]
+            if cfg.max_series_total is not None and len(chosen) >= cfg.max_series_total:
+                drops["total_cap"] += len(q)
+                q.clear()
+                continue
+            if (cfg.max_series_per_domain is not None
+                    and per_domain[rec.domain] >= cfg.max_series_per_domain):
+                drops["domain_cap"] += 1
+                q.pop(0)
+                progressed = True
+                continue
+            cell = (rec.domain, rec.metadata.get("freq"))
+            if (cfg.max_series_per_domain_freq is not None
+                    and per_cell[cell] >= cfg.max_series_per_domain_freq):
+                drops["domain_freq_cap"] += 1
+                q.pop(0)
+                progressed = True
+                continue
+            q.pop(0)
+            chosen.append(rec)
+            per_domain[rec.domain] += 1
+            per_cell[cell] += 1
+            progressed = True
+
+    # Id disambiguation over a canonical order, so it is seed- and
+    # harvest-order-independent for any given chosen set.
+    chosen.sort(key=lambda r: (r.series_id, r.content_hash))
+    used_counts: dict[str, int] = {}
+    assigned: set[str] = set()
+    records: list[SeriesRecord] = []
+    for rec in chosen:
+        base = rec.series_id
+        count = used_counts.get(base, 0)
+        sid = base if count == 0 else f"{base}-{count + 1}"
+        while sid in assigned:
+            count += 1
+            sid = f"{base}-{count + 1}"
+        used_counts[base] = count + 1
+        assigned.add(sid)
+        if sid != base:
+            rec = SeriesRecord(sid, rec.values, rec.metadata, rec.domain, rec.content_hash)
+        records.append(rec)
+    records.sort(key=lambda r: r.series_id)
     return records, drops
 
 

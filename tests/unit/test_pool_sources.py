@@ -430,3 +430,74 @@ def test_tsbench_forge_picks_up_a_new_cadence_source(tmp_path):
     assert len(out) == 1
     assert out[0].freq == "1200S" and out[0].seasonal_period == 72
     assert out[0].source == "new_feed"
+
+
+def _write_wide_panel(tmp_path, as_of, n_rows=12):
+    """One hourly feed panel-expanded into ``n_rows`` stations; station s00 is
+    all-NaN (fails extraction) so a first-N cap would waste a slot on it."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    yaml = pytest.importorskip("yaml")
+    root = tmp_path / "forge"
+    root.mkdir()
+    (root / "sources.yaml").write_text(yaml.safe_dump([
+        {"id": "bikes", "domain": "transport", "frequency": "PT1H"},
+    ]), encoding="utf-8")
+    hours = pd.date_range("2026-05-20", periods=400, freq="h", tz="UTC")
+    rows = []
+    for k in range(n_rows):
+        vals = [float("nan")] * 400 if k == 0 else [float((i * (k + 1)) % 24) for i in range(400)]
+        rows.append(pd.DataFrame({"timestamp": hours.astype(str), "docks": vals,
+                                  "_panel_STATION": [f"s{k:02d}"] * 400}))
+    d = root / "data" / "bikes"
+    d.mkdir(parents=True)
+    pd.concat(rows, ignore_index=True).to_parquet(d / f"{as_of.isoformat()}.parquet")
+    return root
+
+
+def test_tsbench_forge_seeded_panel_sample(tmp_path):
+    """--selection balanced: the per-feed cap keeps a SEEDED sample of panel
+    rows, counts only rows that yield values, and rotates with the seed; with
+    no seed the historical first-N (sorted) behaviour is unchanged."""
+    from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
+
+    as_of = dt.date(2026, 6, 1)
+    root = _write_wide_panel(tmp_path, as_of)
+    ctx = HarvestContext(as_of=as_of, context_length=512, horizon=16, max_series=100)
+
+    def ids(seed):
+        src = TsbenchForgeSource(root, max_series_per_source=4, panel_sample_seed=seed)
+        return sorted(s.series_id.rsplit("_", 1)[-1] for s in src.harvest(lambda u, p: None, ctx))
+
+    first = ids(None)
+    assert first == ["s01", "s02", "s03"]          # s00 burned a slot (legacy)
+    a, a2 = ids("block:1"), ids("block:1")
+    assert a == a2 and len(a) == 4 and "s00" not in a
+    assert len({tuple(ids(f"block:{b}")) for b in range(1, 6)}) > 1
+
+
+def test_cli_balanced_seeds_the_forge_source_and_provenance(tmp_path, monkeypatch):
+    import json
+
+    from cascade.pool import cli
+    from cascade.pool.sources.tsbench_forge import ENV_FORGE_DIR
+
+    as_of = dt.date(2026, 6, 1)
+    root = _write_forge_mirror(tmp_path, as_of)
+    monkeypatch.setenv(ENV_FORGE_DIR, str(root))
+    seen = {}
+    real_build_pool = cli.build_pool
+
+    def spy(sources, *a, **kw):
+        seen["seeds"] = [getattr(s, "panel_sample_seed", None) for s in sources]
+        return real_build_pool(sources, *a, **kw)
+
+    monkeypatch.setattr(cli, "build_pool", spy)
+    out = tmp_path / "pool"
+    rc = cli.main(["build", "--out", str(out), "--sources", "tsbench_forge",
+                   "--as-of", as_of.isoformat(), "--selection", "balanced"])
+    assert rc == 0
+    assert seen["seeds"] == [f"as_of:{as_of.isoformat()}"]
+    prov = json.loads((out / "provenance.json").read_text())
+    assert prov["config"]["selection"] == "balanced"
+    assert prov["config"]["selection_seed"] == f"as_of:{as_of.isoformat()}"
