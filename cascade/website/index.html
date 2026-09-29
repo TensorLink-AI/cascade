@@ -2427,6 +2427,10 @@ var _trainMetric="crps", _trainScope="king";
 // holds for every channel mix). Contracted spend: a leg the wall stopped early
 // (deadline_hit) trained fewer steps than plotted.
 var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
+// The official Toto2 pretraining run the lineage is measured against (Toto 2.0
+// release): 400k optimiser steps × 64 batch × 32 channels × 4096 context.
+var TOTO2_PRETRAIN = { steps: 400000, batch: 64, channels: 32, ctx: 4096 };
+function toto2Tokens(){ return TOTO2_PRETRAIN.steps*TOTO2_PRETRAIN.batch*TOTO2_PRETRAIN.channels*TOTO2_PRETRAIN.ctx; }
 function tokensPerLeg(){ return TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
 function stepsPerLeg(){ return Math.round(tokensPerLeg()/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
 function fmtSteps(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e6) return (v/1e6).toFixed(v>=1e7?0:1)+"M steps"; if(v>=1e3) return Math.round(v/1e3)+"k steps"; return Math.round(v)+" steps"; }
@@ -2709,8 +2713,9 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Width C",leg&&leg.width!=null?esc(leg.width):'<span class="muted">--</span>',
       leg&&leg.width!=null?(leg.width===1?"univariate":"max channels seen"):"not measured",
       {title:"Channel width of the latest king leg's corpus (max channels seen in the shadow channel telemetry); a C-wide series trains C× the tokens per step"}));
-    tiles.push(tile("Batch × context",esc(batch)+'<span class="u">×</span>'+esc(ctx),fmtTokens(batch*ctx).replace(" tokens","")+" tokens per step",
-      {title:"Tokens per step at C = 1: "+batch+" series × "+ctx+" context (from the round's contract terms)"}));
+    var effPct=lin.tokens/toto2Tokens()*100;
+    tiles.push(tile("Token efficiency",(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+'<span class="u">%</span>',"",
+      {title:"Tokens the king lineage has trained on as a share of the official Toto2 pretraining run: "+fmtTokens(lin.tokens)+" ÷ "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context)"}));
   }
   // ── row two: the latest king checkpoint's six public-benchmark numbers, then the benched count ──
   if(lastK){

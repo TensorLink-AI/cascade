@@ -177,7 +177,7 @@ def test_training_summary_is_fetched_immutably(page: str):
         "the tab does not fetch training_summary_key() objects cache-friendly")
 
 
-@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Lineage legs", "Width C", "Batch × context"])
+@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Lineage legs", "Width C", "Token efficiency"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
@@ -202,3 +202,12 @@ def test_official_toto2_reference_line_on_every_chart(page: str):
     assert 'id="train-legend-ref"' in page
     tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
     assert tip and "S.ref" in tip.group(1)
+
+
+def test_token_efficiency_is_measured_against_the_official_toto2_run(page: str):
+    m = re.search(r"var TOTO2_PRETRAIN\s*=\s*(\{[^}]*\})\s*;", page)
+    assert m, "TOTO2_PRETRAIN not found"
+    b = json.loads(re.sub(r"(\w+):", r'"\1":', m.group(1)))
+    assert b == {"steps": 400000, "batch": 64, "channels": 32, "ctx": 4096}
+    body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
+    assert body and "lin.tokens/toto2Tokens()" in body.group(1), "the tile does not divide lineage tokens by the Toto2 run"
