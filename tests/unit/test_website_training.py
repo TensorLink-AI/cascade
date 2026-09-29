@@ -223,3 +223,9 @@ def test_token_efficiency_is_measured_against_the_official_toto2_run(page: str):
 def test_removed_tiles_stay_removed(page: str, gone: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{gone}"' not in body.group(1), f"{gone!r} tile is back"
+
+
+def test_benchmark_cells_are_tagged_when_the_king_beats_toto2(page: str):
+    body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
+    assert body and 'return (rv!=null&&s[key]<rv)?"beats Toto2":""' in body.group(1)
+    assert 'tag:beat(kc)' in body.group(1) and 'tag:beat(km)' in body.group(1)

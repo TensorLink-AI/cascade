@@ -1032,7 +1032,9 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .chip i { width:14px; height:3px; display:inline-block; background:var(--sc); }
 .chip.on { opacity:1; outline:2px solid var(--sc); outline-offset:-2px; }
 .train-filters { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:0 0 14px; font-family:var(--font-mono); font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
-.train-filters .grp { display:inline-flex; gap:6px; align-items:center; }
+.train-filters .grp { display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.train-big ~ .chart-meta .legend span { white-space:nowrap; }
+.train-big .chart-wrap svg { width:100%; height:100%; }
 .train-filters .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
 .train-grid { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:18px 22px; }
 .train-grid.one { grid-template-columns:1fr; }
@@ -1041,8 +1043,8 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-chart .t .muted { font-weight:400; text-transform:none; letter-spacing:0; }
 .train-chart .chart-wrap { aspect-ratio:4/3; }
 .train-grid.one .chart-wrap { aspect-ratio:5/2; }
-.train-big .chart-wrap { aspect-ratio:2.2/1; }
-@media (max-width: 720px) { .train-big .chart-wrap { aspect-ratio:4/3; } }
+.train-big .train-chart .chart-wrap { aspect-ratio:2.2/1; }
+@media (max-width: 720px) { .train-big .train-chart .chart-wrap { aspect-ratio:4/3; } }
 .train-tip { position:absolute; z-index:5; pointer-events:none; background:var(--surface); border:var(--line); padding:8px 10px; font-family:var(--font-mono); font-size:11px; color:var(--ink); min-width:150px; max-width:260px; box-shadow:0 2px 10px rgba(0,0,0,0.12); }
 .train-tip .h { font-weight:700; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }
 .train-tip .r { display:flex; gap:8px; justify-content:space-between; white-space:nowrap; }
@@ -1055,7 +1057,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
 .train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
 .train-big ~ .chart-meta { font-size:13px; }
-.train-big ~ .chart-meta .legend { gap:20px; }
+.train-big ~ .chart-meta .legend { gap:14px 20px; flex-wrap:wrap; }
 .train-big ~ .chart-meta .swatch { width:18px; height:3px; }
 .train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
@@ -1075,6 +1077,8 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; line-height:1.35; }
 .train-tiles .tile .s.good { color:var(--good); }
 .train-tiles .tile.hl { border-color:var(--ink); }
+.train-tiles .tile .tag { position:absolute; top:10px; right:10px; font:700 9px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--good); border:1px solid var(--good); padding:3px 6px; border-radius:2px; }
+.train-tiles .tile { position:relative; }
 .train-tiles .empty { grid-column:1 / -1; }
 @media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
 @media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
@@ -1083,7 +1087,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .role-pill.king { color:var(--ink); border-style:solid; }
 .role-pill.chal { color:var(--chal-line); }
 .role-pill.scratch { color:var(--muted); }
-@media (max-width: 900px) { .train-grid { grid-template-columns:1fr; } .train-chart .chart-wrap { aspect-ratio:5/2; } }
+@media (max-width: 900px) { .train-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1221,7 +1225,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
           <button class="btn" data-tscope="all" title="Every checkpoint the trainer benched: the king's, each challenger's, and the from-scratch controls">Everything trained</button>
         </span>
       </div>
-      <div id="train-charts" class="train-big"><div class="train-chart"><div class="chart-wrap"><svg id="train-svg" viewBox="0 0 1000 455" preserveAspectRatio="none"></svg></div><div class="train-tip" hidden></div></div></div>
+      <div id="train-charts" class="train-big"><div class="train-chart"><div class="chart-wrap"><svg id="train-svg" viewBox="0 0 1000 455"></svg></div><div class="train-tip" hidden></div></div></div>
       <div class="chart-meta">
         <span class="legend train-legend" id="train-legend">
           <span><i class="swatch" style="background:var(--ink)"></i>Best king per generation</span>
@@ -2521,7 +2525,7 @@ function fmtVal(v){ return _trainView==="relative"?((v>0?"+":"")+v.toFixed(2)+"%
 // (one column per generation), the palette slot as the series colour,
 // direct labels at each line's end, the reference dashed in the same hue.
 function trainChartSVG(rows, SS, W, H){
-  var PAD_L=64,PAD_R=210,PAD_T=16,PAD_B=30, n=rows.length;
+  var narrow=W<640, FS=narrow?12:15, PAD_L=narrow?46:64, PAD_R=narrow?14:210, PAD_T=narrow?12:16, PAD_B=narrow?26:30, n=rows.length;
   var all=[]; SS.forEach(function(S){ ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); }); if(S.ref&&S.king.length) all.push(S.ref.v); });
   if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">'+(SS.length?'no bench numbers yet':'pick a benchmark above')+'</text>';
   var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
@@ -2535,7 +2539,7 @@ function trainChartSVG(rows, SS, W, H){
   for(var g=0;g<=4;g++){
     var val=min+(max-min)*g/4, y=Y(val);
     out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/>';
-    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="15">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
+    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="'+FS+'">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
   }
   if(_trainView==="relative"&&min<0&&max>0){ var y0=Y(0); out+='<line x1="'+PAD_L+'" y1="'+y0.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y0.toFixed(1)+'" stroke="currentColor" stroke-width="0.8" opacity="0.35"/>'; }
   rows.forEach(function(row,i){
@@ -2544,7 +2548,7 @@ function trainChartSVG(rows, SS, W, H){
   var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
   for(var t=Math.ceil(xmin/nice)*nice; t<=xmax+1e-6; t+=nice){
     var xt=PAD_L+(t-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
-    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="15">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
+    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="'+FS+'">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
   }
   // end labels: stacked so two series ending close together never overlap
   var labels=[];
@@ -2560,8 +2564,12 @@ function trainChartSVG(rows, SS, W, H){
     if(S.best.length){ var last=S.best[S.best.length-1]; labels.push({y:Y(last.v),text:seriesOf(S.key).label+" "+fmtVal(last.v),col:col,dim:false}); }
   });
   labels.sort(function(a,b){ return a.y-b.y; });
-  var prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+18); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
-  labels.forEach(function(L){ out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="15" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>'; });
+  var gap=narrow?14:18, prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+gap); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
+  // wide: labels in the right margin; narrow: inside the plot, right-aligned, on a surface pad
+  labels.forEach(function(L){
+    if(narrow) out+='<text x="'+(W-PAD_R-4)+'" y="'+(L.y+4).toFixed(1)+'" text-anchor="end" fill="'+L.col+'" font-size="'+(FS-1)+'" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.8':'1')+'" stroke="var(--surface)" stroke-width="3" paint-order="stroke">'+esc(L.text)+'</text>';
+    else out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="'+FS+'" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>';
+  });
   out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
   var cols=[]; rows.forEach(function(row,i){ if(!cols.length||cols[cols.length-1].steps!==row.steps) cols.push({steps:row.steps,i:i}); });
   cols.forEach(function(c,k){
@@ -2611,7 +2619,7 @@ function wireTrainChart(wrap, rows, SS){
 function tile(k,v,sub,o){
   // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
-  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
+  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'>'+(o.tag?'<span class="tag">'+esc(o.tag)+'</span>':'')+'<div class="k">'+esc(k)+'</div>'+
     '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+'</div>';
 }
 function renderTrainStats(rows, info){
@@ -2654,12 +2662,16 @@ function renderTrainStats(rows, info){
   }
   // ── row two: the latest king checkpoint's six public-benchmark numbers ──
   if(lastK){
-    var s=lastK.e.six;
+    var s=lastK.e.six, ref=trainReference(rows);
+    // tag a cell when the king's latest number is under the official Toto2 checkpoint's (lower is better)
+    function beat(key){ if(!ref) return ""; var rv=ref.six[key]; return (rv!=null&&s[key]<rv)?"beats Toto2":""; }
+    function beatTxt(key){ if(!ref) return ""; var rv=ref.six[key]; return rv==null?"":(s[key]<rv?" This beats the official Toto2 "+ref.rung+" checkpoint's "+fmt(rv,4)+" by "+((rv-s[key])/rv*100).toFixed(1)+"%.":" The official Toto2 "+ref.rung+" checkpoint scores "+fmt(rv,4)+"."); }
     SUITES.forEach(function(su){
-      tiles.push(tile(su.label+" CRPS",fmt(s[su.key+"_crps"],4),"",
-        {title:"How accurate the king's latest checkpoint's probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+lastK.row.label+"'s signed bench report."}));
-      tiles.push(tile(su.label+" MASE",fmt(s[su.key+"_mase"],4),"",
-        {title:"How accurate the king's latest checkpoint's point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+lastK.row.label+"'s signed bench report."}));
+      var kc=su.key+"_crps", km=su.key+"_mase";
+      tiles.push(tile(su.label+" CRPS",fmt(s[kc],4),"",
+        {tag:beat(kc),title:"How accurate the king's latest checkpoint's probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+lastK.row.label+"'s signed bench report."+beatTxt(kc)}));
+      tiles.push(tile(su.label+" MASE",fmt(s[km],4),"",
+        {tag:beat(km),title:"How accurate the king's latest checkpoint's point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+lastK.row.label+"'s signed bench report."+beatTxt(km)}));
     });
   }
   el.innerHTML=tiles.join("");
@@ -2706,7 +2718,9 @@ function renderTrain(){
   renderTrainStats(rows, info);
   renderTrainChips();
   var SS=selectedSeries().map(function(x){ return trainSeries(rows,x.key); });
-  var wrap=grid.querySelector(".train-chart"), svg=document.getElementById("train-svg"), W=1000, H=455;
+  var wrap=grid.querySelector(".train-chart"), svg=document.getElementById("train-svg"), box=wrap.querySelector(".chart-wrap");
+  var W=Math.max(300,Math.round(box.clientWidth||1000)), H=Math.max(220,Math.round(box.clientHeight||W*0.45));
+  svg.setAttribute("viewBox","0 0 "+W+" "+H); svg.setAttribute("preserveAspectRatio","none");
   svg.innerHTML=trainChartSVG(rows,SS,W,H);
   wireTrainChart(wrap,rows,SS);
   var anyScratch=rows.some(function(r){ return !!r.scratch; }), ref=trainReference(rows);
@@ -2753,6 +2767,7 @@ function renderTrainTable(rows){
   var ms=document.querySelectorAll("[data-tview]"), ss=document.querySelectorAll("[data-tscope]");
   function bind(list, attr, set){ for(var i=0;i<list.length;i++) list[i].addEventListener("click", function(){ set(this.dataset[attr]); for(var j=0;j<list.length;j++) list[j].classList.toggle("active", list[j]===this); renderTrain(); }); }
   bind(ms,"tview",function(v){ _trainView=v; });
+  var rt=null; window.addEventListener("resize", function(){ clearTimeout(rt); rt=setTimeout(function(){ if(_page==="train") renderTrain(); }, 150); });
   bind(ss,"tscope",function(v){ _trainScope=v; });
 })();
 
