@@ -1154,6 +1154,8 @@ var LADDER = [
 // Community links. A glyph renders only when its URL is set — never ship a
 // guessed handle or invite. NOTE: the Discord link is a channel deep-link
 // (works for members); swap in a discord.gg invite to onboard outsiders.
+// The king's generator code on GitHub (champions/king, one commit per reign).
+var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
 var COMMUNITY = {
   x:       "https://x.com/cascade_sn91",
   discord: "https://discord.com/channels/799672011265015819/1524889682520047776",
@@ -1820,7 +1822,13 @@ function renderCompetition(){
       (dense ? '<div class="tl-note">hover a marker for its date</div>' : '');
   }
 
-  var rows = rg.slice().reverse().map(function(g){
+  var rows = rg.slice().reverse().map(function(g, i){
+    // the sitting king (first row): its code is archived on GitHub — link there,
+    // keep the exact registry digest beside it
+    var gen = i === 0
+      ? '<a href="'+KING_GITHUB+'" target="_blank" rel="noopener" title="'+esc(g.gen_ref)+' — code archived at champions/king on GitHub">'+esc(shortRef(g.gen_ref))+'</a> <span class="muted">·</span> '+
+        '<a class="muted" href="'+genUrl(g.gen_ref)+'" target="_blank" rel="noopener" title="The exact digest on the registry">hub</a>'
+      : refLink(g.gen_ref);
     var who = g.baseline
       ? '<span class="muted">miner '+(g.uid!=null?g.uid:"?")+'</span> <span class="badge ret">day one</span>'
       : 'miner '+(g.uid!=null?g.uid:"?")+' '+
@@ -1831,7 +1839,7 @@ function renderCompetition(){
       '<td>'+who+'</td>' +
       '<td class="num">'+(g.gain!=null?'<span class="good" style="color:var(--good)">'+signedPct(g.gain)+'</span>':'<span class="muted">--</span>')+'</td>' +
       '<td class="num">'+g.rounds+'</td>' +
-      '<td>'+refLink(g.gen_ref)+'</td>' +
+      '<td>'+gen+'</td>' +
       '<td class="muted">'+esc(shortRound(g.round))+'</td></tr>';
   }).join("");
   document.getElementById("reigns").innerHTML = rows ||

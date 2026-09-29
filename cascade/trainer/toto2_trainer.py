@@ -645,6 +645,7 @@ class Toto2Trainer:
         warmup = int(getattr(contract, "warmup_tokens", int(token_budget * 0.05)))
 
         tokens = 0
+        channel_tokens = 0     # every value entry processed: B×C×L, whatever the billing
         step = 0
         last_loss = float("nan")
         # The wall-clock cap measures ACTUAL TRAINING TIME: the clock starts at
@@ -816,6 +817,11 @@ class Toto2Trainer:
             # the stream billed them and the model processed them (as masked
             # inputs); only the LOSS excludes them.
             tokens += batch_points(vals_np, budget_denomination)
+            # Channel tokens beside the billed count: under "series_points" a
+            # wide batch bills B×L but trains B×C×L — this is the number a
+            # tokens-trained reading (dashboard Training tab) wants, and it
+            # equals `tokens` at C = 1 under every denomination.
+            channel_tokens += int(n_batch) * int(n_ch) * int(width)
             step += 1
             if logger is not None and step % LOG_EVERY_STEPS == 0:
                 elapsed = max(1e-6, time.time() - t0)
@@ -865,6 +871,7 @@ class Toto2Trainer:
         )
         metrics = {
             "final_loss": last_loss, "steps": step, "tokens_seen": tokens,
+            "channel_tokens": channel_tokens,
             "param_count": param_count,
             "throughput_tokens_per_s": tokens / max(1e-6, train_seconds),
             # Steps/s alongside tokens/s: tokens per step vary with the bucketed

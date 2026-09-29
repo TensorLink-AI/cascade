@@ -1168,6 +1168,11 @@ class TrainerRunner:
     _round_telemetry: dict = field(
         default_factory=lambda: {"heat": [], "final": []}, repr=False
     )
+    # The summary row of every leg trained IN THIS PROCESS, keyed
+    # round_id → log role, for the public training summary
+    # (cascade.shared.training_summary): a remote leg's row is read back from
+    # the log its worker flushed instead. Rounds are dropped once published.
+    _leg_summaries: dict = field(default_factory=dict, repr=False)
     # Which pod each FINAL run actually landed on, keyed by (role, size,
     # hotkey) — the post-publish bench runs on the pod that holds the
     # checkpoint at its _train_work path, and the dispatch retry means that is
@@ -4922,6 +4927,9 @@ class TrainerRunner:
                    "train_seconds": result.train_seconds, **host_facts, **result.metrics}
         for s in emitters:
             s.emit(summary)
+        self._leg_summaries.setdefault(str(seeds.base_seed), {})[log_role] = summary
+        while len(self._leg_summaries) > 8:          # bounded: a round that never publishes
+            del self._leg_summaries[next(iter(self._leg_summaries))]
         if sink is not None:
             try:
                 sink.flush()
@@ -8056,6 +8064,59 @@ class TrainerRunner:
         # round across a process restart (and through a store too flaky to
         # answer the guard's manifest probe).
         self._persist_last_round(manifest.round_id)
+        # Last: it reads each pod leg's log back from the logs bucket, and
+        # nothing consensus-relevant waits on it.
+        self._publish_training_summary(manifest)
+
+    def _publish_training_summary(self, manifest: TrainingManifest) -> str | None:
+        """Unsigned per-round training telemetry — what each duel leg actually
+        trained (steps, budget count, channel tokens, wall stop) — published
+        public-read as ``training/round-<id>.json`` for the dashboard's
+        Training tab (:mod:`cascade.shared.training_summary`). Local legs fold
+        in from their in-process summary row; pod legs are read back from the
+        log the worker flushed. Best-effort: never raises, never delays the
+        manifest (which is already out)."""
+        try:
+            from ..shared.hippius import log_key
+            from ..shared.training_summary import (
+                build_training_summary,
+                collect_round_legs,
+                contract_block,
+                dump_training_summary,
+                publish_training_summary,
+            )
+
+            contracts = list(self.cfg.throne_contracts())
+            primary = contracts[0].arch_preset
+            rid = str(manifest.round_id)
+            cached = self._leg_summaries.pop(rid, {})
+            logs = self.logs_store()
+
+            def read_log(log_role: str) -> str | None:
+                try:
+                    return logs.get_text(log_key(rid, log_role))
+                except Exception:  # noqa: BLE001 — absent/unreadable ⇒ unmeasured leg
+                    return None
+
+            legs = collect_round_legs(manifest.entries, primary, cached=cached, read_log=read_log)
+            by_size = {c.arch_preset: c for c in contracts}
+            for leg in legs:
+                c = by_size.get(leg.get("size"))
+                if c is not None and c is not contracts[0]:
+                    leg["contract"] = contract_block(c)
+            doc = build_training_summary(
+                rid, manifest.created_block, contract_block(contracts[0]), legs,
+                warm_start_ckpt=str(getattr(manifest, "warm_start_ckpt", "") or ""),
+                warm_start_size=str(getattr(manifest, "warm_start_size", "") or ""))
+            key = publish_training_summary(self.manifest_store(), dump_training_summary(doc), rid)
+            log.info("published training summary round=%s legs=%d measured=%d → s3://%s/%s",
+                     rid, len(legs), sum(1 for x in legs if x.get("measured")),
+                     self.cfg.storage.manifest_bucket, key)
+            return key
+        except Exception as e:  # noqa: BLE001 — telemetry must never fail a round
+            log.warning("round=%s: training summary publish failed (ignored): %s",
+                        manifest.round_id, e)
+            return None
 
     def _publish_mix(self, manifest: TrainingManifest) -> None:
         """Mirror the manifest's unsigned ``composition`` block to

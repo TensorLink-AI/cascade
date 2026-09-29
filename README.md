@@ -198,12 +198,22 @@ receipts/<hotkey>/round-<id>.json  a validator's signed receipt (scores, verdict
 receipts/index.json                rolling summary the dashboard reads
 funded/round-<id>.json             seat order, GPU capacities, outcomes
 benchmarks/round-<id>.json         signed public benchmark numbers
+training/round-<id>.json           unsigned per-leg training telemetry (steps, tokens, width)
 champions/                         published kings
 promotions/                        signed warm-start promotions
 ```
 
 `cascade-audit latest` re-derives a receipt without trusting the operator.
 The dashboard (`cascade/website/index.html`) reads only these public records.
+Its **Training** tab charts the king checkpoint's public-benchmark numbers
+(GIFT-Eval / BOOM / TIME, CRPS + MASE, from the signed per-round bench
+reports) against the training behind the checkpoint — one leg per warm-start
+generation (every round of a generation trains from that generation's
+promoted set, so promotions add depth, rounds do not), each leg measured from
+the training summary (steps, tokens seen, channel tokens = steps × batch ×
+width × context) with the contracted budget as the labelled fallback; the
+line follows the best king per generation — and, on request, every checkpoint
+the trainer benched (each challenger's and the from-scratch controls).
 Every throne-holding generator is also archived to a private bucket by
 `scripts/scrape_kings.py`.
 
