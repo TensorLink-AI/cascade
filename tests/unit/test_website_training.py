@@ -188,3 +188,17 @@ def test_top_box_is_a_grid_of_bordered_tiles(page: str):
     assert re.search(r"\.train-tiles \.tile \{[^}]*border:", page), "tiles carry no border"
     m = re.search(r"function tile\(k,v,sub,o\)\{(.*?)\n\}", page, re.S)
     assert m and 'class="tile' in m.group(1) and 'class="k"' in m.group(1) and 'class="v"' in m.group(1)
+
+
+def test_official_toto2_reference_line_on_every_chart(page: str):
+    """The official Toto2 checkpoint of the king's size, benched by the same
+    battery (benchmarks/reference-toto2-<rung>.json, the stakeholder page's
+    source), is drawn as a dashed line on each chart, in the y-range, legend
+    and tooltip."""
+    assert re.search(r'fetchJSON\("benchmarks/reference-toto2-"\s*\+\s*rung\s*\+\s*"\.json",\{bust:false\}', page)
+    chart = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
+    assert chart and "S.ref" in chart.group(1) and "stroke-dasharray" in chart.group(1)
+    assert "all.push(S.ref.v)" in chart.group(1), "the reference is not part of the y-range"
+    assert 'id="train-legend-ref"' in page
+    tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
+    assert tip and "S.ref" in tip.group(1)

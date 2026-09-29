@@ -1046,6 +1046,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tip .r .who { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
 .train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
+.train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
 .train-tiles { display:grid; grid-template-columns:repeat(7, minmax(0,1fr)); gap:12px; }
 .train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; }
@@ -1228,6 +1229,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
           <span id="train-legend-chal"><i class="swatch hollow"></i>Challenger checkpoint</span>
           <span id="train-legend-scratch" hidden><i class="swatch diamond"></i>Scratch control</span>
           <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
+          <span id="train-legend-ref" hidden><i class="swatch dashed"></i><span id="train-legend-ref-label">Official Toto2</span></span>
         </span>
       </div>
     </div>
@@ -2371,6 +2373,29 @@ var _train={}, _trainMissing={}, _trainInflight={};
 // the latest generation in force at its block, and a generation's members
 // (checkpoint id + source round) are the links the lineage walk follows.
 var _gens={}, _gensInflight={}, _gensLatest=0;
+// benchmarks/reference-toto2-<rung>.json: the OFFICIAL Toto2 checkpoint of a
+// ladder size, run through the identical battery (scripts/publish_reference_bench.py)
+// — drawn as the dashed reference line on every chart. Probed per size seen
+// on a king entry; a missing doc simply means that size has no reference yet.
+var _refBench={}, _refMissing={}, _refInflight={};
+function rungKey(tag){ var m=String(tag||"").toLowerCase().match(/(\d+(?:\.\d+)?)\s*([mb])\b/); return m?(m[1]+m[2]):""; }
+function loadReference(rung){
+  if(!rung||_refBench[rung]||_refInflight[rung]||_refMissing[rung]) return;
+  _refInflight[rung]=true;
+  fetchJSON("benchmarks/reference-toto2-"+rung+".json",{bust:false})
+    .then(function(d){ delete _refInflight[rung]; _refBench[rung]=d; renderTrain(); })
+    .catch(function(){ delete _refInflight[rung]; _refMissing[rung]=true; });
+}
+// The reference for the latest king checkpoint's size: {six, geo, rung} or null.
+function trainReference(rows){
+  var rung=""; rows.forEach(function(row){ if(row.king&&row.king.size) rung=rungKey(row.king.size)||rung; });
+  if(!rung){ var rs=_index&&_index.rounds||[]; for(var i=rs.length-1;i>=0&&!rung;i--){ (rs[i].sizes||[]).forEach(function(z){ rung=rung||rungKey(z); }); } }
+  if(!rung) return null;
+  loadReference(rung);
+  var d=_refBench[rung]; if(!d) return null;
+  var six=readSix(d); if(!six) return null;
+  return {six:six, geo:sixGeomean(six), rung:rung, label:"Toto2 "+rung};
+}
 function loadGenerations(){
   fetchJSON("promotions/index.json").then(function(d){
     var n=Number(d&&d.latest_generation)||0; _gensLatest=n;
@@ -2545,11 +2570,14 @@ function trainSeries(rows, suite){
   });
   // the trajectory: the best king checkpoint at each lineage depth, in order
   var best=Object.keys(bestByX).map(Number).sort(function(a,b){ return a-b; }).map(function(x){ return bestByX[x]; });
-  return {king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[]};
+  var ref=trainReference(rows), rv=ref?val(ref.six):null;
+  return {king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[],
+          ref:(rv!=null&&isFinite(rv))?{v:rv,label:ref.label}:null};
 }
 function trainChartSVG(rows, S, W, H){
   var PAD_L=54,PAD_R=14,PAD_T=12,PAD_B=24, n=rows.length;
   var all=[]; ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); });
+  if(S.ref&&all.length) all.push(S.ref.v);
   if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">no bench numbers yet</text>';
   var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
   if(min===max){ min-=Math.abs(min)*0.05||0.5; max+=Math.abs(max)*0.05||0.5; }
@@ -2567,6 +2595,12 @@ function trainChartSVG(rows, S, W, H){
   rows.forEach(function(row,i){
     if(row.r.dethroned){ var x=X(i); out+='<line x1="'+x.toFixed(1)+'" y1="'+PAD_T+'" x2="'+x.toFixed(1)+'" y2="'+(H-PAD_B)+'" stroke="var(--chal)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>'; }
   });
+  // the official Toto2 checkpoint of this size: a dashed reference line
+  if(S.ref){
+    var ry=Y(S.ref.v);
+    out+='<line x1="'+PAD_L+'" y1="'+ry.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+ry.toFixed(1)+'" stroke="var(--ink)" stroke-width="1.4" stroke-dasharray="6 5" opacity="0.6"/>'+
+      '<text x="'+(W-PAD_R)+'" y="'+(ry-5).toFixed(1)+'" text-anchor="end" fill="var(--ink)" font-size="11" opacity="0.8">'+esc(S.ref.label)+' '+fmt(S.ref.v)+'</text>';
+  }
   // scratch controls: diamonds, muted (a control, not a contender)
   S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="var(--muted)"/>'; });
   // challengers: hollow dots with a surface ring so overlaps stay readable
@@ -2606,6 +2640,7 @@ function trainTipHTML(row, S, i, unit){
   cs.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k chal"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · '+(p.e.crowned?'♛ ':'')+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
   ss.forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · scratch</span></div>'); });
   var total=ks.length+cs.length+ss.length, more=total>MAX?'<div class="muted">+'+(total-MAX)+' more</div>':'';
+  if(S.ref) more+='<div class="r"><span><i class="k" style="height:0;border-top:2px dashed var(--ink)"></i><b>'+fmt(S.ref.v)+'</b></span><span class="who">'+esc(S.ref.label)+' · official</span></div>';
   var first=rows[rowsHere[0]]||row, last=rows[rowsHere[rowsHere.length-1]]||row;
   var span=rowsHere.length>1?esc(first.label)+' – '+esc(last.label)+' · '+rowsHere.length+' rounds':esc(row.label);
   return '<div class="h">Generation '+row.gen+' <span class="muted">· '+span+'</span></div>'+
@@ -2705,7 +2740,9 @@ function renderTrain(){
     wrap.querySelector("svg").innerHTML=trainChartSVG(rows,S,W,H);
     wireTrainChart(wrap,rows,S,(c.suite?c.label+" "+_trainMetric.toUpperCase():"geomean")+" · lower is better");
   });
-  var anyScratch=rows.some(function(r){ return !!r.scratch; });
+  var anyScratch=rows.some(function(r){ return !!r.scratch; }), ref=trainReference(rows);
+  document.getElementById("train-legend-ref").hidden=!ref;
+  if(ref) document.getElementById("train-legend-ref-label").textContent="Official "+ref.label;
   document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
   document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
   renderTrainTable(rows);
