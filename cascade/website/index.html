@@ -1062,7 +1062,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
 .train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
-.train-tiles .tile { border:var(--line); border-color:var(--ink); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:96px; box-sizing:border-box; }
+.train-tiles .tile { border:var(--line); border-color:var(--ink); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:108px; box-sizing:border-box; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles { position:relative; }
 .train-tiles .tile[data-help] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
@@ -1077,7 +1077,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; line-height:1.35; }
 .train-tiles .tile .s.good { color:var(--good); }
 .train-tiles .tile.hl { border-color:var(--ink); }
-.train-tiles .tile .tag { position:absolute; top:10px; right:10px; font:700 9px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--good); border:1px solid var(--good); padding:3px 6px; border-radius:2px; }
+.train-tiles .tile .tag { display:inline-block; margin-top:8px; font:700 9px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--good); border:1px solid var(--good); padding:3px 6px; border-radius:2px; }
 .train-tiles .tile { position:relative; }
 .train-tiles .empty { grid-column:1 / -1; }
 @media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
@@ -2619,8 +2619,8 @@ function wireTrainChart(wrap, rows, SS){
 function tile(k,v,sub,o){
   // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
-  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'>'+(o.tag?'<span class="tag">'+esc(o.tag)+'</span>':'')+'<div class="k">'+esc(k)+'</div>'+
-    '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+'</div>';
+  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'>'+'<div class="k">'+esc(k)+'</div>'+
+    '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+(o.tag?'<span class="tag">'+esc(o.tag)+'</span>':'')+'</div>';
 }
 function renderTrainStats(rows, info){
   var el=document.getElementById("train-stats"), when=document.getElementById("train-when"); if(!el) return;
