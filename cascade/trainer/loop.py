@@ -2739,9 +2739,10 @@ class TrainerRunner:
                               "gone — still billing the miner; kept on the "
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
-            if not keep_payers:
-                reconcile_funded(self._load_funded_ledger(), vault,
-                                 netuid=self.cfg.subnet.netuid)
+            # Orphans of every payer WITHOUT an in-flight leg — not only when
+            # the field is empty (under rolling eras it never is).
+            reconcile_funded(self._load_funded_ledger(), vault,
+                             netuid=self.cfg.subnet.netuid, exclude=keep_payers)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -3777,12 +3778,42 @@ class TrainerRunner:
         )
 
     def _teardown_kept_funded_pod(self, hotkey: str) -> None:
-        """Tear down the pod kept for ``hotkey``'s bench (no-op if none)."""
+        """Tear down the pod kept for ``hotkey``'s bench. When nothing is kept
+        in memory the payer's ACCOUNT is swept for this payer's funded pods
+        instead: a leg re-attached after a restart and settled from its
+        persisted checkpoint never passes the funded-leg path that registers
+        the kept pod, so the in-memory lookup alone left the pod running on
+        the miner's bill (2026-09-29: four pods, 5–14 h idle)."""
         with self._funded_bench_lock:
             pod = self._funded_bench_pods.pop(hotkey, None)
             self._funded_bench_pod_round.pop(hotkey, None)
         if pod is not None:
             self._teardown_funded_pod(pod)
+            return
+        self._sweep_payer_account(hotkey, why="leg finished with no kept pod on record")
+
+    def _sweep_payer_account(self, hotkey: str, *, why: str) -> list[str]:
+        """Terminate every funded pod of THIS payer on their account (their
+        vaulted key; names scoped by ``payer_pod_pattern``) and drop their
+        ledger rows. Returns the pod names confirmed gone."""
+        vault = self._payer_vault()
+        if vault is None or not vault.has(hotkey):
+            log.warning("funded teardown: %s — no vaulted key for payer %s, cannot sweep "
+                        "their account; any pod there bills them until they stop it",
+                        why, hotkey[:12])
+            return []
+        from ..provision.funded import lium_provider_for_key, reconcile_funded
+
+        factory = self.__dict__.get("_funded_provider_factory") or lium_provider_for_key
+        killed = reconcile_funded([], vault, netuid=self.cfg.subnet.netuid,
+                                  provider_factory=factory, hotkeys=[hotkey])
+        with self._funded_ledger_lock:
+            self._save_funded_ledger([x for x in self._load_funded_ledger()
+                                      if x.payer_hotkey != hotkey])
+        log.log(logging.WARNING if killed else logging.INFO,
+                "funded teardown: %s — swept payer %s's account: %d pod(s) terminated%s",
+                why, hotkey[:12], len(killed), f" ({', '.join(killed)})" if killed else "")
+        return killed
 
     def _after_round_failure(self) -> str:
         """What happens to the payer pods kept for a bench when the service

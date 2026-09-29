@@ -104,6 +104,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_record_funded_failure", "_rent_funded_host",
                  "_teardown_funded_pod", "_run_funded_leg", "_settle_funded",
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
+                 "_sweep_payer_account",
                  "_teardown_kept_funded_pods", "_bench_hold_rounds",
                  "_pod_held_by_bench", "_funded_harvest",
                  "_harvest_funded_checkpoint", "_pod_checkpoint_dir",
@@ -1657,3 +1658,62 @@ def test_harvest_leg_resolves_contract_and_seeds_from_the_receipt(tmp_path, monk
     import pytest as _pytest
     with _pytest.raises(RuntimeError, match="unknown size"):
         r._harvest_leg("HOST", SimpleNamespace(size="toto2-999x", role="king"), base_seed=1)
+
+
+# ── 2026-09-29: pods leaked when a re-attached leg settled from its persisted checkpoint ──
+
+class _AccountProvider:
+    """A payer's Lium account: lists tagged pods, terminates verifiably."""
+    def __init__(self, tagged):
+        self.tagged = list(tagged)
+        self.terminated = []
+
+    def list_tagged(self, prefix):
+        return [n for n in self.tagged if n.startswith(prefix)]
+
+    def terminate(self, pod_id):
+        self.terminated.append(pod_id)
+        self.tagged = [n for n in self.tagged if n != pod_id]
+
+
+def test_finished_leg_with_no_kept_pod_sweeps_the_payers_account(tmp_path):
+    """A leg re-attached after a restart and settled from its persisted checkpoint
+    never registers a kept pod; the finish-time teardown must still reach the pod
+    on the payer's account (2026-09-29: four pods idled 5–14 h on miners' bills)."""
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    pod = _pod("hkA")
+    runner._ledger_add(pod)
+    account = _AccountProvider([pod.instance_id,
+                                "cascade-n91-777-funded-hkb-0",     # another payer's slug — untouchable
+                                "cascade-777-heat-0"])             # the miner's own deployment — untouchable
+    runner._funded_provider_factory = lambda key: account
+    assert runner._funded_bench_pods == {}                          # nothing kept in memory
+    runner._teardown_kept_funded_pod("hkA")
+    assert account.terminated == [pod.instance_id]
+    assert runner._load_funded_ledger() == []                       # its ledger row dropped
+
+
+def test_finished_leg_with_no_kept_pod_and_no_key_logs_and_leaves_ledger(tmp_path):
+    runner = _runner(tmp_path)
+    PayerKeyVault(dir=tmp_path / "pv")                              # vault exists, no key for hkA
+    pod = _pod("hkA")
+    runner._ledger_add(pod)
+    account = _AccountProvider([pod.instance_id])
+    runner._funded_provider_factory = lambda key: account
+    runner._teardown_kept_funded_pod("hkA")
+    assert account.terminated == []
+    assert [p.instance_id for p in runner._load_funded_ledger()] == [pod.instance_id]
+
+
+def test_restart_sweep_reaps_other_payers_orphans_while_legs_are_in_flight(tmp_path, monkeypatch):
+    """The per-payer orphan sweep used to run only when NO leg was in flight —
+    under rolling eras that is never. It must run every sweep, skipping only
+    the payers whose leg is still running."""
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    seen = {}
+    monkeypatch.setattr(funded_mod, "reconcile_funded",
+                        lambda o, v, **kw: (seen.update(kw), [])[1])
+    runner._reconcile_funded_pods(keep_payers={"hkA"})
+    assert seen and set(seen["exclude"]) == {"hkA"}
