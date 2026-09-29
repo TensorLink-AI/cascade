@@ -835,8 +835,8 @@ body {
 .page { width: 100%; max-width: 1200px; padding: 30px 44px 88px; display: flex; flex-direction: column; gap: 52px; }
 /* the tab panes hold the actual sections — without their own flex gap the
    sections stack edge-to-edge (the page-level gap can't reach inside them) */
-#page-main, #page-mix, #page-train { display: flex; flex-direction: column; gap: 68px; }
-#page-main[hidden], #page-mix[hidden], #page-train[hidden] { display: none; }
+#page-main, #page-train { display: flex; flex-direction: column; gap: 68px; }
+#page-main[hidden], #page-train[hidden] { display: none; }
 /* two narrow tables share a row on desktop so the page scrolls shorter */
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 68px 44px; align-items: stretch; min-width: 0; }
 .grid-2 > div { min-width: 0; display: flex; flex-direction: column; }
@@ -1013,7 +1013,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 @media (max-width: 720px) {
   .page { padding: 22px 18px 64px; gap: 34px; }
   .panel { padding: 12px 14px; }
-  #page-main, #page-mix, #page-train { gap: 44px; }
+  #page-main, #page-train { gap: 44px; }
   .header .wordmark { font-size: 34px; }
   .chart-wrap { aspect-ratio: 3/2; }
   .scroll-box { overflow-x: auto; }
@@ -1021,9 +1021,6 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 }
 .page-tabs { display:flex; gap:8px; margin:0 0 12px; }
 .page-tabs .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
-.mixbar { height:8px; min-width:120px; background:rgba(127,127,127,.15); border-radius:4px; overflow:hidden; }
-.mixbar i { display:block; height:100%; background:#7E9B7E; }
-.mix-note { font-size:12px; opacity:.7; margin-top:8px; }
 /* training page — public-benchmark trajectories (DEC-CA-0013 telemetry) */
 /* categorical series slots for the big plot — validated with the dataviz
    palette checks on the light card (#F8FAF6) and the dark card (#29343F);
@@ -1057,10 +1054,13 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tip .r .who { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
 .train-legend .swatch.hollow { width:9px; height:9px; border:2px solid var(--chal-line); border-radius:50%; background:transparent; }
+.train-big ~ .chart-meta { font-size:13px; }
+.train-big ~ .chart-meta .legend { gap:20px; }
+.train-big ~ .chart-meta .swatch { width:18px; height:3px; }
 .train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
 .train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
 .train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
-.train-tiles .tile { border:var(--line); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:96px; box-sizing:border-box; }
+.train-tiles .tile { border:var(--line); border-color:var(--ink); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:96px; box-sizing:border-box; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
 .train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1113,7 +1113,6 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
   <div class="page-tabs">
     <button class="btn active" data-ptab="main">Dashboard</button>
-    <button class="btn" data-ptab="mix">Eval mix</button>
     <button class="btn" data-ptab="train">Training</button>
   </div>
 
@@ -1195,24 +1194,6 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
   </div><!-- /page-main -->
 
-  <div id="page-mix" hidden>
-
-    <div>
-      <div class="section-label"><span>Eval mix &mdash; latest round</span><span id="mix-when" class="muted"></span></div>
-      <div id="mix-latest" class="muted">Loading&hellip;</div>
-      <div class="panel"><div class="scroll-box"><table id="mix-domains-table" hidden><thead><tr><th>Domain</th><th class="num">Windows</th><th class="num">Share</th><th>&nbsp;</th><th class="num">&Delta; vs prev</th></tr></thead><tbody id="mix-domains"></tbody></table></div></div>
-      <div id="mix-cadences" class="mix-note"></div>
-      <div class="mix-note">Each round's eval draw is a Dirichlet jitter around the pool mix (salted by block hash) &mdash; the realised composition publishes unsigned in that round's manifest at round end. Rounds before the jitter activation drew uniformly from the pool and published no composition block.</div>
-    </div>
-
-    <div>
-      <div class="section-label"><span>Mix history</span><span class="muted">domain share per round</span></div>
-      <div class="panel"><div class="scroll-box scroll-hist">
-        <table><thead id="mix-hist-head"></thead><tbody id="mix-hist"></tbody></table>
-      </div></div>
-    </div>
-
-  </div><!-- /page-mix -->
 
   <div id="page-train" hidden>
 
@@ -2268,104 +2249,19 @@ _dataState="loading"; renderAll();
 // (2026-07-21). The anchored prefix is single-writer and signature-anchored
 // (same trail validator bootstrap trusts); shared stays as a fallback only.
 var RECEIPT_ANCHOR="5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
-// ── eval-mix page (DEC-CA-0019 jittered draw) ─────────────────────────────
-// Composition is an unsigned block in each round's published manifest; fetch
-// per round (cached — manifests are immutable once published) for the last N
-// rounds in the receipts index. Pre-jitter rounds have no block: rendered as
-// "uniform" rows, never fabricated.
-var _page="main", _mixCache={}, _MIX_N=10;
+var _page="main";
 function setPage(p){
   _page=p;
   var tabs=document.querySelectorAll(".page-tabs .btn");
   for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle("active", tabs[i].dataset.ptab===p);
   document.getElementById("page-main").hidden = p!=="main";
-  document.getElementById("page-mix").hidden = p!=="mix";
   document.getElementById("page-train").hidden = p!=="train";
-  if(p==="mix") loadMix();
   if(p==="train") loadBench();
 }
 (function(){
   var tabs=document.querySelectorAll(".page-tabs .btn");
   for(var i=0;i<tabs.length;i++) tabs[i].addEventListener("click", function(){ setPage(this.dataset.ptab); });
 })();
-function mixRounds(){
-  var rs=(_index&&_index.rounds||[]).slice();
-  return rs.slice(-_MIX_N).reverse();  // newest first
-}
-function loadMix(){
-  var rs=mixRounds();
-  if(!rs.length){ renderMix(); return; }
-  var pending=0;
-  rs.forEach(function(r){
-    var id=String(r.round_id||"");
-    if(!id || _mixCache[id]!==undefined) return;
-    pending++;
-    // mix/round-<id>.json is the composition block re-published public-read
-    // (the manifest itself is not anonymously readable). 404 ⇒ no composition
-    // for that round (pre-jitter uniform draw, or doc not yet published).
-    fetchJSON("mix/round-"+id+".json")
-      .then(function(m){ _mixCache[id]=(m&&m.composition)||null; })
-      .catch(function(){ _mixCache[id]=null; })
-      .then(function(){ if(--pending===0) renderMix(); });
-  });
-  renderMix();
-}
-function mixShares(comp){
-  var doms=comp&&comp.domains||{}, total=0, k;
-  for(k in doms) total+=doms[k];
-  var out={};
-  for(k in doms) out[k]=total?doms[k]/total:0;
-  return out;
-}
-function renderMix(){
-  var rs=mixRounds();
-  var latest=null, latestId=null, prev=null;
-  for(var i=0;i<rs.length;i++){
-    var id=String(rs[i].round_id||""), c=_mixCache[id];
-    if(c){ if(!latest){ latest=c; latestId=id; } else if(!prev){ prev=c; break; } }
-  }
-  var el=document.getElementById("mix-latest"), tbl=document.getElementById("mix-domains-table");
-  document.getElementById("mix-when").textContent = latestId?("round "+shortRoundId(latestId)):"";
-  if(!latest){
-    el.textContent = rs.length?"No composition published yet — rounds so far drew uniformly from the pool.":"Waiting for round data…";
-    tbl.hidden=true; document.getElementById("mix-cadences").textContent="";
-  } else {
-    var m=latest.mix||{};
-    el.innerHTML = "<b>"+esc(latest.n_windows)+"</b> windows · <b>"+esc(latest.n_clusters)+"</b> clusters · effective domains <b>"+fmt(latest.effective_domains,2)+"</b>"
-      + ' <span class="muted">· jitter &alpha;='+esc(m.jitter_alpha)+" · block slots "+esc(m.block_slots)+" · series bag "+pct(m.series_bag_frac)+" · from block "+esc(m.from_block)+"</span>";
-    var shares=mixShares(latest), pshares=prev?mixShares(prev):null;
-    var doms=Object.keys(shares).sort(function(a,b){ return shares[b]-shares[a]; });
-    var maxShare=doms.length?shares[doms[0]]:1, rows="";
-    doms.forEach(function(d){
-      var s=shares[d], dd=pshares&&pshares[d]!=null?(s-pshares[d])*100:null;
-      rows+="<tr><td>"+esc(d)+'</td><td class="num">'+esc((latest.domains||{})[d])+'</td><td class="num">'+(s*100).toFixed(1)+"%</td>"
-        + '<td><div class="mixbar"><i style="width:'+Math.round(s/maxShare*100)+'%"></i></div></td>'
-        + '<td class="num">'+(dd==null?'<span class="muted">--</span>':(dd>0?"+":"")+dd.toFixed(1)+"pp")+"</td></tr>";
-    });
-    document.getElementById("mix-domains").innerHTML=rows; tbl.hidden=false;
-    var cads=latest.cadences||{}, ck=Object.keys(cads).sort(function(a,b){ return cads[b]-cads[a]; });
-    document.getElementById("mix-cadences").textContent = ck.length ? ("Cadences: "+ck.map(function(k){ return k+" ×"+cads[k]; }).join(" · ")) : "";
-  }
-  // history: one row per round, share % per domain (union of seen domains)
-  var seen={}, haveAny=false;
-  rs.forEach(function(r){ var c=_mixCache[String(r.round_id||"")]; if(c){ haveAny=true; Object.keys(c.domains||{}).forEach(function(d){ seen[d]=1; }); } });
-  var cols=Object.keys(seen).sort();
-  var head="<tr><th>Round</th><th class=\"num\">Windows</th><th class=\"num\">Eff. dom</th>"+cols.map(function(d){ return '<th class="num">'+esc(d)+"</th>"; }).join("")+"</tr>";
-  document.getElementById("mix-hist-head").innerHTML = haveAny?head:"";
-  var body="";
-  rs.forEach(function(r){
-    var id=String(r.round_id||""), c=_mixCache[id];
-    if(c){
-      var sh=mixShares(c);
-      body+="<tr><td>"+esc(shortRoundId(id))+'</td><td class="num">'+esc(c.n_windows)+'</td><td class="num">'+fmt(c.effective_domains,2)+"</td>"
-        + cols.map(function(d){ return '<td class="num">'+(sh[d]!=null?(sh[d]*100).toFixed(1)+"%":"--")+"</td>"; }).join("")+"</tr>";
-    } else if(c===null){
-      body+="<tr><td>"+esc(shortRoundId(id))+'</td><td colspan="'+(cols.length+2)+'" class="muted">no composition published (uniform pre-jitter draw)</td></tr>';
-    }
-  });
-  document.getElementById("mix-hist").innerHTML = body || '<tr><td class="muted" colspan="3">No rounds yet.</td></tr>';
-}
-
 // ── training page: public-benchmark trajectory of every trained checkpoint ──
 // After a round's manifest publishes, the trainer benches BOTH duel checkpoints
 // (the king's and each challenger's) on GIFT-Eval / BOOM / TIME and signs the
@@ -2618,7 +2514,7 @@ function fmtVal(v){ return _trainView==="relative"?((v>0?"+":"")+v.toFixed(2)+"%
 // (one column per generation), the palette slot as the series colour,
 // direct labels at each line's end, the reference dashed in the same hue.
 function trainChartSVG(rows, SS, W, H){
-  var PAD_L=54,PAD_R=150,PAD_T=14,PAD_B=24, n=rows.length;
+  var PAD_L=64,PAD_R=210,PAD_T=16,PAD_B=30, n=rows.length;
   var all=[]; SS.forEach(function(S){ ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); }); if(S.ref&&S.king.length) all.push(S.ref.v); });
   if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">'+(SS.length?'no bench numbers yet':'pick a benchmark above')+'</text>';
   var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
@@ -2632,7 +2528,7 @@ function trainChartSVG(rows, SS, W, H){
   for(var g=0;g<=4;g++){
     var val=min+(max-min)*g/4, y=Y(val);
     out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/>';
-    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
+    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="15">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
   }
   if(_trainView==="relative"&&min<0&&max>0){ var y0=Y(0); out+='<line x1="'+PAD_L+'" y1="'+y0.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y0.toFixed(1)+'" stroke="currentColor" stroke-width="0.8" opacity="0.35"/>'; }
   rows.forEach(function(row,i){
@@ -2641,7 +2537,7 @@ function trainChartSVG(rows, SS, W, H){
   var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
   for(var t=Math.ceil(xmin/nice)*nice; t<=xmax+1e-6; t+=nice){
     var xt=PAD_L+(t-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
-    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="11">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
+    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="15">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
   }
   // end labels: stacked so two series ending close together never overlap
   var labels=[];
@@ -2657,8 +2553,8 @@ function trainChartSVG(rows, SS, W, H){
     if(S.best.length){ var last=S.best[S.best.length-1]; labels.push({y:Y(last.v),text:seriesOf(S.key).label+" "+fmtVal(last.v),col:col,dim:false}); }
   });
   labels.sort(function(a,b){ return a.y-b.y; });
-  var prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+13); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
-  labels.forEach(function(L){ out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="11" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>'; });
+  var prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+18); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
+  labels.forEach(function(L){ out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="15" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>'; });
   out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
   var cols=[]; rows.forEach(function(row,i){ if(!cols.length||cols[cols.length-1].steps!==row.steps) cols.push({steps:row.steps,i:i}); });
   cols.forEach(function(c,k){
@@ -2819,7 +2715,7 @@ function renderTrainTable(rows){
 })();
 
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="mix") loadMix(); if(_page==="train") loadBench(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
