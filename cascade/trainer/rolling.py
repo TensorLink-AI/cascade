@@ -834,10 +834,36 @@ class RollingScheduler:
 
     # ── king legs ────────────────────────────────────────────────────────────
 
+    def _drop_foreign_king_entry(self, era: EraState | None) -> bool:
+        """A king entry is only ever the era king's own leg. A dethrone adopted
+        while the previous king's leg was still training (``_adopt_dethrone``
+        cannot stop a running thread) used to let that leg land as the NEW
+        king's entry: the settlement then published the old king's checkpoint
+        under a crowned challenger, the validators held on king_resyncing,
+        and the new king's leg never trained that era (2026-09-29 era 2549).
+        Drop it so the king leg retrains for the real king. Returns True when
+        an entry was dropped. Caller need not hold the lock."""
+        if era is None or not era.king_entry or not era.king_hotkey:
+            return False
+        entry = _entry_from_json(era.king_entry)
+        if entry.miner_hotkey == era.king_hotkey:
+            return False
+        with self._lock:
+            log.error("rolling: era %d king entry %s belongs to %s but the era king is %s "
+                      "— dropped, the king leg retrains for %s", era.index,
+                      entry.trained_pointer, entry.miner_hotkey[:12], era.king_hotkey[:12],
+                      era.king_hotkey[:12])
+            era.king_entry, era.king_bench, era.king_bench_published = None, None, False
+            era.king_init = ""
+            self._save()
+        return True
+
     def _maybe_king_legs(self, client, block: int, now: float) -> None:
         cur = self.state.current
         if cur is None:
             return
+        self._drop_foreign_king_entry(cur)
+        self._drop_foreign_king_entry(self.state.next)
         if (cur.king_entry is not None and cur.index not in self._king_threads
                 and self._forfeit_switch(cur)):      # armed mid-reign: the running era switches too
             self.ops.retire_king_pod(cur)
@@ -943,6 +969,13 @@ class RollingScheduler:
             try:
                 entry = self.ops.train_king(gen, era, block, end_wall=end_wall)
                 entry = replace(entry, role="king")
+                if era.king_hotkey != gen.hotkey:
+                    # The throne moved while this leg trained: it is not the
+                    # era king's leg any more — discard, never adopt or bench it.
+                    log.warning("rolling: era %d king leg for %s landed after the throne "
+                                "passed to %s — discarded (%s)", era.index, gen.hotkey[:12],
+                                (era.king_hotkey or "<vacant>")[:12], entry.trained_pointer)
+                    return
                 with self._lock:
                     era.king_entry = _entry_to_json(entry)
                     era.king_init = era.warm_start_ckpt
@@ -1452,6 +1485,7 @@ class RollingScheduler:
             self.state.last_settled_boundary = epoch_start
             self._save()
             return
+        self._drop_foreign_king_entry(cur)
         with self._lock:
             ready = [f for f in self.state.finished if f.era_index == cur.index]
             king = cur.king()

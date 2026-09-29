@@ -1675,3 +1675,107 @@ def test_leg_records_are_looked_up_under_the_eras_contract_not_the_base_one(tmp_
     ops.discard_cached_leg(era, "challenger", gen)
     assert ("discard", at_era) in calls
     assert not any(c[1] is base for c in calls if c[0] in ("load", "discard"))
+
+
+# ── a dethrone while the OLD king's leg is still training (2026-09-29) ──────
+
+class _HeldKingOps(FakeOps):
+    """train_king blocks on ``king_gate`` for the hotkeys in ``hold_kings``."""
+
+    def __init__(self, tmp_path, clock):
+        super().__init__(tmp_path, clock)
+        self.king_gate = threading.Event()
+        self.hold_kings: set[str] = set()
+
+    def train_king(self, gen, era, block, *, end_wall):
+        if gen.hotkey in self.hold_kings:
+            self.king_calls.append((gen.hotkey, era.index, block, end_wall))
+            self.king_gate.wait(10)
+            return TrainedEntry(gen.hotkey, gen.uid, "king", gen.ref,
+                                _ptr(f"K{gen.hotkey}-{era.index}"), "d", block,
+                                gpu_name="RTX 4090")
+        return super().train_king(gen, era, block, end_wall=end_wall)
+
+
+def test_old_king_leg_landing_after_a_dethrone_is_discarded_and_new_king_trains(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _HeldKingOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.hold_kings = {"KING"}
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)                      # era starts; KING's leg in flight
+    assert [c[0] for c in ops.king_calls] == ["KING"]
+    idx = sched.state.current.index
+    # validators crown ALFA (a winner from an earlier era: no settled leg here)
+    ops.king_hk = ops.chain_king = "ALFA"
+    sched.tick(client, b0 + 1)
+    assert sched.state.current.king_hotkey == "ALFA"
+    assert sched.state.current.king_entry is None
+    ops.king_gate.set()                         # KING's leg lands late
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king_entry is None, "the old king's leg must not become ALFA's entry"
+    assert not any(b[0] == "king" and b[1] == "KING" for b in ops.benches)
+    sched.tick(client, b0 + 2)                  # next tick trains the real king
+    _join(sched)
+    cur = sched.state.current
+    assert [c[0] for c in ops.king_calls] == ["KING", "ALFA"]
+    assert cur.index == idx and cur.king().miner_hotkey == "ALFA"
+
+
+def test_foreign_king_entry_restored_from_disk_is_dropped_and_retrained(cfg, tmp_path):
+    """The live failure shape: the state on disk already carries the old
+    king's entry under the new king. After a restart the entry is dropped
+    and the real king's leg trains."""
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king().miner_hotkey == "KING"
+    with sched._lock:                            # simulate the bad persisted state
+        cur.king_hotkey, cur.king_uid, cur.king_ref = "ALFA", -1, ""
+        sched._save()
+    ops2 = FakeOps(tmp_path, clock)
+    ops2.commits = list(ops.commits)
+    ops2.king_hk = ops2.chain_king = "ALFA"
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
+    assert sched2.state.current.king().miner_hotkey == "KING"   # as persisted
+    sched2.tick(client, b0 + 1)
+    _join(sched2)
+    assert [c[0] for c in ops2.king_calls] == ["ALFA"]
+    assert sched2.state.current.king().miner_hotkey == "ALFA"
+
+
+def test_settlement_never_publishes_a_foreign_king_entry(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b0 - 100))
+    q.add("BRAV", REF["BRAV"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    cur = sched.state.current
+    with sched._lock:                            # foreign entry, and the retrain fails
+        cur.king_hotkey, cur.king_uid, cur.king_ref = "ALFA", -1, ""
+        sched._save()
+    ops.king_hk = ops.chain_king = "ALFA"
+    ops.fail_king = True
+    sched._settle(client, era_start + EB + 1, era_start + EB)
+    assert ops.manifests == [], "a manifest carrying the old king must never publish"
+    assert sched.state.current.king_entry is None
+    assert any(f.hotkey == "BRAV" for f in sched.state.finished)   # the leg waits
