@@ -58,7 +58,8 @@ Rules that matter:
   same way). Compiled or native modules (`.so`, `.pyd`, `.pyc`, …) are
   rejected outright: generators are source-only.
 - **Every module is a file.** Where `[static_guard] packed_sources = "reject"`
-  (testnet now), a string constant that decodes to Python *code* — definitions
+  (mainnet since block 9169200, 2026-09-28, era 2547; testnet before that), a
+  string constant that decodes to Python *code* — definitions
   or imports, in any encoding the scanner knows — is itself a rejection at
   admission. Data that merely parses (a JSON blob, a literal) is fine; a
   flush-left docstring example that imports is not. Use as many generators as
@@ -79,10 +80,16 @@ Rules that matter:
 
 ### Multivariate series
 
-A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32).
+A `(C, L)` yield is one series with `C` coupled channels (C ≤ 32). A full
+worked example (two coupled channels, layout, what the scanner rejects, the
+commands) is in `docs/MINER_MULTICHANNEL_WALKTHROUGH.md`.
 
-- The budget is per time-step: `(C, L)` bills `L` points, so a C-channel corpus
-  trains `C×` the channel tokens a univariate one does (C=32 → 32×).
+- **Billing on mainnet is `points+mv20` since block 9165600 (2026-09-28, era
+  2546):** every channel value is a budget point and a `C > 1` series is billed
+  at 100/120 of its values, so an all-multichannel corpus trains 20 % more
+  tokens than a univariate one on any GPU. Before that block, under
+  `series_points`, a `(C, L)` series billed `L` points and the extra channel
+  tokens had to fit inside the 5 h wall.
 - Batches hold 64 series at every C, so the optimizer step count does not
   depend on C; a wide batch simply trains `C×` the tokens per step.
 - The 5 h wall does not scale with C. A wide step costs ~C× the GPU time, so a
