@@ -1116,7 +1116,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
     </div>
     <div class="tagline">King-of-the-hill · compete on synthetic data · Bittensor</div>
     <div class="meta">
-      <span><span class="crown">♛</span> KING GENERATOR: <a id="king-link" href="#" target="_blank" rel="noopener" title="The king's generator code, archived on GitHub (champions/king — one commit per reign)">--</a> <a id="king-hub" class="muted" href="#" target="_blank" rel="noopener" hidden>hub</a> <span id="king-hotkey" class="muted"></span></span>
+      <span><span class="crown">♛</span> KING GENERATOR: <a id="king-link" href="https://github.com/TensorLink-AI/cascade/tree/main/champions/king" target="_blank" rel="noopener" title="The king's generator code, archived on GitHub (champions/king — one commit per reign)">TensorLink-AI/cascade · champions/king</a> <span id="king-hotkey" class="muted"></span></span>
       <span>FIXED MODEL: <b id="base-arch">toto2</b> · SIZES <b id="sizes">--</b></span>
       <span><a href="https://github.com/TensorLink-AI/cascade" target="_blank">GitHub</a> · <span title="Verify any round with the audit CLI">AUDIT: <code>cascade-audit latest</code></span></span>
     </div>
@@ -1363,12 +1363,14 @@ function renderHeader(){
   document.getElementById("tb-rounds").textContent=(_index&&_index.rounds||[]).length||"--";
   document.getElementById("tb-updated").textContent=_index&&_index.updated_at?timeAgo(_index.updated_at):"--";
   var rg=reigns(), king=rg.length?rg[rg.length-1]:null;
-  var link=document.getElementById("king-link"), hub=document.getElementById("king-hub"), hk=document.getElementById("king-hotkey");
+  // One plain link to the king's code on our GitHub (champions/king, re-synced
+  // hourly from the chain); the digest lives in the tooltip, not the text.
+  var link=document.getElementById("king-link"), hk=document.getElementById("king-hotkey");
+  link.href=KING_GITHUB; link.textContent="TensorLink-AI/cascade · champions/king";
   if(king&&king.gen_ref){
-    link.href=KING_GITHUB; link.textContent=shortRef(king.gen_ref); link.title=king.gen_ref+" — code archived at champions/king on GitHub";
-    hub.href=genUrl(king.gen_ref); hub.hidden=false; hub.title="The exact digest on the registry";
+    link.title=king.gen_ref+" — code archived at champions/king on GitHub";
     hk.textContent=king.uid!=null?"· uid "+king.uid+" · "+shortHk(king.hotkey):shortHk(king.hotkey);
-  } else { link.textContent="--"; link.href=KING_GITHUB; hub.hidden=true; hk.textContent=""; }
+  } else { link.title="The king's generator code, archived on GitHub (champions/king — one commit per reign)"; hk.textContent=""; }
   var sizes="", rs=_index&&_index.rounds||[];
   for(var i=rs.length-1;i>=0&&!sizes;i--){ if(rs[i].sizes&&rs[i].sizes.length) sizes=rs[i].sizes.filter(Boolean).join(" · "); }
   document.getElementById("sizes").textContent=sizes||"--";
