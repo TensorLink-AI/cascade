@@ -177,7 +177,7 @@ def test_training_summary_is_fetched_immutably(page: str):
         "the tab does not fetch training_summary_key() objects cache-friendly")
 
 
-@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Lineage legs", "Width C", "Token efficiency"])
+@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Series-points", "Lineage legs", "Token efficiency"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
@@ -211,3 +211,9 @@ def test_token_efficiency_is_measured_against_the_official_toto2_run(page: str):
     assert b == {"steps": 400000, "batch": 64, "channels": 32, "ctx": 4096}
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and "lin.tokens/toto2Tokens()" in body.group(1), "the tile does not divide lineage tokens by the Toto2 run"
+
+
+@pytest.mark.parametrize("gone", ["Width C", "Benched", "Batch × context", "King checkpoint", "Geomean", "Best ever"])
+def test_removed_tiles_stay_removed(page: str, gone: str):
+    body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
+    assert body and f'tile("{gone}"' not in body.group(1), f"{gone!r} tile is back"
