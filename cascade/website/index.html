@@ -1118,6 +1118,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
     <div class="meta">
       <span><span class="crown">♛</span> KING GENERATOR: <a id="king-link" href="#" target="_blank" rel="noopener" title="The king's generator code, archived on GitHub (champions/king — one commit per reign)">--</a> <a id="king-hub" class="muted" href="#" target="_blank" rel="noopener" hidden>hub</a> <span id="king-hotkey" class="muted"></span></span>
       <span>FIXED MODEL: <b id="base-arch">toto2</b> · SIZES <b id="sizes">--</b></span>
+      <span id="rules-line" title="Since block 9165600 (2026-09-28 10:03 UTC) the training contract bills every channel value and grants a multichannel series a 20 % width bonus (points+mv20, DEC-CA-0047); before that a series cost its length once whatever its width (series-points, DEC-CA-0042). Since block 9169200 (2026-09-28 22:03 UTC) a generator that ships Python inside a string constant is rejected at admission (static_guard packed_sources = reject). Building openly on the published king code (champions/king) is allowed.">RULES: stacked multichannel generators <b>allowed</b> (+20 % width bonus) · code packed in strings <b>rejected</b> since era 2547</span>
       <span><a href="https://github.com/TensorLink-AI/cascade" target="_blank">GitHub</a> · <span title="Verify any round with the audit CLI">AUDIT: <code>cascade-audit latest</code></span></span>
     </div>
   </div>
@@ -2354,9 +2355,11 @@ function metricVal(six,key){ return key==="geomean"?sixGeomean(six):six[key]; }
 // plotted at round-number × steps-per-leg. The leg budget is not carried in the
 // receipts (the summary records the contract digest, not its parameters), so it
 // is transcribed from the public chain.toml [training] — hours × ref throughput
-// is the fixed token (series-points) budget, and each step consumes batch × ctx
-// of it (DEC-CA-0042: batches are 64 series at every width, so the step count
-// holds for every channel mix). Contracted spend: a leg the wall stopped early
+// is the fixed token budget (series-points under DEC-CA-0042; from block
+// 9165600 points+mv20 under DEC-CA-0047 — every channel value billed, with a
+// 20 % width bonus for multichannel series), and each step consumes batch × ctx
+// of it (batches are 64 series at every width, so the step count holds for
+// every channel mix). Contracted spend: a leg the wall stopped early
 // (deadline_hit) trained fewer steps than plotted.
 var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
 // The official Toto2 pretraining run the lineage is measured against (Toto 2.0
@@ -2652,8 +2655,8 @@ function renderTrainStats(rows, info){
       {hl:true,title:"Optimiser steps behind the current king's checkpoint, added up along its lineage: its own training leg plus one leg per generation before it ("+lin.legs+" legs). "+(est?lin.measured+" of them were measured from the trainer's published training summary; the rest are counted at the contract's budget of about "+fmtSteps(stepsPerLeg())+" per leg.":"All "+lin.legs+" legs were measured from the trainer's published training summaries.")}));
     tiles.push(tile("Tokens trained",esc(fmtTokens(lin.tokens).replace(" tokens","")),"",
       {hl:true,title:"Every data point the lineage's training legs processed, added up the same way as steps: steps × batch size × channels × context length. "+(lin.exact<lin.legs?(lin.exact?lin.exact+" of "+lin.legs+" legs reported the exact count; the others use their billed count, which is the same number for single-channel data.":"No leg reported the exact count yet, so this uses each leg's billed count, which is the same number for single-channel data."):"Exact for every leg.")}));
-    tiles.push(tile("Series-points",esc(fmtTokens(lin.points).replace(" tokens","")),"",
-      {title:"The unit the training contract bills in. A multi-channel series costs its length once, however many channels it has, so this equals tokens trained on single-channel data and is smaller than it when the data is multivariate."}));
+    tiles.push(tile("Budget points",esc(fmtTokens(lin.points).replace(" tokens","")),"",
+      {title:"The unit the training contract bills in, summed under the rule in force when each leg trained. Since block 9165600 (DEC-CA-0047, points+mv20) every channel value is a point and a multichannel series is billed at 100/120 of its values, so a stacked generator trains up to 20 % more tokens for the same budget. Before that (DEC-CA-0042, series-points) a multi-channel series cost its length once, however many channels it had, so this equals tokens trained on single-channel data and is smaller than it when the data is multivariate."}));
     tiles.push(tile("Lineage legs",lin.legs,"",
       {title:"Training legs behind the current king's checkpoint: one per generation plus its own. "+(unres?unres+" could not be traced to a published training summary and are counted at the contract's budget. ":"")+(lin.deadline?lin.deadline+" hit the wall-clock limit and trained less than the budget.":"")}));
     var effPct=lin.tokens/toto2Tokens()*100, effTxt=(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+"%";

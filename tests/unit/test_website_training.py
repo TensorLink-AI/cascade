@@ -187,7 +187,7 @@ def test_training_summary_is_fetched_immutably(page: str):
         "the tab does not fetch training_summary_key() objects cache-friendly")
 
 
-@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Series-points", "Lineage legs", "Tokens vs Toto2"])
+@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Budget points", "Lineage legs", "Tokens vs Toto2"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"

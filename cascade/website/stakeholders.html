@@ -1120,7 +1120,13 @@ var TOKEN_ERAS = [
   // series-points (64 series per step at every width), so this step count holds
   // for every channel mix — a C-channel round trains C× these tokens in the same
   // steps; only the wall grew to 5h.
-  { from: "2026-09-16", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "5h wall, 3h series-points budget (DEC-CA-0042)" }
+  { from: "2026-09-16", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "5h wall, 3h series-points budget (DEC-CA-0042)" },
+  // DEC-CA-0047 (block 9165600, 2026-09-28): same hours and throughput, but the
+  // budget is billed in points+mv20 — every channel value is a point and a
+  // multichannel series gets a 20 % width bonus, so stacked generators are
+  // allowed and rewarded per value; packed-source generators are rejected from
+  // era 2547 (block 9169200).
+  { from: "2026-09-28", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "points+mv20 (DEC-CA-0047): every channel value billed, multichannel series +20 % width bonus; packed-source generators rejected from era 2547" }
 ];
 
 // Official Toto2 pretraining budget per ladder size, in OPTIMISER STEPS — the
