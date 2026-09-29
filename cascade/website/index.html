@@ -1062,7 +1062,14 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
 .train-tiles .tile { border:var(--line); border-color:var(--ink); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:96px; box-sizing:border-box; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.train-tiles .tile[title] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
+.train-tiles { position:relative; }
+.train-tiles .tile[data-help] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
+.train-tiles .tile.open .k { border-bottom-color:var(--ink); color:var(--ink); }
+.tile-help { position:absolute; z-index:6; box-sizing:border-box; width:min(420px, 100%); background:var(--surface); border:1px solid var(--ink); padding:14px 40px 14px 16px; font:14px/1.55 var(--font-sans); color:var(--ink); box-shadow:0 6px 24px rgba(0,0,0,0.16); }
+.tile-help .h { font:700 11px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:8px; }
+.tile-help .x { position:absolute; top:6px; right:8px; background:none; border:none; color:var(--muted); font:700 18px/1 var(--font-mono); cursor:pointer; padding:4px 6px; }
+.tile-help .x:hover { color:var(--ink); }
+.tile-help .pin { display:block; margin-top:8px; font:10px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
 .train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile .v .u { font-size:11px; color:var(--muted); margin-left:4px; }
 .train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; line-height:1.35; }
@@ -2604,7 +2611,7 @@ function wireTrainChart(wrap, rows, SS){
 function tile(k,v,sub,o){
   // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
-  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
+  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
     '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+'</div>';
 }
 function renderTrainStats(rows, info){
@@ -2656,7 +2663,42 @@ function renderTrainStats(rows, info){
     });
   }
   el.innerHTML=tiles.join("");
+  wireTileHelp(el);
   when.textContent=lastK&&lastK.row.r.published_at?"benched round settled "+timeAgo(lastK.row.r.published_at):"";
+}
+// The explanation box for a cell: hover the title to peek, click it to pin
+// the box open until its × (or Escape, or a click elsewhere) closes it.
+var _helpPinned=null;
+function wireTileHelp(el){
+  var box=el.querySelector(".tile-help");
+  if(!box){ box=document.createElement("div"); box.className="tile-help"; box.hidden=true; el.appendChild(box);
+    box.addEventListener("click", function(ev){ if(ev.target.classList.contains("x")) closeHelp(el); ev.stopPropagation(); });
+    document.addEventListener("click", function(ev){ if(!el.contains(ev.target)) closeHelp(el); });
+    document.addEventListener("keydown", function(ev){ if(ev.key==="Escape") closeHelp(el); });
+  }
+  function closeHelp(){ _helpPinned=null; box.hidden=true; var o=el.querySelector(".tile.open"); if(o) o.classList.remove("open"); }
+  function show(tile,pin){
+    var text=tile.dataset.help; if(!text) return;
+    box.innerHTML='<button class="x" title="Close">×</button><div class="h">'+esc(tile.querySelector(".k").textContent)+'</div>'+esc(text)+
+      (pin?'':'<span class="pin">click the title to keep this open</span>');
+    box.hidden=false;
+    var top=tile.offsetTop+tile.offsetHeight+6, left=tile.offsetLeft, maxLeft=el.clientWidth-box.offsetWidth;
+    box.style.top=top+"px"; box.style.left=Math.max(0,Math.min(left,maxLeft))+"px";
+    var o=el.querySelector(".tile.open"); if(o&&o!==tile) o.classList.remove("open");
+    if(pin) tile.classList.add("open");
+  }
+  var ks=el.querySelectorAll(".tile[data-help] .k");
+  for(var i=0;i<ks.length;i++){
+    ks[i].addEventListener("mouseenter", function(){ if(_helpPinned) return; show(this.parentNode,false); });
+    ks[i].addEventListener("mouseleave", function(){ if(_helpPinned) return; box.hidden=true; });
+    ks[i].addEventListener("click", function(ev){
+      ev.stopPropagation(); var t=this.parentNode;
+      if(_helpPinned===t.dataset.help){ closeHelp(); return; }
+      _helpPinned=t.dataset.help; show(t,true);
+    });
+  }
+  // keep a pinned box (re-rendered on every poll) where it was
+  if(_helpPinned){ for(var j=0;j<ks.length;j++){ var t=ks[j].parentNode; if(t.dataset.help===_helpPinned){ show(t,true); return; } } _helpPinned=null; }
 }
 function renderTrain(){
   var grid=document.getElementById("train-charts"); if(!grid) return;
