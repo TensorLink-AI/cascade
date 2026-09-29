@@ -1,0 +1,29 @@
+{
+  "name": "cascade-fullctx-spectral-v12",
+  "description": "Prefetched dynamics-heavy full-context mixture with modulated seasonality, regime changes, event recovery, and sparse measurement artifacts.",
+  "min_length": 4096,
+  "max_length": 4096,
+  "family_weights": {
+    "trend_seasonal_ar": 0.12,
+    "regime_shift": 0.12,
+    "multiplicative": 0.08,
+    "ar2": 0.15,
+    "integrated": 0.12,
+    "threshold_ar": 0.08,
+    "chaotic": 0.04,
+    "spectral_gp": 0.07,
+    "long_memory": 0.06,
+    "ou_stochastic_vol": 0.1,
+    "physical_sensors": 0.02,
+    "seasonal_counts": 0.02,
+    "intermittent": 0.01,
+    "pulse_outlier": 0.01
+  },
+  "tr_exc_lo": 0.4,
+  "tr_exc_hi": 2.5,
+  "gr_exc_lo": 0.3,
+  "gr_exc_hi": 1.5,
+  "sa_clean_frac": 0.4,
+  "sa_clean_lo": 0.02,
+  "sa_clean_hi": 0.12
+}

@@ -1,0 +1,103 @@
+{
+  "name": "cs35step25",
+  "description": "cascade-heat3 with the conditional_stability family raised from 0.05 to 0.173 (mass taken from trend_seasonal_ar and integrated) and the curriculum disabled \u2014 heat3's curriculum never engaged anyway (its budget recovery overestimates the token budget 64x, so the blend stays at 0 for the whole run). Every other knob is heat3's own start configuration: a 1-D difficulty sweep, a 17-point family-mixture design, a 7-variant corpus-length sweep and a seasonal-period-table swap all failed to beat it.",
+  "min_length": 4096,
+  "max_length": 4096,
+  "prefetch_depth": 2,
+  "family_weights": {
+    "trend_seasonal_ar": 0.011818181818181832,
+    "regime_shift": 0.009090909090909103,
+    "multiplicative": 0.0072727272727272805,
+    "ar2": 0.23500000000000004,
+    "integrated": 0.0018181818181818206,
+    "threshold_ar": 0.0022727272727272757,
+    "chaotic": 0.0,
+    "spectral_gp": 0.003181818181818186,
+    "long_memory": 0.0022727272727272757,
+    "ou_stochastic_vol": 0.0027272727272727297,
+    "physical_sensors": 0.009545454545454555,
+    "seasonal_counts": 0.00818181818181819,
+    "intermittent": 0.0013636363636363648,
+    "pulse_outlier": 0.00045454545454545503,
+    "conditional_stability": 0.41125,
+    "step_level": 0.29375,
+    "vol_regime_switch": 0.0,
+    "weekly_demand": 0.0,
+    "tidal_harmonic": 0.0,
+    "flow_recession": 0.0,
+    "bounded_counts": 0.0
+  },
+  "curriculum": {
+    "enabled": false,
+    "expected_budget_fraction": 0.65,
+    "start_fraction": 0.05,
+    "end_fraction": 0.7,
+    "start_family_weights": {
+      "trend_seasonal_ar": 0.19,
+      "regime_shift": 0.1,
+      "multiplicative": 0.08,
+      "ar2": 0.2,
+      "integrated": 0.05,
+      "threshold_ar": 0.025,
+      "chaotic": 0.0,
+      "spectral_gp": 0.035,
+      "long_memory": 0.025,
+      "ou_stochastic_vol": 0.03,
+      "physical_sensors": 0.105,
+      "seasonal_counts": 0.09,
+      "intermittent": 0.015,
+      "pulse_outlier": 0.005,
+      "conditional_stability": 0.05
+    },
+    "start_parameters": {
+      "tr_exc_lo": 0.15,
+      "tr_exc_hi": 0.8,
+      "gr_exc_lo": 0.1,
+      "gr_exc_hi": 0.6,
+      "sa_clean_frac": 0.75,
+      "sa_clean_lo": 0.01,
+      "sa_clean_hi": 0.05,
+      "integrated_heavy_frac": 0.0,
+      "integrated_sv_frac": 0.0,
+      "observation": {
+        "censor_rate": 0.0,
+        "quantize_rate": 0.02,
+        "regular_hold_rate": 0.0,
+        "irregular_hold_rate": 0.0,
+        "irregular_hold_prob_lo": 0.0,
+        "irregular_hold_prob_hi": 0.02,
+        "shock_row_rate": 0.0,
+        "shock_prob_lo": 0.0,
+        "shock_prob_hi": 0.002
+      },
+      "augment": {
+        "tsmixup": 0.0,
+        "pad_prefix": 0.0
+      }
+    }
+  },
+  "tr_exc_lo": 0.15,
+  "tr_exc_hi": 0.8,
+  "gr_exc_lo": 0.1,
+  "gr_exc_hi": 0.6,
+  "sa_clean_frac": 0.75,
+  "sa_clean_lo": 0.01,
+  "sa_clean_hi": 0.05,
+  "integrated_heavy_frac": 0.0,
+  "integrated_sv_frac": 0.0,
+  "observation": {
+    "censor_rate": 0.0,
+    "quantize_rate": 0.02,
+    "regular_hold_rate": 0.0,
+    "irregular_hold_rate": 0.0,
+    "irregular_hold_prob_lo": 0.0,
+    "irregular_hold_prob_hi": 0.02,
+    "shock_row_rate": 0.0,
+    "shock_prob_lo": 0.0,
+    "shock_prob_hi": 0.002
+  },
+  "augment": {
+    "tsmixup": 0.0,
+    "pad_prefix": 0.0
+  }
+}

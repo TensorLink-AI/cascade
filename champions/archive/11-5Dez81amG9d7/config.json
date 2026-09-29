@@ -1,0 +1,726 @@
+{
+  "name": "p1-top-health",
+  "description": "Lerp #1 and g1-nh-f1h28 (healthcare leader) at held 32. 08-27-19 on the j1-nm-h32hl recipe. Host j1-nm-h32hl. AR(2) TDF-II. No new threading.",
+  "min_length": 4096,
+  "max_length": 4096,
+  "prefetch_depth": 4,
+  "family_weights": {
+    "step_level": 0.118463,
+    "conditional_stability": 0.072405,
+    "ar2": 0.030019,
+    "cs_drift": 0.033213,
+    "tidal_constituents": 0.010756,
+    "cs_countwalk": 0.011528,
+    "rate_counts": 0.022397,
+    "envelope_mod": 0.017718,
+    "cs_flat": 0.009199,
+    "cycle_profile": 0.029641,
+    "arma_sarima": 0.029422,
+    "flow_recession": 0.010842,
+    "transport_flow": 0.014404,
+    "regime_dwell_intcounter": 0.014929,
+    "cs_pulse": 0.014245,
+    "hawkes_marked": 0.005986,
+    "spectral_kernel_zoo": 0.004519,
+    "econ_release_staircase": 0.012479,
+    "energy_load_price_solar": 0.0111,
+    "ops_counter_reset": 0.011835,
+    "threshold_ar": 0.0088,
+    "clinical_bounded_vitals": 0.010518,
+    "epi_renewal": 0.011732,
+    "admin_reporting_counts": 0.017152,
+    "regime_dwell_flat": 0.008943,
+    "physical_sensors": 0.007291,
+    "grid_flow": 0.00751,
+    "regime_shift": 0.007446,
+    "trend_seasonal_ar": 0.006512,
+    "seasonal_counts": 0.006109,
+    "sticky_station": 0.00657,
+    "ops_saturating_feedback": 0.007531,
+    "epi_decay": 0.007926,
+    "rk4_flows": 0.005578,
+    "physio_quasiperiodic": 0.007622,
+    "met_thermal": 0.005615,
+    "spiky_price": 0.005565,
+    "price_shock": 0.004106,
+    "long_memory": 0.003873,
+    "ops_diurnal_traffic": 0.003816,
+    "smooth_drift_extrapolable": 0.003499,
+    "multiplicative": 0.006352,
+    "bounded_counts": 0.00293,
+    "garch_leverage": 0.001354,
+    "met_pressure_smooth": 0.002806,
+    "met_bounded_atom": 0.002806,
+    "integrated": 0.002639,
+    "spectral_gp": 0.002617,
+    "intermittent": 0.002459,
+    "ou_stochastic_vol": 0.00221,
+    "met_wind_speed": 0.002116,
+    "wet_dry_intermittent": 0.002116,
+    "level_ladder_staircase": 0.002116,
+    "coastal_residual": 0.001889,
+    "vol_regime_switch": 0.001465,
+    "pulse_outlier": 0.000369,
+    "chaotic": 0.0,
+    "weekly_demand": 0.0,
+    "tidal_harmonic": 0.0,
+    "sl_exact_cont": 0.0,
+    "sl_exact_int": 0.0,
+    "sl_noisy_cont": 0.0,
+    "sl_noisy_int": 0.0,
+    "ops_latency_queue": 0.004846,
+    "ops_deploy_transient": 0.002104,
+    "ops_rate_plateau": 0.004729,
+    "transport_flow_tail": 0.005385,
+    "capacity_counts": 0.009689,
+    "overdispersed_counts": 0.009126,
+    "reported_epi_counts": 0.005363,
+    "retail_promo_tail": 0.007011,
+    "heavy_traffic_counts": 0.033071,
+    "gauge_rain": 0.008665,
+    "storm_outage_counts": 0.007776,
+    "held_rate": 0.36368
+  },
+  "curriculum": {
+    "enabled": false,
+    "expected_budget_fraction": 0.65,
+    "start_fraction": 0.05,
+    "end_fraction": 0.7,
+    "start_family_weights": {
+      "trend_seasonal_ar": 0.19,
+      "regime_shift": 0.1,
+      "multiplicative": 0.08,
+      "ar2": 0.2,
+      "integrated": 0.05,
+      "threshold_ar": 0.025,
+      "chaotic": 0,
+      "spectral_gp": 0.035,
+      "long_memory": 0.025,
+      "ou_stochastic_vol": 0.03,
+      "physical_sensors": 0.105,
+      "seasonal_counts": 0.09,
+      "intermittent": 0.015,
+      "pulse_outlier": 0.005,
+      "conditional_stability": 0.05
+    },
+    "start_parameters": {
+      "tr_exc_lo": 0.15,
+      "tr_exc_hi": 0.8,
+      "gr_exc_lo": 0.1,
+      "gr_exc_hi": 0.6,
+      "sa_clean_frac": 0.75,
+      "sa_clean_lo": 0.01,
+      "sa_clean_hi": 0.05,
+      "integrated_heavy_frac": 0,
+      "integrated_sv_frac": 0,
+      "observation": {
+        "censor_rate": 0,
+        "quantize_rate": 0.02,
+        "regular_hold_rate": 0,
+        "irregular_hold_rate": 0,
+        "irregular_hold_prob_lo": 0,
+        "irregular_hold_prob_hi": 0.02,
+        "shock_row_rate": 0,
+        "shock_prob_lo": 0,
+        "shock_prob_hi": 0.002
+      },
+      "augment": {
+        "tsmixup": 0,
+        "pad_prefix": 0
+      }
+    }
+  },
+  "tr_exc_lo": 0.15,
+  "tr_exc_hi": 0.8,
+  "gr_exc_lo": 0.1,
+  "gr_exc_hi": 0.6,
+  "sa_clean_frac": 0.75,
+  "sa_clean_lo": 0.01,
+  "sa_clean_hi": 0.05,
+  "integrated_heavy_frac": 0,
+  "integrated_sv_frac": 0,
+  "observation": {
+    "censor_rate": 0.35,
+    "quantize_rate": 0.02,
+    "regular_hold_rate": 0.06,
+    "irregular_hold_rate": 0,
+    "irregular_hold_prob_lo": 0,
+    "irregular_hold_prob_hi": 0.02,
+    "shock_row_rate": 0,
+    "shock_prob_lo": 0,
+    "shock_prob_hi": 0.002,
+    "amp_trend_rate": 0.54,
+    "kernel_spike_rate": 0.45,
+    "periodic_spike_frac": 0.0,
+    "time_warp_rate": 0.0,
+    "duty_cycle_rate": 0.0,
+    "nonuniform_quantize_frac": 0.0,
+    "gamma_warp_rate": 0.95,
+    "hold_block_rate": 0.63,
+    "post_amp_drift_rate": 0.95,
+    "nonneg_skip_range_artifacts": 1.0
+  },
+  "augment": {
+    "tsmixup": 0.18,
+    "pad_prefix": 0.05
+  },
+  "tsmixup_mean_scale": 1.0,
+  "tsmixup_source_alpha": 2.5,
+  "tail_rebase_rate": 0.18,
+  "nonneg_integer_frac": 0.9,
+  "chronoforge": {
+    "schema_version": 1,
+    "generator_name": "chronoforge",
+    "internal_length": 4096,
+    "batch_schedule": {
+      "ramp": [
+        64,
+        64,
+        256,
+        256
+      ],
+      "steady": 512
+    },
+    "threads": {
+      "max_workers": 4,
+      "max_inflight_batches": 6
+    },
+    "family_weights": {
+      "met_thermal": 7.0,
+      "met_pressure_smooth": 4.5,
+      "met_bounded_atom": 8.5,
+      "met_wind_speed": 4.0,
+      "wet_dry_intermittent": 2.0,
+      "ops_diurnal_traffic": 5.5,
+      "ops_saturating_feedback": 3.5,
+      "ops_counter_reset": 2.0,
+      "ops_latency_queue": 2.0,
+      "ops_deploy_transient": 1.5,
+      "ops_rate_plateau": 1.0,
+      "epi_renewal": 3.5,
+      "admin_reporting_counts": 3.5,
+      "physio_quasiperiodic": 2.0,
+      "clinical_bounded_vitals": 2.0,
+      "regime_dwell_flat": 3.0,
+      "regime_dwell_microdrift": 2.5,
+      "regime_dwell_intcounter": 2.0,
+      "regime_dwell_zerosparse": 1.5,
+      "regime_dwell_transitional": 2.0,
+      "level_ladder_staircase": 7.0,
+      "smooth_drift_extrapolable": 6.0,
+      "arma_sarima": 4.0,
+      "garch_leverage": 0.5,
+      "hawkes_marked": 2.5,
+      "chaotic_delay": 0.5,
+      "spectral_kernel_zoo": 1.0,
+      "changepoint_composite": 3.0,
+      "energy_load_price_solar": 5.5,
+      "transport_flow": 3.5,
+      "retail_promo_intermittent": 2.0,
+      "econ_release_staircase": 1.0
+    },
+    "family_coarse_pref": {
+      "met_thermal": 0.02,
+      "met_pressure_smooth": 0.02,
+      "met_bounded_atom": 0.05,
+      "met_wind_speed": 0.02,
+      "wet_dry_intermittent": 0.25,
+      "ops_diurnal_traffic": 0.2,
+      "ops_saturating_feedback": 0.1,
+      "ops_counter_reset": 0.3,
+      "ops_latency_queue": 0.1,
+      "ops_deploy_transient": 0.1,
+      "ops_rate_plateau": 0.15,
+      "epi_renewal": 0.75,
+      "admin_reporting_counts": 0.85,
+      "physio_quasiperiodic": 0.0,
+      "clinical_bounded_vitals": 0.02,
+      "regime_dwell_flat": 0.25,
+      "regime_dwell_microdrift": 0.25,
+      "regime_dwell_intcounter": 0.25,
+      "regime_dwell_zerosparse": 0.25,
+      "regime_dwell_transitional": 0.25,
+      "level_ladder_staircase": 0.3,
+      "smooth_drift_extrapolable": 0.25,
+      "arma_sarima": 0.25,
+      "garch_leverage": 0.2,
+      "hawkes_marked": 0.2,
+      "chaotic_delay": 0.1,
+      "spectral_kernel_zoo": 0.2,
+      "changepoint_composite": 0.25,
+      "energy_load_price_solar": 0.1,
+      "transport_flow": 0.1,
+      "retail_promo_intermittent": 0.7,
+      "econ_release_staircase": 0.8
+    },
+    "cadence": {
+      "fine_seconds": [
+        30,
+        60,
+        150,
+        300,
+        360,
+        600,
+        900,
+        1800,
+        3600
+      ],
+      "fine_weights": [
+        0.039,
+        0.065,
+        0.026,
+        0.091,
+        0.039,
+        0.065,
+        0.13,
+        0.104,
+        0.441
+      ],
+      "coarse_seconds": [
+        28800,
+        86400
+      ],
+      "coarse_weights": [
+        0.087,
+        0.913
+      ]
+    },
+    "length_ladder": {
+      "fine": {
+        "lengths": [
+          4096
+        ],
+        "weights": [
+          1.0
+        ]
+      },
+      "coarse": {
+        "lengths": [
+          4096
+        ],
+        "weights": [
+          1.0
+        ]
+      }
+    },
+    "seasonality": {
+      "active_fine": {
+        "day": 0.85,
+        "half": 0.3,
+        "third": 0.1,
+        "week": 0.55,
+        "bizweek": 0.06,
+        "month": 0.05,
+        "quarter": 0.02,
+        "free": 0.18
+      },
+      "active_coarse": {
+        "day": 0.0,
+        "half": 0.0,
+        "third": 0.0,
+        "week": 0.9,
+        "bizweek": 0.22,
+        "month": 0.28,
+        "quarter": 0.12,
+        "free": 0.18
+      },
+      "shape_mix": [
+        0.4,
+        0.3,
+        0.15,
+        0.1,
+        0.05
+      ],
+      "phase_drift_rate": 0.35,
+      "period_drift_rate": 0.12,
+      "amplitude_modulation_rate": 0.45
+    },
+    "calendar": {
+      "monday_factor": 1.28,
+      "monday_sigma": 0.2,
+      "weekday_sigma": 0.12,
+      "weekend_factor": 0.45,
+      "weekend_sigma": 0.35,
+      "n_fixed_holidays": 13,
+      "n_moving_holidays": 4,
+      "holiday_count_lo": 8,
+      "holiday_count_hi": 17,
+      "holiday_factor": 0.35,
+      "holiday_sigma": 0.4,
+      "holiday_comp_lo": 1.25,
+      "holiday_comp_hi": 2.4
+    },
+    "observation": {
+      "block_aggregation_rate": 0.22,
+      "quantise_rate": 0.3,
+      "log_grid_share": 0.12,
+      "censor_rate": 0.18,
+      "staleness_rate": 0.18,
+      "missing_zero_rate": 0.06,
+      "outlier_rate": 0.08,
+      "drift_recal_rate": 0.1,
+      "round_rate": 0.25,
+      "round_min_ticks": 20.0,
+      "integer_tick_share": 0.4,
+      "count_prior_rate": 0.95,
+      "count_integer_share": 0.9,
+      "count_floor_frac": 0.15,
+      "count_levels_log10": [
+        0.8,
+        2.2
+      ]
+    },
+    "scale": {
+      "log10_scale_mixture": [
+        {
+          "weight": 0.55,
+          "mean": 0.0,
+          "sigma": 1.2
+        },
+        {
+          "weight": 0.25,
+          "mean": 3.0,
+          "sigma": 1.5
+        },
+        {
+          "weight": 0.12,
+          "mean": -2.0,
+          "sigma": 1.5
+        },
+        {
+          "weight": 0.08,
+          "mean": 6.0,
+          "sigma": 2.0
+        }
+      ],
+      "zero_anchor_share": 0.45,
+      "large_offset_share": 0.3,
+      "sign_cross_share": 0.04,
+      "large_offset_ratio": [
+        0.5,
+        50.0
+      ]
+    },
+    "aggregation": {
+      "rate": 0.12
+    },
+    "families": {
+      "met_thermal": {
+        "synoptic_ell": [
+          24.0,
+          400.0
+        ],
+        "synoptic_amp": [
+          0.3,
+          12.0
+        ],
+        "diurnal_amp_mix": [
+          0.35,
+          0.4,
+          0.25
+        ],
+        "cloud_coupling": [
+          0.3,
+          0.9
+        ],
+        "noise_ratio": [
+          0.005,
+          0.08
+        ],
+        "annual_rate": 0.3
+      },
+      "met_pressure_smooth": {
+        "synoptic_ell": [
+          60.0,
+          600.0
+        ],
+        "noise_ratio": [
+          0.0003,
+          0.02
+        ],
+        "dip_rate": 0.18,
+        "quantise_rate": 0.25
+      },
+      "met_bounded_atom": {
+        "variant_mix": [
+          0.45,
+          0.3,
+          0.25
+        ],
+        "latent_ell": [
+          4.0,
+          240.0
+        ],
+        "eta": [
+          0.8,
+          4.0
+        ],
+        "centre_mean": 0.45,
+        "centre_sigma": 0.35,
+        "upper_mix": [
+          0.18,
+          0.1,
+          0.07,
+          0.55,
+          0.1
+        ],
+        "quantise_rate": 0.55,
+        "saturation_event_rate": 0.32
+      },
+      "met_wind_speed": {
+        "component_ell": [
+          6.0,
+          200.0
+        ],
+        "gust_rate": 0.35,
+        "quantise_rate": 0.3
+      },
+      "wet_dry_intermittent": {
+        "dry_dwell": [
+          8.0,
+          600.0
+        ],
+        "wet_dwell": [
+          2.0,
+          40.0
+        ],
+        "intensity_shape": [
+          0.25,
+          0.9
+        ]
+      },
+      "ops_diurnal_traffic": {
+        "taylor_exponent": [
+          0.45,
+          1.0
+        ],
+        "burst_rate": 0.55,
+        "count_emit_rate": 0.55,
+        "dst_rate": 0.18
+      },
+      "ops_saturating_feedback": {
+        "step_gain": [
+          0.15,
+          0.6
+        ],
+        "emit_mix": [
+          0.4,
+          0.3,
+          0.3
+        ]
+      },
+      "ops_counter_reset": {
+        "reset_mix": [
+          0.55,
+          0.2,
+          0.25
+        ],
+        "revision_rate": 0.3
+      },
+      "ops_latency_queue": {
+        "lognormal_rate": 0.55,
+        "percentile_rate": 0.35
+      },
+      "ops_deploy_transient": {
+        "outage_mix": [
+          0.45,
+          0.35,
+          0.2
+        ]
+      },
+      "ops_rate_plateau": {
+        "plateau_dwell": [
+          40.0,
+          1500.0
+        ]
+      },
+      "epi_renewal": {
+        "logr_corr_time": [
+          120.0,
+          900.0
+        ],
+        "logr_sigma": 0.3,
+        "serial_interval_mean": [
+          3.0,
+          20.0
+        ],
+        "dispersion": [
+          0.3,
+          20.0
+        ],
+        "reporting_layer_rate": 0.7,
+        "endemic_rate": 0.6
+      },
+      "admin_reporting_counts": {
+        "batch_rate": 0.3,
+        "revision_rate": 0.2,
+        "emission_mix": [
+          0.62,
+          0.18,
+          0.2
+        ],
+        "holiday_rate": 0.75,
+        "month_end_rate": 0.2
+      },
+      "physio_quasiperiodic": {
+        "base_period": [
+          10.0,
+          150.0
+        ],
+        "rsa_depth": [
+          0.02,
+          0.18
+        ]
+      },
+      "clinical_bounded_vitals": {
+        "range_mix": [
+          0.35,
+          0.3,
+          0.15,
+          0.2
+        ],
+        "ceiling_bias": [
+          0.4,
+          3.2
+        ],
+        "excursion_tau": [
+          150.0,
+          2000.0
+        ]
+      },
+      "regime_dwell": {
+        "dormant_dwell": [
+          20.0,
+          1200.0
+        ],
+        "active_dwell": [
+          15.0,
+          700.0
+        ],
+        "pareto_mix": 0.15
+      },
+      "level_ladder_staircase": {
+        "run_length": [
+          15.0,
+          900.0
+        ],
+        "jump_mix": [
+          0.7,
+          0.25,
+          0.05
+        ],
+        "tick_snap_rate": 0.4,
+        "noiseless_rate": 0.5,
+        "monotone_rate": 0.18
+      },
+      "smooth_drift_extrapolable": {
+        "matern_nu_mix": [
+          0.2,
+          0.5,
+          0.3
+        ],
+        "lengthscale": [
+          64.0,
+          4096.0
+        ],
+        "obs_noise_ratio": [
+          0.001,
+          0.3
+        ],
+        "damped_rate": 0.15,
+        "saturating_rate": 0.25
+      },
+      "arma_sarima": {
+        "seasonal_rate": 0.45,
+        "d_rate": 0.35,
+        "big_d_rate": 0.35,
+        "student_rate": 0.35
+      },
+      "garch_leverage": {
+        "persistence": [
+          0.9,
+          0.999
+        ],
+        "student_rate": 0.6,
+        "emit_mix": [
+          0.55,
+          0.25,
+          0.2
+        ],
+        "arma_mean_rate": 0.3
+      },
+      "hawkes_marked": {
+        "branching": [
+          0.2,
+          0.92
+        ],
+        "power_law_rate": 0.4,
+        "emit_mix": [
+          0.4,
+          0.3,
+          0.3
+        ]
+      },
+      "chaotic_delay": {
+        "system_mix": [
+          0.32,
+          0.24,
+          0.2,
+          0.24
+        ],
+        "projection_rate": 0.35,
+        "mackey_glass_rate": 0.3
+      },
+      "spectral_kernel_zoo": {
+        "product_rate": 0.6,
+        "envelope_rate": 0.5,
+        "warp_rate": 0.3
+      },
+      "changepoint_composite": {
+        "join_mix": [
+          0.45,
+          0.35,
+          0.2
+        ],
+        "state_hazard": [
+          0.0,
+          2.0
+        ]
+      },
+      "energy_load_price_solar": {
+        "mode_mix": [
+          0.45,
+          0.3,
+          0.25
+        ],
+        "negative_price_rate": 0.1
+      },
+      "transport_flow": {
+        "capacity_ratio": [
+          0.9,
+          2.2
+        ]
+      },
+      "retail_promo_intermittent": {
+        "slow_mover_rate": 0.35,
+        "stockout_rate": 0.12,
+        "launch_rate": 0.1
+      },
+      "econ_release_staircase": {
+        "release_mix": [
+          0.35,
+          0.45,
+          0.2
+        ],
+        "nelson_siegel_rate": 0.4,
+        "business_day_rate": 0.25,
+        "month_end_rate": 0.2
+      }
+    }
+  },
+  "step_level_exact_frac": 0.9,
+  "step_level_noise_lo": 0.0005,
+  "step_level_noise_hi": 0.01,
+  "step_level_jumps_hi": 5.0,
+  "flat_level_spread": 20000.0
+}

@@ -1,0 +1,102 @@
+{
+  "name": "",
+  "min_length": 4096,
+  "max_length": 4096,
+  "prefetch_depth": 2,
+  "family_weights": {
+    "k00": 0.09142325581395348,
+    "k01": 0.07032558139534885,
+    "k02": 0.056260465116279065,
+    "k03": 0.1406511627906977,
+    "k04": 0.01406511627906977,
+    "k05": 0.017581395348837212,
+    "k06": 0.0,
+    "k07": 0.024613953488372097,
+    "k08": 0.017581395348837212,
+    "k09": 0.021097674418604648,
+    "k10": 0.07384186046511627,
+    "k11": 0.06329302325581394,
+    "k12": 0.010548837209302324,
+    "k13": 0.0035162790697674416,
+    "k14": 0.23520000000000005,
+    "k15": 0.16,
+    "k16": 0.0,
+    "k17": 0.0,
+    "k18": 0.0,
+    "k19": 0.0,
+    "k20": 0.0
+  },
+  "curriculum": {
+    "enabled": false,
+    "expected_budget_fraction": 0.65,
+    "start_fraction": 0.05,
+    "end_fraction": 0.7,
+    "start_family_weights": {
+      "k00": 0.19,
+      "k01": 0.1,
+      "k02": 0.08,
+      "k03": 0.2,
+      "k04": 0.05,
+      "k05": 0.025,
+      "k06": 0.0,
+      "k07": 0.035,
+      "k08": 0.025,
+      "k09": 0.03,
+      "k10": 0.105,
+      "k11": 0.09,
+      "k12": 0.015,
+      "k13": 0.005,
+      "k14": 0.05
+    },
+    "start_parameters": {
+      "tr_exc_lo": 0.15,
+      "tr_exc_hi": 0.8,
+      "gr_exc_lo": 0.1,
+      "gr_exc_hi": 0.6,
+      "sa_clean_frac": 0.75,
+      "sa_clean_lo": 0.01,
+      "sa_clean_hi": 0.05,
+      "integrated_heavy_frac": 0.0,
+      "integrated_sv_frac": 0.0,
+      "observation": {
+        "censor_rate": 0.0,
+        "quantize_rate": 0.02,
+        "regular_hold_rate": 0.0,
+        "irregular_hold_rate": 0.0,
+        "irregular_hold_prob_lo": 0.0,
+        "irregular_hold_prob_hi": 0.02,
+        "shock_row_rate": 0.0,
+        "shock_prob_lo": 0.0,
+        "shock_prob_hi": 0.002
+      },
+      "augment": {
+        "tsmixup": 0.0,
+        "pad_prefix": 0.0
+      }
+    }
+  },
+  "tr_exc_lo": 0.15,
+  "tr_exc_hi": 0.8,
+  "gr_exc_lo": 0.1,
+  "gr_exc_hi": 0.6,
+  "sa_clean_frac": 0.75,
+  "sa_clean_lo": 0.01,
+  "sa_clean_hi": 0.05,
+  "integrated_heavy_frac": 0.0,
+  "integrated_sv_frac": 0.0,
+  "observation": {
+    "censor_rate": 0.0,
+    "quantize_rate": 0.02,
+    "regular_hold_rate": 0.0,
+    "irregular_hold_rate": 0.0,
+    "irregular_hold_prob_lo": 0.0,
+    "irregular_hold_prob_hi": 0.02,
+    "shock_row_rate": 0.0,
+    "shock_prob_lo": 0.0,
+    "shock_prob_hi": 0.002
+  },
+  "augment": {
+    "tsmixup": 0.0,
+    "pad_prefix": 0.0
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "reign": 16,
+  "hotkey": "5HDvXrTbUgK72UEkc7HrSpEtd6HpUDXuwh5pvePmWraqLHwu",
+  "uid": 105,
+  "ref": "vault/direct@sha256:65e5b9dc80e58322b1c331489ccc26be2e8a49127d3568ef963afa1ffd94a6ab",
+  "digest": "65e5b9dc80e58322b1c331489ccc26be2e8a49127d3568ef963afa1ffd94a6ab",
+  "network": "finney",
+  "first_round_id": "10985573485289259398",
+  "last_round_id": "17498386004487721329",
+  "first_epoch_start_block": 9147600,
+  "last_epoch_start_block": 9160200,
+  "first_published_at": "2026-09-25T22:08:37+00:00",
+  "last_published_at": "2026-09-27T16:09:32+00:00",
+  "rounds_reigned": 18,
+  "source": "public champions bucket: champions/65e5b9dc80e58322b1c331489ccc26be2e8a49127d3568ef963afa1ffd94a6ab.zip",
+  "fetched_at": "2026-09-29T05:55:43Z",
+  "note": "archived by scripts/champions_archive.py \u2014 read-only copy of the code that held the throne; verify against the round receipts (cascade-audit). Static scan only \u2014 never run outside a sandbox."
+}

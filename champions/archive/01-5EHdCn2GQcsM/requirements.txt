@@ -1,0 +1,9 @@
+# Hash-locked, allowlisted deps for the generator. The generator is numpy-only
+# by design, so this is the whole dependency surface. The trainer only
+# FORMAT-checks these lines (pkg==ver + a 64-hex sha256) — it does not reinstall
+# them; the sandbox image already ships the allowlisted stack (numpy, scipy,
+# torch, …). So the placeholder zero-hash below is accepted, exactly as the
+# shipped reference generators use it. Pinning real wheel hashes is optional
+# hygiene: pip hash $(pip download numpy==1.26.4 -d /tmp/x)
+numpy==1.26.4 --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+scipy==1.17.1 --hash=sha256:43af8d1f3bea642559019edfe64e9b11192a8978efbd1539d7bc2aaa23d92de4

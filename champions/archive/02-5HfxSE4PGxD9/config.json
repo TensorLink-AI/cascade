@@ -1,0 +1,99 @@
+{
+  "name": "cascade-heat15-heat4-stable-calendar-count-split",
+  "description": "Heat4 with 1.5 points of existing count mass split into a lower-variance calendar-count family for robust healthcare, web, and demand coverage.",
+  "min_length": 4096,
+  "max_length": 4096,
+  "prefetch_depth": 2,
+  "family_weights": {
+    "trend_seasonal_ar": 0.1,
+    "regime_shift": 0.105,
+    "multiplicative": 0.05,
+    "ar2": 0.105,
+    "integrated": 0.09,
+    "threshold_ar": 0.06,
+    "chaotic": 0.01,
+    "spectral_gp": 0.065,
+    "long_memory": 0.06,
+    "ou_stochastic_vol": 0.075,
+    "physical_sensors": 0.085,
+    "seasonal_counts": 0.060,
+    "intermittent": 0.025,
+    "pulse_outlier": 0.02,
+    "conditional_stability": 0.075,
+    "stable_calendar_counts": 0.015
+  },
+  "curriculum": {
+    "enabled": true,
+    "expected_budget_fraction": 0.65,
+    "start_fraction": 0.05,
+    "end_fraction": 0.70,
+    "start_family_weights": {
+      "trend_seasonal_ar": 0.19,
+      "regime_shift": 0.10,
+      "multiplicative": 0.08,
+      "ar2": 0.20,
+      "integrated": 0.05,
+      "threshold_ar": 0.025,
+      "chaotic": 0.0,
+      "spectral_gp": 0.035,
+      "long_memory": 0.025,
+      "ou_stochastic_vol": 0.03,
+      "physical_sensors": 0.105,
+      "seasonal_counts": 0.075,
+      "intermittent": 0.015,
+      "pulse_outlier": 0.005,
+      "conditional_stability": 0.05,
+      "stable_calendar_counts": 0.015
+    },
+    "start_parameters": {
+      "tr_exc_lo": 0.15,
+      "tr_exc_hi": 0.8,
+      "gr_exc_lo": 0.1,
+      "gr_exc_hi": 0.6,
+      "sa_clean_frac": 0.75,
+      "sa_clean_lo": 0.01,
+      "sa_clean_hi": 0.05,
+      "integrated_heavy_frac": 0.0,
+      "integrated_sv_frac": 0.0,
+      "observation": {
+        "censor_rate": 0.0,
+        "quantize_rate": 0.02,
+        "regular_hold_rate": 0.0,
+        "irregular_hold_rate": 0.0,
+        "irregular_hold_prob_lo": 0.0,
+        "irregular_hold_prob_hi": 0.02,
+        "shock_row_rate": 0.0,
+        "shock_prob_lo": 0.0,
+        "shock_prob_hi": 0.002
+      },
+      "augment": {
+        "tsmixup": 0.0,
+        "pad_prefix": 0.0
+      }
+    }
+  },
+  "tr_exc_lo": 0.4,
+  "tr_exc_hi": 2.5,
+  "gr_exc_lo": 0.3,
+  "gr_exc_hi": 1.5,
+  "sa_clean_frac": 0.4,
+  "sa_clean_lo": 0.02,
+  "sa_clean_hi": 0.12,
+  "integrated_heavy_frac": 0.25,
+  "integrated_sv_frac": 0.3,
+  "observation": {
+    "censor_rate": 0.08,
+    "quantize_rate": 0.15,
+    "regular_hold_rate": 0.08,
+    "irregular_hold_rate": 0.25,
+    "irregular_hold_prob_lo": 0.01,
+    "irregular_hold_prob_hi": 0.1,
+    "shock_row_rate": 0.4,
+    "shock_prob_lo": 0.002,
+    "shock_prob_hi": 0.025
+  },
+  "augment": {
+    "tsmixup": 0.03,
+    "pad_prefix": 0.02
+  }
+}

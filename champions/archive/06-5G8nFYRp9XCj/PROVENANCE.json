@@ -1,0 +1,18 @@
+{
+  "reign": 6,
+  "hotkey": "5G8nFYRp9XCjHWzuLS76oi9stHpzQpJB7P1HSp3WnxdMiBRy",
+  "uid": 49,
+  "ref": "angry-bird/gen-d79b2f553e11@hf:71076df6e00a9c7b40cea5c67d67e1f9847ece7b",
+  "digest": "71076df6e00a9c7b40cea5c67d67e1f9847ece7b",
+  "network": "finney",
+  "first_round_id": "6348529366906230387",
+  "last_round_id": "19462759146447327",
+  "first_epoch_start_block": 8762400,
+  "last_epoch_start_block": 8794800,
+  "first_published_at": "2026-08-03T14:04:22+00:00",
+  "last_published_at": "2026-08-08T01:24:03+00:00",
+  "rounds_reigned": 20,
+  "source": "operator king archive: kings/angry-bird/gen-d79b2f553e11/hf-71076df6e00a9c7b40cea5c67d67e1f9847ece7b.tar",
+  "fetched_at": "2026-09-29T05:55:38Z",
+  "note": "archived by scripts/champions_archive.py \u2014 read-only copy of the code that held the throne; verify against the round receipts (cascade-audit). Static scan only \u2014 never run outside a sandbox."
+}
