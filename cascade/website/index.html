@@ -1025,6 +1025,15 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .mixbar i { display:block; height:100%; background:#7E9B7E; }
 .mix-note { font-size:12px; opacity:.7; margin-top:8px; }
 /* training page — public-benchmark trajectories (DEC-CA-0013 telemetry) */
+/* categorical series slots for the big plot — validated with the dataviz
+   palette checks on the light card (#F8FAF6) and the dark card (#29343F);
+   dark steps are the same hues re-stepped, not a flip. Colour follows the
+   series identity, never its position in the current selection. */
+:root { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#4a3aa7; --s7:#e34948; }
+:root[data-theme="dark"] { --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#9085e9; --s7:#e66767; }
+.chip { display:inline-flex; align-items:center; gap:7px; background:none; border:var(--line); color:var(--ink); font:600 10px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; padding:5px 9px; cursor:pointer; opacity:0.55; }
+.chip i { width:14px; height:3px; display:inline-block; background:var(--sc); }
+.chip.on { opacity:1; outline:2px solid var(--sc); outline-offset:-2px; }
 .train-filters { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:0 0 14px; font-family:var(--font-mono); font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
 .train-filters .grp { display:inline-flex; gap:6px; align-items:center; }
 .train-filters .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
@@ -1035,6 +1044,8 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-chart .t .muted { font-weight:400; text-transform:none; letter-spacing:0; }
 .train-chart .chart-wrap { aspect-ratio:4/3; }
 .train-grid.one .chart-wrap { aspect-ratio:5/2; }
+.train-big .chart-wrap { aspect-ratio:2.2/1; }
+@media (max-width: 720px) { .train-big .chart-wrap { aspect-ratio:4/3; } }
 .train-tip { position:absolute; z-index:5; pointer-events:none; background:var(--surface); border:var(--line); padding:8px 10px; font-family:var(--font-mono); font-size:11px; color:var(--ink); min-width:150px; max-width:260px; box-shadow:0 2px 10px rgba(0,0,0,0.12); }
 .train-tip .h { font-weight:700; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }
 .train-tip .r { display:flex; gap:8px; justify-content:space-between; white-space:nowrap; }
@@ -1212,24 +1223,24 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
     <div>
       <div class="train-filters">
-        <span class="grp">Metric
-          <button class="btn active" data-tmetric="crps" title="Continuous Ranked Probability Score — the probabilistic forecast error">CRPS</button>
-          <button class="btn" data-tmetric="mase" title="Mean Absolute Scaled Error — the point forecast error, scaled by a seasonal-naive baseline">MASE</button>
-          <button class="btn" data-tmetric="geomean" title="Geometric mean of all six numbers — the score the warm-start promotion ranks checkpoints by">Geomean</button>
+        <span class="grp" id="train-chips"></span>
+        <span class="grp">View
+          <button class="btn active" data-tview="values" title="Each benchmark's own score; lower is better">Values</button>
+          <button class="btn" data-tview="relative" title="Change against the first generation's best king, per benchmark — one axis for every series">Relative</button>
         </span>
         <span class="grp">Show
-          <button class="btn active" data-tscope="king" title="Only the king's checkpoint each round — the lineage">King lineage</button>
+          <button class="btn active" data-tscope="king" title="Only the king's checkpoints — the lineage">King lineage</button>
           <button class="btn" data-tscope="all" title="Every checkpoint the trainer benched: the king's, each challenger's, and the from-scratch controls">Everything trained</button>
         </span>
       </div>
-      <div id="train-charts" class="train-grid"></div>
+      <div id="train-charts" class="train-big"><div class="train-chart"><div class="chart-wrap"><svg id="train-svg" viewBox="0 0 1000 455" preserveAspectRatio="none"></svg></div><div class="train-tip" hidden></div></div></div>
       <div class="chart-meta">
         <span class="legend train-legend" id="train-legend">
-          <span><i class="swatch" style="background:var(--king)"></i>King checkpoint</span>
-          <span id="train-legend-chal"><i class="swatch hollow"></i>Challenger checkpoint</span>
-          <span id="train-legend-scratch" hidden><i class="swatch diamond"></i>Scratch control</span>
+          <span><i class="swatch" style="background:var(--ink)"></i>Best king per generation</span>
+          <span id="train-legend-chal"><i class="swatch hollow" style="border-color:var(--ink)"></i>Challenger checkpoint</span>
+          <span id="train-legend-scratch" hidden><i class="swatch diamond" style="background:var(--ink)"></i>Scratch control</span>
           <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
-          <span id="train-legend-ref" hidden><i class="swatch dashed"></i><span id="train-legend-ref-label">Official Toto2</span></span>
+          <span id="train-legend-ref" hidden><i class="swatch dashed" style="border-color:var(--ink)"></i><span id="train-legend-ref-label">Official Toto2</span></span>
         </span>
       </div>
     </div>
@@ -2422,7 +2433,15 @@ function loadGenerations(){
 // rolling grid, else the block the reign clock fired at.
 function genStartBlock(G){ var cn=chainNow(); return (G.effective_era&&cn&&cn.eraBlocks)?G.effective_era*cn.eraBlocks:G.fired_block; }
 function genOfBlock(b){ var best=0; Object.keys(_gens).forEach(function(k){ var G=_gens[k]; if(genStartBlock(G)<=b&&G.gen>best) best=G.gen; }); return best; }
-var _trainMetric="crps", _trainScope="king";
+var _trainScope="king", _trainView="values";
+// The seven series of the big plot, in fixed palette order (slot = colour):
+// the six public-benchmark numbers and the six-suite geomean.
+var SERIES=[{key:"gifteval_crps",label:"GIFT-Eval CRPS",slot:1},{key:"gifteval_mase",label:"GIFT-Eval MASE",slot:2},
+            {key:"boom_crps",label:"BOOM CRPS",slot:3},{key:"boom_mase",label:"BOOM MASE",slot:4},
+            {key:"time_crps",label:"TIME CRPS",slot:5},{key:"time_mase",label:"TIME MASE",slot:6},
+            {key:"geomean",label:"Geomean",slot:7}];
+var _trainSel={gifteval_crps:1, boom_crps:1, time_crps:1};
+function metricVal(six,key){ return key==="geomean"?sixGeomean(six):six[key]; }
 // The x axis is CUMULATIVE TRAINING, not the round ordinal: every round's king
 // leg is one more slice of optimiser steps on the same lineage, so a round is
 // plotted at round-number × steps-per-leg. The leg budget is not carried in the
@@ -2565,30 +2584,43 @@ function trainRows(){
   out.forEach(function(x){ var g=byGen[x.gen]; x.steps=g.steps/g.n; x.tokens=g.tokens/g.n; });
   return {rows:out, pending:pending, missing:missing};
 }
-function trainSeries(rows, suite){
-  // suite = "gifteval" | "boom" | "time" | null (geomean)
-  function val(six){ return suite?six[suite+"_"+_trainMetric]:sixGeomean(six); }
+// One series of the big plot: every king checkpoint, the BEST king per
+// generation (the line), challengers + scratch controls when shown, and the
+// official Toto2 reference; values as scored, or relative (%) to the first
+// generation's best king when the view is "relative".
+function trainSeries(rows, key){
   var king=[], chal=[], scratch=[], bestByX={};
   rows.forEach(function(row,i){
     row.entries.forEach(function(e){
-      var v=val(e.six); if(v==null||!isFinite(v)) return;
+      var v=metricVal(e.six,key); if(v==null||!isFinite(v)) return;
       var pt={i:i,v:v,e:e,row:row};
       if(e.role==="king"){ king.push(pt); var b=bestByX[row.steps]; if(!b||v<b.v) bestByX[row.steps]=pt; }
       else chal.push(pt);
     });
-    if(row.scratch){ var sv=val(row.scratch.six); if(sv!=null&&isFinite(sv)) scratch.push({i:i,v:sv,row:row,e:{role:"scratch",hotkey:"",size:""}}); }
+    if(row.scratch){ var sv=metricVal(row.scratch.six,key); if(sv!=null&&isFinite(sv)) scratch.push({i:i,v:sv,row:row,e:{role:"scratch",hotkey:"",size:""}}); }
   });
-  // the trajectory: the best king checkpoint at each lineage depth, in order
   var best=Object.keys(bestByX).map(Number).sort(function(a,b){ return a-b; }).map(function(x){ return bestByX[x]; });
-  var ref=trainReference(rows), rv=ref?val(ref.six):null;
-  return {king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[],
-          ref:(rv!=null&&isFinite(rv))?{v:rv,label:ref.label}:null};
+  var ref=trainReference(rows), rv=ref?metricVal(ref.six,key):null;
+  var S={key:key, king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[],
+         ref:(rv!=null&&isFinite(rv))?{v:rv,label:ref.label}:null, base:null};
+  if(_trainView==="relative"&&best.length&&best[0].v>0){
+    var base=best[0].v; S.base=base;
+    function rel(p){ return {i:p.i, v:(p.v/base-1)*100, raw:p.v, e:p.e, row:p.row}; }
+    S.king=S.king.map(rel); S.best=S.best.map(rel); S.chal=S.chal.map(rel); S.scratch=S.scratch.map(rel);
+    if(S.ref) S.ref={v:(S.ref.v/base-1)*100, raw:S.ref.v, label:S.ref.label};
+  }
+  return S;
 }
-function trainChartSVG(rows, S, W, H){
-  var PAD_L=54,PAD_R=14,PAD_T=12,PAD_B=24, n=rows.length;
-  var all=[]; ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); });
-  if(S.ref&&all.length) all.push(S.ref.v);
-  if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">no bench numbers yet</text>';
+function seriesOf(key){ for(var i=0;i<SERIES.length;i++) if(SERIES[i].key===key) return SERIES[i]; return null; }
+function selectedSeries(){ return SERIES.filter(function(x){ return _trainSel[x.key]; }); }
+function fmtVal(v){ return _trainView==="relative"?((v>0?"+":"")+v.toFixed(2)+"%"):fmt(v); }
+// The big plot: every selected series on ONE axis, lineage steps along x
+// (one column per generation), the palette slot as the series colour,
+// direct labels at each line's end, the reference dashed in the same hue.
+function trainChartSVG(rows, SS, W, H){
+  var PAD_L=54,PAD_R=150,PAD_T=14,PAD_B=24, n=rows.length;
+  var all=[]; SS.forEach(function(S){ ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); }); if(S.ref&&S.king.length) all.push(S.ref.v); });
+  if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">'+(SS.length?'no bench numbers yet':'pick a benchmark above')+'</text>';
   var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
   if(min===max){ min-=Math.abs(min)*0.05||0.5; max+=Math.abs(max)*0.05||0.5; }
   var pad=(max-min)*0.1; min-=pad; max+=pad;
@@ -2596,41 +2628,37 @@ function trainChartSVG(rows, S, W, H){
   if(xmin===xmax){ xmin-=stepsPerLeg()/2; xmax+=stepsPerLeg()/2; }
   function X(i){ return PAD_L+(rows[i].steps-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R); }
   function Y(v){ return PAD_T+(1-(v-min)/(max-min))*(H-PAD_T-PAD_B); }
-  var out="", tickStep=(max-min)/4, tickDp=Math.min(6,Math.max(2,Math.ceil(-Math.log10(tickStep||1))));
+  var out="", tickStep=(max-min)/4, tickDp=_trainView==="relative"?1:Math.min(6,Math.max(2,Math.ceil(-Math.log10(tickStep||1))));
   for(var g=0;g<=4;g++){
     var val=min+(max-min)*g/4, y=Y(val);
     out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/>';
-    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+val.toFixed(tickDp)+'</text>';
+    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
   }
+  if(_trainView==="relative"&&min<0&&max>0){ var y0=Y(0); out+='<line x1="'+PAD_L+'" y1="'+y0.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y0.toFixed(1)+'" stroke="currentColor" stroke-width="0.8" opacity="0.35"/>'; }
   rows.forEach(function(row,i){
     if(row.r.dethroned){ var x=X(i); out+='<line x1="'+x.toFixed(1)+'" y1="'+PAD_T+'" x2="'+x.toFixed(1)+'" y2="'+(H-PAD_B)+'" stroke="var(--chal)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>'; }
   });
-  // the official Toto2 checkpoint of this size: a dashed reference line
-  if(S.ref){
-    var ry=Y(S.ref.v);
-    out+='<line x1="'+PAD_L+'" y1="'+ry.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+ry.toFixed(1)+'" stroke="var(--ink)" stroke-width="1.4" stroke-dasharray="6 5" opacity="0.6"/>'+
-      '<text x="'+(W-PAD_R)+'" y="'+(ry-5).toFixed(1)+'" text-anchor="end" fill="var(--ink)" font-size="11" opacity="0.8">'+esc(S.ref.label)+' '+fmt(S.ref.v)+'</text>';
-  }
-  // scratch controls: diamonds, muted (a control, not a contender)
-  S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="var(--muted)"/>'; });
-  // challengers: hollow dots with a surface ring so overlaps stay readable
-  S.chal.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="'+(p.e.crowned?'var(--chal-line)':'var(--surface)')+'" stroke="var(--chal-line)" stroke-width="1.6"/>'; });
-  // every king checkpoint as a point; the line follows the BEST king at each
-  // lineage depth (rounds of one generation share a column)
-  var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
-  S.king.forEach(function(p){ if(bestKey[p.i+":"+p.e.pointer]) return; var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="3.6" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.4" fill="var(--king)" opacity="0.45"/>'; });
-  if(S.best.length>1) out+='<polyline points="'+S.best.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="var(--king)" stroke-width="2" stroke-linejoin="round"/>';
-  S.best.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="var(--king)"/>'; });
-  // x ticks in cumulative optimiser steps (nice multiples of the leg budget,
-  // ~4 per chart); the token equivalent rides the axis title and the tooltip
   var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
   for(var t=Math.ceil(xmin/nice)*nice; t<=xmax+1e-6; t+=nice){
     var xt=PAD_L+(t-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
     out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="11">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
   }
-  // hover layer: one column per round reaching halfway to its neighbours (hit
-  // target wider than the marks), a crosshair, and the tooltip listing every
-  // checkpoint at that round
+  // end labels: stacked so two series ending close together never overlap
+  var labels=[];
+  SS.forEach(function(S){
+    var col="var(--s"+seriesOf(S.key).slot+")";
+    if(S.ref){ var ry=Y(S.ref.v); out+='<line x1="'+PAD_L+'" y1="'+ry.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+ry.toFixed(1)+'" stroke="'+col+'" stroke-width="1.3" stroke-dasharray="6 5" opacity="0.7"/>'; labels.push({y:ry,text:S.ref.label+" "+fmtVal(S.ref.v),col:col,dim:true}); }
+    S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="'+col+'" opacity="0.7"/>'; });
+    S.chal.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="'+(p.e.crowned?col:'var(--surface)')+'" stroke="'+col+'" stroke-width="1.6"/>'; });
+    var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
+    S.king.forEach(function(p){ if(bestKey[p.i+":"+p.e.pointer]) return; var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="3.4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.3" fill="'+col+'" opacity="0.4"/>'; });
+    if(S.best.length>1) out+='<polyline points="'+S.best.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="'+col+'" stroke-width="2.2" stroke-linejoin="round"/>';
+    S.best.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3.1" fill="'+col+'"/>'; });
+    if(S.best.length){ var last=S.best[S.best.length-1]; labels.push({y:Y(last.v),text:seriesOf(S.key).label+" "+fmtVal(last.v),col:col,dim:false}); }
+  });
+  labels.sort(function(a,b){ return a.y-b.y; });
+  var prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+13); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
+  labels.forEach(function(L){ out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="11" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>'; });
   out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
   var cols=[]; rows.forEach(function(row,i){ if(!cols.length||cols[cols.length-1].steps!==row.steps) cols.push({steps:row.steps,i:i}); });
   cols.forEach(function(c,k){
@@ -2639,25 +2667,27 @@ function trainChartSVG(rows, S, W, H){
   });
   return out;
 }
-function trainTipHTML(row, S, i, unit){
-  // all rows at this lineage depth: a generation's rounds share the column
-  var x=row.steps, idxs={}; S.king.concat(S.chal,S.scratch).forEach(function(p){ if(p.row.steps===x) idxs[p.i]=1; });
+// The tooltip for one column (a generation): every selected series' best king
+// there, its round, and the reference, keyed by the series' line colour.
+function trainTipHTML(row, SS, i){
+  var x=row.steps, idxs={};
+  SS.forEach(function(S){ S.king.concat(S.chal,S.scratch).forEach(function(p){ if(p.row.steps===x) idxs[p.i]=1; }); });
   var rowsHere=Object.keys(idxs).map(Number).sort(function(a,b){ return a-b; });
-  function pick(list){ return list.filter(function(p){ return p.row.steps===x; }); }
-  var lines=[], ks=pick(S.king), cs=pick(S.chal), ss=pick(S.scratch), shown=0, MAX=8;
-  var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
-  ks.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k king"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+(bestKey[p.i+":"+p.e.pointer]?'★ ':'')+esc(p.row.label)+' · king'+(p.e.uid!=null?' uid '+esc(p.e.uid):'')+'</span></div>'); });
-  cs.sort(function(a,b){ return a.v-b.v; }).forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k chal"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · '+(p.e.crowned?'♛ ':'')+esc(p.e.uid!=null?"uid "+p.e.uid:shortHk(p.e.hotkey))+'</span></div>'); });
-  ss.forEach(function(p){ if(shown++>=MAX) return; lines.push('<div class="r"><span><i class="k scratch"></i><b>'+fmt(p.v)+'</b></span><span class="who">'+esc(p.row.label)+' · scratch</span></div>'); });
-  var total=ks.length+cs.length+ss.length, more=total>MAX?'<div class="muted">+'+(total-MAX)+' more</div>':'';
-  if(S.ref) more+='<div class="r"><span><i class="k" style="height:0;border-top:2px dashed var(--ink)"></i><b>'+fmt(S.ref.v)+'</b></span><span class="who">'+esc(S.ref.label)+' · official</span></div>';
+  var lines=[];
+  SS.forEach(function(S){
+    var col="var(--s"+seriesOf(S.key).slot+")", best=null, nk=0, nc=0;
+    S.best.forEach(function(p){ if(p.row.steps===x) best=p; });
+    S.king.forEach(function(p){ if(p.row.steps===x) nk++; }); S.chal.forEach(function(p){ if(p.row.steps===x) nc++; });
+    var who=best?esc(best.row.label)+(best.e.uid!=null?' · uid '+esc(best.e.uid):''):'--';
+    lines.push('<div class="r"><span><i class="k" style="background:'+col+'"></i><b>'+(best?fmtVal(best.v):'--')+'</b></span><span class="who">'+esc(seriesOf(S.key).label)+' · '+who+(nc?' · '+nc+' chal':'')+'</span></div>');
+    if(S.ref) lines.push('<div class="r"><span><i class="k" style="height:0;border-top:2px dashed '+col+'"></i><b>'+fmtVal(S.ref.v)+'</b></span><span class="who">'+esc(S.ref.label)+' · official</span></div>');
+  });
   var first=rows[rowsHere[0]]||row, last=rows[rowsHere[rowsHere.length-1]]||row;
   var span=rowsHere.length>1?esc(first.label)+' – '+esc(last.label)+' · '+rowsHere.length+' rounds':esc(row.label);
   return '<div class="h">Generation '+row.gen+' <span class="muted">· '+span+'</span></div>'+
-    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' · '+row.depth+' leg'+(row.depth===1?'':'s')+' deep</div>'+
-    (lines.join("")||'<div class="muted">no bench numbers</div>')+more+(unit?'<div class="muted" style="margin-top:4px">'+esc(unit)+'</div>':'');
+    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' · '+row.depth+' leg'+(row.depth===1?'':'s')+' deep'+(_trainView==="relative"?' · vs first generation':'')+'</div>'+lines.join("");
 }
-function wireTrainChart(wrap, rows, S, unit){
+function wireTrainChart(wrap, rows, SS){
   var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), xh=svg.querySelector(".xh");
   if(!svg||!tip) return;
   function hide(){ tip.hidden=true; if(xh) xh.setAttribute("opacity","0"); }
@@ -2667,9 +2697,10 @@ function wireTrainChart(wrap, rows, S, unit){
     cols[c].addEventListener("mousemove", function(ev){
       var i=Number(this.dataset.i), x=this.dataset.x;
       if(xh){ xh.setAttribute("x1",x); xh.setAttribute("x2",x); xh.setAttribute("opacity","0.35"); }
-      tip.innerHTML=trainTipHTML(rows[i],S,i,unit); tip.hidden=false;
+      tip.innerHTML=trainTipHTML(rows[i],SS,i); tip.hidden=false;
       var b=wrap.getBoundingClientRect(), px=ev.clientX-b.left, py=ev.clientY-b.top;
       var tw=tip.offsetWidth||160, left=px+14; if(left+tw>b.width) left=Math.max(0,px-14-tw);
+      if(rows.length&&tip.querySelector(".r")===null) tip.hidden=true;
       tip.style.left=left+"px"; tip.style.top=Math.max(0,py-10)+"px";
     });
   }
@@ -2678,7 +2709,7 @@ function tile(k,v,sub,o){
   // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
   return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'><div class="k">'+esc(k)+'</div>'+
-    '<div class="v">'+v+'</div></div>';
+    '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+'</div>';
 }
 function renderTrainStats(rows, info){
   var el=document.getElementById("train-stats"), when=document.getElementById("train-when"); if(!el) return;
@@ -2717,8 +2748,9 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Lineage legs",lin.legs,(unres?unres+" unresolved · ":"")+(lin.deadline?lin.deadline+" wall-stopped":"one per generation"),
       {title:"Legs of training behind the latest king checkpoint: one per generation plus its own. Unresolved = the chain could not be followed to a published training summary, so the leg is priced at the contract"+(lin.deadline?"; a wall-stopped leg (deadline_hit) trained less than contracted":"")}));
     var effPct=lin.tokens/toto2Tokens()*100;
-    tiles.push(tile("Token efficiency",(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+'<span class="u">%</span>',"",
-      {title:"Tokens the king lineage has trained on as a share of the official Toto2 pretraining run: "+fmtTokens(lin.tokens)+" ÷ "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context)"}));
+    tiles.push(tile("Tokens vs Toto2",esc(fmtTokens(lin.tokens).replace(" tokens",""))+'<span class="u">/ '+esc(fmtTokens(toto2Tokens()).replace(" tokens",""))+'</span>',"",
+      {sub:(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+"% of Toto2 pretraining tokens",
+       title:"Tokens the king lineage has trained on as a share of the official Toto2 pretraining run: "+fmtTokens(lin.tokens)+" ÷ "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context)"}));
   }
   // ── row two: the latest king checkpoint's six public-benchmark numbers, then the benched count ──
   if(lastK){
@@ -2735,24 +2767,25 @@ function renderTrain(){
   var grid=document.getElementById("train-charts"); if(!grid) return;
   var info=trainRows(), rows=info.rows;
   renderTrainStats(rows, info);
-  var geo=_trainMetric==="geomean", W=geo?1000:520, H=geo?400:390;
-  var charts=geo?[{suite:null,label:"Six-suite geomean",sub:"the promotion score"}]:SUITES.map(function(s){ return {suite:s.key,label:s.label,sub:_trainMetric.toUpperCase()}; });
-  grid.className="train-grid"+(geo?" one":"");
-  grid.innerHTML=charts.map(function(c,k){
-    return '<div class="train-chart" data-k="'+k+'"><div class="t">'+esc(c.label)+' <span class="muted">— '+esc(c.sub)+'</span></div>'+
-      '<div class="chart-wrap"><svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none"></svg></div><div class="train-tip" hidden></div></div>';
-  }).join("");
-  charts.forEach(function(c,k){
-    var S=trainSeries(rows,c.suite), wrap=grid.querySelector('.train-chart[data-k="'+k+'"]');
-    wrap.querySelector("svg").innerHTML=trainChartSVG(rows,S,W,H);
-    wireTrainChart(wrap,rows,S,(c.suite?c.label+" "+_trainMetric.toUpperCase():"geomean")+" · lower is better");
-  });
+  renderTrainChips();
+  var SS=selectedSeries().map(function(x){ return trainSeries(rows,x.key); });
+  var wrap=grid.querySelector(".train-chart"), svg=document.getElementById("train-svg"), W=1000, H=455;
+  svg.innerHTML=trainChartSVG(rows,SS,W,H);
+  wireTrainChart(wrap,rows,SS);
   var anyScratch=rows.some(function(r){ return !!r.scratch; }), ref=trainReference(rows);
   document.getElementById("train-legend-ref").hidden=!ref;
   if(ref) document.getElementById("train-legend-ref-label").textContent="Official "+ref.label;
   document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
   document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
   renderTrainTable(rows);
+}
+function renderTrainChips(){
+  var el=document.getElementById("train-chips"); if(!el||el.children.length) return;
+  el.innerHTML=SERIES.map(function(x){ return '<button class="chip'+(_trainSel[x.key]?' on':'')+'" data-tser="'+x.key+'" style="--sc:var(--s'+x.slot+')" title="Toggle '+esc(x.label)+'"><i></i>'+esc(x.label)+'</button>'; }).join("");
+  for(var i=0;i<el.children.length;i++) el.children[i].addEventListener("click", function(){
+    var k=this.dataset.tser; if(_trainSel[k]) delete _trainSel[k]; else _trainSel[k]=1;
+    this.classList.toggle("on", !!_trainSel[k]); renderTrain();
+  });
 }
 function renderTrainTable(rows){
   var tb=document.getElementById("train-rows"); if(!tb) return;
@@ -2780,9 +2813,9 @@ function renderTrainTable(rows){
   document.getElementById("train-table-when").textContent=out.length?out.length+" checkpoints · newest first":"";
 }
 (function(){
-  var ms=document.querySelectorAll("[data-tmetric]"), ss=document.querySelectorAll("[data-tscope]");
+  var ms=document.querySelectorAll("[data-tview]"), ss=document.querySelectorAll("[data-tscope]");
   function bind(list, attr, set){ for(var i=0;i<list.length;i++) list[i].addEventListener("click", function(){ set(this.dataset[attr]); for(var j=0;j<list.length;j++) list[j].classList.toggle("active", list[j]===this); renderTrain(); }); }
-  bind(ms,"tmetric",function(v){ _trainMetric=v; });
+  bind(ms,"tview",function(v){ _trainView=v; });
   bind(ss,"tscope",function(v){ _trainScope=v; });
 })();
 

@@ -97,20 +97,32 @@ def test_every_report_role_renders_a_pill(page: str):
 def test_king_lineage_is_the_default_and_everything_trained_is_offered(page: str):
     assert re.search(r'data-tscope="king"[^>]*>', page)
     assert re.search(r'data-tscope="all"[^>]*>', page)
-    assert 'var _trainMetric="crps", _trainScope="king"' in page
-    for metric in ("crps", "mase", "geomean"):
-        assert f'data-tmetric="{metric}"' in page, f"no {metric} metric button"
+    assert 'var _trainScope="king", _trainView="values"' in page
+    for view in ("values", "relative"):
+        assert f'data-tview="{view}"' in page, f"no {view} view button"
 
 
-def test_charts_are_per_suite_small_multiples_with_a_hover_layer(page: str):
-    suites = _js_string_list(page, "SUITES")
-    assert suites[::2] == ["gifteval", "boom", "time"], suites
-    fn = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
+def test_one_big_plot_with_multi_select_series_and_a_fixed_palette(page: str):
+    """One chart, every selected benchmark on one axis; series chips are a
+    multi-select whose colour is a fixed palette slot per series (never
+    re-assigned on filter); direct end labels relieve the low-contrast slots."""
+    keys = re.findall(r'\{key:"([a-z_]+)",label:"[^"]+",slot:(\d)\}', page)
+    assert [k for k, _ in keys] == ["gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase",
+                                    "time_crps", "time_mase", "geomean"]
+    assert [int(s) for _, s in keys] == [1, 2, 3, 4, 5, 6, 7], "slots must be fixed per series"
+    for slot in range(1, 8):
+        assert re.search(rf"--s{slot}:#[0-9a-f]{{6}};", page), f"no light token for slot {slot}"
+    assert re.search(r'\[data-theme="dark"\] \{ --s1:#', page), "no dark re-step of the palette"
+    fn = re.search(r"function trainChartSVG\(rows, SS, W, H\)\{(.*?)\n\}", page, re.S)
     assert fn, "trainChartSVG() missing"
     body = fn.group(1)
-    assert 'class="col"' in body and 'class="xh"' in body, "no per-round hit targets / crosshair"
-    assert "r.dethroned" in body, "dethrones are not marked on the round axis"
-    assert "function wireTrainChart" in page and "train-tip" in page
+    assert 'class="col"' in body and 'class="xh"' in body, "no per-column hit targets / crosshair"
+    assert "r.dethroned" in body and "S.best" in body and "S.ref" in body and "stroke-dasharray" in body
+    assert "labels.push" in body, "no direct end labels"
+    assert "function renderTrainChips" in page and 'data-tser=' in page
+    assert 'id="train-svg"' in page and page.count('<svg id="train-svg"') == 1
+    tip = re.search(r"function trainTipHTML\(row, SS, i\)\{(.*?)\n\}", page, re.S)
+    assert tip and "fmtTokens(row.tokens)" in tip.group(1) and "S.ref" in tip.group(1)
 
 
 def test_tab_polls_while_open(page: str):
@@ -162,11 +174,9 @@ def test_lineage_depth_is_one_leg_per_generation(page: str):
     assert gens and 'fetchJSON("promotions/index.json")' in gens.group(1)
     assert re.search(r"\.fired_block\b", gens.group(1)) and re.search(r"\.effective_era\b", gens.group(1)), (
         "a generation's activation block is not read off its promotion record")
-    chart = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
+    chart = re.search(r"function trainChartSVG\(rows, SS, W, H\)\{(.*?)\n\}", page, re.S)
     assert chart and "rows[i].steps" in chart.group(1), "the chart does not place rounds by lineage steps"
     assert "S.best" in chart.group(1), "the line does not follow the best king per generation"
-    tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
-    assert tip and "fmtTokens(row.tokens)" in tip.group(1), "the tooltip does not show the token count"
 
 
 def test_training_summary_is_fetched_immutably(page: str):
@@ -177,7 +187,7 @@ def test_training_summary_is_fetched_immutably(page: str):
         "the tab does not fetch training_summary_key() objects cache-friendly")
 
 
-@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Series-points", "Lineage legs", "Token efficiency"])
+@pytest.mark.parametrize("tile", ["Generations", "Steps trained", "Tokens trained", "Series-points", "Lineage legs", "Tokens vs Toto2"])
 def test_top_box_has_a_tile_per_trained_quantity(page: str, tile: str):
     body = re.search(r"function renderTrainStats\(rows, info\)\{(.*?)\n\}", page, re.S)
     assert body and f'tile("{tile}"' in body.group(1), f"no {tile!r} tile in the top box"
@@ -190,18 +200,14 @@ def test_top_box_is_a_grid_of_bordered_tiles(page: str):
     assert m and 'class="tile' in m.group(1) and 'class="k"' in m.group(1) and 'class="v"' in m.group(1)
 
 
-def test_official_toto2_reference_line_on_every_chart(page: str):
-    """The official Toto2 checkpoint of the king's size, benched by the same
-    battery (benchmarks/reference-toto2-<rung>.json, the stakeholder page's
-    source), is drawn as a dashed line on each chart, in the y-range, legend
-    and tooltip."""
+def test_official_toto2_reference_line_per_series(page: str):
+    """The official Toto2 checkpoint of the king's size (benchmarks/reference-
+    toto2-<rung>.json) is a dashed line in each selected series' colour, in
+    the y-range, the legend and the tooltip."""
     assert re.search(r'fetchJSON\("benchmarks/reference-toto2-"\s*\+\s*rung\s*\+\s*"\.json",\{bust:false\}', page)
-    chart = re.search(r"function trainChartSVG\(rows, S, W, H\)\{(.*?)\n\}", page, re.S)
-    assert chart and "S.ref" in chart.group(1) and "stroke-dasharray" in chart.group(1)
-    assert "all.push(S.ref.v)" in chart.group(1), "the reference is not part of the y-range"
+    chart = re.search(r"function trainChartSVG\(rows, SS, W, H\)\{(.*?)\n\}", page, re.S)
+    assert chart and "all.push(S.ref.v)" in chart.group(1), "the reference is not part of the y-range"
     assert 'id="train-legend-ref"' in page
-    tip = re.search(r"function trainTipHTML\(row, S, i, unit\)\{(.*?)\n\}", page, re.S)
-    assert tip and "S.ref" in tip.group(1)
 
 
 def test_token_efficiency_is_measured_against_the_official_toto2_run(page: str):
