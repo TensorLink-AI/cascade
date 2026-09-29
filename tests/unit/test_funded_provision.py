@@ -325,3 +325,20 @@ def test_scan_ssh_host_key_prefers_ed25519():
     key = scan_ssh_host_key("10.0.0.9", 2222,
                             runner=lambda a: subprocess.CompletedProcess(a, 0, stdout=out, stderr=""))
     assert key == "ssh-ed25519 AAAAed"
+
+
+def test_reconcile_funded_hotkeys_restricts_and_exclude_skips_payers():
+    """2026-09-29: a finished leg's teardown fallback sweeps ITS payer only
+    (``hotkeys``); the restart sweep skips payers with a leg in flight
+    (``exclude``) instead of waiting for the whole field to empty."""
+    hk2 = "5FakeHotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    vault = _vault_with_key()
+    vault.insert(hk2, "sk-miner-2")
+    orphan1 = f"{funded_pod_name('777', HK, 91)}-r1"
+    orphan2 = f"{funded_pod_name('777', hk2, 91)}-r1"
+    providers = {"sk-miner": FakeProvider(tagged=[orphan1]), "sk-miner-2": FakeProvider(tagged=[orphan2])}
+    killed = reconcile_funded([], vault, netuid=91, provider_factory=lambda key: providers[key], hotkeys=[HK])
+    assert killed == [orphan1] and providers["sk-miner-2"].terminated == []
+    providers = {"sk-miner": FakeProvider(tagged=[orphan1]), "sk-miner-2": FakeProvider(tagged=[orphan2])}
+    killed = reconcile_funded([], vault, netuid=91, provider_factory=lambda key: providers[key], exclude=[HK])
+    assert killed == [orphan2] and providers["sk-miner"].terminated == []

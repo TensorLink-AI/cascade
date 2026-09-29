@@ -451,8 +451,17 @@ def reconcile_funded(
     *,
     netuid: int = 0,
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
+    hotkeys: Iterable[str] | None = None,
+    exclude: Iterable[str] = (),
 ) -> list[str]:
     """The orphan reaper's per-payer sweep; returns the pod names CONFIRMED gone.
+
+    ``hotkeys`` restricts the sweep to those payers (a finished leg's
+    teardown fallback sweeps ITS payer only); ``exclude`` skips payers whose
+    leg is still in flight (their pod is the leg — the restart sweep must
+    reap everyone else's orphans without waiting for the field to empty,
+    2026-09-29: four pods idled 5–14 h because the sweep only ran when no leg
+    was in flight, which under rolling eras is never).
 
     The operator-account reaper cannot see pods on miners' accounts, so this
     walks every hotkey that has a vaulted key, lists THAT account's pods, and
@@ -468,7 +477,11 @@ def reconcile_funded(
     """
     owned_ids = {i.instance_id for i in owned if i.stage == FUNDED_STAGE}
     killed: list[str] = []
+    only = None if hotkeys is None else {str(h) for h in hotkeys}
+    skip = {str(h) for h in exclude}
     for hotkey in vault.hotkeys():
+        if (only is not None and hotkey not in only) or hotkey in skip:
+            continue
         key = vault.get(hotkey)
         if not key:
             continue
