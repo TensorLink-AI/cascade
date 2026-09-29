@@ -1467,6 +1467,68 @@ def test_leg_finishing_after_its_era_is_requeued_at_finish_not_at_rollover(cfg, 
     assert (tmp_path / "leg_walls.json").exists()                  # its wall was still measured
 
 
+def test_leg_whose_bench_outlives_its_era_is_requeued_not_orphaned(cfg, tmp_path):
+    """2026-09-28 22:24–22:33: three legs finished TRAINING before the 22:03
+    rollover, benched ~80 min on their payer pods, and were filed under the
+    dead era after it — unjudgeable, stranded until the next rollover."""
+    armed = _armed(cfg)
+    clock = Clock()
+
+    class BenchHold(FakeOps):
+        def bench_challenger(self, entry, king, era):
+            self.hold["BENCH"].wait(10)
+            return super().bench_challenger(entry, king, era)
+
+    sched, ops = _sched(armed, tmp_path, clock, ops=BenchHold(tmp_path, clock))
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    era_len = EB * armed.round.era_settlements
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    ops.hold = {"BENCH": threading.Event()}                         # training done, bench blocks
+    sched.tick(client, b0)
+    time.sleep(0.05)
+    assert q.get("ALFA").status == "in_flight"
+    clock.t += era_len * R.BLOCK_SECONDS                            # the era rolls mid-bench
+    sched.tick(client, era_start + era_len + 1)
+    assert sched.state.current.index == armed.round.rolling_from_block // era_len + 1
+    ops.hold["BENCH"].set()
+    _join(sched)
+    assert q.get("ALFA").status == "queued"                         # requeued when the bench ended
+    assert q.get("ALFA").attempts == 0
+    assert all(f.hotkey != "ALFA" for f in sched.state.finished)    # no orphan recorded
+    assert ops.torn_down and ops.torn_down[0][0] == "ALFA"          # payer pod released once
+
+
+def test_finished_legs_stranded_under_a_dead_era_are_swept_at_the_next_tick(cfg, tmp_path):
+    """A dead-era orphan already on disk (recorded by an older trainer) is
+    requeued unburned at the next tick, not at the next rollover."""
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    assert [f.hotkey for f in sched.state.finished] == ["ALFA"]
+    cur = sched.state.current.index
+    # strand it: the record says an era that is already over
+    sched.state.finished[0] = replace(sched.state.finished[0], era_index=cur - 1)
+    sched._save()
+    sched.tick(client, b0 + 1)
+    _join(sched)
+    # swept (requeued unburned) and re-seated by the same tick's intake: the
+    # only record left is the fresh leg under the live era
+    assert [(f.hotkey, f.era_index) for f in sched.state.finished] == [("ALFA", cur)]
+    assert len(ops.leg_calls) == 2 and q.get("ALFA").attempts == 0
+
+
 # ── relaunch after a forfeiture (2026-09-28 13:05–13:08 class) ───────────────
 
 def test_stale_receipt_or_incentive_never_hands_the_throne_back_to_a_forfeited_king(cfg, tmp_path):
